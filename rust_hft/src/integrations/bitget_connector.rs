@@ -20,6 +20,8 @@ pub enum ReconnectStrategy {
     Fast,
     /// Standard reconnect for orderbook data (1s-5s)
     Standard,
+    /// Conservative reconnect for low-frequency data (5s-120s)
+    Conservative,
     /// Custom reconnect with user-defined delays
     Custom {
         initial_delay_ms: u64,
@@ -245,6 +247,11 @@ impl BitgetConnector {
                     _ => 120000,   // 120s - 最大延迟
                 }
             }
+            ReconnectStrategy::Custom { initial_delay_ms, max_delay_ms, multiplier } => {
+                // 自定义策略：基于失败次数的指数退避
+                let delay = (*initial_delay_ms as f64 * multiplier.powi(consecutive_failures as i32 - 1)) as u64;
+                delay.min(*max_delay_ms)
+            }
         }
     }
 
@@ -266,6 +273,15 @@ impl BitgetConnector {
                     1 => 1000,
                     2 => 3000,
                     _ => 5000,
+                }
+            }
+            ReconnectStrategy::Conservative => {
+                // Conservative strategy: 5s -> 15s -> 30s -> 60s
+                match attempt {
+                    1 => 5000,
+                    2 => 15000,
+                    3 => 30000,
+                    _ => 60000,
                 }
             }
             ReconnectStrategy::Custom { initial_delay_ms, max_delay_ms, multiplier } => {

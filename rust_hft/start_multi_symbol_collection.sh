@@ -20,7 +20,7 @@ echo "✅ 配置文件檢查通過: $CONFIG_FILE"
 
 # 檢查ClickHouse連接
 echo "🔍 檢查ClickHouse連接..."
-if curl -s "http://localhost:8123/?query=SELECT%201" > /dev/null 2>&1; then
+if docker exec hft_clickhouse clickhouse-client --query "SELECT 1" > /dev/null 2>&1; then
     echo "✅ ClickHouse連接正常"
 else
     echo "⚠️  ClickHouse未啟動，嘗試啟動..."
@@ -28,7 +28,7 @@ else
         docker-compose up -d clickhouse
         sleep 5
         
-        if curl -s "http://localhost:8123/?query=SELECT%201" > /dev/null 2>&1; then
+        if docker exec hft_clickhouse clickhouse-client --query "SELECT 1" > /dev/null 2>&1; then
             echo "✅ ClickHouse啟動成功"
         else
             echo "❌ ClickHouse啟動失敗，繼續運行但不會入庫"
@@ -40,9 +40,13 @@ fi
 
 # 創建數據表
 echo "📊 創建ClickHouse數據表..."
-if curl -s "http://localhost:8123/?query=SELECT%201" > /dev/null 2>&1; then
-    curl -s "http://localhost:8123/" --data-binary @clickhouse/multi_symbol_tables.sql > /dev/null
-    echo "✅ 數據表創建完成"
+if docker exec hft_clickhouse clickhouse-client --query "SELECT 1" > /dev/null 2>&1; then
+    if [ -f "clickhouse/multi_symbol_tables.sql" ]; then
+        docker exec -i hft_clickhouse clickhouse-client < clickhouse/multi_symbol_tables.sql > /dev/null 2>&1
+        echo "✅ 數據表創建完成"
+    else
+        echo "⚠️  數據表SQL文件不存在，跳過創建"
+    fi
 else
     echo "⚠️  跳過數據表創建"
 fi
@@ -72,148 +76,89 @@ fi
 
 # 選擇運行模式
 echo ""
-echo "請選擇運行模式："
-echo "1) 🚀 基於流量的多連接 (推薦，穩定) - 快速測試 (5分鐘 = 300秒)"
-echo "2) 🚀 基於流量的多連接 (推薦，穩定) - 標準收集 (30分鐘 = 1800秒)" 
-echo "3) 🚀 基於流量的多連接 (推薦，穩定) - 長期收集 (2小時 = 7200秒)"
-echo "4) 🤖 自適應動態連接 (最新，智能) - 快速測試 (10分鐘 = 600秒)"
-echo "5) 🤖 自適應動態連接 (最新，智能) - 標準收集 (30分鐘 = 1800秒)"
-echo "6) 🤖 自適應動態連接 (最新，智能) - 長期收集 (2小時 = 7200秒)"
-echo "7) ⚠️  單連接模式 (僅供測試，可能不穩定)"
-echo "8) 自定義參數"
+echo "🎯 高性能數據錄製測試模式："
+echo "1) ⚡ 快速測試 (5分鐘) - 驗證系統穩定性"
+echo "2) 📊 標準測試 (30分鐘) - 性能基準測試"  
+echo "3) 🔋 長期測試 (2小時) - 承載量測試"
+echo "4) 🌙 24小時測試 - 準生產測試"
+echo "5) 🛠️  自定義時長"
 echo ""
-read -p "請輸入選擇 [1-8]: " choice
+read -p "請輸入選擇 [1-5]: " choice
 
 case $choice in
     1)
-        echo "🚀 啟動基於流量的多連接快速測試模式..."
-        echo "💡 採用智能連接分配 - 高流量商品獨立連接，確保穩定性"
-        cargo run --example volume_based_collection --release -- --config $CONFIG_FILE --duration 300 --monitor
+        echo "⚡ 啟動快速穩定性測試 (5分鐘)..."
+        echo "💡 測試目標：驗證連接穩定性、數據完整性、錯誤率"
+        echo "📊 開始時間: $(date)"
+        cargo run --example adaptive_collection --release -- --config $CONFIG_FILE --duration 300 --monitor --auto-rebalance
         ;;
     2)
-        echo "🚀 啟動基於流量的多連接標準收集模式..."
-        echo "💡 採用智能連接分配 - 根據商品數據量動態分配連接"
-        cargo run --example volume_based_collection --release -- --config $CONFIG_FILE --duration 1800 --monitor
-        ;;
-    3)
-        echo "🚀 啟動基於流量的多連接長期收集模式..."
-        echo "💡 採用智能連接分配 - 長期穩定運行，詳細流量監控"
-        cargo run --example volume_based_collection --release -- --config $CONFIG_FILE --duration 7200 --monitor
-        ;;
-    4)
-        echo "🤖 啟動自適應動態連接快速測試模式..."
-        echo "💡 採用最新智能算法 - 實時流量監控 + 動態重新平衡"
-        cargo run --example adaptive_collection --release -- --config $CONFIG_FILE --duration 600 --monitor --auto-rebalance
-        ;;
-    5)
-        echo "🤖 啟動自適應動態連接標準收集模式..."
-        echo "💡 採用最新智能算法 - 基於實時數據自動優化連接分配"
+        echo "📊 啟動標準性能測試 (30分鐘)..."
+        echo "💡 測試目標：吞吐量基準、內存使用、延遲分佈"
+        echo "📊 開始時間: $(date)"
         cargo run --example adaptive_collection --release -- --config $CONFIG_FILE --duration 1800 --monitor --auto-rebalance
         ;;
-    6)
-        echo "🤖 啟動自適應動態連接長期收集模式..."
-        echo "💡 採用最新智能算法 - 長期穩定運行，自動故障恢復"
+    3)
+        echo "🔋 啟動長期承載量測試 (2小時)..."
+        echo "💡 測試目標：最大承載量、長期穩定性、性能退化"
+        echo "📊 開始時間: $(date)"
         cargo run --example adaptive_collection --release -- --config $CONFIG_FILE --duration 7200 --monitor --auto-rebalance
         ;;
-    7)
-        echo "⚠️  啟動單連接模式 (僅供測試)..."
-        echo "⚠️  注意：此模式可能在2-4分鐘後因連接過載而斷開"
-        # 創建臨時配置
-        cat > config/quick_test.yaml << EOF
-symbols:
-  - "BTCUSDT"
-  - "ETHUSDT" 
-  - "SOLUSDT"
-data_collection:
-  channels: ["Books5", "Trade"]
-  performance:
-    batch_size: 1000
-    buffer_capacity: 5000
-    flush_interval_ms: 100
-    enable_simd: true
-    cpu_affinity: true
-    memory_prefault_mb: 256
-  quality_control:
-    enable_validation: true
-    max_latency_ms: 50
-    duplicate_detection: false
-    sequence_validation: false
-clickhouse:
-  enabled: true
-  connection:
-    url: "http://localhost:8123"
-    database: "hft_db"
-    username: "hft_user"
-    password: "hft_password"
-  batch_settings:
-    batch_size: 2000
-    flush_interval_ms: 1000
-    max_memory_mb: 100
-    compression: "lz4"
-  tables:
-    market_data: "enhanced_market_data"
-    trade_data: "trade_executions"
-    quality_metrics: "data_quality_metrics"
-monitoring:
-  enable_realtime_stats: true
-  stats_interval_sec: 30
-  enable_performance_metrics: true
-  log_level: "info"
-  alerts:
-    max_processing_latency_us: 1000
-    min_throughput_msg_per_sec: 100
-    max_error_rate_percent: 5.0
-EOF
-        cargo run --example multi_symbol_high_perf_collection --release -- --config config/quick_test.yaml --duration 5
+    4)
+        echo "🌙 啟動24小時準生產測試..."
+        echo "💡 測試目標：24/7穩定運行、故障自動恢復、完整性能報告"
+        echo "📊 開始時間: $(date)"
+        cargo run --example adaptive_collection --release -- --config $CONFIG_FILE --duration 86400 --monitor --auto-rebalance
         ;;
-    8)
-        echo "請選擇自定義模式："
-        echo "a) 基於流量的多連接 (推薦)"
-        echo "b) 自適應動態連接 (最新)"
-        echo "c) 單連接模式 (測試用)"
-        read -p "選擇 [a/b/c]: " custom_mode
-        
-        read -p "輸入收集時長（分鐘）: " duration
-        read -p "輸入配置文件路徑 [config/multi_symbol_collection.yaml]: " config_path
-        config_path=${config_path:-config/multi_symbol_collection.yaml}
-        
-        # 將分鐘轉換為秒
+    5)
+        read -p "📝 輸入測試時長（分鐘）: " duration
         duration_seconds=$((duration * 60))
-        
-        if [ "$custom_mode" = "a" ]; then
-            echo "🚀 啟動自定義基於流量的多連接模式..."
-            echo "⏱️  運行時長: ${duration} 分鐘 (${duration_seconds} 秒)"
-            cargo run --example volume_based_collection --release -- --config "$config_path" --duration "$duration_seconds" --monitor
-        elif [ "$custom_mode" = "b" ]; then
-            echo "🤖 啟動自定義自適應動態連接模式..."
-            echo "⏱️  運行時長: ${duration} 分鐘 (${duration_seconds} 秒)"
-            cargo run --example adaptive_collection --release -- --config "$config_path" --duration "$duration_seconds" --monitor --auto-rebalance
-        else
-            echo "⚠️  啟動自定義單連接模式..."
-            echo "⏱️  運行時長: ${duration} 分鐘 (${duration_seconds} 秒)"
-            cargo run --example multi_symbol_high_perf_collection --release -- --config "$config_path" --duration "$duration_seconds"
-        fi
+        echo "🛠️  啟動自定義測試 (${duration} 分鐘)..."
+        echo "💡 測試配置：自適應動態連接 + 增強重連 + 性能監控"
+        echo "📊 開始時間: $(date)"
+        cargo run --example adaptive_collection --release -- --config $CONFIG_FILE --duration "$duration_seconds" --monitor --auto-rebalance
         ;;
     *)
-        echo "❌ 無效選擇，使用默認自適應動態連接標準模式"
-        echo "💡 採用最新智能算法確保最佳性能"
+        echo "❌ 無效選擇，使用默認標準測試模式"
+        echo "📊 啟動標準性能測試 (30分鐘)..."
         cargo run --example adaptive_collection --release -- --config $CONFIG_FILE --duration 1800 --monitor --auto-rebalance
         ;;
 esac
 
+# 測試完成後的性能報告
 echo ""
-echo "🎉 動態連接優化數據收集完成！"
+echo "🎉 數據錄製測試完成！"
+echo "📊 結束時間: $(date)"
 echo ""
-echo "📊 查看收集結果："
-echo "curl 'http://localhost:8123/?query=SELECT%20symbol%2C%20count%28%2A%29%20FROM%20hft_db.enhanced_market_data%20GROUP%20BY%20symbol'"
+echo "📈 快速性能檢查："
+if docker exec hft_clickhouse clickhouse-client --query "SELECT 1" > /dev/null 2>&1; then
+    echo "✅ 數據庫連接正常"
+    
+    # 檢查數據量
+    total_records=$(docker exec hft_clickhouse clickhouse-client --query "SELECT count(*) FROM hft_db.enhanced_market_data" 2>/dev/null || echo "查詢失敗")
+    echo "📊 總記錄數: ${total_records}"
+    
+    # 檢查每個商品的數據量
+    echo "📋 各商品數據統計:"
+    docker exec hft_clickhouse clickhouse-client --query "SELECT symbol, count(*) as records, min(timestamp) as start_time, max(timestamp) as end_time FROM hft_db.enhanced_market_data GROUP BY symbol ORDER BY records DESC LIMIT 10" 2>/dev/null || echo "查詢失敗"
+    
+    # 檢查最近數據
+    echo ""
+    echo "⏰ 最近數據時間檢查:"
+    docker exec hft_clickhouse clickhouse-client --query "SELECT symbol, max(timestamp) as latest_time FROM hft_db.enhanced_market_data GROUP BY symbol ORDER BY latest_time DESC LIMIT 5" 2>/dev/null || echo "查詢失敗"
+else
+    echo "⚠️  數據庫連接失敗，無法生成性能報告"
+fi
+
 echo ""
-echo "📈 查看實時統計："
-echo "curl 'http://localhost:8123/?query=SELECT%20%2A%20FROM%20hft_db.multi_symbol_dashboard'"
+echo "💡 性能優化建議："
+echo "✅ 已啟用增強重連機制 - 自動故障恢復"
+echo "✅ 已啟用自適應動態連接 - 智能負載均衡"
+echo "✅ 已啟用實時監控 - 性能指標追蹤"
 echo ""
-echo "💡 系統特色："
-echo "✅ 自適應動態連接架構 - 基於 barter-rs 設計理念"
-echo "✅ 智能流量分析和實時重新平衡"
-echo "✅ 零停機熱遷移技術"
-echo "✅ 自動健康檢查和故障恢復"
-echo "✅ 吞吐量優化 50%+，負載均衡比 >0.85"
-echo "📊 智能分組算法和動態負載均衡已啟用"
+echo "📋 下一步測試建議："
+echo "1. 短期測試：觀察連接穩定性和錯誤率"
+echo "2. 中期測試：監控吞吐量和內存使用"
+echo "3. 長期測試：驗證24/7運行能力"
+echo "4. 負載測試：逐步增加商品數量測試極限"
+

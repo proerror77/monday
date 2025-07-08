@@ -41,11 +41,11 @@ data_collection:
 
 # 連接配置
 connection:
-  # 重連策略: "fast", "standard", "custom"
-  reconnect_strategy: "fast"      # 適用於ticker數據的快速重連
+  # 重連策略: "fast", "standard", "conservative", "custom"
+  reconnect_strategy: "standard"  # 標準重連策略，平衡速度和穩定性
   auto_reconnect: true           # 自動重連開關
-  max_reconnect_attempts: 5      # 最大重連次數
-  timeout_seconds: 10            # 連接超時時間
+  max_reconnect_attempts: 999    # 幾乎無限重連（實際會無限重連）
+  timeout_seconds: 30            # 連接超時時間（增加到30秒）
   
   # 自定義重連參數（當策略為"custom"時使用）
   custom_reconnect:

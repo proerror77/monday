@@ -255,6 +255,14 @@ impl DynamicBitgetConnector {
     ) -> Result<usize> {
         let mut groups = self.connection_groups.write().await;
         
+        // 首先检查该商品是否已经分配到其他组
+        for (group_idx, group) in groups.iter().enumerate() {
+            if group.symbols.contains(&symbol.to_string()) {
+                debug!("符号 {} 已存在于连接组 {}, 重用该组", symbol, group_idx);
+                return Ok(group_idx);
+            }
+        }
+        
         match &self.strategy {
             DynamicGroupingStrategy::TrafficBased { 
                 high_traffic_threshold, 
