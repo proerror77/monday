@@ -1,0 +1,184 @@
+# HFT Trading Platform Code Owners
+# 
+# This file defines which teams and individuals are responsible for 
+# reviewing code changes in specific areas of the codebase.
+#
+# Learn more about CODEOWNERS:
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# =============================================================================
+# Global Fallback
+# =============================================================================
+# These owners will be requested for review when no specific rule matches
+* @hft-core-team
+
+# =============================================================================
+# Rust HFT Core Engine
+# =============================================================================
+
+# Core system components (critical path)
+/rust_hft/src/core/ @rust-experts @performance-team @hft-core-team
+/rust_hft/src/main.rs @rust-experts @hft-core-team
+
+# Trading engine (high-frequency components)
+/rust_hft/src/engine/ @rust-experts @trading-team @hft-core-team
+/rust_hft/src/integrations/ @rust-experts @trading-team
+
+# Machine learning and model inference
+/rust_hft/src/ml/ @ml-team @rust-experts @hft-core-team
+
+# Data processing and storage
+/rust_hft/src/data/ @rust-experts @data-team
+/rust_hft/src/database/ @rust-experts @data-team @devops-team
+
+# Performance-critical utilities
+/rust_hft/src/utils/performance.rs @performance-team @rust-experts
+/rust_hft/src/utils/ultra_low_latency.rs @performance-team @rust-experts
+
+# API and Python bindings
+/rust_hft/src/api/ @rust-experts @python-team
+/rust_hft/src/python_bindings/ @rust-experts @python-team
+
+# =============================================================================
+# Python Agno Control Plane
+# =============================================================================
+
+# All Python agent code
+/agno_hft/ @python-team @ai-team
+
+# Core agent implementations
+/agno_hft/hft_agents.py @python-team @ai-team @hft-core-team
+/agno_hft/main.py @python-team @ai-team
+
+# Pipeline management
+/agno_hft/pipeline_manager.py @python-team @ml-team
+/agno_hft/rust_hft_tools.py @python-team @rust-experts
+
+# Training and ML workflows
+/agno_hft/test_training_workflow.py @ml-team @python-team
+/agno_hft/demo_multi_training.py @ml-team @python-team
+
+# =============================================================================
+# Performance and Benchmarking
+# =============================================================================
+
+# All benchmark code
+/rust_hft/benches/ @performance-team @rust-experts
+/rust_hft/examples/performance_test.rs @performance-team @rust-experts
+
+# Performance monitoring
+/rust_hft/src/utils/performance.rs @performance-team
+/rust_hft/scripts/setup_ultra_low_latency.sh @performance-team @devops-team
+
+# =============================================================================
+# Configuration and Deployment
+# =============================================================================
+
+# Rust configuration
+/rust_hft/Cargo.toml @rust-experts @hft-core-team
+/rust_hft/Cargo.lock @rust-experts @hft-core-team
+/rust_hft/config/ @devops-team @trading-team @hft-core-team
+
+# Python configuration
+/agno_hft/requirements.txt @python-team @devops-team
+/agno_hft/setup_env.sh @python-team @devops-team
+
+# Docker and deployment
+/docker-compose.yml @devops-team @hft-core-team
+/rust_hft/docker-compose.yml @devops-team @rust-experts
+
+# Database schemas and migrations
+/rust_hft/clickhouse/ @data-team @devops-team
+/rust_hft/redis/ @data-team @devops-team
+
+# =============================================================================
+# CI/CD and Automation
+# =============================================================================
+
+# GitHub Actions workflows
+/.github/workflows/ @devops-team @hft-core-team
+/.github/branch-protection-config.md @devops-team @hft-core-team
+
+# This CODEOWNERS file
+/.github/CODEOWNERS @hft-core-team
+
+# =============================================================================
+# Documentation
+# =============================================================================
+
+# Critical documentation
+/CLAUDE.md @hft-core-team @tech-writers
+/README.md @hft-core-team @tech-writers
+
+# Technical documentation
+/rust_hft/README.md @rust-experts @tech-writers
+/rust_hft/docs/ @rust-experts @tech-writers
+/rust_hft/PRD*.md @hft-core-team @product-team @tech-writers
+
+# Implementation reports
+/rust_hft/*_REPORT.md @hft-core-team @tech-writers
+/rust_hft/*_GUIDE.md @hft-core-team @tech-writers
+
+# Example code documentation
+/rust_hft/examples/README.md @rust-experts @tech-writers
+/rust_hft/examples/NEW_UNIFIED_GUIDE.md @rust-experts @tech-writers
+
+# =============================================================================
+# Data and Models
+# =============================================================================
+
+# Model files and training data
+/models/ @ml-team @data-team
+/rust_hft/models/ @ml-team @data-team
+/rust_hft/demo_models/ @ml-team @data-team
+
+# Test data
+/rust_hft/test_data/ @data-team @testing-team
+/rust_hft/debug_data/ @data-team @testing-team
+
+# =============================================================================
+# Special Files and Scripts
+# =============================================================================
+
+# Build and test scripts
+/rust_hft/start_multi_symbol_collection.sh @rust-experts @devops-team
+/rust_hft/test_*.sh @testing-team @rust-experts
+
+# Python execution scripts
+/agno_hft/start_hft.py @python-team @trading-team
+
+# Configuration files
+/config.yaml @devops-team @trading-team
+/rust_hft/config/*.yaml @devops-team @trading-team
+
+# =============================================================================
+# Security-Sensitive Areas
+# =============================================================================
+
+# API keys and secrets (should be encrypted/external)
+**/secrets/ @security-team @devops-team
+**/*key* @security-team @devops-team
+**/*secret* @security-team @devops-team
+
+# Network and integration code
+/rust_hft/src/integrations/bitget_connector.rs @security-team @trading-team @rust-experts
+
+# =============================================================================
+# Team Definitions (for reference)
+# =============================================================================
+#
+# @hft-core-team - Overall technical leadership and architecture decisions
+# @rust-experts - Rust language experts and performance optimization
+# @python-team - Python development and AI agent implementation  
+# @ml-team - Machine learning, model training, and data science
+# @trading-team - Trading strategy and financial domain expertise
+# @performance-team - Low-latency optimization and benchmarking
+# @data-team - Data engineering, storage, and pipeline management
+# @devops-team - Infrastructure, deployment, and operations
+# @security-team - Security reviews and vulnerability assessments
+# @testing-team - Quality assurance and test automation
+# @tech-writers - Documentation and technical communication
+# @product-team - Product requirements and business logic
+# @ai-team - AI system design and intelligent agent development
+#
+# =============================================================================

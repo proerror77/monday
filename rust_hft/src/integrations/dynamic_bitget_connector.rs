@@ -808,6 +808,8 @@ impl DynamicBitgetConnector {
                 healthy_connections += 1;
             } else {
                 warn!("🚨 連接組 {} 健康檢查失敗", i);
+                // TODO: 在这里可以添加自动重启逻辑
+                // Self::restart_connection_group(connection_groups, i).await;
             }
             
             // 計算實際負載
@@ -850,25 +852,36 @@ impl DynamicBitgetConnector {
     async fn check_group_health(group: &ConnectionGroup, volume_monitor: &Arc<SymbolVolumeMonitor>) -> bool {
         // 檢查連接是否存在
         if group.connection_handle.is_none() {
+            warn!("⚠️ 連接組 {} 沒有連接句柄", group.group_id);
             return false;
         }
         
-        // 檢查是否有最近的消息活動
+        // 檢查是否有最近的消息活動 (放宽到5分钟)
         let mut has_recent_activity = false;
+        let activity_threshold = Duration::from_secs(300); // 5分钟
+        
         for symbol in &group.symbols {
             if let Some(stats) = volume_monitor.get_symbol_stats(symbol).await {
-                // 檢查最近 2 分鐘內是否有活動
-                if stats.last_update.elapsed() < Duration::from_secs(120) {
+                if stats.last_update.elapsed() < activity_threshold {
                     has_recent_activity = true;
                     break;
                 }
             }
         }
         
-        // 如果組有符號但沒有活動，可能有問題
+        // 如果組有符號但沒有活動，檢查是否需要重連
         if !group.symbols.is_empty() && !has_recent_activity {
-            warn!("⚠️ 連接組 {} 缺乏最近活動，符號: {:?}", group.group_id, group.symbols);
-            return false;
+            warn!("⚠️ 連接組 {} 缺乏最近活動，符號: {:?} (超過{}秒)", 
+                  group.group_id, group.symbols, activity_threshold.as_secs());
+            
+            // 检查上次重新平衡时间，避免频繁重连
+            if group.last_rebalance.elapsed() > Duration::from_secs(600) { // 10分钟
+                warn!("🔄 連接組 {} 需要重新啟動", group.group_id);
+                return false;
+            } else {
+                debug!("⏳ 連接組 {} 最近已重新平衡，暫時容忍", group.group_id);
+                return true; // 暂时标记为健康，避免频繁重启
+            }
         }
         
         true

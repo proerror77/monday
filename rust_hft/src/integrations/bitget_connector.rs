@@ -164,31 +164,91 @@ impl BitgetConnector {
     /// Connect to Bitget public WebSocket and start streaming
     pub async fn connect_public(&self, mut message_handler: impl FnMut(BitgetMessage) + Send + 'static) -> Result<()> {
         let mut reconnect_attempts = 0;
+        let mut consecutive_failures = 0;
         
-        while reconnect_attempts < self.config.max_reconnect_attempts {
+        loop {
             match self.try_connect_public(&mut message_handler).await {
                 Ok(_) => {
                     info!("Bitget public WebSocket disconnected normally");
-                    return Ok(());
+                    consecutive_failures = 0; // 重置失败计数
+                    
+                    // 正常断开后等待一下再重连
+                    if self.config.auto_reconnect {
+                        warn!("Connection lost, auto-reconnecting in 2s...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
+                    } else {
+                        return Ok(());
+                    }
                 }
                 Err(e) => {
                     reconnect_attempts += 1;
+                    consecutive_failures += 1;
                     error!("Bitget connection attempt {} failed: {}", reconnect_attempts, e);
                     
-                    if reconnect_attempts < self.config.max_reconnect_attempts && self.config.auto_reconnect {
-                        let delay_ms = self.calculate_reconnect_delay(reconnect_attempts);
-                        warn!("Retrying connection in {}ms... ({}/{})", 
-                              delay_ms, reconnect_attempts, self.config.max_reconnect_attempts);
+                    if self.config.auto_reconnect {
+                        let delay_ms = self.calculate_adaptive_reconnect_delay(consecutive_failures);
+                        warn!("Retrying connection in {}ms... (attempt: {}, consecutive failures: {})", 
+                              delay_ms, reconnect_attempts, consecutive_failures);
                         tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        
+                        // 如果连续失败太多次，增加额外延迟
+                        if consecutive_failures >= 10 {
+                            warn!("Too many consecutive failures, adding extra delay...");
+                            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                            consecutive_failures = 0; // 重置计数
+                        }
+                    } else {
+                        return Err(e);
                     }
                 }
             }
         }
-        
-        Err(anyhow::anyhow!("Max reconnection attempts reached"))
     }
     
-    /// Calculate adaptive reconnection delay based on strategy
+    /// Calculate adaptive reconnection delay based on consecutive failures
+    fn calculate_adaptive_reconnect_delay(&self, consecutive_failures: usize) -> u64 {
+        match &self.config.reconnect_strategy {
+            ReconnectStrategy::Fast => {
+                // 快速策略：针对ticker数据优化
+                match consecutive_failures {
+                    1 => 200,      // 200ms - 第一次失败快速重试
+                    2 => 500,      // 500ms
+                    3 => 1000,     // 1s
+                    4 => 2000,     // 2s
+                    5 => 3000,     // 3s
+                    6..=9 => 5000, // 5s
+                    _ => 10000,    // 10s - 最大延迟
+                }
+            }
+            ReconnectStrategy::Standard => {
+                // 标准策略：指数退避
+                let base_delay = match consecutive_failures {
+                    1 => 1000,     // 1s
+                    2 => 2000,     // 2s
+                    3 => 4000,     // 4s
+                    4 => 8000,     // 8s
+                    5 => 15000,    // 15s
+                    6..=9 => 30000, // 30s
+                    _ => 60000,    // 60s - 最大延迟
+                };
+                base_delay
+            }
+            ReconnectStrategy::Conservative => {
+                // 保守策略：较长延迟避免服务器过载
+                match consecutive_failures {
+                    1 => 5000,     // 5s
+                    2 => 10000,    // 10s
+                    3 => 20000,    // 20s
+                    4 => 30000,    // 30s
+                    5 => 60000,    // 60s
+                    _ => 120000,   // 120s - 最大延迟
+                }
+            }
+        }
+    }
+
+    /// Calculate adaptive reconnection delay based on strategy (旧方法保留兼容性)
     fn calculate_reconnect_delay(&self, attempt: usize) -> u64 {
         match &self.config.reconnect_strategy {
             ReconnectStrategy::Fast => {

@@ -1,0 +1,114 @@
+# Enhanced ML Training Pipeline Configuration
+# This would be developed in the monday-ml-pipeline worktree
+
+pipeline_name: "enhanced_btc_prediction_v2"
+version: "2.1.0"
+
+data_sources:
+  primary:
+    - name: "bitget_websocket"
+      symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+      data_types: ["orderbook", "trades", "klines"]
+      buffer_size: 10000
+      
+  auxiliary:
+    - name: "market_sentiment"
+      source: "twitter_api"
+      keywords: ["bitcoin", "crypto", "btc"]
+      
+    - name: "onchain_metrics"
+      source: "dune_analytics"
+      metrics: ["active_addresses", "transaction_volume", "fees"]
+
+feature_engineering:
+  orderbook_features:
+    - "bid_ask_spread"
+    - "order_imbalance" 
+    - "volume_weighted_price"
+    - "liquidity_depth_5_levels"
+    
+  time_series_features:
+    windows: [10, 30, 60, 300]
+    indicators:
+      - "exponential_moving_average"
+      - "relative_strength_index"
+      - "bollinger_bands"
+      - "volume_profile"
+      
+  microstructure_features:
+    - "tick_direction"
+    - "trade_size_distribution"
+    - "inter_arrival_time"
+    - "price_impact"
+
+model_architecture:
+  type: "transformer_ensemble"
+  models:
+    primary:
+      name: "temporal_transformer"
+      config:
+        sequence_length: 512
+        hidden_size: 256
+        num_attention_heads: 8
+        num_layers: 6
+        dropout: 0.1
+        
+    auxiliary:
+      - name: "lstm_baseline"
+        config:
+          hidden_size: 128
+          num_layers: 2
+          bidirectional: true
+          
+      - name: "cnn_price_pattern"
+        config:
+          conv_layers: [64, 128, 256]
+          kernel_sizes: [3, 5, 7]
+          pooling: "adaptive_avg"
+
+training:
+  optimization:
+    optimizer: "AdamW"
+    learning_rate: 0.0001
+    weight_decay: 0.01
+    scheduler: "cosine_annealing"
+    
+  regularization:
+    dropout: 0.1
+    label_smoothing: 0.05
+    mixup_alpha: 0.2
+    
+  training_params:
+    batch_size: 256
+    epochs: 100
+    early_stopping_patience: 10
+    gradient_clip_norm: 1.0
+
+validation:
+  strategy: "time_series_split"
+  test_size: 0.2
+  validation_size: 0.1
+  
+  metrics:
+    primary: "sharpe_ratio"
+    secondary: ["max_drawdown", "win_rate", "profit_factor"]
+    
+  thresholds:
+    min_sharpe: 1.8
+    max_drawdown: 0.12
+    min_win_rate: 0.55
+
+deployment:
+  strategy: "blue_green"
+  health_checks:
+    latency_ms: 5
+    accuracy_threshold: 0.85
+    
+  rollback_conditions:
+    performance_degradation: 0.1
+    error_rate_threshold: 0.05
+    
+  monitoring:
+    model_drift_detection: true
+    prediction_confidence_tracking: true
+    feature_importance_monitoring: true
