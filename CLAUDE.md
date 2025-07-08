@@ -493,7 +493,679 @@ jobs:
 
 ⸻
 
-9 · Gemini CLI大代碼庫分析
+9 · Git Worktree 開發工作流程
+
+## 9.1 Worktree架構策略
+
+**基於Gemini分析建議，採用多Worktree並行開發模式：**
+
+### 9.1.1 Worktree組織結構
+
+```
+/Users/shihsonic/Documents/
+├── monday/                    # 主要集成環境 (develop分支)
+├── monday-rust-core/          # Rust引擎開發 (feature/rust-core)
+├── monday-python-agents/      # Python代理開發 (feature/python-agents)
+├── monday-performance/        # 性能優化 (feature/performance)
+├── monday-ml-pipeline/        # ML流水線開發 (feature/ml-pipeline)
+├── monday-release/           # 發佈準備 (release/staging)
+└── monday-hotfix/            # 緊急修復 (hotfix/*)
+```
+
+### 9.1.2 分支策略
+
+```
+main (生產穩定版)
+├── develop (開發主線)
+├── feature/rust-core (Rust核心功能)
+├── feature/python-agents (Python代理系統)
+├── feature/performance (性能優化)
+├── feature/ml-pipeline (ML流水線)
+├── release/staging (發佈候選)
+└── hotfix/* (緊急修復)
+```
+
+## 9.2 Worktree操作指南
+
+### 9.2.1 創建和管理Worktree
+
+```bash
+# 創建Rust核心開發環境
+git worktree add -b feature/rust-core ../monday-rust-core develop
+
+# 創建Python代理開發環境
+git worktree add -b feature/python-agents ../monday-python-agents develop
+
+# 創建性能優化環境
+git worktree add -b feature/performance ../monday-performance develop
+
+# 創建發佈準備環境
+git worktree add -b release/v2.1.0 ../monday-release develop
+
+# 列出所有worktree
+git worktree list
+
+# 刪除worktree
+git worktree remove ../monday-rust-core
+git branch -D feature/rust-core
+```
+
+### 9.2.2 並行開發工作流程
+
+**Rust核心開發 (monday-rust-core/)**
+```bash
+cd /Users/shihsonic/Documents/monday-rust-core
+# 專注於Rust HFT引擎
+cargo build --release
+cargo test
+cargo bench
+```
+
+**Python代理開發 (monday-python-agents/)**
+```bash
+cd /Users/shihsonic/Documents/monday-python-agents
+# 專注於7個智能代理
+python -m pytest agno_hft/tests/
+python agno_hft/main.py
+```
+
+**性能優化 (monday-performance/)**
+```bash
+cd /Users/shihsonic/Documents/monday-performance
+# 專注於延遲優化和基準測試
+cargo bench --bench decision_latency
+cargo bench --bench orderbook_benchmarks
+```
+
+## 9.3 IDE集成最佳實踐
+
+### 9.3.1 多窗口開發環境
+
+**VS Code工作區配置：**
+```json
+{
+  "folders": [
+    {"name": "Main", "path": "../monday"},
+    {"name": "Rust-Core", "path": "../monday-rust-core"},
+    {"name": "Python-Agents", "path": "../monday-python-agents"},
+    {"name": "Performance", "path": "../monday-performance"}
+  ],
+  "settings": {
+    "rust-analyzer.linkedProjects": [
+      "../monday-rust-core/Cargo.toml",
+      "../monday-performance/Cargo.toml"
+    ]
+  }
+}
+```
+
+### 9.3.2 專業化開發環境
+
+**Rust環境 (CLion/VS Code):**
+- rust-analyzer配置
+- 獨立的Cargo.toml依賴
+- 專用的benchmark配置
+
+**Python環境 (PyCharm/VS Code):**
+- 獨立的虛擬環境
+- 專用的requirements.txt
+- Agent開發調試配置
+
+## 9.4 合併和發佈流程
+
+### 9.4.1 功能合併流程
+
+```bash
+# 1. 在feature worktree中完成開發
+cd /Users/shihsonic/Documents/monday-rust-core
+git add .
+git commit -m "feat: optimize orderbook latency to <1μs"
+
+# 2. 推送到遠程
+git push -u origin feature/rust-core
+
+# 3. 切換到主環境進行合併
+cd /Users/shihsonic/Documents/monday
+git checkout develop
+git pull origin develop
+git merge feature/rust-core
+
+# 4. 運行集成測試
+cargo test --all
+python -m pytest agno_hft/tests/
+
+# 5. 推送合併結果
+git push origin develop
+```
+
+### 9.4.2 發佈準備流程
+
+```bash
+# 1. 創建發佈worktree
+git worktree add -b release/v2.1.0 ../monday-release develop
+
+# 2. 在發佈環境中進行最終準備
+cd /Users/shihsonic/Documents/monday-release
+
+# 3. 版本號更新
+sed -i 's/version = "2.0.0"/version = "2.1.0"/' Cargo.toml
+sed -i 's/version = "2.0.0"/version = "2.1.0"/' agno_hft/pyproject.toml
+
+# 4. 運行完整測試套件
+cargo test --release --all
+python -m pytest agno_hft/tests/ -v
+cargo bench
+
+# 5. 合併到main並打tag
+git checkout main
+git merge release/v2.1.0
+git tag v2.1.0
+git push origin main --tags
+```
+
+## 9.5 緊急修復流程
+
+### 9.5.1 Hotfix工作流程
+
+```bash
+# 1. 從main創建hotfix worktree
+git worktree add -b hotfix/fix-critical-bug ../monday-hotfix main
+
+# 2. 在hotfix環境中修復
+cd /Users/shihsonic/Documents/monday-hotfix
+# 進行緊急修復...
+
+# 3. 測試修復
+cargo test
+python -m pytest agno_hft/tests/
+
+# 4. 合併到main和develop
+git checkout main
+git merge hotfix/fix-critical-bug
+git checkout develop  
+git merge hotfix/fix-critical-bug
+
+# 5. 清理hotfix worktree
+git worktree remove ../monday-hotfix
+git branch -D hotfix/fix-critical-bug
+```
+
+## 9.6 性能和效率優勢
+
+### 9.6.1 並行開發效益
+
+**時間節省：**
+- 無需頻繁分支切換
+- 獨立的編譯緩存
+- 專業化的IDE配置
+
+**風險降低：**
+- 功能隔離開發
+- 獨立的測試環境
+- 並行的CI/CD驗證
+
+### 9.6.2 團隊協作優化
+
+**角色分工：**
+- Rust工程師：專注於monday-rust-core/
+- Python工程師：專注於monday-python-agents/
+- 性能工程師：專注於monday-performance/
+- DevOps工程師：專注於monday-release/
+
+**衝突最小化：**
+- 獨立的代碼修改範圍
+- 清晰的責任邊界
+- 結構化的合併流程
+
+⸻
+
+10 · GitHub Actions 多Worktree CI/CD
+
+## 10.1 CI/CD架構設計
+
+**基於多Worktree的分布式CI/CD策略：**
+
+### 10.1.1 分支觸發策略
+
+```yaml
+# 觸發器配置
+on:
+  push:
+    branches: 
+      - main                    # 生產部署
+      - develop                 # 集成測試
+      - 'feature/*'            # 功能測試
+      - 'release/*'            # 發佈候選測試
+  pull_request:
+    branches: [main, develop]
+```
+
+### 10.1.2 並行測試矩陣
+
+```yaml
+strategy:
+  matrix:
+    worktree: 
+      - rust-core               # Rust核心引擎測試
+      - python-agents           # Python代理測試
+      - performance            # 性能基準測試
+      - ml-pipeline            # ML流水線測試
+    include:
+      - worktree: rust-core
+        language: rust
+        test_cmd: "cargo test --release"
+      - worktree: python-agents
+        language: python
+        test_cmd: "pytest agno_hft/tests/ -v"
+      - worktree: performance
+        language: rust
+        test_cmd: "cargo bench"
+      - worktree: ml-pipeline
+        language: python
+        test_cmd: "python -m pytest agno_hft/test_training_workflow.py"
+```
+
+## 10.2 分層測試流水線
+
+### 10.2.1 快速驗證 (< 5分鐘)
+
+```yaml
+name: Quick Validation
+jobs:
+  lint-and-format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust格式檢查
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+      - name: Python格式檢查
+        run: |
+          pip install black flake8
+          black --check agno_hft/
+          flake8 agno_hft/
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [rust-core, python-agents]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust單元測試
+        if: matrix.component == 'rust-core'
+        run: cargo test --lib
+      - name: Python單元測試
+        if: matrix.component == 'python-agents'
+        run: |
+          pip install -r agno_hft/requirements.txt
+          pytest agno_hft/tests/unit/ -v
+```
+
+### 10.2.2 集成測試 (< 15分鐘)
+
+```yaml
+name: Integration Tests
+jobs:
+  rust-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 設置Rust環境
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+      - name: Rust集成測試
+        run: |
+          cargo test --release
+          cargo test --release --features integration_tests
+
+  python-integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python集成測試
+        run: |
+          pip install -r agno_hft/requirements.txt
+          pytest agno_hft/test_integration.py -v
+
+  rust-python-ipc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 跨語言IPC測試
+        run: |
+          # 構建Rust庫
+          cargo build --release
+          # 測試Python調用
+          cd agno_hft && python test_training_workflow.py
+```
+
+### 10.2.3 性能基準測試 (< 30分鐘)
+
+```yaml
+name: Performance Benchmarks
+jobs:
+  latency-benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 決策延遲基準測試
+        run: |
+          cargo bench --bench decision_latency
+          cargo bench --bench orderbook_benchmarks
+      - name: 性能退化檢查
+        run: |
+          # 比較當前性能與基線
+          python scripts/check_performance_regression.py
+
+  memory-benchmarks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 內存使用基準測試
+        run: |
+          cargo bench --bench memory_usage
+          # 檢查內存洩漏
+          valgrind --tool=memcheck cargo test
+
+  load-testing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 負載測試
+        run: |
+          # 啟動模擬交易環境
+          docker-compose -f docker-compose.test.yml up -d
+          # 運行負載測試
+          python scripts/load_test.py --duration 300
+```
+
+## 10.3 分支特定的工作流程
+
+### 10.3.1 Feature分支工作流程
+
+```yaml
+name: Feature Branch CI
+on:
+  push:
+    branches: ['feature/*']
+  pull_request:
+    branches: [develop]
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust-changed: ${{ steps.changes.outputs.rust }}
+      python-changed: ${{ steps.changes.outputs.python }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            rust:
+              - 'rust_hft/**/*.rs'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            python:
+              - 'agno_hft/**/*.py'
+              - 'requirements.txt'
+
+  rust-tests:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.rust-changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust功能測試
+        run: |
+          cargo test --release
+          cargo clippy
+
+  python-tests:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.python-changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python功能測試
+        run: |
+          pip install -r agno_hft/requirements.txt
+          pytest agno_hft/tests/ -v
+```
+
+### 10.3.2 Release分支工作流程
+
+```yaml
+name: Release Candidate
+on:
+  push:
+    branches: ['release/*']
+
+jobs:
+  full-test-suite:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-type: [unit, integration, performance, security]
+    steps:
+      - uses: actions/checkout@v4
+      - name: ${{ matrix.test-type }}測試
+        run: |
+          case "${{ matrix.test-type }}" in
+            unit) cargo test --lib && pytest agno_hft/tests/unit/ ;;
+            integration) cargo test --release && pytest agno_hft/test_integration.py ;;
+            performance) cargo bench ;;
+            security) cargo audit && safety check ;;
+          esac
+
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 版本一致性檢查
+        run: |
+          # 檢查Cargo.toml和pyproject.toml版本是否一致
+          python scripts/check_version_consistency.py
+
+  build-artifacts:
+    runs-on: ubuntu-latest
+    needs: [full-test-suite, version-check]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 構建發佈產物
+        run: |
+          cargo build --release
+          # 打包Python wheel
+          cd agno_hft && python setup.py bdist_wheel
+```
+
+### 10.3.3 Main分支生產部署
+
+```yaml
+name: Production Deployment
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: 部署到Staging環境
+        run: |
+          docker build -t hft-platform:staging .
+          docker-compose -f docker-compose.staging.yml up -d
+
+  smoke-tests:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Staging環境煙霧測試
+        run: |
+          python scripts/smoke_test.py --env staging
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    environment: production
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - name: 生產部署
+        run: |
+          docker build -t hft-platform:${{ github.ref_name }} .
+          # 藍綠部署
+          python scripts/blue_green_deploy.py --version ${{ github.ref_name }}
+```
+
+## 10.4 並行測試優化
+
+### 10.4.1 緩存策略
+
+```yaml
+cache-strategies:
+  rust-cache:
+    uses: Swatinem/rust-cache@v2
+    with:
+      key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+  python-cache:
+    uses: actions/cache@v3
+    with:
+      path: ~/.cache/pip
+      key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+
+  docker-cache:
+    uses: docker/build-push-action@v4
+    with:
+      cache-from: type=gha
+      cache-to: type=gha,mode=max
+```
+
+### 10.4.2 並行任務調度
+
+```yaml
+jobs:
+  # 快速反饋循環 (< 2分鐘)
+  quick-feedback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 語法檢查
+        run: |
+          cargo check
+          python -m py_compile agno_hft/*.py
+
+  # 並行測試執行
+  parallel-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # 不因單個失敗而停止全部
+      matrix:
+        shard: [1, 2, 3, 4]  # 4個並行分片
+    steps:
+      - name: 運行測試分片 ${{ matrix.shard }}
+        run: |
+          pytest agno_hft/tests/ \
+            --shard-id=${{ matrix.shard }} \
+            --num-shards=4
+```
+
+## 10.5 監控和報告
+
+### 10.5.1 測試報告聚合
+
+```yaml
+test-reporting:
+  runs-on: ubuntu-latest
+  if: always()
+  needs: [rust-tests, python-tests, performance-tests]
+  steps:
+    - name: 聚合測試結果
+      run: |
+        # 生成統一的測試報告
+        python scripts/aggregate_test_results.py
+    - name: 發送飛書通知
+      if: failure()
+      run: |
+        python scripts/send_feishu_notification.py \
+          --type "CI_FAILURE" \
+          --branch ${{ github.ref_name }} \
+          --commit ${{ github.sha }}
+```
+
+### 10.5.2 性能趨勢追蹤
+
+```yaml
+performance-tracking:
+  runs-on: ubuntu-latest
+  steps:
+    - name: 性能數據收集
+      run: |
+        cargo bench -- --output-format json > bench_results.json
+    - name: 上傳性能數據
+      run: |
+        # 上傳到ClickHouse進行趨勢分析
+        python scripts/upload_performance_data.py bench_results.json
+```
+
+## 10.6 Worktree特定優化
+
+### 10.6.1 智能路徑檢測
+
+```yaml
+path-based-optimization:
+  - name: 檢測修改路徑
+    id: changes
+    uses: dorny/paths-filter@v2
+    with:
+      filters: |
+        rust-core:
+          - 'rust_hft/src/core/**'
+          - 'rust_hft/src/engine/**'
+        python-agents:
+          - 'agno_hft/**'
+        performance:
+          - 'rust_hft/benches/**'
+          - 'rust_hft/src/utils/performance.rs'
+        ml-pipeline:
+          - 'rust_hft/src/ml/**'
+          - 'agno_hft/pipeline_manager.py'
+```
+
+### 10.6.2 條件執行策略
+
+```yaml
+conditional-execution:
+  rust-core-tests:
+    if: contains(github.event.head_commit.message, '[rust-core]') || 
+        steps.changes.outputs.rust-core == 'true'
+    
+  python-agents-tests:
+    if: contains(github.event.head_commit.message, '[python-agents]') || 
+        steps.changes.outputs.python-agents == 'true'
+    
+  performance-tests:
+    if: contains(github.event.head_commit.message, '[performance]') || 
+        steps.changes.outputs.performance == 'true'
+```
+
+⸻
+
+11 · Gemini CLI大代碼庫分析
 
 ## 9.1 Context Include語法
 ```bash

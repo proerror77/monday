@@ -1,0 +1,299 @@
+name: Release Pipeline
+
+on:
+  push:
+    branches: ['release/*']
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 版本一致性檢查
+  version-check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Get version from tag or branch
+        id: get-version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          elif [[ $GITHUB_REF == refs/heads/release/* ]]; then
+            VERSION=${GITHUB_REF#refs/heads/release/}
+          else
+            VERSION="unknown"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+          
+      - name: Check version consistency
+        run: |
+          # 檢查Cargo.toml中的版本
+          CARGO_VERSION=$(grep '^version = ' rust_hft/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "Cargo.toml version: $CARGO_VERSION"
+          
+          # 檢查Python setup中的版本 (如果存在)
+          if [ -f agno_hft/pyproject.toml ]; then
+            PYTHON_VERSION=$(grep '^version = ' agno_hft/pyproject.toml | sed 's/version = "\(.*\)"/\1/' || echo "not found")
+            echo "Python version: $PYTHON_VERSION"
+          fi
+          
+          # 這裡可以添加版本一致性驗證邏輯
+
+  # 完整測試套件
+  full-test-suite:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-type: [unit, integration, performance, security]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          components: rustfmt, clippy
+          
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cache/pip
+          key: ${{ runner.os }}-release-${{ hashFiles('rust_hft/Cargo.lock', 'agno_hft/requirements.txt') }}
+          
+      - name: Run ${{ matrix.test-type }} tests
+        run: |
+          case "${{ matrix.test-type }}" in
+            unit)
+              cd rust_hft && cargo test --lib --release
+              pip install -r agno_hft/requirements.txt
+              cd agno_hft && pytest tests/unit/ -v
+              ;;
+            integration)
+              cd rust_hft && cargo test --release --features integration_tests
+              pip install -r agno_hft/requirements.txt
+              cd agno_hft && python test_integration.py
+              ;;
+            performance)
+              cd rust_hft && cargo bench
+              ;;
+            security)
+              cargo install cargo-audit
+              cd rust_hft && cargo audit
+              pip install safety
+              cd agno_hft && safety check -r requirements.txt
+              ;;
+          esac
+
+  # 構建發佈產物
+  build-artifacts:
+    needs: [version-check, full-test-suite]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, x86_64-apple-darwin, aarch64-apple-darwin]
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          profile: minimal
+          
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          
+      - name: Build Rust binary
+        run: |
+          cd rust_hft
+          cargo build --release --target ${{ matrix.target }}
+          
+      - name: Package artifacts
+        run: |
+          mkdir -p artifacts
+          if [[ "${{ matrix.target }}" == *"linux"* ]]; then
+            tar -czf artifacts/hft-platform-${{ needs.version-check.outputs.version }}-${{ matrix.target }}.tar.gz \
+              -C rust_hft/target/${{ matrix.target }}/release rust_hft
+          elif [[ "${{ matrix.target }}" == *"darwin"* ]]; then
+            tar -czf artifacts/hft-platform-${{ needs.version-check.outputs.version }}-${{ matrix.target }}.tar.gz \
+              -C rust_hft/target/${{ matrix.target }}/release rust_hft
+          fi
+          
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: hft-platform-${{ matrix.target }}
+          path: artifacts/
+
+  # 構建Python wheel
+  build-python-wheel:
+    needs: [version-check, full-test-suite]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install build dependencies
+        run: |
+          pip install build wheel setuptools
+          
+      - name: Build Python wheel
+        run: |
+          cd agno_hft
+          python -m build
+          
+      - name: Upload Python artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: python-wheel
+          path: agno_hft/dist/
+
+  # 構建Docker鏡像
+  build-docker-images:
+    needs: [version-check, full-test-suite]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [hft-engine, agno-agents, complete-platform]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          
+      - name: Build and push ${{ matrix.image }}
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./docker/Dockerfile.${{ matrix.image }}
+          push: true
+          tags: |
+            hft-platform-${{ matrix.image }}:${{ needs.version-check.outputs.version }}
+            hft-platform-${{ matrix.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 創建GitHub Release
+  create-release:
+    needs: [version-check, build-artifacts, build-python-wheel, build-docker-images]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: release-artifacts/
+          
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # 生成變更日誌
+          echo "## Changes in v${{ needs.version-check.outputs.version }}" > changelog.md
+          echo "" >> changelog.md
+          echo "### Features" >> changelog.md
+          git log --pretty=format:"- %s" --grep="feat:" $(git describe --tags --abbrev=0 HEAD^)..HEAD >> changelog.md
+          echo "" >> changelog.md
+          echo "### Bug Fixes" >> changelog.md
+          git log --pretty=format:"- %s" --grep="fix:" $(git describe --tags --abbrev=0 HEAD^)..HEAD >> changelog.md
+          echo "" >> changelog.md
+          echo "### Performance Improvements" >> changelog.md
+          git log --pretty=format:"- %s" --grep="perf:" $(git describe --tags --abbrev=0 HEAD^)..HEAD >> changelog.md
+          
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: Release ${{ github.ref_name }}
+          body_path: changelog.md
+          draft: false
+          prerelease: false
+          
+      - name: Upload Release Assets
+        run: |
+          # 上傳所有構建產物到Release
+          for file in release-artifacts/**/*; do
+            if [ -f "$file" ]; then
+              echo "Uploading $file"
+              # 這裡需要使用GitHub CLI或API上傳文件
+            fi
+          done
+
+  # 部署到生產環境
+  deploy-production:
+    needs: [create-release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to production
+        run: |
+          echo "Deploying HFT Platform v${{ needs.version-check.outputs.version }} to production"
+          # 實際的生產部署邏輯
+          # 可能包括：
+          # 1. 更新Kubernetes配置
+          # 2. 執行藍綠部署
+          # 3. 健康檢查
+          # 4. 回滾機制
+          
+      - name: Health check
+        run: |
+          # 部署後健康檢查
+          echo "Performing health check..."
+          # curl -f http://production-endpoint/health || exit 1
+          
+      - name: Notify deployment success
+        run: |
+          echo "✅ Successfully deployed HFT Platform v${{ needs.version-check.outputs.version }}"
+          # 發送成功通知到飛書或其他通知系統
+
+  # 失敗通知
+  notify-failure:
+    needs: [version-check, full-test-suite, build-artifacts, build-python-wheel, build-docker-images]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify release failure
+        run: |
+          echo "❌ Release pipeline failed for ${{ github.ref_name }}"
+          # 發送失敗通知

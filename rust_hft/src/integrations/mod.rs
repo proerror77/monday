@@ -7,6 +7,7 @@
 pub mod bitget_connector;
 pub mod multi_connection_bitget;
 pub mod dynamic_bitget_connector;
+pub mod traffic_based_grouping;
 pub mod volume_monitor;
 pub mod barter_bitget_adapter;
 pub mod barter_orderbook_manager;
@@ -28,8 +29,19 @@ pub use dynamic_bitget_connector::{
     DynamicGroupingStrategy,
     ConnectionGroup,
     DynamicConnectorStats,
+    ConnectionHealth,
     create_traffic_based_dynamic_connector,
     create_adaptive_dynamic_connector
+};
+pub use traffic_based_grouping::{
+    TrafficBasedGrouper,
+    TrafficGrouping,
+    TrafficGroup,
+    GroupType,
+    GroupPriority,
+    GroupingConfig,
+    create_hft_optimized_grouper,
+    create_conservative_grouper
 };
 pub use volume_monitor::{
     SymbolVolumeMonitor,

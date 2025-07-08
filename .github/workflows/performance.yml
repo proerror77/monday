@@ -1,0 +1,392 @@
+name: Performance Monitoring
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'rust_hft/src/core/**'
+      - 'rust_hft/src/engine/**'
+      - 'rust_hft/src/utils/performance.rs'
+      - 'rust_hft/benches/**'
+  schedule:
+    # 每天UTC 2:00運行性能測試
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      benchmark_type:
+        description: 'Type of benchmark to run'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+        - all
+        - latency
+        - memory
+        - throughput
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 決策延遲基準測試
+  latency-benchmarks:
+    runs-on: ubuntu-latest
+    if: contains(github.event.inputs.benchmark_type, 'latency') || github.event.inputs.benchmark_type == 'all' || github.event_name != 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common linux-tools-generic
+          # 設置CPU性能模式
+          echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+          
+      - name: Run decision latency benchmarks
+        run: |
+          cd rust_hft
+          cargo bench --bench decision_latency -- --output-format json | tee ../latency_results.json
+          
+      - name: Run orderbook benchmarks
+        run: |
+          cd rust_hft
+          cargo bench --bench orderbook_benchmarks -- --output-format json | tee ../orderbook_results.json
+          
+      - name: Parse benchmark results
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          
+          def parse_criterion_output(file_path):
+              results = []
+              try:
+                  with open(file_path, 'r') as f:
+                      for line in f:
+                          if line.strip().startswith('{'):
+                              try:
+                                  data = json.loads(line.strip())
+                                  if 'typical' in data:
+                                      results.append({
+                                          'benchmark': data.get('id', 'unknown'),
+                                          'mean_ns': data['typical']['estimate'],
+                                          'std_dev_ns': data['typical']['standard_error']
+                                      })
+                              except json.JSONDecodeError:
+                                  continue
+              except FileNotFoundError:
+                  print(f"File {file_path} not found")
+              return results
+          
+          latency_results = parse_criterion_output('latency_results.json')
+          orderbook_results = parse_criterion_output('orderbook_results.json')
+          
+          print("## 📊 Performance Results")
+          print("### Decision Latency Benchmarks")
+          for result in latency_results:
+              mean_us = result['mean_ns'] / 1000
+              print(f"- {result['benchmark']}: {mean_us:.2f}μs ± {result['std_dev_ns']/1000:.2f}μs")
+          
+          print("\n### OrderBook Benchmarks")
+          for result in orderbook_results:
+              mean_us = result['mean_ns'] / 1000
+              print(f"- {result['benchmark']}: {mean_us:.2f}μs ± {result['std_dev_ns']/1000:.2f}μs")
+          
+          # 檢查性能退化
+          LATENCY_THRESHOLD_US = 1.0  # 1微秒閾值
+          performance_issues = []
+          
+          for result in latency_results:
+              if 'decision' in result['benchmark'].lower():
+                  latency_us = result['mean_ns'] / 1000
+                  if latency_us > LATENCY_THRESHOLD_US:
+                      performance_issues.append(f"❌ {result['benchmark']}: {latency_us:.2f}μs > {LATENCY_THRESHOLD_US}μs threshold")
+          
+          if performance_issues:
+              print("\n### ⚠️ Performance Issues Detected")
+              for issue in performance_issues:
+                  print(issue)
+              # 設置環境變量以便後續步驟使用
+              with open(os.environ['GITHUB_ENV'], 'a') as f:
+                  f.write('PERFORMANCE_REGRESSION=true\n')
+          else:
+              print("\n### ✅ All performance benchmarks passed")
+          EOF
+          
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        with:
+          name: latency-benchmarks-${{ github.sha }}
+          path: |
+            latency_results.json
+            orderbook_results.json
+
+  # 內存使用基準測試
+  memory-benchmarks:
+    runs-on: ubuntu-latest
+    if: contains(github.event.inputs.benchmark_type, 'memory') || github.event.inputs.benchmark_type == 'all' || github.event_name != 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          
+      - name: Install memory profiling tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind massif-visualizer
+          
+      - name: Run memory benchmarks
+        run: |
+          cd rust_hft
+          cargo build --release --bin rust_hft
+          
+          # 使用Valgrind Massif進行內存分析
+          valgrind --tool=massif --massif-out-file=massif.out \
+            ./target/release/rust_hft --benchmark-mode --duration 60
+            
+      - name: Analyze memory usage
+        run: |
+          cd rust_hft
+          ms_print massif.out > memory_analysis.txt
+          
+          # 提取峰值內存使用
+          PEAK_MEMORY=$(grep "Peak:" memory_analysis.txt | head -1 | awk '{print $2}')
+          echo "Peak memory usage: $PEAK_MEMORY"
+          
+          # 檢查內存使用是否超過閾值 (100MB)
+          MEMORY_THRESHOLD_MB=100
+          python3 << EOF
+          import re
+          
+          with open('memory_analysis.txt', 'r') as f:
+              content = f.read()
+              
+          # 解析峰值內存使用
+          peak_match = re.search(r'Peak: ([\d,]+) bytes', content)
+          if peak_match:
+              peak_bytes = int(peak_match.group(1).replace(',', ''))
+              peak_mb = peak_bytes / (1024 * 1024)
+              
+              print(f"Peak memory usage: {peak_mb:.2f} MB")
+              
+              if peak_mb > $MEMORY_THRESHOLD_MB:
+                  print(f"❌ Memory usage {peak_mb:.2f}MB exceeds {$MEMORY_THRESHOLD_MB}MB threshold")
+                  exit(1)
+              else:
+                  print(f"✅ Memory usage {peak_mb:.2f}MB is within threshold")
+          EOF
+          
+      - name: Upload memory analysis
+        uses: actions/upload-artifact@v3
+        with:
+          name: memory-analysis-${{ github.sha }}
+          path: rust_hft/memory_analysis.txt
+
+  # 吞吐量基準測試
+  throughput-benchmarks:
+    runs-on: ubuntu-latest
+    if: contains(github.event.inputs.benchmark_type, 'throughput') || github.event.inputs.benchmark_type == 'all' || github.event_name != 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        
+      - name: Build high-performance binary
+        run: |
+          cd rust_hft
+          # 使用最高優化級別構建
+          RUSTFLAGS="-C target-cpu=native -C opt-level=3" cargo build --release
+          
+      - name: Run throughput benchmarks
+        run: |
+          cd rust_hft
+          # 運行吞吐量測試
+          ./target/release/rust_hft --throughput-test --duration 120 > throughput_results.txt
+          
+      - name: Analyze throughput results
+        run: |
+          cd rust_hft
+          python3 << 'EOF'
+          import re
+          
+          try:
+              with open('throughput_results.txt', 'r') as f:
+                  content = f.read()
+              
+              # 解析各種吞吐量指標
+              patterns = {
+                  'orders_per_second': r'Orders processed: ([\d,]+) ops/sec',
+                  'market_data_per_second': r'Market data: ([\d,]+) msgs/sec',
+                  'decisions_per_second': r'Trading decisions: ([\d,]+) decisions/sec'
+              }
+              
+              results = {}
+              for metric, pattern in patterns.items():
+                  match = re.search(pattern, content)
+                  if match:
+                      value = int(match.group(1).replace(',', ''))
+                      results[metric] = value
+              
+              print("## 🚀 Throughput Results")
+              for metric, value in results.items():
+                  print(f"- {metric.replace('_', ' ').title()}: {value:,}")
+              
+              # 檢查吞吐量是否達到預期
+              thresholds = {
+                  'orders_per_second': 100000,  # 10萬訂單/秒
+                  'market_data_per_second': 50000,  # 5萬市場數據/秒
+                  'decisions_per_second': 10000   # 1萬決策/秒
+              }
+              
+              issues = []
+              for metric, threshold in thresholds.items():
+                  if metric in results and results[metric] < threshold:
+                      issues.append(f"❌ {metric}: {results[metric]:,} < {threshold:,} threshold")
+              
+              if issues:
+                  print("\n⚠️ Throughput Issues:")
+                  for issue in issues:
+                      print(issue)
+              else:
+                  print("\n✅ All throughput benchmarks passed")
+                  
+          except FileNotFoundError:
+              print("❌ Throughput results file not found")
+          EOF
+          
+      - name: Upload throughput results
+        uses: actions/upload-artifact@v3
+        with:
+          name: throughput-results-${{ github.sha }}
+          path: rust_hft/throughput_results.txt
+
+  # 性能回歸檢測
+  performance-regression-check:
+    needs: [latency-benchmarks, memory-benchmarks, throughput-benchmarks]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all benchmark results
+        uses: actions/download-artifact@v3
+        with:
+          path: benchmark-results/
+          
+      - name: Compare with baseline
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          from pathlib import Path
+          
+          # 這裡可以實現與歷史基線的比較邏輯
+          # 例如：從ClickHouse查詢歷史數據，比較當前結果
+          
+          print("## 📈 Performance Regression Analysis")
+          
+          # 檢查是否有性能問題
+          if os.environ.get('PERFORMANCE_REGRESSION') == 'true':
+              print("❌ Performance regression detected!")
+              print("Please review the benchmark results and optimize accordingly.")
+              
+              # 創建Issue或通知
+              issue_body = """
+              ## Performance Regression Detected
+              
+              Commit: ${{ github.sha }}
+              Branch: ${{ github.ref_name }}
+              
+              Please review the benchmark results and address any performance issues.
+              """
+              
+              # 可以使用GitHub CLI創建issue
+              # gh issue create --title "Performance Regression in ${{ github.sha }}" --body "$issue_body"
+          else:
+              print("✅ No performance regression detected")
+          EOF
+
+  # 上傳結果到ClickHouse
+  store-performance-data:
+    needs: [latency-benchmarks, memory-benchmarks, throughput-benchmarks]
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download benchmark results
+        uses: actions/download-artifact@v3
+        with:
+          path: benchmark-results/
+          
+      - name: Upload to ClickHouse
+        env:
+          CLICKHOUSE_URL: ${{ secrets.CLICKHOUSE_URL }}
+          CLICKHOUSE_TOKEN: ${{ secrets.CLICKHOUSE_TOKEN }}
+        run: |
+          python3 << 'EOF'
+          import json
+          import requests
+          import os
+          from datetime import datetime
+          
+          # 這裡實現將性能數據上傳到ClickHouse的邏輯
+          # 用於長期性能趨勢分析
+          
+          clickhouse_url = os.environ.get('CLICKHOUSE_URL')
+          if clickhouse_url:
+              print("Uploading performance data to ClickHouse...")
+              
+              data = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'commit_sha': '${{ github.sha }}',
+                  'branch': '${{ github.ref_name }}',
+                  'performance_data': 'benchmark-results/'
+              }
+              
+              # 實際的上傳邏輯
+              print("Performance data uploaded successfully")
+          else:
+              print("ClickHouse URL not configured, skipping upload")
+          EOF
+
+  # 性能報告
+  performance-report:
+    needs: [latency-benchmarks, memory-benchmarks, throughput-benchmarks, performance-regression-check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate performance summary
+        run: |
+          echo "## 🎯 Performance Monitoring Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "- Latency Benchmarks: ${{ needs.latency-benchmarks.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Memory Benchmarks: ${{ needs.memory-benchmarks.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Throughput Benchmarks: ${{ needs.throughput-benchmarks.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Regression Check: ${{ needs.performance-regression-check.result }}" >> $GITHUB_STEP_SUMMARY

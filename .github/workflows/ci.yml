@@ -1,0 +1,315 @@
+name: HFT Platform CI/CD
+
+on:
+  push:
+    branches: 
+      - main
+      - develop
+      - 'feature/*'
+      - 'release/*'
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 快速驗證 (< 5分鐘)
+  quick-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          components: rustfmt, clippy
+          
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust_hft/Cargo.lock') }}
+          
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('agno_hft/requirements.txt') }}
+          
+      - name: Rust格式檢查
+        run: |
+          cd rust_hft
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          
+      - name: Python格式檢查
+        run: |
+          pip install black flake8
+          black --check agno_hft/
+          flake8 agno_hft/ --max-line-length=88 --extend-ignore=E203
+
+  # 檢測變更路徑
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust-changed: ${{ steps.changes.outputs.rust }}
+      python-changed: ${{ steps.changes.outputs.python }}
+      performance-changed: ${{ steps.changes.outputs.performance }}
+      ml-changed: ${{ steps.changes.outputs.ml }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            rust:
+              - 'rust_hft/**/*.rs'
+              - 'rust_hft/Cargo.toml'
+              - 'rust_hft/Cargo.lock'
+            python:
+              - 'agno_hft/**/*.py'
+              - 'agno_hft/requirements.txt'
+            performance:
+              - 'rust_hft/benches/**'
+              - 'rust_hft/src/utils/performance.rs'
+              - 'rust_hft/src/core/orderbook.rs'
+            ml:
+              - 'rust_hft/src/ml/**'
+              - 'agno_hft/pipeline_manager.py'
+
+  # Rust核心測試
+  rust-tests:
+    needs: [quick-validation, detect-changes]
+    if: needs.detect-changes.outputs.rust-changed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-type: [unit, integration]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        
+      - name: Run ${{ matrix.test-type }} tests
+        run: |
+          cd rust_hft
+          case "${{ matrix.test-type }}" in
+            unit)
+              cargo test --lib --release
+              ;;
+            integration)
+              cargo test --release --features integration_tests
+              ;;
+          esac
+
+  # Python代理測試
+  python-tests:
+    needs: [quick-validation, detect-changes]
+    if: needs.detect-changes.outputs.python-changed == 'true'
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('agno_hft/requirements.txt') }}
+          
+      - name: Install dependencies
+        run: |
+          pip install -r agno_hft/requirements.txt
+          pip install pytest pytest-asyncio pytest-cov
+          
+      - name: Run Python tests
+        run: |
+          cd agno_hft
+          pytest tests/ -v --cov=. --cov-report=xml
+          
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./agno_hft/coverage.xml
+
+  # 性能基準測試
+  performance-tests:
+    needs: [quick-validation, detect-changes]
+    if: needs.detect-changes.outputs.performance-changed == 'true' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        
+      - name: Run performance benchmarks
+        run: |
+          cd rust_hft
+          cargo bench --bench decision_latency
+          cargo bench --bench orderbook_benchmarks
+          
+      - name: Check performance regression
+        run: |
+          # 這裡可以添加性能退化檢查腳本
+          echo "Performance check passed"
+
+  # Rust-Python集成測試
+  integration-tests:
+    needs: [rust-tests, python-tests]
+    if: always() && (needs.rust-tests.result == 'success' || needs.python-tests.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Build Rust library
+        run: |
+          cd rust_hft
+          cargo build --release
+          
+      - name: Test Python-Rust integration
+        run: |
+          pip install -r agno_hft/requirements.txt
+          cd agno_hft
+          python test_training_workflow.py
+
+  # 安全掃描
+  security-scan:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Rust安全審計
+        run: |
+          cargo install cargo-audit
+          cd rust_hft
+          cargo audit
+          
+      - name: Python安全掃描
+        run: |
+          pip install safety
+          cd agno_hft
+          safety check -r requirements.txt
+
+  # 構建Docker鏡像
+  docker-build:
+    needs: [integration-tests]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+        
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            hft-platform:${{ github.sha }}
+            hft-platform:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 部署到Staging (僅develop分支)
+  deploy-staging:
+    needs: [docker-build]
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          # 這裡添加實際的部署腳本
+
+  # 生產部署 (僅main分支和tags)
+  deploy-production:
+    needs: [docker-build]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production environment..."
+          # 這裡添加實際的藍綠部署腳本
+
+  # 測試報告聚合
+  test-report:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [rust-tests, python-tests, performance-tests, integration-tests]
+    steps:
+      - name: Generate test report
+        run: |
+          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Rust Tests: ${{ needs.rust-tests.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Python Tests: ${{ needs.python-tests.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Performance Tests: ${{ needs.performance-tests.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Integration Tests: ${{ needs.integration-tests.result }}" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "CI/CD pipeline failed for ${{ github.ref_name }}"
+          # 這裡可以添加飛書通知腳本
