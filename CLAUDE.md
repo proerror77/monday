@@ -493,229 +493,247 @@ jobs:
 
 ⸻
 
-9 · Git Worktree 開發工作流程
+9 · 統一項目開發工作流程
 
-## 9.1 Worktree架構策略
+## 9.1 項目結構概覽
 
-**基於Gemini分析建議，採用多Worktree並行開發模式：**
+**HFT交易平台採用統一的單目錄結構，便於集成開發：**
 
-### 9.1.1 Worktree組織結構
+### 9.1.1 核心項目組織
 
 ```
-/Users/shihsonic/Documents/
-├── monday/                    # 主要集成環境 (develop分支)
-├── monday-rust-core/          # Rust引擎開發 (feature/rust-core)
-├── monday-python-agents/      # Python代理開發 (feature/python-agents)
-├── monday-performance/        # 性能優化 (feature/performance)
-├── monday-ml-pipeline/        # ML流水線開發 (feature/ml-pipeline)
-├── monday-release/           # 發佈準備 (release/staging)
-└── monday-hotfix/            # 緊急修復 (hotfix/*)
+monday/                        # 統一項目根目錄
+├── agno_hft/                  # Python Agno智能代理框架
+│   ├── hft_agents.py          # 7個專業化代理
+│   ├── main.py                # 主要控制界面
+│   ├── pipeline_manager.py    # ML流水線管理
+│   └── requirements.txt       # Python依賴
+├── rust_hft/                  # Rust高頻交易引擎
+│   ├── src/                   # 核心引擎代碼
+│   ├── benches/               # 性能基準測試
+│   ├── examples/              # 使用示例
+│   └── Cargo.toml             # Rust依賴
+├── models/                    # 共享ML模型
+├── logs/                      # 系統日誌
+├── config.yaml                # 全局配置
+└── .github/                   # CI/CD配置
 ```
 
-### 9.1.2 分支策略
+### 9.1.2 分支策略（簡化版）
 
 ```
 main (生產穩定版)
-├── develop (開發主線)
-├── feature/rust-core (Rust核心功能)
-├── feature/python-agents (Python代理系統)
-├── feature/performance (性能優化)
-├── feature/ml-pipeline (ML流水線)
-├── release/staging (發佈候選)
-└── hotfix/* (緊急修復)
+└── develop (開發主線)
+    ├── feature/rust-* (Rust功能分支)
+    ├── feature/python-* (Python功能分支)
+    ├── feature/integration-* (集成功能分支)
+    └── release/* (發佈分支)
 ```
 
-## 9.2 Worktree操作指南
+## 9.2 並行開發最佳實踐
 
-### 9.2.1 創建和管理Worktree
+### 9.2.1 多終端開發模式
 
+**終端1：Rust HFT引擎開發**
 ```bash
-# 創建Rust核心開發環境
-git worktree add -b feature/rust-core ../monday-rust-core develop
-
-# 創建Python代理開發環境
-git worktree add -b feature/python-agents ../monday-python-agents develop
-
-# 創建性能優化環境
-git worktree add -b feature/performance ../monday-performance develop
-
-# 創建發佈準備環境
-git worktree add -b release/v2.1.0 ../monday-release develop
-
-# 列出所有worktree
-git worktree list
-
-# 刪除worktree
-git worktree remove ../monday-rust-core
-git branch -D feature/rust-core
-```
-
-### 9.2.2 並行開發工作流程
-
-**Rust核心開發 (monday-rust-core/)**
-```bash
-cd /Users/shihsonic/Documents/monday-rust-core
-# 專注於Rust HFT引擎
+cd /Users/shihsonic/Documents/monday
+# 專注於Rust引擎開發
+cd rust_hft/
 cargo build --release
 cargo test
-cargo bench
-```
-
-**Python代理開發 (monday-python-agents/)**
-```bash
-cd /Users/shihsonic/Documents/monday-python-agents
-# 專注於7個智能代理
-python -m pytest agno_hft/tests/
-python agno_hft/main.py
-```
-
-**性能優化 (monday-performance/)**
-```bash
-cd /Users/shihsonic/Documents/monday-performance
-# 專注於延遲優化和基準測試
 cargo bench --bench decision_latency
-cargo bench --bench orderbook_benchmarks
 ```
 
-## 9.3 IDE集成最佳實踐
+**終端2：Python Agno代理開發**
+```bash
+cd /Users/shihsonic/Documents/monday
+# 專注於Python代理開發  
+cd agno_hft/
+python main.py
+python -m pytest tests/
+python hft_agents.py
+```
 
-### 9.3.1 多窗口開發環境
+**終端3：集成測試和監控**
+```bash
+cd /Users/shihsonic/Documents/monday
+# 集成測試和系統監控
+python agno_hft/test_integration.py
+./test-parallel-development.sh
+```
 
-**VS Code工作區配置：**
+### 9.2.2 IDE工作區配置
+
+**VS Code統一工作區配置：**
 ```json
 {
   "folders": [
-    {"name": "Main", "path": "../monday"},
-    {"name": "Rust-Core", "path": "../monday-rust-core"},
-    {"name": "Python-Agents", "path": "../monday-python-agents"},
-    {"name": "Performance", "path": "../monday-performance"}
+    {"name": "HFT-Project", "path": "."},
+    {"name": "Rust-Engine", "path": "./rust_hft"},
+    {"name": "Python-Agents", "path": "./agno_hft"}
   ],
   "settings": {
-    "rust-analyzer.linkedProjects": [
-      "../monday-rust-core/Cargo.toml",
-      "../monday-performance/Cargo.toml"
-    ]
+    "rust-analyzer.linkedProjects": ["./rust_hft/Cargo.toml"],
+    "python.pythonPath": "./agno_hft/venv/bin/python",
+    "files.associations": {
+      "*.rs": "rust",
+      "*.py": "python"
+    }
   }
 }
 ```
 
-### 9.3.2 專業化開發環境
+**PyCharm/CLion項目配置：**
+- 將整個monday/目錄作為項目根目錄
+- 配置Rust和Python的混合項目支持
+- 設置專用的運行配置和調試配置
 
-**Rust環境 (CLion/VS Code):**
-- rust-analyzer配置
-- 獨立的Cargo.toml依賴
-- 專用的benchmark配置
+## 9.3 Claude Code並行開發策略
 
-**Python環境 (PyCharm/VS Code):**
-- 獨立的虛擬環境
-- 專用的requirements.txt
-- Agent開發調試配置
+### 9.3.1 上下文切換開發
 
-## 9.4 合併和發佈流程
+**Rust引擎開發模式：**
+```bash
+cd /Users/shihsonic/Documents/monday
+# 告訴Claude Code當前焦點
+# "我現在專注於Rust HFT引擎開發，請幫我優化OrderBook性能"
+```
 
-### 9.4.1 功能合併流程
+**Python代理開發模式：**
+```bash
+cd /Users/shihsonic/Documents/monday  
+# 切換上下文到Python開發
+# "我現在在開發Python Agno代理，請幫我實現新的TradeAgent"
+```
+
+**集成開發模式：**
+```bash
+cd /Users/shihsonic/Documents/monday
+# 全系統集成開發
+# "我需要測試Rust引擎和Python代理的集成，請幫我創建測試腳本"
+```
+
+### 9.3.2 組件導向的開發流程
+
+**流程1：Rust性能優化**
+```
+1. 進入 rust_hft/ 目錄
+2. 與Claude Code討論性能瓶頸
+3. 實施優化建議
+4. 運行基準測試驗證
+5. 集成到主項目
+```
+
+**流程2：Python代理增強**
+```
+1. 進入 agno_hft/ 目錄  
+2. 與Claude Code設計新代理功能
+3. 實現代理邏輯
+4. 測試代理性能
+5. 集成到主控制系統
+```
+
+**流程3：跨語言集成**
+```
+1. 在項目根目錄工作
+2. 與Claude Code討論FFI接口
+3. 測試Rust-Python通信
+4. 優化數據傳遞性能
+5. 完成端到端測試
+```
+
+## 9.4 簡化的開發工作流程
+
+### 9.4.1 功能開發流程
 
 ```bash
-# 1. 在feature worktree中完成開發
-cd /Users/shihsonic/Documents/monday-rust-core
+# 1. 創建功能分支
+git checkout -b feature/optimize-latency develop
+
+# 2. 並行開發（多終端）
+# 終端1: Rust優化
+cd rust_hft/
+# 進行Rust引擎優化...
+
+# 終端2: Python調整  
+cd agno_hft/
+# 調整Python代理配置...
+
+# 3. 測試集成
+cd ..  # 回到項目根目錄
+python agno_hft/test_integration.py
+
+# 4. 提交和合併
 git add .
-git commit -m "feat: optimize orderbook latency to <1μs"
-
-# 2. 推送到遠程
-git push -u origin feature/rust-core
-
-# 3. 切換到主環境進行合併
-cd /Users/shihsonic/Documents/monday
+git commit -m "feat: optimize trading latency to <1μs"
 git checkout develop
-git pull origin develop
-git merge feature/rust-core
-
-# 4. 運行集成測試
-cargo test --all
-python -m pytest agno_hft/tests/
-
-# 5. 推送合併結果
-git push origin develop
+git merge feature/optimize-latency
 ```
 
 ### 9.4.2 發佈準備流程
 
 ```bash
-# 1. 創建發佈worktree
-git worktree add -b release/v2.1.0 ../monday-release develop
+# 1. 創建發佈分支
+git checkout -b release/v2.1.0 develop
 
-# 2. 在發佈環境中進行最終準備
-cd /Users/shihsonic/Documents/monday-release
+# 2. 版本號統一更新
+# 更新 rust_hft/Cargo.toml
+# 更新 agno_hft/requirements.txt 或版本文件
 
-# 3. 版本號更新
-sed -i 's/version = "2.0.0"/version = "2.1.0"/' Cargo.toml
-sed -i 's/version = "2.0.0"/version = "2.1.0"/' agno_hft/pyproject.toml
+# 3. 完整測試
+cd rust_hft/ && cargo test --release
+cd ../agno_hft/ && python -m pytest tests/
+cd .. && python agno_hft/test_integration.py
 
-# 4. 運行完整測試套件
-cargo test --release --all
-python -m pytest agno_hft/tests/ -v
-cargo bench
-
-# 5. 合併到main並打tag
+# 4. 發佈
 git checkout main
 git merge release/v2.1.0
 git tag v2.1.0
 git push origin main --tags
 ```
 
-## 9.5 緊急修復流程
+## 9.5 開發效率優化
 
-### 9.5.1 Hotfix工作流程
+### 9.5.1 快速切換腳本
 
+**創建開發環境別名：**
 ```bash
-# 1. 從main創建hotfix worktree
-git worktree add -b hotfix/fix-critical-bug ../monday-hotfix main
-
-# 2. 在hotfix環境中修復
-cd /Users/shihsonic/Documents/monday-hotfix
-# 進行緊急修復...
-
-# 3. 測試修復
-cargo test
-python -m pytest agno_hft/tests/
-
-# 4. 合併到main和develop
-git checkout main
-git merge hotfix/fix-critical-bug
-git checkout develop  
-git merge hotfix/fix-critical-bug
-
-# 5. 清理hotfix worktree
-git worktree remove ../monday-hotfix
-git branch -D hotfix/fix-critical-bug
+# 添加到 ~/.bashrc 或 ~/.zshrc
+alias hft='cd /Users/shihsonic/Documents/monday'
+alias rust-dev='cd /Users/shihsonic/Documents/monday/rust_hft'
+alias python-dev='cd /Users/shihsonic/Documents/monday/agno_hft'
+alias hft-test='cd /Users/shihsonic/Documents/monday && python agno_hft/test_integration.py'
 ```
 
-## 9.6 性能和效率優勢
+### 9.5.2 智能開發助手
 
-### 9.6.1 並行開發效益
+**環境檢查腳本：**
+```bash
+#!/bin/bash
+# 快速檢查開發環境狀態
+echo "=== HFT開發環境狀態 ==="
+echo "當前目錄: $(pwd)"
+echo "Git分支: $(git branch --show-current)"
+echo "Rust版本: $(rustc --version)"
+echo "Python版本: $(python --version)"
+echo "========================"
+```
 
-**時間節省：**
-- 無需頻繁分支切換
-- 獨立的編譯緩存
-- 專業化的IDE配置
+### 9.5.3 統一開發優勢
 
-**風險降低：**
-- 功能隔離開發
-- 獨立的測試環境
-- 並行的CI/CD驗證
+**相比複雜worktree的優勢：**
+- ✅ 簡單直觀的項目結構
+- ✅ 統一的依賴管理
+- ✅ 便於集成測試和調試
+- ✅ 減少配置複雜性
+- ✅ 更好的IDE支持
+- ✅ 清晰的文件組織
 
-### 9.6.2 團隊協作優化
-
-**角色分工：**
-- Rust工程師：專注於monday-rust-core/
-- Python工程師：專注於monday-python-agents/
-- 性能工程師：專注於monday-performance/
-- DevOps工程師：專注於monday-release/
-
-**衝突最小化：**
-- 獨立的代碼修改範圍
-- 清晰的責任邊界
-- 結構化的合併流程
+**適合的開發場景：**
+- 單人或小團隊開發
+- 需要頻繁進行跨語言集成
+- 快速原型開發和測試
+- 保持項目結構簡潔
 
 ⸻
 
