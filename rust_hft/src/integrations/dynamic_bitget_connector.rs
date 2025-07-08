@@ -270,13 +270,15 @@ impl DynamicBitgetConnector {
                 max_load_per_connection,
                 target_balance_ratio: _,
             } => {
+                // 降低最大負載以減少連接壓力
+                let adjusted_max_load = max_load_per_connection * 0.75; // 降低25%負載
                 // 高流量符號：獨立連接或負載最低的連接
                 if expected_rate >= *high_traffic_threshold {
                     // 尋找負載最低且能容納的組
                     let optimal_group = groups
                         .iter()
                         .enumerate()
-                        .filter(|(_, group)| group.total_expected_load() + expected_rate <= *max_load_per_connection)
+                        .filter(|(_, group)| group.total_expected_load() + expected_rate <= adjusted_max_load)
                         .min_by(|(_, a), (_, b)| a.total_expected_load().partial_cmp(&b.total_expected_load()).unwrap())
                         .map(|(idx, _)| idx);
                     
@@ -296,7 +298,7 @@ impl DynamicBitgetConnector {
                         .iter()
                         .enumerate()
                         .filter(|(_, group)| {
-                            group.total_expected_load() + expected_rate <= *max_load_per_connection
+                            group.total_expected_load() + expected_rate <= adjusted_max_load
                         })
                         .min_by(|(_, a), (_, b)| {
                             let a_load_after = a.total_expected_load() + expected_rate;
@@ -314,7 +316,7 @@ impl DynamicBitgetConnector {
                 let optimal_group = groups
                     .iter()
                     .enumerate()
-                    .filter(|(_, group)| group.total_expected_load() + expected_rate <= *max_load_per_connection)
+                    .filter(|(_, group)| group.total_expected_load() + expected_rate <= adjusted_max_load)
                     .min_by(|(_, a), (_, b)| a.total_expected_load().partial_cmp(&b.total_expected_load()).unwrap())
                     .map(|(idx, _)| idx);
                 

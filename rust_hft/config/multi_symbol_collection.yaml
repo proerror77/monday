@@ -1,18 +1,14 @@
 # 多商品高性能數據收集配置
 # Multi-Symbol High Performance Data Collection Configuration
 
-# 交易對配置
+# 交易對配置 - 減少符號數量以提高穩定性
 symbols:
-  - "BTCUSDT"    # Bitcoin
-  - "ETHUSDT"    # Ethereum  
-  - "SOLUSDT"    # Solana
-  - "ADAUSDT"    # Cardano
-  - "BNBUSDT"    # Binance Coin
-  - "DOGEUSDT"   # Dogecoin
-  - "XRPUSDT"    # Ripple
-  - "DOTUSDT"    # Polkadot
-  - "MATICUSDT"  # Polygon
-  - "AVAXUSDT"   # Avalanche
+  - "BTCUSDT"    # Bitcoin - 主要
+  - "ETHUSDT"    # Ethereum - 主要
+  - "SOLUSDT"    # Solana - 高流量
+  - "XRPUSDT"    # Ripple - 中等流量
+  - "DOGEUSDT"   # Dogecoin - 中等流量
+  - "ADAUSDT"    # Cardano - 低流量
 
 # 數據收集配置
 data_collection:
@@ -23,14 +19,14 @@ data_collection:
     - "Trade"      # 成交數據
     - "Ticker"     # 價格摘要
 
-  # 高性能設置
+  # 高性能設置 - 降低內存使用
   performance:
-    batch_size: 2000              # 批量處理大小
-    buffer_capacity: 10000        # 緩衝區容量
-    flush_interval_ms: 100        # 刷新間隔(毫秒)
+    batch_size: 1000              # 批量處理大小（降低）
+    buffer_capacity: 5000         # 緩衝區容量（降低）
+    flush_interval_ms: 200        # 刷新間隔(毫秒)（增加以減少頻率）
     enable_simd: true             # 啟用SIMD優化
     cpu_affinity: true            # CPU親和性
-    memory_prefault_mb: 512       # 內存預分配
+    memory_prefault_mb: 256       # 內存預分配（降低）
     
   # 數據質量
   quality_control:
@@ -39,19 +35,26 @@ data_collection:
     duplicate_detection: true     # 重複檢測
     sequence_validation: true     # 序列驗證
 
-# 連接配置
+# 連接配置 - 優化防止頻繁斷線
 connection:
   # 重連策略: "fast", "standard", "conservative", "custom"
-  reconnect_strategy: "standard"  # 標準重連策略，平衡速度和穩定性
-  auto_reconnect: true           # 自動重連開關
-  max_reconnect_attempts: 999    # 幾乎無限重連（實際會無限重連）
-  timeout_seconds: 30            # 連接超時時間（增加到30秒）
+  reconnect_strategy: "conservative"  # 使用保守策略，減少對服務器壓力
+  auto_reconnect: true               # 自動重連開關
+  max_reconnect_attempts: 999        # 幾乎無限重連（實際會無限重連）
+  timeout_seconds: 45                # 連接超時時間（增加到45秒，給服務器更多響應時間）
+  
+  # 連接優化設置
+  connection_limits:
+    max_subscriptions_per_connection: 16  # 每個連接最大訂閱數（降低負載）
+    subscription_batch_delay_ms: 100      # 批量訂閱間延遲（避免速率限制）
+    keepalive_interval_sec: 25            # 心跳間隔（保持連接活躍）
+    message_timeout_sec: 90               # 消息超時（降低敏感度）
   
   # 自定義重連參數（當策略為"custom"時使用）
   custom_reconnect:
-    initial_delay_ms: 200        # 初始延遲
-    max_delay_ms: 3000          # 最大延遲
-    multiplier: 2.0             # 延遲倍數
+    initial_delay_ms: 500        # 初始延遲增加
+    max_delay_ms: 10000         # 最大延遲增加
+    multiplier: 1.5             # 延遲倍數降低（更溫和的退避）
 
 # ClickHouse配置
 clickhouse:

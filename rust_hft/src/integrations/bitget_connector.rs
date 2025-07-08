@@ -12,6 +12,10 @@ use std::collections::HashMap;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
 use tracing::{info, warn, error, debug};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Reconnection strategy for different data types
 #[derive(Debug, Clone)]
@@ -143,11 +147,74 @@ impl BitgetChannel {
     }
 }
 
-/// Bitget V2 WebSocket connector
+/// Connection health statistics
+#[derive(Debug, Default)]
+pub struct ConnectionStats {
+    pub total_messages: AtomicU64,
+    pub connection_attempts: AtomicU64,
+    pub successful_connections: AtomicU64,
+    pub disconnections: AtomicU64,
+    pub reconnections: AtomicU64,
+    pub last_connection_time: AtomicU64,
+    pub last_message_time: AtomicU64,
+}
+
+impl Clone for ConnectionStats {
+    fn clone(&self) -> Self {
+        Self {
+            total_messages: AtomicU64::new(self.total_messages.load(Ordering::Relaxed)),
+            connection_attempts: AtomicU64::new(self.connection_attempts.load(Ordering::Relaxed)),
+            successful_connections: AtomicU64::new(self.successful_connections.load(Ordering::Relaxed)),
+            disconnections: AtomicU64::new(self.disconnections.load(Ordering::Relaxed)),
+            reconnections: AtomicU64::new(self.reconnections.load(Ordering::Relaxed)),
+            last_connection_time: AtomicU64::new(self.last_connection_time.load(Ordering::Relaxed)),
+            last_message_time: AtomicU64::new(self.last_message_time.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl ConnectionStats {
+    pub fn record_connection_attempt(&self) {
+        self.connection_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    pub fn record_successful_connection(&self) {
+        self.successful_connections.fetch_add(1, Ordering::Relaxed);
+        self.last_connection_time.store(now_micros(), Ordering::Relaxed);
+    }
+    
+    pub fn record_disconnection(&self) {
+        self.disconnections.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    pub fn record_reconnection(&self) {
+        self.reconnections.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    pub fn record_message(&self) {
+        self.total_messages.fetch_add(1, Ordering::Relaxed);
+        self.last_message_time.store(now_micros(), Ordering::Relaxed);
+    }
+    
+    pub fn get_connection_rate(&self) -> f64 {
+        let attempts = self.connection_attempts.load(Ordering::Relaxed);
+        let successful = self.successful_connections.load(Ordering::Relaxed);
+        if attempts > 0 {
+            successful as f64 / attempts as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Bitget V2 WebSocket connector with robust connection management
 #[derive(Debug, Clone)]
 pub struct BitgetConnector {
     config: BitgetConfig,
     subscriptions: HashMap<String, Vec<BitgetChannel>>,
+    stats: Arc<ConnectionStats>,
+    is_running: Arc<AtomicBool>,
+    consecutive_failures: Arc<AtomicU64>,
 }
 
 impl BitgetConnector {
@@ -155,7 +222,197 @@ impl BitgetConnector {
         Self {
             config,
             subscriptions: HashMap::new(),
+            stats: Arc::new(ConnectionStats::default()),
+            is_running: Arc::new(AtomicBool::new(false)),
+            consecutive_failures: Arc::new(AtomicU64::new(0)),
         }
+    }
+    
+    /// Start WebSocket connection with robust error handling
+    pub async fn run_websocket(&self, message_sender: mpsc::UnboundedSender<BitgetMessage>) -> Result<()> {
+        self.is_running.store(true, Ordering::Relaxed);
+        
+        while self.is_running.load(Ordering::Relaxed) {
+            let result = self.connect_and_run(&message_sender).await;
+            
+            match result {
+                Ok(()) => {
+                    info!("WebSocket connection closed normally");
+                    self.consecutive_failures.store(0, Ordering::Relaxed);
+                    break;
+                }
+                Err(e) => {
+                    let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.stats.record_disconnection();
+                    
+                    error!("WebSocket connection failed (attempt {}): {}", failures, e);
+                    
+                    if !self.config.auto_reconnect {
+                        error!("Auto-reconnect disabled, stopping");
+                        break;
+                    }
+                    
+                    if failures >= self.config.max_reconnect_attempts as u64 {
+                        error!("Max reconnection attempts reached ({}), stopping", self.config.max_reconnect_attempts);
+                        break;
+                    }
+                    
+                    let delay = self.calculate_adaptive_reconnect_delay(failures as usize);
+                    warn!("Reconnecting in {} ms (attempt {})", delay, failures);
+                    
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    self.stats.record_reconnection();
+                }
+            }
+        }
+        
+        self.is_running.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+    
+    /// Adaptive reconnection delay calculation
+    fn calculate_adaptive_reconnect_delay(&self, consecutive_failures: usize) -> u64 {
+        match &self.config.reconnect_strategy {
+            ReconnectStrategy::Fast => {
+                std::cmp::min(100 * (1 << consecutive_failures.min(4)), 2000)
+            }
+            ReconnectStrategy::Standard => {
+                std::cmp::min(1000 * (1 << consecutive_failures.min(3)), 8000)
+            }
+            ReconnectStrategy::Conservative => {
+                std::cmp::min(5000 * (1 << consecutive_failures.min(2)), 30000)
+            }
+            ReconnectStrategy::Custom { initial_delay_ms, max_delay_ms, multiplier } => {
+                let delay = (*initial_delay_ms as f64 * multiplier.powi(consecutive_failures as i32)) as u64;
+                std::cmp::min(delay, *max_delay_ms)
+            }
+        }
+    }
+    
+    /// Main WebSocket connection logic with enhanced error handling
+    async fn connect_and_run(&self, message_sender: &mpsc::UnboundedSender<BitgetMessage>) -> Result<()> {
+        self.stats.record_connection_attempt();
+        
+        info!("Connecting to Bitget V2 WebSocket: {}", self.config.public_ws_url);
+        
+        // Create WebSocket connection with timeout
+        let connect_future = connect_async(&self.config.public_ws_url);
+        let (ws_stream, _) = tokio::time::timeout(
+            Duration::from_secs(self.config.timeout_seconds),
+            connect_future
+        ).await
+            .map_err(|_| anyhow::anyhow!("Connection timeout after {} seconds", self.config.timeout_seconds))?
+            .map_err(|e| anyhow::anyhow!("WebSocket connection failed: {}", e))?;
+            
+        info!("Bitget V2 WebSocket connected successfully");
+        self.stats.record_successful_connection();
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        
+        let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+        
+        // Send all subscriptions
+        for (symbol, channels) in &self.subscriptions {
+            for channel in channels {
+                let subscription_msg = self.create_subscription_message(symbol, channel)?;
+                
+                ws_sender.send(Message::Text(subscription_msg)).await
+                    .map_err(|e| anyhow::anyhow!("Failed to send subscription: {}", e))?;
+                    
+                info!("Subscribed to {} {} on Bitget V2", channel.as_str(), symbol);
+                
+                // Small delay between subscriptions to avoid rate limiting
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        
+        // Enhanced message processing loop with keepalive
+        let mut last_message_time = Instant::now();
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+        
+        loop {
+            tokio::select! {
+                // Process incoming messages
+                message = ws_receiver.next() => {
+                    match message {
+                        Some(Ok(msg)) => {
+                            last_message_time = Instant::now();
+                            self.stats.record_message();
+                            
+                            match msg {
+                                Message::Text(text) => {
+                                    if let Ok(Some(parsed_msg)) = self.parse_message(&text) {
+                                        if let Err(e) = message_sender.send(parsed_msg) {
+                                            error!("Failed to send parsed message: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                Message::Ping(payload) => {
+                                    debug!("Received ping, sending pong");
+                                    if let Err(e) = ws_sender.send(Message::Pong(payload)).await {
+                                        error!("Failed to send pong: {}", e);
+                                        break;
+                                    }
+                                }
+                                Message::Pong(_) => {
+                                    debug!("Received pong");
+                                }
+                                Message::Close(frame) => {
+                                    info!("WebSocket closed by server: {:?}", frame);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error!("WebSocket error: {}", e);
+                            break;
+                        }
+                        None => {
+                            warn!("WebSocket stream ended");
+                            break;
+                        }
+                    }
+                }
+                
+                // Send periodic pings to keep connection alive
+                _ = ping_interval.tick() => {
+                    if let Err(e) = ws_sender.send(Message::Ping(vec![])).await {
+                        error!("Failed to send ping: {}", e);
+                        break;
+                    }
+                    debug!("Sent keepalive ping");
+                }
+                
+                // Check for message timeout (connection might be stale)
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                    if last_message_time.elapsed() > Duration::from_secs(120) {
+                        warn!("No messages received for 2 minutes, connection might be stale");
+                        break;
+                    }
+                }
+                
+                // Check if we should stop
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if !self.is_running.load(Ordering::Relaxed) {
+                        info!("Stopping WebSocket connection");
+                        break;
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Stop the WebSocket connection
+    pub fn stop(&self) {
+        self.is_running.store(false, Ordering::Relaxed);
+    }
+    
+    /// Get connection statistics
+    pub fn get_stats(&self) -> ConnectionStats {
+        (*self.stats).clone()
     }
     
     /// Add a subscription for a trading pair
@@ -208,89 +465,6 @@ impl BitgetConnector {
         }
     }
     
-    /// Calculate adaptive reconnection delay based on consecutive failures
-    fn calculate_adaptive_reconnect_delay(&self, consecutive_failures: usize) -> u64 {
-        match &self.config.reconnect_strategy {
-            ReconnectStrategy::Fast => {
-                // 快速策略：针对ticker数据优化
-                match consecutive_failures {
-                    1 => 200,      // 200ms - 第一次失败快速重试
-                    2 => 500,      // 500ms
-                    3 => 1000,     // 1s
-                    4 => 2000,     // 2s
-                    5 => 3000,     // 3s
-                    6..=9 => 5000, // 5s
-                    _ => 10000,    // 10s - 最大延迟
-                }
-            }
-            ReconnectStrategy::Standard => {
-                // 标准策略：指数退避
-                let base_delay = match consecutive_failures {
-                    1 => 1000,     // 1s
-                    2 => 2000,     // 2s
-                    3 => 4000,     // 4s
-                    4 => 8000,     // 8s
-                    5 => 15000,    // 15s
-                    6..=9 => 30000, // 30s
-                    _ => 60000,    // 60s - 最大延迟
-                };
-                base_delay
-            }
-            ReconnectStrategy::Conservative => {
-                // 保守策略：较长延迟避免服务器过载
-                match consecutive_failures {
-                    1 => 5000,     // 5s
-                    2 => 10000,    // 10s
-                    3 => 20000,    // 20s
-                    4 => 30000,    // 30s
-                    5 => 60000,    // 60s
-                    _ => 120000,   // 120s - 最大延迟
-                }
-            }
-            ReconnectStrategy::Custom { initial_delay_ms, max_delay_ms, multiplier } => {
-                // 自定义策略：基于失败次数的指数退避
-                let delay = (*initial_delay_ms as f64 * multiplier.powi(consecutive_failures as i32 - 1)) as u64;
-                delay.min(*max_delay_ms)
-            }
-        }
-    }
-
-    /// Calculate adaptive reconnection delay based on strategy (旧方法保留兼容性)
-    fn calculate_reconnect_delay(&self, attempt: usize) -> u64 {
-        match &self.config.reconnect_strategy {
-            ReconnectStrategy::Fast => {
-                // Fast strategy for ticker data: 100ms -> 500ms -> 1s -> 2s (max)
-                match attempt {
-                    1 => 100,
-                    2 => 500,
-                    3 => 1000,
-                    _ => 2000,
-                }
-            }
-            ReconnectStrategy::Standard => {
-                // Standard strategy: 1s -> 3s -> 5s
-                match attempt {
-                    1 => 1000,
-                    2 => 3000,
-                    _ => 5000,
-                }
-            }
-            ReconnectStrategy::Conservative => {
-                // Conservative strategy: 5s -> 15s -> 30s -> 60s
-                match attempt {
-                    1 => 5000,
-                    2 => 15000,
-                    3 => 30000,
-                    _ => 60000,
-                }
-            }
-            ReconnectStrategy::Custom { initial_delay_ms, max_delay_ms, multiplier } => {
-                // Custom exponential backoff
-                let delay = (*initial_delay_ms as f64 * multiplier.powi(attempt as i32 - 1)) as u64;
-                delay.min(*max_delay_ms)
-            }
-        }
-    }
     
     async fn try_connect_public(&self, message_handler: &mut (impl FnMut(BitgetMessage) + Send + 'static)) -> Result<()> {
         info!("Connecting to Bitget V2 public WebSocket: {}", self.config.public_ws_url);
