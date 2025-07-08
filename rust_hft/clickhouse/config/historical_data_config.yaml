@@ -1,0 +1,265 @@
+# HFT Historical Data Download Configuration
+# 使用 Bitget 公開歷史數據，無需 API key
+# 數據源: https://img.bitgetimg.com/online/depth/{symbol}/1/{date}.zip
+
+# 默認配置
+default:
+  symbol: "BTCUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2024-07-01"
+    end_date: "2024-07-02"
+  output:
+    directory: "./historical_data"
+    cleanup_zip: true
+    skip_existing: true
+  performance:
+    max_concurrent: 3
+    batch_size: 1000
+    max_retries: 3
+  clickhouse:
+    enabled: false
+    url: "http://localhost:8123"
+    database: "hft_db"
+    username: "default"
+    password: ""
+
+# 開發測試配置  
+development:
+  symbol: "BTCUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2024-07-06"
+    end_date: "2024-07-06"
+  output:
+    directory: "./historical_data"
+    cleanup_zip: true
+    skip_existing: true
+  performance:
+    max_concurrent: 2
+    batch_size: 500
+    max_retries: 3
+  clickhouse:
+    enabled: false
+
+# 生產環境配置
+production:
+  symbol: "BTCUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2024-06-01"
+    end_date: "2024-07-01"
+  output:
+    directory: "./historical_data"
+    cleanup_zip: true
+    skip_existing: true
+  performance:
+    max_concurrent: 5
+    batch_size: 5000
+    max_retries: 3
+  clickhouse:
+    enabled: false
+
+# 測試配置
+test:
+  symbol: "BTCUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2024-07-06"
+    end_date: "2024-07-06"
+  output:
+    directory: "./test_data"
+    cleanup_zip: false
+    skip_existing: true
+  performance:
+    max_concurrent: 1
+    batch_size: 100
+    max_retries: 3
+  clickhouse:
+    enabled: false
+
+# 快速測試配置
+quick_test:
+  symbol: "SOLUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2025-07-03"
+    end_date: "2025-07-03"
+  output:
+    directory: "./test_data"
+    cleanup_zip: false
+    skip_existing: false
+  performance:
+    max_concurrent: 1
+    batch_size: 100
+    max_retries: 3
+  clickhouse:
+    enabled: true
+    url: "http://localhost:8123"
+    database: "hft_db"
+    username: "hft_user"
+    password: "hft_password"
+
+# SOLUSDT 配置
+solusdt_weekly:
+  symbol: "SOLUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2024-06-24"
+    end_date: "2024-07-01"
+  output:
+    directory: "./historical_data"
+    cleanup_zip: true
+    skip_existing: true
+  performance:
+    max_concurrent: 3
+    batch_size: 1500
+    max_retries: 3
+  clickhouse:
+    enabled: false
+
+# ETHUSDT 配置
+ethusdt_monthly:
+  symbol: "ETHUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2024-06-01"
+    end_date: "2024-07-01"
+  output:
+    directory: "./historical_data"
+    cleanup_zip: true
+    skip_existing: true
+  performance:
+    max_concurrent: 4
+    batch_size: 2000
+    max_retries: 3
+  clickhouse:
+    enabled: false
+
+# 成交數據配置 - SPBL/SOLUSDT/20250618_007.zip
+trade_data_test:
+  symbol: "SOLUSDT"
+  data_type: "trade"
+  date_range:
+    start_date: "2025-06-18"
+    end_date: "2025-06-18"
+  output:
+    directory: "./trade_data"
+    cleanup_zip: false
+    skip_existing: false
+  performance:
+    max_concurrent: 1
+    batch_size: 500
+    max_retries: 3
+  clickhouse:
+    enabled: true
+    url: "http://localhost:8123"
+    database: "hft_db"
+    username: "hft_user"
+    password: "hft_password"
+
+# 訂單簿快照配置 - depth/SOLUSDT/1/20250703.zip
+depth_snapshot_test:
+  symbol: "SOLUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2025-07-03"
+    end_date: "2025-07-03"
+  output:
+    directory: "./depth_data"
+    cleanup_zip: false
+    skip_existing: false
+  performance:
+    max_concurrent: 1
+    batch_size: 500
+    max_retries: 3
+  clickhouse:
+    enabled: true
+    url: "http://localhost:8123"
+    database: "hft_db"
+    username: "hft_user"
+    password: "hft_password"
+
+# 高性能配置
+high_performance:
+  symbol: "BTCUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2024-07-01"
+    end_date: "2024-07-07"
+  output:
+    directory: "./historical_data"
+    cleanup_zip: true
+    skip_existing: true
+  performance:
+    max_concurrent: 5
+    batch_size: 10000
+    max_retries: 3
+  clickhouse:
+    enabled: false
+
+# SOLUSDT 30天深度數據配置
+solusdt_30days_depth:
+  symbol: "SOLUSDT"
+  data_type: "depth"
+  date_range:
+    start_date: "2025-06-07"
+    end_date: "2025-07-07"
+  output:
+    directory: "./solusdt_30days_depth"
+    cleanup_zip: true
+    skip_existing: false
+  performance:
+    max_concurrent: 4
+    batch_size: 2000
+    max_retries: 3
+  clickhouse:
+    enabled: true
+    url: "http://localhost:8123"
+    database: "hft_db"
+    username: "hft_user"
+    password: "hft_password"
+
+# SOLUSDT 30天成交數據配置
+solusdt_30days_trade:
+  symbol: "SOLUSDT"
+  data_type: "trade"
+  date_range:
+    start_date: "2025-06-07"
+    end_date: "2025-07-07"
+  output:
+    directory: "./solusdt_30days_trade"
+    cleanup_zip: true
+    skip_existing: false
+  performance:
+    max_concurrent: 4
+    batch_size: 2000
+    max_retries: 3
+  clickhouse:
+    enabled: true
+    url: "http://localhost:8123"
+    database: "hft_db"
+    username: "hft_user"
+    password: "hft_password"
+
+# SOLUSDT 可用成交數據配置 (只下載可用日期)
+solusdt_available_trade:
+  symbol: "SOLUSDT"
+  data_type: "trade"
+  date_range:
+    start_date: "2025-06-17"
+    end_date: "2025-06-18"
+  output:
+    directory: "./solusdt_available_trade"
+    cleanup_zip: true
+    skip_existing: false
+  performance:
+    max_concurrent: 2
+    batch_size: 1000
+    max_retries: 3
+  clickhouse:
+    enabled: true
+    url: "http://localhost:8123"
+    database: "hft_db"
+    username: "hft_user"
+    password: "hft_password"

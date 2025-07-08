@@ -1,0 +1,43 @@
+symbols:
+  - "BTCUSDT"
+  - "ETHUSDT" 
+  - "SOLUSDT"
+data_collection:
+  channels: ["Books5", "Trade"]
+  performance:
+    batch_size: 1000
+    buffer_capacity: 5000
+    flush_interval_ms: 100
+    enable_simd: true
+    cpu_affinity: true
+    memory_prefault_mb: 256
+  quality_control:
+    enable_validation: true
+    max_latency_ms: 50
+    duplicate_detection: false
+    sequence_validation: false
+clickhouse:
+  enabled: true
+  connection:
+    url: "http://localhost:8123"
+    database: "hft_db"
+    username: "hft_user"
+    password: "hft_password"
+  batch_settings:
+    batch_size: 2000
+    flush_interval_ms: 1000
+    max_memory_mb: 100
+    compression: "lz4"
+  tables:
+    market_data: "enhanced_market_data"
+    trade_data: "trade_executions"
+    quality_metrics: "data_quality_metrics"
+monitoring:
+  enable_realtime_stats: true
+  stats_interval_sec: 30
+  enable_performance_metrics: true
+  log_level: "info"
+  alerts:
+    max_processing_latency_us: 1000
+    min_throughput_msg_per_sec: 100
+    max_error_rate_percent: 5.0

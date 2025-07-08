@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- 強制 ClickHouse 監聽所有網絡接口 -->
+    <listen_host>0.0.0.0</listen_host>
+    
+    <!-- 禁用 IPv6 以避免潛在的網絡問題 -->
+    <listen_host replace="true">0.0.0.0</listen_host>
+    
+    <!-- 啟用詳細日誌以便調試 -->
+    <logger>
+        <level>debug</level>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+        <size>1000M</size>
+        <count>10</count>
+    </logger>
+    
+    <!-- HTTP 接口設置 -->
+    <http_port>8123</http_port>
+    <tcp_port>9000</tcp_port>
+    
+    <!-- 完全禁用 interserver 相關配置以避免衝突 -->
+    <!-- 對於單實例部署，不需要副本間通信 -->
+    <interserver_http_port remove="remove"/>
+    <interserver_http_host remove="remove"/>
+</clickhouse>

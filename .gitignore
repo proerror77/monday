@@ -1,0 +1,93 @@
+# System files
+.DS_Store
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.pytest_cache/
+.cache/
+
+# Rust specific
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.redb
+
+# ClickHouse data
+rust_hft/clickhouse/data/
+rust_hft/clickhouse/logs/
+
+# Redis data
+rust_hft/redis/data/
+
+# Model files (too large for git)
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.pkl
+models/
+
+# Data files
+*.jsonl
+*.json
+*.csv
+*.xlsx
+*.zip
+test_data/
+debug_data/
+depth_data/
+solusdt_*/
+
+# Temporary files
+*.tmp
+*.temp
+demo_orderbook.redb
+market_data.jsonl
+training_report_*.json
+backtest_report_*.json
+download_log.txt
+
+# Environment files
+.env
+.env.local
+agno_env/
+
+# Documentation builds
+docs/_build/
+site/
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Large binary directories
+rust_hft/target/

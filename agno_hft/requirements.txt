@@ -1,0 +1,11 @@
+# Agno HFT系統依賴
+agno>=0.6.0
+ollama>=0.5.0
+numpy>=1.20.0
+asyncio
+logging
+typing-extensions
+
+# 可選依賴（如果不使用PyO3直接調用）
+# subprocess
+# json

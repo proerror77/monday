@@ -1,0 +1,97 @@
+# 多商品高性能數據收集配置
+# Multi-Symbol High Performance Data Collection Configuration
+
+# 交易對配置
+symbols:
+  - "BTCUSDT"    # Bitcoin
+  - "ETHUSDT"    # Ethereum  
+  - "SOLUSDT"    # Solana
+  - "ADAUSDT"    # Cardano
+  - "BNBUSDT"    # Binance Coin
+  - "DOGEUSDT"   # Dogecoin
+  - "XRPUSDT"    # Ripple
+  - "DOTUSDT"    # Polkadot
+  - "MATICUSDT"  # Polygon
+  - "AVAXUSDT"   # Avalanche
+
+# 數據收集配置
+data_collection:
+  # 收集類型
+  channels:
+    - "Books5"     # 5檔深度
+    - "Books15"    # 15檔深度  
+    - "Trade"      # 成交數據
+    - "Ticker"     # 價格摘要
+
+  # 高性能設置
+  performance:
+    batch_size: 2000              # 批量處理大小
+    buffer_capacity: 10000        # 緩衝區容量
+    flush_interval_ms: 100        # 刷新間隔(毫秒)
+    enable_simd: true             # 啟用SIMD優化
+    cpu_affinity: true            # CPU親和性
+    memory_prefault_mb: 512       # 內存預分配
+    
+  # 數據質量
+  quality_control:
+    enable_validation: true       # 啟用數據驗證
+    max_latency_ms: 50           # 最大延遲閾值
+    duplicate_detection: true     # 重複檢測
+    sequence_validation: true     # 序列驗證
+
+# 連接配置
+connection:
+  # 重連策略: "fast", "standard", "custom"
+  reconnect_strategy: "fast"      # 適用於ticker數據的快速重連
+  auto_reconnect: true           # 自動重連開關
+  max_reconnect_attempts: 5      # 最大重連次數
+  timeout_seconds: 10            # 連接超時時間
+  
+  # 自定義重連參數（當策略為"custom"時使用）
+  custom_reconnect:
+    initial_delay_ms: 200        # 初始延遲
+    max_delay_ms: 3000          # 最大延遲
+    multiplier: 2.0             # 延遲倍數
+
+# ClickHouse配置
+clickhouse:
+  enabled: true
+  connection:
+    url: "http://localhost:8123"
+    database: "hft_db"
+    username: "hft_user"
+    password: "hft_password"
+    
+  # 寫入優化
+  batch_settings:
+    batch_size: 1000            # 數據庫批量大小
+    flush_interval_ms: 5000     # 數據庫刷新間隔
+    max_memory_mb: 100          # 最大內存使用
+    compression: "lz4"          # 壓縮算法
+    
+  # 表配置
+  tables:
+    market_data: "enhanced_market_data"
+    trade_data: "trade_executions"
+    quality_metrics: "data_quality_metrics"
+
+# 監控配置
+monitoring:
+  enable_realtime_stats: true
+  stats_interval_sec: 30
+  enable_performance_metrics: true
+  log_level: "info"
+  
+  # 警報閾值
+  alerts:
+    max_processing_latency_us: 1000
+    min_throughput_msg_per_sec: 500
+    max_error_rate_percent: 1.0
+
+# 文件輸出（可選）
+file_output:
+  enabled: false
+  format: "jsonl"
+  directory: "./market_data"
+  rotation_size_mb: 100
+  compression: true

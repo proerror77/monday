@@ -1,0 +1,227 @@
+[package]
+name = "rust_hft"
+version = "0.1.0"
+edition = "2021"
+authors = ["HFT Developer"]
+description = "High-Frequency Trading System in Pure Rust"
+
+[lib]
+name = "rust_hft"
+path = "src/lib.rs"
+crate-type = ["cdylib", "lib"]  # 支持Python擴展模塊和標準庫
+
+[[bin]]
+name = "rust_hft"
+path = "src/main.rs"
+
+[dependencies]
+# 網絡和異步 (僅用於網絡線程)
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+futures = "0.3"
+url = "2.5"
+
+# JSON 解析: simd-json 比 serde_json 更快
+simd-json = "0.15.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }  # JSON 操作
+
+# 無鎖隊列: crossbeam 是 Rust 中無鎖數據結構的黃金標準
+crossbeam-channel = "0.5"
+
+# PyO3 Python 綁定依賴
+pyo3 = { version = "0.22", features = ["extension-module", "abi3"], optional = true }
+numpy = { version = "0.22", optional = true }
+
+# 機器學習: Candle 深度學習框架 (Pure Rust)
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+candle-datasets = "0.9.1"
+
+# Barter-rs 生態系統: 事件驅動的交易框架
+barter = "0.12.2"
+barter-data = "0.10.1"  
+barter-integration = "0.9.1"
+barter-instrument = "0.3.1"  # 金融工具定義
+barter-execution = "0.5.3"   # 訂單執行引擎 (暂時禁用，等待穩定版本)
+
+tokio-stream = "0.1"  # 用於 Stream 功能
+
+# GPU 加速 (可選) - 注意：實際的GPU支持在candle-core中
+# candle-cuda = { version = "0.8.0", optional = true }
+# candle-metal = { version = "0.8.0", optional = true }
+
+# 傳統 ML 算法作為 fallback
+smartcore = "0.4.1"
+
+# 高性能時序數據庫
+redb = "2.1.3"
+
+# 數據結構和數學計算
+ordered-float = { version = "5.0.0", features = ["serde"] }  # 可排序的浮點數
+rust_decimal = { version = "1.32", features = ["std", "serde"] }  # 高精度定點數
+rust_decimal_macros = "1.32"  # Decimal 宏支持
+
+# 性能監控和日誌
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 線程釘選
+core_affinity = "0.8"
+
+# 錯誤處理
+anyhow = "1.0"
+thiserror = "2.0.12"
+
+# 時間處理
+chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde"] }
+serde_bytes = "0.11"
+
+# HTTP 客戶端 (用於REST API)
+reqwest = { version = "0.12.22", features = ["json"] }
+
+# 加密 (用於API簽名)
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22.1"
+
+# CRC32 校驗和計算 (用於 Bitget checksum 驗證)
+crc32fast = "1.3"
+
+# 內存池分配器
+bumpalo = "3.14"
+
+# 數值計算和隨機數生成
+rand = "0.9.1"
+num_cpus = "1.16"
+
+# 高性能無鎖數據結構
+crossbeam-utils = "0.8"
+dashmap = "6.0"
+parking_lot = "0.12"
+lockfree = "0.5"  # 無鎖數據結構
+
+# 系統級優化
+libc = "0.2"  # Linux 系統調用
+
+# 序列化支持
+bincode = "2.0.1"
+uuid = { version = "1.17.0", features = ["v4"] }
+async-trait = "0.1.88"
+fastrand = "2.3.0"
+crossterm = "0.29.0"
+
+# Command line argument parsing
+clap = { version = "4.0", features = ["derive"] }
+
+# 時間和網絡相關 (chrono 已在上面定義)
+chrono-tz = "0.10"
+
+# ZIP 文件處理
+zip = "0.6"
+
+# ClickHouse 客戶端
+clickhouse = { version = "0.12", features = ["rustls-tls", "time"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+
+# 文件操作
+flate2 = "1.0"
+
+# YAML 配置文件解析
+serde_yaml = "0.9"
+
+# Excel 文件讀取支持
+calamine = "0.26"
+
+# 依賴項的額外功能已在上面配置
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+lto = "fat"         # 啟用鏈接時優化 (Link-Time Optimization)
+codegen-units = 1   # 最大化優化機會
+panic = "abort"     # 遇到 panic 直接終止，避免展開的開銷
+strip = true        # 剝離調試符號
+opt-level = 3       # 最高優化級別
+
+[profile.dev]
+opt-level = 1       # 開發時也啟用基本優化，提高調試體驗
+
+[features]
+default = []  # 不再默認啟用 Python 綁定
+# GPU features will be handled through candle-core's CUDA/Metal support
+gpu = []
+cuda = []
+metal = []
+# Python bindings feature
+python = ["pyo3", "numpy"]
+
+# ==================== EXAMPLES ====================
+# 🚀 新統一架構範例 - 6個強大的統一應用
+# 將原有的19個重複範例整合為功能更強大、代碼更清潔的統一應用
+
+# Basic Connection and Setup (保留作為基礎連接工具)
+[[example]]
+name = "connect_to_exchange"
+path = "examples/01_connect_to_exchange.rs"
+
+# 📊 統一數據收集系統 (整合 02, 06, 08)
+[[example]]
+name = "data_collection"
+path = "examples/data_collection.rs"
+
+# 🧠 統一模型訓練系統 (整合 04, 10, 11)
+[[example]]
+name = "model_training"
+path = "examples/model_training.rs"
+
+# 📈 統一模型評估系統 (整合 09, 12)
+[[example]]
+name = "model_evaluation"
+path = "examples/model_evaluation.rs"
+
+# ⚡ 統一實盤交易系統 (整合 05, 13)
+[[example]]
+name = "live_trading"
+path = "examples/live_trading.rs"
+
+# 🔧 統一性能測試系統 (整合 07, 14)
+[[example]]
+name = "performance_test"
+path = "examples/performance_test.rs"
+
+# 📊 統一回測系統 (整合 03)
+[[example]]
+name = "backtesting"
+path = "examples/backtesting.rs"
+
+# 📥 歷史資料下載器
+[[example]]
+name = "download_historical_lob"
+path = "examples/download_historical_lob.rs"
+
+
+# 💾 歷史資料導入器
+[[example]]
+name = "import_historical_data"
+path = "examples/import_historical_data.rs"
+
+# 🧠 歷史資料預訓練系統
+[[example]]
+name = "train_with_historical"
+path = "examples/train_with_historical.rs"
+
+[[bench]]
+name = "orderbook_benchmarks"
+harness = false
+
+[[bench]]
+name = "ultra_high_perf_benchmarks"
+harness = false
+
+[workspace]
