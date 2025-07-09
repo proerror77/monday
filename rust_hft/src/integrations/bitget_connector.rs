@@ -325,9 +325,13 @@ impl BitgetConnector {
             }
         }
         
-        // Enhanced message processing loop with keepalive
+        // Enhanced message processing loop with official Bitget keepalive
         let mut last_message_time = Instant::now();
-        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+        let mut last_ping_time = Instant::now();
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30)); // 官方要求30秒
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip); // 跳過錯過的tick
+        let mut pong_received = true; // 跟蹤pong響應狀態
+        let mut consecutive_ping_failures = 0; // 跟蹤連續ping失敗次數
         
         loop {
             tokio::select! {
@@ -340,10 +344,18 @@ impl BitgetConnector {
                             
                             match msg {
                                 Message::Text(text) => {
-                                    if let Ok(Some(parsed_msg)) = self.parse_message(&text) {
-                                        if let Err(e) = message_sender.send(parsed_msg) {
-                                            error!("Failed to send parsed message: {}", e);
-                                            break;
+                                    // 檢查是否是 Bitget 的 "pong" 響應
+                                    if text == "pong" {
+                                        info!("✅ Received Bitget pong response, resetting ping failure count");
+                                        pong_received = true; // 標記收到pong響應
+                                        consecutive_ping_failures = 0; // 重置連續失敗計數
+                                    } else {
+                                        // 處理其他文本消息
+                                        if let Ok(Some(parsed_msg)) = self.parse_message(&text) {
+                                            if let Err(e) = message_sender.send(parsed_msg) {
+                                                error!("Failed to send parsed message: {}", e);
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -356,6 +368,8 @@ impl BitgetConnector {
                                 }
                                 Message::Pong(_) => {
                                     debug!("Received pong");
+                                    pong_received = true; // 標記收到pong響應
+                                    consecutive_ping_failures = 0; // 重置連續失敗計數
                                 }
                                 Message::Close(frame) => {
                                     info!("WebSocket closed by server: {:?}", frame);
@@ -375,19 +389,45 @@ impl BitgetConnector {
                     }
                 }
                 
-                // Send periodic pings to keep connection alive
+                // Send periodic pings to keep connection alive (Bitget官方要求)
                 _ = ping_interval.tick() => {
-                    if let Err(e) = ws_sender.send(Message::Ping(vec![])).await {
+                    // 檢查是否收到上一個ping的pong響應
+                    if !pong_received {
+                        consecutive_ping_failures += 1;
+                        warn!("No pong received for ping {} (consecutive failures: {})", 
+                              consecutive_ping_failures, consecutive_ping_failures);
+                        
+                        // 如果連續5次ping沒有收到pong響應，重新連接 (增加容錯性)
+                        if consecutive_ping_failures >= 5 {
+                            warn!("No pong received for {} consecutive pings, connection may be unstable", 
+                                  consecutive_ping_failures);
+                            break;
+                        }
+                    } else {
+                        // 重置連續失敗計數
+                        if consecutive_ping_failures > 0 {
+                            debug!("Pong received, resetting consecutive failures (was: {})", consecutive_ping_failures);
+                            consecutive_ping_failures = 0;
+                        }
+                    }
+                    
+                    // 發送ping並記錄時間
+                    last_ping_time = Instant::now();
+                    pong_received = false; // 重置狀態，等待pong響應
+                    
+                    // Bitget官方要求發送字符串"ping"而不是WebSocket ping frame
+                    if let Err(e) = ws_sender.send(Message::Text("ping".to_string())).await {
                         error!("Failed to send ping: {}", e);
                         break;
                     }
-                    debug!("Sent keepalive ping");
+                    info!("📡 Sent Bitget keepalive ping at {} (failures: {})", 
+                          chrono::Utc::now().format("%H:%M:%S"), consecutive_ping_failures);
                 }
                 
-                // Check for message timeout (connection might be stale)
+                // Check for message timeout (connection might be stale) - 延長到 5 分鐘
                 _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                    if last_message_time.elapsed() > Duration::from_secs(120) {
-                        warn!("No messages received for 2 minutes, connection might be stale");
+                    if last_message_time.elapsed() > Duration::from_secs(300) {
+                        warn!("No messages received for 5 minutes, connection might be stale");
                         break;
                     }
                 }
@@ -433,8 +473,9 @@ impl BitgetConnector {
                     
                     // 正常断开后等待一下再重连
                     if self.config.auto_reconnect {
-                        warn!("Connection lost, auto-reconnecting in 2s...");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        let delay = self.calculate_adaptive_reconnect_delay(1);
+                        warn!("Connection lost, auto-reconnecting in {}ms...", delay);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
                         continue;
                     } else {
                         return Ok(());
@@ -496,6 +537,13 @@ impl BitgetConnector {
                     match message {
                         Some(Ok(Message::Text(text))) => {
                             last_activity = tokio::time::Instant::now();
+                            
+                            // 檢查是否是 Bitget 的 "pong" 響應
+                            if text == "pong" {
+                                debug!("Received Bitget pong response");
+                                continue;
+                            }
+                            
                             match self.parse_message(&text) {
                                 Ok(Some(bitget_msg)) => {
                                     message_handler(bitget_msg);
@@ -544,13 +592,13 @@ impl BitgetConnector {
                     }
                 }
                 
-                // Send periodic ping messages
+                // Send periodic ping messages (Bitget官方要求字符串"ping")
                 _ = ping_timer.tick() => {
-                    if let Err(e) = ws_sender.send(Message::Ping(b"heartbeat".to_vec())).await {
+                    if let Err(e) = ws_sender.send(Message::Text("ping".to_string())).await {
                         error!("Failed to send ping: {}", e);
                         break;
                     }
-                    debug!("Sent heartbeat ping");
+                    debug!("Sent Bitget heartbeat ping");
                 }
                 
                 // Check for connection timeout
@@ -566,17 +614,18 @@ impl BitgetConnector {
         Ok(())
     }
     
-    /// Create Bitget V2 subscription message (matches Python implementation)
+    /// Create Bitget V2 subscription message (符合官方文檔格式)
     fn create_subscription_message(&self, symbol: &str, channel: &BitgetChannel) -> Result<String> {
         let message = serde_json::json!({
             "op": "subscribe",
             "args": [{
-                "instType": "SPOT",
+                "instType": "SPOT",  // 現貨交易類型
                 "channel": channel.as_str(),
                 "instId": symbol
             }]
         });
         
+        debug!("Creating subscription for {} {}: {}", channel.as_str(), symbol, message);
         Ok(message.to_string())
     }
     

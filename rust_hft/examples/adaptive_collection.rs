@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 use tracing::{info, warn, error, debug};
+use serde_yaml;
 
 #[derive(Parser)]
 #[command(
@@ -92,28 +93,57 @@ async fn main() -> Result<()> {
     let runner = HftAppRunner::new()?;
     info!("✅ HFT應用初始化完成");
     
-    // Create adaptive traffic-based dynamic connector
+    // Load configuration from file (使用我們優化後的配置)
+    let config = match std::fs::read_to_string(&args.config) {
+        Ok(content) => match serde_yaml::from_str::<serde_yaml::Value>(&content) {
+            Ok(yaml) => yaml,
+            Err(e) => {
+                error!("Failed to parse config YAML: {}", e);
+                return Err(e.into());
+            }
+        },
+        Err(e) => {
+            error!("Failed to read config file: {}", e);
+            return Err(e.into());
+        }
+    };
+    
+    // Create adaptive traffic-based dynamic connector with optimized settings
     let bitget_config = BitgetConfig {
         public_ws_url: "wss://ws.bitget.com/v2/ws/public".to_string(),
         auto_reconnect: true,
-        max_reconnect_attempts: 10,
-        timeout_seconds: 15,
+        max_reconnect_attempts: 999,  // 符合配置文件設置
+        timeout_seconds: config.get("connection")
+            .and_then(|c| c.get("timeout_seconds"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(60),  // 增加到60秒提高穩定性
+        reconnect_strategy: rust_hft::integrations::bitget_connector::ReconnectStrategy::Custom {
+            initial_delay_ms: 2000,  // 2秒初始延遲
+            max_delay_ms: 30000,     // 最大30秒延遲
+            multiplier: 1.5,         // 1.5倍遞增
+        },
         ..Default::default()
     };
     
     let mut dynamic_connector = create_traffic_based_dynamic_connector(bitget_config);
     
-    // Define symbols with comprehensive coverage
-    let symbols = vec![
-        // 主要加密貨幣 (預期高流量)
-        "ETHUSDT", "BTCUSDT", "XRPUSDT", "SOLUSDT",
-        
-        // 二線加密貨幣 (預期中等流量)
-        "DOGEUSDT", "BNBUSDT", "ADAUSDT", "DOTUSDT",
-        
-        // 其他加密貨幣 (預期低流量)
-        "AVAXUSDT", "MATICUSDT", "LINKUSDT", "UNIUSDT",
-    ];
+    // Read symbols from configuration file (從配置文件讀取符號)
+    let symbols: Vec<String> = config.get("symbols")
+        .and_then(|s| s.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            warn!("No symbols found in config, using defaults");
+            vec![
+                "BTCUSDT".to_string(), "ETHUSDT".to_string(), 
+                "SOLUSDT".to_string(), "XRPUSDT".to_string(),
+                "DOGEUSDT".to_string(), "ADAUSDT".to_string()
+            ]
+        });
     
     info!("📋 準備收集 {} 個交易對的數據", symbols.len());
     

@@ -41,14 +41,17 @@ connection:
   reconnect_strategy: "conservative"  # 使用保守策略，減少對服務器壓力
   auto_reconnect: true               # 自動重連開關
   max_reconnect_attempts: 999        # 幾乎無限重連（實際會無限重連）
-  timeout_seconds: 45                # 連接超時時間（增加到45秒，給服務器更多響應時間）
+  timeout_seconds: 60                # 連接超時時間（增加到60秒，提高穩定性）
   
-  # 連接優化設置
+  # 連接優化設置（基於官方文檔 + 性能優化）
   connection_limits:
-    max_subscriptions_per_connection: 16  # 每個連接最大訂閱數（降低負載）
-    subscription_batch_delay_ms: 100      # 批量訂閱間延遲（避免速率限制）
-    keepalive_interval_sec: 25            # 心跳間隔（保持連接活躍）
-    message_timeout_sec: 90               # 消息超時（降低敏感度）
+    max_subscriptions_per_connection: 24  # 每個連接最大訂閱數（官方建議不超過50）
+    subscription_batch_delay_ms: 100      # 批量訂閱間延遲（降低延遲）
+    keepalive_interval_sec: 25            # 心跳間隔（更頻繁的心跳）
+    message_timeout_sec: 300              # 消息超時（延長到5分鐘）
+    pong_tolerance: 3                     # 容忍連續無pong響應次數
+    max_connections_per_ip: 20            # 單IP最大連接數（官方限制100個）
+    connection_requests_per_5min: 50      # 5分鐘內連接請求數（官方限制300次）
   
   # 自定義重連參數（當策略為"custom"時使用）
   custom_reconnect:

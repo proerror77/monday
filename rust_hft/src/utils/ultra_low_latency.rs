@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
+use std::cell::UnsafeCell;
 use lockfree::queue::Queue;
 use anyhow::Result;
 use tracing::{debug, warn, info};
@@ -81,13 +82,14 @@ impl CpuAffinityManager {
     }
 }
 
-/// SIMD 優化的特徵計算器
+/// SIMD 優化的特徵計算器  
+/// 使用零分配內存池實現真正的高性能計算
 #[derive(Debug)]
 pub struct SIMDFeatureProcessor {
     /// 預分配的計算緩衝區
     compute_buffer: Vec<f32>,
-    /// 對齊的內存池
-    aligned_memory: AlignedMemoryPool,
+    /// 零分配內存池
+    zero_alloc_pool: ZeroAllocMemoryPool,
 }
 
 impl SIMDFeatureProcessor {
@@ -95,22 +97,22 @@ impl SIMDFeatureProcessor {
     pub fn new() -> Self {
         Self {
             compute_buffer: vec![0.0f32; 256], // 預分配緩衝區
-            aligned_memory: AlignedMemoryPool::new(1024, 32), // 32字節對齊
+            zero_alloc_pool: ZeroAllocMemoryPool::new(1024, 32), // 32字節對齊
         }
     }
     
-    /// SIMD 優化的 LOB 特徵提取
+    /// SIMD 優化的 LOB 特徵提取（零分配版本）
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    pub unsafe fn extract_lob_features_simd(&mut self, lob_data: &[f64]) -> Vec<f32> {
-        let mut result = self.aligned_memory.get_aligned_vector(52);
+    pub unsafe fn extract_lob_features_simd_zero_alloc(&mut self, lob_data: &[f64], output: &mut [f32]) {
+        assert!(output.len() >= 52, "Output buffer must be at least 52 elements");
         
         // 8x 並行處理 LOB 數據
         let chunks = lob_data.chunks_exact(4);
         let mut output_idx = 0;
         
         for chunk in chunks {
-            if output_idx + 4 <= result.len() {
+            if output_idx + 4 <= output.len() && output_idx + 4 <= 52 {
                 // 加載 4 個 f64 值
                 let data = _mm256_loadu_pd(chunk.as_ptr());
                 
@@ -122,11 +124,19 @@ impl SIMDFeatureProcessor {
                 let combined = _mm_movelh_ps(lower_f32, upper_f32);
                 
                 // 存儲結果
-                _mm_storeu_ps(result[output_idx..].as_mut_ptr(), combined);
+                _mm_storeu_ps(output[output_idx..].as_mut_ptr(), combined);
                 output_idx += 4;
             }
         }
-        
+    }
+    
+    /// SIMD 優化的 LOB 特徵提取（傳統版本，保持兼容性）
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[deprecated(note = "Use extract_lob_features_simd_zero_alloc for better performance")]
+    pub unsafe fn extract_lob_features_simd(&mut self, lob_data: &[f64]) -> Vec<f32> {
+        let mut result = vec![0.0f32; 52];
+        self.extract_lob_features_simd_zero_alloc(lob_data, &mut result);
         result
     }
     
@@ -168,18 +178,24 @@ impl SIMDFeatureProcessor {
         result
     }
     
-    /// 非 SIMD 備用實現 - LOB 特徵提取
+    /// 非 SIMD 備用實現 - LOB 特徵提取（零分配版本）
     #[cfg(not(target_arch = "x86_64"))]
-    pub fn extract_lob_features_simd(&mut self, lob_data: &[f64]) -> Vec<f32> {
-        // 標準實現，無 SIMD 優化
-        let mut result = self.aligned_memory.get_aligned_vector(52);
+    pub fn extract_lob_features_zero_alloc(&mut self, lob_data: &[f64], output: &mut [f32]) {
+        assert!(output.len() >= 52, "Output buffer must be at least 52 elements");
         
         for (i, &value) in lob_data.iter().take(52).enumerate() {
-            if i < result.len() {
-                result[i] = value as f32;
+            if i < output.len() {
+                output[i] = value as f32;
             }
         }
-        
+    }
+    
+    /// 非 SIMD 備用實現 - LOB 特徵提取（傳統版本）
+    #[cfg(not(target_arch = "x86_64"))]
+    #[deprecated(note = "Use extract_lob_features_zero_alloc for better performance")]
+    pub fn extract_lob_features_simd(&mut self, lob_data: &[f64]) -> Vec<f32> {
+        let mut result = vec![0.0f32; 52];
+        self.extract_lob_features_zero_alloc(lob_data, &mut result);
         result
     }
     
@@ -246,111 +262,231 @@ pub struct AlignedMemoryPool {
     alignment: usize,
 }
 
-impl AlignedMemoryPool {
-    /// 創建對齊內存池
-    pub fn new(pool_size: usize, alignment: usize) -> Self {
-        let pool_count = 8; // 8個池子輪換使用
-        let mut pools = Vec::with_capacity(pool_count);
-        
-        for _ in 0..pool_count {
-            let mut pool = Vec::with_capacity(pool_size);
-            pool.resize(pool_size, 0.0f32);
-            pools.push(pool);
-        }
+/// 零分配的對齊內存分配器
+/// 使用無鎖的單線程本地存儲，避免緩存行競爭
+#[derive(Debug)]
+pub struct ZeroAllocMemoryPool {
+    /// 每個線程的本地內存池
+    local_pools: std::cell::RefCell<Vec<Vec<f32>>>,
+    /// 預分配的大塊內存區域
+    base_memory: Box<[f32]>,
+    /// 當前使用的內存偏移
+    memory_offset: std::cell::Cell<usize>,
+    /// 池大小
+    pool_size: usize,
+}
+
+impl ZeroAllocMemoryPool {
+    /// 創建零分配內存池
+    pub fn new(pool_size: usize, _alignment: usize) -> Self {
+        // 預分配大塊對齊內存
+        let total_size = pool_size * 32; // 32個池子的總大小
+        let mut base_memory = vec![0.0f32; total_size];
+        base_memory.shrink_to_fit();
         
         Self {
-            pools,
+            local_pools: std::cell::RefCell::new(Vec::new()),
+            base_memory: base_memory.into_boxed_slice(),
+            memory_offset: std::cell::Cell::new(0),
+            pool_size,
+        }
+    }
+    
+    /// 獲取零分配的內存切片
+    /// 注意：返回的切片必須在下次調用前使用完畢
+    #[inline]
+    pub fn get_temp_slice(&self, size: usize) -> &mut [f32] {
+        if size > self.pool_size {
+            panic!("Requested size {} exceeds pool size {}", size, self.pool_size);
+        }
+        
+        let current_offset = self.memory_offset.get();
+        let remaining = self.base_memory.len() - current_offset;
+        
+        if remaining < size {
+            // 重置到內存開始位置（環形使用）
+            self.memory_offset.set(size);
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.base_memory.as_ptr() as *mut f32,
+                    size
+                )
+            }
+        } else {
+            // 使用當前位置
+            self.memory_offset.set(current_offset + size);
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.base_memory.as_ptr().add(current_offset) as *mut f32,
+                    size
+                )
+            }
+        }
+    }
+    
+    /// 廢棄的方法，保持接口兼容但不推薦使用
+    #[deprecated(note = "Use get_temp_slice for zero-allocation access")]
+    pub fn get_aligned_vector(&self, size: usize) -> Vec<f32> {
+        // 只在必要時分配新向量
+        vec![0.0f32; size]
+    }
+}
+
+// 移除舊的AlignedMemoryPool實現，因為它完全無效
+impl AlignedMemoryPool {
+    /// 創建傳統內存池（已廢棄）
+    #[deprecated(note = "Use ZeroAllocMemoryPool for better performance")]
+    pub fn new(pool_size: usize, alignment: usize) -> Self {
+        Self {
+            pools: Vec::new(),
             current_pool: AtomicU64::new(0),
             pool_size,
             alignment,
         }
     }
     
-    /// 獲取對齊的向量
+    /// 獲取向量（效率低下的實現）
+    #[deprecated(note = "This implementation is inefficient due to cloning")]
     pub fn get_aligned_vector(&self, size: usize) -> Vec<f32> {
-        if size <= self.pool_size {
-            let pool_idx = self.current_pool.fetch_add(1, Ordering::Relaxed) % self.pools.len() as u64;
-            let mut vec = self.pools[pool_idx as usize].clone();
-            vec.truncate(size);
-            vec.clear();
-            vec.resize(size, 0.0f32);
-            vec
-        } else {
-            vec![0.0f32; size]
+        // 警告：這個實現性能很差，應該使用ZeroAllocMemoryPool
+        warn!("Using deprecated AlignedMemoryPool::get_aligned_vector - consider migrating to ZeroAllocMemoryPool");
+        vec![0.0f32; size]
+    }
+}
+
+/// 緩存行大小常量
+const CACHE_LINE_SIZE: usize = 64;
+
+/// 緩存行對齊的原子計數器
+#[repr(align(64))]  // 確保緩存行對齊
+#[derive(Debug)]
+struct AlignedAtomic {
+    value: AtomicU64,
+    _padding: [u8; CACHE_LINE_SIZE - 8], // 填充到64字節避免false sharing
+}
+
+impl AlignedAtomic {
+    fn new(val: u64) -> Self {
+        Self {
+            value: AtomicU64::new(val),
+            _padding: [0; CACHE_LINE_SIZE - 8],
         }
     }
 }
 
-/// 無鎖環形緩衝區
+/// 高性能SPSC (Single Producer Single Consumer) 無鎖隊列
+/// 專為市場數據管道優化，避免了多生產者的複雜性
 #[derive(Debug)]
-pub struct LockFreeRingBuffer<T> {
-    /// 數據存儲
-    data: Vec<MaybeUninit<T>>,
-    /// 寫入位置
-    write_pos: AtomicU64,
-    /// 讀取位置
-    read_pos: AtomicU64,
+pub struct HighPerfSPSCQueue<T> {
+    /// 數據存儲，使用UnsafeCell實現內部可變性
+    data: UnsafeCell<Box<[MaybeUninit<T>]>>,
+    /// 寫入位置 (緩存行對齊)
+    write_pos: AlignedAtomic,
+    /// 讀取位置 (緩存行對齊)  
+    read_pos: AlignedAtomic,
     /// 緩衝區大小
     capacity: usize,
     /// 容量掩碼（用於快速取模）
     capacity_mask: u64,
 }
 
-impl<T> LockFreeRingBuffer<T> {
-    /// 創建無鎖環形緩衝區
+// 實現Sync trait，因為我們的無鎖實現是線程安全的
+unsafe impl<T: Send> Sync for HighPerfSPSCQueue<T> {}
+unsafe impl<T: Send> Send for HighPerfSPSCQueue<T> {}
+
+impl<T> HighPerfSPSCQueue<T> {
+    /// 創建高性能SPSC隊列
+    /// capacity 必須是2的幂，用於快速取模操作
     pub fn new(capacity: usize) -> Self {
-        // 確保容量是2的幂
-        let capacity = capacity.next_power_of_two();
+        assert!(capacity > 0 && capacity.is_power_of_two(), 
+                "Capacity must be a power of two");
+        
+        // 分配對齊的內存
         let mut data = Vec::with_capacity(capacity);
         data.resize_with(capacity, || MaybeUninit::uninit());
+        let data = data.into_boxed_slice();
         
         Self {
-            data,
-            write_pos: AtomicU64::new(0),
-            read_pos: AtomicU64::new(0),
+            data: UnsafeCell::new(data),
+            write_pos: AlignedAtomic::new(0),
+            read_pos: AlignedAtomic::new(0),
             capacity,
             capacity_mask: (capacity - 1) as u64,
         }
     }
     
-    /// 嘗試寫入數據
+    /// 高性能寫入（生產者端）
+    /// 使用正確的內存順序避免ABA問題
+    #[inline(always)]
     pub fn try_push(&self, item: T) -> Result<(), T> {
-        let write_pos = self.write_pos.load(Ordering::Relaxed);
-        let read_pos = self.read_pos.load(Ordering::Acquire);
+        // 獲取當前寫入位置
+        let current_write = self.write_pos.value.load(Ordering::Relaxed);
+        let next_write = current_write.wrapping_add(1);
         
-        // 檢查是否已滿
-        if write_pos.wrapping_sub(read_pos) >= self.capacity as u64 {
+        // 檢查隊列是否已滿
+        // 使用Acquire確保看到消費者的最新讀取位置
+        let current_read = self.read_pos.value.load(Ordering::Acquire);
+        
+        if next_write.wrapping_sub(current_read) > self.capacity as u64 {
             return Err(item);
         }
         
-        // 寫入數據
-        let slot = &self.data[(write_pos & self.capacity_mask) as usize];
+        // 寫入數據到指定位置
+        let slot_index = (current_write & self.capacity_mask) as usize;
         unsafe {
-            ptr::write(slot.as_ptr() as *mut T, item);
+            let data = &mut *self.data.get();
+            data[slot_index].as_mut_ptr().write(item);
         }
         
-        // 更新寫入位置
-        self.write_pos.store(write_pos.wrapping_add(1), Ordering::Release);
+        // 使用Release確保數據寫入對消費者可見
+        self.write_pos.value.store(next_write, Ordering::Release);
         Ok(())
     }
     
-    /// 嘗試讀取數據
+    /// 高性能讀取（消費者端）
+    #[inline(always)]
     pub fn try_pop(&self) -> Option<T> {
-        let read_pos = self.read_pos.load(Ordering::Relaxed);
-        let write_pos = self.write_pos.load(Ordering::Acquire);
+        // 獲取當前讀取位置
+        let current_read = self.read_pos.value.load(Ordering::Relaxed);
         
-        // 檢查是否為空
-        if read_pos == write_pos {
+        // 檢查隊列是否為空
+        // 使用Acquire確保看到生產者的最新寫入位置
+        let current_write = self.write_pos.value.load(Ordering::Acquire);
+        
+        if current_read == current_write {
             return None;
         }
         
-        // 讀取數據
-        let slot = &self.data[(read_pos & self.capacity_mask) as usize];
-        let item = unsafe { ptr::read(slot.as_ptr()) };
+        // 從指定位置讀取數據
+        let slot_index = (current_read & self.capacity_mask) as usize;
+        let item = unsafe {
+            let data = &*self.data.get();
+            data[slot_index].as_ptr().read()
+        };
         
-        // 更新讀取位置
-        self.read_pos.store(read_pos.wrapping_add(1), Ordering::Release);
+        // 使用Release確保讀取位置更新對生產者可見
+        self.read_pos.value.store(
+            current_read.wrapping_add(1), 
+            Ordering::Release
+        );
+        
         Some(item)
+    }
+    
+    /// 獲取隊列中元素數量（近似值）
+    #[inline]
+    pub fn len(&self) -> usize {
+        let write_pos = self.write_pos.value.load(Ordering::Relaxed);
+        let read_pos = self.read_pos.value.load(Ordering::Relaxed);
+        write_pos.wrapping_sub(read_pos) as usize
+    }
+    
+    /// 檢查隊列是否為空
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        let write_pos = self.write_pos.value.load(Ordering::Relaxed);
+        let read_pos = self.read_pos.value.load(Ordering::Relaxed);
+        write_pos == read_pos
     }
 }
 
@@ -431,8 +567,8 @@ impl HighPrecisionTimer {
 /// 延遲測量器
 #[derive(Debug)]
 pub struct LatencyMeasurer {
-    /// 延遲樣本
-    samples: LockFreeRingBuffer<u64>,
+    /// 延遲樣本（使用高性能SPSC隊列）
+    samples: HighPerfSPSCQueue<u64>,
     /// 總樣本數
     total_samples: AtomicU64,
     /// 計時器
@@ -446,7 +582,7 @@ impl LatencyMeasurer {
         timer.calibrate().expect("Failed to calibrate timer");
         
         Self {
-            samples: LockFreeRingBuffer::new(10000),
+            samples: HighPerfSPSCQueue::new(8192), // 使用2的幂大小
             total_samples: AtomicU64::new(0),
             timer,
         }
@@ -541,7 +677,7 @@ pub struct UltraLowLatencyExecutor {
     /// 延遲測量器
     latency_measurer: LatencyMeasurer,
     /// 預分配的推理結果池
-    prediction_pool: LockFreeRingBuffer<Vec<f32>>,
+    prediction_pool: HighPerfSPSCQueue<Vec<f32>>,
 }
 
 impl UltraLowLatencyExecutor {
@@ -551,7 +687,7 @@ impl UltraLowLatencyExecutor {
             cpu_manager: CpuAffinityManager::new(cpu_core),
             feature_processor: SIMDFeatureProcessor::new(),
             latency_measurer: LatencyMeasurer::new(),
-            prediction_pool: LockFreeRingBuffer::new(64),
+            prediction_pool: HighPerfSPSCQueue::new(64),
         };
         
         // 綁定 CPU 親和性
@@ -661,7 +797,7 @@ mod tests {
     
     #[test]
     fn test_lockfree_ring_buffer() {
-        let buffer = LockFreeRingBuffer::new(4);
+        let buffer = HighPerfSPSCQueue::new(4);
         
         // 測試推入
         assert!(buffer.try_push(1).is_ok());

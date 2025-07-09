@@ -43,7 +43,7 @@ impl Default for DynamicGroupingStrategy {
             high_traffic_threshold: 15.0,
             medium_traffic_threshold: 8.0,
             max_load_per_connection: 25.0,
-            target_balance_ratio: 0.8,
+            target_balance_ratio: 0.6,  // 降低到更現實的0.6
         }
     }
 }
@@ -469,12 +469,25 @@ impl DynamicBitgetConnector {
             }
         }
         
-        // 在後台啟動連接
+        // 在後台啟動連接 (使用新的增強 WebSocket 實現)
         let connector_clone = Arc::clone(&connector_arc);
         tokio::spawn(async move {
             let connector = connector_clone.lock().await;
-            if let Err(e) = connector.connect_public(message_handler).await {
-                error!("Group {} connection failed: {}", group_id, e);
+            
+            // 創建消息發送通道
+            let (message_sender, mut message_receiver) = tokio::sync::mpsc::unbounded_channel();
+            
+            // 啟動消息處理任務
+            let message_handler_clone = message_handler;
+            tokio::spawn(async move {
+                while let Some(message) = message_receiver.recv().await {
+                    message_handler_clone(message);
+                }
+            });
+            
+            // 使用新的 run_websocket 方法
+            if let Err(e) = connector.run_websocket(message_sender).await {
+                error!("Group {} WebSocket connection failed: {}", group_id, e);
             }
         });
         
@@ -762,8 +775,17 @@ impl DynamicBitgetConnector {
         // 在後台啟動連接
         let connector_clone = Arc::clone(&connector_arc);
         tokio::spawn(async move {
+            let (message_sender, mut message_receiver) = tokio::sync::mpsc::unbounded_channel();
+            
+            // 在背景任務中處理消息
+            tokio::spawn(async move {
+                while let Some(message) = message_receiver.recv().await {
+                    message_handler(message);
+                }
+            });
+            
             let connector = connector_clone.lock().await;
-            if let Err(e) = connector.connect_public(message_handler).await {
+            if let Err(e) = connector.run_websocket(message_sender).await {
                 error!("New group {} connection failed during migration: {}", group_id, e);
             }
         });
@@ -786,6 +808,8 @@ impl DynamicBitgetConnector {
         let is_running = Arc::clone(&self.is_running);
         let stats = Arc::clone(&self.stats);
         let volume_monitor = Arc::clone(&self.volume_monitor);
+        let config = self.config.clone();
+        let unified_message_sender = self.unified_message_sender.clone();
         
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60)); // 每分鐘檢查
@@ -795,6 +819,20 @@ impl DynamicBitgetConnector {
                 
                 info!("🏥 執行連接健康檢查...");
                 Self::perform_health_check(&connection_groups, &volume_monitor, &stats).await;
+                
+                // 在健康檢查後自動修復不健康的連接
+                info!("🔧 開始自動修復不健康的連接...");
+                let result = Self::auto_repair_unhealthy_connections(
+                    &connection_groups,
+                    &volume_monitor,
+                    &stats,
+                    &config,
+                    &unified_message_sender,
+                ).await;
+                
+                if let Err(e) = result {
+                    error!("自動修復連接失敗: {}", e);
+                }
             }
         });
         
@@ -818,8 +856,8 @@ impl DynamicBitgetConnector {
                 healthy_connections += 1;
             } else {
                 warn!("🚨 連接組 {} 健康檢查失敗", i);
-                // TODO: 在这里可以添加自动重启逻辑
-                // Self::restart_connection_group(connection_groups, i).await;
+                // 標記需要重啟，但不在靜態上下文中執行
+                // 實際重啟會在 auto_repair_connections 中進行
             }
             
             // 計算實際負載
@@ -935,6 +973,51 @@ impl DynamicBitgetConnector {
         health_status
     }
     
+    /// 重啟特定連接組 (健康檢查失敗時自動調用)
+    async fn restart_connection_group(
+        connection_groups: &Arc<RwLock<Vec<ConnectionGroup>>>,
+        group_id: usize,
+        volume_monitor: &Arc<SymbolVolumeMonitor>,
+        stats: &Arc<RwLock<DynamicConnectorStats>>,
+    ) -> Result<()> {
+        info!("🔄 重啟連接組 {} ...", group_id);
+        
+        // 1. 獲取需要重啟的組的配置
+        let (symbols, channels) = {
+            let groups = connection_groups.read().await;
+            if let Some(group) = groups.get(group_id) {
+                (group.symbols.clone(), group.channels.clone())
+            } else {
+                return Err(anyhow::anyhow!("連接組 {} 不存在", group_id));
+            }
+        };
+        
+        if symbols.is_empty() {
+            info!("跳過空連接組 {} 的重啟", group_id);
+            return Ok(());
+        }
+        
+        // 2. 關閉舊連接
+        {
+            let mut groups = connection_groups.write().await;
+            if let Some(group) = groups.get_mut(group_id) {
+                if let Some(handle) = group.connection_handle.take() {
+                    debug!("關閉連接組 {} 的舊連接", group_id);
+                    // 連接句柄會在 drop 時自動關閉
+                }
+                group.last_rebalance = Instant::now();
+            }
+        }
+        
+        // 3. 等待短暫時間，讓舊連接完全關閉
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // 4. 創建新連接 (這裡需要訪問 self，所以我們需要不同的實現方式)
+        // 這個方法需要在 impl 中重新實現為實例方法
+        info!("✅ 連接組 {} 重啟准備完成", group_id);
+        Ok(())
+    }
+
     /// 自動修復不健康的連接
     pub async fn auto_repair_connections(&self) -> Result<()> {
         info!("🔧 開始自動修復不健康的連接...");
@@ -947,7 +1030,7 @@ impl DynamicBitgetConnector {
                 warn!("🔧 修復連接組 {}", health.group_id);
                 
                 // 重新初始化該組的連接
-                if let Err(e) = self.initialize_group_connection(health.group_id).await {
+                if let Err(e) = self.restart_unhealthy_group(health.group_id).await {
                     error!("修復連接組 {} 失敗: {}", health.group_id, e);
                 } else {
                     repaired_count += 1;
@@ -957,6 +1040,283 @@ impl DynamicBitgetConnector {
         }
         
         info!("🎯 自動修復完成，修復了 {} 個連接組", repaired_count);
+        Ok(())
+    }
+
+    /// 重啟不健康的連接組 (實例方法)
+    async fn restart_unhealthy_group(&self, group_id: usize) -> Result<()> {
+        info!("🔄 重啟不健康的連接組 {} ...", group_id);
+        
+        // 1. 獲取需要重啟的組的配置
+        let (symbols, channels) = {
+            let groups = self.connection_groups.read().await;
+            if let Some(group) = groups.get(group_id) {
+                (group.symbols.clone(), group.channels.clone())
+            } else {
+                return Err(anyhow::anyhow!("連接組 {} 不存在", group_id));
+            }
+        };
+        
+        if symbols.is_empty() {
+            info!("跳過空連接組 {} 的重啟", group_id);
+            return Ok(());
+        }
+        
+        // 2. 關閉舊連接
+        {
+            let mut groups = self.connection_groups.write().await;
+            if let Some(group) = groups.get_mut(group_id) {
+                if let Some(handle) = group.connection_handle.take() {
+                    debug!("關閉連接組 {} 的舊連接", group_id);
+                    // 連接句柄會在 drop 時自動關閉
+                }
+                group.last_rebalance = Instant::now();
+            }
+        }
+        
+        // 3. 等待短暫時間，讓舊連接完全關閉
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // 4. 創建新連接
+        let mut connector = BitgetConnector::new(self.config.clone());
+        
+        // 5. 添加所有訂閱
+        for symbol in &symbols {
+            for channel in &channels {
+                connector.add_subscription(symbol.clone(), channel.clone());
+            }
+        }
+        
+        // 6. 創建消息處理器
+        let message_sender = self.unified_message_sender.clone();
+        let volume_monitor = Arc::clone(&self.volume_monitor);
+        let stats = Arc::clone(&self.stats);
+        
+        let message_handler = move |message: BitgetMessage| {
+            // 記錄流量和統計
+            tokio::spawn({
+                let volume_monitor = Arc::clone(&volume_monitor);
+                let stats = Arc::clone(&stats);
+                let message_clone = message.clone();
+                async move {
+                    let (symbol, size) = match &message_clone {
+                        BitgetMessage::OrderBook { symbol, data, .. } => {
+                            (symbol.clone(), data.to_string().len())
+                        }
+                        BitgetMessage::Trade { symbol, data, .. } => {
+                            (symbol.clone(), data.to_string().len())
+                        }
+                        BitgetMessage::Ticker { symbol, data, .. } => {
+                            (symbol.clone(), data.to_string().len())
+                        }
+                    };
+                    
+                    volume_monitor.record_message(&symbol, size).await;
+                    
+                    {
+                        let mut stats = stats.write().await;
+                        stats.total_messages += 1;
+                    }
+                }
+            });
+            
+            if let Err(e) = message_sender.send(message) {
+                if !e.to_string().contains("channel closed") {
+                    error!("Failed to send message during restart: {}", e);
+                }
+            }
+        };
+        
+        // 7. 啟動新連接
+        let connector_arc = Arc::new(Mutex::new(connector));
+        let connector_clone = Arc::clone(&connector_arc);
+        
+        tokio::spawn(async move {
+            let (message_sender, mut message_receiver) = tokio::sync::mpsc::unbounded_channel();
+            
+            // 在背景任務中處理消息
+            tokio::spawn(async move {
+                while let Some(message) = message_receiver.recv().await {
+                    message_handler(message);
+                }
+            });
+            
+            let connector = connector_clone.lock().await;
+            if let Err(e) = connector.run_websocket(message_sender).await {
+                error!("Restarted group {} connection failed: {}", group_id, e);
+            }
+        });
+        
+        // 8. 更新連接組句柄
+        {
+            let mut groups = self.connection_groups.write().await;
+            if let Some(group) = groups.get_mut(group_id) {
+                group.connection_handle = Some(connector_arc);
+            }
+        }
+        
+        info!("✅ 連接組 {} 重啟完成", group_id);
+        Ok(())
+    }
+
+    /// 自動修復不健康的連接 (靜態方法供健康檢查調度器使用)
+    async fn auto_repair_unhealthy_connections(
+        connection_groups: &Arc<RwLock<Vec<ConnectionGroup>>>,
+        volume_monitor: &Arc<SymbolVolumeMonitor>,
+        stats: &Arc<RwLock<DynamicConnectorStats>>,
+        config: &BitgetConfig,
+        unified_message_sender: &mpsc::UnboundedSender<BitgetMessage>,
+    ) -> Result<()> {
+        let mut repaired_count = 0;
+        let groups = connection_groups.read().await;
+        let mut unhealthy_groups = Vec::new();
+        
+        // 1. 識別不健康的連接組
+        for (i, group) in groups.iter().enumerate() {
+            let is_healthy = Self::check_group_health(group, volume_monitor).await;
+            if !is_healthy && !group.symbols.is_empty() {
+                unhealthy_groups.push((i, group.symbols.clone(), group.channels.clone()));
+            }
+        }
+        
+        // 釋放讀鎖
+        drop(groups);
+        
+        // 2. 修復每個不健康的連接組
+        for (group_id, symbols, channels) in unhealthy_groups {
+            info!("🔧 修復連接組 {} (符號: {:?})", group_id, symbols);
+            
+            // 重啟連接組
+            if let Err(e) = Self::restart_connection_group_static(
+                connection_groups,
+                group_id,
+                &symbols,
+                &channels,
+                config,
+                unified_message_sender,
+                volume_monitor,
+                stats,
+            ).await {
+                error!("修復連接組 {} 失敗: {}", group_id, e);
+            } else {
+                repaired_count += 1;
+                info!("✅ 連接組 {} 修復完成", group_id);
+            }
+        }
+        
+        if repaired_count > 0 {
+            info!("🎯 自動修復完成，修復了 {} 個連接組", repaired_count);
+        }
+        Ok(())
+    }
+
+    /// 重啟連接組 (靜態方法)
+    async fn restart_connection_group_static(
+        connection_groups: &Arc<RwLock<Vec<ConnectionGroup>>>,
+        group_id: usize,
+        symbols: &[String],
+        channels: &[BitgetChannel],
+        config: &BitgetConfig,
+        unified_message_sender: &mpsc::UnboundedSender<BitgetMessage>,
+        volume_monitor: &Arc<SymbolVolumeMonitor>,
+        stats: &Arc<RwLock<DynamicConnectorStats>>,
+    ) -> Result<()> {
+        info!("🔄 重啟連接組 {} ...", group_id);
+        
+        // 1. 關閉舊連接
+        {
+            let mut groups = connection_groups.write().await;
+            if let Some(group) = groups.get_mut(group_id) {
+                if let Some(handle) = group.connection_handle.take() {
+                    debug!("關閉連接組 {} 的舊連接", group_id);
+                    // 連接句柄會在 drop 時自動關閉
+                }
+                group.last_rebalance = Instant::now();
+            }
+        }
+        
+        // 2. 等待短暫時間，讓舊連接完全關閉
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        
+        // 3. 創建新連接
+        let mut connector = BitgetConnector::new(config.clone());
+        
+        // 4. 添加所有訂閱
+        for symbol in symbols {
+            for channel in channels {
+                connector.add_subscription(symbol.clone(), channel.clone());
+            }
+        }
+        
+        // 5. 創建消息處理器
+        let message_sender = unified_message_sender.clone();
+        let volume_monitor = Arc::clone(volume_monitor);
+        let stats = Arc::clone(stats);
+        
+        let message_handler = move |message: BitgetMessage| {
+            // 記錄流量和統計
+            tokio::spawn({
+                let volume_monitor = Arc::clone(&volume_monitor);
+                let stats = Arc::clone(&stats);
+                let message_clone = message.clone();
+                async move {
+                    let (symbol, size) = match &message_clone {
+                        BitgetMessage::OrderBook { symbol, data, .. } => {
+                            (symbol.clone(), data.to_string().len())
+                        }
+                        BitgetMessage::Trade { symbol, data, .. } => {
+                            (symbol.clone(), data.to_string().len())
+                        }
+                        BitgetMessage::Ticker { symbol, data, .. } => {
+                            (symbol.clone(), data.to_string().len())
+                        }
+                    };
+                    
+                    volume_monitor.record_message(&symbol, size).await;
+                    
+                    {
+                        let mut stats = stats.write().await;
+                        stats.total_messages += 1;
+                    }
+                }
+            });
+            
+            if let Err(e) = message_sender.send(message) {
+                if !e.to_string().contains("channel closed") {
+                    error!("Failed to send message during restart: {}", e);
+                }
+            }
+        };
+        
+        // 6. 啟動新連接
+        let connector_arc = Arc::new(Mutex::new(connector));
+        let connector_clone = Arc::clone(&connector_arc);
+        
+        tokio::spawn(async move {
+            let (ws_message_sender, mut ws_message_receiver) = tokio::sync::mpsc::unbounded_channel();
+            
+            // 在背景任務中處理消息
+            tokio::spawn(async move {
+                while let Some(message) = ws_message_receiver.recv().await {
+                    message_handler(message);
+                }
+            });
+            
+            let connector = connector_clone.lock().await;
+            if let Err(e) = connector.run_websocket(ws_message_sender).await {
+                error!("Restarted group {} connection failed: {}", group_id, e);
+            }
+        });
+        
+        // 7. 更新連接組句柄
+        {
+            let mut groups = connection_groups.write().await;
+            if let Some(group) = groups.get_mut(group_id) {
+                group.connection_handle = Some(connector_arc);
+            }
+        }
+        
+        info!("✅ 連接組 {} 重啟完成", group_id);
         Ok(())
     }
     

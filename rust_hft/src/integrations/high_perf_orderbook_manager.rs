@@ -92,6 +92,7 @@ impl CachedOrderBookStats {
 }
 
 /// 高性能 OrderBook
+/// 針對單線程環境優化，移除不必要的原子操作
 #[derive(Debug)]
 pub struct HighPerfOrderBook {
     pub symbol: String,
@@ -102,8 +103,8 @@ pub struct HighPerfOrderBook {
     
     // 緩存統計信息
     pub cached_stats: CachedOrderBookStats,
-    pub sequence: AtomicU64,
-    pub last_update: AtomicU64,
+    pub sequence: u64,        // 移除原子操作開銷
+    pub last_update: u64,     // 移除原子操作開銷
 }
 
 impl HighPerfOrderBook {
@@ -115,8 +116,8 @@ impl HighPerfOrderBook {
             l2_bids: BTreeMap::new(),
             l2_asks: BTreeMap::new(),
             cached_stats: CachedOrderBookStats::default(),
-            sequence: AtomicU64::new(0),
-            last_update: AtomicU64::new(0),
+            sequence: 0,
+            last_update: 0,
         }
     }
 
@@ -153,12 +154,9 @@ impl HighPerfOrderBook {
         // 更新緩存統計
         self.update_cached_stats(total_bid_volume, total_ask_volume);
         
-        // 更新序列號和時間戳
-        self.sequence.fetch_add(1, Ordering::Relaxed);
-        self.last_update.store(
-            Utc::now().timestamp_micros() as u64, 
-            Ordering::Relaxed
-        );
+        // 更新序列號和時間戳（零成本更新）
+        self.sequence += 1;
+        self.last_update = Utc::now().timestamp_micros() as u64;
     }
 
     /// 從 L2 更新 L1
@@ -628,7 +626,7 @@ impl HighPerfOrderBookManager {
         // 顯示每個訂單簿的緩存統計
         for (symbol, orderbook) in &self.orderbooks {
             let stats = orderbook.get_cached_stats();
-            let sequence = orderbook.sequence.load(Ordering::Relaxed);
+            let sequence = orderbook.sequence;
             
             info!("   {} - Mid: {:.4}, Spread: {:.6}, Liquidity: {:.2}/{:.2}, Seq: {}", 
                   symbol, 

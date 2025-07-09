@@ -22,7 +22,8 @@ pub use ultra_low_latency::{
     SIMDFeatureProcessor,
     LatencyMeasurer,
     LatencyStats,
-    LockFreeRingBuffer,
+    HighPerfSPSCQueue,
+    ZeroAllocMemoryPool,
     HighPrecisionTimer,
 };
 
