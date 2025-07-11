@@ -1,15 +1,16 @@
-Rust HFT × Agno 24/7 AI Trading Platform — CLAUDE.md Guide
+# Rust HFT 核心引擎开发环境
 
-Version 3.0 (2025-07-08) — Complete PRD v2.0 Implementation Guide
+## 🦀 **专用环境说明**
 
-⸻
+此 Worktree (`monday-rust-hft`) 专门用于 **Rust HFT核心引擎开发**，专注于超低延迟交易系统的核心组件。
 
-0 · Executive Summary
+- **分支**: `feature/rust-hft-unified`
+- **专注领域**: 高性能OrderBook、策略引擎、风险管理、市场数据处理、PyO3 Python绑定
+- **开发语言**: Rust (核心) + PyO3 (Python绑定)
+- **核心目标**: <1μs 决策延迟，零分配算法，为Agno Framework提供高性能接口
 
-This guide provides the complete implementation roadmap for the Rust HFT × Agno 24/7 AI Trading Platform based on PRD v2.0. The system combines ultra-low-latency Rust execution plane (≤ 1μs decision) with intelligent Python Agno control plane (7 specialized agents) for automated trading, ML lifecycle management, and 24/7 monitoring. Key innovations include dual-plane architecture separation, YAML-driven ML pipelines, blue-green model deployment, and comprehensive observability.
-
-**Current Status**: Code restructuring phase based on existing codebase analysis
-**Target**: Production-ready HFT system with <1μs latency and 99.5%+ uptime
+**当前状态**: 代码重构阶段，基于现有代码库分析
+**目标**: 生产级HFT系统，<1μs延迟，99.5%+可用性
 
 ## 📋 PRD v2.0 Reference
 

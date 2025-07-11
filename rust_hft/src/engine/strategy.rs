@@ -7,6 +7,7 @@
 
 use crate::core::types::*;
 use crate::core::config::Config;
+use crate::core::ultra_performance::{ZeroAllocDecisionEngine, PerformanceStats as UltraPerformanceStats};
 use crate::ml::features::{features_to_vector, validate_features};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
@@ -69,6 +70,9 @@ pub fn run(
 /// ML-based trading strategy with layered prediction architecture
 #[allow(dead_code)]
 struct MLStrategy {
+    /// Ultra-fast decision engine (<1μs)
+    ultra_fast_engine: Option<ZeroAllocDecisionEngine>,
+    
     /// Primary: Candle deep learning model
     candle_model: Option<CandleModel>,
     
@@ -169,7 +173,11 @@ impl MLStrategy {
         // Initialize fallback model
         let fallback_model = Self::initialize_fallback_model()?;
         
+        // Initialize ultra-fast decision engine
+        let ultra_fast_engine = Self::initialize_ultra_fast_engine()?;
+        
         Ok(Self {
+            ultra_fast_engine,
             candle_model,
             fallback_model,
             device,
@@ -232,6 +240,29 @@ impl MLStrategy {
         Ok(Some(()))
     }
     
+    /// Initialize ultra-fast decision engine
+    fn initialize_ultra_fast_engine() -> Result<Option<ZeroAllocDecisionEngine>> {
+        info!("Initializing ultra-fast decision engine for <1μs latency");
+        
+        let mut engine = ZeroAllocDecisionEngine::new();
+        
+        // Load pre-trained weights (in production, load from file)
+        let mock_weights: Vec<f32> = (0..64).map(|i| {
+            // Generate reasonable mock weights
+            match i % 8 {
+                0..=2 => 0.3 + (i as f32 * 0.01), // OBI features
+                3..=5 => 0.2 + (i as f32 * 0.005), // Depth features  
+                6..=7 => 0.1 + (i as f32 * 0.002), // Other features
+                _ => 0.05 + (i as f32 * 0.001), // Noise/bias
+            }
+        }).collect();
+        
+        engine.load_weights(&mock_weights)?;
+        
+        info!("✅ Ultra-fast decision engine initialized with mock weights");
+        Ok(Some(engine))
+    }
+    
     /// Process features and generate trading signal
     fn process_features(
         &mut self,
@@ -279,11 +310,47 @@ impl MLStrategy {
         Ok(filtered_signal)
     }
     
-    /// Make layered prediction: Candle -> SmartCore -> Rule-based
-    fn make_layered_prediction(&self, features: &FeatureSet) -> Result<Prediction> {
+    /// Make layered prediction: Ultra-fast -> Candle -> SmartCore -> Rule-based
+    fn make_layered_prediction(&mut self, features: &FeatureSet) -> Result<Prediction> {
         let start_time = now_micros();
         
-        // Try primary Candle model first
+        // Try ultra-fast engine first (<1μs target)
+        if let Some(ref mut ultra_engine) = self.ultra_fast_engine {
+            // Convert features to 64-element fixed array for zero-alloc engine
+            let feature_vector = self.features_to_fixed_array(features);
+            
+            // Make ultra-fast decision (target <1μs)
+            let decision = ultra_engine.make_decision(&feature_vector);
+            
+            let latency = now_micros() - start_time;
+            if latency < 5_000 { // 5μs threshold for ultra-fast path
+                debug!("Ultra-fast prediction latency: {}μs", latency);
+                
+                // Convert decision to probability
+                let probability = match decision {
+                    1 => 0.8,   // Strong buy
+                    -1 => 0.2,  // Strong sell
+                    _ => 0.5,   // Hold/neutral
+                };
+                
+                // Calculate confidence based on signal strength
+                let confidence = match decision.abs() {
+                    1 => 0.9,   // High confidence for strong signals
+                    _ => 0.3,   // Low confidence for neutral
+                };
+                
+                return Ok(Prediction {
+                    probability,
+                    confidence,
+                    model_version: "ultra_fast_v1".to_string(),
+                    feature_count: 64,
+                });
+            } else {
+                warn!("Ultra-fast prediction too slow ({}μs), falling back", latency);
+            }
+        }
+        
+        // Try primary Candle model second
         if let Some(ref candle_model) = self.candle_model {
             match self.make_candle_prediction(candle_model, features) {
                 Ok(prediction) => {
@@ -320,6 +387,47 @@ impl MLStrategy {
         let latency = now_micros() - start_time;
         debug!("Rule-based fallback prediction latency: {}μs", latency);
         Ok(prediction)
+    }
+    
+    
+    /// Convert FeatureSet to 64-element fixed array for ultra-fast engine
+    fn features_to_fixed_array(&self, features: &FeatureSet) -> [f32; 64] {
+        let mut array = [0.0f32; 64];
+        
+        // Map key features to array positions
+        array[0] = features.obi_l1 as f32;
+        array[1] = features.obi_l5 as f32;
+        array[2] = features.obi_l10 as f32;
+        array[3] = features.obi_l20 as f32;
+        array[4] = features.depth_imbalance_l5 as f32;
+        array[5] = features.depth_imbalance_l10 as f32;
+        array[6] = features.depth_imbalance_l20 as f32;
+        array[7] = features.spread_bps as f32 / 1000.0; // Normalize
+        array[8] = features.bid_depth_l5 as f32 / 10000.0; // Normalize
+        array[9] = features.ask_depth_l5 as f32 / 10000.0; // Normalize
+        array[10] = features.bid_depth_l10 as f32 / 20000.0; // Normalize
+        array[11] = features.ask_depth_l10 as f32 / 20000.0; // Normalize
+        array[12] = features.bid_depth_l20 as f32 / 40000.0; // Normalize
+        array[13] = features.ask_depth_l20 as f32 / 40000.0; // Normalize
+        array[14] = features.price_momentum as f32;
+        array[15] = features.volume_imbalance as f32;
+        array[16] = features.bid_slope as f32;
+        array[17] = features.ask_slope as f32;
+        array[18] = features.total_bid_levels as f32 / 100.0; // Normalize
+        array[19] = features.total_ask_levels as f32 / 100.0; // Normalize
+        array[20] = features.data_quality_score as f32;
+        
+        // Fill remaining positions with derived features or zeros
+        for i in 21..64 {
+            array[i] = match i % 4 {
+                0 => features.obi_l10 as f32 * 0.1, // Scaled OBI
+                1 => features.spread_bps as f32 / 10000.0, // Ultra-normalized spread
+                2 => (features.best_ask - features.best_bid) as f32 / features.mid_price as f32, // Relative spread
+                _ => 0.0, // Padding
+            };
+        }
+        
+        array
     }
     
     /// Make prediction using Candle deep learning model
@@ -501,6 +609,13 @@ impl MLStrategy {
     #[allow(dead_code)]
     pub fn get_stats(&self) -> StrategyStats {
         self.stats.clone()
+    }
+    
+    /// Get ultra-performance statistics
+    #[allow(dead_code)]
+    pub fn get_ultra_performance_stats(&self) -> Option<UltraPerformanceStats> {
+        self.ultra_fast_engine.as_ref()
+            .map(|engine| engine.get_performance_stats())
     }
 }
 

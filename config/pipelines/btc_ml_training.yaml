@@ -1,0 +1,216 @@
+# BTCUSDT完整ML訓練Pipeline
+# 從數據收集到模型部署的端到端工作流程
+
+name: "btc_ml_training_pipeline"
+version: "2.0"
+description: "BTCUSDT深度學習模型訓練與部署的完整Pipeline"
+
+# 全局配置
+global_config:
+  symbol: "BTCUSDT"
+  base_data_path: "/data/hft"
+  model_output_path: "/models/btc"
+  log_level: "INFO"
+  max_parallel_tasks: "4"
+  notification_webhook: "https://hooks.slack.com/your-webhook"
+
+# 調度策略：資源感知調度
+scheduling_policy: "ResourceAware"
+
+# 失敗處理策略
+failure_policy:
+  max_failures: 2
+  failure_action: "Rollback"
+  notification_channels: ["slack", "email"]
+
+# 任務定義
+tasks:
+  # 1. 數據收集階段
+  - id: "data_collection"
+    name: "市場數據收集"
+    task_type:
+      DataCollection:
+        symbol: "BTCUSDT"
+        duration_hours: 24
+        target_samples: 1000000
+    dependencies: []
+    max_retries: 3
+    timeout_minutes: 120
+    priority: 100
+    resource_requirements:
+      cpu_cores: 2.0
+      memory_mb: 4096
+      disk_space_mb: 10240
+      network_bandwidth_mbps: 100
+    environment:
+      EXCHANGE_API_KEY: "${BITGET_API_KEY}"
+      EXCHANGE_SECRET: "${BITGET_SECRET}"
+      DATA_QUALITY_THRESHOLD: "0.95"
+
+  # 2. 數據預處理
+  - id: "data_preprocessing"
+    name: "數據清洗與特徵工程"
+    task_type:
+      DataCollection:
+        symbol: "BTCUSDT"
+        duration_hours: 1
+        target_samples: 0
+    dependencies: ["data_collection"]
+    max_retries: 2
+    timeout_minutes: 60
+    priority: 90
+    resource_requirements:
+      cpu_cores: 4.0
+      memory_mb: 8192
+      disk_space_mb: 5120
+    environment:
+      INPUT_DATA_PATH: "${base_data_path}/raw/btcusdt"
+      OUTPUT_DATA_PATH: "${base_data_path}/processed/btcusdt"
+      FEATURE_WINDOW_SIZES: "30,60,120,300"
+      OUTLIER_THRESHOLD: "3.0"
+
+  # 3. 模型訓練
+  - id: "model_training"
+    name: "深度學習模型訓練"
+    task_type:
+      ModelTraining:
+        symbol: "BTCUSDT"
+        model_type: "transformer"
+        epochs: 100
+        batch_size: 256
+    dependencies: ["data_preprocessing"]
+    max_retries: 1
+    timeout_minutes: 480  # 8小時
+    priority: 80
+    resource_requirements:
+      cpu_cores: 8.0
+      memory_mb: 16384
+      gpu_memory_mb: 8192
+      disk_space_mb: 20480
+    environment:
+      TRAINING_DATA_PATH: "${base_data_path}/processed/btcusdt/train"
+      MODEL_OUTPUT_PATH: "${model_output_path}/btc_transformer_v2"
+      LEARNING_RATE: "0.0001"
+      DROPOUT_RATE: "0.1"
+      ATTENTION_HEADS: "8"
+      HIDDEN_SIZE: "512"
+      NUM_LAYERS: "6"
+      EARLY_STOPPING_PATIENCE: "10"
+      VALIDATION_SPLIT: "0.2"
+
+  # 4. 模型評估
+  - id: "model_evaluation"
+    name: "模型性能評估"
+    task_type:
+      ModelEvaluation:
+        symbol: "BTCUSDT"
+        model_path: "${model_output_path}/btc_transformer_v2"
+        test_data_path: "${base_data_path}/processed/btcusdt/test"
+    dependencies: ["model_training"]
+    max_retries: 2
+    timeout_minutes: 120
+    priority: 70
+    resource_requirements:
+      cpu_cores: 4.0
+      memory_mb: 8192
+      gpu_memory_mb: 4096
+      disk_space_mb: 5120
+    environment:
+      TEST_DATA_PATH: "${base_data_path}/processed/btcusdt/test"
+      EVALUATION_METRICS: "sharpe,max_drawdown,win_rate,profit_factor"
+      MIN_SHARPE_RATIO: "1.5"
+      MAX_DRAWDOWN_THRESHOLD: "0.15"
+      MIN_WIN_RATE: "0.52"
+
+  # 5. 回測驗證
+  - id: "backtesting"
+    name: "歷史數據回測"
+    task_type:
+      ModelEvaluation:
+        symbol: "BTCUSDT"
+        model_path: "${model_output_path}/btc_transformer_v2"
+        test_data_path: "${base_data_path}/backtest/btcusdt"
+    dependencies: ["model_evaluation"]
+    max_retries: 2
+    timeout_minutes: 180
+    priority: 60
+    resource_requirements:
+      cpu_cores: 6.0
+      memory_mb: 12288
+      disk_space_mb: 10240
+    environment:
+      BACKTEST_START_DATE: "2024-01-01"
+      BACKTEST_END_DATE: "2024-12-31"
+      INITIAL_CAPITAL: "100000"
+      COMMISSION_RATE: "0.001"
+      SLIPPAGE_BPS: "2"
+
+  # 6. 模型部署（藍綠部署）
+  - id: "model_deployment"
+    name: "生產環境模型部署"
+    task_type:
+      ModelDeployment:
+        symbol: "BTCUSDT"
+        model_path: "${model_output_path}/btc_transformer_v2"
+        deployment_strategy:
+          BlueGreen:
+            shadow_duration_minutes: 60
+            promotion_criteria:
+              min_profit_threshold: 0.01
+              max_drawdown_threshold: 0.05
+              min_sharpe_ratio: 1.2
+              max_correlation_with_existing: 0.8
+    dependencies: ["backtesting"]
+    max_retries: 1
+    timeout_minutes: 90
+    priority: 50
+    resource_requirements:
+      cpu_cores: 2.0
+      memory_mb: 4096
+      disk_space_mb: 2048
+    environment:
+      PRODUCTION_API_ENDPOINT: "${PRODUCTION_TRADING_API}"
+      SHADOW_MODE_DURATION: "60"
+      PROMOTION_THRESHOLD_PROFIT: "0.01"
+      MONITORING_ALERTS_ENABLED: "true"
+
+  # 7. 性能監控設置
+  - id: "monitoring_setup"
+    name: "設置生產監控"
+    task_type:
+      SystemMaintenance:
+        maintenance_type: "monitoring_setup"
+        target_components: ["trading_engine", "model_inference", "risk_manager"]
+    dependencies: ["model_deployment"]
+    max_retries: 2
+    timeout_minutes: 30
+    priority: 40
+    resource_requirements:
+      cpu_cores: 1.0
+      memory_mb: 2048
+      disk_space_mb: 1024
+    environment:
+      PROMETHEUS_ENDPOINT: "http://prometheus:9090"
+      GRAFANA_ENDPOINT: "http://grafana:3000"
+      ALERT_MANAGER_ENDPOINT: "http://alertmanager:9093"
+      METRICS_RETENTION_DAYS: "30"
+
+  # 8. 通知發送
+  - id: "completion_notification"
+    name: "Pipeline完成通知"
+    task_type:
+      SystemMaintenance:
+        maintenance_type: "notification"
+        target_components: ["notification_service"]
+    dependencies: ["monitoring_setup"]
+    max_retries: 3
+    timeout_minutes: 5
+    priority: 30
+    resource_requirements:
+      cpu_cores: 0.5
+      memory_mb: 512
+      disk_space_mb: 100
+    environment:
+      NOTIFICATION_CHANNELS: "slack,email,webhook"
+      SUCCESS_MESSAGE_TEMPLATE: "BTCUSDT ML模型訓練Pipeline成功完成"
+      INCLUDE_PERFORMANCE_METRICS: "true"

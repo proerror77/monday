@@ -5,13 +5,22 @@
  */
 
 pub mod performance;
+pub mod performance_monitor;
 pub mod feature_store;
 pub mod backtesting;
 pub mod ultra_low_latency;
 pub mod precise_timing;
 pub mod network_latency;
+pub mod concurrency_safety;
+pub mod memory_optimization;
+pub mod parallel_processing;
 
 pub use performance::{PerformanceManager, PerformanceConfig, HardwareCapabilities, detect_hardware_capabilities};
+pub use performance_monitor::{
+    PerformanceMonitor, MonitorConfig, LatencyStats, ThroughputStats, 
+    MemoryStats, SystemStats, PerformanceReport, create_default_monitor, 
+    create_high_performance_config
+};
 pub use feature_store::{FeatureStore, FeatureStoreConfig};
 pub use backtesting::{BacktestEngine, BacktestConfig};
 
@@ -21,7 +30,7 @@ pub use ultra_low_latency::{
     CpuAffinityManager,
     SIMDFeatureProcessor,
     LatencyMeasurer,
-    LatencyStats,
+    LatencyStats as UltraLatencyStats,
     HighPerfSPSCQueue,
     ZeroAllocMemoryPool,
     HighPrecisionTimer,
@@ -45,4 +54,41 @@ pub use network_latency::{
     RealLatencyMeasurer,
     ComprehensiveLatencyStats,
     NetworkLatencyStats,
+};
+
+// Concurrency Safety exports
+pub use concurrency_safety::{
+    SafeLockManager,
+    LockOrder,
+    LockResult,
+    LockContentionStats,
+    LockFreeCounter,
+    DEFAULT_LOCK_TIMEOUT,
+    GLOBAL_LOCK_MANAGER,
+};
+
+// Memory Optimization exports
+pub use memory_optimization::{
+    MemoryStats,
+    PoolStats,
+    MemoryTracker,
+    ZeroAllocVec,
+    MemoryPool,
+    CowPtr,
+    StackAllocator,
+    ZeroCopyStr,
+    MemoryManager,
+    GLOBAL_MEMORY_MANAGER,
+};
+
+// Parallel Processing exports
+pub use parallel_processing::{
+    ParallelConfig,
+    ParallelStats,
+    ParallelProcessor,
+    FeatureTask,
+    TechnicalIndicators,
+    ValidationResult,
+    OHLCVData,
+    GLOBAL_PARALLEL_PROCESSOR,
 };

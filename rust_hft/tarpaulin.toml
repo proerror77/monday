@@ -1,0 +1,45 @@
+# Tarpaulin 測試覆蓋率配置
+
+[tool.tarpaulin.coverage]
+# 覆蓋率設置
+line = true          # 行覆蓋率
+branch = true        # 分支覆蓋率
+count = true         # 計數覆蓋率
+
+# 輸出格式
+output-formats = ["Html", "Lcov", "Json"]
+output-dir = "target/coverage"
+
+# 包含的文件
+include-tests = false
+run-ignored = false
+fail-under = 90.0    # 最低覆蓋率要求 90%
+
+# 排除的目錄和文件
+exclude-files = [
+    "*/tests/*",
+    "*/benches/*", 
+    "*/examples/*",
+    "*/target/*",
+    "*/build.rs",
+    "*_generated.rs"
+]
+
+# 排除的函數
+exclude = [
+    "main",
+    "panic_hook",
+    "test_*",
+    "bench_*"
+]
+
+[tool.tarpaulin.report]
+# 報告設置
+engine = "llvm"      # 使用 LLVM 引擎
+timeout = 300        # 超時時間 5 分鐘
+
+[tool.tarpaulin.flags]
+# 編譯器標誌
+release = false      # 在 debug 模式下運行測試
+all-features = true  # 啟用所有功能
+workspace = true     # 包含整個工作空間

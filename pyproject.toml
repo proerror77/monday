@@ -1,0 +1,60 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rust-hft"
+version = "2.0.0"
+description = "Ultra-low latency HFT engine for Agno Framework"
+authors = [
+    {name = "HFT Team", email = "hft@example.com"},
+]
+dependencies = [
+    "numpy>=1.21.0",
+    "pandas>=1.3.0",
+    "typing-extensions>=4.0.0",
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+keywords = ["trading", "hft", "rust", "python", "finance"]
+
+[project.urls]
+Homepage = "https://github.com/your-org/rust-hft"
+Documentation = "https://docs.rs/rust-hft"
+Repository = "https://github.com/your-org/rust-hft"
+Issues = "https://github.com/your-org/rust-hft/issues"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "rust_hft"
+
+[tool.maturin.sdist]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "Cargo.lock",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE",
+]
+exclude = [
+    "target/**/*",
+    "examples/**/*",
+    "benches/**/*",
+    ".git/**/*",
+    "*.pyc",
+    "__pycache__/**/*",
+]
