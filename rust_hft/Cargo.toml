@@ -43,12 +43,12 @@ candle-nn = "0.9.1"
 candle-transformers = "0.9.1"
 candle-datasets = "0.9.1"
 
-# Barter-rs 生態系統: 事件驅動的交易框架
-barter = "0.12.2"
-barter-data = "0.10.1"  
-barter-integration = "0.9.1"
-barter-instrument = "0.3.1"  # 金融工具定義
-barter-execution = "0.5.3"   # 訂單執行引擎 (暂時禁用，等待穩定版本)
+# Barter-rs 生態系統: 事件驅動的交易框架 (可選)
+barter = { version = "0.12.2", optional = true }
+barter-data = { version = "0.10.1", optional = true }
+barter-integration = { version = "0.9.1", optional = true }
+barter-instrument = { version = "0.3.1", optional = true }  # 金融工具定義
+barter-execution = { version = "0.5.3", optional = true }   # 訂單執行引擎
 
 tokio-stream = "0.1"  # 用於 Stream 功能
 
@@ -112,6 +112,7 @@ crossbeam-utils = "0.8"
 dashmap = "6.0"
 parking_lot = "0.12"
 lockfree = "0.5"  # 無鎖數據結構
+lru = "0.12"       # LRU cache for replay system
 
 # 系統級優化
 libc = "0.2"  # Linux 系統調用
@@ -132,8 +133,8 @@ chrono-tz = "0.10"
 # ZIP 文件處理
 zip = "0.6"
 
-# ClickHouse 客戶端
-clickhouse = { version = "0.12", features = ["rustls-tls", "time"] }
+# ClickHouse 客戶端 (可選)
+clickhouse = { version = "0.12", features = ["rustls-tls", "time"], optional = true }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 
 # 文件操作
@@ -171,16 +172,74 @@ opt-level = 3       # 最高優化級別
 opt-level = 1       # 開發時也啟用基本優化，提高調試體驗
 
 [features]
-default = ["tch"]  # 默認啟用PyTorch模型加載
-# ML model loading features
-tch = ["dep:tch"]           # PyTorch模型加載 (主要)
-candle-only = []            # 純Candle模式 (fallback)
-# GPU features will be handled through candle-core's CUDA/Metal support  
-gpu = []
-cuda = []
-metal = []
-# Python bindings feature (僅用於開發測試)
-python = ["pyo3", "numpy"]
+# 🎯 默認最小功能集 - 僅核心基礎設施
+default = ["core"]
+
+# 🔧 核心基礎設施
+core = []                   # 基礎類型、配置、錯誤處理、工具函數
+
+# 📊 市場數據功能
+market-data = ["core"]      # 市場數據接收和解析
+orderbook-engine = ["market-data"]     # 高性能訂單簿引擎  
+tick-data = ["market-data"] # Tick數據處理
+kline-data = ["market-data"] # K線數據處理
+
+# 🏦 交易所連接
+bitget-connector = ["market-data"]      # Bitget交易所連接
+barter-integration = ["dep:barter", "dep:barter-data", "dep:barter-integration", "dep:barter-execution"]  # Barter框架集成
+
+# 📈 策略引擎
+strategy-engine = ["orderbook-engine"] # 策略執行引擎
+risk-management = ["strategy-engine"]   # 風險管理系統
+portfolio-manager = ["strategy-engine", "risk-management"]  # 投資組合管理
+
+# 🔄 回測引擎
+backtest-engine = ["strategy-engine", "historical-data"]   # 回測引擎
+simulation = ["backtest-engine"]        # 模擬交易環境
+
+# 🧠 機器學習
+ml-features = ["market-data"]           # 特徵工程
+ml-training = ["ml-features"]           # 模型訓練
+ml-inference = ["ml-features"]          # 模型推理
+ml-candle = ["ml-training", "ml-inference"]  # 純Rust ML (Candle)
+ml-pytorch = ["ml-training", "ml-inference", "dep:tch"]  # PyTorch集成
+
+# 💾 數據存儲
+historical-data = ["core"]              # 歷史數據管理
+database = ["dep:clickhouse"]           # ClickHouse數據庫
+data-recording = ["database", "market-data"]  # 實時數據記錄
+
+# ⚡ 高頻交易
+hft-engine = ["orderbook-engine", "ultra-performance"]  # 高頻交易引擎
+ultra-performance = ["core"]            # 零分配、SIMD優化
+latency-optimization = ["ultra-performance"]  # 延遲優化
+
+# 🐍 Python綁定
+python-api = ["dep:pyo3", "dep:numpy"] # Python API接口
+
+# 🧪 測試和工具
+testing-framework = ["simulation"]      # 測試框架
+performance-testing = ["ultra-performance"]  # 性能測試
+dev-tools = ["testing-framework", "performance-testing"]  # 開發工具
+
+# 🎯 預設組合包
+# 基礎交易 - 適合簡單策略開發
+basic-trading = ["core", "market-data", "orderbook-engine", "bitget-connector", "strategy-engine"]
+
+# 標準交易 - 包含回測和風險管理
+standard-trading = ["basic-trading", "backtest-engine", "risk-management", "historical-data"]
+
+# 量化交易 - 包含ML功能
+quant-trading = ["standard-trading", "ml-candle", "database", "portfolio-manager"]
+
+# 高頻交易 - 專注極致性能
+high-frequency = ["hft-engine", "bitget-connector", "latency-optimization"]
+
+# ML研發 - 專注機器學習開發
+ml-research = ["core", "ml-pytorch", "ml-candle", "database", "python-api", "testing-framework"]
+
+# 完整功能 - 所有功能模塊
+full = ["quant-trading", "high-frequency", "ml-research", "dev-tools"]
 
 # ==================== EXAMPLES ====================
 # 🚀 新統一架構範例 - 6個強大的統一應用
@@ -248,5 +307,11 @@ harness = false
 [[bench]]
 name = "ultra_performance_bench"
 harness = false
+
+# 🚀 高性能WebSocket数据接收测试
+[[example]]
+name = "high_perf_websocket_test"
+path = "examples/high_perf_websocket_test.rs"
+required-features = ["market-data", "ultra-performance"]
 
 [workspace]

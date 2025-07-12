@@ -1,0 +1,49 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- 🚀 HFT专用ClickHouse性能优化配置 -->
+    
+    <!-- 跳过设置检查以兼容旧版配置 -->
+    <skip_check_for_incorrect_settings>1</skip_check_for_incorrect_settings>
+    
+    <!-- 网络配置 -->
+    <tcp_port>9000</tcp_port>
+    <http_port>8123</http_port>
+    <max_connections>1000</max_connections>
+    <keep_alive_timeout>30</keep_alive_timeout>
+    
+    <!-- 并发控制 -->
+    <max_concurrent_queries>100</max_concurrent_queries>
+    
+    <!-- 压缩设置 -->
+    <compression>
+        <case>
+            <min_part_size>10485760</min_part_size> <!-- 10MB -->
+            <min_part_size_ratio>0.01</min_part_size_ratio>
+            <method>lz4</method> <!-- 快速压缩用于实时数据 -->
+        </case>
+        <case>
+            <min_part_size>104857600</min_part_size> <!-- 100MB -->
+            <min_part_size_ratio>0.05</min_part_size_ratio>
+            <method>zstd</method> <!-- 高压缩比用于历史数据 -->
+        </case>
+    </compression>
+    
+    <!-- MergeTree引擎优化 -->
+    <merge_tree>
+        <max_suspicious_broken_parts>100</max_suspicious_broken_parts>
+        <parts_to_delay_insert>300</parts_to_delay_insert>
+        <parts_to_throw_insert>600</parts_to_throw_insert>
+        <max_delay_to_insert>5</max_delay_to_insert>
+        <max_bytes_to_merge_at_min_space_in_pool>1073741824</max_bytes_to_merge_at_min_space_in_pool>
+    </merge_tree>
+    
+    <!-- 日志级别 -->
+    <logger>
+        <level>information</level>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+        <size>1000M</size>
+        <count>10</count>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    </logger>
+</clickhouse>

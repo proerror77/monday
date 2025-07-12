@@ -1,0 +1,49 @@
+[package]
+name = "websocket-perf-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "websocket_perf_test"
+path = "websocket_perf_test.rs"
+
+[[bin]]
+name = "real_bitget_test"
+path = "real_bitget_websocket_test.rs"
+
+[[bin]]
+name = "ultra_perf_test"
+path = "ultra_high_perf_websocket_test.rs"
+
+[[bin]]
+name = "simd_perf_test"
+path = "simd_optimized_websocket_test.rs"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+simd-json = "0.13"
+crossbeam-channel = "0.5"
+tracing = "0.1"
+anyhow = "1.0"
+url = "2.5"
+bytes = "1.5"
+memchr = "2.7"
+fastwebsockets = { version = "0.6", features = ["upgrade"] }
+hyper = { version = "1.0", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1"] }
+tokio-rustls = "0.25"
+webpki-roots = "0.26"
+
+# ClickHouse數據庫客戶端
+clickhouse = { version = "0.12", features = ["rustls-tls", "time"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3

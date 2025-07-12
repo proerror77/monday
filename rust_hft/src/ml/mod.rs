@@ -17,6 +17,7 @@ pub mod dl_trend_predictor;
 pub mod parallel_feature_engineering;
 pub mod dl_rl_extractors;
 pub mod unified_model_engine;  // 🧠 統一模型引擎 (主要接口)
+pub mod torchscript_inference; // ⚡ TorchScript超低延迟推理引擎
 
 pub use features::FeatureExtractor;
 // Re-export FeatureSet from core types
@@ -95,4 +96,25 @@ pub use unified_model_engine::{
     NormalizationConfig,
     FeatureScalingConfig,
     SequencePaddingConfig,
+};
+
+// ⚡ TorchScript推理引擎相關導出
+pub use torchscript_inference::{
+    TorchScriptInferenceEngine,
+    ModelCacheManager,
+    InferenceConfig,
+    InferenceRequest,
+    InferenceResult,
+    InferenceInput,
+    InferenceOutput,
+    InputData,
+    OutputData,
+    InferenceOptions,
+    InferencePriority,
+    InferenceStats,
+    ModelMetadata,
+    PerformanceProfile,
+    DeviceManager,
+    InferenceDevice,
+    DeviceType,
 };

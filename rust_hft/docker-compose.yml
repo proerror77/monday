@@ -2,12 +2,12 @@ version: '3.8'
 
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:23.8
     container_name: hft_clickhouse
     restart: unless-stopped
     ports:
-      - "8123:8123"  # HTTP interface
-      - "9000:9000"  # Native interface
+      - "8124:8123"  # HTTP interface (避免端口冲突)
+      - "9001:9000"  # Native interface (避免端口冲突)
     volumes:
       - ./clickhouse/data:/var/lib/clickhouse
       - ./clickhouse/logs:/var/log/clickhouse-server
@@ -24,23 +24,113 @@ services:
         soft: 262144
         hard: 262144
     healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD", "clickhouse-client", "--user", "hft_user", "--password", "hft_password", "--query", "SELECT 1"]
+      interval: 15s
+      timeout: 10s
       retries: 5
-      start_period: 40s
+      start_period: 60s
+    mem_limit: 4g
+    networks:
+      - hft_network
 
-  # Redis for caching and session management (optional)
+  # Redis for real-time caching and pub/sub
   redis:
-    image: redis:7-alpine
+    image: redis:7.2-alpine
     container_name: hft_redis
     restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
       - ./redis/data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+      - ./redis/conf:/usr/local/etc/redis
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 60
+      --timeout 300
+      --tcp-backlog 511
+      --databases 16
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    mem_limit: 1g
+    networks:
+      - hft_network
+
+  # PostgreSQL for application metadata and configuration (optional)
+  postgres:
+    image: postgres:15-alpine
+    container_name: hft_postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+    environment:
+      POSTGRES_DB: hft_config
+      POSTGRES_USER: hft_admin
+      POSTGRES_PASSWORD: hft_admin_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hft_admin -d hft_config"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    mem_limit: 512m
+    networks:
+      - hft_network
+    profiles:
+      - full  # 只在需要时启用
+
+  # Grafana for monitoring dashboard (optional)
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: hft_grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      GF_SECURITY_ADMIN_USER: hft_admin
+      GF_SECURITY_ADMIN_PASSWORD: hft_dashboard_password
+      GF_USERS_ALLOW_SIGN_UP: false
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    mem_limit: 512m
+    networks:
+      - hft_network
+    profiles:
+      - monitoring  # 只在需要监控时启用
 
 networks:
-  default:
-    name: hft_network
+  hft_network:
+    external: true
+
+volumes:
+  clickhouse_data:
+    driver: local
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+  grafana_data:
+    driver: local
