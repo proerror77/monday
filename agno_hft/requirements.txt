@@ -6,6 +6,23 @@ asyncio
 logging
 typing-extensions
 
+# ML訓練層依賴
+torch>=2.0.0
+pandas>=2.0.0
+clickhouse-driver>=0.2.6
+scikit-learn>=1.3.0
+tensorboard>=2.14.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# 數據處理和特徵工程
+ta-lib>=0.4.28  # 技術指標計算
+scipy>=1.11.0
+
+# 強化學習相關
+gym>=0.26.0
+stable-baselines3>=2.1.0
+
 # 可選依賴（如果不使用PyO3直接調用）
 # subprocess
 # json

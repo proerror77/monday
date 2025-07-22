@@ -7,15 +7,15 @@ __version__ = "1.0.0"
 __author__ = "HFT Team"
 __description__ = "智能化高頻交易系統"
 
-# 導出主要類
-from .rust_hft_tools import RustHFTTools
-from .hft_agents import HFTTeam, HFTMasterAgent, TrainingAgent, EvaluationAgent, RiskManagementAgent
+# 導出主要類 (暫時註釋以避免依賴問題)
+# from .rust_hft_tools import RustHFTTools
+# from .hft_agents import HFTTeam, HFTMasterAgent, TrainingAgent, EvaluationAgent, RiskManagementAgent
 
 __all__ = [
-    "RustHFTTools",
-    "HFTTeam", 
-    "HFTMasterAgent",
-    "TrainingAgent",
-    "EvaluationAgent", 
-    "RiskManagementAgent"
+    # "RustHFTTools",
+    # "HFTTeam", 
+    # "HFTMasterAgent",
+    # "TrainingAgent",
+    # "EvaluationAgent", 
+    # "RiskManagementAgent"
 ]

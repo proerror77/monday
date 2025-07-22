@@ -1,3 +1,48 @@
+Metadata-Version: 2.4
+Name: agno-hft
+Version: 0.1.0
+Summary: Rust HFT × Agno 24/7 AI Trading Platform
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: pydantic>=2.0.0
+Requires-Dist: pydantic-settings>=2.0.0
+Requires-Dist: loguru>=0.7.0
+Requires-Dist: httpx>=0.24.0
+Requires-Dist: aiofiles>=23.0.0
+Requires-Dist: asyncio-mqtt>=0.16.0
+Requires-Dist: torch>=2.0.0
+Requires-Dist: numpy>=1.21.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: scikit-learn>=1.3.0
+Requires-Dist: clickhouse-driver>=0.2.6
+Requires-Dist: redis>=4.5.0
+Requires-Dist: ccxt>=4.0.0
+Requires-Dist: pybit>=5.7.0
+Requires-Dist: ta>=0.10.2
+Requires-Dist: fastapi>=0.100.0
+Requires-Dist: uvicorn>=0.23.0
+Requires-Dist: websockets>=11.0.0
+Requires-Dist: rich>=13.0.0
+Requires-Dist: typer>=0.9.0
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: schedule>=1.2.0
+Requires-Dist: maturin>=1.9.1
+Requires-Dist: rust-hft-py
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Requires-Dist: pytest-xdist>=3.3.0; extra == "dev"
+Requires-Dist: psutil>=5.9.0; extra == "dev"
+Requires-Dist: black>=23.0.0; extra == "dev"
+Requires-Dist: isort>=5.12.0; extra == "dev"
+Requires-Dist: mypy>=1.5.0; extra == "dev"
+Requires-Dist: ruff>=0.0.280; extra == "dev"
+Provides-Extra: cli
+Requires-Dist: click>=8.1.0; extra == "cli"
+Requires-Dist: rich>=13.0.0; extra == "cli"
+Requires-Dist: questionary>=1.10.0; extra == "cli"
+
 # Rust HFT × Agno 24/7 AI Trading Platform
 
 > 企業級高頻交易系統，結合 Rust 微秒執行引擎與 Python Agno 智能工作流

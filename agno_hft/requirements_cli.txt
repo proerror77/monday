@@ -1,0 +1,38 @@
+# CLI 相關依賴
+click>=8.1.0
+rich>=13.0.0
+asyncclick>=8.1.0
+
+# 原有依賴（保持兼容）
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+pandas>=1.5.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+clickhouse-driver>=0.2.6
+redis>=4.5.0
+websockets>=11.0
+pydantic>=2.0.0
+fastapi>=0.100.0
+uvicorn>=0.20.0
+python-dotenv>=1.0.0
+
+# Agno 框架
+agno>=0.1.0
+
+# 開發工具
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.4.0
+
+# 數據處理
+aiofiles>=23.0.0
+httpx>=0.24.0
+pyyaml>=6.0
+
+# 監控和日誌
+structlog>=23.0.0
+prometheus-client>=0.16.0
