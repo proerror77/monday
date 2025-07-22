@@ -638,7 +638,20 @@ pub struct SummaryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ml::model_training_simple::generate_synthetic_data;
+    // 簡單的合成數據生成函數
+    fn generate_synthetic_data(_length: usize, _symbols: usize) -> Vec<FeatureSet> {
+        let mut data = Vec::new();
+        let base_time = now_micros();
+        
+        for i in 0.._length {
+            let mut feature_set = FeatureSet::default_enhanced();
+            feature_set.timestamp = base_time + (i as u64) * 1000; // 每毫秒一個數據點
+            feature_set.mid_price = (100.0 + i as f64 * 0.01).to_price(); // 稍微變化的價格
+            data.push(feature_set);
+        }
+        
+        data
+    }
     
     #[test]
     fn test_portfolio_operations() {
@@ -679,10 +692,10 @@ mod tests {
         let mut engine = BacktestEngine::new(config);
         
         // Generate synthetic data
-        let data = generate_synthetic_data(100, 10).unwrap();
+        let data = generate_synthetic_data(100, 10);
         let mut strategy = BuyAndHoldStrategy::new(0.1);
         
-        let results = engine.run_backtest(&data.features, &mut strategy).unwrap();
+        let results = engine.run_backtest(&data, &mut strategy).unwrap();
         
         assert!(results.total_trades >= 1);
         assert_ne!(results.final_balance, results.initial_balance);

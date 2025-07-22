@@ -1,0 +1,37 @@
+# 簡化的性能測試配置
+# 用於快速測試
+
+websocket:
+  url: "wss://ws.bitget.com/v2/ws/public"
+  reconnect_attempts: 3
+  reconnect_delay_ms: 1000
+  connection_mode: "single"
+  connection_count: 1
+  subscriptions:
+    - symbol: "BTCUSDT"
+      channels: ["books", "trade"]
+
+clickhouse:
+  url: "http://localhost:8123"
+  database: "hft"
+  username: "default"
+  password: ""
+  batch_size: 100
+  flush_interval_ms: 500
+
+performance_test:
+  duration_secs: 60  # 1分鐘測試
+  warmup_secs: 5
+  stats_interval_secs: 10
+  test_modes:
+    - name: "websocket_throughput"
+      enabled: true
+      settings:
+        measure_latency: true
+    - name: "clickhouse_write"
+      enabled: true
+      settings:
+        test_batch_sizes: [100, 500]
+
+monitoring:
+  log_level: "info"

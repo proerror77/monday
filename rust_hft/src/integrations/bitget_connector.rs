@@ -112,7 +112,7 @@ impl BitgetConfig {
 }
 
 /// Bitget V2 subscription types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BitgetChannel {
     /// books5 - 5-level orderbook depth
     Books5,
@@ -142,7 +142,7 @@ impl BitgetChannel {
 }
 
 /// Bitget V2 WebSocket connector
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct BitgetConnector {
     config: BitgetConfig,
     subscriptions: HashMap<String, Vec<BitgetChannel>>,

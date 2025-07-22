@@ -7,7 +7,7 @@
  * - 高性能的數據流處理
  */
 
-use crate::integrations::bitget_connector::{BitgetConnector, BitgetConfig, BitgetChannel, BitgetMessage};
+use crate::integrations::unified_bitget_connector::{UnifiedBitgetConnector, UnifiedBitgetConfig, ConnectionMode, BitgetChannel, BitgetMessage};
 use crate::core::types::Timestamp;
 
 use barter_data::{
@@ -90,7 +90,7 @@ impl Stream for BarterMarketStream {
 /// Barter-rs 標準化訂閱管理器
 pub struct BarterStandardSubscriptionManager {
     subscriptions: Vec<BarterSubscriptionConfig>,
-    bitget_connector: Option<BitgetConnector>,
+    bitget_connector: Option<UnifiedBitgetConnector>,
     market_stream_sender: tokio::sync::mpsc::UnboundedSender<Result<MarketEvent, ReconnectEvent>>,
     stats: SubscriptionManagerStats,
     symbol_cache: HashMap<String, (String, String)>, // symbol -> (base, quote)
@@ -155,8 +155,8 @@ impl BarterStandardSubscriptionManager {
     }
 
     /// 初始化 Bitget 連接器
-    pub fn initialize_connector(&mut self, config: BitgetConfig) -> Result<()> {
-        let mut connector = BitgetConnector::new(config);
+    pub async fn initialize_connector(&mut self, config: UnifiedBitgetConfig) -> Result<()> {
+        let mut connector = UnifiedBitgetConnector::new(config);
 
         // 根據 barter-rs 訂閱配置設置 Bitget 訂閱
         for sub_config in &self.subscriptions {
@@ -164,13 +164,13 @@ impl BarterStandardSubscriptionManager {
             
             for kind in &sub_config.subscription_kinds {
                 let bitget_channel = match kind {
-                    SubKind::OrderBooksL1 => BitgetChannel::Books1,
-                    SubKind::PublicTrades => BitgetChannel::Trade,
+                    SubKind::OrderBooksL1 => BitgetChannel::OrderBook,
+                    SubKind::PublicTrades => BitgetChannel::Trades,
                     _ => continue,
                 };
                 
                 debug!("Added Bitget subscription: {} -> {:?}", symbol, bitget_channel);
-                connector.add_subscription(symbol.clone(), bitget_channel);
+                connector.subscribe(&symbol, bitget_channel).await?;
             }
         }
 
@@ -214,8 +214,15 @@ impl BarterStandardSubscriptionManager {
 
         // 啟動連接器
         tokio::spawn(async move {
-            if let Err(e) = connector.connect_public(message_handler).await {
-                error!("❌ Bitget connector failed: {}", e);
+            match connector.start().await {
+                Ok(mut receiver) => {
+                    while let Some(message) = receiver.recv().await {
+                        message_handler(message);
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Bitget connector failed: {}", e);
+                }
             }
         });
 
@@ -227,15 +234,18 @@ impl BarterStandardSubscriptionManager {
         message: BitgetMessage,
         cache: &HashMap<String, (String, String)>
     ) -> Result<MarketEvent> {
-        match message {
-            BitgetMessage::OrderBook { symbol, data, action: _, timestamp } => {
-                Self::normalize_orderbook_message(symbol, data, timestamp, cache)
+        match message.channel {
+            BitgetChannel::OrderBook => {
+                Self::normalize_orderbook_message(message.symbol, message.data, message.timestamp, cache)
             }
-            BitgetMessage::Trade { symbol, data, timestamp } => {
-                Self::normalize_trade_message(symbol, data, timestamp, cache)
+            BitgetChannel::Trades => {
+                Self::normalize_trade_message(message.symbol, message.data, message.timestamp, cache)
             }
-            BitgetMessage::Ticker { .. } => {
+            BitgetChannel::Ticker => {
                 Err(anyhow!("Ticker messages not yet supported in normalization"))
+            }
+            _ => {
+                Err(anyhow!("Unsupported channel: {:?}", message.channel))
             }
         }
     }

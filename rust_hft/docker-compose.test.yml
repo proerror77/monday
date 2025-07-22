@@ -1,0 +1,53 @@
+# Docker Compose for ClickHouse Testing Environment
+# 用于完整数据库压力测试的 ClickHouse 环境
+
+version: '3.8'
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: hft_clickhouse_test
+    ports:
+      - "8123:8123"    # HTTP 接口
+      - "9000:9000"    # TCP 接口 (可选)
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./config/clickhouse:/etc/clickhouse-server/config.d
+    environment:
+      CLICKHOUSE_DB: hft_stress_test
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # 可选的监控工具
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: hft_grafana_test
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    restart: unless-stopped
+    profiles: ["monitoring"]  # 使用 --profile monitoring 启动
+
+volumes:
+  clickhouse_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  default:
+    name: hft_test_network

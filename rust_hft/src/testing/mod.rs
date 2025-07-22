@@ -1,25 +1,8 @@
 /*!
- * Testing Module - 模擬測試框架
+ * Testing Module - 測試框架
  * 
- * 提供完整的交易系統測試能力
+ * 提供單元測試和集成測試支持
  */
 
-pub mod simulation_framework;
-
-// Re-export main testing components
-pub use simulation_framework::{
-    SimulationFramework,
-    SimulationConfig,
-    SimulationResults,
-    TestScenario,
-    MarketSimulator,
-    SimulationExecutionMetrics,
-    TradingPerformanceMetrics,
-    RiskMetrics,
-    SystemHealthMetrics,
-    SystemRecommendation,
-    ValidationResults,
-    MarketTick,
-    MarketState,
-    TradingSignal,
-};
+// 測試框架已移至 tests/ 目錄
+// 請參考 tests/unit/ 和 tests/integration/ 中的測試

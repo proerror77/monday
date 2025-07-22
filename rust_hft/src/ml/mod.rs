@@ -1,20 +1,23 @@
 /*!
- * ML Module - 機器學習和特徵工程
+ * ML Module - TorchScript 推理和特徵提取
  * 
- * 包含特徵提取、模型訓練和在線學習功能
+ * 只負責模型推理，不包含訓練功能
+ * 模型訓練由 Python 層負責
  */
 
 pub mod features;
-pub mod model_training_simple;
-pub mod online_learning;
 pub mod lob_time_series_extractor;
-pub mod dl_trend_predictor;
+
+#[cfg(feature = "torchscript")]
+pub mod torchscript_inference;
+
+// 為沒有 torchscript 特性時提供基本推理接口
+#[cfg(not(feature = "torchscript"))]
+pub mod cpu_inference;
 
 pub use features::FeatureExtractor;
 // Re-export FeatureSet from core types
 pub use crate::core::types::FeatureSet;
-pub use model_training_simple::{SimplifiedPredictor, generate_synthetic_data};
-pub use online_learning::{OnlineLearningEngine, OnlineLearningConfig};
 pub use lob_time_series_extractor::{
     LobTimeSeriesExtractor, 
     LobTimeSeriesConfig, 
@@ -22,11 +25,19 @@ pub use lob_time_series_extractor::{
     LobTimeSeriesSequence,
     LobTimeSeriesExtractorStats
 };
-pub use dl_trend_predictor::{
-    DlTrendPredictor,
-    DlTrendPredictorConfig,
-    TrendClass,
-    TrendPrediction,
-    DlTrendPredictorStats,
-    LobTransformerModel,
+
+#[cfg(feature = "torchscript")]
+pub use torchscript_inference::{
+    TorchScriptInference,
+    InferenceResult,
+    TradingAction,
+    InferenceStatsSummary,
+};
+
+#[cfg(not(feature = "torchscript"))]
+pub use cpu_inference::{
+    CpuInference,
+    InferenceResult,
+    TradingAction,
+    InferenceStatsSummary,
 };

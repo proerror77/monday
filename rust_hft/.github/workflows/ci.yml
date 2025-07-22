@@ -1,0 +1,281 @@
+name: Rust HFT CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, restructure-project ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: debug
+
+jobs:
+  # 代碼質量檢查
+  lint-and-format:
+    name: 代碼質量檢查
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        components: rustfmt, clippy
+        override: true
+    
+    - name: 緩存依賴
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+    
+    - name: 檢查代碼格式
+      run: cargo fmt --all -- --check
+    
+    - name: Clippy 代碼檢查
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # 安全審計
+  security-audit:
+    name: 安全審計
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: 安裝 cargo-audit
+      run: cargo install cargo-audit
+    
+    - name: 運行安全審計
+      run: cargo audit
+
+  # 多平台編譯測試
+  build-and-test:
+    name: 編譯和測試
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macOS-latest]
+        rust-version: [stable, 1.70.0]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macOS-latest
+            target: x86_64-apple-darwin
+    
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust ${{ matrix.rust-version }}
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: ${{ matrix.rust-version }}
+        target: ${{ matrix.target }}
+        override: true
+    
+    - name: 緩存依賴
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ matrix.os }}-${{ matrix.rust-version }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ matrix.os }}-${{ matrix.rust-version }}-cargo-
+    
+    - name: 檢查編譯
+      run: cargo check --all-targets --all-features
+    
+    - name: 運行單元測試
+      run: cargo test --lib --all-features
+    
+    - name: 編譯Release版本
+      run: cargo build --release --all-features
+    
+    - name: 運行集成測試
+      run: cargo test --test '*' --all-features
+
+  # 性能基準測試
+  benchmark:
+    name: 性能基準測試
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: 緩存依賴
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: benchmark-cargo-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: 運行基準測試
+      run: cargo bench --bench latency_benchmarks
+    
+    - name: 保存基準測試結果
+      uses: actions/upload-artifact@v3
+      with:
+        name: benchmark-results
+        path: target/criterion/
+
+  # Examples 編譯測試
+  examples-build:
+    name: Examples 編譯測試
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: 緩存依賴
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: examples-cargo-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: 編譯所有示例
+      run: |
+        cargo build --examples --all-features
+        echo "✅ 所有示例編譯成功"
+    
+    - name: 檢查核心示例
+      run: |
+        cargo check --example 00_quickstart
+        cargo check --example performance_e2e_test
+        echo "✅ 核心示例檢查通過"
+
+  # 文檔生成
+  docs:
+    name: 文檔生成
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: 生成文檔
+      run: cargo doc --all-features --no-deps
+    
+    - name: 部署文檔到 GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      if: github.ref == 'refs/heads/main'
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: ./target/doc
+
+  # 測試覆蓋率
+  coverage:
+    name: 測試覆蓋率
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        components: llvm-tools-preview
+        override: true
+    
+    - name: 安裝 grcov
+      run: cargo install grcov
+    
+    - name: 運行測試並收集覆蓋率
+      env:
+        RUSTFLAGS: '-Cinstrument-coverage'
+        LLVM_PROFILE_FILE: 'target/coverage/rust_hft-%p-%m.profraw'
+      run: |
+        mkdir -p target/coverage
+        cargo test --all-features
+    
+    - name: 生成覆蓋率報告
+      run: |
+        grcov target/coverage \
+          --binary-path target/debug/ \
+          --source-dir . \
+          --output-type lcov \
+          --output-path target/coverage/lcov.info \
+          --branch \
+          --ignore-not-existing
+    
+    - name: 上傳覆蓋率到 Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: target/coverage/lcov.info
+        flags: rust
+        name: rust-hft-coverage
+
+  # 部署準備 (僅在主分支)
+  deploy-prep:
+    name: 部署準備
+    needs: [lint-and-format, security-audit, build-and-test, examples-build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: 構建生產版本
+      run: |
+        export RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C lto=fat"
+        cargo build --release --all-features
+    
+    - name: 創建部署包
+      run: |
+        mkdir -p deploy/bin
+        cp target/release/rust_hft deploy/bin/
+        cp -r config/ deploy/ || echo "沒有config目錄"
+        cp docker-compose.yml deploy/ || echo "沒有docker-compose.yml"
+        cp CLAUDE.md deploy/README.md
+    
+    - name: 上傳部署包
+      uses: actions/upload-artifact@v3
+      with:
+        name: rust-hft-release
+        path: deploy/
+        retention-days: 30

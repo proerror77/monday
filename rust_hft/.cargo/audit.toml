@@ -1,0 +1,44 @@
+# Cargo.audit 配置文件
+# 用於自定義安全審計規則和例外
+
+[advisories]
+# 忽略某些低風險的advisory (如果需要)
+# ignore = []
+
+# 設置漏洞的最低等級
+severity-threshold = "medium"
+
+[bans]
+# 禁止的依賴包 (已知有問題的包)
+deny = []
+
+# 禁止的許可證
+deny-licenses = [
+    "GPL-3.0",
+    "AGPL-3.0", 
+    "LGPL-3.0",
+    "LGPL-2.1+",
+]
+
+# 允許的許可證
+allow-licenses = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause", 
+    "ISC",
+    "0BSD",
+    "Unlicense",
+]
+
+[licenses]
+# 許可證檢查配置
+confidence-threshold = 0.8
+
+# 允許未知許可證（謹慎使用）
+allow-osi-fsf-libre = "both"
+
+[sources]
+# 允許的 crate 來源
+allow-git = true
+allow-registry = ["crates-io"]

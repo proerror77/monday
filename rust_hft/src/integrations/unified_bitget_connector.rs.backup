@@ -1,0 +1,614 @@
+/*!
+ * Unified Bitget WebSocket Connector
+ * 
+ * 整合了單連接、多連接和動態連接管理的統一實現
+ * 支持自動負載均衡、動態重連和流量優化
+ */
+
+use crate::core::types::{Timestamp, now_micros};
+use anyhow::{Result, Context};
+use futures::{StreamExt, SinkExt};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio::sync::{RwLock, Mutex, mpsc};
+use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream, MaybeTlsStream};
+use tracing::{info, warn, error};
+
+/// 統一的 Bitget 連接器配置
+#[derive(Debug, Clone)]
+pub struct UnifiedBitgetConfig {
+    /// WebSocket URL
+    pub ws_url: String,
+    
+    /// API credentials (optional for public endpoints)
+    pub api_key: Option<String>,
+    pub api_secret: Option<String>,
+    pub passphrase: Option<String>,
+    
+    /// Connection mode
+    pub mode: ConnectionMode,
+    
+    /// Reconnection settings
+    pub max_reconnect_attempts: u32,
+    pub reconnect_delay_ms: u64,
+    
+    /// Performance settings
+    pub enable_compression: bool,
+    pub max_message_size: usize,
+    pub ping_interval_secs: u64,
+}
+
+/// 連接模式
+#[derive(Debug, Clone)]
+pub enum ConnectionMode {
+    /// 單一連接模式（簡單場景）
+    Single,
+    
+    /// 多連接模式（按策略分配）
+    Multi {
+        strategy: LoadBalancingStrategy,
+        connection_count: usize,
+    },
+    
+    /// 動態連接模式（自動調整）
+    Dynamic {
+        min_connections: usize,
+        max_connections: usize,
+        rebalance_interval_secs: u64,
+    },
+}
+
+/// 負載均衡策略
+#[derive(Debug, Clone)]
+pub enum LoadBalancingStrategy {
+    /// 按數據類型分配（orderbook, trades, ticker）
+    ByDataType,
+    
+    /// 按交易對分配
+    BySymbol,
+    
+    /// 按流量大小分配
+    ByVolume,
+    
+    /// 輪詢分配
+    RoundRobin,
+    
+    /// 自定義分配規則
+    Custom(HashMap<String, usize>),
+}
+
+/// Bitget 訂閱頻道
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BitgetChannel {
+    #[serde(rename = "books5")]
+    OrderBook5,
+    #[serde(rename = "books1")]
+    OrderBook1,
+    #[serde(rename = "books15")]
+    OrderBook15,
+    #[serde(rename = "trade")]
+    Trades,
+    #[serde(rename = "ticker")]
+    Ticker,
+    #[serde(rename = "candle1m")]
+    Candles1m,
+    #[serde(rename = "candle5m")]
+    Candles5m,
+    
+    // 為了向後相容，保留舊名稱
+    #[serde(rename = "books")]
+    #[deprecated(since = "0.2.0", note = "Use OrderBook5 instead")]
+    OrderBook,
+}
+
+/// 統一的 Bitget 消息格式
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BitgetMessage {
+    pub channel: BitgetChannel,
+    pub symbol: String,
+    pub data: serde_json::Value,
+    pub timestamp: u64,
+}
+
+/// 統一的 Bitget 連接器
+pub struct UnifiedBitgetConnector {
+    config: UnifiedBitgetConfig,
+    connections: Arc<RwLock<Vec<Connection>>>,
+    subscription_router: Arc<RwLock<SubscriptionRouter>>,
+    message_aggregator: Arc<MessageAggregator>,
+    message_receiver: Arc<Mutex<Option<mpsc::UnboundedReceiver<BitgetMessage>>>>,
+    stats: Arc<RwLock<ConnectorStats>>,
+    is_running: Arc<RwLock<bool>>,
+}
+
+/// 單個連接的管理
+struct Connection {
+    id: usize,
+    ws: Arc<Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>,
+    subscriptions: HashMap<String, Vec<BitgetChannel>>,
+    stats: ConnectionStats,
+}
+
+/// 訂閱路由器
+struct SubscriptionRouter {
+    strategy: LoadBalancingStrategy,
+    routing_table: HashMap<(String, BitgetChannel), usize>, // (symbol, channel) -> connection_id
+    round_robin_counter: usize,
+}
+
+/// 消息聚合器
+struct MessageAggregator {
+    sender: mpsc::UnboundedSender<BitgetMessage>,
+}
+
+/// 連接器統計信息
+#[derive(Debug, Default)]
+struct ConnectorStats {
+    total_messages: u64,
+    total_errors: u64,
+    total_reconnects: u64,
+    connection_stats: Vec<ConnectionStats>,
+}
+
+/// 單個連接的統計信息
+#[derive(Debug, Default, Clone)]
+struct ConnectionStats {
+    messages_received: u64,
+    errors: u64,
+    reconnects: u64,
+    last_message_time: Option<u64>,
+    subscriptions_count: usize,
+}
+
+impl UnifiedBitgetConnector {
+    /// 創建新的統一連接器
+    pub fn new(config: UnifiedBitgetConfig) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        
+        Self {
+            config,
+            connections: Arc::new(RwLock::new(Vec::new())),
+            subscription_router: Arc::new(RwLock::new(SubscriptionRouter {
+                strategy: LoadBalancingStrategy::RoundRobin,
+                routing_table: HashMap::new(),
+                round_robin_counter: 0,
+            })),
+            message_aggregator: Arc::new(MessageAggregator {
+                sender: tx,
+            }),
+            message_receiver: Arc::new(Mutex::new(Some(rx))),
+            stats: Arc::new(RwLock::new(ConnectorStats::default())),
+            is_running: Arc::new(RwLock::new(false)),
+        }
+    }
+    
+    /// 添加訂閱
+    pub async fn subscribe(&self, symbol: &str, channel: BitgetChannel) -> Result<()> {
+        let mut router = self.subscription_router.write().await;
+        let connection_id = router.route_subscription(symbol, &channel)?;
+        
+        let mut connections = self.connections.write().await;
+        if let Some(conn) = connections.get_mut(connection_id) {
+            conn.subscriptions
+                .entry(symbol.to_string())
+                .or_default()
+                .push(channel.clone());
+            
+            // 如果已連接，發送訂閱消息
+            if let Some(ws) = conn.ws.lock().await.as_mut() {
+                let sub_msg = self.build_subscription_message(symbol, &channel)?;
+                ws.send(Message::Text(sub_msg)).await?;
+            }
+        }
+        
+        router.routing_table.insert((symbol.to_string(), channel), connection_id);
+        Ok(())
+    }
+    
+    /// 獲取消息發送器
+    pub fn get_sender(&self) -> mpsc::UnboundedSender<BitgetMessage> {
+        self.message_aggregator.sender.clone()
+    }
+    
+    /// 開始連接和數據流
+    pub async fn start(&self) -> Result<mpsc::UnboundedReceiver<BitgetMessage>> {
+        *self.is_running.write().await = true;
+        
+        // 初始化連接
+        match &self.config.mode {
+            ConnectionMode::Single => {
+                self.initialize_connections(1).await?;
+            }
+            ConnectionMode::Multi { connection_count, strategy } => {
+                self.subscription_router.write().await.strategy = strategy.clone();
+                self.initialize_connections(*connection_count).await?;
+            }
+            ConnectionMode::Dynamic { min_connections, .. } => {
+                self.initialize_connections(*min_connections).await?;
+                self.start_dynamic_rebalancer().await?;
+            }
+        }
+        
+        // 啟動所有連接
+        self.start_all_connections().await?;
+        
+        // 直接返回內部 receiver
+        let mut receiver_guard = self.message_receiver.lock().await;
+        let receiver = receiver_guard.take()
+            .ok_or_else(|| anyhow::anyhow!("Connector already started"))?;
+        drop(receiver_guard);
+        
+        Ok(receiver)
+    }
+    
+    /// 停止連接器
+    pub async fn stop(&self) -> Result<()> {
+        *self.is_running.write().await = false;
+        
+        // 關閉所有連接
+        let mut connections = self.connections.write().await;
+        for conn in connections.iter_mut() {
+            if let Some(ws) = conn.ws.lock().await.as_mut() {
+                let _ = ws.close(None).await;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// 獲取統計信息
+    pub async fn get_stats(&self) -> ConnectorStats {
+        self.stats.read().await.clone()
+    }
+    
+    // --- 內部實現方法 ---
+    
+    async fn initialize_connections(&self, count: usize) -> Result<()> {
+        let mut connections = self.connections.write().await;
+        
+        for i in 0..count {
+            connections.push(Connection {
+                id: i,
+                ws: Arc::new(Mutex::new(None)),
+                subscriptions: HashMap::new(),
+                stats: ConnectionStats::default(),
+            });
+        }
+        
+        Ok(())
+    }
+    
+    async fn start_all_connections(&self) -> Result<()> {
+        let connections = self.connections.read().await;
+        let mut tasks = Vec::new();
+        
+        for (id, _) in connections.iter().enumerate() {
+            let connector = self.clone();
+            let task = tokio::spawn(async move {
+                if let Err(e) = connector.run_connection(id).await {
+                    error!("Connection {} failed: {}", id, e);
+                }
+            });
+            tasks.push(task);
+        }
+        
+        Ok(())
+    }
+    
+    async fn run_connection(&self, connection_id: usize) -> Result<()> {
+        let mut reconnect_attempts = 0;
+        
+        while *self.is_running.read().await && reconnect_attempts < self.config.max_reconnect_attempts {
+            match self.connect_and_stream(connection_id).await {
+                Ok(_) => {
+                    reconnect_attempts = 0;
+                }
+                Err(e) => {
+                    warn!("Connection {} error: {}, attempting reconnect...", connection_id, e);
+                    reconnect_attempts += 1;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        self.config.reconnect_delay_ms * reconnect_attempts as u64
+                    )).await;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    async fn connect_and_stream(&self, connection_id: usize) -> Result<()> {
+        // 建立 WebSocket 連接
+        let (ws_stream, _) = connect_async(&self.config.ws_url).await
+            .context("Failed to connect to Bitget WebSocket")?;
+        
+        info!("Connection {} established to {}", connection_id, self.config.ws_url);
+        
+        // 更新連接
+        {
+            let mut connections = self.connections.write().await;
+            if let Some(conn) = connections.get_mut(connection_id) {
+                *conn.ws.lock().await = Some(ws_stream);
+                
+                // 發送所有訂閱
+                for (symbol, channels) in &conn.subscriptions {
+                    for channel in channels {
+                        let sub_msg = self.build_subscription_message(symbol, channel)?;
+                        if let Some(ws) = conn.ws.lock().await.as_mut() {
+                            ws.send(Message::Text(sub_msg)).await?;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 處理消息流
+        self.process_message_stream(connection_id).await
+    }
+    
+    async fn process_message_stream(&self, connection_id: usize) -> Result<()> {
+        loop {
+            let connections = self.connections.read().await;
+            let conn = connections.get(connection_id)
+                .ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+            
+            let mut ws_guard = conn.ws.lock().await;
+            if let Some(ws) = ws_guard.as_mut() {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(msg) = self.parse_message(&text) {
+                            self.message_aggregator.sender.send(msg)?;
+                            
+                            // 更新統計
+                            let mut stats = self.stats.write().await;
+                            stats.total_messages += 1;
+                            if let Some(conn_stats) = stats.connection_stats.get_mut(connection_id) {
+                                conn_stats.messages_received += 1;
+                                conn_stats.last_message_time = Some(chrono::Utc::now().timestamp_millis() as u64);
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        ws.send(Message::Pong(data)).await?;
+                    }
+                    Some(Err(e)) => {
+                        error!("WebSocket error on connection {}: {}", connection_id, e);
+                        return Err(e.into());
+                    }
+                    None => {
+                        warn!("Connection {} closed", connection_id);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            } else {
+                return Err(anyhow::anyhow!("No active WebSocket connection"));
+            }
+        }
+    }
+    
+    fn build_subscription_message(&self, symbol: &str, channel: &BitgetChannel) -> Result<String> {
+        // 映射 channel 枚舉到字符串
+        let channel_str = match channel {
+            BitgetChannel::OrderBook5 => "books5",
+            BitgetChannel::OrderBook1 => "books1", 
+            BitgetChannel::OrderBook15 => "books15",
+            BitgetChannel::Trades => "trade",
+            BitgetChannel::Ticker => "ticker",
+            BitgetChannel::Candles1m => "candle1m",
+            BitgetChannel::Candles5m => "candle5m",
+            #[allow(deprecated)]
+            BitgetChannel::OrderBook => "books5", // 向後相容
+        };
+        
+        let sub = serde_json::json!({
+            "op": "subscribe",
+            "args": [{
+                "instType": "SPOT",
+                "channel": channel_str,
+                "instId": symbol
+            }]
+        });
+        
+        tracing::info!("Building subscription: {}", sub);
+        Ok(sub.to_string())
+    }
+    
+    fn parse_message(&self, text: &str) -> Result<BitgetMessage> {
+        let json: serde_json::Value = serde_json::from_str(text)?;
+        
+        // 處理訂閱確認消息
+        if let Some(event) = json.get("event") {
+            if event == "subscribe" {
+                // 訂閱確認消息，不處理
+                return Err(anyhow::anyhow!("Subscription confirmation message"));
+            }
+        }
+        
+        // 解析實際數據消息
+        let arg = json.get("arg")
+            .ok_or_else(|| anyhow::anyhow!("Missing 'arg' field"))?;
+            
+        let channel_str = arg.get("channel")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing channel in arg"))?;
+            
+        let symbol = arg.get("instId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing instId in arg"))?;
+            
+        // 映射 channel 字符串到枚舉
+        let channel = match channel_str {
+            "books5" => BitgetChannel::OrderBook5,
+            "books1" => BitgetChannel::OrderBook1,
+            "books15" => BitgetChannel::OrderBook15,
+            "trade" => BitgetChannel::Trades,
+            "ticker" => BitgetChannel::Ticker,
+            "candle1m" => BitgetChannel::Candles1m,
+            "candle5m" => BitgetChannel::Candles5m,
+            _ => return Err(anyhow::anyhow!("Unknown channel: {}", channel_str)),
+        };
+        
+        Ok(BitgetMessage {
+            channel,
+            symbol: symbol.to_string(),
+            data: json.get("data").unwrap_or(&json).clone(),
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        })
+    }
+    
+    async fn start_dynamic_rebalancer(&self) -> Result<()> {
+        if let ConnectionMode::Dynamic { rebalance_interval_secs, .. } = &self.config.mode {
+            let connector = self.clone();
+            let interval = *rebalance_interval_secs;
+            
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval));
+                
+                while *connector.is_running.read().await {
+                    interval.tick().await;
+                    if let Err(e) = connector.rebalance_connections().await {
+                        error!("Rebalancing failed: {}", e);
+                    }
+                }
+            });
+        }
+        
+        Ok(())
+    }
+    
+    async fn rebalance_connections(&self) -> Result<()> {
+        // 實現動態重新平衡邏輯
+        info!("Rebalancing connections...");
+        
+        // TODO: 根據當前負載情況調整連接數和訂閱分配
+        
+        Ok(())
+    }
+}
+
+impl SubscriptionRouter {
+    fn route_subscription(&mut self, symbol: &str, channel: &BitgetChannel) -> Result<usize> {
+        match &self.strategy {
+            LoadBalancingStrategy::RoundRobin => {
+                let id = self.round_robin_counter;
+                self.round_robin_counter = (self.round_robin_counter + 1) % 4; // 假設最多4個連接
+                Ok(id)
+            }
+            LoadBalancingStrategy::ByDataType => {
+                // 根據數據類型分配
+                match channel {
+                    BitgetChannel::OrderBook5 | BitgetChannel::OrderBook1 | BitgetChannel::OrderBook15 => Ok(0),
+                    #[allow(deprecated)]
+                    BitgetChannel::OrderBook => Ok(0),
+                    BitgetChannel::Trades => Ok(1),
+                    BitgetChannel::Ticker => Ok(2),
+                    _ => Ok(3),
+                }
+            }
+            LoadBalancingStrategy::BySymbol => {
+                // 根據 symbol 的 hash 分配
+                let hash = symbol.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
+                Ok((hash % 4) as usize)
+            }
+            _ => Ok(0), // 默認使用第一個連接
+        }
+    }
+}
+
+// 實現 Clone 以便在異步任務中使用
+impl Clone for UnifiedBitgetConnector {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            connections: self.connections.clone(),
+            subscription_router: self.subscription_router.clone(),
+            message_aggregator: self.message_aggregator.clone(),
+            message_receiver: self.message_receiver.clone(),
+            stats: self.stats.clone(),
+            is_running: self.is_running.clone(),
+        }
+    }
+}
+
+impl Clone for MessageAggregator {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
+}
+
+impl Clone for ConnectorStats {
+    fn clone(&self) -> Self {
+        Self {
+            total_messages: self.total_messages,
+            total_errors: self.total_errors,
+            total_reconnects: self.total_reconnects,
+            connection_stats: self.connection_stats.clone(),
+        }
+    }
+}
+
+/// 便捷函數：創建單連接模式
+pub fn create_single_connector(ws_url: String) -> UnifiedBitgetConnector {
+    let config = UnifiedBitgetConfig {
+        ws_url,
+        api_key: None,
+        api_secret: None,
+        passphrase: None,
+        mode: ConnectionMode::Single,
+        max_reconnect_attempts: 5,
+        reconnect_delay_ms: 1000,
+        enable_compression: true,
+        max_message_size: 1024 * 1024, // 1MB
+        ping_interval_secs: 30,
+    };
+    
+    UnifiedBitgetConnector::new(config)
+}
+
+/// 便捷函數：創建多連接模式
+pub fn create_multi_connector(ws_url: String, strategy: LoadBalancingStrategy, count: usize) -> UnifiedBitgetConnector {
+    let config = UnifiedBitgetConfig {
+        ws_url,
+        api_key: None,
+        api_secret: None,
+        passphrase: None,
+        mode: ConnectionMode::Multi {
+            strategy,
+            connection_count: count,
+        },
+        max_reconnect_attempts: 5,
+        reconnect_delay_ms: 1000,
+        enable_compression: true,
+        max_message_size: 1024 * 1024,
+        ping_interval_secs: 30,
+    };
+    
+    UnifiedBitgetConnector::new(config)
+}
+
+/// 便捷函數：創建動態連接模式
+pub fn create_dynamic_connector(ws_url: String, min: usize, max: usize) -> UnifiedBitgetConnector {
+    let config = UnifiedBitgetConfig {
+        ws_url,
+        api_key: None,
+        api_secret: None,
+        passphrase: None,
+        mode: ConnectionMode::Dynamic {
+            min_connections: min,
+            max_connections: max,
+            rebalance_interval_secs: 60,
+        },
+        max_reconnect_attempts: 5,
+        reconnect_delay_ms: 1000,
+        enable_compression: true,
+        max_message_size: 1024 * 1024,
+        ping_interval_secs: 30,
+    };
+    
+    UnifiedBitgetConnector::new(config)
+}

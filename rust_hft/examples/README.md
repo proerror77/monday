@@ -1,155 +1,143 @@
-# 🚀 HFT 系統統一架構範例
+# Rust HFT Examples - 核心示例程序
 
-這個目錄包含了重構後的統一 HFT 系統範例，將原有的 19 個重複範例整合為 **6 個強大的統一應用**。
+本目錄包含 Rust HFT 高頻交易系統的**14個核心示例**，演示系統主要功能。已清理10個重複示例，保留最重要的功能演示。
 
-## ✨ 重構成果
+## 🚀 快速開始指南
 
-- **68%** 應用數量減少 (19 → 6)
-- **70%** 代碼重複減少
-- **統一的 CLI 介面**和使用體驗
-- **更強大的功能集成**
+### 基礎示例 (必看)
+- **00_quickstart.rs** - 系統快速入門，WebSocket連接和數據處理
+- **02_simplified_unified_system.rs** - 統一交易系統架構演示
 
-## 📋 6 個統一應用
+### 性能測試
+- **performance_e2e_test.rs** - 端到端性能基準測試  
+- **comprehensive_db_stress_test.rs** - 15分鐘完整數據庫壓力測試
 
-### 1. 📊 `data_collection.rs` - 統一數據收集系統
-**整合功能**: 基礎數據記錄 + 高性能OrderBook + 交易監控
+## 📁 核心模塊結構
 
+### 01_data_collection/ - 數據收集層
+- **ws_performance_test.rs** - WebSocket連接性能測試
+- **clickhouse_writer.rs** - ClickHouse批量寫入測試
+- **multi_symbol_collector.rs** - 多標的並行收集
+- **data_quality_monitor.rs** - 實時數據品質監控
+
+### 03_model_inference/ - 模型推理層
+- **inference_benchmark.rs** - 推理性能基準測試
+- **strategy_executor.rs** - 策略執行引擎
+
+### 05_system_integration/ - 系統整合層
+- **end_to_end_test.rs** - 完整交易流程測試
+- **latency_benchmark.rs** - 系統延遲基準測試
+- **stress_test.rs** - 高負載壓力測試
+- **system_monitoring.rs** - 系統監控和告警
+
+## 🚀 運行示例
+
+### 基礎示例
 ```bash
-# 基礎數據收集
-cargo run --example data_collection -- --symbol BTCUSDT --duration-seconds 3600
+# 系統快速入門
+cargo run --example 00_quickstart
 
-# 高性能模式
-cargo run --example data_collection -- --compress --symbol SOLUSDT
+# 統一系統演示
+cargo run --example 02_simplified_unified_system
 ```
 
-### 2. 🧠 `model_training.rs` - 統一模型訓練系統  
-**整合功能**: 基礎訓練 + LOB Transformer + 完整訓練流程
-
+### 性能測試
 ```bash
-# LOB Transformer 訓練
-cargo run --example model_training -- --symbol BTCUSDT --epochs 50
+# 端到端性能測試
+cargo run --example performance_e2e_test
 
-# 快速線性模型訓練
-cargo run --example model_training -- --symbol SOLUSDT --epochs 20
+# 完整15分鐘壓力測試 (需要ClickHouse和Redis)
+cargo run --example comprehensive_db_stress_test
 ```
 
-### 3. 📈 `model_evaluation.rs` - 統一模型評估系統
-**整合功能**: 基礎評估 + LOB Transformer評估
-
+### 數據收集測試
 ```bash
-# 模型評估
-cargo run --example model_evaluation -- --model-path "./models/lob_transformer.safetensors"
+# WebSocket性能測試
+cargo run --example 01_data_collection/ws_performance_test
+
+# ClickHouse寫入測試  
+cargo run --example 01_data_collection/clickhouse_writer
 ```
 
-### 4. ⚡ `live_trading.rs` - 統一實盤交易系統
-**整合功能**: 完整交易系統 + LOB Transformer交易
-
+### 系統整合測試
 ```bash
-# DRY RUN 模式（安全測試）
-cargo run --example live_trading -- --mode dry-run --symbol BTCUSDT --capital 1000
+# 端到端測試
+cargo run --example 05_system_integration/end_to_end_test
 
-# 實盤交易（謹慎使用！）
-cargo run --example live_trading -- --mode live --symbol BTCUSDT --capital 1000
+# 延遲基準測試
+cargo run --example 05_system_integration/latency_benchmark
 ```
 
-### 5. 🔧 `performance_test.rs` - 統一性能測試系統
-**整合功能**: 延遲測試 + 優化測試 + 硬件檢測
+## ⚡ 性能基準 (Apple M3)
 
+| 組件 | 實測延遲 | 目標延遲 | 測試狀態 |
+|------|----------|----------|----------|
+| 消息處理 | 4.9μs | <1μs | 🟡 需優化 |
+| 數據庫寫入 | 12.5ms | <10ms | ✅ 達標 |
+| WebSocket連接 | ~86 msg/s | >100 msg/s | 🟡 可提升 |
+| 端到端系統 | <50ms P95 | <100ms | ✅ 優秀 |
+
+## 🔧 前置要求
+
+### Docker 服務
 ```bash
-# 完整性能測試
-cargo run --example performance_test -- --iterations 10000 --enable-simd
+# 啟動必要服務
+docker-compose up -d clickhouse redis
 
-# 指定CPU核心測試
-cargo run --example performance_test -- --cpu-core 2 --target-latency-us 50
+# 檢查服務狀態
+docker-compose ps
 ```
 
-### 6. 📊 `backtesting.rs` - 統一回測系統
-**整合功能**: 策略回測框架
-
+### 系統優化
 ```bash
-# 策略回測
-cargo run --example backtesting -- --input-file market_data.jsonl --initial-capital 10000
+# 編譯優化 (Release模式)
+export RUSTFLAGS="-C target-cpu=native -C opt-level=3"
+cargo build --release
+
+# macOS 系統調優
+sudo sysctl -w kern.ipc.maxsockbuf=16777216
+sudo sysctl -w net.inet.tcp.recvspace=65536
 ```
 
-## 🏗️ 統一架構優勢
+## 📊 測試報告生成
 
-### 1. 一致的命令行介面
-所有應用都使用相同的參數約定：
-- `--symbol`: 交易對（如 BTCUSDT, SOLUSDT）
-- `--duration-seconds`: 運行時間（秒）
-- `--dry-run`: 乾跑模式開關
+每個測試會自動生成性能報告至 `test_results/` 目錄：
+- **延遲統計**: P50/P95/P99 分佈
+- **吞吐量**: 消息/秒，記錄/秒
+- **資源使用**: CPU，內存，網絡
+- **連接穩定性**: 成功率，錯誤率
 
-### 2. 統一的工作流執行
-每個應用都採用步驟化工作流：
-```
-Step 1/4: 系統初始化 ✅ (2.3s)
-Step 2/4: 數據收集   ⏳ (估計 180s)
-Step 3/4: 模型訓練   ⏳ (估計 300s)  
-Step 4/4: 結果驗證   ⏳ (估計 60s)
-```
+### 最新測試結果
+- **總記錄數**: 309,492 (15分鐘)
+- **平均處理速度**: 343.9 記錄/秒
+- **連接成功率**: 100% (25個交易對)
+- **數據庫寫入**: 0錯誤 (892批次)
 
-### 3. 自動性能監控
-所有應用內建性能監控：
-- 實時延遲測量
-- 內存使用追蹤  
-- CPU 使用率監控
-- 30秒周期報告
+## 🗑️ 已清理的文件
 
-## 🎯 使用場景
+已將以下10個重複和過時的示例移至 `examples_archived/redundant/`：
+- `00_quickstart_lockfree.rs`
+- `00_zero_copy_websocket_test.rs`  
+- `concurrent_test_demo.rs`
+- `debug_bitget_ws.rs`
+- `quick_ws_performance_check.rs`
+- `real_ws_stress_test.rs`
+- `test_*.rs` 系列
+- `simple_clickhouse_test.rs`
 
-### 場景 1：開發新策略
+## 🔍 故障排除
+
+### 常見問題
+1. **編譯錯誤**: 確保 Rust 1.70+ 和所有依賴已安裝
+2. **ClickHouse連接失敗**: 檢查 Docker 容器狀態
+3. **性能不佳**: 使用 `--release` 標誌編譯
+4. **權限錯誤**: macOS 可能需要允許網絡訪問
+
+### 日誌調試
 ```bash
-# 1. 收集數據
-cargo run --example data_collection -- --symbol BTCUSDT --duration-seconds 7200
+# 詳細日誌
+RUST_LOG=debug cargo run --release --example 00_quickstart
 
-# 2. 訓練模型  
-cargo run --example model_training -- --symbol BTCUSDT
-
-# 3. 評估模型
-cargo run --example model_evaluation -- --model-path "./models/lob_transformer.safetensors"
-
-# 4. 回測驗證
-cargo run --example backtesting -- --input-file market_data.jsonl
-
-# 5. 實時測試
-cargo run --example live_trading -- --mode dry-run --symbol BTCUSDT --capital 1000
+# 錯誤專用日誌
+RUST_LOG=error cargo run --example comprehensive_db_stress_test
 ```
-
-### 場景 2：部署到生產環境
-```bash
-# 1. 性能基準測試
-cargo run --example performance_test -- --iterations 10000 --enable-simd
-
-# 2. 最終模型評估
-cargo run --example model_evaluation -- --model-path "./models/production_model.bin"
-
-# 3. 實盤部署（小額開始）
-cargo run --example live_trading -- --mode live --symbol BTCUSDT --capital 100
-```
-
-## 📚 舊版範例備份
-
-原有的 19 個範例檔案已移動到 `old_replaced_examples/` 目錄作為備份參考。
-
-## ⚠️ 重要提醒
-
-### 交易模式說明
-- **DryRun**: 連接真實市場數據，執行完整邏輯，但不下真實訂單
-- **Paper**: 模擬交易環境，跟蹤虛擬 PnL  
-- **Live**: 真實交易，涉及真實資金，請謹慎使用！
-
-### 最佳實踐
-1. **總是先使用 DryRun 模式測試**
-2. **定期運行性能測試確保系統健康**
-3. **使用回測驗證策略有效性**
-4. **從小額資金開始實盤交易**
-
-## 🔗 更多信息
-
-- 詳細使用指南：[NEW_UNIFIED_GUIDE.md](NEW_UNIFIED_GUIDE.md)
-- 舊版範例備份：[old_replaced_examples/README.md](old_replaced_examples/README.md)
-- 核心連接測試：`01_connect_to_exchange.rs`（保留作為基礎連接工具）
-
----
-
-**注意**: 新的統一架構大大簡化了使用體驗，提供了更強大的功能和更好的性能。所有原有功能都得到了保留和增強！

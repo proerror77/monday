@@ -5,7 +5,7 @@
  * 實現高性能的異步流處理
  */
 
-use super::bitget_connector::{BitgetConnector, BitgetMessage, BitgetConfig, BitgetChannel};
+use super::unified_bitget_connector::{UnifiedBitgetConnector, UnifiedBitgetConfig, ConnectionMode, BitgetChannel};
 use crate::core::types::*;
 use anyhow::Result;
 use serde_json::Value;
@@ -42,20 +42,20 @@ impl Stream for BitgetMarketStream {
 
 /// Bitget 適配器，用於創建符合 barter-data 標準的市場數據流
 pub struct BitgetAdapter {
-    connector: BitgetConnector,
+    connector: UnifiedBitgetConnector,
 }
 
 impl BitgetAdapter {
     /// 創建新的 Bitget 適配器
-    pub fn new(config: BitgetConfig) -> Self {
+    pub fn new(config: UnifiedBitgetConfig) -> Self {
         Self {
-            connector: BitgetConnector::new(config),
+            connector: UnifiedBitgetConnector::new(config),
         }
     }
     
     /// 添加訂閱
-    pub fn add_subscription(&mut self, symbol: String, channel: BitgetChannel) {
-        self.connector.add_subscription(symbol, channel);
+    pub async fn add_subscription(&mut self, symbol: String, channel: BitgetChannel) -> Result<()> {
+        self.connector.subscribe(&symbol, channel).await
     }
     
     /// 初始化市場數據流
@@ -65,41 +65,47 @@ impl BitgetAdapter {
         // 1. 創建 MPSC 通道
         let (tx, rx) = mpsc::unbounded_channel();
         
-        // 2. 克隆連接器用於異步任務
-        let connector_clone = self.connector.clone();
+        // 2. 啟動統一連接器並獲取消息接收器
+        let mut message_rx = match self.connector.start().await {
+            Ok(rx) => rx,
+            Err(e) => {
+                error!("Failed to start UnifiedBitgetConnector: {}", e);
+                let _ = tx.send(Err(DataError::Socket(format!("Connection failed: {}", e))));
+                return Err(DataError::Socket(format!("Connection failed: {}", e)));
+            }
+        };
         
-        // 3. 在新任務中運行連接和消息處理邏輯
+        // 3. 在新任務中處理消息
         let tx_clone = tx.clone();
         tokio::spawn(async move {
-            let message_handler = move |msg: BitgetMessage| {
+            while let Some(msg) = message_rx.recv().await {
                 // 將 BitgetMessage 轉換為 MarketEvent
-                let market_event_result = match msg {
-                    BitgetMessage::OrderBook { symbol, data, action, timestamp } => {
-                        debug!("Processing OrderBook message for {}", symbol);
-                        convert_bitget_orderbook(&symbol, &data, action.as_deref(), timestamp)
+                let market_event_result = match msg.channel {
+                    super::unified_bitget_connector::BitgetChannel::OrderBook => {
+                        debug!("Processing OrderBook message for {}", msg.symbol);
+                        convert_bitget_orderbook(&msg.symbol, &msg.data, None, msg.timestamp)
                             .map_err(|e| DataError::Socket(e.to_string()))
                     },
-                    BitgetMessage::Trade { symbol, data, timestamp } => {
-                        debug!("Processing Trade message for {}", symbol);
-                        convert_bitget_trade(&symbol, &data, timestamp)
+                    super::unified_bitget_connector::BitgetChannel::Trades => {
+                        debug!("Processing Trade message for {}", msg.symbol);
+                        convert_bitget_trade(&msg.symbol, &msg.data, msg.timestamp)
                             .map_err(|e| DataError::Socket(e.to_string()))
                     },
-                    BitgetMessage::Ticker { symbol, data: _, timestamp: _ } => {
-                        debug!("Ignoring Ticker message for {} (not implemented)", symbol);
-                        return; // 暫時忽略 Ticker 消息
+                    super::unified_bitget_connector::BitgetChannel::Ticker => {
+                        debug!("Ignoring Ticker message for {} (not implemented)", msg.symbol);
+                        continue; // 暫時忽略 Ticker 消息
+                    },
+                    _ => {
+                        debug!("Ignoring unsupported channel message for {}", msg.symbol);
+                        continue;
                     },
                 };
                 
                 // 發送處理結果到 Stream
                 if let Err(e) = tx_clone.send(market_event_result) {
                     error!("Failed to send MarketEvent to stream: {}", e);
+                    break;
                 }
-            };
-            
-            // 運行連接邏輯
-            if let Err(e) = connector_clone.connect_public(message_handler).await {
-                error!("BitgetConnector failed: {}", e);
-                let _ = tx.send(Err(DataError::Socket(format!("Connection failed: {}", e))));
             }
         });
         
@@ -268,12 +274,26 @@ pub async fn create_bitget_stream(
     symbols: Vec<&str>,
     channels: Vec<BitgetChannel>,
 ) -> Result<BitgetMarketStream, DataError> {
-    let mut adapter = BitgetAdapter::new(BitgetConfig::default());
+    let config = UnifiedBitgetConfig {
+        ws_url: "wss://ws.bitget.com/v2/ws/public".to_string(),
+        api_key: None,
+        api_secret: None,
+        passphrase: None,
+        mode: ConnectionMode::Single,
+        max_reconnect_attempts: 3,
+        reconnect_delay_ms: 1000,
+        enable_compression: true,
+        max_message_size: 1024 * 1024,
+        ping_interval_secs: 30,
+        connection_timeout_secs: 10,
+    };
+    let mut adapter = BitgetAdapter::new(config);
     
     // 為所有符號和通道組合添加訂閱
     for symbol in symbols {
         for channel in &channels {
-            adapter.add_subscription(symbol.to_string(), channel.clone());
+            adapter.add_subscription(symbol.to_string(), channel.clone()).await
+                .map_err(|e| DataError::Socket(format!("Failed to add subscription: {}", e)))?;
         }
     }
     
@@ -283,6 +303,7 @@ pub async fn create_bitget_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{ConnectionMode, UnifiedBitgetConfig};
     use serde_json::json;
     
     #[test]
@@ -332,8 +353,21 @@ mod tests {
     
     #[tokio::test]
     async fn test_adapter_creation() {
-        let mut adapter = BitgetAdapter::new(BitgetConfig::default());
-        adapter.add_subscription("BTCUSDT".to_string(), BitgetChannel::Books5);
+        let config = UnifiedBitgetConfig {
+            ws_url: "wss://ws.bitget.com/v2/ws/public".to_string(),
+            api_key: None,
+            api_secret: None,
+            passphrase: None,
+            mode: ConnectionMode::Single,
+            max_reconnect_attempts: 3,
+            reconnect_delay_ms: 1000,
+            enable_compression: true,
+            max_message_size: 1024 * 1024,
+            ping_interval_secs: 30,
+            connection_timeout_secs: 10,
+        };
+        let mut adapter = BitgetAdapter::new(config);
+        let _ = adapter.add_subscription("BTCUSDT".to_string(), BitgetChannel::OrderBook).await;
         
         // Note: This test won't actually connect to avoid network dependencies
         // In a real scenario, you would test with a mock WebSocket server

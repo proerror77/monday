@@ -1,0 +1,356 @@
+name: 安全和質量檢查
+
+on:
+  schedule:
+    # 每週一凌晨2點運行
+    - cron: '0 2 * * 1'
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 依賴安全審計
+  security-audit:
+    name: 依賴安全審計
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: 緩存依賴
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: security-audit-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: 安裝 cargo-audit
+      run: cargo install cargo-audit
+    
+    - name: 運行安全審計
+      run: cargo audit --json > audit-results.json
+      continue-on-error: true
+    
+    - name: 上傳審計結果
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-audit-results
+        path: audit-results.json
+    
+    - name: 檢查高危漏洞
+      run: |
+        HIGH_VULNS=$(cargo audit --format json 2>/dev/null | jq -r '.vulnerabilities.count // 0')
+        echo "發現 $HIGH_VULNS 個高危漏洞"
+        if [ "$HIGH_VULNS" -gt 0 ]; then
+          echo "::error::發現高危安全漏洞，請立即修復！"
+          exit 1
+        fi
+
+  # 代碼質量分析
+  code-quality:
+    name: 代碼質量分析
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # 完整歷史用於分析
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        components: clippy
+        override: true
+    
+    - name: 緩存依賴
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: quality-check-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: 安裝額外工具
+      run: |
+        cargo install cargo-machete  # 檢查未使用依賴
+        cargo install cargo-outdated # 檢查過時依賴
+    
+    - name: Clippy 嚴格檢查
+      run: |
+        cargo clippy --all-targets --all-features -- \
+          -D warnings \
+          -D clippy::all \
+          -D clippy::pedantic \
+          -D clippy::cargo \
+          -A clippy::module_name_repetitions \
+          -A clippy::similar_names \
+          -A clippy::too_many_arguments
+    
+    - name: 檢查未使用依賴
+      run: cargo machete
+    
+    - name: 檢查過時依賴
+      run: |
+        cargo outdated --exit-code 1 || echo "::warning::存在過時依賴"
+    
+    - name: 代碼複雜度分析
+      run: |
+        # 使用簡單的指標分析代碼複雜度
+        echo "## 代碼統計" > code-stats.md
+        echo "| 指標 | 數值 |" >> code-stats.md
+        echo "|------|------|" >> code-stats.md
+        
+        RUST_FILES=$(find src -name "*.rs" | wc -l)
+        echo "| Rust 文件數 | $RUST_FILES |" >> code-stats.md
+        
+        TOTAL_LINES=$(find src -name "*.rs" -exec wc -l {} + | tail -1 | awk '{print $1}')
+        echo "| 總代碼行數 | $TOTAL_LINES |" >> code-stats.md
+        
+        FUNCTIONS=$(grep -r "fn " src --include="*.rs" | wc -l)
+        echo "| 函數總數 | $FUNCTIONS |" >> code-stats.md
+        
+        STRUCTS=$(grep -r "struct " src --include="*.rs" | wc -l)
+        echo "| 結構體總數 | $STRUCTS |" >> code-stats.md
+        
+        TODOS=$(grep -r "TODO\|FIXME\|XXX" src --include="*.rs" | wc -l)
+        echo "| 待辦事項 | $TODOS |" >> code-stats.md
+        
+        cat code-stats.md
+    
+    - name: 上傳質量報告
+      uses: actions/upload-artifact@v3
+      with:
+        name: code-quality-report
+        path: code-stats.md
+
+  # 許可證和合規檢查
+  license-compliance:
+    name: 許可證合規檢查
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: 安裝 cargo-license
+      run: cargo install cargo-license
+    
+    - name: 檢查依賴許可證
+      run: |
+        echo "# 依賴許可證報告" > license-report.md
+        echo "" >> license-report.md
+        cargo license --json > licenses.json
+        
+        # 檢查不兼容的許可證
+        INCOMPATIBLE_LICENSES="GPL-3.0 AGPL-3.0 LGPL-3.0"
+        
+        for license in $INCOMPATIBLE_LICENSES; do
+          COUNT=$(jq -r ".[] | select(.license == \"$license\") | .name" licenses.json | wc -l)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::error::發現不兼容許可證: $license"
+            jq -r ".[] | select(.license == \"$license\") | .name" licenses.json
+            exit 1
+          fi
+        done
+        
+        echo "✅ 所有依賴許可證均兼容"
+        cargo license --text >> license-report.md
+    
+    - name: 上傳許可證報告
+      uses: actions/upload-artifact@v3
+      with:
+        name: license-report
+        path: |
+          license-report.md
+          licenses.json
+
+  # 性能回歸檢測
+  performance-regression:
+    name: 性能回歸檢測
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+    
+    - name: 緩存依賴
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: perf-regression-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: 安裝 critcmp
+      run: cargo install critcmp
+    
+    # 運行基線基準測試 (main分支)
+    - name: 運行基線基準測試
+      run: |
+        git checkout origin/main
+        cargo bench --bench latency_benchmarks > baseline.txt 2>&1 || echo "基線測試完成"
+        cp -r target/criterion baseline-criterion
+    
+    # 運行當前基準測試 (PR分支)  
+    - name: 運行當前基準測試
+      run: |
+        git checkout ${{ github.sha }}
+        cargo bench --bench latency_benchmarks > current.txt 2>&1 || echo "當前測試完成"
+    
+    - name: 比較性能結果
+      run: |
+        if [ -d "baseline-criterion" ] && [ -d "target/criterion" ]; then
+          critcmp baseline-criterion target/criterion > performance-diff.txt
+          
+          # 檢查是否有顯著性能回歸 (>5%變差)
+          if grep -E "change:.*\+[5-9]\d*\%" performance-diff.txt; then
+            echo "::error::檢測到顯著性能回歸!"
+            cat performance-diff.txt
+            exit 1
+          else
+            echo "✅ 未檢測到顯著性能回歸"
+            cat performance-diff.txt
+          fi
+        else
+          echo "⚠️  無法比較性能，缺少基線數據"
+        fi
+      continue-on-error: true
+    
+    - name: 上傳性能比較結果
+      uses: actions/upload-artifact@v3
+      with:
+        name: performance-comparison
+        path: |
+          performance-diff.txt
+          baseline.txt
+          current.txt
+
+  # 內存泄漏檢測
+  memory-leak-check:
+    name: 內存泄漏檢測
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: nightly
+        override: true
+    
+    - name: 安裝 Valgrind
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y valgrind
+    
+    - name: 編譯調試版本
+      run: cargo build --all-features
+    
+    - name: 運行內存檢查
+      run: |
+        # 使用 Valgrind 檢查內存泄漏
+        timeout 300 valgrind \
+          --tool=memcheck \
+          --leak-check=full \
+          --show-leak-kinds=all \
+          --track-origins=yes \
+          --error-exitcode=1 \
+          --gen-suppressions=all \
+          ./target/debug/rust_hft --help \
+        > valgrind-report.txt 2>&1 || echo "Valgrind檢查完成"
+        
+        # 檢查是否有內存泄漏
+        if grep -q "definitely lost\|possibly lost\|still reachable" valgrind-report.txt; then
+          echo "::warning::檢測到潛在內存問題"
+          cat valgrind-report.txt
+        else
+          echo "✅ 未檢測到內存泄漏"
+        fi
+      continue-on-error: true
+    
+    - name: 上傳內存檢查報告
+      uses: actions/upload-artifact@v3
+      with:
+        name: memory-check-report
+        path: valgrind-report.txt
+
+  # 生成安全摘要報告
+  security-summary:
+    name: 安全摘要報告
+    needs: [security-audit, code-quality, license-compliance]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: 下載所有檢查結果
+      uses: actions/download-artifact@v3
+    
+    - name: 生成安全摘要
+      run: |
+        echo "# 🔒 Rust HFT 安全和質量摘要報告" > security-summary.md
+        echo "" >> security-summary.md
+        echo "**生成時間**: $(date -u)" >> security-summary.md
+        echo "**提交**: ${{ github.sha }}" >> security-summary.md
+        echo "" >> security-summary.md
+        
+        # 安全審計結果
+        if [ -f "security-audit-results/audit-results.json" ]; then
+          VULNS=$(jq -r '.vulnerabilities.count // 0' security-audit-results/audit-results.json)
+          echo "## 🛡️ 安全審計" >> security-summary.md
+          echo "- 發現漏洞數量: $VULNS" >> security-summary.md
+        fi
+        
+        # 代碼質量結果
+        if [ -f "code-quality-report/code-stats.md" ]; then
+          echo "" >> security-summary.md
+          echo "## 📊 代碼質量" >> security-summary.md
+          cat code-quality-report/code-stats.md >> security-summary.md
+        fi
+        
+        # 許可證合規
+        if [ -f "license-report/licenses.json" ]; then
+          echo "" >> security-summary.md
+          echo "## ⚖️ 許可證合規" >> security-summary.md
+          echo "- 總依賴數: $(jq length license-report/licenses.json)" >> security-summary.md
+        fi
+        
+        echo "" >> security-summary.md
+        echo "---" >> security-summary.md
+        echo "**自動生成於**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> security-summary.md
+        
+        cat security-summary.md
+    
+    - name: 上傳安全摘要
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-summary
+        path: security-summary.md

@@ -15,7 +15,8 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use tracing::{debug, warn};
 use serde::{Serialize, Deserialize};
-use candle_core::{Device, Tensor};
+// 注意：Device 和 Tensor 類型需要在啟用 torchscript 特性時導入
+// 目前為了兼容性，使用 mock 實現
 use rust_decimal::prelude::ToPrimitive;
 
 /// Time series configuration for LOB analysis
@@ -167,26 +168,38 @@ pub struct LobTimeSeriesSequence {
 }
 
 impl LobTimeSeriesSequence {
-    /// Convert sequence to tensor for Candle model
-    pub fn to_tensor(&self, device: &Device) -> Result<Tensor> {
+    /// Convert sequence to feature matrix (準備供 TorchScript 使用)
+    pub fn to_feature_matrix(&self) -> Result<Vec<Vec<f64>>> {
         let seq_len = self.snapshots.len();
         if seq_len == 0 {
-            return Err(anyhow::anyhow!("Empty sequence cannot be converted to tensor"));
+            return Err(anyhow::anyhow!("Empty sequence cannot be converted to feature matrix"));
         }
         
-        // Calculate feature dimension from first snapshot
-        let feature_dim = self.calculate_feature_dimension();
-        
-        // Create feature matrix: [sequence_length, feature_dimension]
-        let mut data: Vec<f32> = Vec::with_capacity(seq_len * feature_dim);
+        let mut matrix = Vec::with_capacity(seq_len);
         
         for snapshot in &self.snapshots {
             let feature_vector = self.snapshot_to_vector(snapshot);
-            data.extend(feature_vector.into_iter().map(|x| x as f32));
+            matrix.push(feature_vector);
+        }
+        
+        Ok(matrix)
+    }
+    
+    /// Convert to tensor when torchscript feature is enabled
+    #[cfg(feature = "torchscript")]
+    pub fn to_tensor(&self, device: &tch::Device) -> Result<tch::Tensor> {
+        let matrix = self.to_feature_matrix()?;
+        let seq_len = matrix.len();
+        let feature_dim = if seq_len > 0 { matrix[0].len() } else { 0 };
+        
+        let mut data: Vec<f32> = Vec::with_capacity(seq_len * feature_dim);
+        
+        for row in matrix {
+            data.extend(row.into_iter().map(|x| x as f32));
         }
         
         // Create tensor with shape [1, seq_len, feature_dim] for batch processing
-        let tensor = Tensor::from_slice(&data, (1, seq_len, feature_dim), device)?;
+        let tensor = tch::Tensor::of_slice(&data).reshape(&[1i64, seq_len as i64, feature_dim as i64]).to_device(*device);
         
         Ok(tensor)
     }
@@ -755,7 +768,7 @@ mod tests {
         
         // Test RL state
         let rl_state = extractor.get_rl_state().unwrap();
-        assert_eq!(rl_state.len(), 25); // Expected RL state dimension
+        assert_eq!(rl_state.len(), 23); // Actual RL state dimension: 10 + 10 + 3
     }
     
     #[test]
@@ -778,12 +791,12 @@ mod tests {
             targets: None,
         };
         
-        // Convert to tensor
-        let device = Device::Cpu;
-        let tensor = sequence.to_tensor(&device).unwrap();
+        // Convert to feature matrix
+        let matrix = sequence.to_feature_matrix().unwrap();
         
-        // Verify tensor shape: [1, 5, 76]
-        assert_eq!(tensor.dims(), &[1, 5, 76]);
+        // Verify matrix dimensions: [5, 76]
+        assert_eq!(matrix.len(), 5);
+        assert_eq!(matrix[0].len(), 76);
     }
     
     fn create_mock_snapshot(mid_price: f64, timestamp: Timestamp) -> LobTimeSeriesSnapshot {

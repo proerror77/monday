@@ -1,64 +1,190 @@
 /*!
  * Engine Module - 交易策略和執行引擎
  * 
- * 包含策略實現和訂單執行邏輯
+ * 包含統一的引擎架構和專門化實現
  */
 
+// 統一引擎架構（推薦使用）
+pub mod unified_engine;
+pub mod unified_risk_manager;
+
+// 核心功能模塊
 pub mod strategy;
 pub mod execution;
-pub mod barter_execution;
-pub mod risk_manager;
-pub mod enhanced_risk_controller;
-pub mod barter_engine;
-pub mod barter_backtest;
-pub mod dual_symbol_trading_framework;
-pub mod test_capital_position_manager;
-pub mod single_symbol_dl_trader;
+pub mod inference_strategy;
 
-// Re-export main functions and types
+// 舊版實現已移除，請使用 unified_engine 和 unified_risk_manager
+
+// 特定策略實現已移除，請使用 unified_engine 自定義策略
+
+// 導出統一接口（推薦使用）
+pub use unified_engine::{
+    UnifiedTradingEngine,
+    UnifiedEngineConfig,
+    UnifiedEngineBuilder,
+    EngineMode,
+    RiskConfig,
+    ExecutionConfig,
+    PerformanceConfig,
+    TradingStrategy,
+    RiskManager,
+    ExecutionManager,
+    MarketData,
+    Signal,
+    SignalAction,
+    Order,
+    OrderType,
+    OrderSide,
+    OrderStatus,
+    Portfolio,
+    Position,
+    RiskDecision,
+    RiskReport,
+    RiskLevel,
+    StrategyState,
+    OrderModification,
+    Trade,
+    EngineEvent,
+};
+
+pub use unified_risk_manager::{
+    UnifiedRiskManager,
+    RiskManagerConfig,
+    create_default_risk_manager,
+    create_conservative_risk_manager,
+    create_aggressive_risk_manager,
+};
+
+// 導出核心功能
 pub use strategy::run as strategy_run;
 pub use execution::run as execution_run;
-pub use barter_execution::run_barter_execution;
-pub use risk_manager::{BarterRiskManager, RiskCheckResult, RiskStatus, RiskLevel};
-pub use enhanced_risk_controller::{
-    EnhancedRiskController, 
-    EnhancedRiskConfig, 
-    RiskAssessment, 
-    PositionRisk, 
-    PortfolioRiskMetrics,
-    KellyParameters,
-    TradeRecord,
-    EnhancedRiskStats,
-};
-pub use barter_engine::{BarterUnifiedEngine, BarterEvent, BarterEngineBuilder, SystemControlEvent};
-pub use barter_backtest::{BarterBacktestEngine, BacktestConfig, BacktestResults, FileDataSource};
-pub use dual_symbol_trading_framework::{
-    DualSymbolTradingFramework,
-    DualSymbolTradingConfig,
-    DualSymbolTradingSignal,
-    TradingAction as DualTradingAction,
-    SymbolTradingState,
-    Position,
-    SymbolPerformanceMetrics,
-    FrameworkPerformanceMetrics,
-    FrameworkStatus,
-    SymbolStatus,
-};
-pub use test_capital_position_manager::{
-    TestCapitalPositionManager,
-    TestCapitalConfig,
-    TestPosition,
-    TestPortfolioMetrics,
-    PositionAssessment,
-    TestPortfolioStatus,
-    PerformanceSummary,
-    ClosedPosition,
-};
-pub use single_symbol_dl_trader::{
-    BtcusdtDlTrader,
-    BtcusdtDlConfig,
-    MultiHorizonPrediction,
-    BtcusdtTradingSignal,
-    TradingAction,
-    BtcusdtPerformanceMetrics,
-};
+
+// 舊版接口已移除
+
+// 便捷函數：創建實時交易引擎
+pub fn create_live_engine(
+    symbols: Vec<String>,
+    strategy: Box<dyn TradingStrategy>,
+    dry_run: bool,
+) -> UnifiedTradingEngine {
+    let config = UnifiedEngineConfig {
+        mode: EngineMode::Live {
+            dry_run,
+            enable_paper_trading: dry_run,
+        },
+        symbols,
+        risk_config: RiskConfig {
+            max_position_ratio: 0.1,
+            max_loss_per_trade: 0.02,
+            max_daily_loss: 0.05,
+            max_leverage: 1.0,
+            enable_dynamic_adjustment: true,
+            kelly_fraction: Some(0.25),
+        },
+        execution_config: ExecutionConfig {
+            preferred_order_type: OrderType::Limit,
+            slippage_tolerance_bps: 10.0,
+            order_timeout_ms: 5000,
+            enable_smart_routing: true,
+            enable_iceberg: false,
+        },
+        performance_config: PerformanceConfig {
+            enable_metrics: true,
+            metrics_update_interval_secs: 10,
+            enable_latency_tracking: true,
+            enable_memory_optimization: true,
+        },
+    };
+    
+    UnifiedEngineBuilder::new()
+        .with_config(config)
+        .with_strategy(strategy)
+        .with_risk_manager(Box::new(create_default_risk_manager()))
+        .with_execution_manager(Box::new(DummyExecutionManager))
+        .build()
+        .expect("Failed to build engine")
+}
+
+// 便捷函數：創建回測引擎
+pub fn create_backtest_engine(
+    symbols: Vec<String>,
+    strategy: Box<dyn TradingStrategy>,
+    start_time: u64,
+    end_time: u64,
+    initial_capital: f64,
+) -> UnifiedTradingEngine {
+    let config = UnifiedEngineConfig {
+        mode: EngineMode::Backtest {
+            start_time,
+            end_time,
+            initial_capital,
+        },
+        symbols,
+        risk_config: RiskConfig {
+            max_position_ratio: 0.1,
+            max_loss_per_trade: 0.02,
+            max_daily_loss: 0.05,
+            max_leverage: 1.0,
+            enable_dynamic_adjustment: true,
+            kelly_fraction: Some(0.25),
+        },
+        execution_config: ExecutionConfig {
+            preferred_order_type: OrderType::Market,
+            slippage_tolerance_bps: 5.0,
+            order_timeout_ms: 0, // 回測中立即執行
+            enable_smart_routing: false,
+            enable_iceberg: false,
+        },
+        performance_config: PerformanceConfig {
+            enable_metrics: true,
+            metrics_update_interval_secs: 60,
+            enable_latency_tracking: false,
+            enable_memory_optimization: false,
+        },
+    };
+    
+    UnifiedEngineBuilder::new()
+        .with_config(config)
+        .with_strategy(strategy)
+        .with_risk_manager(Box::new(create_default_risk_manager()))
+        .with_execution_manager(Box::new(DummyExecutionManager))
+        .build()
+        .expect("Failed to build engine")
+}
+
+// 臨時的執行管理器實現（用於示例）
+struct DummyExecutionManager;
+
+#[async_trait::async_trait]
+impl ExecutionManager for DummyExecutionManager {
+    async fn execute_signal(&mut self, signal: Signal) -> Result<Order, anyhow::Error> {
+        Ok(Order {
+            id: uuid::Uuid::new_v4().to_string(),
+            symbol: signal.symbol,
+            side: match signal.action {
+                SignalAction::Buy => OrderSide::Buy,
+                SignalAction::Sell => OrderSide::Sell,
+                _ => OrderSide::Buy,
+            },
+            order_type: OrderType::Market,
+            quantity: signal.quantity,
+            price: signal.price,
+            status: OrderStatus::Pending,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            filled_quantity: 0.0,
+            average_price: 0.0,
+        })
+    }
+    
+    async fn cancel_order(&mut self, _order_id: &str) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+    
+    async fn modify_order(&mut self, _order_id: &str, _new_params: OrderModification) -> Result<(), anyhow::Error> {
+        Ok(())
+    }
+    
+    async fn get_order_status(&self, _order_id: &str) -> Result<OrderStatus, anyhow::Error> {
+        Ok(OrderStatus::Pending)
+    }
+}

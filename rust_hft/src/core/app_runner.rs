@@ -11,7 +11,7 @@
 
 use crate::{
     core::{config::Config, types::*},
-    integrations::bitget_connector::*,
+    integrations::{UnifiedBitgetConnector, UnifiedBitgetConfig, UnifiedBitgetMessage, UnifiedBitgetChannel, ConnectionMode},
     utils::performance::*,
 };
 use anyhow::Result;
@@ -23,7 +23,7 @@ use std::sync::Arc;
 pub struct HftAppRunner {
     pub config: Config,
     pub performance_manager: PerformanceManager,
-    connector: Option<BitgetConnector>,
+    connector: Option<UnifiedBitgetConnector>,
     reporter: Option<Arc<UnifiedReporter>>,
 }
 
@@ -71,8 +71,8 @@ impl HftAppRunner {
     }
     
     /// 設置Bitget連接器
-    pub fn with_bitget_connector(&mut self, bitget_config: BitgetConfig) -> &mut Self {
-        self.connector = Some(BitgetConnector::new(bitget_config));
+    pub fn with_bitget_connector(&mut self, bitget_config: UnifiedBitgetConfig) -> &mut Self {
+        self.connector = Some(UnifiedBitgetConnector::new(bitget_config));
         self
     }
     
@@ -83,19 +83,19 @@ impl HftAppRunner {
     }
     
     /// 獲取連接器的可變引用
-    pub fn get_connector_mut(&mut self) -> Option<&mut BitgetConnector> {
+    pub fn get_connector_mut(&mut self) -> Option<&mut UnifiedBitgetConnector> {
         self.connector.as_mut()
     }
     
     /// 設置連接器
-    pub fn set_connector(&mut self, connector: Option<BitgetConnector>) {
+    pub fn set_connector(&mut self, connector: Option<UnifiedBitgetConnector>) {
         self.connector = connector;
     }
     
     /// 運行應用 - 標準模式
     pub async fn run<F>(&mut self, message_handler: F) -> Result<()>
     where
-        F: Fn(BitgetMessage) + Send + Sync + 'static,
+        F: Fn(UnifiedBitgetMessage) + Send + Sync + 'static,
     {
         let connector = self.connector.take()
             .ok_or_else(|| anyhow::anyhow!("Bitget connector not configured"))?;
@@ -108,7 +108,7 @@ impl HftAppRunner {
                                      message_handler: F, 
                                      timeout_secs: u64) -> Result<()>
     where
-        F: Fn(BitgetMessage) + Send + Sync + 'static,
+        F: Fn(UnifiedBitgetMessage) + Send + Sync + 'static,
     {
         let connector = self.connector.take()
             .ok_or_else(|| anyhow::anyhow!("Bitget connector not configured"))?;
@@ -129,7 +129,7 @@ impl HftAppRunner {
                                            message_handler: F, 
                                            max_messages: u64) -> Result<()>
     where
-        F: Fn(BitgetMessage) + Send + Sync + 'static,
+        F: Fn(UnifiedBitgetMessage) + Send + Sync + 'static,
     {
         let connector = self.connector.take()
             .ok_or_else(|| anyhow::anyhow!("Bitget connector not configured"))?;
@@ -139,7 +139,7 @@ impl HftAppRunner {
         let message_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let message_count_clone = message_count.clone();
         
-        let wrapped_handler = move |msg: BitgetMessage| {
+        let wrapped_handler = move |msg: UnifiedBitgetMessage| {
             let count = message_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if count < max_messages {
                 message_handler(msg);
@@ -164,10 +164,10 @@ impl HftAppRunner {
     
     /// 核心運行邏輯
     async fn run_with_connector<F>(&mut self, 
-                                   mut connector: BitgetConnector, 
+                                   mut connector: UnifiedBitgetConnector, 
                                    message_handler: F) -> Result<()>
     where
-        F: Fn(BitgetMessage) + Send + Sync + 'static,
+        F: Fn(UnifiedBitgetMessage) + Send + Sync + 'static,
     {
         // 啟動統計報告器
         let reporter_task = if let Some(reporter) = &self.reporter {
@@ -182,7 +182,7 @@ impl HftAppRunner {
         // 創建增強的消息處理器（帶性能監控）
         let reporter = self.reporter.clone();
         
-        let enhanced_handler = move |message: BitgetMessage| {
+        let enhanced_handler = move |message: UnifiedBitgetMessage| {
             let start_time = now_micros();
             
             // 調用用戶處理器
@@ -201,7 +201,7 @@ impl HftAppRunner {
         
         // 運行連接器
         tokio::select! {
-            result = connector.connect_public(enhanced_handler) => {
+            result = connector.start() => {
                 if let Err(e) = result {
                     error!("❌ Connection failed: {}", e);
                     return Err(e);
@@ -324,15 +324,27 @@ impl UnifiedReporter {
 /// 快速創建應用的便利函數
 pub async fn run_simple_app<F>(symbol: &str, handler: F) -> Result<()>
 where
-    F: Fn(BitgetMessage) + Send + Sync + 'static,
+    F: Fn(UnifiedBitgetMessage) + Send + Sync + 'static,
 {
     let mut app = HftAppRunner::new()?;
     
-    let bitget_config = BitgetConfig::default();
+    let bitget_config = UnifiedBitgetConfig {
+        ws_url: "wss://ws.bitget.com/v2/ws/public".to_string(),
+        api_key: None,
+        api_secret: None,
+        passphrase: None,
+        mode: crate::integrations::ConnectionMode::Single,
+        max_reconnect_attempts: 5,
+        reconnect_delay_ms: 1000,
+        enable_compression: true,
+        max_message_size: 1024 * 1024,
+        ping_interval_secs: 30,
+        connection_timeout_secs: 10,
+    };
     app.with_bitget_connector(bitget_config);
     
     let mut connector = app.connector.take().unwrap();
-    connector.add_subscription(symbol.to_string(), BitgetChannel::Books5);
+    let _ = connector.subscribe(&symbol, crate::integrations::UnifiedBitgetChannel::OrderBook).await;
     app.connector = Some(connector);
     
     app.run(handler).await
@@ -341,16 +353,28 @@ where
 /// 快速創建帶超時的應用
 pub async fn run_timed_app<F>(symbol: &str, timeout_secs: u64, handler: F) -> Result<()>
 where
-    F: Fn(BitgetMessage) + Send + Sync + 'static,
+    F: Fn(UnifiedBitgetMessage) + Send + Sync + 'static,
 {
     let mut app = HftAppRunner::new()?;
     
-    let bitget_config = BitgetConfig::default();
+    let bitget_config = UnifiedBitgetConfig {
+        ws_url: "wss://ws.bitget.com/v2/ws/public".to_string(),
+        api_key: None,
+        api_secret: None,
+        passphrase: None,
+        mode: ConnectionMode::Single,
+        max_reconnect_attempts: 5,
+        reconnect_delay_ms: 1000,
+        enable_compression: true,
+        max_message_size: 1024 * 1024,
+        ping_interval_secs: 30,
+        connection_timeout_secs: 10,
+    };
     app.with_bitget_connector(bitget_config)
        .with_reporter(30); // 30秒報告間隔
     
     let mut connector = app.connector.take().unwrap();
-    connector.add_subscription(symbol.to_string(), BitgetChannel::Books5);
+    let _ = connector.subscribe(&symbol, UnifiedBitgetChannel::OrderBook).await;
     app.connector = Some(connector);
     
     app.run_with_timeout(handler, timeout_secs).await

@@ -1,0 +1,35 @@
+# Prometheus configuration for HFT monitoring
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  # The job name is added as a label `job=<job_name>` to any timeseries scraped from this config.
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # HFT system metrics (if we add metrics endpoint later)
+  - job_name: 'hft-system'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+    scrape_interval: 5s
+    metrics_path: /metrics
+
+  # ClickHouse system metrics (if available)
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse:8123']
+    scrape_interval: 30s
+    metrics_path: /metrics
+    
+  # Redis metrics (if redis_exporter is added)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+    scrape_interval: 30s
+    metrics_path: /metrics

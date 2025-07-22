@@ -6,7 +6,8 @@
  */
 
 use crate::utils::feature_store::FeatureStore;
-use crate::integrations::bitget_connector::{BitgetConnector, BitgetConfig, BitgetChannel, BitgetMessage, ReconnectStrategy};
+use crate::integrations::{UnifiedBitgetConnector, UnifiedBitgetConfig, ConnectionMode};
+use crate::integrations::unified_bitget_connector::BitgetChannel;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -70,36 +71,34 @@ impl SymbolRecorder {
     pub async fn start_recording(&mut self, url: String) -> Result<()> {
         info!("Starting Bitget V2 recording for symbol: {} at {}", self.symbol, url);
         
-        // Create Bitget connector configuration
-        let config = BitgetConfig {
-            public_ws_url: url,
-            private_ws_url: "wss://ws.bitget.com/v2/ws/private".to_string(),
-            timeout_seconds: 10,
-            auto_reconnect: true,
+        // Create Unified Bitget connector configuration
+        let config = UnifiedBitgetConfig {
+            ws_url: url,
+            api_key: None,
+            api_secret: None,
+            passphrase: None,
+            mode: ConnectionMode::Single,
             max_reconnect_attempts: 3,
-            reconnect_strategy: ReconnectStrategy::Standard,
+            reconnect_delay_ms: 1000,
+            enable_compression: true,
+            max_message_size: 1024 * 1024,
+            ping_interval_secs: 30,
+            connection_timeout_secs: 10,
         };
         
-        let mut connector = BitgetConnector::new(config);
-        connector.add_subscription(self.symbol.clone(), BitgetChannel::Books5);
+        let mut connector = UnifiedBitgetConnector::new(config);
+        connector.subscribe(&self.symbol, BitgetChannel::OrderBook).await?;
         
-        // Create message handler
+        // Start connector and get message receiver
+        let mut message_rx = connector.start().await?;
         let symbol_clone = self.symbol.clone();
-        let message_handler = move |message: BitgetMessage| {
-            if let Ok(Some(update)) = message.to_orderbook_update() {
-                // Process the orderbook update asynchronously
-                let symbol_inner = symbol_clone.clone();
-                tokio::spawn(async move {
-                    // Note: In a real implementation, we'd need to send this update
-                    // to the recorder through a channel or callback mechanism
-                    debug!("Received orderbook update for {}: {} bids, {} asks", 
-                           symbol_inner, update.bids.len(), update.asks.len());
-                });
-            }
-        };
         
-        // Connect and start streaming
-        connector.connect_public(message_handler).await?;
+        // Process messages from receiver
+        while let Some(message) = message_rx.recv().await {
+            debug!("Received message for {}: channel={:?}", symbol_clone, message.channel);
+            // Note: In a real implementation, we'd need to send this update
+            // to the recorder through a channel or callback mechanism
+        }
         
         info!("Recording stopped for symbol: {}", self.symbol);
         Ok(())
