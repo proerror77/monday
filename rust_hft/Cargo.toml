@@ -97,6 +97,9 @@ num_cpus = "1.16"
 crossbeam-utils = "0.8"
 dashmap = "6.0"
 parking_lot = "0.12"
+
+# Redis 客戶端 (用於快速數據發布)
+redis = "0.27"
 lockfree = "0.5"  # 無鎖數據結構
 
 # 系統級優化
