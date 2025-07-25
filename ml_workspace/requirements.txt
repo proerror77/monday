@@ -1,0 +1,76 @@
+# ML Workspace Requirements - L3 ML-Agent
+# 專責模型訓練、特徵工程、GPU計算
+
+# Agno Framework
+agno>=2.0.0
+
+# Deep Learning Frameworks
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+transformers>=4.30.0
+pytorch-lightning>=2.0.0
+accelerate>=0.20.0
+
+# Scientific Computing
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# Data Processing
+clickhouse-driver>=0.2.6
+redis>=4.5.0
+asyncio-mqtt>=0.11.0
+
+# Feature Engineering
+ta-lib>=0.4.25
+pyarrow>=12.0.0
+polars>=0.18.0
+
+# Model Serialization  
+safetensors>=0.3.0
+onnx>=1.14.0
+onnxruntime-gpu>=1.15.0
+
+# Visualization & Analysis
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.15.0
+tensorboard>=2.13.0
+wandb>=0.15.0
+
+# Performance & Optimization
+numba>=0.57.0
+cupy-cuda12x>=12.0.0  # CUDA 12.x support
+cython>=0.29.0
+
+# Communication & gRPC
+grpcio>=1.50.0
+grpcio-tools>=1.50.0
+protobuf>=4.21.0
+
+# Async & Concurrency
+asyncio>=3.4.0
+uvloop>=0.17.0
+aiofiles>=23.0.0
+
+# Configuration & Logging
+pydantic>=2.0.0
+loguru>=0.7.0
+python-dotenv>=1.0.0
+toml>=0.10.0
+
+# Monitoring & Metrics
+prometheus-client>=0.16.0
+psutil>=5.9.0
+
+# Testing & Development
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-benchmark>=4.0.0
+
+# Quality & Formatting
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0

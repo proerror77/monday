@@ -1,0 +1,281 @@
+// HFT Control gRPC Service Definition
+// 統一的gRPC契約，被rust_hft、ml_workspace、ops_workspace共享
+// 符合PRD第4節的API設計規範
+
+syntax = "proto3";
+
+package hft.control.v1;
+
+option go_package = "github.com/hft/proto/control/v1";
+
+// ========================================
+// Core HFT Control Service
+// ========================================
+
+service HFTControlService {
+  // L1 Rust Engine Control - PRD第2節
+  rpc StartTrading(StartTradingRequest) returns (StartTradingResponse);
+  rpc StopTrading(StopTradingRequest) returns (StopTradingResponse);
+  rpc GetSystemStatus(GetSystemStatusRequest) returns (GetSystemStatusResponse);
+  rpc EmergencyStop(EmergencyStopRequest) returns (EmergencyStopResponse);
+  
+  // L3 ML Model Management - PRD第3.1節
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc GetModelStatus(GetModelStatusRequest) returns (GetModelStatusResponse);
+  
+  // L2 Ops Monitoring - PRD第3.2節
+  rpc SubscribeAlerts(SubscribeAlertsRequest) returns (stream AlertEvent);
+  rpc TriggerAlert(TriggerAlertRequest) returns (TriggerAlertResponse);
+  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+}
+
+// ========================================
+// Trading Control Messages
+// ========================================
+
+message StartTradingRequest {
+  string symbol = 1;                    // 交易對，如 "BTCUSDT"
+  string model_path = 2;                // 模型文件路徑
+  double initial_capital = 3;           // 初始資金 USDT
+  TradingConfig config = 4;             // 交易配置
+}
+
+message StartTradingResponse {
+  bool success = 1;
+  string task_id = 2;                   // 任務ID
+  string error_message = 3;
+  int64 started_at = 4;                 // Unix時間戳
+}
+
+message StopTradingRequest {
+  string task_id = 1;                   // 要停止的任務ID
+  bool force = 2;                       // 是否強制停止
+}
+
+message StopTradingResponse {
+  bool success = 1;
+  string error_message = 2;
+  TradingStats final_stats = 3;         // 最終統計數據
+}
+
+message TradingConfig {
+  double max_position_size = 1;         // 最大倉位
+  double stop_loss_percent = 2;         // 止損百分比
+  double take_profit_percent = 3;       // 止盈百分比
+  int32 max_trades_per_hour = 4;        // 每小時最大交易次數
+  RiskLimits risk_limits = 5;           // 風險限制
+}
+
+message RiskLimits {
+  double max_drawdown_percent = 1;      // 最大回撤百分比 - PRD第3.2.2節
+  double daily_loss_limit = 2;          // 日損失限制
+  int32 max_consecutive_losses = 3;     // 最大連續虧損次數
+}
+
+// ========================================
+// Model Management Messages  
+// ========================================
+
+message LoadModelRequest {
+  string model_path = 1;                // 模型文件路徑
+  string symbol = 2;                    // 目標交易對
+  ModelConfig config = 3;               // 模型配置
+  bool replace_existing = 4;            // 是否替換現有模型
+}
+
+message LoadModelResponse {
+  bool success = 1;
+  string model_id = 2;                  // 模型ID
+  string error_message = 3;
+  int64 loaded_at = 4;                  // 加載時間
+  ModelMetrics metrics = 5;             // 模型性能指標
+}
+
+message UnloadModelRequest {
+  string model_id = 1;                  // 要卸載的模型ID
+}
+
+message UnloadModelResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message GetModelStatusRequest {
+  string model_id = 1;                  // 可選：特定模型ID
+}
+
+message GetModelStatusResponse {
+  repeated ModelStatus models = 1;       // 所有模型狀態
+}
+
+message ModelConfig {
+  int32 sequence_length = 1;            // 序列長度
+  int32 prediction_horizon = 2;         // 預測時間範圍
+  double confidence_threshold = 3;       // 信心閾值
+  bool enable_risk_adjustment = 4;      // 啟用風險調整
+}
+
+message ModelMetrics {
+  double accuracy = 1;                  // 準確率
+  double sharpe_ratio = 2;              // 夏普比率
+  double max_drawdown = 3;              // 最大回撤
+  double information_coefficient = 4;    // 信息係數
+  int64 training_samples = 5;           // 訓練樣本數
+}
+
+message ModelStatus {
+  string model_id = 1;
+  string symbol = 2;
+  string status = 3;                    // "loaded", "training", "unloaded"
+  int64 last_prediction_at = 4;         // 最後預測時間
+  ModelMetrics current_metrics = 5;
+}
+
+// ========================================
+// System Status Messages
+// ========================================
+
+message GetSystemStatusRequest {
+  bool include_detailed_metrics = 1;    // 是否包含詳細指標
+}
+
+message GetSystemStatusResponse {
+  SystemHealth health = 1;              // 系統健康狀態
+  repeated TaskStatus active_tasks = 2;  // 活躍任務
+  SystemMetrics metrics = 3;            // 系統指標
+  int64 uptime_seconds = 4;             // 運行時間
+}
+
+message SystemHealth {
+  string overall_status = 1;            // "healthy", "degraded", "critical"
+  repeated string issues = 2;           // 問題列表
+  double cpu_usage_percent = 3;         // CPU使用率
+  double memory_usage_mb = 4;           // 記憶體使用量
+  double disk_usage_percent = 5;        // 磁碟使用率
+}
+
+message TaskStatus {
+  string task_id = 1;
+  string type = 2;                      // "trading", "training", "evaluation"
+  string status = 3;                    // "running", "paused", "completed"
+  string symbol = 4;
+  int64 started_at = 5;
+  TradingStats stats = 6;               // 當前統計
+}
+
+message TradingStats {
+  double current_capital = 1;           // 當前資金
+  double unrealized_pnl = 2;            // 未實現盈虧
+  double realized_pnl = 3;              // 已實現盈虧
+  int32 total_trades = 4;               // 總交易次數
+  int32 winning_trades = 5;             // 盈利交易次數
+  double win_rate = 6;                  // 勝率
+  double max_drawdown = 7;              // 最大回撤
+}
+
+message SystemMetrics {
+  double execution_latency_us = 1;      // 執行延遲微秒 - PRD第3.2.1節
+  double throughput_per_second = 2;     // 每秒吞吐量
+  double error_rate = 3;                // 錯誤率
+  int64 total_orders_processed = 4;     // 總處理訂單數
+  NetworkStats network = 5;             // 網路統計
+}
+
+message NetworkStats {
+  double websocket_latency_ms = 1;      // WebSocket延遲
+  int64 messages_received = 2;          // 接收消息數
+  int64 messages_sent = 3;              // 發送消息數
+  int32 connection_drops = 4;           // 連接中斷次數
+}
+
+// ========================================
+// Alert and Monitoring Messages
+// ========================================
+
+message SubscribeAlertsRequest {
+  repeated AlertType alert_types = 1;   // 訂閱的告警類型
+  AlertSeverity min_severity = 2;       // 最低嚴重級別
+}
+
+message AlertEvent {
+  string alert_id = 1;
+  AlertType type = 2;
+  AlertSeverity severity = 3;
+  string message = 4;
+  int64 timestamp = 5;
+  map<string, string> metadata = 6;    // 額外元數據
+  string source_component = 7;         // 告警來源組件
+}
+
+message TriggerAlertRequest {
+  AlertType type = 1;
+  AlertSeverity severity = 2;
+  string message = 3;
+  map<string, string> metadata = 4;
+}
+
+message TriggerAlertResponse {
+  bool success = 1;
+  string alert_id = 2;
+  string error_message = 3;
+}
+
+message GetMetricsRequest {
+  repeated string metric_names = 1;     // 指定指標名稱
+  int64 start_time = 2;                 // 開始時間
+  int64 end_time = 3;                   // 結束時間
+}
+
+message GetMetricsResponse {
+  map<string, MetricSeries> metrics = 1;
+}
+
+message MetricSeries {
+  repeated MetricDataPoint data_points = 1;
+}
+
+message MetricDataPoint {
+  int64 timestamp = 1;
+  double value = 2;
+  map<string, string> labels = 3;
+}
+
+// ========================================
+// Emergency Control Messages
+// ========================================
+
+message EmergencyStopRequest {
+  string reason = 1;                    // 停止原因
+  bool force_immediate = 2;             // 立即強制停止
+  repeated string task_ids = 3;         // 特定任務ID（可選）
+}
+
+message EmergencyStopResponse {
+  bool success = 1;
+  string error_message = 2;
+  int32 stopped_tasks = 3;              // 停止的任務數
+  repeated string failed_tasks = 4;     // 停止失敗的任務
+}
+
+// ========================================
+// Enumerations
+// ========================================
+
+enum AlertType {
+  ALERT_TYPE_UNSPECIFIED = 0;
+  ALERT_TYPE_LATENCY = 1;               // 延遲告警 - PRD第3.2.1節
+  ALERT_TYPE_DRAWDOWN = 2;              // 回撤告警 - PRD第3.2.2節
+  ALERT_TYPE_SYSTEM_ERROR = 3;          // 系統錯誤
+  ALERT_TYPE_MODEL_FAILURE = 4;         // 模型失效
+  ALERT_TYPE_NETWORK_ISSUE = 5;         // 網路問題
+  ALERT_TYPE_RISK_BREACH = 6;           // 風險突破
+}
+
+enum AlertSeverity {
+  ALERT_SEVERITY_UNSPECIFIED = 0;
+  ALERT_SEVERITY_LOW = 1;
+  ALERT_SEVERITY_MEDIUM = 2;
+  ALERT_SEVERITY_HIGH = 3;
+  ALERT_SEVERITY_CRITICAL = 4;
+}

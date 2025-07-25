@@ -35,7 +35,7 @@ pub use utils::*;
 
 /// Python模塊定義
 #[pymodule]
-fn rust_hft_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn rust_hft_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // 添加版本信息
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     

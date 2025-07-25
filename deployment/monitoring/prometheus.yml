@@ -1,0 +1,165 @@
+# Prometheus 配置 - Rust HFT × Agno 24/7 AI Trading Platform
+# 監控雙平面架構：Rust執行平面 + Python Agno控制平面
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'hft-production'
+    environment: 'prod'
+
+# 告警規則文件
+rule_files:
+  - "alert_rules.yml"
+
+# 告警管理器配置
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+# 抓取配置
+scrape_configs:
+  # ==========================================
+  # 🦀 Rust HFT 執行平面監控
+  # ==========================================
+  
+  - job_name: 'rust-hft-engine'
+    static_configs:
+      - targets: ['rust-engine:9090']
+    scrape_interval: 5s  # 高頻抓取，監控μs級延遲
+    metrics_path: '/metrics'
+    params:
+      format: ['prometheus']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: rust-engine:9090
+
+  # Rust 引擎詳細指標
+  - job_name: 'rust-hft-detailed'
+    static_configs:
+      - targets: ['rust-engine:9091']
+    scrape_interval: 1s  # 超高頻監控決策延遲
+    metrics_path: '/detailed-metrics'
+    sample_limit: 10000
+
+  # ==========================================
+  # 🐍 Python Agno 控制平面監控  
+  # ==========================================
+  
+  - job_name: 'agno-hft-operations'
+    static_configs:
+      - targets: ['agno-operations:8000']
+    scrape_interval: 10s
+    metrics_path: '/metrics'
+    params:
+      format: ['prometheus']
+
+  # Agent 內部指標
+  - job_name: 'agno-agents-internal'
+    static_configs:
+      - targets: ['agno-operations:8001']
+    scrape_interval: 30s
+    metrics_path: '/internal-metrics'
+
+  # ==========================================
+  # 🗄️ 數據存儲層監控
+  # ==========================================
+  
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse:8123']
+    scrape_interval: 30s
+    metrics_path: '/metrics'
+    params:
+      query: ['SELECT * FROM system.metrics FORMAT Prometheus']
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+    scrape_interval: 15s
+    metrics_path: '/metrics'
+
+  # ==========================================  
+  # 🤖 AI/ML 服務監控
+  # ==========================================
+  
+  - job_name: 'ollama'
+    static_configs:
+      - targets: ['ollama:11434']
+    scrape_interval: 60s
+    metrics_path: '/metrics'
+
+  # ==========================================
+  # 🏗️ 基礎設施監控
+  # ==========================================
+  
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 30s
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 15s
+
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+    scrape_interval: 15s
+    metrics_path: '/metrics'
+
+  # ==========================================
+  # 📊 自定義業務指標
+  # ==========================================
+  
+  - job_name: 'hft-business-metrics'
+    static_configs:
+      - targets: ['rust-engine:9092']  # 自定義業務指標端點
+    scrape_interval: 10s
+    metrics_path: '/business-metrics'
+    params:
+      format: ['prometheus']
+
+  - job_name: 'trading-performance'
+    static_configs:
+      - targets: ['agno-operations:8002']  # 交易性能指標
+    scrape_interval: 5s
+    metrics_path: '/trading-metrics'
+
+# ==========================================
+# 📐 遠程寫入配置 (可選)
+# ==========================================
+
+# remote_write:
+#   - url: "https://your-remote-prometheus/api/v1/write"
+#     basic_auth:
+#       username: "prometheus"
+#       password: "your-password"
+#     queue_config:
+#       max_samples_per_send: 1000
+#       max_shards: 200
+#       capacity: 2500
+
+# ==========================================
+# 🔧 性能調優配置
+# ==========================================
+
+# 存儲配置
+storage:
+  tsdb:
+    retention.time: 30d
+    retention.size: 10GB
+    wal-compression: true
+
+# 查詢配置  
+query:
+  max_concurrency: 20
+  timeout: 2m
+  max_samples: 50000000

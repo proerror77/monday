@@ -1,0 +1,87 @@
+# Dockerfile for ML Workspace - L3 ML-Agent
+# 專責模型訓練、特徵工程、批次處理
+# GPU支持、大內存、訓練框架優化
+
+FROM nvidia/cuda:12.1-devel-ubuntu22.04
+
+# 設置環境變量
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_VISIBLE_DEVICES=0
+ENV TORCH_HOME=/app/cache/torch
+ENV HF_HOME=/app/cache/huggingface
+
+# 設置工作目錄
+WORKDIR /app
+
+# 安裝系統依賴
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    build-essential \
+    cmake \
+    git \
+    curl \
+    wget \
+    unzip \
+    libprotobuf-dev \
+    protobuf-compiler \
+    redis-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# 升級pip並安裝Python依賴
+RUN pip3 install --upgrade pip setuptools wheel
+
+# 複製requirements文件
+COPY ml_workspace/requirements.txt /app/requirements.txt
+
+# 安裝Python依賴（ML專用）
+RUN pip3 install -r requirements.txt
+
+# 複製ml_workspace代碼
+COPY ml_workspace/ /app/ml_workspace/
+COPY protos/ /app/protos/
+
+# 複製共享工具和配置
+COPY deployment/scripts/ /app/scripts/
+
+# 編譯gRPC proto文件
+RUN python3 -m grpc_tools.protoc \
+    --proto_path=/app/protos \
+    --python_out=/app/ml_workspace \
+    --grpc_python_out=/app/ml_workspace \
+    /app/protos/hft_control.proto
+
+# 創建必要目錄
+RUN mkdir -p /app/models /app/data /app/logs /app/cache
+
+# 設置權限
+RUN chmod +x /app/scripts/*.sh
+
+# 健康檢查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python3 -c "import torch; print('GPU:', torch.cuda.is_available())" || exit 1
+
+# 暴露端口（可選，主要用於監控）
+EXPOSE 8001
+
+# 入口點腳本
+COPY deployment/scripts/ml_workspace_entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# 設置用戶（安全性）
+RUN useradd -m -u 1000 ml_user && chown -R ml_user:ml_user /app
+USER ml_user
+
+# 啟動命令
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python3", "-m", "ml_workspace.workflows.training_workflow"]
+
+# 標籤
+LABEL maintainer="HFT Team"
+LABEL description="ML Workspace for L3 ML-Agent - TLOB Model Training"
+LABEL version="1.0.0"
+LABEL gpu.required="true"
+LABEL memory.requirement="16GB"
+LABEL usage="batch_training"

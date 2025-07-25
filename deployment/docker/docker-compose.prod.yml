@@ -1,0 +1,398 @@
+version: '3.8'
+
+# Rust HFT × Agno 24/7 AI Trading Platform - Production Configuration
+# 基於雙平面架構：Rust執行平面 + Python Agno控制平面
+
+networks:
+  hft_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  clickhouse_data:
+    driver: local
+  redis_data:
+    driver: local
+  rust_models:
+    driver: local
+  agno_logs:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+services:
+  # ==========================================
+  # 🗄️ 數據存儲層 (Data Layer)
+  # ==========================================
+  
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1-alpine
+    container_name: hft_clickhouse_prod
+    hostname: clickhouse
+    networks:
+      hft_network:
+        ipv4_address: 172.20.0.10
+    ports:
+      - "8123:8123"  # HTTP接口
+      - "9000:9000"  # TCP接口
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ../rust_hft/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ../rust_hft/clickhouse/multi_symbol_tables.sql:/docker-entrypoint-initdb.d/multi_symbol.sql:ro
+    environment:
+      CLICKHOUSE_DB: hft_db
+      CLICKHOUSE_USER: hft_user
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-hft_secure_2025}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: hft_redis_prod
+    hostname: redis
+    networks:
+      hft_network:
+        ipv4_address: 172.20.0.11
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_secure_2025}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ==========================================
+  # 🦀 Rust HFT 執行平面 (Hot Path <1μs)
+  # ==========================================
+  
+  rust-hft-engine:
+    build:
+      context: ../../rust_hft
+      dockerfile: Dockerfile.prod
+      args:
+        RUST_VERSION: 1.77
+        OPTIMIZATION_LEVEL: 3
+    image: rust-hft:prod-v1.0
+    container_name: hft_rust_engine_prod
+    hostname: rust-engine
+    networks:
+      hft_network:
+        ipv4_address: 172.20.0.20
+    ports:
+      - "8080:8080"  # API接口
+      - "9090:9090"  # 指標接口
+    volumes:
+      - rust_models:/app/models
+      - ../config.yaml:/app/config/production.yaml:ro
+      - agno_logs:/app/logs
+    environment:
+      RUST_LOG: info
+      CONFIG_PATH: /app/config/production.yaml
+      CLICKHOUSE_URL: http://clickhouse:8123
+      REDIS_URL: redis://redis:6379
+      BITGET_API_KEY: ${BITGET_API_KEY}
+      BITGET_SECRET_KEY: ${BITGET_SECRET_KEY}
+      BITGET_PASSPHRASE: ${BITGET_PASSPHRASE}
+      TRADING_MODE: ${TRADING_MODE:-paper}  # paper/live
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    # 性能優化配置
+    cpu_count: 4
+    mem_limit: 2G
+    memswap_limit: 2G
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    sysctls:
+      net.core.rmem_max: 134217728
+      net.core.wmem_max: 134217728
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "200m"
+        max-file: "10"
+
+  # ==========================================
+  # 🐍 Python Agno 控制平面 (Cold Path >1ms)
+  # ==========================================
+  
+  agno-hft-operations:
+    build:
+      context: ../../
+      dockerfile: deployment/docker/Dockerfile.agno
+      args:
+        PYTHON_VERSION: 3.11
+    image: agno-hft:prod-v1.0
+    container_name: hft_agno_operations_prod
+    hostname: agno-operations
+    networks:
+      hft_network:
+        ipv4_address: 172.20.0.30
+    ports:
+      - "8000:8000"  # FastAPI接口
+    volumes:
+      - rust_models:/app/models
+      - agno_logs:/app/logs
+      - ../config.yaml:/app/config/config.yaml:ro
+    environment:
+      PYTHONPATH: /app
+      AGNO_MODE: production
+      CLICKHOUSE_URL: http://clickhouse:8123
+      REDIS_URL: redis://redis:6379
+      RUST_ENGINE_URL: http://rust-engine:8080
+      OLLAMA_API_BASE: http://ollama:11434
+      LOG_LEVEL: INFO
+    depends_on:
+      rust-hft-engine:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    mem_limit: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+  # ==========================================
+  # 🤖 AI/ML 支持服務
+  # ==========================================
+  
+  ollama:
+    image: ollama/ollama:0.1.32
+    container_name: hft_ollama_prod
+    hostname: ollama
+    networks:
+      hft_network:
+        ipv4_address: 172.20.0.40
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama_models:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h
+      OLLAMA_NUM_PARALLEL: 2
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    # GPU支持 (如果可用)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ==========================================
+  # 📊 監控和觀測性
+  # ==========================================
+  
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: hft_prometheus_prod
+    hostname: prometheus
+    networks:
+      hft_network:
+        ipv4_address: 172.20.0.50
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--storage.tsdb.retention.size=10GB'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: hft_grafana_prod
+    hostname: grafana
+    networks:
+      hft_network:
+        ipv4_address: 172.20.0.51
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-grafana_secure_2025}
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+      GF_SERVER_ROOT_URL: http://localhost:3000
+      GF_ANALYTICS_REPORTING_ENABLED: false
+      GF_ANALYTICS_CHECK_FOR_UPDATES: false
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ==========================================
+  # 🛡️ 安全和網關
+  # ==========================================
+  
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: hft_nginx_prod
+    hostname: nginx
+    networks:
+      hft_network:
+        ipv4_address: 172.20.0.60
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../nginx/ssl:/etc/nginx/ssl:ro
+      - ../nginx/html:/usr/share/nginx/html:ro
+    depends_on:
+      - agno-hft-operations
+      - grafana
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ==========================================
+  # 🔄 工具和輔助服務
+  # ==========================================
+  
+  scheduler:
+    build:
+      context: ../../
+      dockerfile: deployment/docker/Dockerfile.scheduler
+    image: hft-scheduler:prod-v1.0
+    container_name: hft_scheduler_prod
+    hostname: scheduler
+    networks:
+      hft_network:
+        ipv4_address: 172.20.0.70
+    volumes:
+      - agno_logs:/app/logs
+      - ../scripts:/app/scripts:ro
+    environment:
+      PYTHONPATH: /app
+      SCHEDULE_CONFIG: /app/config/schedule_config.yml
+      CLICKHOUSE_URL: http://clickhouse:8123
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - clickhouse
+      - redis
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+# ==========================================
+# 🔧 生產環境配置說明
+# ==========================================
+
+# 環境變量文件: .env.prod
+# CLICKHOUSE_PASSWORD=your_secure_clickhouse_password
+# REDIS_PASSWORD=your_secure_redis_password  
+# GRAFANA_PASSWORD=your_secure_grafana_password
+# BITGET_API_KEY=your_bitget_api_key
+# BITGET_SECRET_KEY=your_bitget_secret_key
+# BITGET_PASSPHRASE=your_bitget_passphrase
+# TRADING_MODE=paper  # paper/live
+
+# 部署命令:
+# docker-compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+# 健康檢查:
+# docker-compose -f docker-compose.prod.yml ps
+# docker-compose -f docker-compose.prod.yml logs -f [service_name]
+
+# 擴展命令:
+# docker-compose -f docker-compose.prod.yml up -d --scale agno-hft-operations=3

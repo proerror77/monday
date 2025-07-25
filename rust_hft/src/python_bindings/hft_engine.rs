@@ -7,12 +7,15 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use tokio::runtime::Runtime;
 use tracing::{info, error, debug};
 
 use crate::core::types::*;
 use crate::core::config::Config;
+
+/// 確保全局日誌初始化只執行一次
+static INIT_TRACING: Once = Once::new();
 
 /// HFT引擎的Python包裝器
 #[pyclass]
@@ -125,8 +128,10 @@ impl HftEngine {
     #[new]
     #[pyo3(signature = (config_path=None))]
     pub fn new(config_path: Option<String>) -> PyResult<Self> {
-        // 初始化日誌
-        tracing_subscriber::fmt::init();
+        // 確保全局日誌初始化只執行一次，避免重複設置錯誤
+        INIT_TRACING.call_once(|| {
+            tracing_subscriber::fmt::init();
+        });
         
         info!("🤖 初始化 HFT 引擎 Python 綁定...");
         

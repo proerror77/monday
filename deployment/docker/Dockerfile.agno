@@ -1,0 +1,113 @@
+# Agno HFT Python 控制平面 Dockerfile
+# 基於 uv 包管理器的高性能 Python 環境
+
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim-bullseye as base
+
+# 安裝系統依賴
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安裝 uv 包管理器
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+# 設置工作目錄
+WORKDIR /app
+
+# 設置環境變量
+ENV PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_SYSTEM_PYTHON=1
+
+# ==========================================
+# 📦 依賴安裝階段
+# ==========================================
+
+FROM base as deps
+
+# 複製項目依賴文件
+COPY agno_hft/pyproject.toml agno_hft/uv.lock ./
+
+# 安裝依賴
+RUN uv sync --frozen --no-cache
+
+# ==========================================
+# 🏗️ 應用構建階段  
+# ==========================================
+
+FROM base as builder
+
+# 從依賴階段複製虛擬環境
+COPY --from=deps /app/.venv /app/.venv
+
+# 複製應用代碼
+COPY agno_hft/ ./agno_hft/
+COPY hft_operations_agent.py ./
+COPY ml_workflow_agent.py ./
+COPY final_agno_compliant_workflow.py ./
+COPY agno_production_agent_workflow.py ./
+COPY test_redis_integration.py ./
+COPY config.yaml ./config/
+
+# 複製核心模塊
+COPY core/ ./core/
+COPY workflows/ ./workflows/
+COPY ml/ ./ml/
+
+# 創建必要目錄
+RUN mkdir -p /app/logs /app/models /app/outputs
+
+# ==========================================
+# 🚀 生產運行階段
+# ==========================================
+
+FROM base as production
+
+# 創建非root用戶
+RUN groupadd -r agno && useradd -r -g agno -s /bin/bash agno
+
+# 設置應用目錄所有權
+RUN mkdir -p /app/logs /app/models /app/outputs && \
+    chown -R agno:agno /app
+
+# 從構建階段複製應用
+COPY --from=builder --chown=agno:agno /app /app
+
+# 切換到非root用戶
+USER agno
+
+# 確保虛擬環境在PATH中
+ENV PATH="/app/.venv/bin:$PATH"
+
+# 健康檢查腳本
+COPY deployment/docker/health_check.py /app/health_check.py
+
+# 暴露端口
+EXPOSE 8000
+
+# 健康檢查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python /app/health_check.py
+
+# 啟動腳本
+COPY deployment/docker/start_agno.sh /app/start_agno.sh
+RUN chmod +x /app/start_agno.sh
+
+# 默認啟動命令
+CMD ["/app/start_agno.sh"]
+
+# ==========================================
+# 🏷️ 標籤和元數據
+# ==========================================
+
+LABEL maintainer="HFT Team <hft@company.com>" \
+      version="1.0.0" \
+      description="Agno HFT Python Control Plane" \
+      architecture="agno-framework-v2" \
+      component="control-plane"

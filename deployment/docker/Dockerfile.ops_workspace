@@ -1,0 +1,79 @@
+# Dockerfile for Ops Workspace - L2 Ops-Agent  
+# 專責實時監控、告警處理、風險控制
+# 輕量級、低延遲、7x24小時常駐
+
+FROM python:3.10-slim
+
+# 設置環境變量
+ENV PYTHONUNBUFFERED=1
+ENV REDIS_URL=redis://localhost:6379
+ENV GRPC_PORT=50051
+ENV LOG_LEVEL=INFO
+
+# 設置工作目錄  
+WORKDIR /app
+
+# 安裝系統依賴（最小化）
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libprotobuf-dev \
+    protobuf-compiler \
+    redis-tools \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 升級pip
+RUN pip install --upgrade pip setuptools wheel
+
+# 複製requirements文件
+COPY ops_workspace/requirements.txt /app/requirements.txt
+
+# 安裝Python依賴（輕量級）
+RUN pip install -r requirements.txt
+
+# 複製ops_workspace代碼
+COPY ops_workspace/ /app/ops_workspace/
+COPY protos/ /app/protos/
+
+# 複製共享工具和配置
+COPY deployment/scripts/ /app/scripts/
+
+# 編譯gRPC proto文件
+RUN python3 -m grpc_tools.protoc \
+    --proto_path=/app/protos \
+    --python_out=/app/ops_workspace \
+    --grpc_python_out=/app/ops_workspace \
+    /app/protos/hft_control.proto
+
+# 創建必要目錄
+RUN mkdir -p /app/logs /app/config
+
+# 設置權限
+RUN chmod +x /app/scripts/*.sh  
+
+# 健康檢查（監控Redis和gRPC連接）
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
+    CMD python3 -c "import redis; r=redis.Redis(host='localhost'); r.ping()" || exit 1
+
+# 暴露端口（監控和gRPC）
+EXPOSE 8000 50051
+
+# 入口點腳本
+COPY deployment/scripts/ops_workspace_entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# 設置用戶（安全性）
+RUN useradd -m -u 1001 ops_user && chown -R ops_user:ops_user /app
+USER ops_user
+
+# 啟動命令
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python3", "-m", "ops_workspace.workflows.alert_workflow"]
+
+# 標籤
+LABEL maintainer="HFT Team"
+LABEL description="Ops Workspace for L2 Ops-Agent - Real-time Monitoring"
+LABEL version="1.0.0"
+LABEL gpu.required="false"
+LABEL memory.requirement="2GB"
+LABEL usage="daemon_monitoring"

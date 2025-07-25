@@ -1,0 +1,278 @@
+# HFT系統Docker Compose配置  
+# 基於PRD v2.0架構：L1 Rust + L2 Ops + L3 ML三層分離
+version: '3.8'
+
+services:
+  # ==========================================
+  # L1: Rust HFT 核心引擎 (修改自現有rust_hft)
+  # ==========================================
+  rust-hft-engine:
+    build:
+      context: ../
+      dockerfile: deployment/docker/Dockerfile.rust_hft
+    container_name: hft-rust-engine
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info
+      - CONFIG_PATH=/config/production.yaml
+      - REDIS_URL=redis://redis:6379
+      - CLICKHOUSE_URL=http://clickhouse:8123
+    volumes:
+      - ../rust_hft/config:/config:ro
+      - ../rust_hft/models:/models:ro
+      - rust_logs:/app/logs
+      - rust_data:/app/data
+    depends_on:
+      - redis
+      - clickhouse
+    ports:
+      - "50051:50051"  # gRPC端口
+    networks:
+      - hft-network
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 4G
+        reservations:
+          cpus: "2.0"
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=:50051"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==========================================  
+  # L2: Ops Workspace - 實時監控Agent (7x24常駐)
+  # ==========================================
+  ops-agent:
+    build:
+      context: ../
+      dockerfile: deployment/docker/Dockerfile.ops_workspace
+    container_name: hft-ops-agent
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - GRPC_HOST=rust-hft-engine
+      - GRPC_PORT=50051
+      - LOG_LEVEL=INFO
+      - PROMETHEUS_PORT=8000
+    volumes:
+      - ops_logs:/app/logs
+      - ops_config:/app/config
+    depends_on:
+      - rust-hft-engine
+      - redis
+    ports:
+      - "8000:8000"  # Prometheus監控端口
+    networks:
+      - hft-network
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import redis; redis.Redis(host='redis').ping()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================
+  # L3: ML Workspace - 批次訓練Agent (按需啟動)
+  # ==========================================
+  ml-trainer:
+    build:
+      context: ../
+      dockerfile: deployment/docker/Dockerfile.ml_workspace
+    container_name: hft-ml-trainer
+    restart: "no"  # 批次任務，不自動重啟
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - TORCH_HOME=/app/cache/torch
+      - HF_HOME=/app/cache/huggingface
+      - REDIS_URL=redis://redis:6379
+      - CLICKHOUSE_URL=http://clickhouse:8123
+    volumes:
+      - ml_models:/app/models
+      - ml_data:/app/data
+      - ml_cache:/app/cache
+      - ml_logs:/app/logs
+    depends_on:
+      - redis
+      - clickhouse
+    ports:
+      - "8001:8001"  # 監控端口
+    networks:
+      - hft-network
+    deploy:
+      resources:
+        limits:
+          cpus: "8.0"
+          memory: 16G
+        reservations:
+          cpus: "4.0"
+          memory: 8G
+      restart_policy:
+        condition: none  # 批次任務完成後不重啟
+    runtime: nvidia  # GPU支持
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import torch; print(torch.cuda.is_available())"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+
+  # ==========================================
+  # 基礎設施服務
+  # ==========================================
+  
+  # Redis - 實時消息和緩存
+  redis:
+    image: redis:7.2-alpine
+    container_name: hft-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - hft-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ClickHouse - 歷史數據存儲
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: hft-clickhouse
+    restart: unless-stopped
+    environment:
+      - CLICKHOUSE_DB=hft
+      - CLICKHOUSE_USER=hft_user
+      - CLICKHOUSE_PASSWORD=hft_password
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ../deployment/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    networks:
+      - hft-network
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Prometheus - 監控指標收集
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: hft-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ../deployment/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - hft-network
+    depends_on:
+      - ops-agent
+      - rust-hft-engine
+
+  # Grafana - 監控面板
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: hft-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    volumes:
+      - ../deployment/grafana:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - hft-network
+    depends_on:
+      - prometheus
+
+# ==========================================
+# 網路和存儲配置
+# ==========================================
+
+networks:
+  hft-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  # Rust HFT數據
+  rust_logs:
+    driver: local
+  rust_data:
+    driver: local
+    
+  # Ops Agent數據
+  ops_logs:
+    driver: local
+  ops_config:
+    driver: local
+    
+  # ML Trainer數據
+  ml_models:
+    driver: local
+  ml_data:
+    driver: local
+  ml_cache:
+    driver: local
+  ml_logs:
+    driver: local
+    
+  # 基礎設施數據
+  redis_data:
+    driver: local
+  clickhouse_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# ==========================================
+# 服務編排配置 - 基於PRD工作流程
+# ==========================================
+
+# 生產部署命令示例：
+# docker-compose -f deployment/docker-compose.yml up -d rust-hft-engine redis clickhouse ops-agent
+# docker-compose -f deployment/docker-compose.yml run --rm ml-trainer python3 -m ml_workspace.workflows.training_workflow --symbol BTCUSDT --hours 24
+
+# 開發測試命令：
+# docker-compose -f deployment/docker-compose.yml up --build
+
+# 監控命令：
+# docker-compose -f deployment/docker-compose.yml logs -f ops-agent
+# docker-compose -f deployment/docker-compose.yml exec ops-agent python3 -c "from ops_workspace.workflows.alert_workflow import *; print('Agent Status OK')"
+
+# 清理命令：
+# docker-compose -f deployment/docker-compose.yml down -v
