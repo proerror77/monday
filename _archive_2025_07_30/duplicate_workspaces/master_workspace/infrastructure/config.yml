@@ -1,0 +1,111 @@
+# Master Workspace Infrastructure Configuration
+# ==========================================
+
+infrastructure:
+  # Redis 配置
+  redis:
+    host: "localhost"
+    port: 6379
+    db: 0
+    proxy_enabled: true
+    failover_enabled: true
+    backup_instances:
+      - host: "localhost"
+        port: 6380
+        db: 0
+        read_only: false
+      # 可添加更多備用實例
+
+  # ClickHouse 配置  
+  clickhouse:
+    host: "localhost"
+    port: 9000
+    database: "hft"
+    proxy_enabled: true
+    cluster_enabled: false
+    backup_instances:
+      - host: "localhost"
+        port: 9001
+        database: "hft"
+        read_only: true
+      # 可添加更多備用/只讀實例
+
+  # Docker 配置
+  docker:
+    compose_file: "docker-compose.yml"
+    project_name: "hft-master"
+    auto_restart: true
+    health_check_interval: 30
+
+  # 遷移配置
+  migration:
+    phase: "Phase0_Preparation"
+    traffic_split_percent: 0
+    rollback_enabled: true
+    canary_deployment: false
+    
+    # 遷移時間表
+    phases:
+      Phase0_Preparation:
+        description: "準備階段 - 建立代理和測試"
+        duration_days: 2
+        traffic_percent: 0
+      
+      Phase1_Infrastructure:
+        description: "基礎設施遷移"
+        duration_days: 3
+        traffic_percent: 20
+      
+      Phase2_Service_Proxy:
+        description: "服務代理實施"
+        duration_days: 5
+        traffic_percent: 50
+      
+      Phase3_Traffic_Switch:
+        description: "流量切換"
+        duration_days: 7
+        traffic_percent: 100
+      
+      Phase4_Validation:
+        description: "驗證和清理"
+        duration_days: 3
+        traffic_percent: 100
+
+# 健康檢查配置
+health_check:
+  enabled: true
+  interval_seconds: 30
+  
+  # 告警閾值
+  alert_thresholds:
+    cpu_usage: 80.0
+    memory_usage: 80.0
+    disk_usage: 85.0
+    redis_latency_ms: 10.0
+    clickhouse_latency_ms: 100.0
+    service_downtime_minutes: 5.0
+
+# 日誌配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "/var/log/hft/master_workspace.log"
+  max_size_mb: 100
+  backup_count: 5
+
+# 監控配置
+monitoring:
+  prometheus:
+    enabled: true
+    port: 8090
+    path: "/metrics"
+  
+  grafana:
+    enabled: true
+    port: 3000
+    admin_password: "hft_admin"
+  
+  alerts:
+    enabled: true
+    webhook_url: ""  # Slack/Discord webhook URL
+    email_recipients: []

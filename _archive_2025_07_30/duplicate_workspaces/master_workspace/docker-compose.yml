@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  master_workspace-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: master_workspace-ui
+    ports:
+      - "8503:8503"
+    environment:
+      - RUNTIME_ENV=dev
+      - REDIS_URL=redis://host.docker.internal:6379
+      - CLICKHOUSE_URL=http://host.docker.internal:8123
+      - RUST_GRPC_URL=http://host.docker.internal:50051
+    command: streamlit run ui/main.py --server.port=8503 --server.address=0.0.0.0 --server.headless=true
+    restart: unless-stopped
+    networks:
+      - hft-network
+
+  master_workspace-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: master_workspace-api  
+    ports:
+      - "8002:8002"
+    environment:
+      - RUNTIME_ENV=dev
+      - REDIS_URL=redis://host.docker.internal:6379
+      - CLICKHOUSE_URL=http://host.docker.internal:8123
+      - RUST_GRPC_URL=http://host.docker.internal:50051
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8002 --reload
+    restart: unless-stopped
+    networks:
+      - hft-network
+
+networks:
+  hft-network:
+    external: true

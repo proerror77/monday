@@ -1,0 +1,510 @@
+# HFT System Fixed Docker Compose Stack
+# 修复了workspace依赖关系和启动顺序问题
+# 包含正确的健康检查和服务发现配置
+
+services:
+  # =============================================================================
+  # Phase 0: 基础设施服务 (Infrastructure Services)
+  # =============================================================================
+  
+  hft-redis:
+    image: redis:7-alpine
+    container_name: hft-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - hft_redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - hft-shared
+    environment:
+      REDIS_DATABASES: 16
+
+  hft-clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: hft-clickhouse
+    restart: unless-stopped
+    ports:
+      - "8123:8123"  # HTTP
+      - "9000:9000"  # Native
+    volumes:
+      - hft_clickhouse_data:/var/lib/clickhouse
+      - ./rust_hft/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - hft-shared
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+
+  # PostgreSQL databases for each workspace
+  hft-master-db:
+    image: pgvector/pgvector:pg16
+    container_name: hft-master-db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    volumes:
+      - hft_master_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ai
+      POSTGRES_PASSWORD: ai
+      POSTGRES_DB: ai
+      PGDATA: /var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai -d ai -h localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - hft-master
+
+  hft-ops-db:
+    image: pgvector/pgvector:pg16
+    container_name: hft-ops-db
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    volumes:
+      - hft_ops_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ai
+      POSTGRES_PASSWORD: ai
+      POSTGRES_DB: ai
+      PGDATA: /var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai -d ai -h localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - hft-ops
+
+  hft-ml-db:
+    image: pgvector/pgvector:pg16
+    container_name: hft-ml-db
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    volumes:
+      - hft_ml_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ai
+      POSTGRES_PASSWORD: ai
+      POSTGRES_DB: ai
+      PGDATA: /var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai -d ai -h localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - hft-ml
+
+  # =============================================================================
+  # Phase 1: Rust HFT 核心引擎 (Core Trading Engine)
+  # =============================================================================
+  
+  rust-hft:
+    build:
+      context: ./rust_hft
+      dockerfile: Dockerfile
+    image: local/rust-hft:dev
+    container_name: rust-hft
+    restart: unless-stopped
+    ports:
+      - "50051:50051"  # gRPC
+      - "9090:9090"    # Prometheus metrics
+    volumes:
+      - ./rust_hft:/app
+      - ./shared_config:/app/config
+      - ./models:/app/models:ro
+    environment:
+      RUST_LOG: info
+      REDIS_URL: redis://hft-redis:6379
+      CLICKHOUSE_URL: http://hft-clickhouse:8123
+      GRPC_PORT: 50051
+      METRICS_PORT: 9090
+      CONFIG_PATH: /app/config
+    command: ["cargo", "run", "--release", "--bin", "rust_hft"]
+    depends_on:
+      hft-redis:
+        condition: service_healthy
+      hft-clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "grpc_health_probe", "-addr=localhost:50051"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - hft-shared
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+
+  # =============================================================================
+  # Phase 2: Ops Workspace (运维监控工作区)
+  # =============================================================================
+  
+  hft-ops-api:
+    build:
+      context: ./hft-ops-workspace
+      dockerfile: Dockerfile
+    image: local/hft-ops:dev
+    container_name: hft-ops-api
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./hft-ops-workspace:/app
+      - ./shared_config:/app/shared_config:ro
+    environment:
+      RUNTIME_ENV: dev
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-ops-db
+      DB_PORT: 5432
+      DB_USER: ai
+      DB_PASS: ai
+      DB_DATABASE: ai
+      REDIS_URL: redis://hft-redis:6379
+      RUST_HFT_GRPC: rust-hft:50051
+      CLICKHOUSE_URL: http://hft-clickhouse:8123
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "True"
+      PYTHONPATH: "/app"
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8003", "--reload"]
+    depends_on:
+      hft-ops-db:
+        condition: service_healthy
+      hft-redis:
+        condition: service_healthy
+      rust-hft:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - hft-ops
+      - hft-shared
+
+  hft-ops-ui:
+    image: local/hft-ops:dev
+    container_name: hft-ops-ui
+    restart: unless-stopped
+    ports:
+      - "8503:8503"
+    volumes:
+      - ./hft-ops-workspace:/app
+      - ./shared_config:/app/shared_config:ro
+    environment:
+      RUNTIME_ENV: dev
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-ops-db
+      DB_PORT: 5432
+      DB_USER: ai
+      DB_PASS: ai
+      DB_DATABASE: ai
+      REDIS_URL: redis://hft-redis:6379
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "False"  # API已经迁移过了
+      PYTHONPATH: "/app"
+    command: ["streamlit", "run", "ui/Home.py", "--server.port", "8503", "--server.headless", "true"]
+    depends_on:
+      hft-ops-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8503/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    networks:
+      - hft-ops
+      - hft-shared
+
+  # =============================================================================
+  # Phase 3: ML Workspace (机器学习工作区)
+  # =============================================================================
+  
+  hft-ml-api:
+    build:
+      context: ./hft-ml-workspace
+      dockerfile: Dockerfile
+    image: local/hft-ml:dev
+    container_name: hft-ml-api
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./hft-ml-workspace:/app
+      - ./shared_config:/app/shared_config:ro
+      - ./models:/app/models
+      - ./outputs:/app/outputs
+    environment:
+      RUNTIME_ENV: dev
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-ml-db
+      DB_PORT: 5432
+      DB_USER: ai
+      DB_PASS: ai
+      DB_DATABASE: ai
+      REDIS_URL: redis://hft-redis:6379
+      CLICKHOUSE_URL: http://hft-clickhouse:8123
+      RUST_HFT_GRPC: rust-hft:50051
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "True"
+      PYTHONPATH: "/app"
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+    depends_on:
+      hft-ml-db:
+        condition: service_healthy
+      hft-clickhouse:
+        condition: service_healthy
+      hft-redis:
+        condition: service_healthy
+      rust-hft:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 90s  # ML工作区需要更长的启动时间
+    networks:
+      - hft-ml
+      - hft-shared
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+
+  hft-ml-ui:
+    image: local/hft-ml:dev
+    container_name: hft-ml-ui
+    restart: unless-stopped
+    ports:
+      - "8502:8502"
+    volumes:
+      - ./hft-ml-workspace:/app
+      - ./shared_config:/app/shared_config:ro
+      - ./models:/app/models
+      - ./outputs:/app/outputs
+    environment:
+      RUNTIME_ENV: dev
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-ml-db
+      DB_PORT: 5432
+      DB_USER: ai
+      DB_PASS: ai
+      DB_DATABASE: ai
+      REDIS_URL: redis://hft-redis:6379
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "False"
+      PYTHONPATH: "/app"
+    command: ["streamlit", "run", "ui/Home.py", "--server.port", "8502", "--server.headless", "true"]
+    depends_on:
+      hft-ml-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8502/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - hft-ml
+      - hft-shared
+
+  # =============================================================================
+  # Phase 4: Master Workspace (主控工作区)
+  # =============================================================================
+  
+  hft-master-api:
+    build:
+      context: ./hft-master-workspace
+      dockerfile: Dockerfile
+    image: local/hft-master:dev
+    container_name: hft-master-api
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./hft-master-workspace:/app
+      - ./shared_config:/app/shared_config:ro
+    environment:
+      RUNTIME_ENV: dev
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-master-db
+      DB_PORT: 5432
+      DB_USER: ai
+      DB_PASS: ai
+      DB_DATABASE: ai
+      REDIS_URL: redis://hft-redis:6379
+      RUST_HFT_GRPC: rust-hft:50051
+      OPS_API_URL: http://hft-ops-api:8003
+      ML_API_URL: http://hft-ml-api:8001
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "True"
+      PYTHONPATH: "/app"
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
+    depends_on:
+      hft-master-db:
+        condition: service_healthy
+      rust-hft:
+        condition: service_healthy
+      hft-ops-api:
+        condition: service_healthy
+      hft-ml-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - hft-master
+      - hft-shared
+
+  hft-master-ui:
+    image: local/hft-master:dev
+    container_name: hft-master-ui
+    restart: unless-stopped
+    ports:
+      - "8504:8504"
+    volumes:
+      - ./hft-master-workspace:/app
+      - ./shared_config:/app/shared_config:ro
+    environment:
+      RUNTIME_ENV: dev
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-master-db
+      DB_PORT: 5432
+      DB_USER: ai
+      DB_PASS: ai
+      DB_DATABASE: ai
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "False"
+      PYTHONPATH: "/app"
+    command: ["streamlit", "run", "ui/Home.py", "--server.port", "8504", "--server.headless", "true"]
+    depends_on:
+      hft-master-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8504/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    networks:
+      - hft-master
+      - hft-shared
+
+  # =============================================================================
+  # 辅助服务: Workspace Coordinator
+  # =============================================================================
+  
+  workspace-coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    image: local/workspace-coordinator:dev
+    container_name: workspace-coordinator
+    restart: unless-stopped
+    volumes:
+      - ./shared_config:/app/shared_config:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      PYTHONPATH: "/app"
+      LOG_LEVEL: INFO
+    command: ["python", "workspace_coordinator.py"]
+    depends_on:
+      hft-redis:
+        condition: service_healthy
+    networks:
+      - hft-shared
+    profiles:
+      - monitoring
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  hft-shared:
+    driver: bridge
+    name: hft-shared
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+  hft-master:
+    driver: bridge
+    name: hft-master
+  hft-ops:
+    driver: bridge
+    name: hft-ops
+  hft-ml:
+    driver: bridge
+    name: hft-ml
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  hft_redis_data:
+    driver: local
+  hft_clickhouse_data:
+    driver: local
+  hft_master_db_data:
+    driver: local
+  hft_ops_db_data:
+    driver: local
+  hft_ml_db_data:
+    driver: local

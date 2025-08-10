@@ -7,6 +7,7 @@
 
 pub mod features;
 pub mod lob_time_series_extractor;
+pub mod lob_extractor;
 
 #[cfg(feature = "torchscript")]
 pub mod torchscript_inference;

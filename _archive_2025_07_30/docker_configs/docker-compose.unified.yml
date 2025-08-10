@@ -1,0 +1,635 @@
+# HFT System Unified Docker Compose Configuration
+# 統一的Docker資源架構 - 解決配置衝突和重複定義問題
+# Author: Docker Integration Expert
+# Version: 1.0
+
+version: '3.8'
+
+# =============================================================================
+# INFRASTRUCTURE SERVICES (Core Layer - L0)
+# 基礎設施服務必須先於應用服務啟動
+# =============================================================================
+services:
+  # Redis - 實時消息隊列和緩存
+  hft-redis:
+    image: redis:7.2-alpine
+    container_name: hft-redis
+    restart: unless-stopped
+    ports:
+      - "${HFT_REDIS_PORT:-6379}:6379"
+    volumes:
+      - hft_redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 60
+      --timeout 300
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - hft-infrastructure
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # ClickHouse - 時序數據存儲
+  hft-clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    container_name: hft-clickhouse
+    restart: unless-stopped
+    ports:
+      - "${HFT_CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${HFT_CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    volumes:
+      - hft_clickhouse_data:/var/lib/clickhouse
+      - hft_clickhouse_logs:/var/log/clickhouse-server
+      - ./rust_hft/clickhouse:/etc/clickhouse-server/config.d:ro
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-hft}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - hft-infrastructure
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '2.0'
+          memory: 4G
+
+  # Prometheus - 監控指標收集
+  hft-prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: hft-prometheus
+    restart: unless-stopped
+    ports:
+      - "${HFT_PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - hft_prometheus_data:/prometheus
+      - hft_prometheus_config:/etc/prometheus/config:ro
+    command:
+      - '--config.file=/etc/prometheus/config/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--log.level=info'
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - hft-infrastructure
+      - hft-monitoring
+    depends_on:
+      hft-redis:
+        condition: service_healthy
+      hft-clickhouse:
+        condition: service_healthy
+
+  # Grafana - 監控面板
+  hft-grafana:
+    image: grafana/grafana:10.2.0
+    container_name: hft-grafana
+    restart: unless-stopped
+    ports:
+      - "${HFT_GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - hft_grafana_data:/var/lib/grafana
+      - hft_grafana_config:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin123}
+      GF_USERS_ALLOW_SIGN_UP: false
+      GF_SERVER_ROOT_URL: http://localhost:3000
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - hft-monitoring
+    depends_on:
+      - hft-prometheus
+
+# =============================================================================
+# RUST HFT CORE ENGINE (L1 Layer)
+# Rust核心引擎 - 微秒級交易執行
+# =============================================================================
+  
+  # Rust HFT 核心引擎
+  hft-rust-core:
+    build:
+      context: ./rust_hft
+      dockerfile: Dockerfile
+      target: production
+    image: hft/rust-core:latest
+    container_name: hft-rust-core
+    restart: unless-stopped
+    ports:
+      - "${HFT_GRPC_PORT:-50051}:50051"  # gRPC API
+      - "${HFT_METRICS_PORT:-8080}:8080" # Metrics endpoint
+    volumes:
+      - hft_rust_logs:/app/logs
+      - hft_rust_data:/app/data
+      - hft_rust_models:/app/models
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      REDIS_URL: redis://hft-redis:6379
+      CLICKHOUSE_URL: http://hft-clickhouse:8123
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-hft}
+      GRPC_PORT: 50051
+      METRICS_PORT: 8080
+    healthcheck:
+      test: ["CMD", "/app/health-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - hft-infrastructure
+      - hft-trading
+    depends_on:
+      hft-redis:
+        condition: service_healthy
+      hft-clickhouse:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '6.0'
+          memory: 8G
+        reservations:
+          cpus: '4.0'
+          memory: 4G
+    # 使用低延遲網絡配置
+    sysctls:
+      - net.core.rmem_max=134217728
+      - net.core.wmem_max=134217728
+
+# =============================================================================
+# AGNO WORKSPACES (L2/L3 Layers)
+# Agno工作區 - 智能代理和機器學習
+# =============================================================================
+
+  # Master Workspace Database
+  hft-master-db:
+    image: pgvector/pgvector:pg16
+    container_name: hft-master-db
+    restart: unless-stopped
+    ports:
+      - "${HFT_MASTER_DB_PORT:-5432}:5432"
+    volumes:
+      - hft_master_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${MASTER_DB_USER:-ai}
+      POSTGRES_PASSWORD: ${MASTER_DB_PASS:-ai}
+      POSTGRES_DB: ${MASTER_DB_DATABASE:-ai}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MASTER_DB_USER:-ai} -d ${MASTER_DB_DATABASE:-ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - hft-master
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+
+  # Master Workspace UI
+  hft-master-ui:
+    build:
+      context: ./hft-master-workspace
+      dockerfile: Dockerfile
+    image: hft/master-ui:latest
+    container_name: hft-master-ui
+    restart: unless-stopped
+    ports:
+      - "${HFT_MASTER_UI_PORT:-8504}:8504"
+    volumes:
+      - ./hft-master-workspace:/app
+      - hft_master_cache:/app/cache
+    environment:
+      RUNTIME_ENV: ${RUNTIME_ENV:-dev}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-master-db
+      DB_PORT: 5432
+      DB_USER: ${MASTER_DB_USER:-ai}
+      DB_PASS: ${MASTER_DB_PASS:-ai}
+      DB_DATABASE: ${MASTER_DB_DATABASE:-ai}
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "True"
+      PYTHONPATH: "/app"
+      # Infrastructure connections
+      REDIS_URL: redis://hft-redis:6379
+      CLICKHOUSE_URL: http://hft-clickhouse:8123
+    command: ["streamlit", "run", "ui/Home.py", "--server.port", "8504", "--server.headless", "true"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8504/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hft-master
+      - hft-infrastructure
+    depends_on:
+      hft-master-db:
+        condition: service_healthy
+      hft-redis:
+        condition: service_healthy
+      hft-clickhouse:
+        condition: service_healthy
+
+  # Master Workspace API
+  hft-master-api:
+    image: hft/master-ui:latest
+    container_name: hft-master-api
+    restart: unless-stopped
+    ports:
+      - "${HFT_MASTER_API_PORT:-8002}:8002"
+    volumes:
+      - ./hft-master-workspace:/app
+      - hft_master_cache:/app/cache
+    environment:
+      RUNTIME_ENV: ${RUNTIME_ENV:-dev}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-master-db
+      DB_PORT: 5432
+      DB_USER: ${MASTER_DB_USER:-ai}
+      DB_PASS: ${MASTER_DB_PASS:-ai}
+      DB_DATABASE: ${MASTER_DB_DATABASE:-ai}
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "True"
+      # Infrastructure connections
+      REDIS_URL: redis://hft-redis:6379
+      CLICKHOUSE_URL: http://hft-clickhouse:8123
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hft-master
+      - hft-infrastructure
+    depends_on:
+      hft-master-db:
+        condition: service_healthy
+      hft-redis:
+        condition: service_healthy
+
+  # Ops Workspace Database
+  hft-ops-db:
+    image: pgvector/pgvector:pg16
+    container_name: hft-ops-db
+    restart: unless-stopped
+    ports:
+      - "${HFT_OPS_DB_PORT:-5434}:5432"
+    volumes:
+      - hft_ops_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${OPS_DB_USER:-ai}
+      POSTGRES_PASSWORD: ${OPS_DB_PASS:-ai}
+      POSTGRES_DB: ${OPS_DB_DATABASE:-ai}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${OPS_DB_USER:-ai} -d ${OPS_DB_DATABASE:-ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - hft-ops
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # Ops Workspace - Real-time Monitoring Agent
+  hft-ops-agent:
+    build:
+      context: ./hft-ops-workspace
+      dockerfile: Dockerfile
+    image: hft/ops-agent:latest
+    container_name: hft-ops-agent
+    restart: unless-stopped
+    ports:
+      - "${HFT_OPS_UI_PORT:-8503}:8503"
+      - "${HFT_OPS_API_PORT:-8003}:8003"
+    volumes:
+      - ./hft-ops-workspace:/app
+      - hft_ops_logs:/app/logs
+    environment:
+      RUNTIME_ENV: ${RUNTIME_ENV:-dev}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-ops-db
+      DB_PORT: 5432
+      DB_USER: ${OPS_DB_USER:-ai}
+      DB_PASS: ${OPS_DB_PASS:-ai}
+      DB_DATABASE: ${OPS_DB_DATABASE:-ai}
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "True"
+      # Infrastructure connections
+      REDIS_URL: redis://hft-redis:6379
+      CLICKHOUSE_URL: http://hft-clickhouse:8123
+      # Rust Core gRPC connection
+      HFT_GRPC_HOST: hft-rust-core
+      HFT_GRPC_PORT: 50051
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import redis; redis.Redis(host='hft-redis').ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hft-ops
+      - hft-infrastructure
+      - hft-trading
+    depends_on:
+      hft-ops-db:
+        condition: service_healthy
+      hft-redis:
+        condition: service_healthy
+      hft-rust-core:
+        condition: service_healthy
+
+  # ML Workspace Database  
+  hft-ml-db:
+    image: pgvector/pgvector:pg16
+    container_name: hft-ml-db
+    restart: unless-stopped
+    ports:
+      - "${HFT_ML_DB_PORT:-5433}:5432"
+    volumes:
+      - hft_ml_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${ML_DB_USER:-ai}
+      POSTGRES_PASSWORD: ${ML_DB_PASS:-ai}
+      POSTGRES_DB: ${ML_DB_DATABASE:-ai}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ML_DB_USER:-ai} -d ${ML_DB_DATABASE:-ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - hft-ml
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # ML Workspace - Batch Training Agent  
+  hft-ml-trainer:
+    build:
+      context: ./hft-ml-workspace
+      dockerfile: Dockerfile
+    image: hft/ml-trainer:latest
+    container_name: hft-ml-trainer
+    restart: "no"  # 批次任務，按需運行
+    ports:
+      - "${HFT_ML_UI_PORT:-8502}:8502"
+      - "${HFT_ML_API_PORT:-8001}:8001"
+    volumes:
+      - ./hft-ml-workspace:/app
+      - hft_ml_models:/app/models
+      - hft_ml_data:/app/data
+      - hft_ml_cache:/app/cache
+      - hft_ml_logs:/app/logs
+    environment:
+      RUNTIME_ENV: ${RUNTIME_ENV:-dev}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXA_API_KEY: ${EXA_API_KEY}
+      AGNO_MONITOR: "True"
+      AGNO_API_KEY: ${AGNO_API_KEY}
+      DB_HOST: hft-ml-db
+      DB_PORT: 5432
+      DB_USER: ${ML_DB_USER:-ai}
+      DB_PASS: ${ML_DB_PASS:-ai}
+      DB_DATABASE: ${ML_DB_DATABASE:-ai}
+      WAIT_FOR_DB: "True"
+      MIGRATE_DB: "True"
+      # ML specific
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      TORCH_HOME: /app/cache/torch
+      HF_HOME: /app/cache/huggingface
+      # Infrastructure connections
+      REDIS_URL: redis://hft-redis:6379
+      CLICKHOUSE_URL: http://hft-clickhouse:8123
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import torch; print('GPU Available:', torch.cuda.is_available())"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+    networks:
+      - hft-ml
+      - hft-infrastructure
+    depends_on:
+      hft-ml-db:
+        condition: service_healthy
+      hft-clickhouse:
+        condition: service_healthy
+      hft-redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'
+          memory: 16G
+        reservations:
+          cpus: '4.0'
+          memory: 8G
+    # GPU支持（如果可用）
+    runtime: nvidia
+
+# =============================================================================
+# NETWORKS CONFIGURATION
+# 分層網絡架構確保安全隔離和高效通信
+# =============================================================================
+networks:
+  # 基礎設施網絡 - 所有基礎服務
+  hft-infrastructure:
+    driver: bridge
+    name: hft-infrastructure
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
+
+  # 交易網絡 - Rust核心和Ops監控
+  hft-trading:
+    driver: bridge
+    name: hft-trading
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
+          gateway: 172.21.0.1
+
+  # 監控網絡 - Prometheus和Grafana
+  hft-monitoring:
+    driver: bridge
+    name: hft-monitoring
+    ipam:
+      config:
+        - subnet: 172.22.0.0/24
+          gateway: 172.22.0.1
+
+  # Master工作區網絡
+  hft-master:
+    driver: bridge
+    name: hft-master
+    ipam:
+      config:
+        - subnet: 172.23.0.0/24
+          gateway: 172.23.0.1
+
+  # Ops工作區網絡
+  hft-ops:
+    driver: bridge
+    name: hft-ops
+    ipam:
+      config:
+        - subnet: 172.24.0.0/24
+          gateway: 172.24.0.1
+
+  # ML工作區網絡
+  hft-ml:
+    driver: bridge
+    name: hft-ml
+    ipam:
+      config:
+        - subnet: 172.25.0.0/24
+          gateway: 172.25.0.1
+
+# =============================================================================
+# VOLUMES CONFIGURATION
+# 持久化存儲配置
+# =============================================================================
+volumes:
+  # Infrastructure volumes
+  hft_redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/redis
+  
+  hft_clickhouse_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/clickhouse
+  
+  hft_clickhouse_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./logs/clickhouse
+
+  hft_prometheus_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/prometheus
+
+  hft_prometheus_config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./config/prometheus
+
+  hft_grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/grafana
+
+  hft_grafana_config:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./config/grafana
+
+  # Rust Core volumes
+  hft_rust_logs:
+    driver: local
+  hft_rust_data:
+    driver: local
+  hft_rust_models:
+    driver: local
+
+  # Master Workspace volumes
+  hft_master_db_data:
+    driver: local
+  hft_master_cache:
+    driver: local
+
+  # Ops Workspace volumes
+  hft_ops_db_data:
+    driver: local
+  hft_ops_logs:
+    driver: local
+
+  # ML Workspace volumes
+  hft_ml_db_data:
+    driver: local
+  hft_ml_models:
+    driver: local
+  hft_ml_data:
+    driver: local
+  hft_ml_cache:
+    driver: local
+  hft_ml_logs:
+    driver: local

@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hft-master-workspace"
+version = "1.0.0"
+description = "HFT System Master Controller - Agno Workspace"
+authors = [
+    {name = "HFT Developer", email = "dev@hft.com"}
+]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    # Agno Framework
+    "agno[team]>=1.7.6",
+    
+    # System Management
+    "psutil>=6.0.0",
+    "redis>=5.1.1",
+    "aiohttp>=3.10.11",
+    
+    # Async Support
+    "asyncio",
+    "asyncio-compat",
+    
+    # Data Processing
+    "pandas>=2.2.3",
+    "numpy>=1.24.0",
+    
+    # Logging and Monitoring
+    "structlog>=24.4.0",
+    "rich>=13.9.4",
+    
+    # Configuration
+    "pydantic>=2.10.3",
+    "python-dotenv>=1.0.1",
+    
+    # Development Tools
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "black>=24.10.0",
+    "isort>=5.13.2",
+    "mypy>=1.13.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/hft-team/master-workspace"
+Repository = "https://github.com/hft-team/master-workspace.git"
+
+[tool.hatch.build.targets.wheel]
+packages = ["workspace"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--verbose",
+]
