@@ -9,7 +9,7 @@
  */
 
 use anyhow::Result;
-use chrono::{DateTime, Utc, TimeZone};
+use chrono::Utc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};

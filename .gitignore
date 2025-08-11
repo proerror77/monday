@@ -91,3 +91,21 @@ $RECYCLE.BIN/
 
 # Large binary directories
 rust_hft/target/
+# UI build and logs
+hft_ui_nextjs/.next/
+hft_ui_nextjs/node_modules/
+hft_ui_nextjs/*.log
+hft_ui_nextjs/**/*.log
+
+# General logs and large artifacts
+*.log
+*.rdb
+*.tmp
+*.cache
+
+# Python venv
+**/.venv/
+**/__pycache__/
+
+# Rust target
+**/target/

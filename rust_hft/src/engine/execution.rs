@@ -20,6 +20,18 @@ use serde_json;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// 統一的執行請求結構（由策略信號轉換而來）
+#[derive(Debug, Clone)]
+pub struct ExecutionRequest {
+    pub signal_type: SignalType,
+    pub confidence: f64,
+    pub suggested_price: Price,
+    pub suggested_quantity: Quantity,
+    pub timestamp: Timestamp,
+    pub features_timestamp: Timestamp,
+    pub signal_latency_us: u64,
+}
+
 /// Execution statistics
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionStats {
@@ -37,7 +49,7 @@ pub struct ExecutionStats {
 /// Main execution thread entry point
 pub fn run(
     config: Config,
-    signal_rx: Receiver<TradingSignal>,
+    signal_rx: Receiver<ExecutionRequest>,
 ) -> Result<()> {
     info!("🎯 Execution thread starting...");
     
@@ -100,7 +112,7 @@ impl OrderExecutor {
     /// Execute trading signal
     fn execute_signal(
         &mut self,
-        signal: TradingSignal,
+        signal: ExecutionRequest,
         _execution_start: Timestamp,
     ) -> Result<()> {
         let start_time = now_micros();
@@ -152,7 +164,7 @@ impl OrderExecutor {
     /// Create order from trading signal
     fn create_order_from_signal(
         &self,
-        signal: TradingSignal,
+        signal: ExecutionRequest,
         order_id: String,
     ) -> Result<Order> {
         let side = match signal.signal_type {
@@ -328,8 +340,8 @@ mod tests {
     fn test_order_creation_from_signal() {
         let config = Config::default();
         let executor = OrderExecutor::new(config).unwrap();
-        
-        let signal = TradingSignal {
+
+        let signal = ExecutionRequest {
             signal_type: SignalType::Buy,
             confidence: 0.8,
             suggested_price: 100.0.to_price(),

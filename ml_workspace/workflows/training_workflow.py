@@ -304,7 +304,6 @@ class TLOBTrainingWorkflow(Workflow):
     async def _notify_deployment_ready(self, training_results: Dict[str, Any]):
         """通知部署就緒"""
         if training_results.get("deployment_ready"):
-            # 發送Redis通知到ml.deploy channel
             notification = {
                 "event": "model_ready",
                 "symbol": self.symbol,
@@ -312,9 +311,17 @@ class TLOBTrainingWorkflow(Workflow):
                 "metrics": training_results.get("metrics", {}),
                 "timestamp": datetime.now().isoformat()
             }
-            
-            # TODO: 實現Redis發布邏輯
-            logger.info(f"📡 發送模型就緒通知: {notification}")
+            # 發送Redis通知到ml.deploy channel
+            try:
+                import redis
+
+                r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+                import json
+
+                r.publish("ml.deploy", json.dumps({**notification, "version": 1}))
+                logger.info(f"📡 發送模型就緒通知: {notification}")
+            except Exception as e:
+                logger.warning(f"⚠️ 無法發布ml.deploy，僅記錄通知: {e}")
 
 class MultiAssetTrainingWorkflow(Workflow):
     """

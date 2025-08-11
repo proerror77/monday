@@ -105,6 +105,7 @@ pub enum LoadBalancingStrategy {
 /// Bitget 訂閱頻道
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[allow(deprecated)]
 pub enum BitgetChannel {
     #[serde(rename = "books5")]
     OrderBook5,
@@ -124,6 +125,7 @@ pub enum BitgetChannel {
     // 為了向後相容，保留舊名稱
     #[serde(rename = "books")]
     #[deprecated(since = "0.2.0", note = "Use OrderBook5 instead")]
+    #[allow(deprecated)]
     OrderBook,
 }
 
@@ -134,6 +136,58 @@ pub struct BitgetMessage {
     pub symbol: String,
     pub data: serde_json::Value,
     pub timestamp: u64,
+}
+
+impl BitgetMessage {
+    /// 嘗試將 Bitget 訂單簿消息轉為核心 OrderBookUpdate
+    pub fn to_orderbook_update(&self) -> anyhow::Result<Option<crate::core::types::OrderBookUpdate>> {
+        use crate::core::types::{PriceLevel, Side, ToPrice, ToQuantity, now_micros};
+        match self.channel {
+            BitgetChannel::OrderBook1 | BitgetChannel::OrderBook5 | BitgetChannel::OrderBook15 => {
+                let data = &self.data;
+                let arr = data.as_array().ok_or_else(|| anyhow::anyhow!("data is not array"))?;
+                if arr.is_empty() { return Ok(None); }
+                let first = &arr[0];
+
+                let empty_vec = vec![];
+                let bids_v = first.get("bids").and_then(|v| v.as_array()).unwrap_or(&empty_vec);
+                let asks_v = first.get("asks").and_then(|v| v.as_array()).unwrap_or(&empty_vec);
+
+                let mut bids = Vec::with_capacity(bids_v.len());
+                for b in bids_v {
+                    if let Some(pair) = b.as_array() { if pair.len() >= 2 {
+                        let p: f64 = pair[0].as_str().ok_or_else(|| anyhow::anyhow!("bid price format"))?.parse()?;
+                        let q = pair[1].as_str().ok_or_else(|| anyhow::anyhow!("bid qty format"))?;
+                        bids.push(PriceLevel { price: p.to_price(), quantity: q.to_quantity(), side: Side::Bid });
+                    }}
+                }
+
+                let mut asks = Vec::with_capacity(asks_v.len());
+                for a in asks_v {
+                    if let Some(pair) = a.as_array() { if pair.len() >= 2 {
+                        let p: f64 = pair[0].as_str().ok_or_else(|| anyhow::anyhow!("ask price format"))?.parse()?;
+                        let q = pair[1].as_str().ok_or_else(|| anyhow::anyhow!("ask qty format"))?;
+                        asks.push(PriceLevel { price: p.to_price(), quantity: q.to_quantity(), side: Side::Ask });
+                    }}
+                }
+
+                let ts_us = first.get("ts").and_then(|v| v.as_u64()).map(|ms| ms * 1000).unwrap_or_else(now_micros);
+                // seqId 可選
+                let seq = first.get("seqId").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                Ok(Some(crate::core::types::OrderBookUpdate {
+                    symbol: self.symbol.clone(),
+                    bids,
+                    asks,
+                    timestamp: ts_us,
+                    sequence_start: seq,
+                    sequence_end: seq,
+                    is_snapshot: true,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 /// 待處理的訂閱
@@ -182,12 +236,12 @@ impl UnifiedBitgetConnector {
         Ok(())
     }
     
-    /// 開始連接 - 在這裡創建channel並等待連接建立
-    pub async fn start(&self) -> Result<mpsc::UnboundedReceiver<BitgetMessage>> {
+    /// 開始連接 - 在這裡創建channel並等待連接建立（P0 修復：使用有界通道）
+    pub async fn start(&self) -> Result<mpsc::Receiver<BitgetMessage>> {
         *self.is_running.write().await = true;
         
-        // 在這裡創建channel，避免構造函數中的問題
-        let (tx, rx) = mpsc::unbounded_channel();
+        // P0 修復：使用有界通道防止內存泄漏，緩衝區大小 10000
+        let (tx, rx) = mpsc::channel(10000);
         
         // 創建連接完成信號
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -361,8 +415,9 @@ impl UnifiedBitgetConnector {
                                 info!("UnifiedBitgetConnector: Processed {} messages", message_count);
                             }
                             
-                            if message_tx.send(message).is_err() {
-                                warn!("UnifiedBitgetConnector: Message receiver dropped, stopping connection");
+                            // P0 修復：使用 send 代替 try_send，因為是 UnboundedSender
+                            if let Err(e) = message_tx.send(message) {
+                                warn!("UnifiedBitgetConnector: Message receiver dropped, stopping connection: {}", e);
                                 break;
                             }
                         }

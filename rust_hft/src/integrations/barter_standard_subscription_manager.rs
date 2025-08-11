@@ -7,7 +7,7 @@
  * - 高性能的數據流處理
  */
 
-use crate::integrations::unified_bitget_connector::{UnifiedBitgetConnector, UnifiedBitgetConfig, ConnectionMode, BitgetChannel, BitgetMessage};
+use crate::integrations::unified_bitget_connector::{UnifiedBitgetConnector, UnifiedBitgetConfig, BitgetChannel, BitgetMessage};
 use crate::core::types::Timestamp;
 
 use barter_data::{
@@ -15,14 +15,12 @@ use barter_data::{
     subscription::{
         book::OrderBookL1,
         trade::PublicTrade,
-        Subscription, SubKind,
+        SubKind,
     },
     books::Level,
 };
-use barter_instrument::{
-    Side as BarterSide, 
-    exchange::ExchangeId,
-};
+use barter_instrument::exchange::ExchangeId;
+use barter_instrument::Side as BarterSide;
 
 use serde_json::Value;
 use anyhow::{Result, anyhow};
@@ -30,7 +28,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use tracing::{info, warn, error, debug};
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -156,7 +154,7 @@ impl BarterStandardSubscriptionManager {
 
     /// 初始化 Bitget 連接器
     pub async fn initialize_connector(&mut self, config: UnifiedBitgetConfig) -> Result<()> {
-        let mut connector = UnifiedBitgetConnector::new(config);
+        let connector = UnifiedBitgetConnector::new(config);
 
         // 根據 barter-rs 訂閱配置設置 Bitget 訂閱
         for sub_config in &self.subscriptions {
@@ -164,7 +162,7 @@ impl BarterStandardSubscriptionManager {
             
             for kind in &sub_config.subscription_kinds {
                 let bitget_channel = match kind {
-                    SubKind::OrderBooksL1 => BitgetChannel::OrderBook,
+                    SubKind::OrderBooksL1 => BitgetChannel::OrderBook5,
                     SubKind::PublicTrades => BitgetChannel::Trades,
                     _ => continue,
                 };
@@ -235,7 +233,7 @@ impl BarterStandardSubscriptionManager {
         cache: &HashMap<String, (String, String)>
     ) -> Result<MarketEvent> {
         match message.channel {
-            BitgetChannel::OrderBook => {
+            BitgetChannel::OrderBook5 => {
                 Self::normalize_orderbook_message(message.symbol, message.data, message.timestamp, cache)
             }
             BitgetChannel::Trades => {

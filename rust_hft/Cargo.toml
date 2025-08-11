@@ -35,8 +35,8 @@ crossbeam-channel = "0.5"
 pyo3 = { version = "0.22", features = ["extension-module", "abi3"], optional = true }
 numpy = { version = "0.22", optional = true }
 
-# TorchScript 推理
-tch = { version = "0.16.0", optional = true }
+# TorchScript 推理 (移除可選依賴，避免編譯問題)
+# tch = { version = "0.16.0", optional = true }
 
 # Barter-rs 生態系統: 事件驅動的交易框架
 barter = "0.12.2"
@@ -99,11 +99,16 @@ dashmap = "6.0"
 parking_lot = "0.12"
 
 # Redis 客戶端 (用於快速數據發布)
-redis = "0.27"
+redis = { version = "0.27", features = ["aio", "tokio-comp"] }
 lockfree = "0.5"  # 無鎖數據結構
 
 # 系統級優化
 libc = "0.2"  # Linux 系統調用
+
+# 監控和指標
+metrics = "0.24"
+metrics-exporter-prometheus = "0.15"
+warp = "0.3"
 
 # 序列化支持
 bincode = "2.0.1"
@@ -111,6 +116,8 @@ uuid = { version = "1.17.0", features = ["v4"] }
 async-trait = "0.1.88"
 fastrand = "2.3.0"
 crossterm = "0.29.0"
+urlencoding = "2.1"
+hex = "0.4"
 
 # Command line argument parsing
 clap = { version = "4.0", features = ["derive"] }
@@ -136,24 +143,80 @@ calamine = "0.26"
 [dev-dependencies]
 tempfile = "3.8"
 criterion = { version = "0.5", features = ["html_reports"] }
+# Testing dependencies
+tokio-test = "0.4"
+mockall = "0.12"
+serial_test = "3.0"
+wiremock = "0.6"
+approx = "0.5"
+# For benchmarking and performance tests
+pprof = { version = "0.13", features = ["criterion", "protobuf-codec"] }
+# Redis testing
+redis-test = "0.4"
+# Time simulation for testing
+tokio-util = "0.7"
 
 [[bench]]
 name = "concurrent_connector_benchmark"
 harness = false
 
+[[bench]]
+name = "performance_optimization_benchmarks"
+harness = false
+
+[[bench]]
+name = "simple_performance_benchmarks"
+harness = false
+
+# 🚀 Ultra-High Performance Release Profile for HFT
 [profile.release]
-lto = "fat"         # 啟用鏈接時優化 (Link-Time Optimization)
-codegen-units = 1   # 最大化優化機會
-panic = "abort"     # 遇到 panic 直接終止，避免展開的開銷
-strip = true        # 剝離調試符號
-opt-level = 3       # 最高優化級別
-overflow-checks = false  # 禁用溢出檢查以提升性能
-debug = false       # 禁用調試信息
-# rpath = false     # 禁用 rpath (默認值)
+lto = "fat"                    # 啟用鏈接時優化 (Link-Time Optimization)
+codegen-units = 1              # 最大化優化機會，單線程代碼生成
+panic = "abort"                # 遇到 panic 直接終止，避免展開的開銷
+strip = true                   # 剝離調試符號，減少二進制大小
+opt-level = 3                  # 最高優化級別，啟用所有優化
+overflow-checks = false        # 禁用溢出檢查以提升性能
+debug = false                  # 禁用調試信息
+incremental = false            # 禁用增量編譯以獲得最佳優化
+
+# ⚡ Aggressive Optimization Profile (experimental)
+[profile.release-max]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+overflow-checks = false
+debug = false
+strip = true
+# Additional experimental flags
+[target.'cfg(target_arch = "x86_64")'.release-max]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+avx2,+fma,+bmi2,+lzcnt,+popcnt",
+    "-C", "llvm-args=-enable-machine-outliner=never",  # Disable outlining for predictable performance
+    "-C", "force-frame-pointers=no",                   # Disable frame pointers for more registers
+]
+
+# 🎯 Benchmarking Profile  
+[profile.bench]
+inherits = "release"
+debug = 1                      # Minimal debug info for profiling
+lto = "thin"                   # Faster compilation while still optimized
 
 # 針對當前 CPU 架構優化
 [target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]
+rustflags = [
+    "-C", "target-cpu=native", 
+    "-C", "target-feature=+avx2,+fma,+bmi2,+lzcnt,+popcnt"
+]
+
+# ARM64 優化 (Apple Silicon 等)
+[target.'cfg(target_arch = "aarch64")']
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "target-feature=+neon"
+]
 
 [profile.dev]
 opt-level = 1       # 開發時也啟用基本優化，提高調試體驗
@@ -162,8 +225,8 @@ opt-level = 1       # 開發時也啟用基本優化，提高調試體驗
 default = []  # 不再默認啟用 Python 綁定
 # Python bindings feature
 python = ["pyo3", "numpy"]
-# TorchScript inference feature
-torchscript = ["tch"]
+# TorchScript inference feature (暫時禁用)
+# torchscript = ["tch"]
 
 # ==================== EXAMPLES ====================
 # 🚀 新統一架構範例 - 6個強大的統一應用

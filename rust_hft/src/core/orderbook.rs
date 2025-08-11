@@ -353,6 +353,32 @@ impl OrderBook {
             0.0
         }
     }
+
+    /// Get volume at specific price level
+    pub fn get_volume_at_price(&self, price: f64, side: Side) -> f64 {
+        let price_key = Price::from(price);
+        match side {
+            Side::Bid => self.bids.get(&price_key).map(|q| q.to_f64().unwrap_or(0.0)).unwrap_or(0.0),
+            Side::Ask => self.asks.get(&price_key).map(|q| q.to_f64().unwrap_or(0.0)).unwrap_or(0.0),
+        }
+    }
+
+    /// Get price and quantity at specific level (0-indexed)
+    pub fn get_level(&self, level: usize, side: Side) -> Option<(f64, f64)> {
+        match side {
+            Side::Bid => {
+                self.bids.iter()
+                    .rev()
+                    .nth(level)
+                    .map(|(price, qty)| (price.0, qty.to_f64().unwrap_or(0.0)))
+            },
+            Side::Ask => {
+                self.asks.iter()
+                    .nth(level)
+                    .map(|(price, qty)| (price.0, qty.to_f64().unwrap_or(0.0)))
+            },
+        }
+    }
 }
 
 /// OrderBook statistics

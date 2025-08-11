@@ -5,9 +5,11 @@
  */
 
 use super::{UnifiedEngineConfig, UnifiedTradingEngine};
-use crate::engine::strategy::TradingStrategy;
-use crate::engine::unified_risk_manager::UnifiedRiskManager;
+use crate::engine::strategies::TradingStrategy;
 use anyhow::Result;
+use async_trait::async_trait;
+use uuid;
+use chrono;
 
 /// 統一引擎建構器
 pub struct UnifiedEngineBuilder {
@@ -75,13 +77,32 @@ impl Default for UnifiedEngineBuilder {
     }
 }
 
-// Placeholder traits - these would be defined elsewhere in a real implementation
-pub trait RiskManager: Send + Sync {
-    fn evaluate_risk(&self, order: &PendingOrder) -> RiskDecision;
+// Import types from parent module, avoid redefinition
+pub use super::{Signal, Portfolio, OrderStatus, OrderModification, RiskReport, OrderSide};
+
+// Define RiskDecision locally to avoid conflict
+#[derive(Debug, Clone)]
+pub enum RiskDecision {
+    Approve,
+    Reject { reason: String },
+    Modify { adjustments: std::collections::HashMap<String, f64> },
 }
 
+// Updated traits to match actual usage
+#[async_trait]
+pub trait RiskManager: Send + Sync {
+    async fn check_signal(&self, signal: &Signal, portfolio: &Portfolio) -> Result<RiskDecision>;
+    async fn check_order(&self, order: &Order, portfolio: &Portfolio) -> Result<RiskDecision>;
+    async fn update_metrics(&mut self, portfolio: &Portfolio) -> Result<()>;
+    async fn get_risk_report(&self) -> RiskReport;
+}
+
+#[async_trait]
 pub trait ExecutionManager: Send + Sync {
-    fn execute_order(&mut self, order: Order) -> Result<ExecutionResult>;
+    async fn execute_signal(&mut self, signal: Signal) -> Result<Order>;
+    async fn cancel_order(&mut self, order_id: &str) -> Result<()>;
+    async fn modify_order(&mut self, order_id: &str, new_params: OrderModification) -> Result<()>;
+    async fn get_order_status(&self, order_id: &str) -> Result<OrderStatus>;
 }
 
 // Placeholder types
@@ -100,14 +121,12 @@ pub struct Order {
     pub side: String,
     pub quantity: f64,
     pub price: Option<f64>,
+    pub order_type: super::OrderType,
+    pub status: OrderStatus,
+    pub filled_quantity: f64,
 }
 
-#[derive(Debug, Clone)]
-pub enum RiskDecision {
-    Allow,
-    Reject(String),
-    Modify(f64), // New quantity
-}
+// Removed duplicate RiskDecision definition
 
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
@@ -120,21 +139,64 @@ pub struct ExecutionResult {
 // Dummy implementations for compilation
 pub struct DummyRiskManager;
 
+#[async_trait]
 impl RiskManager for DummyRiskManager {
-    fn evaluate_risk(&self, _order: &PendingOrder) -> RiskDecision {
-        RiskDecision::Allow
+    async fn check_signal(&self, _signal: &Signal, _portfolio: &Portfolio) -> Result<RiskDecision> {
+        Ok(RiskDecision::Approve)
+    }
+    
+    async fn check_order(&self, _order: &Order, _portfolio: &Portfolio) -> Result<RiskDecision> {
+        Ok(RiskDecision::Approve)
+    }
+    
+    async fn update_metrics(&mut self, _portfolio: &Portfolio) -> Result<()> {
+        Ok(())
+    }
+    
+    async fn get_risk_report(&self) -> RiskReport {
+        RiskReport {
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            var_95: 0.0,
+            var_99: 0.0,
+            sharpe_ratio: 0.0,
+            max_drawdown: 0.0,
+            current_drawdown: 0.0,
+            exposure: std::collections::HashMap::new(),
+            risk_level: super::RiskLevel::Low,
+        }
     }
 }
 
 pub struct DummyExecutionManager;
 
+#[async_trait]
 impl ExecutionManager for DummyExecutionManager {
-    fn execute_order(&mut self, order: Order) -> Result<ExecutionResult> {
-        Ok(ExecutionResult {
-            order_id: order.id,
-            status: "filled".to_string(),
-            filled_quantity: order.quantity,
-            average_price: order.price.unwrap_or(100.0),
+    async fn execute_signal(&mut self, signal: Signal) -> Result<Order> {
+        Ok(Order {
+            id: uuid::Uuid::new_v4().to_string(),
+            symbol: signal.symbol,
+            side: match signal.action {
+                super::SignalAction::Buy => "Buy".to_string(),
+                super::SignalAction::Sell => "Sell".to_string(),
+                _ => "Buy".to_string(),
+            },
+            quantity: signal.quantity,
+            price: signal.price,
+            order_type: super::OrderType::Market,
+            status: OrderStatus::New,
+            filled_quantity: 0.0,
         })
+    }
+    
+    async fn cancel_order(&mut self, _order_id: &str) -> Result<()> {
+        Ok(())
+    }
+    
+    async fn modify_order(&mut self, _order_id: &str, _new_params: OrderModification) -> Result<()> {
+        Ok(())
+    }
+    
+    async fn get_order_status(&self, _order_id: &str) -> Result<OrderStatus> {
+        Ok(OrderStatus::New)
     }
 }

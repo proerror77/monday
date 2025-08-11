@@ -8,6 +8,7 @@
 pub mod features;
 pub mod lob_time_series_extractor;
 pub mod lob_extractor;
+pub mod inference_engine;
 
 #[cfg(feature = "torchscript")]
 pub mod torchscript_inference;
@@ -41,4 +42,10 @@ pub use cpu_inference::{
     InferenceResult,
     TradingAction,
     InferenceStatsSummary,
+};
+
+// Re-export the new inference engine
+pub use inference_engine::{
+    InferenceEngine, TradingSignal, SignalType, SignalAction, 
+    ModelContainer, ModelType, ModelMetadata, InferenceConfig
 };

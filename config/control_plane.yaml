@@ -1,0 +1,23 @@
+redis_url: redis://localhost:6379/0
+grpc:
+  host: localhost
+  port: 50051
+
+channels:
+  ops_alert: ops.alert
+  kill_switch: kill-switch
+  ml_deploy: ml.deploy
+  ml_reject: ml.reject
+  model_status: model.status
+  system_metrics: system.metrics
+
+rollout_policy:
+  promote_threshold:
+    ic: 0.03
+    ir: 1.2
+    max_drawdown: 0.05
+  canary_percent: 10
+  health_timeout_seconds: 60
+  latency_p99_us_max: 25
+  error_rate_max: 0.01
+  pnl_drawdown_max: 0.05

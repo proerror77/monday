@@ -279,7 +279,7 @@ impl AdvancedFeatureExtractor {
 
     /// Calculate data quality score
     fn calculate_data_quality_score(&self, orderbook: &OrderBook) -> f64 {
-        let mut score = 1.0;
+        let mut score = 1.0f64;
 
         // Penalize for invalid orderbook
         if !orderbook.is_valid {
@@ -299,7 +299,7 @@ impl AdvancedFeatureExtractor {
             score *= 0.9;
         }
 
-        score.max(0.0).min(1.0)
+        score.max(0.0f64).min(1.0f64)
     }
 
     /// Calculate correlation between two series

@@ -18,9 +18,9 @@ pub use advanced_features::{AdvancedFeatures, AdvancedFeatureExtractor};
 
 use crate::core::types::*;
 use crate::core::orderbook::OrderBook;
+use tracing::debug;
 use anyhow::Result;
-use std::collections::VecDeque;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Unified Feature Extractor - 统一特征提取器
 /// 整合所有子模块的功能，提供统一接口
@@ -118,4 +118,48 @@ pub struct FeatureExtractionStats {
     pub total_extractions: u64,
     pub last_extraction: Timestamp,
     pub window_size: usize,
+}
+
+/// Convert feature set to vector for ML inference
+pub fn features_to_vector(features: &FeatureSet) -> Vec<f64> {
+    vec![
+        features.best_bid.0,
+        features.best_ask.0,
+        features.mid_price.0,
+        features.spread,
+        features.spread_bps,
+        features.obi_l1,
+        features.obi_l5,
+        features.obi_l10,
+        features.obi_l20,
+        features.order_flow_imbalance,
+        features.latency_network_us as f64,
+        features.latency_processing_us as f64,
+    ]
+}
+
+/// Validate feature set for quality
+pub fn validate_features(features: &FeatureSet) -> bool {
+    // Basic validation checks
+    if features.best_bid.0 <= 0.0 || features.best_ask.0 <= 0.0 {
+        return false;
+    }
+    
+    if features.spread < 0.0 {
+        return false;
+    }
+    
+    if features.best_ask.0 <= features.best_bid.0 {
+        return false;
+    }
+    
+    // Check for NaN values
+    let values = features_to_vector(features);
+    for value in values {
+        if value.is_nan() || value.is_infinite() {
+            return false;
+        }
+    }
+    
+    true
 }

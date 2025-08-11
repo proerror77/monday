@@ -10,7 +10,6 @@ use crate::core::orderbook::OrderBook;
 use anyhow::Result;
 use std::collections::VecDeque;
 use tracing::warn;
-use rust_decimal::prelude::ToPrimitive;
 
 /// Basic features from orderbook
 #[derive(Debug, Clone)]

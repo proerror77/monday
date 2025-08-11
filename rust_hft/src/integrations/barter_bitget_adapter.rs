@@ -14,12 +14,10 @@ use futures_util::stream::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tracing::{info, error, debug};
-use rust_decimal::prelude::ToPrimitive;
 
 // 為了與 barter-data 兼容，我們需要使用 barter-data 的類型
 use barter_data::{
     event::MarketEvent,
-    books::{OrderBook as BarterOrderBook, Level},
     subscription::trade::PublicTrade,
     error::DataError,
 };
@@ -81,7 +79,7 @@ impl BitgetAdapter {
             while let Some(msg) = message_rx.recv().await {
                 // 將 BitgetMessage 轉換為 MarketEvent
                 let market_event_result = match msg.channel {
-                    super::unified_bitget_connector::BitgetChannel::OrderBook => {
+                    super::unified_bitget_connector::BitgetChannel::OrderBook5 => {
                         debug!("Processing OrderBook message for {}", msg.symbol);
                         convert_bitget_orderbook(&msg.symbol, &msg.data, None, msg.timestamp)
                             .map_err(|e| DataError::Socket(e.to_string()))
@@ -367,7 +365,7 @@ mod tests {
             connection_timeout_secs: 10,
         };
         let mut adapter = BitgetAdapter::new(config);
-        let _ = adapter.add_subscription("BTCUSDT".to_string(), BitgetChannel::OrderBook).await;
+        let _ = adapter.add_subscription("BTCUSDT".to_string(), BitgetChannel::OrderBook5).await;
         
         // Note: This test won't actually connect to avoid network dependencies
         // In a real scenario, you would test with a mock WebSocket server

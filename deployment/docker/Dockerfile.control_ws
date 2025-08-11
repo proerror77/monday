@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY control_ws/requirements.txt /app/control_ws/requirements.txt
+RUN pip install --no-cache-dir -r /app/control_ws/requirements.txt
+
+COPY . /app
+
+ENV REDIS_URL=redis://redis:6379/0 \
+    GRPC_HOST=rust-hft-engine \
+    GRPC_PORT=50051 \
+    LOG_LEVEL=INFO
+
+CMD ["python", "control_ws/cli.py"]
+

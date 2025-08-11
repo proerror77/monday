@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir redis PyYAML
+
+COPY scripts/e2e_smoke.py /app/scripts/e2e_smoke.py
+
+ENV REDIS_URL=redis://redis:6379/0
+
+CMD ["python", "/app/scripts/e2e_smoke.py"]
+

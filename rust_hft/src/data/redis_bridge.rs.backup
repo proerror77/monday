@@ -1,0 +1,561 @@
+//! Redis 數據橋接
+//! 
+//! 負責與Redis進行高效的數據交互，支援市場數據發布和ML信號接收
+
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
+use redis::{Client, Connection, Commands, PubSubCommands};
+use tracing::{info, warn, error, debug};
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+
+use crate::core::types::*;
+use crate::exchanges::MarketEvent;
+use crate::ml::TradingSignal;
+
+/// Redis橋接器
+pub struct RedisBridge {
+    /// Redis客戶端
+    client: Client,
+    
+    /// 發布連接池
+    pub_connections: Arc<RwLock<Vec<Connection>>>,
+    
+    /// 訂閱連接
+    sub_connection: Arc<RwLock<Option<Connection>>>,
+    
+    /// 配置
+    config: RedisBridgeConfig,
+    
+    /// 統計信息
+    stats: Arc<RwLock<RedisBridgeStats>>,
+    
+    /// 事件發送器
+    event_sender: mpsc::UnboundedSender<BridgeEvent>,
+}
+
+/// Redis橋接配置
+#[derive(Debug, Clone)]
+pub struct RedisBridgeConfig {
+    /// Redis連接URL
+    pub redis_url: String,
+    
+    /// 連接池大小
+    pub connection_pool_size: usize,
+    
+    /// 發布頻道前綴
+    pub publish_prefix: String,
+    
+    /// 訂閱頻道前綴  
+    pub subscribe_prefix: String,
+    
+    /// 批量發送大小
+    pub batch_size: usize,
+    
+    /// 批量發送間隔（毫秒）
+    pub batch_interval_ms: u64,
+    
+    /// 重連間隔（毫秒）
+    pub reconnect_interval_ms: u64,
+    
+    /// 消息TTL（秒）
+    pub message_ttl_sec: u64,
+}
+
+impl Default for RedisBridgeConfig {
+    fn default() -> Self {
+        Self {
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            connection_pool_size: 5,
+            publish_prefix: "hft.market".to_string(),
+            subscribe_prefix: "hft.signals".to_string(),
+            batch_size: 100,
+            batch_interval_ms: 10,
+            reconnect_interval_ms: 1000,
+            message_ttl_sec: 60,
+        }
+    }
+}
+
+/// Redis橋接統計
+#[derive(Debug, Clone, Default)]
+pub struct RedisBridgeStats {
+    /// 發布的消息數量
+    pub messages_published: u64,
+    
+    /// 接收的消息數量
+    pub messages_received: u64,
+    
+    /// 發布失敗數量
+    pub publish_failures: u64,
+    
+    /// 接收失敗數量
+    pub receive_failures: u64,
+    
+    /// 連接重試次數
+    pub connection_retries: u64,
+    
+    /// 平均發布延遲（微秒）
+    pub avg_publish_latency_us: f64,
+    
+    /// 批量發送次數
+    pub batch_sends: u64,
+    
+    /// 最後活動時間
+    pub last_activity: u64,
+}
+
+/// 橋接事件
+#[derive(Debug, Clone)]
+pub enum BridgeEvent {
+    /// 連接建立
+    Connected,
+    
+    /// 連接丟失
+    Disconnected,
+    
+    /// 發布成功
+    PublishSuccess { channel: String, message_count: u64 },
+    
+    /// 發布失敗
+    PublishError { channel: String, error: String },
+    
+    /// 接收到信號
+    SignalReceived { signal: TradingSignal },
+    
+    /// 批量發送完成
+    BatchSent { batch_size: usize, latency_us: u64 },
+}
+
+/// Redis消息包裝器
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisMessage {
+    /// 消息類型
+    pub msg_type: String,
+    
+    /// 消息內容
+    pub payload: serde_json::Value,
+    
+    /// 時間戳
+    pub timestamp: u64,
+    
+    /// 交易所
+    pub exchange: String,
+    
+    /// 交易對
+    pub symbol: String,
+    
+    /// 消息ID
+    pub message_id: String,
+}
+
+impl RedisBridge {
+    pub fn new() -> Result<(Self, mpsc::UnboundedReceiver<BridgeEvent>), String> {
+        Self::with_config(RedisBridgeConfig::default())
+    }
+    
+    pub fn with_config(config: RedisBridgeConfig) -> Result<(Self, mpsc::UnboundedReceiver<BridgeEvent>), String> {
+        let client = Client::open(config.redis_url.clone())
+            .map_err(|e| format!("Failed to create Redis client: {}", e))?;
+        
+        let (event_sender, event_receiver) = mpsc::unbounded_channel();
+        
+        let bridge = Self {
+            client,
+            pub_connections: Arc::new(RwLock::new(Vec::new())),
+            sub_connection: Arc::new(RwLock::new(None)),
+            config,
+            stats: Arc::new(RwLock::new(RedisBridgeStats::default())),
+            event_sender,
+        };
+        
+        Ok((bridge, event_receiver))
+    }
+    
+    /// 啟動Redis橋接
+    pub async fn start(&self) -> Result<(), String> {
+        info!("Starting Redis Bridge");
+        
+        // 初始化連接池
+        self.initialize_connection_pool().await?;
+        
+        // 初始化訂閱連接
+        self.initialize_subscription().await?;
+        
+        // 啟動批量發送任務
+        self.start_batch_publisher().await;
+        
+        // 啟動連接監控任務
+        self.start_connection_monitor().await;
+        
+        // 發送連接成功事件
+        let _ = self.event_sender.send(BridgeEvent::Connected);
+        
+        info!("Redis Bridge started successfully");
+        Ok(())
+    }
+    
+    /// 發布市場事件
+    pub async fn publish_market_event(&self, event: &MarketEvent) -> Result<(), String> {
+        let start_time = std::time::Instant::now();
+        
+        let redis_msg = self.convert_market_event_to_redis_msg(event)?;
+        let channel = format!("{}.{}.{}", self.config.publish_prefix, event.exchange(), event.symbol());
+        
+        // 序列化消息
+        let payload = serde_json::to_string(&redis_msg)
+            .map_err(|e| format!("Failed to serialize message: {}", e))?;
+        
+        // 發布消息
+        let result = self.publish_to_channel(&channel, &payload).await;
+        
+        // 更新統計
+        let latency_us = start_time.elapsed().as_micros() as u64;
+        {
+            let mut stats = self.stats.write().await;
+            match &result {
+                Ok(_) => {
+                    stats.messages_published += 1;
+                    stats.avg_publish_latency_us = (stats.avg_publish_latency_us * (stats.messages_published - 1) as f64 + latency_us as f64) / stats.messages_published as f64;
+                    stats.last_activity = chrono::Utc::now().timestamp_nanos() as u64;
+                },
+                Err(_) => {
+                    stats.publish_failures += 1;
+                }
+            }
+        }
+        
+        match result {
+            Ok(_) => {
+                debug!("Published market event to {}: {} bytes", channel, payload.len());
+                Ok(())
+            },
+            Err(e) => {
+                let _ = self.event_sender.send(BridgeEvent::PublishError { 
+                    channel: channel.clone(), 
+                    error: e.clone() 
+                });
+                Err(e)
+            }
+        }
+    }
+    
+    /// 批量發布市場事件
+    pub async fn publish_market_events_batch(&self, events: &[MarketEvent]) -> Result<(), String> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        
+        let start_time = std::time::Instant::now();
+        
+        // 按交易對分組
+        let mut events_by_channel: HashMap<String, Vec<&MarketEvent>> = HashMap::new();
+        for event in events {
+            let channel = format!("{}.{}.{}", self.config.publish_prefix, event.exchange(), event.symbol());
+            events_by_channel.entry(channel).or_insert_with(Vec::new).push(event);
+        }
+        
+        // 批量發送
+        for (channel, channel_events) in events_by_channel {
+            let mut pipeline_data = Vec::new();
+            
+            for event in channel_events {
+                let redis_msg = self.convert_market_event_to_redis_msg(event)?;
+                let payload = serde_json::to_string(&redis_msg)
+                    .map_err(|e| format!("Failed to serialize message: {}", e))?;
+                pipeline_data.push(payload);
+            }
+            
+            // 使用pipeline批量發送
+            self.publish_batch_to_channel(&channel, &pipeline_data).await?;
+        }
+        
+        let latency_us = start_time.elapsed().as_micros() as u64;
+        
+        // 更新統計
+        {
+            let mut stats = self.stats.write().await;
+            stats.messages_published += events.len() as u64;
+            stats.batch_sends += 1;
+            stats.last_activity = chrono::Utc::now().timestamp_nanos() as u64;
+        }
+        
+        let _ = self.event_sender.send(BridgeEvent::BatchSent { 
+            batch_size: events.len(), 
+            latency_us 
+        });
+        
+        debug!("Published batch of {} events in {}μs", events.len(), latency_us);
+        Ok(())
+    }
+    
+    /// 訂閱交易信號
+    pub async fn subscribe_trading_signals(&self) -> Result<mpsc::UnboundedReceiver<TradingSignal>, String> {
+        let (signal_sender, signal_receiver) = mpsc::unbounded_channel();
+        
+        let sub_connection = self.sub_connection.clone();
+        let subscribe_prefix = self.config.subscribe_prefix.clone();
+        let event_sender = self.event_sender.clone();
+        let stats = self.stats.clone();
+        
+        tokio::spawn(async move {
+            loop {
+                let mut conn_guard = sub_connection.write().await;
+                if let Some(mut conn) = conn_guard.take() {
+                    let channel_pattern = format!("{}.*", subscribe_prefix);
+                    
+                    match conn.psubscribe(&channel_pattern) {
+                        Ok(mut pubsub) => {
+                            info!("Subscribed to pattern: {}", channel_pattern);
+                            
+                            loop {
+                                match pubsub.get_message() {
+                                    Ok(msg) => {
+                                        if let Ok(payload) = msg.get_payload::<String>() {
+                                            match serde_json::from_str::<TradingSignal>(&payload) {
+                                                Ok(signal) => {
+                                                    // 更新統計
+                                                    {
+                                                        let mut stats_guard = stats.write().await;
+                                                        stats_guard.messages_received += 1;
+                                                        stats_guard.last_activity = chrono::Utc::now().timestamp_nanos() as u64;
+                                                    }
+                                                    
+                                                    // 發送事件
+                                                    let _ = event_sender.send(BridgeEvent::SignalReceived { 
+                                                        signal: signal.clone() 
+                                                    });
+                                                    
+                                                    // 轉發信號
+                                                    if signal_sender.send(signal).is_err() {
+                                                        warn!("Signal receiver dropped, stopping subscription");
+                                                        break;
+                                                    }
+                                                },
+                                                Err(e) => {
+                                                    error!("Failed to deserialize trading signal: {}", e);
+                                                    let mut stats_guard = stats.write().await;
+                                                    stats_guard.receive_failures += 1;
+                                                }
+                                            }
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("Redis subscription error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            error!("Failed to subscribe: {}", e);
+                        }
+                    }
+                    
+                    *conn_guard = Some(conn);
+                }
+                
+                // 重連延遲
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            }
+        });
+        
+        Ok(signal_receiver)
+    }
+    
+    /// 獲取統計信息
+    pub async fn get_stats(&self) -> RedisBridgeStats {
+        self.stats.read().await.clone()
+    }
+    
+    /// 初始化連接池
+    async fn initialize_connection_pool(&self) -> Result<(), String> {
+        let mut connections = Vec::new();
+        
+        for i in 0..self.config.connection_pool_size {
+            match self.client.get_connection() {
+                Ok(conn) => {
+                    connections.push(conn);
+                    debug!("Created Redis connection {}/{}", i + 1, self.config.connection_pool_size);
+                },
+                Err(e) => {
+                    return Err(format!("Failed to create Redis connection {}: {}", i + 1, e));
+                }
+            }
+        }
+        
+        *self.pub_connections.write().await = connections;
+        info!("Initialized Redis connection pool with {} connections", self.config.connection_pool_size);
+        Ok(())
+    }
+    
+    /// 初始化訂閱連接
+    async fn initialize_subscription(&self) -> Result<(), String> {
+        match self.client.get_connection() {
+            Ok(conn) => {
+                *self.sub_connection.write().await = Some(conn);
+                info!("Initialized Redis subscription connection");
+                Ok(())
+            },
+            Err(e) => Err(format!("Failed to create subscription connection: {}", e))
+        }
+    }
+    
+    /// 發布到頻道
+    async fn publish_to_channel(&self, channel: &str, payload: &str) -> Result<(), String> {
+        let mut connections = self.pub_connections.write().await;
+        
+        if let Some(conn) = connections.first_mut() {
+            conn.publish(channel, payload)
+                .map_err(|e| format!("Failed to publish to {}: {}", channel, e))?;
+            Ok(())
+        } else {
+            Err("No available Redis connections".to_string())
+        }
+    }
+    
+    /// 批量發布到頻道
+    async fn publish_batch_to_channel(&self, channel: &str, payloads: &[String]) -> Result<(), String> {
+        let mut connections = self.pub_connections.write().await;
+        
+        if let Some(conn) = connections.first_mut() {
+            let mut pipe = redis::pipe();
+            for payload in payloads {
+                pipe.cmd("PUBLISH").arg(channel).arg(payload);
+            }
+            
+            pipe.execute(conn)
+                .map_err(|e| format!("Failed to execute batch publish: {}", e))?;
+            Ok(())
+        } else {
+            Err("No available Redis connections".to_string())
+        }
+    }
+    
+    /// 轉換市場事件為Redis消息
+    fn convert_market_event_to_redis_msg(&self, event: &MarketEvent) -> Result<RedisMessage, String> {
+        let payload = serde_json::to_value(event)
+            .map_err(|e| format!("Failed to serialize market event: {}", e))?;
+        
+        let msg_type = match event {
+            MarketEvent::OrderBookUpdate { .. } => "orderbook_update",
+            MarketEvent::Trade { .. } => "trade",
+            MarketEvent::Ticker { .. } => "ticker",
+            _ => "unknown",
+        };
+        
+        Ok(RedisMessage {
+            msg_type: msg_type.to_string(),
+            payload,
+            timestamp: chrono::Utc::now().timestamp_nanos() as u64,
+            exchange: event.exchange().to_string(),
+            symbol: event.symbol().to_string(),
+            message_id: uuid::Uuid::new_v4().to_string(),
+        })
+    }
+    
+    /// 啟動批量發布任務
+    async fn start_batch_publisher(&self) {
+        let batch_interval = self.config.batch_interval_ms;
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(batch_interval));
+            
+            loop {
+                interval.tick().await;
+                // TODO: 實現批量發送緩衝區邏輯
+                debug!("Batch publisher tick");
+            }
+        });
+    }
+    
+    /// 啟動連接監控任務
+    async fn start_connection_monitor(&self) {
+        let pub_connections = self.pub_connections.clone();
+        let sub_connection = self.sub_connection.clone();
+        let client = self.client.clone();
+        let stats = self.stats.clone();
+        let event_sender = self.event_sender.clone();
+        let reconnect_interval = self.config.reconnect_interval_ms;
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(reconnect_interval));
+            
+            loop {
+                interval.tick().await;
+                
+                // 檢查發布連接健康狀態
+                {
+                    let mut connections = pub_connections.write().await;
+                    for (i, conn) in connections.iter_mut().enumerate() {
+                        match conn.ping::<String>() {
+                            Ok(_) => {
+                                debug!("Publish connection {} is healthy", i);
+                            },
+                            Err(e) => {
+                                warn!("Publish connection {} failed ping: {}, reconnecting", i, e);
+                                match client.get_connection() {
+                                    Ok(new_conn) => {
+                                        *conn = new_conn;
+                                        info!("Reconnected publish connection {}", i);
+                                        
+                                        let mut stats_guard = stats.write().await;
+                                        stats_guard.connection_retries += 1;
+                                    },
+                                    Err(e) => {
+                                        error!("Failed to reconnect publish connection {}: {}", i, e);
+                                        let _ = event_sender.send(BridgeEvent::Disconnected);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 檢查訂閱連接健康狀態
+                {
+                    let mut sub_conn_guard = sub_connection.write().await;
+                    if let Some(conn) = sub_conn_guard.as_mut() {
+                        match conn.ping::<String>() {
+                            Ok(_) => {
+                                debug!("Subscription connection is healthy");
+                            },
+                            Err(e) => {
+                                warn!("Subscription connection failed ping: {}, reconnecting", e);
+                                match client.get_connection() {
+                                    Ok(new_conn) => {
+                                        *conn = new_conn;
+                                        info!("Reconnected subscription connection");
+                                        
+                                        let mut stats_guard = stats.write().await;
+                                        stats_guard.connection_retries += 1;
+                                    },
+                                    Err(e) => {
+                                        error!("Failed to reconnect subscription connection: {}", e);
+                                        let _ = event_sender.send(BridgeEvent::Disconnected);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[tokio::test]
+    async fn test_redis_bridge_creation() {
+        let config = RedisBridgeConfig::default();
+        
+        // 這個測試只有在Redis服務器運行時才會通過
+        if let Ok((bridge, _receiver)) = RedisBridge::with_config(config) {
+            let stats = bridge.get_stats().await;
+            assert_eq!(stats.messages_published, 0);
+        }
+    }
+}

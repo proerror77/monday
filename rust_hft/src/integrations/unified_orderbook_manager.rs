@@ -7,7 +7,7 @@
 
 use crate::core::types::*;
 use crate::core::orderbook::OrderBook;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::Arc;

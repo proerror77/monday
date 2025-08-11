@@ -7,8 +7,10 @@
 pub mod network;
 pub mod processor;
 pub mod orderbook_recorder;
+// pub mod redis_bridge; // 已移至 integrations 模塊
 
 // Re-export main functions
 pub use network::run as network_run;
 pub use processor::run as processor_run;
 pub use orderbook_recorder::SymbolRecorder;
+// Redis bridge moved to integrations module

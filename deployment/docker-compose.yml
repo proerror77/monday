@@ -44,41 +44,37 @@ services:
       retries: 3
 
   # ==========================================  
-  # L2: Ops Workspace - 實時監控Agent (7x24常駐)
+  # L2: Control Workspace - 控制面 (7x24常駐)
   # ==========================================
-  ops-agent:
+  control-ws:
     build:
       context: ../
-      dockerfile: deployment/docker/Dockerfile.ops_workspace
-    container_name: hft-ops-agent
+      dockerfile: deployment/docker/Dockerfile.control_ws
+    container_name: hft-control-ws
     restart: unless-stopped
     environment:
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=redis://redis:6379/0
       - GRPC_HOST=rust-hft-engine
       - GRPC_PORT=50051
       - LOG_LEVEL=INFO
-      - PROMETHEUS_PORT=8000
-    volumes:
-      - ops_logs:/app/logs
-      - ops_config:/app/config
     depends_on:
-      - rust-hft-engine
-      - redis
-    ports:
-      - "8000:8000"  # Prometheus監控端口
+      redis:
+        condition: service_healthy
+      rust-hft-engine:
+        condition: service_started
     networks:
       - hft-network
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 2G
+          cpus: "1.0"
+          memory: 1G
         reservations:
-          cpus: "0.5"
-          memory: 512M
+          cpus: "0.25"
+          memory: 256M
     healthcheck:
-      test: ["CMD", "python3", "-c", "import redis; redis.Redis(host='redis').ping()"]
-      interval: 10s
+      test: ["CMD", "python3", "-c", "import redis; import os; import sys; import json; import redis; redis.Redis.from_url(os.getenv('REDIS_URL','redis://redis:6379/0')).ping()"]
+      interval: 15s
       timeout: 5s
       retries: 5
 
@@ -103,8 +99,10 @@ services:
       - ml_cache:/app/cache
       - ml_logs:/app/logs
     depends_on:
-      - redis
-      - clickhouse
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_started
     ports:
       - "8001:8001"  # 監控端口
     networks:
@@ -147,6 +145,24 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+  # E2E smoke test (optional, run-once)
+  e2e-smoke:
+    build:
+      context: ../
+      dockerfile: deployment/docker/Dockerfile.smoke
+    container_name: hft-e2e-smoke
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - SMOKE_SYMBOL=BTCUSDT
+    depends_on:
+      control-ws:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    networks:
+      - hft-network
+    restart: "no"
 
   # ClickHouse - 歷史數據存儲
   clickhouse:

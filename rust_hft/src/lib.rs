@@ -25,6 +25,9 @@ pub mod engine;
 // 外部集成模塊 - 交易所連接器和適配器
 pub mod integrations;
 
+// 交易所抽象模塊 - 統一的交易所接口
+pub mod exchanges;
+
 // 機器學習模塊 - 特徵工程和模型
 pub mod ml;
 
@@ -48,8 +51,7 @@ pub use crate::core::*;
 // Re-export specific types for examples
 pub use crate::core::workflow::{WorkflowExecutor, WorkflowStep, StepResult, WorkflowConfig, WorkflowReport};
 pub use crate::core::app_runner::{HftAppRunner, UnifiedReporter, run_simple_app, run_timed_app};
-pub use crate::core::cli::*;
-pub use crate::core::types::*;
+// Note: cli and types exports removed as unused
 pub use crate::core::config::Config;
 pub use crate::core::orderbook::OrderBook;
 

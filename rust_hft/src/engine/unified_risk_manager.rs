@@ -4,7 +4,7 @@
  * 統一的風險管理實現，整合基礎和高級風險控制功能
  */
 
-use crate::engine::unified_engine::{
+use crate::engine::unified::{
     RiskManager, RiskDecision, RiskReport, RiskLevel, Signal, Order, Portfolio
 };
 use async_trait::async_trait;
@@ -133,7 +133,7 @@ impl UnifiedRiskManager {
         portfolio: &Portfolio,
     ) -> Result<f64> {
         let total_value = portfolio.cash + portfolio.positions.values()
-            .map(|p| p.quantity * p.current_price)
+            .map(|p| p.quantity() * p.current_price())
             .sum::<f64>();
         
         // 基礎持倉大小（風險平價）
@@ -314,7 +314,7 @@ impl RiskManager for UnifiedRiskManager {
         
         // 更新資金和槓桿
         let total_value = portfolio.cash + portfolio.positions.values()
-            .map(|p| p.quantity * p.current_price)
+            .map(|p| p.quantity() * p.current_price())
             .sum::<f64>();
         
         limits.available_capital = portfolio.cash;
@@ -322,7 +322,7 @@ impl RiskManager for UnifiedRiskManager {
         
         // 計算當前槓桿
         let position_value = portfolio.positions.values()
-            .map(|p| p.quantity * p.current_price)
+            .map(|p| p.quantity() * p.current_price())
             .sum::<f64>();
         limits.current_leverage = if total_value > 0.0 {
             position_value / total_value
@@ -340,7 +340,7 @@ impl RiskManager for UnifiedRiskManager {
         // 更新暴露
         metrics.symbol_exposure.clear();
         for (symbol, position) in &portfolio.positions {
-            let exposure = position.quantity * position.current_price / total_value;
+            let exposure = position.quantity() * position.current_price() / total_value;
             metrics.symbol_exposure.insert(symbol.clone(), exposure);
         }
         

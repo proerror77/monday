@@ -4,6 +4,9 @@
  * 包含交易所連接器和 barter-rs 適配器
  */
 
+// 多交易所統一管理器（新增）
+pub mod multi_exchange_manager;
+
 // 統一的實現（推薦使用）
 pub mod unified_bitget_connector;
 pub mod unified_orderbook_manager;
@@ -25,6 +28,18 @@ pub mod barter_bitget_adapter;
 // barter_standard_subscription_manager 已完全廢棄，不再導出
 #[deprecated(since = "0.2.0", note = "Please use unified_bitget_connector with barter_bitget_adapter instead")]
 pub mod barter_standard_subscription_manager;
+
+// 導出多交易所管理器（新增）
+pub use multi_exchange_manager::{
+    MultiExchangeManager,
+    MultiExchangeConfig,
+    AggregationStrategy,
+    BackoffStrategy,
+    ConnectionError,
+    SubscriptionError,
+    DataFetchError,
+    AggregationError,
+};
 
 // 導出統一實現（推薦使用）
 pub use unified_bitget_connector::{
@@ -73,3 +88,6 @@ pub use volume_monitor::{
 pub use barter_bitget_adapter::{BitgetAdapter, BitgetMarketStream, create_bitget_stream};
 // 舊版 OrderBook 管理器已移除，請使用 unified_orderbook_manager
 // barter_standard_subscription_manager 導出已完全移除，模塊已廢棄
+
+// Redis數據橋接服務
+pub mod redis_bridge;

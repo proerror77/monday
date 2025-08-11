@@ -416,7 +416,7 @@ impl Default for OrderBookUpdate {
 }
 
 /// Comprehensive feature set for ML model
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FeatureSet {
     // Timing
     pub timestamp: Timestamp,
@@ -557,6 +557,12 @@ impl FeatureSet {
     }
 }
 
+impl Default for FeatureSet {
+    fn default() -> Self {
+        Self::default_enhanced()
+    }
+}
+
 /// Orderbook snapshot for delta calculations
 #[derive(Debug, Clone)]
 pub struct OrderBookSnapshot {
@@ -607,20 +613,69 @@ pub struct TradingSignal {
     pub signal_latency_us: u64,
 }
 
+/// Order side (Buy/Sell)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
 /// Order types
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum OrderType {
     Market,
     Limit,
     PostOnly,
+    StopLoss,
+    StopLossLimit,
+    TakeProfit,
+    TakeProfitLimit,
 }
 
 /// Order time in force
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum TimeInForce {
     GTC,  // Good Till Cancel
     IOC,  // Immediate Or Cancel
     FOK,  // Fill Or Kill
+}
+
+/// Position side
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum PositionSide {
+    Long,
+    Short,
+}
+
+/// Position information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Position {
+    /// 交易對
+    pub symbol: String,
+    
+    /// 持倉方向
+    pub side: PositionSide,
+    
+    /// 持倉數量
+    pub size: f64,
+    
+    /// 入場價格
+    pub entry_price: f64,
+    
+    /// 標記價格
+    pub mark_price: f64,
+    
+    /// 未實現盈虧
+    pub unrealized_pnl: f64,
+    
+    /// 已實現盈虧
+    pub realized_pnl: f64,
+    
+    /// 保證金
+    pub margin_used: f64,
+    
+    /// 時間戳
+    pub timestamp: u64,
 }
 
 /// Order status
@@ -631,6 +686,8 @@ pub enum OrderStatus {
     Filled,
     Cancelled,
     Rejected,
+    Pending,
+    Expired,
 }
 
 /// Trading order

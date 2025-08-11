@@ -6,12 +6,14 @@
 
 use super::{UnifiedEngineConfig, builder::{RiskManager, ExecutionManager}};
 use crate::engine::strategy::TradingStrategy;
+use crate::engine::strategies::traits::TradingSignal;
 use crate::core::orderbook::OrderBook;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
-use tracing::{info, warn, error, debug};
+use tracing::{info, debug};
+
 
 /// 統一交易引擎
 pub struct UnifiedTradingEngine {
@@ -86,14 +88,6 @@ pub enum EngineEvent {
     EngineStateChange { old_state: EngineState, new_state: EngineState },
 }
 
-/// 交易信号
-#[derive(Debug, Clone)]
-pub enum TradingSignal {
-    Buy { quantity: f64, price: Option<f64> },
-    Sell { quantity: f64, price: Option<f64> },
-    Hold,
-    Close { ratio: f64 },
-}
 
 /// 引擎統計
 #[derive(Debug, Clone, Default)]
@@ -174,10 +168,10 @@ impl UnifiedTradingEngine {
         let _ = self.event_sender.send(EngineEvent::OrderbookUpdate { symbol: symbol.clone() });
         
         // 運行策略
-        let signal = self.strategy.on_orderbook_update(&symbol, &orderbook).await?;
+        let strategy_signal = self.strategy.on_orderbook_update(&symbol, &orderbook).await?;
         
-        // 處理策略信號
-        self.handle_strategy_signal(symbol, signal).await?;
+        // 處理策略信號（直接使用策略層信號型別）
+        self.handle_strategy_signal(symbol, strategy_signal).await?;
         
         Ok(())
     }
@@ -193,10 +187,10 @@ impl UnifiedTradingEngine {
         });
         
         match signal {
-            TradingSignal::Buy { quantity, price } => {
+            TradingSignal::Buy { quantity, price, .. } => {
                 self.execute_buy_order(symbol, quantity, price).await?;
             },
-            TradingSignal::Sell { quantity, price } => {
+            TradingSignal::Sell { quantity, price, .. } => {
                 self.execute_sell_order(symbol, quantity, price).await?;
             },
             TradingSignal::Hold => {
@@ -204,6 +198,9 @@ impl UnifiedTradingEngine {
             },
             TradingSignal::Close { ratio } => {
                 self.close_position(symbol, ratio).await?;
+            },
+            TradingSignal::CloseAll => {
+                self.close_position(symbol, 1.0).await?;
             },
         }
         
@@ -232,9 +229,13 @@ impl UnifiedTradingEngine {
 
     /// 平倉所有持倉
     async fn close_all_positions(&mut self) -> Result<()> {
-        let positions = self.positions.read().await;
-        for symbol in positions.keys() {
-            self.close_position(symbol.clone(), 1.0).await?;
+        let symbols: Vec<String> = {
+            let positions = self.positions.read().await;
+            positions.keys().cloned().collect()
+        };
+        
+        for symbol in symbols {
+            self.close_position(symbol, 1.0).await?;
         }
         Ok(())
     }

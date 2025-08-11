@@ -6,147 +6,127 @@
  */
 
 use anyhow::Result;
-use crossbeam_channel::{bounded, Receiver, Sender};
-use std::thread;
-use tracing::{info, warn, error};
+use std::env;
+use tokio::signal;
+use tracing::{info, error};
+use std::sync::Arc;
 
-// Import from the new modular structure
-use rust_hft::core::types::*;
-use rust_hft::core::config::Config;
-use rust_hft::data::{network_run, processor_run};
-use rust_hft::engine::{strategy_run, execution_run};
+use rust_hft::core::monitoring::MonitoringServer;
+use rust_hft::integrations::redis_bridge::RedisBridge;
+// P0 修復：集成完整 OMS 和交易引擎
+use rust_hft::engine::complete_oms::CompleteOMS;
+use rust_hft::exchanges::ExchangeManager;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_env_filter("rust_hft=debug")
+        .with_env_filter("rust_hft=debug,redis_bridge=debug")
         .init();
 
-    info!("🚀 Starting Rust HFT System");
-
-    // Load configuration
-    let config = Config::load()?;
-    info!("Configuration loaded: {:?}", config);
-
-    // Check CPU cores
-    let core_ids = core_affinity::get_core_ids()
-        .ok_or_else(|| anyhow::anyhow!("Failed to get CPU core IDs"))?;
+    info!("🚀 啟動 Rust HFT System");
     
-    if core_ids.len() < 4 {
-        warn!("Only {} CPU cores available, recommend at least 4 for optimal performance", core_ids.len());
-    }
-
-    info!("Available CPU cores: {}", core_ids.len());
-
-    // Create lock-free channels for inter-thread communication
-    // Network -> Processor
-    let (raw_msg_tx, raw_msg_rx): (Sender<RawMessage>, Receiver<RawMessage>) = bounded(2048);
+    // 啟動監控服務 (Prometheus metrics)
+    let monitoring = Arc::new(
+        MonitoringServer::new(9090).await
+            .map_err(|e| anyhow::anyhow!("監控服務啟動失敗: {}", e))?
+    );
     
-    // Processor -> Strategy  
-    let (features_tx, features_rx): (Sender<FeatureSet>, Receiver<FeatureSet>) = bounded(1024);
+    // 更新組件健康狀態
+    monitoring.update_health("system", true).await;
+    info!("📊 監控服務已啟動在端口 9090");
     
-    // Strategy -> Execution
-    let (signal_tx, signal_rx): (Sender<TradingSignal>, Receiver<TradingSignal>) = bounded(512);
-
-    // CPU core assignment
-    let network_core = core_ids[0];
-    let processor_core = core_ids[1];
-    let strategy_core = core_ids[2];
-    let execution_core = if core_ids.len() >= 4 { Some(core_ids[3]) } else { None };
-
-    // Start performance monitoring
-    let start_time = std::time::Instant::now();
-
-    // Spawn threads with CPU affinity
-    info!("Spawning threads with CPU affinity...");
-
-    // Network Thread (Core 0)
-    let network_config = config.clone();
-    let network_handle = thread::spawn(move || {
-        // Pin to specific CPU core
-        if !core_affinity::set_for_current(network_core) {
-            error!("Failed to set CPU affinity for network thread");
-        } else {
-            info!("Network thread pinned to core {:?}", network_core);
-        }
-
-        // Run network layer
-        if let Err(e) = network_run(network_config, raw_msg_tx) {
-            error!("Network thread error: {}", e);
+    // 啟動Redis數據橋接服務
+    let redis_bridge = RedisBridge::new().await?;
+    info!("🔗 Redis橋接服務已初始化");
+    
+    // P0 修復：啟動完整交易系統
+    info!("🏦 初始化交易所管理器");
+    let exchange_manager = Arc::new(ExchangeManager::new());
+    
+    // 添加支持的交易所
+    use rust_hft::exchanges::{BitgetExchange, BinanceExchange};
+    
+    info!("🔗 添加 Bitget 交易所");
+    let bitget_exchange = Box::new(BitgetExchange::new());
+    exchange_manager.add_exchange("bitget".to_string(), bitget_exchange).await;
+    
+    info!("🔗 添加 Binance 交易所");
+    let binance_exchange = Box::new(BinanceExchange::new());
+    exchange_manager.add_exchange("binance".to_string(), binance_exchange).await;
+    
+    info!("✅ 交易所添加完成: {} 個交易所", exchange_manager.list_exchanges().await.len());
+    
+    info!("📋 初始化完整 OMS 系統");
+    let oms = Arc::new(CompleteOMS::new(exchange_manager.clone()));
+    let mut order_updates = oms.start().await
+        .map_err(|e| anyhow::anyhow!("OMS 啟動失敗: {}", e))?;
+    
+    // 啟動 OMS 事件處理
+    let oms_clone = oms.clone();
+    let oms_task = tokio::spawn(async move {
+        info!("🎯 OMS 事件處理器已啟動");
+        while let Some(order_update) = order_updates.recv().await {
+            debug!("收到訂單更新: {:?}", order_update);
+            // 可以在這裡添加額外的訂單更新處理邏輯
         }
     });
-
-    // Processor Thread (Core 1)  
-    let processor_config = config.clone();
-    let processor_handle = thread::spawn(move || {
-        if !core_affinity::set_for_current(processor_core) {
-            error!("Failed to set CPU affinity for processor thread");
-        } else {
-            info!("Processor thread pinned to core {:?}", processor_core);
-        }
-
-        if let Err(e) = processor_run(processor_config, raw_msg_rx, features_tx) {
-            error!("Processor thread error: {}", e);
+    
+    info!("💹 完整交易系統已啟動");
+    
+    // 啟動真實市場數據橋接
+    info!("🎯 啟動真實市場數據橋接模式");
+    
+    // 啟動真實數據流橋接
+    let bridge_task = tokio::spawn(async move {
+        if let Err(e) = redis_bridge.start_real_data_bridge().await {
+            error!("真實數據流橋接失敗: {}", e);
         }
     });
-
-    // Strategy Thread (Core 2)
-    let strategy_config = config.clone();
-    let strategy_handle = thread::spawn(move || {
-        if !core_affinity::set_for_current(strategy_core) {
-            error!("Failed to set CPU affinity for strategy thread");
-        } else {
-            info!("Strategy thread pinned to core {:?}", strategy_core);
+        
+        // 啟動健康檢查端點
+        let monitoring_clone = monitoring.clone();
+        let health_task = tokio::spawn(async move {
+            monitoring_clone.start_health_endpoint().await;
+        });
+        
+    info!("✅ 完整 HFT 交易系統已啟動:");
+    info!("   • 完整 OMS: 訂單管理系統 ✅");
+    info!("   • 交易所支持: Bitget, Binance ✅");
+    info!("   • Redis橋接服務: 真實Bitget數據流 ✅");
+    info!("   • Prometheus指標: http://localhost:9090/metrics");
+    info!("   • 健康檢查: http://localhost:9091/health");
+    info!("   • 系統狀態: http://localhost:9091/ready");
+    info!("");
+    info!("🚀 系統準備接收交易信號...");
+    info!("📡 Redis channels:");
+    info!("   • market.orderbook (真實訂單簿數據)");
+    info!("   • market.ticker (真實價格數據)");
+    info!("   • market.trade (真實交易數據)");
+    info!("   • system.metrics (系統指標)");
+    info!("");
+    info!("🔴 警告: 使用真實交易所數據，請確保網絡連接穩定");
+    info!("按 Ctrl+C 停止服務...");
+        
+    // 等待中斷信號
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            info!("👋 接收到停止信號，正在關閉服務...");
+            bridge_task.abort();
+            health_task.abort();
+            oms_task.abort();
         }
-
-        if let Err(e) = strategy_run(strategy_config, features_rx, signal_tx) {
-            error!("Strategy thread error: {}", e);
+        _ = bridge_task => {
+            error!("Redis橋接任務異常結束");
         }
-    });
-
-    // Execution Thread (Core 3, optional)
-    let execution_handle = if let Some(exec_core) = execution_core {
-        let execution_config = config.clone();
-        Some(thread::spawn(move || {
-            if !core_affinity::set_for_current(exec_core) {
-                error!("Failed to set CPU affinity for execution thread");
-            } else {
-                info!("Execution thread pinned to core {:?}", exec_core);
-            }
-
-            if let Err(e) = execution_run(execution_config, signal_rx) {
-                error!("Execution thread error: {}", e);
-            }
-        }))
-    } else {
-        warn!("Not enough cores for dedicated execution thread");
-        None
-    };
-
-    info!("All threads started in {:.2}ms", start_time.elapsed().as_micros() as f64 / 1000.0);
-
-    // Wait for threads to complete
-    info!("System running... Press Ctrl+C to stop");
-
-    // Join threads
-    if let Err(e) = network_handle.join() {
-        error!("Network thread panicked: {:?}", e);
-    }
-
-    if let Err(e) = processor_handle.join() {
-        error!("Processor thread panicked: {:?}", e);
-    }
-
-    if let Err(e) = strategy_handle.join() {
-        error!("Strategy thread panicked: {:?}", e);
-    }
-
-    if let Some(handle) = execution_handle {
-        if let Err(e) = handle.join() {
-            error!("Execution thread panicked: {:?}", e);
+        _ = health_task => {
+            error!("健康檢查任務異常結束");
+        }
+        _ = oms_task => {
+            error!("OMS 任務異常結束");
         }
     }
-
-    info!("🏁 Rust HFT System shutdown complete");
+    
+    info!("🏁 Rust HFT System ready");
     Ok(())
 }

@@ -87,7 +87,7 @@ impl SymbolRecorder {
         };
         
         let mut connector = UnifiedBitgetConnector::new(config);
-        connector.subscribe(&self.symbol, BitgetChannel::OrderBook).await?;
+        connector.subscribe(&self.symbol, BitgetChannel::OrderBook5).await?;
         
         // Start connector and get message receiver
         let mut message_rx = connector.start().await?;

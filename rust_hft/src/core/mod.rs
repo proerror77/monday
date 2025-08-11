@@ -9,9 +9,12 @@ pub mod config;
 pub mod config_loader;
 pub mod orderbook;
 pub mod lockfree_orderbook;
+pub mod ultra_fast_orderbook;
 pub mod app_runner;
 pub mod cli;
 pub mod workflow;
+pub mod monitoring;
+pub mod dataflow;
 
 // Re-export commonly used types
 pub use types::*;
@@ -19,6 +22,7 @@ pub use config::Config;
 pub use config_loader::{ConfigLoader, ResolvedConfig, HistoricalDataConfig};
 pub use orderbook::OrderBook;
 pub use lockfree_orderbook::{LockFreeOrderBook, LockFreePriceLevel, OrderBookStats};
+pub use ultra_fast_orderbook::{UltraFastOrderBook, UltraFastPriceLevel, PriceLevelPool};
 pub use app_runner::{HftAppRunner, UnifiedReporter, run_simple_app, run_timed_app};
 pub use cli::*;
 pub use workflow::{WorkflowExecutor, WorkflowStep, StepResult, WorkflowConfig, WorkflowReport};

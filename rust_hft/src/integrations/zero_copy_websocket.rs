@@ -5,14 +5,11 @@
  * 目標：將消息處理延遲降至 < 100ns
  */
 
-use crate::types::*;
 use anyhow::Result;
-use serde_json::Value;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::collections::VecDeque;
-use std::pin::Pin;
-use std::ptr;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
 use tracing::{debug, warn, error};

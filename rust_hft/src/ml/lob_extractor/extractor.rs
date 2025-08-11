@@ -177,10 +177,10 @@ impl LobTimeSeriesExtractor {
         
         for level in 1..=self.config.lob_depth {
             if let Some(bid) = orderbook.get_level(level, Side::Bid) {
-                bid_levels.push((bid.price.0, bid.size));
+                bid_levels.push((bid.0, bid.1));  // (price, quantity)
             }
             if let Some(ask) = orderbook.get_level(level, Side::Ask) {
-                ask_levels.push((ask.price.0, ask.size));
+                ask_levels.push((ask.0, ask.1));  // (price, quantity)
             }
         }
 
@@ -248,7 +248,7 @@ impl LobTimeSeriesExtractor {
         bid_levels: &[(f64, f64)],
         ask_levels: &[(f64, f64)]
     ) -> f64 {
-        let mut score = 1.0;
+        let mut score = 1.0f64;
         
         // Penalize for wide spreads
         if features.spread_bps > 20.0 {
@@ -268,7 +268,7 @@ impl LobTimeSeriesExtractor {
             score *= 0.6;
         }
         
-        score.max(0.0).min(1.0)
+        score.max(0.0f64).min(1.0f64)
     }
 
     /// Cleanup old data from memory

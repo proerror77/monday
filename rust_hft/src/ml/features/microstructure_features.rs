@@ -162,8 +162,8 @@ impl MicrostructureExtractor {
         }
 
         // Get volumes at best prices
-        let bid_volume = orderbook.get_volume_at_price(best_bid, Side::Bid);
-        let ask_volume = orderbook.get_volume_at_price(best_ask, Side::Ask);
+        let bid_volume = orderbook.get_volume_at_price(best_bid.0, Side::Bid);
+        let ask_volume = orderbook.get_volume_at_price(best_ask.0, Side::Ask);
         
         if bid_volume + ask_volume == 0.0 {
             return orderbook.mid_price().unwrap_or(0.0.to_price()).0;
@@ -181,11 +181,11 @@ impl MicrostructureExtractor {
         // Calculate VWAP for top 10 levels
         for level in 1..=10 {
             if let (Some(bid), Some(ask)) = (orderbook.get_level(level, Side::Bid), orderbook.get_level(level, Side::Ask)) {
-                let bid_contribution = bid.price.0 * bid.size;
-                let ask_contribution = ask.price.0 * ask.size;
+                let bid_contribution = bid.0 * bid.1;  // price * quantity
+                let ask_contribution = ask.0 * ask.1;  // price * quantity
                 
                 weighted_price += bid_contribution + ask_contribution;
-                total_volume += bid.size + ask.size;
+                total_volume += bid.1 + ask.1;  // bid quantity + ask quantity
             }
         }
 

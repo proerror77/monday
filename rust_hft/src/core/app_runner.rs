@@ -31,7 +31,6 @@ impl HftAppRunner {
     /// 創建新的應用啟動器，包含所有標準初始化
     pub fn new() -> Result<Self> {
         // 1. 初始化日誌系統 (安全初始化，避免重複設置)
-        use tracing_subscriber::util::SubscriberInitExt;
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
             .try_init();
@@ -163,8 +162,8 @@ impl HftAppRunner {
     }
     
     /// 核心運行邏輯
-    async fn run_with_connector<F>(&mut self, 
-                                   mut connector: UnifiedBitgetConnector, 
+    async fn run_with_connector<F>(&mut self,
+                                   connector: UnifiedBitgetConnector,
                                    message_handler: F) -> Result<()>
     where
         F: Fn(UnifiedBitgetMessage) + Send + Sync + 'static,
@@ -198,28 +197,39 @@ impl HftAppRunner {
         };
         
         info!("🔌 Starting WebSocket connection...");
-        
-        // 運行連接器
-        tokio::select! {
-            result = connector.start() => {
-                if let Err(e) = result {
-                    error!("❌ Connection failed: {}", e);
-                    return Err(e);
-                }
+
+        // 啟動連接並獲取消息接收端
+        let mut rx = match connector.start().await {
+            Ok(rx) => rx,
+            Err(e) => {
+                error!("❌ Connection failed: {}", e);
+                // 結束前清理 reporter
+                if let Some(task) = reporter_task { task.abort(); }
+                return Err(e);
             }
+        };
+
+        // 消息處理循環與關閉信號監聽
+        tokio::select! {
+            _ = async {
+                while let Some(msg) = rx.recv().await {
+                    enhanced_handler(msg);
+                }
+            } => {}
             _ = tokio::signal::ctrl_c() => {
                 info!("📊 Shutdown signal received");
             }
         }
-        
+
+        // 嘗試停止連接器
+        let _ = connector.stop().await;
+
         // 清理
-        if let Some(task) = reporter_task {
-            task.abort();
-        }
-        
+        if let Some(task) = reporter_task { task.abort(); }
+
         // 生成最終報告
         self.generate_final_report();
-        
+
         Ok(())
     }
     
@@ -343,8 +353,8 @@ where
     };
     app.with_bitget_connector(bitget_config);
     
-    let mut connector = app.connector.take().unwrap();
-    let _ = connector.subscribe(&symbol, crate::integrations::UnifiedBitgetChannel::OrderBook).await;
+    let connector = app.connector.take().unwrap();
+    let _ = connector.subscribe(&symbol, crate::integrations::UnifiedBitgetChannel::OrderBook5).await;
     app.connector = Some(connector);
     
     app.run(handler).await
@@ -373,8 +383,8 @@ where
     app.with_bitget_connector(bitget_config)
        .with_reporter(30); // 30秒報告間隔
     
-    let mut connector = app.connector.take().unwrap();
-    let _ = connector.subscribe(&symbol, UnifiedBitgetChannel::OrderBook).await;
+    let connector = app.connector.take().unwrap();
+    let _ = connector.subscribe(&symbol, UnifiedBitgetChannel::OrderBook5).await;
     app.connector = Some(connector);
     
     app.run_with_timeout(handler, timeout_secs).await

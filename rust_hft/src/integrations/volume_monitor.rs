@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, debug};
+use tracing::info;
 
 /// 時間戳類型
 pub type Timestamp = u64;

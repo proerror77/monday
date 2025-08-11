@@ -5,13 +5,17 @@
  */
 
 // 統一引擎架構（推薦使用）
+pub mod unified;
 pub mod unified_engine;
 pub mod unified_risk_manager;
+pub mod strategies;
 
 // 核心功能模塊
 pub mod strategy;
 pub mod execution;
 pub mod inference_strategy;
+pub mod complete_oms;
+pub mod risk_manager;
 
 // 舊版實現已移除，請使用 unified_engine 和 unified_risk_manager
 
@@ -55,9 +59,19 @@ pub use unified_risk_manager::{
     create_aggressive_risk_manager,
 };
 
-// 導出核心功能
-pub use strategy::run as strategy_run;
-pub use execution::run as execution_run;
+// 導出新的完整OMS和風險管理器
+pub use complete_oms::{
+    CompleteOMS, OMSConfig, OMSStats, OrderStateMachine, Fill, OrderUpdate
+};
+pub use risk_manager::{
+    RiskManager as CoreRiskManager, RiskLimits, RiskState, 
+    RiskLevel as CoreRiskLevel, RiskEvent, OrderRiskDecision, 
+    RiskConfig as CoreRiskConfig, RiskStats
+};
+
+// 導出核心功能 - 暫時註釋掉不存在的函數
+// pub use strategy::run as strategy_run;
+// pub use execution::run as execution_run;
 
 // 舊版接口已移除
 
@@ -162,17 +176,17 @@ impl ExecutionManager for DummyExecutionManager {
             id: uuid::Uuid::new_v4().to_string(),
             symbol: signal.symbol,
             side: match signal.action {
-                SignalAction::Buy => OrderSide::Buy,
-                SignalAction::Sell => OrderSide::Sell,
-                _ => OrderSide::Buy,
+                SignalAction::Buy => "Buy".to_string(),
+                SignalAction::Sell => "Sell".to_string(),
+                _ => "Buy".to_string(),
             },
             order_type: OrderType::Market,
             quantity: signal.quantity,
             price: signal.price,
-            status: OrderStatus::Pending,
-            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            status: OrderStatus::New,
+            // timestamp: chrono::Utc::now().timestamp_millis() as u64,
             filled_quantity: 0.0,
-            average_price: 0.0,
+            // average_price: 0.0,
         })
     }
     
@@ -185,6 +199,6 @@ impl ExecutionManager for DummyExecutionManager {
     }
     
     async fn get_order_status(&self, _order_id: &str) -> Result<OrderStatus, anyhow::Error> {
-        Ok(OrderStatus::Pending)
+        Ok(OrderStatus::New)
     }
 }

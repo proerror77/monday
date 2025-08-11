@@ -4,6 +4,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use std::collections::HashMap;
+use tokio::sync::{mpsc, Mutex};
+use std::sync::Arc;
+use anyhow::Result;
 
 /// 性能測試助手
 #[derive(Debug)]
@@ -99,6 +103,142 @@ pub mod mock_websocket {
         });
         
         rx
+    }
+}
+
+/// Mock Redis Connection for testing
+#[derive(Clone)]
+pub struct MockRedis {
+    published_messages: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl MockRedis {
+    pub fn new() -> Self {
+        Self {
+            published_messages: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub async fn publish(&self, channel: &str, message: &str) -> Result<()> {
+        let mut messages = self.published_messages.lock().await;
+        messages.push((channel.to_string(), message.to_string()));
+        Ok(())
+    }
+
+    pub async fn get_published_messages(&self) -> Vec<(String, String)> {
+        self.published_messages.lock().await.clone()
+    }
+
+    pub async fn clear_messages(&self) {
+        self.published_messages.lock().await.clear();
+    }
+}
+
+/// Test Exchange Connector for mocking exchange connections
+pub struct TestExchangeConnector {
+    pub name: String,
+    pub connected: bool,
+    pub subscribed_symbols: Vec<String>,
+    pub message_sender: Option<mpsc::UnboundedSender<String>>,
+}
+
+impl TestExchangeConnector {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            connected: false,
+            subscribed_symbols: Vec::new(),
+            message_sender: None,
+        }
+    }
+
+    pub fn set_message_sender(&mut self, sender: mpsc::UnboundedSender<String>) {
+        self.message_sender = Some(sender);
+    }
+
+    pub fn simulate_market_data(&self, symbol: &str, sequence: u64) -> Result<()> {
+        if let Some(sender) = &self.message_sender {
+            let message = test_data::generate_market_message(symbol, sequence);
+            sender.send(message).map_err(|e| anyhow::anyhow!("Send error: {}", e))?;
+        }
+        Ok(())
+    }
+}
+
+/// Test Configuration Builder
+pub struct TestConfigBuilder {
+    symbols: Vec<String>,
+    exchanges: Vec<String>,
+    redis_url: String,
+}
+
+impl TestConfigBuilder {
+    pub fn new() -> Self {
+        Self {
+            symbols: vec!["BTCUSDT".to_string()],
+            exchanges: vec!["binance".to_string()],
+            redis_url: "redis://localhost:6379".to_string(),
+        }
+    }
+
+    pub fn with_symbols(mut self, symbols: Vec<&str>) -> Self {
+        self.symbols = symbols.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_exchanges(mut self, exchanges: Vec<&str>) -> Self {
+        self.exchanges = exchanges.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn build(self) -> rust_hft::integrations::multi_exchange_manager::MultiExchangeConfig {
+        rust_hft::integrations::multi_exchange_manager::MultiExchangeConfig {
+            enabled_exchanges: self.exchanges,
+            symbols: self.symbols,
+            redis_url: self.redis_url,
+            auto_reconnect: true,
+            reconnect_interval_secs: 1, // Fast reconnect for tests
+        }
+    }
+}
+
+/// Latency Measurement Helper
+pub struct LatencyTracker {
+    measurements: Arc<Mutex<Vec<u64>>>,
+}
+
+impl LatencyTracker {
+    pub fn new() -> Self {
+        Self {
+            measurements: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub async fn record_latency(&self, latency_ns: u64) {
+        self.measurements.lock().await.push(latency_ns);
+    }
+
+    pub async fn get_p99_latency(&self) -> f64 {
+        let mut measurements = self.measurements.lock().await.clone();
+        if measurements.is_empty() {
+            return 0.0;
+        }
+        measurements.sort_unstable();
+        let index = ((measurements.len() as f64 * 0.99) as usize).min(measurements.len() - 1);
+        measurements[index] as f64
+    }
+
+    pub async fn get_avg_latency(&self) -> f64 {
+        let measurements = self.measurements.lock().await;
+        if measurements.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = measurements.iter().sum();
+        sum as f64 / measurements.len() as f64
+    }
+
+    pub async fn get_count(&self) -> usize {
+        self.measurements.lock().await.len()
     }
 }
 

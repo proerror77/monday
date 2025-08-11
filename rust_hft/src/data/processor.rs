@@ -370,40 +370,37 @@ impl MessageProcessor {
     }
     
     /// Publish OrderBook data to Redis for Python agents
+    /// P1 修復：統一使用 integrations/redis_bridge 的 market.* 模式
     fn publish_orderbook_to_redis(&mut self) -> Result<()> {
         if let Some(ref mut redis_client) = self.redis_client {
             if self.orderbook.is_valid {
                 let mut con = redis_client.get_connection()
                     .map_err(|e| anyhow::anyhow!("Redis connection error: {}", e))?;
                 
-                // Create fast snapshot for Python consumption
-                let snapshot = serde_json::json!({
-                    "symbol": self.orderbook.symbol,
-                    "mid_price": self.orderbook.mid_price().map(|p| p.0),
-                    "best_bid": self.orderbook.best_bid().map(|p| p.0),
-                    "best_ask": self.orderbook.best_ask().map(|p| p.0),
-                    "spread": self.orderbook.spread(),
-                    "spread_bps": self.orderbook.spread_bps(),
-                    "bid_levels": self.orderbook.bids.len(),
-                    "ask_levels": self.orderbook.asks.len(),
-                    "last_update": self.orderbook.last_update,
-                    "last_sequence": self.orderbook.last_sequence,
-                    "is_valid": self.orderbook.is_valid,
-                    "data_quality_score": self.orderbook.data_quality_score,
-                    "timestamp_us": now_micros(),
-                    "source": "rust_fast_processor"
+                // 統一使用 market.orderbook 域名模式，與 integrations/redis_bridge 一致
+                let message = serde_json::json!({
+                    "channel": "orderbook",
+                    "data": {
+                        "symbol": self.orderbook.symbol,
+                        "mid_price": self.orderbook.mid_price().map(|p| p.0),
+                        "best_bid": self.orderbook.best_bid().map(|p| p.0),
+                        "best_ask": self.orderbook.best_ask().map(|p| p.0),
+                        "spread": self.orderbook.spread(),
+                        "spread_bps": self.orderbook.spread_bps(),
+                        "bid_levels": self.orderbook.bids.len(),
+                        "ask_levels": self.orderbook.asks.len(),
+                        "last_sequence": self.orderbook.last_sequence,
+                        "is_valid": self.orderbook.is_valid,
+                        "data_quality_score": self.orderbook.data_quality_score,
+                        "source": "rust_fast_processor"
+                    },
+                    "timestamp": now_micros()
                 });
                 
-                let redis_key = format!("hft:orderbook:{}", self.orderbook.symbol);
-                let data = snapshot.to_string();
+                // 統一使用 market.orderbook 通道，與 integrations/redis_bridge 一致
+                let _: Result<(), redis::RedisError> = con.publish("market.orderbook", message.to_string());
                 
-                // Publish to Redis channel (non-blocking)
-                let _: Result<(), redis::RedisError> = con.publish(&redis_key, &data);
-                
-                // Also set as key-value for latest data access
-                let _: Result<(), redis::RedisError> = con.set_ex(&redis_key, &data, 5);
-                
-                debug!("📡 Published OrderBook to Redis: {}", redis_key);
+                debug!("📡 Published OrderBook to unified market.orderbook channel: {}", self.orderbook.symbol);
             }
         }
         Ok(())

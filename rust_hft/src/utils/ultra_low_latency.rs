@@ -15,12 +15,10 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
-use std::sync::Arc;
-use std::mem::{self, MaybeUninit};
 use std::ptr;
-use lockfree::queue::Queue;
+use std::mem::MaybeUninit;
 use anyhow::Result;
-use tracing::{debug, warn, info};
+use tracing::{warn, info};
 
 /// CPU 親和性管理器
 #[derive(Debug)]
