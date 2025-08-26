@@ -44,6 +44,9 @@ tracing = { workspace = true }
 rust_decimal = { workspace = true }
 chrono = { workspace = true }
 regex = "1.5"
+redis = { version = "0.24", features = ["tokio-comp", "aio"], optional = true }
+serde_json = { version = "1.0", optional = true }
+clickhouse = { version = "0.12", optional = true }
 
 [features]
 default = []
@@ -68,9 +71,12 @@ strategy-arbitrage = ["dep:strategy-arbitrage"]
 strategy-dl = [] # Forward compatibility - will be implemented later
 
 # Infrastructure
-infra-clickhouse = ["dep:infra-clickhouse"]
-infra-redis = ["dep:infra-redis"]
+infra-clickhouse = ["dep:infra-clickhouse", "dep:clickhouse"]
+infra-redis = ["dep:infra-redis", "dep:redis"]
 infra-metrics = ["dep:infra-metrics"]
+
+# Enable Redis support
+redis = ["dep:redis", "dep:serde_json"]
 
 # Convenience features
 bitget = ["adapter-bitget-data", "adapter-bitget-execution"]

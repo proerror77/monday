@@ -190,6 +190,7 @@ impl Engine {
     pub fn register_execution_client_boxed(&mut self, e: Box<dyn ExecutionClient>) {
         self.execution_clients.push(e);
     }
+
     
     /// 獲取當前市場視圖快照
     pub fn get_market_view(&self) -> Arc<MarketView> {
@@ -209,6 +210,26 @@ impl Engine {
     /// 獲取帳戶快照讀取者  
     pub fn account_reader(&self) -> Arc<dyn snapshot::SnapshotReader<AccountView>> {
         self.account_snapshots.reader()
+    }
+    
+    /// 提交訂單意圖到執行隊列（用於 dry-run 測試）
+    pub fn submit_order_intent(&mut self, intent: ports::OrderIntent) -> Result<(), HftError> {
+        if let Some(queues) = &mut self.execution_queues {
+            match queues.send_intent(intent) {
+                Ok(()) => {
+                    debug!("成功提交訂單意圖到執行隊列");
+                    Ok(())
+                }
+                Err(rejected_intent) => {
+                    warn!("執行隊列滿載，訂單意圖被拒絕: {} {}", 
+                          rejected_intent.symbol.0, rejected_intent.quantity.0);
+                    Err(HftError::Execution("執行隊列滿載".to_string()))
+                }
+            }
+        } else {
+            warn!("執行隊列未初始化，無法提交訂單意圖");
+            Err(HftError::Execution("執行隊列未初始化".to_string()))
+        }
     }
     
     /// 單次事件循環

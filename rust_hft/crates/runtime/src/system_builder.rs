@@ -10,6 +10,14 @@ use engine::{Engine, EngineConfig, dataflow::{EventConsumer, FlipPolicy}, create
 use tokio::sync::Mutex;
 use integration;
 use risk;
+use serde_yaml::Value as YamlValue;
+use std::collections::{BTreeSet, HashMap};
+
+#[cfg(feature = "redis")]
+use serde_json;
+
+#[cfg(feature = "redis")]
+use engine::aggregation;
 
 /// 系統配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +26,7 @@ pub struct SystemConfig {
     pub venues: Vec<VenueConfig>,
     pub strategies: Vec<StrategyConfig>,
     pub risk: RiskConfig,
+    pub infra: Option<InfraConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +135,71 @@ pub struct RiskConfig {
     pub staleness_threshold_us: u64,
 }
 
+/// 基礎設施配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraConfig {
+    pub redis: Option<RedisConfig>,
+    pub clickhouse: Option<ClickHouseConfig>,
+}
+
+/// Redis 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisConfig {
+    pub url: String,
+}
+
+/// ClickHouse 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClickHouseConfig {
+    pub url: String,
+    pub database: Option<String>,
+}
+
+/// 模板化配置（可選）：商品分組與策略模板/綁定
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct InstrumentsSection {
+    pub groups: Vec<InstrumentGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InstrumentGroup {
+    pub name: String,
+    #[serde(default)]
+    pub symbols: Vec<Symbol>,
+    #[serde(default)]
+    pub selector: Option<String>, // TODO: 後續支持正則匹配
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StrategiesSection {
+    #[serde(default)]
+    pub templates: Vec<StrategyTemplate>,
+    #[serde(default)]
+    pub bindings: Vec<StrategyBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StrategyTemplate {
+    pub id: String,
+    pub strategy_type: StrategyType,
+    pub params: StrategyParams,
+    pub risk: StrategyRiskLimits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct StrategyOverrides {
+    #[serde(default)]
+    pub risk: Option<StrategyRiskLimits>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StrategyBinding {
+    pub template: String,
+    pub apply_to: Vec<String>, // e.g. ["group:layer1", "symbol:ETHUSDT"]
+    #[serde(default)]
+    pub overrides: HashMap<String, StrategyOverrides>, // symbol -> overrides
+}
+
 /// 系統建構器 - 使用構建者模式
 pub struct SystemBuilder {
     config: SystemConfig,
@@ -154,7 +228,22 @@ impl SystemBuilder {
     pub fn from_yaml(yaml_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let yaml_content = std::fs::read_to_string(yaml_path)?;
         let expanded_content = expand_env_vars(&yaml_content)?;
-        let config: SystemConfig = serde_yaml::from_str(&expanded_content)?;
+
+        // 先解析為動態 YAML
+        let mut root: YamlValue = serde_yaml::from_str(&expanded_content)?;
+        // 展開模板到最終 strategies 列表
+        if let Some(expanded) = expand_templates_into_strategies(&root)? {
+            if let YamlValue::Mapping(ref mut map) = root {
+                map.insert(YamlValue::from("strategies"), serde_yaml::to_value(&expanded)?);
+                // 解析後移除 instruments / templates/bindings 節點：
+                map.remove(&YamlValue::from("instruments"));
+                if let Some(YamlValue::Mapping(mut strat_map)) = map.remove(&YamlValue::from("strategies")) {
+                    // 已將 strategies 設為列表，恢復插入
+                    map.insert(YamlValue::from("strategies"), serde_yaml::to_value(&expanded)?);
+                }
+            }
+        }
+        let config: SystemConfig = serde_yaml::from_value(root)?;
         Ok(Self::new(config))
     }
     
@@ -203,7 +292,7 @@ impl SystemBuilder {
         info!("自動註冊適配器...");
 
         // 1) 根據策略聚合需要訂閱的 symbols（去重）
-        let mut symbol_set = std::collections::BTreeSet::new();
+        let mut symbol_set = BTreeSet::new();
         for strat in &self.config.strategies {
             for s in &strat.symbols {
                 symbol_set.insert(s.0.clone());
@@ -574,6 +663,22 @@ impl SystemRuntime {
         });
         self.tasks.push(handle);
 
+        // 啟動 Redis 導出任務（如果配置了 Redis）
+        #[cfg(feature = "redis")]
+        if let Some(infra) = &self.config.infra {
+            if let Some(redis_config) = &infra.redis {
+                self.spawn_redis_exporter(redis_config.clone()).await?;
+            }
+        }
+
+        // 啟動 ClickHouse Writer 任務（如果配置了 ClickHouse）
+        #[cfg(feature = "infra-clickhouse")]
+        if let Some(infra) = &self.config.infra {
+            if let Some(clickhouse_config) = &infra.clickhouse {
+                self.spawn_clickhouse_writer(clickhouse_config.clone()).await?;
+            }
+        }
+
         info!("系統運行時已啟動（引擎背景運行）");
         Ok(())
     }
@@ -612,11 +717,239 @@ impl SystemRuntime {
             strategy_id: "test_order".to_string(),
         };
         
-        // 注意：现在订单通过队列系统异步处理，无法直接返回 OrderId
-        // 返回一个测试用的 OrderId，实际的执行结果通过 ExecutionEvent 异步回报
+        // 提交訂單意圖到執行隊列
+        {
+            let mut engine_lock = self.engine.lock().await;
+            engine_lock.submit_order_intent(intent)?;
+        }
+        
+        // 生成測試用的 OrderId，實際執行結果通過 ExecutionEvent 異步回報
         let test_order_id = hft_core::OrderId(format!("test_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
-        info!("测试订单已发送到执行队列: {} {}", symbol, test_order_id.0);
+        info!("測試訂單已成功提交到執行隊列: {} {}", symbol, test_order_id.0);
         Ok(test_order_id)
+    }
+
+    /// 啟動 Redis 導出任務
+    #[cfg(feature = "redis")]
+    async fn spawn_redis_exporter(&mut self, redis_config: RedisConfig) -> Result<(), Box<dyn std::error::Error>> {
+        use engine::aggregation::TopNSnapshot;
+        
+        // 計算中間價格的輔助函數
+        fn calculate_mid_price(orderbook: &TopNSnapshot) -> Option<f64> {
+            if !orderbook.bid_prices.is_empty() && !orderbook.ask_prices.is_empty() {
+                let best_bid = orderbook.bid_prices[0].to_f64();
+                let best_ask = orderbook.ask_prices[0].to_f64();
+                Some((best_bid + best_ask) / 2.0)
+            } else {
+                None
+            }
+        }
+        
+        // 計算價差的輔助函數
+        fn calculate_spread(orderbook: &TopNSnapshot) -> Option<f64> {
+            if !orderbook.bid_prices.is_empty() && !orderbook.ask_prices.is_empty() {
+                let best_bid = orderbook.bid_prices[0].to_f64();
+                let best_ask = orderbook.ask_prices[0].to_f64();
+                Some(best_ask - best_bid)
+            } else {
+                None
+            }
+        }
+        use redis::{AsyncCommands, Client};
+        
+        info!("啟動 Redis 導出器，連接到: {}", redis_config.url);
+        
+        // 測試連接
+        let client = Client::open(redis_config.url.as_str())?;
+        let mut conn = client.get_async_connection().await?;
+        let _: String = redis::cmd("PING").query_async(&mut conn).await?;
+        info!("Redis 連接測試成功");
+        
+        // 克隆引擎引用以供任務使用
+        let engine_arc = self.engine.clone();
+        let redis_url = redis_config.url.clone();
+        
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            let client = match Client::open(redis_url.as_str()) {
+                Ok(client) => client,
+                Err(e) => {
+                    tracing::error!("Redis 客戶端創建失敗: {}", e);
+                    return;
+                }
+            };
+            
+            loop {
+                interval.tick().await;
+                
+                // 獲取當前市場視圖
+                let market_view = {
+                    let engine = engine_arc.lock().await;
+                    engine.get_market_view()
+                };
+                
+                // 連接 Redis 並導出數據
+                match client.get_async_connection().await {
+                    Ok(mut conn) => {
+                        // 為每個訂單簿創建簡化的快照
+                        for (symbol, orderbook) in &market_view.orderbooks {
+                            let snapshot_data = serde_json::json!({
+                                "symbol": symbol.0,
+                                "mid_price": calculate_mid_price(orderbook),
+                                "spread": calculate_spread(orderbook),
+                                "timestamp": market_view.timestamp,
+                                "bid_levels": orderbook.bid_prices.len(),
+                                "ask_levels": orderbook.ask_prices.len(),
+                                "version": market_view.version
+                            });
+                            
+                            // 寫入 Redis Streams
+                            let result: Result<String, redis::RedisError> = conn.xadd(
+                                "market_snapshots",
+                                "*",
+                                &[
+                                    ("symbol", symbol.0.as_str()),
+                                    ("data", snapshot_data.to_string().as_str())
+                                ]
+                            ).await;
+                            
+                            if let Err(e) = result {
+                                tracing::warn!("Redis 寫入失敗 {}: {}", symbol.0, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Redis 連接失敗: {}", e);
+                    }
+                }
+            }
+        });
+        
+        self.tasks.push(handle);
+        info!("Redis 導出任務已啟動");
+        Ok(())
+    }
+
+    /// 啟動 ClickHouse Writer 任務
+    #[cfg(feature = "infra-clickhouse")]
+    async fn spawn_clickhouse_writer(&mut self, clickhouse_config: ClickHouseConfig) -> Result<(), Box<dyn std::error::Error>> {
+        use clickhouse::{Client, Row};
+        use serde::{Deserialize, Serialize};
+        
+        info!("啟動 ClickHouse Writer，連接到: {}", clickhouse_config.url);
+        
+        // 測試連接
+        let client = Client::default()
+            .with_url(&clickhouse_config.url)
+            .with_database(clickhouse_config.database.as_ref().unwrap_or(&"default".to_string()));
+        
+        // 測試連接可用性
+        let result: Result<Vec<u8>, clickhouse::error::Error> = client
+            .query("SELECT 1")
+            .fetch_all()
+            .await;
+        
+        if let Err(e) = result {
+            return Err(format!("ClickHouse 連接測試失敗: {}", e).into());
+        }
+        info!("ClickHouse 連接測試成功");
+
+        // 定義 lob_depth 表的行格式
+        #[derive(Row, Serialize, Deserialize)]
+        struct LobDepthRow {
+            timestamp: u64,
+            symbol: String,
+            venue: String,
+            side: String,        // "bid" or "ask"
+            level: u32,          // 0 = best, 1 = second, etc.
+            price: f64,
+            quantity: f64,
+        }
+
+        // 克隆引擎引用以供任務使用
+        let engine_arc = self.engine.clone();
+        
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            let mut batch = Vec::<LobDepthRow>::new();
+            
+            loop {
+                interval.tick().await;
+                
+                // 獲取當前市場視圖
+                let market_view = {
+                    let engine = engine_arc.lock().await;
+                    engine.get_market_view()
+                };
+                
+                batch.clear();
+                
+                // 轉換 MarketView 到 LobDepthRow 批量數據
+                for (symbol, orderbook) in &market_view.orderbooks {
+                    let timestamp = market_view.timestamp;
+                    let venue = "COMBINED"; // 可以後續擴展為多交易所
+                    
+                    // 處理買盤深度
+                    for (level, (&price, &quantity)) in orderbook.bid_prices
+                        .iter()
+                        .zip(orderbook.bid_quantities.iter())
+                        .enumerate() 
+                    {
+                        if level < 10 { // 只保存前10檔
+                            batch.push(LobDepthRow {
+                                timestamp,
+                                symbol: symbol.0.clone(),
+                                venue: venue.to_string(),
+                                side: "bid".to_string(),
+                                level: level as u32,
+                                price: price.to_f64(),
+                                quantity: quantity.to_f64(),
+                            });
+                        }
+                    }
+                    
+                    // 處理賣盤深度
+                    for (level, (&price, &quantity)) in orderbook.ask_prices
+                        .iter()
+                        .zip(orderbook.ask_quantities.iter())
+                        .enumerate()
+                    {
+                        if level < 10 { // 只保存前10檔
+                            batch.push(LobDepthRow {
+                                timestamp,
+                                symbol: symbol.0.clone(),
+                                venue: venue.to_string(),
+                                side: "ask".to_string(),
+                                level: level as u32,
+                                price: price.to_f64(),
+                                quantity: quantity.to_f64(),
+                            });
+                        }
+                    }
+                }
+                
+                // 批量寫入 ClickHouse
+                if !batch.is_empty() {
+                    match client
+                        .insert("lob_depth")
+                        .expect("Failed to create insert")
+                        .write(&batch)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::debug!("成功寫入 {} 條 lob_depth 記錄", batch.len());
+                        }
+                        Err(e) => {
+                            tracing::warn!("ClickHouse 寫入失敗: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+        
+        self.tasks.push(handle);
+        info!("ClickHouse Writer 已啟動，每秒批量寫入 lob_depth 表");
+        Ok(())
     }
 }
 
@@ -638,6 +971,7 @@ impl Default for SystemConfig {
                 max_orders_per_second: 100,
                 staleness_threshold_us: 5000,
             },
+            infra: None,
         }
     }
 }
@@ -679,4 +1013,81 @@ fn expand_env_vars(content: &str) -> Result<String, Box<dyn std::error::Error>> 
     }
     
     Ok(result)
+}
+
+/// 將模板化配置展開為最終 strategies 列表（若存在模板節點）
+fn expand_templates_into_strategies(root: &YamlValue) -> Result<Option<Vec<StrategyConfig>>, Box<dyn std::error::Error>> {
+    // 讀取 instruments
+    let mut group_map: HashMap<String, Vec<Symbol>> = HashMap::new();
+    if let Some(instruments) = root.get("instruments") {
+        if let Ok(sec) = serde_yaml::from_value::<InstrumentsSection>(instruments.clone()) {
+            for g in sec.groups {
+                // 目前僅支持顯式 symbols；selector TODO
+                if g.selector.is_some() {
+                    warn!("instrument group '{}' 使用 selector 暫未實作，請使用 symbols 顯式列出", g.name);
+                }
+                group_map.insert(g.name, g.symbols);
+            }
+        }
+    }
+
+    // strategies 有兩種情況：
+    // 1) 直接是列表（舊格式）→ 不處理（返回 None）
+    // 2) 是 mapping，包含 templates/bindings → 展開
+    let strategies_node = match root.get("strategies") { Some(v) => v, None => return Ok(None) };
+    if strategies_node.is_sequence() { return Ok(None); }
+
+    let sec: StrategiesSection = match serde_yaml::from_value(strategies_node.clone()) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+
+    if sec.templates.is_empty() || sec.bindings.is_empty() {
+        return Ok(None);
+    }
+
+    let tpl_map: HashMap<String, StrategyTemplate> = sec.templates.into_iter().map(|t| (t.id.clone(), t)).collect();
+    let mut out: Vec<StrategyConfig> = Vec::new();
+
+    for b in sec.bindings {
+        let Some(tpl) = tpl_map.get(&b.template) else {
+            warn!("找不到策略模板: {}，跳過綁定", b.template);
+            continue;
+        };
+
+        // 收集作用範圍內的 symbols
+        let mut symbols: Vec<Symbol> = Vec::new();
+        for target in &b.apply_to {
+            if let Some(rest) = target.strip_prefix("group:") {
+                if let Some(gs) = group_map.get(rest) {
+                    symbols.extend(gs.clone());
+                } else {
+                    warn!("未定義的商品組: {}，跳過", rest);
+                }
+            } else if let Some(sym) = target.strip_prefix("symbol:") {
+                symbols.push(Symbol(sym.to_string()));
+            } else {
+                warn!("未知的 apply_to 項: {}，應為 group:<name> 或 symbol:<SYM>", target);
+            }
+        }
+
+        // 產生實例化策略
+        for sym in symbols {
+            let mut risk = tpl.risk.clone();
+            if let Some(ov) = b.overrides.get(&sym.0) {
+                if let Some(r) = &ov.risk { risk = r.clone(); }
+            }
+
+            let cfg = StrategyConfig {
+                name: format!("{}:{}", tpl.id, sym.0),
+                strategy_type: tpl.strategy_type.clone(),
+                symbols: vec![sym],
+                params: tpl.params.clone(),
+                risk_limits: risk,
+            };
+            out.push(cfg);
+        }
+    }
+
+    Ok(Some(out))
 }

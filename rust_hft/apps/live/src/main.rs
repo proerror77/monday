@@ -299,5 +299,6 @@ fn convert_legacy_config(legacy: Config) -> SystemConfig {
             max_orders_per_second: 100,
             staleness_threshold_us: 5000,
         },
+        infra: None,
     }
 }

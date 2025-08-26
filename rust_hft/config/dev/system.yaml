@@ -27,36 +27,66 @@ venues:
       all_in_one_topics: true
       private_ws_heartbeat: true
 
-strategies:
-  - name: "trend_btc"
-    strategy_type: "Trend"
-    symbols:
-      - "BTCUSDT"
-    params:
-      Trend:
-        ema_fast: 12
-        ema_slow: 26
-        rsi_period: 14
-    risk_limits:
-      max_notional: 20000.0
-      max_position: 5.0
-      daily_loss_limit: 1000.0
-      cooldown_ms: 1000
+  - name: "binance"
+    venue_type: "Binance"
+    ws_public: "wss://stream.binance.com:9443/ws"
+    ws_private: "wss://stream.binance.com:9443/ws"
+    rest: "https://api.binance.com"
+    api_key: "${BINANCE_API_KEY}"       # 從環境變量讀取 API Key
+    secret: "${BINANCE_SECRET}"         # 從環境變量讀取 Secret
+    execution_mode: "Paper"             # "Paper" | "Live"，預設為 Paper
+    capabilities:
+      ws_order_placement: true
+      snapshot_crc: false
+      all_in_one_topics: false
+      private_ws_heartbeat: false
 
-  - name: "arbitrage_btc"
-    strategy_type: "Arbitrage"
-    symbols:
-      - "BTCUSDT"
-    params:
-      Arbitrage:
-        min_spread_bps: 1.2
-        max_position: 0.1
-        execution_timeout_ms: 5000
-    risk_limits:
-      max_notional: 10000.0
-      max_position: 2.0
-      daily_loss_limit: 500.0
-      cooldown_ms: 2000
+instruments:
+  groups:
+    - name: layer1
+      symbols: ["ETHUSDT", "SOLUSDT", "SUIUSDT"]
+
+strategies:
+  templates:
+    - id: trend_default
+      strategy_type: Trend
+      params:
+        Trend:
+          ema_fast: 12
+          ema_slow: 26
+          rsi_period: 14
+      risk:
+        max_notional: 10000.0
+        max_position: 5.0
+        daily_loss_limit: 500.0
+        cooldown_ms: 1000
+
+    - id: arbitrage_cross
+      strategy_type: Arbitrage
+      params:
+        Arbitrage:
+          min_spread_bps: 1.5
+          max_position: 0.1
+          execution_timeout_ms: 3000
+      risk:
+        max_notional: 12000.0
+        max_position: 2.0
+        daily_loss_limit: 400.0
+        cooldown_ms: 2000
+
+  bindings:
+    - template: trend_default
+      apply_to: ["group:layer1"]
+      overrides:
+        ETHUSDT:
+          risk: { max_notional: 15000.0, max_position: 3.0, daily_loss_limit: 800.0, cooldown_ms: 1000 }
+        SOLUSDT:
+          risk: { max_notional: 10000.0, max_position: 5.0, daily_loss_limit: 500.0, cooldown_ms: 1000 }
+        SUIUSDT:
+          risk: { max_notional: 8000.0,  max_position: 10.0, daily_loss_limit: 300.0, cooldown_ms: 1000 }
+
+    - template: arbitrage_cross
+      apply_to: ["group:layer1"]
 
 risk:
   global_position_limit: 1000000.0
@@ -64,3 +94,11 @@ risk:
   max_daily_trades: 10000
   max_orders_per_second: 100
   staleness_threshold_us: 5000
+
+# 基礎設施配置（可選）
+infra:
+  redis:
+    url: "redis://localhost:6379"
+  clickhouse:
+    url: "http://localhost:8123"
+    database: "hft"
