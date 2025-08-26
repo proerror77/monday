@@ -1,0 +1,260 @@
+# Prometheus 告警規則 - HFT 系統 SLO 監控
+# Phase 1 LOB-Live 硬化所需的完整告警體系
+
+groups:
+  # === 執行 SLO 告警 ===
+  - name: hft_execution_slo
+    rules:
+      # 下單成功率低於 99.5%
+      - alert: OrderSuccessRateLow
+        expr: |
+          (
+            rate(hft_orders_filled_total[1m]) + rate(hft_orders_rejected_total[1m])
+          ) / rate(hft_orders_submitted_total[1m]) < 0.995
+        for: 30s
+        labels:
+          severity: critical
+          component: execution
+        annotations:
+          summary: "下單成功率低於 SLO 閾值"
+          description: "過去 1 分鐘內下單成功率為 {{ $value | humanizePercentage }}，低於 99.5% SLO 要求"
+
+      # 下單確認延遲 p99 超過 50ms
+      - alert: OrderAckLatencyHigh
+        expr: |
+          histogram_quantile(0.99, rate(hft_latency_execution_microseconds_bucket[1m])) > 50000
+        for: 1m
+        labels:
+          severity: warning  
+          component: execution
+        annotations:
+          summary: "下單確認延遲過高"
+          description: "下單確認 p99 延遲為 {{ $value | humanizeDuration }}，超過 50ms 閾值"
+
+      # 撤單成功率低於 99%
+      - alert: CancelSuccessRateLow
+        expr: |
+          # 假設我們有撤單相關指標
+          rate(hft_orders_cancelled_success_total[1m]) / rate(hft_orders_cancel_requests_total[1m]) < 0.99
+        for: 30s
+        labels:
+          severity: warning
+          component: execution
+        annotations:
+          summary: "撤單成功率低於預期"
+          description: "撤單成功率為 {{ $value | humanizePercentage }}，低於 99% 預期"
+
+      # 拒單率超過 1%
+      - alert: OrderRejectionRateHigh
+        expr: |
+          rate(hft_orders_rejected_total[1m]) / rate(hft_orders_submitted_total[1m]) > 0.01
+        for: 1m
+        labels:
+          severity: warning
+          component: execution
+        annotations:
+          summary: "訂單拒絕率過高"
+          description: "過去 1 分鐘拒單率為 {{ $value | humanizePercentage }}，超過 1% 閾值"
+
+  # === 風控熔斷告警 ===
+  - name: hft_risk_circuit_breaker
+    rules:
+      # 熔斷器激活
+      - alert: CircuitBreakerTriggered
+        expr: hft_circuit_breaker_active == 1
+        for: 0s  # 立即告警
+        labels:
+          severity: critical
+          component: risk_manager
+          urgency: immediate
+        annotations:
+          summary: "🔴 風控熔斷器激活 - 交易已暫停"
+          description: "風控熔斷器已激活，所有交易活動已暫停。需要人工介入檢查系統狀態"
+          runbook_url: "https://hft-docs.internal/runbooks/circuit-breaker"
+
+      # 熔斷器觸發頻率過高
+      - alert: CircuitBreakerTriggerRateHigh
+        expr: rate(hft_circuit_breaker_triggers_total[1h]) > 3
+        for: 0s
+        labels:
+          severity: critical
+          component: risk_manager
+        annotations:
+          summary: "熔斷器觸發頻率過高"
+          description: "過去 1 小時內熔斷器觸發 {{ $value }} 次，超過正常範圍"
+
+      # 連續虧損過多
+      - alert: ConsecutiveLossesHigh
+        expr: hft_consecutive_losses >= 3
+        for: 0s
+        labels:
+          severity: warning
+          component: risk_manager
+        annotations:
+          summary: "連續虧損警告"
+          description: "當前連續虧損 {{ $value }} 筆，接近熔斷閾值"
+
+      # 回撤過大
+      - alert: DrawdownExcessive
+        expr: hft_drawdown_percentage > 2.0
+        for: 30s
+        labels:
+          severity: critical
+          component: risk_manager
+        annotations:
+          summary: "回撤過大警告"
+          description: "當前回撤比例為 {{ $value }}%，超過 2% 風險閾值"
+
+      # 日內 PnL 虧損過大
+      - alert: DailyPnLLoss
+        expr: hft_daily_pnl_usd < -2000
+        for: 30s
+        labels:
+          severity: critical
+          component: risk_manager
+        annotations:
+          summary: "日內虧損過大"
+          description: "日內 PnL 為 ${{ $value }}，虧損超過 $2000 閾值"
+
+  # === 延遲性能告警 ===
+  - name: hft_latency_slo
+    rules:
+      # 端到端延遲 p99 超過 100μs
+      - alert: EndToEndLatencyHigh
+        expr: |
+          histogram_quantile(0.99, rate(hft_latency_end_to_end_microseconds_bucket[1m])) > 100
+        for: 30s
+        labels:
+          severity: critical
+          component: engine
+        annotations:
+          summary: "端到端延遲過高"
+          description: "p99 端到端延遲為 {{ $value }}μs，超過 100μs SLO"
+
+      # 風控檢查延遲過高
+      - alert: RiskCheckLatencyHigh
+        expr: |
+          histogram_quantile(0.95, rate(hft_latency_risk_microseconds_bucket[1m])) > 50
+        for: 1m
+        labels:
+          severity: warning
+          component: risk_manager
+        annotations:
+          summary: "風控檢查延遲過高"
+          description: "風控檢查 p95 延遲為 {{ $value }}μs，影響系統性能"
+
+      # 數據陳舊度過高
+      - alert: DataStalenessHigh
+        expr: |
+          histogram_quantile(0.95, rate(hft_staleness_milliseconds_bucket[1m])) > 5
+        for: 30s
+        labels:
+          severity: warning
+          component: data_ingestion
+        annotations:
+          summary: "數據陳舊度過高"
+          description: "p95 數據陳舊度為 {{ $value }}ms，超過 5ms 閾值"
+
+  # === 系統健康告警 ===
+  - name: hft_system_health
+    rules:
+      # 隊列利用率過高
+      - alert: QueueUtilizationHigh
+        expr: hft_queue_utilization_ratio > 0.8
+        for: 1m
+        labels:
+          severity: warning
+          component: engine
+        annotations:
+          summary: "隊列利用率過高"
+          description: "SPSC 隊列利用率為 {{ $value | humanizePercentage }}，系統接近過載"
+
+      # 事件丟棄率過高
+      - alert: EventDropRateHigh
+        expr: |
+          rate(hft_events_dropped_total[1m]) / rate(hft_events_processed_total[1m]) > 0.001
+        for: 30s
+        labels:
+          severity: critical
+          component: engine
+        annotations:
+          summary: "事件丟棄率過高"
+          description: "事件丟棄率為 {{ $value | humanizePercentage }}，系統可能過載"
+
+      # 陳舊事件過多
+      - alert: StaleEventRateHigh
+        expr: |
+          rate(hft_events_stale_total[1m]) / rate(hft_events_processed_total[1m]) > 0.01
+        for: 1m
+        labels:
+          severity: warning
+          component: data_ingestion
+        annotations:
+          summary: "陳舊事件比例過高"
+          description: "陳舊事件比例為 {{ $value | humanizePercentage }}，數據質量下降"
+
+      # WebSocket 重連過頻
+      - alert: WebSocketReconnectRateHigh
+        expr: rate(hft_websocket_reconnects_total[10m]) > 3
+        for: 0s
+        labels:
+          severity: warning
+          component: data_ingestion
+        annotations:
+          summary: "WebSocket 重連過於頻繁"
+          description: "過去 10 分鐘 WebSocket 重連 {{ $value }} 次，可能存在網路問題"
+
+  # === 業務指標告警 ===  
+  - name: hft_business_metrics
+    rules:
+      # 交易量異常低
+      - alert: TradingVolumeAbnormallyLow
+        expr: |
+          rate(hft_orders_filled_total[10m]) < 0.1  # 每秒少於 0.1 筆成交
+        for: 5m
+        labels:
+          severity: warning
+          component: strategy
+        annotations:
+          summary: "交易量異常低"
+          description: "過去 10 分鐘平均成交率為每秒 {{ $value }} 筆，低於預期"
+
+      # 策略延遲過高
+      - alert: StrategyLatencyHigh
+        expr: |
+          histogram_quantile(0.95, rate(hft_latency_strategy_microseconds_bucket[1m])) > 1000
+        for: 1m
+        labels:
+          severity: warning
+          component: strategy
+        annotations:
+          summary: "策略計算延遲過高"
+          description: "策略 p95 延遲為 {{ $value }}μs，可能影響交易決策時效性"
+
+# === 熔斷恢復告警 ===
+  - name: hft_recovery_alerts
+    rules:
+      # 熔斷器恢復
+      - alert: CircuitBreakerRecovered
+        expr: hft_circuit_breaker_active == 0 and hft_circuit_breaker_active offset 1m == 1
+        for: 0s
+        labels:
+          severity: info
+          component: risk_manager
+        annotations:
+          summary: "🟢 風控熔斷器已恢復"
+          description: "風控熔斷器已恢復正常狀態，交易活動可以恢復"
+
+      # 系統性能恢復
+      - alert: LatencyRecovered  
+        expr: |
+          histogram_quantile(0.99, rate(hft_latency_end_to_end_microseconds_bucket[1m])) < 50
+          and
+          histogram_quantile(0.99, rate(hft_latency_end_to_end_microseconds_bucket[1m]) offset 5m) > 100
+        for: 1m
+        labels:
+          severity: info
+          component: engine
+        annotations:
+          summary: "系統延遲已恢復正常"
+          description: "p99 端到端延遲已降至 {{ $value }}μs，系統性能恢復正常"

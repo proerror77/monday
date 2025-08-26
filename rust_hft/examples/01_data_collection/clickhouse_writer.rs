@@ -1,6 +1,6 @@
 /*!
  * ClickHouse 批量寫入性能測試
- * 
+ *
  * 測試重點：
  * - 批量寫入吞吐量
  * - 網絡延遲影響
@@ -9,20 +9,17 @@
  * - 錯誤恢復機制
  */
 
-use rust_hft::{
-    integrations::bitget_connector::*,
-    core::types::*,
-};
-use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use clap::Parser;
-use tokio::sync::mpsc;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use clickhouse::{Client, Row};
+use rust_hft::{core::types::*, integrations::bitget_connector::*};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, warn, error};
-use serde_json::{json, Value};
-use clickhouse::{Client, Row};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 // Helper function to get current time in microseconds
 fn now_micros() -> u64 {
@@ -38,35 +35,35 @@ struct Args {
     /// ClickHouse 連接URL
     #[arg(long, default_value = "http://localhost:8123")]
     clickhouse_url: String,
-    
+
     /// 數據庫名稱
     #[arg(long, default_value = "hft_test")]
     database: String,
-    
+
     /// 表名稱
     #[arg(long, default_value = "orderbook_test")]
     table: String,
-    
+
     /// 批量大小
     #[arg(short, long, default_value_t = 1000)]
     batch_size: usize,
-    
+
     /// 測試時長（秒）
     #[arg(short, long, default_value_t = 60)]
     duration: u64,
-    
+
     /// 併發寫入數
     #[arg(short, long, default_value_t = 1)]
     concurrency: usize,
-    
+
     /// 數據生成速率（記錄/秒）
     #[arg(short, long, default_value_t = 10000)]
     rate: usize,
-    
+
     /// 詳細輸出
     #[arg(short, long)]
     verbose: bool,
-    
+
     /// 啟用壓縮
     #[arg(long)]
     compression: bool,
@@ -85,21 +82,23 @@ struct WriteMetrics {
 
 impl WriteMetrics {
     fn record_batch_write(&self, records: usize, bytes: usize, latency_us: u64) {
-        self.total_records.fetch_add(records as u64, Ordering::Relaxed);
+        self.total_records
+            .fetch_add(records as u64, Ordering::Relaxed);
         self.total_batches.fetch_add(1, Ordering::Relaxed);
         self.total_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-        self.write_latency_sum_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.write_latency_sum_us
+            .fetch_add(latency_us, Ordering::Relaxed);
         self.write_latency_count.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     fn record_error(&self) {
         self.write_errors.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     fn update_queue_size(&self, size: usize) {
         self.queue_size.store(size as u64, Ordering::Relaxed);
     }
-    
+
     fn get_stats(&self) -> (u64, u64, u64, u64, f64, u64) {
         let records = self.total_records.load(Ordering::Relaxed);
         let batches = self.total_batches.load(Ordering::Relaxed);
@@ -108,13 +107,13 @@ impl WriteMetrics {
         let latency_sum = self.write_latency_sum_us.load(Ordering::Relaxed);
         let latency_count = self.write_latency_count.load(Ordering::Relaxed);
         let queue_size = self.queue_size.load(Ordering::Relaxed);
-        
+
         let avg_latency = if latency_count > 0 {
             latency_sum as f64 / latency_count as f64
         } else {
             0.0
         };
-        
+
         (records, batches, bytes, errors, avg_latency, queue_size)
     }
 }
@@ -141,23 +140,23 @@ async fn real_data_collector(
     let bitget_config = BitgetConfig::default();
     let mut connector = BitgetConnector::new(bitget_config);
     connector.add_subscription(symbol.clone(), BitgetChannel::Books5);
-    
+
     let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
     let ws_tx_clone = ws_tx.clone();
-    
+
     let message_handler = move |message: BitgetMessage| {
         let _ = ws_tx_clone.send(message);
     };
-    
+
     // 啟動 WebSocket 連接
     let connector_task = tokio::spawn(async move {
         if let Err(e) = connector.connect_public(message_handler).await {
             error!("WebSocket 連接失敗: {}", e);
         }
     });
-    
+
     info!("開始收集 {} 的實時 OrderBook 數據", symbol);
-    
+
     while !shutdown.load(Ordering::Relaxed) {
         tokio::select! {
             Some(message) = ws_rx.recv() => {
@@ -180,53 +179,67 @@ async fn real_data_collector(
             }
         }
     }
-    
+
     connector_task.abort();
     Ok(())
 }
 
-fn convert_to_clickhouse_record(symbol: &str, data: &Value, timestamp: u64) -> Result<OrderBookRecord> {
+fn convert_to_clickhouse_record(
+    symbol: &str,
+    data: &Value,
+    timestamp: u64,
+) -> Result<OrderBookRecord> {
     // 解析 Bitget OrderBook 數據
     let empty_vec = Vec::new();
-    
+
     if let Some(data_array) = data.as_array() {
         if let Some(orderbook_data) = data_array.first() {
-            let bids_data = orderbook_data.get("bids").and_then(|v| v.as_array()).unwrap_or(&empty_vec);
-            let asks_data = orderbook_data.get("asks").and_then(|v| v.as_array()).unwrap_or(&empty_vec);
-            
+            let bids_data = orderbook_data
+                .get("bids")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&empty_vec);
+            let asks_data = orderbook_data
+                .get("asks")
+                .and_then(|v| v.as_array())
+                .unwrap_or(&empty_vec);
+
             // 計算 mid price, spread, volumes
-            let best_bid = bids_data.first()
+            let best_bid = bids_data
+                .first()
                 .and_then(|b| b.as_array())
                 .and_then(|b| b.get(0))
                 .and_then(|p| p.as_str())
                 .and_then(|p| p.parse::<f64>().ok())
                 .unwrap_or(0.0);
-                
-            let best_ask = asks_data.first()
+
+            let best_ask = asks_data
+                .first()
                 .and_then(|a| a.as_array())
                 .and_then(|a| a.get(0))
                 .and_then(|p| p.as_str())
                 .and_then(|p| p.parse::<f64>().ok())
                 .unwrap_or(0.0);
-            
+
             let mid_price = (best_bid + best_ask) / 2.0;
             let spread = best_ask - best_bid;
-            
+
             // 計算總成交量
-            let total_bid_volume: f64 = bids_data.iter()
+            let total_bid_volume: f64 = bids_data
+                .iter()
                 .filter_map(|b| b.as_array())
                 .filter_map(|b| b.get(1))
                 .filter_map(|v| v.as_str())
                 .filter_map(|v| v.parse::<f64>().ok())
                 .sum();
-                
-            let total_ask_volume: f64 = asks_data.iter()
+
+            let total_ask_volume: f64 = asks_data
+                .iter()
                 .filter_map(|a| a.as_array())
                 .filter_map(|a| a.get(1))
                 .filter_map(|v| v.as_str())
                 .filter_map(|v| v.parse::<f64>().ok())
                 .sum();
-            
+
             return Ok(OrderBookRecord {
                 timestamp: timestamp as i64,
                 symbol: symbol.to_string(),
@@ -239,7 +252,7 @@ fn convert_to_clickhouse_record(symbol: &str, data: &Value, timestamp: u64) -> R
             });
         }
     }
-    
+
     Err(anyhow::anyhow!("無法解析 OrderBook 數據"))
 }
 
@@ -255,13 +268,13 @@ async fn batch_writer(
     let mut batch = Vec::with_capacity(batch_size);
     let mut last_flush = Instant::now();
     let flush_interval = Duration::from_secs(1);
-    
+
     while !shutdown.load(Ordering::Relaxed) {
         tokio::select! {
             Some(record) = rx.recv() => {
                 batch.push(record);
                 metrics.update_queue_size(batch.len());
-                
+
                 if batch.len() >= batch_size {
                     if let Err(e) = flush_batch(&client, &mut batch, &table, &metrics, writer_id).await {
                         error!("Writer {}: Batch flush failed: {}", writer_id, e);
@@ -280,7 +293,7 @@ async fn batch_writer(
             }
         }
     }
-    
+
     // 最終刷新
     if !batch.is_empty() {
         if let Err(e) = flush_batch(&client, &mut batch, &table, &metrics, writer_id).await {
@@ -288,7 +301,7 @@ async fn batch_writer(
             metrics.record_error();
         }
     }
-    
+
     Ok(())
 }
 
@@ -302,24 +315,26 @@ async fn flush_batch(
     if batch.is_empty() {
         return Ok(());
     }
-    
+
     let start_time = Instant::now();
     let record_count = batch.len();
-    
+
     // 使用真實的 ClickHouse 客戶端寫入
     let mut insert = client.insert(table)?;
     for record in batch.iter() {
         insert.write(record).await?;
     }
     insert.end().await?;
-    
+
     let data_size = record_count * std::mem::size_of::<OrderBookRecord>();
     let latency_us = start_time.elapsed().as_micros() as u64;
     metrics.record_batch_write(record_count, data_size, latency_us);
-    
-    info!("Writer {}: Flushed {} records in {}μs", 
-          writer_id, record_count, latency_us);
-    
+
+    info!(
+        "Writer {}: Flushed {} records in {}μs",
+        writer_id, record_count, latency_us
+    );
+
     batch.clear();
     Ok(())
 }
@@ -328,7 +343,7 @@ async fn setup_clickhouse_table(client: &Client, database: &str, table: &str) ->
     // 創建真實的 ClickHouse 數據庫和表
     let create_db_sql = format!("CREATE DATABASE IF NOT EXISTS {}", database);
     client.query(&create_db_sql).execute().await?;
-    
+
     let create_table_sql = format!(
         r#"
         CREATE TABLE IF NOT EXISTS {}.{} (
@@ -346,21 +361,21 @@ async fn setup_clickhouse_table(client: &Client, database: &str, table: &str) ->
         "#,
         database, table
     );
-    
+
     client.query(&create_table_sql).execute().await?;
     info!("ClickHouse table {}.{} created/verified", database, table);
-    
+
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    
+
     let args = Args::parse();
     let metrics = Arc::new(WriteMetrics::default());
     let shutdown = Arc::new(AtomicBool::new(false));
-    
+
     info!("🚀 ClickHouse 批量寫入性能測試開始");
     info!("📊 測試參數:");
     info!("   URL: {}", args.clickhouse_url);
@@ -370,16 +385,16 @@ async fn main() -> Result<()> {
     info!("   併發數: {}", args.concurrency);
     info!("   生成速率: {}/s", args.rate);
     info!("   測試時長: {}s", args.duration);
-    
+
     // 初始化 ClickHouse 客戶端
     let client = Arc::new(Client::default());
-    
+
     // 設置表結構
     setup_clickhouse_table(&client, &args.database, &args.table).await?;
-    
+
     // 創建數據管道
     let (tx, mut rx) = mpsc::channel(args.batch_size * args.concurrency * 2);
-    
+
     // 啟動真實數據收集器
     let collector_shutdown = shutdown.clone();
     let collector_symbol = "BTCUSDT".to_string();
@@ -387,20 +402,20 @@ async fn main() -> Result<()> {
     let collector_handle = tokio::spawn(async move {
         real_data_collector(tx, collector_symbol, collector_shutdown, collector_metrics).await
     });
-    
+
     // 創建多個發送器來分發數據到多個寫入器
     let mut writer_handles = Vec::new();
     let mut writer_senders = Vec::new();
-    
+
     for i in 0..args.concurrency {
         let (writer_tx, writer_rx) = mpsc::channel(args.batch_size * 2);
         writer_senders.push(writer_tx);
-        
+
         let client_clone = client.clone();
         let metrics_clone = metrics.clone();
         let shutdown_clone = shutdown.clone();
         let table_name = format!("{}.{}", args.database, args.table);
-        
+
         let handle = tokio::spawn(async move {
             batch_writer(
                 writer_rx,
@@ -410,11 +425,12 @@ async fn main() -> Result<()> {
                 metrics_clone,
                 shutdown_clone,
                 i,
-            ).await
+            )
+            .await
         });
         writer_handles.push(handle);
     }
-    
+
     // 數據分發器：將來自收集器的數據輪詢分發給多個寫入器
     let distributor_shutdown = shutdown.clone();
     let distributor_handle = tokio::spawn(async move {
@@ -433,43 +449,46 @@ async fn main() -> Result<()> {
             }
         }
     });
-    
+
     // 統計報告任務
     let report_metrics = metrics.clone();
     let report_shutdown = shutdown.clone();
     let report_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         let start_time = Instant::now();
-        
+
         while !report_shutdown.load(Ordering::Relaxed) {
             interval.tick().await;
-            
-            let (records, batches, bytes, errors, avg_latency, queue_size) = 
+
+            let (records, batches, bytes, errors, avg_latency, queue_size) =
                 report_metrics.get_stats();
-            
+
             let elapsed = start_time.elapsed().as_secs_f64();
             let records_per_sec = records as f64 / elapsed;
             let mb_per_sec = (bytes as f64 / elapsed) / (1024.0 * 1024.0);
-            
+
             info!("📊 寫入統計 ({:.1}s):", elapsed);
             info!("   記錄: {} ({:.1}/s)", records, records_per_sec);
             info!("   批次: {}", batches);
-            info!("   流量: {:.2} MB ({:.2} MB/s)", 
-                  bytes as f64 / (1024.0 * 1024.0), mb_per_sec);
+            info!(
+                "   流量: {:.2} MB ({:.2} MB/s)",
+                bytes as f64 / (1024.0 * 1024.0),
+                mb_per_sec
+            );
             info!("   延遲: {:.1}μs", avg_latency);
             info!("   佇列: {}", queue_size);
             info!("   錯誤: {}", errors);
             info!("   ──────────────────────────");
         }
     });
-    
+
     // 等待測試完成
     tokio::time::sleep(Duration::from_secs(args.duration)).await;
-    
+
     // 關閉生成器和寫入器
     info!("🔄 正在關閉測試...");
     shutdown.store(true, Ordering::Relaxed);
-    
+
     // 等待所有任務完成
     let _ = collector_handle.await;
     let _ = distributor_handle.await;
@@ -477,25 +496,32 @@ async fn main() -> Result<()> {
         let _ = handle.await;
     }
     let _ = report_handle.await;
-    
+
     // 最終統計
     let (records, batches, bytes, errors, avg_latency, _) = metrics.get_stats();
     let total_time = args.duration as f64;
     let records_per_sec = records as f64 / total_time;
     let mb_per_sec = (bytes as f64 / total_time) / (1024.0 * 1024.0);
-    let error_rate = if records > 0 { errors as f64 / records as f64 * 100.0 } else { 0.0 };
-    
+    let error_rate = if records > 0 {
+        errors as f64 / records as f64 * 100.0
+    } else {
+        0.0
+    };
+
     info!("🎉 測試完成 - 最終報告:");
     info!("   ⏱️  總時間: {:.1}s", total_time);
     info!("   📝 總記錄: {} ({:.1}/s)", records, records_per_sec);
     info!("   📦 總批次: {}", batches);
-    info!("   📊 總流量: {:.2} MB ({:.2} MB/s)", 
-          bytes as f64 / (1024.0 * 1024.0), mb_per_sec);
+    info!(
+        "   📊 總流量: {:.2} MB ({:.2} MB/s)",
+        bytes as f64 / (1024.0 * 1024.0),
+        mb_per_sec
+    );
     info!("   🚀 平均延遲: {:.1}μs", avg_latency);
     info!("   ❌ 錯誤率: {:.2}%", error_rate);
     info!("   🔗 併發數: {}", args.concurrency);
     info!("   📏 批量大小: {}", args.batch_size);
-    
+
     // 性能評級
     let grade = if records_per_sec > 50000.0 && avg_latency < 1000.0 && error_rate < 0.1 {
         "A+ 優秀"
@@ -506,8 +532,8 @@ async fn main() -> Result<()> {
     } else {
         "C 需要優化"
     };
-    
+
     info!("🏆 性能評級: {}", grade);
-    
+
     Ok(())
 }

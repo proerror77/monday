@@ -1,23 +1,32 @@
 # HFT System Test Suite
 
-全面的高頻交易系統測試套件，確保系統在生產環境中的可靠性、性能和正確性。
+全面的高頻交易系統測試套件，專注於集成測試和端到端測試，確保系統在生產環境中的可靠性、性能和正確性。
 
 ## 測試架構
 
 ```
 tests/
-├── common/              # 共用測試工具和輔助函數
-│   └── mod.rs          # 測試助手、模擬對象、性能追蹤器
-├── unit/               # 單元測試
-│   ├── multi_exchange_manager_test.rs  # 多交易所管理器測試
-│   ├── orderbook_comprehensive_test.rs # 訂單簿全面測試
-│   ├── trading_strategies_test.rs      # 交易策略測試
-│   └── unified_engine_test.rs         # 統一引擎測試
-├── integration/        # 集成測試
+├── common/                    # 共用測試工具和輔助函數
+│   └── mod.rs                # 測試助手、模擬對象、性能追蹤器
+├── integration/              # 集成測試
 │   ├── end_to_end_system_test.rs      # 端到端系統測試
-│   └── performance_benchmarks.rs      # 性能基準測試
-└── lib.rs             # 測試套件主入口
+│   ├── hft_system_test.rs            # HFT 系統集成測試
+│   ├── performance_benchmarks.rs      # 性能基準測試
+│   └── precision_semantic_test.rs     # 精度語義測試
+├── core_functionality_test.rs        # 核心功能測試
+├── event_hub_integration_test.rs     # 事件中心集成測試
+├── lockfree_safety_test.rs          # 無鎖安全性測試
+├── new_architecture_integration_test.rs # 新架構集成測試
+└── lib.rs                           # 測試套件主入口
 ```
+
+## 架構變更說明
+
+**單元測試遷移**: 所有單元測試已遷移到對應的 crate 中：
+- 核心類型測試 → `crates/core/src/lib.rs`
+- 適配器測試 → `crates/data/adapters/*/src/lib.rs`
+- 策略測試 → `strategies/*/src/lib.rs`
+- 引擎測試 → `crates/engine/src/lib.rs`
 
 ## 測試類型
 

@@ -1,0 +1,18 @@
+[package]
+name = "hft-infra-redis"
+version = "0.1.0"
+edition = "2021"
+description = "Redis 整合：Streams / Rate-Limit / KV & PubSub（旁路）"
+
+[dependencies]
+redis = { workspace = true, optional = true, features = ["tokio-comp"] }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+infra-redis = ["dep:redis"]
+
+[lib]
+name = "infra_redis"
+

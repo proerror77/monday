@@ -1,0 +1,27 @@
+[package]
+name = "hft-paper"
+version = "0.1.0"
+edition = "2021"
+description = "模擬盤交易應用 - 無風險模式"
+
+[dependencies]
+# 核心依賴
+runtime = { package = "hft-runtime", path = "../../crates/runtime" }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.0", features = ["derive"] }
+serde = { workspace = true }
+serde_yaml = "0.9"
+
+[features]
+default = ["mock"]
+mock = ["runtime/adapter-mock-data"]
+bitget = ["runtime/adapter-bitget-data"]
+binance = ["runtime/adapter-binance-data"]
+bybit = ["runtime/adapter-bybit-data"]
+
+[[bin]]
+name = "hft-paper"
+path = "src/main.rs"
+

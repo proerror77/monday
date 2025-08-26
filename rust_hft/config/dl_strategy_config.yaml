@@ -1,0 +1,91 @@
+# DL 策略系統配置範例
+# 展示深度學習策略的完整配置架構
+
+engine:
+  queue_capacity: 32768
+  stale_us: 3000
+  top_n: 10
+  flip_policy: "OnUpdate"
+
+venues:
+  - name: "bitget_spot"
+    venue_type: "Bitget"
+    ws_public: "wss://ws.bitget.com/spot/v1/stream"
+    ws_private: "wss://ws.bitget.com/spot/v1/stream"
+    rest: "https://api.bitget.com"
+    api_key: "${BITGET_API_KEY}"
+    secret: "${BITGET_SECRET_KEY}"
+    capabilities:
+      ws_order_placement: false
+      snapshot_crc: true
+      all_in_one_topics: true
+      private_ws_heartbeat: true
+
+strategies:
+  - name: "btc_dl_trend"
+    strategy_type: "Dl"
+    symbols: ["BTCUSDT"]
+    params:
+      # 模型配置
+      model_path: "models/btc_trend_model.pt"  # TorchScript 模型路徑
+      device: "cpu"                            # 推理設備: "cpu", "cuda:0", "auto"
+      
+      # 特徵配置
+      top_n: 10                               # 訂單簿前 N 檔
+      window_size: 30                         # 滑動窗口大小 (tick 數)
+      
+      # 推理觸發配置
+      trigger_threshold: 0.1                  # 市場變化觸發閾值
+      output_threshold: 0.5                   # 模型輸出觸發交易閾值
+      
+      # 推理引擎配置
+      queue_capacity: 100                     # 推理隊列容量
+      timeout_ms: 5                           # 推理超時 (毫秒)
+      
+      # 降級與風控配置
+      max_error_rate: 0.05                    # 最大錯誤率 (5%)
+      degradation_mode: "fallback"           # 降級模式: fallback/pause/simple_strategy
+      
+    risk_limits:
+      max_notional: 10000.0                   # 最大名義金額
+      max_position: 5.0                       # 最大倉位
+      daily_loss_limit: 1000.0                # 日損失限額
+      cooldown_ms: 1000                       # 冷卻期 (毫秒)
+
+  - name: "eth_dl_arbitrage"
+    strategy_type: "Dl"
+    symbols: ["ETHUSDT"]
+    params:
+      # 套利模型配置
+      model_path: "models/eth_arbitrage_model.pt"
+      device: "auto"                          # 自動檢測 GPU/CPU
+      
+      # 高頻套利特徵配置
+      top_n: 20                               # 更深的訂單簿資訊
+      window_size: 10                         # 較短的窗口以快速反應
+      
+      # 更敏感的觸發配置
+      trigger_threshold: 0.05                 # 更小的觸發閾值
+      output_threshold: 0.3                   # 更低的交易閾值
+      
+      # 高頻推理配置
+      queue_capacity: 200                     # 更大的隊列容量
+      timeout_ms: 3                           # 更短的超時時間
+      
+      # 嚴格的風控配置
+      max_error_rate: 0.03                    # 更嚴格的錯誤率限制
+      degradation_mode: "pause"              # 出錯時暫停策略
+      
+    risk_limits:
+      max_notional: 50000.0
+      max_position: 10.0
+      daily_loss_limit: 2000.0
+      cooldown_ms: 500                        # 更短的冷卻期
+
+# 全域風控配置
+risk:
+  global_position_limit: 1000000.0
+  global_notional_limit: 10000000.0
+  max_daily_trades: 10000
+  max_orders_per_second: 100
+  staleness_threshold_us: 5000

@@ -1,6 +1,96 @@
-# Rust HFT Examples - 核心示例程序
+# HFT System Examples Guide
 
-本目錄包含 Rust HFT 高頻交易系統的**14個核心示例**，演示系統主要功能。已清理10個重複示例，保留最重要的功能演示。
+本目錄包含 HFT 高頻交易系統的**核心示例程序**，演示系統主要功能和最佳實踐。
+
+## 示例放置原則
+
+### 1. 示例類型分類
+
+#### 🚀 快速開始示例 (頂級目錄)
+- **目標**: 5分鐘快速理解系統
+- **位置**: `examples/00_quickstart.rs`
+- **內容**: 基本 WebSocket 連接和數據處理
+
+#### 📚 教學示例 (按模組分組)
+- **目標**: 深入理解特定模組
+- **位置**: `examples/{module}/`
+- **內容**: 詳細功能演示和配置選項
+
+#### ⚡ 性能測試示例 (專門目錄)
+- **目標**: 性能基準和壓力測試
+- **位置**: `examples/03_performance_testing/`
+- **內容**: 基準測試和系統限制測試
+
+#### 🔧 完整應用示例 (應用目錄)
+- **目標**: 完整的端到端應用
+- **位置**: `examples/app_layer_demo/`
+- **內容**: 可部署的示例應用
+
+### 2. 命名規範
+
+#### 示例文件命名
+```
+{priority}_{module}_{description}.rs
+
+例子:
+00_quickstart.rs              - 快速開始
+01_data_collection_demo.rs    - 數據收集示例  
+02_strategy_basic_trend.rs    - 基礎趨勢策略
+03_performance_benchmark.rs   - 性能基準測試
+```
+
+#### 示例目錄命名
+```
+{priority}_{purpose}/
+
+例子:
+01_data_collection/           - 數據收集相關
+02_strategy_development/      - 策略開發相關
+03_performance_testing/       - 性能測試相關
+```
+
+### 3. 示例內容指南
+
+#### 必須包含的元素
+```rust
+//! # 示例標題
+//! 
+//! ## 功能描述
+//! 簡潔描述示例的主要功能
+//!
+//! ## 運行方法
+//! ```bash
+//! cargo run --example example_name
+//! ```
+//!
+//! ## 依賴要求
+//! - Redis: 實時緩存
+//! - ClickHouse: 數據存儲 (可選)
+
+use tracing::info;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 初始化日誌
+    tracing_subscriber::fmt::init();
+    
+    info!("🚀 啟動 {} 示例", env!("CARGO_BIN_NAME"));
+    
+    // 示例邏輯
+    
+    Ok(())
+}
+```
+
+#### 錯誤處理標準
+- 使用 `Result<(), Box<dyn std::error::Error>>` 作為返回類型
+- 提供清晰的錯誤信息和恢復建議
+- 包含優雅的資源清理
+
+#### 配置管理
+- 支持命令行參數覆蓋
+- 提供合理的默認值
+- 使用環境變量進行敏感配置
 
 ## 🚀 快速開始指南
 
@@ -31,6 +121,52 @@
 - **system_monitoring.rs** - 系統監控和告警
 
 ## 🚀 運行示例
+
+### Feature 啟用說明
+
+許多示例需要特定的 feature 才能編譯和運行。使用 `--features` 參數啟用所需功能：
+
+#### 交易所適配器
+```bash
+# Bitget 相關示例
+cargo run --example test_bitget_connection --features bitget
+
+# Binance 相關示例  
+cargo run --example test_binance_adapter --features binance
+
+# Bybit 相關示例
+cargo run --example test_exchange_integration --features bybit
+
+# 多交易所示例
+cargo run --example test_all_exchanges --features "bitget,binance,bybit"
+```
+
+#### 策略和基礎設施
+```bash
+# 趨勢策略演示
+cargo run --example multi_strategy_demo --features trend-strategy
+
+# 套利策略演示  
+cargo run --example arbitrage_strategy_demo --features arbitrage-strategy
+
+# 監控和指標
+cargo run --example observability_demo --features metrics
+
+# ClickHouse 數據存儲
+cargo run --example comprehensive_db_stress_test --features clickhouse
+
+# Redis 緩存
+cargo run --example redis_streams_demo --features redis
+```
+
+#### 完整功能集
+```bash
+# 啟用所有功能的完整演示
+cargo run --example s1_adapter_engine_demo --features full
+
+# Live 交易應用 (生產環境)
+cargo run -p hft-live --features "bitget,trend-strategy,metrics"
+```
 
 ### 基礎示例
 ```bash

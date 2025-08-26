@@ -3,6 +3,11 @@
 # 🚀 HFT 歷史資料下載器 - YAML 配置示例腳本
 # 
 # 展示如何使用 YAML 配置文件簡化複雜的下載任務
+#
+# 💡 注意：建議使用 Makefile 命令來管理基礎設施：
+#    make dev      # 啟動完整開發環境
+#    make down     # 停止所有服務
+#    make status   # 檢查服務狀態
 
 set -e
 
@@ -40,7 +45,7 @@ if curl -s http://localhost:8123/ping > /dev/null; then
     log_success "ClickHouse 服務正常運行"
 else
     log_warning "ClickHouse 未運行，啟動服務..."
-    docker-compose up -d clickhouse
+    cd ops && docker-compose up -d clickhouse && cd ..
     sleep 10
 fi
 

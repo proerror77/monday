@@ -1,0 +1,66 @@
+# HFT 系統配置
+# 
+# 環境變量展開支援：
+# - 使用 ${VAR_NAME} 格式引用環境變量
+# - 未設置的環境變量會保留原始格式並發出警告
+# - 設置環境變量示例：export BITGET_API_KEY="your_api_key"
+#
+engine:
+  queue_capacity: 32768
+  stale_us: 3000
+  top_n: 10
+  flip_policy: "OnUpdate"
+
+venues:
+  - name: "bitget"
+    venue_type: "Bitget"
+    ws_public: "wss://ws.bitget.com/spot/v1/stream"
+    ws_private: "wss://ws.bitget.com/spot/v1/stream"
+    rest: "https://api.bitget.com"
+    api_key: "${BITGET_API_KEY}"        # 從環境變量讀取 API Key
+    secret: "${BITGET_SECRET}"          # 從環境變量讀取 Secret
+    passphrase: "${BITGET_PASSPHRASE}"  # 從環境變量讀取 Passphrase
+    execution_mode: "Paper"             # "Paper" | "Live"，預設為 Paper
+    capabilities:
+      ws_order_placement: true
+      snapshot_crc: false
+      all_in_one_topics: true
+      private_ws_heartbeat: true
+
+strategies:
+  - name: "trend_btc"
+    strategy_type: "Trend"
+    symbols:
+      - "BTCUSDT"
+    params:
+      Trend:
+        ema_fast: 12
+        ema_slow: 26
+        rsi_period: 14
+    risk_limits:
+      max_notional: 20000.0
+      max_position: 5.0
+      daily_loss_limit: 1000.0
+      cooldown_ms: 1000
+
+  - name: "arbitrage_btc"
+    strategy_type: "Arbitrage"
+    symbols:
+      - "BTCUSDT"
+    params:
+      Arbitrage:
+        min_spread_bps: 1.2
+        max_position: 0.1
+        execution_timeout_ms: 5000
+    risk_limits:
+      max_notional: 10000.0
+      max_position: 2.0
+      daily_loss_limit: 500.0
+      cooldown_ms: 2000
+
+risk:
+  global_position_limit: 1000000.0
+  global_notional_limit: 10000000.0
+  max_daily_trades: 10000
+  max_orders_per_second: 100
+  staleness_threshold_us: 5000

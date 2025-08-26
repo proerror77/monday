@@ -1,0 +1,162 @@
+# HFT System Configuration
+# 符合實際系統結構的配置文件
+
+system:
+  name: "HFT System"
+  version: "1.0.0"
+  environment: "development"
+  log_level: "info"
+
+# 引擎配置
+engine:
+  # 事件摄取配置
+  ingestion:
+    queue_capacity: 32768
+    stale_threshold_us: 3000
+    flip_policy: "OnUpdate"        # OnUpdate | OnTimer
+    backpressure_policy: "LastWins" # Reject | LastWins | Throttle
+  
+  max_events_per_cycle: 1000
+  
+  # 聚合引擎配置
+  aggregation:
+    symbols: ["BTCUSDT", "ETHUSDT"]
+    top_n: 10
+    bar_intervals_ms: [60000]  # 1分鐘 K 線
+
+# 適配器橋接配置
+adapter_bridge:
+  max_concurrent_adapters: 4
+  ingestion:
+    queue_capacity: 16384
+    stale_threshold_us: 5000
+    flip_policy: "OnUpdate"
+    backpressure_policy: "LastWins"
+
+# 數據適配器配置
+data_adapters:
+  mock:
+    enabled: true
+    interval_ms: 500
+    volatility: 0.01
+    symbols: ["BTCUSDT"]
+    
+  bitget:
+    enabled: false
+    ws_url: "wss://ws.bitget.com/spot/v1/stream"
+    auto_reconnect: true
+    heartbeat_interval_ms: 30000
+    subscription_timeout_sec: 10
+    channels:
+      - channel: "books15"
+        symbols: ["BTCUSDT", "ETHUSDT"]
+      - channel: "ticker"
+        symbols: ["BTCUSDT", "ETHUSDT"]
+      - channel: "trade"
+        symbols: ["BTCUSDT"]
+        
+  binance:
+    enabled: false
+    ws_url: "wss://stream.binance.com:9443/ws"
+    auto_reconnect: true
+    heartbeat_interval_ms: 30000
+    channels:
+      - channel: "btcusdt@depth@100ms"
+      - channel: "btcusdt@trade"
+      - channel: "ethusdt@depth@100ms"
+
+# 策略配置
+strategies:
+  trend:
+    enabled: true
+    symbol: "BTCUSDT"
+    ema_fast_period: 3
+    ema_slow_period: 7
+    rsi_period: 3
+    rsi_oversold: 30.0
+    rsi_overbought: 70.0
+    position_size: 0.01
+    max_position: 1.0
+    min_spread_bps: 1.0
+    
+  arbitrage:
+    enabled: false
+    symbol: "BTCUSDT"
+    min_spread_bps: 2.0
+    max_position_size: 0.1
+    max_total_position: 1.0
+    max_stale_us: 3000
+    min_profit_usd: 1.0
+    taker_fee_rate: 0.001
+
+# 風險管理配置
+risk_management:
+  # 風控規則
+  max_position_per_symbol: 100.0    # 單品種最大持倉
+  max_global_notional: 1000000.0    # 全局最大名義價值
+  max_orders_per_second: 10         # 每秒最大下單數
+  order_cooldown_ms: 100            # 下單冷卻期
+  staleness_threshold_us: 5000      # 數據陳舊度閾值
+  max_daily_loss: 10000.0           # 最大日內虧損
+  aggressive_mode: false            # 激進模式（跳過某些檢查）
+  
+  # 交易所規格（默認值）
+  venue_spec:
+    tick_size: 0.01
+    lot_size: 0.001
+    min_quantity: 0.001
+    max_quantity: 1000.0
+    min_notional: 10.0
+    max_notional: 1000000.0
+    maker_fee_bps: 10  # 0.10%
+    taker_fee_bps: 10  # 0.10%
+
+# 執行配置
+execution:
+  mode: "paper"                    # live | paper | replay
+  simulate_latency_us: 100
+  simulate_slippage_bps: 0.5
+  
+  # Paper trading 配置
+  paper:
+    initial_balance: 100000.0
+    fill_probability: 0.95
+    
+  # Live trading 配置（Bitget）
+  bitget:
+    api_key: ""
+    api_secret: ""
+    passphrase: ""
+    base_url: "https://api.bitget.com"
+    timeout_ms: 5000
+
+# 監控配置
+monitoring:
+  print_statistics_interval_sec: 60
+  snapshot_publish_frequency: "OnUpdate"  # OnUpdate | Interval
+  metrics_port: 9090                      # Prometheus metrics port
+  
+  # 告警閾值
+  alerts:
+    latency_p99_us: 1000
+    drawdown_pct: 5.0
+    error_rate_pct: 1.0
+
+# 運行時配置
+runtime:
+  duration_sec: 300                       # 運行時長（0 = 無限）
+  graceful_shutdown_timeout_sec: 10       # 優雅停止超時
+  
+# 數據存儲配置
+storage:
+  clickhouse:
+    enabled: false
+    url: "http://localhost:8123"
+    database: "hft"
+    batch_size: 1000
+    flush_interval_ms: 1000
+    
+  redis:
+    enabled: false
+    url: "redis://localhost:6379"
+    channel_prefix: "hft"

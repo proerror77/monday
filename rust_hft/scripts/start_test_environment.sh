@@ -60,7 +60,7 @@ start_services() {
     log_info "正在启动服务: ClickHouse, Redis, Prometheus, Grafana"
     
     # 启动所有服务
-    docker-compose up -d
+    cd ops && docker-compose up -d && cd ..
     
     if [ $? -eq 0 ]; then
         log_success "所有服务启动命令执行完成 ✓"
@@ -187,7 +187,7 @@ show_service_status() {
     echo "🚀 HFT 测试环境服务状态"
     echo "=================================================================="
     
-    docker-compose ps
+    cd ops && docker-compose ps && cd ..
     
     echo ""
     echo "📊 服务访问地址:"
@@ -244,8 +244,8 @@ main() {
 }
 
 # 检查是否从正确的目录运行
-if [ ! -f "docker-compose.yml" ]; then
-    log_error "请从包含 docker-compose.yml 的项目根目录运行此脚本"
+if [ ! -f "ops/docker-compose.yml" ]; then
+    log_error "请从项目根目录运行此脚本，确保 ops/docker-compose.yml 存在"
     exit 1
 fi
 

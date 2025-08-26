@@ -1,0 +1,69 @@
+# 交易所規格配置
+# 按照 Phase 1 要求，支持 per-symbol tick/lot/min_notional/價格上下限
+
+venues:
+  BITGET:
+    # 现货交易规格
+    spot:
+      BTCUSDT:
+        tick_size: 0.1        # 最小价格变动
+        lot_size: 0.00001     # 最小数量单位  
+        min_qty: 0.00001      # 最小下单量
+        max_qty: 1000.0       # 最大下单量
+        min_notional: 5.0     # 最小名义价值 (USDT)
+        price_min: 1.0        # 最低价格
+        price_max: 1000000.0  # 最高价格
+        maker_fee_bps: 1.0    # Maker费率 (0.01%)
+        taker_fee_bps: 1.0    # Taker费率 (0.01%)
+        rate_limit: 100       # 每秒请求限制
+        
+      ETHUSDT:
+        tick_size: 0.01
+        lot_size: 0.0001
+        min_qty: 0.0001
+        max_qty: 10000.0
+        min_notional: 5.0
+        price_min: 1.0
+        price_max: 100000.0
+        maker_fee_bps: 1.0
+        taker_fee_bps: 1.0
+        rate_limit: 100
+
+  BINANCE:
+    spot:
+      BTCUSDT:
+        tick_size: 0.01
+        lot_size: 0.00001
+        min_qty: 0.00001
+        max_qty: 9000.0       # Binance 限制
+        min_notional: 10.0    # 更高的最小名义值
+        price_min: 1.0
+        price_max: 1000000.0
+        maker_fee_bps: 1.0
+        taker_fee_bps: 1.0
+        rate_limit: 1200      # 更高的限制
+        
+      ETHUSDT:
+        tick_size: 0.01
+        lot_size: 0.0001
+        min_qty: 0.0001
+        max_qty: 100000.0
+        min_notional: 10.0
+        price_min: 1.0
+        price_max: 100000.0
+        maker_fee_bps: 1.0
+        taker_fee_bps: 1.0
+        rate_limit: 1200
+
+# 全局默认设置
+defaults:
+  tick_size: 0.01
+  lot_size: 0.001
+  min_qty: 0.001
+  max_qty: 1000.0
+  min_notional: 10.0
+  price_min: 0.01
+  price_max: 1000000.0
+  maker_fee_bps: 2.0
+  taker_fee_bps: 2.0
+  rate_limit: 50

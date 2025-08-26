@@ -1,0 +1,19 @@
+[package]
+name = "hft-data-adapter-mock"
+version = "0.1.0"
+edition = "2021"
+description = "Mock market data adapter producing synthetic MarketEvent for testing"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../core" }
+ports = { package = "hft-ports", path = "../../../ports" }
+async-trait = "0.1"
+futures = { workspace = true }
+tokio = { workspace = true, features = ["time", "macros"] }
+tokio-stream = "0.1"
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[lib]
+name = "data_adapter_mock"
+

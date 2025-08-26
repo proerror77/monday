@@ -1,0 +1,75 @@
+# HFT 系統配置 - Production 環境
+engine:
+  queue_capacity: 131072  # 最大隊列容量
+  stale_us: 1500          # 最嚴格的延遲要求
+  top_n: 20
+  flip_policy: "OnUpdate"
+
+venues:
+  - name: "bitget"
+    venue_type: "Bitget"
+    ws_public: "wss://ws.bitget.com/spot/v1/stream"
+    ws_private: "wss://ws.bitget.com/spot/v1/stream"
+    rest: "https://api.bitget.com"
+    api_key: "${BITGET_PROD_API_KEY}"
+    secret: "${BITGET_PROD_SECRET}"
+    capabilities:
+      ws_order_placement: true
+      snapshot_crc: true
+      all_in_one_topics: true
+      private_ws_heartbeat: true
+
+  - name: "binance"
+    venue_type: "Binance"
+    ws_public: "wss://stream.binance.com:9443/ws"
+    ws_private: "wss://stream.binance.com:9443/ws"
+    rest: "https://api.binance.com"
+    api_key: "${BINANCE_PROD_API_KEY}"
+    secret: "${BINANCE_PROD_SECRET}"
+    capabilities:
+      ws_order_placement: true
+      snapshot_crc: false
+      all_in_one_topics: false
+      private_ws_heartbeat: true
+
+strategies:
+  - name: "trend_multi"
+    strategy_type: "Trend"
+    symbols:
+      - "BTCUSDT"
+      - "ETHUSDT"
+      - "ADAUSDT"
+      - "SOLUSDT"
+    params:
+      Trend:
+        ema_fast: 8
+        ema_slow: 18
+        rsi_period: 12
+    risk_limits:
+      max_notional: 100000.0
+      max_position: 20.0
+      daily_loss_limit: 5000.0
+      cooldown_ms: 250
+
+  - name: "cross_exchange_arb"
+    strategy_type: "Arbitrage"
+    symbols:
+      - "BTCUSDT"
+      - "ETHUSDT"
+    params:
+      Arbitrage:
+        min_spread_bps: 0.5
+        max_position: 1.0
+        execution_timeout_ms: 2000
+    risk_limits:
+      max_notional: 100000.0
+      max_position: 10.0
+      daily_loss_limit: 3000.0
+      cooldown_ms: 500
+
+risk:
+  global_position_limit: 10000000.0
+  global_notional_limit: 100000000.0
+  max_daily_trades: 100000
+  max_orders_per_second: 500
+  staleness_threshold_us: 1500

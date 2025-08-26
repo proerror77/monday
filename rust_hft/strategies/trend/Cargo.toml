@@ -1,0 +1,17 @@
+[package]
+name = "hft-strategy-trend"
+version = "0.1.0"
+edition = "2021"
+description = "策略樣板：趨勢"
+
+[dependencies]
+hft_core = { package = "hft-core", path = "../../crates/core" }
+ports = { package = "hft-ports", path = "../../crates/ports" }
+serde = { workspace = true }
+log = "0.4"
+tracing = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+
+[lib]
+name = "strategy_trend"

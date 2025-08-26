@@ -1,0 +1,22 @@
+[package]
+name = "hft-execution-adapter-binance"
+version = "0.1.0"
+edition = "2021"
+description = "Binance 私有WS/REST adapter (實作 ExecutionClient)"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../core" }
+ports = { package = "hft-ports", path = "../../../ports" }
+integration = { package = "hft-integration", path = "../../../integration" }
+serde = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+async-trait = "0.1"
+
+[features]
+default = []
+live = []
+paper = []
+
+[lib]
+name = "execution_adapter_binance"

@@ -8,6 +8,54 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, Mutex};
 use std::sync::Arc;
 use anyhow::Result;
+use tracing_subscriber::{EnvFilter, fmt};
+
+/// 初始化测试日志
+pub fn init_test_logging() {
+    let _ = fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("rust_hft=debug".parse().unwrap()))
+        .with_test_writer()
+        .try_init();
+}
+
+/// 延迟跟踪器
+#[derive(Debug)]
+pub struct LatencyTracker {
+    samples: Arc<Mutex<Vec<f64>>>,
+}
+
+impl LatencyTracker {
+    pub fn new() -> Self {
+        Self {
+            samples: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+    
+    pub async fn record(&self, latency_ms: f64) {
+        let mut samples = self.samples.lock().await;
+        samples.push(latency_ms);
+    }
+    
+    pub async fn get_stats(&self) -> (f64, f64, f64) {
+        let samples = self.samples.lock().await;
+        if samples.is_empty() {
+            return (0.0, 0.0, 0.0);
+        }
+        
+        let sum: f64 = samples.iter().sum();
+        let avg = sum / samples.len() as f64;
+        
+        let mut sorted = samples.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        
+        let p99_index = ((samples.len() as f64) * 0.99) as usize;
+        let p99 = sorted.get(p99_index.min(sorted.len() - 1)).copied().unwrap_or(0.0);
+        
+        let max = sorted.last().copied().unwrap_or(0.0);
+        
+        (avg, p99, max)
+    }
+}
 
 /// 性能測試助手
 #[derive(Debug)]
@@ -202,45 +250,7 @@ impl TestConfigBuilder {
     }
 }
 
-/// Latency Measurement Helper
-pub struct LatencyTracker {
-    measurements: Arc<Mutex<Vec<u64>>>,
-}
-
-impl LatencyTracker {
-    pub fn new() -> Self {
-        Self {
-            measurements: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    pub async fn record_latency(&self, latency_ns: u64) {
-        self.measurements.lock().await.push(latency_ns);
-    }
-
-    pub async fn get_p99_latency(&self) -> f64 {
-        let mut measurements = self.measurements.lock().await.clone();
-        if measurements.is_empty() {
-            return 0.0;
-        }
-        measurements.sort_unstable();
-        let index = ((measurements.len() as f64 * 0.99) as usize).min(measurements.len() - 1);
-        measurements[index] as f64
-    }
-
-    pub async fn get_avg_latency(&self) -> f64 {
-        let measurements = self.measurements.lock().await;
-        if measurements.is_empty() {
-            return 0.0;
-        }
-        let sum: u64 = measurements.iter().sum();
-        sum as f64 / measurements.len() as f64
-    }
-
-    pub async fn get_count(&self) -> usize {
-        self.measurements.lock().await.len()
-    }
-}
+// 移除重复的 LatencyTracker 定义 - 使用上面已定义的版本
 
 #[cfg(test)]
 mod tests {

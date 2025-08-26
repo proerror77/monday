@@ -33,7 +33,7 @@ start_services() {
     echo -e "\n${BLUE}📦 Starting services...${NC}"
     
     # 只啟動 ClickHouse 和 Redis
-    docker-compose up -d clickhouse redis
+    cd ops && docker-compose up -d clickhouse redis && cd ..
     
     # 等待服務就緒
     echo -e "${YELLOW}⏳ Waiting for services to be ready...${NC}"

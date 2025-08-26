@@ -1,0 +1,53 @@
+[package]
+name = "hft-live"
+version = "0.1.0"
+edition = "2021"
+description = "真盤交易應用 - 開啟所有重特性的地方"
+
+[dependencies]
+# 核心依賴
+hft_core = { package = "hft-core", path = "../../crates/core" }
+ports = { package = "hft-ports", path = "../../crates/ports" }
+runtime = { package = "hft-runtime", path = "../../crates/runtime" }
+engine = { package = "hft-engine", path = "../../crates/engine" }
+data = { package = "hft-data", path = "../../crates/data" }
+rust_decimal = { version = "1.33", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# 注意：所有可選依賴現在通過 runtime 轉發，移除直接依賴
+
+# 運行時依賴 (真盤重特性全開)
+tokio = { workspace = true, features = ["full", "tracing"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4.0", features = ["derive"] }
+serde = { workspace = true }
+serde_yaml = "0.9"
+
+[features]
+default = ["bitget", "trend-strategy", "metrics"]
+
+# 交易所適配器 (轉發到 runtime)
+bitget = ["runtime/bitget"]
+binance = ["runtime/binance"]
+bybit = ["runtime/bybit"]
+mock = ["runtime/mock"]
+all-exchanges = ["bitget", "binance", "bybit"]
+
+# 策略 (轉發到 runtime)
+trend-strategy = ["runtime/strategy-trend"]
+arbitrage-strategy = ["runtime/strategy-arbitrage"]
+dl-strategy = ["runtime/strategy-dl"]
+all-strategies = ["trend-strategy", "arbitrage-strategy", "dl-strategy"]
+
+# 基礎設施 (轉發到 runtime)
+clickhouse = ["runtime/infra-clickhouse"]
+redis = ["runtime/infra-redis"]
+metrics = ["runtime/infra-metrics"]
+full-infra = ["clickhouse", "redis", "metrics"]
+
+# SIMD 優化 (生產環境)
+simd = ["data/json-simd"]
+
+# 完整特性集
+full = ["all-exchanges", "all-strategies", "full-infra", "simd", "mock"]

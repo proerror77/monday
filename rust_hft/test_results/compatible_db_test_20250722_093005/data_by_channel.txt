@@ -1,3 +1,0 @@
-OrderBook5	149080
-Ticker	120448
-Trades	39964

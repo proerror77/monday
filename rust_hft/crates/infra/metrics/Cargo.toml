@@ -1,0 +1,17 @@
+[package]
+name = "hft-infra-metrics"
+version = "0.1.0"
+edition = "2021"
+description = "Prometheus 指標（可選，旁路）"
+
+[dependencies]
+prometheus = { workspace = true, optional = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+infra-metrics = ["dep:prometheus"]
+
+[lib]
+name = "infra_metrics"
+

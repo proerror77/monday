@@ -1,0 +1,60 @@
+# HFT 系統配置 - Staging 環境
+engine:
+  queue_capacity: 65536  # 更大的隊列容量
+  stale_us: 2000         # 更嚴格的延遲要求
+  top_n: 15
+  flip_policy: "OnUpdate"
+
+venues:
+  - name: "bitget"
+    venue_type: "Bitget"
+    ws_public: "wss://ws.bitget.com/spot/v1/stream"
+    ws_private: "wss://ws.bitget.com/spot/v1/stream"
+    rest: "https://api.bitget.com"
+    api_key: "${BITGET_STAGING_API_KEY}"
+    secret: "${BITGET_STAGING_SECRET}"
+    capabilities:
+      ws_order_placement: true
+      snapshot_crc: true
+      all_in_one_topics: true
+      private_ws_heartbeat: true
+
+strategies:
+  - name: "trend_btc"
+    strategy_type: "Trend"
+    symbols:
+      - "BTCUSDT"
+      - "ETHUSDT"
+    params:
+      Trend:
+        ema_fast: 10
+        ema_slow: 21
+        rsi_period: 14
+    risk_limits:
+      max_notional: 50000.0
+      max_position: 10.0
+      daily_loss_limit: 2000.0
+      cooldown_ms: 500
+
+  - name: "arbitrage_btc_eth"
+    strategy_type: "Arbitrage"
+    symbols:
+      - "BTCUSDT"
+      - "ETHUSDT"
+    params:
+      Arbitrage:
+        min_spread_bps: 0.8
+        max_position: 0.5
+        execution_timeout_ms: 3000
+    risk_limits:
+      max_notional: 25000.0
+      max_position: 5.0
+      daily_loss_limit: 1000.0
+      cooldown_ms: 1000
+
+risk:
+  global_position_limit: 5000000.0
+  global_notional_limit: 50000000.0
+  max_daily_trades: 50000
+  max_orders_per_second: 200
+  staleness_threshold_us: 2000

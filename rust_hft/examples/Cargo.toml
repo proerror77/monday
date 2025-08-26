@@ -1,0 +1,40 @@
+[package]
+name = "hft-examples"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "e2e_smoke_test"
+path = "e2e_smoke_test.rs"
+
+[[bin]]
+name = "test_binance_adapter"
+path = "test_binance_adapter.rs"
+
+[dependencies]
+# HFT crates
+hft_core = { package = "hft-core", path = "../crates/core" }
+ports = { package = "hft-ports", path = "../crates/ports" }
+engine = { package = "hft-engine", path = "../crates/engine" }
+
+# Data adapters (optional)
+data_adapter_binance = { package = "hft-data-adapter-binance", path = "../crates/data/adapters/adapter-binance", optional = true }
+
+# Async
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Math
+rust_decimal = { workspace = true }
+
+[features]
+default = []
+binance = ["data_adapter_binance"]

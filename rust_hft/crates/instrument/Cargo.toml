@@ -1,0 +1,16 @@
+[package]
+name = "hft-instrument"
+version = "0.1.0"
+edition = "2021"
+description = "交易所/合約/精度/費率模型"
+
+[dependencies]
+serde = { workspace = true }
+hft-core = { package = "hft-core", path = "../core" }
+rust_decimal = { workspace = true }
+
+[features]
+default = []
+
+[lib]
+name = "instrument"

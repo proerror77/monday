@@ -124,7 +124,7 @@ step1_start_core_services() {
     log_info "启动 ClickHouse 和 Redis..."
     
     # 只启动ClickHouse和Redis
-    if docker-compose up -d clickhouse redis > "$RESULTS_DIR/environment_setup.log" 2>&1; then
+    if (cd ops && docker-compose up -d clickhouse redis) > "$RESULTS_DIR/environment_setup.log" 2>&1; then
         log_success "✅ 核心服务启动完成"
     else
         log_error "❌ 核心服务启动失败"

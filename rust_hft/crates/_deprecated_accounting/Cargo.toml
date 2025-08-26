@@ -1,0 +1,16 @@
+[package]
+name = "hft-accounting"
+version = "0.1.0"
+edition = "2021"
+description = "會計：資金/持倉/PNL/DD（唯一真相源，快照只讀）"
+
+[dependencies]
+serde = { workspace = true }
+hft-core = { package = "hft-core", path = "../core" }
+ports = { package = "hft-ports", path = "../ports" }
+
+[features]
+default = []
+
+[lib]
+name = "accounting"

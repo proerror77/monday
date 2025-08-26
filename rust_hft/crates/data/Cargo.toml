@@ -1,0 +1,24 @@
+[package]
+name = "hft-data"
+version = "0.1.0"
+edition = "2021"
+description = "公共行情：統一 MarketStream；多交易所 adapters"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../core" }
+ports = { package = "hft-ports", path = "../ports" }
+integration = { package = "hft-integration", path = "../integration" }
+serde = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+json-simd = ["dep:simd-json"]
+
+[dependencies.simd-json]
+workspace = true
+optional = true
+
+[lib]
+name = "data"

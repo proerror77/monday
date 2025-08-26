@@ -1,0 +1,19 @@
+# Rust 本地加速配置
+
+[build]
+# 開發時並行度 (根據 CPU 核數調整)
+jobs = 8
+
+# 針對不同平台的快速 linker
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.x86_64-apple-darwin] 
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# 環境變數
+[env]
+# sccache 快取編譯結果 (安裝: cargo install sccache)
+RUSTC_WRAPPER = "sccache"
+# 增量編譯
+CARGO_INCREMENTAL = "1"

@@ -1,0 +1,26 @@
+[package]
+name = "hft-data-adapter-bitget"
+version = "0.1.0"
+edition = "2021"
+description = "Bitget 公有行情 adapter (實作 MarketStream)"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../core" }
+ports = { package = "hft-ports", path = "../../../ports" }
+integration = { package = "hft-integration", path = "../../../integration" }
+engine = { package = "hft-engine", path = "../../../engine" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+simd-json = "0.13"
+tracing = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+async-trait = "0.1"
+async-stream = "0.3"
+rust_decimal = { workspace = true }
+
+[features]
+default = []
+
+[lib]
+name = "data_adapter_bitget"

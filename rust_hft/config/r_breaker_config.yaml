@@ -1,0 +1,145 @@
+# R-Breaker 策略配置文件
+# R-Breaker Live Trading Configuration
+
+# 交易對配置
+trading:
+  symbol: "BTCUSDT"
+  initial_capital: 10000.0
+  max_position_ratio: 0.1  # 單筆最大倉位比例
+  
+# R-Breaker 策略參數
+r_breaker:
+  sensitivity: 0.35  # 敏感度係數，影響突破和反轉價位計算
+  lookback_days: 1   # 回看天數，用於計算前日OHLC
+  
+  # 信號過濾參數
+  min_confidence: 0.6  # 最小信號信心度
+  max_trades_per_day: 20  # 每日最大交易次數
+  
+  # 時間過濾
+  trading_hours:
+    start: "09:00"  # 交易開始時間 (UTC)
+    end: "23:00"    # 交易結束時間 (UTC)
+    timezone: "UTC"
+
+# 風險管理
+risk_management:
+  stop_loss: 0.02      # 止損比例 (2%)
+  take_profit: 0.04    # 止盈比例 (4%)
+  max_daily_loss: 0.05 # 每日最大虧損比例 (5%)
+  max_drawdown: 0.15   # 最大回撤限制 (15%)
+  
+  # 倉位管理
+  position_sizing:
+    method: "fixed_ratio"  # fixed_ratio, kelly, volatility_adjusted
+    base_size: 0.1         # 基礎倉位大小
+    max_size: 0.3          # 最大倉位大小
+    
+  # 連續虧損保護
+  consecutive_loss_limit: 3  # 連續虧損次數限制
+  cooldown_period_minutes: 30  # 冷卻期（分鐘）
+
+# 交易所配置
+exchange:
+  name: "bitget"
+  websocket_url: "wss://ws.bitget.com/v2/ws/public"
+  rest_api_url: "https://api.bitget.com"
+  
+  # 連接配置
+  connection:
+    reconnect_attempts: 5
+    reconnect_delay_seconds: 5
+    heartbeat_interval_seconds: 30
+    timeout_seconds: 10
+    
+  # 手續費設置
+  fees:
+    maker_fee: 0.001   # 掛單手續費 0.1%
+    taker_fee: 0.001   # 吃單手續費 0.1%
+
+# 數據配置
+data:
+  # K線數據
+  klines:
+    interval: "1m"       # K線間隔
+    history_limit: 1440  # 歷史K線數量 (24小時)
+    
+  # 訂單簿數據
+  orderbook:
+    depth: 5           # 訂單簿深度
+    update_frequency: 100  # 更新頻率 (毫秒)
+    
+  # 成交數據
+  trades:
+    buffer_size: 1000  # 成交數據緩存大小
+
+# 監控和日誌
+monitoring:
+  # 性能監控
+  metrics:
+    enabled: true
+    update_interval_seconds: 30
+    export_prometheus: false
+    
+  # 報告配置
+  reporting:
+    console_interval_seconds: 30
+    detailed_reports: true
+    save_trades_to_file: true
+    trades_file_path: "./trades_history.json"
+    
+  # 告警配置
+  alerts:
+    enabled: true
+    max_drawdown_alert: 0.10  # 回撤告警閾值
+    consecutive_loss_alert: 3  # 連續虧損告警
+    daily_loss_alert: 0.03    # 日虧損告警閾值
+
+# 日誌配置
+logging:
+  level: "INFO"  # DEBUG, INFO, WARN, ERROR
+  file_output: true
+  file_path: "./r_breaker_trading.log"
+  max_file_size_mb: 100
+  max_files: 5
+  
+  # 組件日誌級別
+  components:
+    strategy: "INFO"
+    exchange: "INFO"
+    risk_manager: "INFO"
+    data_feed: "WARN"
+
+# 回測配置（可選）
+backtest:
+  enabled: false
+  start_date: "2024-01-01"
+  end_date: "2024-12-31"
+  initial_balance: 10000.0
+  commission: 0.001
+  slippage: 0.0001
+
+# 模擬交易配置
+simulation:
+  enabled: true  # 默認開啟模擬模式
+  slippage: 0.0001  # 滑點
+  latency_ms: 50    # 模擬延遲
+  fill_probability: 0.95  # 成交概率
+
+# 高級配置
+advanced:
+  # 多線程配置
+  threading:
+    strategy_threads: 1
+    data_threads: 2
+    
+  # 內存配置
+  memory:
+    price_history_size: 10000
+    trade_history_size: 1000
+    
+  # 性能優化
+  performance:
+    enable_fast_mode: true
+    batch_processing: true
+    async_execution: true

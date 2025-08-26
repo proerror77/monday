@@ -1,0 +1,69 @@
+# 增強型風控配置
+# Phase 1 LOB-Live 硬化所需的完整風控參數
+
+risk_manager:
+  type: "enhanced"  # enhanced | default
+
+# 持倉與敞口限額
+position_limits:
+  max_position_per_symbol: 50.0      # 單品種最大持倉
+  max_global_notional: 200000.0      # 全局最大名義價值 (USDT)
+  max_order_notional: 5000.0         # 單筆訂單最大金額
+
+# 頻率控制
+rate_limits:
+  max_orders_per_second: 3           # 秒級下單限制
+  max_orders_per_minute: 50          # 分鐘級下單限制  
+  max_orders_per_hour: 500           # 小時級下單限制
+
+# 冷卻期設置
+cooldown:
+  global_order_cooldown_ms: 200      # 全局下單間隔
+  symbol_order_cooldown_ms: 1000     # 品種下單間隔
+  failed_order_penalty_ms: 5000      # 失敗訂單懲罰冷卻
+
+# 數據質量檢查
+data_quality:
+  market_data_staleness_us: 3000     # 行情數據陳舊度閾值 (3ms)
+  inference_staleness_us: 8000       # 推理結果陳舊度閾值 (8ms)
+  execution_report_staleness_us: 2000 # 執行回報陳舊度閾值 (2ms)
+
+# 損失控制
+loss_control:
+  max_daily_loss: 3000.0             # 最大日內虧損 (USDT)
+  max_drawdown_pct: 2.5               # 最大回撤比例 (%)
+  max_consecutive_losses: 3           # 連續虧損次數
+  max_position_loss_pct: 1.5          # 單倉位最大虧損比例 (%)
+
+# 熔斷器設置
+circuit_breaker:
+  enabled: true
+  daily_loss_threshold: 2000.0       # 日虧損熔斷閾值
+  drawdown_threshold: 2.0             # 回撤熔斷閾值 (%)
+  consecutive_losses: 2               # 連續虧損熔斷閾值
+  recovery_time_minutes: 10           # 熔斷後恢復時間
+
+# 交易時間窗口 (可選)
+trading_window:
+  enabled: false
+  start_hour_utc: 0                   # 開始時間 (UTC)
+  end_hour_utc: 24                    # 結束時間 (UTC)
+  allowed_weekdays: [1, 2, 3, 4, 5]  # 1=周一, 7=周日
+  market_holidays: []                 # 市場假期 (YYYY-MM-DD)
+
+# 系統控制
+system:
+  aggressive_mode: false              # 激進模式 (跳過某些檢查)
+  dry_run_mode: false                 # 僅檢查模式 (不實際攔截)
+
+# 不同策略的專用配置
+strategy_overrides:
+  trend_k1m:
+    max_position_per_symbol: 20.0
+    max_order_notional: 2000.0
+    order_cooldown_ms: 500
+    
+  cross_cex_arb:
+    max_orders_per_second: 8          # 套利需要更高頻率
+    symbol_order_cooldown_ms: 200     # 套利需要更短冷卻
+    staleness_threshold_us: 1500      # 套利對延遲更敏感

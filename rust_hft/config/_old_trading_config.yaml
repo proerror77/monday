@@ -1,0 +1,193 @@
+# HFT Trading System Configuration
+# Version: 1.0
+
+# System Configuration
+system:
+  name: "HFT-Trading-System"
+  version: "1.0.0"
+  environment: "development" # development, staging, production
+  log_level: "info" # trace, debug, info, warn, error
+
+# Performance Targets
+performance:
+  l1_trades_p99_us: 800      # L1/Trades p99 latency target (microseconds)
+  l2_diff_p99_us: 1500       # L2/OrderBook diff p99 latency target (microseconds)  
+  placement_latency_p99_us: 5000    # Order placement latency p99 target
+  cancellation_latency_p99_us: 3000 # Order cancellation latency p99 target
+  max_message_rate: 10000    # Maximum message processing rate (msgs/sec)
+  max_reconnect_interval_sec: 30     # Maximum reconnection interval
+
+# Network Configuration
+network:
+  connect_timeout_ms: 10000
+  read_timeout_ms: 30000
+  tcp_nodelay: true
+  tcp_keepalive: 300  # seconds
+  heartbeat_interval_ms: 30000
+  heartbeat_timeout_ms: 60000
+  max_reconnect_attempts: 5
+  reconnect_backoff_ms: 1000
+
+# Data Layer Configuration
+data:
+  # Bitget WebSocket Configuration
+  bitget:
+    ws_url: "wss://ws.bitget.com/spot/v1/stream"
+    channel_buffer_size: 1000
+    auto_reconnect: true
+    subscription_timeout_sec: 10
+    
+  # Feature Flags
+  features:
+    json_parser: "json-std"    # json-std or json-simd
+    snapshot_store: "snapshot-basic"  # snapshot-basic or snapshot-left-right
+
+# Execution Configuration
+execution:
+  mode: "paper"              # live, paper, simulation
+  order_timeout_sec: 30
+  max_concurrent_orders: 100
+  event_buffer_size: 1000
+  position_tracking: true
+  metrics_enabled: true
+  
+  # Exchange-specific settings
+  exchanges:
+    bitget:
+      enabled: true
+      api_key: "${BITGET_API_KEY}"
+      api_secret: "${BITGET_API_SECRET}"
+      api_passphrase: "${BITGET_API_PASSPHRASE}"
+      sandbox: true
+
+# Strategy Configuration
+strategies:
+  momentum:
+    enabled: true
+    lookback_periods: 5
+    threshold: 0.02
+    position_size: 100.0
+    
+  mean_reversion:
+    enabled: false
+    window_size: 20
+    deviation_threshold: 2.0
+    position_size: 200.0
+    
+  arbitrage:
+    enabled: false
+    min_profit_bps: 10
+    max_position_size: 500.0
+
+# Risk Management Configuration
+risk:
+  # Global Risk Limits
+  max_daily_loss: 10000.0     # USD
+  max_var: 5000.0             # Value at Risk
+  max_drawdown_pct: 10.0      # Maximum drawdown percentage
+  
+  # Position Limits per Symbol
+  position_limits:
+    BTCUSDT: 1000.0
+    ETHUSDT: 5000.0
+    ADAUSDT: 10000.0
+  
+  # Order Size Limits per Symbol  
+  order_limits:
+    BTCUSDT: 100.0
+    ETHUSDT: 500.0
+    ADAUSDT: 1000.0
+    
+  # Rate Limiting
+  max_orders_per_second: 10
+  
+# Portfolio Configuration
+portfolio:
+  initial_balance: 100000.0   # USD
+  base_currency: "USDT"
+  
+  # Instruments to trade
+  instruments:
+    - symbol: "BTCUSDT"
+      weight: 0.4
+      min_order_size: 10.0
+      tick_size: 0.01
+      
+    - symbol: "ETHUSDT" 
+      weight: 0.3
+      min_order_size: 50.0
+      tick_size: 0.01
+      
+    - symbol: "ADAUSDT"
+      weight: 0.3
+      min_order_size: 100.0
+      tick_size: 0.0001
+
+# Database Configuration
+database:
+  clickhouse:
+    url: "http://localhost:8123"
+    username: "default"
+    password: ""
+    database: "hft_data"
+    
+    # Table TTL Settings
+    ttl:
+      spot_books15: 90        # days
+      spot_trades: 365        # days
+      spot_ticker: 180        # days
+
+# Monitoring & Alerting
+monitoring:
+  metrics:
+    enabled: true
+    prometheus:
+      listen_address: "0.0.0.0:9090"
+      
+  alerts:
+    enabled: true
+    channels:
+      - type: "webhook"
+        url: "${SLACK_WEBHOOK_URL}"
+        level: "error"
+      - type: "email"  
+        recipients: ["admin@company.com"]
+        level: "critical"
+
+# Development & Testing
+development:
+  debug_mode: true
+  mock_exchange: false
+  enable_profiling: true
+  
+  # Simulation settings
+  simulation:
+    start_date: "2024-01-01"
+    end_date: "2024-12-31"
+    initial_balance: 10000.0
+    latency_model:
+      mean_us: 500
+      std_us: 100
+      
+# Security Configuration
+security:
+  tls_verify: true
+  api_key_rotation_days: 30
+  session_timeout_minutes: 60
+  
+  # IP Whitelisting (production only)
+  allowed_ips: []
+
+# Backup & Recovery
+backup:
+  enabled: true
+  interval_hours: 24
+  retention_days: 30
+  storage_path: "/opt/hft/backups"
+
+# Feature Flags
+features:
+  enable_ml_predictions: true
+  enable_market_making: false
+  enable_arbitrage: false
+  enable_dark_pool: false

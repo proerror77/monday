@@ -1,0 +1,29 @@
+[package]
+name = "hft-replay"
+version = "0.1.0"
+edition = "2021"
+description = "歷史回放應用 - 用於回測和驗證"
+
+[dependencies]
+# 核心依賴
+runtime = { package = "hft-runtime", path = "../../crates/runtime" }
+testing = { package = "hft-testing", path = "../../crates/testing" }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.0", features = ["derive"] }
+serde = { workspace = true }
+serde_yaml = "0.9"
+
+[features]
+default = ["mock"]
+mock = ["runtime/adapter-mock-data"]
+clickhouse = ["runtime/infra-clickhouse"]
+bitget = ["runtime/adapter-bitget-data"]
+binance = ["runtime/adapter-binance-data"]
+bybit = ["runtime/adapter-bybit-data"]
+
+[[bin]]
+name = "hft-replay"
+path = "src/main.rs"
+
