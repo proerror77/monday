@@ -2,7 +2,7 @@ name: Rust HFT CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop, restructure-project ]
+    branches: [ main, urgent-code-cleanup-clean-20250808 ]
   pull_request:
     branches: [ main ]
 
@@ -134,7 +134,7 @@ jobs:
         key: benchmark-cargo-${{ hashFiles('**/Cargo.lock') }}
     
     - name: 運行基準測試
-      run: cargo bench --bench latency_benchmarks
+      run: cargo bench --bench hotpath_latency_p99
     
     - name: 保存基準測試結果
       uses: actions/upload-artifact@v3
@@ -172,9 +172,10 @@ jobs:
     
     - name: 檢查核心示例
       run: |
-        cargo check --example 00_quickstart
-        cargo check --example performance_e2e_test
-        echo "✅ 核心示例檢查通過"
+        cargo check --bin live
+        cargo check --bin replay
+        cargo check --bin collector
+        echo "✅ 核心應用檢查通過"
 
   # 文檔生成
   docs:
@@ -268,9 +269,11 @@ jobs:
     - name: 創建部署包
       run: |
         mkdir -p deploy/bin
-        cp target/release/rust_hft deploy/bin/
+        cp target/release/live deploy/bin/ || echo "沒有live二進制"
+        cp target/release/replay deploy/bin/ || echo "沒有replay二進制"
+        cp target/release/collector deploy/bin/ || echo "沒有collector二進制"
         cp -r config/ deploy/ || echo "沒有config目錄"
-        cp docker-compose.yml deploy/ || echo "沒有docker-compose.yml"
+        cp ops/docker-compose.yml deploy/ || echo "沒有docker-compose.yml"
         cp CLAUDE.md deploy/README.md
     
     - name: 上傳部署包
