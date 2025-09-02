@@ -4,8 +4,8 @@
 
 use tracing::{debug};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(feature = "infra-metrics")]
 use prometheus::{
     Counter, Gauge, Histogram, HistogramVec, CounterVec, GaugeVec, IntCounter, IntCounterVec,
     Registry, Opts, HistogramOpts, 
@@ -16,69 +16,54 @@ use prometheus::{
 /// 全局指標註冊表
 static METRICS_REGISTRY: OnceLock<MetricsRegistry> = OnceLock::new();
 
+// HTTP 服务器模块
+#[cfg(feature = "http-server")]
+pub mod http_server;
+
 /// HFT 系統指標註冊表
 #[derive(Debug)]
 pub struct MetricsRegistry {
-    #[cfg(feature = "infra-metrics")]
     pub registry: Registry,
     
     // 分段延遲直方圖
-    #[cfg(feature = "infra-metrics")]
     pub latency_ingestion: Histogram,
-    #[cfg(feature = "infra-metrics")]
     pub latency_aggregation: Histogram,
-    #[cfg(feature = "infra-metrics")]
     pub latency_strategy: Histogram,
-    #[cfg(feature = "infra-metrics")]
     pub latency_risk: Histogram,
-    #[cfg(feature = "infra-metrics")]
     pub latency_execution: Histogram,
-    #[cfg(feature = "infra-metrics")]
     pub latency_end_to_end: Histogram,
+    pub latency_order_ack: Histogram,
+    pub latency_order_fill: Histogram,
     
     // 隊列利用率與計數
-    #[cfg(feature = "infra-metrics")]
     pub queue_utilization: Gauge,
-    #[cfg(feature = "infra-metrics")]
     pub events_processed: IntCounter,
-    #[cfg(feature = "infra-metrics")]
     pub events_dropped: IntCounter,
-    #[cfg(feature = "infra-metrics")]
     pub events_stale: IntCounter,
     
     // Staleness 指標
-    #[cfg(feature = "infra-metrics")]
     pub staleness_histogram: Histogram,
-    #[cfg(feature = "infra-metrics")]
     pub staleness_count: IntCounter,
     
     // 快照發佈指標
-    #[cfg(feature = "infra-metrics")]
     pub snapshot_flips: IntCounter,
-    #[cfg(feature = "infra-metrics")]
     pub snapshot_version: Gauge,
     
     // 執行指標
-    #[cfg(feature = "infra-metrics")]
     pub orders_submitted: IntCounter,
-    #[cfg(feature = "infra-metrics")]
     pub orders_filled: IntCounter,
-    #[cfg(feature = "infra-metrics")]
     pub orders_rejected: IntCounter,
+
+    // 本地就緒狀態跟蹤（不依賴 Prometheus 讀取，使 /readiness 更輕量）
+    last_activity_micros: AtomicU64,
+    last_queue_utilization_ppm: AtomicU64, // 以百萬分位儲存（ppm），避免 f64 原子
 }
 
 impl MetricsRegistry {
     /// 初始化全局指標註冊表
     pub fn init() -> &'static Self {
         METRICS_REGISTRY.get_or_init(|| {
-            #[cfg(feature = "infra-metrics")]
-            {
-                Self::create_with_prometheus()
-            }
-            #[cfg(not(feature = "infra-metrics"))]
-            {
-                Self::create_noop()
-            }
+            Self::create_with_prometheus()
         })
     }
     
@@ -87,7 +72,6 @@ impl MetricsRegistry {
         Self::init()
     }
     
-    #[cfg(feature = "infra-metrics")]
     fn create_with_prometheus() -> Self {
         let registry = Registry::new();
         
@@ -138,6 +122,21 @@ impl MetricsRegistry {
                 "端到端總延遲 (微秒)"
             ).buckets(latency_buckets)
         ).expect("創建端到端延遲直方圖失敗");
+
+        // Ack/Fill 直方圖（微秒）
+        let latency_order_ack = Histogram::with_opts(
+            HistogramOpts::new(
+                "hft_order_ack_latency_microseconds",
+                "下單到 Ack 延遲 (微秒)"
+            ).buckets(vec![1.0, 2.0, 5.0, 10.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0, 50_000.0, 100_000.0, 500_000.0])
+        ).expect("創建 Ack 延遲直方圖失敗");
+
+        let latency_order_fill = Histogram::with_opts(
+            HistogramOpts::new(
+                "hft_order_fill_latency_microseconds",
+                "下單到 Fill 延遲 (微秒)"
+            ).buckets(vec![1.0, 2.0, 5.0, 10.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10_000.0, 50_000.0, 100_000.0, 500_000.0])
+        ).expect("創建 Fill 延遲直方圖失敗");
         
         // 隊列指標
         let queue_utilization = Gauge::new(
@@ -211,6 +210,8 @@ impl MetricsRegistry {
         registry.register(Box::new(latency_risk.clone())).expect("註冊風控延遲指標失敗");
         registry.register(Box::new(latency_execution.clone())).expect("註冊執行延遲指標失敗");
         registry.register(Box::new(latency_end_to_end.clone())).expect("註冊端到端延遲指標失敗");
+        registry.register(Box::new(latency_order_ack.clone())).expect("註冊 Ack 延遲指標失敗");
+        registry.register(Box::new(latency_order_fill.clone())).expect("註冊 Fill 延遲指標失敗");
         
         registry.register(Box::new(queue_utilization.clone())).expect("註冊隊列利用率指標失敗");
         registry.register(Box::new(events_processed.clone())).expect("註冊處理事件指標失敗");
@@ -228,7 +229,8 @@ impl MetricsRegistry {
         registry.register(Box::new(orders_rejected.clone())).expect("註冊拒絕訂單指標失敗");
         
         debug!("Prometheus 指標註冊完成");
-        
+
+        let now = now_micros();
         Self {
             registry,
             latency_ingestion,
@@ -237,6 +239,8 @@ impl MetricsRegistry {
             latency_risk,
             latency_execution,
             latency_end_to_end,
+            latency_order_ack,
+            latency_order_fill,
             queue_utilization,
             events_processed,
             events_dropped,
@@ -248,172 +252,198 @@ impl MetricsRegistry {
             orders_submitted,
             orders_filled,
             orders_rejected,
+            last_activity_micros: AtomicU64::new(now),
+            last_queue_utilization_ppm: AtomicU64::new(0),
         }
     }
     
-    #[cfg(not(feature = "infra-metrics"))]
-    fn create_noop() -> Self {
-        debug!("指標功能已禁用 (infra-metrics feature 未啟用)");
-        Self {}
-    }
     
     /// 記錄攝取階段延遲
     pub fn record_ingestion_latency(&self, latency_us: f64) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.latency_ingestion.observe(latency_us);
-            debug!("記錄攝取延遲: {:.2}μs", latency_us);
-        }
-        #[cfg(not(feature = "infra-metrics"))]
-        let _ = latency_us;
+        self.latency_ingestion.observe(latency_us);
+        debug!("記錄攝取延遲: {:.2}μs", latency_us);
+        self.note_activity();
     }
     
     /// 記錄聚合階段延遲
     pub fn record_aggregation_latency(&self, latency_us: f64) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.latency_aggregation.observe(latency_us);
-            debug!("記錄聚合延遲: {:.2}μs", latency_us);
-        }
-        #[cfg(not(feature = "infra-metrics"))]
-        let _ = latency_us;
+        self.latency_aggregation.observe(latency_us);
+        debug!("記錄聚合延遲: {:.2}μs", latency_us);
+        self.note_activity();
     }
     
     /// 記錄策略階段延遲
     pub fn record_strategy_latency(&self, latency_us: f64) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.latency_strategy.observe(latency_us);
-            debug!("記錄策略延遲: {:.2}μs", latency_us);
-        }
-        #[cfg(not(feature = "infra-metrics"))]
-        let _ = latency_us;
+        self.latency_strategy.observe(latency_us);
+        debug!("記錄策略延遲: {:.2}μs", latency_us);
+        self.note_activity();
     }
     
     /// 記錄風控階段延遲
     pub fn record_risk_latency(&self, latency_us: f64) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.latency_risk.observe(latency_us);
-            debug!("記錄風控延遲: {:.2}μs", latency_us);
-        }
-        #[cfg(not(feature = "infra-metrics"))]
-        let _ = latency_us;
+        self.latency_risk.observe(latency_us);
+        debug!("記錄風控延遲: {:.2}μs", latency_us);
+        self.note_activity();
     }
     
     /// 記錄執行階段延遲
     pub fn record_execution_latency(&self, latency_us: f64) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.latency_execution.observe(latency_us);
-            debug!("記錄執行延遲: {:.2}μs", latency_us);
-        }
-        #[cfg(not(feature = "infra-metrics"))]
-        let _ = latency_us;
+        self.latency_execution.observe(latency_us);
+        debug!("記錄執行延遲: {:.2}μs", latency_us);
+        self.note_activity();
+    }
+
+    /// 記錄下單→Ack 延遲
+    pub fn record_order_ack_latency(&self, latency_us: f64) {
+        self.latency_order_ack.observe(latency_us);
+    }
+
+    /// 記錄下單→Fill 延遲
+    pub fn record_order_fill_latency(&self, latency_us: f64) {
+        self.latency_order_fill.observe(latency_us);
     }
     
     /// 記錄端到端延遲
     pub fn record_end_to_end_latency(&self, latency_us: f64) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.latency_end_to_end.observe(latency_us);
-            debug!("記錄端到端延遲: {:.2}μs", latency_us);
-        }
-        #[cfg(not(feature = "infra-metrics"))]
-        let _ = latency_us;
+        self.latency_end_to_end.observe(latency_us);
+        debug!("記錄端到端延遲: {:.2}μs", latency_us);
+        self.note_activity();
     }
     
     /// 更新隊列利用率
     pub fn update_queue_utilization(&self, ratio: f64) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.queue_utilization.set(ratio);
-        }
-        #[cfg(not(feature = "infra-metrics"))]
-        let _ = ratio;
+        self.queue_utilization.set(ratio);
+        // ppm 儲存避免 f64 原子
+        let ppm = (ratio.max(0.0).min(1.0) * 1_000_000.0) as u64;
+        self.last_queue_utilization_ppm.store(ppm, Ordering::Relaxed);
+        self.note_activity();
     }
     
     /// 增加處理事件計數
     pub fn inc_events_processed(&self) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.events_processed.inc();
-        }
+        self.events_processed.inc();
+        self.note_activity();
     }
     
     /// 增加丟棄事件計數
     pub fn inc_events_dropped(&self) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.events_dropped.inc();
-        }
+        self.events_dropped.inc();
     }
     
     /// 增加過期事件計數
     pub fn inc_events_stale(&self) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.events_stale.inc();
-        }
+        self.events_stale.inc();
     }
     
     /// 記錄數據陳舊度
     pub fn record_staleness(&self, staleness_ms: f64) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.staleness_histogram.observe(staleness_ms);
-            self.staleness_count.inc();
-        }
-        #[cfg(not(feature = "infra-metrics"))]
-        let _ = staleness_ms;
+        self.staleness_histogram.observe(staleness_ms);
+        self.staleness_count.inc();
+        self.note_activity();
     }
     
     /// 增加快照翻轉計數
     pub fn inc_snapshot_flips(&self) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.snapshot_flips.inc();
-        }
+        self.snapshot_flips.inc();
+        self.note_activity();
     }
     
     /// 更新快照版本號
     pub fn update_snapshot_version(&self, version: u64) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.snapshot_version.set(version as f64);
-        }
-        #[cfg(not(feature = "infra-metrics"))]
-        let _ = version;
+        self.snapshot_version.set(version as f64);
+        self.note_activity();
     }
     
     /// 增加提交訂單計數
     pub fn inc_orders_submitted(&self) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.orders_submitted.inc();
-        }
+        self.orders_submitted.inc();
+        self.note_activity();
     }
     
     /// 增加成交訂單計數
     pub fn inc_orders_filled(&self) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.orders_filled.inc();
-        }
+        self.orders_filled.inc();
+        self.note_activity();
     }
     
     /// 增加拒絕訂單計數
     pub fn inc_orders_rejected(&self) {
-        #[cfg(feature = "infra-metrics")]
-        {
-            self.orders_rejected.inc();
-        }
+        self.orders_rejected.inc();
+        self.note_activity();
     }
     
     /// 獲取 Prometheus 註冊表（用於 HTTP 暴露）
-    #[cfg(feature = "infra-metrics")]
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+    
+    /// 从 LatencyMonitor 批量更新指标
+    pub fn update_from_latency_monitor(&self, latency_stats: &std::collections::HashMap<hft_core::latency::LatencyStage, hft_core::latency::LatencyStageStats>) {
+        use hft_core::latency::LatencyStage;
+        
+        for (stage, stats) in latency_stats {
+            match stage {
+                LatencyStage::Ingestion => {
+                    // 更新所有样本到直方图
+                    for _ in 0..stats.count {
+                        self.latency_ingestion.observe(stats.mean_micros);
+                    }
+                }
+                LatencyStage::Aggregation => {
+                    for _ in 0..stats.count {
+                        self.latency_aggregation.observe(stats.mean_micros);
+                    }
+                }
+                LatencyStage::Strategy => {
+                    for _ in 0..stats.count {
+                        self.latency_strategy.observe(stats.mean_micros);
+                    }
+                }
+                LatencyStage::Execution => {
+                    for _ in 0..stats.count {
+                        self.latency_execution.observe(stats.mean_micros);
+                    }
+                }
+                LatencyStage::EndToEnd => {
+                    for _ in 0..stats.count {
+                        self.latency_end_to_end.observe(stats.mean_micros);
+                    }
+                }
+            }
+        }
+        self.note_activity();
+    }
+}
+
+impl MetricsRegistry {
+    /// 更新最後活動時間（用於 readiness）
+    fn note_activity(&self) {
+        self.last_activity_micros.store(now_micros(), Ordering::Relaxed);
+    }
+
+    /// 取得最近的隊列利用率（0.0-1.0）
+    pub fn queue_utilization_value(&self) -> f64 {
+        self.last_queue_utilization_ppm.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
+    /// 就緒評估（簡易版）：
+    /// - 最近活動間隔小於 max_idle_secs
+    /// - 隊列利用率低於 max_utilization
+    pub fn assess_readiness(&self, max_utilization: f64, max_idle_secs: u64) -> (bool, serde_json::Value) {
+        let now = now_micros();
+        let last = self.last_activity_micros.load(Ordering::Relaxed);
+        let idle_secs = (now.saturating_sub(last)) as f64 / 1_000_000.0;
+        let util = self.queue_utilization_value();
+        let ready = idle_secs <= max_idle_secs as f64 && util <= max_utilization;
+        (
+            ready,
+            serde_json::json!({
+                "idle_secs": idle_secs,
+                "queue_utilization": util,
+                "max_idle_secs": max_idle_secs,
+                "max_utilization": max_utilization,
+            })
+        )
     }
 }
 

@@ -5,6 +5,7 @@ use hft_core::*;
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
+use serde::{Deserialize, Serialize};
 
 /// 裝箱的事件流
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = HftResult<T>> + Send>>;
@@ -63,6 +64,9 @@ pub trait ExecutionClient: Send + Sync {
     /// 執行回報流 (填充、ACK、拒絕等)
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>>;
     
+    /// 獲取未結訂單列表 (用於對賬)
+    async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>>;
+
     /// 連線管理
     async fn connect(&mut self) -> HftResult<()>;
     async fn disconnect(&mut self) -> HftResult<()>;
@@ -70,7 +74,7 @@ pub trait ExecutionClient: Send + Sync {
 }
 
 /// 帳戶視圖 (策略決策用)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountView {
     pub cash_balance: f64,
     pub positions: std::collections::HashMap<Symbol, Position>,
@@ -89,7 +93,7 @@ impl Default for AccountView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: Symbol,
     pub quantity: Quantity,
@@ -98,6 +102,10 @@ pub struct Position {
 }
 
 /// 策略接口
+/// 策略處理的市場範疇
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VenueScope { Single, Cross }
+
 pub trait Strategy: Send + Sync {
     /// 處理市場事件，返回交易意圖
     fn on_market_event(
@@ -115,6 +123,10 @@ pub trait Strategy: Send + Sync {
     
     /// 策略名稱
     fn name(&self) -> &str;
+    /// 策略實例ID（預設等同於 name；可被覆寫以回傳穩定實例ID）
+    fn id(&self) -> &str { self.name() }
+    /// 策略場域範疇（單場/跨場）；預設單場，可由策略覆寫
+    fn venue_scope(&self) -> VenueScope { VenueScope::Single }
     
     /// 策略初始化
     fn initialize(&mut self) -> HftResult<()> { Ok(()) }
@@ -167,9 +179,63 @@ impl Default for VenueSpec {
     }
 }
 
+impl VenueSpec {
+    /// Phase 1 重構：為常見交易所創建預設 VenueSpec
+    pub fn binance_spot() -> Self {
+        Self {
+            name: "BINANCE".to_string(),
+            tick_size: Price::from_f64(0.01).unwrap(), // 通用價格精度
+            lot_size: Quantity::from_f64(0.00001).unwrap(), // 5位小數
+            min_qty: Quantity::from_f64(0.00001).unwrap(),
+            max_quantity: Some(Quantity::from_f64(900000.0).unwrap()),
+            min_notional: rust_decimal::Decimal::from(10), // 10 USDT
+            maker_fee_bps: Some(rust_decimal::Decimal::new(10, 4)), // 0.1%
+            taker_fee_bps: Some(rust_decimal::Decimal::new(10, 4)), // 0.1%
+            rate_limit: Some(1200), // 1200 requests/minute
+        }
+    }
+    
+    pub fn bitget_spot() -> Self {
+        Self {
+            name: "BITGET".to_string(),
+            tick_size: Price::from_f64(0.01).unwrap(),
+            lot_size: Quantity::from_f64(0.0001).unwrap(), // 4位小數
+            min_qty: Quantity::from_f64(0.0001).unwrap(),
+            max_quantity: Some(Quantity::from_f64(1000000.0).unwrap()),
+            min_notional: rust_decimal::Decimal::from(5), // 5 USDT
+            maker_fee_bps: Some(rust_decimal::Decimal::new(10, 4)), // 0.1%
+            taker_fee_bps: Some(rust_decimal::Decimal::new(10, 4)), // 0.1%
+            rate_limit: Some(600), // 600 requests/minute
+        }
+    }
+    
+    pub fn bybit_spot() -> Self {
+        Self {
+            name: "BYBIT".to_string(),
+            tick_size: Price::from_f64(0.01).unwrap(),
+            lot_size: Quantity::from_f64(0.000001).unwrap(), // 6位小數
+            min_qty: Quantity::from_f64(0.000001).unwrap(),
+            max_quantity: Some(Quantity::from_f64(500000.0).unwrap()),
+            min_notional: rust_decimal::Decimal::from(1), // 1 USDT
+            maker_fee_bps: Some(rust_decimal::Decimal::new(10, 4)), // 0.1%
+            taker_fee_bps: Some(rust_decimal::Decimal::new(10, 4)), // 0.1%
+            rate_limit: Some(120), // 120 requests/minute
+        }
+    }
+    
+    /// 構建預設的 VenueSpec 映射
+    pub fn build_default_venue_specs() -> std::collections::HashMap<VenueId, VenueSpec> {
+        let mut specs = std::collections::HashMap::new();
+        specs.insert(VenueId::BINANCE, Self::binance_spot());
+        specs.insert(VenueId::BITGET, Self::bitget_spot());
+        specs.insert(VenueId::BYBIT, Self::bybit_spot());
+        specs
+    }
+}
+
 /// 風控管理器接口
 pub trait RiskManager: Send + Sync {
-    /// 審核訂單意圖，返回風控決策
+    /// 審核訂單意圖，返回風控決策（舊版 - 字符串映射）
     fn review_orders(
         &mut self,
         intents: Vec<OrderIntent>,
@@ -177,13 +243,47 @@ pub trait RiskManager: Send + Sync {
         venue_specs: &std::collections::HashMap<String, VenueSpec>,
     ) -> Vec<OrderIntent>;
     
-    /// 審核訂單意圖（使用新的 instrument VenueSpec）
+    /// 審核訂單意圖（使用單個 VenueSpec）
     fn review(
         &mut self,
         intents: Vec<OrderIntent>,
         account: &AccountView,
         venue: &VenueSpec,
     ) -> Vec<OrderIntent>;
+    
+    /// Phase 1 重構：審核訂單意圖（使用 VenueId 映射）
+    fn review_with_venue_specs(
+        &mut self,
+        intents: Vec<OrderIntent>,
+        account: &AccountView,
+        venue_specs: &std::collections::HashMap<VenueId, VenueSpec>,
+    ) -> Vec<OrderIntent> {
+        // 默認實現：批量調用 review()，根據 target_venue 或 symbol 查找對應 VenueSpec
+        let mut approved_intents = Vec::new();
+        
+        for intent in intents {
+            // 1. 優先使用 intent.target_venue
+            let venue_spec = if let Some(target_venue) = intent.target_venue {
+                venue_specs.get(&target_venue)
+            } else {
+                // 2. 回退到從 symbol 推斷 venue（簡單實現）
+                // 這裡假設 symbol 格式為 "VENUE:SYMBOL" 或純 symbol
+                let base_symbol = BaseSymbol::from_venue_symbol(&intent.symbol.0);
+                // 簡化處理：使用第一個可用的 VenueSpec
+                venue_specs.values().next()
+            };
+            
+            if let Some(spec) = venue_spec {
+                let reviewed = self.review(vec![intent], account, spec);
+                approved_intents.extend(reviewed);
+            } else {
+                // 沒有找到對應的 VenueSpec，拒絕此訂單
+                eprintln!("Warning: No VenueSpec found for intent: {:?}", intent);
+            }
+        }
+        
+        approved_intents
+    }
     
     /// 處理執行事件
     fn on_execution_event(&mut self, event: &ExecutionEvent);

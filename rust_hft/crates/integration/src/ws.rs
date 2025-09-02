@@ -1,8 +1,9 @@
 //! WebSocket 基元 - 高性能 WebSocket 客戶端
-use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream, MaybeTlsStream};
+//! 專為 HFT 場景優化：TCP_NODELAY + 禁用壓縮 + 持久連接
+use tokio_tungstenite::{connect_async_with_config, tungstenite::{Message, protocol::WebSocketConfig}, WebSocketStream, MaybeTlsStream};
 use tokio::net::TcpStream;
 use futures_util::{SinkExt, StreamExt};
-use tracing::{trace, warn, error, info};
+use tracing::{trace, warn, error, info, debug};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -12,6 +13,14 @@ pub struct WsClientConfig {
     pub heartbeat_interval: Duration,
     pub reconnect_interval: Duration,
     pub max_reconnect_attempts: u32,
+    /// 啟用 TCP_NODELAY（禁用 Nagle 算法）以降低延遲
+    pub tcp_nodelay: bool,
+    /// 禁用 WebSocket 壓縮以降低 CPU 開銷和延遲
+    pub disable_compression: bool,
+    /// WebSocket 消息大小限制（字節）
+    pub max_message_size: usize,
+    /// WebSocket 幀大小限制（字節）  
+    pub max_frame_size: usize,
 }
 
 impl Default for WsClientConfig {
@@ -21,6 +30,12 @@ impl Default for WsClientConfig {
             heartbeat_interval: Duration::from_secs(30),
             reconnect_interval: Duration::from_secs(5),
             max_reconnect_attempts: 10,
+            tcp_nodelay: true,           // HFT 必須啟用
+            disable_compression: true,   // HFT 必須禁用壓縮
+            // Bitget/多品種訂閱時，單條 books/trade 訊息可能 >64KB
+            // 提升上限以避免 "Space limit exceeded" 斷線
+            max_message_size: 512 * 1024, // 512KB 訊息上限
+            max_frame_size: 256 * 1024,   // 256KB 幀上限
         }
     }
 }
@@ -52,11 +67,39 @@ impl WsClient {
     }
     
     pub async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        info!("連接到 WebSocket: {}", self.cfg.url);
+        info!("連接到 WebSocket: {} (TCP_NODELAY: {}, 禁用壓縮: {})", 
+              self.cfg.url, self.cfg.tcp_nodelay, self.cfg.disable_compression);
         
-        match connect_async(&self.cfg.url).await {
+        // 配置專為 HFT 優化的 WebSocket 設置
+        let ws_config = Some(WebSocketConfig {
+            // 消息和幀大小限制
+            max_message_size: Some(self.cfg.max_message_size),
+            max_frame_size: Some(self.cfg.max_frame_size),
+            // 增大寫入緩衝區以提高批量寫入效率
+            write_buffer_size: self.cfg.max_frame_size,
+            max_write_buffer_size: self.cfg.max_message_size,
+            // 發送隊列大小限制
+            max_send_queue: None, // 不限制發送隊列大小
+            // 不接受未遮罩幀（安全考慮）
+            accept_unmasked_frames: false,
+        });
+        
+        match connect_async_with_config(&self.cfg.url, ws_config, false).await {
             Ok((ws_stream, response)) => {
                 info!("WebSocket 連接成功，狀態碼: {}", response.status());
+                
+                // 如果配置啟用了 TCP_NODELAY，設置 TCP 選項
+                if self.cfg.tcp_nodelay {
+                    if let MaybeTlsStream::Plain(ref stream) = ws_stream.get_ref() {
+                        if let Err(e) = stream.set_nodelay(true) {
+                            warn!("無法設置 TCP_NODELAY: {}", e);
+                        } else {
+                            debug!("已啟用 TCP_NODELAY 以降低延遲");
+                        }
+                    }
+                    // 對於 TLS 連接，底層 TCP 流不直接可訪問，依賴於 TLS 庫的默認設置
+                }
+                
                 self.connection = Some(ws_stream);
                 Ok(())
             }
@@ -294,4 +337,3 @@ impl ReconnectingWsClient {
         }
     }
 }
-

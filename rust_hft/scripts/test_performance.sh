@@ -130,7 +130,7 @@ build_project() {
 # 運行測試
 run_test() {
     local test_type=$1
-    local config_file=${2:-"config/performance_test.yaml"}
+    local config_file=${2:-"config/test/performance_test.yaml"}
     
     echo -e "\n${BLUE}🧪 Running $test_type test...${NC}"
     
@@ -208,7 +208,7 @@ cleanup() {
 # 主函數
 main() {
     local test_type=${1:-"full"}
-    local config_file=${2:-"config/performance_test.yaml"}
+    local config_file=${2:-"config/test/performance_test.yaml"}
     
     echo "Test type: $test_type"
     echo "Config file: $config_file"

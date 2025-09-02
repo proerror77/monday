@@ -8,8 +8,8 @@ engine:
 venues:
   - name: "bitget"
     venue_type: "Bitget"
-    ws_public: "wss://ws.bitget.com/spot/v1/stream"
-    ws_private: "wss://ws.bitget.com/spot/v1/stream"
+    ws_public: "wss://ws.bitget.com/v2/ws/public"
+    ws_private: "wss://ws.bitget.com/v2/ws/private"
     rest: "https://api.bitget.com"
     api_key: "${BITGET_STAGING_API_KEY}"
     secret: "${BITGET_STAGING_SECRET}"

@@ -1,0 +1,82 @@
+# Simplified config without templates: direct strategies list for OBI on ETH/SOL/SUI
+
+engine:
+  queue_capacity: 32768
+  stale_us: 100000   # 放寬至 100ms，避免本機/容器延遲導致事件被丟棄
+  top_n: 10
+  flip_policy: OnUpdate
+
+venues:
+  - name: "bitget"
+    venue_type: "Bitget"
+    ws_public: "wss://ws.bitget.com/v2/ws/public"
+    ws_private: "wss://ws.bitget.com/v2/ws/private"
+    rest: "https://api.bitget.com"
+    api_key: "${BITGET_API_KEY}"
+    secret: "${BITGET_SECRET}"
+    passphrase: "${BITGET_PASSPHRASE}"
+    execution_mode: "Paper"
+    capabilities:
+      ws_order_placement: true
+      snapshot_crc: false
+      all_in_one_topics: true
+      private_ws_heartbeat: true
+      use_incremental_books: true
+
+  - name: "binance"
+    venue_type: "Binance"
+    ws_public: "wss://stream.binance.com:9443/ws"
+    ws_private: "wss://stream.binance.com:9443/ws"
+    rest: "https://api.binance.com"
+    api_key: "${BINANCE_API_KEY}"
+    secret: "${BINANCE_SECRET}"
+    execution_mode: "Paper"
+    capabilities:
+      ws_order_placement: true
+      snapshot_crc: false
+      all_in_one_topics: false
+      private_ws_heartbeat: false
+
+strategies:
+  - name: "imbalance_ETH"
+    strategy_type: Imbalance
+    symbols: ["ETHUSDT"]
+    params:
+      Imbalance: { obi_threshold: 0.2, lot: 0.01, top_levels: 5 }
+    risk_limits: { max_notional: 15000.0, max_position: 3.0, daily_loss_limit: 800.0, cooldown_ms: 1000 }
+
+  - name: "imbalance_SOL"
+    strategy_type: Imbalance
+    symbols: ["SOLUSDT"]
+    params:
+      Imbalance: { obi_threshold: 0.2, lot: 0.01, top_levels: 5 }
+    risk_limits: { max_notional: 10000.0, max_position: 5.0, daily_loss_limit: 500.0, cooldown_ms: 1000 }
+
+  - name: "imbalance_SUI"
+    strategy_type: Imbalance
+    symbols: ["SUIUSDT"]
+    params:
+      Imbalance: { obi_threshold: 0.2, lot: 0.01, top_levels: 5 }
+    risk_limits: { max_notional: 8000.0, max_position: 10.0, daily_loss_limit: 300.0, cooldown_ms: 1000 }
+
+# 執行路由配置：簡單規則，將所有訂單路由到 bitget
+router:
+  default_venue: "bitget"
+  symbol_routes:
+    "ETHUSDT": "bitget"
+    "SOLUSDT": "bitget"  
+    "SUIUSDT": "bitget"
+
+risk:
+  global_position_limit: 1000000.0
+  global_notional_limit: 10000000.0
+  max_daily_trades: 10000
+  max_orders_per_second: 100
+  staleness_threshold_us: 5000
+
+infra:
+  clickhouse:
+    url: "http://localhost:8123"
+    database: "hft"
+  redis:
+    url: "redis://127.0.0.1:6379"

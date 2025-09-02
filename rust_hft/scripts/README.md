@@ -45,7 +45,8 @@ make health       # 檢查系統健康狀態
 
 - `start_test_environment.sh` - 完整的測試環境啟動和健康檢查
 - `run_comprehensive_db_test.sh` - 完整的數據庫壓力測試
-- `run_full_test_suite.sh` - 完整的測試套件
+- `run_test_suite.sh` - 完整的測試套件（統一入口）
+- `run_full_test_suite.sh` - 向後相容 shim，轉呼叫 `run_test_suite.sh`
 - `verify_project_structure.sh` - 項目結構驗證
 
 ## 遷移指南

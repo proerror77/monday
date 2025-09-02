@@ -1,7 +1,7 @@
 //! Binance 消息格式轉換器
 
 use crate::message_types::*;
-use hft_core::{HftError, HftResult, Price, Quantity, Side, Symbol, Timestamp};
+use hft_core::{HftError, HftResult, Price, Quantity, Side, Symbol, Timestamp, VenueId};
 use ports::events::*;
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -26,6 +26,7 @@ impl MessageConverter {
             bids,
             asks,
             sequence: snapshot.last_update_id,
+            source_venue: Some(VenueId::BINANCE),
         })
     }
 
@@ -37,6 +38,7 @@ impl MessageConverter {
 
         Ok(BookUpdate {
             symbol,
+            source_venue: Some(VenueId::BINANCE),
             timestamp: update.event_time,
             bids,
             asks,
@@ -63,6 +65,7 @@ impl MessageConverter {
             quantity,
             side,
             trade_id: trade.trade_id.to_string(),
+            source_venue: Some(VenueId::BINANCE),
         })
     }
 
@@ -91,6 +94,7 @@ impl MessageConverter {
             close,
             volume,
             trade_count: kline.trade_count,
+            source_venue: Some(VenueId::BINANCE),
         })
     }
 

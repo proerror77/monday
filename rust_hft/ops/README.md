@@ -68,10 +68,10 @@ cd ops && docker-compose down
 - **默認登錄**: admin/admin
 - **配置**: `monitoring/grafana/`
 
-### Redis
+### ClickHouse 指標端點
 
-- **端口**: 6379
-- **用途**: 實時數據緩存和事件發布/訂閱
+- **端口**: 9363 (`/metrics`)
+- **用途**: 暴露 ClickHouse 內建 Prometheus 指標（system.metrics/events 等）
 
 ## 常用運維命令
 
@@ -111,8 +111,8 @@ docker-compose ps
 docker-compose logs -f clickhouse
 docker-compose logs -f prometheus
 
-# 重啟特定服務
-docker-compose restart redis
+# 重啟特定服務（示例）
+docker-compose restart clickhouse
 
 # 清理數據卷（謹慎使用）
 docker-compose down -v
@@ -128,9 +128,6 @@ docker-compose down -v
 # ClickHouse 配置
 CLICKHOUSE_USER=default
 CLICKHOUSE_PASSWORD=your_password
-
-# Redis 配置  
-REDIS_PASSWORD=your_redis_password
 
 # Grafana 配置
 GRAFANA_ADMIN_PASSWORD=your_admin_password

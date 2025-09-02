@@ -30,11 +30,14 @@ adapter-bybit-execution = { package = "hft-execution-adapter-bybit", path = "../
 strategy-trend = { package = "hft-strategy-trend", path = "../../strategies/trend", optional = true }
 strategy-arbitrage = { package = "hft-strategy-arbitrage", path = "../../strategies/arbitrage", optional = true }
 # Note: strategy-dl is not yet implemented, but we provide the feature flag for forward compatibility
+strategy-imbalance = { package = "hft-strategy-imbalance", path = "../../strategies/imbalance", optional = true }
 
 # Infrastructure (optional)
 infra-clickhouse = { package = "hft-infra-clickhouse", path = "../infra/clickhouse", optional = true }
 infra-redis = { package = "hft-infra-redis", path = "../infra/redis", optional = true }
 infra-metrics = { package = "hft-infra-metrics", path = "../infra/metrics", optional = true }
+infra-ipc = { package = "hft-ipc", path = "../infra/ipc", optional = true }
+hft-recovery = { path = "../recovery", optional = true }
 
 # Serialization and async
 serde = { workspace = true }
@@ -47,6 +50,8 @@ regex = "1.5"
 redis = { version = "0.24", features = ["tokio-comp", "aio"], optional = true }
 serde_json = { version = "1.0", optional = true }
 clickhouse = { version = "0.12", optional = true }
+async-trait = "0.1"
+futures = { workspace = true }
 
 [features]
 default = []
@@ -69,11 +74,16 @@ adapter-bybit-execution = ["dep:adapter-bybit-execution"]
 strategy-trend = ["dep:strategy-trend"]
 strategy-arbitrage = ["dep:strategy-arbitrage"]
 strategy-dl = [] # Forward compatibility - will be implemented later
+strategy-imbalance = ["dep:strategy-imbalance"]
 
 # Infrastructure
 infra-clickhouse = ["dep:infra-clickhouse", "dep:clickhouse"]
 infra-redis = ["dep:infra-redis", "dep:redis"]
+# Decouple engine features from runtime to avoid cross-crate feature coupling.
+# Metrics in engine should be enabled by top-level apps (e.g., hft-live).
 infra-metrics = ["dep:infra-metrics"]
+infra-ipc = ["dep:infra-ipc"]
+recovery = ["dep:hft-recovery"]
 
 # Enable Redis support
 redis = ["dep:redis", "dep:serde_json"]
@@ -83,5 +93,5 @@ bitget = ["adapter-bitget-data", "adapter-bitget-execution"]
 binance = ["adapter-binance-data", "adapter-binance-execution"]
 bybit = ["adapter-bybit-data", "adapter-bybit-execution"]
 mock = ["adapter-mock-data"]
-all-strategies = ["strategy-trend", "strategy-arbitrage", "strategy-dl"]
+all-strategies = ["strategy-trend", "strategy-arbitrage", "strategy-imbalance", "strategy-dl"]
 full = ["bitget", "binance", "bybit", "all-strategies", "adapter-mock-data"]

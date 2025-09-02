@@ -401,7 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. 加載 YAML 配置
     println!("📝 加載配置文件...");
-    let config_path = "config/s1_e2e_config.yaml";
+    let config_path = "config/test/s1_e2e_config.yaml";
     let config_content = fs::read_to_string(config_path)
         .map_err(|e| format!("無法讀取配置文件 {}: {}", config_path, e))?;
     

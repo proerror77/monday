@@ -43,11 +43,16 @@ impl ZeroCopyBitgetStream {
     }
 
     fn create_ws_config() -> WsClientConfig {
+        // 放寬訊息/幀上限以容納多品種 LOB/Trade 聚合
         WsClientConfig {
-            url: "wss://ws.bitget.com/spot/v1/stream".to_string(),
+            url: "wss://ws.bitget.com/v2/ws/public".to_string(),
             heartbeat_interval: std::time::Duration::from_secs(30),
             reconnect_interval: std::time::Duration::from_secs(5),
             max_reconnect_attempts: 10,
+            tcp_nodelay: true,           // HFT 必須啟用
+            disable_compression: true,   // HFT 必須禁用壓縮
+            max_message_size: 512 * 1024, // 512KB 訊息上限
+            max_frame_size: 256 * 1024,   // 256KB 幀上限
         }
     }
 
@@ -137,6 +142,7 @@ impl ZeroCopyBitgetStream {
             bids,
             asks,
             sequence: 0, // Bitget 暫時沒有序列號
+            source_venue: Some(VenueId::BITGET),
         })
     }
 
@@ -200,6 +206,7 @@ impl ZeroCopyBitgetStream {
             quantity: Quantity::from_f64(quantity).unwrap_or(Quantity::zero()),
             side,
             trade_id,
+            source_venue: Some(VenueId::BITGET),
         })
     }
 }
@@ -292,6 +299,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
                         bids: Vec::new(),
                         asks: Vec::new(),
                         sequence: 0,
+                        source_venue: Some(VenueId::BITGET),
                     };
                     
                     let event = MarketEvent::Snapshot(snapshot);

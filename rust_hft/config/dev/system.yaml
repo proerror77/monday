@@ -14,8 +14,8 @@ engine:
 venues:
   - name: "bitget"
     venue_type: "Bitget"
-    ws_public: "wss://ws.bitget.com/spot/v1/stream"
-    ws_private: "wss://ws.bitget.com/spot/v1/stream"
+    ws_public: "wss://ws.bitget.com/v2/ws/public"
+    ws_private: "wss://ws.bitget.com/v2/ws/private"
     rest: "https://api.bitget.com"
     api_key: "${BITGET_API_KEY}"        # 從環境變量讀取 API Key
     secret: "${BITGET_SECRET}"          # 從環境變量讀取 Secret
@@ -74,6 +74,19 @@ strategies:
         daily_loss_limit: 400.0
         cooldown_ms: 2000
 
+    - id: imbalance_lob
+      strategy_type: Imbalance
+      params:
+        Imbalance:
+          obi_threshold: 0.2   # 20% 不平衡
+          lot: 0.01            # 下單數量
+          top_levels: 5        # 使用前5檔計算
+      risk:
+        max_notional: 15000.0
+        max_position: 3.0
+        daily_loss_limit: 800.0
+        cooldown_ms: 1000
+
   bindings:
     - template: trend_default
       apply_to: ["group:layer1"]
@@ -87,6 +100,25 @@ strategies:
 
     - template: arbitrage_cross
       apply_to: ["group:layer1"]
+
+    - template: imbalance_lob
+      apply_to: ["group:layer1"]
+
+# 🔥 Phase 1.5: 路由器配置 - 策略到場的映射
+router:
+  type: StrategyMap
+  default_venue: BINANCE
+  strategy_venues:
+    # 基於策略實例 ID (template_id:SYMBOL) 進行路由
+    trend_default:ETHUSDT: BINANCE
+    trend_default:SOLUSDT: BITGET
+    trend_default:SUIUSDT: BINANCE
+    arbitrage_cross:ETHUSDT: BINANCE  # 跨場策略，指定主場
+    arbitrage_cross:SOLUSDT: BITGET
+    arbitrage_cross:SUIUSDT: BINANCE
+    imbalance_lob:ETHUSDT: BINANCE
+    imbalance_lob:SOLUSDT: BITGET
+    imbalance_lob:SUIUSDT: BINANCE
 
 risk:
   global_position_limit: 1000000.0

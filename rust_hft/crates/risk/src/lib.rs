@@ -4,9 +4,13 @@
 
 pub mod default_risk_manager;
 pub mod enhanced_risk_manager;
+pub mod simplified_professional_risk;
 
 pub use default_risk_manager::{DefaultRiskManager, RiskConfig, PrecisionNormalizer};
 pub use enhanced_risk_manager::{EnhancedRiskManager, EnhancedRiskConfig, TradingWindow, RiskReport};
+pub use simplified_professional_risk::{
+    SimplifiedProfessionalRiskManager, SimplifiedRiskConfig, SimplifiedRiskDecision, SimplifiedRiskStats
+};
 
 // 重新导出 ports 中的 trait
 pub use ports::RiskManager;

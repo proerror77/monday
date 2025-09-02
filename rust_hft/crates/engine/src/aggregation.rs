@@ -115,6 +115,7 @@ pub struct BarBuilder {
     pub close: Option<Price>,
     pub volume: Quantity,
     pub trade_count: u32,
+    pub source_venue: Option<VenueId>,
 }
 
 impl BarBuilder {
@@ -130,10 +131,16 @@ impl BarBuilder {
             close: None,
             volume: Quantity::zero(),
             trade_count: 0,
+            source_venue: None,
         }
     }
     
     pub fn add_trade(&mut self, trade: &Trade) {
+        // 設置來源交易所（Phase 1 重構：顯式 venue 語義）
+        if self.source_venue.is_none() {
+            self.source_venue = trade.source_venue;
+        }
+        
         // 設置 OHLC
         if self.open.is_none() {
             self.open = Some(trade.price);
@@ -176,6 +183,7 @@ impl BarBuilder {
                 close,
                 volume: self.volume,
                 trade_count: self.trade_count,
+                source_venue: self.source_venue,
             })
         } else {
             None
@@ -187,7 +195,7 @@ impl BarBuilder {
 #[derive(Debug)]
 pub struct CrossExchangeJoiner {
     pub symbol: Symbol,
-    pub exchanges: HashMap<String, TopNSnapshot>,
+    pub exchanges: HashMap<VenueId, TopNSnapshot>,
     pub last_update: Timestamp,
 }
 
@@ -200,7 +208,7 @@ impl CrossExchangeJoiner {
         }
     }
     
-    pub fn update_exchange(&mut self, exchange: String, snapshot: TopNSnapshot) {
+    pub fn update_exchange(&mut self, exchange: VenueId, snapshot: TopNSnapshot) {
         self.last_update = std::cmp::max(self.last_update, snapshot.timestamp);
         self.exchanges.insert(exchange, snapshot);
     }
@@ -211,16 +219,16 @@ impl CrossExchangeJoiner {
             return None;
         }
         
-        let mut best_bid = (FixedPrice::ZERO.raw(), String::new());
-        let mut best_ask = (FixedPrice::from_f64(f64::MAX).raw(), String::new());
+        let mut best_bid = (FixedPrice::ZERO.raw(), VenueId::BINANCE); // 默認值，實際會被覆蓋
+        let mut best_ask = (FixedPrice::from_f64(f64::MAX).raw(), VenueId::BINANCE); // 默認值，實際會被覆蓋
         
-        for (exchange, snapshot) in &self.exchanges {
+        for (&exchange, snapshot) in &self.exchanges {
             if !snapshot.bid_prices.is_empty() && snapshot.bid_prices[0].raw() > best_bid.0 {
-                best_bid = (snapshot.bid_prices[0].raw(), exchange.clone());
+                best_bid = (snapshot.bid_prices[0].raw(), exchange);
             }
             
             if !snapshot.ask_prices.is_empty() && snapshot.ask_prices[0].raw() < best_ask.0 {
-                best_ask = (snapshot.ask_prices[0].raw(), exchange.clone());
+                best_ask = (snapshot.ask_prices[0].raw(), exchange);
             }
         }
         
@@ -237,8 +245,8 @@ impl CrossExchangeJoiner {
                 let max_qty = if bid_qty.raw() < ask_qty.raw() { bid_qty } else { ask_qty };
                 
                 return Some(ArbitrageOpportunity {
-                    leg1: Symbol(format!("{}:{}", best_bid.1, self.symbol.0)),
-                    leg2: Symbol(format!("{}:{}", best_ask.1, self.symbol.0)),
+                    leg1: Symbol(format!("{}:{}", best_bid.1.as_str(), self.symbol.0)),
+                    leg2: Symbol(format!("{}:{}", best_ask.1.as_str(), self.symbol.0)),
                     spread_bps: spread_bps_fixed.into(),
                     max_quantity: max_qty.into(),
                     timestamp: self.last_update,
@@ -256,21 +264,21 @@ impl CrossExchangeJoiner {
             return None;
         }
         
-        let mut best_bid = (FixedPrice::ZERO, String::new());
-        let mut best_ask = (FixedPrice::from_f64(f64::MAX), String::new());
+        let mut best_bid = (FixedPrice::ZERO, VenueId::BINANCE);
+        let mut best_ask = (FixedPrice::from_f64(f64::MAX), VenueId::BINANCE);
         
-        for (exchange, snapshot) in &self.exchanges {
+        for (&exchange, snapshot) in &self.exchanges {
             if !snapshot.bid_prices.is_empty() {
                 let bid_price = snapshot.bid_prices[0]; // 已经是 FixedPrice
                 if bid_price.raw() > best_bid.0.raw() {
-                    best_bid = (bid_price, exchange.clone());
+                    best_bid = (bid_price, exchange);
                 }
             }
             
             if !snapshot.ask_prices.is_empty() {
                 let ask_price = snapshot.ask_prices[0]; // 已经是 FixedPrice
                 if ask_price.raw() < best_ask.0.raw() {
-                    best_ask = (ask_price, exchange.clone());
+                    best_ask = (ask_price, exchange);
                 }
             }
         }
@@ -285,8 +293,8 @@ impl CrossExchangeJoiner {
                 let max_qty = if bid_qty.raw() < ask_qty.raw() { bid_qty } else { ask_qty };
                 
                 return Some(ArbitrageOpportunity {
-                    leg1: Symbol(format!("{}:{}", best_bid.1, self.symbol.0)),
-                    leg2: Symbol(format!("{}:{}", best_ask.1, self.symbol.0)),
+                    leg1: Symbol(format!("{}:{}", best_bid.1.as_str(), self.symbol.0)),
+                    leg2: Symbol(format!("{}:{}", best_ask.1.as_str(), self.symbol.0)),
                     spread_bps: spread_bps.into(), // 转回 Decimal 用于边界输出
                     max_quantity: max_qty.into(),
                     timestamp: self.last_update,
@@ -363,19 +371,24 @@ impl AggregationEngine {
                 // 标记该 symbol 已变更
                 self.changed_symbols.insert(snapshot.symbol.clone());
                 
+                // 將原始快照事件透傳給策略（允許策略基於 LOB 做決策，如 OBI）
+                output_events.push(MarketEvent::Snapshot(snapshot.clone()));
+
                 // 更新 Joiner (假設 symbol 格式為 "EXCHANGE:SYMBOL")
-                if let Some((exchange, base_symbol)) = snapshot.symbol.0.split_once(':') {
+                if let Some((exchange_str, base_symbol)) = snapshot.symbol.0.split_once(':') {
                     let base_symbol = Symbol(base_symbol.to_string());
                     let joiner = self.joiners.entry(base_symbol.clone())
                         .or_insert_with(|| CrossExchangeJoiner::new(base_symbol));
                     
-                    // 获取新创建的 Arc 快照
+                    // 获取新创建的 Arc 快照，並轉換 exchange 字符串為 VenueId
                     if let Some(topn_arc) = self.orderbooks.get(&snapshot.symbol) {
-                        joiner.update_exchange(exchange.to_string(), (**topn_arc).clone());
-                        
-                        // 檢查套利機會
-                        if let Some(arb_opp) = joiner.check_arbitrage_opportunity(Decimal::from(5)) { // 5 bps 最小利差
-                            output_events.push(MarketEvent::Arbitrage(arb_opp));
+                        if let Some(venue_id) = VenueId::from_str(exchange_str) {
+                            joiner.update_exchange(venue_id, (**topn_arc).clone());
+                            
+                            // 檢查套利機會
+                            if let Some(arb_opp) = joiner.check_arbitrage_opportunity(Decimal::from(5)) { // 5 bps 最小利差
+                                output_events.push(MarketEvent::Arbitrage(arb_opp));
+                            }
                         }
                     }
                 }

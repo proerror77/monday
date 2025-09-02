@@ -5,10 +5,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
 
-use hft_core::{Price, Quantity, Symbol, Side};
+use hft_core::{Price, Quantity, Symbol, Side, OrderId};
 use ports::{AccountView, ExecutionEvent, Position};
 use snapshot::SnapshotContainer;
+use tracing::info;
+
+/// Portfolio state that can be persisted
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioState {
+    pub account_view: AccountView,
+    pub order_meta: HashMap<OrderId, (Symbol, Side)>,
+    pub market_prices: HashMap<Symbol, Price>,
+}
 
 /// 最小 Portfolio：單帳戶，根據 fills 更新倉位/現金與 PnL
 pub struct Portfolio {
@@ -124,6 +134,40 @@ impl Portfolio {
                 self.view.cash_balance += price_f * qty_f;
             }
         }
+    }
+    
+    /// Export portfolio state for persistence
+    pub fn export_state(&self) -> PortfolioState {
+        PortfolioState {
+            account_view: self.view.clone(),
+            order_meta: self.order_meta.clone(),
+            market_prices: self.market_prices.clone(),
+        }
+    }
+    
+    /// Import portfolio state from persistent storage
+    pub fn import_state(&mut self, state: PortfolioState) {
+        
+        info!("Importing portfolio state - Cash: {:.2}, Positions: {}, Orders: {}", 
+              state.account_view.cash_balance,
+              state.account_view.positions.len(),
+              state.order_meta.len());
+        
+        self.view = state.account_view;
+        self.order_meta = state.order_meta;
+        self.market_prices = state.market_prices;
+        
+        // Recalculate unrealized PnL with current market prices
+        self.recalculate_unrealized_pnl();
+        
+        // Update snapshot
+        self.snapshot.store(Arc::new(self.view.clone()));
+        
+        // Log summary
+        info!("Portfolio state imported - Total value: {:.2}, Realized PnL: {:.2}, Unrealized PnL: {:.2}",
+              self.view.cash_balance + self.view.unrealized_pnl,
+              self.view.realized_pnl,
+              self.view.unrealized_pnl);
     }
 }
 

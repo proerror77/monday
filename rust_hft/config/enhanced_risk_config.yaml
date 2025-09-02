@@ -1,0 +1,170 @@
+# Enhanced Risk Management Configuration Example
+# This demonstrates the new configurable risk management system with per-strategy overrides
+
+system:
+  name: "Enhanced Risk HFT System"
+  version: "1.0.0"
+  environment: "development"
+
+# Core engine settings
+engine:
+  queue_capacity: 32768
+  stale_us: 3000
+  top_n: 10
+  flip_policy: "OnUpdate"
+
+# Venues configuration
+venues:
+  - name: "bitget"
+    venue_type: "Bitget"
+    execution_mode: "Paper"
+    capabilities:
+      ws_order_placement: true
+      snapshot_crc: false
+      use_incremental_books: false
+
+# Strategy configuration with individual risk limits
+strategies:
+  - name: "conservative_trend"
+    strategy_type: "Trend"
+    symbols: ["BTCUSDT"]
+    params:
+      Trend:
+        ema_fast: 12
+        ema_slow: 26
+        rsi_period: 14
+    risk_limits:
+      max_notional: 50000.0
+      max_position: 10.0
+      daily_loss_limit: 5000.0
+      cooldown_ms: 1000
+      
+  - name: "aggressive_arbitrage"
+    strategy_type: "Arbitrage"
+    symbols: ["ETHUSDT", "BTCUSDT"]
+    params:
+      Arbitrage:
+        min_spread_bps: 1.5
+        max_position: 20.0
+        execution_timeout_ms: 500
+    risk_limits:
+      max_notional: 100000.0
+      max_position: 20.0
+      daily_loss_limit: 8000.0
+      cooldown_ms: 50
+
+# Enhanced Risk Management Configuration
+risk:
+  # Risk manager type: "Default" or "Enhanced"
+  risk_type: "Enhanced"
+  
+  # Base global settings (applied to all strategies)
+  global_position_limit: 1000000.0
+  global_notional_limit: 5000000.0
+  max_daily_trades: 10000
+  max_orders_per_second: 50
+  staleness_threshold_us: 5000
+  
+  # Enhanced risk settings (only used when risk_type = "Enhanced")
+  enhanced:
+    # Position and notional limits
+    max_position_per_symbol: 500.0
+    max_order_notional: 100000.0
+    
+    # Advanced rate limiting
+    max_orders_per_minute: 2000
+    max_orders_per_hour: 20000
+    
+    # Cooldown periods (milliseconds)
+    global_order_cooldown_ms: 10
+    symbol_order_cooldown_ms: 50
+    failed_order_penalty_ms: 1000
+    
+    # Data staleness thresholds (microseconds)
+    market_data_staleness_us: 2000
+    inference_staleness_us: 3000
+    execution_report_staleness_us: 10000
+    
+    # Loss control
+    max_daily_loss: 25000.0
+    max_drawdown_pct: 3.0
+    max_consecutive_losses: 5
+    max_position_loss_pct: 1.5
+    
+    # Circuit breaker
+    circuit_breaker_enabled: true
+    cb_daily_loss_threshold: 20000.0
+    cb_drawdown_threshold: 2.5
+    cb_consecutive_losses: 4
+    cb_recovery_time_minutes: 15
+    
+    # Trading window (optional - restricts trading to specific hours/days)
+    trading_window:
+      start_hour_utc: 0   # 00:00 UTC
+      end_hour_utc: 23    # 23:00 UTC
+      allowed_weekdays: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+      market_holidays: ["2024-12-25", "2024-01-01"]  # ISO date strings
+      
+    # System control
+    aggressive_mode: false
+    dry_run_mode: false
+    
+  # Per-strategy risk overrides
+  strategy_overrides:
+    conservative_trend:
+      # Override limits for conservative strategy
+      max_position: 25.0
+      max_notional: 30000.0
+      max_orders_per_second: 20
+      order_cooldown_ms: 200
+      staleness_threshold_us: 4000
+      max_daily_loss: 3000.0
+      aggressive_mode: false
+      # Enhanced-specific overrides
+      enhanced_overrides:
+        max_drawdown_pct: 2.0
+        max_consecutive_losses: 3
+        circuit_breaker_enabled: true
+        dry_run_mode: false
+        
+    aggressive_arbitrage:
+      # Override limits for aggressive strategy
+      max_position: 100.0
+      max_notional: 150000.0
+      max_orders_per_second: 100
+      order_cooldown_ms: 25
+      staleness_threshold_us: 1500
+      max_daily_loss: 10000.0
+      aggressive_mode: true
+      # Enhanced-specific overrides
+      enhanced_overrides:
+        max_drawdown_pct: 4.0
+        max_consecutive_losses: 8
+        circuit_breaker_enabled: false
+        dry_run_mode: false
+
+# Execution settings
+execution:
+  mode: "paper"
+  simulate_latency_us: 50
+  simulate_slippage_bps: 0.25
+  
+  paper:
+    initial_balance: 1000000.0
+    fill_probability: 0.98
+
+# Monitoring
+monitoring:
+  print_statistics_interval_sec: 30
+  snapshot_publish_frequency: "OnUpdate"
+  metrics_port: 9091
+  
+  alerts:
+    latency_p99_us: 2000
+    drawdown_pct: 2.0
+    error_rate_pct: 0.5
+
+# Runtime settings
+runtime:
+  duration_sec: 3600  # 1 hour test run
+  graceful_shutdown_timeout_sec: 15

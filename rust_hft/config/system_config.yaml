@@ -43,7 +43,7 @@ data_adapters:
     
   bitget:
     enabled: false
-    ws_url: "wss://ws.bitget.com/spot/v1/stream"
+    ws_url: "wss://ws.bitget.com/v2/ws/public"
     auto_reconnect: true
     heartbeat_interval_ms: 30000
     subscription_timeout_sec: 10

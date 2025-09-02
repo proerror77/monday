@@ -5,11 +5,12 @@ edition = "2021"
 description = "以 fill/fee/funding 為唯一真相源，導出 AccountView 快照"
 
 [dependencies]
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 hft-core = { package = "hft-core", path = "../core" }
 ports = { package = "hft-ports", path = "../ports" }
 snapshot = { package = "hft-snapshot", path = "../snapshot" }
 rust_decimal = { version = "1.33", features = ["serde"] }
+tracing = { workspace = true }
 
 [features]
 default = []

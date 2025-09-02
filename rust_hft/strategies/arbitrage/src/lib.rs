@@ -2,8 +2,8 @@
 //! - Joins multi-venue snapshots and emits OrderIntent on opportunities
 //! - Detects cross-exchange price discrepancies for simultaneous buy/sell
 
-use hft_core::{HftResult, Symbol, Price, Quantity, Side, OrderType, TimeInForce};
-use ports::{Strategy, MarketEvent, ExecutionEvent, OrderIntent, AccountView, MarketSnapshot};
+use hft_core::{HftResult, Symbol, Price, Quantity, Side, OrderType, TimeInForce, VenueId};
+use ports::{Strategy, MarketEvent, ExecutionEvent, OrderIntent, AccountView, MarketSnapshot, VenueScope};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use num_traits::{ToPrimitive, FromPrimitive};
@@ -92,14 +92,20 @@ pub struct ArbitrageStrategy {
 }
 
 impl ArbitrageStrategy {
+    /// 創建新的套利策略（舊版，保持向後兼容性）
     pub fn new(symbol: Symbol, config: ArbitrageStrategyConfig) -> Self {
-        let strategy_id = format!("arbitrage_{}_{}", symbol.0, chrono::Utc::now().timestamp());
-        
+        // 使用基於符號的穩定 ID，而非動態時間戳
+        let strategy_id = format!("arbitrage_{}", symbol.0);
+        Self::with_name(symbol, config, strategy_id)
+    }
+    
+    /// 🔥 Phase 1.4: 創建帶穩定名稱的套利策略
+    pub fn with_name(symbol: Symbol, config: ArbitrageStrategyConfig, strategy_name: String) -> Self {
         Self {
             symbol,
             config,
             venue_snapshots: HashMap::new(),
-            strategy_id,
+            strategy_id: strategy_name,
             last_signal_time: 0,
         }
     }
@@ -253,6 +259,7 @@ impl ArbitrageStrategy {
             price: None,
             time_in_force: TimeInForce::IOC,
             strategy_id: self.strategy_id.clone(),
+            target_venue: VenueId::from_str(&signal.buy_venue), // 明確指定買入交易所
         });
         
         // 生成賣出訂單 (在賣出所)
@@ -264,6 +271,7 @@ impl ArbitrageStrategy {
             price: None,
             time_in_force: TimeInForce::IOC,
             strategy_id: self.strategy_id.clone(),
+            target_venue: VenueId::from_str(&signal.sell_venue), // 明確指定賣出交易所
         });
         
         orders
@@ -280,6 +288,8 @@ impl ArbitrageStrategy {
 }
 
 impl Strategy for ArbitrageStrategy {
+    fn id(&self) -> &str { &self.strategy_id }
+    fn venue_scope(&self) -> VenueScope { VenueScope::Cross }
     fn on_market_event(&mut self, event: &MarketEvent, account: &AccountView) -> Vec<OrderIntent> {
         match event {
             MarketEvent::Snapshot(snapshot) => {
@@ -363,6 +373,7 @@ mod tests {
             bids: vec![BookLevel::new_unchecked(50000.0, 1.0)],
             asks: vec![BookLevel::new_unchecked(50100.0, 1.0)],
             sequence: 1,
+            source_venue: Some(VenueId::BINANCE),
         };
         
         let venue_snap = VenueSnapshot::from_market_snapshot("BINANCE".to_string(), &snapshot);

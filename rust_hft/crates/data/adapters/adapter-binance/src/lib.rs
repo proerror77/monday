@@ -207,36 +207,66 @@ impl MarketStream for BinanceMarketStream {
         let symbols_clone = symbols.clone();
         
         tokio::spawn(async move {
-            match ws_client.connect_and_subscribe(symbols_clone).await {
-                Ok(mut ws_stream) => {
-                    loop {
-                        match ws_stream.next().await {
-                            Some(Ok(Message::Text(text))) => {
-                                match MessageConverter::parse_stream_message(&text) {
-                                    Ok(Some(event)) => {
-                                        if let Err(_) = tx.send(Ok(event)) {
-                                            break;
+            // 簡易自動重連循環
+            let mut attempts: u32 = 0;
+            const MAX_ATTEMPTS: u32 = 5;
+            const BASE_DELAY_MS: u64 = 500;
+
+            loop {
+                match ws_client.connect_and_subscribe(symbols_clone.clone()).await {
+                    Ok(mut ws_stream) => {
+                        attempts = 0; // 成功連上，重置計數
+                        loop {
+                            match ws_stream.next().await {
+                                Some(Ok(Message::Text(text))) => {
+                                    match MessageConverter::parse_stream_message(&text) {
+                                        Ok(Some(event)) => {
+                                            if let Err(_) = tx.send(Ok(event)) { return; }
                                         }
-                                    }
-                                    Ok(None) => {
-                                        // 忽略未知消息
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(Err(e));
+                                        Ok(None) => {}
+                                        Err(e) => { let _ = tx.send(Err(e)); }
                                     }
                                 }
+                                Some(Ok(Message::Pong(_))) => {}
+                                Some(Ok(Message::Close(_))) => {
+                                    warn!("Binance WS 關閉，準備重連");
+                                    break;
+                                }
+                                Some(Err(e)) => {
+                                    error!("Binance WS 錯誤: {}，準備重連", e);
+                                    break;
+                                }
+                                None => {
+                                    warn!("Binance WS 流結束，準備重連");
+                                    break;
+                                }
+                                Some(Ok(Message::Binary(_))) | Some(Ok(Message::Ping(_))) | Some(Ok(Message::Frame(_))) => {
+                                    // 其他控制訊息：忽略並繼續
+                                }
                             }
-                            Some(Err(e)) => {
-                                let _ = tx.send(Err(HftError::Network(e.to_string())));
-                                break;
-                            }
-                            _ => {}
                         }
                     }
+                    Err(e) => {
+                        error!("Binance WS 連接失敗: {}", e);
+                        attempts += 1;
+                        if attempts > MAX_ATTEMPTS {
+                            let _ = tx.send(Err(HftError::Network(format!("WS 重連失敗次數過多: {}", e))));
+                            return;
+                        }
+                        let delay = BASE_DELAY_MS * (1 << (attempts - 1).min(6)) as u64;
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
+
+                // 斷開後的退避重連
+                attempts += 1;
+                if attempts > MAX_ATTEMPTS {
+                    let _ = tx.send(Err(HftError::Network("WS 重連失敗次數過多".to_string())));
+                    return;
                 }
+                let delay = BASE_DELAY_MS * (1 << (attempts - 1).min(6)) as u64;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
         });
 

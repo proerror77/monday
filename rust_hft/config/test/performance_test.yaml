@@ -1,0 +1,119 @@
+# Rust HFT 性能測試配置
+# 用於測試 WebSocket 吞吐量和 ClickHouse 寫入性能
+
+# WebSocket 連接配置
+websocket:
+  url: "wss://ws.bitget.com/v2/ws/public"
+  reconnect_attempts: 5
+  reconnect_delay_ms: 1000
+  ping_interval_secs: 30
+  
+  # 連接模式配置
+  connection_mode: "multi"  # single, multi, dynamic
+  connection_count: 4       # 多連接模式下的連接數
+  
+  # 訂閱配置
+  subscriptions:
+    - symbol: "BTCUSDT"
+      channels: ["books", "trade", "ticker"]
+    - symbol: "ETHUSDT"
+      channels: ["books", "trade"]
+    - symbol: "SOLUSDT"
+      channels: ["books", "trade"]
+      
+# ClickHouse 配置
+clickhouse:
+  url: "http://localhost:8123"
+  database: "hft"
+  username: "default"
+  password: ""
+  
+  # 批量寫入配置
+  batch_size: 1000
+  flush_interval_ms: 100
+  max_retries: 3
+  
+  # 表結構
+  tables:
+    orderbook:
+      name: "orderbook_snapshots"
+      ttl_days: 7
+    trades:
+      name: "trades"
+      ttl_days: 30
+    metrics:
+      name: "performance_metrics"
+      ttl_days: 90
+
+# Redis 配置（可選）
+redis:
+  url: "redis://localhost:6379"
+  channel_prefix: "hft:"
+  ttl_seconds: 300
+
+# 性能測試配置
+performance_test:
+  # 測試持續時間（秒）
+  duration_secs: 300
+  
+  # 預熱時間（秒）
+  warmup_secs: 10
+  
+  # 統計間隔（秒）
+  stats_interval_secs: 5
+  
+  # 測試模式
+  test_modes:
+    - name: "websocket_throughput"
+      enabled: true
+      settings:
+        measure_latency: true
+        track_message_types: true
+        
+    - name: "clickhouse_write"
+      enabled: true
+      settings:
+        test_batch_sizes: [100, 500, 1000, 5000]
+        test_concurrent_writers: [1, 2, 4, 8]
+        
+    - name: "end_to_end"
+      enabled: true
+      settings:
+        simulate_trading: false
+        track_memory_usage: true
+
+# 監控配置
+monitoring:
+  # Prometheus 指標
+  prometheus:
+    enabled: true
+    port: 9090
+    
+  # 日誌級別
+  log_level: "info"  # trace, debug, info, warn, error
+  
+  # 指標輸出
+  metrics_output:
+    console: true
+    file: "performance_metrics.json"
+    clickhouse: true
+
+# 系統優化配置
+optimization:
+  # CPU 親和性
+  cpu_affinity:
+    enabled: true
+    websocket_cores: [0, 1]
+    processing_cores: [2, 3]
+    database_cores: [4, 5]
+    
+  # 內存配置
+  memory:
+    preallocate_mb: 512
+    max_buffer_size_mb: 1024
+    
+  # 網絡優化
+  network:
+    tcp_nodelay: true
+    socket_buffer_size_kb: 2048
+# Moved to config/test/performance_test.yaml

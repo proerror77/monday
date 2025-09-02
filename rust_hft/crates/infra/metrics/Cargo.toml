@@ -5,12 +5,17 @@ edition = "2021"
 description = "Prometheus 指標（可選，旁路）"
 
 [dependencies]
-prometheus = { workspace = true, optional = true }
+hft-core = { package = "hft-core", path = "../../core" }
+prometheus = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"], optional = true }
+chrono = { workspace = true, optional = true }
 
 [features]
 default = []
-infra-metrics = ["dep:prometheus"]
+http-server = ["dep:axum", "dep:tokio", "dep:chrono"]
 
 [lib]
 name = "infra_metrics"

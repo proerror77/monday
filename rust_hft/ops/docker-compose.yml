@@ -5,8 +5,10 @@ services:
     ports:
       - "8123:8123"  # HTTP interface
       - "9000:9000"  # Native client
+      - "9363:9363"  # Prometheus /metrics (built-in)
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/config:/etc/clickhouse-server/config.d:ro
     environment:
       - CLICKHOUSE_DB=hft
       - CLICKHOUSE_USER=default
@@ -18,20 +20,6 @@ services:
         hard: 262144
     healthcheck:
       test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  redis:
-    image: redis:7.2-alpine
-    container_name: hft_redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy allkeys-lru
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -49,6 +37,8 @@ services:
       - '--storage.tsdb.path=/prometheus'
       - '--web.console.libraries=/usr/share/prometheus/console_libraries'
       - '--web.console.templates=/usr/share/prometheus/consoles'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
       interval: 5s
@@ -66,6 +56,8 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource,redis-datasource
+      - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=2s
     depends_on:
       - prometheus
       - clickhouse
@@ -75,9 +67,32 @@ services:
       timeout: 5s
       retries: 5
 
+  # ClickHouse built-in Prometheus endpoint is exposed on port 9363
+
+  # hft-live application inside compose for internal scraping
+  hft_app:
+    build:
+      context: ..
+      dockerfile: ops/hft-live.Dockerfile
+    container_name: hft_app
+    profiles: ["app"]
+    environment:
+      - RUST_LOG=info
+      # Pass API keys if needed (uncomment and set in your env before `docker compose up`)
+      # - BITGET_API_KEY=${BITGET_API_KEY}
+      # - BITGET_SECRET=${BITGET_SECRET}
+      # - BITGET_PASSPHRASE=${BITGET_PASSPHRASE}
+      # - BINANCE_API_KEY=${BINANCE_API_KEY}
+      # - BINANCE_SECRET=${BINANCE_SECRET}
+    volumes:
+      - ../config/dev/system_imbalance.yaml:/app/config/system.yaml:ro
+    command: ["/usr/local/bin/hft-live", "--config", "/app/config/system.yaml"]
+    depends_on:
+      - clickhouse
+    # Only needed for internal Prometheus scraping; no host port mapping by default
+
 volumes:
   clickhouse_data:
-  redis_data:
   prometheus_data:
   grafana_data:
 

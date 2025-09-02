@@ -3,7 +3,7 @@
 //! - Implements simple EMA crossover with RSI filter
 
 use hft_core::{HftResult, Symbol, Price, Quantity, Side, OrderType, TimeInForce};
-use ports::{Strategy, MarketEvent, ExecutionEvent, OrderIntent, AccountView, AggregatedBar};
+use ports::{Strategy, MarketEvent, ExecutionEvent, OrderIntent, AccountView, AggregatedBar, VenueScope};
 use serde::{Deserialize, Serialize};
 use num_traits::ToPrimitive;
 
@@ -185,15 +185,22 @@ pub struct TrendStrategy {
 }
 
 impl TrendStrategy {
+    /// 創建新的趨勢策略（舊版，保持向後兼容性）
     pub fn new(symbol: Symbol, config: TrendStrategyConfig) -> Self {
+        // 使用基於符號的穩定 ID，而非動態時間戳
+        let strategy_id = format!("trend_{}", symbol.0);
+        Self::with_name(symbol, config, strategy_id)
+    }
+    
+    /// 🔥 Phase 1.4: 創建帶穩定名稱的趨勢策略
+    pub fn with_name(symbol: Symbol, config: TrendStrategyConfig, strategy_name: String) -> Self {
         let state = StrategyState::new(&config);
-        let strategy_id = format!("trend_{}_{}", symbol.0, chrono::Utc::now().timestamp());
         
         Self {
             symbol,
             config,
             state,
-            strategy_id,
+            strategy_id: strategy_name,
         }
     }
     
@@ -254,6 +261,7 @@ impl TrendStrategy {
                                 price: Some(price),
                                 time_in_force: TimeInForce::IOC, // 立即成交或取消
                                 strategy_id: self.strategy_id.clone(),
+                                target_venue: None, // 由 Router 決定路由
                             });
                         }
                     }
@@ -277,6 +285,7 @@ impl TrendStrategy {
                                 price: Some(price),
                                 time_in_force: TimeInForce::IOC,
                                 strategy_id: self.strategy_id.clone(),
+                                target_venue: None, // 由 Router 決定路由
                             });
                         }
                     }
@@ -292,6 +301,8 @@ impl TrendStrategy {
 }
 
 impl Strategy for TrendStrategy {
+    fn id(&self) -> &str { &self.strategy_id }
+    fn venue_scope(&self) -> VenueScope { VenueScope::Single }
     fn on_market_event(&mut self, event: &MarketEvent, account: &AccountView) -> Vec<OrderIntent> {
         match event {
             MarketEvent::Bar(bar) => {

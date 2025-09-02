@@ -1,0 +1,59 @@
+# Ignore build artifacts
+target/
+**/target/
+
+# Ignore version control
+.git/
+.gitignore
+
+# Ignore temporary files
+*.swp
+*.swo
+*~
+*.tmp
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.iml
+
+# Ignore documentation
+docs/
+*.md
+
+# Ignore test data
+test-data/
+**/tests/
+
+# Keep examples Cargo.toml for workspace build
+examples/*
+!examples/Cargo.toml
+
+# Ignore benchmarks
+benches/
+
+# Ignore local environment files
+.env
+.env.local
+
+# Ignore macOS files
+.DS_Store
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Ignore node modules (if any)
+node_modules/
+
+# Ignore logs
+*.log
+
+# Ignore ops folder except Dockerfile
+ops/*
+!ops/hft-live.Dockerfile
+
+# Ignore other workspaces
+../ml_workspace/
+../ops_workspace/

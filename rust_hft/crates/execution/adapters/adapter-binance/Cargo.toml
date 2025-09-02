@@ -12,6 +12,8 @@ serde = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 async-trait = "0.1"
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 [features]
 default = []

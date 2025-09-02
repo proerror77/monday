@@ -4,16 +4,28 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "e2e_smoke_test"
-path = "e2e_smoke_test.rs"
+name = "00_quickstart"
+path = "00_quickstart.rs"
 
 [[bin]]
-name = "test_binance_adapter"
-path = "test_binance_adapter.rs"
+name = "01_data"
+path = "01_data/main.rs"
 
 [[bin]]
-name = "config_validation"
-path = "config_validation.rs"
+name = "02_strategy"
+path = "02_strategy/main.rs"
+
+[[bin]]
+name = "03_execution"
+path = "03_execution/main.rs"
+
+[[bin]]
+name = "04_risk"
+path = "04_risk/main.rs"
+
+[[bin]]
+name = "05_e2e"
+path = "05_e2e/main.rs"
 
 [dependencies]
 # HFT crates
@@ -33,12 +45,14 @@ async-trait = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+clap = { version = "4.0", features = ["derive"] }
 
 # Time
 chrono = { workspace = true }
 
 # Math
 rust_decimal = { workspace = true }
+core_affinity = "0.8"
 
 # Serialization
 serde_yaml = "0.9"

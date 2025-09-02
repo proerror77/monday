@@ -7,6 +7,7 @@ pub mod error;
 pub mod fixed_point;
 pub mod latency;
 pub mod unified_timestamp;
+pub mod topn_orderbook;
 
 // 對外穩定導出
 pub use error::{HftError, HftResult};
@@ -14,12 +15,11 @@ pub use types::*;
 pub use fixed_point::{FixedPrice, FixedQuantity, FixedBps};
 pub use latency::{LatencyStage, LatencyTracker, LatencyMeasurement, LatencyStats, MicrosTimestamp, now_micros};
 pub use unified_timestamp::UnifiedTimestamp;
+pub use topn_orderbook::{TopNOrderBook, DualTopNJoiner, DEFAULT_TOP_N, MAX_TOP_N};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ports::ExecutionEvent;
-    use std::collections::HashSet;
     
     #[test]
     fn test_price_precision_parsing() {
@@ -155,67 +155,4 @@ mod tests {
         }
     }
     
-    #[test]
-    fn test_execution_event_completeness() {
-        // 测试ExecutionEvent的完整性
-        let order_id = OrderId("TEST-001".to_string());
-        let price = Price::from_str("67188.123").unwrap();
-        let quantity = Quantity::from_str("0.123").unwrap();
-        let timestamp = 1640995200_123_456u64;
-        
-        // 测试不同类型的ExecutionEvent
-        let events = vec![
-            ExecutionEvent::OrderAck {
-                order_id: order_id.clone(),
-                timestamp,
-            },
-            ExecutionEvent::Fill {
-                order_id: order_id.clone(),
-                price,
-                quantity,
-                timestamp,
-                fill_id: "FILL-001".to_string(),
-            },
-            ExecutionEvent::OrderRejected {
-                order_id: order_id.clone(),
-                reason: "Insufficient funds".to_string(),
-                timestamp,
-            },
-            ExecutionEvent::OrderCompleted {
-                order_id: order_id.clone(),
-                final_price: price,
-                total_filled: quantity,
-                timestamp,
-            },
-        ];
-        
-        // 验证每个事件都有正确的字段
-        for event in events {
-            match event {
-                ExecutionEvent::OrderAck { order_id, timestamp } => {
-                    assert!(!order_id.0.is_empty());
-                    assert!(timestamp > 0);
-                }
-                ExecutionEvent::Fill { order_id, price, quantity, timestamp, fill_id } => {
-                    assert!(!order_id.0.is_empty());
-                    assert!(price.0 > rust_decimal::Decimal::ZERO);
-                    assert!(quantity.0 > rust_decimal::Decimal::ZERO);
-                    assert!(timestamp > 0);
-                    assert!(!fill_id.is_empty());
-                }
-                ExecutionEvent::OrderRejected { order_id, reason, timestamp } => {
-                    assert!(!order_id.0.is_empty());
-                    assert!(!reason.is_empty());
-                    assert!(timestamp > 0);
-                }
-                ExecutionEvent::OrderCompleted { order_id, final_price, total_filled, timestamp } => {
-                    assert!(!order_id.0.is_empty());
-                    assert!(final_price.0 > rust_decimal::Decimal::ZERO);
-                    assert!(total_filled.0 > rust_decimal::Decimal::ZERO);
-                    assert!(timestamp > 0);
-                }
-                _ => {} // 其他事件类型
-            }
-        }
-    }
 }

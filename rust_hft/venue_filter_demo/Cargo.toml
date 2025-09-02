@@ -1,0 +1,10 @@
+[package]
+name = "venue_filter_demo"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+# 空的 workspace 以避免继承父级
+
+[dependencies]
+hft-core = { path = "../crates/core" }

@@ -3,12 +3,13 @@
 //! - 冪等與路由策略（不含任何網路）
 
 use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 
 use hft_core::{OrderId, Price, Quantity, Side, Symbol};
 use ports::ExecutionEvent;
 use tracing::{info, debug};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {
     New,
     Acknowledged,
@@ -20,7 +21,7 @@ pub enum OrderStatus {
     Replaced,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRecord {
     pub order_id: OrderId,
     pub client_order_id: Option<String>,
@@ -47,7 +48,7 @@ impl OrderRecord {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderUpdate {
     pub order_id: OrderId,
     pub status: OrderStatus,
@@ -199,7 +200,81 @@ impl OmsCore {
         None
     }
 
-    pub fn get(&self, id: &OrderId) -> Option<&OrderRecord> { self.orders.get(id) }
+    pub fn get(&self, id: &OrderId) -> Option<&OrderRecord> { 
+        self.orders.get(id) 
+    }
+    
+    /// Export OMS state for persistence
+    pub fn export_state(&self) -> HashMap<OrderId, OrderRecord> {
+        self.orders.clone()
+    }
+    
+    /// Import OMS state from persistent storage
+    pub fn import_state(&mut self, state: HashMap<OrderId, OrderRecord>) {
+        info!("Importing OMS state with {} orders", state.len());
+        self.orders = state;
+        
+        // Log summary of imported orders
+        let mut status_counts = HashMap::new();
+        for record in self.orders.values() {
+            *status_counts.entry(record.status).or_insert(0) += 1;
+        }
+        
+        info!("OMS state imported - Status summary: {:?}", status_counts);
+    }
+    
+    /// Get all open orders (not Filled, Canceled, Rejected, or Expired)
+    pub fn get_open_orders(&self) -> Vec<&OrderRecord> {
+        self.orders.values()
+            .filter(|order| matches!(order.status, 
+                OrderStatus::New | 
+                OrderStatus::Acknowledged | 
+                OrderStatus::PartiallyFilled
+            ))
+            .collect()
+    }
+    
+    /// Get total number of orders
+    pub fn order_count(&self) -> usize {
+        self.orders.len()
+    }
+
+    /// 直接更新某筆訂單的累計成交量與平均成交價（恢復/對賬使用）
+    pub fn update_filled_quantity(&mut self, order_id: &OrderId, new_cum_qty: Quantity, new_avg_price: Option<Price>) -> Option<OrderUpdate> {
+        if let Some(ord) = self.orders.get_mut(order_id) {
+            let previous_status = ord.status;
+            ord.cum_qty = new_cum_qty;
+            if let Some(px) = new_avg_price { ord.avg_price = Some(px); }
+            // 根據累計成交量與原始數量推導狀態
+            ord.status = if ord.cum_qty.0 >= ord.qty.0 { OrderStatus::Filled }
+                         else if ord.cum_qty.0 > rust_decimal::Decimal::ZERO { OrderStatus::PartiallyFilled }
+                         else { ord.status };
+            return Some(OrderUpdate {
+                order_id: order_id.clone(),
+                status: ord.status,
+                cum_qty: ord.cum_qty,
+                avg_price: ord.avg_price,
+                previous_status,
+            });
+        }
+        None
+    }
+
+    /// 直接更新某筆訂單的狀態（恢復/對賬使用）
+    pub fn update_status(&mut self, order_id: &OrderId, new_status: OrderStatus) -> Option<OrderUpdate> {
+        if let Some(ord) = self.orders.get_mut(order_id) {
+            let previous_status = ord.status;
+            ord.status = new_status;
+            return Some(OrderUpdate {
+                order_id: order_id.clone(),
+                status: ord.status,
+                cum_qty: ord.cum_qty,
+                avg_price: ord.avg_price,
+                previous_status,
+            });
+        }
+        None
+    }
 }
 
 #[cfg(test)]

@@ -6,5 +6,8 @@ pub mod lockfree_queue;
 pub mod ingestion;
 
 pub use ingestion::{
-    EventIngester, EventConsumer, IngestionConfig, FlipPolicy, BackpressurePolicy
+    EventIngester, EventConsumer, IngestionConfig, FlipPolicy, BackpressurePolicy,
+    IngestionMetrics, BackpressureStatus,
 };
+// 直接從 ports 導出 TrackedMarketEvent（而非從 ingestion 轉導）
+pub use ports::events::TrackedMarketEvent;

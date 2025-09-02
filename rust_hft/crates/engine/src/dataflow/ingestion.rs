@@ -7,22 +7,14 @@
 //! - flip 策略控制快照發佈頻率
 
 use super::ring_buffer::{spsc_ring_buffer, SpscProducer, SpscConsumer};
-use ports::MarketEvent;
+use ports::{MarketEvent, TrackedMarketEvent};
 use hft_core::{Symbol, HftError, LatencyTracker, LatencyStage, now_micros, MicrosTimestamp};
-use tracing::{warn, error, debug, info};
+use tracing::{warn, error, debug};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use tokio::sync::Notify;
-
-/// 帶延遲追蹤的市場事件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrackedMarketEvent {
-    pub event: MarketEvent,
-    pub tracker: LatencyTracker,
-    pub ingestion_time: MicrosTimestamp,
-}
 
 /// 事件攝取配置
 #[derive(Debug, Clone)]
@@ -43,7 +35,36 @@ impl Default for IngestionConfig {
             queue_capacity: 32768,        // 32K events
             stale_threshold_us: 3000,     // 3ms
             flip_policy: FlipPolicy::OnUpdate,
-            backpressure_policy: BackpressurePolicy::LastWins,
+            // 使用自適應背壓策略作為安全默認值
+            backpressure_policy: BackpressurePolicy::Adaptive {
+                low_threshold: 0.6,       // 60% 以下使用 LastWins
+                high_threshold: 0.85,     // 85% 以上使用 DropNew
+            },
+        }
+    }
+}
+
+impl IngestionConfig {
+    /// 創建保守的生產環境配置
+    pub fn production_safe() -> Self {
+        Self {
+            queue_capacity: 65536,        // 64K events - 更大緩衝區
+            stale_threshold_us: 2000,     // 2ms - 更嚴格的新鮮度要求
+            flip_policy: FlipPolicy::OnUpdate,
+            backpressure_policy: BackpressurePolicy::DropNew, // 最保守策略
+        }
+    }
+
+    /// 創建高性能配置（適用於低延遲場景）
+    pub fn high_performance() -> Self {
+        Self {
+            queue_capacity: 16384,        // 16K events - 較小緩衝區
+            stale_threshold_us: 1000,     // 1ms - 非常嚴格
+            flip_policy: FlipPolicy::OnUpdate,
+            backpressure_policy: BackpressurePolicy::Adaptive {
+                low_threshold: 0.5,       // 50% 以下使用 LastWins
+                high_threshold: 0.8,      // 80% 以上使用 DropNew
+            },
         }
     }
 }
@@ -62,12 +83,19 @@ pub enum FlipPolicy {
 /// 背壓策略
 #[derive(Debug, Clone)]
 pub enum BackpressurePolicy {
-    /// 丟棄新事件，保留已入隊事件
+    /// 丟棄新事件，保留已入隊事件（最安全）
     DropNew,
     /// 丟棄舊事件，保留最新事件 (last-wins)
     LastWins,
     /// 阻塞直到有空間 (可能導致死鎖)
     Block,
+    /// 自適應策略：根據利用率自動選擇 (推薦用於生產環境)
+    Adaptive {
+        /// 低利用率閾值，小於此值使用 LastWins
+        low_threshold: f64,
+        /// 高利用率閾值，大於此值使用 DropNew  
+        high_threshold: f64,
+    },
 }
 
 /// 事件攝取統計
@@ -84,9 +112,24 @@ pub struct IngestionMetrics {
     pub recent_latency_micros: Option<u64>,
 }
 
+/// 背壓狀態報告
+#[derive(Debug, Clone)]
+pub struct BackpressureStatus {
+    /// 當前隊列利用率 (0.0-1.0)
+    pub utilization: f64,
+    /// 是否處於背壓狀態
+    pub is_under_pressure: bool,
+    /// 累計丟棄的事件數量
+    pub events_dropped_total: u64,
+    /// 建議操作
+    pub recommended_action: String,
+    /// 隊列容量
+    pub queue_capacity: usize,
+}
+
 /// 單向事件攝取器 (Producer 端)
 pub struct EventIngester {
-    producer: SpscProducer<MarketEvent>,
+    producer: SpscProducer<TrackedMarketEvent>,
     config: IngestionConfig,
     metrics: IngestionMetrics,
     #[allow(dead_code)]
@@ -123,6 +166,12 @@ impl EventIngester {
         
         // 記錄攝取階段完成
         tracker.record_stage(LatencyStage::Ingestion);
+
+        // 創建帶追蹤的事件
+        let tracked_event = TrackedMarketEvent {
+            event: event.clone(),
+            tracker,
+        };
         
         // 檢查陳舊度
         if let Some(event_ts) = self.extract_timestamp(&event) {
@@ -132,6 +181,8 @@ impl EventIngester {
             // 記錄攝取延遲統計
             self.metrics.ingestion_latency_micros.push(delay);
             self.metrics.recent_latency_micros = Some(delay);
+
+            // Prometheus 直方圖打點（可選）
             
             // 記錄每個事件的延遲情況
             debug!("EventIngester 攝取延遲: {}μs, 閾值: {}μs", delay, self.config.stale_threshold_us);
@@ -144,9 +195,9 @@ impl EventIngester {
         }
         
         // 嘗試發送，應用背壓策略
-        match self.producer.send(event.clone()) {
+        match self.producer.send(tracked_event.clone()) {
             Ok(()) => {
-                info!("EventIngester 事件成功入隊到 ring buffer");
+                debug!("EventIngester 事件成功入隊到 ring buffer");
                 
                 // 更新利用率統計
                 let utilization = self.producer.utilization();
@@ -156,19 +207,40 @@ impl EventIngester {
                 
                 Ok(())
             }
-            Err(event) => {
+            Err(tracked_event) => {
                 // Ring buffer 滿載，應用背壓策略
-                match self.config.backpressure_policy {
+                let current_utilization = self.producer.utilization();
+                
+                let effective_policy = match &self.config.backpressure_policy {
+                    BackpressurePolicy::Adaptive { low_threshold, high_threshold } => {
+                        if current_utilization <= *low_threshold {
+                            BackpressurePolicy::LastWins
+                        } else if current_utilization >= *high_threshold {
+                            BackpressurePolicy::DropNew
+                        } else {
+                            // 中間區域：根據利用率線性插值決定
+                            let ratio = (current_utilization - low_threshold) / (high_threshold - low_threshold);
+                            if ratio < 0.5 {
+                                BackpressurePolicy::LastWins
+                            } else {
+                                BackpressurePolicy::DropNew
+                            }
+                        }
+                    },
+                    policy => policy.clone(),
+                };
+
+                match effective_policy {
                     BackpressurePolicy::DropNew => {
                         self.metrics.events_dropped += 1;
-                        warn!("Ring buffer 滿載，丟棄新事件");
+                        warn!("Ring buffer 滿載 ({:.1}% 利用率)，丟棄新事件", current_utilization * 100.0);
                         Ok(())
                     }
                     BackpressurePolicy::LastWins => {
                         // 使用 force_send 實現 Last-Wins：強制插入新事件，丟棄最舊事件
-                        if self.producer.force_send(event) {
+                        if self.producer.force_send(tracked_event) {
                             self.metrics.events_dropped += 1; // 有一個舊事件被丟棄
-                            warn!("Last-wins: 丟棄最舊事件，插入新事件");
+                            warn!("Last-wins ({:.1}% 利用率): 丟棄最舊事件，插入新事件", current_utilization * 100.0);
                             Ok(())
                         } else {
                             self.metrics.events_dropped += 1;
@@ -179,6 +251,9 @@ impl EventIngester {
                     BackpressurePolicy::Block => {
                         error!("Ring buffer 滿載，阻塞模式暫不支援");
                         Err(HftError::Generic { message: "Ring buffer full, blocking not implemented".to_string() })
+                    }
+                    BackpressurePolicy::Adaptive { .. } => {
+                        unreachable!("Adaptive policy should have been resolved above")
                     }
                 }
             }
@@ -206,11 +281,39 @@ impl EventIngester {
     pub fn reset_metrics(&mut self) {
         self.metrics = IngestionMetrics::default();
     }
+
+    /// 獲取當前背壓狀態
+    pub fn backpressure_status(&self) -> BackpressureStatus {
+        let utilization = self.producer.utilization();
+        let is_under_pressure = utilization > 0.8; // 80% 以上認為有背壓
+        let recommended_action = match &self.config.backpressure_policy {
+            BackpressurePolicy::Adaptive { low_threshold, high_threshold } => {
+                if utilization <= *low_threshold {
+                    "Normal operation - LastWins active".to_string()
+                } else if utilization >= *high_threshold {
+                    "High pressure - DropNew active".to_string()
+                } else {
+                    "Medium pressure - Adaptive switching".to_string()
+                }
+            },
+            BackpressurePolicy::DropNew => "DropNew policy active".to_string(),
+            BackpressurePolicy::LastWins => "LastWins policy active".to_string(),
+            BackpressurePolicy::Block => "Block policy active".to_string(),
+        };
+
+        BackpressureStatus {
+            utilization,
+            is_under_pressure,
+            events_dropped_total: self.metrics.events_dropped,
+            recommended_action,
+            queue_capacity: self.config.queue_capacity,
+        }
+    }
 }
 
 /// 事件消費者 (Consumer 端，engine 主循環使用)
 pub struct EventConsumer {
-    consumer: SpscConsumer<MarketEvent>,
+    consumer: SpscConsumer<TrackedMarketEvent>,
     config: IngestionConfig,
     symbol_state: HashMap<Symbol, SymbolState>,
     flip_metrics: FlipMetrics,
@@ -233,7 +336,7 @@ pub struct FlipMetrics {
 }
 
 impl EventConsumer {
-    fn new(consumer: SpscConsumer<MarketEvent>, config: IngestionConfig) -> Self {
+    fn new(consumer: SpscConsumer<TrackedMarketEvent>, config: IngestionConfig) -> Self {
         Self {
             consumer,
             config,
@@ -249,20 +352,20 @@ impl EventConsumer {
     }
     
     /// 消費事件，返回是否應該觸發快照發佈
-    pub fn consume_events(&mut self, mut callback: impl FnMut(MarketEvent) -> bool) -> bool {
+    pub fn consume_events(&mut self, mut callback: impl FnMut(TrackedMarketEvent) -> bool) -> bool {
         let mut should_flip = false;
         let mut events_processed = 0;
         
         // 批量消費事件
-        while let Some(event) = self.consumer.recv() {
+        while let Some(tracked_event) = self.consumer.recv() {
             self.flip_metrics.events_processed += 1;
             events_processed += 1;
             
             // 更新 symbol 狀態
-            self.update_symbol_state(&event);
+            self.update_symbol_state(&tracked_event.event);
             
             // 調用回調處理事件
-            let callback_wants_flip = callback(event);
+            let callback_wants_flip = callback(tracked_event);
             should_flip = should_flip || callback_wants_flip;
             
             // 檢查是否達到批處理限制

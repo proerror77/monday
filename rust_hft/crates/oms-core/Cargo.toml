@@ -5,7 +5,7 @@ edition = "2021"
 description = "統一訂單狀態機、冪等、路由（純邏輯，無網路）"
 
 [dependencies]
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 hft-core = { package = "hft-core", path = "../core" }
 ports = { package = "hft-ports", path = "../ports" }
 rust_decimal = { version = "1.33", features = ["serde"] }

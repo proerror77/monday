@@ -245,7 +245,7 @@ mod tests {
         );
         
         let signer = BitgetSigner::new(credentials);
-        let headers = signer.generate_headers("GET", "/api/spot/v1/account/assets", "", Some(1640995200000));
+        let headers = signer.generate_headers("GET", "/api/v2/spot/account/assets", "", Some(1640995200000));
         
         assert!(headers.contains_key("ACCESS-KEY"));
         assert!(headers.contains_key("ACCESS-SIGN"));
@@ -285,4 +285,3 @@ mod tests {
         assert!(headers.contains_key("X-BAPI-RECV-WINDOW"));
     }
 }
-

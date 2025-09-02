@@ -19,6 +19,7 @@ rust_decimal = { version = "1.33", features = ["serde"] }
 ports = { package = "hft-ports", path = "../ports" }
 instrument = { package = "hft-instrument", path = "../instrument" }
 chrono = { version = "0.4", features = ["serde"] }
+infra-metrics = { package = "hft-infra-metrics", path = "../infra/metrics" }
 
 [features]
 default = []
@@ -36,3 +37,4 @@ async-trait = "0.1"
 
 [lib]
 name = "engine"
+ 

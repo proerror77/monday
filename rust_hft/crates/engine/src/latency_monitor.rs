@@ -22,8 +22,8 @@ pub struct LatencyMonitorConfig {
 impl Default for LatencyMonitorConfig {
     fn default() -> Self {
         let mut alert_thresholds = HashMap::new();
-        // HFT 標準延遲閾值設定
-        alert_thresholds.insert(LatencyStage::Ingestion, 1000);    // 1ms
+        // 延遲閾值設定（公網環境建議將 Ingestion 放寬到 30ms）
+        alert_thresholds.insert(LatencyStage::Ingestion, 30_000);  // 30ms
         alert_thresholds.insert(LatencyStage::Aggregation, 500);   // 0.5ms  
         alert_thresholds.insert(LatencyStage::Strategy, 2000);     // 2ms
         alert_thresholds.insert(LatencyStage::Execution, 5000);    // 5ms

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use ports::{BoxStream, MarketEvent, MarketStream, ConnectionHealth, AggregatedBar};
-use hft_core::{HftResult, HftError, Symbol, Price, Quantity, Timestamp};
+use hft_core::{HftResult, HftError, Symbol, Price, Quantity, Timestamp, VenueId};
 use tokio::time::{interval, Duration, Instant};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::info;
@@ -60,6 +60,7 @@ impl MarketStream for MockMarketStream {
                 close: Price::from_f64(close).unwrap(),
                 volume: Quantity::from_f64((counter % 10 + 1) as f64).unwrap(), // 變化的成交量
                 trade_count: (counter % 5 + 1) as u32,
+                source_venue: Some(VenueId::MOCK), // Mock adapter always uses MOCK venue
             };
             
             tracing::info!("MockStream 生成 Bar: symbol={}, close={:.1}, counter={}", 

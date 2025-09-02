@@ -9,9 +9,17 @@
 //! - Event consumers
 
 pub mod system_builder;
+pub mod ipc_handler;
+pub mod recovery_integration;
+pub mod risk_manager_factory;
+pub mod sharding;
 
 // Re-export main types for convenient access
 pub use system_builder::*;
+pub use ipc_handler::*;
+pub use recovery_integration::*;
+pub use risk_manager_factory::*;
+pub use sharding::*;
 
 #[cfg(test)]
 mod tests {

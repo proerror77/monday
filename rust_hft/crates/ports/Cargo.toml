@@ -7,7 +7,7 @@ description = "穩定介面：事件模型 + traits (Never break userspace)"
 [dependencies]
 hft-core = { package = "hft-core", path = "../core" }
 instrument = { package = "hft-instrument", path = "../instrument" }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
 rust_decimal = { version = "1.33", features = ["serde"] }
 

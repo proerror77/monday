@@ -87,7 +87,7 @@
 1. **檢查交易所狀態**:
    ```bash
    # 檢查 Bitget API 狀態
-   curl -s https://api.bitget.com/api/spot/v1/public/time
+  curl -s https://api.bitget.com/api/v2/public/time
    
    # 檢查私有 WebSocket 連接
    grep "WebSocket" /var/log/hft/execution.log | tail -10

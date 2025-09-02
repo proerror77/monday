@@ -1,0 +1,80 @@
+# 20+商品 × 15分钟完整数据库压力测试配置
+test_config:
+  # 基本测试参数
+  test_duration_minutes: 15
+  target_symbols_count: 25
+  monitoring_interval_secs: 30
+  
+  # ClickHouse 数据库配置
+  clickhouse:
+    url: "http://localhost:8123"
+    database_name: "hft"
+    table_name: "market_data_15min"
+    
+  # 批量写入配置
+  batch_config:
+    batch_size: 500
+    batch_timeout_secs: 2
+    writer_count: 4
+    
+  # WebSocket 连接配置
+  websocket:
+    ws_url: "wss://ws.bitget.com/v2/ws/public"
+    connection_timeout_secs: 15
+    max_reconnect_attempts: 5
+    reconnect_delay_ms: 1000
+    enable_compression: true
+    max_message_size: 2097152  # 2MB
+    ping_interval_secs: 30
+    
+  # 目标交易对列表
+  target_symbols:
+    - "BTCUSDT"
+    - "ETHUSDT" 
+    - "BNBUSDT"
+    - "XRPUSDT"
+    - "ADAUSDT"
+    - "SOLUSDT"
+    - "DOGEUSDT"
+    - "MATICUSDT"
+    - "LINKUSDT"
+    - "UNIUSDT"
+    - "LTCUSDT"
+    - "BCHUSDT"
+    - "XLMUSDT"
+    - "VETUSDT"
+    - "TRXUSDT"
+    - "EOSUSDT"
+    - "ATOMUSDT"
+    - "DOTUSDT"
+    - "AVAXUSDT"
+    - "SHIBUSDT"
+    - "FTMUSDT"
+    - "NEARUSDT"
+    - "ALGOUSDT"
+    - "KSMUSDT"
+    - "WAVESUSDT"
+    
+  # 测试通道
+  test_channels:
+    - "OrderBook5"
+    - "Trades"
+    - "Ticker"
+    
+  # 性能阈值配置
+  performance_thresholds:
+    min_message_rate_per_sec: 5000
+    min_write_success_rate_percent: 90.0
+    max_error_rate_percent: 1.0
+    max_avg_processing_latency_us: 1000
+    max_avg_db_write_latency_us: 5000
+    max_queue_size_ratio: 5.0  # 相对于 batch_size 的倍数
+    
+  # 报告配置
+  reporting:
+    enable_detailed_stats: true
+    enable_per_symbol_stats: true
+    enable_optimization_suggestions: true
+    save_results_to_file: true
+    results_output_dir: "./test_results"
+# Moved to config/test/comprehensive_test.yaml
