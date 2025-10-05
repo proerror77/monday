@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  hft-collector:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.collector
+      args:
+        FEATURES: ${FEATURES:-collector-bitget,collector-binance,collector-okx,collector-bybit,collector-hyperliquid}
+    image: hft-collector:local
+    restart: unless-stopped
+    env_file:
+      - ./hft-collector.env
+    command: >
+      --exchanges ${EXCHANGES}
+      --symbols ${SYMBOLS}
+      --ch-url ${CH_URL}
+      --database ${CH_DATABASE}
+      --batch-size ${BATCH_SIZE}
+      --flush-ms ${FLUSH_MS}
+      --depth-mode ${DEPTH_MODE}
+      --depth-levels ${DEPTH_LEVELS}
+      ${DRY_RUN}
+

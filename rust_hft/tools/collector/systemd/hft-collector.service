@@ -1,0 +1,33 @@
+[Unit]
+Description=HFT Collector (minimal)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/hft-collector.env
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
+# 建議將二進位安裝到 /usr/local/bin/hft-collector
+ExecStart=/usr/local/bin/hft-collector \
+  --exchanges ${EXCHANGES} \
+  --symbols ${SYMBOLS} \
+  --ch-url ${CH_URL} \
+  --database ${CH_DATABASE} \
+  --batch-size ${BATCH_SIZE} \
+  --flush-ms ${FLUSH_MS} \
+  --depth-mode ${DEPTH_MODE} \
+  --depth-levels ${DEPTH_LEVELS} \
+  ${DRY_RUN}
+
+# 可選本地緩存（避免過量佔用本地空間，僅在環境變數中調整）
+# COLLECTOR_SPOOL_DIR=/var/lib/hft-collector/spool
+# COLLECTOR_SPOOL_MAX_BYTES=67108864   # 64MiB
+# COLLECTOR_SPOOL_DRAIN_LIMIT=5        # 每次回放最多 5 個批次
+# COLLECTOR_SPOOL_TTL_SECS=21600       # 6 小時
+
+[Install]
+WantedBy=multi-user.target
+
