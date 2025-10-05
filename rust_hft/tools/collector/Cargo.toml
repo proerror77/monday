@@ -1,0 +1,65 @@
+[package]
+name = "hft-collector"
+version = "0.2.0"
+edition = "2021"
+description = "多交易所數據收集器：WebSocket → ClickHouse"
+
+[dependencies]
+# 核心異步運行時
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+
+# WebSocket + HTTP 客戶端（統一使用 rustls）
+tokio-tungstenite = { version = "0.20", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+# ClickHouse 客戶端
+clickhouse = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# JSON 處理
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 基礎工具
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1", features = ["serde"] }
+ordered-float = "4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI 參數解析
+clap = { version = "4", features = ["derive"] }
+
+# WebSocket 相關
+futures = "0.3"
+url = "2"
+urlencoding = "2"
+
+# HTTP request builder for custom WS headers
+http = "0.2"
+
+# 壓縮支持
+flate2 = "1"
+lz4 = "1"
+
+# WebSocket 握手
+base64 = "0.21"
+rand = "0.8"
+
+# 全局變量
+once_cell = "1"
+
+[features]
+default = ["collector-bitget"]
+collector-binance = []
+collector-binance-futures = []
+collector-bitget = []
+collector-bybit = []
+collector-hyperliquid = []
+collector-okx = []
+collector-asterdex = []
+
+[[bin]]
+name = "hft-collector"
+path = "src/main.rs"

@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::Parser;
 use clickhouse::Client;
 use exchanges::{create_exchange, DepthMode, ExchangeContext, MessageBuffers};
+use http::Request;
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use std::sync::Arc;
@@ -15,7 +16,6 @@ use std::time::Duration;
 use tokio::time::interval;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
-use http::Request;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "多交易所數據收集器：WebSocket → ClickHouse")]
