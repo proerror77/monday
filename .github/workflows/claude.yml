@@ -1,5 +1,15 @@
 name: Claude Code
 
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  id-token: write
+
+concurrency:
+  group: claude-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   issue_comment:
     types: [created]
@@ -56,4 +66,3 @@ jobs:
           # Optional: Custom environment variables for Claude
           # claude_env: |
           #   NODE_ENV: test
-
