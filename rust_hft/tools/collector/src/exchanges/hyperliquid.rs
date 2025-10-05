@@ -3,17 +3,33 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clickhouse::Client;
+use ordered_float::OrderedFloat;
 use serde_json::Value;
+use tracing::debug;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+
+#[derive(Default, Debug)]
+struct OrderBookState {
+    bids: BTreeMap<OrderedFloat<f64>, f64>,
+    asks: BTreeMap<OrderedFloat<f64>, f64>,
+    // 最近一次已知的最優買/賣（即使某側臨時為空也保留上次值，保證 L1 穩定輸出）
+    last_bid_px: Option<f64>,
+    last_bid_qty: Option<f64>,
+    last_ask_px: Option<f64>,
+    last_ask_qty: Option<f64>,
+}
 
 pub struct HyperliquidExchange {
     #[allow(dead_code)]
     ctx: Arc<ExchangeContext>,
+    ob: RwLock<HashMap<String, OrderBookState>>, // 內存訂單簿狀態（保證 L1 穩定）
 }
 
 impl HyperliquidExchange {
     pub fn new(ctx: Arc<ExchangeContext>) -> Self {
-        Self { ctx }
+        Self { ctx, ob: RwLock::new(HashMap::new()) }
     }
 }
 
@@ -145,8 +161,8 @@ impl Exchange for HyperliquidExchange {
                 let symbol = data.get("coin").and_then(|x| x.as_str()).unwrap_or("");
                 if let Some(levels) = data.get("levels").and_then(|x| x.as_array()) {
                     let ts = Utc::now().timestamp_millis();
-                    let mut best_bid: Option<(f64, f64)> = None;
-                    let mut best_ask: Option<(f64, f64)> = None;
+                    let mut updated_bids = false;
+                    let mut updated_asks = false;
                     for lvl in levels {
                         let px = lvl.get(0).and_then(|x| x.as_f64()).unwrap_or(0.0);
                         let qty = lvl.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0);
@@ -161,25 +177,60 @@ impl Exchange for HyperliquidExchange {
                         });
                         buffers.push_spot_orderbook(serde_json::to_string(&row)?);
 
-                        // 追蹤最佳買賣
-                        if side.eq_ignore_ascii_case("b") {
-                            if best_bid.map(|(p, _)| px > p).unwrap_or(true) {
-                                best_bid = Some((px, qty));
-                            }
-                        } else {
-                            if best_ask.map(|(p, _)| px < p).unwrap_or(true) {
-                                best_ask = Some((px, qty));
+                        // 更新內存訂單簿（用於跨增量保持 L1 穩定）
+                        {
+                            let mut books = self.ob.write().await;
+                            let book = books.entry(symbol.to_string()).or_default();
+                            let k = OrderedFloat(px);
+                            if side.eq_ignore_ascii_case("b") {
+                                if qty == 0.0 { book.bids.remove(&k); } else { book.bids.insert(k, qty); }
+                                updated_bids = true;
+                            } else {
+                                if qty == 0.0 { book.asks.remove(&k); } else { book.asks.insert(k, qty); }
+                                updated_asks = true;
                             }
                         }
                     }
-                    if let (Some((bp, bq)), Some((ap, aq))) = (best_bid, best_ask) {
+                    // 由內存簿推導穩定 L1：若本次只更新一側，另一側採用最近一次已知 BBO
+                    let (emit_bp, emit_bq, emit_ap, emit_aq) = {
+                        let mut books = self.ob.write().await;
+                        if let Some(book) = books.get_mut(symbol) {
+                            let cur_bb = book.bids.iter().rev().next().map(|(p,q)| (p.0, *q));
+                            let cur_ba = book.asks.iter().next().map(|(p,q)| (p.0, *q));
+
+                            // 更新最近一次 BBO 記憶
+                            if let Some((px, qty)) = cur_bb {
+                                book.last_bid_px = Some(px);
+                                book.last_bid_qty = Some(qty);
+                            }
+                            if let Some((px, qty)) = cur_ba {
+                                book.last_ask_px = Some(px);
+                                book.last_ask_qty = Some(qty);
+                            }
+
+                            // 推導輸出（允許一側使用最近一次 BBO）
+                            let bp = cur_bb.map(|t| t.0).or(book.last_bid_px).unwrap_or(0.0);
+                            let bq = cur_bb.map(|t| t.1).or(book.last_bid_qty).unwrap_or(0.0);
+                            let ap = cur_ba.map(|t| t.0).or(book.last_ask_px).unwrap_or(0.0);
+                            let aq = cur_ba.map(|t| t.1).or(book.last_ask_qty).unwrap_or(0.0);
+                            (bp, bq, ap, aq)
+                        } else {
+                            (0.0, 0.0, 0.0, 0.0)
+                        }
+                    };
+                    // 僅當本次有更新且能組成有效 BBO 才輸出，避免重複刷屏
+                    debug!(
+                        "[HL L1] sym={} updated_bids={} updated_asks={} bp={} bq={} ap={} aq={}",
+                        symbol, updated_bids, updated_asks, emit_bp, emit_bq, emit_ap, emit_aq
+                    );
+                    if (updated_bids || updated_asks) && emit_bp > 0.0 && emit_ap > 0.0 {
                         let l1 = serde_json::json!({
                             "ts": chrono::DateTime::<Utc>::from_timestamp_millis(ts).unwrap(),
                             "symbol": format!("{}-USDT", symbol),
-                            "bid_px": bp,
-                            "bid_qty": bq,
-                            "ask_px": ap,
-                            "ask_qty": aq,
+                            "bid_px": emit_bp,
+                            "bid_qty": emit_bq,
+                            "ask_px": emit_ap,
+                            "ask_qty": emit_aq,
                         });
                         buffers.push_spot_l1(serde_json::to_string(&l1)?);
                     }
@@ -216,25 +267,35 @@ impl Exchange for HyperliquidExchange {
             if let Some(obj) = v.get("data").and_then(|x| x.as_object()) {
                 let coin = obj.get("coin").and_then(|x| x.as_str()).unwrap_or("");
                 let ts = Utc::now().timestamp_millis();
-                // 支持多種字段命名
+                // 支持多種字段命名（價格必須，數量可使用上次 BBO 回退）
                 let bid_px = obj
                     .get("bp")
                     .and_then(|x| x.as_f64())
                     .or_else(|| obj.get("bidPx").and_then(|x| x.as_f64()));
-                let bid_qty = obj
-                    .get("bq")
-                    .and_then(|x| x.as_f64())
-                    .or_else(|| obj.get("bidSz").and_then(|x| x.as_f64()));
                 let ask_px = obj
                     .get("ap")
                     .and_then(|x| x.as_f64())
                     .or_else(|| obj.get("askPx").and_then(|x| x.as_f64()));
-                let ask_qty = obj
-                    .get("aq")
-                    .and_then(|x| x.as_f64())
-                    .or_else(|| obj.get("askSz").and_then(|x| x.as_f64()));
-                if let (Some(bp), Some(bq), Some(ap), Some(aq)) = (bid_px, bid_qty, ask_px, ask_qty)
-                {
+                if let (Some(bp), Some(ap)) = (bid_px, ask_px) {
+                    // 數量：優先採用當前字段，否則使用最近一次 BBO 記憶
+                    let (bq, aq) = {
+                        let mut books = self.ob.write().await;
+                        let book = books.entry(coin.to_string()).or_default();
+                        let cur_bq = obj
+                            .get("bq").and_then(|x| x.as_f64())
+                            .or_else(|| obj.get("bidSz").and_then(|x| x.as_f64()));
+                        let cur_aq = obj
+                            .get("aq").and_then(|x| x.as_f64())
+                            .or_else(|| obj.get("askSz").and_then(|x| x.as_f64()));
+                        let bq = cur_bq.or(book.last_bid_qty).unwrap_or(0.0);
+                        let aq = cur_aq.or(book.last_ask_qty).unwrap_or(0.0);
+                        // 更新最近一次 BBO 記憶
+                        book.last_bid_px = Some(bp);
+                        book.last_ask_px = Some(ap);
+                        book.last_bid_qty = Some(bq);
+                        book.last_ask_qty = Some(aq);
+                        (bq, aq)
+                    };
                     let l1 = serde_json::json!({
                         "ts": chrono::DateTime::<Utc>::from_timestamp_millis(ts).unwrap(),
                         "symbol": format!("{}-USDT", coin),

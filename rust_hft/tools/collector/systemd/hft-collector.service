@@ -10,6 +10,8 @@ Restart=always
 RestartSec=5
 StartLimitIntervalSec=60
 StartLimitBurst=10
+# 啟動前執行一次 ClickHouse schema 檢查（可選，存在則執行）
+ExecStartPre=/bin/sh -c 'if [ -x /usr/local/bin/hft-collector-check-schema ]; then CH_URL=${CH_URL} CH_USER=${CH_USER:-default} CH_PASSWORD=${CH_PASSWORD:-} CH_DATABASE=${CH_DATABASE} /usr/local/bin/hft-collector-check-schema ${EXCHANGES}; fi'
 # 建議將二進位安裝到 /usr/local/bin/hft-collector
 ExecStart=/usr/local/bin/hft-collector \
   --exchanges ${EXCHANGES} \
@@ -30,4 +32,3 @@ ExecStart=/usr/local/bin/hft-collector \
 
 [Install]
 WantedBy=multi-user.target
-
