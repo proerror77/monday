@@ -52,7 +52,10 @@ fi
 # Whitelist base tokens (prefer config/symbol_whitelist.json if present)
 BASE=()
 if [ -f config/symbol_whitelist.json ]; then
-  mapfile -t BASE < <(jq -r '.base_tokens[]? // empty' config/symbol_whitelist.json | sed 's/^\s*//; s/\s*$//' | tr 'a-z' 'A-Z') || true
+  while IFS= read -r line; do
+    line=$(echo "$line" | sed 's/^\s*//; s/\s*$//' | tr 'a-z' 'A-Z')
+    [ -n "$line" ] && BASE+=("$line")
+  done < <(jq -r '.base_tokens[]? // empty' config/symbol_whitelist.json | sed 's/^\s*//; s/\s*$//')
 fi
 if [ ${#BASE[@]} -eq 0 ]; then
   BASE=(BTC ETH SOL SUI XRP XLM HYPE ASTER PUMP DOGE AVAX WLFI ADA ENA ONDO SEI MERL B BNB BGB OKB)
