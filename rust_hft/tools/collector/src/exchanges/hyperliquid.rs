@@ -6,6 +6,17 @@ use clickhouse::Client;
 use ordered_float::OrderedFloat;
 use serde_json::Value;
 use tracing::debug;
+use once_cell::sync::Lazy;
+
+static HL_DEBUG: Lazy<bool> = Lazy::new(|| {
+    match std::env::var("HYPERLIQUID_DEBUG") {
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "debug" => true,
+            _ => false,
+        },
+        Err(_) => false,
+    }
+});
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -31,6 +42,12 @@ impl HyperliquidExchange {
     pub fn new(ctx: Arc<ExchangeContext>) -> Self {
         Self { ctx, ob: RwLock::new(HashMap::new()) }
     }
+}
+
+fn v_to_f64(v: &Value) -> Option<f64> {
+    if let Some(x) = v.as_f64() { return Some(x); }
+    if let Some(s) = v.as_str() { return s.parse().ok(); }
+    None
 }
 
 #[async_trait]
@@ -146,6 +163,9 @@ impl Exchange for HyperliquidExchange {
     }
 
     async fn process_message(&self, message: &str, buffers: &mut MessageBuffers) -> Result<()> {
+        if *HL_DEBUG {
+            debug!("[HL RAW] {}", message);
+        }
         let v: Value = match serde_json::from_str(message) {
             Ok(x) => x,
             Err(_) => return Ok(()),
@@ -159,66 +179,69 @@ impl Exchange for HyperliquidExchange {
         if channel == "l2Book" {
             if let Some(data) = v.get("data") {
                 let symbol = data.get("coin").and_then(|x| x.as_str()).unwrap_or("");
+                let ts = data.get("time").and_then(|x| x.as_i64()).unwrap_or_else(|| Utc::now().timestamp_millis());
                 if let Some(levels) = data.get("levels").and_then(|x| x.as_array()) {
-                    let ts = Utc::now().timestamp_millis();
+                    // levels 形如 [ bids[], asks[] ]，每条为 { px, sz, n }
                     let mut updated_bids = false;
                     let mut updated_asks = false;
-                    for lvl in levels {
-                        let px = lvl.get(0).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        let qty = lvl.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        let side = lvl.get(2).and_then(|x| x.as_str()).unwrap_or("b");
-                        let row = serde_json::json!({
-                            "ts": chrono::DateTime::<Utc>::from_timestamp_millis(ts).unwrap(),
-                            "symbol": format!("{}-USDT", symbol),
-                            "side": if side.starts_with('b'){"bid"} else {"ask"},
-                            "price": px,
-                            "qty": qty,
-                            "update_id": 0,
-                        });
-                        buffers.push_spot_orderbook(serde_json::to_string(&row)?);
-
-                        // 更新內存訂單簿（用於跨增量保持 L1 穩定）
-                        {
-                            let mut books = self.ob.write().await;
-                            let book = books.entry(symbol.to_string()).or_default();
-                            let k = OrderedFloat(px);
-                            if side.eq_ignore_ascii_case("b") {
+                    if let Some(bids) = levels.get(0).and_then(|x| x.as_array()) {
+                        for ent in bids {
+                            if let Some(obj) = ent.as_object() {
+                                let px = obj.get("px").and_then(v_to_f64).unwrap_or(0.0);
+                                let qty = obj.get("sz").and_then(v_to_f64).unwrap_or(0.0);
+                                let row = serde_json::json!({
+                                    "ts": chrono::DateTime::<Utc>::from_timestamp_millis(ts).unwrap(),
+                                    "symbol": format!("{}-USDT", symbol),
+                                    "side": "bid",
+                                    "price": px,
+                                    "qty": qty,
+                                    "update_id": 0,
+                                });
+                                buffers.push_spot_orderbook(serde_json::to_string(&row)?);
+                                let mut books = self.ob.write().await;
+                                let book = books.entry(symbol.to_string()).or_default();
+                                let k = OrderedFloat(px);
                                 if qty == 0.0 { book.bids.remove(&k); } else { book.bids.insert(k, qty); }
                                 updated_bids = true;
-                            } else {
+                            }
+                        }
+                    }
+                    if let Some(asks) = levels.get(1).and_then(|x| x.as_array()) {
+                        for ent in asks {
+                            if let Some(obj) = ent.as_object() {
+                                let px = obj.get("px").and_then(v_to_f64).unwrap_or(0.0);
+                                let qty = obj.get("sz").and_then(v_to_f64).unwrap_or(0.0);
+                                let row = serde_json::json!({
+                                    "ts": chrono::DateTime::<Utc>::from_timestamp_millis(ts).unwrap(),
+                                    "symbol": format!("{}-USDT", symbol),
+                                    "side": "ask",
+                                    "price": px,
+                                    "qty": qty,
+                                    "update_id": 0,
+                                });
+                                buffers.push_spot_orderbook(serde_json::to_string(&row)?);
+                                let mut books = self.ob.write().await;
+                                let book = books.entry(symbol.to_string()).or_default();
+                                let k = OrderedFloat(px);
                                 if qty == 0.0 { book.asks.remove(&k); } else { book.asks.insert(k, qty); }
                                 updated_asks = true;
                             }
                         }
                     }
-                    // 由內存簿推導穩定 L1：若本次只更新一側，另一側採用最近一次已知 BBO
                     let (emit_bp, emit_bq, emit_ap, emit_aq) = {
                         let mut books = self.ob.write().await;
                         if let Some(book) = books.get_mut(symbol) {
                             let cur_bb = book.bids.iter().rev().next().map(|(p,q)| (p.0, *q));
                             let cur_ba = book.asks.iter().next().map(|(p,q)| (p.0, *q));
-
-                            // 更新最近一次 BBO 記憶
-                            if let Some((px, qty)) = cur_bb {
-                                book.last_bid_px = Some(px);
-                                book.last_bid_qty = Some(qty);
-                            }
-                            if let Some((px, qty)) = cur_ba {
-                                book.last_ask_px = Some(px);
-                                book.last_ask_qty = Some(qty);
-                            }
-
-                            // 推導輸出（允許一側使用最近一次 BBO）
+                            if let Some((px, qty)) = cur_bb { book.last_bid_px = Some(px); book.last_bid_qty = Some(qty); }
+                            if let Some((px, qty)) = cur_ba { book.last_ask_px = Some(px); book.last_ask_qty = Some(qty); }
                             let bp = cur_bb.map(|t| t.0).or(book.last_bid_px).unwrap_or(0.0);
                             let bq = cur_bb.map(|t| t.1).or(book.last_bid_qty).unwrap_or(0.0);
                             let ap = cur_ba.map(|t| t.0).or(book.last_ask_px).unwrap_or(0.0);
                             let aq = cur_ba.map(|t| t.1).or(book.last_ask_qty).unwrap_or(0.0);
                             (bp, bq, ap, aq)
-                        } else {
-                            (0.0, 0.0, 0.0, 0.0)
-                        }
+                        } else { (0.0,0.0,0.0,0.0) }
                     };
-                    // 僅當本次有更新且能組成有效 BBO 才輸出，避免重複刷屏
                     debug!(
                         "[HL L1] sym={} updated_bids={} updated_asks={} bp={} bq={} ap={} aq={}",
                         symbol, updated_bids, updated_asks, emit_bp, emit_bq, emit_ap, emit_aq
@@ -240,8 +263,8 @@ impl Exchange for HyperliquidExchange {
             if let Some(list) = v.get("data").and_then(|x| x.as_array()) {
                 for tr in list {
                     let symbol = tr.get("coin").and_then(|x| x.as_str()).unwrap_or("");
-                    let px = tr.get("px").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    let sz = tr.get("sz").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                    let px = tr.get("px").and_then(v_to_f64).unwrap_or(0.0);
+                    let sz = tr.get("sz").and_then(v_to_f64).unwrap_or(0.0);
                     let side = tr.get("side").and_then(|x| x.as_str()).unwrap_or("B");
                     let ts = tr
                         .get("time")
@@ -266,49 +289,44 @@ impl Exchange for HyperliquidExchange {
         } else if channel == "bbo" {
             if let Some(obj) = v.get("data").and_then(|x| x.as_object()) {
                 let coin = obj.get("coin").and_then(|x| x.as_str()).unwrap_or("");
-                let ts = Utc::now().timestamp_millis();
-                // 支持多種字段命名（價格必須，數量可使用上次 BBO 回退）
-                let bid_px = obj
-                    .get("bp")
-                    .and_then(|x| x.as_f64())
-                    .or_else(|| obj.get("bidPx").and_then(|x| x.as_f64()));
-                let ask_px = obj
-                    .get("ap")
-                    .and_then(|x| x.as_f64())
-                    .or_else(|| obj.get("askPx").and_then(|x| x.as_f64()));
-                if let (Some(bp), Some(ap)) = (bid_px, ask_px) {
-                    // 數量：優先採用當前字段，否則使用最近一次 BBO 記憶
-                    let (bq, aq) = {
-                        let mut books = self.ob.write().await;
-                        let book = books.entry(coin.to_string()).or_default();
-                        let cur_bq = obj
-                            .get("bq").and_then(|x| x.as_f64())
-                            .or_else(|| obj.get("bidSz").and_then(|x| x.as_f64()));
-                        let cur_aq = obj
-                            .get("aq").and_then(|x| x.as_f64())
-                            .or_else(|| obj.get("askSz").and_then(|x| x.as_f64()));
-                        let bq = cur_bq.or(book.last_bid_qty).unwrap_or(0.0);
-                        let aq = cur_aq.or(book.last_ask_qty).unwrap_or(0.0);
-                        // 更新最近一次 BBO 記憶
-                        book.last_bid_px = Some(bp);
-                        book.last_ask_px = Some(ap);
-                        book.last_bid_qty = Some(bq);
-                        book.last_ask_qty = Some(aq);
-                        (bq, aq)
-                    };
-                    let l1 = serde_json::json!({
-                        "ts": chrono::DateTime::<Utc>::from_timestamp_millis(ts).unwrap(),
-                        "symbol": format!("{}-USDT", coin),
-                        "bid_px": bp,
-                        "bid_qty": bq,
-                        "ask_px": ap,
-                        "ask_qty": aq,
-                    });
-                    buffers.push_spot_l1(serde_json::to_string(&l1)?);
+                let ts = obj.get("time").and_then(|x| x.as_i64()).unwrap_or_else(|| Utc::now().timestamp_millis());
+                if let Some(bbo) = obj.get("bbo").and_then(|x| x.as_array()) {
+                    if bbo.len() >= 2 {
+                        let bid = bbo.get(0).and_then(|x| x.as_object());
+                        let ask = bbo.get(1).and_then(|x| x.as_object());
+                        if let (Some(b), Some(a)) = (bid, ask) {
+                            let bp = b.get("px").and_then(v_to_f64).unwrap_or(0.0);
+                            let bq = b.get("sz").and_then(v_to_f64).unwrap_or(0.0);
+                            let ap = a.get("px").and_then(v_to_f64).unwrap_or(0.0);
+                            let aq = a.get("sz").and_then(v_to_f64).unwrap_or(0.0);
+                            if bp > 0.0 && ap > 0.0 {
+                                let mut books = self.ob.write().await;
+                                let book = books.entry(coin.to_string()).or_default();
+                                book.last_bid_px = Some(bp);
+                                book.last_bid_qty = Some(bq);
+                                book.last_ask_px = Some(ap);
+                                book.last_ask_qty = Some(aq);
+                                drop(books);
+                                let l1 = serde_json::json!({
+                                    "ts": chrono::DateTime::<Utc>::from_timestamp_millis(ts).unwrap(),
+                                    "symbol": format!("{}-USDT", coin),
+                                    "bid_px": bp,
+                                    "bid_qty": bq,
+                                    "ask_px": ap,
+                                    "ask_qty": aq,
+                                });
+                                buffers.push_spot_l1(serde_json::to_string(&l1)?);
+                            }
+                        }
+                    }
                 }
             }
         } else if channel == "allMids" {
             // 可選：忽略或寫入專用表；當前忽略。
+        } else if *HL_DEBUG {
+            // 未匹配到已知频道时打印关键信息，辅助调试
+            let keys: Vec<_> = v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+            debug!("[HL DBG] unknown channel='{}' top_keys={:?}", channel, keys);
         }
         Ok(())
     }
