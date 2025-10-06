@@ -510,11 +510,7 @@ impl Exchange for BinanceFuturesExchange {
         Ok(())
     }
 
-    async fn flush_data(
-        &self,
-        database: &str,
-        buffers: &mut MessageBuffers,
-    ) -> Result<()> {
+    async fn flush_data(&self, database: &str, buffers: &mut MessageBuffers) -> Result<()> {
         let sink = crate::db::get_sink_async(database).await?;
 
         buffers
@@ -526,11 +522,46 @@ impl Exchange for BinanceFuturesExchange {
         buffers
             .flush_futures_table(&sink, "binance_futures_ticker", |f| &mut f.ticker)
             .await?;
-        buffers
-            .flush_futures_table(&sink, "binance_futures_snapshot_books", |f| {
-                &mut f.snapshots
-            })
-            .await?;
+        // 快照需雙寫：專用表 + 通用 snapshot_books
+        if let Some(fut) = buffers.futures_mut() {
+            if !fut.snapshots.is_empty() {
+                let batch = std::mem::take(&mut fut.snapshots);
+                let total = batch.len();
+                tracing::debug!(
+                    "[binance_futures] flushing {} snapshot rows (dual-write)",
+                    total
+                );
+
+                let written_primary = match sink
+                    .insert_json_rows("binance_futures_snapshot_books", &batch)
+                    .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(
+                            "插入 {} 條到 binance_futures_snapshot_books 失敗: {:?}",
+                            total,
+                            e
+                        );
+                        0
+                    }
+                };
+                if written_primary < total {
+                    let _ = crate::spool::save("binance_futures_snapshot_books", &batch);
+                }
+
+                let written_mirror = match sink.insert_json_rows("snapshot_books", &batch).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!("插入 {} 條到 snapshot_books 失敗: {:?}", total, e);
+                        0
+                    }
+                };
+                if written_mirror < total {
+                    let _ = crate::spool::save("snapshot_books", &batch);
+                }
+            }
+        }
         buffers
             .flush_futures_table(&sink, "binance_futures_l1", |f| &mut f.l1)
             .await?;
