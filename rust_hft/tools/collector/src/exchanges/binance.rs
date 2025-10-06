@@ -1,8 +1,8 @@
 use super::{
     binance_common::{
         BookTicker, DepthUpdate, L1Row as BinanceL1Row, MiniTicker, OrderBookState,
-        OrderbookRow as BinanceOrderbookRow, PartialDepthSnapshot,
-        TickerRow as BinanceTickerRow, Trade as BinanceTrade, TradesRow as BinanceTradesRow,
+        OrderbookRow as BinanceOrderbookRow, PartialDepthSnapshot, TickerRow as BinanceTickerRow,
+        Trade as BinanceTrade, TradesRow as BinanceTradesRow,
     },
     binance_spot_pairs, Exchange, ExchangeContext, MessageBuffers, WebsocketPlan,
 };
@@ -26,9 +26,15 @@ pub struct BinanceExchange {
 
 impl BinanceExchange {
     pub fn new(ctx: Arc<ExchangeContext>) -> Self {
+        let depth_levels = match ctx.depth_levels {
+            5 | 10 | 20 => ctx.depth_levels,
+            n if n < 5 => 5,
+            n if n < 10 => 10,
+            _ => 20,
+        };
         Self {
             ob: RwLock::new(HashMap::new()),
-            top_n: 20,
+            top_n: depth_levels,
             ctx,
         }
     }
@@ -63,6 +69,13 @@ impl Exchange for BinanceExchange {
             "1" | "true" | "yes"
         );
 
+        let depth_levels = match self.ctx.depth_levels {
+            5 | 10 | 20 => self.ctx.depth_levels,
+            n if n < 5 => 5,
+            n if n < 10 => 10,
+            _ => 20,
+        };
+
         let mut streams: Vec<String> = Vec::with_capacity(symbols.len() * 4 + 1);
         for symbol in symbols {
             let lower_symbol = symbol.to_lowercase();
@@ -72,10 +85,7 @@ impl Exchange for BinanceExchange {
                 streams.push(format!("{}@miniTicker", lower_symbol));
             }
             if self.ctx.depth_mode.include_limited() {
-                streams.push(format!(
-                    "{}@depth{}@100ms",
-                    lower_symbol, self.ctx.depth_levels
-                ));
+                streams.push(format!("{}@depth{}@100ms", lower_symbol, depth_levels));
             }
             if self.ctx.depth_mode.include_incremental() {
                 streams.push(format!("{}@depth@100ms", lower_symbol));
@@ -388,9 +398,14 @@ impl Exchange for BinanceExchange {
                 }
 
                 // 寫入逐價位 L2 行表到 binance_orderbook
+                tracing::debug!(
+                    "[binance] snapshot {}: bids={} asks={}",
+                    symbol,
+                    snapshot.bids.len(),
+                    snapshot.asks.len()
+                );
                 for (price_str, qty_str) in &snapshot.bids {
-                    if let (Ok(price), Ok(qty)) =
-                        (price_str.parse::<f64>(), qty_str.parse::<f64>())
+                    if let (Ok(price), Ok(qty)) = (price_str.parse::<f64>(), qty_str.parse::<f64>())
                     {
                         if qty > 0.0 {
                             let row = BinanceOrderbookRow {
@@ -406,8 +421,7 @@ impl Exchange for BinanceExchange {
                     }
                 }
                 for (price_str, qty_str) in &snapshot.asks {
-                    if let (Ok(price), Ok(qty)) =
-                        (price_str.parse::<f64>(), qty_str.parse::<f64>())
+                    if let (Ok(price), Ok(qty)) = (price_str.parse::<f64>(), qty_str.parse::<f64>())
                     {
                         if qty > 0.0 {
                             let row = BinanceOrderbookRow {
@@ -443,7 +457,13 @@ impl Exchange for BinanceExchange {
                         }
                         (bids_px, bids_qty, asks_px, asks_qty, book.last_update_id)
                     } else {
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), snapshot.last_update_id)
+                        (
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            snapshot.last_update_id,
+                        )
                     }
                 };
                 let snap = serde_json::json!({
@@ -498,6 +518,12 @@ impl Exchange for BinanceExchange {
                     }
 
                     // 写入逐价位 L2 行表到 binance_orderbook
+                    tracing::debug!(
+                        "[binance] depthUpdate {}: bids={} asks={}",
+                        depth_update.symbol,
+                        depth_update.bids.len(),
+                        depth_update.asks.len()
+                    );
                     for (price_str, qty_str) in &depth_update.bids {
                         if let (Ok(price), Ok(qty)) =
                             (price_str.parse::<f64>(), qty_str.parse::<f64>())
@@ -655,11 +681,7 @@ impl Exchange for BinanceExchange {
         Ok(())
     }
 
-    async fn flush_data(
-        &self,
-        database: &str,
-        buffers: &mut MessageBuffers,
-    ) -> Result<()> {
+    async fn flush_data(&self, database: &str, buffers: &mut MessageBuffers) -> Result<()> {
         let sink = crate::db::get_sink_async(database).await?;
 
         let orderbook_count = buffers
@@ -690,11 +712,17 @@ impl Exchange for BinanceExchange {
             tracing::debug!("插入 {} 条 Binance Ticker 记录", ticker_count);
         }
 
-        let snapshot_count = buffers
-            .flush_spot_table(&sink, "binance_snapshot_books", |spot| &mut spot.snapshots)
-            .await?;
-        if snapshot_count > 0 {
-            tracing::debug!("插入 {} 条 Binance LOB 快照", snapshot_count);
+        // 快照雙寫：專用表 + 通用 snapshot_books
+        if !buffers.spot.snapshots.is_empty() {
+            let batch = std::mem::take(&mut buffers.spot.snapshots);
+            let count = batch.len();
+            if count > 0 {
+                let _ = sink
+                    .insert_json_rows("binance_snapshot_books", &batch)
+                    .await?;
+                let _ = sink.insert_json_rows("snapshot_books", &batch).await?;
+                tracing::debug!("插入 {} 条 Binance LOB 快照（專用+通用）", count);
+            }
         }
 
         // 嘗試回放本地緩存（若前次寫入失敗）

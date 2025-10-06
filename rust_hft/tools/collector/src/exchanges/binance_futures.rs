@@ -23,9 +23,15 @@ pub struct BinanceFuturesExchange {
 
 impl BinanceFuturesExchange {
     pub fn new(ctx: Arc<ExchangeContext>) -> Self {
+        let depth_levels = match ctx.depth_levels {
+            5 | 10 | 20 => ctx.depth_levels,
+            n if n < 5 => 5,
+            n if n < 10 => 10,
+            _ => 20,
+        };
         Self {
             ob: RwLock::new(HashMap::new()),
-            top_n: 20,
+            top_n: depth_levels,
             ctx,
         }
     }
@@ -65,6 +71,13 @@ impl Exchange for BinanceFuturesExchange {
         );
 
         let mut streams: Vec<String> = Vec::with_capacity(symbols.len() * 4 + 1);
+        let depth_levels = match self.ctx.depth_levels {
+            5 | 10 | 20 => self.ctx.depth_levels,
+            n if n < 5 => 5,
+            n if n < 10 => 10,
+            _ => 20,
+        };
+
         for symbol in symbols {
             let lower_symbol = symbol.to_lowercase();
             streams.push(format!("{}@trade", lower_symbol));
@@ -73,10 +86,7 @@ impl Exchange for BinanceFuturesExchange {
                 streams.push(format!("{}@miniTicker", lower_symbol));
             }
             if self.ctx.depth_mode.include_limited() {
-                streams.push(format!(
-                    "{}@depth{}@100ms",
-                    lower_symbol, self.ctx.depth_levels
-                ));
+                streams.push(format!("{}@depth{}@100ms", lower_symbol, depth_levels));
             }
             if self.ctx.depth_mode.include_incremental() {
                 streams.push(format!("{}@depth@100ms", lower_symbol));
