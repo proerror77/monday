@@ -32,7 +32,10 @@ mod config_types; // 預留：後續逐步搬移配置型別
 mod infra_exporters; // 預留：後續搬移 Redis/ClickHouse 導出
 
 // 將部分配置型別從子模組對外公開
-pub use config_types::{ClickHouseConfig, CpuAffinityConfig, InfraConfig, RedisConfig, SystemEngineConfig};
+pub use config_types::{
+    ClickHouseConfig, CpuAffinityConfig, InfraConfig, PortfolioSpec, RedisConfig, RiskConfig,
+    StrategyRiskLimits, StrategyRiskOverride, SystemEngineConfig, TradingWindowConfig,
+};
 
 #[cfg(feature = "redis")]
 use serde_json;
@@ -162,20 +165,7 @@ pub struct StrategyConfig {
 }
 
 /// 投資組合設定，用於聚合多策略並套用整體限制
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PortfolioSpec {
-    pub name: String,
-    #[serde(default)]
-    pub strategies: Vec<String>,
-    #[serde(default)]
-    pub max_notional: Option<rust_decimal::Decimal>,
-    #[serde(default)]
-    pub max_position: Option<rust_decimal::Decimal>,
-    #[serde(default)]
-    pub max_drawdown_pct: Option<f64>,
-    #[serde(default)]
-    pub notes: Option<String>,
-}
+// PortfolioSpec 已移至 config_types
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StrategyType {
@@ -425,158 +415,7 @@ fn apply_lob_flow_overrides(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct StrategyRiskLimits {
-    pub max_notional: rust_decimal::Decimal,
-    pub max_position: rust_decimal::Decimal,
-    pub daily_loss_limit: rust_decimal::Decimal,
-    pub cooldown_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RiskConfig {
-    /// Risk manager type: "Default" or "Enhanced"
-    #[serde(default = "default_risk_type")]
-    pub risk_type: String,
-
-    /// Base risk settings (applied to all strategies)
-    pub global_position_limit: rust_decimal::Decimal,
-    pub global_notional_limit: rust_decimal::Decimal,
-    pub max_daily_trades: u32,
-    pub max_orders_per_second: u32,
-    pub staleness_threshold_us: u64,
-
-    /// Enhanced risk settings (only used if risk_type = "Enhanced")
-    #[serde(default)]
-    pub enhanced: Option<EnhancedRiskSettings>,
-
-    /// Per-strategy risk overrides
-    #[serde(default)]
-    pub strategy_overrides: HashMap<String, StrategyRiskOverride>,
-}
-
-fn default_risk_type() -> String {
-    "Default".to_string()
-}
-
-/// Enhanced risk manager specific settings
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnhancedRiskSettings {
-    // Position and notional limits
-    pub max_position_per_symbol: rust_decimal::Decimal,
-    pub max_order_notional: rust_decimal::Decimal,
-
-    // Advanced rate limiting
-    pub max_orders_per_minute: u32,
-    pub max_orders_per_hour: u32,
-
-    // Cooldown periods (milliseconds)
-    pub global_order_cooldown_ms: u64,
-    pub symbol_order_cooldown_ms: u64,
-    pub failed_order_penalty_ms: u64,
-
-    // Data staleness thresholds (microseconds)
-    pub market_data_staleness_us: u64,
-    pub inference_staleness_us: u64,
-    pub execution_report_staleness_us: u64,
-
-    // Loss control
-    pub max_daily_loss: rust_decimal::Decimal,
-    pub max_drawdown_pct: f64,
-    pub max_consecutive_losses: u32,
-    pub max_position_loss_pct: f64,
-
-    // Circuit breaker
-    pub circuit_breaker_enabled: bool,
-    pub cb_daily_loss_threshold: rust_decimal::Decimal,
-    pub cb_drawdown_threshold: f64,
-    pub cb_consecutive_losses: u32,
-    pub cb_recovery_time_minutes: u64,
-
-    // Trading window (optional)
-    pub trading_window: Option<TradingWindowConfig>,
-
-    // System control
-    pub aggressive_mode: bool,
-    pub dry_run_mode: bool,
-}
-
-impl Default for EnhancedRiskSettings {
-    fn default() -> Self {
-        Self {
-            max_position_per_symbol: rust_decimal::Decimal::from(100),
-            max_order_notional: rust_decimal::Decimal::from(50000),
-            max_orders_per_minute: 300,
-            max_orders_per_hour: 3000,
-            global_order_cooldown_ms: 50,
-            symbol_order_cooldown_ms: 100,
-            failed_order_penalty_ms: 1000,
-            market_data_staleness_us: 3000,
-            inference_staleness_us: 5000,
-            execution_report_staleness_us: 10000,
-            max_daily_loss: rust_decimal::Decimal::from(10000),
-            max_drawdown_pct: 5.0,
-            max_consecutive_losses: 5,
-            max_position_loss_pct: 2.0,
-            circuit_breaker_enabled: true,
-            cb_daily_loss_threshold: rust_decimal::Decimal::from(8000),
-            cb_drawdown_threshold: 4.0,
-            cb_consecutive_losses: 4,
-            cb_recovery_time_minutes: 30,
-            trading_window: None,
-            aggressive_mode: false,
-            dry_run_mode: false,
-        }
-    }
-}
-
-/// Trading window configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TradingWindowConfig {
-    pub start_hour_utc: u8,
-    pub end_hour_utc: u8,
-    pub allowed_weekdays: Vec<String>, // ["Monday", "Tuesday", etc.]
-    #[serde(default)]
-    pub market_holidays: Vec<String>, // ISO date strings
-}
-
-/// Per-strategy risk overrides
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StrategyRiskOverride {
-    /// Override global position limit for this strategy
-    pub max_position: Option<rust_decimal::Decimal>,
-
-    /// Override max notional for this strategy
-    pub max_notional: Option<rust_decimal::Decimal>,
-
-    /// Override order rate limits
-    pub max_orders_per_second: Option<u32>,
-
-    /// Override cooldown period
-    pub order_cooldown_ms: Option<u64>,
-
-    /// Override staleness threshold
-    pub staleness_threshold_us: Option<u64>,
-
-    /// Override daily loss limit for this strategy
-    pub max_daily_loss: Option<rust_decimal::Decimal>,
-
-    /// Strategy-specific aggressive mode
-    pub aggressive_mode: Option<bool>,
-
-    /// Enhanced-specific overrides (only used with Enhanced risk manager)
-    #[serde(default)]
-    pub enhanced_overrides: Option<StrategyEnhancedRiskOverride>,
-}
-
-/// Enhanced risk manager specific per-strategy overrides
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StrategyEnhancedRiskOverride {
-    pub max_drawdown_pct: Option<f64>,
-    pub max_consecutive_losses: Option<u32>,
-    pub circuit_breaker_enabled: Option<bool>,
-    pub dry_run_mode: Option<bool>,
-}
+// RiskConfig 與相關型別已移至 config_types 模組
 
 
 /// 系統建構器 - 使用構建者模式
