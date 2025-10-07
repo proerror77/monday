@@ -1,0 +1,45 @@
+schema_version: v2
+# 支援 quotes-only（只行情、不下單）。此鍵不屬於 shared config schema，
+# 但 runtime 的 config loader 會從 YAML 根讀取並應用。
+# quotes_only: true
+engine:
+  queue_capacity: 16384
+  stale_us: 500000
+  top_n: 10
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  auto_cancel_exchange_only: false
+
+venues:
+  - name: binance
+    venue_type: BINANCE
+    symbol_catalog:
+      - BTCUSDT@BINANCE
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    simulate_execution: false
+
+strategies:
+  - name: trend_btc
+    strategy_type: Trend
+    symbols: [BTCUSDT]
+    params:
+      kind: trend
+      ema_fast: 12
+      ema_slow: 26
+      rsi_period: 14
+    risk_limits:
+      max_notional: 100000.0
+      max_position: 2.0
+      daily_loss_limit: 5000.0
+      cooldown_ms: 500
+
+risk:
+  risk_type: Default
+  global_position_limit: 1000000.0
+  global_notional_limit: 10000000.0
+  max_daily_trades: 1000
+  max_orders_per_second: 50
+  staleness_threshold_us: 5000

@@ -1,0 +1,23 @@
+[package]
+name = "hyperliquid-demo"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "complete_demo"
+path = "src/complete_demo.rs"
+
+[dependencies]
+hft-core = { path = "../../market-core/core" }
+ports = { package = "hft-ports", path = "../../market-core/ports" }
+adapter_hyperliquid_data = { package = "hft-data-adapter-hyperliquid", path = "../../data-pipelines/adapters/adapter-hyperliquid" }
+adapter_hyperliquid_execution = { package = "hft-execution-adapter-hyperliquid", path = "../../execution-gateway/adapters/adapter-hyperliquid" }
+
+tokio = { workspace = true, features = ["full"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+clap = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

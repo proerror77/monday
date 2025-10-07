@@ -1,0 +1,34 @@
+[package]
+name = "hft-data-adapter-asterdex"
+version = "0.1.0"
+edition = "2021"
+description = "Aster DEX 公有行情 adapter (實作 MarketStream)"
+
+[dependencies]
+# Core dependencies
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+integration = { package = "hft-integration", path = "../../../market-core/integration" }
+
+# Async and networking
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { version = "1.0" }
+simd-json = { version = "0.13", features = ["serde"] }
+
+# Utilities
+tracing = { workspace = true }
+url = "2.4"
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+async-trait = "0.1"
+
+[features]
+default = []
+
+[lib]
+name = "adapter_asterdex_data"

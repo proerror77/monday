@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        env:
+          # Ensure tests won't try to reach real CH
+          CLICKHOUSE_HOST: http://localhost:8123
+          CLICKHOUSE_USERNAME: default
+          CLICKHOUSE_PASSWORD: ''
+          CLICKHOUSE_DATABASE: default
+        run: |
+          pytest -q
+

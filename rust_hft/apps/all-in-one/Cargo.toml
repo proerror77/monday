@@ -1,0 +1,48 @@
+[package]
+name = "hft-all-in-one"
+version = "0.1.0"
+edition = "2021"
+description = "統一入口的 HFT 應用，可透過 feature 選擇交易所與策略"
+
+[dependencies]
+runtime = { package = "hft-runtime", path = "../../market-core/runtime" }
+clap = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { workspace = true, features = ["full"] }
+
+[features]
+default = []
+
+# 交易所適配器 (轉發到 runtime)
+bitget = ["runtime/bitget"]
+binance = ["runtime/binance"]
+bybit = ["runtime/bybit"]
+okx = ["runtime/okx"]
+hyperliquid = ["runtime/hyperliquid"]
+asterdex = ["runtime/asterdex"]
+mock = ["runtime/mock"]
+all-exchanges = ["bitget", "binance", "bybit", "okx", "hyperliquid", "asterdex", "mock"]
+
+# 策略 (轉發到 runtime)
+trend-strategy = ["runtime/strategy-trend"]
+arbitrage-strategy = ["runtime/strategy-arbitrage"]
+imbalance-strategy = ["runtime/strategy-imbalance"]
+dl-strategy = ["runtime/strategy-dl"]
+lob-flow-grid-strategy = ["runtime/strategy-lob-flow-grid"]
+all-strategies = [
+    "trend-strategy",
+    "arbitrage-strategy",
+    "imbalance-strategy",
+    "dl-strategy",
+    "lob-flow-grid-strategy"
+]
+
+# 基礎設施 (轉發到 runtime)
+clickhouse = ["runtime/clickhouse"]
+redis = ["runtime/redis"]
+metrics = ["runtime/metrics"]
+full-infra = ["clickhouse", "redis", "metrics"]
+
+# 方便一次開啟所有功能
+full = ["all-exchanges", "all-strategies", "full-infra"]

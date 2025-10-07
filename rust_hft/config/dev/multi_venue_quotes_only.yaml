@@ -1,0 +1,69 @@
+schema_version: v2
+quotes_only: true
+
+engine:
+  queue_capacity: 16384
+  stale_us: 500000
+  top_n: 10
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  auto_cancel_exchange_only: false
+
+# 說明：為了驗證多交易所行情接入，這裡顯式配置 symbol_catalog
+# 若要自動從 instrument catalog 補全，可設置環境變量 HFT_AUTOFILL_SYMBOLS=1
+venues:
+  - name: binance_main
+    account_id: binance_main
+    venue_type: BINANCE
+    # 公開行情不需要私有憑證
+    ws_public: "wss://stream.binance.com:9443/ws"
+    rest: "https://api.binance.com"
+    symbol_catalog:
+      - BTCUSDT@BINANCE
+      - ETHUSDT@BINANCE
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    simulate_execution: false
+
+  - name: bitget_main
+    account_id: bitget_main
+    venue_type: BITGET
+    ws_public: "wss://ws.bitget.com/v2/ws/public"
+    rest: "https://api.bitget.com"
+    symbol_catalog:
+      - BTCUSDT@BITGET
+      - ETHUSDT@BITGET
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    simulate_execution: false
+
+  - name: aster_main
+    account_id: aster_main
+    venue_type: ASTERDEX
+    # Aster DEX 行情適配器使用內建默認端點，可不填 ws_public/rest
+    symbol_catalog:
+      - BTCUSDT@ASTERDEX
+      - ETHUSDT@ASTERDEX
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    simulate_execution: false
+
+strategies: []
+
+risk:
+  risk_type: Default
+  global_position_limit: 1000000.0
+  global_notional_limit: 10000000.0
+  max_daily_trades: 1000
+  max_orders_per_second: 50
+  staleness_threshold_us: 5000
+
+# 目前暫無策略，可保留為空映射；未來增加策略後，請綁定至對應 account_id
+strategy_accounts: {}
+

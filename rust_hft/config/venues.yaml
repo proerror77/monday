@@ -1,0 +1,28 @@
+# Venue catalog (shared/instrument::VenueMeta)
+# 用於記錄交易所端點、能力與額外元資料。
+# System runtime 若未提供 config/instruments.yaml 可依此檔案補足 venue 基本資訊。
+
+venues:
+  - venue_id: BINANCE
+    name: Binance Spot
+    rest_endpoint: https://api.binance.com
+    ws_public_endpoint: wss://stream.binance.com:9443/ws
+    ws_private_endpoint: wss://stream.binance.com:9443/stream
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+      max_subscriptions: 400
+    metadata:
+      region: global
+  - venue_id: BITGET
+    name: Bitget USDT Futures
+    rest_endpoint: https://api.bitget.com
+    ws_public_endpoint: wss://ws.bitget.com/spot/v2
+    ws_private_endpoint: wss://ws.bitget.com/spot/v2
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    metadata:
+      inst_type: usdt-futures

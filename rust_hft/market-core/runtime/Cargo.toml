@@ -1,0 +1,131 @@
+[package]
+name = "hft-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "runtime"
+
+[dependencies]
+# Core dependencies
+hft_core = { package = "hft-core", path = "../core" }
+ports = { package = "hft-ports", path = "../ports" }
+engine = { package = "hft-engine", path = "../engine" }
+integration = { package = "hft-integration", path = "../integration" }
+risk = { package = "hft-risk", path = "../../risk-control/risk" }
+snapshot = { package = "hft-snapshot", path = "../snapshot" }
+shared_config = { package = "hft-shared-config", path = "../../shared/config" }
+shared_instrument = { package = "hft-shared-instrument", path = "../../shared/instrument" }
+
+# Data adapters (optional)
+adapter-bitget-data = { package = "hft-data-adapter-bitget", path = "../../data-pipelines/adapters/adapter-bitget", optional = true }
+adapter-binance-data = { package = "hft-data-adapter-binance", path = "../../data-pipelines/adapters/adapter-binance", optional = true }
+adapter-backpack-data = { package = "hft-data-adapter-backpack", path = "../../data-pipelines/adapters/adapter-backpack", optional = true }
+adapter-bybit-data = { package = "hft-data-adapter-bybit", path = "../../data-pipelines/adapters/adapter-bybit", optional = true }
+adapter-mock-data = { package = "hft-data-adapter-mock", path = "../../data-pipelines/adapters/adapter-mock", optional = true }
+adapter-asterdex-data = { package = "hft-data-adapter-asterdex", path = "../../data-pipelines/adapters/adapter-asterdex", optional = true }
+adapter-lighter-data = { package = "hft-data-adapter-lighter", path = "../../data-pipelines/adapters/adapter-lighter", optional = true }
+adapter-grvt-data = { package = "hft-data-adapter-grvt", path = "../../data-pipelines/adapters/adapter-grvt", optional = true }
+
+# Execution adapters (optional)
+adapter-bitget-execution = { package = "hft-execution-adapter-bitget", path = "../../execution-gateway/adapters/adapter-bitget", optional = true }
+adapter-binance-execution = { package = "hft-execution-adapter-binance", path = "../../execution-gateway/adapters/adapter-binance", optional = true }
+adapter-backpack-execution = { package = "hft-execution-adapter-backpack", path = "../../execution-gateway/adapters/adapter-backpack", optional = true }
+adapter-bybit-execution = { package = "hft-execution-adapter-bybit", path = "../../execution-gateway/adapters/adapter-bybit", optional = true }
+adapter-okx-execution = { package = "hft-execution-adapter-okx", path = "../../execution-gateway/adapters/adapter-okx", optional = true }
+adapter-hyperliquid-data = { package = "hft-data-adapter-hyperliquid", path = "../../data-pipelines/adapters/adapter-hyperliquid", optional = true }
+adapter-hyperliquid-execution = { package = "hft-execution-adapter-hyperliquid", path = "../../execution-gateway/adapters/adapter-hyperliquid", optional = true }
+adapter-asterdex-execution = { package = "hft-execution-adapter-asterdex", path = "../../execution-gateway/adapters/adapter-asterdex", optional = true }
+adapter-lighter-execution = { package = "hft-execution-adapter-lighter", path = "../../execution-gateway/adapters/adapter-lighter", optional = true }
+adapter-grvt-execution = { package = "hft-execution-adapter-grvt", path = "../../execution-gateway/adapters/adapter-grvt", optional = true }
+
+# Strategy libraries (optional)
+strategy-trend = { package = "hft-strategy-trend", path = "../../strategy-framework/strategies/trend", optional = true }
+strategy-arbitrage = { package = "hft-strategy-arbitrage", path = "../../strategy-framework/strategies/arbitrage", optional = true }
+strategy-dl = { package = "hft-strategy-dl", path = "../../strategy-framework/strategy-dl", optional = true }
+strategy-imbalance = { package = "hft-strategy-imbalance", path = "../../strategy-framework/strategies/imbalance", optional = true }
+strategy-lob-flow-grid = { package = "hft-strategy-lob-flow-grid", path = "../../strategy-framework/strategies/lob_flow_grid", optional = true }
+
+# Infrastructure (optional)
+infra-clickhouse = { package = "hft-infra-clickhouse", path = "../../infra-services/core/clickhouse", optional = true }
+infra-redis = { package = "hft-infra-redis", path = "../../infra-services/core/redis", optional = true }
+infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics", optional = true }
+infra-ipc = { package = "hft-ipc", path = "../../infra-services/core/ipc", optional = true }
+hft-recovery = { path = "../../infra-services/recovery", optional = true }
+
+# Serialization and async
+serde = { workspace = true }
+serde_yaml = "0.9"
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+regex = "1.5"
+redis = { version = "0.24", features = ["tokio-comp", "aio"], optional = true }
+serde_json = { version = "1.0", optional = true }
+clickhouse = { version = "0.12", optional = true }
+async-trait = "0.1"
+futures = { workspace = true }
+core_affinity = "0.8"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[features]
+default = []
+
+# 完整運行時測試（包含 async 啟停）
+full_runtime_test = ["tokio/test-util"]
+
+# Data adapters
+adapter-bitget-data = ["dep:adapter-bitget-data"]
+adapter-binance-data = ["dep:adapter-binance-data"]
+adapter-backpack-data = ["dep:adapter-backpack-data"]
+adapter-bybit-data = ["dep:adapter-bybit-data"]
+adapter-mock-data = ["dep:adapter-mock-data"]
+adapter-asterdex-data = ["dep:adapter-asterdex-data"]
+adapter-lighter-data = ["dep:adapter-lighter-data"]
+adapter-grvt-data = ["dep:adapter-grvt-data"]
+
+# Execution adapters
+adapter-bitget-execution = ["dep:adapter-bitget-execution"]
+adapter-binance-execution = ["dep:adapter-binance-execution"]
+adapter-backpack-execution = ["dep:adapter-backpack-execution"]
+adapter-bybit-execution = ["dep:adapter-bybit-execution"]
+adapter-okx-execution = ["dep:adapter-okx-execution"]
+adapter-hyperliquid-data = ["dep:adapter-hyperliquid-data"]
+adapter-hyperliquid-execution = ["dep:adapter-hyperliquid-execution"]
+adapter-asterdex-execution = ["dep:adapter-asterdex-execution"]
+adapter-lighter-execution = ["dep:adapter-lighter-execution"]
+adapter-grvt-execution = ["dep:adapter-grvt-execution"]
+
+# Strategies
+strategy-trend = ["dep:strategy-trend"]
+strategy-arbitrage = ["dep:strategy-arbitrage"]
+strategy-dl = ["dep:strategy-dl"]
+strategy-imbalance = ["dep:strategy-imbalance"]
+strategy-lob-flow-grid = ["dep:strategy-lob-flow-grid"]
+
+# Infrastructure
+clickhouse = ["dep:infra-clickhouse", "dep:clickhouse"]
+redis = ["dep:infra-redis", "dep:redis", "dep:serde_json"]
+metrics = ["dep:infra-metrics", "engine/metrics"]
+infra-ipc = ["dep:infra-ipc"]
+recovery = ["dep:hft-recovery"]
+
+# Convenience features
+bitget = ["adapter-bitget-data", "adapter-bitget-execution"]
+binance = ["adapter-binance-data", "adapter-binance-execution"]
+backpack = ["adapter-backpack-data", "adapter-backpack-execution"]
+bybit = ["adapter-bybit-data", "adapter-bybit-execution"]
+okx = ["adapter-okx-execution"]
+hyperliquid = ["adapter-hyperliquid-data", "adapter-hyperliquid-execution"]
+asterdex = ["adapter-asterdex-data", "adapter-asterdex-execution"]
+lighter = ["adapter-lighter-data", "adapter-lighter-execution"]
+grvt = ["adapter-grvt-data", "adapter-grvt-execution"]
+mock = ["adapter-mock-data"]
+all-strategies = ["strategy-trend", "strategy-arbitrage", "strategy-imbalance", "strategy-dl", "strategy-lob-flow-grid"]
+full = ["bitget", "binance", "bybit", "okx", "hyperliquid", "asterdex", "lighter", "backpack", "grvt", "all-strategies", "adapter-mock-data"]

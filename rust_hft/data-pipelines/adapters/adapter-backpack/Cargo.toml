@@ -1,0 +1,21 @@
+[package]
+name = "hft-data-adapter-backpack"
+version = "0.1.0"
+edition = "2021"
+description = "Backpack Exchange market data adapter"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+
+async-trait = "0.1"
+async-stream = "0.3"
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { version = "1.0" }
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { workspace = true }
+
+[lib]
+name = "adapter_backpack_data"

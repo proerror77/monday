@@ -1,0 +1,60 @@
+# Backpack Paper 模式配置示例
+# 使用 REST 輪詢行情與模擬下單
+
+venues:
+  - name: "BACKPACK"
+    venue_type: "Backpack"
+
+    data_config:
+      adapter_type: "backpack"
+      ws_url: "wss://ws.backpack.exchange"
+      subscribe_depth: true
+      subscribe_trades: true
+      reconnect_interval_ms: 5000
+      default_symbols:
+        - SOL_USDC
+
+    execution_config:
+      adapter_type: "backpack"
+      mode: "Paper"
+      rest_base_url: "https://api.backpack.exchange"
+      ws_public_url: "wss://ws.backpack.exchange"
+      timeout_ms: 5000
+      window_ms: 5000
+      api_key: ""
+      secret_key: ""
+
+instruments:
+  - symbol: "SOL_USDC"
+    venue: "BACKPACK"
+    asset_type: "spot"
+    base_currency: "SOL"
+    quote_currency: "USDC"
+    tick_size: "0.01"
+    lot_size: "0.001"
+    min_order_size: "0.001"
+    max_order_size: "1000"
+
+strategies:
+  - name: "paper_mm"
+    type: "trend"
+    symbols: ["SOL_USDC"]
+    target_venue: "BACKPACK"
+    enabled: true
+    params:
+      ema_fast: 5
+      ema_slow: 10
+      rsi_period: 14
+      signal_threshold: 0.01
+
+risk_management:
+  global_limits:
+    max_daily_loss_usd: 5000.0
+    max_position_usd: 20000.0
+    max_orders_per_second: 10
+
+logging:
+  level: "info"
+  file: "logs/backpack_paper.log"
+  max_file_size_mb: 50
+  max_files: 5

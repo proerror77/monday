@@ -1,0 +1,21 @@
+[package]
+name = "hft-ports"
+version = "0.1.0"
+edition = "2021"
+description = "穩定介面：事件模型 + traits (Never break userspace)"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../core" }
+instrument = { package = "hft-instrument", path = "../instrument" }
+serde = { workspace = true, features = ["derive"] }
+futures = { workspace = true }
+rust_decimal = { version = "1.33", features = ["serde"] }
+
+# async-trait 用於 trait 中的 async fn
+async-trait = "0.1"
+
+[features]
+default = []
+
+[lib]
+name = "ports"

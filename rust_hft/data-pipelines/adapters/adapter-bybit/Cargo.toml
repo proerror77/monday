@@ -1,0 +1,36 @@
+[package]
+name = "hft-data-adapter-bybit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "adapter_bybit_data"
+
+[dependencies]
+# Core dependencies
+hft_core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+integration = { package = "hft-integration", path = "../../../market-core/integration" }
+
+# Async and networking
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures = { workspace = true }
+async-stream = "0.3"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { version = "1.0" }
+
+# Utilities
+tracing = { workspace = true }
+url = "2.4"
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+async-trait = "0.1"
+
+# Optional optimizations
+simd-json = { version = "0.13", features = ["serde"] }
+
+[features]
+default = []

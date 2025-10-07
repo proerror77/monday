@@ -1,0 +1,10 @@
+host: ${CLICKHOUSE_HOST}
+user: ${CLICKHOUSE_USERNAME}
+password: ${CLICKHOUSE_PASSWORD}
+database: ${CLICKHOUSE_DATABASE}
+
+start: 2025-09-03T00:00:00Z
+end: 2025-09-05T23:59:59Z
+top: 12
+pick: 8
+out: ./workspace/datasets

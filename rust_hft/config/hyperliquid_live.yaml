@@ -1,0 +1,120 @@
+# Hyperliquid 实盘交易配置
+# 警告：此为实盘配置，请谨慎使用
+
+venues:
+  - name: "HYPERLIQUID"
+    venue_type: "perp"
+    
+    # 数据配置
+    data_config:
+      adapter_type: "hyperliquid"
+      ws_url: "wss://api.hyperliquid.xyz/ws"
+      reconnect_interval_ms: 5000
+      heartbeat_interval_ms: 30000
+    
+    # 执行配置
+    execution_config:
+      adapter_type: "hyperliquid"
+      mode: "Live"  # Live 模式 - 真实交易
+      rest_base_url: "https://api.hyperliquid.xyz"
+      ws_private_url: "wss://api.hyperliquid.xyz/ws"
+      timeout_ms: 5000
+      # 重要：请将您的实际私钥填入此处
+      private_key: "YOUR_64_CHAR_HEX_PRIVATE_KEY_HERE"
+      # 可选：如果使用 vault 账户
+      # vault_address: "0x..."
+
+# 支持的交易对
+instruments:
+  - symbol: "BTC-PERP"
+    venue: "HYPERLIQUID"
+    asset_type: "perp"
+    base_currency: "BTC"
+    quote_currency: "USD"
+    tick_size: "0.1"
+    lot_size: "0.001"
+    min_order_size: "0.001"
+    max_order_size: "1000.0"
+    
+  - symbol: "ETH-PERP"
+    venue: "HYPERLIQUID"
+    asset_type: "perp"
+    base_currency: "ETH"
+    quote_currency: "USD"
+    tick_size: "0.01"
+    lot_size: "0.01"
+    min_order_size: "0.01"
+    max_order_size: "10000.0"
+    
+  - symbol: "SOL-PERP"
+    venue: "HYPERLIQUID"
+    asset_type: "perp"
+    base_currency: "SOL"
+    quote_currency: "USD"
+    tick_size: "0.001"
+    lot_size: "0.1"
+    min_order_size: "0.1"
+    max_order_size: "50000.0"
+    
+  - symbol: "SUI-PERP"
+    venue: "HYPERLIQUID"
+    asset_type: "perp"
+    base_currency: "SUI"
+    quote_currency: "USD"
+    tick_size: "0.0001"
+    lot_size: "1.0"
+    min_order_size: "1.0"
+    max_order_size: "100000.0"
+
+# 策略配置
+strategies:
+  - name: "hyperliquid_trend_btc"
+    type: "trend"
+    symbols: ["BTC-PERP"]
+    target_venue: "HYPERLIQUID"
+    enabled: true
+    params:
+      ema_fast: 12
+      ema_slow: 26
+      rsi_period: 14
+      signal_threshold: 0.02
+    
+  - name: "hyperliquid_arbitrage"
+    type: "arbitrage"
+    symbols: ["BTC-PERP", "ETH-PERP"]
+    target_venue: "HYPERLIQUID"
+    enabled: false  # 默认关闭套利策略
+    params:
+      spread_threshold_bps: 10
+      min_profit_usd: 5.0
+
+# 风控配置
+risk_management:
+  global_limits:
+    max_daily_loss_usd: 1000.0
+    max_position_usd: 10000.0
+    max_orders_per_second: 5
+    
+  symbol_limits:
+    "BTC-PERP":
+      max_position_usd: 5000.0
+      max_order_size: 0.1
+      
+    "ETH-PERP":
+      max_position_usd: 3000.0
+      max_order_size: 2.0
+      
+    "SOL-PERP":
+      max_position_usd: 2000.0
+      max_order_size: 50.0
+      
+    "SUI-PERP":
+      max_position_usd: 1000.0
+      max_order_size: 500.0
+
+# 日志配置
+logging:
+  level: "info"
+  file: "logs/hyperliquid_live.log"
+  max_file_size_mb: 100
+  max_files: 10

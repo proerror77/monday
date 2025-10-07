@@ -1,0 +1,131 @@
+# Hyperliquid 永续合约演示配置
+# 支持 BTC-PERP, ETH-PERP, SOL-PERP, SUI-PERP 主网交易
+
+system:
+  name: "hyperliquid-perp-demo"
+  mode: "paper"  # paper | live
+  
+venues:
+  - name: "HYPERLIQUID"
+    venue_type: "perp"
+    enabled: true
+    data_config:
+      adapter_type: "hyperliquid"
+      ws_url: "wss://api.hyperliquid.xyz/ws"
+      symbols:
+        - "BTC-PERP"
+        - "ETH-PERP" 
+        - "SOL-PERP"
+        - "SUI-PERP"
+      reconnect_interval_ms: 5000
+      heartbeat_interval_ms: 30000
+      
+    execution_config:
+      adapter_type: "hyperliquid"
+      mode: "paper"  # paper | live
+      rest_base_url: "https://api.hyperliquid.xyz"
+      ws_private_url: "wss://api.hyperliquid.xyz/ws"
+      timeout_ms: 5000
+      # 生产环境通过环境变量注入
+      # private_key: "${HYPERLIQUID_PRIVATE_KEY}"
+      # vault_address: "${HYPERLIQUID_VAULT_ADDRESS}"  # 可选
+
+# 交易对精度规格
+instrument_specs:
+  "BTC-PERP":
+    tick_size: "0.1"
+    min_quantity: "0.001"
+    max_quantity: "1000.0"
+    price_precision: 1
+    quantity_precision: 3
+    
+  "ETH-PERP":
+    tick_size: "0.01"
+    min_quantity: "0.01"
+    max_quantity: "10000.0"
+    price_precision: 2
+    quantity_precision: 2
+    
+  "SOL-PERP":
+    tick_size: "0.001"
+    min_quantity: "0.1"
+    max_quantity: "100000.0"
+    price_precision: 3
+    quantity_precision: 1
+    
+  "SUI-PERP":
+    tick_size: "0.0001"
+    min_quantity: "1.0"
+    max_quantity: "1000000.0"
+    price_precision: 4
+    quantity_precision: 0
+
+# 策略配置
+strategies:
+  - name: "hyperliquid_trend_following"
+    enabled: true
+    symbols: ["BTC-PERP", "ETH-PERP"]
+    strategy_type: "trend_following"
+    params:
+      ema_fast: 12
+      ema_slow: 26
+      rsi_period: 14
+      position_size: 0.1
+      
+  - name: "hyperliquid_cross_perp_arbitrage"
+    enabled: false  # 需要实时数据验证
+    symbols: ["BTC-PERP", "ETH-PERP"]
+    strategy_type: "arbitrage"
+    params:
+      spread_threshold_bps: 5.0
+      max_position_ratio: 0.05
+
+# 风控配置
+risk:
+  global:
+    max_position_value: 100000.0
+    max_daily_loss: 5000.0
+    max_drawdown_pct: 3.0
+    
+  per_symbol:
+    "BTC-PERP":
+      max_position: 10.0
+      max_order_size: 1.0
+      cooldown_ms: 1000
+      
+    "ETH-PERP":
+      max_position: 100.0
+      max_order_size: 10.0
+      cooldown_ms: 1000
+      
+    "SOL-PERP":
+      max_position: 1000.0
+      max_order_size: 100.0
+      cooldown_ms: 500
+      
+    "SUI-PERP":
+      max_position: 10000.0
+      max_order_size: 1000.0
+      cooldown_ms: 500
+
+# 监控配置
+monitoring:
+  metrics_enabled: true
+  prometheus_port: 8080
+  health_check_interval_ms: 10000
+  
+  alerts:
+    connection_loss: true
+    execution_latency_ms: 100
+    price_deviation_pct: 5.0
+    
+# 日志配置
+logging:
+  level: "info"
+  structured: true
+  targets:
+    - type: "stdout"
+    - type: "file"
+      path: "./logs/hyperliquid_demo.log"
+      max_size_mb: 100
+      max_files: 5

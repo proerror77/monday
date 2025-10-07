@@ -1,0 +1,45 @@
+# 使用cargo-chef优化构建缓存
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+WORKDIR /app
+
+# 第一阶段：生成recipe（依赖清单）
+FROM chef AS planner
+# 只复制Cargo文件，不需要源代码
+COPY Cargo.standalone.toml Cargo.toml
+# 创建虚拟的main.rs以满足cargo要求
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo chef prepare --recipe-path recipe.json
+
+# 第二阶段：构建依赖（可缓存）
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# 构建依赖项 - 这一层会被缓存！
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# 现在复制源代码并构建
+COPY Cargo.standalone.toml Cargo.toml
+COPY src/ src/
+# 启用所有必要的features
+RUN cargo build --release --bin hft-collector \
+    --features "binance,binance-futures,bitget"
+
+# 第三阶段：最小运行时镜像
+FROM debian:bookworm-slim AS runtime
+WORKDIR /app
+
+# 只安装必要的运行时依赖
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制编译好的二进制
+COPY --from=builder /app/target/release/hft-collector /usr/local/bin/
+
+# 创建非root用户
+RUN useradd -m -u 1001 -s /bin/bash collector && \
+    chown -R collector:collector /app
+
+USER collector
+
+ENTRYPOINT ["hft-collector"]

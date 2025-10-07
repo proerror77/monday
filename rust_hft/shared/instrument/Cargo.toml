@@ -1,0 +1,18 @@
+[package]
+name = "hft-shared-instrument"
+version = "0.1.0"
+edition = "2021"
+description = "Shared instrument and venue catalog primitives"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_yaml = { version = "0.9" }
+hft-core = { package = "hft-core", path = "../../market-core/core" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lib]
+name = "shared_instrument"
+crate-type = ["rlib"]

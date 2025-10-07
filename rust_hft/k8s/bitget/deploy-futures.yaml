@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bitget-futures
+  labels:
+    app: collector
+    exchange: bitget
+    market: usdt-futures
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: collector
+      exchange: bitget
+      market: usdt-futures
+  template:
+    metadata:
+      labels:
+        app: collector
+        exchange: bitget
+        market: usdt-futures
+    spec:
+      containers:
+      - name: collector
+        image: your-registry/hft-collector:structure-v2
+        imagePullPolicy: IfNotPresent
+        args:
+          - multi
+          - --exchange
+          - bitget
+          - --ch-url
+          - $(CLICKHOUSE_URL)
+          - --database
+          - hft_db
+          - --batch-size
+          - "500"
+          - --flush-ms
+          - "3000"
+          - --depth-mode
+          - limited
+          - --depth-levels
+          - "20"
+          - --lob-mode
+          - snapshot
+        env:
+        - name: RUST_LOG
+          value: info
+        - name: CLICKHOUSE_URL
+          valueFrom:
+            secretKeyRef:
+              name: clickhouse-credentials
+              key: CLICKHOUSE_URL
+        - name: CLICKHOUSE_USER
+          valueFrom:
+            secretKeyRef:
+              name: clickhouse-credentials
+              key: CLICKHOUSE_USER
+        - name: CLICKHOUSE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: clickhouse-credentials
+              key: CLICKHOUSE_PASSWORD
+        - name: BITGET_MARKET
+          value: USDT-FUTURES
+        - name: BITGET_CHANNELS
+          value: books,books1,publicTrade,ticker
+        - name: SYMBOLS_FILE
+          value: /etc/collector/bitget_base.json
+        volumeMounts:
+        - name: whitelist
+          mountPath: /etc/collector
+          readOnly: true
+        resources:
+          requests:
+            cpu: 200m
+            memory: 256Mi
+          limits:
+            cpu: 400m
+            memory: 512Mi
+      volumes:
+      - name: whitelist
+        configMap:
+          name: bitget-whitelist
+          items:
+          - key: bitget_base.json
+            path: bitget_base.json
+

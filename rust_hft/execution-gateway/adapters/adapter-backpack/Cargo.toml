@@ -1,0 +1,24 @@
+[package]
+name = "hft-execution-adapter-backpack"
+version = "0.1.0"
+edition = "2021"
+description = "Backpack Exchange execution adapter"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { version = "1.0" }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.21"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+futures = { workspace = true }
+rust_decimal = { workspace = true }
+thiserror = "1.0"
+
+[lib]
+name = "adapter_backpack_execution"

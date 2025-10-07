@@ -1,0 +1,80 @@
+[package]
+name = "hft-engine"
+version = "0.1.0"
+edition = "2021"
+description = "單 writer 事件循環：Scheduler/Joiner/BarBuilder/Router"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../core" }
+snapshot = { package = "hft-snapshot", path = "../snapshot" }
+oms-core = { package = "hft-oms-core", path = "../../risk-control/oms-core" }
+portfolio-core = { package = "hft-portfolio-core", path = "../../risk-control/portfolio-core" }
+crossbeam = { workspace = true }
+crossbeam-utils = { version = "0.8", default-features = false }
+serde = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync", "rt", "macros"] }
+futures = { workspace = true }
+rust_decimal = { version = "1.33", features = ["serde"] }
+ports = { package = "hft-ports", path = "../ports" }
+instrument = { package = "hft-instrument", path = "../instrument" }
+chrono = { version = "0.4", features = ["serde"] }
+infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics" }
+rustc-hash = "1.1"
+
+[features]
+default = []
+# 僅在基準測試或實驗時啟用 lockfree_queue 模組導出
+bench-lockfree = []
+# 指標收集開關（向後兼容 infra-metrics）
+metrics = []
+infra-metrics = ["metrics"]
+legacy-sdk = []
+
+[dev-dependencies]
+hft-data-adapter-bitget = { path = "../../data-pipelines/adapters/adapter-bitget" }
+strategy-trend = { package = "hft-strategy-trend", path = "../../strategy-framework/strategies/trend" }
+strategy-arbitrage = { package = "hft-strategy-arbitrage", path = "../../strategy-framework/strategies/arbitrage" }
+async-stream = "0.3"
+num-traits = "0.2"
+serde_yaml = "0.9"
+async-trait = "0.1"
+
+[lib]
+name = "engine"
+ 
+
+[[example]]
+name = "s1_adapter_engine_demo"
+path = "examples/s1_adapter_engine_demo.rs"
+required-features = ["legacy-sdk"]
+
+[[example]]
+name = "s1_aggregation_test"
+path = "examples/s1_aggregation_test.rs"
+required-features = ["legacy-sdk"]
+
+[[example]]
+name = "s1_bitget_real_stream_demo"
+path = "examples/s1_bitget_real_stream_demo.rs"
+required-features = ["legacy-sdk"]
+
+[[example]]
+name = "s1_e2e_yaml_demo"
+path = "examples/s1_e2e_yaml_demo.rs"
+required-features = ["legacy-sdk"]
+
+[[example]]
+name = "s1_simple_demo"
+path = "examples/s1_simple_demo.rs"
+required-features = ["legacy-sdk"]
+
+[[example]]
+name = "s1_strategy_demo"
+path = "examples/s1_strategy_demo.rs"
+required-features = ["legacy-sdk"]
+
+[[example]]
+name = "s1_strategy_simple_demo"
+path = "examples/s1_strategy_simple_demo.rs"
+required-features = ["legacy-sdk"]

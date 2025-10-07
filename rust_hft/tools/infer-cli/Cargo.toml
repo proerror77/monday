@@ -1,0 +1,23 @@
+[package]
+name = "hft-infer-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Simple CLI to run ONNX inference on dataset_samples"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ndarray = "0.15"
+clickhouse = "0.12"
+hft-infer-onnx = { path = "../../strategy-framework/infer-onnx" }
+
+[[bin]]
+name = "hft-infer-cli"
+path = "src/main.rs"
+required-features = ["legacy-sdk"]
+
+[features]
+default = []
+legacy-sdk = []

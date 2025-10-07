@@ -1,0 +1,23 @@
+[package]
+name = "hft-data-adapter-hyperliquid"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+integration = { package = "hft-integration", path = "../../../market-core/integration" }
+async-trait = "0.1"
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tracing = { workspace = true }
+futures = { workspace = true }
+async-stream = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+simd-json = { version = "0.13", features = ["serde"] }
+tokio-tungstenite = { workspace = true }
+url = "2.5"
+rust_decimal = { workspace = true }
+
+[lib]
+name = "adapter_hyperliquid_data"

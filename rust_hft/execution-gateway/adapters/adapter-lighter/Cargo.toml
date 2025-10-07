@@ -1,0 +1,23 @@
+[package]
+name = "hft-execution-adapter-lighter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "adapter_lighter_execution"
+
+[dependencies]
+hft_core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+integration = { package = "hft-integration", path = "../../../market-core/integration" }
+async-trait = "0.1"
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tracing = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = "2.5"
+libloading = "0.8"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+rust_decimal = { workspace = true }
+

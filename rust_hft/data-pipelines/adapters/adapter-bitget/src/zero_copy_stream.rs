@@ -1,0 +1,551 @@
+//! Bitget 零拷貝 WebSocket 適配器 - 直接寫入 SPSC
+//!
+//! 優化要點：
+//! 1. 移除 tokio::mpsc 中間層，直接寫入 EventIngester
+//! 2. 使用 simd-json 借用模式減少分配
+//! 3. 復用緩衝區，統一時間戳處理
+
+#![allow(dead_code)]
+
+use async_trait::async_trait;
+use simd_json::prelude::{ValueAsContainer, ValueAsScalar, ValueObjectAccess};
+use std::sync::Arc;
+use tracing::{debug, error, info, trace, warn};
+
+use engine::dataflow::EventIngester;
+use hft_core::*;
+use integration::ws::{MessageHandler, ReconnectingWsClient, WsClientConfig};
+use ports::*;
+
+/// 零拷貝 Bitget 市場流
+pub struct ZeroCopyBitgetStream {
+    ws_client: Option<ReconnectingWsClient>,
+    event_ingester: Option<Arc<std::sync::Mutex<EventIngester>>>,
+    subscribed_symbols: Vec<Symbol>,
+    /// 復用的 JSON 解析緩衝區
+    parse_buffer: Vec<u8>,
+}
+
+impl ZeroCopyBitgetStream {
+    /// 創建新的零拷貝 Bitget 流
+    pub fn new() -> Self {
+        Self {
+            ws_client: None,
+            event_ingester: None,
+            subscribed_symbols: Vec::new(),
+            parse_buffer: Vec::with_capacity(4096), // 預分配 4KB 緩衝
+        }
+    }
+
+    /// 設置事件攝取器（直接寫入 SPSC）
+    pub fn set_ingester(&mut self, ingester: Arc<std::sync::Mutex<EventIngester>>) {
+        self.event_ingester = Some(ingester);
+    }
+
+    fn create_ws_config() -> WsClientConfig {
+        // 放寬訊息/幀上限以容納多品種 LOB/Trade 聚合
+        WsClientConfig {
+            url: "wss://ws.bitget.com/v2/ws/public".to_string(),
+            heartbeat_interval: std::time::Duration::from_secs(30),
+            reconnect_interval: std::time::Duration::from_secs(5),
+            max_reconnect_attempts: 10,
+            tcp_nodelay: true,            // HFT 必須啟用
+            disable_compression: true,    // HFT 必須禁用壓縮
+            max_message_size: 512 * 1024, // 512KB 訊息上限
+            max_frame_size: 256 * 1024,   // 256KB 幀上限
+        }
+    }
+
+    /// 零拷貝解析訂單簿數據
+    fn parse_orderbook_zero_copy(
+        &mut self,
+        json_bytes: &[u8],
+        symbol: &Symbol,
+    ) -> Result<MarketSnapshot, HftError> {
+        // 使用 simd-json 借用模式解析
+        self.parse_buffer.clear();
+        self.parse_buffer.extend_from_slice(json_bytes);
+
+        let value = simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| {
+            HftError::Generic {
+                message: format!("JSON 解析失败: {}", e),
+            }
+        })?;
+
+        // 借用模式訪問，減少字符串分配
+        let data = value
+            .get("data")
+            .and_then(|d| d.as_array()?.get(0))
+            .ok_or_else(|| HftError::Generic {
+                message: "無效的訂單簿數據".to_string(),
+            })?;
+
+        // 統一時間戳處理 - 區分交易所和本地時間戳
+        let exchange_ts = data
+            .get("ts")
+            .and_then(|ts| ts.as_str())
+            .and_then(|ts_str| ts_str.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let unified_ts = if exchange_ts > 0 {
+            // 將毫秒轉為微秒並創建統一時間戳
+            UnifiedTimestamp::auto(exchange_ts * 1000)
+        } else {
+            // 使用當前時間作為回退
+            UnifiedTimestamp::default()
+        };
+
+        let mut bids = Vec::new();
+        let mut asks = Vec::new();
+
+        // 零拷貝處理 bids
+        if let Some(bids_array) = data.get("bids").and_then(|b| b.as_array()) {
+            for bid_item in bids_array {
+                if let Some(bid_array) = bid_item.as_array() {
+                    if bid_array.len() >= 3 {
+                        let price_str = bid_array[0].as_str().unwrap_or("0");
+                        let qty_str = bid_array[1].as_str().unwrap_or("0");
+
+                        // 直接解析到 FixedPrice/FixedQuantity，避免 Decimal 中間轉換
+                        if let (Ok(price), Ok(qty)) =
+                            (price_str.parse::<f64>(), qty_str.parse::<f64>())
+                        {
+                            bids.push(BookLevel {
+                                price: Price::from_f64(price).unwrap_or(Price::zero()),
+                                quantity: Quantity::from_f64(qty).unwrap_or(Quantity::zero()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 零拷貝處理 asks
+        if let Some(asks_array) = data.get("asks").and_then(|a| a.as_array()) {
+            for ask_item in asks_array {
+                if let Some(ask_array) = ask_item.as_array() {
+                    if ask_array.len() >= 3 {
+                        let price_str = ask_array[0].as_str().unwrap_or("0");
+                        let qty_str = ask_array[1].as_str().unwrap_or("0");
+
+                        if let (Ok(price), Ok(qty)) =
+                            (price_str.parse::<f64>(), qty_str.parse::<f64>())
+                        {
+                            asks.push(BookLevel {
+                                price: Price::from_f64(price).unwrap_or(Price::zero()),
+                                quantity: Quantity::from_f64(qty).unwrap_or(Quantity::zero()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 按價格排序
+        bids.sort_by(|a, b| b.price.cmp(&a.price)); // 降序
+        asks.sort_by(|a, b| a.price.cmp(&b.price)); // 升序
+
+        Ok(MarketSnapshot {
+            symbol: symbol.clone(),
+            timestamp: unified_ts.into(), // 向後兼容轉換
+            bids,
+            asks,
+            sequence: 0, // Bitget 暫時沒有序列號
+            source_venue: Some(VenueId::BITGET),
+        })
+    }
+
+    /// 零拷貝解析成交數據
+    fn parse_trade_zero_copy(&mut self, json_bytes: &[u8]) -> Result<Trade, HftError> {
+        self.parse_buffer.clear();
+        self.parse_buffer.extend_from_slice(json_bytes);
+
+        let value = simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| {
+            HftError::Generic {
+                message: format!("JSON 解析失败: {}", e),
+            }
+        })?;
+
+        let data = value
+            .get("data")
+            .and_then(|d| d.as_array()?.get(0))
+            .ok_or_else(|| HftError::Generic {
+                message: "無效的成交數據".to_string(),
+            })?;
+
+        let symbol_str = data.get("instId").and_then(|s| s.as_str()).unwrap_or("");
+
+        let exchange_ts = data
+            .get("ts")
+            .and_then(|ts| ts.as_str())
+            .and_then(|ts_str| ts_str.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let unified_ts = if exchange_ts > 0 {
+            // 將毫秒轉為微秒並創建統一時間戳
+            UnifiedTimestamp::auto(exchange_ts * 1000)
+        } else {
+            // 使用當前時間作為回退
+            UnifiedTimestamp::default()
+        };
+
+        let price = data
+            .get("px")
+            .and_then(|p| p.as_str())
+            .and_then(|p_str| p_str.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        let quantity = data
+            .get("sz")
+            .and_then(|q| q.as_str())
+            .and_then(|q_str| q_str.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        let side = data
+            .get("side")
+            .and_then(|s| s.as_str())
+            .map(|side_str| match side_str {
+                "buy" => Side::Buy,
+                "sell" => Side::Sell,
+                _ => Side::Buy, // 默認
+            })
+            .unwrap_or(Side::Buy);
+
+        let trade_id = data
+            .get("tradeId")
+            .and_then(|id| id.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(Trade {
+            symbol: Symbol(symbol_str.to_string()),
+            timestamp: unified_ts.into(), // 向後兼容轉換
+            price: Price::from_f64(price).unwrap_or(Price::zero()),
+            quantity: Quantity::from_f64(quantity).unwrap_or(Quantity::zero()),
+            side,
+            trade_id,
+            source_venue: Some(VenueId::BITGET),
+        })
+    }
+}
+
+/// 零拷貝消息處理器 - 直接寫入 EventIngester
+pub struct ZeroCopyMessageHandler {
+    event_ingester: Arc<std::sync::Mutex<EventIngester>>,
+    subscribed_symbols: Vec<Symbol>,
+    /// 復用緩衝區
+    buffer: Vec<u8>,
+}
+
+impl ZeroCopyMessageHandler {
+    pub fn new(ingester: Arc<std::sync::Mutex<EventIngester>>, symbols: Vec<Symbol>) -> Self {
+        Self {
+            event_ingester: ingester,
+            subscribed_symbols: symbols,
+            buffer: Vec::with_capacity(4096),
+        }
+    }
+
+    /// 直接攝取市場事件，跳過 tokio::mpsc
+    fn ingest_event_direct(&self, event: MarketEvent) {
+        if let Ok(mut ingester) = self.event_ingester.lock() {
+            match ingester.ingest(event) {
+                Ok(()) => {
+                    trace!("零拷貝事件攝取成功");
+                }
+                Err(e) => {
+                    warn!("零拷貝事件攝取失敗: {}", e);
+                }
+            }
+        } else {
+            error!("無法獲取 EventIngester 鎖");
+        }
+    }
+}
+
+impl MessageHandler for ZeroCopyMessageHandler {
+    fn handle_connected(
+        &mut self,
+        _client: &mut integration::ws::WsClient,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!("零拷貝 Bitget WebSocket 連接成功");
+
+        // 發送訂閱請求 - 簡化處理，暫時只記錄
+        for symbol in &self.subscribed_symbols {
+            debug!("訂閱 {} 的訂單簿數據", symbol.0);
+        }
+
+        Ok(())
+    }
+
+    fn handle_message(
+        &mut self,
+        message: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 統計時間戳：開始解析
+        let parse_start = hft_core::now_micros();
+
+        // 零拷貝解析 JSON - 直接處理不存儲
+        let mut buffer = message.into_bytes();
+        let value = simd_json::to_borrowed_value(&mut buffer)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        // 檢查消息類型
+        if let Some(arg) = value.get("arg") {
+            let channel = arg.get("channel").and_then(|c| c.as_str()).unwrap_or("");
+            let inst_id = arg.get("instId").and_then(|id| id.as_str()).unwrap_or("");
+
+            match channel {
+                "books15" => {
+                    // 處理訂單簿快照
+                    let symbol = Symbol(inst_id.to_string());
+
+                    // 提取交易所時間戳並創建統一時間戳
+                    let exchange_ts = value
+                        .get("data")
+                        .and_then(|data_array| data_array.as_array()?.get(0))
+                        .and_then(|data_item| data_item.get("ts"))
+                        .and_then(|ts| ts.as_str())
+                        .and_then(|ts_str| ts_str.parse::<u64>().ok())
+                        .unwrap_or(0);
+
+                    let unified_ts = if exchange_ts > 0 {
+                        // Bitget 時間戳通常是毫秒，轉為微秒
+                        UnifiedTimestamp::auto(exchange_ts * 1000)
+                    } else {
+                        UnifiedTimestamp::default()
+                    };
+
+                    // 這裡需要實現完整的訂單簿解析
+                    // 暫時創建一個最小快照用於演示
+                    let snapshot = MarketSnapshot {
+                        symbol: symbol.clone(),
+                        timestamp: unified_ts.into(), // 向後兼容轉換
+                        bids: Vec::new(),
+                        asks: Vec::new(),
+                        sequence: 0,
+                        source_venue: Some(VenueId::BITGET),
+                    };
+
+                    let event = MarketEvent::Snapshot(snapshot);
+                    self.ingest_event_direct(event);
+
+                    // 記錄解析延遲
+                    let parse_latency = hft_core::now_micros() - parse_start;
+                    trace!("零拷貝解析延遲: {}μs", parse_latency);
+                }
+                "trade" | "trades" => {
+                    // 處理成交數據
+                    if let Some(data_arr) = value.get("data").and_then(|d| d.as_array()) {
+                        for item in data_arr.iter() {
+                            let symbol_str = item
+                                .get("instId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(inst_id);
+                            // 解析時間戳（毫秒 -> 微秒）
+                            let exchange_ts = item
+                                .get("ts")
+                                .and_then(|ts| ts.as_str())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .or_else(|| item.get("ts").and_then(|v| v.as_u64()))
+                                .unwrap_or(0);
+                            let unified_ts = if exchange_ts > 0 {
+                                UnifiedTimestamp::auto(exchange_ts.saturating_mul(1000))
+                            } else {
+                                UnifiedTimestamp::default()
+                            };
+
+                            // 解析價格/數量（優先字串，再嘗試數字）
+                            let price = item
+                                .get("px")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .or_else(|| {
+                                    item.get("price")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                })
+                                .or_else(|| item.get("px").and_then(|v| v.as_f64()))
+                                .or_else(|| item.get("price").and_then(|v| v.as_f64()))
+                                .unwrap_or(0.0);
+                            let qty = item
+                                .get("sz")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .or_else(|| {
+                                    item.get("size")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                })
+                                .or_else(|| item.get("sz").and_then(|v| v.as_f64()))
+                                .or_else(|| item.get("size").and_then(|v| v.as_f64()))
+                                .unwrap_or(0.0);
+
+                            let side = item.get("side").and_then(|v| v.as_str()).unwrap_or("buy");
+                            let side = match side {
+                                "buy" | "BUY" => Side::Buy,
+                                "sell" | "SELL" => Side::Sell,
+                                _ => Side::Buy,
+                            };
+                            let trade_id = item
+                                .get("tradeId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            let event = MarketEvent::Trade(Trade {
+                                symbol: Symbol(symbol_str.to_string()),
+                                timestamp: unified_ts.into(),
+                                price: Price::from_f64(price).unwrap_or(Price::zero()),
+                                quantity: Quantity::from_f64(qty).unwrap_or(Quantity::zero()),
+                                side,
+                                trade_id,
+                                source_venue: Some(VenueId::BITGET),
+                            });
+                            self.ingest_event_direct(event);
+                        }
+                    }
+                    // 記錄解析延遲
+                    let parse_latency = hft_core::now_micros() - parse_start;
+                    trace!("零拷貝成交解析延遲: {}μs", parse_latency);
+                }
+                _ => {
+                    debug!("未知頻道: {}", channel);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_disconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        warn!("零拷貝 Bitget WebSocket 連接中斷");
+
+        let disconnect_event = MarketEvent::Disconnect {
+            reason: "Connection lost".to_string(),
+        };
+
+        self.ingest_event_direct(disconnect_event);
+        Ok(())
+    }
+}
+
+/// 零拷貝市場流實現
+#[async_trait]
+impl MarketStream for ZeroCopyBitgetStream {
+    async fn health(&self) -> ConnectionHealth {
+        // 簡單的健康檢查實現
+        if self.event_ingester.is_some() {
+            ConnectionHealth {
+                connected: true,
+                latency_ms: None,
+                last_heartbeat: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64,
+            }
+        } else {
+            ConnectionHealth {
+                connected: false,
+                latency_ms: None,
+                last_heartbeat: 0,
+            }
+        }
+    }
+
+    async fn connect(&mut self) -> Result<(), HftError> {
+        // 連接邏輯，這裡簡化處理
+        info!("零拷貝 Bitget 流連接中");
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> Result<(), HftError> {
+        // 斷開連接邏輯
+        info!("零拷貝 Bitget 流斷開連接");
+        self.ws_client = None;
+        Ok(())
+    }
+
+    async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>> {
+        info!("零拷貝 Bitget 流開始訂閱 {} 個符號", symbols.len());
+
+        if self.event_ingester.is_none() {
+            return Err(HftError::Generic {
+                message: "EventIngester 未設置".to_string(),
+            });
+        }
+
+        // 創建 WebSocket 客戶端
+        let ws_config = Self::create_ws_config();
+        let mut ws_client = ReconnectingWsClient::new(ws_config);
+
+        // 創建零拷貝消息處理器
+        let handler = ZeroCopyMessageHandler::new(
+            self.event_ingester.as_ref().unwrap().clone(),
+            symbols.clone(),
+        );
+
+        // 在後台任務中運行 WebSocket 客戶端
+        tokio::spawn(async move {
+            if let Err(e) = ws_client.run_with_handler(handler).await {
+                error!("零拷貝 Bitget WebSocket 客戶端錯誤: {}", e);
+            }
+        });
+
+        // 由於現在直接寫入 EventIngester，這裡返回一個狀態流
+        // 實際的事件會通過 SPSC 流向引擎
+        let stream = async_stream::stream! {
+            // 這個流現在主要用於保持接口兼容和狀態報告
+            // 實際事件通過 EventIngester 直接進入引擎
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                // 定期發送健康檢查事件
+                yield Ok(MarketEvent::Disconnect {
+                    reason: "health_check".to_string()
+                });
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn test_zero_copy_stream_creation() {
+        let stream = ZeroCopyBitgetStream::new();
+        assert!(stream.event_ingester.is_none());
+        assert_eq!(stream.subscribed_symbols.len(), 0);
+        assert_eq!(stream.parse_buffer.capacity(), 4096);
+    }
+
+    #[tokio::test]
+    async fn test_zero_copy_json_parsing() {
+        let mut stream = ZeroCopyBitgetStream::new();
+        let symbol = Symbol("BTCUSDT".to_string());
+
+        // 模擬 Bitget 訂單簿 JSON 數據
+        let json_data = r#"
+        {
+            "data": [{
+                "asks": [["67000.5", "0.1", 1], ["67001.0", "0.2", 1]],
+                "bids": [["66999.5", "0.15", 1], ["66999.0", "0.25", 1]],
+                "ts": "1638360000000"
+            }]
+        }
+        "#;
+
+        let result = stream.parse_orderbook_zero_copy(json_data.as_bytes(), &symbol);
+        assert!(result.is_ok());
+
+        let snapshot = result.unwrap();
+        assert_eq!(snapshot.symbol.0, "BTCUSDT");
+        assert_eq!(snapshot.timestamp, 1638360000000);
+        assert_eq!(snapshot.bids.len(), 2);
+        assert_eq!(snapshot.asks.len(), 2);
+    }
+}

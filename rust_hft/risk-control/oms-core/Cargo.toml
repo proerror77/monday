@@ -1,0 +1,18 @@
+[package]
+name = "hft-oms-core"
+version = "0.1.0"
+edition = "2021"
+description = "統一訂單狀態機、冪等、路由（純邏輯，無網路）"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+hft-core = { package = "hft-core", path = "../../market-core/core" }
+ports = { package = "hft-ports", path = "../../market-core/ports" }
+rust_decimal = { version = "1.33", features = ["serde"] }
+tracing = { workspace = true }
+
+[features]
+default = []
+
+[lib]
+name = "oms_core"

@@ -1,0 +1,56 @@
+engine:
+  queue_capacity: 32768
+  stale_us: 500000
+  top_n: 10
+  flip_policy: { OnTimer: 100000 }
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  auto_cancel_exchange_only: false
+
+# 新的帳戶驅動配置方式（取代 venues 直填憑證）：
+accounts:
+  - id: binance_main
+    venue_type: Binance
+    rest: "https://api.binance.com"
+    ws_private: "wss://stream.binance.com:9443/ws"
+    execution_mode: "Live"   # 或 "Paper"
+    credentials:
+      api_key: "${BINANCE_API_KEY}"
+      secret: "${BINANCE_SECRET}"
+
+  - id: okx_prod
+    venue_type: Okx
+    rest: "https://www.okx.com"
+    ws_private: "wss://ws.okx.com:8443/ws/v5/private"
+    execution_mode: "Live"
+    credentials:
+      api_key: "${OKX_API_KEY}"
+      secret: "${OKX_SECRET}"
+      passphrase: "${OKX_PASSPHRASE}"
+
+  - id: bybit_test
+    venue_type: Bybit
+    rest: "https://api.bybit.com"
+    ws_private: "wss://stream.bybit.com/v5/private"
+    execution_mode: "Testnet"  # Live / Paper / Testnet
+    credentials:
+      api_key: "${BYBIT_API_KEY}"
+      secret: "${BYBIT_SECRET}"
+
+# 策略（示例可保留空陣列，或依需求填入）
+strategies: []
+
+# 風控（需提供基本限額）
+risk:
+  risk_type: "Default"
+  global_position_limit: 100
+  global_notional_limit: 50000
+  max_daily_trades: 2000
+  max_orders_per_second: 50
+  staleness_threshold_us: 300000
+  enhanced: null
+  strategy_overrides: {}
+
+router: null
+infra: null
+

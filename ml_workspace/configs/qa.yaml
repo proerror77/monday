@@ -1,0 +1,28 @@
+host: ${CLICKHOUSE_HOST}
+user: ${CLICKHOUSE_USERNAME}
+password: ${CLICKHOUSE_PASSWORD}
+database: ${CLICKHOUSE_DATABASE}
+
+symbol: WLFIUSDT
+start: 2025-09-03T00:00:00Z
+end: 2025-09-05T23:59:59Z
+
+tables:
+  - bitget_futures_bbo
+  - bitget_futures_depth
+  - bitget_futures_trades
+
+list_tables: true
+overlap: true
+top_gaps: 5
+
+compat_profile: spot
+schema_dump_tables: [spot_ticker, spot_books15, spot_trades]
+search_symbol: WLFI
+search_tables: [spot_ticker, spot_books15, spot_trades]
+load_tests_hours: 240
+
+range_compare:
+  raw: hft.bitget_futures_bbo
+  feature: hft.simple_mid_term_features
+  symbol: ETHUSDT

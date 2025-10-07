@@ -12,6 +12,7 @@ members = [
 
     # Data Pipelines
     "data-pipelines/core",
+    "data-pipelines/adapters-common",
     "data-pipelines/adapters/adapter-bitget",
     "data-pipelines/adapters/adapter-binance",
     "data-pipelines/adapters/adapter-backpack",

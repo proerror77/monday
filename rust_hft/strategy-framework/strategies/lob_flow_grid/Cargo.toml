@@ -1,0 +1,18 @@
+[package]
+name = "hft-strategy-lob-flow-grid"
+version = "0.1.0"
+edition = "2021"
+description = "LOB Flow driven adaptive grid strategy for crypto venues"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+
+[lib]
+name = "strategy_lob_flow_grid"
+
