@@ -293,6 +293,13 @@ def cmd_backtest_dl(args: argparse.Namespace) -> None:
             plot_equity_curve(result['trades'], float(args.initial_equity), str(outp))
         except Exception as e:
             print(json.dumps({"ok": False, "error": f"plot failed: {e}"}, ensure_ascii=False))
+    # optional: save summary
+    if args.summary_output:
+        summ = {k: v for k, v in result.items() if k != 'trades'}
+        outp = Path(args.summary_output)
+        outp.parent.mkdir(parents=True, exist_ok=True)
+        with open(outp, 'w', encoding='utf-8') as f:
+            json.dump(summ, f, ensure_ascii=False, indent=2)
 
     print(json.dumps({"ok": True, "summary": {k: v for k, v in result.items() if k != 'trades'}, "num_trades": result.get('num_trades', 0)}, ensure_ascii=False, indent=2))
 
@@ -370,6 +377,7 @@ def build_parser() -> argparse.ArgumentParser:
     bt_dl.add_argument("--database", default=None)
     bt_dl.add_argument("--trades_output", default=None, help="Optional path to save trades JSON")
     bt_dl.add_argument("--plot_output", default=None, help="Optional path to save equity curve image (e.g., equity.png)")
+    bt_dl.add_argument("--summary_output", default=None, help="Optional path to save backtest summary JSON")
     bt_dl.add_argument("--refresh", action="store_true", help="Bypass local cache and requery features")
     bt_dl.set_defaults(func=cmd_backtest_dl)
 

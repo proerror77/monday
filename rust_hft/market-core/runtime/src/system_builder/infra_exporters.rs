@@ -13,7 +13,7 @@ mod redis_export {
     /// 啟動 Redis 導出任務（從 system_builder.rs 拆分）
     pub async fn spawn_redis_exporter(
         this: &mut SystemRuntime,
-        redis_config: super::super::RedisConfig,
+        redis_config: super::RedisConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // 計算中間價格
         fn calculate_mid_price(orderbook: &TopNSnapshot) -> Option<f64> {
@@ -117,7 +117,7 @@ mod redis_export {
         #[cfg(feature = "redis")]
         pub async fn spawn_redis_exporter(
             &mut self,
-            redis_config: super::super::RedisConfig,
+            redis_config: super::RedisConfig,
         ) -> Result<(), Box<dyn std::error::Error>> {
             spawn_redis_exporter(self, redis_config).await
         }
@@ -171,7 +171,7 @@ mod clickhouse_export {
     /// 啟動 ClickHouse Writer 任務（從 system_builder.rs 拆分）
     pub async fn spawn_clickhouse_writer(
         this: &mut SystemRuntime,
-        clickhouse_config: super::super::ClickHouseConfig,
+        clickhouse_config: super::ClickHouseConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let ch_url = clickhouse_config.url.clone();
         let ch_db = clickhouse_config.database.clone().unwrap_or_else(|| "default".into());
@@ -369,7 +369,7 @@ mod clickhouse_export {
         #[cfg(feature = "clickhouse")]
         pub async fn spawn_clickhouse_writer(
             &mut self,
-            clickhouse_config: super::super::ClickHouseConfig,
+            clickhouse_config: super::ClickHouseConfig,
         ) -> Result<(), Box<dyn std::error::Error>> {
             spawn_clickhouse_writer(self, clickhouse_config).await
         }
