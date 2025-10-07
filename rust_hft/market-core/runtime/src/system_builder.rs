@@ -31,6 +31,9 @@ mod runtime_management;
 mod config_types; // 預留：後續逐步搬移配置型別
 mod infra_exporters; // 預留：後續搬移 Redis/ClickHouse 導出
 
+// 將部分配置型別從子模組對外公開
+pub use config_types::{ClickHouseConfig, InfraConfig, RedisConfig};
+
 #[cfg(feature = "redis")]
 use serde_json;
 
@@ -605,25 +608,6 @@ pub struct StrategyEnhancedRiskOverride {
     pub dry_run_mode: Option<bool>,
 }
 
-/// 基礎設施配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InfraConfig {
-    pub redis: Option<RedisConfig>,
-    pub clickhouse: Option<ClickHouseConfig>,
-}
-
-/// Redis 配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RedisConfig {
-    pub url: String,
-}
-
-/// ClickHouse 配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClickHouseConfig {
-    pub url: String,
-    pub database: Option<String>,
-}
 
 /// 系統建構器 - 使用構建者模式
 pub struct SystemBuilder {
