@@ -1325,8 +1325,9 @@ impl SystemRuntime {
         Ok(())
     }
 
-    /// 熱更新指定策略實例的參數
-    pub async fn update_strategy_params(
+    /// 熱更新指定策略實例的參數（已遷移至 runtime_management）
+    #[allow(dead_code)]
+    pub async fn update_strategy_params_legacy(
         &mut self,
         strategy_id: &str,
         new_params: SharedStrategyParams,
@@ -1413,13 +1414,15 @@ impl SystemRuntime {
         Ok(())
     }
 
-    /// 獲取市場視圖快照
-    pub async fn get_market_view(&self) -> Arc<engine::aggregation::MarketView> {
+    /// 獲取市場視圖快照（已遷移至 runtime_management）
+    #[allow(dead_code)]
+    pub async fn get_market_view_legacy(&self) -> Arc<engine::aggregation::MarketView> {
         self.engine.lock().await.get_market_view()
     }
 
-    /// 獲取賬戶視圖快照
-    pub async fn get_account_view(&self) -> Arc<ports::AccountView> {
+    /// 獲取賬戶視圖快照（已遷移至 runtime_management）
+    #[allow(dead_code)]
+    pub async fn get_account_view_legacy(&self) -> Arc<ports::AccountView> {
         self.engine.lock().await.get_account_view()
     }
 
@@ -1429,7 +1432,8 @@ impl SystemRuntime {
 
     /// 取消指定策略的所有未結訂單（非阻塞）：
     /// 返回已下發取消請求的訂單數量
-    pub async fn cancel_orders_for_strategy(&self, strategy_id: &str) -> usize {
+    #[allow(dead_code)]
+    pub async fn cancel_orders_for_strategy_legacy(&self, strategy_id: &str) -> usize {
         // 收集該策略未結訂單 (order_id, symbol)
         let pairs = {
             let eng = self.engine.lock().await;
@@ -1448,7 +1452,8 @@ impl SystemRuntime {
     }
 
     /// 熱更新風控配置：替換風控管理器並應用新的策略覆蓋
-    pub async fn update_risk_config(
+    #[allow(dead_code)]
+    pub async fn update_risk_config_legacy(
         &mut self,
         new_risk: RiskConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1473,7 +1478,8 @@ impl SystemRuntime {
     }
 
     /// 測試：通过执行队列发送订单意图 (异步处理)
-    pub async fn place_test_order(
+    #[allow(dead_code)]
+    pub async fn place_test_order_legacy(
         &self,
         symbol: &str,
     ) -> Result<hft_core::OrderId, Box<dyn std::error::Error>> {
