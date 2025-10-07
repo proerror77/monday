@@ -233,15 +233,25 @@ impl DbSink for ClickHouseHttpSink {
                     if !resp.status().is_success() {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
-                        tracing::error!("Failed to insert {} rows to {}: HTTP {} - {}",
-                            rows.len(), table_full, status, body);
+                        tracing::error!(
+                            "Failed to insert {} rows to {}: HTTP {} - {}",
+                            rows.len(),
+                            table_full,
+                            status,
+                            body
+                        );
                         Ok(0)
                     } else {
                         Ok(rows.len())
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Request error inserting {} rows to {}: {}", rows.len(), table_full, e);
+                    tracing::error!(
+                        "Request error inserting {} rows to {}: {}",
+                        rows.len(),
+                        table_full,
+                        e
+                    );
                     Ok(0)
                 }
             }

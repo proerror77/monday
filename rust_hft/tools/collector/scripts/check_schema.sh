@@ -48,7 +48,9 @@ for ex in "${EXCHANGES[@]}"; do
 done
 
 echo "Checking tables in ${CH_DATABASE} on ${CH_URL}" >&2
-RESP=$(curl -sS -u "$CH_USER:$CH_PASSWORD" -H 'Content-Type: text/plain' --data-binary "SHOW TABLES FROM ${CH_DATABASE}" "$CH_URL/")
+curl_flags=( -sS )
+if [ "${CH_INSECURE:-0}" = "1" ]; then curl_flags+=( -k ); fi
+RESP=$(curl "${curl_flags[@]}" -u "$CH_USER:$CH_PASSWORD" -H 'Content-Type: text/plain' --data-binary "SHOW TABLES FROM ${CH_DATABASE}" "$CH_URL/")
 missing=()
 for t in "${TABLES[@]}"; do
   if ! echo "$RESP" | awk '{print $1}' | grep -qx "$t"; then

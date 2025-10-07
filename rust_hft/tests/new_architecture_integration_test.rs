@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-sdk")]
+
 /*!
  * 新架构集成测试 (New Architecture Integration Test)
  *

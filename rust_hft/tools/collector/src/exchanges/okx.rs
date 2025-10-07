@@ -577,10 +577,14 @@ impl Exchange for OkxExchange {
                             "asks_qty": asks_qty,
                             "source": channel,
                         });
-                        buffers
-                            .spot
-                            .snapshots
-                            .push(serde_json::to_string(&snapshot)?);
+                        let line = serde_json::to_string(&snapshot)?;
+                        if is_deriv {
+                            if let Some(f) = buffers.futures_mut() {
+                                f.snapshots.push(line);
+                            }
+                        } else {
+                            buffers.spot.snapshots.push(line);
+                        }
                     }
                 }
             }
@@ -706,11 +710,7 @@ impl Exchange for OkxExchange {
         Ok(())
     }
 
-    async fn flush_data(
-        &self,
-        database: &str,
-        buffers: &mut MessageBuffers,
-    ) -> Result<()> {
+    async fn flush_data(&self, database: &str, buffers: &mut MessageBuffers) -> Result<()> {
         let sink = crate::db::get_sink_async(database).await?;
 
         buffers
@@ -739,8 +739,12 @@ impl Exchange for OkxExchange {
             .flush_futures_table(&sink, "okx_futures_ticker", |f| &mut f.ticker)
             .await?;
 
+        // 通用快照：現貨 + 永續
         buffers
             .flush_spot_table(&sink, "snapshot_books", |spot| &mut spot.snapshots)
+            .await?;
+        buffers
+            .flush_futures_table(&sink, "snapshot_books", |f| &mut f.snapshots)
             .await?;
 
         let _ = crate::spool::drain(&sink).await;

@@ -38,6 +38,16 @@ run-live: ## 運行真盤應用
 	@echo "💰 啟動真盤交易..."
 	cargo run -p hft-live --features="bitget,trend-strategy,metrics"
 
+run-quotes-only: ## 運行只行情（Binance）
+	@echo "📈 啟動只行情（Binance）..."
+	cargo run -p hft-live --features="binance" -- \
+		--config config/dev/binance_quotes_only.yaml --exit-after-ms 15000
+
+run-multi-quotes: ## 運行多交易所只行情（Binance/Bitget/Aster）
+	@echo "📈 啟動多交易所只行情（Binance/Bitget/Aster）..."
+	cargo run -p hft-live --features="binance,bitget,asterdex,metrics" -- \
+		--config config/prod/system_accounts_multi_quotes_only.yaml --exit-after-ms 30000
+
 run-paper: ## 運行模擬盤應用  
 	@echo "📊 啟動模擬盤交易..."
 	cargo run -p hft-paper

@@ -3,7 +3,7 @@
  *
  * Validates that the system meets CLAUDE.md performance requirements:
  * - Latency: p99 ≤ 25 μs from market data to order
- * - Throughput: ≥ 100,000 ops/sec orderbook updates  
+ * - Throughput: ≥ 100,000 ops/sec orderbook updates
  * - Memory: ≤ 10MB per trading pair
  * - Stability: < 3 WebSocket reconnections per hour
  */

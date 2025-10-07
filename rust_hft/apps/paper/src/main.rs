@@ -1,10 +1,10 @@
 //! HFT 模擬盤應用
-//! 
+//!
 //! 零風險模式，適用於策略驗證和調試
 
 use clap::Parser;
-use tracing::{info, warn};
 use runtime::{SystemBuilder, SystemConfig};
+use tracing::{info, warn};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -12,7 +12,7 @@ struct Args {
     /// 配置檔案路徑
     #[arg(short, long, default_value = "config/dev/system.yaml")]
     config: String,
-    
+
     /// 啟動後自動退出的毫秒數（用於測試）
     #[arg(long)]
     exit_after_ms: Option<u64>,
@@ -21,12 +21,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化日誌
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
-    
+    tracing_subscriber::fmt().with_env_filter("info").init();
+
     let args = Args::parse();
-    
+
     info!("啟動 HFT 模擬盤系統");
     info!("配置檔案: {}", args.config);
 
@@ -43,10 +41,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .build()
         }
     };
-    
+
     // 啟動系統
     system.start().await?;
-    
+
     info!("模擬盤系統正在運行...");
 
     // 保持運行直到收到停止信號或到達自動退出時間
@@ -58,12 +56,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         tokio::signal::ctrl_c().await?;
     }
-    
+
     info!("收到停止信號，正在關閉系統...");
-    
+
     // 優雅停止系統
     system.stop().await?;
-    
+
     Ok(())
 }
-

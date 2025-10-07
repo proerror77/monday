@@ -111,7 +111,13 @@ fn decompress_lz4_to_vec(mut rdr: Decoder<File>) -> Result<Vec<u8>> {
 fn sanitize_table_name(table: &str) -> String {
     table
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -220,15 +226,21 @@ pub async fn drain(sink: &Arc<dyn DbSink>) -> Result<usize> {
         };
         let table = match serde_json::from_str::<serde_json::Value>(header)
             .ok()
-            .and_then(|v| v.get("table").and_then(|x| x.as_str()).map(|s| s.to_string()))
-        {
+            .and_then(|v| {
+                v.get("table")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+            }) {
             Some(t) => t,
             None => {
                 let _ = fs::remove_file(&path);
                 continue;
             }
         };
-        let rows: Vec<String> = lines.map(|ln| ln.to_string()).filter(|ln| !ln.is_empty()).collect();
+        let rows: Vec<String> = lines
+            .map(|ln| ln.to_string())
+            .filter(|ln| !ln.is_empty())
+            .collect();
         if rows.is_empty() {
             let _ = fs::remove_file(&path);
             continue;
@@ -251,4 +263,3 @@ pub async fn drain(sink: &Arc<dyn DbSink>) -> Result<usize> {
     }
     Ok(done_rows)
 }
-

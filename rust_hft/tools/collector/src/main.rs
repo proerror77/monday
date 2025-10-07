@@ -8,8 +8,8 @@ use anyhow::Result;
 use clap::Parser;
 use clickhouse::Client;
 use exchanges::{create_exchange, DepthMode, ExchangeContext, MessageBuffers};
-use http::Request;
 use futures::{SinkExt, StreamExt};
+use http::Request;
 use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,8 +64,7 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -86,8 +85,7 @@ async fn main() -> Result<()> {
         .collect();
 
     // ClickHouse 配置
-    let ch_user =
-        std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
+    let ch_user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
     let ch_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "".to_string());
 
     db::init_db_config(db::DbConfig::clickhouse(
@@ -193,6 +191,15 @@ async fn run_exchange_collector(
         exchange.setup_tables(&client, &database).await?;
     }
 
+    // 驗證模式（僅日誌匯總，不寫入 CH）
+    let validate_mode = matches!(
+        std::env::var("COLLECTOR_VALIDATE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    );
+
     // 獲取 WebSocket 連接計劃
     // 穩定運行：自動重連 + 指數退避
     let mut backoff_secs: u64 = 1;
@@ -218,7 +225,16 @@ async fn run_exchange_collector(
         let connect_res = if !custom_headers.is_empty() {
             let mut req = Request::builder()
                 .uri(&ws_url)
-                .header("Host", ws_url.split("://").nth(1).unwrap_or("").split('/').next().unwrap_or(""))
+                .header(
+                    "Host",
+                    ws_url
+                        .split("://")
+                        .nth(1)
+                        .unwrap_or("")
+                        .split('/')
+                        .next()
+                        .unwrap_or(""),
+                )
                 .header("Connection", "Upgrade")
                 .header("Upgrade", "websocket")
                 .header("Sec-WebSocket-Version", "13");
@@ -290,7 +306,32 @@ async fn run_exchange_collector(
                                         error!("Flush 失敗: {:?}", e);
                                     }
                                 } else {
-                                    info!("📦 [Dry-run] 緩衝區達到 {} 條", buffers.len());
+                                    if validate_mode {
+                                        // 簡要匯總各類別條數與抽樣
+                                        let spot = &buffers.spot;
+                                        info!(
+                                            "✅ [Validate] {} spot: ob={} trd={} l1={} tkr={} snap={}",
+                                            exchange.name(),
+                                            spot.orderbook.len(),
+                                            spot.trades.len(),
+                                            spot.l1.len(),
+                                            spot.ticker.len(),
+                                            spot.snapshots.len()
+                                        );
+                                        if let Some(f) = buffers.futures_ref() {
+                                            info!(
+                                                "✅ [Validate] {} futures: ob={} trd={} l1={} tkr={} snap={}",
+                                                exchange.name(),
+                                                f.orderbook.len(),
+                                                f.trades.len(),
+                                                f.l1.len(),
+                                                f.ticker.len(),
+                                                f.snapshots.len()
+                                            );
+                                        }
+                                    } else {
+                                        info!("📦 [Dry-run] 緩衝區達到 {} 條", buffers.len());
+                                    }
                                     buffers = MessageBuffers::new(futures_enabled);
                                 }
                             }
@@ -309,9 +350,34 @@ async fn run_exchange_collector(
                     if let Err(e) = ws_sender.send(Message::Ping(vec![])).await { error!("心跳失敗: {:?}", e); break; }
                 }
                 _ = flush_timer.tick() => {
-                    if buffers.len() > 0 && !dry_run {
-                        if let Err(e) = exchange.flush_data(&database, &mut buffers).await {
-                            error!("定期 Flush 失敗: {:?}", e);
+                    if buffers.len() > 0 {
+                        if !dry_run {
+                            if let Err(e) = exchange.flush_data(&database, &mut buffers).await {
+                                error!("定期 Flush 失敗: {:?}", e);
+                            }
+                        } else if validate_mode {
+                            let spot = &buffers.spot;
+                            info!(
+                                "✅ [ValidateTick] {} spot: ob={} trd={} l1={} tkr={} snap={}",
+                                exchange.name(),
+                                spot.orderbook.len(),
+                                spot.trades.len(),
+                                spot.l1.len(),
+                                spot.ticker.len(),
+                                spot.snapshots.len()
+                            );
+                            if let Some(f) = buffers.futures_ref() {
+                                info!(
+                                    "✅ [ValidateTick] {} futures: ob={} trd={} l1={} tkr={} snap={}",
+                                    exchange.name(),
+                                    f.orderbook.len(),
+                                    f.trades.len(),
+                                    f.l1.len(),
+                                    f.ticker.len(),
+                                    f.snapshots.len()
+                                );
+                            }
+                            buffers = MessageBuffers::new(futures_enabled);
                         }
                     }
                 }

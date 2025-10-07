@@ -31,38 +31,45 @@ L3: 機器學習工作區    - 模型訓練優化
 
 ```
 rust_hft/
-├── apps/                    # 應用層 (Feature Gates 入口)
-│   ├── live/               # 真盤交易應用
-│   ├── paper/              # 模擬盤交易應用
-│   └── replay/             # 歷史回放應用
-├── crates/                 # 核心庫和組件
-│   ├── core/              # 零依賴基礎類型
-│   ├── ports/             # 穩定事件和traits
-│   ├── engine/            # 單writer事件循環
-│   ├── data/              # 市場數據處理
-│   │   └── adapters/      # 交易所適配器
-│   ├── execution/         # 交易執行組件
-│   │   └── adapters/      # 執行適配器
-│   ├── risk/              # 風險管理
-│   ├── runtime/           # 系統運行時和建構器
-│   └── infra/             # 基礎設施集成
-├── strategies/            # 策略實現
-│   ├── trend/            # 趨勢策略
-│   └── arbitrage/        # 套利策略
-├── config/               # 配置管理
-│   ├── dev/              # 開發環境配置
-│   ├── staging/          # 測試環境配置
-│   └── prod/             # 生產環境配置
-├── ops/                  # 運維和基礎設施
-│   ├── clickhouse/       # ClickHouse 配置
-│   ├── monitoring/       # Prometheus + Grafana
-│   ├── deployment/       # 部署腳本
-│   └── docker-compose.yml
-├── tests/                # 集成和E2E測試
-│   └── integration/      # 集成測試
-├── examples/             # 示例和教程
-├── scripts/              # 開發腳本
-└── docs/                 # 項目文檔
+├── market-core/                 # 行情核心：基礎型別 + 引擎 + Runtime
+│   ├── core/
+│   ├── ports/
+│   ├── instrument/
+│   ├── snapshot/
+│   ├── engine/
+│   ├── integration/
+│   └── runtime/
+├── data-pipelines/              # 行情輸入渠道
+│   ├── core/                    # 統一 MarketStream 實作
+│   └── adapters/                # 各交易所行情適配器
+├── strategy-framework/          # 策略框架與示例
+│   ├── strategies/
+│   ├── strategy-dl/
+│   └── infer-onnx/
+├── risk-control/                # 風控與頭寸管理
+│   ├── risk/
+│   ├── oms-core/
+│   └── portfolio-core/
+├── execution-gateway/           # 交易執行與適配
+│   ├── execution/
+│   └── adapters/
+├── infra-services/              # 基礎設施服務
+│   ├── core/
+│   │   ├── clickhouse/
+│   │   ├── redis/
+│   │   ├── metrics/
+│   │   ├── venue/
+│   │   └── ipc/
+│   ├── testing/
+│   └── recovery/
+├── apps/                        # 實際運行入口（Live/Paper/Replay 等）
+├── tools/                       # 補助工具（Collector / Dataset / Infer CLI…）
+├── docs/                        # 文檔
+├── examples/                    # 教學與 Demo
+├── tests/                       # 集成與 E2E 測試
+├── ops/                         # 運維腳本與 Docker 編排
+├── scripts/                     # 開發工具腳本
+└── legacy/                      # 歷史/存檔代碼
 ```
 
 ## 命名規範
@@ -314,3 +321,29 @@ ops/deployment/docker/      - Docker 生產部署
 ---
 
 此文檔隨系統演進持續更新，確保架構文檔與實際實現保持一致。
+
+## 架構校驗與後續重構（2025-10-07）
+
+本日對核心代碼（engine/runtime/ports/snapshot/integration）進行逐段校驗，結論如下：
+
+- 熱路徑設計已達專業 HFT 標準：單寫入者引擎、SPSC 佇列、ArcSwap/left-right 快照、工作緩衝復用、FxHashMap，與文檔描述一致。
+- async 僅用於 I/O 與後台任務，撮合/路由熱圈保持同步，不存在不必要的調度開銷。
+- Runtime Hub 與 feature 轉發符合設計；多帳戶/路由映射與恢復/觀測（Redis/ClickHouse/IPC）按需可選。
+
+為提升維護性與消重，計劃進行小幅「結構性重構」，不改動行為與熱路徑：
+
+1) P0 Adapters-Common（不合併適配器為單一 crate）
+- 目標：抽取行情適配器共用邏輯（JSON 解析、訂閱組裝、錯誤映射、WS/REST 輔助）到 `data-pipelines/adapters-common`，各交易所仍保留獨立 crate。
+- 效益：顯著降低重複（每個 adapter 約下降 70–85% 重複段），又不犧牲編譯增量快取與邊界。
+
+2) P1 System Builder 模組化
+- 現狀：`market-core/runtime/src/system_builder.rs` 體量偏大。
+- 拆分：新增 `config_types.rs`（配置結構）、`infra_exporters.rs`（Redis/ClickHouse 任務）、`runtime_management.rs`（運行時管理 API），主檔僅保留 Builder 與 start/stop 核心流程。
+
+3) P2 管理層鎖型優化
+- 僅於 runtime/IPC 管理層使用 `parking_lot::Mutex`，不觸碰熱路徑；避免偶發慢鎖，提升可預測性。
+
+4) P3 度量與可觀測性補強
+- 在 `EngineStats` 增加 backpressure/丟棄統計，導出至 metrics；補齊 Criterion 基準測試與（環境可用時）flamegraph 腳本。
+
+本重構僅為檔案/模組邊界整理與共用碼抽取，不改動運行語義與熱路徑行為。詳見 `docs/REFACTOR_PLAN.md`。

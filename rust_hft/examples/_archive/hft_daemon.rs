@@ -89,15 +89,15 @@ async fn main() -> Result<()> {
 
     // 創建交易所映射
     let mut exchanges_map = HashMap::new();
-    
+
     // 添加 bitget（暫時不指定具體的交易對）
     let bitget_symbols = HashMap::new();
     exchanges_map.insert("bitget".to_string(), Arc::new(ExchangeSnapshot::new(bitget_symbols)));
-    
+
     // 添加 binance（暫時不指定具體的交易對）
-    let binance_symbols = HashMap::new(); 
+    let binance_symbols = HashMap::new();
     exchanges_map.insert("binance".to_string(), Arc::new(ExchangeSnapshot::new(binance_symbols)));
-    
+
     // 發布交易所
     exchange_manager.publish_exchanges(exchanges_map);
 

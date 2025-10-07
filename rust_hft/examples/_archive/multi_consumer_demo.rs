@@ -243,8 +243,8 @@ impl RiskMonitor {
                 OrderSide::Sell => total_pnl += trade_value,
             }
 
-            info!("Risk Monitor {}: Order {} filled: {:?} {:.6} {} @ {:.4}, Position: {:.2}, PnL: {:.2}", 
-                 self.id, report.order_id, report.side, report.executed_quantity, 
+            info!("Risk Monitor {}: Order {} filled: {:?} {:.6} {} @ {:.4}, Position: {:.2}, PnL: {:.2}",
+                 self.id, report.order_id, report.side, report.executed_quantity,
                  report.symbol, report.avg_price, total_position, total_pnl);
 
             // 風險檢查

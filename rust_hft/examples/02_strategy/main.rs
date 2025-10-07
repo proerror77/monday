@@ -1,9 +1,9 @@
 /*!
  * R-Breaker 獨立測試版本
- * 
+ *
  * 這是一個完全獨立的 R-Breaker 策略測試，展示：
  * 1. 報價功能 - 模擬實時價格數據
- * 2. 交易監控 - 實時交易狀態監控  
+ * 2. 交易監控 - 實時交易狀態監控
  * 3. 訂單監控 - 訂單執行和狀態跟蹤
  * 4. 策略載入 - R-Breaker 策略邏輯
  * 5. 交易執行 - 自動化交易決策
@@ -78,7 +78,7 @@ struct RBreakerLevels {
 impl RBreakerLevels {
     fn calculate(high: f64, low: f64, close: f64, sensitivity: f64) -> Self {
         let pivot = (high + close + low) / 3.0;
-        
+
         Self {
             breakthrough_buy: high + 2.0 * sensitivity * (pivot - low),
             observation_sell: pivot + sensitivity * (high - low),
@@ -143,7 +143,12 @@ impl RBreakerStrategy {
     }
 
     fn update_levels(&mut self, high: f64, low: f64, close: f64) {
-        self.levels = Some(RBreakerLevels::calculate(high, low, close, self.sensitivity));
+        self.levels = Some(RBreakerLevels::calculate(
+            high,
+            low,
+            close,
+            self.sensitivity,
+        ));
         println!("📊 R-Breaker 價位更新:");
         if let Some(ref levels) = self.levels {
             println!("  突破買入: {:.2}", levels.breakthrough_buy);
@@ -157,7 +162,7 @@ impl RBreakerStrategy {
 
     fn process_quote(&mut self, quote: &MarketQuote) -> Option<RBreakerSignal> {
         let price = quote.last;
-        
+
         // 更新當日高低點
         if self.daily_high == 0.0 {
             self.daily_high = price;
@@ -168,10 +173,10 @@ impl RBreakerStrategy {
 
         // 如果沒有R-Breaker價位，返回Hold
         let levels = self.levels.as_ref()?;
-        
+
         // 生成信號
         let signal = levels.get_signal(price, self.daily_high, self.daily_low);
-        
+
         // 過濾信號（避免重複開倉）
         match signal {
             RBreakerSignal::TrendBuy | RBreakerSignal::ReversalBuy => {
@@ -200,7 +205,7 @@ impl RBreakerStrategy {
             RBreakerSignal::TrendBuy | RBreakerSignal::ReversalBuy => {
                 self.position = quantity;
                 self.entry_price = Some(price);
-                
+
                 Some(Order {
                     id: order_id,
                     symbol: self.symbol.clone(),
@@ -225,7 +230,7 @@ impl RBreakerStrategy {
 
                 self.position = -quantity;
                 self.entry_price = Some(price);
-                
+
                 Some(Order {
                     id: order_id,
                     symbol: self.symbol.clone(),
@@ -269,22 +274,27 @@ impl TradingSystem {
         println!("🎯 載入 R-Breaker 策略...");
         println!("  交易對: {}", self.strategy.symbol);
         println!("  敏感度係數: {:.2}", self.strategy.sensitivity);
-        println!("  前日數據: H={:.2}, L={:.2}, C={:.2}", yesterday_high, yesterday_low, yesterday_close);
-        
-        self.strategy.update_levels(yesterday_high, yesterday_low, yesterday_close);
+        println!(
+            "  前日數據: H={:.2}, L={:.2}, C={:.2}",
+            yesterday_high, yesterday_low, yesterday_close
+        );
+
+        self.strategy
+            .update_levels(yesterday_high, yesterday_low, yesterday_close);
         println!("✅ 策略載入完成\n");
     }
 
     fn process_market_data(&mut self, quote: &MarketQuote) {
         // 📈 報價功能
-        if self.trade_count % 10 == 0 { // 每10次打印一次報價
+        if self.trade_count % 10 == 0 {
+            // 每10次打印一次報價
             self.display_quote(quote);
         }
 
         // 🎯 策略處理
         if let Some(signal) = self.strategy.process_quote(quote) {
             println!("🔥 交易信號: {:?} @ {:.2}", signal, quote.last);
-            
+
             // 執行交易
             if let Some(order) = self.strategy.execute_trade(&signal, quote.last) {
                 self.process_order(order, quote);
@@ -298,16 +308,24 @@ impl TradingSystem {
     }
 
     fn display_quote(&self, quote: &MarketQuote) {
-        println!("📈 報價 [{}] Bid: {:.2} | Ask: {:.2} | Last: {:.2} | Vol: {:.0}", 
-                 quote.symbol, quote.bid, quote.ask, quote.last, quote.volume);
+        println!(
+            "📈 報價 [{}] Bid: {:.2} | Ask: {:.2} | Last: {:.2} | Vol: {:.0}",
+            quote.symbol, quote.bid, quote.ask, quote.last, quote.volume
+        );
     }
 
     fn process_order(&mut self, order: Order, quote: &MarketQuote) {
-        println!("📋 訂單執行: {} {} {:.4} @ {:.2}", 
-                 order.id, 
-                 if order.side == OrderSide::Buy { "買入" } else { "賣出" },
-                 order.quantity, 
-                 order.price);
+        println!(
+            "📋 訂單執行: {} {} {:.4} @ {:.2}",
+            order.id,
+            if order.side == OrderSide::Buy {
+                "買入"
+            } else {
+                "賣出"
+            },
+            order.quantity,
+            order.price
+        );
 
         // 計算PnL
         let pnl = if let Some(entry_price) = self.strategy.entry_price {
@@ -343,8 +361,10 @@ impl TradingSystem {
         self.total_pnl += pnl;
 
         // 訂單監控
-        println!("✅ 訂單完成: {} | PnL: ${:.2} | 狀態: {:?}", 
-                 order.id, pnl, order.status);
+        println!(
+            "✅ 訂單完成: {} | PnL: ${:.2} | 狀態: {:?}",
+            order.id, pnl, order.status
+        );
 
         // 保存記錄
         self.orders.push_back(order);
@@ -369,11 +389,17 @@ impl TradingSystem {
         };
 
         println!("\n📊 交易監控狀態:");
-        println!("  持倉: {:.4} | 價格: {:.2}", self.strategy.position, quote.last);
+        println!(
+            "  持倉: {:.4} | 價格: {:.2}",
+            self.strategy.position, quote.last
+        );
         println!("  交易次數: {} | 勝率: {:.1}%", self.trade_count, win_rate);
         println!("  總盈虧: ${:.2} | 收益率: {:.2}%", self.total_pnl, returns);
         println!("  投資組合價值: ${:.2}", current_portfolio);
-        println!("  當日區間: {:.2} - {:.2}", self.strategy.daily_low, self.strategy.daily_high);
+        println!(
+            "  當日區間: {:.2} - {:.2}",
+            self.strategy.daily_low, self.strategy.daily_high
+        );
         println!("");
     }
 
@@ -382,30 +408,55 @@ impl TradingSystem {
         println!("=========================================");
         println!("策略: R-Breaker | 交易對: {}", self.strategy.symbol);
         println!("總交易次數: {}", self.trade_count);
-        println!("勝率: {:.1}%", if self.trade_count > 0 { 
-            self.winning_trades as f64 / self.trade_count as f64 * 100.0 
-        } else { 0.0 });
+        println!(
+            "勝率: {:.1}%",
+            if self.trade_count > 0 {
+                self.winning_trades as f64 / self.trade_count as f64 * 100.0
+            } else {
+                0.0
+            }
+        );
         println!("總盈虧: ${:.2}", self.total_pnl);
-        println!("最終收益率: {:.2}%", self.total_pnl / self.portfolio_value * 100.0);
+        println!(
+            "最終收益率: {:.2}%",
+            self.total_pnl / self.portfolio_value * 100.0
+        );
 
         if !self.trades.is_empty() {
             let avg_pnl = self.total_pnl / self.trade_count as f64;
             println!("平均每筆盈虧: ${:.2}", avg_pnl);
 
-            let best_trade = self.trades.iter().max_by(|a, b| a.pnl.partial_cmp(&b.pnl).unwrap()).unwrap();
-            let worst_trade = self.trades.iter().min_by(|a, b| a.pnl.partial_cmp(&b.pnl).unwrap()).unwrap();
-            
+            let best_trade = self
+                .trades
+                .iter()
+                .max_by(|a, b| a.pnl.partial_cmp(&b.pnl).unwrap())
+                .unwrap();
+            let worst_trade = self
+                .trades
+                .iter()
+                .min_by(|a, b| a.pnl.partial_cmp(&b.pnl).unwrap())
+                .unwrap();
+
             println!("最佳交易: ${:.2} ({})", best_trade.pnl, best_trade.order_id);
-            println!("最差交易: ${:.2} ({})", worst_trade.pnl, worst_trade.order_id);
+            println!(
+                "最差交易: ${:.2} ({})",
+                worst_trade.pnl, worst_trade.order_id
+            );
         }
 
         println!("\n📋 最近訂單:");
         for order in self.orders.iter().rev().take(5) {
-            println!("  {} | {} {:.4} @ {:.2}", 
-                     order.id,
-                     if order.side == OrderSide::Buy { "買" } else { "賣" },
-                     order.quantity,
-                     order.price);
+            println!(
+                "  {} | {} {:.4} @ {:.2}",
+                order.id,
+                if order.side == OrderSide::Buy {
+                    "買"
+                } else {
+                    "賣"
+                },
+                order.quantity,
+                order.price
+            );
         }
     }
 }
@@ -461,7 +512,7 @@ fn simple_random() -> f64 {
     let a = 1664525u64;
     let c = 1013904223u64;
     let m = 2u64.pow(32);
-    
+
     let result = (a.wrapping_mul(now).wrapping_add(c)) % m;
     result as f64 / m as f64
 }
@@ -478,7 +529,7 @@ fn main() {
 
     // 創建交易系統
     let mut trading_system = TradingSystem::new(symbol.to_string(), initial_capital, sensitivity);
-    
+
     // 模擬前一日數據
     let yesterday_high = 3600.0;
     let yesterday_low = 3400.0;
@@ -499,10 +550,13 @@ fn main() {
 
         // 添加一些延遲以便觀察
         std::thread::sleep(std::time::Duration::from_millis(100));
-        
+
         // 進度顯示
         if (i + 1) % 15 == 0 {
-            println!("⏳ 進度: {:.1}%", (i + 1) as f64 / data_points as f64 * 100.0);
+            println!(
+                "⏳ 進度: {:.1}%",
+                (i + 1) as f64 / data_points as f64 * 100.0
+            );
         }
     }
 

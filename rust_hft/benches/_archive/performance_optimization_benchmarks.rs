@@ -426,17 +426,17 @@ fn bench_end_to_end_latency(c: &mut Criterion) {
     group.bench_function("complete_pipeline_latency", |b| {
         let orderbook = Arc::new(LockFreeOrderBook::new("E2E_TEST".to_string()));
         let test_json = r#"{"arg":{"channel":"books15","instId":"BTCUSDT"},"data":[{"asks":[["67189.5","0.25",1]],"bids":[["67188.1","0.12",1]],"ts":"1721810005123","seqId":"12345"}]}"#;
-        
+
         b.iter_custom(|iters| {
             let mut latency_tracker = LatencyMeasurement::new();
             let mut total_duration = Duration::new(0, 0);
-            
+
             for _i in 0..iters {
                 let pipeline_start = Instant::now();
-                
+
                 // Step 1: JSON Parsing
                 let parsed = serde_json::from_str::<serde_json::Value>(test_json).unwrap();
-                
+
                 // Step 2: Extract market data
                 if let Some(data_array) = parsed["data"].as_array() {
                     for data in data_array {
@@ -446,7 +446,7 @@ fn bench_end_to_end_latency(c: &mut Criterion) {
                                 if let (Some(price), Some(qty)) = (bid[0].as_str(), bid[1].as_str()) {
                                     let price_val = price.parse::<f64>().unwrap();
                                     let qty_val = qty.parse::<f64>().unwrap();
-                                    
+
                                     orderbook.update_level(
                                         Side::Bid,
                                         Price::from(price_val),
@@ -455,16 +455,16 @@ fn bench_end_to_end_latency(c: &mut Criterion) {
                                 }
                             }
                         }
-                        
+
                         // Step 4: Trading decision (simulate)
                         let _mid_price = orderbook.mid_price();
                         let _spread = orderbook.spread();
                     }
                 }
-                
+
                 total_duration += pipeline_start.elapsed();
             }
-            
+
             total_duration
         });
     });

@@ -1,6 +1,6 @@
 /*!
  * 多交易所 API 集成測試
- * 
+ *
  * 驗證 Bitget, Binance, Bybit 真實 API 連接和基本功能
  */
 
@@ -66,12 +66,12 @@ async fn test_bitget_integration() -> Result<()> {
     // 測試連接
     info!("📡 測試 Bitget 連接...");
     let start_time = Instant::now();
-    
+
     match exchange.connect().await {
         Ok(_) => {
             let latency = start_time.elapsed();
             info!("✅ Bitget 連接成功 - 延遲: {:?}", latency);
-            
+
             // 驗證連接狀態
             let status = exchange.get_connection_status().await;
             match status {
@@ -97,9 +97,9 @@ async fn test_bitget_integration() -> Result<()> {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_millis() as u64;
             let time_diff = (server_time as i64 - current_time as i64).abs();
-            
+
             info!("✅ Bitget 服務器時間: {} (偏差: {}ms)", server_time, time_diff);
-            
+
             if time_diff > 5000 {
                 warn!("⚠️ Bitget 時間偏差過大: {}ms", time_diff);
             }
@@ -166,7 +166,7 @@ async fn test_binance_integration() -> Result<()> {
 
     info!("📡 測試 Binance 連接...");
     let start_time = Instant::now();
-    
+
     match exchange.connect().await {
         Ok(_) => {
             let latency = start_time.elapsed();
@@ -227,7 +227,7 @@ async fn test_bybit_integration() -> Result<()> {
 
     info!("📡 測試 Bybit 連接...");
     let start_time = Instant::now();
-    
+
     match exchange.connect().await {
         Ok(_) => {
             let latency = start_time.elapsed();
@@ -284,7 +284,7 @@ async fn test_bybit_integration() -> Result<()> {
 /// 打印測試總結
 fn print_test_summary(results: &[(&str, bool)]) {
     info!("\n🎯 ===== 多交易所 API 集成測試總結 =====");
-    
+
     let total_tests = results.len();
     let passed_tests = results.iter().filter(|(_, passed)| *passed).count();
     let failed_tests = total_tests - passed_tests;

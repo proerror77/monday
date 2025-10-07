@@ -1,55 +1,92 @@
 [workspace]
 resolver = "2"  # 防止 feature 無腦合併
 members = [
-    # 穩定核心 (長期穩定)
-    "crates/core",            # hft-core: 新型別/錯誤/常量 (0 依賴)
-    "crates/ports",           # hft-ports: 穩定事件/traits (ports)
-    "crates/instrument",      # hft-instrument: 合約/精度/費率模型
-    "crates/snapshot",        # hft-snapshot: ArcSwap/left-right 快照容器
-    "crates/engine",          # hft-engine: 單 writer 事件循環
-    "crates/data",            # hft-data: 公有行情介面 + 聚合
-    "crates/execution",       # hft-execution: OMS/ExecutionClient
-    "crates/oms-core",        # hft-oms-core: 訂單狀態機/冪等/路由（純邏輯）
-    "crates/portfolio-core",  # hft-portfolio-core: 會計真相源（AccountView）
-    # "crates/accounting",    # Removed: duplicate with portfolio-core
-    "crates/risk",            # hft-risk: 事前風控
-    "crates/integration",     # hft-integration: WS/HTTP/TLS/簽名/限流
-    "crates/runtime",         # hft-runtime: 系統運行時和建構器
+    # Market Core
+    "market-core/core",
+    "market-core/ports",
+    "market-core/instrument",
+    "market-core/snapshot",
+    "market-core/engine",
+    "market-core/integration",
+    "market-core/runtime",
 
-    # 擴充插槽：adapters (不動核心)
-    "crates/data/adapters/adapter-bitget",
-    "crates/data/adapters/adapter-binance",
-    "crates/data/adapters/adapter-mock",
-    "crates/execution/adapters/adapter-bitget",
-    "crates/execution/adapters/adapter-binance",
+    # Data Pipelines
+    "data-pipelines/core",
+    "data-pipelines/adapters/adapter-bitget",
+    "data-pipelines/adapters/adapter-binance",
+    "data-pipelines/adapters/adapter-backpack",
+    "data-pipelines/adapters/adapter-mock",
+    "data-pipelines/adapters/adapter-replay",
+    "data-pipelines/adapters/adapter-asterdex",
+    "data-pipelines/adapters/adapter-hyperliquid",
+    "data-pipelines/adapters/adapter-bybit",
+    "data-pipelines/adapters/adapter-lighter",
+    "data-pipelines/adapters/adapter-grvt",
 
-    # 策略 (只依賴 ports + core + instrument)
-    "strategies/trend",
-    "strategies/arbitrage",
-    "strategies/imbalance",
+    # Strategy Framework
+    "strategy-framework/strategy-dl",
+    "strategy-framework/infer-onnx",
+    "strategy-framework/strategies/trend",
+    "strategy-framework/strategies/arbitrage",
+    "strategy-framework/strategies/imbalance",
+    "strategy-framework/strategies/lob_flow_grid",
 
-    # 基建旁路 (可選)
-    "crates/infra/clickhouse",
-    "crates/infra/redis",
-    "crates/infra/metrics",
-    "crates/infra/venue",
-    "crates/infra/ipc",
+    # Risk Control
+    "risk-control/risk",
+    "risk-control/oms-core",
+    "risk-control/portfolio-core",
 
-    # 測試/回放
-    "crates/testing",
-    "crates/recovery",
+    # Execution Gateway
+    "execution-gateway/execution",
+    "execution-gateway/adapters/adapter-bitget",
+    "execution-gateway/adapters/adapter-binance",
+    "execution-gateway/adapters/adapter-okx",
+    "execution-gateway/adapters/adapter-hyperliquid",
+    "execution-gateway/adapters/adapter-bybit",
+    "execution-gateway/adapters/adapter-asterdex",
+    "execution-gateway/adapters/adapter-backpack",
+    "execution-gateway/adapters/adapter-lighter",
+    "execution-gateway/adapters/adapter-grvt",
 
-    # Apps: feature 開關入口
-    "apps/live",          # 真盤
-    "apps/collector",     # 原始行情收集器（RAW WS → ClickHouse）
-    "apps/paper",         # 模擬盤
-    "apps/replay",        # 歷史回放
-    "apps/dataset",       # 資料導出（grid/export）
-    "apps/infer-cli",     # 簡易 ONNX 推理 CLI
-    "crates/infer-onnx",  # ONNX 推理封裝（Tract）
-    
+    # Infra Services
+    "infra-services/core/clickhouse",
+    "infra-services/core/redis",
+    "infra-services/core/metrics",
+    "infra-services/core/venue",
+    "infra-services/core/ipc",
+    "infra-services/testing",
+    "infra-services/recovery",
+
+    # Applications
+    "apps/live",
+    "apps/all-in-one",
+    "apps/paper",
+    "apps/replay",
+
+    # Shared Catalogs
+    "shared/instrument",
+    "shared/config",
+
+    # Tools & Utilities
+    "tools/collector",
+    "tools/dataset",
+    "tools/infer-cli",
+    "tools/hyperliquid-demo",
+
     # Examples
-    "examples",           # E2E 測試範例
+    "examples"
+]
+
+# 預設只編譯核心元件與主要應用，可透過 `cargo build -p` 指定其他 crate。
+default-members = [
+    "market-core/core",
+    "market-core/ports",
+    "market-core/engine",
+    "market-core/runtime",
+    "strategy-framework/strategy-dl",
+    "apps/live",
+    "apps/paper",
+    "apps/all-in-one"
 ]
 
 # 工作區級別依賴 (最小化)
@@ -98,6 +135,9 @@ async-trait = "0.1"
 
 # Decimal types
 rust_decimal = { version = "1.33", features = ["serde"] }
+
+# CLI and examples
+clap = { version = "4.0", features = ["derive"] }
 
 [profile.dev]
 # 開發模式：編譯快優先

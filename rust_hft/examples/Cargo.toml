@@ -6,36 +6,47 @@ edition = "2021"
 [[bin]]
 name = "00_quickstart"
 path = "00_quickstart.rs"
+required-features = ["legacy-sdk"]
 
 [[bin]]
 name = "01_data"
 path = "01_data/main.rs"
+required-features = ["legacy-sdk"]
 
 [[bin]]
 name = "02_strategy"
 path = "02_strategy/main.rs"
+required-features = ["legacy-sdk"]
 
 [[bin]]
 name = "03_execution"
 path = "03_execution/main.rs"
+required-features = ["legacy-sdk"]
+
+[[bin]]
+name = "03_execution_legacy"
+path = "_archive/legacy_oms.rs"
+required-features = ["legacy-oms"]
 
 [[bin]]
 name = "04_risk"
 path = "04_risk/main.rs"
+required-features = ["legacy-sdk"]
 
 [[bin]]
 name = "05_e2e"
 path = "05_e2e/main.rs"
+required-features = ["legacy-sdk"]
 
 [dependencies]
 # HFT crates
-hft_core = { package = "hft-core", path = "../crates/core" }
-ports = { package = "hft-ports", path = "../crates/ports" }
-engine = { package = "hft-engine", path = "../crates/engine" }
-runtime = { package = "hft-runtime", path = "../crates/runtime" }
+hft_core = { package = "hft-core", path = "../market-core/core" }
+ports = { package = "hft-ports", path = "../market-core/ports" }
+engine = { package = "hft-engine", path = "../market-core/engine" }
+runtime = { package = "hft-runtime", path = "../market-core/runtime" }
 
 # Data adapters (optional)
-data_adapter_binance = { package = "hft-data-adapter-binance", path = "../crates/data/adapters/adapter-binance", optional = true }
+data_adapter_binance = { package = "hft-data-adapter-binance", path = "../data-pipelines/adapters/adapter-binance", optional = true }
 
 # Async
 tokio = { workspace = true, features = ["full"] }
@@ -59,4 +70,6 @@ serde_yaml = "0.9"
 
 [features]
 default = []
+legacy-oms = []
+legacy-sdk = []
 binance = ["data_adapter_binance"]

@@ -1,9 +1,11 @@
+#![cfg(feature = "legacy-sdk")]
+
 /*!
  * HFT System Test Suite
- * 
+ *
  * 完整的 HFT 系统测试套件，包括：
  * - 单元测试 (Unit Tests)
- * - 集成测试 (Integration Tests)  
+ * - 集成测试 (Integration Tests)
  * - 性能基准测试 (Performance Benchmarks)
  * - 端到端测试 (End-to-End Tests)
  */
@@ -19,7 +21,7 @@ pub mod unit {
     pub mod unified_engine_test;
 }
 
-// Integration test modules  
+// Integration test modules
 pub mod integration {
     pub mod end_to_end_system_test;
     pub mod performance_benchmarks;
@@ -28,7 +30,7 @@ pub mod integration {
 #[cfg(test)]
 mod test_runner {
     use super::*;
-    
+
     /// Test suite configuration
     pub struct TestSuiteConfig {
         pub run_unit_tests: bool,
@@ -36,7 +38,7 @@ mod test_runner {
         pub run_performance_tests: bool,
         pub run_stress_tests: bool,
     }
-    
+
     impl Default for TestSuiteConfig {
         fn default() -> Self {
             Self {
@@ -47,7 +49,7 @@ mod test_runner {
             }
         }
     }
-    
+
     #[tokio::test]
     async fn run_comprehensive_test_suite() -> anyhow::Result<()> {
         // Initialize test logging
@@ -55,43 +57,43 @@ mod test_runner {
             .with_env_filter("info")
             .with_test_writer()
             .try_init();
-        
+
         println!("🚀 Starting HFT System Comprehensive Test Suite");
         println!("===============================================");
-        
+
         let config = TestSuiteConfig::default();
         let mut test_results = TestResults::new();
-        
+
         if config.run_unit_tests {
             println!("🧪 Running Unit Tests...");
             test_results.unit_tests_passed = run_unit_test_suite().await?;
             println!("✅ Unit Tests: {}", if test_results.unit_tests_passed { "PASSED" } else { "FAILED" });
         }
-        
+
         if config.run_integration_tests {
             println!("🔄 Running Integration Tests...");
             test_results.integration_tests_passed = run_integration_test_suite().await?;
             println!("✅ Integration Tests: {}", if test_results.integration_tests_passed { "PASSED" } else { "FAILED" });
         }
-        
+
         if config.run_performance_tests {
             println!("⚡ Running Performance Tests...");
             test_results.performance_tests_passed = run_performance_test_suite().await?;
             println!("✅ Performance Tests: {}", if test_results.performance_tests_passed { "PASSED" } else { "FAILED" });
         }
-        
+
         if config.run_stress_tests {
             println!("🔥 Running Stress Tests...");
             test_results.stress_tests_passed = run_stress_test_suite().await?;
             println!("✅ Stress Tests: {}", if test_results.stress_tests_passed { "PASSED" } else { "FAILED" });
         }
-        
+
         // Print final results
         println!();
         println!("📊 COMPREHENSIVE TEST SUITE RESULTS");
         println!("====================================");
         test_results.print_summary();
-        
+
         // Overall pass/fail
         let overall_passed = test_results.all_passed();
         println!();
@@ -100,12 +102,12 @@ mod test_runner {
         } else {
             println!("❌ SOME TESTS FAILED - Review failures before deployment");
         }
-        
+
         assert!(overall_passed, "Test suite failed");
-        
+
         Ok(())
     }
-    
+
     async fn run_unit_test_suite() -> anyhow::Result<bool> {
         // Unit tests are automatically run by cargo test
         // This is a placeholder for any additional unit test coordination
@@ -115,7 +117,7 @@ mod test_runner {
         println!("   - UnifiedEngine tests");
         Ok(true)
     }
-    
+
     async fn run_integration_test_suite() -> anyhow::Result<bool> {
         // Integration tests coordination
         println!("   - End-to-end system tests");
@@ -123,7 +125,7 @@ mod test_runner {
         println!("   - Data flow tests");
         Ok(true)
     }
-    
+
     async fn run_performance_test_suite() -> anyhow::Result<bool> {
         // Performance tests coordination
         println!("   - Latency benchmarks");
@@ -132,7 +134,7 @@ mod test_runner {
         println!("   - Concurrent performance tests");
         Ok(true)
     }
-    
+
     async fn run_stress_test_suite() -> anyhow::Result<bool> {
         // Stress tests coordination
         println!("   - High load tests");
@@ -140,14 +142,14 @@ mod test_runner {
         println!("   - Long-running stability tests");
         Ok(true)
     }
-    
+
     struct TestResults {
         unit_tests_passed: bool,
         integration_tests_passed: bool,
         performance_tests_passed: bool,
         stress_tests_passed: bool,
     }
-    
+
     impl TestResults {
         fn new() -> Self {
             Self {
@@ -157,14 +159,14 @@ mod test_runner {
                 stress_tests_passed: false,
             }
         }
-        
+
         fn all_passed(&self) -> bool {
-            self.unit_tests_passed && 
-            self.integration_tests_passed && 
-            self.performance_tests_passed && 
+            self.unit_tests_passed &&
+            self.integration_tests_passed &&
+            self.performance_tests_passed &&
             self.stress_tests_passed
         }
-        
+
         fn print_summary(&self) {
             println!("Unit Tests:        {}", if self.unit_tests_passed { "✅ PASS" } else { "❌ FAIL" });
             println!("Integration Tests: {}", if self.integration_tests_passed { "✅ PASS" } else { "❌ FAIL" });

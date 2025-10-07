@@ -6,8 +6,8 @@ description = "歷史回放應用 - 用於回測和驗證"
 
 [dependencies]
 # 核心依賴
-runtime = { package = "hft-runtime", path = "../../crates/runtime" }
-testing = { package = "hft-testing", path = "../../crates/testing" }
+runtime = { package = "hft-runtime", path = "../../market-core/runtime" }
+testing = { package = "hft-testing", path = "../../infra-services/testing" }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -23,7 +23,7 @@ ordered-float = "4"
 [features]
 default = ["mock"]
 mock = ["runtime/adapter-mock-data"]
-clickhouse = ["runtime/infra-clickhouse"]
+clickhouse = ["runtime/clickhouse"]
 bitget = ["runtime/adapter-bitget-data"]
 binance = ["runtime/adapter-binance-data"]
 bybit = ["runtime/adapter-bybit-data"]

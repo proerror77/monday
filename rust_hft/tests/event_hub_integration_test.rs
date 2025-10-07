@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-sdk")]
+
 //! 事件分發中心集成測試
 
 use rust_hft::exchanges::*;

@@ -679,7 +679,11 @@ impl Exchange for BitgetExchange {
                             "asks_qty": a_qty,
                             "source": "WS",
                         });
-                        buffers.push_spot_snapshot(serde_json::to_string(&snap)?);
+                        if is_futures {
+                            buffers.push_futures_snapshot(serde_json::to_string(&snap)?);
+                        } else {
+                            buffers.push_spot_snapshot(serde_json::to_string(&snap)?);
+                        }
 
                         let (best_bid_px, best_bid_qty, best_ask_px, best_ask_qty) = {
                             let books = self.ob.read().await;
@@ -796,7 +800,7 @@ impl Exchange for BitgetExchange {
                         if let chrono::LocalResult::Single(ts) = Utc.timestamp_millis_opt(ex_ms) {
                             // Bitget WebSocket v2 ticker field names
                             let last = item
-                                .get("lastPr")      // v2 primary field
+                                .get("lastPr") // v2 primary field
                                 .or_else(|| item.get("last"))
                                 .or_else(|| item.get("close"))
                                 .or_else(|| item.get("price"))
@@ -804,28 +808,28 @@ impl Exchange for BitgetExchange {
                                 .and_then(Self::value_to_f64)
                                 .unwrap_or(0.0);
                             let open = item
-                                .get("open24h")     // v2 primary field
+                                .get("open24h") // v2 primary field
                                 .or_else(|| item.get("openUtc0"))
                                 .or_else(|| item.get("open"))
                                 .or_else(|| item.get("o"))
                                 .and_then(Self::value_to_f64)
                                 .unwrap_or(0.0);
                             let high = item
-                                .get("high24h")     // v2 primary field
+                                .get("high24h") // v2 primary field
                                 .or_else(|| item.get("highUtc0"))
                                 .or_else(|| item.get("high"))
                                 .or_else(|| item.get("h"))
                                 .and_then(Self::value_to_f64)
                                 .unwrap_or(0.0);
                             let low = item
-                                .get("low24h")      // v2 primary field
+                                .get("low24h") // v2 primary field
                                 .or_else(|| item.get("lowUtc0"))
                                 .or_else(|| item.get("low"))
                                 .or_else(|| item.get("l"))
                                 .and_then(Self::value_to_f64)
                                 .unwrap_or(0.0);
                             let volume = item
-                                .get("baseVolume")  // v2 primary field
+                                .get("baseVolume") // v2 primary field
                                 .or_else(|| item.get("baseVol"))
                                 .or_else(|| item.get("vol24h"))
                                 .or_else(|| item.get("v"))
@@ -861,11 +865,7 @@ impl Exchange for BitgetExchange {
         Ok(())
     }
 
-    async fn flush_data(
-        &self,
-        database: &str,
-        buffers: &mut MessageBuffers,
-    ) -> Result<()> {
+    async fn flush_data(&self, database: &str, buffers: &mut MessageBuffers) -> Result<()> {
         let sink = crate::db::get_sink_async(database).await?;
 
         buffers
@@ -894,8 +894,12 @@ impl Exchange for BitgetExchange {
         buffers
             .flush_spot_table(&sink, "bitget_l1", |spot| &mut spot.l1)
             .await?;
+        // 通用快照：現貨 + 永續
         buffers
             .flush_spot_table(&sink, "snapshot_books", |spot| &mut spot.snapshots)
+            .await?;
+        buffers
+            .flush_futures_table(&sink, "snapshot_books", |f| &mut f.snapshots)
             .await?;
 
         let _ = crate::spool::drain(&sink).await;

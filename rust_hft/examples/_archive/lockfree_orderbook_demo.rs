@@ -1,6 +1,6 @@
 /*!
  * 无锁 OrderBook 演示程序
- * 
+ *
  * 演示如何使用新的无锁 OrderBook 实现，验证其基本功能
  */
 
@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 创建无锁 OrderBook
     let orderbook = LockFreeOrderBook::new("BTCUSDT".to_string());
     println!("✅ 创建无锁 OrderBook: {}", orderbook.symbol);
-    
+
     // 验证初始状态
     println!("📊 初始状态:");
     println!("   - 有效性: {}", orderbook.is_valid());
@@ -68,23 +68,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📊 更新后状态:");
     println!("   - 有效性: {}", orderbook.is_valid());
     println!("   - 更新计数: {}", orderbook.update_count());
-    
+
     if let Some(best_bid) = orderbook.best_bid() {
         println!("   - 最佳买价: ${:.2}", best_bid.to_f64().unwrap_or(0.0));
     }
-    
+
     if let Some(best_ask) = orderbook.best_ask() {
         println!("   - 最佳卖价: ${:.2}", best_ask.to_f64().unwrap_or(0.0));
     }
-    
+
     if let Some(mid) = orderbook.mid_price() {
         println!("   - 中间价: ${:.2}", mid.to_f64().unwrap_or(0.0));
     }
-    
+
     if let Some(spread) = orderbook.spread() {
         println!("   - 价差: ${:.2}", spread);
     }
-    
+
     if let Some(spread_bps) = orderbook.spread_bps() {
         println!("   - 价差 (基点): {:.2} bps", spread_bps);
     }
@@ -103,14 +103,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔥 性能测试 - 无锁读取:");
     let start = std::time::Instant::now();
     let iterations = 10000;
-    
+
     for _ in 0..iterations {
         let _best_bid = orderbook.best_bid();
         let _best_ask = orderbook.best_ask();
         let _mid = orderbook.mid_price();
         let _spread = orderbook.spread();
     }
-    
+
     let duration = start.elapsed();
     let ns_per_op = duration.as_nanos() / iterations as u128;
     println!("   - {} 次读取操作用时: {:?}", iterations, duration);
@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✨ 无锁 OrderBook 演示完成！");
     println!("💡 无锁设计实现了微秒级别的极低延迟访问，非常适合 HFT 场景");
-    
+
     Ok(())
 }
 // Archived legacy example

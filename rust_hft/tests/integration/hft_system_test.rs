@@ -1,6 +1,6 @@
 /*!
  * 統一HFT系統集成測試
- * 
+ *
  * 提取自 unified_hft_test，專注於完整系統集成測試
  */
 
@@ -34,7 +34,7 @@ impl LockFreePriceLevel {
             order_count: 1,
         }
     }
-    
+
     pub fn price_as_f64(&self) -> f64 {
         self.price as f64 / 10000.0
     }
@@ -64,11 +64,11 @@ impl HighPerfOrderBook {
             checksum: AtomicU64::new(0),
         }
     }
-    
+
     /// 原子更新買價等級
     pub fn update_bid(&self, price: u64, quantity: f64) -> bool {
         let start = Instant::now();
-        
+
         if quantity > 0.0 {
             let level = LockFreePriceLevel::new(price, quantity);
             self.bids.insert(price, level);
@@ -79,18 +79,18 @@ impl HighPerfOrderBook {
                 self.recalculate_best_bid();
             }
         }
-        
+
         self.update_metadata();
-        
+
         // 性能檢查：目標 < 1μs
         let latency = start.elapsed().as_nanos() as u64;
         latency < 1000
     }
-    
+
     /// 原子更新賣價等級
     pub fn update_ask(&self, price: u64, quantity: f64) -> bool {
         let start = Instant::now();
-        
+
         if quantity > 0.0 {
             let level = LockFreePriceLevel::new(price, quantity);
             self.asks.insert(price, level);
@@ -101,13 +101,13 @@ impl HighPerfOrderBook {
                 self.recalculate_best_ask();
             }
         }
-        
+
         self.update_metadata();
-        
+
         let latency = start.elapsed().as_nanos() as u64;
         latency < 1000
     }
-    
+
     /// 無鎖更新最佳買價
     fn update_best_bid(&self, price: u64) {
         let mut current_best = self.best_bid_price.load(Ordering::Relaxed);
@@ -120,7 +120,7 @@ impl HighPerfOrderBook {
             }
         }
     }
-    
+
     /// 無鎖更新最佳賣價
     fn update_best_ask(&self, price: u64) {
         let mut current_best = self.best_ask_price.load(Ordering::Relaxed);
@@ -133,7 +133,7 @@ impl HighPerfOrderBook {
             }
         }
     }
-    
+
     /// 重新計算最佳買價
     fn recalculate_best_bid(&self) {
         let best = self.bids.iter()
@@ -142,7 +142,7 @@ impl HighPerfOrderBook {
             .unwrap_or(0);
         self.best_bid_price.store(best, Ordering::Relaxed);
     }
-    
+
     /// 重新計算最佳賣價
     fn recalculate_best_ask(&self) {
         let best = self.asks.iter()
@@ -151,40 +151,40 @@ impl HighPerfOrderBook {
             .unwrap_or(u64::MAX);
         self.best_ask_price.store(best, Ordering::Relaxed);
     }
-    
+
     /// 更新元數據
     fn update_metadata(&self) {
         self.update_count.fetch_add(1, Ordering::Relaxed);
         self.last_update_time.store(get_timestamp_micros(), Ordering::Relaxed);
-        
+
         // 計算簡單校驗和
         let bid_sum: u64 = self.bids.iter().map(|entry| *entry.key()).sum();
         let ask_sum: u64 = self.asks.iter().map(|entry| *entry.key()).sum();
         let new_checksum = bid_sum.wrapping_add(ask_sum);
         self.checksum.store(new_checksum, Ordering::Relaxed);
     }
-    
+
     /// 獲取最佳買賣價
     pub fn get_best_prices(&self) -> (Option<f64>, Option<f64>) {
         let best_bid = self.best_bid_price.load(Ordering::Relaxed);
         let best_ask = self.best_ask_price.load(Ordering::Relaxed);
-        
+
         let bid = if best_bid > 0 { Some(best_bid as f64 / 10000.0) } else { None };
         let ask = if best_ask < u64::MAX { Some(best_ask as f64 / 10000.0) } else { None };
-        
+
         (bid, ask)
     }
-    
+
     /// 獲取訂單簿深度
     pub fn get_depth(&self) -> (usize, usize) {
         (self.bids.len(), self.asks.len())
     }
-    
+
     /// 獲取統計信息
     pub fn get_stats(&self) -> OrderBookStats {
         let (bid_depth, ask_depth) = self.get_depth();
         let (best_bid, best_ask) = self.get_best_prices();
-        
+
         OrderBookStats {
             bid_depth,
             ask_depth,
@@ -228,7 +228,7 @@ impl ZeroCopyMarketMessage {
         // 生成模擬但真實的市場數據
         let base_price = 50000.0 + (sequence as f64 * 0.001) % 100.0;
         let volatility = 1.0 + (sequence as f64 * 0.0001) % 0.1;
-        
+
         Self {
             symbol,
             bids: vec![
@@ -279,10 +279,10 @@ impl UltraPerformanceStats {
             start_time: Instant::now(),
         }
     }
-    
+
     pub fn record_latency(&self, latency_ns: u64) {
         self.total_latency_ns.fetch_add(latency_ns, Ordering::Relaxed);
-        
+
         // 更新最大延遲
         let mut current_max = self.max_latency_ns.load(Ordering::Relaxed);
         while latency_ns > current_max {
@@ -293,7 +293,7 @@ impl UltraPerformanceStats {
                 Err(x) => current_max = x,
             }
         }
-        
+
         // 更新最小延遲
         let mut current_min = self.min_latency_ns.load(Ordering::Relaxed);
         while latency_ns < current_min {
@@ -304,7 +304,7 @@ impl UltraPerformanceStats {
                 Err(x) => current_min = x,
             }
         }
-        
+
         // 統計超低延遲
         if latency_ns < 1_000 {
             self.sub_microsecond_count.fetch_add(1, Ordering::Relaxed);
@@ -313,7 +313,7 @@ impl UltraPerformanceStats {
             self.sub_100ns_count.fetch_add(1, Ordering::Relaxed);
         }
     }
-    
+
     pub fn record_update_result(&self, success: bool) {
         if success {
             self.successful_updates.fetch_add(1, Ordering::Relaxed);
@@ -322,13 +322,13 @@ impl UltraPerformanceStats {
         }
         self.orderbook_updates.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     pub fn summary(&self) -> DetailedStatsSummary {
         let elapsed = self.start_time.elapsed();
         let messages = self.messages_processed.load(Ordering::Relaxed);
         let total_latency = self.total_latency_ns.load(Ordering::Relaxed);
         let min_latency = self.min_latency_ns.load(Ordering::Relaxed);
-        
+
         DetailedStatsSummary {
             runtime_seconds: elapsed.as_secs_f64(),
             total_messages: messages,
@@ -348,7 +348,7 @@ impl UltraPerformanceStats {
                 messages as f64 / elapsed.as_secs_f64()
             } else { 0.0 },
             success_rate: if self.orderbook_updates.load(Ordering::Relaxed) > 0 {
-                self.successful_updates.load(Ordering::Relaxed) as f64 / 
+                self.successful_updates.load(Ordering::Relaxed) as f64 /
                 self.orderbook_updates.load(Ordering::Relaxed) as f64 * 100.0
             } else { 0.0 },
             errors: self.errors.load(Ordering::Relaxed),
@@ -394,12 +394,12 @@ impl UnifiedHftEngine {
             message_sequence: AtomicU64::new(0),
         }
     }
-    
+
     /// 核心消息處理（目標 < 1μs）
     pub fn process_market_message(&self, message: &ZeroCopyMarketMessage) -> Result<bool, String> {
         let start = Instant::now();
         let mut all_success = true;
-        
+
         // 處理買價更新（Lock-Free）
         for (price, quantity) in &message.bids {
             let price_fixed = (*price * 10000.0) as u64;
@@ -407,7 +407,7 @@ impl UnifiedHftEngine {
             self.stats.record_update_result(success);
             if !success { all_success = false; }
         }
-        
+
         // 處理賣價更新（Lock-Free）
         for (price, quantity) in &message.asks {
             let price_fixed = (*price * 10000.0) as u64;
@@ -415,30 +415,30 @@ impl UnifiedHftEngine {
             self.stats.record_update_result(success);
             if !success { all_success = false; }
         }
-        
+
         // 記錄性能指標
         let latency_ns = start.elapsed().as_nanos() as u64;
         self.stats.record_latency(latency_ns);
         self.stats.messages_processed.fetch_add(1, Ordering::Relaxed);
-        
+
         Ok(all_success)
     }
-    
+
     /// 生成測試消息
     pub fn generate_test_message(&self) -> ZeroCopyMarketMessage {
         let sequence = self.message_sequence.fetch_add(1, Ordering::Relaxed);
         ZeroCopyMarketMessage::new(self.symbol.clone(), sequence)
     }
-    
+
     /// 獲取實時統計
     pub fn get_realtime_stats(&self) -> (OrderBookStats, DetailedStatsSummary) {
         (self.orderbook.get_stats(), self.stats.summary())
     }
-    
+
     pub fn start(&self) {
         self.running.store(true, Ordering::Relaxed);
     }
-    
+
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
     }
@@ -448,85 +448,85 @@ impl UnifiedHftEngine {
 mod tests {
     use super::*;
     use crate::common::PerformanceHelper;
-    
+
     #[test]
     fn test_unified_hft_engine_basic() {
         let engine = UnifiedHftEngine::new("BTCUSDT".to_string(), 1);
         engine.start();
-        
+
         let message = engine.generate_test_message();
         let result = engine.process_market_message(&message);
-        
+
         assert!(result.is_ok());
         assert!(result.unwrap());
-        
+
         let (ob_stats, perf_stats) = engine.get_realtime_stats();
         assert_eq!(perf_stats.total_messages, 1);
         assert!(ob_stats.bid_depth > 0);
         assert!(ob_stats.ask_depth > 0);
-        
+
         engine.stop();
     }
-    
+
     #[test]
     fn test_high_perf_orderbook() {
         let orderbook = HighPerfOrderBook::new();
-        
+
         // 測試買價更新
         assert!(orderbook.update_bid(500000000, 1.0)); // 50000.0000
         assert!(orderbook.update_bid(499990000, 2.0)); // 49999.0000
-        
+
         // 測試賣價更新
         assert!(orderbook.update_ask(500010000, 1.5)); // 50001.0000
         assert!(orderbook.update_ask(500020000, 2.5)); // 50002.0000
-        
+
         let (bid_depth, ask_depth) = orderbook.get_depth();
         assert_eq!(bid_depth, 2);
         assert_eq!(ask_depth, 2);
-        
+
         let (best_bid, best_ask) = orderbook.get_best_prices();
         assert_eq!(best_bid, Some(50000.0));
         assert_eq!(best_ask, Some(50001.0));
-        
+
         let stats = orderbook.get_stats();
         assert_eq!(stats.update_count, 4);
         assert!(stats.spread.is_some());
         assert_eq!(stats.spread.unwrap(), 1.0);
     }
-    
+
     #[test]
     fn test_zero_copy_market_message() {
         let message = ZeroCopyMarketMessage::new("BTCUSDT".to_string(), 123);
-        
+
         assert_eq!(message.symbol, "BTCUSDT");
         assert_eq!(message.sequence, 123);
         assert!(!message.bids.is_empty());
         assert!(!message.asks.is_empty());
         assert!(message.timestamp > 0);
-        
+
         // 驗證價格合理性
         assert!(message.bids[0].0 > 40000.0);
         assert!(message.bids[0].0 < 60000.0);
         assert!(message.asks[0].0 > message.bids[0].0);
     }
-    
+
     #[test]
     fn test_ultra_performance_stats() {
         let stats = UltraPerformanceStats::new();
-        
+
         // 記錄一些測試數據
         stats.record_latency(500); // 500ns
         stats.record_latency(1500); // 1.5μs
         stats.record_latency(50); // 50ns
-        
+
         stats.record_update_result(true);
         stats.record_update_result(true);
         stats.record_update_result(false);
-        
+
         stats.messages_processed.store(3, Ordering::Relaxed);
-        
+
         let summary = stats.summary();
-        
+
         assert_eq!(summary.total_messages, 3);
         assert_eq!(summary.orderbook_updates, 3);
         assert_eq!(summary.successful_updates, 2);
@@ -538,12 +538,12 @@ mod tests {
         assert_eq!(summary.sub_microsecond_percentage, 66.66666666666666); // 2/3
         assert_eq!(summary.success_rate, 66.66666666666666); // 2/3
     }
-    
+
     #[tokio::test]
     async fn test_concurrent_hft_processing() {
         let engine = Arc::new(UnifiedHftEngine::new("BTCUSDT".to_string(), 1));
         engine.start();
-        
+
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let engine_clone = engine.clone();
@@ -555,41 +555,41 @@ mod tests {
                 })
             })
             .collect();
-        
+
         for handle in handles {
             handle.await.unwrap();
         }
-        
+
         let (ob_stats, perf_stats) = engine.get_realtime_stats();
-        
+
         assert_eq!(perf_stats.total_messages, 1000);
         assert!(ob_stats.bid_depth > 0);
         assert!(ob_stats.ask_depth > 0);
         assert!(perf_stats.success_rate > 90.0);
-        
+
         println!("並發測試結果:");
         println!("  處理消息: {}", perf_stats.total_messages);
         println!("  平均延遲: {:.2}ns", perf_stats.avg_latency_ns);
         println!("  成功率: {:.1}%", perf_stats.success_rate);
         println!("  亞微秒級: {:.1}%", perf_stats.sub_microsecond_percentage);
-        
+
         engine.stop();
     }
-    
+
     #[test]
     fn test_performance_target_achievement() {
         let engine = UnifiedHftEngine::new("BTCUSDT".to_string(), 1);
         let message_count = 10000;
-        
+
         engine.start();
-        
+
         for _ in 0..message_count {
             let message = engine.generate_test_message();
             let _ = engine.process_market_message(&message);
         }
-        
+
         let (_, perf_stats) = engine.get_realtime_stats();
-        
+
         println!("性能目標測試結果:");
         println!("  處理消息: {}", perf_stats.total_messages);
         println!("  平均延遲: {:.2}ns ({:.3}μs)", perf_stats.avg_latency_ns, perf_stats.avg_latency_ns / 1000.0);
@@ -598,27 +598,27 @@ mod tests {
         println!("  亞微秒級: {:.1}%", perf_stats.sub_microsecond_percentage);
         println!("  < 100ns: {:.1}%", perf_stats.sub_100ns_percentage);
         println!("  吞吐量: {:.0} msgs/s", perf_stats.throughput_msgs_per_sec);
-        
+
         // 性能目標驗證
         let avg_target_met = perf_stats.avg_latency_ns < 1000.0;
         let sub_microsecond_target_met = perf_stats.sub_microsecond_percentage > 50.0;
-        
+
         if avg_target_met {
             println!("✅ 平均延遲目標達成 (< 1μs)");
         } else {
             println!("❌ 平均延遲目標未達成");
         }
-        
+
         if sub_microsecond_target_met {
             println!("✅ 亞微秒級目標達成 (> 50%)");
         } else {
             println!("❌ 亞微秒級目標未達成");
         }
-        
+
         assert_eq!(perf_stats.total_messages, message_count);
         assert!(perf_stats.success_rate > 95.0);
         assert!(perf_stats.throughput_msgs_per_sec > 1000.0);
-        
+
         engine.stop();
     }
 }

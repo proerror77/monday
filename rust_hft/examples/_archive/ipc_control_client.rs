@@ -1,5 +1,5 @@
 //! Example IPC control client
-//! 
+//!
 //! Demonstrates how to send commands to the HFT control plane
 
 use hft_ipc::{IPCClient, Command, Response, DEFAULT_SOCKET_PATH};
@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() < 2 {
         println!("Usage: {} <command> [args...]", args[0]);
         println!("Commands:");
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let command = &args[1];
-    
+
     let response = match command.as_str() {
         "start" => {
             info!("Starting trading system...");

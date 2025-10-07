@@ -28,21 +28,21 @@ async fn test_basic_ipc_communication() {
     let response = timeout(Duration::from_secs(5), client.start()).await
         .expect("Timeout waiting for response")
         .expect("Failed to send start command");
-    
+
     assert!(matches!(response, Response::Ok));
 
     // Test status command
     let response = timeout(Duration::from_secs(5), client.get_status()).await
         .expect("Timeout waiting for response")
         .expect("Failed to send status command");
-    
+
     assert!(matches!(response, Response::Data(_)));
 
     // Test stop command
     let response = timeout(Duration::from_secs(5), client.stop()).await
         .expect("Timeout waiting for response")
         .expect("Failed to send stop command");
-    
+
     assert!(matches!(response, Response::Ok));
 
     // Cleanup
@@ -66,16 +66,16 @@ async fn test_model_loading() {
 
     // Test model loading
     let response = timeout(
-        Duration::from_secs(5), 
+        Duration::from_secs(5),
         client.load_model(
-            "/path/to/model.pt".to_string(), 
-            "v1.2.3".to_string(), 
+            "/path/to/model.pt".to_string(),
+            "v1.2.3".to_string(),
             Some("abc123".to_string())
         )
     ).await
         .expect("Timeout waiting for response")
         .expect("Failed to send load model command");
-    
+
     assert!(matches!(response, Response::Ok));
 
     server_handle.abort();
@@ -91,11 +91,11 @@ async fn test_client_timeout() {
     assert!(result.is_err());
 }
 
-#[tokio::test] 
+#[tokio::test]
 async fn test_invalid_socket_path() {
     // Test with invalid socket path
     let client = IPCClient::new("/invalid/path/socket.sock");
-    
+
     let result = client.start().await;
     assert!(result.is_err());
 }

@@ -1,8 +1,8 @@
 /*!
  * R-Breaker 真實數據交易系統
- * 
+ *
  * 使用真實的 Bitget WebSocket 數據進行 R-Breaker 策略交易
- * 
+ *
  * 功能特點：
  * 1. 真實 Bitget WebSocket 連接
  * 2. ETHUSDT 實時報價和訂單簿數據
@@ -87,7 +87,7 @@ struct RBreakerLevels {
 impl RBreakerLevels {
     fn calculate(high: f64, low: f64, close: f64, sensitivity: f64) -> Self {
         let pivot = (high + close + low) / 3.0;
-        
+
         Self {
             breakthrough_buy: high + 2.0 * sensitivity * (pivot - low),
             observation_sell: pivot + sensitivity * (high - low),
@@ -199,7 +199,7 @@ impl TradingStats {
                             }
                         }
                     }
-                    
+
                     // 開多頭
                     let trade_value = self.current_capital * position_size;
                     let quantity = trade_value / price;
@@ -214,7 +214,7 @@ impl TradingStats {
                         _ => "買入".to_string(),
                     };
 
-                    info!("🟢 {} @ {:.2}, 數量: {:.4}, PnL: ${:.2}", 
+                    info!("🟢 {} @ {:.2}, 數量: {:.4}, PnL: ${:.2}",
                           signal_type, price, quantity, pnl);
                 }
                 else {
@@ -234,7 +234,7 @@ impl TradingStats {
                             self.current_capital += self.position * price;
                         }
                     }
-                    
+
                     // 開空頭
                     let trade_value = self.current_capital * position_size;
                     let quantity = trade_value / price;
@@ -249,7 +249,7 @@ impl TradingStats {
                         _ => "賣出".to_string(),
                     };
 
-                    info!("🔴 {} @ {:.2}, 數量: {:.4}, PnL: ${:.2}", 
+                    info!("🔴 {} @ {:.2}, 數量: {:.4}, PnL: ${:.2}",
                           signal_type, price, quantity, pnl);
                 }
                 else {
@@ -283,7 +283,7 @@ impl TradingStats {
         if portfolio_value > self.peak_value {
             self.peak_value = portfolio_value;
         }
-        
+
         let drawdown = (self.peak_value - portfolio_value) / self.peak_value;
         if drawdown > self.max_drawdown {
             self.max_drawdown = drawdown;
@@ -303,7 +303,7 @@ impl TradingStats {
         } else {
             0.0
         };
-        
+
         self.current_capital + position_value
     }
 
@@ -334,7 +334,7 @@ impl RBreakerStrategy {
         initial_capital: f64,
     ) -> Self {
         let levels = RBreakerLevels::calculate(yesterday_high, yesterday_low, yesterday_close, sensitivity);
-        
+
         println!("📊 R-Breaker 關鍵價位:");
         println!("  突破買入: {:.2}", levels.breakthrough_buy);
         println!("  觀察賣出: {:.2}", levels.observation_sell);
@@ -355,7 +355,7 @@ impl RBreakerStrategy {
 
     fn process_market_data(&mut self, data: &MarketData) {
         let price = data.last_price;
-        
+
         // 更新當日高低點
         if self.daily_high == 0.0 {
             self.daily_high = price;
@@ -366,7 +366,7 @@ impl RBreakerStrategy {
 
         // 生成交易信號
         let signal = self.levels.get_signal(price, self.daily_high, self.daily_low);
-        
+
         if signal != RBreakerSignal::Hold {
             if let Ok(mut stats) = self.stats.lock() {
                 stats.execute_trade(&signal, price, data.timestamp);
@@ -388,11 +388,11 @@ fn parse_orderbook_data(data: &serde_json::Value) -> Option<MarketData> {
         if let Some(first_item) = data_array.first() {
             let bids = first_item.get("bids")?.as_array()?;
             let asks = first_item.get("asks")?.as_array()?;
-            
+
             let best_bid = bids.first()?.as_array()?.first()?.as_str()?.parse::<f64>().ok()?;
             let best_ask = asks.first()?.as_array()?.first()?.as_str()?.parse::<f64>().ok()?;
             let last_price = (best_bid + best_ask) / 2.0;
-            
+
             return Some(MarketData {
                 symbol: "ETHUSDT".to_string(),
                 timestamp: now_micros(),
@@ -414,7 +414,7 @@ fn parse_ticker_data(data: &serde_json::Value) -> Option<MarketData> {
             let best_bid = first_item.get("bidPr")?.as_str()?.parse::<f64>().ok()?;
             let best_ask = first_item.get("askPr")?.as_str()?.parse::<f64>().ok()?;
             let volume = first_item.get("baseVolume")?.as_str()?.parse::<f64>().ok()?;
-            
+
             return Some(MarketData {
                 symbol: "ETHUSDT".to_string(),
                 timestamp: now_micros(),
@@ -460,9 +460,9 @@ async fn main() -> Result<()> {
     // 創建 Bitget 連接器
     let mut config = BitgetConfig::for_ticker_data();
     config.max_reconnect_attempts = 5;
-    
+
     let mut connector = BitgetConnector::new(config);
-    
+
     // 添加訂閱
     connector.add_subscription(args.symbol.clone(), BitgetChannel::Books5);
     connector.add_subscription(args.symbol.clone(), BitgetChannel::Ticker);
@@ -477,7 +477,7 @@ async fn main() -> Result<()> {
     // 消息處理器
     let symbol_clone = args.symbol.clone();
     let verbose = args.verbose;
-    
+
     let message_handler = {
         let mut strategy = strategy;
         move |message: BitgetMessage| {
@@ -486,19 +486,19 @@ async fn main() -> Result<()> {
                     if symbol == symbol_clone {
                         if let Some(market_data) = parse_orderbook_data(&data) {
                             strategy.process_market_data(&market_data);
-                            
+
                             if verbose {
-                                debug!("📈 OrderBook [{}] Bid: {:.2} | Ask: {:.2} | Mid: {:.2}", 
-                                       market_data.symbol, market_data.best_bid, 
+                                debug!("📈 OrderBook [{}] Bid: {:.2} | Ask: {:.2} | Mid: {:.2}",
+                                       market_data.symbol, market_data.best_bid,
                                        market_data.best_ask, market_data.last_price);
                             }
-                            
+
                             // 每10個數據點打印一次報價
                             if let Ok(mut count) = data_count_clone.lock() {
                                 *count += 1;
                                 if *count % 10 == 0 {
-                                    info!("📈 報價 [{}] Bid: {:.2} | Ask: {:.2} | Last: {:.2}", 
-                                           market_data.symbol, market_data.best_bid, 
+                                    info!("📈 報價 [{}] Bid: {:.2} | Ask: {:.2} | Last: {:.2}",
+                                           market_data.symbol, market_data.best_bid,
                                            market_data.best_ask, market_data.last_price);
                                 }
                             }
@@ -509,9 +509,9 @@ async fn main() -> Result<()> {
                     if symbol == symbol_clone {
                         if let Some(market_data) = parse_ticker_data(&data) {
                             strategy.process_market_data(&market_data);
-                            
+
                             if verbose {
-                                debug!("📊 Ticker [{}] Last: {:.2} | Volume: {:.0}", 
+                                debug!("📊 Ticker [{}] Last: {:.2} | Volume: {:.0}",
                                        market_data.symbol, market_data.last_price, market_data.volume);
                             }
                         }
@@ -530,14 +530,14 @@ async fn main() -> Result<()> {
     let stats_clone = strategy_stats.clone();
     let monitoring_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
-        
+
         loop {
             interval.tick().await;
-            
+
             if let Ok(stats) = stats_clone.lock() {
                 let portfolio_value = stats.get_portfolio_value(3500.0); // 估算價格
                 let returns = (portfolio_value - stats.initial_capital) / stats.initial_capital * 100.0;
-                
+
                 println!("\n📊 交易監控狀態:");
                 println!("  持倉: {:.4} | 交易次數: {}", stats.position, stats.total_trades);
                 println!("  勝率: {:.1}% | 總盈虧: ${:.2}", stats.win_rate() * 100.0, stats.total_pnl);
@@ -550,7 +550,7 @@ async fn main() -> Result<()> {
 
     // 連接並處理消息
     info!("🎯 開始接收真實市場數據...");
-    
+
     // 啟動連接任務
     let connection_task = tokio::spawn(async move {
         if let Err(e) = connector.connect_public(message_handler).await {
@@ -588,7 +588,7 @@ async fn main() -> Result<()> {
 
         println!("\n📋 最近交易記錄:");
         for trade in stats.trades.iter().rev().take(5) {
-            println!("  {} | {} {:.4} @ {:.2} | PnL: ${:.2}", 
+            println!("  {} | {} {:.4} @ {:.2} | PnL: ${:.2}",
                      trade.signal_type, trade.side, trade.quantity, trade.price, trade.pnl);
         }
 

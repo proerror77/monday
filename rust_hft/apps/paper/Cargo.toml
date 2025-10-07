@@ -6,7 +6,7 @@ description = "模擬盤交易應用 - 無風險模式"
 
 [dependencies]
 # 核心依賴
-runtime = { package = "hft-runtime", path = "../../crates/runtime" }
+runtime = { package = "hft-runtime", path = "../../market-core/runtime" }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

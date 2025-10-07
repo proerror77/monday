@@ -175,19 +175,19 @@ fn benchmark_end_to_end_latency(c: &mut Criterion) {
     group.bench_function("完整消息處理流程", |b| {
         let mut parser = BitgetMessageParser::new();
         let json_message = r#"{"action":"snapshot","arg":{"instId":"BTCUSDT","channel":"books15"},"data":[{"asks":[["67189.5","0.25",1]],"bids":[["67188.1","0.12",1]],"ts":"1721810005123"}]}"#;
-        
+
         b.iter(|| {
             let start = Instant::now();
-            
+
             // 1. JSON 解析 (simd-json)
             let orderbook = parser.parse_orderbook_message(json_message);
-            
+
             // 2. 實例選擇 (ArcSwap)
             let instance = manager.select_instance("bitget", "BTCUSDT");
-            
+
             // 3. 處理結果
             black_box((orderbook, instance));
-            
+
             let duration = start.elapsed();
             black_box(duration);
         })
@@ -201,22 +201,22 @@ fn benchmark_end_to_end_latency(c: &mut Criterion) {
                 tokio::spawn(async move {
                     let mut parser = BitgetMessageParser::new();
                     let json_message = r#"{"action":"snapshot","arg":{"instId":"BTCUSDT","channel":"books15"},"data":[{"asks":[["67189.5","0.25",1]],"bids":[["67188.1","0.12",1]],"ts":"1721810005123"}]}"#;
-                    
+
                     for _ in 0..100 {
                         let start = Instant::now();
-                        
+
                         // JSON 解析 + 實例選擇
                         let orderbook = parser.parse_orderbook_message(json_message);
                         let instance = manager.select_instance("bitget", "BTCUSDT");
-                        
+
                         black_box((orderbook, instance));
-                        
+
                         let duration = start.elapsed();
                         black_box(duration);
                     }
                 })
             }).collect();
-            
+
             for task in tasks {
                 task.await.unwrap();
             }

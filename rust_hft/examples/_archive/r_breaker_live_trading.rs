@@ -1,8 +1,8 @@
 /*!
  * R-Breaker Live Trading System
- * 
+ *
  * R-Breaker 策略是一種成熟的日內反轉策略，基於前一日的高低點計算阻力支撐位
- * 
+ *
  * 策略原理：
  * 1. 計算六個關鍵價位：突破買入、觀察賣出、反轉賣出、反轉買入、觀察買入、突破賣出
  * 2. 基於價格突破這些關鍵位進行交易決策
@@ -17,7 +17,7 @@ use rust_hft::{
         types::{Side, Timestamp, Price, Quantity},
     },
     engine::strategies::traits::{
-        TradingStrategy, StrategyContext, TradingSignal, StrategyState, 
+        TradingStrategy, StrategyContext, TradingSignal, StrategyState,
         StrategyStatus, StrategyPerformance, StrategyPosition
     },
     integrations::bitget_connector::*,
@@ -84,7 +84,7 @@ struct Args {
 struct RBreakerLevels {
     /// 突破買入價位
     breakthrough_buy: f64,
-    /// 觀察賣出價位  
+    /// 觀察賣出價位
     observation_sell: f64,
     /// 反轉賣出價位
     reversal_sell: f64,
@@ -106,7 +106,7 @@ impl RBreakerLevels {
     /// 根據前一日OHLC計算R-Breaker關鍵價位
     fn calculate(high: f64, low: f64, close: f64, sensitivity: f64) -> Self {
         let pivot = (high + close + low) / 3.0;
-        
+
         // R-Breaker六個關鍵價位
         let breakthrough_buy = high + 2.0 * sensitivity * (pivot - low);
         let observation_sell = pivot + sensitivity * (high - low);
@@ -153,7 +153,7 @@ impl RBreakerLevels {
 #[derive(Debug, Clone, PartialEq)]
 enum RBreakerSignal {
     TrendBuy,
-    TrendSell, 
+    TrendSell,
     ReversalBuy,
     ReversalSell,
     Hold,
@@ -268,7 +268,7 @@ impl RBreakerStrategy {
                 close: price,
                 volume,
             });
-            
+
             self.last_minute_timestamp = minute_timestamp;
 
             // 檢查是否需要更新R-Breaker價位（新的一天）
@@ -303,7 +303,7 @@ impl RBreakerStrategy {
         // 實際實現中應該根據交易所的具體時區來判斷
         let hours_since_epoch = timestamp / (3600 * 1000 * 1000);
         let current_day = hours_since_epoch / 24;
-        
+
         // 這裡需要更精確的邏輯來判斷新的交易日
         // 暫時使用簡化實現
     }
@@ -323,7 +323,7 @@ impl RBreakerStrategy {
                 let close = yesterday_klines.last().unwrap().close;
 
                 self.levels = Some(RBreakerLevels::calculate(high, low, close, self.sensitivity));
-                
+
                 debug!("R-Breaker價位更新: {:?}", self.levels);
             }
         }
@@ -332,9 +332,9 @@ impl RBreakerStrategy {
     /// 生成交易信號
     fn generate_signal(&mut self, current_price: f64) -> Option<TradingSignal> {
         let levels = self.levels.as_ref()?;
-        
+
         let signal = levels.get_signal(current_price, self.daily_high, self.daily_low);
-        
+
         match signal {
             RBreakerSignal::TrendBuy | RBreakerSignal::ReversalBuy => {
                 if self.current_position <= 0.0 {
@@ -435,27 +435,27 @@ impl TradingStrategy for RBreakerStrategy {
     ) -> Result<TradingSignal> {
         let current_price = (orderbook.best_bid + orderbook.best_ask) / 2.0;
         let timestamp = orderbook.last_update;
-        
+
         // 更新K線數據
         self.update_kline(current_price, 1.0, timestamp);
-        
+
         // 如果還沒有R-Breaker價位，嘗試計算
         if self.levels.is_none() {
             self.update_rbreaker_levels();
         }
-        
+
         self.last_update = timestamp;
-        
+
         // 生成交易信號
         let signal = self.generate_signal(current_price).unwrap_or(TradingSignal::Hold);
         self.last_signal = Some(signal.clone());
-        
+
         Ok(signal)
     }
 
     async fn on_trade_execution(&mut self, trade: &TradeExecution) -> Result<()> {
         self.total_trades += 1;
-        
+
         match trade.side {
             Side::Buy => {
                 self.current_position += trade.quantity;
@@ -476,15 +476,15 @@ impl TradingStrategy for RBreakerStrategy {
                 }
             }
         }
-        
+
         // 如果平倉完畢
         if self.current_position.abs() < 0.0001 {
             self.entry_price = None;
         }
-        
-        info!("交易執行: {:?} {} @ {:.2}, 當前持倉: {:.4}", 
+
+        info!("交易執行: {:?} {} @ {:.2}, 當前持倉: {:.4}",
               trade.side, trade.quantity, trade.price, self.current_position);
-        
+
         Ok(())
     }
 
@@ -574,11 +574,11 @@ impl SimulatedTradeExecutor {
                 let trade_value = self.current_capital * quantity;
                 let shares = trade_value / current_price;
                 let commission = trade_value * self.commission_rate;
-                
+
                 if self.current_capital >= trade_value + commission {
                     self.current_capital -= trade_value + commission;
                     self.current_position += shares;
-                    
+
                     Some(TradeExecution {
                         order_id: format!("buy_{}", timestamp),
                         symbol: "BTCUSDT".to_string(),
@@ -596,11 +596,11 @@ impl SimulatedTradeExecutor {
                 let shares = self.current_position * quantity;
                 let trade_value = shares * current_price;
                 let commission = trade_value * self.commission_rate;
-                
+
                 if self.current_position >= shares {
                     self.current_capital += trade_value - commission;
                     self.current_position -= shares;
-                    
+
                     Some(TradeExecution {
                         order_id: format!("sell_{}", timestamp),
                         symbol: "BTCUSDT".to_string(),
@@ -618,11 +618,11 @@ impl SimulatedTradeExecutor {
                 if self.current_position > 0.0 {
                     let trade_value = self.current_position * current_price;
                     let commission = trade_value * self.commission_rate;
-                    
+
                     self.current_capital += trade_value - commission;
                     let shares = self.current_position;
                     self.current_position = 0.0;
-                    
+
                     Some(TradeExecution {
                         order_id: format!("close_{}", timestamp),
                         symbol: "BTCUSDT".to_string(),
@@ -664,7 +664,7 @@ async fn main() -> Result<()> {
 
     info!("🚀 R-Breaker Live Trading System 啟動");
     info!("交易對: {}, 初始資金: ${:.2}", args.symbol, args.capital);
-    info!("參數 - 敏感度: {:.2}, 止損: {:.2}%, 止盈: {:.2}%", 
+    info!("參數 - 敏感度: {:.2}, 止損: {:.2}%, 止盈: {:.2}%",
           args.sensitivity, args.stop_loss * 100.0, args.take_profit * 100.0);
 
     // 創建策略
@@ -710,7 +710,7 @@ async fn main() -> Result<()> {
                 BitgetMessage::OrderBook { data, timestamp, .. } => {
                     if let Ok(orderbook) = parse_orderbook(&symbol_clone, &data, timestamp) {
                         let current_price = (orderbook.best_bid + orderbook.best_ask) / 2.0;
-                        
+
                         // 策略信號生成
                         if let Ok(mut strat) = strategy_clone.lock() {
                             if let Ok(signal) = strat.on_orderbook_update(&symbol_clone, &orderbook).await {
@@ -725,13 +725,13 @@ async fn main() -> Result<()> {
                                             if let Err(e) = strat.on_trade_execution(&trade).await {
                                                 error!("交易執行回調失敗: {}", e);
                                             }
-                                            
+
                                             let portfolio_value = exec.get_portfolio_value(current_price);
                                             let returns = exec.get_returns(current_price);
-                                            
-                                            info!("✅ 交易執行: {:?} {:.4} @ {:.2}", 
+
+                                            info!("✅ 交易執行: {:?} {:.4} @ {:.2}",
                                                   trade.side, trade.quantity, trade.price);
-                                            info!("💰 投資組合價值: ${:.2} (收益率: {:.2}%)", 
+                                            info!("💰 投資組合價值: ${:.2} (收益率: {:.2}%)",
                                                   portfolio_value, returns * 100.0);
                                         }
                                     }
@@ -776,7 +776,7 @@ async fn main() -> Result<()> {
                 println!("現金餘額: ${:.2}", exec.current_capital);
                 println!("投資組合價值: ${:.2}", portfolio_value);
                 println!("總收益率: {:.2}%", returns * 100.0);
-                
+
                 if let Some(levels) = &strat.levels {
                     println!("\nR-Breaker 關鍵價位:");
                     println!("  突破買入: {:.2}", levels.breakthrough_buy);
@@ -839,12 +839,12 @@ fn parse_orderbook(symbol: &str, _data: &serde_json::Value, timestamp: u64) -> R
     let mut orderbook = OrderBook::new(symbol.to_string());
     orderbook.last_update = timestamp;
     orderbook.is_valid = true;
-    
+
     // 這裡應該解析真實的訂單簿數據
     // 簡化實現，需要根據實際Bitget數據格式進行解析
     orderbook.best_bid = 67000.0; // 示例價格
     orderbook.best_ask = 67001.0;
-    
+
     Ok(orderbook)
 }
 // Archived legacy example; see 02_strategy/

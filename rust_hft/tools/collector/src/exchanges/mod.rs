@@ -114,11 +114,7 @@ pub trait Exchange {
     async fn process_message(&self, message: &str, buffers: &mut MessageBuffers) -> Result<()>;
 
     /// 刷新数据到 ClickHouse
-    async fn flush_data(
-        &self,
-        database: &str,
-        buffers: &mut MessageBuffers,
-    ) -> Result<()>;
+    async fn flush_data(&self, database: &str, buffers: &mut MessageBuffers) -> Result<()>;
 
     /// 連線後的訂閱消息（預設不需要）
     async fn subscription_messages(&self, _symbols: &[String]) -> Result<Vec<String>> {

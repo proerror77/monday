@@ -3,7 +3,7 @@
  *
  * Performance targets:
  * - Market data processing: p99 ≤ 25 μs from receive to order
- * - Throughput: ≥ 100,000 ops/sec orderbook updates  
+ * - Throughput: ≥ 100,000 ops/sec orderbook updates
  * - Memory efficiency: ≤ 10MB per trading pair
  * - WebSocket stability: < 3 reconnections per hour
  *
@@ -547,7 +547,7 @@ fn bench_cpu_optimization(c: &mut Criterion) {
 }
 
 /// Benchmark 8: Ultra Low Latency Execution Pipeline
-/// Target: Complete pipeline p99 ≤ 25 μs  
+/// Target: Complete pipeline p99 ≤ 25 μs
 fn bench_ultra_low_latency_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("ultra_low_latency_pipeline");
     group.measurement_time(Duration::from_secs(15));

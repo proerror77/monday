@@ -358,11 +358,7 @@ impl Exchange for BybitExchange {
         Ok(())
     }
 
-    async fn flush_data(
-        &self,
-        database: &str,
-        buffers: &mut MessageBuffers,
-    ) -> Result<()> {
+    async fn flush_data(&self, database: &str, buffers: &mut MessageBuffers) -> Result<()> {
         let sink = crate::db::get_sink_async(database).await?;
 
         // orderbook

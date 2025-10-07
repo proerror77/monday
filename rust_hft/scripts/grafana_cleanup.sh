@@ -28,12 +28,7 @@ fi
 read -r -d '' KEEP_TITLES << 'EOF' || true
 HFT System Overview - Professional
 HFT Data Collection Dashboard - Fixed
-HFT Redis Live Dashboard - Enhanced
 LOB Depth Overview (Fixed)
-ClickHouse Factors
-HFT Overview
-HFT Data Collection Dashboard
-HFT Redis Live
 EOF
 
 # Convert keep list to jq-compatible array

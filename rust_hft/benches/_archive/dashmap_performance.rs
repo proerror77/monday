@@ -23,7 +23,7 @@ fn generate_test_data() -> Vec<(String, i32)> {
 fn rwlock_hashmap_benchmark(c: &mut Criterion) {
     let data = generate_test_data();
     let map = Arc::new(RwLock::new(HashMap::new()));
-    
+
     // 預先填充數據
     {
         let mut write_guard = map.write().unwrap();
@@ -63,7 +63,7 @@ fn rwlock_hashmap_benchmark(c: &mut Criterion) {
                     thread::spawn(move || {
                         for i in 0..NUM_OPERATIONS {
                             let key = format!("key_{}", (thread_id * NUM_OPERATIONS + i) % NUM_ITEMS);
-                            
+
                             if i % 10 == 0 {
                                 // 10% 寫操作
                                 let mut write_guard = map.write().unwrap();
@@ -89,7 +89,7 @@ fn rwlock_hashmap_benchmark(c: &mut Criterion) {
 fn dashmap_benchmark(c: &mut Criterion) {
     let data = generate_test_data();
     let map = Arc::new(DashMap::new());
-    
+
     // 預先填充數據
     for (key, value) in &data {
         map.insert(key.clone(), *value);
@@ -126,7 +126,7 @@ fn dashmap_benchmark(c: &mut Criterion) {
                     thread::spawn(move || {
                         for i in 0..NUM_OPERATIONS {
                             let key = format!("key_{}", (thread_id * NUM_OPERATIONS + i) % NUM_ITEMS);
-                            
+
                             if i % 10 == 0 {
                                 // 10% 寫操作
                                 map.insert(key, thread_id as i32 * 1000 + i as i32);
@@ -150,7 +150,7 @@ fn dashmap_benchmark(c: &mut Criterion) {
 /// 單線程性能測試（用於對比）
 fn single_thread_benchmark(c: &mut Criterion) {
     let data = generate_test_data();
-    
+
     // HashMap 單線程
     let mut hashmap = HashMap::new();
     for (key, value) in &data {

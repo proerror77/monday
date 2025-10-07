@@ -7,4 +7,4 @@ edition = "2021"
 # 空的 workspace 以避免继承父级
 
 [dependencies]
-hft-core = { path = "../crates/core" }
+hft-core = { path = "../market-core/core" }

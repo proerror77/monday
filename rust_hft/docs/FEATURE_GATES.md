@@ -4,7 +4,7 @@
 
 ## 命名与分组原则
 
-- 作用域前缀：`adapter-*`、`strategy-*`、`infra-*`、`simd-*`、`profile-*`
+- 作用域前缀：`adapter-*`、`strategy-*`、`infrastructure`（逐步统一为 `metrics`/`clickhouse`/`redis` 等）、`simd-*`、`profile-*`
 - 转发而不重命名：上层 crate 仅做特性转发，不改变下游特性语义
 - 小而清晰：避免“超级特性”聚合过多子特性（如 `full` 仅用于开发便捷）
 
@@ -12,7 +12,7 @@
 
 ### hft-engine
 
-- `infra-metrics`: 启用引擎侧 Prometheus 指标埋点（依赖 `hft-infra-metrics`）
+- `metrics`: 启用引擎侧 Prometheus 指标埋点（依赖 `hft-infra-metrics`）
 
 ### hft-integration
 
@@ -22,10 +22,10 @@
 
 - 适配器特性：`adapter-*-data`、`adapter-*-execution`
 - 策略特性：`strategy-*`
-- 基础设施：`infra-clickhouse`、`infra-redis`、`infra-metrics`、`infra-ipc`、`recovery`
+- 基础设施：`clickhouse`、`redis`、`metrics`、`infra-ipc`、`recovery`
 - 便捷聚合：`bitget`、`binance`、`bybit`、`mock`、`all-strategies`、`full`
 
-注意：自 2025-08 起，`hft-runtime` 不再转发 `engine/infra-metrics`，由最上层应用显式启用（见下）。
+注意：`metrics` 会自动转发到 `engine/metrics`，无需另外声明。
 
 ## 应用层特性组合
 
@@ -34,8 +34,7 @@
 默认特性：`bitget`、`trend-strategy`、`metrics`
 
 - `metrics` 组合包含：
-  - `runtime/infra-metrics`
-  - `engine/infra-metrics`（重要：驱动引擎内指标）
+  - `runtime/metrics`
   - `infra-metrics/http-server` + `prometheus`
 
 常用构建：
@@ -65,10 +64,20 @@ cargo run -p hft-replay --features "mock,clickhouse"
 ## 推荐实践
 
 - 明确场景组合：优先以“场景”为单位组合特性（live/paper/replay），尽量避免“all-*”大集成用于生产
-- 顶层启用指标：由应用层启用 `engine/infra-metrics`，避免跨 crate 特性耦合
+- 顶层启用指标：优先使用统一的 `metrics` 特性，由 runtime 串联 engine 与指标服务
 - 文档即代码：新增特性务必在本文件补充说明与示例
+
+## 新增：Lighter DEX（行情）
+
+- 适配器特性：`adapter-lighter-data`（公有 WS 行情 `/stream`）
+- 便捷聚合：`lighter` 仅包含行情（执行集成需接入官方 signer 库，后续提供）
+
+示例：
+
+```bash
+cargo run -p hft-paper --features "lighter"
+```
 
 ## 后续计划（提案）
 
 - 添加 `profile-live`、`profile-paper`、`profile-replay` 三个场景特性，封装稳定组合，进一步简化特性矩阵
-

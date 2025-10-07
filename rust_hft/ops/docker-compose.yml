@@ -56,7 +56,7 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource,redis-datasource
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
       - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=2s
     depends_on:
       - prometheus

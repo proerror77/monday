@@ -305,7 +305,7 @@ impl DepthComparisonTest {
                     0.0
                 };
 
-                info!("   深度 {:2}: {:4} 事件 ({:5.1}/秒) [訂單簿:{:4.1}% 交易:{:4.1}% Ticker:{:4.1}%]", 
+                info!("   深度 {:2}: {:4} 事件 ({:5.1}/秒) [訂單簿:{:4.1}% 交易:{:4.1}% Ticker:{:4.1}%]",
                     result.depth, result.total_events, result.events_per_second,
                     ob_percent, trade_percent, ticker_percent);
             }

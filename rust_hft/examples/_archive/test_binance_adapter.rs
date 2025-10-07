@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 測試健康檢查
     let health = binance_stream.health().await;
-    info!("連接健康狀態: connected={}, latency={:?}", 
+    info!("連接健康狀態: connected={}, latency={:?}",
         health.connected, health.latency_ms);
 
     // 測試市場數據訂閱
@@ -56,18 +56,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     info!("訂閱市場數據: {:?}", symbols);
-    
+
     match binance_stream.subscribe(symbols).await {
         Ok(mut stream) => {
             info!("✅ 市場數據訂閱成功");
-            
+
             // 設置 30 秒超時
             let timeout_duration = Duration::from_secs(30);
             let mut event_count = 0;
             const MAX_EVENTS: usize = 10;
-            
+
             info!("開始接收市場數據 (最多 {} 個事件, 超時 {} 秒)...", MAX_EVENTS, timeout_duration.as_secs());
-            
+
             while event_count < MAX_EVENTS {
                 match timeout(timeout_duration, stream.next()).await {
                     Ok(Some(result)) => {
@@ -76,17 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 event_count += 1;
                                 match market_event {
                                     ports::MarketEvent::Snapshot(snapshot) => {
-                                        info!("📈 快照事件: {} 序號={} 買檔={} 賣檔={}", 
+                                        info!("📈 快照事件: {} 序號={} 買檔={} 賣檔={}",
                                             snapshot.symbol, snapshot.sequence,
                                             snapshot.bids.len(), snapshot.asks.len());
-                                        
+
                                         // 顯示前3檔
                                         if !snapshot.bids.is_empty() {
-                                            info!("   買一: {} @ {}", 
+                                            info!("   買一: {} @ {}",
                                                 snapshot.bids[0].price, snapshot.bids[0].quantity);
                                         }
                                         if !snapshot.asks.is_empty() {
-                                            info!("   賣一: {} @ {}", 
+                                            info!("   賣一: {} @ {}",
                                                 snapshot.asks[0].price, snapshot.asks[0].quantity);
                                         }
                                     }
@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     ports::MarketEvent::Trade(trade) => {
                                         info!("💰 交易事件: {} {} {} @ {} ID={}",
-                                            trade.symbol, 
+                                            trade.symbol,
                                             if trade.side == hft_core::Side::Buy { "買入" } else { "賣出" },
                                             trade.quantity, trade.price, trade.trade_id);
                                     }
@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            
+
             info!("收到 {} 個市場事件", event_count);
         }
         Err(e) => {

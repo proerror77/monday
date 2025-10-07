@@ -3,19 +3,17 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::prelude::*;
 use clickhouse::Client;
+use once_cell::sync::Lazy;
 use ordered_float::OrderedFloat;
 use serde_json::Value;
 use tracing::debug;
-use once_cell::sync::Lazy;
 
-static HL_DEBUG: Lazy<bool> = Lazy::new(|| {
-    match std::env::var("HYPERLIQUID_DEBUG") {
-        Ok(v) => match v.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "debug" => true,
-            _ => false,
-        },
-        Err(_) => false,
-    }
+static HL_DEBUG: Lazy<bool> = Lazy::new(|| match std::env::var("HYPERLIQUID_DEBUG") {
+    Ok(v) => match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "debug" => true,
+        _ => false,
+    },
+    Err(_) => false,
 });
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -40,13 +38,20 @@ pub struct HyperliquidExchange {
 
 impl HyperliquidExchange {
     pub fn new(ctx: Arc<ExchangeContext>) -> Self {
-        Self { ctx, ob: RwLock::new(HashMap::new()) }
+        Self {
+            ctx,
+            ob: RwLock::new(HashMap::new()),
+        }
     }
 }
 
 fn v_to_f64(v: &Value) -> Option<f64> {
-    if let Some(x) = v.as_f64() { return Some(x); }
-    if let Some(s) = v.as_str() { return s.parse().ok(); }
+    if let Some(x) = v.as_f64() {
+        return Some(x);
+    }
+    if let Some(s) = v.as_str() {
+        return s.parse().ok();
+    }
     None
 }
 
@@ -179,7 +184,10 @@ impl Exchange for HyperliquidExchange {
         if channel == "l2Book" {
             if let Some(data) = v.get("data") {
                 let symbol = data.get("coin").and_then(|x| x.as_str()).unwrap_or("");
-                let ts = data.get("time").and_then(|x| x.as_i64()).unwrap_or_else(|| Utc::now().timestamp_millis());
+                let ts = data
+                    .get("time")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or_else(|| Utc::now().timestamp_millis());
                 if let Some(levels) = data.get("levels").and_then(|x| x.as_array()) {
                     // levels 形如 [ bids[], asks[] ]，每条为 { px, sz, n }
                     let mut updated_bids = false;
@@ -201,7 +209,11 @@ impl Exchange for HyperliquidExchange {
                                 let mut books = self.ob.write().await;
                                 let book = books.entry(symbol.to_string()).or_default();
                                 let k = OrderedFloat(px);
-                                if qty == 0.0 { book.bids.remove(&k); } else { book.bids.insert(k, qty); }
+                                if qty == 0.0 {
+                                    book.bids.remove(&k);
+                                } else {
+                                    book.bids.insert(k, qty);
+                                }
                                 updated_bids = true;
                             }
                         }
@@ -223,7 +235,11 @@ impl Exchange for HyperliquidExchange {
                                 let mut books = self.ob.write().await;
                                 let book = books.entry(symbol.to_string()).or_default();
                                 let k = OrderedFloat(px);
-                                if qty == 0.0 { book.asks.remove(&k); } else { book.asks.insert(k, qty); }
+                                if qty == 0.0 {
+                                    book.asks.remove(&k);
+                                } else {
+                                    book.asks.insert(k, qty);
+                                }
                                 updated_asks = true;
                             }
                         }
@@ -231,16 +247,24 @@ impl Exchange for HyperliquidExchange {
                     let (emit_bp, emit_bq, emit_ap, emit_aq) = {
                         let mut books = self.ob.write().await;
                         if let Some(book) = books.get_mut(symbol) {
-                            let cur_bb = book.bids.iter().rev().next().map(|(p,q)| (p.0, *q));
-                            let cur_ba = book.asks.iter().next().map(|(p,q)| (p.0, *q));
-                            if let Some((px, qty)) = cur_bb { book.last_bid_px = Some(px); book.last_bid_qty = Some(qty); }
-                            if let Some((px, qty)) = cur_ba { book.last_ask_px = Some(px); book.last_ask_qty = Some(qty); }
+                            let cur_bb = book.bids.iter().rev().next().map(|(p, q)| (p.0, *q));
+                            let cur_ba = book.asks.iter().next().map(|(p, q)| (p.0, *q));
+                            if let Some((px, qty)) = cur_bb {
+                                book.last_bid_px = Some(px);
+                                book.last_bid_qty = Some(qty);
+                            }
+                            if let Some((px, qty)) = cur_ba {
+                                book.last_ask_px = Some(px);
+                                book.last_ask_qty = Some(qty);
+                            }
                             let bp = cur_bb.map(|t| t.0).or(book.last_bid_px).unwrap_or(0.0);
                             let bq = cur_bb.map(|t| t.1).or(book.last_bid_qty).unwrap_or(0.0);
                             let ap = cur_ba.map(|t| t.0).or(book.last_ask_px).unwrap_or(0.0);
                             let aq = cur_ba.map(|t| t.1).or(book.last_ask_qty).unwrap_or(0.0);
                             (bp, bq, ap, aq)
-                        } else { (0.0,0.0,0.0,0.0) }
+                        } else {
+                            (0.0, 0.0, 0.0, 0.0)
+                        }
                     };
                     debug!(
                         "[HL L1] sym={} updated_bids={} updated_asks={} bp={} bq={} ap={} aq={}",
@@ -289,7 +313,10 @@ impl Exchange for HyperliquidExchange {
         } else if channel == "bbo" {
             if let Some(obj) = v.get("data").and_then(|x| x.as_object()) {
                 let coin = obj.get("coin").and_then(|x| x.as_str()).unwrap_or("");
-                let ts = obj.get("time").and_then(|x| x.as_i64()).unwrap_or_else(|| Utc::now().timestamp_millis());
+                let ts = obj
+                    .get("time")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or_else(|| Utc::now().timestamp_millis());
                 if let Some(bbo) = obj.get("bbo").and_then(|x| x.as_array()) {
                     if bbo.len() >= 2 {
                         let bid = bbo.get(0).and_then(|x| x.as_object());
@@ -325,17 +352,16 @@ impl Exchange for HyperliquidExchange {
             // 可選：忽略或寫入專用表；當前忽略。
         } else if *HL_DEBUG {
             // 未匹配到已知频道时打印关键信息，辅助调试
-            let keys: Vec<_> = v.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+            let keys: Vec<_> = v
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
             debug!("[HL DBG] unknown channel='{}' top_keys={:?}", channel, keys);
         }
         Ok(())
     }
 
-    async fn flush_data(
-        &self,
-        database: &str,
-        buffers: &mut MessageBuffers,
-    ) -> Result<()> {
+    async fn flush_data(&self, database: &str, buffers: &mut MessageBuffers) -> Result<()> {
         let sink = crate::db::get_sink_async(database).await?;
         buffers
             .flush_spot_table(&sink, "hyperliquid_orderbook", |spot| &mut spot.orderbook)

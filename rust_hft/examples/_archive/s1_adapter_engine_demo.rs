@@ -28,15 +28,15 @@ struct Args {
     /// 交易對
     #[arg(short, long, default_value = "BTCUSDT")]
     symbol: String,
-    
+
     /// Ring buffer 容量 (2的冪)
     #[arg(long, default_value = "32768")]
     queue_capacity: usize,
-    
+
     /// 陳舊度閾值 (微秒)
     #[arg(long, default_value = "3000")]
     stale_threshold_us: u64,
-    
+
     /// 運行時間 (秒)
     #[arg(long, default_value = "60")]
     runtime_secs: u64,
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    
+
     info!(
         "🚀 S1 演示開始 - 交易對: {}, 隊列容量: {}, 運行時間: {}s",
         args.symbol, args.queue_capacity, args.runtime_secs
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
     info!("📡 正在連接 Bitget WebSocket...");
     let bitget_stream = BitgetMarketStream::new();
     let symbols = vec![Symbol(args.symbol.clone())];
-    
+
     let consumer = match adapter_bridge.bridge_stream(bitget_stream, symbols).await {
         Ok(consumer) => consumer,
         Err(e) => {
@@ -104,16 +104,16 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(5));
             let mut tick_count = 0;
-            
+
             loop {
                 interval.tick().await;
                 tick_count += 1;
-                
+
                 info!(
-                    "📊 統計 [{}min]: 運行中...", 
+                    "📊 統計 [{}min]: 運行中...",
                     tick_count * 5 / 60
                 );
-                
+
                 if tick_count * 5 >= runtime_secs {
                     info!("⏰ 達到預設運行時間，準備停止");
                     break;
@@ -127,14 +127,14 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let mut total_events = 0u64;
             let mut total_snapshots = 0u64;
-            
+
             info!("🔄 Engine 主循環開始");
-            
+
             loop {
                 match engine.tick() {
                     Ok(result) => {
                         total_events += result.events_total as u64;
-                        
+
                         if result.snapshot_published {
                             total_snapshots += 1;
                             let market_view = engine.get_market_view();
@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
                                 market_view.timestamp
                             );
                         }
-                        
+
                         // 每處理 1000 個事件報告一次
                         if total_events % 1000 == 0 && total_events > 0 {
                             let stats = engine.get_statistics();
@@ -154,7 +154,7 @@ async fn main() -> Result<()> {
                                 total_events, total_snapshots, stats.consumers_count
                             );
                         }
-                        
+
                         // 如果沒有事件，短暫休眠避免 CPU 佔用
                         if result.events_total == 0 {
                             sleep(Duration::from_micros(100)).await;
