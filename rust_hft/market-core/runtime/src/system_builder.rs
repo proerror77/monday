@@ -32,7 +32,7 @@ mod config_types; // 預留：後續逐步搬移配置型別
 mod infra_exporters; // 預留：後續搬移 Redis/ClickHouse 導出
 
 // 將部分配置型別從子模組對外公開
-pub use config_types::{ClickHouseConfig, InfraConfig, RedisConfig};
+pub use config_types::{ClickHouseConfig, CpuAffinityConfig, InfraConfig, RedisConfig, SystemEngineConfig};
 
 #[cfg(feature = "redis")]
 use serde_json;
@@ -96,37 +96,7 @@ pub struct AccountConfig {
     pub credentials: Option<AccountCredentials>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemEngineConfig {
-    pub queue_capacity: usize,
-    pub stale_us: u64,
-    pub top_n: usize,
-    pub flip_policy: FlipPolicy,
-    #[serde(default)]
-    pub cpu_affinity: CpuAffinityConfig,
-    /// Ack timeout for execution worker (ms)
-    #[serde(default = "default_ack_timeout_ms")]
-    pub ack_timeout_ms: u64,
-    /// Reconciliation interval (ms)
-    #[serde(default = "default_reconcile_interval_ms")]
-    pub reconcile_interval_ms: u64,
-    /// Auto-cancel exchange-only orders discovered in reconciliation
-    #[serde(default)]
-    pub auto_cancel_exchange_only: bool,
-}
-
-fn default_ack_timeout_ms() -> u64 {
-    3000
-}
-fn default_reconcile_interval_ms() -> u64 {
-    5000
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CpuAffinityConfig {
-    /// 將引擎主循環綁定到指定 CPU 核心（0-based）
-    pub engine_core: Option<usize>,
-}
+// SystemEngineConfig 與 CpuAffinityConfig 已移至 config_types 模組
 
 // FlipPolicy 現在從 engine::dataflow 導入
 
