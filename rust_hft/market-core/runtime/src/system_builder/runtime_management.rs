@@ -46,7 +46,7 @@ impl SystemRuntime {
             .ok_or_else(|| HftError::Config(format!("找不到策略 '{}' 的配置", base_name)))?;
 
         let strategy_type = self.config.strategies[cfg_index].strategy_type.clone();
-        let shared_type = super::config_loader::to_shared_strategy_type(&strategy_type);
+        let shared_type = super::to_shared_strategy_type(&strategy_type);
         let runtime_params = super::config_loader::convert_strategy_params(&shared_type, new_params)
             .map_err(HftError::Config)?;
 

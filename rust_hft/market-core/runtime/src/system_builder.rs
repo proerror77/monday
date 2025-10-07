@@ -37,7 +37,7 @@ use serde_json;
 #[cfg(feature = "redis")]
 use engine::aggregation;
 
-// ClickHouse 插入行結構（模組級，避免局部 struct 導致 Row derive 失效）
+// 臨時保留：ClickHouse 行結構（待 legacy 導出方法移除後一併刪除）
 #[cfg(feature = "clickhouse")]
 #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
 struct LobDepthRow {
@@ -50,7 +50,6 @@ struct LobDepthRow {
     quantity: f64,
 }
 
-// ClickHouse 引擎統計行（每秒一次，用於計算填單率等）
 #[cfg(feature = "clickhouse")]
 #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
 struct EngineStatsRow {
@@ -78,6 +77,7 @@ struct FactorRow {
     ofi_l5: f64,
     mid_change_bps: f64,
 }
+
 
 /// 系統配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1325,78 +1325,6 @@ impl SystemRuntime {
         Ok(())
     }
 
-    /// 熱更新指定策略實例的參數（已遷移至 runtime_management）
-    #[allow(dead_code)]
-    pub async fn update_strategy_params_legacy(
-        &mut self,
-        strategy_id: &str,
-        new_params: SharedStrategyParams,
-    ) -> Result<(), HftError> {
-        info!("熱更新策略參數: {}", strategy_id);
-
-        let (base_name, symbol_part) = match strategy_id.split_once(':') {
-            Some((base, sym)) => (base.to_string(), Some(sym.to_string())),
-            None => (strategy_id.to_string(), None),
-        };
-
-        let cfg_index = self
-            .config
-            .strategies
-            .iter()
-            .position(|cfg| cfg.name == base_name)
-            .ok_or_else(|| HftError::Config(format!("找不到策略 '{}' 的配置", base_name)))?;
-
-        let strategy_type = self.config.strategies[cfg_index].strategy_type.clone();
-        let shared_type = to_shared_strategy_type(&strategy_type);
-        let runtime_params = config_loader::convert_strategy_params(&shared_type, new_params)
-            .map_err(HftError::Config)?;
-
-        let mut updated_cfg = self.config.strategies[cfg_index].clone();
-        updated_cfg.params = runtime_params.clone();
-
-        let target_symbol = if let Some(symbol_str) = symbol_part {
-            let symbol = Symbol(symbol_str.clone());
-            if !updated_cfg.symbols.iter().any(|s| s == &symbol) {
-                return Err(HftError::Config(format!(
-                    "策略 '{}' 未配置商品 {}",
-                    base_name, symbol_str
-                )));
-            }
-            Some(symbol)
-        } else if updated_cfg.symbols.len() == 1 {
-            updated_cfg.symbols.first().cloned()
-        } else {
-            None
-        };
-
-        let new_strategy = if let Some(symbol) = target_symbol {
-            create_strategy_instance_for_symbol(&updated_cfg, &symbol)?
-        } else {
-            let mut instances = create_strategy_instances_from_config(&updated_cfg)?;
-            if instances.len() != 1 {
-                return Err(HftError::Config(format!(
-                    "策略 '{}' 產生 {} 個實例，請提供更精確的策略 ID",
-                    base_name,
-                    instances.len()
-                )));
-            }
-            instances.remove(0)
-        };
-
-        {
-            let mut engine = self.engine.lock().await;
-            let index = engine
-                .strategy_instance_ids()
-                .iter()
-                .position(|id| id == strategy_id)
-                .ok_or_else(|| HftError::Config(format!("策略實例 '{}' 不存在", strategy_id)))?;
-            engine.replace_strategy(index, new_strategy)?;
-        }
-
-        self.config.strategies[cfg_index] = updated_cfg;
-        Ok(())
-    }
-
     /// 停止系統
     pub async fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("停止系統運行時...");
@@ -1513,126 +1441,7 @@ impl SystemRuntime {
         Ok(test_order_id)
     }
 
-    /// 啟動 Redis 導出任務（已遷移至 infra_exporters；此為臨時保留避免大範圍改動）
-    #[allow(dead_code)]
-    #[cfg(feature = "redis")]
-    async fn spawn_redis_exporter_legacy(
-        &mut self,
-        redis_config: RedisConfig,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use engine::aggregation::TopNSnapshot;
-
-        // 計算中間價格的輔助函數
-        fn calculate_mid_price(orderbook: &TopNSnapshot) -> Option<f64> {
-            if !orderbook.bid_prices.is_empty() && !orderbook.ask_prices.is_empty() {
-                let best_bid = orderbook.bid_prices[0].to_f64();
-                let best_ask = orderbook.ask_prices[0].to_f64();
-                Some((best_bid + best_ask) / 2.0)
-            } else {
-                None
-            }
-        }
-
-        // 計算價差的輔助函數
-        fn calculate_spread(orderbook: &TopNSnapshot) -> Option<f64> {
-            if !orderbook.bid_prices.is_empty() && !orderbook.ask_prices.is_empty() {
-                let best_bid = orderbook.bid_prices[0].to_f64();
-                let best_ask = orderbook.ask_prices[0].to_f64();
-                Some(best_ask - best_bid)
-            } else {
-                None
-            }
-        }
-        use redis::{AsyncCommands, Client};
-
-        info!("啟動 Redis 導出器，連接到: {}", redis_config.url);
-
-        // 測試連接
-        let client = Client::open(redis_config.url.as_str())?;
-        let mut conn = client.get_async_connection().await?;
-        let _: String = redis::cmd("PING").query_async(&mut conn).await?;
-        info!("Redis 連接測試成功");
-
-        // 克隆引擎引用以供任務使用
-        let engine_arc = self.engine.clone();
-        let redis_url = redis_config.url.clone();
-
-        let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
-            let client = match Client::open(redis_url.as_str()) {
-                Ok(client) => client,
-                Err(e) => {
-                    tracing::error!("Redis 客戶端創建失敗: {}", e);
-                    return;
-                }
-            };
-
-            loop {
-                interval.tick().await;
-                // 如果引擎已停止，退出任務
-                {
-                    let eng = engine_arc.lock().await;
-                    if !eng.get_statistics().is_running {
-                        break;
-                    }
-                }
-
-                // 獲取當前市場視圖
-                let market_view = {
-                    let engine = engine_arc.lock().await;
-                    engine.get_market_view()
-                };
-
-                // 連接 Redis 並導出數據
-                match client.get_async_connection().await {
-                    Ok(mut conn) => {
-                        // 為每個訂單簿創建簡化的快照
-                        for (vs, orderbook) in &market_view.orderbooks {
-                            let snapshot_data = serde_json::json!({
-                                "symbol": vs.symbol.0,
-                                "venue": vs.venue.as_str(),
-                                "mid_price": calculate_mid_price(orderbook),
-                                "spread": calculate_spread(orderbook),
-                                "timestamp": market_view.timestamp,
-                                "bid_levels": orderbook.bid_prices.len(),
-                                "ask_levels": orderbook.ask_prices.len(),
-                                "version": market_view.version
-                            });
-
-                            // 寫入 Redis Streams
-                            let result: Result<String, redis::RedisError> = conn
-                                .xadd(
-                                    "market_snapshots",
-                                    "*",
-                                    &[
-                                        ("symbol", vs.symbol.0.as_str()),
-                                        ("venue", vs.venue.as_str()),
-                                        ("data", snapshot_data.to_string().as_str()),
-                                    ],
-                                )
-                                .await;
-
-                            if let Err(e) = result {
-                                tracing::warn!(
-                                    "Redis 寫入失敗 {}:{}: {}",
-                                    vs.venue.as_str(),
-                                    vs.symbol.0,
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Redis 連接失敗: {}", e);
-                    }
-                }
-            }
-        });
-
-        self.tasks.push(handle);
-        info!("Redis 導出任務已啟動(legacy)");
-        Ok(())
-    }
+    // legacy Redis exporter 已移除（請使用 infra_exporters 版本）
 
     /// 啟動 ClickHouse Writer 任務（已遷移至 infra_exporters；此為臨時保留）
     #[allow(dead_code)]
