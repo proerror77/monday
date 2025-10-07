@@ -33,8 +33,10 @@ mod infra_exporters; // 預留：後續搬移 Redis/ClickHouse 導出
 
 // 將部分配置型別從子模組對外公開
 pub use config_types::{
-    ClickHouseConfig, CpuAffinityConfig, InfraConfig, PortfolioSpec, RedisConfig, RiskConfig,
-    StrategyRiskLimits, StrategyRiskOverride, SystemEngineConfig, TradingWindowConfig,
+    ClickHouseConfig, CpuAffinityConfig, InfraConfig, LobFlowGridParams, PortfolioSpec,
+    RedisConfig, RiskConfig, StrategyConfig, StrategyParams, StrategyRiskLimits,
+    StrategyRiskOverride, StrategyType, SystemEngineConfig, TradingWindowConfig, VenueCapabilities,
+    VenueConfig, VenueType,
 };
 
 #[cfg(feature = "redis")]
@@ -103,197 +105,22 @@ pub struct AccountConfig {
 
 // FlipPolicy 現在從 engine::dataflow 導入
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VenueConfig {
-    pub name: String,
-    /// 具名帳戶/實例 ID（同交易所多帳戶時用於路由）
-    #[serde(default)]
-    pub account_id: Option<String>,
-    pub venue_type: VenueType,
-    pub ws_public: Option<String>,
-    pub ws_private: Option<String>,
-    pub rest: Option<String>,
-    pub api_key: Option<String>,
-    pub secret: Option<String>,
-    pub passphrase: Option<String>, // 新增：用於 Bitget 等需要 passphrase 的交易所
-    pub execution_mode: Option<String>, // 新增："Paper" | "Live"，預設為 Paper
-    pub capabilities: VenueCapabilities,
-    /// 產品型別（Bitget：SPOT/USDT-FUTURES/COIN-FUTURES/USDC-FUTURES）
-    #[serde(default)]
-    pub inst_type: Option<String>,
-    #[serde(default)]
-    pub simulate_execution: bool,
-    #[serde(default)]
-    pub symbol_catalog: Vec<InstrumentId>,
-    #[serde(default)]
-    pub data_config: Option<YamlValue>,
-    #[serde(default)]
-    pub execution_config: Option<YamlValue>,
-}
+// VenueConfig 已移至 config_types
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum VenueType {
-    Bitget,
-    Binance,
-    Bybit,
-    Okx,
-    Hyperliquid,
-    Grvt,
-    Asterdex,
-    Lighter,
-    Backpack,
-    Mock,
-}
+// VenueType 已移至 config_types
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct VenueCapabilities {
-    pub ws_order_placement: bool,
-    pub snapshot_crc: bool,
-    pub all_in_one_topics: bool,
-    pub private_ws_heartbeat: bool,
-    #[serde(default)]
-    pub use_incremental_books: bool,
-}
+// VenueCapabilities 已移至 config_types
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StrategyConfig {
-    pub name: String,
-    pub strategy_type: StrategyType,
-    pub symbols: Vec<Symbol>,
-    pub params: StrategyParams,
-    pub risk_limits: StrategyRiskLimits,
-}
+// StrategyConfig 已移至 config_types
 
 /// 投資組合設定，用於聚合多策略並套用整體限制
 // PortfolioSpec 已移至 config_types
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum StrategyType {
-    Trend,
-    Arbitrage,
-    MarketMaking,
-    Dl,
-    Imbalance,
-    LobFlowGrid,
-}
+// StrategyType 已移至 config_types
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum StrategyParams {
-    Trend {
-        ema_fast: u32,
-        ema_slow: u32,
-        rsi_period: u32,
-    },
-    Arbitrage {
-        min_spread_bps: rust_decimal::Decimal,
-        max_position: rust_decimal::Decimal,
-        execution_timeout_ms: u64,
-    },
-    Imbalance {
-        obi_threshold: f64,
-        lot: rust_decimal::Decimal,
-        top_levels: usize,
-    },
-    MarketMaking {
-        spread_bps: rust_decimal::Decimal,
-        max_inventory: rust_decimal::Decimal,
-        skew_factor: rust_decimal::Decimal,
-    },
-    Dl {
-        model_path: String,
-        device: String,
-        top_n: usize,
-        window_size: Option<usize>,
-        trigger_threshold: f64,
-        output_threshold: f64,
-        queue_capacity: usize,
-        timeout_ms: u64,
-        max_error_rate: f64,
-        degradation_mode: String,
-    },
-    LobFlowGrid {
-        #[serde(flatten)]
-        config: LobFlowGridParams,
-    },
-}
+// StrategyParams 已移至 config_types
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LobFlowGridParams {
-    #[serde(default)]
-    pub venue: Option<String>,
-    #[serde(default)]
-    pub base_order_size: Option<f64>,
-    #[serde(default)]
-    pub max_long_position: Option<f64>,
-    #[serde(default)]
-    pub max_short_position: Option<f64>,
-    #[serde(default)]
-    pub maker_fee_bps: Option<f64>,
-    #[serde(default)]
-    pub slippage_bps: Option<f64>,
-    #[serde(default)]
-    pub safety_bps: Option<f64>,
-    #[serde(default)]
-    pub min_margin_bps: Option<f64>,
-    #[serde(default)]
-    pub volatility_alpha: Option<f64>,
-    #[serde(default)]
-    pub asr_gamma: Option<f64>,
-    #[serde(default)]
-    pub asr_micro_coeff: Option<f64>,
-    #[serde(default)]
-    pub asr_ai_coeff: Option<f64>,
-    #[serde(default)]
-    pub asr_ofi_coeff: Option<f64>,
-    #[serde(default)]
-    pub top_levels: Option<usize>,
-    #[serde(default)]
-    pub ai_window_secs: Option<u64>,
-    #[serde(default)]
-    pub ofi_halflife_secs: Option<f64>,
-    #[serde(default)]
-    pub mid_return_halflife_secs: Option<f64>,
-    #[serde(default)]
-    pub refresh_interval_secs: Option<f64>,
-    #[serde(default)]
-    pub tick_size: Option<f64>,
-    #[serde(default)]
-    pub lot_size: Option<f64>,
-    #[serde(default)]
-    pub core_levels: Option<usize>,
-    #[serde(default)]
-    pub buffer_levels: Option<usize>,
-    #[serde(default)]
-    pub tail_levels: Option<usize>,
-    #[serde(default)]
-    pub core_weight: Option<f64>,
-    #[serde(default)]
-    pub buffer_weight: Option<f64>,
-    #[serde(default)]
-    pub tail_weight: Option<f64>,
-    #[serde(default)]
-    pub core_spacing_multiplier: Option<f64>,
-    #[serde(default)]
-    pub buffer_spacing_multiplier: Option<f64>,
-    #[serde(default)]
-    pub tail_spacing_multiplier: Option<f64>,
-    #[serde(default)]
-    pub target_depth_usd: Option<f64>,
-    #[serde(default)]
-    pub max_depth_steps: Option<usize>,
-    #[serde(default)]
-    pub min_top_depth_usd: Option<f64>,
-    #[serde(default)]
-    pub min_spread_bps: Option<f64>,
-    #[serde(default)]
-    pub max_spread_bps: Option<f64>,
-    #[serde(default)]
-    pub bias_micro_threshold_bps: Option<f64>,
-    #[serde(default)]
-    pub bias_ai_threshold: Option<f64>,
-    #[serde(default)]
-    pub bias_extra_ticks: Option<i32>,
-}
+// LobFlowGridParams 已移至 config_types
 
 #[cfg(feature = "strategy-lob-flow-grid")]
 fn apply_lob_flow_overrides(
