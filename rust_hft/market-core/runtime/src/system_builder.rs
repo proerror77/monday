@@ -27,6 +27,9 @@ mod execution_registry;
 mod simulated_execution;
 mod strategy_factory;
 mod venue_registry;
+mod runtime_management;
+mod config_types; // 預留：後續逐步搬移配置型別
+mod infra_exporters; // 預留：後續搬移 Redis/ClickHouse 導出
 
 #[cfg(feature = "redis")]
 use serde_json;
@@ -1504,9 +1507,10 @@ impl SystemRuntime {
         Ok(test_order_id)
     }
 
-    /// 啟動 Redis 導出任務
+    /// 啟動 Redis 導出任務（已遷移至 infra_exporters；此為臨時保留避免大範圍改動）
+    #[allow(dead_code)]
     #[cfg(feature = "redis")]
-    async fn spawn_redis_exporter(
+    async fn spawn_redis_exporter_legacy(
         &mut self,
         redis_config: RedisConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1620,13 +1624,14 @@ impl SystemRuntime {
         });
 
         self.tasks.push(handle);
-        info!("Redis 導出任務已啟動");
+        info!("Redis 導出任務已啟動(legacy)");
         Ok(())
     }
 
-    /// 啟動 ClickHouse Writer 任務
+    /// 啟動 ClickHouse Writer 任務（已遷移至 infra_exporters；此為臨時保留）
+    #[allow(dead_code)]
     #[cfg(feature = "clickhouse")]
-    async fn spawn_clickhouse_writer(
+    async fn spawn_clickhouse_writer_legacy(
         &mut self,
         clickhouse_config: ClickHouseConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2032,7 +2037,7 @@ impl SystemRuntime {
         });
 
         self.tasks.push(handle);
-        info!("ClickHouse Writer 已啟動，每秒批量寫入 lob_depth 表");
+        info!("ClickHouse Writer 已啟動（legacy），每秒批量寫入 lob_depth 表");
 
         // 啟動 Trade Writer：訂閱引擎內部成交廣播，逐批寫入 trade_data
         let engine_for_trades = self.engine.clone();
@@ -2239,26 +2244,11 @@ impl SystemRuntime {
             }
         });
         self.tasks.push(l1_handle);
-        info!("ClickHouse L1 per-venue Writer 已啟動（hft.l1_venue）");
+        info!("ClickHouse L1 per-venue Writer 已啟動（legacy hft.l1_venue）");
         Ok(())
     }
 
-    /// 為 IPC 創建共享實例，避免雙實例問題
-    /// 共享引擎和配置，但使用獨立的任務列表
-    #[allow(dead_code)]
-    fn clone_for_ipc(&self) -> SystemRuntime {
-        SystemRuntime {
-            engine: self.engine.clone(),
-            config: self.config.clone(),
-            tasks: vec![],                  // IPC 專用空任務列表
-            execution_worker_tasks: vec![], // IPC 專用空任務列表
-            exec_control_txs: vec![],
-            market_plans: self.market_plans.clone(),
-            execution_client_venues: self.execution_client_venues.clone(),
-            execution_client_accounts: self.execution_client_accounts.clone(),
-            portfolio_manager: self.portfolio_manager.clone(),
-        }
-    }
+    // clone_for_ipc 已移至 runtime_management 模組
 }
 
 #[cfg(feature = "adapter-backpack-data")]
