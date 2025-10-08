@@ -55,9 +55,25 @@ pub struct MetricsRegistry {
     pub reconcile_cancel_sent: IntCounter,
     pub reconcile_errors: IntCounter,
 
+    // P3: 新增執行/快照相關統計
+    pub intents_dropped: IntCounter,
+    pub snapshot_publish_failed: IntCounter,
+
     // 本地就緒狀態跟蹤（不依賴 Prometheus 讀取，使 /readiness 更輕量）
     last_activity_micros: AtomicU64,
     last_queue_utilization_ppm: AtomicU64, // 以百萬分位儲存（ppm），避免 f64 原子
+}
+
+/// 引擎統計快照（由 engine 匯出，用於更新 gauges）
+#[derive(Debug, Clone)]
+pub struct EngineStatisticsExport {
+    pub cycle_count: u64,
+    pub execution_events_processed: u64,
+    pub orders_submitted: u64,
+    pub orders_ack: u64,
+    pub orders_filled: u64,
+    pub orders_rejected: u64,
+    pub orders_canceled: u64,
 }
 
 impl MetricsRegistry {
@@ -286,6 +302,25 @@ impl MetricsRegistry {
             .register(Box::new(reconcile_errors.clone()))
             .expect("註冊對帳錯誤指標失敗");
 
+        // P3: 新增統計註冊
+        let intents_dropped = IntCounter::new(
+            "hft_intents_dropped_total",
+            "因執行隊列滿載而丟棄的意圖總數",
+        )
+        .expect("創建 intents_dropped 計數器失敗");
+        let snapshot_publish_failed = IntCounter::new(
+            "hft_snapshot_publish_failed_total",
+            "快照發佈失敗計數（理論上為 0，保留監控）",
+        )
+        .expect("創建 snapshot_publish_failed 計數器失敗");
+
+        registry
+            .register(Box::new(intents_dropped.clone()))
+            .expect("註冊 intents_dropped 指標失敗");
+        registry
+            .register(Box::new(snapshot_publish_failed.clone()))
+            .expect("註冊 snapshot_publish_failed 指標失敗");
+
         debug!("Prometheus 指標註冊完成");
 
         let now = now_micros();
@@ -314,6 +349,8 @@ impl MetricsRegistry {
             reconcile_exchange_only_found,
             reconcile_cancel_sent,
             reconcile_errors,
+            intents_dropped,
+            snapshot_publish_failed,
             last_activity_micros: AtomicU64::new(now),
             last_queue_utilization_ppm: AtomicU64::new(0),
         }
@@ -452,9 +489,35 @@ impl MetricsRegistry {
         self.note_activity();
     }
 
+    // P3: 新增方法
+    pub fn add_intents_dropped(&self, n: u64) {
+        for _ in 0..n {
+            self.intents_dropped.inc();
+        }
+    }
+    pub fn inc_snapshot_publish_failed(&self) {
+        self.snapshot_publish_failed.inc();
+    }
+
     /// 獲取 Prometheus 註冊表（用於 HTTP 暴露）
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// 用於引擎將快照統計同步到 Prometheus（以 Gauge 型式）
+    pub fn update_engine_statistics(&self, s: &EngineStatisticsExport) {
+        self.engine_cycle_count.set(s.cycle_count as f64);
+        self.engine_exec_events_processed
+            .set(s.execution_events_processed as f64);
+        self.engine_orders_submitted
+            .set(s.orders_submitted as f64);
+        self.engine_orders_ack.set(s.orders_ack as f64);
+        self.engine_orders_filled.set(s.orders_filled as f64);
+        self.engine_orders_rejected
+            .set(s.orders_rejected as f64);
+        self.engine_orders_canceled
+            .set(s.orders_canceled as f64);
+        self.note_activity();
     }
 
     /// 从 LatencyMonitor 批量更新指标

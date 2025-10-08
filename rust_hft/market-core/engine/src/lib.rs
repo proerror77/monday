@@ -47,6 +47,10 @@ pub struct EngineStats {
     pub orders_filled: u64,
     pub orders_rejected: u64,
     pub orders_canceled: u64,
+    // P3: 指標增強
+    pub market_events_dropped: u64,
+    pub intents_dropped: u64,
+    pub snapshot_publish_failed: u64,
 }
 
 /// 事件廣播器集合
@@ -179,6 +183,9 @@ impl Engine {
                 orders_filled: 0,
                 orders_rejected: 0,
                 orders_canceled: 0,
+                market_events_dropped: 0,
+                intents_dropped: 0,
+                snapshot_publish_failed: 0,
             },
             pending_market_events: Vec::new(),
             intents_work_buf: Vec::new(),
@@ -336,6 +343,18 @@ impl Engine {
             infra_metrics::MetricsRegistry::global().update_from_latency_monitor(&latency_stats);
             debug!("同步了 {} 個延遲統計到 Prometheus", latency_stats.len());
         }
+        // 同步引擎統計（以 Gauge）
+        let s = self.get_statistics();
+        let export = infra_metrics::EngineStatisticsExport {
+            cycle_count: s.cycle_count,
+            execution_events_processed: s.execution_events_processed,
+            orders_submitted: s.orders_submitted,
+            orders_ack: s.orders_ack,
+            orders_filled: s.orders_filled,
+            orders_rejected: s.orders_rejected,
+            orders_canceled: s.orders_canceled,
+        };
+        infra_metrics::MetricsRegistry::global().update_engine_statistics(&export);
     }
 
     #[cfg(not(feature = "metrics"))]
@@ -567,6 +586,7 @@ impl Engine {
                             .record_latency(LatencyStage::Aggregation, aggregation_latency);
 
                         // 記錄聚合延遲到 Prometheus
+                        #[cfg(feature = "metrics")]
                         infra_metrics::MetricsRegistry::global()
                             .record_aggregation_latency(aggregation_latency as f64);
 
@@ -673,6 +693,13 @@ impl Engine {
         self.market_snapshots.store(Arc::new(market_view));
         result.snapshot_published = true;
         result.snapshot_sequence += 1;
+        // P3: 指標 - 快照翻轉與版本
+        #[cfg(feature = "metrics")]
+        {
+            infra_metrics::MetricsRegistry::global().inc_snapshot_flips();
+            infra_metrics::MetricsRegistry::global()
+                .update_snapshot_version(self.aggregation_engine.snapshot_version);
+        }
 
         // 标记快照已发布，清除变更标记
         self.aggregation_engine.mark_snapshot_published();
@@ -730,6 +757,7 @@ impl Engine {
             self.portfolio
                 .register_order(order_id.clone(), symbol.clone(), *side);
             self.stats.orders_submitted = self.stats.orders_submitted.saturating_add(1);
+            #[cfg(feature = "metrics")]
             infra_metrics::MetricsRegistry::global().inc_orders_submitted();
             self.order_submit_ts.insert(order_id.clone(), *timestamp);
             debug!(
@@ -779,6 +807,7 @@ impl Engine {
                 self.stats.orders_ack = self.stats.orders_ack.saturating_add(1);
                 if let Some(&start_ts) = self.order_submit_ts.get(order_id) {
                     let lat = (*timestamp).saturating_sub(start_ts) as f64;
+                    #[cfg(feature = "metrics")]
                     infra_metrics::MetricsRegistry::global().record_order_ack_latency(lat);
                 }
             }
@@ -788,15 +817,18 @@ impl Engine {
                 ..
             } => {
                 self.stats.orders_filled = self.stats.orders_filled.saturating_add(1);
+                #[cfg(feature = "metrics")]
                 infra_metrics::MetricsRegistry::global().inc_orders_filled();
                 if let Some(&start_ts) = self.order_submit_ts.get(order_id) {
                     let lat = (*timestamp).saturating_sub(start_ts) as f64;
+                    #[cfg(feature = "metrics")]
                     infra_metrics::MetricsRegistry::global().record_order_fill_latency(lat);
                 }
 
                 // 記錄端到端DoD延遲指標（從市場事件到執行完成）
                 if let Some(market_ts) = self.recent_market_event_timestamp {
                     let end_to_end_latency = timestamp.saturating_sub(market_ts) as f64;
+                    #[cfg(feature = "metrics")]
                     infra_metrics::MetricsRegistry::global()
                         .record_end_to_end_latency(end_to_end_latency);
                     debug!(
@@ -807,6 +839,7 @@ impl Engine {
             }
             ExecutionEvent::OrderReject { .. } => {
                 self.stats.orders_rejected = self.stats.orders_rejected.saturating_add(1);
+                #[cfg(feature = "metrics")]
                 infra_metrics::MetricsRegistry::global().inc_orders_rejected();
             }
             ExecutionEvent::OrderCanceled { .. } => {
@@ -955,6 +988,7 @@ impl Engine {
                 .record_latency(LatencyStage::Strategy, strategy_latency);
 
             // 記錄策略延遲到 Prometheus
+            #[cfg(feature = "metrics")]
             infra_metrics::MetricsRegistry::global()
                 .record_strategy_latency(strategy_latency as f64);
 
@@ -974,6 +1008,7 @@ impl Engine {
 
             // 記錄風控階段完成
             let risk_latency = now_micros().saturating_sub(risk_start) as f64;
+            #[cfg(feature = "metrics")]
             infra_metrics::MetricsRegistry::global().record_risk_latency(risk_latency);
 
             let orders_count = intents_to_send.len() as u32;
@@ -1036,6 +1071,14 @@ impl Engine {
                 }
                 if dropped > 0 {
                     warn!("{}个意图因队列满载被丢弃", dropped);
+                    // P3: 更新引擎統計與指標
+                    self.stats.intents_dropped = self
+                        .stats
+                        .intents_dropped
+                        .saturating_add(dropped as u64);
+                    #[cfg(feature = "metrics")]
+                    infra_metrics::MetricsRegistry::global()
+                        .add_intents_dropped(dropped as u64);
                 }
             } else {
                 intents_to_send.clear();
@@ -1057,6 +1100,7 @@ impl Engine {
             }
 
             // 記錄執行延遲到 Prometheus
+            #[cfg(feature = "metrics")]
             infra_metrics::MetricsRegistry::global()
                 .record_execution_latency(execution_latency as f64);
         }
@@ -1200,9 +1244,10 @@ pub struct EngineStatistics {
 
 #[cfg(test)]
 mod tests {
+    #![allow(unused_imports)]
     use super::*;
-    use hft_core::{Price, Quantity, Side, Symbol, VenueId};
-    use ports::{AggregatedBar, BookLevel, MarketEvent, MarketSnapshot, Trade};
+    use hft_core::{Price, Quantity, Symbol, VenueId};
+    use ports::{AggregatedBar, MarketEvent};
 
     struct SingleVenueStub {
         id: String,

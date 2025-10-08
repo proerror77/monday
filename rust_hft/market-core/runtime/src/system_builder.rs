@@ -1,13 +1,11 @@
 //! 系統建構器 - 宣告式裝配與註冊
 use crate::sharding::ShardConfig;
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value as YamlValue;
+// use serde_yaml::Value as YamlValue; // 移除未使用引用
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use self::strategy_factory::{
-    create_strategy_instance_for_symbol, create_strategy_instances_from_config,
-};
+// strategy_factory 僅在 runtime_management 使用
 use crate::portfolio_manager::PortfolioManager;
 use engine::{
     create_execution_queues,
@@ -18,7 +16,7 @@ use hft_core::HftError;
 use hft_core::*;
 use ports::*;
 use shared_config::{StrategyParams as SharedStrategyParams, StrategyType as SharedStrategyType};
-use shared_instrument::InstrumentId;
+// use shared_instrument::InstrumentId; // 已移至 config_types
 use std::collections::HashMap;
 use tokio::sync::{Mutex, Notify};
 

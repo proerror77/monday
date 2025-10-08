@@ -416,6 +416,7 @@ impl ExecutionWorker {
                         .record_latency(LatencyStage::Execution, execution_latency);
                     self.stats.execution_latency_micros.push(execution_latency);
                     self.stats.recent_execution_latency_micros = Some(execution_latency);
+                    #[cfg(feature = "metrics")]
                     infra_metrics::MetricsRegistry::global()
                         .record_execution_latency(execution_latency as f64);
 
@@ -793,7 +794,6 @@ pub enum ControlCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
     use ports::OrderIntent;
     use std::collections::HashSet;
@@ -983,6 +983,7 @@ impl ExecutionWorker {
                 Ok(list) => {
                     #[cfg(feature = "metrics")]
                     {
+                        #[cfg(feature = "metrics")]
                         infra_metrics::MetricsRegistry::global().inc_reconcile_runs();
                     }
                     total_open += list.len();
@@ -999,6 +1000,7 @@ impl ExecutionWorker {
                     warn!("對帳：獲取客戶端 {} 未結訂單失敗: {}", idx, e);
                     #[cfg(feature = "metrics")]
                     {
+                        #[cfg(feature = "metrics")]
                         infra_metrics::MetricsRegistry::global().inc_reconcile_errors();
                     }
                 }
@@ -1013,6 +1015,7 @@ impl ExecutionWorker {
             );
             #[cfg(feature = "metrics")]
             {
+                #[cfg(feature = "metrics")]
                 infra_metrics::MetricsRegistry::global()
                     .add_reconcile_exchange_only_found(exchange_only.len() as u64);
             }
@@ -1027,6 +1030,7 @@ impl ExecutionWorker {
                         }
                         #[cfg(feature = "metrics")]
                         {
+                            #[cfg(feature = "metrics")]
                             infra_metrics::MetricsRegistry::global().add_reconcile_cancel_sent(1);
                         }
                     }

@@ -19,16 +19,15 @@ rust_decimal = { version = "1.33", features = ["serde"] }
 ports = { package = "hft-ports", path = "../ports" }
 instrument = { package = "hft-instrument", path = "../instrument" }
 chrono = { version = "0.4", features = ["serde"] }
-infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics" }
+infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics", optional = true }
 rustc-hash = "1.1"
 
 [features]
 default = []
 # 僅在基準測試或實驗時啟用 lockfree_queue 模組導出
 bench-lockfree = []
-# 指標收集開關（向後兼容 infra-metrics）
-metrics = []
-infra-metrics = ["metrics"]
+# 指標收集開關：顯式開啟才連帶引入 infra-metrics 依賴
+metrics = ["dep:infra-metrics"]
 legacy-sdk = []
 
 [dev-dependencies]
@@ -39,6 +38,7 @@ async-stream = "0.3"
 num-traits = "0.2"
 serde_yaml = "0.9"
 async-trait = "0.1"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [lib]
 name = "engine"
@@ -78,3 +78,7 @@ required-features = ["legacy-sdk"]
 name = "s1_strategy_simple_demo"
 path = "examples/s1_strategy_simple_demo.rs"
 required-features = ["legacy-sdk"]
+
+[[bench]]
+name = "engine_hotpath"
+harness = false

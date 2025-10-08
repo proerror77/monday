@@ -3,7 +3,7 @@
 use super::SystemRuntime;
 use crate::system_builder::{RiskConfig, SharedStrategyParams};
 use crate::system_builder::strategy_factory::{create_strategy_instance_for_symbol, create_strategy_instances_from_config};
-use crate::portfolio_manager::PortfolioManager;
+// use crate::portfolio_manager::PortfolioManager; // 未使用，移除
 use engine; // for types in signatures
 use hft_core::{HftError, Symbol};
 use std::sync::Arc;

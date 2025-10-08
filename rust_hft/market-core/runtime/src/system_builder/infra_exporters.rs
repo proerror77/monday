@@ -2,7 +2,7 @@
 //! - Redis 導出（條件編譯 feature = "redis"）
 //! - ClickHouse 導出與資料列結構（條件編譯 feature = "clickhouse"）
 
-use super::SystemRuntime;
+// use super::SystemRuntime; // 未使用，移除
 
 #[cfg(feature = "redis")]
 mod redis_export {
