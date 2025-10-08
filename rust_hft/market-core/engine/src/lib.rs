@@ -802,13 +802,16 @@ impl Engine {
         match event {
             ExecutionEvent::OrderAck {
                 order_id,
-                timestamp,
+                timestamp: _timestamp,
             } => {
                 self.stats.orders_ack = self.stats.orders_ack.saturating_add(1);
-                if let Some(&start_ts) = self.order_submit_ts.get(order_id) {
-                    let lat = (*timestamp).saturating_sub(start_ts) as f64;
+                if let Some(&_start_ts) = self.order_submit_ts.get(order_id) {
                     #[cfg(feature = "metrics")]
-                    infra_metrics::MetricsRegistry::global().record_order_ack_latency(lat);
+                    {
+                        let lat = (*_timestamp).saturating_sub(_start_ts) as f64;
+                        infra_metrics::MetricsRegistry::global()
+                            .record_order_ack_latency(lat);
+                    }
                 }
             }
             ExecutionEvent::Fill {
@@ -819,10 +822,13 @@ impl Engine {
                 self.stats.orders_filled = self.stats.orders_filled.saturating_add(1);
                 #[cfg(feature = "metrics")]
                 infra_metrics::MetricsRegistry::global().inc_orders_filled();
-                if let Some(&start_ts) = self.order_submit_ts.get(order_id) {
-                    let lat = (*timestamp).saturating_sub(start_ts) as f64;
+                if let Some(&_start_ts) = self.order_submit_ts.get(order_id) {
                     #[cfg(feature = "metrics")]
-                    infra_metrics::MetricsRegistry::global().record_order_fill_latency(lat);
+                    {
+                        let lat = (*timestamp).saturating_sub(_start_ts) as f64;
+                        infra_metrics::MetricsRegistry::global()
+                            .record_order_fill_latency(lat);
+                    }
                 }
 
                 // 記錄端到端DoD延遲指標（從市場事件到執行完成）
@@ -993,7 +999,7 @@ impl Engine {
                 .record_strategy_latency(strategy_latency as f64);
 
             // 通過風控審核（如果有配置風控管理器）
-            let risk_start = now_micros();
+            let _risk_start = now_micros();
             let intents_total_before_risk = intents_work_buf.len();
             let mut intents_to_send = if let Some(risk_manager) = &mut self.risk_manager {
                 // 使用新的 venue-specific 風控方法
@@ -1007,9 +1013,11 @@ impl Engine {
             };
 
             // 記錄風控階段完成
-            let risk_latency = now_micros().saturating_sub(risk_start) as f64;
             #[cfg(feature = "metrics")]
-            infra_metrics::MetricsRegistry::global().record_risk_latency(risk_latency);
+            {
+                let risk_latency = now_micros().saturating_sub(_risk_start) as f64;
+                infra_metrics::MetricsRegistry::global().record_risk_latency(risk_latency);
+            }
 
             let orders_count = intents_to_send.len() as u32;
             result.orders_generated += orders_count;

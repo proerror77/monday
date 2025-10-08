@@ -59,6 +59,15 @@ pub struct MetricsRegistry {
     pub intents_dropped: IntCounter,
     pub snapshot_publish_failed: IntCounter,
 
+    // 引擎統計 Gauges（來自 EngineStatisticsExport 的當前快照）
+    pub engine_cycle_count: Gauge,
+    pub engine_exec_events_processed: Gauge,
+    pub engine_orders_submitted: Gauge,
+    pub engine_orders_ack: Gauge,
+    pub engine_orders_filled: Gauge,
+    pub engine_orders_rejected: Gauge,
+    pub engine_orders_canceled: Gauge,
+
     // 本地就緒狀態跟蹤（不依賴 Prometheus 讀取，使 /readiness 更輕量）
     last_activity_micros: AtomicU64,
     last_queue_utilization_ppm: AtomicU64, // 以百萬分位儲存（ppm），避免 f64 原子
@@ -213,6 +222,37 @@ impl MetricsRegistry {
         let orders_rejected = IntCounter::new("hft_orders_rejected_total", "已拒絕訂單總數")
             .expect("創建拒絕訂單計數器失敗");
 
+        // 引擎統計 Gauges（當前值，不累加）
+        let engine_cycle_count = Gauge::new("hft_engine_cycle_count", "引擎循環計數（當前快照）")
+            .expect("創建 engine_cycle_count 失敗");
+        let engine_exec_events_processed = Gauge::new(
+            "hft_engine_exec_events_processed",
+            "已處理執行事件數（當前快照）",
+        )
+        .expect("創建 engine_exec_events_processed 失敗");
+        let engine_orders_submitted = Gauge::new(
+            "hft_engine_orders_submitted",
+            "已提交訂單數（當前快照）",
+        )
+        .expect("創建 engine_orders_submitted 失敗");
+        let engine_orders_ack = Gauge::new("hft_engine_orders_ack", "已 Ack 訂單數（當前快照）")
+            .expect("創建 engine_orders_ack 失敗");
+        let engine_orders_filled = Gauge::new(
+            "hft_engine_orders_filled",
+            "已成交訂單數（當前快照）",
+        )
+        .expect("創建 engine_orders_filled 失敗");
+        let engine_orders_rejected = Gauge::new(
+            "hft_engine_orders_rejected",
+            "已拒絕訂單數（當前快照）",
+        )
+        .expect("創建 engine_orders_rejected 失敗");
+        let engine_orders_canceled = Gauge::new(
+            "hft_engine_orders_canceled",
+            "已撤銷訂單數（當前快照）",
+        )
+        .expect("創建 engine_orders_canceled 失敗");
+
         // 對帳指標
         let reconcile_runs = IntCounter::new("hft_reconcile_runs_total", "對帳執行次數")
             .expect("創建對帳次數指標失敗");
@@ -289,6 +329,28 @@ impl MetricsRegistry {
         registry
             .register(Box::new(orders_rejected.clone()))
             .expect("註冊拒絕訂單指標失敗");
+        // 註冊引擎統計 Gauges
+        registry
+            .register(Box::new(engine_cycle_count.clone()))
+            .expect("註冊 engine_cycle_count 失敗");
+        registry
+            .register(Box::new(engine_exec_events_processed.clone()))
+            .expect("註冊 engine_exec_events_processed 失敗");
+        registry
+            .register(Box::new(engine_orders_submitted.clone()))
+            .expect("註冊 engine_orders_submitted 失敗");
+        registry
+            .register(Box::new(engine_orders_ack.clone()))
+            .expect("註冊 engine_orders_ack 失敗");
+        registry
+            .register(Box::new(engine_orders_filled.clone()))
+            .expect("註冊 engine_orders_filled 失敗");
+        registry
+            .register(Box::new(engine_orders_rejected.clone()))
+            .expect("註冊 engine_orders_rejected 失敗");
+        registry
+            .register(Box::new(engine_orders_canceled.clone()))
+            .expect("註冊 engine_orders_canceled 失敗");
         registry
             .register(Box::new(reconcile_runs.clone()))
             .expect("註冊對帳次數指標失敗");
@@ -351,6 +413,13 @@ impl MetricsRegistry {
             reconcile_errors,
             intents_dropped,
             snapshot_publish_failed,
+            engine_cycle_count,
+            engine_exec_events_processed,
+            engine_orders_submitted,
+            engine_orders_ack,
+            engine_orders_filled,
+            engine_orders_rejected,
+            engine_orders_canceled,
             last_activity_micros: AtomicU64::new(now),
             last_queue_utilization_ppm: AtomicU64::new(0),
         }
