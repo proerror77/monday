@@ -345,5 +345,6 @@ ops/deployment/docker/      - Docker 生產部署
 
 4) P3 度量與可觀測性補強
 - 在 `EngineStats` 增加 backpressure/丟棄統計，導出至 metrics；補齊 Criterion 基準測試與（環境可用時）flamegraph 腳本。
+ - 引擎指標採用可選 feature（`engine/metrics`），避免熱路徑直接依賴基礎設施；由 runtime 於每秒狀態任務將統計以 Gauges 輸出到 `hft-infra-metrics`。
 
 本重構僅為檔案/模組邊界整理與共用碼抽取，不改動運行語義與熱路徑行為。詳見 `docs/REFACTOR_PLAN.md`。

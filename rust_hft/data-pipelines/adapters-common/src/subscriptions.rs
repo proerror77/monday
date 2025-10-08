@@ -1,4 +1,4 @@
-use hft-core::Symbol;
+use hft_core::Symbol;
 
 #[derive(Debug, Clone)]
 pub enum SubscriptionKind {
@@ -41,4 +41,3 @@ impl SubscriptionBuilder {
 
     pub fn build(self) -> Vec<Subscription> { self.items }
 }
-

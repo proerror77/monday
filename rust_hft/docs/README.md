@@ -127,6 +127,15 @@ ml:
 
 ## 📊 性能監控
 
+### Prometheus 指標啟用（新版）
+```bash
+# 僅收集指標（不開 HTTP）
+cargo run -p hft-paper --features "metrics"
+
+# 收集指標 + 啟用 HTTP 暴露（Axum）
+cargo run -p hft-paper --features "metrics,hft-infra-metrics/http-server"
+```
+
 ### 實時指標
 - **延遲監控**: P50/P95/P99延遲分佈
 - **吞吐量**: 每秒處理訂單數

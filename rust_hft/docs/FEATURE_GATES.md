@@ -25,7 +25,7 @@
 - 基础设施：`clickhouse`、`redis`、`metrics`、`infra-ipc`、`recovery`
 - 便捷聚合：`bitget`、`binance`、`bybit`、`mock`、`all-strategies`、`full`
 
-注意：`metrics` 会自动转发到 `engine/metrics`，无需另外声明。
+注意：`metrics` 会转发到 `engine/metrics` 并引入 `hft-infra-metrics`。如需开启 HTTP 暴露端口，请在应用层额外启用 `infra-metrics/http-server` 特性（runtime 的 `metrics` 不会自动打开 http-server）。
 
 ## 应用层特性组合
 
@@ -34,13 +34,13 @@
 默认特性：`bitget`、`trend-strategy`、`metrics`
 
 - `metrics` 组合包含：
-  - `runtime/metrics`
-  - `infra-metrics/http-server` + `prometheus`
+  - `runtime/metrics`（转发 `engine/metrics` + 引入 infra 库）
+  - 如需 HTTP 暴露：在应用层再加 `hft-infra-metrics/http-server`
 
 常用构建：
 
 ```bash
-cargo build -p hft-live --features "binance,all-strategies,metrics"
+cargo build -p hft-live --features "binance,all-strategies,metrics,hft-infra-metrics/http-server"
 ```
 
 ### hft-paper（模拟）
@@ -64,7 +64,18 @@ cargo run -p hft-replay --features "mock,clickhouse"
 ## 推荐实践
 
 - 明确场景组合：优先以“场景”为单位组合特性（live/paper/replay），尽量避免“all-*”大集成用于生产
-- 顶层启用指标：优先使用统一的 `metrics` 特性，由 runtime 串联 engine 与指标服务
+- 顶层启用指标：优先使用统一的 `metrics` 特性，由 runtime 串联 engine 与指标服务；需要 HTTP 暴露再在应用层开启 `infra-metrics/http-server`
+
+## Metrics 使用（示例）
+
+- 仅启用指标收集（不启动 HTTP）：
+  - `cargo run -p hft-paper --features "metrics"`
+- 启用指标并通过 HTTP 暴露（Axum）：
+  - `cargo run -p hft-paper --features "metrics,hft-infra-metrics/http-server"`
+- Engine 端可观测项（节选）：
+  - 直方图：`hft_latency_*_microseconds`（ingestion/aggregation/strategy/risk/execution/end_to_end）
+  - 计数器：`hft_orders_*_total`, `hft_intents_dropped_total`, `hft_snapshot_publish_failed_total`
+  - Gauges：`hft_engine_*`（cycle_count、exec_events_processed、orders_* 当前快照）
 - 文档即代码：新增特性务必在本文件补充说明与示例
 
 ## 新增：Lighter DEX（行情）

@@ -1,13 +1,5 @@
-//! Minimal REST helpers placeholders.
+//! REST helper stubs for adapters-common.
+//! Keep only exchange-agnostic pieces here.
 
-#[derive(Debug, Clone)]
-pub struct RestConfig {
-    pub base_url: String,
-}
-
-impl Default for RestConfig {
-    fn default() -> Self {
-        Self { base_url: String::new() }
-    }
-}
+// Intentionally minimal placeholder to satisfy current build.
 

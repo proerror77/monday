@@ -1,5 +1,5 @@
 use crate::{AdapterError, AdapterResult};
-use hft-core::{Price, Quantity};
+use hft_core::{Price, Quantity};
 
 /// Parse JSON text into a type using either simd-json (if enabled) or serde_json.
 pub fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> AdapterResult<T> {
@@ -26,4 +26,3 @@ pub fn parse_price(s: &str) -> AdapterResult<Price> {
 pub fn parse_quantity(s: &str) -> AdapterResult<Quantity> {
     Quantity::from_str(s).map_err(|e| AdapterError::Parse(e.to_string()))
 }
-

@@ -70,8 +70,8 @@
 - [ ] P1 抽取 `infra_exporters.rs`（Redis/ClickHouse）並通過編譯（含 feature 測試）
 - [ ] P1 抽取 `runtime_management.rs` 並通過編譯
 - [ ] P2 將 runtime/IPC 管理層鎖改為 `parking_lot`
-- [ ] P3 增補 `EngineStats` 指標並導出到 metrics
-- [ ] P3 補齊 Criterion microbench 與 flamegraph/bloat 腳本
+- [x] P3 增補 `EngineStats` 指標並導出到 metrics（runtime 每秒導出 Gauges；engine 熱路徑採 feature gate）
+- [x] P3 補齊 Criterion microbench（Engine::tick、TopN 聚合）；flamegraph/bloat 腳本待後續補充
 
 備註：以上改動均屬結構與可觀測性整理，對熱路徑行為與延遲指標無語義變更。
 

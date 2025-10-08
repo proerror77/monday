@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 rust_decimal = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+thiserror = { workspace = true }
 
 # Optional SIMD JSON parsing
 simd-json = { workspace = true, optional = true }
@@ -22,4 +23,3 @@ json-simd = ["dep:simd-json"]
 
 [lib]
 name = "adapters_common"
-
