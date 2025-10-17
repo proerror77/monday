@@ -26,11 +26,25 @@ use ports::{
     BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntent, VenueSpec,
 };
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use url::Url;
+
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, HftError> {
+    let mut bytes = text.as_bytes().to_vec();
+    simd_json::serde::from_slice(bytes.as_mut_slice())
+        .map_err(|e| HftError::Serialization(e.to_string()))
+}
+
+fn parse_owned_value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, HftError> {
+    let owned: simd_json::OwnedValue = match value.try_into() {
+        Ok(v) => v,
+        Err(e) => return Err(HftError::Serialization(e.to_string())),
+    };
+    simd_json::serde::from_owned_value(owned).map_err(|e| HftError::Serialization(e.to_string()))
+}
 
 /// 訂單記錄 (內部使用)
 #[derive(Debug, Clone)]
@@ -509,8 +523,7 @@ impl BitgetExecutionClient {
         text: &str,
         event_tx: &broadcast::Sender<ExecutionEvent>,
     ) -> HftResult<()> {
-        let message: PrivateWSMessage =
-            serde_json::from_str(text).map_err(|e| HftError::Serialization(e.to_string()))?;
+        let message: PrivateWSMessage = parse_json(text)?;
 
         debug!("收到私有消息: {:?}", message);
 
@@ -545,11 +558,9 @@ impl BitgetExecutionClient {
     ) -> HftResult<()> {
         // 數據可能是數組格式
         let updates: Vec<BitgetOrderUpdate> = if data.is_array() {
-            serde_json::from_value(data.clone())
-                .map_err(|e| HftError::Serialization(e.to_string()))?
+            parse_owned_value(data.clone())?
         } else {
-            vec![serde_json::from_value(data.clone())
-                .map_err(|e| HftError::Serialization(e.to_string()))?]
+            vec![parse_owned_value(data.clone())?]
         };
 
         for update in updates {
@@ -658,11 +669,9 @@ impl BitgetExecutionClient {
     ) -> HftResult<()> {
         // 數據可能是數組格式
         let fills: Vec<BitgetFillUpdate> = if data.is_array() {
-            serde_json::from_value(data.clone())
-                .map_err(|e| HftError::Serialization(e.to_string()))?
+            parse_owned_value(data.clone())?
         } else {
-            vec![serde_json::from_value(data.clone())
-                .map_err(|e| HftError::Serialization(e.to_string()))?]
+            vec![parse_owned_value(data.clone())?]
         };
 
         for fill in fills {
@@ -898,7 +907,7 @@ impl ExecutionClient for BitgetExecutionClient {
             let order_id = format!("PAPER_{}", Self::current_timestamp());
             info!(
                 "模擬下單: {} {} {} @ {:?}",
-                intent.symbol.0,
+                intent.symbol.as_str(),
                 Self::convert_side(intent.side),
                 intent.quantity.0,
                 intent.price.map(|p| p.0)
@@ -944,7 +953,7 @@ impl ExecutionClient for BitgetExecutionClient {
         let http_client = self.http_client.as_ref().unwrap();
 
         let request = PlaceOrderRequest {
-            symbol: intent.symbol.0.clone(),
+            symbol: intent.symbol.as_str().to_string(),
             side: Self::convert_side(intent.side),
             order_type: Self::convert_order_type(intent.order_type),
             force: Self::convert_time_in_force(intent.time_in_force),
@@ -979,7 +988,7 @@ impl ExecutionClient for BitgetExecutionClient {
                 self.order_records.insert(
                     data.order_id.clone(),
                     OrderRecord {
-                        symbol: intent.symbol.0.clone(),
+                        symbol: intent.symbol.as_str().to_string(),
                         client_order_id: data.client_order_id.clone(),
                         side: intent.side,
                         quantity: intent.quantity,
@@ -1368,7 +1377,7 @@ impl ExecutionClient for BitgetExecutionClient {
 
                 out.push(OpenOrder {
                     order_id: OrderId(it.order_id),
-                    symbol: hft_core::Symbol(symbol),
+                    symbol: hft_core::Symbol::from(symbol),
                     side,
                     order_type,
                     original_quantity: qty,
@@ -1454,7 +1463,7 @@ impl ExecutionClient for BitgetExecutionClient {
 
                 out.push(OpenOrder {
                     order_id: OrderId(it.order_id),
-                    symbol: hft_core::Symbol(symbol),
+                    symbol: hft_core::Symbol::from(symbol),
                     side,
                     order_type,
                     original_quantity: qty,
@@ -1566,7 +1575,7 @@ impl ExecutionClient for BitgetExecutionClient {
 
                     out.push(OpenOrder {
                         order_id: OrderId(it.order_id),
-                        symbol: hft_core::Symbol(symbol),
+                        symbol: hft_core::Symbol::from(symbol),
                         side,
                         order_type,
                         original_quantity: qty,
@@ -1652,7 +1661,7 @@ impl ExecutionClient for BitgetExecutionClient {
 
                     out.push(OpenOrder {
                         order_id: OrderId(it.order_id),
-                        symbol: hft_core::Symbol(symbol),
+                        symbol: hft_core::Symbol::from(symbol),
                         side,
                         order_type,
                         original_quantity: qty,
@@ -1674,7 +1683,7 @@ impl ExecutionClient for BitgetExecutionClient {
 
         // 可選：基於環境變數過濾 symbol，便於測試
         if let Ok(filter_sym) = std::env::var("HFT_OPEN_ORDERS_SYMBOL") {
-            out.retain(|o| o.symbol.0 == filter_sym);
+            out.retain(|o| o.symbol.as_str() == filter_sym);
         }
 
         Ok(out)

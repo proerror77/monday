@@ -75,7 +75,7 @@ async fn run_infer_worker(
                 ask_qty_log.push((1.0 + aq).ln());
             }
 
-            let entry = windows.entry(sym.symbol.0.clone()).or_default();
+            let entry = windows.entry(sym.symbol.as_str().to_string()).or_default();
             entry.push((bid_px_rel, bid_qty_log, ask_px_rel, ask_qty_log));
             if entry.len() > l {
                 entry.remove(0);
@@ -93,10 +93,10 @@ async fn run_infer_worker(
 
                 match predictor.infer(&flat) {
                     Ok(probs) => {
-                        info!(symbol = %sym.symbol.0, ts = market_view.timestamp, ?probs, "ONNX 推理");
+                        info!(symbol = %sym.symbol.as_str(), ts = market_view.timestamp, ?probs, "ONNX 推理");
                     }
                     Err(e) => {
-                        warn!(symbol = %sym.symbol.0, "推理失敗: {}", e);
+                        warn!(symbol = %sym.symbol.as_str(), "推理失敗: {}", e);
                     }
                 }
             }

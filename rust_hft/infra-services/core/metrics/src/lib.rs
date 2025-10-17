@@ -21,11 +21,14 @@ pub struct MetricsRegistry {
     pub registry: Registry,
 
     // 分段延遲直方圖
+    pub latency_ws_receive: Histogram,
+    pub latency_parsing: Histogram,
     pub latency_ingestion: Histogram,
     pub latency_aggregation: Histogram,
     pub latency_strategy: Histogram,
     pub latency_risk: Histogram,
     pub latency_execution: Histogram,
+    pub latency_submission: Histogram,
     pub latency_end_to_end: Histogram,
     pub latency_order_ack: Histogram,
     pub latency_order_fill: Histogram,
@@ -104,6 +107,24 @@ impl MetricsRegistry {
             1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
         ];
 
+        let latency_ws_receive = Histogram::with_opts(
+            HistogramOpts::new(
+                "hft_latency_ws_receive_microseconds",
+                "WebSocket 喚醒到收包延遲 (微秒)",
+            )
+            .buckets(latency_buckets.clone()),
+        )
+        .expect("創建 WS 接收延遲直方圖失敗");
+
+        let latency_parsing = Histogram::with_opts(
+            HistogramOpts::new(
+                "hft_latency_parsing_microseconds",
+                "JSON 解析階段延遲 (微秒)",
+            )
+            .buckets(latency_buckets.clone()),
+        )
+        .expect("創建解析延遲直方圖失敗");
+
         let latency_ingestion = Histogram::with_opts(
             HistogramOpts::new(
                 "hft_latency_ingestion_microseconds",
@@ -145,6 +166,15 @@ impl MetricsRegistry {
             .buckets(latency_buckets.clone()),
         )
         .expect("創建執行延遲直方圖失敗");
+
+        let latency_submission = Histogram::with_opts(
+            HistogramOpts::new(
+                "hft_latency_submission_microseconds",
+                "訂單送出至交易所延遲 (微秒)",
+            )
+            .buckets(latency_buckets.clone()),
+        )
+        .expect("創建提交延遲直方圖失敗");
 
         let latency_end_to_end = Histogram::with_opts(
             HistogramOpts::new("hft_latency_end_to_end_microseconds", "端到端總延遲 (微秒)")
@@ -230,28 +260,20 @@ impl MetricsRegistry {
             "已處理執行事件數（當前快照）",
         )
         .expect("創建 engine_exec_events_processed 失敗");
-        let engine_orders_submitted = Gauge::new(
-            "hft_engine_orders_submitted",
-            "已提交訂單數（當前快照）",
-        )
-        .expect("創建 engine_orders_submitted 失敗");
+        let engine_orders_submitted =
+            Gauge::new("hft_engine_orders_submitted", "已提交訂單數（當前快照）")
+                .expect("創建 engine_orders_submitted 失敗");
         let engine_orders_ack = Gauge::new("hft_engine_orders_ack", "已 Ack 訂單數（當前快照）")
             .expect("創建 engine_orders_ack 失敗");
-        let engine_orders_filled = Gauge::new(
-            "hft_engine_orders_filled",
-            "已成交訂單數（當前快照）",
-        )
-        .expect("創建 engine_orders_filled 失敗");
-        let engine_orders_rejected = Gauge::new(
-            "hft_engine_orders_rejected",
-            "已拒絕訂單數（當前快照）",
-        )
-        .expect("創建 engine_orders_rejected 失敗");
-        let engine_orders_canceled = Gauge::new(
-            "hft_engine_orders_canceled",
-            "已撤銷訂單數（當前快照）",
-        )
-        .expect("創建 engine_orders_canceled 失敗");
+        let engine_orders_filled =
+            Gauge::new("hft_engine_orders_filled", "已成交訂單數（當前快照）")
+                .expect("創建 engine_orders_filled 失敗");
+        let engine_orders_rejected =
+            Gauge::new("hft_engine_orders_rejected", "已拒絕訂單數（當前快照）")
+                .expect("創建 engine_orders_rejected 失敗");
+        let engine_orders_canceled =
+            Gauge::new("hft_engine_orders_canceled", "已撤銷訂單數（當前快照）")
+                .expect("創建 engine_orders_canceled 失敗");
 
         // 對帳指標
         let reconcile_runs = IntCounter::new("hft_reconcile_runs_total", "對帳執行次數")
@@ -269,6 +291,12 @@ impl MetricsRegistry {
 
         // 註冊所有指標到註冊表
         registry
+            .register(Box::new(latency_ws_receive.clone()))
+            .expect("註冊 WS 接收延遲指標失敗");
+        registry
+            .register(Box::new(latency_parsing.clone()))
+            .expect("註冊解析延遲指標失敗");
+        registry
             .register(Box::new(latency_ingestion.clone()))
             .expect("註冊攝取延遲指標失敗");
         registry
@@ -283,6 +311,9 @@ impl MetricsRegistry {
         registry
             .register(Box::new(latency_execution.clone()))
             .expect("註冊執行延遲指標失敗");
+        registry
+            .register(Box::new(latency_submission.clone()))
+            .expect("註冊提交延遲指標失敗");
         registry
             .register(Box::new(latency_end_to_end.clone()))
             .expect("註冊端到端延遲指標失敗");
@@ -388,11 +419,14 @@ impl MetricsRegistry {
         let now = now_micros();
         Self {
             registry,
+            latency_ws_receive,
+            latency_parsing,
             latency_ingestion,
             latency_aggregation,
             latency_strategy,
             latency_risk,
             latency_execution,
+            latency_submission,
             latency_end_to_end,
             latency_order_ack,
             latency_order_fill,
@@ -423,6 +457,20 @@ impl MetricsRegistry {
             last_activity_micros: AtomicU64::new(now),
             last_queue_utilization_ppm: AtomicU64::new(0),
         }
+    }
+
+    /// 記錄 WS 接收延遲
+    pub fn record_ws_receive_latency(&self, latency_us: f64) {
+        self.latency_ws_receive.observe(latency_us);
+        debug!("記錄 WS 接收延遲: {:.2}μs", latency_us);
+        self.note_activity();
+    }
+
+    /// 記錄解析階段延遲
+    pub fn record_parsing_latency(&self, latency_us: f64) {
+        self.latency_parsing.observe(latency_us);
+        debug!("記錄解析延遲: {:.2}μs", latency_us);
+        self.note_activity();
     }
 
     /// 記錄攝取階段延遲
@@ -457,6 +505,13 @@ impl MetricsRegistry {
     pub fn record_execution_latency(&self, latency_us: f64) {
         self.latency_execution.observe(latency_us);
         debug!("記錄執行延遲: {:.2}μs", latency_us);
+        self.note_activity();
+    }
+
+    /// 記錄提交階段延遲
+    pub fn record_submission_latency(&self, latency_us: f64) {
+        self.latency_submission.observe(latency_us);
+        debug!("記錄提交延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
@@ -578,14 +633,11 @@ impl MetricsRegistry {
         self.engine_cycle_count.set(s.cycle_count as f64);
         self.engine_exec_events_processed
             .set(s.execution_events_processed as f64);
-        self.engine_orders_submitted
-            .set(s.orders_submitted as f64);
+        self.engine_orders_submitted.set(s.orders_submitted as f64);
         self.engine_orders_ack.set(s.orders_ack as f64);
         self.engine_orders_filled.set(s.orders_filled as f64);
-        self.engine_orders_rejected
-            .set(s.orders_rejected as f64);
-        self.engine_orders_canceled
-            .set(s.orders_canceled as f64);
+        self.engine_orders_rejected.set(s.orders_rejected as f64);
+        self.engine_orders_canceled.set(s.orders_canceled as f64);
         self.note_activity();
     }
 
@@ -601,6 +653,16 @@ impl MetricsRegistry {
 
         for (stage, stats) in latency_stats {
             match stage {
+                LatencyStage::WsReceive => {
+                    for _ in 0..stats.count {
+                        self.latency_ws_receive.observe(stats.mean_micros);
+                    }
+                }
+                LatencyStage::Parsing => {
+                    for _ in 0..stats.count {
+                        self.latency_parsing.observe(stats.mean_micros);
+                    }
+                }
                 LatencyStage::Ingestion => {
                     // 更新所有样本到直方图
                     for _ in 0..stats.count {
@@ -617,9 +679,19 @@ impl MetricsRegistry {
                         self.latency_strategy.observe(stats.mean_micros);
                     }
                 }
+                LatencyStage::Risk => {
+                    for _ in 0..stats.count {
+                        self.latency_risk.observe(stats.mean_micros);
+                    }
+                }
                 LatencyStage::Execution => {
                     for _ in 0..stats.count {
                         self.latency_execution.observe(stats.mean_micros);
+                    }
+                }
+                LatencyStage::Submission => {
+                    for _ in 0..stats.count {
+                        self.latency_submission.observe(stats.mean_micros);
                     }
                 }
                 LatencyStage::EndToEnd => {

@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use engine::{aggregation::TopNSnapshot, aggregation::MarketView, Engine, EngineConfig};
+use engine::{aggregation::MarketView, aggregation::TopNSnapshot, Engine, EngineConfig};
 use ports::{BookLevel, MarketSnapshot};
 
 fn bench_engine_tick(c: &mut Criterion) {
@@ -27,7 +27,7 @@ criterion_main!(benches, topn_benches);
 
 fn bench_topn_aggregation(c: &mut Criterion) {
     // 構造一個含 10 檔位的快照
-    let symbol = hft_core::Symbol("BTC_USDT".to_string());
+    let symbol = hft_core::Symbol::new("BTC_USDT");
     let bids: Vec<BookLevel> = (0..10)
         .map(|i| BookLevel::new_unchecked(50_000.0 - i as f64, 1.0 + i as f64))
         .collect();
@@ -53,7 +53,4 @@ fn bench_topn_aggregation(c: &mut Criterion) {
 }
 
 // 將新的基準加入 group（保持現有次序在前）
-criterion_group!(
-    topn_benches,
-    bench_topn_aggregation
-);
+criterion_group!(topn_benches, bench_topn_aggregation);

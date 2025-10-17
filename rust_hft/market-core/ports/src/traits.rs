@@ -356,7 +356,7 @@ pub trait RiskManager: Send + Sync {
             } else {
                 // 2. 回退到從 symbol 推斷 venue（簡單實現）
                 // 這裡假設 symbol 格式為 "VENUE:SYMBOL" 或純 symbol
-                let _base_symbol = BaseSymbol::from_venue_symbol(&intent.symbol.0);
+                let _base_symbol = BaseSymbol::from_venue_symbol(intent.symbol.as_str());
                 // 簡化處理：使用第一個可用的 VenueSpec
                 venue_specs.values().next()
             };

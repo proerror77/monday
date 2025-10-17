@@ -4,7 +4,10 @@
 //! - 僅供 adapters 復用
 
 pub mod http;
+pub mod latency;
 pub mod rate_limit;
 pub mod reconnect;
 pub mod signing;
 pub mod ws;
+
+pub use latency::WsFrameMetrics;

@@ -230,7 +230,7 @@ pub struct LobFlowGridStrategy {
 
 impl LobFlowGridStrategy {
     pub fn new(symbol: Symbol, config: LobFlowGridConfig) -> Self {
-        let strategy_id = format!("lob_grid_{}", symbol.0);
+        let strategy_id = format!("lob_grid_{}", symbol.as_str());
         Self::with_name(symbol, config, strategy_id)
     }
 
@@ -552,19 +552,19 @@ impl LobFlowGridStrategy {
 
     fn market_filters_passed(&self, signals: &SignalSnapshot) -> bool {
         if signals.best_ask <= signals.best_bid || signals.mid <= 0.0 {
-            debug!(symbol = %self.symbol.0, "filters: 無有效點差/中價");
+            debug!(symbol = %self.symbol.as_str(), "filters: 無有效點差/中價");
             return false;
         }
         let spread = signals.best_ask - signals.best_bid;
         let spread_bps = (spread / signals.mid) * 10_000.0;
         if spread_bps < self.config.min_spread_bps || spread_bps > self.config.max_spread_bps {
-            debug!(symbol = %self.symbol.0, spread_bps, "filters: 點差超出可接受範圍");
+            debug!(symbol = %self.symbol.as_str(), spread_bps, "filters: 點差超出可接受範圍");
             return false;
         }
         let bid_depth = Self::book_depth_usd(&self.state.bids, self.config.max_depth_steps);
         let ask_depth = Self::book_depth_usd(&self.state.asks, self.config.max_depth_steps);
         if bid_depth < self.config.min_top_depth_usd || ask_depth < self.config.min_top_depth_usd {
-            debug!(symbol = %self.symbol.0, bid_depth, ask_depth, "filters: 書內深度不足");
+            debug!(symbol = %self.symbol.as_str(), bid_depth, ask_depth, "filters: 書內深度不足");
             return false;
         }
         true
@@ -580,7 +580,7 @@ impl LobFlowGridStrategy {
         let levels = self.build_levels();
 
         if !self.market_filters_passed(&signals) {
-            debug!(symbol = %self.symbol.0, "市場過濾條件未滿足，跳過掛單");
+            debug!(symbol = %self.symbol.as_str(), "市場過濾條件未滿足，跳過掛單");
             return orders;
         }
 
@@ -694,7 +694,7 @@ impl LobFlowGridStrategy {
             .unwrap_or(0.0);
         if orders.is_empty() {
             debug!(
-                symbol = %self.symbol.0,
+                symbol = %self.symbol.as_str(),
                 spacing_bps,
                 inventory_before,
                 inventory_after = inventory,
@@ -709,7 +709,7 @@ impl LobFlowGridStrategy {
             );
         } else {
             info!(
-                symbol = %self.symbol.0,
+                symbol = %self.symbol.as_str(),
                 order_count = orders.len(),
                 spacing_bps,
                 inventory_before,
@@ -799,7 +799,7 @@ impl Strategy for LobFlowGridStrategy {
     }
 
     fn initialize(&mut self) -> HftResult<()> {
-        let sym = &self.symbol.0;
+        let sym = &self.symbol.as_str();
         info!(symbol = %sym, "initializing LOB Flow Grid strategy");
         Ok(())
     }
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn test_signal_generation() {
-        let symbol = Symbol("BTCUSDT".to_string());
+        let symbol = Symbol::new("BTCUSDT");
         let config = LobFlowGridConfig::default();
         let mut strategy = LobFlowGridStrategy::new(symbol.clone(), config);
 

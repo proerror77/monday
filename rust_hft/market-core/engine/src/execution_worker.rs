@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::yield_now;
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -74,6 +75,18 @@ impl Default for ExecutionWorkerConfig {
             reconcile_interval_ms: 5000,
             auto_cancel_exchange_only: false,
         }
+    }
+}
+
+impl ExecutionWorkerConfig {
+    /// 高性能預設：降低批量系統調用開銷與空閒睡眠延遲
+    pub fn high_performance() -> Self {
+        let mut cfg = Self::default();
+        cfg.batch_size = 64;
+        cfg.idle_sleep_ms = 0;
+        cfg.ack_timeout_ms = 2000;
+        cfg.retry_delay_ms = 50;
+        cfg
     }
 }
 
@@ -158,7 +171,7 @@ impl ExecutionWorker {
                 if let Err(e) = client.cancel_order(&oid).await {
                     tracing::warn!("Ack timeout cancel failed: {} - {}", oid.0, e);
                 } else {
-                    tracing::info!("Ack timeout: cancel sent for {} ({})", oid.0, sym.0);
+                    tracing::info!("Ack timeout: cancel sent for {} ({})", oid.0, sym.as_str());
                 }
             }
         }
@@ -293,7 +306,10 @@ impl ExecutionWorker {
             // 4. 空闲控制
             if !had_activity {
                 let idle_duration = tick_start.duration_since(last_activity);
-                if idle_duration.as_millis() > 1000 {
+                if self.config.idle_sleep_ms == 0 {
+                    // 忙等模式下交出調度權，避免 100% CPU
+                    yield_now().await;
+                } else if idle_duration.as_millis() > 1000 {
                     // 长时间空闲，增加睡眠时间
                     sleep(Duration::from_millis(self.config.idle_sleep_ms * 2)).await;
                 } else {
@@ -413,12 +429,12 @@ impl ExecutionWorker {
                     // 記錄執行延遲到統一監控器和本地統計
                     let execution_latency = now_micros().saturating_sub(execution_start);
                     self.latency_monitor
-                        .record_latency(LatencyStage::Execution, execution_latency);
+                        .record_latency(LatencyStage::Submission, execution_latency);
                     self.stats.execution_latency_micros.push(execution_latency);
                     self.stats.recent_execution_latency_micros = Some(execution_latency);
                     #[cfg(feature = "metrics")]
                     infra_metrics::MetricsRegistry::global()
-                        .record_execution_latency(execution_latency as f64);
+                        .record_submission_latency(execution_latency as f64);
 
                     self.stats.orders_placed += 1;
                     // 记录订单到客户端映射，用于回报路由
@@ -631,7 +647,7 @@ impl ExecutionWorker {
                     "Router '{}' failed to find route for intent: strategy_id={}, symbol={}",
                     router.name(),
                     intent.strategy_id,
-                    intent.symbol.0
+                    intent.symbol.as_str()
                 ));
             }
         }
@@ -677,7 +693,7 @@ impl ExecutionWorker {
             ClientSelectionStrategy::ConsistentHash => {
                 // 使用品种名称的 FNV-1a hash，确保同一品种总是路由到同一客户端
                 let mut hash: u32 = 2166136261;
-                for byte in intent.symbol.0.as_bytes() {
+                for byte in intent.symbol.as_str().as_bytes() {
                     hash ^= *byte as u32;
                     hash = hash.wrapping_mul(16777619);
                 }
@@ -764,7 +780,7 @@ impl ExecutionWorker {
         match self.config.client_selection {
             ClientSelectionStrategy::ConsistentHash => {
                 let mut hash: u32 = 2166136261;
-                for b in symbol.0.as_bytes() {
+                for b in symbol.as_str().as_bytes() {
                     hash ^= *b as u32;
                     hash = hash.wrapping_mul(16777619);
                 }
@@ -800,7 +816,7 @@ mod tests {
 
     fn create_test_intent(symbol: &str) -> OrderIntent {
         OrderIntent {
-            symbol: Symbol(symbol.to_string()),
+            symbol: Symbol::new(symbol),
             side: Side::Buy,
             order_type: OrderType::Market,
             quantity: Quantity::from_f64(1.0).unwrap(),

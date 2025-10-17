@@ -1,0 +1,11 @@
+# Tarpaulin configuration for rust_hft workspace
+[report]
+out = ["Html"]
+
+[engine]
+ignore-tests = false
+line = true
+branch = false
+
+[exclude]
+files = ["benches/*", "examples/*", "target/*"]

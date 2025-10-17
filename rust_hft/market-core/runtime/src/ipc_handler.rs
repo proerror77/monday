@@ -236,7 +236,7 @@ impl CommandHandler for SystemCommandHandler {
                     .iter()
                     .map(|(symbol, pos)| {
                         Position {
-                            symbol: Symbol(symbol.clone()),
+                            symbol: Symbol::from(symbol.clone()),
                             quantity: pos.quantity,
                             average_price: pos.average_price,
                             market_value: pos.market_value,
@@ -351,7 +351,7 @@ impl CommandHandler for SystemCommandHandler {
             }
 
             Command::CancelOrdersForSymbol { symbol } => {
-                info!("IPC: Cancelling orders for symbol {}", symbol.0);
+                info!("IPC: Cancelling orders for symbol {}", symbol.as_str());
                 let runtime = self.runtime.lock().await;
                 // 導出未結訂單（該 symbol）
                 let pairs = {
@@ -359,7 +359,7 @@ impl CommandHandler for SystemCommandHandler {
                     let state = eng.export_oms_state();
                     let mut pairs = Vec::new();
                     for (order_id, rec) in state.into_iter() {
-                        if rec.symbol.0 == symbol.0 {
+                        if rec.symbol.as_str() == symbol.as_str() {
                             if matches!(
                                 rec.status,
                                 oms_core::OrderStatus::New
@@ -405,7 +405,11 @@ impl CommandHandler for SystemCommandHandler {
             }
 
             Command::CancelOrder { order_id, symbol } => {
-                info!("IPC: Cancel order {} for symbol {}", order_id, symbol.0);
+                info!(
+                    "IPC: Cancel order {} for symbol {}",
+                    order_id,
+                    symbol.as_str()
+                );
                 let runtime = self.runtime.lock().await;
                 let pair = (OrderId(order_id), symbol);
                 for tx in &runtime.exec_control_txs {
@@ -445,7 +449,7 @@ impl CommandHandler for SystemCommandHandler {
                 max_position,
                 max_notional,
             } => {
-                info!("IPC: Setting limits for symbol {}", symbol.0);
+                info!("IPC: Setting limits for symbol {}", symbol.as_str());
                 // TODO: Implement symbol limit updates
                 Response::Error {
                     message: "Symbol limit updates not yet implemented".to_string(),

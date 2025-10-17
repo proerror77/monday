@@ -489,7 +489,8 @@ impl Engine {
                 Err(rejected_intent) => {
                     warn!(
                         "執行隊列滿載，訂單意圖被拒絕: {} {}",
-                        rejected_intent.symbol.0, rejected_intent.quantity.0
+                        rejected_intent.symbol.as_str(),
+                        rejected_intent.quantity.0
                     );
                     Err(HftError::Execution("執行隊列滿載".to_string()))
                 }
@@ -535,9 +536,9 @@ impl Engine {
 
                 // 日誌降噪：逐事件日誌改為 debug 級別
                 let (event_kind, symbol) = match &tracked_event.event {
-                    ports::MarketEvent::Bar(bar) => ("bar", bar.symbol.0.as_str()),
-                    ports::MarketEvent::Trade(trade) => ("trade", trade.symbol.0.as_str()),
-                    ports::MarketEvent::Snapshot(snap) => ("snapshot", snap.symbol.0.as_str()),
+                    ports::MarketEvent::Bar(bar) => ("bar", bar.symbol.as_str()),
+                    ports::MarketEvent::Trade(trade) => ("trade", trade.symbol.as_str()),
+                    ports::MarketEvent::Snapshot(snap) => ("snapshot", snap.symbol.as_str()),
                     _ => ("other", ""),
                 };
 
@@ -658,8 +659,8 @@ impl Engine {
             );
         }
 
-        // 定期同步延遲統計到 Prometheus（每 1000 個 tick 或有活動時）
-        if self.stats.cycle_count % 1000 == 0 || total_events > 0 || exec_processed > 0 {
+        // 定期同步延遲統計到 Prometheus（每 100 個 tick 或有活動時）
+        if self.stats.cycle_count % 100 == 0 || total_events > 0 || exec_processed > 0 {
             self.sync_latency_metrics_to_prometheus();
         }
 
@@ -762,7 +763,7 @@ impl Engine {
             self.order_submit_ts.insert(order_id.clone(), *timestamp);
             debug!(
                 order_id = %order_id.0,
-                sym = %symbol.0,
+                sym = %symbol.as_str(),
                 side = ?side,
                 qty = %quantity.0,
                 "已註冊新訂單到 OMS/Portfolio"
@@ -809,8 +810,7 @@ impl Engine {
                     #[cfg(feature = "metrics")]
                     {
                         let lat = (*_timestamp).saturating_sub(_start_ts) as f64;
-                        infra_metrics::MetricsRegistry::global()
-                            .record_order_ack_latency(lat);
+                        infra_metrics::MetricsRegistry::global().record_order_ack_latency(lat);
                     }
                 }
             }
@@ -826,8 +826,7 @@ impl Engine {
                     #[cfg(feature = "metrics")]
                     {
                         let lat = (*timestamp).saturating_sub(_start_ts) as f64;
-                        infra_metrics::MetricsRegistry::global()
-                            .record_order_fill_latency(lat);
+                        infra_metrics::MetricsRegistry::global().record_order_fill_latency(lat);
                     }
                 }
 
@@ -898,9 +897,9 @@ impl Engine {
 
             // 日誌降噪：逐事件改為 debug 級別
             let (event_kind, symbol) = match event {
-                ports::MarketEvent::Bar(bar) => ("bar", bar.symbol.0.as_str()),
-                ports::MarketEvent::Trade(trade) => ("trade", trade.symbol.0.as_str()),
-                ports::MarketEvent::Snapshot(snap) => ("snapshot", snap.symbol.0.as_str()),
+                ports::MarketEvent::Bar(bar) => ("bar", bar.symbol.as_str()),
+                ports::MarketEvent::Trade(trade) => ("trade", trade.symbol.as_str()),
+                ports::MarketEvent::Snapshot(snap) => ("snapshot", snap.symbol.as_str()),
                 _ => ("other", ""),
             };
 
@@ -950,13 +949,13 @@ impl Engine {
                 if !should_process {
                     let (event_kind, symbol, source) = match event {
                         ports::MarketEvent::Bar(bar) => {
-                            ("bar", bar.symbol.0.as_str(), bar.source_venue)
+                            ("bar", bar.symbol.as_str(), bar.source_venue)
                         }
                         ports::MarketEvent::Trade(trade) => {
-                            ("trade", trade.symbol.0.as_str(), trade.source_venue)
+                            ("trade", trade.symbol.as_str(), trade.source_venue)
                         }
                         ports::MarketEvent::Snapshot(snap) => {
-                            ("snapshot", snap.symbol.0.as_str(), snap.source_venue)
+                            ("snapshot", snap.symbol.as_str(), snap.source_venue)
                         }
                         _ => ("other", "", None),
                     };
@@ -1012,12 +1011,12 @@ impl Engine {
                 intents_work_buf // 沒有風控則全部通過（移動所有權）
             };
 
-            // 記錄風控階段完成
+            let risk_latency = now_micros().saturating_sub(_risk_start);
+            event_tracker.record_stage(LatencyStage::Risk);
+            self.latency_monitor
+                .record_latency(LatencyStage::Risk, risk_latency);
             #[cfg(feature = "metrics")]
-            {
-                let risk_latency = now_micros().saturating_sub(_risk_start) as f64;
-                infra_metrics::MetricsRegistry::global().record_risk_latency(risk_latency);
-            }
+            infra_metrics::MetricsRegistry::global().record_risk_latency(risk_latency as f64);
 
             let orders_count = intents_to_send.len() as u32;
             result.orders_generated += orders_count;
@@ -1080,13 +1079,10 @@ impl Engine {
                 if dropped > 0 {
                     warn!("{}个意图因队列满载被丢弃", dropped);
                     // P3: 更新引擎統計與指標
-                    self.stats.intents_dropped = self
-                        .stats
-                        .intents_dropped
-                        .saturating_add(dropped as u64);
+                    self.stats.intents_dropped =
+                        self.stats.intents_dropped.saturating_add(dropped as u64);
                     #[cfg(feature = "metrics")]
-                    infra_metrics::MetricsRegistry::global()
-                        .add_intents_dropped(dropped as u64);
+                    infra_metrics::MetricsRegistry::global().add_intents_dropped(dropped as u64);
                 }
             } else {
                 intents_to_send.clear();
@@ -1097,12 +1093,14 @@ impl Engine {
 
             // 記錄執行階段延遲到統一監控器
             let execution_latency = now_micros().saturating_sub(execution_start);
+            event_tracker.record_stage(LatencyStage::Execution);
             self.latency_monitor
                 .record_latency(LatencyStage::Execution, execution_latency);
 
             // 如果有起始時間戳，計算端到端延遲
             if let Some(origin_ts) = event_timestamp {
                 let end_to_end_latency = now_micros().saturating_sub(origin_ts);
+                event_tracker.record_stage(LatencyStage::EndToEnd);
                 self.latency_monitor
                     .record_latency(LatencyStage::EndToEnd, end_to_end_latency);
             }
@@ -1362,7 +1360,7 @@ mod tests {
 
         // 事件：Bar 來自 BINANCE（應該只命中 cross1）
         let bar_event = MarketEvent::Bar(AggregatedBar {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             interval_ms: 60000,
             open_time: 1000000,
             close_time: 1060000,

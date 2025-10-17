@@ -7,9 +7,13 @@ use simd_json;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
+
+#[cfg(feature = "metrics")]
+use infra_metrics::MetricsRegistry;
 
 use hft_core::*;
+use integration::latency::WsFrameMetrics;
 use integration::ws::{MessageHandler, ReconnectingWsClient, WsClientConfig};
 use ports::*;
 
@@ -28,6 +32,14 @@ pub struct BitgetWsMessage {
 fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, simd_json::Error> {
     let mut bytes = text.as_bytes().to_vec();
     simd_json::serde::from_slice(bytes.as_mut_slice())
+}
+
+#[inline]
+fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, simd_json::Error> {
+    let owned: simd_json::OwnedValue = value
+        .try_into()
+        .map_err(|e| simd_json::Error::generic(simd_json::ErrorType::Serde(format!("{:?}", e))))?;
+    simd_json::serde::from_owned_value(owned)
 }
 
 #[inline]
@@ -217,7 +229,7 @@ impl BitgetMarketStream {
             }
         };
 
-        let symbol = Symbol(
+        let symbol = Symbol::from(
             data.inst_id
                 .clone()
                 .unwrap_or_else(|| fallback_inst_id.to_string()),
@@ -241,7 +253,7 @@ impl BitgetMarketStream {
                 .map(|s| BitgetSubscriptionArg {
                     inst_type: self.inst_type.clone(),
                     channel: "depth".to_string(),
-                    inst_id: s.0.clone(),
+                    inst_id: s.as_str().to_string(),
                 })
                 .collect();
 
@@ -261,7 +273,7 @@ impl BitgetMarketStream {
                 .map(|s| BitgetSubscriptionArg {
                     inst_type: self.inst_type.clone(),
                     channel: "trades".to_string(),
-                    inst_id: s.0.clone(),
+                    inst_id: s.as_str().to_string(),
                 })
                 .collect();
 
@@ -427,11 +439,29 @@ impl MessageHandler for BitgetMessageHandler {
     fn handle_message(
         &mut self,
         message: String,
+        mut metrics: WsFrameMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("收到 Bitget 消息: {}", message);
 
         // 解析 WebSocket 消息
-        let ws_msg: BitgetWsMessage = parse_json(&message)?;
+        let ws_msg: BitgetWsMessage = match parse_json(&message) {
+            Ok(msg) => {
+                metrics.mark_parsed();
+                msg
+            }
+            Err(e) => {
+                metrics.mark_parsed();
+                let parse_latency = metrics.parsed_at_us.saturating_sub(metrics.received_at_us);
+                trace!("Bitget JSON 解析失敗，耗時 {}μs", parse_latency);
+                return Err(Box::new(e));
+            }
+        };
+
+        let parse_latency = metrics.parsed_at_us.saturating_sub(metrics.received_at_us);
+        trace!("Bitget JSON 解析完成，耗時 {}μs", parse_latency);
+
+        #[cfg(feature = "metrics")]
+        MetricsRegistry::global().record_parsing_latency(parse_latency as f64);
 
         // 優先依據 arg.channel 分流處理
         if let Some(arg) = &ws_msg.arg {
@@ -508,7 +538,7 @@ impl MessageHandler for BitgetMessageHandler {
                 .map(|s| BitgetSubscriptionArg {
                     inst_type: self.inst_type.clone(),
                     channel: lob_channel.to_string(),
-                    inst_id: s.0.clone(),
+                    inst_id: s.as_str().to_string(),
                 })
                 .collect();
             let lob_req = BitgetSubscriptionRequest {
@@ -530,7 +560,7 @@ impl MessageHandler for BitgetMessageHandler {
                 .map(|s| BitgetSubscriptionArg {
                     inst_type: self.inst_type.clone(),
                     channel: "trade".to_string(),
-                    inst_id: s.0.clone(),
+                    inst_id: s.as_str().to_string(),
                 })
                 .collect();
             let trade_req = BitgetSubscriptionRequest {
@@ -568,8 +598,7 @@ impl BitgetMessageHandler {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(arg) = arg {
             if arg.channel == "depth" || arg.channel.starts_with("books") {
-                let orderbook_array: Vec<BitgetOrderBookData> =
-                    serde_json::from_value(data.clone())?;
+                let orderbook_array: Vec<BitgetOrderBookData> = parse_value_owned(data.clone())?;
 
                 for orderbook_data in orderbook_array {
                     // 可選：校驗 checksum（僅快照頻道更可靠）
@@ -580,7 +609,7 @@ impl BitgetMessageHandler {
                             }
                         }
                     }
-                    let symbol = Symbol(arg.inst_id.clone());
+                    let symbol = Symbol::from(arg.inst_id.clone());
 
                     match self.parse_orderbook_data(&orderbook_data, &symbol) {
                         Ok(snapshot) => {
@@ -612,7 +641,7 @@ impl BitgetMessageHandler {
             return Ok(());
         }
 
-        let entries: Vec<BitgetOrderBookData> = serde_json::from_value(data.clone())?;
+        let entries: Vec<BitgetOrderBookData> = parse_value_owned(data.clone())?;
         let sym = arg.inst_id.as_str();
         let state = self.get_state_mut(sym);
 
@@ -638,7 +667,7 @@ impl BitgetMessageHandler {
         }
 
         // 生成快照事件（從狀態構建）
-        let snapshot = state.to_snapshot(Symbol(sym.to_string()), entries.last().map(|e| &e.ts))?;
+        let snapshot = state.to_snapshot(Symbol::new(sym), entries.last().map(|e| &e.ts))?;
         let _ = self.event_sender.send(MarketEvent::Snapshot(snapshot));
         Ok(())
     }
@@ -774,7 +803,7 @@ impl BitgetMessageHandler {
                 .to_string();
 
             let trade = Trade {
-                symbol: Symbol(symbol),
+                symbol: Symbol::from(symbol),
                 timestamp: ts_us,
                 price,
                 quantity,
@@ -867,7 +896,7 @@ impl BitgetMessageHandler {
             }
         };
 
-        let symbol = Symbol(
+        let symbol = Symbol::from(
             data.inst_id
                 .clone()
                 .unwrap_or_else(|| fallback_inst_id.to_string()),

@@ -28,7 +28,7 @@ fn binance_depth_update_dry_run() {
 
     // Build market view and assert we have best bid/ask for BINANCE:BTCUSDT
     let mv: MarketView = agg.build_market_view();
-    let key = hft_core::VenueSymbol::new(VenueId::BINANCE, Symbol("BTCUSDT".to_string()));
+    let key = hft_core::VenueSymbol::new(VenueId::BINANCE, Symbol::new("BTCUSDT"));
     let ob = mv.get_orderbook(&key).expect("orderbook exists");
 
     assert_eq!(ob.bid_prices.len(), 1);

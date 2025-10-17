@@ -183,7 +183,7 @@ impl EngineConfigYaml {
             .aggregation
             .symbols
             .iter()
-            .map(|s| Symbol(s.clone()))
+            .map(|s| Symbol::from(s.clone()))
             .collect();
 
         EngineConfig {
@@ -332,7 +332,7 @@ impl MarketStream for E2EMockAdapter {
                 // 每 10 個循環發送一次 K 線
                 if count % 10 == 0 {
                     let bar = AggregatedBar {
-                        symbol: Symbol("BTCUSDT".to_string()),
+                        symbol: Symbol::new("BTCUSDT"),
                         interval_ms: 60000,
                         open_time: timestamp - 60000,
                         close_time: timestamp,
@@ -349,7 +349,7 @@ impl MarketStream for E2EMockAdapter {
                 // 每 5 個循環發送快照
                 if count % 5 == 0 {
                     let snapshot = MarketSnapshot {
-                        symbol: Symbol("BTCUSDT".to_string()),
+                        symbol: Symbol::new("BTCUSDT"),
                         timestamp,
                         bids: vec![
                             BookLevel::new_unchecked(base_price - 0.5, 0.1),
@@ -434,8 +434,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if config.strategies.trend.enabled {
         let trend_config = config.strategies.trend.to_trend_config();
-        let mut trend_strategy =
-            TrendStrategy::new(Symbol(config.strategies.trend.symbol.clone()), trend_config);
+        let mut trend_strategy = TrendStrategy::new(
+            Symbol::from(config.strategies.trend.symbol.clone()),
+            trend_config,
+        );
         trend_strategy.initialize()?;
         strategies.push((
             "趨勢策略".to_string(),
@@ -447,7 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.strategies.arbitrage.enabled {
         let arbitrage_config = config.strategies.arbitrage.to_arbitrage_config();
         let mut arbitrage_strategy = ArbitrageStrategy::new(
-            Symbol(config.strategies.arbitrage.symbol.clone()),
+            Symbol::from(config.strategies.arbitrage.symbol.clone()),
             arbitrage_config,
         );
         arbitrage_strategy.initialize()?;
@@ -462,7 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.data_adapters.bitget.enabled {
         println!("📡 創建 Bitget 數據適配器...");
         let mock_adapter = E2EMockAdapter::new(config.data_adapters.bitget);
-        let symbols = vec![Symbol("BTCUSDT".to_string())];
+        let symbols = vec![Symbol::new("BTCUSDT")];
 
         let consumer = adapter_bridge.bridge_stream(mock_adapter, symbols).await?;
         engine.register_event_consumer(consumer);

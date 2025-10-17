@@ -4,13 +4,12 @@
 //! (parsing, subscriptions, light helpers). It does not implement any
 //! exchange-specific logic.
 
-pub mod errors;
 pub mod converter;
+pub mod errors;
+pub mod rest_helpers;
 pub mod subscriptions;
 pub mod ws_helpers;
-pub mod rest_helpers;
 
+pub use converter::{parse_json, parse_owned_value, parse_price, parse_quantity};
 pub use errors::{AdapterError, AdapterResult};
-pub use converter::{parse_json, parse_price, parse_quantity};
-pub use subscriptions::{Subscription, SubscriptionKind, SubscriptionBuilder};
-
+pub use subscriptions::{Subscription, SubscriptionBuilder, SubscriptionKind};

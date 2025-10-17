@@ -194,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mk_imb = |sym: &str| RtStrategyConfig {
                 name: format!("imbalance_{}", sym),
                 strategy_type: RtStrategyType::Imbalance,
-                symbols: vec![hft_core::Symbol(sym.to_string())],
+                symbols: vec![hft_core::Symbol::new(sym)],
                 params: RtStrategyParams::Imbalance {
                     obi_threshold: 0.2,
                     lot: rust_decimal::Decimal::try_from(0.01).unwrap(),

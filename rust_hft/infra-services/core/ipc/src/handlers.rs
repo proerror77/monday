@@ -140,7 +140,10 @@ impl CommandHandler for DefaultCommandHandler {
             } => {
                 // TODO: Implement symbol limit updates
                 Response::Error {
-                    message: format!("Set symbol limits for {} not implemented yet", symbol.0),
+                    message: format!(
+                        "Set symbol limits for {} not implemented yet",
+                        symbol.as_str()
+                    ),
                     code: Some(501),
                 }
             }

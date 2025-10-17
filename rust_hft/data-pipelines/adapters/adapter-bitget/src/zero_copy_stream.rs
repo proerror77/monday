@@ -8,9 +8,13 @@
 #![allow(dead_code)]
 
 use async_trait::async_trait;
+use integration::latency::WsFrameMetrics;
 use simd_json::prelude::{ValueAsContainer, ValueAsScalar, ValueObjectAccess};
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
+
+#[cfg(feature = "metrics")]
+use infra_metrics::MetricsRegistry;
 
 use engine::dataflow::EventIngester;
 use hft_core::*;
@@ -218,7 +222,7 @@ impl ZeroCopyBitgetStream {
             .to_string();
 
         Ok(Trade {
-            symbol: Symbol(symbol_str.to_string()),
+            symbol: Symbol::new(symbol_str),
             timestamp: unified_ts.into(), // 向後兼容轉換
             price: Price::from_f64(price).unwrap_or(Price::zero()),
             quantity: Quantity::from_f64(quantity).unwrap_or(Quantity::zero()),
@@ -247,9 +251,9 @@ impl ZeroCopyMessageHandler {
     }
 
     /// 直接攝取市場事件，跳過 tokio::mpsc
-    fn ingest_event_direct(&self, event: MarketEvent) {
+    fn ingest_event_direct(&self, event: MarketEvent, tracker: Option<LatencyTracker>) {
         if let Ok(mut ingester) = self.event_ingester.lock() {
-            match ingester.ingest(event) {
+            match ingester.ingest_with_tracker(event, tracker) {
                 Ok(()) => {
                     trace!("零拷貝事件攝取成功");
                 }
@@ -272,7 +276,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
 
         // 發送訂閱請求 - 簡化處理，暫時只記錄
         for symbol in &self.subscribed_symbols {
-            debug!("訂閱 {} 的訂單簿數據", symbol.0);
+            debug!("訂閱 {} 的訂單簿數據", symbol.as_str());
         }
 
         Ok(())
@@ -281,14 +285,31 @@ impl MessageHandler for ZeroCopyMessageHandler {
     fn handle_message(
         &mut self,
         message: String,
+        mut metrics: WsFrameMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 統計時間戳：開始解析
-        let parse_start = hft_core::now_micros();
-
         // 零拷貝解析 JSON - 直接處理不存儲
         let mut buffer = message.into_bytes();
-        let value = simd_json::to_borrowed_value(&mut buffer)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let value = match simd_json::to_borrowed_value(&mut buffer) {
+            Ok(v) => {
+                metrics.mark_parsed();
+                v
+            }
+            Err(e) => {
+                metrics.mark_parsed();
+                let parse_latency = metrics.parsed_at_us.saturating_sub(metrics.received_at_us);
+                trace!("零拷貝解析失敗，耗時 {}μs", parse_latency);
+                return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+            }
+        };
+
+        let parse_latency = metrics.parsed_at_us.saturating_sub(metrics.received_at_us);
+        trace!("零拷貝解析完成，耗時 {}μs", parse_latency);
+        let mut tracker = LatencyTracker::from_monotonic(metrics.received_at_us);
+        tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+        tracker.record_stage_with_offset(LatencyStage::Parsing, parse_latency);
+
+        #[cfg(feature = "metrics")]
+        MetricsRegistry::global().record_parsing_latency(parse_latency as f64);
 
         // 檢查消息類型
         if let Some(arg) = value.get("arg") {
@@ -298,7 +319,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
             match channel {
                 "books15" => {
                     // 處理訂單簿快照
-                    let symbol = Symbol(inst_id.to_string());
+                    let symbol = Symbol::new(inst_id);
 
                     // 提取交易所時間戳並創建統一時間戳
                     let exchange_ts = value
@@ -328,11 +349,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
                     };
 
                     let event = MarketEvent::Snapshot(snapshot);
-                    self.ingest_event_direct(event);
-
-                    // 記錄解析延遲
-                    let parse_latency = hft_core::now_micros() - parse_start;
-                    trace!("零拷貝解析延遲: {}μs", parse_latency);
+                    self.ingest_event_direct(event, Some(tracker.clone()));
                 }
                 "trade" | "trades" => {
                     // 處理成交數據
@@ -394,7 +411,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
                                 .to_string();
 
                             let event = MarketEvent::Trade(Trade {
-                                symbol: Symbol(symbol_str.to_string()),
+                                symbol: Symbol::new(symbol_str),
                                 timestamp: unified_ts.into(),
                                 price: Price::from_f64(price).unwrap_or(Price::zero()),
                                 quantity: Quantity::from_f64(qty).unwrap_or(Quantity::zero()),
@@ -402,12 +419,9 @@ impl MessageHandler for ZeroCopyMessageHandler {
                                 trade_id,
                                 source_venue: Some(VenueId::BITGET),
                             });
-                            self.ingest_event_direct(event);
+                            self.ingest_event_direct(event, Some(tracker.clone()));
                         }
                     }
-                    // 記錄解析延遲
-                    let parse_latency = hft_core::now_micros() - parse_start;
-                    trace!("零拷貝成交解析延遲: {}μs", parse_latency);
                 }
                 _ => {
                     debug!("未知頻道: {}", channel);
@@ -425,7 +439,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
             reason: "Connection lost".to_string(),
         };
 
-        self.ingest_event_direct(disconnect_event);
+        self.ingest_event_direct(disconnect_event, None);
         Ok(())
     }
 }
@@ -526,7 +540,7 @@ mod tests {
     #[tokio::test]
     async fn test_zero_copy_json_parsing() {
         let mut stream = ZeroCopyBitgetStream::new();
-        let symbol = Symbol("BTCUSDT".to_string());
+        let symbol = Symbol::new("BTCUSDT");
 
         // 模擬 Bitget 訂單簿 JSON 數據
         let json_data = r#"
@@ -543,7 +557,7 @@ mod tests {
         assert!(result.is_ok());
 
         let snapshot = result.unwrap();
-        assert_eq!(snapshot.symbol.0, "BTCUSDT");
+        assert_eq!(snapshot.symbol.as_str(), "BTCUSDT");
         assert_eq!(snapshot.timestamp, 1638360000000);
         assert_eq!(snapshot.bids.len(), 2);
         assert_eq!(snapshot.asks.len(), 2);

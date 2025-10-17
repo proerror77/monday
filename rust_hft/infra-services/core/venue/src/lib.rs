@@ -114,7 +114,7 @@ impl VenueSpecManager {
 
     /// 獲取指定品種的規格
     pub fn get_spec(&self, venue: &str, symbol: &Symbol) -> Option<&VenueSpec> {
-        let key = format!("{}:{}", venue, symbol.0);
+        let key = format!("{}:{}", venue, symbol.as_str());
         self.specs.get(&key)
     }
 
@@ -131,9 +131,9 @@ impl VenueSpecManager {
         price: Option<Price>,
         quantity: Quantity,
     ) -> HftResult<()> {
-        let spec = self
-            .get_spec(venue, symbol)
-            .ok_or_else(|| HftError::Config(format!("找不到規格: {}:{}", venue, symbol.0)))?;
+        let spec = self.get_spec(venue, symbol).ok_or_else(|| {
+            HftError::Config(format!("找不到規格: {}:{}", venue, symbol.as_str()))
+        })?;
 
         // 校驗數量
         if quantity < spec.min_qty {
@@ -267,7 +267,7 @@ mod tests {
 
         match manager.load_config().await {
             Ok(_) => {
-                let btc_spec = manager.get_spec("BITGET", &Symbol("BTCUSDT".to_string()));
+                let btc_spec = manager.get_spec("BITGET", &Symbol::new("BTCUSDT"));
                 assert!(btc_spec.is_some());
 
                 let spec = btc_spec.unwrap();

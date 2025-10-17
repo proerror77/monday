@@ -1,6 +1,18 @@
+[package]
+name = "rust-hft-workspace"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Workspace feature orchestrator for rust_hft"
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
 [workspace]
 resolver = "2"  # 防止 feature 無腦合併
 members = [
+    ".",
     # Market Core
     "market-core/core",
     "market-core/ports",
@@ -63,6 +75,7 @@ members = [
     "apps/all-in-one",
     "apps/paper",
     "apps/replay",
+    "apps/backtest",
 
     # Shared Catalogs
     "shared/instrument",
@@ -80,6 +93,7 @@ members = [
 
 # 預設只編譯核心元件與主要應用，可透過 `cargo build -p` 指定其他 crate。
 default-members = [
+    ".",
     "market-core/core",
     "market-core/ports",
     "market-core/engine",
@@ -91,9 +105,18 @@ default-members = [
 ]
 
 # 工作區級別依賴 (最小化)
+[dependencies]
+serde_json = { workspace = true, optional = true }
+simd-json = { workspace = true, optional = true }
+arc-swap = { workspace = true, optional = true }
+left-right = { workspace = true, optional = true }
+clickhouse = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+
 [workspace.dependencies]
 # 核心零依賴
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 thiserror = "1.0"
 
 # 非同步 (只在需要的 crate 開)
@@ -120,6 +143,8 @@ clickhouse = "0.11"
 redis = "0.24"
 prometheus = "0.13"
 
+parking_lot = "0.12"
+
 # 日誌 
 tracing = "0.1"
 
@@ -139,6 +164,42 @@ rust_decimal = { version = "1.33", features = ["serde"] }
 
 # CLI and examples
 clap = { version = "4.0", features = ["derive"] }
+metrics-exporter-prometheus = "0.17"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+engine = { package = "hft-engine", path = "market-core/engine" }
+ports = { package = "hft-ports", path = "market-core/ports" }
+hft-core = { package = "hft-core", path = "market-core/core" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+# 預設採用標準 JSON + arc-swap 快照策略
+default = ["json-std", "snapshot-arcswap"]
+
+# 熱路徑 JSON 實作（二選一）
+json-std = ["dep:serde_json"]
+json-simd = ["dep:simd-json"]
+
+# 快照策略（二選一）
+snapshot-arcswap = ["dep:arc-swap"]
+snapshot-left-right = ["dep:left-right"]
+
+# 冷路徑可自由組合的特性
+clickhouse = ["dep:clickhouse"]
+redis = ["dep:redis"]
+metrics = ["dep:metrics-exporter-prometheus"]
+
+[[bench]]
+name = "hotpath_latency_p99"
+path = "benches/hotpath_latency_p99.rs"
+harness = true
+
+[[bench]]
+name = "strategy_dispatch"
+path = "benches/strategy_dispatch.rs"
+harness = false
 
 [profile.dev]
 # 開發模式：編譯快優先

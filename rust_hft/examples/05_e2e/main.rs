@@ -128,7 +128,7 @@ impl ExecutionClient for MockExecutionClient {
 
         println!(
             "📤 下單: {} {} {} @ {:?}",
-            intent.symbol.0,
+            intent.symbol.as_str(),
             match intent.side {
                 Side::Buy => "買入",
                 Side::Sell => "賣出",
@@ -194,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::new(config);
 
     // 2. 註冊測試策略
-    let btc_symbol = Symbol("BTCUSDT".to_string());
+    let btc_symbol = Symbol::new("BTCUSDT");
     let strategy = TestStrategy::new(btc_symbol.clone());
     engine.register_strategy(strategy);
 

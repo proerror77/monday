@@ -35,22 +35,22 @@ impl Strategy for DualExchangeTestStrategy {
             MarketEvent::Snapshot(snapshot) => {
                 if let Some(venue) = &snapshot.source_venue {
                     info!("策略 {} 收到来自 {} 的快照: {}",
-                          self.name, venue.as_str(), snapshot.symbol.0);
-                    self.received_events.push((*venue, snapshot.symbol.0.clone()));
+                          self.name, venue.as_str(), snapshot.symbol.as_str());
+                    self.received_events.push((*venue, snapshot.symbol.as_str().to_string()));
                 }
             }
             MarketEvent::Trade(trade) => {
                 if let Some(venue) = &trade.source_venue {
                     info!("策略 {} 收到来自 {} 的交易: {}",
-                          self.name, venue.as_str(), trade.symbol.0);
-                    self.received_events.push((*venue, trade.symbol.0.clone()));
+                          self.name, venue.as_str(), trade.symbol.as_str());
+                    self.received_events.push((*venue, trade.symbol.as_str().to_string()));
                 }
             }
             MarketEvent::Bar(bar) => {
                 if let Some(venue) = &bar.source_venue {
                     info!("策略 {} 收到来自 {} 的K线: {}",
-                          self.name, venue.as_str(), bar.symbol.0);
-                    self.received_events.push((*venue, bar.symbol.0.clone()));
+                          self.name, venue.as_str(), bar.symbol.as_str());
+                    self.received_events.push((*venue, bar.symbol.as_str().to_string()));
                 }
             }
             _ => {}
@@ -123,8 +123,8 @@ async fn test_dual_exchange_sharding_symbol_hash() {
 
     // 注册测试策略
     let test_symbols = vec![
-        Symbol("BINANCE:BTCUSDT".to_string()),
-        Symbol("BITGET:BTCUSDT".to_string()),
+        Symbol::new("BINANCE:BTCUSDT"),
+        Symbol::new("BITGET:BTCUSDT"),
     ];
     let mut strategy = DualExchangeTestStrategy::new("dual_test".to_string(), test_symbols.clone());
 
@@ -189,10 +189,10 @@ async fn test_sharding_distribution_correctness() {
 
     // 测试符号哈希分布
     let symbols = vec![
-        BaseSymbol("BTCUSDT".to_string()),
-        BaseSymbol("ETHUSDT".to_string()),
-        BaseSymbol("ADAUSDT".to_string()),
-        BaseSymbol("BNBUSDT".to_string()),
+        BaseSymbol::new("BTCUSDT"),
+        BaseSymbol::new("ETHUSDT"),
+        BaseSymbol::new("ADAUSDT"),
+        BaseSymbol::new("BNBUSDT"),
     ];
 
     let venues = vec![VenueId::BINANCE, VenueId::BITGET];
@@ -209,7 +209,7 @@ async fn test_sharding_distribution_correctness() {
             for symbol in &symbols {
                 for venue in &venues {
                     if config.should_handle(symbol, venue) {
-                        shard_assignments[shard_index].push((symbol.0.clone(), *venue));
+                        shard_assignments[shard_index].push((symbol.as_str().to_string(), *venue));
                     }
                 }
             }
@@ -310,12 +310,12 @@ async fn test_hybrid_sharding_load_balance() {
     info!("开始测试混合分片策略负载均衡");
 
     let symbols = vec![
-        BaseSymbol("BTCUSDT".to_string()),
-        BaseSymbol("ETHUSDT".to_string()),
-        BaseSymbol("ADAUSDT".to_string()),
-        BaseSymbol("BNBUSDT".to_string()),
-        BaseSymbol("DOTUSDT".to_string()),
-        BaseSymbol("LINKUSDT".to_string()),
+        BaseSymbol::new("BTCUSDT"),
+        BaseSymbol::new("ETHUSDT"),
+        BaseSymbol::new("ADAUSDT"),
+        BaseSymbol::new("BNBUSDT"),
+        BaseSymbol::new("DOTUSDT"),
+        BaseSymbol::new("LINKUSDT"),
     ];
 
     let venues = vec![VenueId::BINANCE, VenueId::BITGET];

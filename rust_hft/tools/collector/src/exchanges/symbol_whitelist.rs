@@ -1,5 +1,6 @@
 use once_cell::sync::OnceCell;
 use serde::Deserialize;
+#[cfg(feature = "collector-binance-futures")]
 use std::collections::HashMap;
 use std::fs;
 
@@ -103,6 +104,7 @@ pub fn parse_symbols_override() -> Option<Vec<String>> {
     }
 }
 
+#[cfg(feature = "collector-binance")]
 pub fn binance_spot_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()
@@ -110,6 +112,7 @@ pub fn binance_spot_pairs() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "collector-binance-futures")]
 pub fn binance_futures_pairs() -> Vec<String> {
     let mut overrides: HashMap<&'static str, &'static str> = HashMap::new();
     overrides.insert("BONK", "1000BONKUSDT");
@@ -129,6 +132,7 @@ pub fn binance_futures_pairs() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "collector-bitget")]
 pub fn bitget_spot_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()
@@ -136,6 +140,7 @@ pub fn bitget_spot_pairs() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "collector-bitget")]
 pub fn bitget_futures_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()
@@ -143,6 +148,7 @@ pub fn bitget_futures_pairs() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "collector-asterdex")]
 pub fn asterdex_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()
@@ -150,6 +156,7 @@ pub fn asterdex_pairs() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "collector-okx")]
 pub fn okx_spot_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()
@@ -157,6 +164,7 @@ pub fn okx_spot_pairs() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "collector-okx")]
 pub fn okx_swap_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()
@@ -164,6 +172,7 @@ pub fn okx_swap_pairs() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "collector-hyperliquid")]
 pub fn hyperliquid_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()

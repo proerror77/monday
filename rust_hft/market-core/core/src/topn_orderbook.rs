@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_topn_orderbook_basic() {
-        let mut book = TopNOrderBook::<5>::new(Symbol("BTCUSDT".to_string()));
+        let mut book = TopNOrderBook::<5>::new(Symbol::new("BTCUSDT"));
 
         // 測試應用快照
         let bids = vec![(67200.0, 1.5), (67199.0, 2.0), (67198.0, 1.0)];
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_topn_orderbook_updates() {
-        let mut book = TopNOrderBook::<5>::new(Symbol("ETHUSDT".to_string()));
+        let mut book = TopNOrderBook::<5>::new(Symbol::new("ETHUSDT"));
 
         // 初始快照
         let bids = vec![(3500.0, 10.0), (3499.0, 15.0)];
@@ -509,8 +509,8 @@ mod tests {
     #[test]
     fn test_dual_joiner_arbitrage() {
         let mut joiner = DualTopNJoiner::<5>::new(
-            Symbol("BTCUSDT_BINANCE".to_string()),
-            Symbol("BTCUSDT_BITGET".to_string()),
+            Symbol::new("BTCUSDT_BINANCE"),
+            Symbol::new("BTCUSDT_BITGET"),
             0.2, // 0.2 bps 最小套利價差（更容易觸發）
         );
 

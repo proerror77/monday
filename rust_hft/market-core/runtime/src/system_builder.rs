@@ -21,13 +21,13 @@ use std::collections::HashMap;
 use tokio::sync::{Mutex, Notify};
 
 mod config_loader;
+mod config_types; // 預留：後續逐步搬移配置型別
 mod execution_registry;
+mod infra_exporters;
+mod runtime_management;
 mod simulated_execution;
 mod strategy_factory;
-mod venue_registry;
-mod runtime_management;
-mod config_types; // 預留：後續逐步搬移配置型別
-mod infra_exporters; // 預留：後續搬移 Redis/ClickHouse 導出
+mod venue_registry; // 預留：後續搬移 Redis/ClickHouse 導出
 
 // 將部分配置型別從子模組對外公開
 pub use config_types::{
@@ -44,7 +44,6 @@ use serde_json;
 use engine::aggregation;
 
 // ClickHouse 行結構已移至 system_builder::infra_exporters（feature = "clickhouse"）
-
 
 /// 系統配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,7 +240,6 @@ fn apply_lob_flow_overrides(
 }
 
 // RiskConfig 與相關型別已移至 config_types 模組
-
 
 /// 系統建構器 - 使用構建者模式
 pub struct SystemBuilder {
@@ -846,8 +844,8 @@ impl SystemRuntime {
                     // 導出引擎統計到 Prometheus（僅在 metrics feature 啟用時）
                     #[cfg(feature = "metrics")]
                     {
-                        infra_metrics::MetricsRegistry::global()
-                            .update_engine_statistics(&infra_metrics::EngineStatisticsExport {
+                        infra_metrics::MetricsRegistry::global().update_engine_statistics(
+                            &infra_metrics::EngineStatisticsExport {
                                 cycle_count: stats.cycle_count,
                                 execution_events_processed: stats.execution_events_processed,
                                 orders_submitted: stats.orders_submitted,
@@ -855,7 +853,8 @@ impl SystemRuntime {
                                 orders_filled: stats.orders_filled,
                                 orders_rejected: stats.orders_rejected,
                                 orders_canceled: stats.orders_canceled,
-                            });
+                            },
+                        );
                     }
                     // 當引擎停止時，狀態任務退出，避免 Ctrl-C 卡住
                     if !stats.is_running {
@@ -1007,7 +1006,7 @@ impl SystemRuntime {
     ) -> Result<hft_core::OrderId, Box<dyn std::error::Error>> {
         use hft_core::{OrderType, Quantity, Side, Symbol, TimeInForce};
         let intent = ports::OrderIntent {
-            symbol: Symbol(symbol.to_string()),
+            symbol: Symbol::new(symbol),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001)?,
             order_type: OrderType::Market,
@@ -1136,14 +1135,14 @@ default_symbols:
             execution_config: None,
         };
 
-        let symbols = vec![Symbol("BTC_USDC".to_string())];
+        let symbols = vec![Symbol::new("BTC_USDC")];
         let cfg = parse_backpack_market_config(&venue_cfg, &symbols).unwrap();
 
         assert_eq!(cfg.ws_url, "wss://api.custom");
         assert!(!cfg.subscribe_depth);
         assert!(cfg.subscribe_trades);
         assert_eq!(cfg.reconnect_interval_ms, 2000);
-        assert_eq!(cfg.default_symbols, vec![Symbol("SOL_USDC".to_string())]);
+        assert_eq!(cfg.default_symbols, vec![Symbol::new("SOL_USDC")]);
     }
 }
 
@@ -1190,14 +1189,20 @@ async fn engine_event_loop(engine_arc: Arc<Mutex<Engine>>, notify: Arc<Notify>) 
             }
         };
 
-        let (tick_result, had_activity) = {
-            let mut eng = engine_arc.lock().await;
-            let prev_stats = eng.get_statistics();
-            let tick_result = eng.tick();
-            let new_stats = eng.get_statistics();
-            let had_activity = new_stats.cycle_count > prev_stats.cycle_count;
-            (tick_result, had_activity)
+        let mut guard = match engine_arc.try_lock() {
+            Ok(eng) => eng,
+            Err(_) => {
+                tokio::task::yield_now().await;
+                continue;
+            }
         };
+
+        let prev_stats = guard.get_statistics();
+        let tick_result = guard.tick();
+        let new_stats = guard.get_statistics();
+        let had_activity = new_stats.cycle_count > prev_stats.cycle_count;
+        let running = new_stats.is_running;
+        drop(guard);
 
         if let Err(e) = tick_result {
             tracing::error!("Engine tick error: {}", e);
@@ -1211,10 +1216,6 @@ async fn engine_event_loop(engine_arc: Arc<Mutex<Engine>>, notify: Arc<Notify>) 
             }
         }
 
-        let running = {
-            let eng = engine_arc.lock().await;
-            eng.get_statistics().is_running
-        };
         if !running {
             break;
         }

@@ -70,7 +70,7 @@ mod tests {
         let _builder = builder.register_market_stream_plan(
             VenueType::Bitget,
             "bitget".to_string(),
-            vec![Symbol("BTCUSDT".to_string())],
+            vec![Symbol::new("BTCUSDT")],
         );
     }
 

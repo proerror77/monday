@@ -221,8 +221,8 @@ impl MarketStream for BybitMarketStream {
                                                         } else {
                                                             state.apply_delta(&bids, &asks, 0);
                                                         }
-                                                        let snap =
-                                                            state.to_snapshot(Symbol(sym), ts);
+                                                        let snap = state
+                                                            .to_snapshot(Symbol::from(sym), ts);
                                                         let _ = tx
                                                             .send(Ok(MarketEvent::Snapshot(snap)));
                                                     }
@@ -263,7 +263,9 @@ impl MarketStream for BybitMarketStream {
                                                             if let (Some(p), Some(q)) = (price, qty)
                                                             {
                                                                 let trade = Trade {
-                                                                    symbol: Symbol(sym.to_string()),
+                                                                    symbol: Symbol::from(
+                                                                        sym.to_string(),
+                                                                    ),
                                                                     timestamp: ts
                                                                         .saturating_mul(1000),
                                                                     price: Price::from_f64(p)

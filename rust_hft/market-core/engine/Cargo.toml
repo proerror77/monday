@@ -21,6 +21,8 @@ instrument = { package = "hft-instrument", path = "../instrument" }
 chrono = { version = "0.4", features = ["serde"] }
 infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics", optional = true }
 rustc-hash = "1.1"
+parking_lot = { workspace = true }
+hdrhistogram = "7"
 
 [features]
 default = []
@@ -81,4 +83,8 @@ required-features = ["legacy-sdk"]
 
 [[bench]]
 name = "engine_hotpath"
+harness = false
+
+[[bench]]
+name = "strategy_dispatch"
 harness = false

@@ -215,7 +215,7 @@ mod tests {
     fn test_portfolio_fill_updates() {
         let mut pf = Portfolio::new();
         let oid = OrderId("O-1".into());
-        let sym = Symbol("BTCUSDT".into());
+        let sym = Symbol::new("BTCUSDT");
         pf.register_order(oid.clone(), sym.clone(), Side::Buy);
 
         let ev = ExecutionEvent::Fill {

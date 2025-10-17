@@ -48,11 +48,8 @@ impl StrategyManager {
         };
 
         Self {
-            trend_strategy: TrendStrategy::new(Symbol("BTCUSDT".to_string()), trend_config),
-            arbitrage_strategy: ArbitrageStrategy::new(
-                Symbol("BTCUSDT".to_string()),
-                arbitrage_config,
-            ),
+            trend_strategy: TrendStrategy::new(Symbol::new("BTCUSDT"), trend_config),
+            arbitrage_strategy: ArbitrageStrategy::new(Symbol::new("BTCUSDT"), arbitrage_config),
         }
     }
 
@@ -71,7 +68,7 @@ impl StrategyManager {
                 println!(
                     "   - {} {} {:.4} @ {:.2}",
                     order.side.as_str(),
-                    order.symbol.0,
+                    order.symbol.as_str(),
                     order.quantity.0.to_f64().unwrap_or(0.0),
                     order
                         .price
@@ -90,7 +87,7 @@ impl StrategyManager {
                 println!(
                     "   - {} {} {:.4}",
                     order.side.as_str(),
-                    order.symbol.0,
+                    order.symbol.as_str(),
                     order.quantity.0.to_f64().unwrap_or(0.0)
                 );
             }
@@ -182,7 +179,7 @@ impl MockMultiVenueGenerator {
         vec![
             // Binance 快照
             MarketSnapshot {
-                symbol: Symbol("BINANCE:BTCUSDT".to_string()),
+                symbol: Symbol::new("BINANCE:BTCUSDT"),
                 timestamp,
                 bids: vec![
                     BookLevel::new_unchecked(self.binance_price, 0.1),
@@ -196,7 +193,7 @@ impl MockMultiVenueGenerator {
             },
             // Bitget 快照
             MarketSnapshot {
-                symbol: Symbol("BITGET:BTCUSDT".to_string()),
+                symbol: Symbol::new("BITGET:BTCUSDT"),
                 timestamp,
                 bids: vec![
                     BookLevel::new_unchecked(self.bitget_price, 0.1),
@@ -222,8 +219,8 @@ struct MockStrategyAdapter {
 impl MockStrategyAdapter {
     fn new() -> Self {
         Self {
-            bar_generator: MockBarGenerator::new(Symbol("BTCUSDT".to_string()), 50000.0),
-            venue_generator: MockMultiVenueGenerator::new(Symbol("BTCUSDT".to_string()), 50000.0),
+            bar_generator: MockBarGenerator::new(Symbol::new("BTCUSDT"), 50000.0),
+            venue_generator: MockMultiVenueGenerator::new(Symbol::new("BTCUSDT"), 50000.0),
             event_count: 0,
         }
     }
@@ -235,8 +232,8 @@ impl MarketStream for MockStrategyAdapter {
         use async_stream::stream;
 
         let stream = stream! {
-            let mut bar_gen = MockBarGenerator::new(Symbol("BTCUSDT".to_string()), 50000.0);
-            let mut venue_gen = MockMultiVenueGenerator::new(Symbol("BTCUSDT".to_string()), 50000.0);
+            let mut bar_gen = MockBarGenerator::new(Symbol::new("BTCUSDT"), 50000.0);
+            let mut venue_gen = MockMultiVenueGenerator::new(Symbol::new("BTCUSDT"), 50000.0);
             let mut count = 0u64;
 
             loop {
@@ -309,7 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_config = EngineConfig {
         ingestion: ingestion_config.clone(),
         max_events_per_cycle: 10,
-        aggregation_symbols: vec![Symbol("BTCUSDT".to_string())],
+        aggregation_symbols: vec![Symbol::new("BTCUSDT")],
     };
 
     let mut engine = Engine::new(engine_config);
@@ -331,7 +328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. 創建 Mock Adapter
     println!("📡 正在創建 Mock 數據適配器...");
     let mock_adapter = MockStrategyAdapter::new();
-    let symbols = vec![Symbol("BTCUSDT".to_string())];
+    let symbols = vec![Symbol::new("BTCUSDT")];
 
     let consumer = adapter_bridge.bridge_stream(mock_adapter, symbols).await?;
     engine.register_event_consumer(consumer);

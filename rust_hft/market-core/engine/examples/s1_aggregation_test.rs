@@ -101,8 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. 測試 TopNSnapshot 更新
     println!("\n📊 測試 TopNSnapshot 更新...");
-    let mut generator = MockMarketDataGenerator::new(Symbol("BTCUSDT".to_string()), 50000.0);
-    let mut topn = TopNSnapshot::new(Symbol("BTCUSDT".to_string()), 5);
+    let mut generator = MockMarketDataGenerator::new(Symbol::new("BTCUSDT"), 50000.0);
+    let mut topn = TopNSnapshot::new(Symbol::new("BTCUSDT"), 5);
 
     let snapshot = generator.generate_snapshot();
     topn.update_from_snapshot(&snapshot);
@@ -133,8 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. 測試 BarBuilder K線聚合
     println!("\n📈 測試 BarBuilder K線聚合...");
-    let mut bar_builder =
-        BarBuilder::new(Symbol("BTCUSDT".to_string()), 60000, current_timestamp_us());
+    let mut bar_builder = BarBuilder::new(Symbol::new("BTCUSDT"), 60000, current_timestamp_us());
 
     // 添加幾筆成交
     for i in 0..5 {
@@ -198,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   - 時間戳: {}", market_view.timestamp);
 
     // 測試 MarketView 查詢方法
-    let symbol = Symbol("BTCUSDT".to_string());
+    let symbol = Symbol::new("BTCUSDT");
     if let Some((bid_price, bid_qty)) = market_view.get_best_bid_any(&symbol) {
         println!(
             "   - 最佳買價: {:.2} @ {:.3}",
@@ -239,7 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_config = EngineConfig {
         ingestion: ingestion_config.clone(),
         max_events_per_cycle: 10,
-        aggregation_symbols: vec![Symbol("BTCUSDT".to_string())],
+        aggregation_symbols: vec![Symbol::new("BTCUSDT")],
     };
 
     let mut engine = Engine::new(engine_config);
@@ -254,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 橋接並運行幾個 tick
     let consumer = adapter_bridge
-        .bridge_stream(mock_adapter, vec![Symbol("BTCUSDT".to_string())])
+        .bridge_stream(mock_adapter, vec![Symbol::new("BTCUSDT")])
         .await?;
     engine.register_event_consumer(consumer);
 

@@ -13,7 +13,8 @@ pub mod unified_timestamp;
 pub use error::{HftError, HftResult};
 pub use fixed_point::{FixedBps, FixedPrice, FixedQuantity};
 pub use latency::{
-    now_micros, LatencyMeasurement, LatencyStage, LatencyStats, LatencyTracker, MicrosTimestamp,
+    monotonic_micros, now_micros, LatencyMeasurement, LatencyStage, LatencyStats, LatencyTracker,
+    MicrosTimestamp,
 };
 pub use topn_orderbook::{DualTopNJoiner, TopNOrderBook, DEFAULT_TOP_N, MAX_TOP_N};
 pub use types::*;

@@ -22,6 +22,7 @@ use crate::spool;
 use anyhow::Result;
 use async_trait::async_trait;
 use clickhouse::Client;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,10 +43,26 @@ impl DepthMode {
         }
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "collector-binance",
+            feature = "collector-binance-futures",
+            feature = "collector-okx"
+        )),
+        allow(dead_code)
+    )]
     pub fn include_limited(self) -> bool {
         matches!(self, DepthMode::Limited | DepthMode::Both)
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "collector-binance",
+            feature = "collector-binance-futures",
+            feature = "collector-okx"
+        )),
+        allow(dead_code)
+    )]
     pub fn include_incremental(self) -> bool {
         matches!(self, DepthMode::Incremental | DepthMode::Both)
     }
@@ -53,9 +70,26 @@ impl DepthMode {
 
 #[derive(Clone, Debug)]
 pub struct ExchangeContext {
+    #[cfg_attr(
+        not(any(
+            feature = "collector-binance",
+            feature = "collector-binance-futures",
+            feature = "collector-okx"
+        )),
+        allow(dead_code)
+    )]
     pub depth_mode: DepthMode,
+    #[cfg_attr(
+        not(any(
+            feature = "collector-binance",
+            feature = "collector-binance-futures",
+            feature = "collector-okx"
+        )),
+        allow(dead_code)
+    )]
     pub depth_levels: usize,
     symbols_override: Option<Arc<Vec<String>>>,
+    stream_profile: Option<StreamProfile>,
 }
 
 impl ExchangeContext {
@@ -68,11 +102,31 @@ impl ExchangeContext {
             depth_mode,
             depth_levels,
             symbols_override,
+            stream_profile: None,
         }
     }
 
     pub fn symbols_override(&self) -> Option<Arc<Vec<String>>> {
         self.symbols_override.as_ref().map(Arc::clone)
+    }
+
+    pub fn with_profile(
+        depth_mode: DepthMode,
+        depth_levels: usize,
+        symbols_override: Option<Arc<Vec<String>>>,
+        profile: StreamProfile,
+    ) -> Self {
+        Self {
+            depth_mode,
+            depth_levels,
+            symbols_override,
+            stream_profile: Some(profile),
+        }
+    }
+
+    pub fn profile(&self, exchange: &str) -> StreamProfile {
+        self.stream_profile
+            .unwrap_or_else(|| StreamProfile::resolve(exchange))
     }
 }
 
@@ -80,6 +134,99 @@ impl ExchangeContext {
 pub struct WebsocketPlan {
     pub url: String,
     pub subscribe_messages: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamProfile {
+    pub trades: bool,
+    pub book: bool,
+    pub depth: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StreamDiagnostics {
+    pub trades: bool,
+    pub book: bool,
+    pub depth: bool,
+}
+
+impl StreamProfile {
+    fn raw_profile(exchange: &str) -> Option<String> {
+        let specific_key = exchange.to_ascii_uppercase().replace('-', "_") + "_STREAM_PROFILE";
+        std::env::var(&specific_key)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("STREAM_PROFILE").ok())
+    }
+
+    pub fn resolve(exchange: &str) -> Self {
+        let raw = Self::raw_profile(exchange)
+            .map(Cow::Owned)
+            .unwrap_or_else(|| Cow::Borrowed("all"));
+        let mut trades = false;
+        let mut book = false;
+        let mut depth = false;
+
+        let tokens: Vec<String> = raw
+            .split(|c: char| matches!(c, ',' | '|' | ';'))
+            .flat_map(|segment| segment.split_whitespace())
+            .map(|token| token.trim().to_ascii_lowercase())
+            .filter(|token| !token.is_empty())
+            .collect();
+
+        if tokens.is_empty() {
+            return Self {
+                trades: true,
+                book: true,
+                depth: true,
+            };
+        }
+
+        for token in &tokens {
+            match token.as_str() {
+                "all" | "full" | "default" => {
+                    trades = true;
+                    book = true;
+                    depth = true;
+                    break;
+                }
+                "trade" | "trades" | "t" => {
+                    trades = true;
+                }
+                "book" | "books" | "ticker" | "tickers" | "bbo" | "quotes" => {
+                    book = true;
+                    depth = true;
+                }
+                "depth" | "l2" | "orderbook" | "lob" => {
+                    depth = true;
+                }
+                "quote" | "mini" => {
+                    book = true;
+                }
+                "none" | "off" => {
+                    // Ignore; we'll fallback later if nothing else enabled
+                }
+                _ => {
+                    // 未知值視為啟用全部，避免意外關閉所有流
+                    trades = true;
+                    book = true;
+                    depth = true;
+                    break;
+                }
+            }
+        }
+
+        if !trades && !book && !depth {
+            // 若使用者設定導致全部關閉，回退為 trades
+            trades = true;
+        }
+
+        Self {
+            trades,
+            book,
+            depth,
+        }
+    }
 }
 
 /// 统一的交易所接口
@@ -105,6 +252,7 @@ pub trait Exchange {
     }
 
     /// 获取热门交易对
+    #[cfg_attr(feature = "collector-bitget", allow(dead_code))]
     async fn get_popular_symbols(&self, limit: usize) -> Result<Vec<String>>;
 
     /// 设置 ClickHouse 表结构
@@ -130,6 +278,11 @@ pub trait Exchange {
     fn requires_futures_buffers(&self) -> bool {
         false
     }
+
+    /// 是否需要診斷資料（dry-run 模式使用）
+    fn stream_diagnostics(&self) -> StreamDiagnostics {
+        StreamDiagnostics::default()
+    }
 }
 
 #[derive(Default)]
@@ -152,7 +305,6 @@ pub struct FuturesBuffers {
 
 /// 消息缓冲区
 pub struct MessageBuffers {
-    futures_enabled: bool,
     pub spot: SpotBuffers,
     pub futures: Option<FuturesBuffers>,
     pub raw_data: Vec<String>,
@@ -161,7 +313,6 @@ pub struct MessageBuffers {
 impl MessageBuffers {
     pub fn new(futures_enabled: bool) -> Self {
         Self {
-            futures_enabled,
             spot: SpotBuffers::default(),
             futures: futures_enabled.then(FuturesBuffers::default),
             raw_data: Vec::new(),
@@ -182,10 +333,6 @@ impl MessageBuffers {
             })
             .unwrap_or(0);
         spot_total + futures_total + self.raw_data.len()
-    }
-
-    pub fn futures_enabled(&self) -> bool {
-        self.futures_enabled
     }
 
     pub fn futures_mut(&mut self) -> Option<&mut FuturesBuffers> {
@@ -216,6 +363,7 @@ impl MessageBuffers {
         self.spot.snapshots.push(line);
     }
 
+    #[cfg(any(feature = "collector-binance-futures", feature = "collector-okx"))]
     pub fn push_futures_orderbook(&mut self, line: String) {
         if let Some(fut) = self.futures_mut() {
             fut.orderbook.push(line);

@@ -51,8 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 測試市場數據訂閱
     let symbols = vec![
-        Symbol("BTCUSDT".to_string()),
-        Symbol("ETHUSDT".to_string()),
+        Symbol::new("BTCUSDT"),
+        Symbol::new("ETHUSDT"),
     ];
 
     info!("訂閱市場數據: {:?}", symbols);

@@ -81,7 +81,7 @@ mod redis_export {
                     Ok(mut conn) => {
                         for (vs, orderbook) in &market_view.orderbooks {
                             let snapshot_data = serde_json::json!({
-                                "symbol": vs.symbol.0,
+                                "symbol": vs.symbol.as_str(),
                                 "venue": vs.venue.as_str(),
                                 "mid_price": calculate_mid_price(orderbook),
                                 "spread": calculate_spread(orderbook),
@@ -91,15 +91,17 @@ mod redis_export {
                                 "version": market_view.version
                             });
 
-                            let _res: Result<String, redis::RedisError> = conn.xadd(
-                                "market_snapshots",
-                                "*",
-                                &[
-                                    ("symbol", vs.symbol.0.as_str()),
-                                    ("venue", vs.venue.as_str()),
-                                    ("data", snapshot_data.to_string().as_str()),
-                                ],
-                            ).await;
+                            let _res: Result<String, redis::RedisError> = conn
+                                .xadd(
+                                    "market_snapshots",
+                                    "*",
+                                    &[
+                                        ("symbol", vs.symbol.as_str()),
+                                        ("venue", vs.venue.as_str()),
+                                        ("data", snapshot_data.to_string().as_str()),
+                                    ],
+                                )
+                                .await;
                         }
                     }
                     Err(e) => {
@@ -174,7 +176,10 @@ mod clickhouse_export {
         clickhouse_config: super::ClickHouseConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let ch_url = clickhouse_config.url.clone();
-        let ch_db = clickhouse_config.database.clone().unwrap_or_else(|| "default".into());
+        let ch_db = clickhouse_config
+            .database
+            .clone()
+            .unwrap_or_else(|| "default".into());
         let client = Client::default().with_url(&ch_url).with_database(&ch_db);
 
         // 檢查連線
@@ -187,7 +192,10 @@ mod clickhouse_export {
         let client_for_lob = Client::default().with_url(&ch_url).with_database(&ch_db);
         let l1_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(200));
-            let mut prev_map: std::collections::HashMap<String, (f64, f64, f64, f64, f64, f64, f64)> = Default::default();
+            let mut prev_map: std::collections::HashMap<
+                String,
+                (f64, f64, f64, f64, f64, f64, f64),
+            > = Default::default();
             loop {
                 ticker.tick().await;
                 // 若引擎停止則退出
@@ -195,7 +203,9 @@ mod clickhouse_export {
                     let eng = engine_arc.lock().await;
                     (eng.get_market_view(), eng.get_statistics().is_running)
                 };
-                if !running { break; }
+                if !running {
+                    break;
+                }
 
                 // 批量轉換 L1/L5 深度
                 let mut batch = Vec::<LobDepthRow>::new();
@@ -206,7 +216,7 @@ mod clickhouse_export {
                     if !orderbook.bid_prices.is_empty() {
                         batch.push(LobDepthRow {
                             timestamp: ts,
-                            symbol: vs.symbol.0.clone(),
+                            symbol: vs.symbol.as_str().to_string(),
                             venue: venue.clone(),
                             side: "bid".into(),
                             level: 0,
@@ -217,7 +227,7 @@ mod clickhouse_export {
                     if !orderbook.ask_prices.is_empty() {
                         batch.push(LobDepthRow {
                             timestamp: ts,
-                            symbol: vs.symbol.0.clone(),
+                            symbol: vs.symbol.as_str().to_string(),
                             venue: venue.clone(),
                             side: "ask".into(),
                             level: 0,
@@ -227,8 +237,11 @@ mod clickhouse_export {
                     }
                 }
                 if !batch.is_empty() {
-                    if let Ok(mut inserter) = client_for_lob.insert::<LobDepthRow>("hft.lob_depth") {
-                        for r in &batch { let _ = inserter.write(r).await; }
+                    if let Ok(mut inserter) = client_for_lob.insert::<LobDepthRow>("hft.lob_depth")
+                    {
+                        for r in &batch {
+                            let _ = inserter.write(r).await;
+                        }
                         let _ = inserter.end().await;
                     }
                 }
@@ -245,7 +258,10 @@ mod clickhouse_export {
             let mut prev_submitted: u64 = 0;
             let mut prev_filled: u64 = 0;
             let mut prev_exec_processed: u64 = 0;
-            let mut prev_map: std::collections::HashMap<String, (f64, f64, f64, f64, f64, f64, f64)> = Default::default();
+            let mut prev_map: std::collections::HashMap<
+                String,
+                (f64, f64, f64, f64, f64, f64, f64),
+            > = Default::default();
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
             loop {
                 ticker.tick().await;
@@ -253,34 +269,71 @@ mod clickhouse_export {
                     let eng = engine_arc.lock().await;
                     (eng.get_market_view(), eng.get_statistics().is_running)
                 };
-                if !running { break; }
+                if !running {
+                    break;
+                }
 
                 let ts = market_view.timestamp;
                 let mut f_rows: Vec<FactorRow> = Vec::new();
                 // 計算市場因子
                 for (vs, ob) in &market_view.orderbooks {
-                    let key = vs.symbol.0.clone();
+                    let key = vs.symbol.as_str().to_string();
                     let mut bid_px = 0.0;
                     let mut ask_px = 0.0;
                     let mut bid_qty = 0.0;
                     let mut ask_qty = 0.0;
                     let mut bid_qty_l5 = 0.0;
                     let mut ask_qty_l5 = 0.0;
-                    if !ob.bid_prices.is_empty() { bid_px = ob.bid_prices[0].to_f64(); bid_qty = ob.bid_qtys[0].to_f64(); }
-                    if !ob.ask_prices.is_empty() { ask_px = ob.ask_prices[0].to_f64(); ask_qty = ob.ask_qtys[0].to_f64(); }
-                    for i in 0..ob.bid_prices.len().min(5) { bid_qty_l5 += ob.bid_qtys[i].to_f64(); }
-                    for i in 0..ob.ask_prices.len().min(5) { ask_qty_l5 += ob.ask_qtys[i].to_f64(); }
-                    let mid = if bid_px > 0.0 && ask_px > 0.0 { (bid_px + ask_px) / 2.0 } else { 0.0 };
-                    let spread_bps = if mid > 0.0 { (ask_px - bid_px) / mid * 10000.0 } else { 0.0 };
-                    let obi1 = if (bid_qty + ask_qty) > 0.0 { (bid_qty - ask_qty) / (bid_qty + ask_qty) } else { 0.0 };
-                    let obi5 = if (bid_qty_l5 + ask_qty_l5) > 0.0 { (bid_qty_l5 - ask_qty_l5) / (bid_qty_l5 + ask_qty_l5) } else { 0.0 };
+                    if !ob.bid_prices.is_empty() {
+                        bid_px = ob.bid_prices[0].to_f64();
+                        bid_qty = ob.bid_qtys[0].to_f64();
+                    }
+                    if !ob.ask_prices.is_empty() {
+                        ask_px = ob.ask_prices[0].to_f64();
+                        ask_qty = ob.ask_qtys[0].to_f64();
+                    }
+                    for i in 0..ob.bid_prices.len().min(5) {
+                        bid_qty_l5 += ob.bid_qtys[i].to_f64();
+                    }
+                    for i in 0..ob.ask_prices.len().min(5) {
+                        ask_qty_l5 += ob.ask_qtys[i].to_f64();
+                    }
+                    let mid = if bid_px > 0.0 && ask_px > 0.0 {
+                        (bid_px + ask_px) / 2.0
+                    } else {
+                        0.0
+                    };
+                    let spread_bps = if mid > 0.0 {
+                        (ask_px - bid_px) / mid * 10000.0
+                    } else {
+                        0.0
+                    };
+                    let obi1 = if (bid_qty + ask_qty) > 0.0 {
+                        (bid_qty - ask_qty) / (bid_qty + ask_qty)
+                    } else {
+                        0.0
+                    };
+                    let obi5 = if (bid_qty_l5 + ask_qty_l5) > 0.0 {
+                        (bid_qty_l5 - ask_qty_l5) / (bid_qty_l5 + ask_qty_l5)
+                    } else {
+                        0.0
+                    };
                     let (mut ofi1, mut ofi5, mut mid_change_bps) = (0.0, 0.0, 0.0);
                     if let Some((pb, pa, qb, qa, qb5, qa5, pmid)) = prev_map.get(&key).copied() {
-                        ofi1 = (bid_px - pb) * qb + (qb - qb) * pb - (ask_px - pa) * qa - (qa - qa) * pa;
+                        ofi1 = (bid_px - pb) * qb + (qb - qb) * pb
+                            - (ask_px - pa) * qa
+                            - (qa - qa) * pa;
                         ofi5 = (bid_qty_l5 - qb5) - (ask_qty_l5 - qa5);
-                        if pmid > 0.0 && mid > 0.0 { mid_change_bps = (mid - pmid) / pmid * 10000.0; }
+                        if pmid > 0.0 && mid > 0.0 {
+                            mid_change_bps = (mid - pmid) / pmid * 10000.0;
+                        }
                     }
-                    prev_map.insert(key.clone(), (bid_px, ask_px, bid_qty, ask_qty, bid_qty_l5, ask_qty_l5, mid));
+                    prev_map.insert(
+                        key.clone(),
+                        (
+                            bid_px, ask_px, bid_qty, ask_qty, bid_qty_l5, ask_qty_l5, mid,
+                        ),
+                    );
                     f_rows.push(FactorRow {
                         timestamp: ts,
                         symbol: key,
@@ -288,8 +341,16 @@ mod clickhouse_export {
                         obi_l1: obi1,
                         obi_l5: obi5,
                         spread_bps,
-                        microprice: if (bid_qty + ask_qty) > 0.0 { (ask_px * bid_qty + bid_px * ask_qty) / (bid_qty + ask_qty) } else { mid },
-                        depth_ratio_l5: if ask_qty_l5 > 0.0 { bid_qty_l5 / ask_qty_l5 } else { 0.0 },
+                        microprice: if (bid_qty + ask_qty) > 0.0 {
+                            (ask_px * bid_qty + bid_px * ask_qty) / (bid_qty + ask_qty)
+                        } else {
+                            mid
+                        },
+                        depth_ratio_l5: if ask_qty_l5 > 0.0 {
+                            bid_qty_l5 / ask_qty_l5
+                        } else {
+                            0.0
+                        },
                         ofi_l1: ofi1,
                         ofi_l5: ofi5,
                         mid_change_bps,
@@ -297,7 +358,9 @@ mod clickhouse_export {
                 }
                 if !f_rows.is_empty() {
                     if let Ok(mut inserter) = factors_client.insert::<FactorRow>("hft.factors") {
-                        for r in &f_rows { let _ = inserter.write(r).await; }
+                        for r in &f_rows {
+                            let _ = inserter.write(r).await;
+                        }
                         let _ = inserter.end().await;
                     }
                 }
@@ -309,7 +372,11 @@ mod clickhouse_export {
                 };
                 let delta_submitted = stats.orders_submitted.saturating_sub(prev_submitted);
                 let delta_filled = stats.orders_filled.saturating_sub(prev_filled);
-                let fill_rate = if delta_submitted > 0 { (delta_filled as f64) / (delta_submitted as f64) } else { 0.0 };
+                let fill_rate = if delta_submitted > 0 {
+                    (delta_filled as f64) / (delta_submitted as f64)
+                } else {
+                    0.0
+                };
                 let row = EngineStatsRow {
                     timestamp: market_view.timestamp,
                     orders_submitted: stats.orders_submitted,
@@ -336,8 +403,12 @@ mod clickhouse_export {
         let engine_for_trades = this.engine.clone();
         let trades_client = Client::default().with_url(&ch_url).with_database(&ch_db);
         let trade_handle = tokio::spawn(async move {
-            let mut rx = { let eng = engine_for_trades.lock().await; eng.subscribe_market_trades() };
-            let mut batch: Vec<(u64, String, String, String, f64, f64, String)> = Vec::with_capacity(1024);
+            let mut rx = {
+                let eng = engine_for_trades.lock().await;
+                eng.subscribe_market_trades()
+            };
+            let mut batch: Vec<(u64, String, String, String, f64, f64, String)> =
+                Vec::with_capacity(1024);
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
             loop {
                 tokio::select! {
@@ -353,7 +424,7 @@ mod clickhouse_export {
                     recv = rx.recv() => {
                         match recv {
                             Ok(tr) => {
-                                batch.push((tr.ts, tr.symbol.0.clone(), tr.venue.as_str().into(), tr.side.as_str().into(), tr.price.to_f64(), tr.quantity.to_f64(), tr.liq.as_str().into()));
+                                batch.push((tr.ts, tr.symbol.as_str().to_string(), tr.venue.as_str().into(), tr.side.as_str().into(), tr.price.to_f64(), tr.quantity.to_f64(), tr.liq.as_str().into()));
                             }
                             Err(_) => break,
                         }

@@ -18,7 +18,7 @@ async fn test_fill_precision_preservation() {
     let mut portfolio = Portfolio::new();
 
     let order_id = OrderId("T-PRECISION-001".to_string());
-    let symbol = Symbol("BTCUSDT".to_string());
+    let symbol = Symbol::new("BTCUSDT");
     let price = Price::from_str("67188.12345678901").unwrap(); // 高精度价格
     let quantity = Quantity::from_str("0.00123456789").unwrap(); // 高精度数量
 
@@ -72,7 +72,7 @@ async fn test_weighted_average_price_precision() {
     let mut portfolio = Portfolio::new();
 
     let order_id = OrderId("T-WAP-001".to_string());
-    let symbol = Symbol("BTCUSDT".to_string());
+    let symbol = Symbol::new("BTCUSDT");
     let total_qty = Quantity::from_str("1.0").unwrap();
 
     oms.register_order(order_id.clone(), None, symbol.clone(), Side::Buy, total_qty, None, Some("test_strategy".to_string()));
@@ -133,7 +133,7 @@ async fn test_fill_deduplication() {
     let mut oms = OmsCore::new();
 
     let order_id = OrderId("T-DEDUP-001".to_string());
-    let symbol = Symbol("BTCUSDT".to_string());
+    let symbol = Symbol::new("BTCUSDT");
     let quantity = Quantity::from_str("1.0").unwrap();
 
     oms.register_order(order_id.clone(), None, symbol.clone(), Side::Buy, quantity, None, Some("test_strategy".to_string()));
@@ -170,7 +170,7 @@ async fn test_order_completed_event_generation() {
     let mut engine = Engine::new(EngineConfig::default());
 
     let order_id = OrderId("T-COMPLETE-001".to_string());
-    let symbol = Symbol("BTCUSDT".to_string());
+    let symbol = Symbol::new("BTCUSDT");
     let quantity = Quantity::from_str("1.0").unwrap();
 
     // 这里需要通过反射或其他方式访问engine的内部OMS进行测试
@@ -232,7 +232,7 @@ async fn test_mtm_synchronization() {
     let mut portfolio = Portfolio::new();
 
     let order_id = OrderId("T-MTM-001".to_string());
-    let symbol = Symbol("BTCUSDT".to_string());
+    let symbol = Symbol::new("BTCUSDT");
 
     portfolio.register_order(order_id.clone(), symbol.clone(), Side::Buy);
 
@@ -272,7 +272,7 @@ async fn test_full_event_chain_precision() {
     let mut portfolio = Portfolio::new();
 
     let order_id = OrderId("T-CHAIN-001".to_string());
-    let symbol = Symbol("BTCUSDT".to_string());
+    let symbol = Symbol::new("BTCUSDT");
 
     // 使用高精度价格和数量
     let price1 = Price::from_str("67188.123456789012").unwrap();

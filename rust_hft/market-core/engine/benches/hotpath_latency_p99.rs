@@ -107,9 +107,9 @@ fn bench_hotpath_latency() {
                 VenueId::BITGET
             };
             let sym = if venue == VenueId::BINANCE {
-                Symbol("BINANCE:BTCUSDT".to_string())
+                Symbol::new("BINANCE:BTCUSDT")
             } else {
-                Symbol("BITGET:BTCUSDT".to_string())
+                Symbol::new("BITGET:BTCUSDT")
             };
             let snap = MarketSnapshot {
                 symbol: sym,

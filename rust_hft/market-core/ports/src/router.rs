@@ -307,7 +307,7 @@ mod tests {
         available.insert(VenueId::BITGET, 1);
 
         let intent = OrderIntent {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             quantity: Quantity::from_f64(1.0).unwrap(),
             order_type: OrderType::Market,
@@ -330,7 +330,7 @@ mod tests {
         available.insert(VenueId::BITGET, 1);
 
         let mut intent = OrderIntent {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             quantity: Quantity::from_f64(1.0).unwrap(),
             order_type: OrderType::Market,

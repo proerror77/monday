@@ -4,25 +4,25 @@ password: ${CLICKHOUSE_PASSWORD}
 database: ${CLICKHOUSE_DATABASE}
 
 symbol: WLFIUSDT
-start: 2025-09-03T00:00:00Z
-end: 2025-09-05T23:59:59Z
+start: 2025-10-06T06:00:00Z  # Actual data start time
+end: 2025-10-08T13:15:00Z    # Extended to cover all available data (max: 13:14:37)
 
 tables:
-  - bitget_futures_bbo
-  - bitget_futures_depth
-  - bitget_futures_trades
+  - bitget_l1           # BBO (Best Bid/Offer) data
+  - bitget_ticker       # Ticker data
 
 list_tables: true
 overlap: true
 top_gaps: 5
 
 compat_profile: spot
-schema_dump_tables: [spot_ticker, spot_books15, spot_trades]
+schema_dump_tables: [bitget_l1, bitget_ticker, bitget_orderbook]
 search_symbol: WLFI
-search_tables: [spot_ticker, spot_books15, spot_trades]
-load_tests_hours: 240
+search_tables: [bitget_l1, bitget_ticker]
+# load_tests_hours: 72  # Disabled: requires spot_* tables that don't exist
 
-range_compare:
-  raw: hft.bitget_futures_bbo
-  feature: hft.simple_mid_term_features
-  symbol: ETHUSDT
+# Disabled: feature table not yet created
+# range_compare:
+#   raw: hft_db.bitget_l1
+#   feature: hft_db.simple_mid_term_features
+#   symbol: WLFIUSDT

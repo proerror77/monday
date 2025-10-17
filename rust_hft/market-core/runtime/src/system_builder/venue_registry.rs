@@ -19,17 +19,17 @@ impl SystemBuilder {
     }
 
     fn collect_market_stream_symbols(&self) -> Vec<Symbol> {
-        let mut symbol_set = BTreeSet::new();
+        let mut symbol_set: BTreeSet<String> = BTreeSet::new();
         for venue in &self.config.venues {
             for instrument_id in &venue.symbol_catalog {
                 if let Some(symbol) = instrument_id.symbol() {
-                    symbol_set.insert(symbol.0);
+                    symbol_set.insert(symbol.as_str().to_string());
                 }
             }
         }
         for strat in &self.config.strategies {
             for symbol in &strat.symbols {
-                symbol_set.insert(symbol.0.clone());
+                symbol_set.insert(symbol.as_str().to_string());
             }
         }
 
@@ -37,7 +37,7 @@ impl SystemBuilder {
             symbol_set.insert("BTCUSDT".to_string());
         }
 
-        symbol_set.into_iter().map(Symbol).collect()
+        symbol_set.into_iter().map(Symbol::from).collect()
     }
 
     fn register_market_streams_for_venue(self, venue: &VenueConfig, symbols: &[Symbol]) -> Self {
@@ -57,7 +57,7 @@ impl SystemBuilder {
             let filtered: Vec<Symbol> = base_symbols
                 .into_iter()
                 .filter(|symbol| {
-                    let base_symbol = BaseSymbol::from(symbol.0.as_str());
+                    let base_symbol = BaseSymbol::from(symbol.as_str());
                     shard_config.should_handle(&base_symbol, &venue_id)
                 })
                 .collect();
@@ -185,7 +185,7 @@ mod tests {
         config.strategies.push(StrategyConfig {
             name: "trend".into(),
             strategy_type: StrategyType::Trend,
-            symbols: vec![Symbol("BTCUSDT".into())],
+            symbols: vec![Symbol::new("BTCUSDT")],
             params: StrategyParams::Trend {
                 ema_fast: 12,
                 ema_slow: 26,

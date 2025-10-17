@@ -1,0 +1,35 @@
+data:
+  path: data/backtest/sample.ndjson
+  format: ndjson
+  tick_size: 0.5
+  lot_size: 0.01
+  max_depth_levels: 20
+
+strategy:
+  liquidity_window_secs: 900    # ΔT = 15 分鐘
+  breakout_window_secs: 5       # Δt = 5 秒
+  price_delta_ticks: 2
+  volume_factor: 1.0
+  cvd_threshold: 80.0
+  ofi_threshold: 50.0
+  support_count: 3
+  resistance_count: 3
+
+execution:
+  base_qty: 0.01
+  max_position: 0.05
+  max_slippage_ticks: 2.0
+  stop_loss_ticks: 8.0
+  take_profit_ticks: 12.0
+  hold_secs: 600.0
+
+risk:
+  inventory_limit: 0.1
+  slippage_limit_ticks: 3.0
+  max_consecutive_losses: 3
+
+output:
+  trades_csv: backtest_trades.csv
+  summary_csv: backtest_summary.csv
+  metrics_json: backtest_metrics.json
+

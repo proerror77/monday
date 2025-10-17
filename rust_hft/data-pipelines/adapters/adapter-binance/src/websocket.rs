@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn test_build_stream_names() {
         let ws = BinanceWebSocket::new();
-        let symbols = vec![Symbol("BTCUSDT".to_string()), Symbol("ETHUSDT".to_string())];
+        let symbols = vec![Symbol::new("BTCUSDT"), Symbol::new("ETHUSDT")];
 
         let streams = ws.build_stream_names(&symbols);
 

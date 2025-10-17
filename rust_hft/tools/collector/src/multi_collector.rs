@@ -3,6 +3,7 @@ use crate::exchanges::{create_exchange, DepthMode, ExchangeContext, MessageBuffe
 use crate::metrics::{
     BATCH_INSERT_SECONDS, ERRORS_BY_KIND_TOTAL, LAST_ERROR_KIND, RECONNECTS_TOTAL,
 };
+use crate::resolve_max_backoff_secs;
 use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
@@ -353,6 +354,7 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
     let mut connected_once = false;
     let mut heartbeat_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(resolve_max_backoff_secs(exchange_name));
     loop {
         let plan_result = exchange.websocket_plan(&symbols).await;
         let plan = match plan_result {
@@ -436,13 +438,8 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
                     let mut interval = interval(hb);
                     loop {
                         interval.tick().await;
-                        // 1) WS 控制幀 Ping（大多數交易所接受）
-                        if let Err(e) = heartbeat_sender
-                            .lock()
-                            .await
-                            .send(Message::Ping(vec![]))
-                            .await
-                        {
+                        let mut sender = heartbeat_sender.lock().await;
+                        if let Err(e) = sender.send(Message::Ping(vec![])).await {
                             ERRORS_BY_KIND_TOTAL
                                 .with_label_values(&[&ex_name_for_hb, "heartbeat_error"])
                                 .inc();
@@ -452,19 +449,24 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
                             debug!("发送心跳失败: {}", e);
                             break;
                         }
-                        // 2) Bybit / Hyperliquid 期望 JSON 形式心跳
-                        if ex_name_for_hb == "bybit" || ex_name_for_hb == "hyperliquid" {
-                            let _ = heartbeat_sender
-                                .lock()
-                                .await
-                                .send(Message::Text("{\"op\":\"ping\"}".to_string()))
-                                .await;
-                            // Hyperliquid 接受 {"method":"ping"}
-                            let _ = heartbeat_sender
-                                .lock()
-                                .await
-                                .send(Message::Text("{\"method\":\"ping\"}".to_string()))
-                                .await;
+                        // JSON心跳：部分交易所需要
+                        match ex_name_for_hb.as_str() {
+                            "bybit" => {
+                                let _ = sender
+                                    .send(Message::Text("{\"op\":\"ping\"}".to_string()))
+                                    .await;
+                            }
+                            "hyperliquid" => {
+                                let _ = sender
+                                    .send(Message::Text("{\"method\":\"ping\"}".to_string()))
+                                    .await;
+                            }
+                            "bitget" => {
+                                let _ = sender
+                                    .send(Message::Text("{\"op\":\"ping\"}".to_string()))
+                                    .await;
+                            }
+                            _ => {}
                         }
                     }
                 });
@@ -477,6 +479,17 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
                 while let Some(msg) = ws_receiver.next().await {
                     match msg {
                         Ok(Message::Text(text)) => {
+                            if exchange_name == "bitget" && text.contains("\"op\":\"ping\"") {
+                                let mut sender = ws_sender.lock().await;
+                                if let Err(e) = sender
+                                    .send(Message::Text("{\"op\":\"pong\"}".to_string()))
+                                    .await
+                                {
+                                    warn!("Bitget pong 回應失敗: {}", e);
+                                    break;
+                                }
+                                continue;
+                            }
                             // 可選：存 raw 負載
                             if args.store_raw {
                                 let now = chrono::Utc::now();
@@ -500,7 +513,7 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
                                 || (last_flush.elapsed() >= flush_duration)
                             {
                                 if buffers.len() > 0 {
-                                    let futures_enabled = buffers.futures_enabled();
+                                    let futures_enabled = buffers.futures.is_some();
                                     let buffers_to_flush = std::mem::replace(
                                         &mut buffers,
                                         MessageBuffers::new(futures_enabled),
@@ -553,7 +566,7 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
                                     || (last_flush.elapsed() >= flush_duration)
                                 {
                                     if buffers.len() > 0 {
-                                        let futures_enabled = buffers.futures_enabled();
+                                        let futures_enabled = buffers.futures.is_some();
                                         let buffers_to_flush = std::mem::replace(
                                             &mut buffers,
                                             MessageBuffers::new(futures_enabled),
@@ -589,6 +602,28 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
                                 debug!("无法解析的二进制消息 ({} bytes)", bin.len());
                             }
                         }
+                        Ok(Message::Ping(payload)) => {
+                            let mut sender = ws_sender.lock().await;
+                            if let Err(e) = sender.send(Message::Pong(payload)).await {
+                                ERRORS_BY_KIND_TOTAL
+                                    .with_label_values(&[exchange_name, "pong_error"])
+                                    .inc();
+                                LAST_ERROR_KIND
+                                    .with_label_values(&[exchange_name, "pong_error"])
+                                    .set(chrono::Utc::now().timestamp() as i64);
+                                warn!("发送 Pong 失败: {}", e);
+                                break;
+                            }
+                            // Bitget 期望 JSON pong，額外發送
+                            if exchange_name == "bitget" {
+                                if let Err(e) = sender
+                                    .send(Message::Text("{\"op\":\"pong\"}".to_string()))
+                                    .await
+                                {
+                                    warn!("发送 JSON pong 失败: {}", e);
+                                }
+                            }
+                        }
                         Ok(Message::Pong(_)) => {}
                         Ok(Message::Close(_)) => {
                             warn!("WebSocket 连接关闭");
@@ -610,7 +645,7 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
 
                 // 刷新剩余数据
                 if buffers.len() > 0 {
-                    let futures_enabled = buffers.futures_enabled();
+                    let futures_enabled = buffers.futures.is_some();
                     let remaining =
                         std::mem::replace(&mut buffers, MessageBuffers::new(futures_enabled));
                     if let Err(e) = flush_tx.try_send(remaining) {
@@ -632,7 +667,7 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
                 }
                 warn!("断开连接，{:.0?} 后重连...", backoff);
                 tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, Duration::from_secs(60));
+                backoff = std::cmp::min(backoff * 2, max_backoff);
             }
             Err(e) => {
                 ERRORS_BY_KIND_TOTAL
@@ -643,7 +678,7 @@ pub async fn run_multi_collector(args: MultiCollectorArgs) -> Result<()> {
                     .set(chrono::Utc::now().timestamp() as i64);
                 error!("连接失败: {}，{:.0?} 后重试", e, backoff);
                 tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, Duration::from_secs(60));
+                backoff = std::cmp::min(backoff * 2, max_backoff);
             }
         }
     }
@@ -820,7 +855,7 @@ async fn run_hl_via_sdk(args: MultiCollectorArgs, symbols: Vec<String>) -> Resul
                     buffers.spot.trades.len(),
                     buffers.spot.l1.len()
                 );
-                let futures_enabled = buffers.futures_enabled();
+                let futures_enabled = buffers.futures.is_some();
                 buffers = crate::exchanges::MessageBuffers::new(futures_enabled);
             } else {
                 let t0 = std::time::Instant::now();

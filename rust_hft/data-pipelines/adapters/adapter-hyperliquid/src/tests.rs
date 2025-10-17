@@ -27,9 +27,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_extract_coin_from_symbol() {
-        let btc_symbol = Symbol("BTC-PERP".to_string());
-        let eth_symbol = Symbol("ETH-PERP".to_string());
-        let invalid_symbol = Symbol("INVALID".to_string());
+        let btc_symbol = Symbol::new("BTC-PERP");
+        let eth_symbol = Symbol::new("ETH-PERP");
+        let invalid_symbol = Symbol::new("INVALID");
 
         assert_eq!(extract_coin_from_symbol(&btc_symbol).unwrap(), "BTC");
         assert_eq!(extract_coin_from_symbol(&eth_symbol).unwrap(), "ETH");
@@ -128,7 +128,7 @@ mod tests {
         if let Some(event) = stream.parse_message(trade_message) {
             match event {
                 MarketEvent::Trade(trade) => {
-                    assert_eq!(trade.symbol, Symbol("BTC-PERP".to_string()));
+                    assert_eq!(trade.symbol, Symbol::new("BTC-PERP"));
                     assert_eq!(trade.side, Side::Buy); // "A" = Aggressive buy
                     assert_eq!(trade.trade_id, "abc123");
                 }
@@ -163,7 +163,7 @@ mod tests {
         if let Some(event) = stream.parse_message(book_message) {
             match event {
                 MarketEvent::Snapshot(snapshot) => {
-                    assert_eq!(snapshot.symbol, Symbol("BTC-PERP".to_string()));
+                    assert_eq!(snapshot.symbol, Symbol::new("BTC-PERP"));
                     assert_eq!(snapshot.bids.len(), 1);
                     assert_eq!(snapshot.asks.len(), 1);
                     assert_eq!(snapshot.timestamp, 1721810005123);
@@ -196,7 +196,7 @@ mod tests {
             "wss://api.hyperliquid-testnet.xyz/ws"
         );
 
-        let custom_symbols = vec![Symbol("BTC-PERP".to_string())];
+        let custom_symbols = vec![Symbol::new("BTC-PERP")];
         let custom_stream = HyperliquidMarketStream::with_symbols(custom_symbols.clone());
         assert_eq!(custom_stream.config.symbols, custom_symbols);
     }

@@ -89,7 +89,7 @@ impl SimpleLoggingStrategy {
                 info!(
                     "{} {} Trade: {} @ {} (Size: {}, Side: {:?})",
                     direction,
-                    trade.symbol.0,
+                    trade.symbol.as_str(),
                     trade.trade_id,
                     trade.price,
                     trade.quantity,
@@ -106,7 +106,11 @@ impl SimpleLoggingStrategy {
                 if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
                     debug!(
                         "📊 {} OrderBook: Bid {} @ {} | Ask {} @ {}",
-                        snapshot.symbol.0, bid.price, bid.quantity, ask.price, ask.quantity
+                        snapshot.symbol.as_str(),
+                        bid.price,
+                        bid.quantity,
+                        ask.price,
+                        ask.quantity
                     );
                 }
             }
@@ -129,7 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("交易對: {:?}", args.symbols);
 
     // 1. 設置數據流
-    let symbols: Vec<Symbol> = args.symbols.iter().map(|s| Symbol(s.clone())).collect();
+    let symbols: Vec<Symbol> = args
+        .symbols
+        .iter()
+        .map(|s| Symbol::from(s.clone()))
+        .collect();
 
     let mut market_config = HyperliquidMarketConfig::default();
     market_config.symbols = symbols.clone();
@@ -171,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("🧪 測試下單功能");
 
         let test_order = OrderIntent {
-            symbol: Symbol("BTC-PERP".to_string()),
+            symbol: Symbol::new("BTC-PERP"),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001)?,
             price: Some(Price::from_f64(40000.0)?), // 遠離市價的限價單
@@ -258,7 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     for (symbol, price) in &strategy.last_trade_prices {
-        info!("    {} 最後價格: {}", symbol.0, price);
+        info!("    {} 最後價格: {}", symbol.as_str(), price);
     }
 
     // 6. 清理連接
@@ -280,7 +288,7 @@ mod tests {
 
         // 測試交易事件處理
         let trade = ports::Trade {
-            symbol: Symbol("BTC-PERP".to_string()),
+            symbol: Symbol::new("BTC-PERP"),
             timestamp: 1234567890,
             price: Price::from_f64(50000.0).unwrap(),
             quantity: Quantity::from_f64(0.1).unwrap(),
@@ -295,7 +303,7 @@ mod tests {
         assert_eq!(strategy.last_trade_prices.len(), 1);
         assert!(strategy
             .last_trade_prices
-            .contains_key(&Symbol("BTC-PERP".to_string())));
+            .contains_key(&Symbol::new("BTC-PERP")));
     }
 
     #[test]

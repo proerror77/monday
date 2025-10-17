@@ -40,7 +40,7 @@ async fn test_recovery_system_end_to_end() {
         oms_guard.register_order(
             OrderId("test-order-1".to_string()),
             Some("client-1".to_string()),
-            Symbol("BTCUSDT".to_string()),
+            Symbol::new("BTCUSDT"),
             Side::Buy,
             Quantity::from_str("1.0").unwrap(),
             None,
@@ -53,7 +53,7 @@ async fn test_recovery_system_end_to_end() {
         let mut portfolio_guard = portfolio.lock().await;
         portfolio_guard.register_order(
             OrderId("test-order-1".to_string()),
-            Symbol("BTCUSDT".to_string()),
+            Symbol::new("BTCUSDT"),
             Side::Buy,
         );
     }
@@ -88,7 +88,7 @@ async fn test_recovery_system_end_to_end() {
 
         let restored_order = oms_guard.get(&OrderId("test-order-1".to_string()));
         assert!(restored_order.is_some());
-        assert_eq!(restored_order.unwrap().symbol.0, "BTCUSDT");
+        assert_eq!(restored_order.unwrap().symbol.as_str(), "BTCUSDT");
     }
 }
 

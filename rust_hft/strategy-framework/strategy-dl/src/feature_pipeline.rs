@@ -575,7 +575,7 @@ mod tests {
 
     fn create_test_snapshot() -> MarketSnapshot {
         MarketSnapshot {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             timestamp: 1_000_000,
             bids: vec![
                 BookLevel::new_unchecked(100.0, 10.0),

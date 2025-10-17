@@ -68,8 +68,8 @@ impl DlStrategy {
         let mut feature_pipeline = FeaturePipeline::new(config.features.clone());
         let mut symbol_states = HashMap::new();
         for symbol in &config.symbols {
-            feature_pipeline.add_symbol(symbol.0.clone());
-            symbol_states.insert(symbol.0.clone(), SymbolState::new(now));
+            feature_pipeline.add_symbol(symbol.as_str().to_string());
+            symbol_states.insert(symbol.as_str().to_string(), SymbolState::new(now));
         }
 
         let model_handle = ModelLoader::load_model(config.model.clone())?;
@@ -96,7 +96,7 @@ impl DlStrategy {
     }
 
     fn state_for_symbol_mut(&mut self, symbol: &Symbol) -> &mut SymbolState {
-        let key = symbol.0.clone();
+        let key = symbol.as_str().to_string();
         let now = Self::current_timestamp();
         self.symbol_states
             .entry(key)
@@ -108,7 +108,7 @@ impl DlStrategy {
         snapshot: &MarketSnapshot,
         account: &AccountView,
     ) -> HftResult<Vec<OrderIntent>> {
-        let symbol_key = snapshot.symbol.0.clone();
+        let symbol_key = snapshot.symbol.as_str().to_string();
         let context = Self::build_context(snapshot);
         let event = MarketEvent::Snapshot(snapshot.clone());
         let maybe_features = self.feature_pipeline.process_event(&symbol_key, &event)?;

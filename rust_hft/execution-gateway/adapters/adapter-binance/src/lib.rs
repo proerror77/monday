@@ -91,7 +91,7 @@ impl ExecutionClient for BinanceExecutionClient {
 
             // 構建參數
             let mut params: HashMap<String, String> = HashMap::new();
-            params.insert("symbol".to_string(), intent.symbol.0.clone());
+            params.insert("symbol".to_string(), intent.symbol.as_str().to_string());
             params.insert(
                 "side".to_string(),
                 match intent.side {
@@ -154,7 +154,7 @@ impl ExecutionClient for BinanceExecutionClient {
         let order_id = OrderId(format!("BINANCE_PAPER_{}", hft_core::now_micros()));
         info!(
             "Binance 模擬下單: {} {} {} @ {:?}",
-            intent.symbol.0,
+            intent.symbol.as_str(),
             match intent.side {
                 hft_core::Side::Buy => "buy",
                 hft_core::Side::Sell => "sell",
@@ -573,7 +573,7 @@ impl ExecutionClient for BinanceExecutionClient {
 
             out.push(OpenOrder {
                 order_id: hft_core::OrderId(it.orderId.to_string()),
-                symbol: hft_core::Symbol(it.symbol),
+                symbol: hft_core::Symbol::from(it.symbol),
                 side,
                 order_type,
                 original_quantity: qty,

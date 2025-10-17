@@ -11,6 +11,7 @@ use std::{
     },
 };
 
+use adapters_common::parse_owned_value;
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
@@ -43,7 +44,7 @@ fn default_reconnect_interval_ms() -> u64 {
 }
 
 fn default_symbols() -> Vec<Symbol> {
-    vec![Symbol("SOL_USDC".to_string())]
+    vec![Symbol::new("SOL_USDC")]
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -191,8 +192,8 @@ impl MarketStream for BackpackMarketStream {
             ));
         }
 
-        effective_symbols.sort_by(|a, b| a.0.cmp(&b.0));
-        effective_symbols.dedup_by(|a, b| a.0 == b.0);
+        effective_symbols.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        effective_symbols.dedup_by(|a, b| a.as_str() == b.as_str());
 
         let subscribe_depth = self.config.subscribe_depth;
         let subscribe_trades = self.config.subscribe_trades;
@@ -204,7 +205,7 @@ impl MarketStream for BackpackMarketStream {
 
         let symbol_map: HashMap<String, Symbol> = effective_symbols
             .iter()
-            .map(|sym| (sym.0.clone(), sym.clone()))
+            .map(|sym| (sym.as_str().to_string(), sym.clone()))
             .collect();
 
         let streams: Vec<String> = effective_symbols
@@ -212,10 +213,10 @@ impl MarketStream for BackpackMarketStream {
             .flat_map(|sym| {
                 let mut v = Vec::new();
                 if subscribe_depth {
-                    v.push(format!("depth.{}", sym.0));
+                    v.push(format!("depth.{}", sym.as_str()));
                 }
                 if subscribe_trades {
-                    v.push(format!("trade.{}", sym.0));
+                    v.push(format!("trade.{}", sym.as_str()));
                 }
                 v
             })
@@ -259,16 +260,20 @@ impl MarketStream for BackpackMarketStream {
                                         .last_heartbeat
                                         .store(now_micros(), Ordering::SeqCst);
 
-                                    let envelope: WsEnvelope = match serde_json::from_str(&text) {
+                                    let mut bytes = text.into_bytes();
+                                    let envelope: WsEnvelope = match simd_json::serde::from_slice(bytes.as_mut_slice()) {
                                         Ok(env) => env,
-                                        Err(_) => continue,
+                                        Err(e) => {
+                                            warn!("Backpack envelope parse error: {}", e);
+                                            continue;
+                                        }
                                     };
 
                                     let Some(stream_name) = envelope.stream else { continue };
                                     let Some(data) = envelope.data else { continue };
 
                                     if stream_name.starts_with("depth.") {
-                                        match serde_json::from_value::<DepthEvent>(data) {
+                                        match parse_owned_value::<DepthEvent>(data) {
                                             Ok(evt) => {
                                                 if let Some(event) = handle_depth_event(
                                                     &evt,
@@ -281,7 +286,7 @@ impl MarketStream for BackpackMarketStream {
                                             Err(e) => warn!("Backpack depth parse error: {}", e),
                                         }
                                     } else if stream_name.starts_with("trade.") {
-                                        match serde_json::from_value::<TradeEvent>(data) {
+                                        match parse_owned_value::<TradeEvent>(data) {
                                             Ok(evt) => {
                                                 if let Some(event) = handle_trade_event(&evt, &symbol_map) {
                                                     yield Ok(event);

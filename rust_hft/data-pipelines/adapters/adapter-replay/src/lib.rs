@@ -134,7 +134,7 @@ impl MarketStream for ClickhouseReplayStream {
                     })
                     .collect();
                 let snapshot = MarketSnapshot {
-                    symbol: Symbol(symbol.clone()),
+                    symbol: Symbol::from(symbol.clone()),
                     timestamp: s.ts,
                     bids,
                     asks,
@@ -221,7 +221,7 @@ impl MarketStream for ClickhouseReplayStream {
                     })
                     .collect();
                 let snapshot = MarketSnapshot {
-                    symbol: Symbol(symbol.clone()),
+                    symbol: Symbol::from(symbol.clone()),
                     timestamp: r.event_ts,
                     bids,
                     asks,

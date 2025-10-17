@@ -9,7 +9,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let symbols_env = std::env::var("SYMBOLS").unwrap_or_else(|_| "BTCUSDT".to_string());
     let symbols: Vec<Symbol> = symbols_env
         .split(',')
-        .map(|s| Symbol(s.trim().to_string()))
+        .map(|s| Symbol::from(s.trim().to_string()))
         .collect();
 
     println!("Lighter smoke test - symbols: {:?}", symbols);
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ports::MarketEvent::Snapshot(sn) => {
                         println!(
                             "SNAPSHOT {} bids:{} asks:{} ts:{}",
-                            sn.symbol.0,
+                            sn.symbol.as_str(),
                             sn.bids.len(),
                             sn.asks.len(),
                             sn.timestamp
@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ports::MarketEvent::Update(upd) => {
                         println!(
                             "UPDATE {} Δbids:{} Δasks:{} ts:{}",
-                            upd.symbol.0,
+                            upd.symbol.as_str(),
                             upd.bids.len(),
                             upd.asks.len(),
                             upd.timestamp
@@ -61,7 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ports::MarketEvent::Trade(tr) => {
                         println!(
                             "TRADE {} {}@{} ts:{}",
-                            tr.symbol.0, tr.quantity, tr.price, tr.timestamp
+                            tr.symbol.as_str(),
+                            tr.quantity,
+                            tr.price,
+                            tr.timestamp
                         );
                     }
                     ports::MarketEvent::Disconnect { reason } => {

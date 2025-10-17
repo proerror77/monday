@@ -384,7 +384,8 @@ impl ExecutionClient for LighterExecutionClient {
             .account_index
             .ok_or_else(|| HftError::Config("缺少 account_index".into()))?;
 
-        let (market_id, size_dec, price_dec) = self.ensure_market_meta(&intent.symbol.0).await?;
+        let (market_id, size_dec, price_dec) =
+            self.ensure_market_meta(&intent.symbol.as_str()).await?;
 
         // 取得 nonce
         let nonce = self.next_nonce(account_index, api_key_index).await?;
@@ -443,7 +444,11 @@ impl ExecutionClient for LighterExecutionClient {
         // record mapping for later cancel/modify
         self.order_map.insert(
             tx_hash.clone(),
-            (intent.symbol.0.clone(), market_id, client_order_index),
+            (
+                intent.symbol.as_str().to_string(),
+                market_id,
+                client_order_index,
+            ),
         );
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderAck {

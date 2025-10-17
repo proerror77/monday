@@ -489,7 +489,7 @@ mod tests {
         let local_order = OrderRecord {
             order_id: order_id.clone(),
             client_order_id: None,
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Quantity::from_str("1.0").unwrap(),
             cum_qty: Quantity::from_str("0.5").unwrap(),

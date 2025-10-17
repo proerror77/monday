@@ -25,19 +25,30 @@ impl SubscriptionBuilder {
     }
 
     pub fn orderbook(mut self, symbol: Symbol) -> Self {
-        self.items.push(Subscription { kind: SubscriptionKind::OrderBook, symbol });
+        self.items.push(Subscription {
+            kind: SubscriptionKind::OrderBook,
+            symbol,
+        });
         self
     }
 
     pub fn trades(mut self, symbol: Symbol) -> Self {
-        self.items.push(Subscription { kind: SubscriptionKind::Trades, symbol });
+        self.items.push(Subscription {
+            kind: SubscriptionKind::Trades,
+            symbol,
+        });
         self
     }
 
     pub fn ticker(mut self, symbol: Symbol) -> Self {
-        self.items.push(Subscription { kind: SubscriptionKind::Ticker, symbol });
+        self.items.push(Subscription {
+            kind: SubscriptionKind::Ticker,
+            symbol,
+        });
         self
     }
 
-    pub fn build(self) -> Vec<Subscription> { self.items }
+    pub fn build(self) -> Vec<Subscription> {
+        self.items
+    }
 }

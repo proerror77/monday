@@ -106,7 +106,7 @@ fn main() {
 
     // 創建測試事件 - Bar 事件帶 Binance source_venue
     let bar_event = MarketEvent::Bar(AggregatedBar {
-        symbol: Symbol("BTCUSDT".to_string()),
+        symbol: Symbol::new("BTCUSDT"),
         interval_ms: 60000,
         open_time: 1000000,
         close_time: 1060000,
@@ -121,7 +121,7 @@ fn main() {
 
     // 創建測試事件 - Snapshot 事件帶 Bitget source_venue
     let snapshot_event = MarketEvent::Snapshot(MarketSnapshot {
-        symbol: Symbol("ETHUSDT".to_string()),
+        symbol: Symbol::new("ETHUSDT"),
         timestamp: 1000000,
         bids: vec![BookLevel::new_unchecked(3000.0, 1.0)],
         asks: vec![BookLevel::new_unchecked(3100.0, 1.0)],
@@ -131,7 +131,7 @@ fn main() {
 
     // 創建測試事件 - Trade 事件無 source_venue
     let trade_event = MarketEvent::Trade(Trade {
-        symbol: Symbol("ADAUSDT".to_string()),
+        symbol: Symbol::new("ADAUSDT"),
         timestamp: 1000000,
         price: Price::from_f64(0.5).unwrap(),
         quantity: Quantity::from_f64(100.0).unwrap(),

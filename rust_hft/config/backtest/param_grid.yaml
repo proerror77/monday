@@ -1,0 +1,4 @@
+strategy:
+  price_delta_ticks: [1.0, 2.0, 3.0]
+  volume_factor: [0.8, 1.0, 1.2]
+  breakout_window_secs: [3.0, 5.0, 8.0]

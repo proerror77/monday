@@ -20,6 +20,7 @@ serde_json = "1.0"
 url = "2.4"
 base64 = "0.21"
 chrono = { workspace = true }
+hft_core = { package = "hft-core", path = "../core" }
 
 [features]
 default = []

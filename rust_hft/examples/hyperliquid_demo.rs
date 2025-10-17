@@ -53,7 +53,7 @@ async fn demo_paper_mode() -> HftResult<()> {
 
     // 创建一个测试订单
     let order_intent = OrderIntent {
-        symbol: Symbol("BTC-PERP".to_string()),
+        symbol: Symbol::new("BTC-PERP"),
         side: Side::Buy,
         quantity: Quantity::from_f64(0.001)?, // 0.001 BTC
         price: Some(Price::from_f64(50000.0)?), // $50,000

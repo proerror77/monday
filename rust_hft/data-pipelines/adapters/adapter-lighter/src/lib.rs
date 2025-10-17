@@ -9,7 +9,7 @@ use ports::{
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Clone, Debug)]
 struct MarketMeta {
@@ -37,8 +37,9 @@ async fn fetch_order_books_meta(rest_base: &str) -> HftResult<Vec<MarketMeta>> {
             status, text
         )));
     }
-    let v: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| HftError::Serialization(e.to_string()))?;
+    let mut bytes = text.into_bytes();
+    let v: serde_json::Value = simd_json::serde::from_slice(bytes.as_mut_slice())
+        .map_err(|e| HftError::Serialization(e.to_string()))?;
     let mut out = Vec::new();
     if let Some(books) = v.get("order_books").and_then(|x| x.as_array()) {
         for it in books {
@@ -113,7 +114,7 @@ impl MarketStream for LighterMarketStream {
         let mut sym_to_mid = std::collections::HashMap::new();
         let mut mid_to_sym = std::collections::HashMap::new();
         let symbol_set: std::collections::HashSet<String> =
-            symbols.iter().map(|s| s.0.clone()).collect();
+            symbols.iter().map(|s| s.as_str().to_string()).collect();
         for m in metas {
             if symbol_set.contains(&m.symbol) {
                 sym_to_mid.insert(m.symbol.clone(), m.market_id);
@@ -147,13 +148,15 @@ impl MarketStream for LighterMarketStream {
             while let Some(msg) = ws.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        let parsed: serde_json::Value = match serde_json::from_str(&text) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _ = tx.send(Err(HftError::Serialization(e.to_string())));
-                                continue;
-                            }
-                        };
+                        let mut bytes = text.into_bytes();
+                        let parsed: serde_json::Value =
+                            match simd_json::serde::from_slice(bytes.as_mut_slice()) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx.send(Err(HftError::Serialization(e.to_string())));
+                                    continue;
+                                }
+                            };
                         let typ = parsed.get("type").and_then(|x| x.as_str()).unwrap_or("");
                         match typ {
                             "connected" => {
@@ -185,7 +188,7 @@ impl MarketStream for LighterMarketStream {
                                             bids.sort_by(|a, b| b.price.cmp(&a.price));
                                             asks.sort_by(|a, b| a.price.cmp(&b.price));
                                             let snapshot = MarketSnapshot {
-                                                symbol: Symbol(sym.clone()),
+                                                symbol: Symbol::from(sym.clone()),
                                                 timestamp: now,
                                                 bids,
                                                 asks,
@@ -216,7 +219,7 @@ impl MarketStream for LighterMarketStream {
                                             ob.get("asks").unwrap_or(&serde_json::Value::Null),
                                         );
                                         let upd = BookUpdate {
-                                            symbol: Symbol(sym.clone()),
+                                            symbol: Symbol::from(sym.clone()),
                                             timestamp: now,
                                             bids,
                                             asks,

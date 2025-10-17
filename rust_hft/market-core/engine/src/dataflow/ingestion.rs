@@ -7,6 +7,7 @@
 //! - flip 策略控制快照發佈頻率
 
 use super::ring_buffer::{spsc_ring_buffer, SpscConsumer, SpscProducer};
+use hdrhistogram::Histogram;
 use hft_core::{now_micros, HftError, LatencyStage, LatencyTracker, Symbol};
 use ports::{MarketEvent, TrackedMarketEvent};
 use rustc_hash::FxHashMap;
@@ -15,6 +16,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tracing::{debug, error, warn};
+
+const STALE_WARN_INTERVAL_US: u64 = 500_000; // 0.5 秒
+const LATENCY_HISTOGRAM_MAX_US: u64 = 60_000_000; // 60 秒上限，覆蓋慢速環境
+const LATENCY_HISTOGRAM_SIGFIGS: u8 = 3;
 
 /// 事件攝取配置
 #[derive(Debug, Clone)]
@@ -99,60 +104,84 @@ pub enum BackpressurePolicy {
 }
 
 /// 事件攝取統計
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct IngestionMetrics {
     pub events_received: u64,
     pub events_dropped: u64,
     pub events_stale: u64,
     pub ring_utilization_max: f64,
     pub flip_count: u64,
-    /// 攝取階段延遲統計（微秒） - 有界環形緩衝
-    ingestion_latency_micros: Vec<u64>,
-    ingestion_latency_write_idx: usize,
+    /// 攝取階段延遲統計（微秒） - HDR 直方圖
+    latency_histogram: Histogram<u64>,
     /// 最近的延遲測量（用於實時監控）
     pub recent_latency_micros: Option<u64>,
+    last_stale_warn_ts: Option<u64>,
+    suppressed_stale_warnings: u64,
 }
 
 impl IngestionMetrics {
-    const LATENCY_HISTORY_CAP: usize = 1024;
+    pub fn new() -> Self {
+        let latency_histogram =
+            Histogram::new_with_bounds(1, LATENCY_HISTOGRAM_MAX_US, LATENCY_HISTOGRAM_SIGFIGS)
+                .expect("latency histogram bounds");
+        Self {
+            events_received: 0,
+            events_dropped: 0,
+            events_stale: 0,
+            ring_utilization_max: 0.0,
+            flip_count: 0,
+            latency_histogram,
+            recent_latency_micros: None,
+            last_stale_warn_ts: None,
+            suppressed_stale_warnings: 0,
+        }
+    }
 
     pub fn record_latency(&mut self, latency: u64) {
-        if self.ingestion_latency_micros.len() < Self::LATENCY_HISTORY_CAP {
-            self.ingestion_latency_micros.push(latency);
-        } else {
-            let idx = self.ingestion_latency_write_idx % Self::LATENCY_HISTORY_CAP;
-            self.ingestion_latency_micros[idx] = latency;
+        if let Err(err) = self.latency_histogram.record(latency) {
+            warn!("记录摄取延迟失败: {}", err);
         }
-        self.ingestion_latency_write_idx =
-            (self.ingestion_latency_write_idx + 1) % Self::LATENCY_HISTORY_CAP;
         self.recent_latency_micros = Some(latency);
     }
 
-    pub fn ingestion_latencies(&self) -> &[u64] {
-        &self.ingestion_latency_micros
+    pub fn record_stale_warn(&mut self, now_us: u64, interval_us: u64) -> Option<u64> {
+        match self.last_stale_warn_ts {
+            Some(last) if now_us.saturating_sub(last) < interval_us => {
+                self.suppressed_stale_warnings = self.suppressed_stale_warnings.saturating_add(1);
+                None
+            }
+            _ => {
+                let suppressed = self.suppressed_stale_warnings;
+                self.suppressed_stale_warnings = 0;
+                self.last_stale_warn_ts = Some(now_us);
+                Some(suppressed)
+            }
+        }
+    }
+
+    pub fn latency_histogram(&self) -> &Histogram<u64> {
+        &self.latency_histogram
     }
 
     pub fn average_latency(&self) -> Option<f64> {
-        if self.ingestion_latency_micros.is_empty() {
+        if self.latency_histogram.len() == 0 {
             return None;
         }
-        let sum: u128 = self
-            .ingestion_latency_micros
-            .iter()
-            .map(|&v| v as u128)
-            .sum();
-        Some(sum as f64 / self.ingestion_latency_micros.len() as f64)
+        Some(self.latency_histogram.mean())
     }
 
     pub fn latency_percentile(&self, percentile: f64) -> Option<u64> {
-        if self.ingestion_latency_micros.is_empty() {
+        if self.latency_histogram.len() == 0 {
             return None;
         }
         let pct = percentile.clamp(0.0, 100.0);
-        let mut data = self.ingestion_latency_micros.clone();
-        data.sort_unstable();
-        let rank = ((pct / 100.0) * (data.len() - 1) as f64).round() as usize;
-        data.get(rank).copied()
+        Some(self.latency_histogram.value_at_quantile(pct / 100.0))
+    }
+}
+
+impl Default for IngestionMetrics {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -206,6 +235,14 @@ impl EventIngester {
 
     /// 攝取單個事件，應用背壓與陳舊度策略
     pub fn ingest(&mut self, event: MarketEvent) -> Result<(), HftError> {
+        self.ingest_with_tracker(event, None)
+    }
+
+    pub fn ingest_with_tracker(
+        &mut self,
+        event: MarketEvent,
+        provided_tracker: Option<LatencyTracker>,
+    ) -> Result<(), HftError> {
         let _ingestion_start = now_micros();
         self.metrics.events_received += 1;
 
@@ -236,21 +273,42 @@ impl EventIngester {
                     infra_metrics::MetricsRegistry::global()
                         .record_staleness(delay as f64 / 1000.0);
                 }
-                warn!(
-                    "丟棄陳舊事件: {}μs 延遲 > {}μs 閾值",
-                    delay, self.config.stale_threshold_us
-                );
+                if let Some(suppressed) =
+                    self.metrics.record_stale_warn(now, STALE_WARN_INTERVAL_US)
+                {
+                    if suppressed > 0 {
+                        warn!(
+                            suppressed,
+                            "丟棄陳舊事件: {}μs 延遲 > {}μs 閾值（過去 {} 筆已合併）",
+                            delay,
+                            self.config.stale_threshold_us,
+                            suppressed
+                        );
+                    } else {
+                        warn!(
+                            "丟棄陳舊事件: {}μs 延遲 > {}μs 閾值",
+                            delay, self.config.stale_threshold_us
+                        );
+                    }
+                }
                 return Ok(()); // 靜默丟棄陳舊事件
             }
         }
 
         // 創建延遲追蹤器（若事件有時間戳，使用其作為起點）
-        let mut tracker = if let Some(event_ts) = event_ts_opt {
-            LatencyTracker::from_time(event_ts)
+        let mut tracker = if let Some(tracker) = provided_tracker {
+            tracker
+        } else if let Some(event_ts) = event_ts_opt {
+            let mut tracker = LatencyTracker::from_time(event_ts);
+            tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+            tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
+            tracker
         } else {
-            LatencyTracker::new()
+            let mut tracker = LatencyTracker::new();
+            tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+            tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
+            tracker
         };
-        // 記錄攝取階段完成
         tracker.record_stage(LatencyStage::Ingestion);
 
         // 創建帶追蹤的事件（零拷貝：移動事件所有權）
@@ -447,7 +505,9 @@ impl EventConsumer {
     /// 消費事件，返回是否應該觸發快照發佈
     pub fn consume_events(&mut self, mut callback: impl FnMut(TrackedMarketEvent) -> bool) -> bool {
         let mut should_flip = false;
-        let mut events_processed = 0;
+        let mut events_processed: u32 = 0;
+        let utilization = self.consumer.utilization();
+        let batch_limit: u32 = if utilization > 0.8 { 256 } else { 64 };
 
         // 批量消費事件
         while let Some(tracked_event) = self.consumer.recv() {
@@ -462,8 +522,11 @@ impl EventConsumer {
             should_flip = should_flip || callback_wants_flip;
 
             // 檢查是否達到批處理限制
-            if events_processed >= 100 {
-                debug!("批處理達到限制，暫停消費");
+            if events_processed >= batch_limit {
+                debug!(
+                    "批處理達到限制，暫停消費 (limit={}, utilization={:.2})",
+                    batch_limit, utilization
+                );
                 break;
             }
         }
@@ -569,7 +632,7 @@ mod tests {
 
         // 創建測試事件
         let snapshot = MarketSnapshot {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             timestamp: current_timestamp_us(),
             bids: vec![BookLevel::new_unchecked(50000.0, 1.0)],
             asks: vec![BookLevel::new_unchecked(50001.0, 1.0)],
@@ -600,7 +663,7 @@ mod tests {
 
         // 創建陳舊事件 (時間戳為 0)
         let stale_snapshot = MarketSnapshot {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             timestamp: 0,
             bids: vec![],
             asks: vec![],

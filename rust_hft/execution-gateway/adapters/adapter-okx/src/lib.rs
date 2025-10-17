@@ -8,8 +8,16 @@ use integration::{
     signing::{OkxCredentials, OkxSigner},
 };
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::warn;
+
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, HftError> {
+    let mut bytes = text.as_bytes().to_vec();
+    simd_json::serde::from_slice(bytes.as_mut_slice())
+        .map_err(|e| HftError::Serialization(e.to_string()))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionMode {
@@ -77,7 +85,7 @@ impl ExecutionClient for OkxExecutionClient {
                 px: Option<String>,
             }
             let req = Req {
-                inst_id: &intent.symbol.0,
+                inst_id: &intent.symbol.as_str(),
                 td_mode: "cash",
                 side: match intent.side {
                     hft_core::Side::Buy => "buy",
@@ -134,7 +142,7 @@ impl ExecutionClient for OkxExecutionClient {
                 });
             }
             self.order_inst
-                .insert(ord_id.clone(), intent.symbol.0.clone());
+                .insert(ord_id.clone(), intent.symbol.as_str().to_string());
             return Ok(OrderId(ord_id));
         }
         // Paper
@@ -343,7 +351,7 @@ impl ExecutionClient for OkxExecutionClient {
                             .await;
                         while let Some(msg) = ws.next().await {
                             if let Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) = msg {
-                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                if let Ok(v) = parse_json::<Value>(&txt) {
                                     if v.get("arg")
                                         .and_then(|a| a.get("channel"))
                                         .and_then(|x| x.as_str())
@@ -521,7 +529,7 @@ impl ExecutionClient for OkxExecutionClient {
                 let updated_at = it.uTime.parse::<u64>().unwrap_or(0) * 1000;
                 out.push(OpenOrder {
                     order_id: OrderId(it.ordId),
-                    symbol: hft_core::Symbol(it.instId),
+                    symbol: hft_core::Symbol::from(it.instId),
                     side,
                     order_type,
                     original_quantity: qty,

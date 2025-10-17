@@ -392,10 +392,11 @@ impl Exchange for BybitExchange {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(50);
 
-        // 兩種風格：字串 topic 或 對象參數。可透過 BYBIT_SUB_STYLE=string|object 指定（預設 object）。
+        // 兩種風格：字串 topic 或 對象參數。可透過 BYBIT_SUB_STYLE=string|object 指定（預設 string）。
+        // Bybit V5 API 使用字串格式：["orderbook.50.BTCUSDT", "publicTrade.BTCUSDT"]
         let use_object_args = std::env::var("BYBIT_SUB_STYLE")
             .map(|v| v.eq_ignore_ascii_case("object"))
-            .unwrap_or(true);
+            .unwrap_or(false);
         let category = std::env::var("BYBIT_CATEGORY")
             .unwrap_or_else(|_| "spot".to_string())
             .to_lowercase();

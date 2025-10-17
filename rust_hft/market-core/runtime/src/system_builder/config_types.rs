@@ -1,11 +1,11 @@
 //! 配置型別模組：逐步將 system_builder.rs 中的配置結構抽離於此
 //! 注意：優先重用 shared_config 既有型別，僅保留 runtime 專屬欄位。
 
-use serde::{Deserialize, Serialize};
 use engine::dataflow::FlipPolicy;
-use rust_decimal::Decimal;
-use std::collections::HashMap;
 use hft_core::Symbol;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 // use crate::system_builder::VenueId; // 未使用，保留註解
 
 /// 基礎設施配置
@@ -38,18 +38,22 @@ pub struct SystemEngineConfig {
     #[serde(default)]
     pub cpu_affinity: CpuAffinityConfig,
     /// Ack timeout for execution worker (ms)
-    #[serde(default = "default_ack_timeout_ms")] 
+    #[serde(default = "default_ack_timeout_ms")]
     pub ack_timeout_ms: u64,
     /// Reconciliation interval (ms)
-    #[serde(default = "default_reconcile_interval_ms")] 
+    #[serde(default = "default_reconcile_interval_ms")]
     pub reconcile_interval_ms: u64,
     /// Auto-cancel exchange-only orders discovered in reconciliation
     #[serde(default)]
     pub auto_cancel_exchange_only: bool,
 }
 
-fn default_ack_timeout_ms() -> u64 { 3000 }
-fn default_reconcile_interval_ms() -> u64 { 5000 }
+fn default_ack_timeout_ms() -> u64 {
+    3000
+}
+fn default_reconcile_interval_ms() -> u64 {
+    5000
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CpuAffinityConfig {
@@ -70,7 +74,7 @@ pub struct StrategyRiskLimits {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RiskConfig {
     /// Risk manager type: "Default" or "Enhanced"
-    #[serde(default = "default_risk_type")] 
+    #[serde(default = "default_risk_type")]
     pub risk_type: String,
 
     /// Base risk settings (applied to all strategies)
@@ -94,7 +98,9 @@ pub struct RiskConfig {
     pub strategy_overrides: HashMap<String, StrategyRiskOverride>,
 }
 
-fn default_risk_type() -> String { "Default".to_string() }
+fn default_risk_type() -> String {
+    "Default".to_string()
+}
 
 /// Enhanced risk manager specific settings（與現有工廠相容的完整欄位）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

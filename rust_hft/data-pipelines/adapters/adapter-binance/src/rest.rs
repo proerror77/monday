@@ -203,7 +203,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_depth() {
         let client = BinanceRestClient::new();
-        let symbol = Symbol("BTCUSDT".to_string());
+        let symbol = Symbol::new("BTCUSDT");
         let result = client.get_depth(&symbol, Some(10)).await;
 
         assert!(result.is_ok(), "獲取深度快照應該成功");

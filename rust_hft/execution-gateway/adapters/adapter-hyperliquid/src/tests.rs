@@ -26,7 +26,7 @@ mod tests {
 
         // 测试下单
         let order_intent = OrderIntent {
-            symbol: Symbol("BTC-PERP".to_string()),
+            symbol: Symbol::new("BTC-PERP"),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.1).unwrap(),
             price: Some(Price::from_f64(50000.0).unwrap()),
@@ -85,22 +85,10 @@ mod tests {
         let client = HyperliquidExecutionClient::new(config);
 
         // 测试资产索引映射
-        assert_eq!(
-            client.asset_map.get(&Symbol("BTC-PERP".to_string())),
-            Some(&0)
-        );
-        assert_eq!(
-            client.asset_map.get(&Symbol("ETH-PERP".to_string())),
-            Some(&1)
-        );
-        assert_eq!(
-            client.asset_map.get(&Symbol("SOL-PERP".to_string())),
-            Some(&2)
-        );
-        assert_eq!(
-            client.asset_map.get(&Symbol("SUI-PERP".to_string())),
-            Some(&3)
-        );
+        assert_eq!(client.asset_map.get(&Symbol::new("BTC-PERP")), Some(&0));
+        assert_eq!(client.asset_map.get(&Symbol::new("ETH-PERP")), Some(&1));
+        assert_eq!(client.asset_map.get(&Symbol::new("SOL-PERP")), Some(&2));
+        assert_eq!(client.asset_map.get(&Symbol::new("SUI-PERP")), Some(&3));
     }
 
     // Market stream tests are in the data adapter, not execution adapter

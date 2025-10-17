@@ -103,7 +103,7 @@ impl ArbitrageStrategy {
     /// 創建新的套利策略（舊版，保持向後兼容性）
     pub fn new(symbol: Symbol, config: ArbitrageStrategyConfig) -> Self {
         // 使用基於符號的穩定 ID，而非動態時間戳
-        let strategy_id = format!("arbitrage_{}", symbol.0);
+        let strategy_id = format!("arbitrage_{}", symbol.as_str());
         Self::with_name(symbol, config, strategy_id)
     }
 
@@ -276,7 +276,7 @@ impl ArbitrageStrategy {
 
         // 生成買入訂單 (在買入所)
         orders.push(OrderIntent {
-            symbol: Symbol(format!("{}:{}", signal.buy_venue, self.symbol.0)),
+            symbol: Symbol::from(format!("{}:{}", signal.buy_venue, self.symbol.as_str())),
             side: Side::Buy,
             quantity: signal.quantity,
             order_type: OrderType::Market, // 使用市價單確保成交
@@ -288,7 +288,7 @@ impl ArbitrageStrategy {
 
         // 生成賣出訂單 (在賣出所)
         orders.push(OrderIntent {
-            symbol: Symbol(format!("{}:{}", signal.sell_venue, self.symbol.0)),
+            symbol: Symbol::from(format!("{}:{}", signal.sell_venue, self.symbol.as_str())),
             side: Side::Sell,
             quantity: signal.quantity,
             order_type: OrderType::Market, // 使用市價單確保成交
@@ -303,8 +303,8 @@ impl ArbitrageStrategy {
 
     /// 解析交易所前綴
     fn parse_venue_symbol(symbol: &Symbol) -> (Option<String>, Symbol) {
-        if let Some((venue, base_symbol)) = symbol.0.split_once(':') {
-            (Some(venue.to_string()), Symbol(base_symbol.to_string()))
+        if let Some((venue, base_symbol)) = symbol.as_str().split_once(':') {
+            (Some(venue.to_string()), Symbol::new(base_symbol))
         } else {
             (None, symbol.clone())
         }
@@ -372,7 +372,7 @@ impl Strategy for ArbitrageStrategy {
     fn initialize(&mut self) -> HftResult<()> {
         log::info!(
             "套利策略初始化: 品種={}, 最小利差={}bps, 最大倉位={}",
-            self.symbol.0,
+            self.symbol.as_str(),
             self.config.min_spread_bps,
             self.config.max_total_position
         );
@@ -380,7 +380,7 @@ impl Strategy for ArbitrageStrategy {
     }
 
     fn shutdown(&mut self) -> HftResult<()> {
-        log::info!("套利策略關閉: {}", self.symbol.0);
+        log::info!("套利策略關閉: {}", self.symbol.as_str());
         Ok(())
     }
 }
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn test_venue_snapshot_creation() {
         let snapshot = MarketSnapshot {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             timestamp: 1234567890,
             bids: vec![BookLevel::new_unchecked(50000.0, 1.0)],
             asks: vec![BookLevel::new_unchecked(50100.0, 1.0)],
@@ -413,30 +413,30 @@ mod tests {
         let venue_snap = VenueSnapshot::from_market_snapshot("BINANCE".to_string(), &snapshot);
 
         assert_eq!(venue_snap.venue, "BINANCE");
-        assert_eq!(venue_snap.symbol.0, "BTCUSDT");
+        assert_eq!(venue_snap.symbol.as_str(), "BTCUSDT");
         assert!(venue_snap.best_bid.is_some());
         assert!(venue_snap.best_ask.is_some());
     }
 
     #[test]
     fn test_arbitrage_strategy_creation() {
-        let symbol = Symbol("BTCUSDT".to_string());
+        let symbol = Symbol::new("BTCUSDT");
         let config = ArbitrageStrategyConfig::default();
         let strategy = ArbitrageStrategy::new(symbol, config);
 
         assert_eq!(strategy.name(), "ArbitrageStrategy");
-        assert_eq!(strategy.symbol.0, "BTCUSDT");
+        assert_eq!(strategy.symbol.as_str(), "BTCUSDT");
     }
 
     #[test]
     fn test_parse_venue_symbol() {
         let (venue, symbol) =
-            ArbitrageStrategy::parse_venue_symbol(&Symbol("BINANCE:BTCUSDT".to_string()));
+            ArbitrageStrategy::parse_venue_symbol(&Symbol::new("BINANCE:BTCUSDT"));
         assert_eq!(venue, Some("BINANCE".to_string()));
-        assert_eq!(symbol.0, "BTCUSDT");
+        assert_eq!(symbol.as_str(), "BTCUSDT");
 
-        let (venue, symbol) = ArbitrageStrategy::parse_venue_symbol(&Symbol("BTCUSDT".to_string()));
+        let (venue, symbol) = ArbitrageStrategy::parse_venue_symbol(&Symbol::new("BTCUSDT"));
         assert_eq!(venue, None);
-        assert_eq!(symbol.0, "BTCUSDT");
+        assert_eq!(symbol.as_str(), "BTCUSDT");
     }
 }

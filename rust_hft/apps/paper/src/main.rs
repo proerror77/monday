@@ -16,6 +16,11 @@ struct Args {
     /// 啟動後自動退出的毫秒數（用於測試）
     #[arg(long)]
     exit_after_ms: Option<u64>,
+
+    /// Metrics HTTP 服務器端口（啟用 metrics feature 時生效）
+    #[cfg(feature = "metrics")]
+    #[arg(long, default_value = "9091")]
+    metrics_port: u16,
 }
 
 #[tokio::main]
@@ -46,6 +51,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     system.start().await?;
 
     info!("模擬盤系統正在運行...");
+
+    // 啟動 metrics HTTP 服務器（如果啟用 metrics feature）
+    #[cfg(feature = "metrics")]
+    {
+        use infra_metrics::http_server::{MetricsServer, MetricsServerConfig};
+        let cfg = MetricsServerConfig {
+            bind_address: "0.0.0.0".to_string(),
+            port: args.metrics_port,
+            verbose_logging: false,
+            readiness_max_idle_secs: 5,
+            readiness_max_utilization: 0.9,
+        };
+        let _handle = MetricsServer::start_background(cfg);
+        info!(
+            "Metrics 服務器已啟動: http://0.0.0.0:{}/metrics",
+            args.metrics_port
+        );
+    }
 
     // 保持運行直到收到停止信號或到達自動退出時間
     if let Some(ms) = args.exit_after_ms {

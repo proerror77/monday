@@ -26,4 +26,3 @@ impl From<simd_json::Error> for AdapterError {
         AdapterError::Serde(e.to_string())
     }
 }
-

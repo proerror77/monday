@@ -1,8 +1,10 @@
 //! 運行時管理相關擴充方法（從 system_builder.rs 拆分）
 
 use super::SystemRuntime;
+use crate::system_builder::strategy_factory::{
+    create_strategy_instance_for_symbol, create_strategy_instances_from_config,
+};
 use crate::system_builder::{RiskConfig, SharedStrategyParams};
-use crate::system_builder::strategy_factory::{create_strategy_instance_for_symbol, create_strategy_instances_from_config};
 // use crate::portfolio_manager::PortfolioManager; // 未使用，移除
 use engine; // for types in signatures
 use hft_core::{HftError, Symbol};
@@ -47,14 +49,15 @@ impl SystemRuntime {
 
         let strategy_type = self.config.strategies[cfg_index].strategy_type.clone();
         let shared_type = super::to_shared_strategy_type(&strategy_type);
-        let runtime_params = super::config_loader::convert_strategy_params(&shared_type, new_params)
-            .map_err(HftError::Config)?;
+        let runtime_params =
+            super::config_loader::convert_strategy_params(&shared_type, new_params)
+                .map_err(HftError::Config)?;
 
         let mut updated_cfg = self.config.strategies[cfg_index].clone();
         updated_cfg.params = runtime_params.clone();
 
         let target_symbol = if let Some(symbol_str) = symbol_part {
-            let symbol = Symbol(symbol_str.clone());
+            let symbol = Symbol::from(symbol_str.clone());
             if !updated_cfg.symbols.iter().any(|s| s == &symbol) {
                 return Err(HftError::Config(format!(
                     "策略 '{}' 未配置商品 {}",
@@ -148,7 +151,7 @@ impl SystemRuntime {
     ) -> Result<hft_core::OrderId, Box<dyn std::error::Error>> {
         use hft_core::{OrderType, Quantity, Side, Symbol, TimeInForce};
         let intent = ports::OrderIntent {
-            symbol: Symbol(symbol.to_string()),
+            symbol: Symbol::new(symbol),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001)?,
             order_type: OrderType::Market,
@@ -165,7 +168,11 @@ impl SystemRuntime {
             "test_{}",
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
-        tracing::info!("測試訂單已成功提交到執行隊列: {} {}", symbol, test_order_id.0);
+        tracing::info!(
+            "測試訂單已成功提交到執行隊列: {} {}",
+            symbol,
+            test_order_id.0
+        );
         Ok(test_order_id)
     }
 }

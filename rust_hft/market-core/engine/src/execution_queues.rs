@@ -100,7 +100,8 @@ impl EngineQueues {
                 self.stats.intent_queue_full_count += 1;
                 warn!(
                     "意图队列满载，丢弃订单: {} {}",
-                    intent.symbol.0, intent.quantity.0
+                    intent.symbol.as_str(),
+                    intent.quantity.0
                 );
                 Err(intent)
             }

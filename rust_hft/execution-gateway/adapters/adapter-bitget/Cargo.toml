@@ -19,6 +19,7 @@ futures-util = "0.3"
 url = "2.4"
 tokio-stream = { version = "0.1", features = ["sync"] }
 rust_decimal = { workspace = true }
+simd-json = { workspace = true }
 
 [features]
 default = []

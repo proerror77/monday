@@ -3,6 +3,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 // 時間戳（微秒）
 pub type Timestamp = u64;
@@ -196,17 +197,53 @@ impl std::fmt::Display for Quantity {
 
 // 符號/ID/Bps
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Symbol(pub String);
+pub struct Symbol(Arc<str>);
+
+impl Symbol {
+    pub fn new<S: AsRef<str>>(symbol: S) -> Self {
+        Symbol(Arc::<str>::from(symbol.as_ref()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 impl Default for Symbol {
     fn default() -> Self {
-        Symbol("".to_string())
+        Symbol(Arc::<str>::from(""))
     }
 }
 
 impl std::fmt::Display for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl From<&str> for Symbol {
+    fn from(value: &str) -> Self {
+        Symbol::new(value)
+    }
+}
+
+impl From<String> for Symbol {
+    fn from(value: String) -> Self {
+        Symbol::new(value)
+    }
+}
+
+impl From<Arc<str>> for Symbol {
+    fn from(value: Arc<str>) -> Self {
+        Symbol(value)
+    }
+}
+
+impl std::ops::Deref for Symbol {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
     }
 }
 

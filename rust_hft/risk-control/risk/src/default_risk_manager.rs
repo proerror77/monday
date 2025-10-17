@@ -247,7 +247,7 @@ impl RiskManager for DefaultRiskManager {
                 // 通过所有检查
                 info!(
                     "风控通过: {} {} {} @ {:?} (标准化后)",
-                    intent.symbol.0,
+                    intent.symbol.as_str(),
                     match intent.side {
                         hft_core::Side::Buy => "买入",
                         hft_core::Side::Sell => "卖出",
@@ -262,7 +262,7 @@ impl RiskManager for DefaultRiskManager {
                 // 风控拒绝
                 warn!(
                     "风控拒绝: {} {} {} @ {:?}, 原因: {}",
-                    intent.symbol.0,
+                    intent.symbol.as_str(),
                     match intent.side {
                         hft_core::Side::Buy => "买入",
                         hft_core::Side::Sell => "卖出",
@@ -437,7 +437,7 @@ mod tests {
         };
 
         let mut mgr = DefaultRiskManager::new(config);
-        let symbol = Symbol("BTCUSDT".to_string());
+        let symbol = Symbol::new("BTCUSDT");
 
         // 第一单应该通过
         assert!(mgr.check_rate_limit(&symbol).is_ok());

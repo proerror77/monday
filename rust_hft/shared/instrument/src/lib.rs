@@ -22,7 +22,7 @@ impl InstrumentId {
         if parts.next().is_some() {
             return None;
         }
-        VenueId::from_str(venue).map(|venue_id| (Symbol(symbol.to_string()), venue_id))
+        VenueId::from_str(venue).map(|venue_id| (Symbol::new(symbol), venue_id))
     }
 
     /// 取得純 Symbol（忽略 venue）。
@@ -122,7 +122,8 @@ impl InstrumentCatalog {
             .instruments
             .into_iter()
             .map(|meta| {
-                let id = InstrumentId::new(format!("{}@{}", meta.symbol.0, meta.venue.as_str()));
+                let id =
+                    InstrumentId::new(format!("{}@{}", meta.symbol.as_str(), meta.venue.as_str()));
                 (id, meta)
             })
             .collect();
@@ -150,7 +151,7 @@ impl InstrumentCatalog {
         symbol: &Symbol,
         venue: &VenueId,
     ) -> Result<&InstrumentMeta, CatalogError> {
-        let id = InstrumentId::new(format!("{}@{}", symbol.0, venue.as_str()));
+        let id = InstrumentId::new(format!("{}@{}", symbol.as_str(), venue.as_str()));
         self.instrument(&id)
     }
 
@@ -246,7 +247,7 @@ mod tests {
                 metadata: HashMap::new(),
             }],
             instruments: vec![InstrumentMeta {
-                symbol: Symbol("BTCUSDT".into()),
+                symbol: Symbol::new("BTCUSDT"),
                 venue: VenueId::BINANCE,
                 base: "BTC".into(),
                 quote: "USDT".into(),
@@ -267,16 +268,16 @@ mod tests {
             .expect("instrument should exist");
         assert_eq!(meta.base, "BTC");
         assert_eq!(meta.tick_size, 0.1);
-        assert!(catalog.has_symbol(&Symbol("BTCUSDT".into())));
+        assert!(catalog.has_symbol(&Symbol::new("BTCUSDT")));
 
         let instrument_id = InstrumentId::new(format!("BTCUSDT@{}", VenueId::BINANCE.as_str()));
         let (symbol, venue) = instrument_id.split().expect("split instrument id");
-        assert_eq!(symbol.0, "BTCUSDT");
+        assert_eq!(symbol.as_str(), "BTCUSDT");
         assert_eq!(venue, VenueId::BINANCE);
         assert_eq!(instrument_id.symbol().unwrap().0, "BTCUSDT");
         assert_eq!(instrument_id.venue_id().unwrap(), VenueId::BINANCE);
 
-        assert!(catalog.has_instrument(&Symbol("BTCUSDT".into()), &VenueId::BINANCE));
+        assert!(catalog.has_instrument(&Symbol::new("BTCUSDT"), &VenueId::BINANCE));
         let ids = catalog.instrument_ids_for_venue(&VenueId::BINANCE);
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].0, instrument_id.0);

@@ -13,7 +13,7 @@ use ports::*;
 /// 模擬的市場事件，帶有特定的 source_venue
 fn create_test_bar_event(symbol: &str, venue: Option<VenueId>) -> MarketEvent {
     MarketEvent::Bar(AggregatedBar {
-        symbol: Symbol(symbol.to_string()),
+        symbol: Symbol::new(symbol),
         timestamp: 1234567890,
         open: Price::from_f64(100.0).unwrap(),
         high: Price::from_f64(102.0).unwrap(),
@@ -158,7 +158,7 @@ async fn test_strategy_map_router_integration() {
 
     // 測試訂單意圖路由
     let trend_intent = OrderIntent {
-        symbol: Symbol("ETHUSDT".to_string()),
+        symbol: Symbol::new("ETHUSDT"),
         side: Side::Buy,
         order_type: OrderType::Market,
         quantity: Quantity::from_f64(1.0).unwrap(),
@@ -169,7 +169,7 @@ async fn test_strategy_map_router_integration() {
     };
 
     let imbalance_intent = OrderIntent {
-        symbol: Symbol("BTCUSDT".to_string()),
+        symbol: Symbol::new("BTCUSDT"),
         side: Side::Buy,
         order_type: OrderType::Limit,
         quantity: Quantity::from_f64(0.1).unwrap(),

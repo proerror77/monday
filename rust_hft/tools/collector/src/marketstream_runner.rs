@@ -113,7 +113,7 @@ fn dec_to_f64(d: &rust_decimal::Decimal) -> f64 {
 
 #[cfg(feature = "use-adapters")]
 fn symbol_to_string(sym: &hft_core::Symbol) -> String {
-    sym.0.clone()
+    sym.as_str().to_string()
 }
 
 #[cfg(feature = "use-adapters")]
@@ -298,7 +298,7 @@ pub async fn run_with_marketstream(
     let ms = create_marketstream(exchange, &symbols)?;
     let hft_symbols: Vec<hft_core::Symbol> = symbols
         .iter()
-        .map(|s| hft_core::Symbol(s.clone()))
+        .map(|s| hft_core::Symbol::from(s.clone()))
         .collect();
     let mut stream = ms
         .subscribe(hft_symbols)
@@ -846,7 +846,7 @@ fn create_marketstream(exchange: &str, symbols: &[String]) -> Result<Box<dyn Mar
         "hyperliquid" => {
             let syms: Vec<hft_core::Symbol> = symbols
                 .iter()
-                .map(|s| hft_core::Symbol(s.clone()))
+                .map(|s| hft_core::Symbol::from(s.clone()))
                 .collect();
             Ok(Box::new(
                 adapter_hyperliquid_data::HyperliquidMarketStream::with_symbols(syms),

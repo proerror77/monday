@@ -346,7 +346,8 @@ fn convert_strategy_config(
             if !cat.has_symbol(sym) {
                 ctx.warn(format!(
                     "策略 {} 參考的商品 {} 未在 instrument catalog 中定義",
-                    name, sym.0
+                    name,
+                    sym.as_str()
                 ));
             }
         }
@@ -357,7 +358,8 @@ fn convert_strategy_config(
             if !whitelist.contains(sym) {
                 ctx.warn(format!(
                     "策略 {} 使用的商品 {} 未出現在任何 venue 的 symbol_catalog 中",
-                    name, sym.0
+                    name,
+                    sym.as_str()
                 ));
             }
         }
@@ -623,7 +625,7 @@ fn expand_templates_into_strategies(
                     warn!("未定義的商品組: {}，跳過", rest);
                 }
             } else if let Some(sym) = target.strip_prefix("symbol:") {
-                symbols.push(Symbol(sym.to_string()));
+                symbols.push(Symbol::new(sym));
             } else {
                 warn!(
                     "未知的 apply_to 項: {}，應為 group:<name> 或 symbol:<SYM>",
@@ -635,11 +637,11 @@ fn expand_templates_into_strategies(
         for sym in symbols {
             let risk = binding
                 .overrides
-                .get(&sym.0)
+                .get(sym.as_str())
                 .and_then(|o| o.risk.clone())
                 .unwrap_or_else(|| tpl.risk.clone());
             out.push(StrategyConfig {
-                name: format!("{}:{}", tpl.id, sym.0),
+                name: format!("{}:{}", tpl.id, sym.as_str()),
                 strategy_type: tpl.strategy_type.clone(),
                 symbols: vec![sym],
                 params: tpl.params.clone(),

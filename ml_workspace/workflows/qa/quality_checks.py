@@ -60,16 +60,53 @@ def check_table_schema(client: ClickHouseClient, table: str, required_cols: List
     return {"table": table, "ok": len(missing) == 0, "missing": missing, "columns": sorted(list(cols))}
 
 
+def _detect_timestamp_field(client: ClickHouseClient, table: str) -> str:
+    """Detect whether table uses 'ts' or 'exchange_ts' as timestamp field."""
+    try:
+        df = client.describe_table(table)
+        if df is not None and not df.empty:
+            cols = set(df["name"].tolist())
+            # Prefer 'ts' (DateTime) over 'exchange_ts' (UInt64)
+            if "ts" in cols:
+                return "ts"
+            elif "exchange_ts" in cols:
+                return "exchange_ts"
+    except Exception:
+        pass
+    # Default fallback
+    return "exchange_ts"
+
+
 def check_table_coverage(client: ClickHouseClient, table: str, symbol: str, start_ms: int, end_ms: int) -> Dict:
-    q = f"""
-    SELECT
-        toInt64(min(exchange_ts)) AS min_ts,
-        toInt64(max(exchange_ts)) AS max_ts,
-        toInt64(count()) AS rows,
-        toInt64(countDistinct(toInt64(exchange_ts/1000))) AS secs_covered
-    FROM {table}
-    WHERE symbol = '{symbol}' AND exchange_ts BETWEEN {start_ms} AND {end_ms}
-    """
+    ts_field = _detect_timestamp_field(client, table)
+
+    # Convert milliseconds to appropriate filter based on field type
+    if ts_field == "ts":
+        # DateTime field: convert ms to seconds for toUnixTimestamp
+        start_sec = start_ms // 1000
+        end_sec = end_ms // 1000
+        q = f"""
+        SELECT
+            toInt64(toUnixTimestamp(min({ts_field})) * 1000) AS min_ts,
+            toInt64(toUnixTimestamp(max({ts_field})) * 1000) AS max_ts,
+            toInt64(count()) AS rows,
+            toInt64(countDistinct(toUnixTimestamp({ts_field}))) AS secs_covered
+        FROM {table}
+        WHERE symbol = '{symbol}'
+          AND toUnixTimestamp({ts_field}) BETWEEN {start_sec} AND {end_sec}
+        """
+    else:
+        # UInt64 field in milliseconds
+        q = f"""
+        SELECT
+            toInt64(min({ts_field})) AS min_ts,
+            toInt64(max({ts_field})) AS max_ts,
+            toInt64(count()) AS rows,
+            toInt64(countDistinct(toInt64({ts_field}/1000))) AS secs_covered
+        FROM {table}
+        WHERE symbol = '{symbol}' AND {ts_field} BETWEEN {start_ms} AND {end_ms}
+        """
+
     df = client.query_to_dataframe(q)
     total_secs = max(0, (end_ms // 1000) - (start_ms // 1000) + 1)
     if df is None or df.empty:
@@ -111,11 +148,22 @@ def compute_overlap_window(client: ClickHouseClient, tables: List[str], symbol: 
     """
     bounds: Dict[str, Dict[str, Optional[int]]] = {}
     for t in tables:
-        q = f"""
-        SELECT toInt64(min(exchange_ts)) AS min_ts, toInt64(max(exchange_ts)) AS max_ts
-        FROM {t}
-        WHERE symbol = '{symbol}'
-        """
+        ts_field = _detect_timestamp_field(client, t)
+
+        if ts_field == "ts":
+            q = f"""
+            SELECT toInt64(toUnixTimestamp(min({ts_field})) * 1000) AS min_ts,
+                   toInt64(toUnixTimestamp(max({ts_field})) * 1000) AS max_ts
+            FROM {t}
+            WHERE symbol = '{symbol}'
+            """
+        else:
+            q = f"""
+            SELECT toInt64(min({ts_field})) AS min_ts, toInt64(max({ts_field})) AS max_ts
+            FROM {t}
+            WHERE symbol = '{symbol}'
+            """
+
         df = client.query_to_dataframe(q)
         if df is None or df.empty:
             bounds[t] = {"min_ts": None, "max_ts": None}
@@ -206,7 +254,7 @@ def schema_dump(client: ClickHouseClient, tables: List[str]) -> Dict[str, List[D
 
 
 def find_tables_with_symbol(client: ClickHouseClient, symbol: str, tables: Optional[List[str]] = None) -> List[str]:
-    """Return tables that contain rows matching symbol or instId LIKE %symbol%.
+    """Return tables that contain rows matching symbol LIKE %symbol%.
 
     If tables is None, scan all tables (may be slow).
     """
@@ -214,9 +262,10 @@ def find_tables_with_symbol(client: ClickHouseClient, symbol: str, tables: Optio
         tables = list_tables(client)
     matched: List[str] = []
     for t in tables:
+        # Try symbol field only - instId is OKX specific
         sample_query = f"""
         SELECT count() cnt FROM {t}
-        WHERE (toString(symbol) LIKE '%{symbol}%' OR toString(instId) LIKE '%{symbol}%')
+        WHERE toString(symbol) LIKE '%{symbol}%'
         LIMIT 1
         """
         try:
@@ -263,14 +312,27 @@ def load_tests(client: ClickHouseClient, symbol: str, hours_back: int) -> Dict:
 
 
 def compare_range(client: ClickHouseClient, raw_table: str, feat_table: str, symbol: str) -> Dict:
-    qtpl = """
-    SELECT min(exchange_ts) AS min_ts, max(exchange_ts) AS max_ts, count() AS total_records,
-           (max(exchange_ts) - min(exchange_ts)) AS duration_ms
-    FROM {table}
-    WHERE symbol = '{symbol}'
-    """
-    raw = client.query_to_dataframe(qtpl.format(table=raw_table))
-    feat = client.query_to_dataframe(qtpl.format(table=feat_table))
+    def _build_query(table: str) -> str:
+        ts_field = _detect_timestamp_field(client, table)
+        if ts_field == "ts":
+            return f"""
+            SELECT toInt64(toUnixTimestamp(min({ts_field})) * 1000) AS min_ts,
+                   toInt64(toUnixTimestamp(max({ts_field})) * 1000) AS max_ts,
+                   count() AS total_records,
+                   toInt64(toUnixTimestamp(max({ts_field})) - toUnixTimestamp(min({ts_field}))) * 1000 AS duration_ms
+            FROM {table}
+            WHERE symbol = '{symbol}'
+            """
+        else:
+            return f"""
+            SELECT min({ts_field}) AS min_ts, max({ts_field}) AS max_ts, count() AS total_records,
+                   (max({ts_field}) - min({ts_field})) AS duration_ms
+            FROM {table}
+            WHERE symbol = '{symbol}'
+            """
+
+    raw = client.query_to_dataframe(_build_query(raw_table))
+    feat = client.query_to_dataframe(_build_query(feat_table))
     def _pack(df: Optional['pd.DataFrame']) -> Dict:
         if df is None or df.empty:
             return {"min_ts": None, "max_ts": None, "duration_hours": None, "total_records": 0}
@@ -323,8 +385,15 @@ def run_checks(
     specs: List[TableSpec]
     if tables:
         # Map table -> default required cols if known, else minimal set
+        # Use flexible timestamp field detection instead of hardcoding
         default_map = {s.name: s.required_cols for s in DEFAULT_SPECS}
-        specs = [TableSpec(name=t, required_cols=default_map.get(t, ["exchange_ts", "symbol"])) for t in tables]
+        specs = []
+        for t in tables:
+            if t in default_map:
+                specs.append(TableSpec(name=t, required_cols=default_map[t]))
+            else:
+                # For unknown tables, just check for 'symbol' - timestamp is auto-detected
+                specs.append(TableSpec(name=t, required_cols=["symbol"]))
     else:
         specs = DEFAULT_SPECS
 
@@ -372,12 +441,26 @@ def run_checks(
         gaps = []
         if top_gaps > 0 and cov["rows"] > 0:
             # 尝试取出存在数据的秒序列，计算缺口（仅在窗口不大时建议启用）
-            qsecs = f"""
-            SELECT DISTINCT toInt64(exchange_ts/1000) AS sec
-            FROM {spec.name}
-            WHERE symbol = '{symbol}' AND exchange_ts BETWEEN {start_ms} AND {end_ms}
-            ORDER BY sec
-            """
+            ts_field = _detect_timestamp_field(client, spec.name)
+            start_sec = start_ms // 1000
+            end_sec = end_ms // 1000
+
+            if ts_field == "ts":
+                qsecs = f"""
+                SELECT DISTINCT toInt64(toUnixTimestamp({ts_field})) AS sec
+                FROM {spec.name}
+                WHERE symbol = '{symbol}'
+                  AND toUnixTimestamp({ts_field}) BETWEEN {start_sec} AND {end_sec}
+                ORDER BY sec
+                """
+            else:
+                qsecs = f"""
+                SELECT DISTINCT toInt64({ts_field}/1000) AS sec
+                FROM {spec.name}
+                WHERE symbol = '{symbol}' AND {ts_field} BETWEEN {start_ms} AND {end_ms}
+                ORDER BY sec
+                """
+
             df_secs = client.query_to_dataframe(qsecs)
             if df_secs is not None and not df_secs.empty:
                 secs = df_secs["sec"].astype(int).tolist()

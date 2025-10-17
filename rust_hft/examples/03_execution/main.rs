@@ -14,7 +14,7 @@ fn main() {
         .init();
 
     let order_id = OrderId("DEMO-ORDER-1".to_string());
-    let symbol = Symbol("BTCUSDT".to_string());
+    let symbol = Symbol::new("BTCUSDT");
     let quantity = Quantity::from_f64(0.05).expect("可轉換數量");
     let venue = Some(VenueId::BINANCE);
 

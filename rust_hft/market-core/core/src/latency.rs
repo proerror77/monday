@@ -5,8 +5,10 @@
 //! - 零分配延遲統計
 //! - 階段式延遲鏈追蹤
 
+use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 微秒級時間戳
 pub type MicrosTimestamp = u64;
@@ -20,29 +22,83 @@ pub fn now_micros() -> MicrosTimestamp {
         .as_micros() as u64
 }
 
+static MONOTONIC_ORIGIN: OnceLock<Instant> = OnceLock::new();
+
+#[inline]
+pub fn monotonic_micros() -> MicrosTimestamp {
+    let origin = MONOTONIC_ORIGIN.get_or_init(Instant::now);
+    origin.elapsed().as_micros() as u64
+}
+
+#[inline]
+fn monotonic_now() -> Instant {
+    Instant::now()
+}
+
 /// 延遲階段定義
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LatencyStage {
+    /// WebSocket frame 接收（epoll 喚醒 → 緩衝前）
+    WsReceive,
+    /// JSON 解析完成
+    Parsing,
     /// 數據接入階段：從交易所接收到進入引擎
     Ingestion,
     /// 聚合階段：從原始數據到市場視圖
     Aggregation,
     /// 策略階段：從市場視圖到交易意圖
     Strategy,
-    /// 執行階段：從交易意圖到訂單發送
+    /// 風控階段：策略意圖的風控檢查
+    Risk,
+    /// 執行階段：從交易意圖到訂單排隊
     Execution,
-    /// 端到端：從接收到發送的完整鏈路
+    /// 訂單送出至交易所
+    Submission,
+    /// 端到端：從接收到發送的完整鏈路（兼容指標）
     EndToEnd,
 }
 
 impl LatencyStage {
+    /// 核心延遲階段（不含 EndToEnd 聚合）
+    pub const fn core_stages() -> [LatencyStage; 8] {
+        [
+            LatencyStage::WsReceive,
+            LatencyStage::Parsing,
+            LatencyStage::Ingestion,
+            LatencyStage::Aggregation,
+            LatencyStage::Strategy,
+            LatencyStage::Risk,
+            LatencyStage::Execution,
+            LatencyStage::Submission,
+        ]
+    }
+
+    /// 核心階段加上端到端聚合
+    pub const fn all_stages() -> [LatencyStage; 9] {
+        [
+            LatencyStage::WsReceive,
+            LatencyStage::Parsing,
+            LatencyStage::Ingestion,
+            LatencyStage::Aggregation,
+            LatencyStage::Strategy,
+            LatencyStage::Risk,
+            LatencyStage::Execution,
+            LatencyStage::Submission,
+            LatencyStage::EndToEnd,
+        ]
+    }
+
     /// 獲取階段名稱（用於指標標籤）
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::WsReceive => "ws_receive",
+            Self::Parsing => "parsing",
             Self::Ingestion => "ingestion",
             Self::Aggregation => "aggregation",
             Self::Strategy => "strategy",
+            Self::Risk => "risk",
             Self::Execution => "execution",
+            Self::Submission => "submission",
             Self::EndToEnd => "end_to_end",
         }
     }
@@ -90,8 +146,10 @@ impl LatencyMeasurement {
 pub struct LatencyTracker {
     /// 起始時間戳
     pub origin_time: MicrosTimestamp,
-    /// 各階段時間戳
-    pub stage_times: Vec<(LatencyStage, MicrosTimestamp)>,
+    #[serde(skip, default = "monotonic_now")]
+    origin_instant: Instant,
+    /// 各階段時間偏移（相對於起點，微秒）
+    pub stage_offsets: Vec<(LatencyStage, u64)>,
 }
 
 impl LatencyTracker {
@@ -99,7 +157,8 @@ impl LatencyTracker {
     pub fn new() -> Self {
         Self {
             origin_time: now_micros(),
-            stage_times: Vec::new(),
+            origin_instant: Instant::now(),
+            stage_offsets: Vec::new(),
         }
     }
 
@@ -107,67 +166,75 @@ impl LatencyTracker {
     pub fn from_time(origin_time: MicrosTimestamp) -> Self {
         Self {
             origin_time,
-            stage_times: Vec::new(),
+            origin_instant: Instant::now(),
+            stage_offsets: Vec::new(),
+        }
+    }
+
+    /// 從 monotonic 時刻開始追蹤（例如 WsFrameMetrics）
+    pub fn from_monotonic(origin_micros: MicrosTimestamp) -> Self {
+        let now_mono = monotonic_micros();
+        let delta = now_mono.saturating_sub(origin_micros);
+        let origin_instant = Instant::now() - Duration::from_micros(delta);
+        let origin_wall = now_micros().saturating_sub(delta);
+        Self {
+            origin_time: origin_wall,
+            origin_instant,
+            stage_offsets: Vec::new(),
         }
     }
 
     /// 記錄階段時間點
     pub fn record_stage(&mut self, stage: LatencyStage) {
-        let now = now_micros();
-        self.stage_times.push((stage, now));
+        let now = Instant::now();
+        let offset = now
+            .saturating_duration_since(self.origin_instant)
+            .as_micros() as u64;
+        self.stage_offsets.push((stage, offset));
+    }
+
+    /// 以指定偏移（微秒）記錄階段
+    pub fn record_stage_with_offset(&mut self, stage: LatencyStage, offset_micros: u64) {
+        self.stage_offsets.push((stage, offset_micros));
     }
 
     /// 獲取指定階段的延遲測量
     pub fn get_measurement(&self, stage: LatencyStage) -> Option<LatencyMeasurement> {
-        // 找到該階段的時間戳
-        let stage_time = self
-            .stage_times
-            .iter()
-            .find(|(s, _)| *s == stage)
-            .map(|(_, t)| *t)?;
+        let stage_idx = self.stage_offsets.iter().position(|(s, _)| *s == stage)?;
 
-        // 找到前一個階段的時間戳，如果沒有則使用起始時間
-        let prev_time =
-            if let Some(stage_idx) = self.stage_times.iter().position(|(s, _)| *s == stage) {
-                if stage_idx == 0 {
-                    self.origin_time
-                } else {
-                    self.stage_times[stage_idx - 1].1
-                }
-            } else {
-                return None;
-            };
+        let stage_offset = self.stage_offsets[stage_idx].1;
+        let prev_offset = if stage_idx == 0 {
+            0
+        } else {
+            self.stage_offsets[stage_idx - 1].1
+        };
 
-        Some(LatencyMeasurement::new(stage, prev_time, stage_time))
+        let start_time = self.origin_time.saturating_add(prev_offset);
+        let end_time = self.origin_time.saturating_add(stage_offset);
+
+        Some(LatencyMeasurement::new(stage, start_time, end_time))
     }
 
     /// 獲取端到端延遲
     pub fn get_end_to_end(&self) -> Option<LatencyMeasurement> {
-        let last_time = self.stage_times.last()?.1;
+        let last_offset = self.stage_offsets.last()?.1;
         Some(LatencyMeasurement::new(
             LatencyStage::EndToEnd,
             self.origin_time,
-            last_time,
+            self.origin_time.saturating_add(last_offset),
         ))
     }
 
     /// 獲取所有階段的延遲測量
     pub fn get_all_measurements(&self) -> Vec<LatencyMeasurement> {
-        let mut measurements = Vec::new();
+        let mut measurements = Vec::with_capacity(self.stage_offsets.len() + 1);
 
-        // 各階段延遲
-        for &stage in &[
-            LatencyStage::Ingestion,
-            LatencyStage::Aggregation,
-            LatencyStage::Strategy,
-            LatencyStage::Execution,
-        ] {
-            if let Some(measurement) = self.get_measurement(stage) {
+        for (stage, _) in &self.stage_offsets {
+            if let Some(measurement) = self.get_measurement(*stage) {
                 measurements.push(measurement);
             }
         }
 
-        // 端到端延遲
         if let Some(end_to_end) = self.get_end_to_end() {
             measurements.push(end_to_end);
         }
@@ -186,10 +253,14 @@ impl Default for LatencyTracker {
 #[derive(Debug, Default)]
 pub struct LatencyStats {
     /// 各階段延遲統計（微秒）
+    pub ws_receive_micros: Vec<u64>,
+    pub parsing_micros: Vec<u64>,
     pub ingestion_micros: Vec<u64>,
     pub aggregation_micros: Vec<u64>,
     pub strategy_micros: Vec<u64>,
+    pub risk_micros: Vec<u64>,
     pub execution_micros: Vec<u64>,
+    pub submission_micros: Vec<u64>,
     pub end_to_end_micros: Vec<u64>,
 }
 
@@ -203,10 +274,14 @@ impl LatencyStats {
     pub fn add_measurement(&mut self, measurement: &LatencyMeasurement) {
         let micros = measurement.latency_micros();
         match measurement.stage {
+            LatencyStage::WsReceive => self.ws_receive_micros.push(micros),
+            LatencyStage::Parsing => self.parsing_micros.push(micros),
             LatencyStage::Ingestion => self.ingestion_micros.push(micros),
             LatencyStage::Aggregation => self.aggregation_micros.push(micros),
             LatencyStage::Strategy => self.strategy_micros.push(micros),
+            LatencyStage::Risk => self.risk_micros.push(micros),
             LatencyStage::Execution => self.execution_micros.push(micros),
+            LatencyStage::Submission => self.submission_micros.push(micros),
             LatencyStage::EndToEnd => self.end_to_end_micros.push(micros),
         }
     }
@@ -221,10 +296,14 @@ impl LatencyStats {
     /// 獲取指定階段的統計信息
     pub fn get_stage_stats(&self, stage: LatencyStage) -> LatencyStageStats {
         let samples = match stage {
+            LatencyStage::WsReceive => &self.ws_receive_micros,
+            LatencyStage::Parsing => &self.parsing_micros,
             LatencyStage::Ingestion => &self.ingestion_micros,
             LatencyStage::Aggregation => &self.aggregation_micros,
             LatencyStage::Strategy => &self.strategy_micros,
+            LatencyStage::Risk => &self.risk_micros,
             LatencyStage::Execution => &self.execution_micros,
+            LatencyStage::Submission => &self.submission_micros,
             LatencyStage::EndToEnd => &self.end_to_end_micros,
         };
 
@@ -284,6 +363,33 @@ impl LatencyStageStats {
             p99_micros,
         }
     }
+
+    /// 從 HDR Histogram 對象產生統計信息
+    pub fn from_histogram(stage: LatencyStage, histogram: &Histogram<u64>) -> Self {
+        if histogram.is_empty() {
+            return Self {
+                stage,
+                count: 0,
+                min_micros: 0,
+                max_micros: 0,
+                mean_micros: 0.0,
+                p50_micros: 0,
+                p95_micros: 0,
+                p99_micros: 0,
+            };
+        }
+
+        Self {
+            stage,
+            count: histogram.len(),
+            min_micros: histogram.min(),
+            max_micros: histogram.max(),
+            mean_micros: histogram.mean(),
+            p50_micros: histogram.value_at_quantile(0.5),
+            p95_micros: histogram.value_at_quantile(0.95),
+            p99_micros: histogram.value_at_quantile(0.99),
+        }
+    }
 }
 
 /// 計算百分位數
@@ -305,9 +411,11 @@ mod tests {
     #[test]
     fn test_latency_tracker() {
         let mut tracker = LatencyTracker::new();
-        let start_time = tracker.origin_time;
 
         // 模擬各階段處理
+        tracker.record_stage(LatencyStage::WsReceive);
+        thread::sleep(Duration::from_millis(1));
+        tracker.record_stage(LatencyStage::Parsing);
         thread::sleep(Duration::from_millis(1));
         tracker.record_stage(LatencyStage::Ingestion);
 
@@ -318,7 +426,13 @@ mod tests {
         tracker.record_stage(LatencyStage::Strategy);
 
         thread::sleep(Duration::from_millis(1));
+        tracker.record_stage(LatencyStage::Risk);
+
+        thread::sleep(Duration::from_millis(1));
         tracker.record_stage(LatencyStage::Execution);
+
+        thread::sleep(Duration::from_millis(1));
+        tracker.record_stage(LatencyStage::Submission);
 
         // 檢查測量結果
         let ingestion = tracker.get_measurement(LatencyStage::Ingestion).unwrap();
@@ -326,12 +440,12 @@ mod tests {
         assert!(ingestion.latency_micros() < 5000); // 小於 5ms
 
         let end_to_end = tracker.get_end_to_end().unwrap();
-        assert!(end_to_end.latency_micros() > 2000); // 至少 2ms
-        assert!(end_to_end.latency_micros() < 20000); // 小於 20ms
+        assert!(end_to_end.latency_micros() > 4000); // 至少 4ms
+        assert!(end_to_end.latency_micros() < 40000); // 小於 40ms
 
         // 檢查所有測量結果
         let all_measurements = tracker.get_all_measurements();
-        assert_eq!(all_measurements.len(), 5); // 4個階段 + 端到端
+        assert_eq!(all_measurements.len(), 9); // 8 個階段 + 端到端
     }
 
     #[test]
@@ -357,5 +471,20 @@ mod tests {
         assert!(stage_stats.p50_micros >= 500 && stage_stats.p50_micros <= 510);
         assert!(stage_stats.p95_micros >= 940 && stage_stats.p95_micros <= 960);
         assert!(stage_stats.p99_micros >= 980 && stage_stats.p99_micros <= 1000);
+    }
+
+    #[test]
+    fn test_manual_stage_offsets() {
+        let mut tracker = LatencyTracker::from_monotonic(10_000);
+        tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+        tracker.record_stage_with_offset(LatencyStage::Parsing, 150);
+
+        // 後續階段使用實時計算
+        tracker.record_stage(LatencyStage::Ingestion);
+
+        let parsing = tracker
+            .get_measurement(LatencyStage::Parsing)
+            .expect("parsing measurement");
+        assert_eq!(parsing.duration_micros, 150);
     }
 }

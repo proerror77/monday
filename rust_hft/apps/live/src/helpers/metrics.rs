@@ -74,12 +74,14 @@ async fn generate_basic_metrics(engine_arc: Arc<Mutex<Engine>>) -> String {
         let _ = writeln!(
             position_lines,
             "hft_position_quantity{{symbol=\"{}\"}} {}",
-            sym.0, pos.quantity.0
+            sym.as_str(),
+            pos.quantity.0
         );
         let _ = writeln!(
             position_lines,
             "hft_position_avg_price{{symbol=\"{}\"}} {}",
-            sym.0, pos.avg_price.0
+            sym.as_str(),
+            pos.avg_price.0
         );
     }
 

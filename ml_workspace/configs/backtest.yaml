@@ -1,0 +1,35 @@
+# DL Backtest Configuration
+# Usage: python cli.py backtest dl --config configs/backtest.yaml
+
+# Model path
+model: ./models/dl_model_20251008.pt
+
+# ClickHouse connection
+host: ${CLICKHOUSE_HOST}
+user: ${CLICKHOUSE_USERNAME}
+password: ${CLICKHOUSE_PASSWORD}
+database: ${CLICKHOUSE_DATABASE}
+
+# Backtest parameters
+symbol: WLFIUSDT
+start: 2025-09-03T00:00:00Z
+end: 2025-09-05T23:59:59Z
+horizon: 5  # prediction horizon in minutes
+
+# Trading parameters
+initial_capital: 10000.0
+position_size_pct: 0.1  # 10% of capital per trade
+max_positions: 3
+stop_loss_pct: 0.02  # 2% stop loss
+take_profit_pct: 0.05  # 5% take profit
+
+# Transaction costs
+maker_fee: 0.0002  # 0.02%
+taker_fee: 0.0006  # 0.06%
+slippage_bps: 5    # 5 basis points
+
+# Output files
+trades_output: ./results/trades.json
+equity_curve_plot: ./results/equity.png
+summary_output: ./results/summary.json
+detailed_log: ./logs/backtest.log

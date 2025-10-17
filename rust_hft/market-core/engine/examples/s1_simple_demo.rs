@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_config = EngineConfig {
         ingestion: ingestion_config.clone(),
         max_events_per_cycle: 50,
-        aggregation_symbols: vec![Symbol("BTCUSDT".to_string())],
+        aggregation_symbols: vec![Symbol::new("BTCUSDT")],
     };
 
     let mut engine = Engine::new(engine_config);
@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. 創建 Bitget Adapter
     println!("📡 正在創建 Bitget 適配器...");
     let bitget_stream = BitgetMarketStream::new();
-    let symbols = vec![Symbol("BTCUSDT".to_string())];
+    let symbols = vec![Symbol::new("BTCUSDT")];
 
     let consumer = match adapter_bridge.bridge_stream(bitget_stream, symbols).await {
         Ok(consumer) => {

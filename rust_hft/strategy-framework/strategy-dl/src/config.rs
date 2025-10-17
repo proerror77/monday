@@ -89,7 +89,7 @@ impl Default for DlStrategyConfig {
     fn default() -> Self {
         Self {
             name: "dl_strategy_default".to_string(),
-            symbols: vec![Symbol("BTCUSDT".to_string())],
+            symbols: vec![Symbol::new("BTCUSDT")],
             model: ModelConfig::default(),
             features: FeatureConfig::default(),
             inference: InferenceConfig::default(),

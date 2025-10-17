@@ -55,8 +55,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for strategy in &config.strategies {
         println!("策略 '{}' ({:?}) 訂閱符號:", strategy.name, strategy.strategy_type);
         for symbol in &strategy.symbols {
-            found_symbols.insert(symbol.0.as_str());
-            println!("  - {}", symbol.0);
+            found_symbols.insert(symbol.as_str());
+            println!("  - {}", symbol.as_str());
         }
     }
 

@@ -14,13 +14,12 @@
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use hft_core::{now_micros, HftError, HftResult, Symbol, VenueId};
+use integration::http::{HttpClient, HttpClientConfig};
 use ports::{
     BookLevel, BookUpdate, BoxStream, ConnectionHealth, MarketEvent, MarketSnapshot, MarketStream,
 };
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
-use integration::http::{HttpClient, HttpClientConfig};
 
 #[derive(Clone, Debug, Default)]
 struct InstrumentSpec {
@@ -57,40 +56,104 @@ async fn fetch_instruments_spec() -> std::collections::HashMap<String, Instrumen
     };
     let mut map = std::collections::HashMap::new();
     // POST full/v1/all_instruments with empty body
-    let resp = match client.post("/full/v1/all_instruments", None, &serde_json::json!({})).await {
+    let resp = match client
+        .post("/full/v1/all_instruments", None, &serde_json::json!({}))
+        .await
+    {
         Ok(r) => r,
         Err(_) => return map,
     };
-    let text = match resp.text().await { Ok(t) => t, Err(_) => return map };
-    let v: serde_json::Value = match serde_json::from_str(&text) { Ok(x) => x, Err(_) => return map };
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(_) => return map,
+    };
+    let mut bytes = text.into_bytes();
+    let v: serde_json::Value = match simd_json::serde::from_slice(bytes.as_mut_slice()) {
+        Ok(x) => x,
+        Err(_) => return map,
+    };
     // 嘗試解析為陣列或物件含陣列
-    let arr_opt = if let Some(a) = v.as_array() { Some(a.clone()) } else { v.get("instruments").and_then(|x| x.as_array()).cloned() };
+    let arr_opt = if let Some(a) = v.as_array() {
+        Some(a.clone())
+    } else {
+        v.get("instruments").and_then(|x| x.as_array()).cloned()
+    };
     if let Some(arr) = arr_opt {
         for it in arr {
             // instrument 名稱
-            let name = it.get("instrument").and_then(|x| x.as_str())
+            let name = it
+                .get("instrument")
+                .and_then(|x| x.as_str())
                 .or_else(|| it.get("name").and_then(|x| x.as_str()))
                 .unwrap_or("");
-            if name.is_empty() { continue; }
+            if name.is_empty() {
+                continue;
+            }
             // 嘗試多種鍵名
-            let tick = it.get("tick_size").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| it.get("price_increment").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()))
-                .or_else(|| it.get("min_price_increment").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()))
-                .or_else(|| it.get("tick").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()));
-            let lot = it.get("lot_size").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| it.get("size_increment").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()))
-                .or_else(|| it.get("quantity_increment").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()))
-                .or_else(|| it.get("step_size").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()));
-            let min_notional = it.get("min_notional").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| it.get("min_order_value").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok()));
-            map.insert(name.to_string(), InstrumentSpec { tick_size: tick, lot_size: lot, min_notional });
+            let tick = it
+                .get("tick_size")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| {
+                    it.get("price_increment")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                })
+                .or_else(|| {
+                    it.get("min_price_increment")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                })
+                .or_else(|| {
+                    it.get("tick")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                });
+            let lot = it
+                .get("lot_size")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| {
+                    it.get("size_increment")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                })
+                .or_else(|| {
+                    it.get("quantity_increment")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                })
+                .or_else(|| {
+                    it.get("step_size")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                });
+            let min_notional = it
+                .get("min_notional")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| {
+                    it.get("min_order_value")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                });
+            map.insert(
+                name.to_string(),
+                InstrumentSpec {
+                    tick_size: tick,
+                    lot_size: lot,
+                    min_notional,
+                },
+            );
         }
     }
     map
 }
 
 fn round_to_step(v: f64, step: f64) -> f64 {
-    if step <= 0.0 { return v; }
+    if step <= 0.0 {
+        return v;
+    }
     (v / step).round() * step
 }
 
@@ -169,7 +232,8 @@ impl MarketStream for GrvtMarketStream {
         }
 
         let ws_url = grvt_ws_url()?;
-        let streams_env = std::env::var("GRVT_FEED_STREAM").unwrap_or_else(|_| "v1.book.s".to_string());
+        let streams_env =
+            std::env::var("GRVT_FEED_STREAM").unwrap_or_else(|_| "v1.book.s".to_string());
         let streams: Vec<String> = streams_env
             .split(',')
             .map(|s| s.trim().to_string())
@@ -184,8 +248,14 @@ impl MarketStream for GrvtMarketStream {
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(50);
-        let ticker_rate = std::env::var("GRVT_TICKER_RATE").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(500);
-        let trade_limit = std::env::var("GRVT_TRADE_LIMIT").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(500);
+        let ticker_rate = std::env::var("GRVT_TICKER_RATE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(500);
+        let trade_limit = std::env::var("GRVT_TRADE_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(500);
 
         // 為每個 stream 構建對應 selectors
         let symbols_clone = symbols.clone();
@@ -193,7 +263,7 @@ impl MarketStream for GrvtMarketStream {
             symbols_clone
                 .iter()
                 .map(|s| {
-                    let ins = to_grvt_instrument(&s.0);
+                    let ins = to_grvt_instrument(s.as_str());
                     match stream_name {
                         "v1.book.s" => format!("{}@{}-{}", ins, book_rate, depth),
                         "v1.book.d" => format!("{}@{}", ins, book_rate),
@@ -242,13 +312,15 @@ impl MarketStream for GrvtMarketStream {
             while let Some(msg) = socket.next().await {
                 match msg {
                     Ok(Message::Text(txt)) => {
-                        let v: serde_json::Value = match serde_json::from_str(&txt) {
-                            Ok(x) => x,
-                            Err(e) => {
-                                let _ = tx.send(Err(HftError::Serialization(e.to_string())));
-                                continue;
-                            }
-                        };
+                        let mut bytes = txt.into_bytes();
+                        let v: serde_json::Value =
+                            match simd_json::serde::from_slice(bytes.as_mut_slice()) {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    let _ = tx.send(Err(HftError::Serialization(e.to_string())));
+                                    continue;
+                                }
+                            };
 
                         // 訂閱回覆包裝：有 result/stream/subs
                         if v.get("result").is_some() && v.get("method").is_some() {
@@ -290,17 +362,41 @@ impl MarketStream for GrvtMarketStream {
                             // 反向映射 selector 的 instrument -> symbol，用 @ 前的 primary
                             let inst = selector.split('@').next().unwrap_or("");
                             // 嘗試還原 base/quote：僅做最小處理
-                            let symbol = Symbol(inst.replace('_', "").replace("Perp", ""));
+                            let symbol = Symbol::from(inst.replace('_', "").replace("Perp", ""));
 
                             // 動態四捨五入
                             if let Some(spec) = specs_clone.get(inst) {
                                 if let Some(tsz) = spec.tick_size {
-                                    for lvl in &mut bids { if let Some(px) = lvl.price.to_f64() { lvl.price = hft_core::Price::from_f64(round_to_step(px, tsz)).unwrap(); } }
-                                    for lvl in &mut asks { if let Some(px) = lvl.price.to_f64() { lvl.price = hft_core::Price::from_f64(round_to_step(px, tsz)).unwrap(); } }
+                                    for lvl in &mut bids {
+                                        if let Some(px) = lvl.price.to_f64() {
+                                            lvl.price =
+                                                hft_core::Price::from_f64(round_to_step(px, tsz))
+                                                    .unwrap();
+                                        }
+                                    }
+                                    for lvl in &mut asks {
+                                        if let Some(px) = lvl.price.to_f64() {
+                                            lvl.price =
+                                                hft_core::Price::from_f64(round_to_step(px, tsz))
+                                                    .unwrap();
+                                        }
+                                    }
                                 }
                                 if let Some(ls) = spec.lot_size {
-                                    for lvl in &mut bids { if let Some(q) = lvl.quantity.to_f64() { lvl.quantity = hft_core::Quantity::from_f64(round_to_step(q, ls)).unwrap(); } }
-                                    for lvl in &mut asks { if let Some(q) = lvl.quantity.to_f64() { lvl.quantity = hft_core::Quantity::from_f64(round_to_step(q, ls)).unwrap(); } }
+                                    for lvl in &mut bids {
+                                        if let Some(q) = lvl.quantity.to_f64() {
+                                            lvl.quantity =
+                                                hft_core::Quantity::from_f64(round_to_step(q, ls))
+                                                    .unwrap();
+                                        }
+                                    }
+                                    for lvl in &mut asks {
+                                        if let Some(q) = lvl.quantity.to_f64() {
+                                            lvl.quantity =
+                                                hft_core::Quantity::from_f64(round_to_step(q, ls))
+                                                    .unwrap();
+                                        }
+                                    }
                                 }
                             }
 
@@ -314,57 +410,163 @@ impl MarketStream for GrvtMarketStream {
                             };
                             let _ = tx.send(Ok(MarketEvent::Snapshot(snapshot)));
                         } else if stream_name.starts_with("v1.book.d") {
-                            let bids_v = feed.get("bids").cloned().or_else(|| feed.get("b").cloned()).unwrap_or(serde_json::Value::Null);
-                            let asks_v = feed.get("asks").cloned().or_else(|| feed.get("a").cloned()).unwrap_or(serde_json::Value::Null);
-                            let ts = feed.get("event_time").and_then(|x| x.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(now_micros);
+                            let bids_v = feed
+                                .get("bids")
+                                .cloned()
+                                .or_else(|| feed.get("b").cloned())
+                                .unwrap_or(serde_json::Value::Null);
+                            let asks_v = feed
+                                .get("asks")
+                                .cloned()
+                                .or_else(|| feed.get("a").cloned())
+                                .unwrap_or(serde_json::Value::Null);
+                            let ts = feed
+                                .get("event_time")
+                                .and_then(|x| x.as_str())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or_else(now_micros);
                             let mut bids = parse_book_levels(&bids_v);
                             let mut asks = parse_book_levels(&asks_v);
                             let inst = selector.split('@').next().unwrap_or("");
-                            let symbol = Symbol(inst.replace('_', "").replace("Perp", ""));
+                            let symbol = Symbol::from(inst.replace('_', "").replace("Perp", ""));
                             if let Some(spec) = specs_clone.get(inst) {
                                 if let Some(tsz) = spec.tick_size {
-                                    for lvl in &mut bids { if let Some(px) = lvl.price.to_f64() { lvl.price = hft_core::Price::from_f64(round_to_step(px, tsz)).unwrap(); } }
-                                    for lvl in &mut asks { if let Some(px) = lvl.price.to_f64() { lvl.price = hft_core::Price::from_f64(round_to_step(px, tsz)).unwrap(); } }
+                                    for lvl in &mut bids {
+                                        if let Some(px) = lvl.price.to_f64() {
+                                            lvl.price =
+                                                hft_core::Price::from_f64(round_to_step(px, tsz))
+                                                    .unwrap();
+                                        }
+                                    }
+                                    for lvl in &mut asks {
+                                        if let Some(px) = lvl.price.to_f64() {
+                                            lvl.price =
+                                                hft_core::Price::from_f64(round_to_step(px, tsz))
+                                                    .unwrap();
+                                        }
+                                    }
                                 }
                                 if let Some(ls) = spec.lot_size {
-                                    for lvl in &mut bids { if let Some(q) = lvl.quantity.to_f64() { lvl.quantity = hft_core::Quantity::from_f64(round_to_step(q, ls)).unwrap(); } }
-                                    for lvl in &mut asks { if let Some(q) = lvl.quantity.to_f64() { lvl.quantity = hft_core::Quantity::from_f64(round_to_step(q, ls)).unwrap(); } }
+                                    for lvl in &mut bids {
+                                        if let Some(q) = lvl.quantity.to_f64() {
+                                            lvl.quantity =
+                                                hft_core::Quantity::from_f64(round_to_step(q, ls))
+                                                    .unwrap();
+                                        }
+                                    }
+                                    for lvl in &mut asks {
+                                        if let Some(q) = lvl.quantity.to_f64() {
+                                            lvl.quantity =
+                                                hft_core::Quantity::from_f64(round_to_step(q, ls))
+                                                    .unwrap();
+                                        }
+                                    }
                                 }
                             }
-                            let upd = BookUpdate { symbol, timestamp: ts, bids, asks, sequence, is_snapshot: false, source_venue: Some(VenueId::GRVT) };
+                            let upd = BookUpdate {
+                                symbol,
+                                timestamp: ts,
+                                bids,
+                                asks,
+                                sequence,
+                                is_snapshot: false,
+                                source_venue: Some(VenueId::GRVT),
+                            };
                             let _ = tx.send(Ok(MarketEvent::Update(upd)));
                         } else if stream_name.starts_with("v1.ticker.") {
                             // 以 ticker 的頂檔生成輕量級 BookUpdate
-                            let ts = feed.get("event_time").and_then(|x| x.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or_else(now_micros);
-                            let bb_px = feed.get("best_bid_price").and_then(|x| x.as_str()).or_else(|| feed.get("bb").and_then(|x| x.as_str()));
-                            let bb_sz = feed.get("best_bid_size").and_then(|x| x.as_str()).or_else(|| feed.get("bb1").and_then(|x| x.as_str()));
-                            let ba_px = feed.get("best_ask_price").and_then(|x| x.as_str()).or_else(|| feed.get("ba").and_then(|x| x.as_str()));
-                            let ba_sz = feed.get("best_ask_size").and_then(|x| x.as_str()).or_else(|| feed.get("ba1").and_then(|x| x.as_str()));
+                            let ts = feed
+                                .get("event_time")
+                                .and_then(|x| x.as_str())
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .unwrap_or_else(now_micros);
+                            let bb_px = feed
+                                .get("best_bid_price")
+                                .and_then(|x| x.as_str())
+                                .or_else(|| feed.get("bb").and_then(|x| x.as_str()));
+                            let bb_sz = feed
+                                .get("best_bid_size")
+                                .and_then(|x| x.as_str())
+                                .or_else(|| feed.get("bb1").and_then(|x| x.as_str()));
+                            let ba_px = feed
+                                .get("best_ask_price")
+                                .and_then(|x| x.as_str())
+                                .or_else(|| feed.get("ba").and_then(|x| x.as_str()));
+                            let ba_sz = feed
+                                .get("best_ask_size")
+                                .and_then(|x| x.as_str())
+                                .or_else(|| feed.get("ba1").and_then(|x| x.as_str()));
                             let mut bids = Vec::new();
                             let mut asks = Vec::new();
-                            if let (Some(px), Some(sz)) = (bb_px, bb_sz) { if let (Ok(p), Ok(q)) = (px.parse::<f64>(), sz.parse::<f64>()) { bids.push(BookLevel::new_unchecked(p, q)); } }
-                            if let (Some(px), Some(sz)) = (ba_px, ba_sz) { if let (Ok(p), Ok(q)) = (px.parse::<f64>(), sz.parse::<f64>()) { asks.push(BookLevel::new_unchecked(p, q)); } }
-                            let inst = selector.split('@').next().unwrap_or("");
-                            let symbol = Symbol(inst.replace('_', "").replace("Perp", ""));
-                            if let Some(spec) = specs_clone.get(inst) {
-                                if let Some(tsz) = spec.tick_size {
-                                    for lvl in &mut bids { if let Some(px) = lvl.price.to_f64() { lvl.price = hft_core::Price::from_f64(round_to_step(px, tsz)).unwrap(); } }
-                                    for lvl in &mut asks { if let Some(px) = lvl.price.to_f64() { lvl.price = hft_core::Price::from_f64(round_to_step(px, tsz)).unwrap(); } }
-                                }
-                                if let Some(ls) = spec.lot_size {
-                                    for lvl in &mut bids { if let Some(q) = lvl.quantity.to_f64() { lvl.quantity = hft_core::Quantity::from_f64(round_to_step(q, ls)).unwrap(); } }
-                                    for lvl in &mut asks { if let Some(q) = lvl.quantity.to_f64() { lvl.quantity = hft_core::Quantity::from_f64(round_to_step(q, ls)).unwrap(); } }
+                            if let (Some(px), Some(sz)) = (bb_px, bb_sz) {
+                                if let (Ok(p), Ok(q)) = (px.parse::<f64>(), sz.parse::<f64>()) {
+                                    bids.push(BookLevel::new_unchecked(p, q));
                                 }
                             }
-                            let upd = BookUpdate { symbol, timestamp: ts, bids, asks, sequence, is_snapshot: false, source_venue: Some(VenueId::GRVT) };
+                            if let (Some(px), Some(sz)) = (ba_px, ba_sz) {
+                                if let (Ok(p), Ok(q)) = (px.parse::<f64>(), sz.parse::<f64>()) {
+                                    asks.push(BookLevel::new_unchecked(p, q));
+                                }
+                            }
+                            let inst = selector.split('@').next().unwrap_or("");
+                            let symbol = Symbol::from(inst.replace('_', "").replace("Perp", ""));
+                            if let Some(spec) = specs_clone.get(inst) {
+                                if let Some(tsz) = spec.tick_size {
+                                    for lvl in &mut bids {
+                                        if let Some(px) = lvl.price.to_f64() {
+                                            lvl.price =
+                                                hft_core::Price::from_f64(round_to_step(px, tsz))
+                                                    .unwrap();
+                                        }
+                                    }
+                                    for lvl in &mut asks {
+                                        if let Some(px) = lvl.price.to_f64() {
+                                            lvl.price =
+                                                hft_core::Price::from_f64(round_to_step(px, tsz))
+                                                    .unwrap();
+                                        }
+                                    }
+                                }
+                                if let Some(ls) = spec.lot_size {
+                                    for lvl in &mut bids {
+                                        if let Some(q) = lvl.quantity.to_f64() {
+                                            lvl.quantity =
+                                                hft_core::Quantity::from_f64(round_to_step(q, ls))
+                                                    .unwrap();
+                                        }
+                                    }
+                                    for lvl in &mut asks {
+                                        if let Some(q) = lvl.quantity.to_f64() {
+                                            lvl.quantity =
+                                                hft_core::Quantity::from_f64(round_to_step(q, ls))
+                                                    .unwrap();
+                                        }
+                                    }
+                                }
+                            }
+                            let upd = BookUpdate {
+                                symbol,
+                                timestamp: ts,
+                                bids,
+                                asks,
+                                sequence,
+                                is_snapshot: false,
+                                source_venue: Some(VenueId::GRVT),
+                            };
                             let _ = tx.send(Ok(MarketEvent::Update(upd)));
                         } else if stream_name == "v1.trade" || stream_name.starts_with("v1.trade") {
                             let inst = selector.split('@').next().unwrap_or("");
-                            let symbol = Symbol(inst.replace('_', "").replace("Perp", ""));
+                            let symbol = Symbol::from(inst.replace('_', "").replace("Perp", ""));
                             if let Some(arr) = feed.as_array() {
-                                for t in arr { if let Some(ev) = parse_trade_obj(t, &symbol) { let _ = tx.send(Ok(ev)); } }
+                                for t in arr {
+                                    if let Some(ev) = parse_trade_obj(t, &symbol) {
+                                        let _ = tx.send(Ok(ev));
+                                    }
+                                }
                             } else {
-                                if let Some(ev) = parse_trade_obj(&feed, &symbol) { let _ = tx.send(Ok(ev)); }
+                                if let Some(ev) = parse_trade_obj(&feed, &symbol) {
+                                    let _ = tx.send(Ok(ev));
+                                }
                             }
                         } else {
                             // 其他 stream 暫不處理
@@ -416,7 +618,11 @@ fn parse_trade_obj(obj: &serde_json::Value, symbol: &Symbol) -> Option<MarketEve
         .get("event_time")
         .and_then(|x| x.as_str())
         .and_then(|s| s.parse::<u64>().ok())
-        .or_else(|| obj.get("et").and_then(|x| x.as_str()).and_then(|s| s.parse::<u64>().ok()))
+        .or_else(|| {
+            obj.get("et")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<u64>().ok())
+        })
         .unwrap_or_else(now_micros);
     let price = obj
         .get("price")

@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_config = EngineConfig {
         ingestion: ingestion_config.clone(),
         max_events_per_cycle: 100,
-        aggregation_symbols: vec![Symbol(config.symbol.clone())],
+        aggregation_symbols: vec![Symbol::from(config.symbol.clone())],
     };
 
     let mut engine = Engine::new(engine_config);
@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. 創建並連接 Bitget Adapter
     info!("📡 正在初始化 Bitget WebSocket 適配器...");
     let bitget_stream = BitgetMarketStream::new();
-    let symbols = vec![Symbol(config.symbol.clone())];
+    let symbols = vec![Symbol::from(config.symbol.clone())];
 
     let consumer = match adapter_bridge.bridge_stream(bitget_stream, symbols).await {
         Ok(consumer) => {
@@ -165,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         {
                                             info!(
                                                 "   {} - 最佳買: {:.4}, 最佳賣: {:.4}, 價差: {:.2}bps",
-                                                vs.symbol.0,
+                                                vs.symbol.as_str(),
                                                 best_bid.0.to_f64().unwrap_or(0.0),
                                                 best_ask.0.to_f64().unwrap_or(0.0),
                                                 spread_bps.0.to_f64().unwrap_or(0.0)

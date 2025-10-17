@@ -1,4 +1,7 @@
-use super::{bitget_futures_pairs, bitget_spot_pairs, Exchange, ExchangeContext, MessageBuffers};
+use super::{
+    bitget_futures_pairs, bitget_spot_pairs, Exchange, ExchangeContext, MessageBuffers,
+    StreamDiagnostics,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::prelude::*;
@@ -8,6 +11,27 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BitgetChannelKind {
+    Trades,
+    Depth,
+    Quote,
+    Other,
+}
+
+fn classify_bitget_channel(channel: &str) -> BitgetChannelKind {
+    let lower = channel.to_ascii_lowercase();
+    if lower.contains("trade") {
+        BitgetChannelKind::Trades
+    } else if lower.starts_with("books") || lower.starts_with("depth") {
+        BitgetChannelKind::Depth
+    } else if lower.contains("ticker") {
+        BitgetChannelKind::Quote
+    } else {
+        BitgetChannelKind::Other
+    }
+}
 
 pub struct BitgetExchange {
     ob: RwLock<HashMap<String, OrderBookState>>, // 內存訂單簿狀態
@@ -911,12 +935,15 @@ impl Exchange for BitgetExchange {
         // 策略建議：
         // - 期货：books（增量）+ books1（L1快照）組合，適合高頻交易
         // - 现货：books5（5檔快照）平衡數據量和深度
+        let profile = self.ctx.profile("bitget");
         let market = self
             .forced_market
             .clone()
             .unwrap_or_else(|| "SPOT".to_string());
         let default_channels = match market.as_str() {
-            "USDT-FUTURES" | "COIN-FUTURES" | "USDC-FUTURES" => "books,books1,publicTrade,ticker",
+            // 永續：使用增量 books + L1 ticker + 成交；books1 會觸發 30001 錯誤
+            "USDT-FUTURES" | "COIN-FUTURES" | "USDC-FUTURES" => "books,publicTrade,ticker",
+            // 現貨：保留輕量 books5
             _ => "books5,publicTrade,ticker",
         };
         let raw_channels = std::env::var("BITGET_CHANNELS").ok();
@@ -937,6 +964,29 @@ impl Exchange for BitgetExchange {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect();
+        }
+
+        let original_channels = channels.clone();
+        if !(profile.trades && profile.book && profile.depth) {
+            let mut filtered = Vec::new();
+            for channel in &channels {
+                match classify_bitget_channel(channel) {
+                    BitgetChannelKind::Trades if profile.trades => filtered.push(channel.clone()),
+                    BitgetChannelKind::Depth if profile.depth => filtered.push(channel.clone()),
+                    BitgetChannelKind::Quote if profile.book => filtered.push(channel.clone()),
+                    BitgetChannelKind::Other => filtered.push(channel.clone()),
+                    _ => {}
+                }
+            }
+            if filtered.is_empty() {
+                tracing::warn!(
+                    "[bitget] stream profile 過濾後無頻道，恢復為原始配置: {:?}",
+                    original_channels
+                );
+                channels = original_channels;
+            } else {
+                channels = filtered;
+            }
         }
 
         let mut seen = HashSet::new();
@@ -993,5 +1043,14 @@ impl Exchange for BitgetExchange {
             messages.push(msg.to_string());
         }
         Ok(messages)
+    }
+
+    fn stream_diagnostics(&self) -> StreamDiagnostics {
+        let profile = self.ctx.profile("bitget");
+        StreamDiagnostics {
+            trades: profile.trades,
+            book: profile.book,
+            depth: profile.depth,
+        }
     }
 }

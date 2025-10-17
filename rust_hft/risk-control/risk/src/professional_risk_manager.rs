@@ -945,7 +945,7 @@ mod tests {
         let mut risk_manager = ProfessionalRiskManager::new(config);
 
         let intent = OrderIntent {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: Quantity(Decimal::from(10)),      // 10 units
@@ -983,7 +983,7 @@ mod tests {
         let mut risk_manager = ProfessionalRiskManager::new(config);
 
         let intent = OrderIntent {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: Quantity(Decimal::from(1)),

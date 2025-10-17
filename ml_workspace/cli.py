@@ -20,16 +20,41 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
 import yaml
+from dotenv import load_dotenv
+
 from utils.logging import configure_logging
+
+# Load environment variables from .env file
+load_dotenv()
+
+
+def _expand_env_vars(value: Any) -> Any:
+    """Recursively expand environment variables in config values."""
+    if isinstance(value, str):
+        # Replace ${VAR} or $VAR with environment variable value
+        def replace_var(match):
+            var_name = match.group(1) or match.group(2)
+            return os.environ.get(var_name, match.group(0))
+
+        return re.sub(r'\$\{([^}]+)\}|\$(\w+)', replace_var, value)
+    elif isinstance(value, dict):
+        return {k: _expand_env_vars(v) for k, v in value.items()}
+    elif isinstance(value, list):
+        return [_expand_env_vars(item) for item in value]
+    return value
 
 
 def _load_yaml(path: str | Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        config = yaml.safe_load(f) or {}
+        return _expand_env_vars(config)
 
 
 def cmd_qa_run(args: argparse.Namespace) -> None:
@@ -65,7 +90,19 @@ def cmd_qa_run(args: argparse.Namespace) -> None:
         ) if _get(cfg, "range_compare") else None,
     )
 
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    # Convert datetime objects to ISO strings for JSON serialization
+    def _convert_datetime(obj):
+        """Recursively convert datetime objects to ISO strings."""
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        elif isinstance(obj, dict):
+            return {k: _convert_datetime(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_convert_datetime(item) for item in obj]
+        return obj
+
+    serializable_result = _convert_datetime(result)
+    print(json.dumps(serializable_result, indent=2, ensure_ascii=False))
 
 
 def cmd_dataset_build(args: argparse.Namespace) -> None:

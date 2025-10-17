@@ -7,6 +7,7 @@ description = "整數新型別、錯誤、常量 (零依賴核心)"
 # 零依賴原則 - 只允許最基礎的 crate
 [dependencies]
 serde = { workspace = true }
+hdrhistogram = "7"
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 rust_decimal = { version = "1.33", features = ["serde"] }

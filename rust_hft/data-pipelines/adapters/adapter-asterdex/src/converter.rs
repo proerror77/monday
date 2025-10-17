@@ -11,8 +11,13 @@ use tracing::debug;
 pub struct MessageConverter;
 
 impl MessageConverter {
+    #[inline]
+    fn parse_value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, simd_json::Error> {
+        let owned: simd_json::OwnedValue = value.try_into()?;
+        simd_json::serde::from_owned_value(owned)
+    }
     pub fn convert_depth_update(update: DepthUpdate) -> HftResult<BookUpdate> {
-        let symbol = Symbol(update.symbol);
+        let symbol = Symbol::from(update.symbol);
         let bids = Self::convert_price_levels(&update.bids)?;
         let asks = Self::convert_price_levels(&update.asks)?;
 
@@ -46,7 +51,7 @@ impl MessageConverter {
     }
 
     pub fn convert_trade_event(trade: TradeEvent) -> HftResult<Trade> {
-        let symbol = Symbol(trade.symbol);
+        let symbol = Symbol::from(trade.symbol);
         let price = Self::parse_price(&trade.price)?;
         let quantity = Self::parse_quantity(&trade.quantity)?;
 
@@ -69,7 +74,7 @@ impl MessageConverter {
     }
 
     pub fn convert_kline_event(kline_event: KlineEvent) -> HftResult<AggregatedBar> {
-        let symbol = Symbol(kline_event.symbol);
+        let symbol = Symbol::from(kline_event.symbol);
         let kline = &kline_event.kline;
 
         let open = Self::parse_price(&kline.open_price)?;
@@ -153,22 +158,22 @@ impl MessageConverter {
         data: &serde_json::Value,
     ) -> HftResult<Option<MarketEvent>> {
         if stream.contains("@depth") {
-            if let Ok(update) = serde_json::from_value::<DepthUpdate>(data.clone()) {
+            if let Ok(update) = Self::parse_value::<DepthUpdate>(data.clone()) {
                 let book_update = Self::convert_depth_update(update)?;
                 return Ok(Some(MarketEvent::Update(book_update)));
             }
         } else if stream.contains("@trade") {
-            if let Ok(trade) = serde_json::from_value::<TradeEvent>(data.clone()) {
+            if let Ok(trade) = Self::parse_value::<TradeEvent>(data.clone()) {
                 let trade_event = Self::convert_trade_event(trade)?;
                 return Ok(Some(MarketEvent::Trade(trade_event)));
-            } else if let Ok(trades) = serde_json::from_value::<Vec<TradeEvent>>(data.clone()) {
+            } else if let Ok(trades) = Self::parse_value::<Vec<TradeEvent>>(data.clone()) {
                 if let Some(trade) = trades.first() {
                     let trade_event = Self::convert_trade_event(trade.clone())?;
                     return Ok(Some(MarketEvent::Trade(trade_event)));
                 }
             }
         } else if stream.contains("@kline") {
-            if let Ok(kline) = serde_json::from_value::<KlineEvent>(data.clone()) {
+            if let Ok(kline) = Self::parse_value::<KlineEvent>(data.clone()) {
                 let bar_event = Self::convert_kline_event(kline)?;
                 return Ok(Some(MarketEvent::Bar(bar_event)));
             }
@@ -232,7 +237,7 @@ mod tests {
             MarketEvent::Update(book) => {
                 assert_eq!(book.timestamp, 1_700_000_123_000);
                 assert_eq!(book.sequence, 105);
-                assert_eq!(book.symbol.0, "BTCUSDT");
+                assert_eq!(book.symbol.as_str(), "BTCUSDT");
                 assert_eq!(book.bids.len(), 1);
                 assert_eq!(book.asks.len(), 1);
                 assert_eq!(book.bids[0].price.0, Decimal::from_str("10000.50").unwrap());
@@ -269,7 +274,7 @@ mod tests {
         match event {
             MarketEvent::Trade(trade) => {
                 assert_eq!(trade.timestamp, 1_700_000_789_000);
-                assert_eq!(trade.symbol.0, "BTCUSDT");
+                assert_eq!(trade.symbol.as_str(), "BTCUSDT");
                 assert_eq!(trade.side, Side::Sell);
                 assert_eq!(trade.price.0, Decimal::from_str("10002.10").unwrap());
                 assert_eq!(trade.quantity.0, Decimal::from_str("0.010").unwrap());

@@ -190,7 +190,7 @@ impl TrendStrategy {
     /// 創建新的趨勢策略（舊版，保持向後兼容性）
     pub fn new(symbol: Symbol, config: TrendStrategyConfig) -> Self {
         // 使用基於符號的穩定 ID，而非動態時間戳
-        let strategy_id = format!("trend_{}", symbol.0);
+        let strategy_id = format!("trend_{}", symbol.as_str());
         Self::with_name(symbol, config, strategy_id)
     }
 
@@ -325,15 +325,15 @@ impl Strategy for TrendStrategy {
                 if bar.symbol != self.symbol {
                     tracing::debug!(
                         "TrendStrategy 忽略不匹配的品種: {} (期望: {})",
-                        bar.symbol.0,
-                        self.symbol.0
+                        bar.symbol.as_str(),
+                        self.symbol.as_str()
                     );
                     return Vec::new();
                 }
 
                 tracing::info!(
                     "TrendStrategy 處理 Bar: symbol={}, close={:.2}, 時間: {}",
-                    bar.symbol.0,
+                    bar.symbol.as_str(),
                     bar.close.0.to_f64().unwrap_or(0.0),
                     bar.close_time
                 );
@@ -406,7 +406,7 @@ impl Strategy for TrendStrategy {
     fn initialize(&mut self) -> HftResult<()> {
         log::info!(
             "趨勢策略初始化: 品種={}, EMA({}/{}), RSI({})",
-            self.symbol.0,
+            self.symbol.as_str(),
             self.config.ema_fast_period,
             self.config.ema_slow_period,
             self.config.rsi_period
@@ -415,7 +415,7 @@ impl Strategy for TrendStrategy {
     }
 
     fn shutdown(&mut self) -> HftResult<()> {
-        log::info!("趨勢策略關閉: {}", self.symbol.0);
+        log::info!("趨勢策略關閉: {}", self.symbol.as_str());
         Ok(())
     }
 }
@@ -459,11 +459,11 @@ mod tests {
 
     #[test]
     fn test_trend_strategy_creation() {
-        let symbol = Symbol("BTCUSDT".to_string());
+        let symbol = Symbol::new("BTCUSDT");
         let config = TrendStrategyConfig::default();
         let strategy = TrendStrategy::new(symbol, config);
 
         assert_eq!(strategy.name(), "TrendStrategy");
-        assert_eq!(strategy.symbol.0, "BTCUSDT");
+        assert_eq!(strategy.symbol.as_str(), "BTCUSDT");
     }
 }

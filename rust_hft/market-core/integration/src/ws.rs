@@ -1,5 +1,6 @@
 //! WebSocket 基元 - 高性能 WebSocket 客戶端
 //! 專為 HFT 場景優化：TCP_NODELAY + 禁用壓縮 + 持久連接
+use crate::latency::WsFrameMetrics;
 use futures_util::{SinkExt, StreamExt};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -141,14 +142,15 @@ impl WsClient {
 
     pub async fn receive_message(
         &mut self,
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<(String, WsFrameMetrics)>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(conn) = &mut self.connection {
             if let Some(msg) = conn.next().await {
                 match msg? {
                     Message::Text(text) => {
                         self.metrics.messages_received += 1;
                         trace!("接收到消息: {}", text);
-                        Ok(Some(text))
+                        let metrics = WsFrameMetrics::record_receive();
+                        Ok(Some((text, metrics)))
                     }
                     Message::Ping(payload) => {
                         // 自動回應 Ping
@@ -170,7 +172,8 @@ impl WsClient {
                         match String::from_utf8(data) {
                             Ok(text) => {
                                 self.metrics.messages_received += 1;
-                                Ok(Some(text))
+                                let metrics = WsFrameMetrics::record_receive();
+                                Ok(Some((text, metrics)))
                             }
                             Err(_) => {
                                 warn!("收到無法解析的二進制數據");
@@ -210,6 +213,7 @@ pub trait MessageHandler: Send + Sync {
     fn handle_message(
         &mut self,
         message: String,
+        metrics: WsFrameMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
     fn handle_disconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -338,8 +342,8 @@ impl ReconnectingWsClient {
                 // 處理消息
                 msg_result = self.client.receive_message() => {
                     match msg_result {
-                        Ok(Some(message)) => {
-                            if let Err(e) = handler.handle_message(message) {
+                        Ok(Some((message, metrics))) => {
+                            if let Err(e) = handler.handle_message(message, metrics) {
                                 error!("處理消息失敗: {}", e);
                             }
                         }

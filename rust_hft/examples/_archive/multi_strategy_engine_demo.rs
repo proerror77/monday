@@ -422,7 +422,7 @@ impl MultiStrategyEngine {
             .len()
             == 1
         {
-            EventFilter::Symbol(
+            EventFilter::Symbol::from(
                 strategy_instance.context.symbol_universe.enabled_symbols[0].clone(),
             )
         } else {

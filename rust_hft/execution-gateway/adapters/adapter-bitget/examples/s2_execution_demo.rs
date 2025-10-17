@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 創建測試訂單意圖
     let order_intents = vec![
         OrderIntent {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001)?,
             order_type: OrderType::Limit,
@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             strategy_id: "test_strategy".to_string(),
         },
         OrderIntent {
-            symbol: Symbol("ETHUSDT".to_string()),
+            symbol: Symbol::new("ETHUSDT"),
             side: Side::Sell,
             quantity: Quantity::from_f64(0.01)?,
             order_type: OrderType::Market,
@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "📋 訂單 #{}: {} {} {} @ {:?}",
             i + 1,
-            intent.symbol.0,
+            intent.symbol.as_str(),
             match intent.side {
                 Side::Buy => "買入",
                 Side::Sell => "賣出",

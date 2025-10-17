@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2) 構建 Bitget 行情適配器（骨架）並橋接
     let bitget = data_adapter_bitget::BitgetMarketStream::new();
-    let symbols = vec![Symbol("BTCUSDT".to_string())];
+    let symbols = vec![Symbol::new("BTCUSDT")];
     let consumer = bridge.bridge_stream(bitget, symbols).await.unwrap();
     engine.register_event_consumer(consumer);
 

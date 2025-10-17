@@ -5,6 +5,7 @@
 //! - 解析生成统一 MarketEvent 事件
 //! - 支持 BTC-PERP, ETH-PERP, SOL-PERP, SUI-PERP
 
+use adapters_common::parse_owned_value;
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use hft_core::{now_micros, HftError, HftResult, Price, Quantity, Side, Symbol, VenueId};
@@ -36,10 +37,10 @@ impl Default for HyperliquidMarketConfig {
         Self {
             ws_base_url: "wss://api.hyperliquid.xyz/ws".to_string(),
             symbols: vec![
-                Symbol("BTC-PERP".to_string()),
-                Symbol("ETH-PERP".to_string()),
-                Symbol("SOL-PERP".to_string()),
-                Symbol("SUI-PERP".to_string()),
+                Symbol::new("BTC-PERP"),
+                Symbol::new("ETH-PERP"),
+                Symbol::new("SOL-PERP"),
+                Symbol::new("SUI-PERP"),
             ],
             reconnect_interval_ms: 5000,
             heartbeat_interval_ms: 30000,
@@ -113,10 +114,10 @@ impl HyperliquidMarketStream {
         let mut symbol_mapping = HashMap::new();
 
         // 映射 Hyperliquid 的资产名称
-        symbol_mapping.insert("BTC".to_string(), Symbol("BTC-PERP".to_string()));
-        symbol_mapping.insert("ETH".to_string(), Symbol("ETH-PERP".to_string()));
-        symbol_mapping.insert("SOL".to_string(), Symbol("SOL-PERP".to_string()));
-        symbol_mapping.insert("SUI".to_string(), Symbol("SUI-PERP".to_string()));
+        symbol_mapping.insert("BTC".to_string(), Symbol::new("BTC-PERP"));
+        symbol_mapping.insert("ETH".to_string(), Symbol::new("ETH-PERP"));
+        symbol_mapping.insert("SOL".to_string(), Symbol::new("SOL-PERP"));
+        symbol_mapping.insert("SUI".to_string(), Symbol::new("SUI-PERP"));
 
         Self {
             config,
@@ -189,7 +190,7 @@ impl HyperliquidMarketStream {
 }
 
 fn extract_coin_from_symbol(symbol: &Symbol) -> HftResult<String> {
-    let symbol_str = &symbol.0;
+    let symbol_str = &symbol.as_str();
     if let Some(coin) = symbol_str.strip_suffix("-PERP") {
         Ok(coin.to_string())
     } else {
@@ -225,9 +226,7 @@ impl HyperliquidMarketStream {
     }
 
     fn parse_l2_book(&self, data: &Value) -> Option<MarketEvent> {
-        let book_data: Result<L2BookData, _> = serde_json::from_value(data.clone());
-
-        match book_data {
+        match parse_owned_value::<L2BookData>(data.clone()) {
             Ok(book) => {
                 let symbol = self.symbol_mapping.get(&book.coin)?.clone();
 
@@ -288,7 +287,7 @@ impl HyperliquidMarketStream {
 
     fn parse_trades(&self, data: &Value) -> Option<MarketEvent> {
         // Hyperliquid 交易数据可能是数组
-        if let Ok(trades) = serde_json::from_value::<Vec<TradeData>>(data.clone()) {
+        if let Ok(trades) = parse_owned_value::<Vec<TradeData>>(data.clone()) {
             if let Some(trade) = trades.first() {
                 let symbol = self.symbol_mapping.get(&trade.coin)?.clone();
                 let price = trade.px.parse::<f64>().ok()?;

@@ -13,7 +13,7 @@ use futures::{SinkExt, StreamExt};
 use hft_core::{now_micros, HftError, HftResult, OrderId, Price, Quantity, Side, Symbol};
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntent, OrderStatus};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +23,20 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 use url::Url;
+
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, HftError> {
+    let mut bytes = text.as_bytes().to_vec();
+    simd_json::serde::from_slice(bytes.as_mut_slice())
+        .map_err(|e| HftError::Serialization(e.to_string()))
+}
+
+fn parse_value<T: DeserializeOwned>(value: Value) -> Result<T, HftError> {
+    let owned: simd_json::OwnedValue = match value.try_into() {
+        Ok(v) => v,
+        Err(e) => return Err(HftError::Serialization(e.to_string())),
+    };
+    simd_json::serde::from_owned_value(owned).map_err(|e| HftError::Serialization(e.to_string()))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionMode {
@@ -377,10 +391,10 @@ impl HyperliquidExecutionClient {
 
         let mut asset_map = HashMap::new();
         // Hyperliquid 主网资产索引 (需要从 API 获取最新映射)
-        asset_map.insert(Symbol("BTC-PERP".to_string()), 0);
-        asset_map.insert(Symbol("ETH-PERP".to_string()), 1);
-        asset_map.insert(Symbol("SOL-PERP".to_string()), 2);
-        asset_map.insert(Symbol("SUI-PERP".to_string()), 3);
+        asset_map.insert(Symbol::new("BTC-PERP"), 0);
+        asset_map.insert(Symbol::new("ETH-PERP"), 1);
+        asset_map.insert(Symbol::new("SOL-PERP"), 2);
+        asset_map.insert(Symbol::new("SUI-PERP"), 3);
 
         Self {
             cfg,
@@ -789,11 +803,11 @@ impl HyperliquidExecutionClient {
         debug!("Hyperliquid 未结订单响应: {}", response_text);
 
         // 解析响应
-        let parsed: Result<Value, _> = serde_json::from_str(&response_text);
+        let parsed: Result<Value, _> = parse_json(&response_text);
         match parsed {
             Ok(data) => {
                 // 尝试解析为订单数组
-                if let Ok(hl_orders) = serde_json::from_value::<Vec<HyperliquidOpenOrder>>(data) {
+                if let Ok(hl_orders) = parse_value::<Vec<HyperliquidOpenOrder>>(data) {
                     let mut open_orders = Vec::new();
 
                     for hl_order in hl_orders {
@@ -822,7 +836,7 @@ impl HyperliquidExecutionClient {
         let our_order_id = self.reverse_order_map.get(&hl_order.oid)?;
 
         // 构建符号
-        let symbol = Symbol(format!("{}-PERP", hl_order.coin));
+        let symbol = Symbol::from(format!("{}-PERP", hl_order.coin));
 
         // 解析价格和数量
         let price = hl_order
@@ -1015,7 +1029,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 impl HyperliquidExecutionClient {
     // 解析私有 WebSocket 消息并生成统一事件
     fn parse_private_ws_message(&mut self, message: &str) -> Option<ExecutionEvent> {
-        let parsed: Result<WsResponse, _> = serde_json::from_str(message);
+        let parsed: Result<WsResponse, _> = parse_json(message);
 
         match parsed {
             Ok(response) => match response.channel.as_str() {
@@ -1039,7 +1053,7 @@ impl HyperliquidExecutionClient {
 
     // 解析用户事件 (订单状态更新)
     fn parse_user_events(&mut self, data: &Value) -> Option<ExecutionEvent> {
-        if let Ok(events) = serde_json::from_value::<Vec<UserEvent>>(data.clone()) {
+        if let Ok(events) = parse_value::<Vec<UserEvent>>(data.clone()) {
             for event in events {
                 match event {
                     UserEvent::Order { order } => {
@@ -1060,7 +1074,7 @@ impl HyperliquidExecutionClient {
 
     // 解析用户成交事件
     fn parse_user_fills(&mut self, data: &Value) -> Option<ExecutionEvent> {
-        if let Ok(fills) = serde_json::from_value::<Vec<FillUpdate>>(data.clone()) {
+        if let Ok(fills) = parse_value::<Vec<FillUpdate>>(data.clone()) {
             if let Some(fill) = fills.first() {
                 return self.handle_fill_update(fill.clone());
             }
@@ -1074,7 +1088,7 @@ impl HyperliquidExecutionClient {
         let our_order_id = self.reverse_order_map.get(&order.oid)?;
 
         // 构建符号
-        let _symbol = Symbol(format!("{}-PERP", order.coin));
+        let _symbol = Symbol::from(format!("{}-PERP", order.coin));
 
         // 解析价格和数量
         let _price = order
@@ -1108,7 +1122,7 @@ impl HyperliquidExecutionClient {
         let our_order_id = self.reverse_order_map.get(&fill.oid)?;
 
         // 构建符号
-        let _symbol = Symbol(format!("{}-PERP", fill.coin));
+        let _symbol = Symbol::from(format!("{}-PERP", fill.coin));
 
         // 解析价格和数量
         let price = fill

@@ -2,10 +2,13 @@
 //!
 //! 收集並統計各階段的延遲數據，提供實時監控和告警功能
 
+use hdrhistogram::Histogram;
 use hft_core::latency::LatencyStageStats;
-use hft_core::{now_micros, LatencyStage, MicrosTimestamp};
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use hft_core::{now_micros, LatencyStage};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// 延遲監控配置
@@ -23,28 +26,35 @@ impl Default for LatencyMonitorConfig {
     fn default() -> Self {
         let mut alert_thresholds = HashMap::new();
         // 延遲閾值設定（公網環境建議將 Ingestion 放寬到 30ms）
+        alert_thresholds.insert(LatencyStage::WsReceive, 100); // 100μs 內完成
+        alert_thresholds.insert(LatencyStage::Parsing, 500); // 0.5ms
         alert_thresholds.insert(LatencyStage::Ingestion, 30_000); // 30ms
         alert_thresholds.insert(LatencyStage::Aggregation, 500); // 0.5ms
         alert_thresholds.insert(LatencyStage::Strategy, 2000); // 2ms
+        alert_thresholds.insert(LatencyStage::Risk, 1500); // 1.5ms
         alert_thresholds.insert(LatencyStage::Execution, 5000); // 5ms
+        alert_thresholds.insert(LatencyStage::Submission, 10_000); // 10ms
         alert_thresholds.insert(LatencyStage::EndToEnd, 25000); // 25ms (目標)
 
         Self {
             alert_thresholds,
-            window_size: 1000,
-            report_interval_ms: 5000, // 每 5 秒報告一次
+            window_size: 200,
+            report_interval_ms: 1000, // 每 1 秒報告一次
         }
     }
 }
+
+const LATENCY_HISTOGRAM_MAX_US: u64 = 120_000_000; // 120 秒，可覆蓋極端情況
+const LATENCY_HISTOGRAM_SIGFIGS: u8 = 3;
 
 /// 延遲監控服務
 #[derive(Debug)]
 pub struct LatencyMonitor {
     config: LatencyMonitorConfig,
     /// 各階段的滾動統計窗口
-    windows: Arc<Mutex<HashMap<LatencyStage, VecDeque<u64>>>>,
-    /// 最後報告時間
-    last_report_time: Arc<Mutex<MicrosTimestamp>>,
+    windows: Arc<Mutex<HashMap<LatencyStage, Histogram<u64>>>>,
+    /// 最後報告時間（微秒）
+    last_report_time: AtomicU64,
 }
 
 impl LatencyMonitor {
@@ -53,7 +63,7 @@ impl LatencyMonitor {
         Self {
             config,
             windows: Arc::new(Mutex::new(HashMap::new())),
-            last_report_time: Arc::new(Mutex::new(now_micros())),
+            last_report_time: AtomicU64::new(now_micros()),
         }
     }
 
@@ -71,15 +81,14 @@ impl LatencyMonitor {
             }
         }
 
-        // 添加到滾動窗口
-        if let Ok(mut windows) = self.windows.lock() {
-            let window = windows
-                .entry(stage)
-                .or_insert_with(|| VecDeque::with_capacity(self.config.window_size));
-            if window.len() == self.config.window_size {
-                window.pop_front();
-            }
-            window.push_back(latency_micros);
+        // 添加到直方圖
+        let mut windows = self.windows.lock();
+        let histogram = windows.entry(stage).or_insert_with(|| {
+            Histogram::new_with_bounds(1, LATENCY_HISTOGRAM_MAX_US, LATENCY_HISTOGRAM_SIGFIGS)
+                .expect("latency histogram bounds")
+        });
+        if let Err(err) = histogram.record(latency_micros) {
+            warn!("延遲統計記錄失敗: {}", err);
         }
 
         // 檢查是否需要生成報告
@@ -88,12 +97,10 @@ impl LatencyMonitor {
 
     /// 獲取指定階段的統計信息
     pub fn get_stage_stats(&self, stage: LatencyStage) -> Option<LatencyStageStats> {
-        if let Ok(mut windows) = self.windows.lock() {
-            if let Some(samples) = windows.get_mut(&stage) {
-                if !samples.is_empty() {
-                    let slice = samples.make_contiguous();
-                    return Some(LatencyStageStats::from_samples(stage, slice));
-                }
+        let windows = self.windows.lock();
+        if let Some(histogram) = windows.get(&stage) {
+            if !histogram.is_empty() {
+                return Some(LatencyStageStats::from_histogram(stage, histogram));
             }
         }
         None
@@ -103,13 +110,11 @@ impl LatencyMonitor {
     pub fn get_all_stats(&self) -> HashMap<LatencyStage, LatencyStageStats> {
         let mut all_stats = HashMap::new();
 
-        if let Ok(mut windows) = self.windows.lock() {
-            for (&stage, samples) in windows.iter_mut() {
-                if !samples.is_empty() {
-                    let slice = samples.make_contiguous();
-                    let stats = LatencyStageStats::from_samples(stage, slice);
-                    all_stats.insert(stage, stats);
-                }
+        let windows = self.windows.lock();
+        for (&stage, histogram) in windows.iter() {
+            if !histogram.is_empty() {
+                let stats = LatencyStageStats::from_histogram(stage, histogram);
+                all_stats.insert(stage, stats);
             }
         }
 
@@ -118,33 +123,22 @@ impl LatencyMonitor {
 
     /// 重置統計數據
     pub fn reset_stats(&self) {
-        if let Ok(mut windows) = self.windows.lock() {
-            windows.clear();
-        }
-
-        if let Ok(mut last_report) = self.last_report_time.lock() {
-            *last_report = now_micros();
-        }
+        self.windows.lock().clear();
+        self.last_report_time.store(now_micros(), Ordering::Relaxed);
     }
 
     /// 檢查並生成定期報告
     fn maybe_generate_report(&self) {
         let now = now_micros();
-        let should_report = {
-            if let Ok(mut last_report) = self.last_report_time.lock() {
-                let elapsed_ms = (now - *last_report) / 1000;
-                if elapsed_ms >= self.config.report_interval_ms {
-                    *last_report = now;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
+        let last = self.last_report_time.load(Ordering::Relaxed);
+        let elapsed_ms = (now - last) / 1000;
 
-        if should_report {
+        if elapsed_ms >= self.config.report_interval_ms
+            && self
+                .last_report_time
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
             self.generate_report();
         }
     }
@@ -160,16 +154,8 @@ impl LatencyMonitor {
 
         info!("=== 延遲監控報告 ===");
 
-        // 按階段順序輸出
-        let stages = [
-            LatencyStage::Ingestion,
-            LatencyStage::Aggregation,
-            LatencyStage::Strategy,
-            LatencyStage::Execution,
-            LatencyStage::EndToEnd,
-        ];
-
-        for stage in &stages {
+        // 按階段順序輸出（含 EndToEnd）
+        for stage in LatencyStage::all_stages().iter() {
             if let Some(stats) = all_stats.get(stage) {
                 info!(
                     "{}: 樣本={}, 平均={:.1}μs, p50={}μs, p95={}μs, p99={}μs",

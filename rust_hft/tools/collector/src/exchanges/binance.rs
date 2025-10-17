@@ -4,7 +4,8 @@ use super::{
         OrderbookRow as BinanceOrderbookRow, PartialDepthSnapshot, TickerRow as BinanceTickerRow,
         Trade as BinanceTrade, TradesRow as BinanceTradesRow,
     },
-    binance_spot_pairs, Exchange, ExchangeContext, MessageBuffers, WebsocketPlan,
+    binance_spot_pairs, Exchange, ExchangeContext, MessageBuffers, StreamDiagnostics,
+    WebsocketPlan,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -69,41 +70,68 @@ impl Exchange for BinanceExchange {
             "1" | "true" | "yes"
         );
 
-        let depth_levels = match self.ctx.depth_levels {
+        let profile = self.ctx.profile("binance");
+        let include_trades = profile.trades;
+        let include_quotes = profile.book;
+        let include_depth = profile.depth;
+
+        let _depth_levels = match self.ctx.depth_levels {
             5 | 10 | 20 => self.ctx.depth_levels,
             n if n < 5 => 5,
             n if n < 10 => 10,
             _ => 20,
         };
 
-        let mut streams: Vec<String> = Vec::with_capacity(symbols.len() * 4 + 1);
+        let mut streams: Vec<String> = Vec::new();
+        streams.reserve(symbols.len() * 4 + 1);
         for symbol in symbols {
             let lower_symbol = symbol.to_lowercase();
-            streams.push(format!("{}@trade", lower_symbol));
-            streams.push(format!("{}@bookTicker", lower_symbol));
-            if !use_miniticker_arr {
-                streams.push(format!("{}@miniTicker", lower_symbol));
+            if include_trades {
+                streams.push(format!("{}@trade", lower_symbol));
             }
-            if self.ctx.depth_mode.include_limited() {
-                streams.push(format!("{}@depth{}@100ms", lower_symbol, depth_levels));
+            if include_quotes {
+                streams.push(format!("{}@bookTicker", lower_symbol));
+                if !use_miniticker_arr {
+                    streams.push(format!("{}@miniTicker", lower_symbol));
+                }
             }
-            if self.ctx.depth_mode.include_incremental() {
+            if include_depth {
+                // 在 /ws + SUBSCRIBE 模式下，partial depth (depth{N}@100ms) 訊息不包含 symbol，
+                // 難以處理；這裡統一採用增量 depth@100ms，以確保事件內含 E 與 s 可解析。
                 streams.push(format!("{}@depth@100ms", lower_symbol));
             }
         }
-        if use_miniticker_arr {
+        if include_quotes && use_miniticker_arr {
             streams.push("!miniTicker@arr".to_string());
         }
 
-        let url = format!(
-            "wss://stream.binance.com:9443/stream?streams={}",
-            streams.join("/")
-        );
+        if streams.is_empty() {
+            // 安全回退，避免空 streams 導致 URL 無效
+            for symbol in symbols {
+                streams.push(format!("{}@trade", symbol.to_lowercase()));
+            }
+        }
+
+        let subscribe_msg = serde_json::json!({
+            "method": "SUBSCRIBE",
+            "params": streams,
+            "id": rand::random::<u32>(),
+        });
+        let url = "wss://stream.binance.com:9443/ws".to_string();
 
         Ok(WebsocketPlan {
             url,
-            subscribe_messages: Vec::new(),
+            subscribe_messages: vec![subscribe_msg.to_string()],
         })
+    }
+
+    fn stream_diagnostics(&self) -> StreamDiagnostics {
+        let profile = self.ctx.profile("binance");
+        StreamDiagnostics {
+            trades: profile.trades,
+            book: profile.book,
+            depth: profile.depth,
+        }
     }
 
     async fn get_popular_symbols(&self, limit: usize) -> Result<Vec<String>> {

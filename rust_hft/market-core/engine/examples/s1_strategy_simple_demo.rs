@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_spread_bps: 2.0,  // 最小價差
     };
 
-    let mut trend_strategy = TrendStrategy::new(Symbol("BTCUSDT".to_string()), trend_config);
+    let mut trend_strategy = TrendStrategy::new(Symbol::new("BTCUSDT"), trend_config);
     trend_strategy.initialize()?;
 
     // 2. 創建套利策略
@@ -48,8 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         taker_fee_rate: 0.001,    // 0.1% 手續費
     };
 
-    let mut arbitrage_strategy =
-        ArbitrageStrategy::new(Symbol("BTCUSDT".to_string()), arbitrage_config);
+    let mut arbitrage_strategy = ArbitrageStrategy::new(Symbol::new("BTCUSDT"), arbitrage_config);
     arbitrage_strategy.initialize()?;
 
     // 3. 模擬帳戶狀態
@@ -67,7 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let timestamp = current_timestamp_us() + (i as u64 * 60000); // 每分鐘一根K線
 
         let bar = AggregatedBar {
-            symbol: Symbol("BTCUSDT".to_string()),
+            symbol: Symbol::new("BTCUSDT"),
             interval_ms: 60000,
             open_time: timestamp - 60000,
             close_time: timestamp,
@@ -98,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Side::Buy => "買入",
                         Side::Sell => "賣出",
                     },
-                    order.symbol.0,
+                    order.symbol.as_str(),
                     order.quantity.0.to_f64().unwrap_or(0.0),
                     order
                         .price
@@ -129,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Binance 快照
         let binance_snapshot = MarketSnapshot {
-            symbol: Symbol("BINANCE:BTCUSDT".to_string()),
+            symbol: Symbol::new("BINANCE:BTCUSDT"),
             timestamp,
             bids: vec![BookLevel::new_unchecked(binance_price, 0.1)],
             asks: vec![BookLevel::new_unchecked(binance_price + 1.0, 0.1)],
@@ -138,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Bitget 快照
         let bitget_snapshot = MarketSnapshot {
-            symbol: Symbol("BITGET:BTCUSDT".to_string()),
+            symbol: Symbol::new("BITGET:BTCUSDT"),
             timestamp,
             bids: vec![BookLevel::new_unchecked(bitget_price, 0.1)],
             asks: vec![BookLevel::new_unchecked(bitget_price + 1.0, 0.1)],
@@ -175,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Side::Buy => "買入",
                         Side::Sell => "賣出",
                     },
-                    order.symbol.0,
+                    order.symbol.as_str(),
                     order.quantity.0.to_f64().unwrap_or(0.0)
                 );
             }

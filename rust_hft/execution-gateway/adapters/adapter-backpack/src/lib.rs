@@ -222,8 +222,11 @@ impl BackpackExecutionClient {
         let mut body = Map::new();
         let mut sign_params = BTreeMap::new();
 
-        body.insert("symbol".to_string(), Value::String(intent.symbol.0.clone()));
-        sign_params.insert("symbol".to_string(), intent.symbol.0.clone());
+        body.insert(
+            "symbol".to_string(),
+            Value::String(intent.symbol.as_str().to_string()),
+        );
+        sign_params.insert("symbol".to_string(), intent.symbol.as_str().to_string());
 
         let side = Self::to_backpack_side(intent.side);
         body.insert("side".to_string(), Value::String(side.to_string()));
@@ -310,7 +313,7 @@ impl BackpackExecutionClient {
 
         let order_id = OrderId(order_id.clone());
         self.order_symbols
-            .insert(order_id.0.clone(), intent.symbol.0.clone());
+            .insert(order_id.0.clone(), intent.symbol.as_str().to_string());
 
         self.connected.store(true, Ordering::SeqCst);
         self.update_heartbeat();
@@ -327,7 +330,7 @@ impl BackpackExecutionClient {
         let timestamp = now_micros();
         let order_id = OrderId(format!("BACKPACK_PAPER_{}", timestamp));
         self.order_symbols
-            .insert(order_id.0.clone(), intent.symbol.0.clone());
+            .insert(order_id.0.clone(), intent.symbol.as_str().to_string());
 
         self.emit_event(ExecutionEvent::OrderNew {
             order_id: order_id.clone(),
@@ -505,7 +508,7 @@ impl OrderRecord {
 
         Some(OpenOrder {
             order_id: OrderId(self.id),
-            symbol: Symbol(self.symbol),
+            symbol: Symbol::from(self.symbol),
             side,
             order_type,
             original_quantity: original_qty,

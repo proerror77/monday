@@ -1,3 +1,5 @@
+#![cfg(any(feature = "collector-binance", feature = "collector-binance-futures"))]
+
 use chrono::prelude::*;
 use clickhouse::Row;
 use ordered_float::OrderedFloat;

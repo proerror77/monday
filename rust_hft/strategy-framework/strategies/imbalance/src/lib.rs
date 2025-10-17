@@ -28,7 +28,7 @@ pub struct ImbalanceStrategy {
 impl ImbalanceStrategy {
     /// 創建新的失衡策略（舊版，保持向後兼容性）
     pub fn new(symbol: Symbol, params: Option<ImbalanceParams>) -> Self {
-        let strategy_name = format!("imbalance_{}", symbol.0);
+        let strategy_name = format!("imbalance_{}", symbol.as_str());
         Self::with_name(symbol, params, strategy_name)
     }
 

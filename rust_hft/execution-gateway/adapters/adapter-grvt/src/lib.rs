@@ -6,16 +6,21 @@
 //! - 下單需要 signature；本版先提供框架，回傳需要簽名錯誤，待整合 EIP-712 細節後實作。
 
 use async_trait::async_trait;
-use futures::StreamExt;
-use hft_core::{HftError, HftResult, OrderId, Price, Quantity, Symbol};
+use hft_core::{HftError, HftResult, OrderId, Price, Quantity};
 use ports::{BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntent};
 use reqwest::{header::HeaderMap, Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, warn};
+use tracing::info;
+
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, HftError> {
+    let mut bytes = text.as_bytes().to_vec();
+    simd_json::serde::from_slice(bytes.as_mut_slice())
+        .map_err(|e| HftError::Serialization(e.to_string()))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionMode {
@@ -242,7 +247,7 @@ impl ExecutionClient for GrvtExecutionClient {
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
         // 由於回應 schema 未提供，暫時不嘗試映射，返回空集合，避免 schema 演進破壞
-        let _raw: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+        let _raw: Value = parse_json(&txt).unwrap_or(Value::Null);
         Ok(Vec::new())
     }
 

@@ -417,7 +417,7 @@ mod tests {
         oms.register_order(
             oid.clone(),
             None,
-            Symbol("BTCUSDT".into()),
+            Symbol::new("BTCUSDT"),
             Side::Buy,
             Quantity::from_f64(1.0).unwrap(),
             None,
@@ -450,7 +450,7 @@ mod tests {
         oms.register_order(
             o1.clone(),
             None,
-            Symbol("BTCUSDT".into()),
+            Symbol::new("BTCUSDT"),
             Side::Buy,
             Quantity::from_f64(1.0).unwrap(),
             None,
@@ -461,7 +461,7 @@ mod tests {
         oms.register_order(
             o2.clone(),
             None,
-            Symbol("ETHUSDT".into()),
+            Symbol::new("ETHUSDT"),
             Side::Buy,
             Quantity::from_f64(2.0).unwrap(),
             None,
@@ -476,7 +476,7 @@ mod tests {
         oms.register_order(
             o3.clone(),
             None,
-            Symbol("SOLUSDT".into()),
+            Symbol::new("SOLUSDT"),
             Side::Buy,
             Quantity::from_f64(1.0).unwrap(),
             None,

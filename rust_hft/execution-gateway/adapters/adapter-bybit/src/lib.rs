@@ -94,7 +94,7 @@ impl ExecutionClient for BybitExecutionClient {
             };
             let req = Req {
                 category: "spot",
-                symbol: &intent.symbol.0,
+                symbol: &intent.symbol.as_str(),
                 side,
                 order_type: typ,
                 qty: intent.quantity.0.to_string(),
@@ -549,7 +549,7 @@ impl ExecutionClient for BybitExecutionClient {
                 let updated_at = it.updatedTime.parse::<u64>().unwrap_or(0) * 1000;
                 out.push(OpenOrder {
                     order_id: OrderId(it.orderId),
-                    symbol: hft_core::Symbol(it.symbol),
+                    symbol: hft_core::Symbol::from(it.symbol),
                     side,
                     order_type,
                     original_quantity: qty,

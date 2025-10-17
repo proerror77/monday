@@ -44,14 +44,15 @@ pub fn create_strategy_instance_for_symbol(
     symbol: &Symbol,
 ) -> HftResult<Box<dyn StrategyTrait>> {
     let instances = create_strategy_instances_from_config(config)?;
-    let target_id = format!("{}:{}", config.name, symbol.0);
+    let target_id = format!("{}:{}", config.name, symbol.as_str());
     instances
         .into_iter()
         .find(|strategy| strategy.id() == target_id)
         .ok_or_else(|| {
             HftError::Config(format!(
                 "策略 {} 未為符號 {} 建立實例",
-                config.name, symbol.0
+                config.name,
+                symbol.as_str()
             ))
         })
 }
@@ -100,7 +101,7 @@ fn create_trend_strategies(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn St
             cfg.ema_fast_period = ema_fast;
             cfg.ema_slow_period = ema_slow;
             cfg.rsi_period = rsi_period;
-            let instance_id = format!("{}:{}", _config.name, sym.0);
+            let instance_id = format!("{}:{}", _config.name, sym.as_str());
             let strat = strategy_trend::TrendStrategy::with_name(sym.clone(), cfg, instance_id);
             instances.push(Box::new(strat));
         }
@@ -129,7 +130,7 @@ fn create_imbalance_strategies(_config: &StrategyConfig) -> HftResult<Vec<Box<dy
                 }),
                 _ => None,
             };
-            let instance_id = format!("{}:{}", _config.name, sym.0);
+            let instance_id = format!("{}:{}", _config.name, sym.as_str());
             let strat =
                 strategy_imbalance::ImbalanceStrategy::with_name(sym.clone(), params, instance_id);
             instances.push(Box::new(strat));
@@ -157,7 +158,7 @@ fn create_lob_flow_grid_strategies(
         for sym in &_config.symbols {
             let mut cfg = strategy_lob_flow_grid::LobFlowGridConfig::default();
             super::apply_lob_flow_overrides(&mut cfg, &params);
-            let instance_id = format!("{}:{}", _config.name, sym.0);
+            let instance_id = format!("{}:{}", _config.name, sym.as_str());
             let strat = LobFlowGridStrategy::with_name(sym.clone(), cfg, instance_id);
             instances.push(Box::new(strat));
         }

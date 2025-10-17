@@ -56,6 +56,16 @@ run-replay: ## 運行歷史回放
 	@echo "⏮️ 啟動歷史回放..."
 	cargo run -p hft-replay
 
+# 便捷：啟動 Paper 並暴露 /metrics 與 /health（預設 9091）
+run-paper-metrics: ## 運行模擬盤並開啟 /metrics 與 /health (預設埠 9091)
+	@echo "📊 啟動 hft-paper (metrics) ..."
+	cargo run -p hft-paper --features "metrics" -- --metrics-port 9091
+
+# 便捷：啟動 Replay 並暴露 /metrics 與 /health（預設 9092）
+run-replay-metrics: ## 運行回放並開啟 /metrics 與 /health (預設埠 9092)
+	@echo "⏮️ 啟動 hft-replay (metrics) ..."
+	cargo run -p hft-replay --features "metrics" -- --metrics-port 9092
+
 # 測試
 test-unit: ## 運行單元測試
 	@echo "🧪 運行單元測試..."

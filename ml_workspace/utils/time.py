@@ -21,11 +21,17 @@ def to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def parse_iso8601(dt_str: str) -> datetime:
+def parse_iso8601(dt_str: str | datetime) -> datetime:
     """Parse ISO8601 string to a timezone-aware datetime.
 
-    Accepts strings like "2025-09-03T00:00:00Z".
+    Accepts strings like "2025-09-03T00:00:00Z" or datetime objects.
     """
+    if isinstance(dt_str, datetime):
+        # Already a datetime, ensure timezone-aware
+        if dt_str.tzinfo is None:
+            return dt_str.replace(tzinfo=timezone.utc)
+        return dt_str
+
     s = dt_str.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"

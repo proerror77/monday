@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
     let engine_config = EngineConfig {
         ingestion: ingestion_config.clone(),
         max_events_per_cycle: 100,
-        aggregation_symbols: vec![Symbol(args.symbol.clone())],
+        aggregation_symbols: vec![Symbol::from(args.symbol.clone())],
     };
 
     let mut engine = Engine::new(engine_config);
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
     // 3. 創建並連接 Bitget Adapter
     info!("📡 正在連接 Bitget WebSocket...");
     let bitget_stream = BitgetMarketStream::new();
-    let symbols = vec![Symbol(args.symbol.clone())];
+    let symbols = vec![Symbol::from(args.symbol.clone())];
 
     let consumer = match adapter_bridge.bridge_stream(bitget_stream, symbols).await {
         Ok(consumer) => consumer,
