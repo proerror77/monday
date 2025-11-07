@@ -274,7 +274,7 @@ impl RiskManager for StrategyAwareRiskManager {
         self.base_risk_manager.emergency_stop()
     }
 
-    fn get_risk_metrics(&self) -> HashMap<String, f64> {
+    fn get_risk_metrics(&self) -> HashMap<String, rust_decimal::Decimal> {
         self.base_risk_manager.get_risk_metrics()
     }
 

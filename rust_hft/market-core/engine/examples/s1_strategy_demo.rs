@@ -317,7 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_concurrent_adapters: 1,
     };
 
-    let adapter_bridge = AdapterBridge::new(bridge_config);
+    let mut adapter_bridge = AdapterBridge::new(bridge_config);
 
     // 3. 創建策略管理器
     let mut strategy_manager = StrategyManager::new();

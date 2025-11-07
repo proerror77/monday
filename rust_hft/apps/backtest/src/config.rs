@@ -244,4 +244,3 @@ fn default_trade_csv() -> String {
 fn default_summary_csv() -> String {
     "backtest_summary.csv".to_string()
 }
-

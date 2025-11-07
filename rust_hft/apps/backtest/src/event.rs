@@ -60,8 +60,14 @@ impl<'de> Deserialize<'de> for Level {
         match Repr::deserialize(deserializer)? {
             Repr::Array([price, quantity]) => Ok(Level { price, quantity }),
             Repr::Object { price, quantity } => Ok(Level { price, quantity }),
-            Repr::ObjectAlt { price, qty } => Ok(Level { price, quantity: qty }),
-            Repr::ObjectSide { p, q } => Ok(Level { price: p, quantity: q }),
+            Repr::ObjectAlt { price, qty } => Ok(Level {
+                price,
+                quantity: qty,
+            }),
+            Repr::ObjectSide { p, q } => Ok(Level {
+                price: p,
+                quantity: q,
+            }),
         }
     }
 }
@@ -106,11 +112,8 @@ impl<R: BufRead> Iterator for EventStream<R> {
                     let event: EventEnvelope = match serde_json::from_str(&raw) {
                         Ok(ev) => ev,
                         Err(err) => {
-                            let error = anyhow::anyhow!(
-                                "解析事件失敗 (line {}): {}",
-                                self.line_no,
-                                err
-                            );
+                            let error =
+                                anyhow::anyhow!("解析事件失敗 (line {}): {}", self.line_no, err);
                             return Some(Err(error));
                         }
                     };

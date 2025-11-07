@@ -425,7 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. 初始化 AdapterBridge
     println!("🌉 初始化 AdapterBridge...");
     let bridge_config = config.adapter_bridge.to_adapter_bridge_config();
-    let adapter_bridge = AdapterBridge::new(bridge_config);
+    let mut adapter_bridge = AdapterBridge::new(bridge_config);
     println!("✅ AdapterBridge 初始化完成");
 
     // 4. 初始化策略

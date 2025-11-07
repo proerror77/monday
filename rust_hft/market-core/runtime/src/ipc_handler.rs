@@ -13,7 +13,7 @@ use infra_ipc::{
 use async_trait::async_trait;
 
 #[cfg(feature = "infra-ipc")]
-use sysinfo::{System, SystemExt, CpuExt};
+use sysinfo::{CpuExt, System, SystemExt};
 
 use crate::SystemRuntime;
 #[cfg(feature = "infra-ipc")]
@@ -148,8 +148,14 @@ impl CommandHandler for SystemCommandHandler {
                         // 通过策略 ID 获取策略实例的可变引用
                         if let Some(strategy) = engine.get_strategy_mut_by_id(&strategy_id) {
                             // 尝试将策略向下转型为 DlStrategy
-                            if let Some(dl_strategy) = strategy.as_any_mut().downcast_mut::<hft_strategy_dl::DlStrategy>() {
-                                match dl_strategy.load_model(PathBuf::from(&model_path), model_version.clone()).await {
+                            if let Some(dl_strategy) = strategy
+                                .as_any_mut()
+                                .downcast_mut::<hft_strategy_dl::DlStrategy>(
+                            ) {
+                                match dl_strategy
+                                    .load_model(PathBuf::from(&model_path), model_version.clone())
+                                    .await
+                                {
                                     Ok(_) => {
                                         info!("策略 {} 成功加载模型: {}", strategy_id, model_path);
                                         loaded_count += 1;
@@ -157,7 +163,10 @@ impl CommandHandler for SystemCommandHandler {
                                     Err(e) => {
                                         error!("策略 {} 模型加载失败: {}", strategy_id, e);
                                         return Response::Error {
-                                            message: format!("策略 {} 模型加载失败: {}", strategy_id, e),
+                                            message: format!(
+                                                "策略 {} 模型加载失败: {}",
+                                                strategy_id, e
+                                            ),
                                             code: Some(500),
                                         };
                                     }
@@ -180,7 +189,8 @@ impl CommandHandler for SystemCommandHandler {
                 #[cfg(not(feature = "strategy-dl"))]
                 {
                     Response::Error {
-                        message: "DL 策略功能未启用，请使用 --features strategy-dl 编译".to_string(),
+                        message: "DL 策略功能未启用，请使用 --features strategy-dl 编译"
+                            .to_string(),
                         code: Some(501),
                     }
                 }
@@ -283,9 +293,12 @@ impl CommandHandler for SystemCommandHandler {
                     } else if runtime.config.quotes_only {
                         // 若 quotes_only = true，系統僅接收行情，不執行交易
                         TradingMode::Replay
-                    } else if runtime.config.venues.iter().any(|v| {
-                        v.execution_mode.as_deref() == Some("Live")
-                    }) {
+                    } else if runtime
+                        .config
+                        .venues
+                        .iter()
+                        .any(|v| v.execution_mode.as_deref() == Some("Live"))
+                    {
                         // 若任一交易所配置為 Live 模式
                         TradingMode::Live
                     } else {
@@ -308,8 +321,13 @@ impl CommandHandler for SystemCommandHandler {
                             let strategy_ids = engine_guard.strategy_instance_ids();
                             let mut version = None;
                             for strategy_id in strategy_ids {
-                                if let Some(strategy) = engine_guard.get_strategy_by_id(&strategy_id) {
-                                    if let Some(dl_strategy) = strategy.as_any().downcast_ref::<hft_strategy_dl::DlStrategy>() {
+                                if let Some(strategy) =
+                                    engine_guard.get_strategy_by_id(&strategy_id)
+                                {
+                                    if let Some(dl_strategy) = strategy
+                                        .as_any()
+                                        .downcast_ref::<hft_strategy_dl::DlStrategy>(
+                                    ) {
                                         version = dl_strategy.get_model_version();
                                         break; // 使用第一个找到的 DL 策略的模型版本
                                     }
@@ -590,7 +608,7 @@ impl CommandHandler for SystemCommandHandler {
                                 Err(e) => Response::Error {
                                     message: format!("启动交易引擎失败: {}", e),
                                     code: Some(500),
-                                }
+                                },
                             }
                         } else {
                             drop(engine);
@@ -611,7 +629,7 @@ impl CommandHandler for SystemCommandHandler {
                             Err(e) => Response::Error {
                                 message: format!("取消订单失败: {}", e),
                                 code: Some(500),
-                            }
+                            },
                         }
                     }
                     TradingMode::Paused => {
@@ -625,7 +643,7 @@ impl CommandHandler for SystemCommandHandler {
                             Err(e) => Response::Error {
                                 message: format!("暂停系统失败: {}", e),
                                 code: Some(500),
-                            }
+                            },
                         }
                     }
                 }
@@ -642,13 +660,21 @@ impl CommandHandler for SystemCommandHandler {
                 let mut engine = runtime.engine.lock().await;
                 match engine.set_strategy_enabled(&strategy_id, enabled) {
                     Ok(_) => {
-                        info!("策略 {} 已{}启用", strategy_id, if enabled { "" } else { "禁" });
+                        info!(
+                            "策略 {} 已{}启用",
+                            strategy_id,
+                            if enabled { "" } else { "禁" }
+                        );
 
                         // 如果禁用策略，取消该策略的所有未结订单
                         if !enabled {
                             drop(engine);
-                            let cancelled_count = runtime.cancel_orders_for_strategy(&strategy_id).await;
-                            info!("已取消策略 {} 的 {} 个未结订单", strategy_id, cancelled_count);
+                            let cancelled_count =
+                                runtime.cancel_orders_for_strategy(&strategy_id).await;
+                            info!(
+                                "已取消策略 {} 的 {} 个未结订单",
+                                strategy_id, cancelled_count
+                            );
                         }
 
                         Response::Ok
@@ -656,7 +682,7 @@ impl CommandHandler for SystemCommandHandler {
                     Err(e) => Response::Error {
                         message: format!("设置策略状态失败: {}", e),
                         code: Some(500),
-                    }
+                    },
                 }
             }
 
@@ -755,7 +781,7 @@ impl SystemCommandHandler {
     /// 计算文件的 SHA256 哈希
     #[cfg(feature = "strategy-dl")]
     fn calculate_sha256(path: &std::path::Path) -> Result<String, std::io::Error> {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         use std::io::Read;
 
         let mut file = std::fs::File::open(path)?;

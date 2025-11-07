@@ -77,19 +77,19 @@ pub trait ExecutionClient: Send + Sync {
 /// 帳戶視圖 (策略決策用)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountView {
-    pub cash_balance: f64,
+    pub cash_balance: rust_decimal::Decimal,
     pub positions: std::collections::HashMap<Symbol, Position>,
-    pub unrealized_pnl: f64,
-    pub realized_pnl: f64,
+    pub unrealized_pnl: rust_decimal::Decimal,
+    pub realized_pnl: rust_decimal::Decimal,
 }
 
 impl Default for AccountView {
     fn default() -> Self {
         Self {
-            cash_balance: 0.0,
+            cash_balance: rust_decimal::Decimal::ZERO,
             positions: std::collections::HashMap::new(),
-            unrealized_pnl: 0.0,
-            realized_pnl: 0.0,
+            unrealized_pnl: rust_decimal::Decimal::ZERO,
+            realized_pnl: rust_decimal::Decimal::ZERO,
         }
     }
 }
@@ -99,7 +99,7 @@ pub struct Position {
     pub symbol: Symbol,
     pub quantity: Quantity,
     pub avg_price: Price,
-    pub unrealized_pnl: f64,
+    pub unrealized_pnl: rust_decimal::Decimal,
 }
 
 /// 策略接口
@@ -391,7 +391,7 @@ pub trait RiskManager: Send + Sync {
     fn emergency_stop(&mut self) -> Result<(), HftError>;
 
     /// 獲取風控指標
-    fn get_risk_metrics(&self) -> std::collections::HashMap<String, f64>;
+    fn get_risk_metrics(&self) -> std::collections::HashMap<String, rust_decimal::Decimal>;
 
     /// 是否應該暫停交易 (熔斷)
     fn should_halt_trading(&self, account: &AccountView) -> bool;
@@ -403,12 +403,12 @@ pub trait RiskManager: Send + Sync {
 /// 風控指標
 #[derive(Debug, Clone)]
 pub struct RiskMetrics {
-    pub max_drawdown: f64,
-    pub current_drawdown: f64,
-    pub var_1d: f64, // 1日風險價值
-    pub leverage: f64,
-    pub concentration_risk: f64,
-    pub order_rate: f64, // 訂單頻率
+    pub max_drawdown: rust_decimal::Decimal,
+    pub current_drawdown: rust_decimal::Decimal,
+    pub var_1d: rust_decimal::Decimal, // 1日風險價值
+    pub leverage: rust_decimal::Decimal,
+    pub concentration_risk: rust_decimal::Decimal,
+    pub order_rate: rust_decimal::Decimal, // 訂單頻率
     pub last_update: Timestamp,
 }
 

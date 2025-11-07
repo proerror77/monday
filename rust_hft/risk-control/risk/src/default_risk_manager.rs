@@ -8,7 +8,7 @@
 
 use hft_core::{HftError, Price, Quantity, Symbol};
 use ports::{AccountView, ExecutionEvent, OrderIntent, RiskManager, RiskMetrics, VenueSpec};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
@@ -172,7 +172,7 @@ impl DefaultRiskManager {
     fn check_daily_loss(&self, account: &AccountView) -> Result<(), String> {
         let total_pnl = account.realized_pnl + account.unrealized_pnl;
 
-        if total_pnl < -self.config.max_daily_loss.to_f64().unwrap_or(0.0) {
+        if total_pnl < -self.config.max_daily_loss {
             return Err(format!(
                 "超过日内最大亏损: {:.2} < -{:.2}",
                 total_pnl, self.config.max_daily_loss
@@ -313,27 +313,24 @@ impl RiskManager for DefaultRiskManager {
         Ok(())
     }
 
-    fn get_risk_metrics(&self) -> HashMap<String, f64> {
+    fn get_risk_metrics(&self) -> HashMap<String, Decimal> {
         let mut metrics = HashMap::new();
 
         metrics.insert(
             "total_orders_today".to_string(),
-            self.total_orders_today as f64,
+            Decimal::from(self.total_orders_today),
         );
         metrics.insert(
             "total_rejected_today".to_string(),
-            self.total_rejected_today as f64,
+            Decimal::from(self.total_rejected_today),
         );
-        metrics.insert(
-            "daily_pnl".to_string(),
-            self.daily_pnl.to_f64().unwrap_or(0.0),
-        );
+        metrics.insert("daily_pnl".to_string(), self.daily_pnl);
 
         if self.total_orders_today > 0 {
             metrics.insert(
                 "approval_rate".to_string(),
-                (self.total_orders_today - self.total_rejected_today) as f64
-                    / self.total_orders_today as f64,
+                Decimal::from(self.total_orders_today - self.total_rejected_today)
+                    / Decimal::from(self.total_orders_today),
             );
         }
 
@@ -355,17 +352,17 @@ impl RiskManager for DefaultRiskManager {
     fn should_halt_trading(&self, account: &AccountView) -> bool {
         // 如果日内亏损超过限额，应该停止交易
         let total_pnl = account.realized_pnl + account.unrealized_pnl;
-        total_pnl < -self.config.max_daily_loss.to_f64().unwrap_or(10000.0)
+        total_pnl < -self.config.max_daily_loss
     }
 
     fn risk_metrics(&self) -> RiskMetrics {
         RiskMetrics {
-            max_drawdown: self.daily_pnl.to_f64().unwrap_or(0.0).min(0.0).abs(),
-            current_drawdown: 0.0,
-            var_1d: 0.0,
-            leverage: 0.0,
-            concentration_risk: 0.0,
-            order_rate: 0.0,
+            max_drawdown: self.daily_pnl.min(Decimal::ZERO).abs(),
+            current_drawdown: Decimal::ZERO,
+            var_1d: Decimal::ZERO,
+            leverage: Decimal::ZERO,
+            concentration_risk: Decimal::ZERO,
+            order_rate: Decimal::ZERO,
             last_update: 0,
         }
     }

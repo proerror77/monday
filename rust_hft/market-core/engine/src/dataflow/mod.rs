@@ -42,10 +42,10 @@
 //! }
 //! ```
 
-pub mod ring_buffer;
-pub mod ring_buffer_ultra;
 pub mod ingestion;
 pub mod ingestion_ultra;
+pub mod ring_buffer;
+pub mod ring_buffer_ultra;
 
 #[cfg(feature = "bench-lockfree")]
 pub mod lockfree_queue;

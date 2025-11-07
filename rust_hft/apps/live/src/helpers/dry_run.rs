@@ -16,10 +16,10 @@ pub async fn run_dry_run_if_enabled(system: &SystemRuntime, enabled: bool, symbo
             tokio::time::sleep(Duration::from_millis(500)).await;
             let account_view = system.get_account_view().await;
             info!(
-                cash = account_view.cash_balance,
+                cash = %account_view.cash_balance,
                 positions = account_view.positions.len(),
-                unrealized = account_view.unrealized_pnl,
-                realized = account_view.realized_pnl,
+                unrealized = %account_view.unrealized_pnl,
+                realized = %account_view.realized_pnl,
                 "AccountView 更新"
             );
         }

@@ -125,15 +125,15 @@ struct FillUpdate {
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct LiquidationUpdate {
-    coin: String,              // 资产名称 (e.g., "BTC")
+    coin: String, // 资产名称 (e.g., "BTC")
     #[serde(rename = "liqPx")]
-    liq_px: String,            // 清算价格
+    liq_px: String, // 清算价格
     #[serde(rename = "sz")]
-    sz: String,                // 清算数量
-    side: String,              // "A" (ask/sell) | "B" (bid/buy)
-    time: u64,                 // 清算时间戳
+    sz: String, // 清算数量
+    side: String, // "A" (ask/sell) | "B" (bid/buy)
+    time: u64,    // 清算时间戳
     #[serde(rename = "markPx", default)]
-    mark_px: Option<String>,   // 标记价格
+    mark_px: Option<String>, // 标记价格
 }
 
 // Hyperliquid 未结订单查询请求
@@ -265,12 +265,12 @@ struct ModifyRequest {
 enum ExchangeResponse {
     Success {
         #[allow(dead_code)]
-        status: String,  // "ok"
+        status: String, // "ok"
         response: ExchangeResponseData,
     },
     Error {
         #[allow(dead_code)]
-        status: String,  // "err"
+        status: String, // "err"
         #[serde(default)]
         response: String,
     },
@@ -280,7 +280,7 @@ enum ExchangeResponse {
 struct ExchangeResponseData {
     #[serde(rename = "type")]
     #[allow(dead_code)]
-    response_type: String,  // "order" | "cancel" | "modify"
+    response_type: String, // "order" | "cancel" | "modify"
     data: Option<OrderResponseData>,
 }
 
@@ -301,7 +301,7 @@ struct OrderStatusResponse {
 
 #[derive(Debug, Deserialize)]
 struct RestingOrderInfo {
-    oid: u64,  // Hyperliquid order ID
+    oid: u64, // Hyperliquid order ID
 }
 
 #[derive(Debug, Deserialize)]
@@ -579,10 +579,7 @@ impl HyperliquidExecutionClient {
         let order = HyperliquidOrder {
             a: *asset_index,
             b: intent.side == Side::Buy,
-            p: intent
-                .price
-                .unwrap_or(Price(Decimal::ZERO))
-                .to_string(),
+            p: intent.price.unwrap_or(Price(Decimal::ZERO)).to_string(),
             s: intent.quantity.to_string(),
             r: false, // reduce_only
             tif: OrderTif::Limit {
@@ -635,8 +632,9 @@ impl HyperliquidExecutionClient {
         debug!("Hyperliquid 响应: {}", response_text);
 
         // 解析 Hyperliquid 下单响应
-        let exchange_response: ExchangeResponse = parse_json(&response_text)
-            .map_err(|e| HftError::Exchange(format!("解析响应失败: {}, 原始响应: {}", e, response_text)))?;
+        let exchange_response: ExchangeResponse = parse_json(&response_text).map_err(|e| {
+            HftError::Exchange(format!("解析响应失败: {}, 原始响应: {}", e, response_text))
+        })?;
 
         let hyperliquid_oid = match exchange_response {
             ExchangeResponse::Success { response, .. } => {
@@ -644,7 +642,10 @@ impl HyperliquidExecutionClient {
                     if let Some(status) = data.statuses.first() {
                         // 检查是否有错误
                         if let Some(error) = &status.error {
-                            return Err(HftError::Exchange(format!("Hyperliquid 拒绝订单: {}", error)));
+                            return Err(HftError::Exchange(format!(
+                                "Hyperliquid 拒绝订单: {}",
+                                error
+                            )));
                         }
 
                         // 优先从 resting 获取 OID (挂单)
@@ -1268,13 +1269,17 @@ impl HyperliquidExecutionClient {
     // 处理清算事件
     fn handle_liquidation_event(&self, liq: LiquidationUpdate) -> Option<ExecutionEvent> {
         // 解析清算价格
-        let liq_price = liq.liq_px.parse::<f64>()
+        let liq_price = liq
+            .liq_px
+            .parse::<f64>()
             .ok()
             .and_then(|p| rust_decimal::Decimal::try_from(p).ok())
             .map(Price);
 
         // 解析清算数量
-        let liq_quantity = liq.sz.parse::<f64>()
+        let liq_quantity = liq
+            .sz
+            .parse::<f64>()
             .ok()
             .and_then(|q| rust_decimal::Decimal::try_from(q).ok())
             .map(Quantity);
@@ -1296,10 +1301,7 @@ impl HyperliquidExecutionClient {
         );
 
         if let Some(mark_px) = &liq.mark_px {
-            warn!(
-                "   标记价格: {}, 清算价格: {}",
-                mark_px, liq.liq_px
-            );
+            warn!("   标记价格: {}, 清算价格: {}", mark_px, liq.liq_px);
         }
 
         // 清算事件通常伴随强制平仓

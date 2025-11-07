@@ -8,7 +8,7 @@ mod helpers;
 
 use clap::Parser;
 use runtime::{
-    RiskConfig as RtRiskConfig, StrategyConfig as RtStrategyConfig,
+    ExecutionQueueSettings, RiskConfig as RtRiskConfig, StrategyConfig as RtStrategyConfig,
     StrategyParams as RtStrategyParams, StrategyRiskLimits as RtStrategyRiskLimits,
     StrategyType as RtStrategyType, SystemEngineConfig, VenueCapabilities,
     VenueConfig as RtVenueConfig, VenueType,
@@ -151,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ack_timeout_ms: 3000,
                 reconcile_interval_ms: 5000,
                 auto_cancel_exchange_only: false,
+                execution_queue: ExecutionQueueSettings::default(),
             };
             let venues = vec![
                 RtVenueConfig {
@@ -170,6 +171,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     symbol_catalog: Vec::new(),
                     data_config: None,
                     execution_config: None,
+                    secret_ref_api_key: None,
+                    secret_ref_secret: None,
+                    secret_ref_passphrase: None,
                 },
                 RtVenueConfig {
                     name: "binance".to_string(),
@@ -188,6 +192,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     symbol_catalog: Vec::new(),
                     data_config: None,
                     execution_config: None,
+                    secret_ref_api_key: None,
+                    secret_ref_secret: None,
+                    secret_ref_passphrase: None,
                 },
             ];
 
@@ -421,7 +428,10 @@ fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
 #[allow(dead_code)]
 fn convert_legacy_config(legacy: Config) -> SystemConfig {
     use engine::dataflow::FlipPolicy;
-    use runtime::{RiskConfig, SystemEngineConfig, VenueCapabilities, VenueConfig, VenueType};
+    use runtime::{
+        ExecutionQueueSettings, RiskConfig, SystemEngineConfig, VenueCapabilities, VenueConfig,
+        VenueType,
+    };
 
     SystemConfig {
         engine: SystemEngineConfig {
@@ -433,6 +443,7 @@ fn convert_legacy_config(legacy: Config) -> SystemConfig {
             ack_timeout_ms: 3000,
             reconcile_interval_ms: 5000,
             auto_cancel_exchange_only: false,
+            execution_queue: ExecutionQueueSettings::default(),
         },
         venues: legacy
             .venues
@@ -469,6 +480,9 @@ fn convert_legacy_config(legacy: Config) -> SystemConfig {
                     symbol_catalog: Vec::new(),
                     data_config: None,
                     execution_config: None,
+                    secret_ref_api_key: None,
+                    secret_ref_secret: None,
+                    secret_ref_passphrase: None,
                 }
             })
             .collect(),

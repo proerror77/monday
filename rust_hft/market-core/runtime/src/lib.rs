@@ -40,6 +40,7 @@ mod tests {
                 ack_timeout_ms: 3000,
                 reconcile_interval_ms: 5000,
                 auto_cancel_exchange_only: false,
+                execution_queue: ExecutionQueueSettings::default(),
             },
             venues: vec![],
             strategies: vec![],

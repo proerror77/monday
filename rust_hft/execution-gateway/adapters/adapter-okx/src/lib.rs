@@ -129,7 +129,8 @@ impl ExecutionClient for OkxExecutionClient {
                 )));
             }
             let ord_id = r
-                .data.first()
+                .data
+                .first()
                 .and_then(|v| v.get("ordId"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")

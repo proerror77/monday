@@ -29,11 +29,15 @@ pub struct ClickHouseConfig {
 }
 
 /// 引擎層配置（從 system_builder.rs 抽離）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SystemEngineConfig {
+    #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
+    #[serde(default = "default_stale_us")]
     pub stale_us: u64,
+    #[serde(default = "default_top_n")]
     pub top_n: usize,
+    #[serde(default)]
     pub flip_policy: FlipPolicy,
     #[serde(default)]
     pub cpu_affinity: CpuAffinityConfig,
@@ -46,37 +50,81 @@ pub struct SystemEngineConfig {
     /// Auto-cancel exchange-only orders discovered in reconciliation
     #[serde(default)]
     pub auto_cancel_exchange_only: bool,
-    /// 執行隊列配置 - 意圖隊列容量 (power of 2)
-    #[serde(default = "default_intent_queue_capacity")]
-    pub intent_queue_capacity: usize,
-    /// 執行隊列配置 - 回報隊列容量 (power of 2)
-    #[serde(default = "default_event_queue_capacity")]
-    pub event_queue_capacity: usize,
-    /// 執行隊列配置 - 批處理大小
-    #[serde(default = "default_execution_batch_size")]
-    pub execution_batch_size: usize,
+    /// 執行隊列與 worker 設定
+    #[serde(default)]
+    pub execution_queue: ExecutionQueueSettings,
+}
+
+fn default_queue_capacity() -> usize {
+    32768
+}
+
+fn default_stale_us() -> u64 {
+    3000
+}
+
+fn default_top_n() -> usize {
+    10
 }
 
 fn default_ack_timeout_ms() -> u64 {
     3000
 }
+
 fn default_reconcile_interval_ms() -> u64 {
     5000
-}
-fn default_intent_queue_capacity() -> usize {
-    4096
-}
-fn default_event_queue_capacity() -> usize {
-    8192
-}
-fn default_execution_batch_size() -> usize {
-    32
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CpuAffinityConfig {
     /// 將引擎主循環綁定到指定 CPU 核心（0-based）
     pub engine_core: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionQueueSettings {
+    #[serde(default = "default_intent_queue_capacity")]
+    pub intent_queue_capacity: usize,
+    #[serde(default = "default_event_queue_capacity")]
+    pub event_queue_capacity: usize,
+    #[serde(default = "default_execution_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_worker_batch_size")]
+    pub worker_batch_size: usize,
+    #[serde(default = "default_worker_idle_sleep_ms")]
+    pub worker_idle_sleep_ms: u64,
+}
+
+impl Default for ExecutionQueueSettings {
+    fn default() -> Self {
+        Self {
+            intent_queue_capacity: default_intent_queue_capacity(),
+            event_queue_capacity: default_event_queue_capacity(),
+            batch_size: default_execution_batch_size(),
+            worker_batch_size: default_worker_batch_size(),
+            worker_idle_sleep_ms: default_worker_idle_sleep_ms(),
+        }
+    }
+}
+
+const fn default_intent_queue_capacity() -> usize {
+    4096
+}
+
+const fn default_event_queue_capacity() -> usize {
+    8192
+}
+
+const fn default_execution_batch_size() -> usize {
+    32
+}
+
+const fn default_worker_batch_size() -> usize {
+    16
+}
+
+const fn default_worker_idle_sleep_ms() -> u64 {
+    1
 }
 
 /// 策略級風控限制
@@ -237,9 +285,27 @@ pub struct VenueConfig {
     pub ws_public: Option<String>,
     pub ws_private: Option<String>,
     pub rest: Option<String>,
+    /// API 密鑰（支援 ${VAR_NAME} 展開，或直接值，向後相容）
     pub api_key: Option<String>,
+    /// API 秘密（支援 ${VAR_NAME} 展開，或直接值，向後相容）
     pub secret: Option<String>,
+    /// Passphrase（支援 ${VAR_NAME} 展開，或直接值，向後相容）
     pub passphrase: Option<String>, // Bitget 等需要 passphrase 的交易所
+    /// 秘密管理器參考鍵（取代 api_key，優先於明文值）
+    /// 格式：「venue::field」，例：「bitget::api_key」
+    /// 優先級：secret_ref > api_key
+    #[serde(default)]
+    pub secret_ref_api_key: Option<String>,
+    /// 秘密管理器參考鍵（取代 secret，優先於明文值）
+    /// 格式：「venue::field」，例：「bitget::secret」
+    /// 優先級：secret_ref > secret
+    #[serde(default)]
+    pub secret_ref_secret: Option<String>,
+    /// 秘密管理器參考鍵（取代 passphrase，優先於明文值）
+    /// 格式：「venue::field」，例：「bitget::passphrase」
+    /// 優先級：secret_ref > passphrase
+    #[serde(default)]
+    pub secret_ref_passphrase: Option<String>,
     pub execution_mode: Option<String>, // "Paper" | "Live"，預設為 Paper
     pub capabilities: VenueCapabilities,
     /// 產品型別（Bitget：SPOT/USDT-FUTURES/COIN-FUTURES/USDC-FUTURES）

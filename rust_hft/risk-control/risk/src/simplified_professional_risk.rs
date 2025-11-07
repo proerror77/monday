@@ -3,16 +3,18 @@
 
 use hft_core::{now_micros, HftError, Timestamp};
 use ports::{AccountView, ExecutionEvent, OrderIntent, RiskManager, RiskMetrics, VenueSpec};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{error, info, warn};
 
 /// 簡化的專業風控配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimplifiedRiskConfig {
     /// 基礎限制
-    pub max_order_notional: f64,
-    pub max_global_notional: f64,
+    pub max_order_notional: Decimal,
+    pub max_global_notional: Decimal,
 
     /// 速率限制
     pub max_orders_per_second: u32,
@@ -23,8 +25,8 @@ pub struct SimplifiedRiskConfig {
     pub symbol_cooldown_us: u64,
 
     /// 損失控制
-    pub max_daily_loss: f64,
-    pub max_drawdown_pct: f64,
+    pub max_daily_loss: Decimal,
+    pub max_drawdown_pct: Decimal,
 
     /// 熔斷器
     pub circuit_breaker_enabled: bool,
@@ -34,14 +36,14 @@ pub struct SimplifiedRiskConfig {
 impl Default for SimplifiedRiskConfig {
     fn default() -> Self {
         Self {
-            max_order_notional: 50_000.0,     // 50K USD
-            max_global_notional: 1_000_000.0, // 1M USD
+            max_order_notional: Decimal::from(50_000),     // 50K USD
+            max_global_notional: Decimal::from(1_000_000), // 1M USD
             max_orders_per_second: 100,
             max_orders_per_minute: 1000,
-            global_cooldown_us: 1000,  // 1ms
-            symbol_cooldown_us: 5000,  // 5ms
-            max_daily_loss: -10_000.0, // -10K USD
-            max_drawdown_pct: 5.0,     // 5%
+            global_cooldown_us: 1000,               // 1ms
+            symbol_cooldown_us: 5000,               // 5ms
+            max_daily_loss: Decimal::from(-10_000), // -10K USD
+            max_drawdown_pct: Decimal::from(5),     // 5%
             circuit_breaker_enabled: true,
             recovery_time_minutes: 15,
         }
@@ -78,13 +80,13 @@ pub struct SimplifiedProfessionalRiskManager {
     last_global_order: Timestamp,
     symbol_cooldowns: HashMap<String, Timestamp>,
 
-    // 熔斷器狀態
-    circuit_breaker_active: bool,
+    // 熔斷器狀態（原子操作，確保線程安全）
+    circuit_breaker_active: AtomicBool,
     circuit_breaker_recovery_time: Timestamp,
 
     // 累計統計（用於計算每日損失等）
-    daily_pnl: f64,
-    max_drawdown_seen: f64,
+    daily_pnl: Decimal,
+    max_drawdown_seen: Decimal,
     last_reset_time: Timestamp,
 }
 
@@ -96,10 +98,10 @@ impl SimplifiedProfessionalRiskManager {
             order_history: VecDeque::with_capacity(10000),
             last_global_order: 0,
             symbol_cooldowns: HashMap::new(),
-            circuit_breaker_active: false,
+            circuit_breaker_active: AtomicBool::new(false),
             circuit_breaker_recovery_time: 0,
-            daily_pnl: 0.0,
-            max_drawdown_seen: 0.0,
+            daily_pnl: Decimal::ZERO,
+            max_drawdown_seen: Decimal::ZERO,
             last_reset_time: now_micros(),
         }
     }
@@ -114,14 +116,14 @@ impl SimplifiedProfessionalRiskManager {
         let current_time = now_micros();
 
         // 1. 熔斷器檢查
-        if self.circuit_breaker_active {
+        if self.circuit_breaker_active.load(Ordering::SeqCst) {
             if current_time < self.circuit_breaker_recovery_time {
                 self.stats.orders_rejected += 1;
                 self.increment_reject_reason("circuit_breaker");
                 return SimplifiedRiskDecision::Reject("熔斷器活躍中".to_string());
             } else {
                 // 恢復時間到，重置熔斷器
-                self.circuit_breaker_active = false;
+                self.circuit_breaker_active.store(false, Ordering::SeqCst);
                 info!("熔斷器已恢復");
             }
         }
@@ -164,13 +166,13 @@ impl SimplifiedProfessionalRiskManager {
 
     fn check_basic_limits(&self, intent: &OrderIntent, account: &AccountView) -> Option<String> {
         // 檢查單筆訂單名義價值
-        let price = intent.price.as_ref()?.to_f64()?;
-        let qty = intent.quantity.to_f64()?;
+        let price = intent.price.as_ref()?.0;
+        let qty = intent.quantity.0;
         let order_notional = price * qty;
 
         if order_notional > self.config.max_order_notional {
             return Some(format!(
-                "單筆訂單名義價值超限: {:.2} > {:.2}",
+                "單筆訂單名義價值超限: {} > {}",
                 order_notional, self.config.max_order_notional
             ));
         }
@@ -179,7 +181,7 @@ impl SimplifiedProfessionalRiskManager {
         let total_notional = account.cash_balance.abs() + account.unrealized_pnl.abs();
         if total_notional > self.config.max_global_notional {
             return Some(format!(
-                "全局名義價值超限: {:.2} > {:.2}",
+                "全局名義價值超限: {} > {}",
                 total_notional, self.config.max_global_notional
             ));
         }
@@ -262,22 +264,23 @@ impl SimplifiedProfessionalRiskManager {
         // 檢查日內損失（使用 realized_pnl 作為代理）
         if account.realized_pnl < self.config.max_daily_loss {
             return Some(format!(
-                "日內損失超限: {:.2} < {:.2}",
+                "日內損失超限: {} < {}",
                 account.realized_pnl, self.config.max_daily_loss
             ));
         }
 
         // 檢查回撤（簡化計算）
         let current_total_pnl = account.realized_pnl + account.unrealized_pnl;
-        let current_drawdown_pct = if self.max_drawdown_seen > 0.0 {
-            (self.max_drawdown_seen - current_total_pnl) / self.max_drawdown_seen * 100.0
+        let current_drawdown_pct = if self.max_drawdown_seen > Decimal::ZERO {
+            (self.max_drawdown_seen - current_total_pnl) / self.max_drawdown_seen
+                * Decimal::from(100)
         } else {
-            0.0
+            Decimal::ZERO
         };
 
         if current_drawdown_pct > self.config.max_drawdown_pct {
             return Some(format!(
-                "回撤超限: {:.2}% > {:.2}%",
+                "回撤超限: {} > {}",
                 current_drawdown_pct, self.config.max_drawdown_pct
             ));
         }
@@ -287,7 +290,7 @@ impl SimplifiedProfessionalRiskManager {
 
     fn trigger_circuit_breaker(&mut self, reason: &str) {
         let current_time = now_micros();
-        self.circuit_breaker_active = true;
+        self.circuit_breaker_active.store(true, Ordering::SeqCst);
         self.circuit_breaker_recovery_time =
             current_time + (self.config.recovery_time_minutes * 60 * 1_000_000);
 
@@ -341,7 +344,8 @@ impl SimplifiedProfessionalRiskManager {
 
     /// 檢查是否應該暫停交易
     pub fn should_halt(&self) -> bool {
-        self.circuit_breaker_active && now_micros() < self.circuit_breaker_recovery_time
+        self.circuit_breaker_active.load(Ordering::SeqCst)
+            && now_micros() < self.circuit_breaker_recovery_time
     }
 }
 
@@ -403,10 +407,10 @@ impl RiskManager for SimplifiedProfessionalRiskManager {
             price, quantity, ..
         } = event
         {
-            let fill_amount = price.to_f64().unwrap_or(0.0) * quantity.to_f64().unwrap_or(0.0);
+            let fill_amount = price.0 * quantity.0;
 
             // 簡單的 PNL 累計（實際實現會更複雜）
-            self.daily_pnl += fill_amount * 0.001; // 假設 0.1% 的利潤率
+            self.daily_pnl += fill_amount * Decimal::from_str_exact("0.001").unwrap(); // 假設 0.1% 的利潤率
             self.max_drawdown_seen = self.max_drawdown_seen.max(self.daily_pnl);
         }
     }
@@ -416,44 +420,44 @@ impl RiskManager for SimplifiedProfessionalRiskManager {
         Ok(())
     }
 
-    fn get_risk_metrics(&self) -> HashMap<String, f64> {
+    fn get_risk_metrics(&self) -> HashMap<String, Decimal> {
         let mut metrics = HashMap::new();
 
         metrics.insert(
             "orders_submitted".to_string(),
-            self.stats.orders_submitted as f64,
+            Decimal::from(self.stats.orders_submitted as u64),
         );
         metrics.insert(
             "orders_allowed".to_string(),
-            self.stats.orders_allowed as f64,
+            Decimal::from(self.stats.orders_allowed as u64),
         );
         metrics.insert(
             "orders_rejected".to_string(),
-            self.stats.orders_rejected as f64,
+            Decimal::from(self.stats.orders_rejected as u64),
         );
         metrics.insert(
             "orders_delayed".to_string(),
-            self.stats.orders_delayed as f64,
+            Decimal::from(self.stats.orders_delayed as u64),
         );
 
-        let total = self.stats.orders_submitted as f64;
-        if total > 0.0 {
+        let total = Decimal::from(self.stats.orders_submitted as u64);
+        if total > Decimal::ZERO {
             metrics.insert(
                 "approval_rate".to_string(),
-                self.stats.orders_allowed as f64 / total,
+                Decimal::from(self.stats.orders_allowed as u64) / total,
             );
             metrics.insert(
                 "rejection_rate".to_string(),
-                self.stats.orders_rejected as f64 / total,
+                Decimal::from(self.stats.orders_rejected as u64) / total,
             );
         }
 
         metrics.insert(
             "circuit_breaker_active".to_string(),
-            if self.circuit_breaker_active {
-                1.0
+            if self.circuit_breaker_active.load(Ordering::SeqCst) {
+                Decimal::ONE
             } else {
-                0.0
+                Decimal::ZERO
             },
         );
         metrics.insert("daily_pnl".to_string(), self.daily_pnl);
@@ -469,10 +473,10 @@ impl RiskManager for SimplifiedProfessionalRiskManager {
         RiskMetrics {
             max_drawdown: self.max_drawdown_seen,
             current_drawdown: self.max_drawdown_seen - self.daily_pnl,
-            var_1d: self.daily_pnl * 0.05, // 簡化的 VaR 計算
-            leverage: 1.0,                 // 簡化
-            concentration_risk: 0.0,       // 簡化
-            order_rate: self.stats.orders_submitted as f64 / 3600.0, // 每小時訂單數
+            var_1d: self.daily_pnl * Decimal::from_str_exact("0.05").unwrap(), // 簡化的 VaR 計算
+            leverage: Decimal::ONE,                                            // 簡化
+            concentration_risk: Decimal::ZERO,                                 // 簡化
+            order_rate: Decimal::from(self.stats.orders_submitted as u64) / Decimal::from(3600), // 每小時訂單數
             last_update: now_micros(),
         }
     }

@@ -1,8 +1,6 @@
 //! Command handlers for IPC server
 
-use crate::{
-    AccountInfo, Command, Response, ResponseData, SystemStatus, TradingMode,
-};
+use crate::{AccountInfo, Command, Response, ResponseData, SystemStatus, TradingMode};
 use async_trait::async_trait;
 
 /// Trait for handling IPC commands
@@ -171,7 +169,7 @@ impl CommandHandler for MockCommandHandler {
             Command::Start => Response::Ok,
             Command::Stop => Response::Ok,
             Command::EmergencyStop => Response::Ok,
-            Command::LoadModel {  .. } => Response::Ok,
+            Command::LoadModel { .. } => Response::Ok,
             Command::UpdateRisk { .. } => Response::Ok,
             Command::UpdateStrategyParams { .. } => Response::Ok,
             Command::GetStatus => {

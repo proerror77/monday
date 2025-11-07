@@ -2,10 +2,8 @@
 //!
 //! 演示如何使用 ultra ring buffer 和 ultra ingestion 實現微秒級延遲
 
+use engine::dataflow::{ultra_ring_buffer, UltraEventIngester, UltraIngestionConfig};
 use hft_core::{now_micros, Symbol};
-use engine::dataflow::{
-    ultra_ring_buffer, UltraEventIngester, UltraIngestionConfig,
-};
 use ports::{BookLevel, MarketEvent, MarketSnapshot};
 use std::time::Instant;
 
@@ -113,7 +111,10 @@ fn demo_ultra_ingester() {
     }
 
     let consume_elapsed = start.elapsed();
-    println!("✅ Consume {} events: {:?}", total_consumed, consume_elapsed);
+    println!(
+        "✅ Consume {} events: {:?}",
+        total_consumed, consume_elapsed
+    );
     println!(
         "   Average: {:.2}ns per consume\n",
         consume_elapsed.as_nanos() as f64 / total_consumed as f64
@@ -150,7 +151,11 @@ fn demo_batch_operations() {
     }
     let batch_ingest_elapsed = start.elapsed();
 
-    println!("✅ Batch ingest {} events: {:?}", events.len(), batch_ingest_elapsed);
+    println!(
+        "✅ Batch ingest {} events: {:?}",
+        events.len(),
+        batch_ingest_elapsed
+    );
     println!(
         "   Average: {:.2}ns per event\n",
         batch_ingest_elapsed.as_nanos() as f64 / events.len() as f64
@@ -169,7 +174,10 @@ fn demo_batch_operations() {
     }
 
     let batch_consume_elapsed = start.elapsed();
-    println!("✅ Batch consume {} events: {:?}", total, batch_consume_elapsed);
+    println!(
+        "✅ Batch consume {} events: {:?}",
+        total, batch_consume_elapsed
+    );
     println!(
         "   Average: {:.2}ns per event\n",
         batch_consume_elapsed.as_nanos() as f64 / total as f64

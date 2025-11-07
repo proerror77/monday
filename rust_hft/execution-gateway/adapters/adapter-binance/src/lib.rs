@@ -568,8 +568,8 @@ impl ExecutionClient for BinanceExecutionClient {
             };
             let qty =
                 hft_core::Quantity::from_str(&it.orig_qty).unwrap_or(hft_core::Quantity::zero());
-            let filled =
-                hft_core::Quantity::from_str(&it.executed_qty).unwrap_or(hft_core::Quantity::zero());
+            let filled = hft_core::Quantity::from_str(&it.executed_qty)
+                .unwrap_or(hft_core::Quantity::zero());
             let remaining = hft_core::Quantity(qty.0 - filled.0);
             let price = hft_core::Price::from_str(&it.price).ok();
             let status = match it.status.as_str() {
@@ -592,7 +592,7 @@ impl ExecutionClient for BinanceExecutionClient {
                 filled_quantity: filled,
                 price,
                 status,
-                created_at: it.time * 1000,       // ms -> μs
+                created_at: it.time * 1000,        // ms -> μs
                 updated_at: it.update_time * 1000, // ms -> μs
             });
         }

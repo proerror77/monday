@@ -1,8 +1,7 @@
 //! IPC Client implementation
 
 use crate::{
-    Command, IPCError, IPCMessage, IPCPayload, IPCResult, Response, StatusUpdate,
-    MAX_MESSAGE_SIZE,
+    Command, IPCError, IPCMessage, IPCPayload, IPCResult, Response, StatusUpdate, MAX_MESSAGE_SIZE,
 };
 use std::path::Path;
 use std::time::Duration;

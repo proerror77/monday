@@ -51,7 +51,7 @@ pub struct UltraIngestionConfig {
 impl Default for UltraIngestionConfig {
     fn default() -> Self {
         Self {
-            queue_capacity: 32768, // 32K events
+            queue_capacity: 32768,    // 32K events
             stale_threshold_us: 3000, // 3ms
         }
     }
@@ -61,7 +61,7 @@ impl UltraIngestionConfig {
     /// 高頻交易配置（極致性能）
     pub fn hft() -> Self {
         Self {
-            queue_capacity: 16384, // 16K
+            queue_capacity: 16384,    // 16K
             stale_threshold_us: 1000, // 1ms
         }
     }

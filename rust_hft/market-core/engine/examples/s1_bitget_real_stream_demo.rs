@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_concurrent_adapters: 4,
     };
 
-    let adapter_bridge = AdapterBridge::new(bridge_config);
+    let mut adapter_bridge = AdapterBridge::new(bridge_config);
 
     // 3. 創建並連接 Bitget Adapter
     info!("📡 正在初始化 Bitget WebSocket 適配器...");

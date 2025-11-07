@@ -334,12 +334,7 @@ mod bitget_adapter_tests {
         let mut stream = adapter.subscribe(symbols).await?;
 
         // 收集事件
-        let events = collect_events(
-            stream.as_mut(),
-            1,
-            Duration::from_secs(5),
-        )
-        .await?;
+        let events = collect_events(stream.as_mut(), 1, Duration::from_secs(5)).await?;
 
         // 驗證接收到快照
         assert!(!events.is_empty(), "Should receive at least one event");
@@ -393,12 +388,7 @@ mod bitget_adapter_tests {
         let mut stream = adapter.subscribe(symbols).await?;
 
         // 收集事件（快照 + 更新）
-        let events = collect_events(
-            stream.as_mut(),
-            2,
-            Duration::from_secs(5),
-        )
-        .await?;
+        let events = collect_events(stream.as_mut(), 2, Duration::from_secs(5)).await?;
 
         assert!(events.len() >= 1, "Should receive at least snapshot");
 
@@ -419,7 +409,9 @@ mod bitget_adapter_tests {
     #[tokio::test]
     async fn test_trade_parsing() -> Result<()> {
         let mut mock_server = MockWebSocketServer::new();
-        mock_server.queue_trade("BTCUSDT", "buy", 67189.5, 0.025).await;
+        mock_server
+            .queue_trade("BTCUSDT", "buy", 67189.5, 0.025)
+            .await;
         let ws_url = mock_server.start().await?;
 
         std::env::set_var("BITGET_WS_URL", &ws_url);
@@ -428,12 +420,7 @@ mod bitget_adapter_tests {
         let symbols = vec![Symbol::from("BTCUSDT")];
         let mut stream = adapter.subscribe(symbols).await?;
 
-        let events = collect_events(
-            stream.as_mut(),
-            1,
-            Duration::from_secs(5),
-        )
-        .await?;
+        let events = collect_events(stream.as_mut(), 1, Duration::from_secs(5)).await?;
 
         assert!(!events.is_empty(), "Should receive trade event");
 
@@ -482,12 +469,7 @@ mod bitget_adapter_tests {
         // 等待訂閱建立
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let events = collect_events(
-            stream.as_mut(),
-            10,
-            Duration::from_secs(10),
-        )
-        .await?;
+        let events = collect_events(stream.as_mut(), 10, Duration::from_secs(10)).await?;
 
         let trade_count = events
             .iter()
@@ -512,7 +494,9 @@ mod bitget_adapter_tests {
     #[tokio::test]
     async fn test_ticker_parsing() -> Result<()> {
         let mut mock_server = MockWebSocketServer::new();
-        mock_server.queue_ticker("BTCUSDT", 67189.5, 67188.1, 67189.6).await;
+        mock_server
+            .queue_ticker("BTCUSDT", 67189.5, 67188.1, 67189.6)
+            .await;
         let ws_url = mock_server.start().await?;
 
         std::env::set_var("BITGET_WS_URL", &ws_url);
@@ -522,12 +506,7 @@ mod bitget_adapter_tests {
         let mut stream = adapter.subscribe(symbols).await?;
 
         // Ticker 事件目前可能未實現，這裡只驗證不崩潰
-        let events = collect_events(
-            stream.as_mut(),
-            1,
-            Duration::from_secs(3),
-        )
-        .await?;
+        let events = collect_events(stream.as_mut(), 1, Duration::from_secs(3)).await?;
 
         // 驗證至少能解析消息（即使未生成 Ticker 事件）
         println!("Received {} events (Ticker support may vary)", events.len());
@@ -555,12 +534,7 @@ mod bitget_adapter_tests {
         let mut stream = adapter.subscribe(symbols).await?;
 
         // 收集初始事件
-        let initial_events = collect_events(
-            stream.as_mut(),
-            1,
-            Duration::from_secs(3),
-        )
-        .await?;
+        let initial_events = collect_events(stream.as_mut(), 1, Duration::from_secs(3)).await?;
 
         assert!(!initial_events.is_empty(), "Should receive initial events");
 
@@ -568,12 +542,7 @@ mod bitget_adapter_tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // 檢查是否收到斷線事件
-        let disconnect_events = collect_events(
-            stream.as_mut(),
-            1,
-            Duration::from_secs(2),
-        )
-        .await?;
+        let disconnect_events = collect_events(stream.as_mut(), 1, Duration::from_secs(2)).await?;
 
         let has_disconnect = disconnect_events
             .iter()
@@ -631,7 +600,10 @@ mod bitget_adapter_tests {
         println!("Heartbeat test completed, received {} events", event_count);
 
         // 驗證連接保持活躍（沒有斷線事件）
-        assert!(event_count > 0, "Should receive some events during heartbeat period");
+        assert!(
+            event_count > 0,
+            "Should receive some events during heartbeat period"
+        );
 
         Ok(())
     }
@@ -648,7 +620,9 @@ mod bitget_adapter_tests {
         let total_messages = 50;
         for i in 0..total_messages {
             let price = 67189.5 + (i as f64 * 0.1);
-            mock_server.queue_trade("BTCUSDT", "buy", price, 0.025).await;
+            mock_server
+                .queue_trade("BTCUSDT", "buy", price, 0.025)
+                .await;
         }
 
         let ws_url = mock_server.start().await?;
@@ -662,12 +636,8 @@ mod bitget_adapter_tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // 收集所有消息
-        let events = collect_events(
-            stream.as_mut(),
-            total_messages,
-            Duration::from_secs(15),
-        )
-        .await?;
+        let events =
+            collect_events(stream.as_mut(), total_messages, Duration::from_secs(15)).await?;
 
         let received = events
             .iter()
@@ -697,7 +667,9 @@ mod bitget_adapter_tests {
 
         // 預設一系列交易以測量延遲
         for _ in 0..20 {
-            mock_server.queue_trade("BTCUSDT", "buy", 67189.5, 0.025).await;
+            mock_server
+                .queue_trade("BTCUSDT", "buy", 67189.5, 0.025)
+                .await;
         }
 
         let ws_url = mock_server.start().await?;
@@ -711,12 +683,7 @@ mod bitget_adapter_tests {
 
         while latencies.len() < 20 {
             let event_start = Instant::now();
-            match tokio::time::timeout(
-                Duration::from_secs(2),
-                stream.next(),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
                 Ok(Some(Ok(event))) => {
                     if matches!(event, MarketEvent::Trade(_)) {
                         // 測量單個事件處理延遲
@@ -759,9 +726,13 @@ mod bitget_adapter_tests {
         // 預設混合消息類型
         mock_server.queue_orderbook_snapshot("BTCUSDT").await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        mock_server.queue_trade("BTCUSDT", "buy", 67189.5, 0.025).await;
+        mock_server
+            .queue_trade("BTCUSDT", "buy", 67189.5, 0.025)
+            .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        mock_server.queue_ticker("BTCUSDT", 67189.5, 67188.1, 67189.6).await;
+        mock_server
+            .queue_ticker("BTCUSDT", 67189.5, 67188.1, 67189.6)
+            .await;
 
         let ws_url = mock_server.start().await?;
         std::env::set_var("BITGET_WS_URL", &ws_url);
@@ -770,12 +741,7 @@ mod bitget_adapter_tests {
         let symbols = vec![Symbol::from("BTCUSDT")];
         let mut stream = adapter.subscribe(symbols).await?;
 
-        let events = collect_events(
-            stream.as_mut(),
-            3,
-            Duration::from_secs(5),
-        )
-        .await?;
+        let events = collect_events(stream.as_mut(), 3, Duration::from_secs(5)).await?;
 
         let snapshot_count = events
             .iter()
@@ -791,10 +757,7 @@ mod bitget_adapter_tests {
             snapshot_count, trade_count
         );
 
-        assert!(
-            snapshot_count >= 1,
-            "Should receive at least one snapshot"
-        );
+        assert!(snapshot_count >= 1, "Should receive at least one snapshot");
         assert!(trade_count >= 1, "Should receive at least one trade");
 
         Ok(())
@@ -819,12 +782,7 @@ mod bitget_adapter_tests {
         let symbols = vec![Symbol::from("BTCUSDT")];
         let mut stream = adapter.subscribe(symbols).await?;
 
-        let events = collect_events(
-            stream.as_mut(),
-            1,
-            Duration::from_secs(5),
-        )
-        .await?;
+        let events = collect_events(stream.as_mut(), 1, Duration::from_secs(5)).await?;
 
         if let Some(MarketEvent::Snapshot(snapshot)) = events.first() {
             // 驗證 bid/ask spread
@@ -840,7 +798,8 @@ mod bitget_adapter_tests {
                 );
 
                 // 驗證 spread 合理性（不超過 1%）
-                let spread_pct = ((best_ask.0 - best_bid.0) / best_bid.0) * rust_decimal::Decimal::from(100);
+                let spread_pct =
+                    ((best_ask.0 - best_bid.0) / best_bid.0) * rust_decimal::Decimal::from(100);
                 assert!(
                     spread_pct < rust_decimal::Decimal::from(1),
                     "Spread {:.4}% exceeds 1%",

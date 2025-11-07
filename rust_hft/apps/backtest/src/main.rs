@@ -58,8 +58,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn apply_strategy_overrides(cfg: &mut BacktestConfig, path: &str) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("無法讀取參數檔: {}", path))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("無法讀取參數檔: {}", path))?;
 
     // 允許兩種格式：直接是 strategy 欄位，或含包裝
     #[derive(serde::Deserialize)]
@@ -138,7 +138,13 @@ fn write_trades_csv(path: &Path, trades: &[TradeRecord]) -> anyhow::Result<()> {
 fn write_summary_csv(path: &Path, summary: &SummaryMetrics) -> anyhow::Result<()> {
     let mut writer = csv::Writer::from_path(path)
         .with_context(|| format!("無法寫入摘要檔案: {}", path.display()))?;
-    writer.write_record(["total_pnl", "trades", "win_rate", "max_drawdown", "max_position"])?;
+    writer.write_record([
+        "total_pnl",
+        "trades",
+        "win_rate",
+        "max_drawdown",
+        "max_position",
+    ])?;
     writer.write_record([
         format!("{:.6}", summary.total_pnl),
         summary.trades.to_string(),
@@ -151,8 +157,7 @@ fn write_summary_csv(path: &Path, summary: &SummaryMetrics) -> anyhow::Result<()
 }
 
 fn write_metrics_json(path: &Path, summary: &SummaryMetrics) -> anyhow::Result<()> {
-    let buffer = serde_json::to_string_pretty(summary)
-        .context("序列化回測指標失敗")?;
+    let buffer = serde_json::to_string_pretty(summary).context("序列化回測指標失敗")?;
     std::fs::write(path, buffer)
         .with_context(|| format!("寫入指標檔案失敗: {}", path.display()))?;
     Ok(())

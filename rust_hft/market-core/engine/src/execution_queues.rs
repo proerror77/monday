@@ -55,7 +55,7 @@ pub struct WorkerQueues {
 }
 
 /// 队列统计
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct QueueStats {
     pub intents_sent: u64,
     pub intents_received: u64,
@@ -141,6 +141,16 @@ impl EngineQueues {
     /// 获取统计信息
     pub fn stats(&self) -> &QueueStats {
         &self.stats
+    }
+
+    /// Intent 隊列容量（監控用）
+    pub fn intent_queue_capacity(&self) -> usize {
+        self.config.intent_queue_capacity
+    }
+
+    /// Event 隊列容量（監控用）
+    pub fn event_queue_capacity(&self) -> usize {
+        self.config.event_queue_capacity
     }
 }
 

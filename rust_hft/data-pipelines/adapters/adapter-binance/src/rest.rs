@@ -5,7 +5,7 @@ use hft_core::{HftError, HftResult, Symbol};
 use serde::de::DeserializeOwned;
 use tracing::{debug, info};
 
-const REST_BASE_URL: &str = "https://api.binance.com";
+pub const REST_BASE_URL: &str = "https://api.binance.com";
 
 pub struct BinanceRestClient {
     client: integration::http::HttpClient,
@@ -13,13 +13,17 @@ pub struct BinanceRestClient {
 
 impl BinanceRestClient {
     pub fn new() -> Self {
+        Self::with_base_url(REST_BASE_URL.to_string())
+    }
+
+    pub fn with_base_url(base_url: impl Into<String>) -> Self {
         let config = integration::http::HttpClientConfig {
-            base_url: REST_BASE_URL.to_string(),
+            base_url: base_url.into(),
             timeout_ms: 10000,
             user_agent: "HFT-Binance-Adapter/1.0".to_string(),
         };
-        let client = integration::http::HttpClient::new(config)
-            .expect("Failed to create HTTP client");
+        let client =
+            integration::http::HttpClient::new(config).expect("Failed to create HTTP client");
 
         Self { client }
     }
@@ -97,8 +101,6 @@ impl BinanceRestClient {
         }
     }
 
-
-
     /// 使用 SIMD-optimized JSON 解析（如果啟用 json-simd feature）
     #[inline]
     fn parse_json<T: DeserializeOwned>(text: &str) -> HftResult<T> {
@@ -111,8 +113,7 @@ impl BinanceRestClient {
         }
         #[cfg(not(feature = "json-simd"))]
         {
-            serde_json::from_str(text)
-                .map_err(|e| HftError::Parse(format!("JSON 解析失敗: {}", e)))
+            serde_json::from_str(text).map_err(|e| HftError::Parse(format!("JSON 解析失敗: {}", e)))
         }
     }
 }

@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::Notify;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // 重新導出關鍵類型
 pub use adapter_bridge::{AdapterBridge, AdapterBridgeConfig};
@@ -444,7 +444,8 @@ impl Engine {
 
     /// 通过策略 ID 获取策略的不可变引用
     pub fn get_strategy_by_id(&self, strategy_id: &str) -> Option<&Box<dyn Strategy>> {
-        let index = self.strategy_instance_ids
+        let index = self
+            .strategy_instance_ids
             .iter()
             .position(|id| id == strategy_id)?;
         self.strategies.get(index)
@@ -452,7 +453,8 @@ impl Engine {
 
     /// 通过策略 ID 获取策略的可变引用
     pub fn get_strategy_mut_by_id(&mut self, strategy_id: &str) -> Option<&mut Box<dyn Strategy>> {
-        let index = self.strategy_instance_ids
+        let index = self
+            .strategy_instance_ids
             .iter()
             .position(|id| id == strategy_id)?;
         self.strategies.get_mut(index)
@@ -460,7 +462,8 @@ impl Engine {
 
     /// 设置策略启用/禁用状态
     pub fn set_strategy_enabled(&mut self, strategy_id: &str, enabled: bool) -> HftResult<()> {
-        let index = self.strategy_instance_ids
+        let index = self
+            .strategy_instance_ids
             .iter()
             .position(|id| id == strategy_id)
             .ok_or_else(|| HftError::Config(format!("策略 {} 不存在", strategy_id)))?;
@@ -724,7 +727,7 @@ impl Engine {
             || result.orders_generated > 10;
 
         if should_log && (total_events > 0 || exec_processed > 0 || result.orders_generated > 0) {
-            info!(
+            debug!(
                 "Tick #{}: {} market events, {} exec events, {} orders, snapshot: {}",
                 self.stats.cycle_count,
                 total_events,
@@ -734,7 +737,7 @@ impl Engine {
             );
         } else if total_events > 0 || exec_processed > 0 || result.orders_generated > 0 {
             // 其他活動 tick 使用 debug! 級別
-            debug!(
+            trace!(
                 "Tick #{}: {} market events, {} exec events, {} orders, snapshot: {}",
                 self.stats.cycle_count,
                 total_events,
@@ -963,10 +966,10 @@ impl Engine {
         if let Some(pm) = &self.portfolio_manager {
             let av = pm.reader().load();
             info!(
-                cash = av.cash_balance,
+                cash = %av.cash_balance,
                 pos_count = av.positions.len(),
-                unrealized = av.unrealized_pnl,
-                realized = av.realized_pnl,
+                unrealized = %av.unrealized_pnl,
+                realized = %av.realized_pnl,
                 "AccountView 已更新"
             );
         }
@@ -1315,74 +1318,61 @@ impl Engine {
     pub fn get_backpressure_status(&self) -> Vec<BackpressureStatus> {
         let mut statuses = Vec::new();
 
-        // 1. 從每個 EventConsumer 收集攝取背壓狀態
         for (idx, consumer) in self.event_consumers.iter().enumerate() {
             let utilization = consumer.utilization();
-            let is_under_pressure = utilization > 0.7;
-
-            let recommended_action = if utilization > 0.9 {
-                "Critical: Ingestion queue near capacity, consider scaling or reducing data flow"
-                    .to_string()
-            } else if utilization > 0.7 {
-                "Warning: High ingestion queue utilization, monitor closely".to_string()
-            } else {
-                "Normal operation".to_string()
-            };
-
-            statuses.push(BackpressureStatus {
-                utilization,
-                is_under_pressure,
-                events_dropped_total: self.stats.market_events_dropped,
-                recommended_action: format!("[Consumer {}] {}", idx, recommended_action),
-                queue_capacity: self.config.ingestion.queue_capacity,
-            });
-        }
-
-        // 2. 從執行隊列收集統計（如果存在）
-        if let Some(exec_queues) = &self.execution_queues {
-            let queue_stats = exec_queues.stats();
-            let intent_queue_full = queue_stats.intent_queue_full_count > 0;
-            let event_queue_full = queue_stats.event_queue_full_count > 0;
-
-            let is_under_pressure = intent_queue_full || event_queue_full;
-            let total_dropped = queue_stats.intent_queue_full_count
-                + queue_stats.event_queue_full_count
-                + self.stats.intents_dropped;
-
-            let recommended_action = if is_under_pressure {
+            let recommended_action = if utilization >= 0.9 {
                 format!(
-                    "Execution queue backpressure detected: intent_full={}, event_full={}, intents_dropped={}",
-                    queue_stats.intent_queue_full_count,
-                    queue_stats.event_queue_full_count,
-                    self.stats.intents_dropped
+                    "Consumer {} saturated - consider sharding or increasing queue",
+                    idx
                 )
+            } else if utilization >= 0.8 {
+                format!("Consumer {} above 80% utilization - monitor closely", idx)
             } else {
-                "Normal execution queue operation".to_string()
-            };
-
-            // 估計執行隊列的利用率（基於 full 計數和實際流量）
-            let utilization = if is_under_pressure {
-                0.95
-            } else {
-                // 基於發送/接收比率估算
-                let intent_ratio = if queue_stats.intents_sent > 0 {
-                    queue_stats.intents_received as f64 / queue_stats.intents_sent as f64
-                } else {
-                    0.0
-                };
-                intent_ratio.min(1.0)
+                format!("Consumer {} healthy", idx)
             };
 
             statuses.push(BackpressureStatus {
                 utilization,
-                is_under_pressure,
-                events_dropped_total: total_dropped,
-                recommended_action: format!("[Execution Queue] {}", recommended_action),
-                queue_capacity: 0, // 執行隊列容量不在此處暴露
+                is_under_pressure: utilization >= 0.8,
+                events_dropped_total: self.stats.market_events_dropped,
+                recommended_action,
+                queue_capacity: consumer.queue_capacity(),
             });
         }
 
-        // 如果沒有任何消費者或隊列，返回一個默認狀態
+        if let Some(exec_queues) = &self.execution_queues {
+            let queue_stats = *exec_queues.stats();
+
+            let intent_util = exec_queues.intent_queue_utilization();
+            statuses.push(BackpressureStatus {
+                utilization: intent_util,
+                is_under_pressure: intent_util >= 0.8,
+                events_dropped_total: queue_stats.intent_queue_full_count
+                    + self.stats.intents_dropped,
+                recommended_action: if intent_util >= 0.8 {
+                    "Execution intent queue saturated - throttle strategy output or enlarge queue"
+                        .to_string()
+                } else {
+                    "Execution intent queue healthy".to_string()
+                },
+                queue_capacity: exec_queues.intent_queue_capacity(),
+            });
+
+            let event_util = exec_queues.event_queue_utilization();
+            statuses.push(BackpressureStatus {
+                utilization: event_util,
+                is_under_pressure: event_util >= 0.8,
+                events_dropped_total: queue_stats.event_queue_full_count,
+                recommended_action: if event_util >= 0.8 {
+                    "Execution event queue saturated - ensure workers drain events promptly"
+                        .to_string()
+                } else {
+                    "Execution event queue healthy".to_string()
+                },
+                queue_capacity: exec_queues.event_queue_capacity(),
+            });
+        }
+
         if statuses.is_empty() {
             statuses.push(BackpressureStatus {
                 utilization: 0.0,

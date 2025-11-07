@@ -77,19 +77,16 @@ impl ZeroCopyBitgetStream {
             // 使用 simd-json 借用模式解析
             self.parse_buffer.clear();
             self.parse_buffer.extend_from_slice(json_bytes);
-            simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| {
-                HftError::Generic {
-                    message: format!("JSON 解析失败: {}", e),
-                }
+            simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| HftError::Generic {
+                message: format!("JSON 解析失败: {}", e),
             })?
         };
 
         #[cfg(not(feature = "json-simd"))]
-        let value: serde_json::Value = serde_json::from_slice(json_bytes).map_err(|e| {
-            HftError::Generic {
+        let value: serde_json::Value =
+            serde_json::from_slice(json_bytes).map_err(|e| HftError::Generic {
                 message: format!("JSON 解析失败: {}", e),
-            }
-        })?;
+            })?;
 
         // 借用模式訪問，減少字符串分配
         let data = value
@@ -180,19 +177,16 @@ impl ZeroCopyBitgetStream {
         let value = {
             self.parse_buffer.clear();
             self.parse_buffer.extend_from_slice(json_bytes);
-            simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| {
-                HftError::Generic {
-                    message: format!("JSON 解析失败: {}", e),
-                }
+            simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| HftError::Generic {
+                message: format!("JSON 解析失败: {}", e),
             })?
         };
 
         #[cfg(not(feature = "json-simd"))]
-        let value: serde_json::Value = serde_json::from_slice(json_bytes).map_err(|e| {
-            HftError::Generic {
+        let value: serde_json::Value =
+            serde_json::from_slice(json_bytes).map_err(|e| HftError::Generic {
                 message: format!("JSON 解析失败: {}", e),
-            }
-        })?;
+            })?;
 
         let data = value
             .get("data")

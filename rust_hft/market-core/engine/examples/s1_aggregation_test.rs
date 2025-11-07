@@ -249,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ingestion: ingestion_config,
         max_concurrent_adapters: 1,
     };
-    let adapter_bridge = AdapterBridge::new(bridge_config);
+    let mut adapter_bridge = AdapterBridge::new(bridge_config);
 
     // 橋接並運行幾個 tick
     let consumer = adapter_bridge

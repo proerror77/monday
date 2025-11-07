@@ -395,7 +395,11 @@ impl EnhancedRiskManager {
     }
 
     /// 更新账户余额与PnL统计（外部调用，由Accounting模块调用）
-    pub fn update_account_balance(&mut self, current_balance: Decimal, realized_pnl_delta: Decimal) {
+    pub fn update_account_balance(
+        &mut self,
+        current_balance: Decimal,
+        realized_pnl_delta: Decimal,
+    ) {
         // 更新峰值余额
         if current_balance > self.stats.peak_balance {
             self.stats.peak_balance = current_balance;
@@ -555,14 +559,16 @@ impl RiskManager for EnhancedRiskManager {
             ExecutionEvent::OrderReject {
                 order_id,
                 reason,
-                timestamp
+                timestamp,
             } => {
                 // 记录订单拒绝（可能来自交易所）
                 warn!("交易所拒绝订单: order_id={:?}, reason={}", order_id, reason);
 
                 // 更新拒绝统计
                 self.stats.total_rejected_today += 1;
-                *self.stats.rejection_reasons
+                *self
+                    .stats
+                    .rejection_reasons
                     .entry("exchange_reject".to_string())
                     .or_insert(0) += 1;
 
@@ -586,7 +592,7 @@ impl RiskManager for EnhancedRiskManager {
             ExecutionEvent::BalanceUpdate {
                 asset,
                 balance,
-                timestamp
+                timestamp,
             } => {
                 // 余额更新（可能来自成交后的余额推送）
                 info!(
@@ -608,19 +614,19 @@ impl RiskManager for EnhancedRiskManager {
         Ok(())
     }
 
-    fn get_risk_metrics(&self) -> HashMap<String, f64> {
+    fn get_risk_metrics(&self) -> HashMap<String, Decimal> {
         let mut m = HashMap::new();
         m.insert(
             "orders_this_second".into(),
-            self.stats.orders_this_second as f64,
+            Decimal::from(self.stats.orders_this_second as u64),
         );
         m.insert(
             "orders_this_minute".into(),
-            self.stats.orders_this_minute as f64,
+            Decimal::from(self.stats.orders_this_minute as u64),
         );
         m.insert(
             "orders_this_hour".into(),
-            self.stats.orders_this_hour as f64,
+            Decimal::from(self.stats.orders_this_hour as u64),
         );
         m
     }
@@ -631,12 +637,12 @@ impl RiskManager for EnhancedRiskManager {
 
     fn risk_metrics(&self) -> RiskMetrics {
         RiskMetrics {
-            max_drawdown: 0.0,
-            current_drawdown: 0.0,
-            var_1d: 0.0,
-            leverage: 0.0,
-            concentration_risk: 0.0,
-            order_rate: self.stats.orders_this_second as f64,
+            max_drawdown: Decimal::ZERO,
+            current_drawdown: Decimal::ZERO,
+            var_1d: Decimal::ZERO,
+            leverage: Decimal::ZERO,
+            concentration_risk: Decimal::ZERO,
+            order_rate: Decimal::from(self.stats.orders_this_second as u64),
             last_update: Self::current_timestamp_us(),
         }
     }

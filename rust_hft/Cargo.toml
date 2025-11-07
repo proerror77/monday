@@ -65,6 +65,7 @@ members = [
     "infra-services/core/clickhouse",
     "infra-services/core/redis",
     "infra-services/core/metrics",
+    "infra-services/core/secrets",
     "infra-services/core/venue",
     "infra-services/core/ipc",
     "infra-services/testing",

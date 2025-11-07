@@ -260,7 +260,9 @@ mod tests {
     fn test_latency_health_check() {
         let mut config = LatencyMonitorConfig::default();
         // 測試使用更嚴格的 Ingestion 閾值，便於快速觸發 Critical
-        config.alert_thresholds.insert(LatencyStage::Ingestion, 1_000);
+        config
+            .alert_thresholds
+            .insert(LatencyStage::Ingestion, 1_000);
         let monitor = LatencyMonitor::new(config);
 
         // 添加一些正常的延遲樣本

@@ -306,7 +306,10 @@ impl DlStrategy {
         model_path: std::path::PathBuf,
         model_version: Option<String>,
     ) -> HftResult<()> {
-        info!("热重载 DL 模型: {:?} (版本: {:?})", model_path, model_version);
+        info!(
+            "热重载 DL 模型: {:?} (版本: {:?})",
+            model_path, model_version
+        );
 
         // 更新配置
         self.config.model.model_path = model_path;

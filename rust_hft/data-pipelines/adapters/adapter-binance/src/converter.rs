@@ -35,8 +35,7 @@ impl MessageConverter {
         }
         #[cfg(not(feature = "json-simd"))]
         {
-            serde_json::from_str(text)
-                .map_err(|e| HftError::Parse(format!("JSON 解析失敗: {}", e)))
+            serde_json::from_str(text).map_err(|e| HftError::Parse(format!("JSON 解析失敗: {}", e)))
         }
     }
 
@@ -225,10 +224,7 @@ impl MessageConverter {
     /// 處理流數據
     ///
     /// 使用統一的 Value 類型（根據 json-simd feature 自動切換）
-    fn process_stream_data(
-        stream: &str,
-        data: &Value,
-    ) -> HftResult<Option<MarketEvent>> {
+    fn process_stream_data(stream: &str, data: &Value) -> HftResult<Option<MarketEvent>> {
         if stream.contains("@depth") {
             if let Ok(update) = Self::parse_value::<DepthUpdate>(data.clone()) {
                 let book_update = Self::convert_depth_update(update)?;

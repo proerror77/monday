@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_concurrent_adapters: 2,
     };
 
-    let adapter_bridge = AdapterBridge::new(bridge_config);
+    let mut adapter_bridge = AdapterBridge::new(bridge_config);
 
     // 3. 創建 Bitget Adapter
     println!("📡 正在創建 Bitget 適配器...");

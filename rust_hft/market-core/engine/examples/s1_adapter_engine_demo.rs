@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::new(engine_cfg);
 
     let bridge_cfg = AdapterBridgeConfig::default();
-    let bridge = AdapterBridge::new(bridge_cfg);
+    let mut bridge = AdapterBridge::new(bridge_cfg);
 
     // 2) 構建 Bitget 行情適配器（骨架）並橋接
     let bitget = data_adapter_bitget::BitgetMarketStream::new();

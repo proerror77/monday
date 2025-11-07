@@ -10,33 +10,37 @@ use integration::ws::{WsClient, WsClientConfig};
 use tokio::time::Duration;
 use tracing::info;
 
-const WS_BASE_URL: &str = "wss://stream.binance.com:9443/ws";
+pub const WS_BASE_URL: &str = "wss://stream.binance.com:9443/ws";
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const _PONG_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct BinanceWebSocket {
     client: WsClient,
     symbols: Vec<Symbol>,
+    ws_base_url: String,
 }
 
 impl BinanceWebSocket {
     pub fn new() -> Self {
+        Self::with_base_url(WS_BASE_URL.to_string())
+    }
+
+    pub fn with_base_url(url: impl Into<String>) -> Self {
+        let url_string = url.into();
         let config = WsClientConfig {
-            url: WS_BASE_URL.to_string(),
+            url: url_string.clone(),
             heartbeat_interval: PING_INTERVAL,
             ..Default::default()
         };
         Self {
             client: WsClient::new(config),
             symbols: Vec::new(),
+            ws_base_url: url_string,
         }
     }
 
     /// 開始連接並訂閱指定品種
-    pub async fn connect_and_subscribe(
-        &mut self,
-        symbols: Vec<Symbol>,
-    ) -> HftResult<()> {
+    pub async fn connect_and_subscribe(&mut self, symbols: Vec<Symbol>) -> HftResult<()> {
         self.symbols = symbols.clone();
 
         // 構建訂閱流名稱
@@ -45,10 +49,10 @@ impl BinanceWebSocket {
 
         // 構建 WebSocket URL
         let url = if streams.is_empty() {
-            WS_BASE_URL.to_string()
+            self.ws_base_url.clone()
         } else {
             let stream_names = streams.join("/");
-            format!("{}/{}", WS_BASE_URL, stream_names)
+            format!("{}/{}", self.ws_base_url, stream_names)
         };
 
         self.client.cfg.url = url;

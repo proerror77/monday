@@ -85,6 +85,12 @@ pub enum FlipPolicy {
     OnUtilization(f64),
 }
 
+impl Default for FlipPolicy {
+    fn default() -> Self {
+        FlipPolicy::OnUpdate
+    }
+}
+
 /// 背壓策略
 #[derive(Debug, Clone)]
 pub enum BackpressurePolicy {
@@ -280,9 +286,7 @@ impl EventIngester {
                 {
                     debug!(
                         "丟棄陳舊事件: {}μs 延遲 > {}μs 閾值（過去 {} 筆已合併）",
-                        delay,
-                        self.config.stale_threshold_us,
-                        suppressed
+                        delay, self.config.stale_threshold_us, suppressed
                     );
                 }
                 return Ok(()); // 靜默丟棄陳舊事件
@@ -581,6 +585,11 @@ impl EventConsumer {
     /// 獲取消費統計
     pub fn flip_metrics(&self) -> &FlipMetrics {
         &self.flip_metrics
+    }
+
+    /// 取得隊列容量（供監控/報告使用）
+    pub fn queue_capacity(&self) -> usize {
+        self.config.queue_capacity
     }
 
     /// 獲取隊列利用率

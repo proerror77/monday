@@ -67,7 +67,10 @@ impl BacktestEngine {
         // 平倉殘餘持倉
         if self.execution.has_position() {
             if let Some(mid) = self.order_book.mid_price() {
-                let ts = self.last_ts.map(|t| t as f64 / MICROS_IN_SECOND).unwrap_or(0.0);
+                let ts = self
+                    .last_ts
+                    .map(|t| t as f64 / MICROS_IN_SECOND)
+                    .unwrap_or(0.0);
                 self.execution
                     .exit_position(ts, mid, ExitReason::SessionEnd, &mut self.stats);
             }
@@ -82,15 +85,19 @@ impl BacktestEngine {
         match &event.payload {
             EventPayload::Snapshot { bids, asks } => {
                 let ofi = self.order_book.apply_snapshot(event.ts, bids, asks);
-                self.liquidity
-                    .update(event.ts, &self.order_book.snapshot(self.cfg.data.max_depth_levels));
+                self.liquidity.update(
+                    event.ts,
+                    &self.order_book.snapshot(self.cfg.data.max_depth_levels),
+                );
                 self.flow.update_ofi(ts_sec, ofi);
                 self.evaluate_signals(event.ts)?;
             }
             EventPayload::L2Update { bids, asks } => {
                 let ofi = self.order_book.apply_delta(event.ts, bids, asks);
-                self.liquidity
-                    .update(event.ts, &self.order_book.snapshot(self.cfg.data.max_depth_levels));
+                self.liquidity.update(
+                    event.ts,
+                    &self.order_book.snapshot(self.cfg.data.max_depth_levels),
+                );
                 self.flow.update_ofi(ts_sec, ofi);
                 self.evaluate_signals(event.ts)?;
             }
@@ -124,8 +131,12 @@ impl BacktestEngine {
         // 計算流動性特徵
         let depth_support = supports.first().cloned();
         let depth_resistance = resistances.first().cloned();
-        let tt_vol_down = self.flow.tt_sell_volume(self.cfg.strategy.breakout_window_secs);
-        let tt_vol_up = self.flow.tt_buy_volume(self.cfg.strategy.breakout_window_secs);
+        let tt_vol_down = self
+            .flow
+            .tt_sell_volume(self.cfg.strategy.breakout_window_secs);
+        let tt_vol_up = self
+            .flow
+            .tt_buy_volume(self.cfg.strategy.breakout_window_secs);
         let cvd_delta = self.flow.cvd_delta(self.cfg.strategy.breakout_window_secs);
         let ofi = self.flow.ofi(self.cfg.strategy.breakout_window_secs);
 
@@ -133,16 +144,15 @@ impl BacktestEngine {
         if let Some(level) = depth_support {
             let price_delta = self.cfg.strategy.price_delta_ticks * self.cfg.data.tick_size;
             let price_condition = mid <= level.price - price_delta;
-            let depth_condition = level.depth > 0.0
-                && tt_vol_down >= self.cfg.strategy.volume_factor * level.depth;
-            let cvd_condition =
-                cvd_delta <= -self.cfg.strategy.cvd_threshold.abs().max(1e-9);
+            let depth_condition =
+                level.depth > 0.0 && tt_vol_down >= self.cfg.strategy.volume_factor * level.depth;
+            let cvd_condition = cvd_delta <= -self.cfg.strategy.cvd_threshold.abs().max(1e-9);
             let ofi_condition = ofi <= -self.cfg.strategy.ofi_threshold.abs().max(1e-9);
 
             if price_condition && depth_condition && cvd_condition && ofi_condition {
                 if let Some((bid_price, _)) = self.order_book.best_bid() {
-                    let entry_price = bid_price
-                        - self.cfg.execution.max_slippage_ticks * self.cfg.data.tick_size;
+                    let entry_price =
+                        bid_price - self.cfg.execution.max_slippage_ticks * self.cfg.data.tick_size;
                     let qty = self.execution.calc_short_qty(
                         level.depth,
                         tt_vol_down,
@@ -166,16 +176,15 @@ impl BacktestEngine {
         if let Some(level) = depth_resistance {
             let price_delta = self.cfg.strategy.price_delta_ticks * self.cfg.data.tick_size;
             let price_condition = mid >= level.price + price_delta;
-            let depth_condition = level.depth > 0.0
-                && tt_vol_up >= self.cfg.strategy.volume_factor * level.depth;
-            let cvd_condition =
-                cvd_delta >= self.cfg.strategy.cvd_threshold.abs().max(1e-9);
+            let depth_condition =
+                level.depth > 0.0 && tt_vol_up >= self.cfg.strategy.volume_factor * level.depth;
+            let cvd_condition = cvd_delta >= self.cfg.strategy.cvd_threshold.abs().max(1e-9);
             let ofi_condition = ofi >= self.cfg.strategy.ofi_threshold.abs().max(1e-9);
 
             if price_condition && depth_condition && cvd_condition && ofi_condition {
                 if let Some((ask_price, _)) = self.order_book.best_ask() {
-                    let entry_price = ask_price
-                        + self.cfg.execution.max_slippage_ticks * self.cfg.data.tick_size;
+                    let entry_price =
+                        ask_price + self.cfg.execution.max_slippage_ticks * self.cfg.data.tick_size;
                     let qty = self.execution.calc_long_qty(
                         level.depth,
                         tt_vol_up,
@@ -478,7 +487,11 @@ impl LiquidityMap {
     }
 
     fn support_levels(&self, mid: f64, count: usize) -> Vec<LiquidityLevel> {
-        let window = self.cfg.liquidity_window_secs.max(self.total_duration).max(1.0);
+        let window = self
+            .cfg
+            .liquidity_window_secs
+            .max(self.total_duration)
+            .max(1.0);
         let alpha = self.cfg.smoothing_alpha.clamp(0.0, 1.0);
         let mut levels = self
             .bid_stats
@@ -500,13 +513,21 @@ impl LiquidityMap {
                 None
             })
             .collect_vec();
-        levels.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal));
+        levels.sort_by(|a, b| {
+            b.depth
+                .partial_cmp(&a.depth)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         levels.truncate(count);
         levels
     }
 
     fn resistance_levels(&self, mid: f64, count: usize) -> Vec<LiquidityLevel> {
-        let window = self.cfg.liquidity_window_secs.max(self.total_duration).max(1.0);
+        let window = self
+            .cfg
+            .liquidity_window_secs
+            .max(self.total_duration)
+            .max(1.0);
         let alpha = self.cfg.smoothing_alpha.clamp(0.0, 1.0);
         let mut levels = self
             .ask_stats
@@ -528,7 +549,11 @@ impl LiquidityMap {
                 None
             })
             .collect_vec();
-        levels.sort_by(|a, b| b.depth.partial_cmp(&a.depth).unwrap_or(std::cmp::Ordering::Equal));
+        levels.sort_by(|a, b| {
+            b.depth
+                .partial_cmp(&a.depth)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         levels.truncate(count);
         levels
     }
@@ -860,23 +885,19 @@ impl ExecutionManager {
         let elapsed = ts - self.position.entry_ts;
         let stop_loss_price = match self.position.side {
             Some(PositionSide::Short) => {
-                self.position.entry_price
-                    + self.cfg.stop_loss_ticks * self.tick_size
+                self.position.entry_price + self.cfg.stop_loss_ticks * self.tick_size
             }
             Some(PositionSide::Long) => {
-                self.position.entry_price
-                    - self.cfg.stop_loss_ticks * self.tick_size
+                self.position.entry_price - self.cfg.stop_loss_ticks * self.tick_size
             }
             None => 0.0,
         };
         let take_profit_price = match self.position.side {
             Some(PositionSide::Short) => {
-                self.position.entry_price
-                    - self.cfg.take_profit_ticks * self.tick_size
+                self.position.entry_price - self.cfg.take_profit_ticks * self.tick_size
             }
             Some(PositionSide::Long) => {
-                self.position.entry_price
-                    + self.cfg.take_profit_ticks * self.tick_size
+                self.position.entry_price + self.cfg.take_profit_ticks * self.tick_size
             }
             None => 0.0,
         };
@@ -885,14 +906,12 @@ impl ExecutionManager {
             Some(PositionSide::Short) => (
                 mid >= stop_loss_price,
                 mid <= take_profit_price,
-                mid >= self.position.reference_level
-                    || (cvd_delta >= 0.0 && ofi >= 0.0),
+                mid >= self.position.reference_level || (cvd_delta >= 0.0 && ofi >= 0.0),
             ),
             Some(PositionSide::Long) => (
                 mid <= stop_loss_price,
                 mid >= take_profit_price,
-                mid <= self.position.reference_level
-                    || (cvd_delta <= 0.0 && ofi <= 0.0),
+                mid <= self.position.reference_level || (cvd_delta <= 0.0 && ofi <= 0.0),
             ),
             None => (false, false, false),
         };

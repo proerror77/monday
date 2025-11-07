@@ -126,7 +126,7 @@ mod redis_export {
 
 #[cfg(feature = "clickhouse")]
 mod clickhouse_export {
-    use crate::system_builder::{SystemRuntime, ClickHouseConfig};
+    use crate::system_builder::{ClickHouseConfig, SystemRuntime};
     use clickhouse::Client;
     use tracing::info;
 

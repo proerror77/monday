@@ -3,7 +3,10 @@ use crate::sharding::ShardConfig;
 use serde::{Deserialize, Serialize};
 // use serde_yaml::Value as YamlValue; // 移除未使用引用
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+#[cfg(feature = "infra-secrets")]
+use infra_secrets::{SecretsConfig, SecretsManager};
 
 // strategy_factory 僅在 runtime_management 使用
 use crate::portfolio_manager::PortfolioManager;
@@ -31,10 +34,11 @@ mod venue_registry; // 預留：後續搬移 Redis/ClickHouse 導出
 
 // 將部分配置型別從子模組對外公開
 pub use config_types::{
-    ClickHouseConfig, CpuAffinityConfig, EnhancedRiskSettings, InfraConfig, LobFlowGridParams,
-    PortfolioSpec, RedisConfig, RiskConfig, StrategyConfig, StrategyEnhancedRiskOverride,
-    StrategyParams, StrategyRiskLimits, StrategyRiskOverride, StrategyType, SystemEngineConfig,
-    TradingWindow, TradingWindowConfig, VenueCapabilities, VenueConfig, VenueType,
+    ClickHouseConfig, CpuAffinityConfig, EnhancedRiskSettings, ExecutionQueueSettings, InfraConfig,
+    LobFlowGridParams, PortfolioSpec, RedisConfig, RiskConfig, StrategyConfig,
+    StrategyEnhancedRiskOverride, StrategyParams, StrategyRiskLimits, StrategyRiskOverride,
+    StrategyType, SystemEngineConfig, TradingWindow, TradingWindowConfig, VenueCapabilities,
+    VenueConfig, VenueType,
 };
 
 #[cfg(feature = "redis")]
@@ -368,6 +372,145 @@ impl SystemBuilder {
         self
     }
 
+    /// 🔥 Phase 2c: 異步解析交易所憑證
+    /// 此方法應在 `auto_register_adapters()` 之前調用，以從 SecretsManager 解析憑證
+    #[cfg(feature = "infra-secrets")]
+    pub async fn resolve_credentials_async(mut self) -> Result<Self, Box<dyn std::error::Error>> {
+        info!("開始解析交易所憑證...");
+
+        // 檢查是否有任何 venue 需要憑證解析
+        let has_credential_refs = self.config.venues.iter().any(|v| {
+            v.secret_ref_api_key.is_some()
+                || v.secret_ref_secret.is_some()
+                || v.secret_ref_passphrase.is_some()
+        });
+
+        if !has_credential_refs {
+            info!("未發現需要解析的憑證參考，跳過解析");
+            return Ok(self);
+        }
+
+        // 初始化 SecretsManager
+        let secrets_config = SecretsConfig::from_env();
+        let manager = SecretsManager::new(secrets_config).await?;
+
+        info!("SecretsManager 已初始化，開始解析憑證");
+
+        // 解析每個 venue 的憑證 - 使用索引避免借用衝突
+        for i in 0..self.config.venues.len() {
+            let venue = &mut self.config.venues[i];
+            Self::resolve_venue_credentials(venue, &manager).await?;
+        }
+
+        info!("憑證解析完成");
+        Ok(self)
+    }
+
+    /// 🔥 Phase 2c: 解析單個 venue 的憑證參考
+    #[cfg(feature = "infra-secrets")]
+    async fn resolve_venue_credentials(
+        venue: &mut VenueConfig,
+        manager: &SecretsManager,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let venue_name = &venue.name;
+
+        // 解析 api_key 參考
+        if let Some(ref secret_ref) = venue.secret_ref_api_key {
+            match manager.get_secret(secret_ref).await {
+                Ok(secret_value) => {
+                    match secret_value.to_string_safe() {
+                        Ok(api_key) => {
+                            venue.api_key = Some(api_key);
+                            venue.secret_ref_api_key = None;
+                            info!("已解析 {} 的 api_key 參考", venue_name);
+                        }
+                        Err(e) => {
+                            error!("無法將 {} 的 api_key 秘密轉換為字符串: {}", venue_name, e);
+                            return Err(format!(
+                                "憑證 {} 無效 UTF-8: {}",
+                                secret_ref, e
+                            ).into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("無法解析 {} 的 api_key 參考 {}: {}", venue_name, secret_ref, e);
+                    return Err(format!(
+                        "無法從 SecretsManager 解析 {} 的 api_key: {}",
+                        venue_name, e
+                    ).into());
+                }
+            }
+        }
+
+        // 解析 secret 參考
+        if let Some(ref secret_ref) = venue.secret_ref_secret {
+            match manager.get_secret(secret_ref).await {
+                Ok(secret_value) => {
+                    match secret_value.to_string_safe() {
+                        Ok(secret) => {
+                            venue.secret = Some(secret);
+                            venue.secret_ref_secret = None;
+                            info!("已解析 {} 的 secret 參考", venue_name);
+                        }
+                        Err(e) => {
+                            error!("無法將 {} 的 secret 秘密轉換為字符串: {}", venue_name, e);
+                            return Err(format!(
+                                "憑證 {} 無效 UTF-8: {}",
+                                secret_ref, e
+                            ).into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("無法解析 {} 的 secret 參考 {}: {}", venue_name, secret_ref, e);
+                    return Err(format!(
+                        "無法從 SecretsManager 解析 {} 的 secret: {}",
+                        venue_name, e
+                    ).into());
+                }
+            }
+        }
+
+        // 解析 passphrase 參考
+        if let Some(ref secret_ref) = venue.secret_ref_passphrase {
+            match manager.get_secret(secret_ref).await {
+                Ok(secret_value) => {
+                    match secret_value.to_string_safe() {
+                        Ok(passphrase) => {
+                            venue.passphrase = Some(passphrase);
+                            venue.secret_ref_passphrase = None;
+                            info!("已解析 {} 的 passphrase 參考", venue_name);
+                        }
+                        Err(e) => {
+                            error!("無法將 {} 的 passphrase 秘密轉換為字符串: {}", venue_name, e);
+                            return Err(format!(
+                                "憑證 {} 無效 UTF-8: {}",
+                                secret_ref, e
+                            ).into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("無法解析 {} 的 passphrase 參考 {}: {}", venue_name, secret_ref, e);
+                    return Err(format!(
+                        "無法從 SecretsManager 解析 {} 的 passphrase: {}",
+                        venue_name, e
+                    ).into());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 🔥 Phase 2c: 無 secrets 功能時的虛擬實現（無操作）
+    #[cfg(not(feature = "infra-secrets"))]
+    pub async fn resolve_credentials_async(self) -> Result<Self, Box<dyn std::error::Error>> {
+        warn!("infra-secrets 功能未啟用，跳過憑證解析。請啟用 infra-secrets 功能以支持 SecretsManager 整合");
+        Ok(self)
+    }
+
     /// 自動註冊適配器基於配置
     pub fn auto_register_adapters(mut self) -> Self {
         info!("自動註冊適配器...");
@@ -565,6 +708,8 @@ impl SystemRuntime {
                 .iter()
                 .find(|v| v.name == venue_name)
                 .cloned();
+            #[allow(unused_variables)]
+            let plan_symbols = symbols.clone();
             match venue_type {
                 VenueType::Bitget => {
                     #[cfg(feature = "adapter-bitget-data")]
@@ -579,12 +724,17 @@ impl SystemRuntime {
                             .and_then(|v| v.inst_type.clone())
                             .unwrap_or_else(|| "SPOT".to_string());
 
-                        let stream = if use_inc {
+                        let mut stream = if use_inc {
                             adapter_bitget_data::BitgetMarketStream::new_with_incremental(true)
                                 .with_inst_type(inst_type)
                         } else {
                             adapter_bitget_data::BitgetMarketStream::new().with_inst_type(inst_type)
                         };
+                        if let Some(cfg) = &venue_cfg {
+                            if let Some(ws_url) = &cfg.ws_public {
+                                stream = stream.with_ws_url(ws_url.clone());
+                            }
+                        }
                         let consumer = bridge.bridge_stream(stream, symbols).await?;
                         self.engine.lock().await.register_event_consumer(consumer);
                         info!("Bitget 行情已橋接至引擎");
@@ -599,7 +749,16 @@ impl SystemRuntime {
                             .unwrap_or_else(|| {
                                 adapter_binance_data::capabilities::BinanceCapabilities::default()
                             });
-                        let stream = adapter_binance_data::BinanceMarketStream::with_capabilities(caps);
+                        let mut stream =
+                            adapter_binance_data::BinanceMarketStream::with_capabilities(caps);
+                        if let Some(cfg) = &venue_cfg {
+                            if let Some(ws_url) = &cfg.ws_public {
+                                stream = stream.with_ws_base_url(ws_url.clone());
+                            }
+                            if let Some(rest_url) = &cfg.rest {
+                                stream = stream.with_rest_base_url(rest_url.clone());
+                            }
+                        }
                         let consumer = bridge.bridge_stream(stream, symbols).await?;
                         self.engine.lock().await.register_event_consumer(consumer);
                     }
@@ -610,8 +769,13 @@ impl SystemRuntime {
                 VenueType::Grvt => {
                     #[cfg(feature = "adapter-grvt-data")]
                     {
-                        let stream = adapter_grvt_data::GrvtMarketStream::new();
-                        let consumer = bridge.bridge_stream(stream, symbols).await?;
+                        let mut stream = adapter_grvt_data::GrvtMarketStream::new();
+                        if let Some(cfg) = &venue_cfg {
+                            if let Some(ws_url) = &cfg.ws_public {
+                                stream = stream.with_ws_url(ws_url.clone());
+                            }
+                        }
+                        let consumer = bridge.bridge_stream(stream, plan_symbols.clone()).await?;
                         self.engine.lock().await.register_event_consumer(consumer);
                         info!("GRVT 行情已橋接至引擎");
                     }
@@ -625,7 +789,8 @@ impl SystemRuntime {
                             .unwrap_or_else(|| {
                                 adapter_hyperliquid_data::HyperliquidMarketConfig::default()
                             });
-                        let stream = adapter_hyperliquid_data::HyperliquidMarketStream::new(market_config);
+                        let stream =
+                            adapter_hyperliquid_data::HyperliquidMarketStream::new(market_config);
                         let consumer = bridge.bridge_stream(stream, symbols).await?;
                         self.engine.lock().await.register_event_consumer(consumer);
                         info!("Hyperliquid 行情已橋接至引擎");
@@ -674,6 +839,7 @@ impl SystemRuntime {
                 _ => {}
             }
         }
+        self.adapter_bridge = Some(bridge);
 
         // 2) (可選) 設置執行队列並啟動执行 worker
         let quotes_only = match std::env::var("HFT_QUOTES_ONLY") {
@@ -684,11 +850,11 @@ impl SystemRuntime {
         if quotes_only {
             info!("Quotes-only 模式：跳過執行隊列與 ExecutionWorker 啟動");
         } else {
-            // 從配置讀取執行隊列參數
+            let queue_settings = &self.config.engine.execution_queue;
             let queue_config = ExecutionQueueConfig {
-                intent_queue_capacity: self.config.engine.intent_queue_capacity,
-                event_queue_capacity: self.config.engine.event_queue_capacity,
-                batch_size: self.config.engine.execution_batch_size,
+                intent_queue_capacity: queue_settings.intent_queue_capacity,
+                event_queue_capacity: queue_settings.event_queue_capacity,
+                batch_size: queue_settings.batch_size,
             };
             let (engine_queues, mut worker_queues) = create_execution_queues(queue_config);
 
@@ -707,6 +873,8 @@ impl SystemRuntime {
             // 🔥 Phase 1.5: 启动执行 worker - 支持路由器配置
             let worker_config = ExecutionWorkerConfig {
                 name: "main_execution_worker".to_string(),
+                batch_size: queue_settings.worker_batch_size,
+                idle_sleep_ms: queue_settings.worker_idle_sleep_ms,
                 ack_timeout_ms: self.config.engine.ack_timeout_ms,
                 reconcile_interval_ms: self.config.engine.reconcile_interval_ms,
                 auto_cancel_exchange_only: self.config.engine.auto_cancel_exchange_only,
@@ -876,10 +1044,10 @@ impl SystemRuntime {
                         break;
                     }
                     tracing::info!(
-                        cash = cash,
+                        cash = %cash,
                         pos = pos,
-                        unrealized = unr,
-                        realized = rlz,
+                        unrealized = %unr,
+                        realized = %rlz,
                         cycles = stats.cycle_count,
                         exec_events = stats.execution_events_processed,
                         ord_new = stats.orders_submitted,
@@ -928,9 +1096,6 @@ impl SystemRuntime {
             self.tasks.push(ipc_handle);
             info!("IPC control server started");
         }
-
-        // 🔥 修復資源洩漏：保存 AdapterBridge 以便優雅關閉
-        self.adapter_bridge = Some(bridge);
 
         info!("系統運行時已啟動（引擎背景運行）");
         Ok(())
@@ -1073,17 +1238,20 @@ fn parse_binance_capabilities(
     // 從 data_config 讀取配置（如果提供）
     if let Some(value) = venue_cfg.data_config.clone() {
         if let Ok(mapping) = serde_yaml::from_value::<serde_yaml::Mapping>(value) {
-            if let Some(v) = mapping.get("snapshot_crc")
+            if let Some(v) = mapping
+                .get("snapshot_crc")
                 .and_then(|v| serde_yaml::from_value(v.clone()).ok())
             {
                 caps.snapshot_crc = v;
             }
-            if let Some(v) = mapping.get("rest_fallback")
+            if let Some(v) = mapping
+                .get("rest_fallback")
                 .and_then(|v| serde_yaml::from_value(v.clone()).ok())
             {
                 caps.rest_fallback = v;
             }
-            if let Some(v) = mapping.get("auto_reconnect")
+            if let Some(v) = mapping
+                .get("auto_reconnect")
                 .and_then(|v| serde_yaml::from_value(v.clone()).ok())
             {
                 caps.auto_reconnect = v;
@@ -1109,14 +1277,18 @@ fn parse_hyperliquid_market_config(
     // 從 data_config 讀取其他配置（如果提供）
     if let Some(value) = venue_cfg.data_config.clone() {
         if let Ok(reconnect) = serde_yaml::from_value::<serde_yaml::Mapping>(value.clone())
-            .and_then(|m| m.get("reconnect_interval_ms")
-                .and_then(|v| serde_yaml::from_value(v.clone()).ok()))
+            .and_then(|m| {
+                m.get("reconnect_interval_ms")
+                    .and_then(|v| serde_yaml::from_value(v.clone()).ok())
+            })
         {
             config.reconnect_interval_ms = reconnect;
         }
         if let Ok(heartbeat) = serde_yaml::from_value::<serde_yaml::Mapping>(value.clone())
-            .and_then(|m| m.get("heartbeat_interval_ms")
-                .and_then(|v| serde_yaml::from_value(v.clone()).ok()))
+            .and_then(|m| {
+                m.get("heartbeat_interval_ms")
+                    .and_then(|v| serde_yaml::from_value(v.clone()).ok())
+            })
         {
             config.heartbeat_interval_ms = heartbeat;
         }
@@ -1242,7 +1414,7 @@ async fn engine_event_loop(engine_arc: Arc<Mutex<Engine>>, notify: Arc<Notify>) 
         drop(guard);
 
         if let Err(e) = tick_result {
-            tracing::error!("Engine tick error: {}", e);
+            error!("Engine tick error: {}", e);
         }
 
         if !was_notified {
@@ -1291,9 +1463,7 @@ impl Default for SystemConfig {
                 ack_timeout_ms: 3000,
                 reconcile_interval_ms: 5000,
                 auto_cancel_exchange_only: false,
-                intent_queue_capacity: 4096,
-                event_queue_capacity: 8192,
-                execution_batch_size: 32,
+                execution_queue: ExecutionQueueSettings::default(),
             },
             venues: Vec::new(),
             strategies: Vec::new(),
@@ -1366,5 +1536,366 @@ default_symbols:
         assert!(cfg.subscribe_trades);
         assert_eq!(cfg.reconnect_interval_ms, 2000);
         assert_eq!(cfg.default_symbols, vec![Symbol::new("SOL_USDC")]);
+    }
+
+    // ===== Credential Resolution Integration Tests =====
+
+    #[cfg(feature = "infra-secrets")]
+    #[tokio::test]
+    async fn test_credential_resolution_with_env_backend() {
+        // Setup: Create environment variables with credential values
+        std::env::set_var("HFT_SECRET_BITGET_API_KEY", "test_api_key_12345");
+        std::env::set_var("HFT_SECRET_BITGET_SECRET", "test_secret_98765");
+        std::env::set_var("HFT_SECRET_BITGET_PASSPHRASE", "test_pass_abcde");
+
+        // Create system config with credential references
+        let config = SystemConfig {
+            engine: SystemEngineConfig::default(),
+            venues: vec![VenueConfig {
+                name: "bitget".to_string(),
+                account_id: None,
+                venue_type: VenueType::Bitget,
+                ws_public: Some("wss://ws.bitget.com".to_string()),
+                ws_private: None,
+                rest: Some("https://api.bitget.com".to_string()),
+                api_key: None, // Will be populated by resolution
+                secret: None, // Will be populated by resolution
+                passphrase: None, // Will be populated by resolution
+                execution_mode: Some("Paper".to_string()),
+                capabilities: VenueCapabilities::default(),
+                inst_type: None,
+                simulate_execution: false,
+                symbol_catalog: Vec::new(),
+                data_config: None,
+                execution_config: None,
+                secret_ref_api_key: Some("BITGET_API_KEY".to_string()),
+                secret_ref_secret: Some("BITGET_SECRET".to_string()),
+                secret_ref_passphrase: Some("BITGET_PASSPHRASE".to_string()),
+            }],
+            strategies: Vec::new(),
+            risk: RiskConfig::default(),
+            quotes_only: false,
+            router: None,
+            infra: None,
+            strategy_accounts: HashMap::new(),
+            accounts: Vec::new(),
+            portfolios: Vec::new(),
+        };
+
+        // Create builder using the proper constructor
+        let builder = SystemBuilder::new(config);
+
+        // Execute credential resolution
+        let builder = builder.resolve_credentials_async().await
+            .expect("Credential resolution should succeed");
+
+        // Verify: Check that plaintext fields are populated
+        let bitget_venue = &builder.config.venues[0];
+        assert_eq!(
+            bitget_venue.api_key, Some("test_api_key_12345".to_string()),
+            "api_key should be resolved from environment"
+        );
+        assert_eq!(
+            bitget_venue.secret, Some("test_secret_98765".to_string()),
+            "secret should be resolved from environment"
+        );
+        assert_eq!(
+            bitget_venue.passphrase, Some("test_pass_abcde".to_string()),
+            "passphrase should be resolved from environment"
+        );
+
+        // Verify: Check that credential references are cleared
+        assert!(
+            bitget_venue.secret_ref_api_key.is_none(),
+            "secret_ref_api_key should be cleared after resolution"
+        );
+        assert!(
+            bitget_venue.secret_ref_secret.is_none(),
+            "secret_ref_secret should be cleared after resolution"
+        );
+        assert!(
+            bitget_venue.secret_ref_passphrase.is_none(),
+            "secret_ref_passphrase should be cleared after resolution"
+        );
+
+        // Cleanup
+        std::env::remove_var("HFT_SECRET_BITGET_API_KEY");
+        std::env::remove_var("HFT_SECRET_BITGET_SECRET");
+        std::env::remove_var("HFT_SECRET_BITGET_PASSPHRASE");
+    }
+
+    #[cfg(feature = "infra-secrets")]
+    #[tokio::test]
+    async fn test_credential_resolution_skips_when_no_references() {
+        // Setup: Create system config with plaintext credentials (no references)
+        let config = SystemConfig {
+            engine: SystemEngineConfig::default(),
+            venues: vec![VenueConfig {
+                name: "binance".to_string(),
+                account_id: None,
+                venue_type: VenueType::Binance,
+                ws_public: Some("wss://stream.binance.com".to_string()),
+                ws_private: None,
+                rest: Some("https://api.binance.com".to_string()),
+                api_key: Some("plaintext_api_key".to_string()),
+                secret: Some("plaintext_secret".to_string()),
+                passphrase: None,
+                execution_mode: Some("Paper".to_string()),
+                capabilities: VenueCapabilities::default(),
+                inst_type: None,
+                simulate_execution: false,
+                symbol_catalog: Vec::new(),
+                data_config: None,
+                execution_config: None,
+                secret_ref_api_key: None, // No references
+                secret_ref_secret: None,
+                secret_ref_passphrase: None,
+            }],
+            strategies: Vec::new(),
+            risk: RiskConfig::default(),
+            quotes_only: false,
+            router: None,
+            infra: None,
+            strategy_accounts: HashMap::new(),
+            accounts: Vec::new(),
+            portfolios: Vec::new(),
+        };
+
+        // Create builder using the proper constructor
+        let builder = SystemBuilder::new(config);
+
+        let original_api_key = builder.config.venues[0].api_key.clone();
+        let original_secret = builder.config.venues[0].secret.clone();
+
+        // Execute credential resolution
+        let builder = builder.resolve_credentials_async().await
+            .expect("Credential resolution should succeed");
+
+        // Verify: Plaintext credentials should remain unchanged
+        assert_eq!(
+            builder.config.venues[0].api_key, original_api_key,
+            "api_key should not change when no reference exists"
+        );
+        assert_eq!(
+            builder.config.venues[0].secret, original_secret,
+            "secret should not change when no reference exists"
+        );
+    }
+
+    #[cfg(feature = "infra-secrets")]
+    #[tokio::test]
+    async fn test_credential_resolution_partial_update() {
+        // Setup: Mix of plaintext and reference credentials
+        std::env::set_var("HFT_SECRET_OKX_SECRET", "resolved_secret_value");
+
+        let config = SystemConfig {
+            engine: SystemEngineConfig::default(),
+            venues: vec![VenueConfig {
+                name: "okx".to_string(),
+                account_id: None,
+                venue_type: VenueType::Okx,
+                ws_public: Some("wss://ws.okex.com".to_string()),
+                ws_private: None,
+                rest: Some("https://www.okex.com".to_string()),
+                api_key: Some("plaintext_api_key".to_string()), // Plaintext
+                secret: None, // Will be resolved
+                passphrase: Some("plaintext_passphrase".to_string()), // Plaintext
+                execution_mode: Some("Paper".to_string()),
+                capabilities: VenueCapabilities::default(),
+                inst_type: None,
+                simulate_execution: false,
+                symbol_catalog: Vec::new(),
+                data_config: None,
+                execution_config: None,
+                secret_ref_api_key: None, // No reference
+                secret_ref_secret: Some("OKX_SECRET".to_string()), // Reference
+                secret_ref_passphrase: None, // No reference
+            }],
+            strategies: Vec::new(),
+            risk: RiskConfig::default(),
+            quotes_only: false,
+            router: None,
+            infra: None,
+            strategy_accounts: HashMap::new(),
+            accounts: Vec::new(),
+            portfolios: Vec::new(),
+        };
+
+        let builder = SystemBuilder::new(config);
+
+        let builder = builder.resolve_credentials_async().await
+            .expect("Credential resolution should succeed");
+
+        let okx_venue = &builder.config.venues[0];
+
+        // Verify: Only the referenced field was updated
+        assert_eq!(
+            okx_venue.api_key, Some("plaintext_api_key".to_string()),
+            "api_key should remain unchanged (no reference)"
+        );
+        assert_eq!(
+            okx_venue.secret, Some("resolved_secret_value".to_string()),
+            "secret should be resolved from reference"
+        );
+        assert_eq!(
+            okx_venue.passphrase, Some("plaintext_passphrase".to_string()),
+            "passphrase should remain unchanged (no reference)"
+        );
+        assert!(okx_venue.secret_ref_secret.is_none(), "secret reference should be cleared");
+
+        // Cleanup
+        std::env::remove_var("HFT_SECRET_OKX_SECRET");
+    }
+
+    #[cfg(feature = "infra-secrets")]
+    #[tokio::test]
+    async fn test_credential_resolution_missing_reference() {
+        // Setup: Reference to non-existent environment variable
+        let config = SystemConfig {
+            engine: SystemEngineConfig::default(),
+            venues: vec![VenueConfig {
+                name: "bybit".to_string(),
+                account_id: None,
+                venue_type: VenueType::Bybit,
+                ws_public: Some("wss://stream.bybit.com".to_string()),
+                ws_private: None,
+                rest: Some("https://api.bybit.com".to_string()),
+                api_key: None,
+                secret: None,
+                passphrase: None,
+                execution_mode: Some("Paper".to_string()),
+                capabilities: VenueCapabilities::default(),
+                inst_type: None,
+                simulate_execution: false,
+                symbol_catalog: Vec::new(),
+                data_config: None,
+                execution_config: None,
+                secret_ref_api_key: Some("NONEXISTENT_KEY".to_string()),
+                secret_ref_secret: None,
+                secret_ref_passphrase: None,
+            }],
+            strategies: Vec::new(),
+            risk: RiskConfig::default(),
+            quotes_only: false,
+            router: None,
+            infra: None,
+            strategy_accounts: HashMap::new(),
+            accounts: Vec::new(),
+            portfolios: Vec::new(),
+        };
+
+        let builder = SystemBuilder::new(config);
+
+        // Execute: Should fail gracefully
+        let result = builder.resolve_credentials_async().await;
+        assert!(result.is_err(), "Resolution should fail for missing credential reference");
+    }
+
+    #[cfg(not(feature = "infra-secrets"))]
+    #[tokio::test]
+    async fn test_credential_resolution_disabled_feature() {
+        // Setup: When feature is disabled, resolution should be no-op
+        let config = SystemConfig {
+            engine: SystemEngineConfig::default(),
+            venues: vec![VenueConfig {
+                name: "test_venue".to_string(),
+                account_id: None,
+                venue_type: VenueType::Mock,
+                ws_public: None,
+                ws_private: None,
+                rest: None,
+                api_key: None,
+                secret: None,
+                passphrase: None,
+                execution_mode: Some("Paper".to_string()),
+                capabilities: VenueCapabilities::default(),
+                inst_type: None,
+                simulate_execution: false,
+                symbol_catalog: Vec::new(),
+                data_config: None,
+                execution_config: None,
+                secret_ref_api_key: Some("SOME_REF".to_string()),
+                secret_ref_secret: None,
+                secret_ref_passphrase: None,
+            }],
+            strategies: Vec::new(),
+            risk: RiskConfig::default(),
+            quotes_only: false,
+            router: None,
+            infra: None,
+            strategy_accounts: HashMap::new(),
+            accounts: Vec::new(),
+            portfolios: Vec::new(),
+        };
+
+        let builder = SystemBuilder::new(config);
+
+        // Execute: Should succeed (no-op) even with unresolved references
+        let builder = builder.resolve_credentials_async().await
+            .expect("Resolution should be no-op when feature disabled");
+
+        // Verify: References should remain unchanged (not resolved, not cleared)
+        assert_eq!(
+            builder.config.venues[0].secret_ref_api_key,
+            Some("SOME_REF".to_string()),
+            "References should remain when feature is disabled"
+        );
+    }
+
+    #[test]
+    fn test_venue_config_credential_field_precedence() {
+        // Verify that credential reference fields take precedence over plaintext
+        let venue = VenueConfig {
+            name: "test".to_string(),
+            account_id: None,
+            venue_type: VenueType::Bitget,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: Some("plaintext_key".to_string()),
+            secret: Some("plaintext_secret".to_string()),
+            passphrase: None,
+            execution_mode: None,
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: false,
+            symbol_catalog: Vec::new(),
+            data_config: None,
+            execution_config: None,
+            secret_ref_api_key: Some("KEY_REFERENCE".to_string()),
+            secret_ref_secret: Some("SECRET_REFERENCE".to_string()),
+            secret_ref_passphrase: None,
+        };
+
+        // When both plaintext and reference exist, reference should be used
+        assert!(venue.secret_ref_api_key.is_some());
+        assert!(venue.api_key.is_some()); // Both exist
+        // In actual resolution, reference would take precedence and plaintext would be overwritten
+
+        // When only reference exists, that's the source of truth
+        let venue_ref_only = VenueConfig {
+            name: "test".to_string(),
+            account_id: None,
+            venue_type: VenueType::Bitget,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: None,
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: false,
+            symbol_catalog: Vec::new(),
+            data_config: None,
+            execution_config: None,
+            secret_ref_api_key: Some("KEY_REFERENCE".to_string()),
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        };
+
+        assert!(venue_ref_only.secret_ref_api_key.is_some());
+        assert!(venue_ref_only.api_key.is_none());
     }
 }

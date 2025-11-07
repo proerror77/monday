@@ -87,8 +87,8 @@ impl From<simd_json::Error> for JsonError {
 #[cfg(not(feature = "json-simd"))]
 pub fn parse_json_bytes(bytes: &mut [u8]) -> Result<Value, JsonError> {
     // serde_json 需要有效的 UTF-8
-    let text = std::str::from_utf8(bytes)
-        .map_err(|e| JsonError::new(format!("UTF-8 驗證失敗: {}", e)))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|e| JsonError::new(format!("UTF-8 驗證失敗: {}", e)))?;
     serde_json::from_str(text).map_err(Into::into)
 }
 

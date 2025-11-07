@@ -159,17 +159,28 @@ mod tests {
         for iteration in 0..3 {
             for i in 0..3 {
                 let value = iteration * 3 + i + 1;
-                assert!(producer.send(value).is_ok(),
-                        "Failed to send {} in iteration {}", value, iteration);
+                assert!(
+                    producer.send(value).is_ok(),
+                    "Failed to send {} in iteration {}",
+                    value,
+                    iteration
+                );
             }
 
             for i in 0..3 {
                 let expected = iteration * 3 + i + 1;
-                assert_eq!(consumer.recv(), Some(expected),
-                          "Failed to recv in iteration {}", iteration);
+                assert_eq!(
+                    consumer.recv(),
+                    Some(expected),
+                    "Failed to recv in iteration {}",
+                    iteration
+                );
             }
 
-            assert!(consumer.recv().is_none(), "Buffer should be empty after consuming all");
+            assert!(
+                consumer.recv().is_none(),
+                "Buffer should be empty after consuming all"
+            );
         }
     }
 
@@ -177,19 +188,31 @@ mod tests {
     fn test_utilization_metrics() {
         let (producer, consumer) = spsc_ring_buffer(8);
 
-        assert_eq!(producer.utilization(), 0.0, "Empty buffer should have 0% utilization");
+        assert_eq!(
+            producer.utilization(),
+            0.0,
+            "Empty buffer should have 0% utilization"
+        );
 
         // Fill to 50% of usable capacity (3 out of 7)
         for i in 0..3 {
             assert!(producer.send(i).is_ok());
         }
         let util = producer.utilization();
-        assert!(util > 0.4 && util < 0.5, "Expected ~43% utilization, got {}", util);
+        assert!(
+            util > 0.4 && util < 0.5,
+            "Expected ~43% utilization, got {}",
+            util
+        );
 
         // Consume one
         assert_eq!(consumer.recv(), Some(0));
         let util_after = consumer.utilization();
-        assert!(util_after > 0.25 && util_after < 0.35, "Expected ~29% utilization, got {}", util_after);
+        assert!(
+            util_after > 0.25 && util_after < 0.35,
+            "Expected ~29% utilization, got {}",
+            util_after
+        );
     }
 
     #[cfg(loom)]
@@ -234,7 +257,11 @@ mod tests {
             let received = cons_handle.join().unwrap();
 
             // Verify SPSC invariants: all sent items received in order
-            assert_eq!(received, vec![1, 2, 3], "Items must be received in FIFO order");
+            assert_eq!(
+                received,
+                vec![1, 2, 3],
+                "Items must be received in FIFO order"
+            );
         });
     }
 
@@ -276,7 +303,11 @@ mod tests {
 
             // The Release fence in try_push and Acquire load in try_pop
             // guarantee that the consumer sees the correct data
-            assert_eq!(result, Some(42), "Consumer must see the value that was sent");
+            assert_eq!(
+                result,
+                Some(42),
+                "Consumer must see the value that was sent"
+            );
         });
     }
 
@@ -321,8 +352,11 @@ mod tests {
             let received = cons_handle.join().unwrap();
 
             // Verify FIFO and wraparound correctness
-            assert_eq!(received, vec![1, 2, 3, 4, 5, 6],
-                      "Wraparound must maintain FIFO order");
+            assert_eq!(
+                received,
+                vec![1, 2, 3, 4, 5, 6],
+                "Wraparound must maintain FIFO order"
+            );
         });
     }
 

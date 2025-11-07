@@ -125,11 +125,7 @@ fn bench_parse_kline_event(c: &mut Criterion) {
 
 /// 基準測試：批量解析混合消息
 fn bench_parse_mixed_batch(c: &mut Criterion) {
-    let messages = vec![
-        DEPTH_UPDATE_JSON,
-        TRADE_EVENT_JSON,
-        KLINE_EVENT_JSON,
-    ];
+    let messages = vec![DEPTH_UPDATE_JSON, TRADE_EVENT_JSON, KLINE_EVENT_JSON];
     let total_bytes: usize = messages.iter().map(|m| m.len()).sum();
 
     let mut group = c.benchmark_group("parse_mixed_batch");

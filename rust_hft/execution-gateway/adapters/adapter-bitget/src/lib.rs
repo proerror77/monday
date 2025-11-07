@@ -406,7 +406,8 @@ impl BitgetExecutionClient {
 
         let handle = tokio::spawn(async move {
             if let Err(e) =
-                Self::private_websocket_loop(ws_url, credentials, event_tx.clone(), latency_tracker).await
+                Self::private_websocket_loop(ws_url, credentials, event_tx.clone(), latency_tracker)
+                    .await
             {
                 error!("私有 WebSocket 錯誤: {}", e);
                 let _ = event_tx.send(ExecutionEvent::ConnectionStatus {
@@ -497,7 +498,9 @@ impl BitgetExecutionClient {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    if let Err(e) = Self::handle_private_message(&text, &event_tx, &latency_tracker).await {
+                    if let Err(e) =
+                        Self::handle_private_message(&text, &event_tx, &latency_tracker).await
+                    {
                         warn!("處理私有消息失敗: {} - {}", e, text);
                     }
                 }
@@ -542,13 +545,15 @@ impl BitgetExecutionClient {
                 "orders" => {
                     // 訂單狀態更新
                     if let Some(data) = &message.data {
-                        Self::handle_order_update(data, event_tx, recv_time, latency_tracker).await?;
+                        Self::handle_order_update(data, event_tx, recv_time, latency_tracker)
+                            .await?;
                     }
                 }
                 "fill" => {
                     // 成交回報
                     if let Some(data) = &message.data {
-                        Self::handle_fill_update(data, event_tx, recv_time, latency_tracker).await?;
+                        Self::handle_fill_update(data, event_tx, recv_time, latency_tracker)
+                            .await?;
                     }
                 }
                 _ => {
@@ -1728,7 +1733,9 @@ impl ExecutionClient for BitgetExecutionClient {
     }
 
     async fn health(&self) -> ConnectionHealth {
-        let latency_ms = self.measured_latency_ms.lock()
+        let latency_ms = self
+            .measured_latency_ms
+            .lock()
             .ok()
             .and_then(|guard| *guard);
 

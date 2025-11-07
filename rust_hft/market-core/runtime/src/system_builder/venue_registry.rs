@@ -150,6 +150,9 @@ mod tests {
             ],
             data_config: None,
             execution_config: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
         });
 
         let builder = SystemBuilder::new(config).register_market_streams_from_config();
@@ -181,6 +184,9 @@ mod tests {
             symbol_catalog: Vec::new(),
             data_config: None,
             execution_config: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
         });
         config.strategies.push(StrategyConfig {
             name: "trend".into(),

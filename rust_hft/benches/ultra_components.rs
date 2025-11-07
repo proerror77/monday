@@ -7,8 +7,8 @@
 //! Run with: cargo bench --bench ultra_components
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use engine::dataflow::UltraRingBuffer;
 use engine::dataflow::ring_buffer::SpscRingBuffer;
+use engine::dataflow::UltraRingBuffer;
 use ports::MarketEvent;
 
 /// 創建測試用的 MarketEvent
@@ -162,18 +162,22 @@ fn bench_ring_buffer_batch(c: &mut Criterion) {
         );
 
         // Ultra 版本
-        group.bench_with_input(BenchmarkId::new("ultra", batch_size), batch_size, |b, &size| {
-            let buffer = UltraRingBuffer::new(2048);
+        group.bench_with_input(
+            BenchmarkId::new("ultra", batch_size),
+            batch_size,
+            |b, &size| {
+                let buffer = UltraRingBuffer::new(2048);
 
-            b.iter(|| unsafe {
-                for i in 0..size {
-                    buffer.push_unchecked(create_test_event(i));
-                }
-                for _ in 0..size {
-                    black_box(buffer.pop_unchecked());
-                }
-            });
-        });
+                b.iter(|| unsafe {
+                    for i in 0..size {
+                        buffer.push_unchecked(create_test_event(i));
+                    }
+                    for _ in 0..size {
+                        black_box(buffer.pop_unchecked());
+                    }
+                });
+            },
+        );
     }
 
     group.finish();
@@ -196,12 +200,16 @@ fn bench_ring_buffer_memory(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(BenchmarkId::new("ultra_alloc", capacity), capacity, |b, &cap| {
-            b.iter(|| {
-                let buffer = UltraRingBuffer::<MarketEvent>::new(cap);
-                black_box(buffer)
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ultra_alloc", capacity),
+            capacity,
+            |b, &cap| {
+                b.iter(|| {
+                    let buffer = UltraRingBuffer::<MarketEvent>::new(cap);
+                    black_box(buffer)
+                });
+            },
+        );
     }
 
     group.finish();

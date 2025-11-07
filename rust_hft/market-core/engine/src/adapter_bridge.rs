@@ -9,7 +9,7 @@ use hft_core::{HftError, Symbol};
 use ports::MarketStream;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{debug, info, trace, warn};
 
 /// Adapter 橋接器配置
 #[derive(Debug, Clone)]
@@ -55,7 +55,7 @@ impl AdapterBridge {
     /// 橋接單個 MarketStream 到 Engine
     /// 返回 EventConsumer 供 Engine 使用
     pub async fn bridge_stream<S>(
-        &self,
+        &mut self,
         stream: S,
         symbols: Vec<Symbol>,
     ) -> Result<EventConsumer, HftError>
@@ -103,7 +103,7 @@ impl AdapterBridge {
                                 // 🔥 降低日誌等級：事件級記錄改為 debug!（避免洪流）
                                 match &event {
                                     ports::MarketEvent::Bar(bar) => {
-                                        tracing::debug!(
+                                        trace!(
                                             seq = events_processed,
                                             event_kind = "bar",
                                             symbol = %bar.symbol,
@@ -113,7 +113,7 @@ impl AdapterBridge {
                                         );
                                     }
                                     ports::MarketEvent::Trade(trade) => {
-                                        tracing::debug!(
+                                        trace!(
                                             seq = events_processed,
                                             event_kind = "trade",
                                             symbol = %trade.symbol,
@@ -124,7 +124,7 @@ impl AdapterBridge {
                                         );
                                     }
                                     ports::MarketEvent::Snapshot(snap) => {
-                                        tracing::debug!(
+                                        trace!(
                                             seq = events_processed,
                                             event_kind = "snapshot",
                                             symbol = %snap.symbol,
@@ -134,7 +134,7 @@ impl AdapterBridge {
                                         );
                                     }
                                     _ => {
-                                        tracing::debug!(
+                                        trace!(
                                             seq = events_processed,
                                             event_kind = "other",
                                             "AdapterBridge 收到事件"
@@ -146,13 +146,13 @@ impl AdapterBridge {
                                     tracing::error!("攝取事件失敗: {}", e);
                                     // 繼續處理，不中斷流
                                 } else {
-                                    tracing::debug!("事件成功攝取到 ring buffer");
+                                    trace!("事件成功攝取到 ring buffer");
                                 }
 
-                                // 🔥 降低統計輸出頻率：每 1000 個事件記錄一次（避免洪流）
-                                if events_processed.is_multiple_of(1000) {
+                                // 統計輸出降為 debug 並降低頻率
+                                if events_processed.is_multiple_of(2000) {
                                     let metrics = ingester.metrics();
-                                    tracing::info!("攝取統計: 接收 {}, 丟棄 {}, 陳舊 {}, 最大利用率 {:.2}%",
+                                    debug!("攝取統計: 接收 {}, 丟棄 {}, 陳舊 {}, 最大利用率 {:.2}%",
                                            metrics.events_received,
                                            metrics.events_dropped,
                                            metrics.events_stale,
@@ -160,12 +160,12 @@ impl AdapterBridge {
                                 }
                             }
                             Some(Err(e)) => {
-                                tracing::warn!("事件流錯誤: {}", e);
+                                warn!("事件流錯誤: {}", e);
                                 // 短暫延遲後繼續
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                             None => {
-                                tracing::warn!("事件流結束");
+                                warn!("事件流結束");
                                 break;
                             }
                         }
@@ -183,6 +183,7 @@ impl AdapterBridge {
             );
         });
 
+        self.is_running = true;
         Ok(consumer)
     }
 
@@ -261,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn test_adapter_bridge_creation() {
         let config = AdapterBridgeConfig::default();
-        let bridge = AdapterBridge::new(config);
+        let mut bridge = AdapterBridge::new(config);
         assert!(!bridge.is_running());
     }
 }

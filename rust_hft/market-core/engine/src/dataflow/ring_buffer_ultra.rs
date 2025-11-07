@@ -467,7 +467,9 @@ mod tests {
         // 快速路徑：預先檢查容量
         for i in 0..5 {
             if !producer.is_full() {
-                unsafe { producer.send_unchecked(i); }
+                unsafe {
+                    producer.send_unchecked(i);
+                }
             }
         }
 
@@ -522,7 +524,11 @@ mod tests {
 
             // 寫入 3 個項但不消費
             for _ in 0..3 {
-                producer.send(DropCounter { count: drop_count.clone() }).unwrap();
+                producer
+                    .send(DropCounter {
+                        count: drop_count.clone(),
+                    })
+                    .unwrap();
             }
 
             // 離開作用域，Ring Buffer Drop

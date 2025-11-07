@@ -54,6 +54,7 @@ infra-clickhouse = { package = "hft-infra-clickhouse", path = "../../infra-servi
 infra-redis = { package = "hft-infra-redis", path = "../../infra-services/core/redis", optional = true }
 infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics", optional = true }
 infra-ipc = { package = "hft-ipc", path = "../../infra-services/core/ipc", optional = true }
+infra-secrets = { package = "hft-infra-secrets", path = "../../infra-services/core/secrets", optional = true }
 
 # Serialization and async
 serde = { workspace = true }
@@ -130,6 +131,7 @@ clickhouse = ["dep:infra-clickhouse", "dep:clickhouse"]
 redis = ["dep:infra-redis", "dep:redis", "dep:serde_json"]
 metrics = ["dep:infra-metrics", "engine/metrics"]
 infra-ipc = ["dep:infra-ipc", "infra-ipc/ipc"]
+infra-secrets = ["dep:infra-secrets"]
 
 # Convenience features
 bitget = ["adapter-bitget-data", "adapter-bitget-execution"]

@@ -2,7 +2,7 @@
 //!
 //! These tests verify that the crate can be used in different feature configurations.
 
-use hft_ipc::{Command, Response, IPCPayload, IPCMessage};
+use hft_ipc::{Command, IPCMessage, IPCPayload, Response};
 
 #[test]
 fn message_types_available_without_features() {
@@ -39,9 +39,8 @@ fn ipc_functionality_available_with_feature() {
     let _path: &str = DEFAULT_SOCKET_PATH;
 
     // This ensures the IPC module and client type are accessible
-    let _phantom: fn() -> IPCClient = || {
-        unreachable!("This is never called, just for type checking")
-    };
+    let _phantom: fn() -> IPCClient =
+        || unreachable!("This is never called, just for type checking");
 }
 
 #[cfg(feature = "ipc")]
@@ -88,7 +87,7 @@ fn response_types_available() {
         Response::Ok,
         Response::Error {
             message: "test error".to_string(),
-            code: Some(500)
+            code: Some(500),
         },
     ];
 
@@ -98,7 +97,7 @@ fn response_types_available() {
 #[cfg(feature = "ipc")]
 #[test]
 fn serialization_roundtrip_with_messagepack() {
-    use rmp_serde::{encode, decode};
+    use rmp_serde::{decode, encode};
 
     // With IPC feature, MessagePack serialization should work
     let command = Command::GetStatus;
@@ -113,7 +112,7 @@ fn serialization_roundtrip_with_messagepack() {
     let decoded: IPCMessage = decode::from_slice(&bytes).expect("Failed to deserialize");
 
     match decoded.payload {
-        IPCPayload::Command(Command::GetStatus) => {},
+        IPCPayload::Command(Command::GetStatus) => {}
         _ => panic!("Wrong payload type after roundtrip"),
     }
 }

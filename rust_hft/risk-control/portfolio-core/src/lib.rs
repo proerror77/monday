@@ -2,7 +2,7 @@
 //! - 根據 ExecutionEvent（fills/fees/funding）更新帳戶狀態
 //! - 發佈只讀 AccountView 快照（Arc 快照）
 
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -71,10 +71,7 @@ impl Portfolio {
         {
             if let Some((symbol, side)) = self.order_meta.get(order_id).cloned() {
                 // De-duplication: skip duplicated fill_id for this order
-                let set = self
-                    .processed_fill_ids
-                    .entry(order_id.clone())
-                    .or_default();
+                let set = self.processed_fill_ids.entry(order_id.clone()).or_default();
                 if !fill_id.is_empty() && set.contains(fill_id) {
                     // duplicate, ignore
                 } else {
@@ -115,15 +112,15 @@ impl Portfolio {
 
     /// 根據市場中間價重新計算未實現盈虧
     fn recalculate_unrealized_pnl(&mut self) {
-        let mut total_unrealized = 0.0;
+        let mut total_unrealized = Decimal::ZERO;
 
         for (symbol, position) in &mut self.view.positions {
             if let Some(market_price) = self.market_prices.get(symbol) {
                 // 未實現盈虧 = (市場價 - 均價) * 持倉量
                 // 注意：賣空倉位的 quantity 為負數
                 let unrealized = (market_price.0 - position.avg_price.0) * position.quantity.0;
-                position.unrealized_pnl = unrealized.to_f64().unwrap_or(0.0);
-                total_unrealized += position.unrealized_pnl;
+                position.unrealized_pnl = unrealized;
+                total_unrealized += unrealized;
             }
         }
 
@@ -139,11 +136,8 @@ impl Portfolio {
                 symbol: symbol.clone(),
                 quantity: Quantity::zero(),
                 avg_price: Price::zero(),
-                unrealized_pnl: 0.0,
+                unrealized_pnl: Decimal::ZERO,
             });
-
-        let qty_f = qty.to_f64().unwrap_or(0.0);
-        let price_f = price.to_f64().unwrap_or(0.0);
 
         match side {
             Side::Buy => {
@@ -158,16 +152,16 @@ impl Portfolio {
                 pos.quantity = new_qty;
                 pos.avg_price = new_avg;
                 // 現金減少
-                self.view.cash_balance -= price_f * qty_f;
+                self.view.cash_balance -= price.0 * qty.0;
             }
             Side::Sell => {
                 // 實現損益 = (賣價 - 均價) * 賣出數量
                 let realized = (price.0 - pos.avg_price.0) * qty.0;
-                self.view.realized_pnl += realized.to_f64().unwrap_or(0.0);
+                self.view.realized_pnl += realized;
                 // 減倉
                 pos.quantity = Quantity(pos.quantity.0 - qty.0);
                 // 現金增加
-                self.view.cash_balance += price_f * qty_f;
+                self.view.cash_balance += price.0 * qty.0;
             }
         }
     }
@@ -185,7 +179,7 @@ impl Portfolio {
     /// Import portfolio state from persistent storage
     pub fn import_state(&mut self, state: PortfolioState) {
         info!(
-            "Importing portfolio state - Cash: {:.2}, Positions: {}, Orders: {}",
+            "Importing portfolio state - Cash: {}, Positions: {}, Orders: {}",
             state.account_view.cash_balance,
             state.account_view.positions.len(),
             state.order_meta.len()
@@ -203,10 +197,12 @@ impl Portfolio {
         self.snapshot.store(Arc::new(self.view.clone()));
 
         // Log summary
-        info!("Portfolio state imported - Total value: {:.2}, Realized PnL: {:.2}, Unrealized PnL: {:.2}",
-              self.view.cash_balance + self.view.unrealized_pnl,
-              self.view.realized_pnl,
-              self.view.unrealized_pnl);
+        info!(
+            "Portfolio state imported - Total value: {}, Realized PnL: {}, Unrealized PnL: {}",
+            self.view.cash_balance + self.view.unrealized_pnl,
+            self.view.realized_pnl,
+            self.view.unrealized_pnl
+        );
     }
 }
 

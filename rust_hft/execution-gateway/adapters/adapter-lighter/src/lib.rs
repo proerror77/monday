@@ -603,9 +603,9 @@ impl ExecutionClient for LighterExecutionClient {
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         match self.cfg.mode {
             ExecutionMode::Paper => Ok(Vec::new()),
-            ExecutionMode::Live => Err(HftError::Config(
-                "Lighter list_open_orders 尚未實作".into(),
-            )),
+            ExecutionMode::Live => {
+                Err(HftError::Config("Lighter list_open_orders 尚未實作".into()))
+            }
         }
     }
 

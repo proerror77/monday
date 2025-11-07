@@ -48,6 +48,7 @@ pub struct BinanceMarketStream {
     rest_client: BinanceRestClient,
     is_connected: bool,
     last_heartbeat: Timestamp,
+    ws_base_url: String,
 }
 
 impl Default for BinanceMarketStream {
@@ -63,6 +64,7 @@ impl BinanceMarketStream {
             rest_client: BinanceRestClient::new(),
             is_connected: false,
             last_heartbeat: 0,
+            ws_base_url: websocket::WS_BASE_URL.to_string(),
         }
     }
 
@@ -72,7 +74,19 @@ impl BinanceMarketStream {
             rest_client: BinanceRestClient::new(),
             is_connected: false,
             last_heartbeat: 0,
+            ws_base_url: websocket::WS_BASE_URL.to_string(),
         }
+    }
+
+    pub fn with_ws_base_url(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.ws_base_url = url;
+        self
+    }
+
+    pub fn with_rest_base_url(mut self, url: impl Into<String>) -> Self {
+        self.rest_client = BinanceRestClient::with_base_url(url);
+        self
     }
 
     /// 獲取訂單簿快照（用於初始化）
@@ -93,7 +107,6 @@ impl BinanceMarketStream {
 
         Ok(snapshots)
     }
-
 }
 
 #[async_trait]
@@ -127,7 +140,7 @@ impl MarketStream for BinanceMarketStream {
         // 啟動 WebSocket 流
         // 注意：這裡我們需要 clone self，但是 self 是 &self，所以需要重新設計
         // 為了演示目的，我們先創建一個簡單的流
-        let mut ws_client = BinanceWebSocket::new();
+        let mut ws_client = BinanceWebSocket::with_base_url(self.ws_base_url.clone());
         let symbols_clone = symbols.clone();
 
         tokio::spawn(async move {

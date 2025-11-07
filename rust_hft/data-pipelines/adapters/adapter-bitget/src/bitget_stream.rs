@@ -124,6 +124,7 @@ pub struct BitgetMarketStream {
     event_sender: Option<mpsc::UnboundedSender<MarketEvent>>,
     subscribed_symbols: Vec<Symbol>,
     use_incremental_books: bool,
+    ws_url: Option<String>,
     /// Bitget 產品型別（SPOT / USDT-FUTURES / COIN-FUTURES / USDC-FUTURES）
     inst_type: String,
     /// 深度頻道：books/books1/books5/books15
@@ -143,6 +144,7 @@ impl BitgetMarketStream {
             event_sender: None,
             subscribed_symbols: Vec::new(),
             use_incremental_books: false,
+            ws_url: None,
             inst_type: "SPOT".to_string(),
             depth_channel: "books15".to_string(),
         }
@@ -153,6 +155,12 @@ impl BitgetMarketStream {
             use_incremental_books,
             ..Self::new()
         }
+    }
+
+    /// 指定自訂 WS URL（預設讀取官方端點）
+    pub fn with_ws_url(mut self, ws_url: impl Into<String>) -> Self {
+        self.ws_url = Some(ws_url.into());
+        self
     }
 
     /// 指定 Bitget 產品型別（SPOT / USDT-FUTURES / COIN-FUTURES / USDC-FUTURES）
@@ -167,11 +175,14 @@ impl BitgetMarketStream {
         self
     }
 
-    fn create_ws_config() -> WsClientConfig {
+    fn create_ws_config(&self) -> WsClientConfig {
         // 放寬訊息/幀上限以容納多品種 LOB/Trade 聚合
-        // 支持從環境變量讀取 URL 以便測試
-        let url = std::env::var("BITGET_WS_URL")
-            .unwrap_or_else(|_| "wss://ws.bitget.com/v2/ws/public".to_string());
+        // 支持從環境變量或 runtime 傳入 URL
+        let url = self
+            .ws_url
+            .clone()
+            .or_else(|| std::env::var("BITGET_WS_URL").ok())
+            .unwrap_or_else(|| "wss://ws.bitget.com/v2/ws/public".to_string());
 
         WsClientConfig {
             url,
@@ -354,7 +365,7 @@ impl MarketStream for BitgetMarketStream {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         // 創建 WebSocket 客戶端
-        let ws_config = Self::create_ws_config();
+        let ws_config = self.create_ws_config();
         let mut ws_client = ReconnectingWsClient::new(ws_config);
 
         // 創建消息處理器
@@ -405,7 +416,7 @@ impl MarketStream for BitgetMarketStream {
     }
 
     async fn connect(&mut self) -> HftResult<()> {
-        let config = Self::create_ws_config();
+        let config = self.create_ws_config();
         let mut client = ReconnectingWsClient::new(config);
 
         client
@@ -621,9 +632,7 @@ impl MessageHandler for BitgetMessageHandler {
 impl BitgetMessageHandler {
     // LOB 狀態（僅增量模式）
     fn get_state_mut(&mut self, sym: &str) -> &mut OrderBookState {
-        self.ob_state
-            .entry(sym.to_string())
-            .or_default()
+        self.ob_state.entry(sym.to_string()).or_default()
     }
 
     fn handle_orderbook_data(

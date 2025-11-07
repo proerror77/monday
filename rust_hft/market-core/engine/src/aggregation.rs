@@ -516,7 +516,9 @@ impl AggregationEngine {
         output_events: &mut Vec<MarketEvent>,
     ) {
         // 記錄聚合階段開始
-        tracked_event.tracker.record_stage(LatencyStage::Aggregation);
+        tracked_event
+            .tracker
+            .record_stage(LatencyStage::Aggregation);
 
         // 處理事件（移動所有權）
         self.process_market_event_into(tracked_event.event, output_events);

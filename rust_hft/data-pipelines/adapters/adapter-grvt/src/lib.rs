@@ -213,6 +213,7 @@ fn parse_book_levels(arr: &serde_json::Value) -> Vec<BookLevel> {
 pub struct GrvtMarketStream {
     connected: bool,
     last_heartbeat: u64,
+    ws_url_override: Option<String>,
 }
 
 impl Default for GrvtMarketStream {
@@ -226,7 +227,13 @@ impl GrvtMarketStream {
         Self {
             connected: false,
             last_heartbeat: 0,
+            ws_url_override: None,
         }
+    }
+
+    pub fn with_ws_url(mut self, url: impl Into<String>) -> Self {
+        self.ws_url_override = Some(url.into());
+        self
     }
 }
 
@@ -237,7 +244,11 @@ impl MarketStream for GrvtMarketStream {
             return Err(HftError::new("GRVT: 符號列表不得為空"));
         }
 
-        let ws_url = grvt_ws_url()?;
+        let ws_url = if let Some(url) = &self.ws_url_override {
+            url.clone()
+        } else {
+            grvt_ws_url()?
+        };
         let streams_env =
             std::env::var("GRVT_FEED_STREAM").unwrap_or_else(|_| "v1.book.s".to_string());
         let streams: Vec<String> = streams_env

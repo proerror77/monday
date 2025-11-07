@@ -404,31 +404,32 @@ impl ports::OrderManager for OmsCore {
     }
 
     fn on_execution_event(&mut self, event: &ExecutionEvent) -> Option<ports::OrderUpdate> {
-        self.on_execution_event(event).map(|update| ports::OrderUpdate {
-            order_id: update.order_id,
-            status: match update.status {
-                OrderStatus::New => ports::OrderStatus::New,
-                OrderStatus::Acknowledged => ports::OrderStatus::Acknowledged,
-                OrderStatus::PartiallyFilled => ports::OrderStatus::PartiallyFilled,
-                OrderStatus::Filled => ports::OrderStatus::Filled,
-                OrderStatus::Canceled => ports::OrderStatus::Canceled,
-                OrderStatus::Rejected => ports::OrderStatus::Rejected,
-                OrderStatus::Expired => ports::OrderStatus::Expired,
-                OrderStatus::Replaced => ports::OrderStatus::Replaced,
-            },
-            cum_qty: update.cum_qty,
-            avg_price: update.avg_price,
-            previous_status: match update.previous_status {
-                OrderStatus::New => ports::OrderStatus::New,
-                OrderStatus::Acknowledged => ports::OrderStatus::Acknowledged,
-                OrderStatus::PartiallyFilled => ports::OrderStatus::PartiallyFilled,
-                OrderStatus::Filled => ports::OrderStatus::Filled,
-                OrderStatus::Canceled => ports::OrderStatus::Canceled,
-                OrderStatus::Rejected => ports::OrderStatus::Rejected,
-                OrderStatus::Expired => ports::OrderStatus::Expired,
-                OrderStatus::Replaced => ports::OrderStatus::Replaced,
-            },
-        })
+        self.on_execution_event(event)
+            .map(|update| ports::OrderUpdate {
+                order_id: update.order_id,
+                status: match update.status {
+                    OrderStatus::New => ports::OrderStatus::New,
+                    OrderStatus::Acknowledged => ports::OrderStatus::Acknowledged,
+                    OrderStatus::PartiallyFilled => ports::OrderStatus::PartiallyFilled,
+                    OrderStatus::Filled => ports::OrderStatus::Filled,
+                    OrderStatus::Canceled => ports::OrderStatus::Canceled,
+                    OrderStatus::Rejected => ports::OrderStatus::Rejected,
+                    OrderStatus::Expired => ports::OrderStatus::Expired,
+                    OrderStatus::Replaced => ports::OrderStatus::Replaced,
+                },
+                cum_qty: update.cum_qty,
+                avg_price: update.avg_price,
+                previous_status: match update.previous_status {
+                    OrderStatus::New => ports::OrderStatus::New,
+                    OrderStatus::Acknowledged => ports::OrderStatus::Acknowledged,
+                    OrderStatus::PartiallyFilled => ports::OrderStatus::PartiallyFilled,
+                    OrderStatus::Filled => ports::OrderStatus::Filled,
+                    OrderStatus::Canceled => ports::OrderStatus::Canceled,
+                    OrderStatus::Rejected => ports::OrderStatus::Rejected,
+                    OrderStatus::Expired => ports::OrderStatus::Expired,
+                    OrderStatus::Replaced => ports::OrderStatus::Replaced,
+                },
+            })
     }
 
     fn export_state(&self) -> std::collections::HashMap<OrderId, ports::OrderRecord> {

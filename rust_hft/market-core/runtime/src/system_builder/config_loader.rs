@@ -15,9 +15,9 @@ use shared_config::SystemConfig as SharedSystemConfig;
 use shared_instrument::{InstrumentCatalog, InstrumentCatalogConfig, VenueMeta};
 
 use super::{
-    CpuAffinityConfig, LobFlowGridParams, PortfolioSpec, RiskConfig, StrategyConfig,
-    StrategyParams, StrategyRiskLimits, StrategyRiskOverride, StrategyType, SystemConfig,
-    SystemEngineConfig, VenueCapabilities, VenueConfig, VenueType,
+    CpuAffinityConfig, ExecutionQueueSettings, LobFlowGridParams, PortfolioSpec, RiskConfig,
+    StrategyConfig, StrategyParams, StrategyRiskLimits, StrategyRiskOverride, StrategyType,
+    SystemConfig, SystemEngineConfig, VenueCapabilities, VenueConfig, VenueType,
 };
 
 use serde::{Deserialize, Serialize};
@@ -121,9 +121,7 @@ fn convert_shared_config(shared_cfg: SharedSystemConfig) -> Result<SystemConfig,
         ack_timeout_ms: shared_cfg.engine.ack_timeout_ms,
         reconcile_interval_ms: shared_cfg.engine.reconcile_interval_ms,
         auto_cancel_exchange_only: shared_cfg.engine.auto_cancel_exchange_only,
-        intent_queue_capacity: 4096,
-        event_queue_capacity: 8192,
-        execution_batch_size: 32,
+        execution_queue: ExecutionQueueSettings::default(),
     };
 
     let strict = is_strict_mode();
@@ -312,6 +310,9 @@ fn convert_venue_config(
         api_key: None,
         secret: None,
         passphrase: None,
+        secret_ref_api_key: None,
+        secret_ref_secret: None,
+        secret_ref_passphrase: None,
         execution_mode: None,
         capabilities: combined_caps,
         inst_type,
@@ -530,6 +531,9 @@ fn normalize_accounts(config: &mut SystemConfig) {
                 api_key: acc.credentials.as_ref().and_then(|c| c.api_key.clone()),
                 secret: acc.credentials.as_ref().and_then(|c| c.secret.clone()),
                 passphrase: acc.credentials.as_ref().and_then(|c| c.passphrase.clone()),
+                secret_ref_api_key: None,
+                secret_ref_secret: None,
+                secret_ref_passphrase: None,
                 execution_mode: acc.execution_mode.clone(),
                 capabilities: acc
                     .capabilities
@@ -546,6 +550,13 @@ fn normalize_accounts(config: &mut SystemConfig) {
     }
 }
 
+/// 判斷給定的環境變量名是否是秘密管理器參考（不應該展開）
+/// 秘密參考格式：「secret:venue::field」或「secret_ref:venue::field」
+/// 例如：「secret:bitget::api_key」表示在秘密管理器中查找「bitget::api_key」
+fn is_credential_reference(var_name: &str) -> bool {
+    var_name.starts_with("secret:") || var_name.starts_with("secret_ref:")
+}
+
 fn expand_env_vars(content: &str) -> Result<String, Box<dyn std::error::Error>> {
     let re = regex::Regex::new(r"\$\{([^}]+)\}")?;
     let mut result = content.to_string();
@@ -557,6 +568,18 @@ fn expand_env_vars(content: &str) -> Result<String, Box<dyn std::error::Error>> 
         if replacements.contains_key(full_match) {
             continue;
         }
+
+        // 跳過秘密管理器參考 - 不在此處展開，而是在模運行時由 SecretsManager 解決
+        if is_credential_reference(var_name) {
+            info!(
+                "跳過秘密參考擴展（稍後由 SecretsManager 解決）: {}",
+                var_name
+            );
+            // 保留原始格式，不展開
+            replacements.insert(full_match.to_string(), full_match.to_string());
+            continue;
+        }
+
         match std::env::var(var_name) {
             Ok(value) => {
                 replacements.insert(full_match.to_string(), value);
@@ -893,7 +916,10 @@ risk:
         assert!(venue.capabilities.use_incremental_books);
         assert_eq!(venue.symbol_catalog.len(), 1);
         assert_eq!(
-            venue.symbol_catalog[0].symbol().expect("catalog symbol").as_str(),
+            venue.symbol_catalog[0]
+                .symbol()
+                .expect("catalog symbol")
+                .as_str(),
             "BTCUSDT"
         );
         assert_eq!(config.strategies.len(), 1);
