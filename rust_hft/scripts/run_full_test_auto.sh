@@ -1,58 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 自动执行完整测试套件 (无交互版本)
-# 
-# 功能：
-# - 自动启动测试环境
-# - 编译优化版本
-# - 运行 20+商品 × 15分钟数据库压力测试
-# - 生成完整报告
-# - 提供优化建议
+# Deprecated in favor of run_test_suite.sh.
+# This shim keeps backward compatibility for CI and docs.
 
-set -e
-
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-NC='\033[0m' # No Color
-
-# 日志函数
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-log_step() {
-    echo -e "${BLUE}[STEP]${NC} $1"
-}
-
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-# 显示开始信息
-show_start_info() {
-    echo -e "${PURPLE}"
-    echo "══════════════════════════════════════════════════════════════════"
-    echo "🚀 Rust HFT - 20+商品 × 15分钟完整数据库压力测试套件 (自动执行)"
-    echo "══════════════════════════════════════════════════════════════════"
-    echo -e "${NC}"
-    echo ""
-    echo "⚡ 自动执行模式 - 无需用户交互确认"
-    echo ""
-    echo "📊 测试配置："
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/run_test_suite.sh" "$@"
     echo "  • 25 个热门交易对 (BTC, ETH, BNB, XRP, ADA...)"
     echo "  • 3 个数据通道 (OrderBook5, Trades, Ticker)"
     echo "  • 15 分钟持续运行"

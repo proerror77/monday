@@ -1,0 +1,113 @@
+# Rust HFT Spec‑Kit Constitution
+
+## 核心原則（Core Principles）
+
+### I. 程式風格（Code Style）
+- 必須使用 `rustfmt`；若無 `rustfmt.toml` 則使用預設規則。CI/Make 走 `cargo fmt -- --check` 強制檢查。
+- 必須啟用 `clippy` 嚴格檢查：工作區採用 `cargo clippy --all-targets --all-features -- -D warnings`（見 `Makefile: check`）。核心 crates（`market-core/*`, `risk-control/*`）應達到零警告；apps/tools 可逐步消除警告。
+- 模組分層與責任：
+  - `market-core/{core,ports,instrument,snapshot,engine,integration,runtime}`：型別與撮合/事件引擎核心。
+  - `data-pipelines/{core,adapters-*}`：行情輸入適配器。
+  - `execution-gateway/{execution,adapters-*}`：執行與下單適配器。
+  - `strategy-framework/{strategy-dl,infer-onnx,strategies/*}`：策略框架與策略實作。
+  - `risk-control/{risk,oms-core,portfolio-core}`：風控與投組。
+  - `infra-services/{core/*,testing,recovery}`：基礎設施（Redis/ClickHouse/Metrics/IP C）。
+  - `apps/{live,paper,replay,all-in-one}`：應用入口與組裝（Runtime Hub）。
+- 公共 API 使用明確 newtype 與命名；禁止以 `String`/`u64` 代表多義實體（以 `market-core/core` 之 `Price`/`Quantity`/`Symbol` 等 newtypes 為準）。
+
+### II. 型別與錯誤處理（Types & Errors）
+- Domain newtypes：以 `market-core/core` 為權威來源（`Price(rust_decimal)`, `Quantity(rust_decimal)`, `Symbol`, `OrderId` 等），避免語意不清的裸型別。
+- 統一錯誤：使用 `market-core/core::error::{HftError, HftResult}` 作為工作區標準返回；庫層以 `thiserror` 描述，跨 crate 邊界不洩漏 `anyhow`。
+- 應用/工具層可使用 `anyhow::Result` 聚合，但在對外 API 轉換為 `HftError`。
+- 錯誤分類（實務）：`Network/Timeout/RateLimit`（可重試）、`Parse/Serialization/InvalidOrder`（輸入問題）、`Risk/Exchange`（業務限制）、`Bug`（邏輯瑕疵需 fail-fast）。
+- 嚴禁在熱路徑使用 `unwrap/expect`；允許在測試或經不變式證明處以 `debug_assert!`。
+- `unsafe` 僅允於經審計的性能熱點，需標註不變式、配套測試與專項審查。
+
+### III. 低延遲與記憶體配置（Low Latency & Memory）
+- 熱路徑零配置（zero-alloc）：初始化預分配（`with_capacity`/工作緩衝復用/固定長度容器 `arrayvec/smallvec`）；避免動態字串拼接與成長性 push。
+- 編譯設定（以現況為準）：
+  - `[profile.release]`：`opt-level=3`, `lto="thin"`, `codegen-units=1`, `panic="abort"`（已在根 `Cargo.toml` 設定）。
+  - `[profile.bench]`：`opt-level=3`, `lto="fat"`（基準測試極致優化，已設定）。
+  - 可選：以環境變數設定 `RUSTFLAGS="-C target-cpu=native"` 於上線環境（依實際機型）。
+- CPU/NUMA：Pin 核心、避免跨 NUMA 訪問；必要結構以 `#[repr(align(64))]` 避免 false sharing。
+- 分支與內聯：冷分支 `#[cold]`，熱小函數審慎 `#[inline(always)]`（以 `cargo-criterion` 報告/`perf` 驗證）。
+- JSON/序列化：熱路徑優先 `simd-json`/零拷貝解析；IPC 使用 `rmp-serde`。避免在引擎循環中進行 serde 分配。
+- 網路 I/O：行情採 `tokio-tungstenite` + 批量處理；對外 TLS 使用 `rustls`（已統一於 workspace）。
+
+### IV. 併發與鎖（Concurrency & Locks）
+- 熱路徑禁用 `std::sync::Mutex`；首選無鎖/原子資料結構（`crossbeam`, `left-right`, `arc-swap`, `concurrent-queue`）。
+- 管理層若必鎖：優先 `parking_lot::{Mutex,RwLock}`；採 `try_lock` + backoff；禁止遞迴鎖（與 `poison` 依賴）。
+- 拓撲：單寫入者引擎 + SPSC/MPSC 佇列串接各 stage；快照讀多寫少使用 `left-right` 或 `ArcSwap` flip。
+- 任務模型：引擎/撮合同步執行；I/O 與後台任務（恢復、度量、存儲）使用 `tokio`，以無鎖通道與核心交互。
+- 減少 `Arc<Mutex<...>>`：以不可變快照或專屬工作執行緒取代跨任務共享可變狀態。
+
+### V. 測試與基準（Testing & Benchmarking）
+- 測試分層：單元（各 crate 內）、整合（`tests/integration/`）、E2E（`tests/` 頂層）、基準（`benches/` 與 `market-core/engine/benches/`）。
+- 基準：使用 `criterion 0.5`（engine 已啟用 `html_reports`）；建議在固定 CPU 親和/關閉渦輪/固定時脈下執行；輸出 `median/p99` 延遲與吞吐，與主分支比對，預設回歸閾值 2%。
+- 目標：端到端 p99 ≤ 25µs、單事件熱路徑 < 5µs（依硬體修正）；吞吐 ≥ 100k ops/s；見 `tests/integration/performance_benchmarks.rs`。
+- 命令：`cargo test`、`cargo bench -p hft-engine`（或在 `market-core/engine` 執行 `cargo bench`）。
+
+### VI. 觀測性（Tracing & Metrics）
+- Tracing：應用於 `apps/*` 初始化 `tracing_subscriber::fmt().with_env_filter("info")`；熱路徑 span 嚴格控量，必要欄位含 `order_id`、`symbol`、`venue`、`seq`、`latency_ns`。
+- Metrics：以 `infra-services/core/metrics` 為唯一來源，暴露（部分）：
+  - 延遲：`hft_latency_ingestion_microseconds`、`hft_latency_aggregation_microseconds`、`hft_latency_strategy_microseconds`、`hft_latency_risk_microseconds`、`hft_latency_execution_microseconds`、`hft_latency_end_to_end_microseconds`、`hft_order_{ack,fill}_latency_microseconds`。
+  - 隊列/事件：`hft_queue_utilization_ratio`、`hft_events_{processed,dropped,stale}_total`、`hft_staleness_milliseconds`。
+  - 快照/引擎：`hft_snapshot_flips_total`、`hft_snapshot_version`、`hft_engine_*` Gauges（cycle_count、orders_*）。
+  - 對帳/執行：`hft_reconcile_*`、`hft_orders_{submitted,filled,rejected}_total`、`hft_intents_dropped_total`。
+- 暴露：apps 可透過 `apps/live/src/helpers/metrics.rs` 啟動 Metrics HTTP（Prometheus text），並定期從引擎同步統計。
+- 日誌策略：熱路徑關閉或抽樣；審計線（下單/拒單/風控決策）保留不可竄改事件。
+- 時間同步：PTP/NTP 偏移納入 metrics；事件時間戳使用 UTC 微秒（`now_micros()`）。
+
+### VII. 安全與法遵（Security & Compliance）
+- 祕密管理：僅從環境變數或祕密管理器讀取（例 `BITGET_API_KEY/SECRET/PASSPHRASE`, `BINANCE_API_KEY/SECRET`）；禁止寫入磁碟明文；審計載入與使用。
+- 通訊安全：外部 API/WS 一律 TLS（workspace 使用 `rustls`）；內網敏感路徑建議 mTLS。
+- 合規與審計：保留下單/拒單/風控決策之輸入、結果、策略/風控版本與校驗指紋；資料保留遵循監管（建議 ≥7 年）與地域規範；PII 最小化/遮罩。
+- 風控追溯：每次拒單/熔斷需帶理由碼與上下文（風控配置快照哈希、策略參數版本）。
+
+### VIII. 部署與回溯（Deployment & Rollback）
+- 構建：`make build` 產出 release 構建（已走 `cargo build --release`）；可在 CI 固定 Rust 工具鏈版本並鎖定依賴（`Cargo.lock`）。
+- 運維：`make dev/test/health/metrics` 啟動/檢查本地基礎設施（ClickHouse/Prometheus/Redis）；ECS/K8s 參見 `ECS_DEPLOYMENT_GUIDE.md` 與 `ops/`。
+- 發布策略：灰度/金絲雀；配置以 YAML+ENV；禁止未審批的熱變更繞過；提供 `restart`/`down` 快速切換。
+- 回滾門檻：延遲回歸 >5% 或錯誤率 >0.1% 或審計事件缺失即回滾；容器/進程級回滾應在 1 分鐘內完成。
+- 容器/裸機：低延遲場景建議裸機（關渦輪、固定頻率、CPU 親和）；容器需配置 `--cpuset-cpus` 與關閉節流。
+
+### IX. 變更控制與版本規則（Change Control & Versioning）
+- 版本使用 SemVer：
+  - MAJOR：公共 API/有線協議/資料格式破壞性變更或安全模型變更。
+  - MINOR：向後相容的新功能、非預設 feature、指標新增。
+  - PATCH：修正、校準、無 API 變更的性能優化。
+- 工作區治理：`market-core`、`risk-control` 為 API 穩定核心；`strategy-framework`、`infra-services`、`execution-gateway`、`apps` 可快速迭代但不得破壞核心語意。
+- 變更要求：
+  - 提交 ADR（架構決策記錄）與 CHANGES 條目。
+  - 附單元/整合測試與基準報告；觀測性欄位調整同步文件與面板。
+  - 破壞性變更需提供遷移腳本/相容層、feature gate 與至少一個版本 deprecation 期。
+
+## 附加約束（Additional Constraints）
+- 允許 crates：`tracing`/`tracing-subscriber`、`prometheus`（metrics）、`thiserror`、`anyhow`（僅 apps/tools）、`parking_lot`、`crossbeam`、`left-right`、`arc-swap`、`concurrent-queue`、`smallvec/arrayvec`、`tokio`（I/O/後台） 、`serde`/`simd-json`（I/O 邊界）。
+- 禁止在核心使用：同步阻塞 I/O、未審計的 `unsafe`、不必要的動態分派、全域可變、`Box<dyn Error>` 作為對外 API。
+- 檔案與建置：
+  - Workspace 統一 profiles（見根 `Cargo.toml`）；crate 不得擅自放寬。
+  - `Makefile` 目前包含 `dev/test/build/check/fmt/fix/metrics/health` 等；可選新增 `bench` 與 `package` 以利 CI。
+
+## 開發流程（Workflow & Quality Gates）
+- 分支：`feature/<id>-<slug>`，以 PR 合併；要求兩名 Reviewer（性能/風控/核心至少其一）。
+- Gate：
+  - `fmt`/`clippy -D warnings` 通過（`make check`）。
+  - 單元/整合測試全綠；`criterion` 與主分支比對無顯著回歸（預設 2%）。
+  - 觀測性欄位檢查（不得移除既有關鍵欄位）；面板/告警更新。
+  - 安全掃描（`cargo audit`/SAST）。
+- 釋出：標記版本、更新 CHANGELOG、生成 SBOM、簽署 artifacts（Sigstore/GPG）。
+
+## 版本升級理由（Upgrade Rationale）
+- MAJOR：撮合/風控/有線協議語意變更；資料模式不相容；審計欄位刪改；`unsafe` 模型更新。
+- MINOR：新增風控檢查（預設關閉）、新增 Prometheus 指標、策略 API 可選參數、無語意改變的性能提升。
+- PATCH：邊界條件修復、觀測性標籤修正、競態修補、向後相容之預設值微調。
+
+## 治理規則（Governance）
+- 本憲章優先於其他檔案；例外需 ADR 記錄並獲核心維護者批准。
+- `market-core`/`risk-control` 變更需性能與風控守門人共同批准；`execution-gateway` 涉及下單語意亦同級別審核。
+- `unsafe` 區塊需專門安全審查與測試證明；建立專責 reviewers 名單。
+- PR 必附：影響面（功能/延遲/風控/合規）、回滾方案、觀測性變更清單。
+- 修補版（PATCH）可在凍結期快速通道，但至少 1 名 Reviewer 與回歸檢查必須。
+
+**Version**: 1.0.0 | **Ratified**: 2025-10-08 | **Last Amended**: 2025-10-08

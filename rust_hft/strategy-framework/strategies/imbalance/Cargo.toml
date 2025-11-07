@@ -1,0 +1,16 @@
+[package]
+name = "hft-strategy-imbalance"
+version = "0.1.0"
+edition = "2021"
+description = "Simple order book imbalance strategy"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+serde = { workspace = true }
+tracing = { workspace = true }
+rust_decimal = { workspace = true }
+
+[lib]
+name = "strategy_imbalance"
+

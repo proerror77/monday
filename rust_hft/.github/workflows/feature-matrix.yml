@@ -1,0 +1,226 @@
+name: Feature Matrix CI
+
+on:
+  push:
+    branches: [ main, master, 'feature/*' ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    # 每週日凌晨 2 點運行完整測試矩陣
+    - cron: '0 2 * * 0'
+
+jobs:
+  # 快速矩陣：PR 時運行核心組合
+  quick-matrix:
+    if: github.event_name == 'pull_request'
+    name: Quick Check (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""                                    # 默認
+          - "json-simd"                           # SIMD JSON
+          - "metrics"                             # 監控
+          - "metrics,clickhouse,redis"            # 完整基礎設施
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: quick-${{ matrix.features }}
+          cache-all-crates: true
+
+      - name: Check workspace
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            echo "Checking default features..."
+            cargo check --workspace
+          else
+            echo "Checking features: ${{ matrix.features }}"
+            cargo check --workspace --features "${{ matrix.features }}"
+          fi
+
+      - name: Clippy
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo clippy --workspace --all-targets -- -D warnings
+          else
+            cargo clippy --workspace --all-targets --features "${{ matrix.features }}" -- -D warnings
+          fi
+
+      - name: Test
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test --workspace
+          else
+            cargo test --workspace --features "${{ matrix.features }}"
+          fi
+
+  # 完整矩陣：定時或手動觸發時運行所有組合
+  full-matrix:
+    if: github.event_name != 'pull_request'
+    name: Full Matrix (${{ matrix.os }}, ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        features:
+          - ""                                    # 默認
+          - "json-simd"                           # SIMD JSON
+          - "metrics"                             # 監控
+          - "clickhouse"                          # ClickHouse
+          - "redis"                               # Redis
+          - "metrics,clickhouse"                  # 監控 + ClickHouse
+          - "metrics,redis"                       # 監控 + Redis
+          - "metrics,clickhouse,redis"            # 完整基礎設施
+          - "json-simd,metrics,clickhouse,redis"  # 全部功能
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: full-${{ matrix.os }}-${{ matrix.features }}
+          cache-all-crates: true
+
+      - name: Check all targets
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo check --workspace --all-targets
+          else
+            cargo check --workspace --all-targets --features "${{ matrix.features }}"
+          fi
+
+      - name: Clippy
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo clippy --workspace --all-targets -- -D warnings
+          else
+            cargo clippy --workspace --all-targets --features "${{ matrix.features }}" -- -D warnings
+          fi
+
+      - name: Test
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test --workspace
+          else
+            cargo test --workspace --features "${{ matrix.features }}"
+          fi
+
+      - name: Doc test
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test --doc --workspace
+          else
+            cargo test --doc --workspace --features "${{ matrix.features }}"
+          fi
+
+  # 核心 crates 專項測試
+  core-crates:
+    name: Core Crate - ${{ matrix.crate }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - hft-core
+          - hft-snapshot
+          - hft-engine
+          - hft-ports
+          - hft-runtime
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: core-${{ matrix.crate }}
+
+      - name: Check ${{ matrix.crate }}
+        run: cargo check -p ${{ matrix.crate }} --all-features
+
+      - name: Test ${{ matrix.crate }}
+        run: cargo test -p ${{ matrix.crate }} --all-features
+
+      - name: Doc ${{ matrix.crate }}
+        run: cargo doc -p ${{ matrix.crate }} --all-features --no-deps
+
+  # 編譯時間監控
+  compile-time:
+    name: Compile Time Tracking
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Clean build
+        run: |
+          cargo clean
+          echo "Starting build at $(date)"
+          time cargo build --workspace 2>&1 | tee build.log
+          echo "Build finished at $(date)"
+
+      - name: Extract metrics
+        run: |
+          FINISHED_LINE=$(grep 'Finished' build.log || echo "N/A")
+          CRATE_COUNT=$(grep 'Compiling' build.log | wc -l)
+
+          echo "## 📊 編譯指標" >> $GITHUB_STEP_SUMMARY
+          echo "- 編譯完成: $FINISHED_LINE" >> $GITHUB_STEP_SUMMARY
+          echo "- Crates 數量: $CRATE_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "- 詳細日誌: 見 build.log artifact" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload build log
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
+
+  # 總結報告
+  summary:
+    name: Feature Matrix Summary
+    runs-on: ubuntu-latest
+    needs: [quick-matrix, core-crates]
+    if: always()
+
+    steps:
+      - name: Summary
+        run: |
+          echo "## 🎯 Feature Matrix CI 總結" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ 已完成測試" >> $GITHUB_STEP_SUMMARY
+          echo "- 快速矩陣（4 個組合）" >> $GITHUB_STEP_SUMMARY
+          echo "- 核心 crates（5 個）" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 測試範圍" >> $GITHUB_STEP_SUMMARY
+          echo "- 默認配置" >> $GITHUB_STEP_SUMMARY
+          echo "- SIMD 優化" >> $GITHUB_STEP_SUMMARY
+          echo "- 監控功能" >> $GITHUB_STEP_SUMMARY
+          echo "- 基礎設施（ClickHouse/Redis）" >> $GITHUB_STEP_SUMMARY

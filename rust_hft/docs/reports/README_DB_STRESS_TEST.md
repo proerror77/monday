@@ -137,7 +137,7 @@ cargo run --release --example comprehensive_db_stress_test
 
 ### 测试参数配置
 
-编辑 `config/comprehensive_test.yaml`:
+编辑 `config/test/comprehensive_test.yaml`:
 
 ```yaml
 test_config:

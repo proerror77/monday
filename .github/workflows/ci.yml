@@ -1,0 +1,158 @@
+name: Monorepo CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monorepo-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust Workspace
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust_hft
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust_hft
+
+      - name: Format check (non-blocking)
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: Clippy (non-blocking)
+        run: |
+          cargo clippy --workspace --all-targets \
+            -W clippy::correctness \
+            -W clippy::perf \
+            -W clippy::suspicious
+        continue-on-error: true
+
+      - name: Build (release)
+        run: cargo build --workspace --release
+
+      - name: Package binaries (if present)
+        run: |
+          mkdir -p dist
+          for bin in hft-live hft-paper hft-all-in-one hft-replay; do
+            if [ -f target/release/$bin ]; then
+              cp target/release/$bin dist/
+            fi
+          done
+          ls -la dist || true
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-binaries-${{ github.sha }}
+          path: rust_hft/dist/*
+          if-no-files-found: ignore
+
+  rust_extra_standalone:
+    name: Rust Standalone (test_bitget_standalone)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: test_bitget_standalone
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust (standalone)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            test_bitget_standalone
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Package standalone binaries (if present)
+        run: |
+          mkdir -p dist
+          for bin in test_bitget_standalone test_bitget_connection; do
+            if [ -f target/release/$bin ]; then
+              cp target/release/$bin dist/
+            fi
+          done
+          ls -la dist || true
+
+      - name: Upload standalone artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-standalone-binaries-${{ github.sha }}
+          path: test_bitget_standalone/dist/*
+          if-no-files-found: ignore
+
+  python_lint:
+    name: Python Lint (ml_workspace)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ml_workspace
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install linters
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff black
+
+      - name: Ruff
+        run: ruff check .
+        continue-on-error: true
+
+      - name: Black
+        run: black --check --diff .
+        continue-on-error: true
+
+      - name: Syntax check
+        run: python -m compileall .
+
+  node_install:
+    name: Node Install (root)
+    runs-on: ubuntu-latest
+    if: ${{ hashFiles('package-lock.json') != '' || hashFiles('pnpm-lock.yaml') != '' || hashFiles('yarn.lock') != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit --fund=false

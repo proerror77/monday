@@ -197,3 +197,40 @@ ALTER TABLE trade_executions MODIFY TTL toDateTime(timestamp / 1000000) + INTERV
 
 -- 完成提示
 SELECT 'Multi-Symbol ClickHouse tables created successfully!' as status;
+
+-- 校驗與監控看板查詢
+
+-- 1) 每分鐘 gap 統計（含原因分佈）
+CREATE VIEW IF NOT EXISTS gap_stats_1min AS
+SELECT
+  venue,
+  symbol,
+  toStartOfMinute(toDateTime(intDiv(ts, 1000000))) AS minute,
+  count() AS gap_count,
+  sumIf(1, reason = 'checksum_fail') AS checksum_fail,
+  sumIf(1, reason = 'seq_gap') AS seq_gap,
+  anyLast(detail) AS sample_detail
+FROM gap_log
+GROUP BY venue, symbol, minute
+ORDER BY minute DESC;
+
+-- 2) Binance 每分鐘事件數
+CREATE VIEW IF NOT EXISTS binance_events_1min AS
+SELECT
+  symbol,
+  toStartOfMinute(toDateTime(intDiv(event_ts, 1000))) AS minute,
+  count() AS msg_count,
+  quantile(0.99)(u - U) AS p99_update_span
+FROM raw_depth_binance
+GROUP BY symbol, minute
+ORDER BY minute DESC;
+
+-- 3) Bitget 每分鐘事件數
+CREATE VIEW IF NOT EXISTS bitget_events_1min AS
+SELECT
+  symbol,
+  toStartOfMinute(toDateTime(intDiv(event_ts, 1000))) AS minute,
+  count() AS msg_count
+FROM raw_books_bitget
+GROUP BY symbol, minute
+ORDER BY minute DESC;

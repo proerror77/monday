@@ -345,7 +345,7 @@ impl OrderService {
         // 6. 添加到待處理訂單 - DashMap 無鎖插入
         self.pending_orders.insert(order_id.clone(), request.clone());
 
-        // 7. 添加到活躍訂單 - DashMap 無鎖插入  
+        // 7. 添加到活躍訂單 - DashMap 無鎖插入
         self.orders.insert(order_id.clone(), order_state.clone());
 
         // 8. 發送訂單更新事件
@@ -425,7 +425,7 @@ impl OrderService {
 
     /// 處理執行回報
     pub async fn handle_execution_report(&self, report: ExecutionReport) -> Result<()> {
-        // DashMap 無鎖可變訪問，執行報告處理性能大幅提升  
+        // DashMap 無鎖可變訪問，執行報告處理性能大幅提升
         let mut order_entry = self.orders.get_mut(&report.order_id).ok_or_else(|| {
             anyhow::anyhow!("Order not found for execution report: {}", report.order_id)
         })?;

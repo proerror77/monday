@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bitget-whitelist
+data:
+  bitget_base.json: |
+    {
+      "base_tokens": [
+        "BTC", "ETH", "SOL", "SUI", "XRP", "XLM", "HYPE", "ASTER", "PUMP",
+        "DOGE", "AVAX", "WLFI", "ADA", "ENA", "ONDO", "SEI", "MERL", "B",
+        "BNB", "BGB", "OKB"
+      ]
+    }
+

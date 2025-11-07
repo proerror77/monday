@@ -1,0 +1,26 @@
+[package]
+name = "hft-execution-adapter-hyperliquid"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+integration = { package = "hft-integration", path = "../../../market-core/integration" }
+async-trait = "0.1"
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+tracing = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+simd-json = { workspace = true }
+hex = "0.4"
+ethers-core = { version = "2.0", features = ["eip712"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+url = "2.5"
+tokio-stream = { version = "0.1", features = ["sync"] }
+rust_decimal = { workspace = true }
+
+[lib]
+name = "adapter_hyperliquid_execution"

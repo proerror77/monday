@@ -1,0 +1,60 @@
+# Legacy runtime schema（直接由 runtime 解析並展開 accounts -> venues）
+# quotes-only：只連行情、不建立執行端、不下單
+
+quotes_only: true
+
+engine:
+  queue_capacity: 16384
+  stale_us: 500000
+  top_n: 10
+  flip_policy: { OnTimer: 100000 }
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  auto_cancel_exchange_only: false
+
+accounts:
+  - id: binance_main
+    venue_type: Binance
+    rest: "https://api.binance.com"
+    ws_private: "wss://stream.binance.com:9443/ws"
+    execution_mode: "Paper"
+    credentials:
+      api_key: "${BINANCE_API_KEY}"
+      secret: "${BINANCE_SECRET}"
+
+  - id: bitget_main
+    venue_type: Bitget
+    rest: "https://api.bitget.com"
+    ws_private: "wss://ws.bitget.com/v2/ws/private"
+    execution_mode: "Paper"
+    credentials:
+      api_key: "${BITGET_API_KEY}"
+      secret: "${BITGET_SECRET}"
+      passphrase: "${BITGET_PASSPHRASE}"
+
+  - id: aster_main
+    venue_type: Asterdex
+    rest: "https://fapi.asterdex.com"
+    ws_private: "wss://fstream.asterdex.com/ws"
+    execution_mode: "Paper"
+    credentials:
+      api_key: "${ASTERDEX_API_KEY}"
+      secret: "${ASTERDEX_SECRET}"
+
+strategies: []
+
+risk:
+  risk_type: "Default"
+  global_position_limit: 100
+  global_notional_limit: 50000
+  max_daily_trades: 2000
+  max_orders_per_second: 50
+  staleness_threshold_us: 300000
+  enhanced: null
+  strategy_overrides: {}
+
+router: null
+infra: null
+
+strategy_accounts: {}
+

@@ -1,0 +1,22 @@
+[package]
+name = "hft-execution"
+version = "0.1.0"
+edition = "2021"
+description = "OMS/ExecutionClient：Live(REST+私有WS)/Sim(queue)"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../market-core/core" }
+ports = { package = "hft-ports", path = "../../market-core/ports" }
+integration = { package = "hft-integration", path = "../../market-core/integration" }
+serde = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+live = []
+paper = []
+replay = []
+
+[lib]
+name = "execution"

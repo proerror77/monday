@@ -6,13 +6,15 @@ description = "模擬盤交易應用 - 無風險模式"
 
 [dependencies]
 # 核心依賴
-runtime = { package = "hft-runtime", path = "../../crates/runtime" }
+runtime = { package = "hft-runtime", path = "../../market-core/runtime" }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.0", features = ["derive"] }
 serde = { workspace = true }
 serde_yaml = "0.9"
+prometheus = { workspace = true, optional = true }
+infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics", features = ["http-server"], optional = true }
 
 [features]
 default = ["mock"]
@@ -21,7 +23,14 @@ bitget = ["runtime/adapter-bitget-data"]
 binance = ["runtime/adapter-binance-data"]
 bybit = ["runtime/adapter-bybit-data"]
 
+# 基礎設施（轉發至 runtime 並啟用 HTTP 暴露）
+metrics = [
+  "runtime/metrics",
+  "dep:prometheus",
+  "dep:infra-metrics",
+  "infra-metrics/http-server"
+]
+
 [[bin]]
 name = "hft-paper"
 path = "src/main.rs"
-

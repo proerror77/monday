@@ -174,9 +174,9 @@ snapshot-left-right = ["left-right"]
 engine-ultra-local = ["crossbeam"]  # 回放/壓測 SPSC ArrayQueue
 
 # 基礎設施模組 (可選，不進熱路徑)
-infra-clickhouse = ["clickhouse"]
-infra-redis = ["redis"] 
-infra-metrics = ["metrics-exporter-prometheus"]
+clickhouse = ["clickhouse"]
+redis = ["redis"] 
+metrics = ["metrics-exporter-prometheus"]
 
 # 運行模式
 live = []

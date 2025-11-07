@@ -1,0 +1,77 @@
+# Hyperliquid Paper 模式配置
+# 安全的模拟交易配置，不会产生真实交易
+
+venues:
+  - name: "HYPERLIQUID"
+    venue_type: "perp"
+    
+    # 数据配置 - 接收真实市场数据
+    data_config:
+      adapter_type: "hyperliquid"
+      ws_url: "wss://api.hyperliquid.xyz/ws"
+      reconnect_interval_ms: 5000
+      heartbeat_interval_ms: 30000
+    
+    # 执行配置 - Paper 模式
+    execution_config:
+      adapter_type: "hyperliquid"
+      mode: "Paper"  # Paper 模式 - 模拟交易
+      rest_base_url: "https://api.hyperliquid.xyz"
+      ws_private_url: "wss://api.hyperliquid.xyz/ws"
+      timeout_ms: 5000
+      # Paper 模式不需要真实私钥
+      private_key: ""
+
+# 交易对配置（与实盘相同）
+instruments:
+  - symbol: "BTC-PERP"
+    venue: "HYPERLIQUID"
+    asset_type: "perp"
+    base_currency: "BTC"
+    quote_currency: "USD"
+    tick_size: "0.1"
+    lot_size: "0.001"
+    min_order_size: "0.001"
+    max_order_size: "1000.0"
+    
+  - symbol: "ETH-PERP"
+    venue: "HYPERLIQUID"
+    asset_type: "perp"
+    base_currency: "ETH"
+    quote_currency: "USD"
+    tick_size: "0.01"
+    lot_size: "0.01"
+    min_order_size: "0.01"
+    max_order_size: "10000.0"
+
+# 测试策略配置
+strategies:
+  - name: "paper_trend_test"
+    type: "trend"
+    symbols: ["BTC-PERP"]
+    target_venue: "HYPERLIQUID"
+    enabled: true
+    params:
+      ema_fast: 5
+      ema_slow: 10
+      rsi_period: 14
+      signal_threshold: 0.01
+
+# 宽松的风控限制（用于测试）
+risk_management:
+  global_limits:
+    max_daily_loss_usd: 10000.0
+    max_position_usd: 50000.0
+    max_orders_per_second: 10
+    
+  symbol_limits:
+    "BTC-PERP":
+      max_position_usd: 20000.0
+      max_order_size: 1.0
+
+# 日志配置
+logging:
+  level: "debug"
+  file: "logs/hyperliquid_paper.log"
+  max_file_size_mb: 50
+  max_files: 5

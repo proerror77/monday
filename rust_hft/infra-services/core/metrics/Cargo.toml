@@ -1,0 +1,23 @@
+[package]
+name = "hft-infra-metrics"
+version = "0.1.0"
+edition = "2021"
+description = "Prometheus 指標（可選，旁路）"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+prometheus = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"], optional = true }
+chrono = { workspace = true, optional = true }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"], optional = true }
+
+[features]
+default = []
+http-server = ["dep:axum", "dep:tokio", "dep:chrono", "dep:reqwest"]
+
+[lib]
+name = "infra_metrics"
+

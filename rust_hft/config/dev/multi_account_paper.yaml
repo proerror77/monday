@@ -1,0 +1,63 @@
+schema_version: v2
+quotes_only: false
+engine:
+  queue_capacity: 4096
+  stale_us: 500000
+  top_n: 10
+  ack_timeout_ms: 2000
+  reconcile_interval_ms: 2000
+  auto_cancel_exchange_only: false
+
+venues:
+  - name: mock_a
+    account_id: mock_a
+    venue_type: MOCK
+    simulate_execution: true
+    symbol_catalog: []
+  - name: mock_b
+    account_id: mock_b
+    venue_type: MOCK
+    simulate_execution: true
+    symbol_catalog: []
+
+strategies:
+  - name: sA
+    strategy_type: Trend
+    symbols: [BTCUSDT]
+    params:
+      kind: trend
+      ema_fast: 5
+      ema_slow: 10
+      rsi_period: 7
+    risk_limits:
+      max_notional: 10000.0
+      max_position: 1.0
+      daily_loss_limit: 100.0
+      cooldown_ms: 100
+  - name: sB
+    strategy_type: Imbalance
+    symbols: [ETHUSDT]
+    params:
+      kind: imbalance
+      obi_threshold: 0.2
+      lot: 0.01
+      top_levels: 5
+    risk_limits:
+      max_notional: 10000.0
+      max_position: 1.0
+      daily_loss_limit: 100.0
+      cooldown_ms: 100
+
+risk:
+  risk_type: Default
+  global_position_limit: 1000000.0
+  global_notional_limit: 10000000.0
+  max_daily_trades: 1000
+  max_orders_per_second: 50
+  staleness_threshold_us: 5000
+
+# 將策略映射到不同帳戶（同交易所多帳戶）
+strategy_accounts:
+  sA: mock_a
+  sB: mock_b
+

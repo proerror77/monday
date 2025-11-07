@@ -1,0 +1,21 @@
+[package]
+name = "hft-data-adapter-replay"
+version = "0.1.0"
+edition = "2021"
+description = "ClickHouse 回放適配器：將歷史數據以 MarketStream 形式重放"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+futures = { workspace = true }
+clickhouse = "0.12"
+ordered-float = "4"
+async-trait = "0.1"
+async-stream = "0.3"
+
+[lib]
+name = "data_adapter_replay"

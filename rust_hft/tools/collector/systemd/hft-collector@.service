@@ -1,0 +1,41 @@
+[Unit]
+Description=HFT Collector (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/hft-collector/%i.env
+# 可选：全局 ClickHouse 凭据
+EnvironmentFile=-/etc/hft-collector/credentials.env
+# 限制重启风暴，1 分钟内最多重启 5 次
+StartLimitIntervalSec=60
+StartLimitBurst=5
+Restart=on-failure
+RestartSec=5
+# 建议将二进制放到 /usr/local/bin/hft-collector
+ExecStart=/usr/local/bin/hft-collector multi \
+    --exchange ${EXCHANGE} \
+    --ch-url ${CH_URL} \
+    --database ${CH_DATABASE} \
+    --batch-size ${BATCH_SIZE} \
+    --flush-ms ${FLUSH_MS} \
+    --depth-mode ${DEPTH_MODE} \
+    --depth-levels ${DEPTH_LEVELS} \
+    --lob-mode ${LOB_MODE} \
+    --shard-count ${SHARD_COUNT} \
+    --shard-index ${SHARD_INDEX} \
+    $([ -n "${SYMBOLS}" ] && printf -- "--symbols %s" "${SYMBOLS}") \
+    $([ "${STORE_RAW}" = "true" ] && printf -- "--store-raw") \
+    $([ "${DRY_RUN}" = "true" ] && printf -- "--dry-run")
+
+# 如果需要 Prometheus 指标，将环境变量 METRICS_ADDR=0.0.0.0:9100 写入 env 文件
+# 并打上 use-adapters feature 后再替换 ExecStart。默认多交易所模式暂不启用。
+
+# 资源限制（按需开启）
+# LimitNOFILE=1048576
+# TasksMax=infinity
+# MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target

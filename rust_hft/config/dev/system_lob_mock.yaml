@@ -1,0 +1,69 @@
+engine:
+  queue_capacity: 4096
+  stale_us: 500000
+  top_n: 5
+  flip_policy: OnUpdate
+
+venues:
+  - name: "mock"
+    venue_type: Mock
+    ws_public: null
+    ws_private: null
+    rest: null
+    capabilities:
+      ws_order_placement: true
+      snapshot_crc: false
+      all_in_one_topics: true
+      private_ws_heartbeat: false
+
+strategies:
+  - name: "lob_grid_mock"
+    strategy_type: LobFlowGrid
+    symbols: ["BTCUSDT"]
+    params: !LobFlowGrid
+      venue: "MOCK"
+      base_order_size: 0.05
+      max_long_position: 0.5
+      max_short_position: -0.5
+      maker_fee_bps: 1.0
+      slippage_bps: 0.6
+      safety_bps: 0.4
+      min_margin_bps: 1.5
+      volatility_alpha: 0.7
+      asr_gamma: 0.7
+      asr_micro_coeff: 0.6
+      asr_ai_coeff: 20.0
+      asr_ofi_coeff: 15.0
+      top_levels: 3
+      ai_window_secs: 20
+      ofi_halflife_secs: 15.0
+      mid_return_halflife_secs: 300.0
+      refresh_interval_secs: 5.0
+      tick_size: 0.1
+      lot_size: 0.001
+      core_levels: 2
+      buffer_levels: 1
+      tail_levels: 1
+      core_weight: 0.5
+      buffer_weight: 0.3
+      tail_weight: 0.2
+      core_spacing_multiplier: 1.0
+      buffer_spacing_multiplier: 1.6
+      tail_spacing_multiplier: 2.4
+      bias_micro_threshold_bps: 1.5
+      bias_ai_threshold: 0.1
+      bias_extra_ticks: 1
+    risk_limits:
+      max_notional: 5000.0
+      max_position: 0.6
+      daily_loss_limit: 150.0
+      cooldown_ms: 1000
+
+risk:
+  global_position_limit: 10000.0
+  global_notional_limit: 200000.0
+  max_daily_trades: 1000
+  max_orders_per_second: 50
+  staleness_threshold_us: 5000
+
+infra: null

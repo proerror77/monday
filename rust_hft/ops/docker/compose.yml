@@ -1,0 +1,111 @@
+version: "3.9"
+
+services:
+  hft-collector-binance:
+    image: ${IMAGE:-hft-collector:local}
+    container_name: hft-collector-binance
+    restart: always
+    env_file:
+      - /etc/hft-collector.env
+    environment:
+      EXCHANGE: binance
+    ulimits:
+      nofile: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  hft-collector-binance-futures:
+    image: ${IMAGE:-hft-collector:local}
+    container_name: hft-collector-binance-futures
+    restart: always
+    env_file:
+      - /etc/hft-collector.env
+    environment:
+      EXCHANGE: binance_futures
+    ulimits:
+      nofile: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  hft-collector-bitget:
+    image: ${IMAGE:-hft-collector:local}
+    container_name: hft-collector-bitget
+    restart: always
+    env_file:
+      - /etc/hft-collector.env
+    environment:
+      EXCHANGE: bitget
+    ulimits:
+      nofile: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  hft-collector-bybit:
+    image: ${IMAGE:-hft-collector:local}
+    container_name: hft-collector-bybit
+    restart: always
+    env_file:
+      - /etc/hft-collector.env
+    environment:
+      EXCHANGE: bybit
+    ulimits:
+      nofile: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  hft-collector-asterdex:
+    image: ${IMAGE:-hft-collector:local}
+    container_name: hft-collector-asterdex
+    restart: always
+    env_file:
+      - /etc/hft-collector.env
+    environment:
+      EXCHANGE: asterdex
+    ulimits:
+      nofile: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  hft-collector-hyperliquid:
+    image: ${IMAGE:-hft-collector:local}
+    container_name: hft-collector-hyperliquid
+    restart: always
+    env_file:
+      - /etc/hft-collector.env
+    environment:
+      EXCHANGE: hyperliquid
+    ulimits:
+      nofile: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 示例：新增其他交易所时，复制一个服务块并修改 EXCHANGE
+  # hft-collector-bitget:
+  #   image: yourrepo/hft-collector:latest
+  #   restart: always
+  #   env_file: [/etc/hft-collector.env]
+  #   environment:
+  #     EXCHANGE: bitget
+  #   ulimits:
+  #     nofile: 65536
+  #   logging:
+  #     driver: json-file
+  #     options: { max-size: "10m", max-file: "3" }

@@ -1,0 +1,29 @@
+# Unsupervised TCN-GRU Training Configuration
+# Usage: python cli.py unsup train --config configs/unsup_train.yaml
+
+# ClickHouse connection
+host: ${CLICKHOUSE_HOST}
+user: ${CLICKHOUSE_USERNAME}
+password: ${CLICKHOUSE_PASSWORD}
+database: ${CLICKHOUSE_DATABASE}
+
+# Data parameters
+symbol: WLFIUSDT
+start: 2025-09-01T00:00:00Z
+end: 2025-09-08T00:00:00Z
+
+# Model architecture
+seq_len: 60
+hidden_dim: 128
+num_layers: 3
+dropout: 0.2
+
+# Training parameters
+epochs: 10
+batch_size: 128
+learning_rate: 0.001
+weight_decay: 0.0001
+
+# Output
+checkpoint_dir: ./models/unsup
+log_dir: ./logs/unsup

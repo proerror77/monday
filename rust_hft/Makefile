@@ -38,6 +38,16 @@ run-live: ## 運行真盤應用
 	@echo "💰 啟動真盤交易..."
 	cargo run -p hft-live --features="bitget,trend-strategy,metrics"
 
+run-quotes-only: ## 運行只行情（Binance）
+	@echo "📈 啟動只行情（Binance）..."
+	cargo run -p hft-live --features="binance" -- \
+		--config config/dev/binance_quotes_only.yaml --exit-after-ms 15000
+
+run-multi-quotes: ## 運行多交易所只行情（Binance/Bitget/Aster）
+	@echo "📈 啟動多交易所只行情（Binance/Bitget/Aster）..."
+	cargo run -p hft-live --features="binance,bitget,asterdex,metrics" -- \
+		--config config/prod/system_accounts_multi_quotes_only.yaml --exit-after-ms 30000
+
 run-paper: ## 運行模擬盤應用  
 	@echo "📊 啟動模擬盤交易..."
 	cargo run -p hft-paper
@@ -45,6 +55,16 @@ run-paper: ## 運行模擬盤應用
 run-replay: ## 運行歷史回放
 	@echo "⏮️ 啟動歷史回放..."
 	cargo run -p hft-replay
+
+# 便捷：啟動 Paper 並暴露 /metrics 與 /health（預設 9091）
+run-paper-metrics: ## 運行模擬盤並開啟 /metrics 與 /health (預設埠 9091)
+	@echo "📊 啟動 hft-paper (metrics) ..."
+	cargo run -p hft-paper --features "metrics" -- --metrics-port 9091
+
+# 便捷：啟動 Replay 並暴露 /metrics 與 /health（預設 9092）
+run-replay-metrics: ## 運行回放並開啟 /metrics 與 /health (預設埠 9092)
+	@echo "⏮️ 啟動 hft-replay (metrics) ..."
+	cargo run -p hft-replay --features "metrics" -- --metrics-port 9092
 
 # 測試
 test-unit: ## 運行單元測試

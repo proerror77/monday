@@ -1,0 +1,19 @@
+[package]
+name = "hft-shared-config"
+version = "0.1.0"
+edition = "2021"
+description = "Shared config schema for system, strategies, venues"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_yaml = "0.9"
+hft-core = { package = "hft-core", path = "../../market-core/core" }
+shared_instrument = { package = "hft-shared-instrument", path = "../instrument" }
+thiserror = { workspace = true }
+rust_decimal = { workspace = true }
+
+[lib]
+name = "shared_config"
+
+[dev-dependencies]
+serde_yaml = "0.9"

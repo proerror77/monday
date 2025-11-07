@@ -217,6 +217,11 @@ cargo bench latency_benchmarks
 # ml_inference         time: [780 ns 820 ns 860 ns]
 ```
 
+> 引擎/聚合 microbench（Criterion）
+```bash
+cargo bench -p hft-engine
+```
+
 ### 3. 集成測試
 ```bash
 # 數據庫壓力測試 (5分鐘)
@@ -227,6 +232,20 @@ cargo run --release --example 00_zero_copy_websocket_test
 ```
 
 ## 📈 監控面板
+
+### 啟用指標與 HTTP 暴露（新版）
+```bash
+# 僅啟用指標收集（不開 HTTP）
+cargo run -p hft-paper --features "metrics"
+
+# 啟用指標並開啟 HTTP 暴露（Axum）
+cargo run -p hft-paper --features "metrics,hft-infra-metrics/http-server"
+```
+
+常見指標名稱：
+- 直方圖：`hft_latency_*_microseconds`（ingestion/aggregation/strategy/risk/execution/end_to_end）
+- 計數器：`hft_orders_*_total`, `hft_intents_dropped_total`, `hft_snapshot_publish_failed_total`
+- Gauges：`hft_engine_*`（cycle_count、exec_events_processed、orders_* 當前快照）
 
 ### 啟動監控系統
 ```bash

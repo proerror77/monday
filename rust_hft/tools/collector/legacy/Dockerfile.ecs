@@ -1,0 +1,47 @@
+# ECS 專用 Dockerfile - 針對快速構建優化
+FROM rust:1.88-bullseye AS builder
+
+# 設置工作目錄
+WORKDIR /app
+
+# 安裝必要的系統依賴
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 先複製 Cargo 文件進行依賴下載
+COPY Cargo.toml Cargo.lock ./
+
+# 創建一個虛擬的 main.rs 來預編譯依賴
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+
+# 預編譯依賴（這一步會被緩存）
+RUN cargo build --release && rm -rf src
+
+# 複製實際的源碼
+COPY src/ ./src/
+
+# 構建實際的應用程序
+RUN cargo build --release --bin hft-collector
+
+# 運行時鏡像
+FROM debian:bookworm-slim
+
+# 安裝運行時依賴
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# 創建工作目錄
+WORKDIR /app
+
+# 複製編譯好的二進制文件
+COPY --from=builder /app/target/release/hft-collector /usr/local/bin/hft-collector
+
+# 設置環境變量
+ENV RUST_LOG=info
+
+# 設置入口點
+ENTRYPOINT ["hft-collector"]
+CMD ["--help"]

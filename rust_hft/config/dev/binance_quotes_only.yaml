@@ -1,0 +1,35 @@
+schema_version: v2
+quotes_only: true
+engine:
+  queue_capacity: 16384
+  stale_us: 500000
+  top_n: 10
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  auto_cancel_exchange_only: false
+
+venues:
+  - name: binance
+    venue_type: BINANCE
+    ws_public: "wss://stream.binance.com:9443/ws"
+    rest: "https://api.binance.com"
+    # 僅行情訂閱所需的交易對（可按需增減）
+    symbol_catalog:
+      - BTCUSDT@BINANCE
+      - ETHUSDT@BINANCE
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    simulate_execution: false
+
+# quotes-only：不配置任何策略，系統不會產生下單意圖
+strategies: []
+
+risk:
+  risk_type: Default
+  global_position_limit: 0.0
+  global_notional_limit: 0.0
+  max_daily_trades: 0
+  max_orders_per_second: 0
+  staleness_threshold_us: 5000

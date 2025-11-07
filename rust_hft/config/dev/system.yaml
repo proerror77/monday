@@ -1,104 +1,42 @@
-# HFT 系統配置
-# 
-# 環境變量展開支援：
-# - 使用 ${VAR_NAME} 格式引用環境變量
-# - 未設置的環境變量會保留原始格式並發出警告
-# - 設置環境變量示例：export BITGET_API_KEY="your_api_key"
-#
+schema_version: v2
 engine:
-  queue_capacity: 32768
-  stale_us: 3000
+  queue_capacity: 16384
+  stale_us: 500000
   top_n: 10
-  flip_policy: "OnUpdate"
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  auto_cancel_exchange_only: false
 
 venues:
-  - name: "bitget"
-    venue_type: "Bitget"
-    ws_public: "wss://ws.bitget.com/spot/v1/stream"
-    ws_private: "wss://ws.bitget.com/spot/v1/stream"
-    rest: "https://api.bitget.com"
-    api_key: "${BITGET_API_KEY}"        # 從環境變量讀取 API Key
-    secret: "${BITGET_SECRET}"          # 從環境變量讀取 Secret
-    passphrase: "${BITGET_PASSPHRASE}"  # 從環境變量讀取 Passphrase
-    execution_mode: "Paper"             # "Paper" | "Live"，預設為 Paper
+  - name: binance
+    venue_type: BINANCE
+    symbol_catalog:
+      - BTCUSDT@BINANCE
     capabilities:
-      ws_order_placement: true
-      snapshot_crc: false
-      all_in_one_topics: true
-      private_ws_heartbeat: true
-
-  - name: "binance"
-    venue_type: "Binance"
-    ws_public: "wss://stream.binance.com:9443/ws"
-    ws_private: "wss://stream.binance.com:9443/ws"
-    rest: "https://api.binance.com"
-    api_key: "${BINANCE_API_KEY}"       # 從環境變量讀取 API Key
-    secret: "${BINANCE_SECRET}"         # 從環境變量讀取 Secret
-    execution_mode: "Paper"             # "Paper" | "Live"，預設為 Paper
-    capabilities:
-      ws_order_placement: true
-      snapshot_crc: false
-      all_in_one_topics: false
-      private_ws_heartbeat: false
-
-instruments:
-  groups:
-    - name: layer1
-      symbols: ["ETHUSDT", "SOLUSDT", "SUIUSDT"]
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    simulate_execution: false
 
 strategies:
-  templates:
-    - id: trend_default
-      strategy_type: Trend
-      params:
-        Trend:
-          ema_fast: 12
-          ema_slow: 26
-          rsi_period: 14
-      risk:
-        max_notional: 10000.0
-        max_position: 5.0
-        daily_loss_limit: 500.0
-        cooldown_ms: 1000
-
-    - id: arbitrage_cross
-      strategy_type: Arbitrage
-      params:
-        Arbitrage:
-          min_spread_bps: 1.5
-          max_position: 0.1
-          execution_timeout_ms: 3000
-      risk:
-        max_notional: 12000.0
-        max_position: 2.0
-        daily_loss_limit: 400.0
-        cooldown_ms: 2000
-
-  bindings:
-    - template: trend_default
-      apply_to: ["group:layer1"]
-      overrides:
-        ETHUSDT:
-          risk: { max_notional: 15000.0, max_position: 3.0, daily_loss_limit: 800.0, cooldown_ms: 1000 }
-        SOLUSDT:
-          risk: { max_notional: 10000.0, max_position: 5.0, daily_loss_limit: 500.0, cooldown_ms: 1000 }
-        SUIUSDT:
-          risk: { max_notional: 8000.0,  max_position: 10.0, daily_loss_limit: 300.0, cooldown_ms: 1000 }
-
-    - template: arbitrage_cross
-      apply_to: ["group:layer1"]
+  - name: trend_btc
+    strategy_type: Trend
+    symbols: [BTCUSDT]
+    params:
+      kind: trend
+      ema_fast: 12
+      ema_slow: 26
+      rsi_period: 14
+    risk_limits:
+      max_notional: 100000.0
+      max_position: 2.0
+      daily_loss_limit: 5000.0
+      cooldown_ms: 500
 
 risk:
+  risk_type: Default
   global_position_limit: 1000000.0
   global_notional_limit: 10000000.0
-  max_daily_trades: 10000
-  max_orders_per_second: 100
+  max_daily_trades: 1000
+  max_orders_per_second: 50
   staleness_threshold_us: 5000
-
-# 基礎設施配置（可選）
-infra:
-  redis:
-    url: "redis://localhost:6379"
-  clickhouse:
-    url: "http://localhost:8123"
-    database: "hft"

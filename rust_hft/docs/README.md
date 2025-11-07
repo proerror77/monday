@@ -21,6 +21,9 @@
 - [**Python API**](api/PYTHON_API.md) - PyO3綁定接口
 - [**配置選項**](api/CONFIGURATION.md) - 所有配置參數
 - [**CLI命令**](api/CLI_REFERENCE.md) - 命令行工具使用
+- [**Schema v2 配置指南**](config/SCHEMA_V2.md) - 宣告式系統設定與 Instrument Catalog
+- [**Catalog 管理指南**](config/CATALOG_GUIDE.md) - Instrument/Venue catalog 的維護與載入流程
+- [**Validation Modes**](config/VALIDATION_MODES.md) - 寬鬆 / 嚴格模式的行為與建議
 
 ### 📊 [測試報告](reports/)
 - [**性能基準**](reports/PERFORMANCE_BENCHMARKS.md) - 延遲和吞吐量測試
@@ -123,6 +126,15 @@ ml:
 ```
 
 ## 📊 性能監控
+
+### Prometheus 指標啟用（新版）
+```bash
+# 僅收集指標（不開 HTTP）
+cargo run -p hft-paper --features "metrics"
+
+# 收集指標 + 啟用 HTTP 暴露（Axum）
+cargo run -p hft-paper --features "metrics,hft-infra-metrics/http-server"
+```
 
 ### 實時指標
 - **延遲監控**: P50/P95/P99延遲分佈

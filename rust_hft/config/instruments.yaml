@@ -1,0 +1,58 @@
+# Instrument & Venue catalog (shared/instrument::InstrumentCatalogConfig)
+# 這份檔案會在 runtime 讀取，並為每個交易所/商品提供連線端點與精度設定。
+# 可透過環境變數 HFT_INSTRUMENT_CATALOG 指向其他路徑。
+
+venues:
+  - venue_id: BINANCE
+    name: Binance Spot
+    rest_endpoint: https://api.binance.com
+    ws_public_endpoint: wss://stream.binance.com:9443/ws
+    ws_private_endpoint: wss://stream.binance.com:9443/stream
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+      max_subscriptions: 400
+    metadata:
+      account_tier: institutional
+  - venue_id: BITGET
+    name: Bitget USDT Futures
+    rest_endpoint: https://api.bitget.com
+    ws_public_endpoint: wss://ws.bitget.com/spot/v2
+    ws_private_endpoint: wss://ws.bitget.com/spot/v2
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    metadata:
+      inst_type: usdt-futures
+
+instruments:
+  - symbol: BTCUSDT
+    venue: BINANCE
+    base: BTC
+    quote: USDT
+    tick_size: 0.1
+    lot_size: 0.0001
+    contract_multiplier: 1.0
+    metadata:
+      product_type: spot
+  - symbol: ETHUSDT
+    venue: BINANCE
+    base: ETH
+    quote: USDT
+    tick_size: 0.01
+    lot_size: 0.001
+    metadata:
+      product_type: spot
+  - symbol: BTCUSDT
+    venue: BITGET
+    base: BTC
+    quote: USDT
+    tick_size: 0.1
+    lot_size: 0.001
+    contract_multiplier: 0.01
+    leverage: 50.0
+    metadata:
+      product_type: futures
+      settlement: usdt

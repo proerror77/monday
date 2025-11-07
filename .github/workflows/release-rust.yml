@@ -1,0 +1,61 @@
+name: Release Rust Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build binaries (linux x86_64)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust_hft
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust_hft
+
+      - name: Build apps
+        run: |
+          cargo build --release -p hft-live -p hft-paper -p hft-all-in-one -p hft-replay
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          for bin in hft-live hft-paper hft-all-in-one hft-replay; do
+            if [ -f target/release/$bin ]; then
+              cp target/release/$bin dist/
+              (cd dist && tar -czf ${bin}-linux-x86_64.tar.gz $bin && rm -f $bin)
+            fi
+          done
+          ls -la dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-binaries-${{ github.ref_name }}
+          path: rust_hft/dist/*.tar.gz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rust_hft/dist/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

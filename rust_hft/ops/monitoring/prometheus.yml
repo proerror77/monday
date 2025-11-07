@@ -13,23 +13,9 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  # HFT system metrics (if we add metrics endpoint later)
-  - job_name: 'hft-system'
-    static_configs:
-      - targets: ['host.docker.internal:8080']
-    scrape_interval: 5s
-    metrics_path: /metrics
-
-  # ClickHouse system metrics (if available)
+  # ClickHouse built-in metrics on :9363/metrics
   - job_name: 'clickhouse'
     static_configs:
-      - targets: ['clickhouse:8123']
-    scrape_interval: 30s
+      - targets: ['clickhouse:9363']
     metrics_path: /metrics
-    
-  # Redis metrics (if redis_exporter is added)
-  - job_name: 'redis'
-    static_configs:
-      - targets: ['redis:6379']
     scrape_interval: 30s
-    metrics_path: /metrics

@@ -1,69 +1,138 @@
+[package]
+name = "rust-hft-workspace"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Workspace feature orchestrator for rust_hft"
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
 [workspace]
 resolver = "2"  # 防止 feature 無腦合併
 members = [
-    # 穩定核心 (長期穩定)
-    "crates/core",            # hft-core: 新型別/錯誤/常量 (0 依賴)
-    "crates/ports",           # hft-ports: 穩定事件/traits (ports)
-    "crates/instrument",      # hft-instrument: 合約/精度/費率模型
-    "crates/snapshot",        # hft-snapshot: ArcSwap/left-right 快照容器
-    "crates/engine",          # hft-engine: 單 writer 事件循環
-    "crates/data",            # hft-data: 公有行情介面 + 聚合
-    "crates/execution",       # hft-execution: OMS/ExecutionClient
-    "crates/oms-core",        # hft-oms-core: 訂單狀態機/冪等/路由（純邏輯）
-    "crates/portfolio-core",  # hft-portfolio-core: 會計真相源（AccountView）
-    # "crates/accounting",    # Removed: duplicate with portfolio-core
-    "crates/risk",            # hft-risk: 事前風控
-    "crates/integration",     # hft-integration: WS/HTTP/TLS/簽名/限流
-    "crates/runtime",         # hft-runtime: 系統運行時和建構器
+    ".",
+    # Market Core
+    "market-core/core",
+    "market-core/ports",
+    "market-core/instrument",
+    "market-core/snapshot",
+    "market-core/engine",
+    "market-core/integration",
+    "market-core/runtime",
 
-    # 擴充插槽：adapters (不動核心)
-    "crates/data/adapters/adapter-bitget",
-    "crates/data/adapters/adapter-binance",
-    "crates/data/adapters/adapter-mock",
-    "crates/execution/adapters/adapter-bitget",
-    "crates/execution/adapters/adapter-binance",
+    # Data Pipelines
+    "data-pipelines/core",
+    "data-pipelines/adapters-common",
+    "data-pipelines/adapters/adapter-bitget",
+    "data-pipelines/adapters/adapter-binance",
+    "data-pipelines/adapters/adapter-backpack",
+    "data-pipelines/adapters/adapter-mock",
+    "data-pipelines/adapters/adapter-replay",
+    "data-pipelines/adapters/adapter-asterdex",
+    "data-pipelines/adapters/adapter-hyperliquid",
+    "data-pipelines/adapters/adapter-bybit",
+    "data-pipelines/adapters/adapter-lighter",
+    "data-pipelines/adapters/adapter-grvt",
 
-    # 策略 (只依賴 ports + core + instrument)
-    "strategies/trend",
-    "strategies/arbitrage",
+    # Strategy Framework
+    "strategy-framework/strategy-dl",
+    "strategy-framework/infer-onnx",
+    "strategy-framework/strategies/trend",
+    "strategy-framework/strategies/arbitrage",
+    "strategy-framework/strategies/imbalance",
+    "strategy-framework/strategies/lob_flow_grid",
 
-    # 基建旁路 (可選)
-    "crates/infra/clickhouse",
-    "crates/infra/redis",
-    "crates/infra/metrics",
-    "crates/infra/venue",
+    # Risk Control
+    "risk-control/risk",
+    "risk-control/oms-core",
+    "risk-control/portfolio-core",
 
-    # 測試/回放
-    "crates/testing",
+    # Execution Gateway
+    "execution-gateway/execution",
+    "execution-gateway/adapters/adapter-bitget",
+    "execution-gateway/adapters/adapter-binance",
+    "execution-gateway/adapters/adapter-okx",
+    "execution-gateway/adapters/adapter-hyperliquid",
+    "execution-gateway/adapters/adapter-bybit",
+    "execution-gateway/adapters/adapter-asterdex",
+    "execution-gateway/adapters/adapter-backpack",
+    "execution-gateway/adapters/adapter-lighter",
+    "execution-gateway/adapters/adapter-grvt",
 
-    # Apps: feature 開關入口
-    "apps/live",          # 真盤
-    "apps/paper",         # 模擬盤
-    "apps/replay",        # 歷史回放
-    
+    # Infra Services
+    "infra-services/core/clickhouse",
+    "infra-services/core/redis",
+    "infra-services/core/metrics",
+    "infra-services/core/venue",
+    "infra-services/core/ipc",
+    "infra-services/testing",
+
+    # Applications
+    "apps/live",
+    "apps/all-in-one",
+    "apps/paper",
+    "apps/replay",
+    "apps/backtest",
+
+    # Shared Catalogs
+    "shared/instrument",
+    "shared/config",
+
+    # Tools & Utilities
+    "tools/collector",
+    "tools/dataset",
+    "tools/infer-cli",
+    "tools/hyperliquid-demo",
+
     # Examples
-    "examples",           # E2E 測試範例
+    "examples"
+]
+
+# 預設只編譯核心元件與主要應用，可透過 `cargo build -p` 指定其他 crate。
+default-members = [
+    ".",
+    "market-core/core",
+    "market-core/ports",
+    "market-core/engine",
+    "market-core/runtime",
+    "strategy-framework/strategy-dl",
+    "apps/live",
+    "apps/paper",
+    "apps/all-in-one"
 ]
 
 # 工作區級別依賴 (最小化)
+[dependencies]
+serde_json = { workspace = true, optional = true }
+simd-json = { workspace = true, optional = true }
+arc-swap = { workspace = true, optional = true }
+# left-right removed: not suitable for HFT (high write cost, lacks Sync)
+clickhouse = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+
 [workspace.dependencies]
 # 核心零依賴
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 thiserror = "1.0"
 
 # 非同步 (只在需要的 crate 開)
 tokio = { version = "1.0", default-features = false }
+tokio-stream = "0.1"
 futures = "0.3"
 
 # 高性能 (只在 integration/apps 開)
 crossbeam = { version = "0.8", default-features = false }
 arc-swap = "1.6"
-left-right = "0.11"
+# left-right = "0.11"  # Removed: incompatible with Sync requirement
 crossbeam-utils = { version = "0.8", default-features = false }
 
 # 網路 (只在 integration 開，其他復用)
 tokio-tungstenite = { version = "0.20", default-features = false, features = ["connect", "stream", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.21", default-features = false, features = ["dangerous_configuration"] }
+axum = "0.7"
 
 # JSON (熱點可選 SIMD)
 serde_json = "1.0"
@@ -74,8 +143,14 @@ clickhouse = "0.11"
 redis = "0.24"
 prometheus = "0.13"
 
+parking_lot = "0.12"
+
 # 日誌 
 tracing = "0.1"
+
+# IPC 相關
+rmp-serde = "1.3"
+uuid = { version = "1.0", features = ["v4"] }
 tracing-subscriber = "0.3"
 
 # 時間處理
@@ -86,6 +161,50 @@ async-trait = "0.1"
 
 # Decimal types
 rust_decimal = { version = "1.33", features = ["serde"] }
+
+# CLI and examples
+clap = { version = "4.0", features = ["derive"] }
+metrics-exporter-prometheus = "0.17"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+engine = { package = "hft-engine", path = "market-core/engine" }
+ports = { package = "hft-ports", path = "market-core/ports" }
+hft-core = { package = "hft-core", path = "market-core/core" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+# 預設採用標準 JSON + arc-swap 快照策略
+default = ["json-std", "snapshot-arcswap"]
+
+# 熱路徑 JSON 實作（二選一）
+json-std = ["dep:serde_json"]
+json-simd = ["dep:simd-json"]
+
+# 快照策略（二選一）
+snapshot-arcswap = ["dep:arc-swap"]
+# snapshot-left-right removed: ArcSwap is the optimal choice for HFT
+
+# 冷路徑可自由組合的特性
+clickhouse = ["dep:clickhouse"]
+redis = ["dep:redis"]
+metrics = ["dep:metrics-exporter-prometheus"]
+
+[[bench]]
+name = "hotpath_latency_p99"
+path = "benches/hotpath_latency_p99.rs"
+harness = true
+
+[[bench]]
+name = "strategy_dispatch"
+path = "benches/strategy_dispatch.rs"
+harness = false
+
+[[bench]]
+name = "ultra_components"
+path = "benches/ultra_components.rs"
+harness = false
 
 [profile.dev]
 # 開發模式：編譯快優先
@@ -106,4 +225,3 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = false
-

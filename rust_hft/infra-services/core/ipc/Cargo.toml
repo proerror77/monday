@@ -1,0 +1,33 @@
+[package]
+name = "hft-ipc"
+version = "0.1.0"
+edition = "2021"
+authors = ["HFT System <dev@hft.com>"]
+description = "IPC control plane for HFT system using Unix Domain Sockets"
+
+[dependencies]
+# Core dependencies (always available)
+serde = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rust_decimal = { workspace = true, features = ["serde-with-str"] }
+
+# Optional dependencies for IPC functionality
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time", "sync"], optional = true }
+rmp-serde = { workspace = true, optional = true }
+uuid = { workspace = true, features = ["serde"], optional = true }
+async-trait = { workspace = true, optional = true }
+
+# Internal dependencies
+hft-core = { path = "../../../market-core/core" }
+shared_config = { package = "hft-shared-config", path = "../../../shared/config" }
+
+[features]
+default = []
+# Full IPC functionality with Unix Domain Socket server/client
+ipc = ["dep:tokio", "dep:rmp-serde", "dep:uuid", "dep:async-trait"]
+
+[dev-dependencies]
+tempfile = "3.8"
+tokio-test = "0.4"
+serde_json = "1.0"

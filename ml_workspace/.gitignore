@@ -1,0 +1,29 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Artifacts and local data
+logs/
+results/
+models/
+workspace/
+cache/
+*.pt
+*.onnx
+
+# Notebooks
+*.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db

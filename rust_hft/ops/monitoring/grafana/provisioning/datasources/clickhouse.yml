@@ -1,0 +1,19 @@
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    uid: clickhouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    isDefault: true
+    editable: true
+    jsonData:
+      defaultDatabase: hft
+      server: clickhouse
+      port: "8123"
+      protocol: http
+      username: default
+      # Keep minimal fields to avoid plugin type issues
+      timeout: "10"
+      queryTimeout: "60"
+    secureJsonData: {}

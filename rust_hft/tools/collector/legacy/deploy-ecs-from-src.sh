@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 使用阿里雲 CLI：上傳 collector 源碼 → ECS 原生編譯 → 建立 systemd 服務
+
+REGION="ap-northeast-1"
+
+# Usage: deploy-ecs-from-src.sh <ECS_INSTANCE_ID> <exchange> [db=hft_db] [top_limit=0]
+if [ $# -lt 2 ]; then
+  echo "用法: $0 <ECS_INSTANCE_ID> <exchange> [db=hft_db] [top_limit=0]"; exit 1; fi
+INSTANCE_ID="$1"
+EXCHANGE="$2"
+CH_URL="https://kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud:8443"
+CH_DB="${3:-hft_db}"
+TOP_LIMIT="${4:-0}"
+CH_USER="${CLICKHOUSE_USER:-default}"
+CH_PASSWORD="${CLICKHOUSE_PASSWORD:-s9wECb~NGZPOE}"
+SERVICE_NAME="${EXCHANGE}-collector"
+
+echo "🚀 阿里雲 CLI 部署（源碼上傳 + 原生編譯）"
+echo "📍 實例: $INSTANCE_ID, 區域: $REGION, 交易所: $EXCHANGE"
+
+if ! command -v aliyun >/dev/null 2>&1; then
+  echo "❌ 未安裝 aliyun CLI"; exit 1
+fi
+
+echo "🔍 檢查實例狀態..."
+INSTANCE_INFO=$(aliyun ecs DescribeInstances --RegionId "$REGION" --InstanceIds '["'"$INSTANCE_ID"'"]')
+STATUS=$(echo "$INSTANCE_INFO" | jq -r '.Instances.Instance[0].Status // empty')
+echo "實例狀態: $STATUS"
+if [ "$STATUS" != "Running" ]; then
+  echo "▶️  啟動實例..."
+  aliyun ecs StartInstance --InstanceId "$INSTANCE_ID" >/dev/null
+  while true; do
+    sleep 5
+    INSTANCE_INFO=$(aliyun ecs DescribeInstances --RegionId "$REGION" --InstanceIds '["'"$INSTANCE_ID"'"]')
+    STATUS=$(echo "$INSTANCE_INFO" | jq -r '.Instances.Instance[0].Status // empty')
+    [ "$STATUS" = "Running" ] && break
+    echo "等待實例啟動中 ($STATUS)..."
+  done
+  echo "✅ 實例已啟動"
+fi
+
+echo "📦 重新打包最小源碼 (apps/collector) ..."
+WORK_DIR=$(pwd)
+SRC_DIR="$WORK_DIR/apps/collector"
+TMP_TAR="/tmp/hft-collector-src.tar.gz"
+tar -C "$SRC_DIR" -czf "$TMP_TAR" src Cargo.toml
+echo "✅ 源碼包: $TMP_TAR ($(ls -lh "$TMP_TAR" | awk '{print $5}'))"
+
+echo "🔐 以 Base64 分片上傳源碼包 (Cloud Assistant SendFile)..."
+TARB64=$(base64 -i "$TMP_TAR")
+# SendFile 每次內容限制嚴格，保守用 15000 字元/次
+CHUNK_SIZE=15000
+TOTAL=${#TARB64}
+CHUNKS=$(( (TOTAL + CHUNK_SIZE - 1) / CHUNK_SIZE ))
+echo "長度: $TOTAL, 分片: $CHUNKS"
+
+# 逐片上傳為 /root/hft-collector-src.tar.gz.b64.partN
+for ((i=0; i<CHUNKS; i++)); do
+  start=$(( i * CHUNK_SIZE ))
+  chunk=${TARB64:$start:$CHUNK_SIZE}
+  echo "  ↪️  上傳分片 $((i+1))/$CHUNKS)"
+  aliyun ecs SendFile \
+    --RegionId "$REGION" \
+    --InstanceId.1 "$INSTANCE_ID" \
+    --Name "hft-collector-src.tar.gz.b64.part$i" \
+    --TargetDir "/root" \
+    --ContentType PlainText \
+    --Content "$chunk" \
+    --Timeout 120 >/dev/null
+done
+
+echo "🗜️  服務端組裝、解碼並解壓源碼..."
+aliyun ecs RunCommand \
+  --RegionId "$REGION" \
+  --Type RunShellScript \
+  --CommandContent "\nset -e\ncd /root\ncat hft-collector-src.tar.gz.b64.part* > hft-collector-src.tar.gz.b64\nrm -f hft-collector-src.tar.gz.b64.part*\nbase64 -d hft-collector-src.tar.gz.b64 > hft-collector-src.tar.gz && rm -f hft-collector-src.tar.gz.b64\nmkdir -p /root/hft-collector-src && tar -xzf /root/hft-collector-src.tar.gz -C /root/hft-collector-src\n" \
+  --InstanceId.1 "$INSTANCE_ID" \
+  --Name DecodeAndExtract \
+  --Timeout 180 >/dev/null
+
+echo "🛠️  安裝編譯環境與 Rust 工具鏈..."
+aliyun ecs RunCommand \
+  --RegionId "$REGION" \
+  --Type RunShellScript \
+  --CommandContent "\nset -e\nif command -v apt-get >/dev/null 2>&1; then\n  apt-get update && apt-get install -y curl build-essential pkg-config ca-certificates lld\nelif command -v yum >/dev/null 2>&1; then\n  yum install -y curl gcc gcc-c++ make pkgconfig ca-certificates lld || true\nelif command -v dnf >/dev/null 2>&1; then\n  dnf install -y curl gcc gcc-c++ make pkgconfig ca-certificates lld || true\nfi\n\nif ! command -v rustup >/dev/null 2>&1; then\n  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\nfi\nsource /root/.cargo/env\n# 避免本機 sccache 變數影響\nunset RUSTC_WRAPPER || true\ncd /root/hft-collector-src\ncargo build --release\n" \
+  --InstanceId.1 "$INSTANCE_ID" \
+  --Name InstallAndBuild \
+  --Timeout 1800
+
+echo "⚙️  建立 systemd 服務與環境檔..."
+UNIT_CONTENT="[Unit]
+Description=${EXCHANGE} Data Collector to ClickHouse Cloud
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+EnvironmentFile=/etc/hft-collector.env
+ExecStart=/root/hft-collector-src/target/release/hft-collector multi --exchange ${EXCHANGE} --ch-url ${CH_URL} --database ${CH_DB} --top-limit ${TOP_LIMIT} --batch-size 1000 --flush-ms 2000
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65536
+LimitNPROC=32768
+
+[Install]
+WantedBy=multi-user.target"
+
+ENV_CONTENT="CLICKHOUSE_USER=${CH_USER}
+CLICKHOUSE_PASSWORD=${CH_PASSWORD}
+RUST_LOG=info
+ALL_SYMBOLS=true
+QUOTE_FILTER=USDT
+EXCLUDE_SYMBOL_CONTAINS=UP,DOWN,BULL,BEAR"
+
+aliyun ecs RunCommand \
+  --RegionId "$REGION" \
+  --Type RunShellScript \
+  --CommandContent "\nset -e\ncat > /etc/hft-collector.env << 'EOF_ENV'\n$ENV_CONTENT\nEOF_ENV\n\nif command -v systemctl >/dev/null 2>&1; then\n  cat > /etc/systemd/system/${SERVICE_NAME}.service << 'EOF_UNIT'\n$UNIT_CONTENT\nEOF_UNIT\n  systemctl daemon-reload\n  systemctl enable ${SERVICE_NAME} || true\n  systemctl restart ${SERVICE_NAME} || true\n  sleep 3\n  echo Service:${SERVICE_NAME} Status:$(systemctl is-active ${SERVICE_NAME} || true)\n  journalctl -u ${SERVICE_NAME} -n 30 --no-pager || true\nelse\n  echo 'systemctl 不可用，改用 nohup 後台啟動...'\n  nohup /root/hft-collector-src/target/release/hft-collector multi --exchange ${EXCHANGE} --ch-url ${CH_URL} --database ${CH_DB} --top-limit ${TOP_LIMIT} --batch-size 1000 --flush-ms 2000 > /var/log/hft-collector.log 2>&1 & echo $! > /var/run/hft-collector.pid\n  sleep 3\n  ps -p $(cat /var/run/hft-collector.pid) -o pid,cmd= || true\n  tail -n 30 /var/log/hft-collector.log || true\nfi\n" \
+  --InstanceId.1 "$INSTANCE_ID" \
+  --Name SetupService \
+  --Timeout 300
+
+echo "🔎 驗證 ClickHouse 寫入（近 2 分鐘交易數）..."
+QUERY="SELECT count() FROM ${CH_DB}.binance_trades WHERE ts > now() - INTERVAL 2 MINUTE"
+curl -sS -G -u "$CH_USER:$CH_PASSWORD" --data-urlencode "query=${QUERY}" "${CH_URL}/" || true
+
+echo "✅ 部署步驟已執行完畢（如上輸出無錯誤且返回計數>0，表示已寫入）"

@@ -1,0 +1,11 @@
+# Disabled legacy pipeline (superseded by ci.yml)
+# Kept for reference; will not run.
+name: HFT System CI/CD (disabled)
+on:
+  workflow_dispatch:
+
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Legacy pipeline is disabled. Use Monorepo CI (ci.yml)."

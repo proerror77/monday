@@ -1,0 +1,12 @@
+target
+.git
+.DS_Store
+*.swp
+*.swo
+*.tmp
+node_modules
+__pycache__
+*.log
+clickhouse
+*.tar.gz
+*.tgz

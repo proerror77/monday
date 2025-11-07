@@ -1,0 +1,12 @@
+[package]
+name = "hft-snapshot"
+version = "0.1.0"
+edition = "2021"
+description = "Snapshot container using ArcSwap - optimized for HFT read-heavy workloads"
+
+[dependencies]
+arc-swap = { workspace = true }
+serde = { workspace = true }
+
+[lib]
+name = "snapshot"

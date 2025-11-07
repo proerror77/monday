@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-sdk")]
+
 //! 事件分發中心集成測試
 
 use rust_hft::exchanges::*;
@@ -20,7 +22,7 @@ async fn test_bitget_multi_consumer_events() {
         .subscribe_market_events(
             "strategy_test".to_string(),
             100,
-            EventFilter::Symbol("BTCUSDT".to_string()),
+            EventFilter::Symbol::new("BTCUSDT"),
         )
         .await;
 
@@ -141,7 +143,7 @@ async fn test_event_hub_statistics() {
         .subscribe_market_events(
             "stats_test_2".to_string(),
             100,
-            EventFilter::Symbol("BTCUSDT".to_string()),
+            EventFilter::Symbol::new("BTCUSDT"),
         )
         .await;
 
@@ -198,7 +200,7 @@ async fn test_event_filtering() {
         .subscribe_market_events(
             "symbol_filter".to_string(),
             100,
-            EventFilter::Symbol("BTCUSDT".to_string()),
+            EventFilter::Symbol::new("BTCUSDT"),
         )
         .await;
 
@@ -215,7 +217,7 @@ async fn test_event_filtering() {
             "combined_filter".to_string(),
             100,
             EventFilter::And(vec![
-                EventFilter::Symbol("BTCUSDT".to_string()),
+                EventFilter::Symbol::new("BTCUSDT"),
                 EventFilter::Exchange("bitget".to_string()),
             ]),
         )

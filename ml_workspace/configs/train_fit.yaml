@@ -1,0 +1,17 @@
+clickhouse:
+  host: ${CLICKHOUSE_HOST}
+  user: ${CLICKHOUSE_USERNAME}
+  password: ${CLICKHOUSE_PASSWORD}
+  database: ${CLICKHOUSE_DATABASE}
+
+symbol: WLFIUSDT
+hours: 24
+d_model: 64
+nhead: 4
+num_layers: 2
+dropout: 0.1
+epochs: 5
+batch_size: 256
+lr: 0.001
+weight_decay: 0.0001
+model_dir: ./models

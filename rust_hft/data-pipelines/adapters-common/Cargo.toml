@@ -1,0 +1,25 @@
+[package]
+name = "hft-data-adapters-common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared utilities for market data adapters: parsing, subscriptions, helpers"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../market-core/core" }
+ports = { package = "hft-ports", path = "../../market-core/ports" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+# Optional SIMD JSON parsing
+simd-json = { workspace = true, optional = true }
+
+[features]
+default = []
+json-simd = ["dep:simd-json"]
+
+[lib]
+name = "adapters_common"

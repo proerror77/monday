@@ -109,3 +109,8 @@ hft_ui_nextjs/**/*.log
 
 # Rust target
 **/target/
+
+# Claude Code PM
+.claude/epics/
+.claude/prds/drafts/
+.claude/context/sensitive/

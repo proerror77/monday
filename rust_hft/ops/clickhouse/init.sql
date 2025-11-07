@@ -5,6 +5,64 @@
 CREATE DATABASE IF NOT EXISTS hft_db;
 USE hft_db;
 
+-- Raw WebSocket payloads (for forensics)
+CREATE TABLE IF NOT EXISTS raw_ws_events (
+    timestamp UInt64,
+    venue LowCardinality(String),
+    channel LowCardinality(String),
+    symbol String,
+    payload String
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(toDateTime(intDiv(timestamp, 1000000)))
+ORDER BY (venue, channel, symbol, timestamp)
+TTL toDateTime(intDiv(timestamp, 1000000)) + INTERVAL 30 DAY;
+
+-- Structured incremental depth for Binance
+CREATE TABLE IF NOT EXISTS raw_depth_binance (
+    event_ts UInt64, ingest_ts UInt64, symbol String,
+    U UInt64, u UInt64, pu UInt64,
+    bids_px Array(Float64), bids_qty Array(Float64),
+    asks_px Array(Float64), asks_qty Array(Float64),
+    price_scale UInt64, qty_scale UInt64,
+    bids_px_i64 Array(Int64), bids_qty_i64 Array(Int64),
+    asks_px_i64 Array(Int64), asks_qty_i64 Array(Int64)
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(toDateTime(intDiv(event_ts, 1000)))
+ORDER BY (symbol, event_ts, u);
+
+-- Structured books for Bitget (snapshot/update)
+CREATE TABLE IF NOT EXISTS raw_books_bitget (
+    event_ts UInt64, ingest_ts UInt64, symbol String, inst_type String, channel String,
+    action String, seq UInt64, checksum Int64,
+    bids_px Array(Float64), bids_qty Array(Float64),
+    asks_px Array(Float64), asks_qty Array(Float64),
+    -- 原始價量字串（保證 CRC 與交易所一致）
+    bids_px_s Array(String), bids_qty_s Array(String),
+    asks_px_s Array(String), asks_qty_s Array(String),
+    price_scale UInt64, qty_scale UInt64,
+    bids_px_i64 Array(Int64), bids_qty_i64 Array(Int64),
+    asks_px_i64 Array(Int64), asks_qty_i64 Array(Int64)
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(toDateTime(intDiv(event_ts, 1000)))
+ORDER BY (symbol, event_ts, seq);
+
+-- Initial snapshots (and gap recovery snapshots)
+CREATE TABLE IF NOT EXISTS snapshot_books (
+    ts UInt64, symbol String, venue String, last_id UInt64,
+    bids_px Array(Float64), bids_qty Array(Float64),
+    asks_px Array(Float64), asks_qty Array(Float64),
+    source String
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(toDateTime(intDiv(ts, 1000000)))
+ORDER BY (symbol, ts);
+
+-- Gap and reconnect log
+CREATE TABLE IF NOT EXISTS gap_log (
+    ts UInt64, venue String, symbol String, reason String, detail String
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(toDateTime(intDiv(ts, 1000000)))
+ORDER BY (symbol, ts);
+
 -- 1. LOB 深度資料表 (Level 2 Order Book)
 CREATE TABLE IF NOT EXISTS lob_depth (
     timestamp DateTime64(6, 'UTC'),     -- 微秒級時間戳
@@ -197,6 +255,44 @@ SELECT 'Trade Data Count:' as description, count(*) as count FROM trade_data;
 -- 創建一些有用的查詢示例
 -- 1. 獲取某個交易對的最新深度
 -- SELECT * FROM lob_depth WHERE symbol = 'BTCUSDT' ORDER BY timestamp DESC LIMIT 1;
+
+-- 追加：模型資料管線表（固定網格與樣本）
+
+-- 10ms/100ms 對齊的簿面快照（Top-K）
+CREATE TABLE IF NOT EXISTS lob_grid (
+    ts UInt64,                    -- 網格時間（微秒）
+    symbol String,
+    venue String,
+    k UInt16,                     -- Top-K 檔數
+    bid_px Array(Float64),
+    bid_qty Array(Float64),
+    ask_px Array(Float64),
+    ask_qty Array(Float64)
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(toDateTime(intDiv(ts, 1000000)))
+ORDER BY (symbol, ts);
+
+-- 已正規化並切窗後的樣本（供訓練導出）
+CREATE TABLE IF NOT EXISTS dataset_samples (
+    ts UInt64,                    -- 窗口起點（微秒）
+    symbol String,
+    venue String,
+    step_ms UInt32,
+    k UInt16,
+    L UInt16,
+    H_ms UInt32,
+    tau_ticks Float64,
+    bid_px_rel Array(Float32),    -- 長度 L*K（逐步展平）
+    bid_qty_log Array(Float32),
+    ask_px_rel Array(Float32),
+    ask_qty_log Array(Float32),
+    update_flag Array(UInt8),     -- 長度 L，是否步內有更新（0/1）
+    label Int8,                   -- -1/0/1
+    mid0 Float64,
+    midH Float64
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(toDateTime(intDiv(ts, 1000000)))
+ORDER BY (symbol, ts);
 
 -- 2. 獲取某個時間範圍內的成交統計
 -- SELECT symbol, count() as trade_count, sum(quantity) as total_volume FROM trade_data WHERE timestamp >= now() - INTERVAL 1 HOUR GROUP BY symbol;
