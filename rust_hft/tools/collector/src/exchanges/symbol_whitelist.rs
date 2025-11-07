@@ -4,21 +4,26 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 
+#[allow(dead_code)]
 const DEFAULT_WHITELIST_PATH: &str = "config/symbol_whitelist.json";
 
+#[allow(dead_code)]
 const FALLBACK_BASE_TOKENS: &[&str] = &[
     "BTC", "ETH", "SOL", "SUI", "XRP", "XLM", "HYPE", "ASTER", "PUMP", "DOGE", "AVAX", "WLFI",
     "ADA", "ENA", "ONDO", "SEI", "MERL", "B", "BNB", "BGB", "OKB",
 ];
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct WhitelistFile {
     #[serde(default)]
     base_tokens: Vec<String>,
 }
 
+#[allow(dead_code)]
 static BASE_TOKENS_CACHE: OnceCell<Vec<String>> = OnceCell::new();
 
+#[allow(dead_code)]
 fn load_base_tokens_from_json() -> Option<Vec<String>> {
     let mut candidates = Vec::new();
     if let Ok(path) = std::env::var("SYMBOLS_FILE") {
@@ -60,6 +65,7 @@ fn load_base_tokens_from_json() -> Option<Vec<String>> {
     None
 }
 
+#[allow(dead_code)]
 fn base_tokens() -> Vec<String> {
     BASE_TOKENS_CACHE
         .get_or_init(|| {
@@ -133,6 +139,7 @@ pub fn binance_futures_pairs() -> Vec<String> {
 }
 
 #[cfg(feature = "collector-bitget")]
+#[allow(dead_code)]
 pub fn bitget_spot_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()
@@ -141,6 +148,7 @@ pub fn bitget_spot_pairs() -> Vec<String> {
 }
 
 #[cfg(feature = "collector-bitget")]
+#[allow(dead_code)]
 pub fn bitget_futures_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()

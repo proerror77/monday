@@ -394,6 +394,65 @@ impl EnhancedRiskManager {
         self.stats.last_inference_time = Some(timestamp);
     }
 
+    /// 更新账户余额与PnL统计（外部调用，由Accounting模块调用）
+    pub fn update_account_balance(&mut self, current_balance: Decimal, realized_pnl_delta: Decimal) {
+        // 更新峰值余额
+        if current_balance > self.stats.peak_balance {
+            self.stats.peak_balance = current_balance;
+        }
+
+        // 更新每日已实现PnL
+        self.stats.daily_realized_pnl += realized_pnl_delta;
+
+        // 追踪连续亏损
+        if realized_pnl_delta < Decimal::ZERO {
+            self.stats.consecutive_losses += 1;
+            self.stats.last_loss_time = Some(Self::current_timestamp_us());
+        } else if realized_pnl_delta > Decimal::ZERO {
+            // 盈利时重置连续亏损计数
+            self.stats.consecutive_losses = 0;
+        }
+
+        // 检查是否触发熔断条件（但不在这里直接触发，由review过程检查）
+        let drawdown = if self.stats.peak_balance > Decimal::ZERO {
+            ((self.stats.peak_balance - current_balance) / self.stats.peak_balance
+                * Decimal::from(100))
+            .to_f64()
+            .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        if drawdown > self.config.cb_drawdown_threshold {
+            warn!(
+                "⚠️ 当前回撤 {:.2}% 接近熔断阈值 {:.2}%",
+                drawdown, self.config.cb_drawdown_threshold
+            );
+        }
+
+        if self.stats.consecutive_losses >= self.config.cb_consecutive_losses {
+            warn!(
+                "⚠️ 连续亏损 {} 次，达到熔断阈值",
+                self.stats.consecutive_losses
+            );
+        }
+    }
+
+    /// 重置每日统计（外部调用，日切时调用）
+    pub fn reset_daily_stats(&mut self, starting_balance: Decimal) {
+        self.stats.daily_realized_pnl = Decimal::ZERO;
+        self.stats.daily_unrealized_pnl = Decimal::ZERO;
+        self.stats.starting_balance = starting_balance;
+        self.stats.peak_balance = starting_balance;
+        self.stats.consecutive_losses = 0;
+        self.stats.total_orders_today = 0;
+        self.stats.total_rejected_today = 0;
+        self.stats.rejection_reasons.clear();
+        self.circuit_breaker.trigger_count_today = 0;
+
+        info!("📊 每日风控统计已重置，起始资金: {}", starting_balance);
+    }
+
     /// 獲取風控統計報告
     pub fn get_risk_report(&self) -> RiskReport {
         RiskReport {
@@ -472,8 +531,74 @@ impl Default for EnhancedRiskConfig {
 }
 
 impl RiskManager for EnhancedRiskManager {
-    fn on_execution_event(&mut self, _event: &ExecutionEvent) {
-        // TODO: 可在此更新 PnL、连续亏损等统计
+    fn on_execution_event(&mut self, event: &ExecutionEvent) {
+        // 根据不同的执行事件类型更新统计
+        match event {
+            ExecutionEvent::Fill {
+                order_id,
+                price,
+                quantity,
+                ..
+            } => {
+                // 计算成交金额
+                let fill_value = price.0 * quantity.0;
+
+                // 更新每日已实现PnL（这里简化处理，实际需要根据开平仓方向计算）
+                // 注意：完整的PnL计算需要在Accounting模块完成，这里仅做粗略估计
+
+                info!(
+                    "成交事件: order_id={:?}, price={}, qty={}, value={}",
+                    order_id, price.0, quantity.0, fill_value
+                );
+            }
+
+            ExecutionEvent::OrderReject {
+                order_id,
+                reason,
+                timestamp
+            } => {
+                // 记录订单拒绝（可能来自交易所）
+                warn!("交易所拒绝订单: order_id={:?}, reason={}", order_id, reason);
+
+                // 更新拒绝统计
+                self.stats.total_rejected_today += 1;
+                *self.stats.rejection_reasons
+                    .entry("exchange_reject".to_string())
+                    .or_insert(0) += 1;
+
+                // 对于失败订单，可以应用惩罚性冷却
+                self.stats.last_global_order_time = *timestamp;
+            }
+
+            ExecutionEvent::OrderCompleted {
+                order_id,
+                final_price,
+                total_filled,
+                ..
+            } => {
+                // 订单完全成交
+                info!(
+                    "订单完成: order_id={:?}, final_price={}, total_filled={}",
+                    order_id, final_price.0, total_filled.0
+                );
+            }
+
+            ExecutionEvent::BalanceUpdate {
+                asset,
+                balance,
+                timestamp
+            } => {
+                // 余额更新（可能来自成交后的余额推送）
+                info!(
+                    "余额更新: asset={}, balance={} @ {}",
+                    asset, balance.0, timestamp
+                );
+            }
+
+            _ => {
+                // 其他事件暂不处理统计
+            }
+        }
     }
 
     fn emergency_stop(&mut self) -> Result<(), HftError> {

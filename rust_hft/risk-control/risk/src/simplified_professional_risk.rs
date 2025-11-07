@@ -399,17 +399,15 @@ impl RiskManager for SimplifiedProfessionalRiskManager {
 
     fn on_execution_event(&mut self, event: &ExecutionEvent) {
         // 更新 PNL 跟踪（簡化實現）
-        match event {
-            ExecutionEvent::Fill {
-                price, quantity, ..
-            } => {
-                let fill_amount = price.to_f64().unwrap_or(0.0) * quantity.to_f64().unwrap_or(0.0);
+        if let ExecutionEvent::Fill {
+            price, quantity, ..
+        } = event
+        {
+            let fill_amount = price.to_f64().unwrap_or(0.0) * quantity.to_f64().unwrap_or(0.0);
 
-                // 簡單的 PNL 累計（實際實現會更複雜）
-                self.daily_pnl += fill_amount * 0.001; // 假設 0.1% 的利潤率
-                self.max_drawdown_seen = self.max_drawdown_seen.max(self.daily_pnl);
-            }
-            _ => {}
+            // 簡單的 PNL 累計（實際實現會更複雜）
+            self.daily_pnl += fill_amount * 0.001; // 假設 0.1% 的利潤率
+            self.max_drawdown_seen = self.max_drawdown_seen.max(self.daily_pnl);
         }
     }
 
@@ -484,7 +482,6 @@ impl RiskManager for SimplifiedProfessionalRiskManager {
 mod tests {
     use super::*;
     use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce, VenueId};
-    use ports::Position;
     use rust_decimal::Decimal;
 
     #[test]
@@ -525,8 +522,10 @@ mod tests {
 
     #[test]
     fn test_order_notional_limit() {
-        let mut config = SimplifiedRiskConfig::default();
-        config.max_order_notional = 1000.0; // 很低的限制
+        let config = SimplifiedRiskConfig {
+            max_order_notional: 1000.0, // 很低的限制
+            ..Default::default()
+        };
 
         let mut risk_manager = SimplifiedProfessionalRiskManager::new(config);
 
@@ -555,8 +554,10 @@ mod tests {
 
     #[test]
     fn test_rate_limits() {
-        let mut config = SimplifiedRiskConfig::default();
-        config.max_orders_per_second = 1; // 非常嚴格的限制
+        let config = SimplifiedRiskConfig {
+            max_orders_per_second: 1, // 非常嚴格的限制
+            ..Default::default()
+        };
 
         let mut risk_manager = SimplifiedProfessionalRiskManager::new(config);
 

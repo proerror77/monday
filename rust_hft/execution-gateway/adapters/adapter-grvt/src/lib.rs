@@ -57,7 +57,7 @@ pub struct GrvtExecutionClient {
     cfg: GrvtExecutionConfig,
     http: Client,
     state: Arc<Mutex<AuthState>>, // 持有 cookie 與 account_id
-    exec_tx: mpsc::UnboundedSender<HftResult<ExecutionEvent>>, // 供回報流使用（WS 尚未接）
+    _exec_tx: mpsc::UnboundedSender<HftResult<ExecutionEvent>>, // 供回報流使用（WS 尚未接）
 }
 
 #[derive(Debug, Default, Clone)]
@@ -78,7 +78,7 @@ impl GrvtExecutionClient {
             cfg,
             http,
             state: Arc::new(Mutex::new(AuthState::default())),
-            exec_tx: tx,
+            _exec_tx: tx,
         }
     }
 

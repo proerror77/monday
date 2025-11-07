@@ -44,5 +44,8 @@ redis = ["runtime/redis"]
 metrics = ["runtime/metrics"]
 full-infra = ["clickhouse", "redis", "metrics"]
 
+# SIMD 優化 (生產環境)
+simd = ["runtime/json-simd"]
+
 # 方便一次開啟所有功能
-full = ["all-exchanges", "all-strategies", "full-infra"]
+full = ["all-exchanges", "all-strategies", "full-infra", "simd"]

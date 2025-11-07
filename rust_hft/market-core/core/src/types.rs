@@ -1,3 +1,4 @@
+#![allow(clippy::should_implement_trait)]
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

@@ -243,6 +243,7 @@ mod tests {
             let symbol = BaseSymbol::from(*symbol_str);
             let venue = VenueId::BINANCE;
 
+            #[allow(clippy::needless_range_loop)]
             for shard_idx in 0..shard_count {
                 let config = ShardConfig::new(
                     shard_idx as u32,

@@ -183,7 +183,7 @@ impl BitgetExchange {
     fn parse_level(level: &Value) -> Option<(f64, f64)> {
         if let Some(arr) = level.as_array() {
             if arr.len() >= 2 {
-                let price = arr.get(0).and_then(Self::value_to_f64)?;
+                let price = arr.first().and_then(Self::value_to_f64)?;
                 let qty = arr.get(1).and_then(Self::value_to_f64)?;
                 return Some((price, qty));
             }
@@ -292,7 +292,7 @@ impl Exchange for BitgetExchange {
         let market_filter = self.forced_market.as_deref();
 
         let mut whitelist = Vec::new();
-        match market_filter.as_deref() {
+        match market_filter {
             Some("SPOT") => {
                 whitelist.extend(bitget_spot_pairs().into_iter().map(|s| s.to_uppercase()));
             }
@@ -712,7 +712,7 @@ impl Exchange for BitgetExchange {
                         let (best_bid_px, best_bid_qty, best_ask_px, best_ask_qty) = {
                             let books = self.ob.read().await;
                             if let Some(book) = books.get(symbol) {
-                                let bb = book.bids.iter().rev().next().map(|(p, q)| (p.0, *q));
+                                let bb = book.bids.iter().next_back().map(|(p, q)| (p.0, *q));
                                 let ba = book.asks.iter().next().map(|(p, q)| (p.0, *q));
                                 match (bb, ba) {
                                     (Some(b), Some(a)) => (b.0, b.1, a.0, a.1),

@@ -159,11 +159,13 @@ pub struct OpenOrder {
 }
 
 /// 訂單狀態
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OrderStatus {
     /// 新訂單，等待確認
     New,
-    /// 已確認，等待成交
+    /// 已確認，等待成交（OMS 層使用）
+    Acknowledged,
+    /// 已確認，等待成交（交易所回報）
     Accepted,
     /// 部分成交
     PartiallyFilled,
@@ -175,6 +177,8 @@ pub enum OrderStatus {
     Rejected,
     /// 過期
     Expired,
+    /// 已替換
+    Replaced,
 }
 
 /// 訂單意圖 (下單前)

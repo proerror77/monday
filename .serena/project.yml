@@ -3,10 +3,6 @@
 #  * For JavaScript, use typescript
 # Special requirements:
 #  * csharp: Requires the presence of a .sln file in the project folder.
-language: python
-
-# whether to use the project's gitignore file to ignore files
-# Added on 2025-04-07
 ignore_all_files_in_gitignore: true
 # list of additional paths to ignore
 # same syntax as gitignore, so you can use * and **
@@ -66,3 +62,8 @@ excluded_tools: []
 initial_prompt: ""
 
 project_name: "monday"
+languages:
+- python
+- rust
+included_optional_tools: []
+encoding: utf-8

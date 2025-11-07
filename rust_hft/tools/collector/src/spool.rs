@@ -177,13 +177,11 @@ pub async fn drain(sink: &Arc<dyn DbSink>) -> Result<usize> {
     let limit = drain_limit();
     let ttl = Duration::from_secs(ttl_secs());
     let now = SystemTime::now();
-    let mut processed = 0usize;
 
-    for path in files {
+    for (processed, path) in files.into_iter().enumerate() {
         if processed >= limit {
             break;
         }
-        processed += 1;
         // TTL: 過舊直接刪除
         if let Ok(md) = fs::metadata(&path) {
             if let Ok(mt) = md.modified() {

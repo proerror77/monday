@@ -180,7 +180,7 @@ hft_orders_canceled_total {}
         let encoder = prometheus::TextEncoder::new();
         if encoder.encode(&mf, &mut buf).is_ok() {
             let text = String::from_utf8_lossy(&buf);
-            combined.push_str("\n");
+            combined.push('\n');
             combined.push_str(&text);
         }
     }

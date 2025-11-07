@@ -36,81 +36,13 @@ impl<T> SpscRingBuffer<T> {
             let slot = &mut *self.buffer.as_ptr().add(head).cast_mut();
             *slot = Some(item);
         }
+        // Memory fence to ensure data write completes before head update is visible
+        // Critical for ARM/weak memory models to prevent consumer seeing stale data
+        std::sync::atomic::fence(Ordering::Release);
         self.head.store(next_head, Ordering::Release);
         Ok(())
     }
 
-    /// Force push - 强制写入策略，用于最新事件优先的场景
-    ///
-    /// # Last-Wins 语义
-    ///
-    /// - 如果队列未满：行为与 `try_push` 一致，直接插入
-    /// - 如果队列已满：**丢弃最旧的元素**，为新元素腾出空间
-    ///
-    /// # 重要特性
-    ///
-    /// - **非 FIFO 语义**: 在满载情况下会跳过（丢弃）旧元素
-    /// - **无阻塞**: 保证插入成功，适用于热路径
-    /// - **最新优先**: 确保最新的数据能够被处理
-    ///
-    /// # 适用场景
-    ///
-    /// - 交易信号队列：最新信号比旧信号更重要
-    /// - 市场数据流：最新价格比历史价格更关键
-    /// - 告警事件：最新告警应该优先处理
-    ///
-    /// # 返回值
-    ///
-    /// 总是返回 `true`，表示插入成功
-    ///
-    /// # 示例
-    ///
-    /// ```
-    /// // 创建容量为 3 的队列
-    /// let (producer, consumer) = spsc_ring_buffer(4); // 实际容量 3 (power-of-2 - 1)
-    ///
-    /// // 填满队列
-    /// assert!(producer.try_push(1).is_ok());
-    /// assert!(producer.try_push(2).is_ok());
-    /// assert!(producer.try_push(3).is_ok());
-    ///
-    /// // 队列已满，普通 push 失败
-    /// assert!(producer.try_push(4).is_err());
-    ///
-    /// // force_push 总是成功，丢弃最旧元素
-    /// assert!(producer.force_push(4));
-    ///
-    /// // 现在读取：跳过了 1，从 2 开始
-    /// assert_eq!(consumer.recv(), Some(2));
-    /// assert_eq!(consumer.recv(), Some(3));
-    /// assert_eq!(consumer.recv(), Some(4));
-    /// ```
-    pub fn force_push(&self, item: T) -> bool {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        let next_head = (head + 1) & (self.capacity - 1);
-
-        // 如果滿了，強制移動 tail 指針（丟棄最舊元素）
-        if next_head == tail {
-            // 先清理舊元素
-            unsafe {
-                let slot = &mut *self.buffer.as_ptr().add(tail).cast_mut();
-                *slot = None; // 清理舊數據
-            }
-
-            // 移動 tail 指針，丟棄最舊元素
-            let next_tail = (tail + 1) & (self.capacity - 1);
-            self.tail.store(next_tail, Ordering::Release);
-        }
-
-        // 現在有空間了，插入新元素
-        unsafe {
-            let slot = &mut *self.buffer.as_ptr().add(head).cast_mut();
-            *slot = Some(item);
-        }
-        self.head.store(next_head, Ordering::Release);
-        true
-    }
     pub fn try_pop(&self) -> Option<T> {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
@@ -157,9 +89,6 @@ impl<T> SpscProducer<T> {
     pub fn send(&self, item: T) -> Result<(), T> {
         self.ring_buffer.try_push(item)
     }
-    pub fn force_send(&self, item: T) -> bool {
-        self.ring_buffer.force_push(item)
-    }
     pub fn is_full(&self) -> bool {
         self.ring_buffer.is_full()
     }
@@ -205,146 +134,267 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_force_push_basic() {
-        let (producer, consumer) = spsc_ring_buffer(4); // 实际容量 3
-
-        // 正常情况：队列未满
-        assert!(producer.force_send(1));
-        assert!(producer.force_send(2));
-        assert!(producer.force_send(3));
-
-        assert_eq!(consumer.recv(), Some(1));
-        assert_eq!(consumer.recv(), Some(2));
-        assert_eq!(consumer.recv(), Some(3));
-    }
-
-    #[test]
-    fn test_force_push_overflow_last_wins() {
-        let (producer, consumer) = spsc_ring_buffer(4); // 实际容量 3
-
-        // 填满队列
+    fn test_basic_push_pop_and_capacity() {
+        let (producer, consumer) = spsc_ring_buffer(4); // 實際可用 3
         assert!(producer.send(1).is_ok());
         assert!(producer.send(2).is_ok());
         assert!(producer.send(3).is_ok());
+        assert!(producer.send(4).is_err()); // 滿載
 
-        // 队列已满，普通 push 失败
-        assert!(producer.send(4).is_err());
-
-        // force_push 成功，丢弃最旧元素 (1)
-        assert!(producer.force_send(4));
-
-        // 验证 Last-Wins 语义：元素 1 被丢弃
-        assert_eq!(consumer.recv(), Some(2));
-        assert_eq!(consumer.recv(), Some(3));
-        assert_eq!(consumer.recv(), Some(4));
-        assert_eq!(consumer.recv(), None);
-    }
-
-    #[test]
-    fn test_force_push_multiple_overflow() {
-        let (producer, consumer) = spsc_ring_buffer(4); // 实际容量 3
-
-        // 填满队列
-        producer.send(1).unwrap();
-        producer.send(2).unwrap();
-        producer.send(3).unwrap();
-
-        // 连续 force_push，每次都丢弃最旧元素
-        assert!(producer.force_send(4)); // 丢弃 1
-        assert!(producer.force_send(5)); // 丢弃 2
-        assert!(producer.force_send(6)); // 丢弃 3
-
-        // 验证：只保留最新的 3 个元素
-        assert_eq!(consumer.recv(), Some(4));
-        assert_eq!(consumer.recv(), Some(5));
-        assert_eq!(consumer.recv(), Some(6));
-        assert_eq!(consumer.recv(), None);
-    }
-
-    #[test]
-    fn test_force_push_interleaved_with_consume() {
-        let (producer, consumer) = spsc_ring_buffer(4);
-
-        // 填满队列
-        producer.send(1).unwrap();
-        producer.send(2).unwrap();
-        producer.send(3).unwrap();
-
-        // 消费一个元素，腾出空间
         assert_eq!(consumer.recv(), Some(1));
-
-        // 现在 force_push 不会丢弃元素
-        assert!(producer.force_send(4));
-
-        // 验证顺序保持
         assert_eq!(consumer.recv(), Some(2));
         assert_eq!(consumer.recv(), Some(3));
-        assert_eq!(consumer.recv(), Some(4));
+        assert_eq!(consumer.recv(), None);
+
+        // 再次寫入
+        assert!(producer.send(5).is_ok());
+        assert_eq!(consumer.recv(), Some(5));
     }
 
     #[test]
-    fn test_force_push_always_succeeds() {
-        let (producer, _) = spsc_ring_buffer(4);
+    fn test_wraparound() {
+        let (producer, consumer) = spsc_ring_buffer(4); // capacity=4, usable=3
 
-        // force_push 总是返回 true
-        for i in 0..100 {
-            assert!(producer.force_send(i));
+        // Fill and empty multiple times to test wraparound
+        for iteration in 0..3 {
+            for i in 0..3 {
+                let value = iteration * 3 + i + 1;
+                assert!(producer.send(value).is_ok(),
+                        "Failed to send {} in iteration {}", value, iteration);
+            }
+
+            for i in 0..3 {
+                let expected = iteration * 3 + i + 1;
+                assert_eq!(consumer.recv(), Some(expected),
+                          "Failed to recv in iteration {}", iteration);
+            }
+
+            assert!(consumer.recv().is_none(), "Buffer should be empty after consuming all");
         }
     }
 
     #[test]
-    fn test_force_push_utilization() {
-        let (producer, consumer) = spsc_ring_buffer(8); // 实际容量 7
+    fn test_utilization_metrics() {
+        let (producer, consumer) = spsc_ring_buffer(8);
 
-        // 填满队列
-        for i in 0..7 {
-            producer.send(i).unwrap();
+        assert_eq!(producer.utilization(), 0.0, "Empty buffer should have 0% utilization");
+
+        // Fill to 50% of usable capacity (3 out of 7)
+        for i in 0..3 {
+            assert!(producer.send(i).is_ok());
         }
+        let util = producer.utilization();
+        assert!(util > 0.4 && util < 0.5, "Expected ~43% utilization, got {}", util);
 
-        // 验证队列已满
-        assert!(producer.is_full());
-        assert!((producer.utilization() - 1.0).abs() < 0.01); // 允许浮点误差
-
-        // force_push 保持队列满状态
-        producer.force_send(100);
-        assert!(producer.is_full());
-        assert_eq!(producer.utilization(), 1.0);
-
-        // 消费一个元素
-        consumer.recv();
-        assert!(!producer.is_full());
-        assert!(producer.utilization() < 1.0);
+        // Consume one
+        assert_eq!(consumer.recv(), Some(0));
+        let util_after = consumer.utilization();
+        assert!(util_after > 0.25 && util_after < 0.35, "Expected ~29% utilization, got {}", util_after);
     }
 
+    #[cfg(loom)]
     #[test]
-    fn test_force_push_ordering_guarantees() {
-        let (producer, consumer) = spsc_ring_buffer(4);
+    fn loom_concurrent_push_pop() {
+        loom::model(|| {
+            let (producer, consumer) = spsc_ring_buffer(4);
 
-        // 场景：快速生产，慢消费
-        producer.send(1).unwrap();
-        producer.send(2).unwrap();
-        producer.send(3).unwrap();
+            let prod_handle = loom::thread::spawn({
+                let producer = producer.clone();
+                move || {
+                    // Producer sends 3 items sequentially
+                    for i in 1..=3 {
+                        while producer.send(i).is_err() {
+                            // Spin until buffer has space
+                            loom::thread::yield_now();
+                        }
+                    }
+                }
+            });
 
-        // force_push 新元素
-        producer.force_send(4);
-        producer.force_send(5);
-        producer.force_send(6);
+            let cons_handle = loom::thread::spawn({
+                let consumer = consumer.clone();
+                move || {
+                    let mut items = Vec::new();
+                    // Consumer tries to receive items
+                    loop {
+                        if let Some(item) = consumer.recv() {
+                            items.push(item);
+                            if items.len() >= 3 {
+                                break;
+                            }
+                        } else {
+                            loom::thread::yield_now();
+                        }
+                    }
+                    items
+                }
+            });
 
-        // 验证最新的 3 个元素按顺序保留
-        let mut results = Vec::new();
-        while let Some(item) = consumer.recv() {
-            results.push(item);
-        }
+            prod_handle.join().unwrap();
+            let received = cons_handle.join().unwrap();
 
-        assert_eq!(results, vec![4, 5, 6]);
+            // Verify SPSC invariants: all sent items received in order
+            assert_eq!(received, vec![1, 2, 3], "Items must be received in FIFO order");
+        });
     }
 
+    #[cfg(loom)]
     #[test]
-    fn test_force_push_empty_queue() {
-        let (producer, consumer) = spsc_ring_buffer(4);
+    fn loom_release_acquire_semantics() {
+        loom::model(|| {
+            // Test that Release/Acquire semantics prevent stale reads
+            let (producer, consumer) = spsc_ring_buffer(4);
 
-        // 空队列上的 force_push
-        assert!(producer.force_send(42));
-        assert_eq!(consumer.recv(), Some(42));
+            let prod_handle = loom::thread::spawn({
+                let producer = producer.clone();
+                move || {
+                    // Producer sends item with data value 42
+                    while producer.send(42).is_err() {
+                        loom::thread::yield_now();
+                    }
+                }
+            });
+
+            let cons_handle = loom::thread::spawn({
+                let consumer = consumer.clone();
+                move || {
+                    let mut received = None;
+                    // Consumer polls until it gets the item
+                    loop {
+                        if let Some(item) = consumer.recv() {
+                            received = Some(item);
+                            break;
+                        }
+                        loom::thread::yield_now();
+                    }
+                    received
+                }
+            });
+
+            prod_handle.join().unwrap();
+            let result = cons_handle.join().unwrap();
+
+            // The Release fence in try_push and Acquire load in try_pop
+            // guarantee that the consumer sees the correct data
+            assert_eq!(result, Some(42), "Consumer must see the value that was sent");
+        });
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_wraparound_with_concurrent_access() {
+        loom::model(|| {
+            let (producer, consumer) = spsc_ring_buffer(4); // capacity=4, usable=3
+
+            let prod_handle = loom::thread::spawn({
+                let producer = producer.clone();
+                move || {
+                    // Producer pushes 6 items (wraps around twice)
+                    for i in 1..=6 {
+                        while producer.send(i).is_err() {
+                            loom::thread::yield_now();
+                        }
+                    }
+                }
+            });
+
+            let cons_handle = loom::thread::spawn({
+                let consumer = consumer.clone();
+                move || {
+                    let mut items = Vec::new();
+                    // Consumer pops all items
+                    loop {
+                        if let Some(item) = consumer.recv() {
+                            items.push(item);
+                            if items.len() >= 6 {
+                                break;
+                            }
+                        } else {
+                            loom::thread::yield_now();
+                        }
+                    }
+                    items
+                }
+            });
+
+            prod_handle.join().unwrap();
+            let received = cons_handle.join().unwrap();
+
+            // Verify FIFO and wraparound correctness
+            assert_eq!(received, vec![1, 2, 3, 4, 5, 6],
+                      "Wraparound must maintain FIFO order");
+        });
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_capacity_boundary() {
+        loom::model(|| {
+            // Test that capacity boundary (tail == next_head) is correctly enforced
+            let (producer, consumer) = spsc_ring_buffer(4); // usable=3
+
+            let prod_handle = loom::thread::spawn({
+                let producer = producer.clone();
+                move || {
+                    // Fill to capacity
+                    assert!(producer.send(1).is_ok());
+                    assert!(producer.send(2).is_ok());
+                    assert!(producer.send(3).is_ok());
+
+                    // 4th attempt should fail (buffer full)
+                    let result = producer.send(4);
+                    assert!(result.is_err(), "Buffer must refuse item when full");
+                }
+            });
+
+            let cons_handle = loom::thread::spawn({
+                let consumer = consumer.clone();
+                move || {
+                    // Let producer fill the buffer first
+                    loom::thread::yield_now();
+
+                    // Now make space by consuming one
+                    let item = consumer.recv();
+                    assert_eq!(item, Some(1), "Should receive first item");
+                }
+            });
+
+            prod_handle.join().unwrap();
+            cons_handle.join().unwrap();
+        });
+    }
+
+    #[cfg(loom)]
+    #[test]
+    fn loom_empty_buffer_handling() {
+        loom::model(|| {
+            // Test that consuming from empty buffer returns None safely
+            let (producer, consumer) = spsc_ring_buffer(4);
+
+            let cons_handle = loom::thread::spawn({
+                let consumer = consumer.clone();
+                move || {
+                    // Try to receive from empty buffer
+                    for _ in 0..3 {
+                        assert_eq!(consumer.recv(), None, "Empty buffer must return None");
+                        loom::thread::yield_now();
+                    }
+                }
+            });
+
+            let prod_handle = loom::thread::spawn({
+                let producer = producer.clone();
+                move || {
+                    loom::thread::yield_now();
+                    // After consumer checks empty, producer sends
+                    while producer.send(99).is_err() {
+                        loom::thread::yield_now();
+                    }
+                }
+            });
+
+            cons_handle.join().unwrap();
+            prod_handle.join().unwrap();
+        });
     }
 }

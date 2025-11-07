@@ -1,28 +1,34 @@
 //! Binance WebSocket 連接管理
+//!
+//! 提供兩種消息接收接口：
+//! - `receive_message()`: 返回 String，向後兼容，易於使用
+//! - `receive_message_bytes()`: 返回 Bytes，零拷貝，高性能
 
-use futures::{SinkExt, StreamExt};
+use bytes::Bytes;
 use hft_core::{HftError, HftResult, Symbol};
-use tokio::time::{interval, Duration};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
-use url::Url;
+use integration::ws::{WsClient, WsClientConfig};
+use tokio::time::Duration;
+use tracing::info;
 
 const WS_BASE_URL: &str = "wss://stream.binance.com:9443/ws";
 const PING_INTERVAL: Duration = Duration::from_secs(20);
-const PONG_TIMEOUT: Duration = Duration::from_secs(5);
+const _PONG_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct BinanceWebSocket {
-    url: String,
+    client: WsClient,
     symbols: Vec<Symbol>,
-    is_connected: bool,
 }
 
 impl BinanceWebSocket {
     pub fn new() -> Self {
-        Self {
+        let config = WsClientConfig {
             url: WS_BASE_URL.to_string(),
+            heartbeat_interval: PING_INTERVAL,
+            ..Default::default()
+        };
+        Self {
+            client: WsClient::new(config),
             symbols: Vec::new(),
-            is_connected: false,
         }
     }
 
@@ -30,33 +36,30 @@ impl BinanceWebSocket {
     pub async fn connect_and_subscribe(
         &mut self,
         symbols: Vec<Symbol>,
-    ) -> HftResult<WebSocketStream> {
+    ) -> HftResult<()> {
         self.symbols = symbols.clone();
 
         // 構建訂閱流名稱
         let streams = self.build_stream_names(&symbols);
         info!("連接 Binance WebSocket，訂閱流: {:?}", streams);
 
-        // 連接 WebSocket
+        // 構建 WebSocket URL
         let url = if streams.is_empty() {
-            // 如果沒有特定流，使用通用端點
-            Url::parse(WS_BASE_URL).map_err(|e| HftError::Parse(format!("URL 解析錯誤: {}", e)))?
+            WS_BASE_URL.to_string()
         } else {
-            // 構建多流端點
             let stream_names = streams.join("/");
-            let combined_url = format!("{}/{}", WS_BASE_URL, stream_names);
-            Url::parse(&combined_url)
-                .map_err(|e| HftError::Parse(format!("URL 解析錯誤: {}", e)))?
+            format!("{}/{}", WS_BASE_URL, stream_names)
         };
 
-        let (ws_stream, response) = connect_async(url)
+        self.client.cfg.url = url;
+
+        self.client
+            .connect()
             .await
             .map_err(|e| HftError::Network(format!("Binance WebSocket 連接失敗: {}", e)))?;
 
-        info!("Binance WebSocket 連接成功: {:?}", response.status());
-        self.is_connected = true;
-
-        Ok(WebSocketStream::new(ws_stream))
+        info!("Binance WebSocket 連接成功");
+        Ok(())
     }
 
     /// 構建訂閱流名稱
@@ -147,91 +150,50 @@ impl BinanceWebSocket {
         streams
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.is_connected
-    }
-
-    pub fn set_disconnected(&mut self) {
-        self.is_connected = false;
-    }
-}
-
-/// WebSocket 流封裝器
-pub struct WebSocketStream {
-    inner: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-}
-
-impl WebSocketStream {
-    fn new(
-        stream: tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) -> Self {
-        Self { inner: stream }
-    }
-
-    /// 發送消息
-    pub async fn send(&mut self, message: Message) -> HftResult<()> {
-        self.inner
-            .send(message)
-            .await
-            .map_err(|e| HftError::Network(format!("發送消息失敗: {}", e)))
-    }
-
-    /// 接收消息
-    pub async fn next(&mut self) -> Option<Result<Message, tokio_tungstenite::tungstenite::Error>> {
-        self.inner.next().await
-    }
-
-    /// 發送 ping
-    pub async fn send_ping(&mut self) -> HftResult<()> {
-        self.send(Message::Ping(vec![])).await
-    }
-
-    /// 啟動心跳任務
-    pub async fn start_heartbeat(mut self) -> HftResult<()> {
-        let mut ping_interval = interval(PING_INTERVAL);
-
-        loop {
-            tokio::select! {
-                _ = ping_interval.tick() => {
-                    debug!("發送 ping");
-                    if let Err(e) = self.send_ping().await {
-                        error!("發送 ping 失敗: {}", e);
-                        return Err(e);
-                    }
-                }
-
-                msg = self.next() => {
-                    match msg {
-                        Some(Ok(Message::Pong(_))) => {
-                            debug!("收到 pong");
-                        }
-                        Some(Ok(Message::Text(text))) => {
-                            debug!("收到文本消息: {}", text);
-                            // 這裡可以發送到消息處理器
-                        }
-                        Some(Ok(Message::Close(_))) => {
-                            warn!("WebSocket 連接被關閉");
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            error!("WebSocket 錯誤: {}", e);
-                            return Err(HftError::Network(e.to_string()));
-                        }
-                        None => {
-                            warn!("WebSocket 流結束");
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
+    /// 接收消息 (String 接口 - 向後兼容)
+    pub async fn receive_message(&mut self) -> HftResult<Option<String>> {
+        match self.client.receive_message().await {
+            Ok(Some((msg, _metrics))) => Ok(Some(msg)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(HftError::Network(format!("接收消息失敗: {}", e))),
         }
+    }
 
-        Ok(())
+    /// 接收消息 (Bytes 接口 - 零拷貝高性能)
+    ///
+    /// 此方法返回 `Bytes` 而非 `String`，避免了 String 分配和 UTF-8 驗證開銷。
+    /// 適合需要直接在原始字節上進行 JSON 解析的高性能場景。
+    ///
+    /// # 性能優勢
+    /// - 零數據拷貝：直接返回 WebSocket 幀的底層緩衝區
+    /// - 延遲 UTF-8 驗證：由調用方決定何時進行字符串轉換
+    /// - SIMD JSON 友好：可直接傳遞給 simd-json 進行解析
+    ///
+    /// # 使用示例
+    /// ```no_run
+    /// # use adapter_binance::BinanceWebSocket;
+    /// # use hft_core::Symbol;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut ws = BinanceWebSocket::new();
+    /// ws.connect_and_subscribe(vec![Symbol::new("BTCUSDT")]).await?;
+    ///
+    /// while let Some(bytes) = ws.receive_message_bytes().await? {
+    ///     // 直接在原始字節上進行 JSON 解析 (simd-json)
+    ///     // let mut buf = bytes.to_vec();
+    ///     // let value = simd_json::to_borrowed_value(&mut buf)?;
+    ///
+    ///     // 或轉換為 String (如需要)
+    ///     // let text = String::from_utf8(bytes.to_vec())?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn receive_message_bytes(&mut self) -> HftResult<Option<Bytes>> {
+        match self.client.receive_message_bytes().await {
+            Ok(Some((bytes, _metrics))) => Ok(Some(bytes)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(HftError::Network(format!("接收消息失敗: {}", e))),
+        }
     }
 }
 

@@ -4,10 +4,8 @@
 //! 便於與引擎對接進行回測或離線測試。
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use hft_core::{HftError, HftResult, Price, Quantity, Symbol};
 use ports::{BookLevel, BoxStream, MarketEvent, MarketSnapshot, MarketStream};
-use tracing::{debug, error, info, warn};
 
 /// 回放來源交易所
 #[derive(Debug, Clone)]
@@ -17,6 +15,7 @@ pub enum ReplayVenue {
 }
 
 impl ReplayVenue {
+    #[allow(dead_code)]
     fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "binance" => ReplayVenue::Binance,
@@ -67,7 +66,7 @@ impl MarketStream for ClickhouseReplayStream {
                 message: "Replay 需要至少一個 symbol".to_string(),
             });
         }
-        let symbol = symbols[0].0.clone();
+        let symbol = symbols[0].as_str().to_string();
         let cfg = self.cfg.clone();
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

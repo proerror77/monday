@@ -6,6 +6,7 @@ description = "穩定介面：事件模型 + traits (Never break userspace)"
 
 [dependencies]
 hft-core = { package = "hft-core", path = "../core" }
+hft-snapshot = { package = "hft-snapshot", path = "../snapshot" }
 instrument = { package = "hft-instrument", path = "../instrument" }
 serde = { workspace = true, features = ["derive"] }
 futures = { workspace = true }

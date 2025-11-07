@@ -595,9 +595,9 @@ fn yaml_get_u64(map: &Mapping, key: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
-    use crate::VenueCapabilities;
     use shared_instrument::InstrumentId;
 
     #[cfg(feature = "adapter-backpack-execution")]

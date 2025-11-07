@@ -274,7 +274,7 @@ mod tests {
         let (symbol, venue) = instrument_id.split().expect("split instrument id");
         assert_eq!(symbol.as_str(), "BTCUSDT");
         assert_eq!(venue, VenueId::BINANCE);
-        assert_eq!(instrument_id.symbol().unwrap().0, "BTCUSDT");
+        assert_eq!(instrument_id.symbol().unwrap().as_str(), "BTCUSDT");
         assert_eq!(instrument_id.venue_id().unwrap(), VenueId::BINANCE);
 
         assert!(catalog.has_instrument(&Symbol::new("BTCUSDT"), &VenueId::BINANCE));

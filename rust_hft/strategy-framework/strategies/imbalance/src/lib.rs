@@ -108,7 +108,9 @@ impl Strategy for ImbalanceStrategy {
                     });
                     info!(
                         "OBI {:.3} > {:.3}, BUY {}",
-                        obi, self.params.obi_threshold, sym.0
+                        obi,
+                        self.params.obi_threshold,
+                        sym.as_str()
                     );
                 } else if obi < -self.params.obi_threshold {
                     intents.push(OrderIntent {
@@ -123,7 +125,9 @@ impl Strategy for ImbalanceStrategy {
                     });
                     info!(
                         "OBI {:.3} < -{:.3}, SELL {}",
-                        obi, self.params.obi_threshold, sym.0
+                        obi,
+                        self.params.obi_threshold,
+                        sym.as_str()
                     );
                 }
             }

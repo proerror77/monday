@@ -6,7 +6,7 @@ use hdrhistogram::Histogram;
 use hft_core::latency::LatencyStageStats;
 use hft_core::{now_micros, LatencyStage};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -51,8 +51,8 @@ const LATENCY_HISTOGRAM_SIGFIGS: u8 = 3;
 #[derive(Debug)]
 pub struct LatencyMonitor {
     config: LatencyMonitorConfig,
-    /// 各階段的滾動統計窗口
-    windows: Arc<Mutex<HashMap<LatencyStage, Histogram<u64>>>>,
+    /// 各階段最近樣本（僅保留 window_size 筆）
+    samples: Arc<Mutex<HashMap<LatencyStage, VecDeque<u64>>>>,
     /// 最後報告時間（微秒）
     last_report_time: AtomicU64,
 }
@@ -62,7 +62,7 @@ impl LatencyMonitor {
     pub fn new(config: LatencyMonitorConfig) -> Self {
         Self {
             config,
-            windows: Arc::new(Mutex::new(HashMap::new())),
+            samples: Arc::new(Mutex::new(HashMap::new())),
             last_report_time: AtomicU64::new(now_micros()),
         }
     }
@@ -81,15 +81,15 @@ impl LatencyMonitor {
             }
         }
 
-        // 添加到直方圖
-        let mut windows = self.windows.lock();
-        let histogram = windows.entry(stage).or_insert_with(|| {
-            Histogram::new_with_bounds(1, LATENCY_HISTOGRAM_MAX_US, LATENCY_HISTOGRAM_SIGFIGS)
-                .expect("latency histogram bounds")
-        });
-        if let Err(err) = histogram.record(latency_micros) {
-            warn!("延遲統計記錄失敗: {}", err);
+        // 保存樣本（僅保留最近 window_size 筆）
+        let mut samples = self.samples.lock();
+        let dq = samples
+            .entry(stage)
+            .or_insert_with(|| VecDeque::with_capacity(self.config.window_size));
+        if dq.len() >= self.config.window_size {
+            dq.pop_front();
         }
+        dq.push_back(latency_micros);
 
         // 檢查是否需要生成報告
         self.maybe_generate_report();
@@ -97,10 +97,22 @@ impl LatencyMonitor {
 
     /// 獲取指定階段的統計信息
     pub fn get_stage_stats(&self, stage: LatencyStage) -> Option<LatencyStageStats> {
-        let windows = self.windows.lock();
-        if let Some(histogram) = windows.get(&stage) {
-            if !histogram.is_empty() {
-                return Some(LatencyStageStats::from_histogram(stage, histogram));
+        let samples = self.samples.lock();
+        if let Some(dq) = samples.get(&stage) {
+            if !dq.is_empty() {
+                // 重建 HDR 直方圖用于統計
+                let mut histogram = Histogram::new_with_bounds(
+                    1,
+                    LATENCY_HISTOGRAM_MAX_US,
+                    LATENCY_HISTOGRAM_SIGFIGS,
+                )
+                .expect("latency histogram bounds");
+                for &v in dq.iter() {
+                    if let Err(err) = histogram.record(v) {
+                        warn!("延遲統計記錄失敗: {}", err);
+                    }
+                }
+                return Some(LatencyStageStats::from_histogram(stage, &histogram));
             }
         }
         None
@@ -110,10 +122,19 @@ impl LatencyMonitor {
     pub fn get_all_stats(&self) -> HashMap<LatencyStage, LatencyStageStats> {
         let mut all_stats = HashMap::new();
 
-        let windows = self.windows.lock();
-        for (&stage, histogram) in windows.iter() {
-            if !histogram.is_empty() {
-                let stats = LatencyStageStats::from_histogram(stage, histogram);
+        let samples = self.samples.lock();
+        for (&stage, dq) in samples.iter() {
+            if !dq.is_empty() {
+                let mut histogram = Histogram::new_with_bounds(
+                    1,
+                    LATENCY_HISTOGRAM_MAX_US,
+                    LATENCY_HISTOGRAM_SIGFIGS,
+                )
+                .expect("latency histogram bounds");
+                for &v in dq.iter() {
+                    let _ = histogram.record(v);
+                }
+                let stats = LatencyStageStats::from_histogram(stage, &histogram);
                 all_stats.insert(stage, stats);
             }
         }
@@ -123,7 +144,7 @@ impl LatencyMonitor {
 
     /// 重置統計數據
     pub fn reset_stats(&self) {
-        self.windows.lock().clear();
+        self.samples.lock().clear();
         self.last_report_time.store(now_micros(), Ordering::Relaxed);
     }
 
@@ -237,7 +258,9 @@ mod tests {
 
     #[test]
     fn test_latency_health_check() {
-        let config = LatencyMonitorConfig::default();
+        let mut config = LatencyMonitorConfig::default();
+        // 測試使用更嚴格的 Ingestion 閾值，便於快速觸發 Critical
+        config.alert_thresholds.insert(LatencyStage::Ingestion, 1_000);
         let monitor = LatencyMonitor::new(config);
 
         // 添加一些正常的延遲樣本
@@ -248,7 +271,7 @@ mod tests {
         let health = monitor.check_latency_health(LatencyStage::Ingestion);
         assert_eq!(health, LatencyHealth::Healthy);
 
-        // 添加一些高延遲樣本
+        // 添加一些高延遲樣本（超過 1ms 的閾值）
         for _ in 0..10 {
             monitor.record_latency(LatencyStage::Ingestion, 2000);
         }
@@ -259,8 +282,10 @@ mod tests {
 
     #[test]
     fn test_rolling_window() {
-        let mut config = LatencyMonitorConfig::default();
-        config.window_size = 5;
+        let config = LatencyMonitorConfig {
+            window_size: 5,
+            ..Default::default()
+        };
         let monitor = LatencyMonitor::new(config);
 
         // 添加超過窗口大小的樣本

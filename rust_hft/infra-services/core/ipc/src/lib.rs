@@ -2,18 +2,29 @@
 //!
 //! Provides Unix Domain Socket based IPC for control plane operations.
 //! Messages are serialized using MessagePack (rmp-serde) for efficiency.
+//!
+//! # Feature Flags
+//!
+//! - `ipc` - Enables full IPC functionality (server, client, MessagePack serialization)
+//!
+//! Without the `ipc` feature, only message type definitions are available for use
+//! in configuration and type-level programming.
 
-use hft_core::Symbol;
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-
-pub mod client;
-pub mod handlers;
+// Message definitions are always available
 pub mod messages;
+pub use messages::*;
+
+// IPC functionality requires the 'ipc' feature
+#[cfg(feature = "ipc")]
+pub mod client;
+#[cfg(feature = "ipc")]
+pub mod handlers;
+#[cfg(feature = "ipc")]
 pub mod server;
 
+#[cfg(feature = "ipc")]
 pub use client::IPCClient;
-pub use messages::*;
+#[cfg(feature = "ipc")]
 pub use server::IPCServer;
 
 /// IPC communication errors
@@ -22,9 +33,11 @@ pub enum IPCError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[cfg(feature = "ipc")]
     #[error("Serialization error: {0}")]
     Serialization(#[from] rmp_serde::encode::Error),
 
+    #[cfg(feature = "ipc")]
     #[error("Deserialization error: {0}")]
     Deserialization(#[from] rmp_serde::decode::Error),
 

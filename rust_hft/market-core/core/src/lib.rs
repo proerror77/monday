@@ -59,8 +59,8 @@ mod tests {
 
     #[test]
     fn test_unified_timestamp_creation() {
-        let exchange_ts = 1640995200_000_000u64;
-        let local_ts = 1640995200_001_500u64;
+        let exchange_ts = 1_640_995_200_000_000_u64;
+        let local_ts = 1_640_995_200_001_500_u64;
 
         let unified = UnifiedTimestamp::new(exchange_ts, local_ts);
 
@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn test_unified_timestamp_fallback() {
         // 测试无交易所时间戳时的降级处理
-        let local_ts = 1640995200_001_500u64;
+        let local_ts = 1_640_995_200_001_500_u64;
         let unified = UnifiedTimestamp::local_only(local_ts);
 
         assert_eq!(unified.exchange_ts, 0);

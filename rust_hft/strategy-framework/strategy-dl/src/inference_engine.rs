@@ -195,6 +195,11 @@ impl InferenceEngine {
         self.stats.build_stats(self.state)
     }
 
+    /// 取得當前狀態
+    pub fn get_state(&self) -> InferenceEngineState {
+        self.state
+    }
+
     /// 手動設定狀態（調試用途）
     pub fn set_state(&mut self, new_state: InferenceEngineState) {
         self.state = new_state;

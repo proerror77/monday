@@ -3,16 +3,13 @@
 //! - WebSocket 實時流 + REST 快照初始化
 
 use async_trait::async_trait;
-use futures::{stream, StreamExt};
+use futures::stream;
 use hft_core::{HftError, HftResult, Symbol, Timestamp};
 use ports::events::MarketSnapshot;
 use ports::{BoxStream, ConnectionHealth, MarketEvent, MarketStream};
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info, warn};
-use url::Url;
+use tracing::{error, info, warn};
 
 mod converter;
 mod message_types;
@@ -22,6 +19,9 @@ mod websocket;
 use converter::*;
 use rest::*;
 use websocket::*;
+
+// Re-export for benchmarks and external use
+pub use converter::MessageConverter;
 
 pub mod capabilities {
     #[derive(Debug, Clone)]
@@ -46,10 +46,14 @@ pub mod capabilities {
 pub struct BinanceMarketStream {
     caps: capabilities::BinanceCapabilities,
     rest_client: BinanceRestClient,
-    ws_client: Option<BinanceWebSocket>,
     is_connected: bool,
     last_heartbeat: Timestamp,
-    symbols: Vec<Symbol>,
+}
+
+impl Default for BinanceMarketStream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BinanceMarketStream {
@@ -57,10 +61,8 @@ impl BinanceMarketStream {
         Self {
             caps: Default::default(),
             rest_client: BinanceRestClient::new(),
-            ws_client: None,
             is_connected: false,
             last_heartbeat: 0,
-            symbols: Vec::new(),
         }
     }
 
@@ -68,10 +70,8 @@ impl BinanceMarketStream {
         Self {
             caps,
             rest_client: BinanceRestClient::new(),
-            ws_client: None,
             is_connected: false,
             last_heartbeat: 0,
-            symbols: Vec::new(),
         }
     }
 
@@ -94,129 +94,6 @@ impl BinanceMarketStream {
         Ok(snapshots)
     }
 
-    /// 啟動 WebSocket 數據流
-    async fn start_websocket_stream(
-        &mut self,
-        symbols: Vec<Symbol>,
-        tx: mpsc::UnboundedSender<HftResult<MarketEvent>>,
-    ) -> HftResult<()> {
-        let mut ws_client = BinanceWebSocket::new();
-        let mut ws_stream = ws_client.connect_and_subscribe(symbols.clone()).await?;
-
-        self.ws_client = Some(ws_client);
-        self.is_connected = true;
-        // 心跳時間紀錄為微秒
-        self.last_heartbeat = (chrono::Utc::now().timestamp_millis() as u64) * 1000;
-
-        // 啟動消息處理任務
-        let tx_clone = tx.clone();
-        tokio::spawn(async move {
-            let mut reconnect_attempts = 0;
-            const MAX_RECONNECT_ATTEMPTS: u32 = 5;
-            const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-
-            loop {
-                match ws_stream.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        match MessageConverter::parse_stream_message(&text) {
-                            Ok(Some(event)) => {
-                                if let Err(_) = tx_clone.send(Ok(event)) {
-                                    error!("事件通道已關閉");
-                                    break;
-                                }
-                            }
-                            Ok(None) => {
-                                debug!("忽略未知消息: {}", text);
-                            }
-                            Err(e) => {
-                                warn!("解析消息失敗: {}", e);
-                                if let Err(_) = tx_clone.send(Err(e)) {
-                                    break;
-                                }
-                            }
-                        }
-                        reconnect_attempts = 0; // 重置重連計數
-                    }
-                    Some(Ok(Message::Pong(_))) => {
-                        debug!("收到 pong");
-                    }
-                    Some(Ok(Message::Close(_))) => {
-                        warn!("WebSocket 連接被關閉");
-                        let _ = tx_clone.send(Err(HftError::Network("連接被關閉".to_string())));
-                        break;
-                    }
-                    Some(Err(e)) => {
-                        error!("WebSocket 錯誤: {}", e);
-
-                        if reconnect_attempts < MAX_RECONNECT_ATTEMPTS {
-                            reconnect_attempts += 1;
-                            warn!(
-                                "嘗試重連 ({}/{})",
-                                reconnect_attempts, MAX_RECONNECT_ATTEMPTS
-                            );
-                            tokio::time::sleep(RECONNECT_DELAY * reconnect_attempts).await;
-
-                            // TODO: 實現重連邏輯
-                        } else {
-                            error!("達到最大重連次數，放棄連接");
-                            let _ = tx_clone
-                                .send(Err(HftError::Network(format!("WebSocket 錯誤: {}", e))));
-                            break;
-                        }
-                    }
-                    None => {
-                        warn!("WebSocket 流結束");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        });
-
-        // 可選：全市場 !bookTicker 獨立連線
-        let sub_all_bt = matches!(
-            std::env::var("COLLECTOR_ALL_BOOK_TICKER")
-                .unwrap_or_default()
-                .to_lowercase()
-                .as_str(),
-            "1" | "true" | "yes"
-        ) || matches!(
-            std::env::var("BINANCE_ALL_BOOK_TICKER")
-                .unwrap_or_default()
-                .to_lowercase()
-                .as_str(),
-            "1" | "true" | "yes"
-        );
-        if sub_all_bt {
-            let tx_bt = tx.clone();
-            tokio::spawn(async move {
-                let url = Url::parse("wss://stream.binance.com:9443/ws/!bookTicker").unwrap();
-                if let Ok((mut ws, _)) = connect_async(url).await {
-                    while let Some(msg) = ws.next().await {
-                        match msg {
-                            Ok(Message::Text(text)) => {
-                                match MessageConverter::parse_stream_message(&text) {
-                                    Ok(Some(ev)) => {
-                                        let _ = tx_bt.send(Ok(ev));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Ok(Message::Close(_)) => {
-                                break;
-                            }
-                            Ok(_) => {}
-                            Err(_) => {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -236,7 +113,7 @@ impl MarketStream for BinanceMarketStream {
             match self.get_initial_snapshots(&symbols).await {
                 Ok(snapshots) => {
                     for snapshot in snapshots {
-                        if let Err(_) = tx.send(Ok(MarketEvent::Snapshot(snapshot))) {
+                        if tx.send(Ok(MarketEvent::Snapshot(snapshot))).is_err() {
                             return Err(HftError::new("事件通道發送失敗"));
                         }
                     }
@@ -261,14 +138,14 @@ impl MarketStream for BinanceMarketStream {
 
             loop {
                 match ws_client.connect_and_subscribe(symbols_clone.clone()).await {
-                    Ok(mut ws_stream) => {
+                    Ok(()) => {
                         attempts = 0; // 成功連上，重置計數
                         loop {
-                            match ws_stream.next().await {
-                                Some(Ok(Message::Text(text))) => {
+                            match ws_client.receive_message().await {
+                                Ok(Some(text)) => {
                                     match MessageConverter::parse_stream_message(&text) {
                                         Ok(Some(event)) => {
-                                            if let Err(_) = tx.send(Ok(event)) {
+                                            if tx.send(Ok(event)).is_err() {
                                                 return;
                                             }
                                         }
@@ -278,22 +155,14 @@ impl MarketStream for BinanceMarketStream {
                                         }
                                     }
                                 }
-                                Some(Ok(Message::Pong(_))) => {}
-                                Some(Ok(Message::Close(_))) => {
+                                Ok(None) => {
                                     warn!("Binance WS 關閉，準備重連");
                                     break;
                                 }
-                                Some(Err(e)) => {
+                                Err(e) => {
                                     error!("Binance WS 錯誤: {}，準備重連", e);
+                                    let _ = tx.send(Err(e));
                                     break;
-                                }
-                                None => {
-                                    warn!("Binance WS 流結束，準備重連");
-                                    break;
-                                }
-                                Some(Ok(Message::Binary(_)))
-                                | Some(Ok(Message::Ping(_)))
-                                | Some(Ok(Message::Frame(_))) => {
                                     // 其他控制訊息：忽略並繼續
                                 }
                             }
@@ -354,9 +223,6 @@ impl MarketStream for BinanceMarketStream {
     }
 
     async fn disconnect(&mut self) -> HftResult<()> {
-        if let Some(ref mut ws_client) = self.ws_client {
-            ws_client.set_disconnected();
-        }
         self.is_connected = false;
         info!("Binance 適配器已斷開");
         Ok(())

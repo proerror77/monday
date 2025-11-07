@@ -463,7 +463,7 @@ impl FeatureExtractor {
         }
 
         // 裁剪極值以避免梯度爆炸
-        normalized = normalized.mapv(|x| x.max(-10.0).min(10.0));
+        normalized = normalized.mapv(|x| x.clamp(-10.0, 10.0));
 
         Ok(normalized)
     }

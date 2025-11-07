@@ -201,9 +201,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     top_levels: 5,
                 },
                 risk_limits: RtStrategyRiskLimits {
-                    max_notional: rust_decimal::Decimal::try_from(15000).unwrap(),
-                    max_position: rust_decimal::Decimal::try_from(3).unwrap(),
-                    daily_loss_limit: rust_decimal::Decimal::try_from(800).unwrap(),
+                    max_notional: rust_decimal::Decimal::from(15000),
+                    max_position: rust_decimal::Decimal::from(3),
+                    daily_loss_limit: rust_decimal::Decimal::from(800),
                     cooldown_ms: 1000,
                 },
             };
@@ -211,8 +211,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let strategies = vec![mk_imb("ETHUSDT"), mk_imb("SOLUSDT"), mk_imb("SUIUSDT")];
             let risk = RtRiskConfig {
                 risk_type: "Default".to_string(),
-                global_position_limit: rust_decimal::Decimal::try_from(1_000_000).unwrap(),
-                global_notional_limit: rust_decimal::Decimal::try_from(10_000_000).unwrap(),
+                global_position_limit: rust_decimal::Decimal::from(1_000_000),
+                global_notional_limit: rust_decimal::Decimal::from(10_000_000),
                 max_daily_trades: 10000,
                 max_orders_per_second: 100,
                 staleness_threshold_us: 5000,
@@ -262,15 +262,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("系統正在運行...");
 
     // 啟動推理 worker（可選）
-    if args.ml_enable {
-        let _ = helpers::spawn_inference_worker(
+    let _inference_handle = if args.ml_enable {
+        Some(helpers::spawn_inference_worker(
             system.engine.clone(),
             args.ml_model.clone(),
             args.ml_k,
             args.ml_l,
             args.ml_step_ms,
-        );
-    }
+        ))
+    } else {
+        None
+    };
 
     // 啟動 metrics HTTP 服務器（如果啟用 metrics feature）
     #[cfg(feature = "metrics")]

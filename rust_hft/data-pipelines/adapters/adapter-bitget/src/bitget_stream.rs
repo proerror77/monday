@@ -3,7 +3,6 @@
 #![allow(dead_code)]
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use simd_json;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -28,14 +27,27 @@ pub struct BitgetWsMessage {
     pub msg: Option<String>,
 }
 
+#[cfg(feature = "json-simd")]
+type JsonError = simd_json::Error;
+#[cfg(not(feature = "json-simd"))]
+type JsonError = serde_json::Error;
+
 #[inline]
-fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, simd_json::Error> {
+#[cfg(feature = "json-simd")]
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, JsonError> {
     let mut bytes = text.as_bytes().to_vec();
     simd_json::serde::from_slice(bytes.as_mut_slice())
 }
 
 #[inline]
-fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, simd_json::Error> {
+#[cfg(not(feature = "json-simd"))]
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, JsonError> {
+    serde_json::from_str(text)
+}
+
+#[inline]
+#[cfg(feature = "json-simd")]
+fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, JsonError> {
     let owned: simd_json::OwnedValue = value
         .try_into()
         .map_err(|e| simd_json::Error::generic(simd_json::ErrorType::Serde(format!("{:?}", e))))?;
@@ -43,8 +55,21 @@ fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> Result<T,
 }
 
 #[inline]
-fn to_json_string<T: Serialize>(value: &T) -> Result<String, simd_json::Error> {
+#[cfg(not(feature = "json-simd"))]
+fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, JsonError> {
+    serde_json::from_value(value)
+}
+
+#[inline]
+#[cfg(feature = "json-simd")]
+fn to_json_string<T: Serialize>(value: &T) -> Result<String, JsonError> {
     simd_json::serde::to_string(value)
+}
+
+#[inline]
+#[cfg(not(feature = "json-simd"))]
+fn to_json_string<T: Serialize>(value: &T) -> Result<String, JsonError> {
+    serde_json::to_string(value)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -105,6 +130,12 @@ pub struct BitgetMarketStream {
     depth_channel: String,
 }
 
+impl Default for BitgetMarketStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BitgetMarketStream {
     pub fn new() -> Self {
         Self {
@@ -138,8 +169,12 @@ impl BitgetMarketStream {
 
     fn create_ws_config() -> WsClientConfig {
         // 放寬訊息/幀上限以容納多品種 LOB/Trade 聚合
+        // 支持從環境變量讀取 URL 以便測試
+        let url = std::env::var("BITGET_WS_URL")
+            .unwrap_or_else(|_| "wss://ws.bitget.com/v2/ws/public".to_string());
+
         WsClientConfig {
-            url: "wss://ws.bitget.com/v2/ws/public".to_string(),
+            url,
             heartbeat_interval: std::time::Duration::from_secs(30),
             reconnect_interval: std::time::Duration::from_secs(5),
             max_reconnect_attempts: 10,
@@ -588,7 +623,7 @@ impl BitgetMessageHandler {
     fn get_state_mut(&mut self, sym: &str) -> &mut OrderBookState {
         self.ob_state
             .entry(sym.to_string())
-            .or_insert_with(OrderBookState::default)
+            .or_default()
     }
 
     fn handle_orderbook_data(
@@ -699,7 +734,7 @@ impl BitgetMessageHandler {
         let mut hasher = Hasher::new();
         hasher.update(s.as_bytes());
         let crc = hasher.finalize() as i64;
-        Some(crc as i64)
+        Some(crc)
     }
 
     fn handle_trade_data(
@@ -985,8 +1020,8 @@ impl OrderBookState {
         let mut bids = Vec::new();
         for (price, qty) in self.bids.iter().rev() {
             // 由高到低
-            let p = Price(price.clone());
-            let q = Quantity(qty.clone());
+            let p = Price(*price);
+            let q = Quantity(*qty);
             bids.push(BookLevel {
                 price: p,
                 quantity: q,
@@ -995,8 +1030,8 @@ impl OrderBookState {
         let mut asks = Vec::new();
         for (price, qty) in self.asks.iter() {
             // 由低到高
-            let p = Price(price.clone());
-            let q = Quantity(qty.clone());
+            let p = Price(*price);
+            let q = Quantity(*qty);
             asks.push(BookLevel {
                 price: p,
                 quantity: q,

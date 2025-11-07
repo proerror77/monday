@@ -10,7 +10,6 @@
 
 pub mod ipc_handler;
 pub mod portfolio_manager;
-pub mod recovery_integration;
 pub mod risk_manager_factory;
 pub mod sharding;
 pub mod system_builder;
@@ -18,7 +17,6 @@ pub mod system_builder;
 // Re-export main types for convenient access
 pub use ipc_handler::*;
 pub use portfolio_manager::*;
-pub use recovery_integration::*;
 pub use risk_manager_factory::*;
 pub use sharding::*;
 pub use system_builder::*;

@@ -13,6 +13,9 @@
 // Common test utilities and helpers
 pub mod common;
 
+// Test frameworks
+pub mod adapter_test_framework;
+
 // Unit test modules
 pub mod unit {
     pub mod multi_exchange_manager_test;
@@ -26,6 +29,9 @@ pub mod integration {
     pub mod end_to_end_system_test;
     pub mod performance_benchmarks;
 }
+
+// E2E test suite
+pub mod e2e_test_suite;
 
 #[cfg(test)]
 mod test_runner {

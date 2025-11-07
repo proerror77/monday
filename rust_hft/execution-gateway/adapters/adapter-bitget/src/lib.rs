@@ -243,6 +243,9 @@ pub struct BitgetExecutionClient {
     fill_id_cache: std::collections::HashSet<String>,
     // 緩存最後清理時間 (用於定期清理舊的 fill_id)
     last_cache_cleanup: Timestamp,
+    // WebSocket 延遲測量
+    last_ping_sent: std::sync::Arc<std::sync::Mutex<Option<Timestamp>>>,
+    measured_latency_ms: std::sync::Arc<std::sync::Mutex<Option<f64>>>,
 }
 
 impl BitgetExecutionClient {
@@ -261,6 +264,8 @@ impl BitgetExecutionClient {
             order_records: std::collections::HashMap::new(),
             fill_id_cache: std::collections::HashSet::new(),
             last_cache_cleanup: Self::current_timestamp(),
+            last_ping_sent: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            measured_latency_ms: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -395,12 +400,13 @@ impl BitgetExecutionClient {
     ) -> HftResult<()> {
         let ws_url = self.config.ws_private_url.clone();
         let credentials = self.config.credentials.clone();
+        let latency_tracker = self.measured_latency_ms.clone();
 
         info!("啟動 Bitget 私有 WebSocket: {}", ws_url);
 
         let handle = tokio::spawn(async move {
             if let Err(e) =
-                Self::private_websocket_loop(ws_url, credentials, event_tx.clone()).await
+                Self::private_websocket_loop(ws_url, credentials, event_tx.clone(), latency_tracker).await
             {
                 error!("私有 WebSocket 錯誤: {}", e);
                 let _ = event_tx.send(ExecutionEvent::ConnectionStatus {
@@ -419,6 +425,7 @@ impl BitgetExecutionClient {
         ws_url: String,
         credentials: BitgetCredentials,
         event_tx: broadcast::Sender<ExecutionEvent>,
+        latency_tracker: std::sync::Arc<std::sync::Mutex<Option<f64>>>,
     ) -> HftResult<()> {
         let url = Url::parse(&ws_url).map_err(|e| HftError::Network(e.to_string()))?;
         let (ws_stream, _) = connect_async(url)
@@ -448,7 +455,7 @@ impl BitgetExecutionClient {
                 "sign": sign,
             }]
         });
-        let _ = write
+        write
             .send(Message::Text(login_msg.to_string()))
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
@@ -490,7 +497,7 @@ impl BitgetExecutionClient {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    if let Err(e) = Self::handle_private_message(&text, &event_tx).await {
+                    if let Err(e) = Self::handle_private_message(&text, &event_tx, &latency_tracker).await {
                         warn!("處理私有消息失敗: {} - {}", e, text);
                     }
                 }
@@ -522,8 +529,10 @@ impl BitgetExecutionClient {
     async fn handle_private_message(
         text: &str,
         event_tx: &broadcast::Sender<ExecutionEvent>,
+        latency_tracker: &std::sync::Arc<std::sync::Mutex<Option<f64>>>,
     ) -> HftResult<()> {
         let message: PrivateWSMessage = parse_json(text)?;
+        let recv_time = Self::current_timestamp();
 
         debug!("收到私有消息: {:?}", message);
 
@@ -533,13 +542,13 @@ impl BitgetExecutionClient {
                 "orders" => {
                     // 訂單狀態更新
                     if let Some(data) = &message.data {
-                        Self::handle_order_update(data, event_tx).await?;
+                        Self::handle_order_update(data, event_tx, recv_time, latency_tracker).await?;
                     }
                 }
                 "fill" => {
                     // 成交回報
                     if let Some(data) = &message.data {
-                        Self::handle_fill_update(data, event_tx).await?;
+                        Self::handle_fill_update(data, event_tx, recv_time, latency_tracker).await?;
                     }
                 }
                 _ => {
@@ -555,6 +564,8 @@ impl BitgetExecutionClient {
     async fn handle_order_update(
         data: &serde_json::Value,
         event_tx: &broadcast::Sender<ExecutionEvent>,
+        recv_time: Timestamp,
+        latency_tracker: &std::sync::Arc<std::sync::Mutex<Option<f64>>>,
     ) -> HftResult<()> {
         // 數據可能是數組格式
         let updates: Vec<BitgetOrderUpdate> = if data.is_array() {
@@ -566,6 +577,19 @@ impl BitgetExecutionClient {
         for update in updates {
             let order_id = OrderId(update.ord_id.clone());
             let timestamp = Self::parse_timestamp(&update.u_time)?;
+
+            // 計算並更新延遲 (服務器時間戳到本地接收時間)
+            if timestamp > 0 && recv_time > timestamp {
+                let latency_us = recv_time - timestamp;
+                let latency_ms = latency_us as f64 / 1000.0;
+                if let Ok(mut tracker) = latency_tracker.lock() {
+                    // 使用指數移動平均 (EMA) 平滑延遲測量
+                    *tracker = Some(match *tracker {
+                        Some(prev) => prev * 0.9 + latency_ms * 0.1,
+                        None => latency_ms,
+                    });
+                }
+            }
 
             // 根據訂單狀態發送相應事件
             match update.state.as_str() {
@@ -666,6 +690,8 @@ impl BitgetExecutionClient {
     async fn handle_fill_update(
         data: &serde_json::Value,
         event_tx: &broadcast::Sender<ExecutionEvent>,
+        recv_time: Timestamp,
+        latency_tracker: &std::sync::Arc<std::sync::Mutex<Option<f64>>>,
     ) -> HftResult<()> {
         // 數據可能是數組格式
         let fills: Vec<BitgetFillUpdate> = if data.is_array() {
@@ -688,6 +714,18 @@ impl BitgetExecutionClient {
                     continue; // 跳過此條記錄，不發送事件
                 }
             };
+
+            // 計算並更新延遲
+            if timestamp > 0 && recv_time > timestamp {
+                let latency_us = recv_time - timestamp;
+                let latency_ms = latency_us as f64 / 1000.0;
+                if let Ok(mut tracker) = latency_tracker.lock() {
+                    *tracker = Some(match *tracker {
+                        Some(prev) => prev * 0.9 + latency_ms * 0.1,
+                        None => latency_ms,
+                    });
+                }
+            }
 
             // 精度保護：直接從字符串解析，避免二次轉換損失
             let fill_price = match Price::from_str(&fill.price) {
@@ -1385,8 +1423,8 @@ impl ExecutionClient for BitgetExecutionClient {
                     filled_quantity: filled,
                     price,
                     status,
-                    created_at: created_at,
-                    updated_at: updated_at,
+                    created_at,
+                    updated_at,
                 });
             }
         }
@@ -1690,9 +1728,13 @@ impl ExecutionClient for BitgetExecutionClient {
     }
 
     async fn health(&self) -> ConnectionHealth {
+        let latency_ms = self.measured_latency_ms.lock()
+            .ok()
+            .and_then(|guard| *guard);
+
         ConnectionHealth {
             connected: self.connected,
-            latency_ms: Some(1.0), // TODO: 實際測量延遲
+            latency_ms,
             last_heartbeat: self.last_heartbeat,
         }
     }

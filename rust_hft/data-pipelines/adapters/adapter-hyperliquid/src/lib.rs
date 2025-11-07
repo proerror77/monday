@@ -16,7 +16,6 @@ use ports::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use simd_json;
 use std::collections::HashMap;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -69,10 +68,17 @@ struct SubscriptionResponse {
     data: Value,
 }
 
+#[cfg(feature = "json-simd")]
 #[inline]
 fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, simd_json::Error> {
     let mut bytes = text.as_bytes().to_vec();
     simd_json::serde::from_slice(bytes.as_mut_slice())
+}
+
+#[cfg(not(feature = "json-simd"))]
+#[inline]
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
+    serde_json::from_str(text)
 }
 
 // Hyperliquid L2 订单簿数据结构
@@ -158,7 +164,7 @@ impl HyperliquidMarketStream {
                     subscription: Subscription::L2Book { coin: coin.clone() },
                 };
 
-                let l2_message = simd_json::serde::to_string(&l2_request)
+                let l2_message = serde_json::to_string(&l2_request)
                     .map_err(|e| HftError::Serialization(format!("序列化订阅请求失败: {}", e)))?;
 
                 ws.send(Message::Text(l2_message))
@@ -173,7 +179,7 @@ impl HyperliquidMarketStream {
                     subscription: Subscription::Trades { coin: coin.clone() },
                 };
 
-                let trades_message = simd_json::serde::to_string(&trades_request).map_err(|e| {
+                let trades_message = serde_json::to_string(&trades_request).map_err(|e| {
                     HftError::Serialization(format!("序列化交易订阅请求失败: {}", e))
                 })?;
 
@@ -230,7 +236,7 @@ impl HyperliquidMarketStream {
             Ok(book) => {
                 let symbol = self.symbol_mapping.get(&book.coin)?.clone();
 
-                if let Some(_levels) = book.levels.get(0) {
+                if let Some(_levels) = book.levels.first() {
                     // bids
                     // 構建完整的快照而不是只處理最佳價位
 
@@ -238,7 +244,7 @@ impl HyperliquidMarketStream {
                     let mut asks = Vec::new();
 
                     // 解析 bids (first array)
-                    if let Some(bid_levels) = book.levels.get(0) {
+                    if let Some(bid_levels) = book.levels.first() {
                         for level in bid_levels {
                             if let (Ok(price), Ok(qty)) =
                                 (level.px.parse::<f64>(), level.sz.parse::<f64>())
@@ -418,8 +424,10 @@ impl MarketStream for HyperliquidMarketStream {
 // 便捷构造函数
 impl HyperliquidMarketStream {
     pub fn with_symbols(symbols: Vec<Symbol>) -> Self {
-        let mut config = HyperliquidMarketConfig::default();
-        config.symbols = symbols;
+        let config = HyperliquidMarketConfig {
+            symbols,
+            ..HyperliquidMarketConfig::default()
+        };
         Self::new(config)
     }
 
@@ -428,8 +436,10 @@ impl HyperliquidMarketStream {
     }
 
     pub fn testnet() -> Self {
-        let mut config = HyperliquidMarketConfig::default();
-        config.ws_base_url = "wss://api.hyperliquid-testnet.xyz/ws".to_string();
+        let config = HyperliquidMarketConfig {
+            ws_base_url: "wss://api.hyperliquid-testnet.xyz/ws".to_string(),
+            ..Default::default()
+        };
         Self::new(config)
     }
 }

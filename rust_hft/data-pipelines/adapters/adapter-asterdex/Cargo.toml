@@ -18,7 +18,7 @@ futures = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { version = "1.0" }
-simd-json = { version = "0.13", features = ["serde"] }
+simd-json = { workspace = true, optional = true }
 
 # Utilities
 tracing = { workspace = true }
@@ -29,6 +29,7 @@ async-trait = "0.1"
 
 [features]
 default = []
+json-simd = ["dep:simd-json"]
 
 [lib]
 name = "adapter_asterdex_data"

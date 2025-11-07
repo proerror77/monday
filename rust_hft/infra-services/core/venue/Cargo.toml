@@ -10,7 +10,7 @@ ports = { package = "hft-ports", path = "../../../market-core/ports" }
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
 tracing = "0.1"
-tokio = { version = "1.0", features = ["fs"] }
+tokio = { version = "1.0", features = ["fs", "macros", "rt"] }
 rust_decimal = { version = "1.35", features = ["serde-with-str"] }
 
 [lib]

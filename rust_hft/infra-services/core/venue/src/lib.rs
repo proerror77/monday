@@ -220,19 +220,19 @@ impl VenueSpecManager {
                 .map_err(|e| HftError::Config(format!("無效的 min_qty: {}", e)))?,
             max_quantity: spec
                 .max_qty
-                .map(|q| Quantity::from_f64(q))
+                .map(Quantity::from_f64)
                 .transpose()
                 .map_err(|e| HftError::Config(format!("無效的 max_qty: {}", e)))?,
             min_notional: rust_decimal::Decimal::try_from(spec.min_notional)
                 .map_err(|e| HftError::Config(format!("無效的 min_notional: {}", e)))?,
             maker_fee_bps: spec
                 .maker_fee_bps
-                .map(|f| rust_decimal::Decimal::try_from(f))
+                .map(rust_decimal::Decimal::try_from)
                 .transpose()
                 .map_err(|e| HftError::Config(format!("無效的 maker_fee_bps: {}", e)))?,
             taker_fee_bps: spec
                 .taker_fee_bps
-                .map(|f| rust_decimal::Decimal::try_from(f))
+                .map(rust_decimal::Decimal::try_from)
                 .transpose()
                 .map_err(|e| HftError::Config(format!("無效的 taker_fee_bps: {}", e)))?,
             rate_limit: spec.rate_limit,
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn test_price_normalization() {
         // 這個測試不需要文件系統
-        let manager = VenueSpecManager::new("dummy".to_string());
+        let _manager = VenueSpecManager::new("dummy".to_string());
         // 添加一個測試用的 spec
         // （實際實現中可以加一個 add_spec 方法）
     }

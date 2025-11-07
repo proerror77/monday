@@ -3,30 +3,25 @@
 use crate::message_types::*;
 use hft_core::{HftError, HftResult, Symbol};
 use serde::de::DeserializeOwned;
-use serde_json;
-use simd_json;
-use std::collections::HashMap;
 use tracing::{debug, info};
 
 const REST_BASE_URL: &str = "https://api.binance.com";
 
 pub struct BinanceRestClient {
-    client: reqwest::Client,
-    base_url: String,
+    client: integration::http::HttpClient,
 }
 
 impl BinanceRestClient {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("HFT-Binance-Adapter/1.0")
-            .build()
+        let config = integration::http::HttpClientConfig {
+            base_url: REST_BASE_URL.to_string(),
+            timeout_ms: 10000,
+            user_agent: "HFT-Binance-Adapter/1.0".to_string(),
+        };
+        let client = integration::http::HttpClient::new(config)
             .expect("Failed to create HTTP client");
 
-        Self {
-            client,
-            base_url: REST_BASE_URL.to_string(),
-        }
+        Self { client }
     }
 
     /// 獲取訂單簿快照
@@ -34,19 +29,13 @@ impl BinanceRestClient {
         let limit = limit.unwrap_or(100);
         let symbol_str = symbol.to_string();
 
-        let url = format!("{}/api/v3/depth", self.base_url);
-        let limit_str = limit.to_string();
-        let mut params = HashMap::new();
-        params.insert("symbol", symbol_str.as_str());
-        params.insert("limit", limit_str.as_str());
+        let path = format!("/api/v3/depth?symbol={}&limit={}", symbol_str, limit);
 
         debug!("獲取 {} 深度快照，限制: {}", symbol, limit);
 
         let response = self
             .client
-            .get(&url)
-            .query(&params)
-            .send()
+            .get(&path, None)
             .await
             .map_err(|e| HftError::Network(format!("REST API 請求失敗: {}", e)))?;
 
@@ -89,12 +78,11 @@ impl BinanceRestClient {
 
     /// 測試連通性
     pub async fn ping(&self) -> HftResult<()> {
-        let url = format!("{}/api/v3/ping", self.base_url);
+        let path = "/api/v3/ping";
 
         let response = self
             .client
-            .get(&url)
-            .send()
+            .get(path, None)
             .await
             .map_err(|e| HftError::Network(format!("ping 請求失敗: {}", e)))?;
 
@@ -109,72 +97,23 @@ impl BinanceRestClient {
         }
     }
 
-    /// 獲取服務器時間
-    pub async fn get_server_time(&self) -> HftResult<u64> {
-        let url = format!("{}/api/v3/time", self.base_url);
 
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| HftError::Network(format!("獲取服務器時間失敗: {}", e)))?;
 
-        if !response.status().is_success() {
-            return Err(HftError::Network(format!(
-                "獲取時間失敗: {}",
-                response.status()
-            )));
-        }
-
-        let text = response
-            .text()
-            .await
-            .map_err(|e| HftError::Network(format!("讀取時間響應失敗: {}", e)))?;
-
-        let json: serde_json::Value = Self::parse_json(&text)
-            .map_err(|e| HftError::Parse(format!("解析時間響應失敗: {}", e)))?;
-
-        let server_time = json["serverTime"]
-            .as_u64()
-            .ok_or_else(|| HftError::Parse("無效的服務器時間格式".to_string()))?;
-
-        Ok(server_time)
-    }
-
-    /// 獲取交易對信息
-    pub async fn get_exchange_info(&self) -> HftResult<serde_json::Value> {
-        let url = format!("{}/api/v3/exchangeInfo", self.base_url);
-
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| HftError::Network(format!("獲取交易所信息失敗: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(HftError::Network(format!(
-                "獲取交易所信息失敗: {}",
-                response.status()
-            )));
-        }
-
-        let text = response
-            .text()
-            .await
-            .map_err(|e| HftError::Network(format!("讀取交易所信息響應失敗: {}", e)))?;
-
-        let json: serde_json::Value = Self::parse_json(&text)
-            .map_err(|e| HftError::Parse(format!("解析交易所信息失敗: {}", e)))?;
-
-        Ok(json)
-    }
-
+    /// 使用 SIMD-optimized JSON 解析（如果啟用 json-simd feature）
     #[inline]
-    fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, simd_json::Error> {
-        let mut bytes = text.as_bytes().to_vec();
-        simd_json::serde::from_slice(bytes.as_mut_slice())
+    fn parse_json<T: DeserializeOwned>(text: &str) -> HftResult<T> {
+        #[cfg(feature = "json-simd")]
+        {
+            // SIMD 優化：需要 &mut [u8]
+            let mut bytes = text.as_bytes().to_vec();
+            simd_json::serde::from_slice(&mut bytes)
+                .map_err(|e| HftError::Parse(format!("SIMD JSON 解析失敗: {}", e)))
+        }
+        #[cfg(not(feature = "json-simd"))]
+        {
+            serde_json::from_str(text)
+                .map_err(|e| HftError::Parse(format!("JSON 解析失敗: {}", e)))
+        }
     }
 }
 
@@ -187,17 +126,6 @@ mod tests {
         let client = BinanceRestClient::new();
         let result = client.ping().await;
         assert!(result.is_ok(), "Binance ping 應該成功");
-    }
-
-    #[tokio::test]
-    async fn test_get_server_time() {
-        let client = BinanceRestClient::new();
-        let result = client.get_server_time().await;
-        assert!(result.is_ok(), "獲取服務器時間應該成功");
-
-        if let Ok(time) = result {
-            assert!(time > 0, "服務器時間應該大於 0");
-        }
     }
 
     #[tokio::test]

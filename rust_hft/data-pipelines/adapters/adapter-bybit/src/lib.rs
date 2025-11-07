@@ -1,16 +1,13 @@
 //! Bybit v5 市場數據適配器（WS 公共流）
 
 use async_trait::async_trait;
-use futures::{SinkExt, StreamExt};
 use hft_core::{HftError, HftResult, Price, Quantity, Symbol, VenueId};
+use integration::ws::{WsClient, WsClientConfig};
 use ports::{BoxStream, ConnectionHealth, MarketEvent, MarketSnapshot, MarketStream, Trade};
 use serde::{de::DeserializeOwned, Deserialize};
-use simd_json;
 use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, warn};
-use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Category {
@@ -46,9 +43,8 @@ struct BybitWsMsg {
 }
 
 #[inline]
-fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, simd_json::Error> {
-    let mut bytes = text.as_bytes().to_vec();
-    simd_json::serde::from_slice(bytes.as_mut_slice())
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
+    serde_json::from_str(text)
 }
 
 #[derive(Default)]
@@ -109,15 +105,15 @@ impl OrderBookState {
         let mut bids = Vec::with_capacity(self.bids.len());
         for (p, q) in self.bids.iter().rev() {
             bids.push(ports::BookLevel {
-                price: Price(p.clone()),
-                quantity: Quantity(q.clone()),
+                price: Price(*p),
+                quantity: Quantity(*q),
             });
         }
         let mut asks = Vec::with_capacity(self.asks.len());
         for (p, q) in self.asks.iter() {
             asks.push(ports::BookLevel {
-                price: Price(p.clone()),
-                quantity: Quantity(q.clone()),
+                price: Price(*p),
+                quantity: Quantity(*q),
             });
         }
         MarketSnapshot {
@@ -132,6 +128,12 @@ impl OrderBookState {
 }
 
 pub struct BybitMarketStream;
+
+impl Default for BybitMarketStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl BybitMarketStream {
     pub fn new() -> Self {
@@ -155,26 +157,32 @@ impl MarketStream for BybitMarketStream {
         tokio::spawn(async move {
             let mut attempts = 0u32;
             loop {
-                let url = Url::parse(category.ws_base()).unwrap();
-                match connect_async(url).await {
-                    Ok((mut ws, _)) => {
+                let url = category.ws_base();
+                let config = WsClientConfig {
+                    url: url.to_string(),
+                    ..Default::default()
+                };
+                let mut ws = WsClient::new(config);
+
+                match ws.connect().await {
+                    Ok(()) => {
                         // build subscribe args
                         let args: Vec<String> = symbols
                             .iter()
                             .flat_map(|s| {
                                 vec![
-                                    format!("orderbook.{}.{}", levels, s.0),
-                                    format!("publicTrade.{}", s.0),
+                                    format!("orderbook.{}.{}", levels, s.as_str()),
+                                    format!("publicTrade.{}", s.as_str()),
                                 ]
                             })
                             .collect();
                         let sub = serde_json::json!({"op":"subscribe","args":args});
-                        let _ = ws.send(Message::Text(sub.to_string())).await;
+                        let _ = ws.send_message(&sub.to_string()).await;
 
                         let mut ob_states: HashMap<String, OrderBookState> = HashMap::new();
-                        while let Some(msg) = ws.next().await {
-                            match msg {
-                                Ok(Message::Text(txt)) => {
+                        loop {
+                            match ws.receive_message().await {
+                                Ok(Some((txt, _metrics))) => {
                                     if let Ok(m) = parse_json::<BybitWsMsg>(&txt) {
                                         if let Some(topic) = m.topic.as_deref() {
                                             if topic.starts_with("orderbook.") {
@@ -296,11 +304,10 @@ impl MarketStream for BybitMarketStream {
                                         }
                                     }
                                 }
-                                Ok(Message::Close(_)) => {
-                                    warn!("Bybit WS closed");
+                                Ok(None) => {
+                                    warn!("Bybit WS disconnected");
                                     break;
                                 }
-                                Ok(_) => {}
                                 Err(e) => {
                                     error!("Bybit WS error: {}", e);
                                     break;

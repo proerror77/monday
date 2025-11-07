@@ -10,7 +10,9 @@ pub mod router;
 pub mod traits;
 
 // 重新導出
+#[allow(ambiguous_glob_reexports)]
 pub use events::*;
 pub use hft_core::{HftError, HftResult};
 pub use router::*;
+#[allow(ambiguous_glob_reexports)]
 pub use traits::*;

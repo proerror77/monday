@@ -39,27 +39,31 @@ pub struct OrderRecord {
     pub processed_fill_ids: HashSet<String>,
 }
 
+/// Parameters for registering a new order
+#[derive(Debug, Clone)]
+pub struct RegisterOrderParams {
+    pub order_id: OrderId,
+    pub client_order_id: Option<String>,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub qty: Quantity,
+    pub venue: Option<hft_core::VenueId>,
+    pub strategy_id: Option<String>,
+}
+
 impl OrderRecord {
-    fn new(
-        order_id: OrderId,
-        client_order_id: Option<String>,
-        symbol: Symbol,
-        side: Side,
-        qty: Quantity,
-        venue: Option<hft_core::VenueId>,
-        strategy_id: Option<String>,
-    ) -> Self {
+    fn new(params: RegisterOrderParams) -> Self {
         Self {
-            order_id,
-            client_order_id,
-            symbol,
-            side,
-            qty,
+            order_id: params.order_id,
+            client_order_id: params.client_order_id,
+            symbol: params.symbol,
+            side: params.side,
+            qty: params.qty,
             cum_qty: Quantity::zero(),
             avg_price: None,
             status: OrderStatus::New,
-            venue,
-            strategy_id,
+            venue: params.venue,
+            strategy_id: params.strategy_id,
             processed_fill_ids: HashSet::new(),
         }
     }
@@ -75,40 +79,20 @@ pub struct OrderUpdate {
 }
 
 /// 最小 OMS 實作：維護 order_id → 訂單資訊 與 狀態機
+#[derive(Default)]
 pub struct OmsCore {
     orders: HashMap<OrderId, OrderRecord>,
 }
 
 impl OmsCore {
     pub fn new() -> Self {
-        Self {
-            orders: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// 註冊新下單（由引擎在 place_order 成功前後調用）
-    pub fn register_order(
-        &mut self,
-        order_id: OrderId,
-        client_order_id: Option<String>,
-        symbol: Symbol,
-        side: Side,
-        qty: Quantity,
-        venue: Option<hft_core::VenueId>,
-        strategy_id: Option<String>,
-    ) {
-        self.orders.insert(
-            order_id.clone(),
-            OrderRecord::new(
-                order_id,
-                client_order_id,
-                symbol,
-                side,
-                qty,
-                venue,
-                strategy_id,
-            ),
-        );
+    pub fn register_order(&mut self, params: RegisterOrderParams) {
+        let order_id = params.order_id.clone();
+        self.orders.insert(order_id, OrderRecord::new(params));
     }
 
     /// 應用執行事件（私有 WS 回報）更新狀態機
@@ -405,6 +389,120 @@ impl OmsCore {
     }
 }
 
+// 實現 OrderManager trait
+impl ports::OrderManager for OmsCore {
+    fn register_order(&mut self, params: ports::RegisterOrderParams) {
+        self.register_order(RegisterOrderParams {
+            order_id: params.order_id,
+            client_order_id: params.client_order_id,
+            symbol: params.symbol,
+            side: params.side,
+            qty: params.qty,
+            venue: params.venue,
+            strategy_id: params.strategy_id,
+        });
+    }
+
+    fn on_execution_event(&mut self, event: &ExecutionEvent) -> Option<ports::OrderUpdate> {
+        self.on_execution_event(event).map(|update| ports::OrderUpdate {
+            order_id: update.order_id,
+            status: match update.status {
+                OrderStatus::New => ports::OrderStatus::New,
+                OrderStatus::Acknowledged => ports::OrderStatus::Acknowledged,
+                OrderStatus::PartiallyFilled => ports::OrderStatus::PartiallyFilled,
+                OrderStatus::Filled => ports::OrderStatus::Filled,
+                OrderStatus::Canceled => ports::OrderStatus::Canceled,
+                OrderStatus::Rejected => ports::OrderStatus::Rejected,
+                OrderStatus::Expired => ports::OrderStatus::Expired,
+                OrderStatus::Replaced => ports::OrderStatus::Replaced,
+            },
+            cum_qty: update.cum_qty,
+            avg_price: update.avg_price,
+            previous_status: match update.previous_status {
+                OrderStatus::New => ports::OrderStatus::New,
+                OrderStatus::Acknowledged => ports::OrderStatus::Acknowledged,
+                OrderStatus::PartiallyFilled => ports::OrderStatus::PartiallyFilled,
+                OrderStatus::Filled => ports::OrderStatus::Filled,
+                OrderStatus::Canceled => ports::OrderStatus::Canceled,
+                OrderStatus::Rejected => ports::OrderStatus::Rejected,
+                OrderStatus::Expired => ports::OrderStatus::Expired,
+                OrderStatus::Replaced => ports::OrderStatus::Replaced,
+            },
+        })
+    }
+
+    fn export_state(&self) -> std::collections::HashMap<OrderId, ports::OrderRecord> {
+        self.orders
+            .iter()
+            .map(|(id, rec)| {
+                (
+                    id.clone(),
+                    ports::OrderRecord {
+                        order_id: rec.order_id.clone(),
+                        client_order_id: rec.client_order_id.clone(),
+                        symbol: rec.symbol.clone(),
+                        side: rec.side,
+                        qty: rec.qty,
+                        cum_qty: rec.cum_qty,
+                        avg_price: rec.avg_price,
+                        status: match rec.status {
+                            OrderStatus::New => ports::OrderStatus::New,
+                            OrderStatus::Acknowledged => ports::OrderStatus::Acknowledged,
+                            OrderStatus::PartiallyFilled => ports::OrderStatus::PartiallyFilled,
+                            OrderStatus::Filled => ports::OrderStatus::Filled,
+                            OrderStatus::Canceled => ports::OrderStatus::Canceled,
+                            OrderStatus::Rejected => ports::OrderStatus::Rejected,
+                            OrderStatus::Expired => ports::OrderStatus::Expired,
+                            OrderStatus::Replaced => ports::OrderStatus::Replaced,
+                        },
+                        venue: rec.venue,
+                        strategy_id: rec.strategy_id.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn import_state(&mut self, state: std::collections::HashMap<OrderId, ports::OrderRecord>) {
+        let converted_state: HashMap<OrderId, OrderRecord> = state
+            .into_iter()
+            .map(|(id, rec)| {
+                (
+                    id,
+                    OrderRecord {
+                        order_id: rec.order_id,
+                        client_order_id: rec.client_order_id,
+                        symbol: rec.symbol,
+                        side: rec.side,
+                        qty: rec.qty,
+                        cum_qty: rec.cum_qty,
+                        avg_price: rec.avg_price,
+                        status: match rec.status {
+                            ports::OrderStatus::New => OrderStatus::New,
+                            ports::OrderStatus::Acknowledged => OrderStatus::Acknowledged,
+                            ports::OrderStatus::Accepted => OrderStatus::Acknowledged, // 映射 Accepted 為 Acknowledged
+                            ports::OrderStatus::PartiallyFilled => OrderStatus::PartiallyFilled,
+                            ports::OrderStatus::Filled => OrderStatus::Filled,
+                            ports::OrderStatus::Canceled => OrderStatus::Canceled,
+                            ports::OrderStatus::Rejected => OrderStatus::Rejected,
+                            ports::OrderStatus::Expired => OrderStatus::Expired,
+                            ports::OrderStatus::Replaced => OrderStatus::Replaced,
+                        },
+                        venue: rec.venue,
+                        strategy_id: rec.strategy_id,
+                        processed_fill_ids: HashSet::new(), // 恢復時重置去重集合
+                    },
+                )
+            })
+            .collect();
+        self.import_state(converted_state);
+    }
+
+    fn open_order_pairs_by_strategy(&self, strategy_id: &str) -> Vec<(OrderId, Symbol)> {
+        self.open_order_pairs_by_strategy(strategy_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,15 +512,15 @@ mod tests {
     fn test_ack_and_fill() {
         let mut oms = OmsCore::new();
         let oid = OrderId("T-1".into());
-        oms.register_order(
-            oid.clone(),
-            None,
-            Symbol::new("BTCUSDT"),
-            Side::Buy,
-            Quantity::from_f64(1.0).unwrap(),
-            None,
-            Some("test_strategy".to_string()),
-        );
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: Some("test_strategy".to_string()),
+        });
 
         let ack = ExecutionEvent::OrderAck {
             order_id: oid.clone(),
@@ -447,41 +545,41 @@ mod tests {
         let mut oms = OmsCore::new();
         // o1: New (open)
         let o1 = OrderId("S-1".into());
-        oms.register_order(
-            o1.clone(),
-            None,
-            Symbol::new("BTCUSDT"),
-            Side::Buy,
-            Quantity::from_f64(1.0).unwrap(),
-            None,
-            Some("stratA".into()),
-        );
+        oms.register_order(RegisterOrderParams {
+            order_id: o1.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: Some("stratA".into()),
+        });
         // o2: Ack (open)
         let o2 = OrderId("S-2".into());
-        oms.register_order(
-            o2.clone(),
-            None,
-            Symbol::new("ETHUSDT"),
-            Side::Buy,
-            Quantity::from_f64(2.0).unwrap(),
-            None,
-            Some("stratA".into()),
-        );
+        oms.register_order(RegisterOrderParams {
+            order_id: o2.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("ETHUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(2.0).unwrap(),
+            venue: None,
+            strategy_id: Some("stratA".into()),
+        });
         let _ = oms.on_execution_event(&ExecutionEvent::OrderAck {
             order_id: o2.clone(),
             timestamp: 0,
         });
         // o3: Filled (not open)
         let o3 = OrderId("S-3".into());
-        oms.register_order(
-            o3.clone(),
-            None,
-            Symbol::new("SOLUSDT"),
-            Side::Buy,
-            Quantity::from_f64(1.0).unwrap(),
-            None,
-            Some("stratB".into()),
-        );
+        oms.register_order(RegisterOrderParams {
+            order_id: o3.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("SOLUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: Some("stratB".into()),
+        });
         let _ = oms.on_execution_event(&ExecutionEvent::Fill {
             order_id: o3,
             price: Price::from_f64(10.0).unwrap(),
@@ -492,6 +590,6 @@ mod tests {
 
         let counts = oms.open_counts_by_strategy();
         assert_eq!(counts.get("stratA"), Some(&2));
-        assert!(counts.get("stratB").is_none());
+        assert!(!counts.contains_key("stratB"));
     }
 }

@@ -18,10 +18,11 @@ use hft_core::{
     now_micros, HftError, HftResult, LatencyStage, LatencyTracker, OrderType, Side, Symbol, VenueId,
 };
 use latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
-use oms_core::OmsCore;
-use portfolio_core::Portfolio;
 use ports::Trade as MarketTrade;
-use ports::{AccountView, BoxStream, ExecutionClient, ExecutionEvent, Strategy, VenueSpec};
+use ports::{
+    AccountView, BoxStream, ExecutionClient, ExecutionEvent, OrderManager, PortfolioManager,
+    Strategy, VenueSpec,
+};
 use rustc_hash::FxHashMap;
 use snapshot::SnapshotContainer;
 use std::collections::HashMap;
@@ -103,10 +104,10 @@ pub struct Engine {
     /// 執行回報流（與 execution_clients 對應）
     #[allow(dead_code)]
     execution_streams: Vec<BoxStream<ExecutionEvent>>,
-    /// OMS 核心 - 訂單生命週期管理
-    oms_core: OmsCore,
-    /// Portfolio 核心 - 會計與資金管理
-    portfolio: Portfolio,
+    /// OMS 核心 - 訂單生命週期管理（通過 trait 注入）
+    order_manager: Option<Box<dyn OrderManager>>,
+    /// Portfolio 核心 - 會計與資金管理（通過 trait 注入）
+    portfolio_manager: Option<Box<dyn PortfolioManager>>,
     /// 执行队列系统 (SPSC)
     execution_queues: Option<EngineQueues>,
     /// 運行統計
@@ -131,6 +132,8 @@ pub struct Engine {
     strategy_venue_mapping: FxHashMap<String, VenueId>,
     /// 策略實例 ID 列表（與 strategies Vec 順序對應，用於事件過濾）
     strategy_instance_ids: Vec<String>,
+    /// 已禁用的策略索引集合（索引對應 strategies Vec）
+    disabled_strategy_indices: std::collections::HashSet<usize>,
     /// 订单到帳戶映射（Phase 1）
     order_account_map: FxHashMap<hft_core::OrderId, hft_core::AccountId>,
     /// 策略到帳戶映射（Phase 1：由 runtime 配置）
@@ -171,8 +174,8 @@ impl Engine {
             venue_specs: VenueSpec::build_default_venue_specs(),
             execution_clients: Vec::new(),
             execution_streams: Vec::new(),
-            oms_core: OmsCore::new(),
-            portfolio: Portfolio::new(),
+            order_manager: None,
+            portfolio_manager: None,
             execution_queues: None,
             stats: EngineStats {
                 cycle_count: 0,
@@ -197,6 +200,7 @@ impl Engine {
             broadcasters,
             strategy_venue_mapping: FxHashMap::default(),
             strategy_instance_ids: Vec::new(),
+            disabled_strategy_indices: std::collections::HashSet::new(),
             order_account_map: FxHashMap::default(),
             strategy_account_mapping: FxHashMap::default(),
         }
@@ -205,6 +209,16 @@ impl Engine {
     /// 设置执行队列系统（Runtime 设置）
     pub fn set_execution_queues(&mut self, queues: EngineQueues) {
         self.execution_queues = Some(queues);
+    }
+
+    /// 設置訂單管理器（依賴注入）
+    pub fn set_order_manager(&mut self, manager: Box<dyn OrderManager>) {
+        self.order_manager = Some(manager);
+    }
+
+    /// 設置 Portfolio 管理器（依賴注入）
+    pub fn set_portfolio_manager(&mut self, manager: Box<dyn PortfolioManager>) {
+        self.portfolio_manager = Some(manager);
     }
 
     /// 設置策略到場所的映射（用於單場策略事件過濾）
@@ -286,8 +300,11 @@ impl Engine {
     }
 
     /// 導出 OMS 狀態（供恢復/持久化使用）
-    pub fn export_oms_state(&self) -> HashMap<hft_core::OrderId, oms_core::OrderRecord> {
-        self.oms_core.export_state()
+    pub fn export_oms_state(&self) -> HashMap<hft_core::OrderId, ports::OrderRecord> {
+        self.order_manager
+            .as_ref()
+            .map(|om| om.export_state())
+            .unwrap_or_default()
     }
 
     /// 取得指定策略的未結訂單 (order_id, symbol) 配對，供外部控制/撤單使用
@@ -295,22 +312,37 @@ impl Engine {
         &self,
         strategy_id: &str,
     ) -> Vec<(hft_core::OrderId, hft_core::Symbol)> {
-        self.oms_core.open_order_pairs_by_strategy(strategy_id)
+        self.order_manager
+            .as_ref()
+            .map(|om| om.open_order_pairs_by_strategy(strategy_id))
+            .unwrap_or_default()
     }
 
     /// 導入 OMS 狀態（供恢復/持久化使用）
-    pub fn import_oms_state(&mut self, state: HashMap<hft_core::OrderId, oms_core::OrderRecord>) {
-        self.oms_core.import_state(state);
+    pub fn import_oms_state(&mut self, state: HashMap<hft_core::OrderId, ports::OrderRecord>) {
+        if let Some(om) = &mut self.order_manager {
+            om.import_state(state);
+        }
     }
 
     /// 導出 Portfolio 狀態（供恢復/持久化使用）
-    pub fn export_portfolio_state(&self) -> portfolio_core::PortfolioState {
-        self.portfolio.export_state()
+    pub fn export_portfolio_state(&self) -> ports::PortfolioState {
+        self.portfolio_manager
+            .as_ref()
+            .map(|pm| pm.export_state())
+            .unwrap_or_else(|| ports::PortfolioState {
+                account_view: AccountView::default(),
+                order_meta: HashMap::new(),
+                market_prices: HashMap::new(),
+                processed_fill_ids: HashMap::new(),
+            })
     }
 
     /// 導入 Portfolio 狀態（供恢復/持久化使用）
-    pub fn import_portfolio_state(&mut self, state: portfolio_core::PortfolioState) {
-        self.portfolio.import_state(state);
+    pub fn import_portfolio_state(&mut self, state: ports::PortfolioState) {
+        if let Some(pm) = &mut self.portfolio_manager {
+            pm.import_state(state);
+        }
     }
 
     /// 獲取所有階段的延遲統計數據
@@ -406,8 +438,42 @@ impl Engine {
         self.strategies.push(s);
     }
 
-    pub fn strategy_instance_ids(&self) -> &[String] {
-        &self.strategy_instance_ids
+    pub fn strategy_instance_ids(&self) -> Vec<String> {
+        self.strategy_instance_ids.clone()
+    }
+
+    /// 通过策略 ID 获取策略的不可变引用
+    pub fn get_strategy_by_id(&self, strategy_id: &str) -> Option<&Box<dyn Strategy>> {
+        let index = self.strategy_instance_ids
+            .iter()
+            .position(|id| id == strategy_id)?;
+        self.strategies.get(index)
+    }
+
+    /// 通过策略 ID 获取策略的可变引用
+    pub fn get_strategy_mut_by_id(&mut self, strategy_id: &str) -> Option<&mut Box<dyn Strategy>> {
+        let index = self.strategy_instance_ids
+            .iter()
+            .position(|id| id == strategy_id)?;
+        self.strategies.get_mut(index)
+    }
+
+    /// 设置策略启用/禁用状态
+    pub fn set_strategy_enabled(&mut self, strategy_id: &str, enabled: bool) -> HftResult<()> {
+        let index = self.strategy_instance_ids
+            .iter()
+            .position(|id| id == strategy_id)
+            .ok_or_else(|| HftError::Config(format!("策略 {} 不存在", strategy_id)))?;
+
+        if enabled {
+            // 从禁用列表中移除
+            self.disabled_strategy_indices.remove(&index);
+        } else {
+            // 添加到禁用列表
+            self.disabled_strategy_indices.insert(index);
+        }
+
+        Ok(())
     }
 
     pub fn replace_strategy(
@@ -468,6 +534,11 @@ impl Engine {
         self.account_snapshots.load()
     }
 
+    /// 獲取風控指標
+    pub fn get_risk_metrics(&self) -> Option<ports::RiskMetrics> {
+        self.risk_manager.as_ref().map(|rm| rm.risk_metrics())
+    }
+
     /// 獲取市場快照讀取者
     pub fn market_reader(&self) -> Arc<dyn snapshot::SnapshotReader<MarketView>> {
         self.market_snapshots.reader()
@@ -507,7 +578,7 @@ impl Engine {
         let mut result = EngineTickResult::default();
 
         // 只在前 100 個循環和有事件時記錄
-        if self.stats.cycle_count <= 100 || self.stats.cycle_count % 1000 == 0 {
+        if self.stats.cycle_count <= 100 || self.stats.cycle_count.is_multiple_of(1000) {
             debug!("引擎 tick #{}", self.stats.cycle_count);
         }
 
@@ -647,9 +718,23 @@ impl Engine {
             self.run_strategies_sync(&mut result)?;
         }
 
-        // 批量統計日誌（只有在有活動時才記錄）
-        if total_events > 0 || exec_processed > 0 || result.orders_generated > 0 {
+        // 🔥 降低日誌等級：只在每 100 個 tick 或有大量活動時記錄（避免洪流）
+        let should_log = self.stats.cycle_count.is_multiple_of(100)
+            || total_events > 100
+            || result.orders_generated > 10;
+
+        if should_log && (total_events > 0 || exec_processed > 0 || result.orders_generated > 0) {
             info!(
+                "Tick #{}: {} market events, {} exec events, {} orders, snapshot: {}",
+                self.stats.cycle_count,
+                total_events,
+                exec_processed,
+                result.orders_generated,
+                result.snapshot_published
+            );
+        } else if total_events > 0 || exec_processed > 0 || result.orders_generated > 0 {
+            // 其他活動 tick 使用 debug! 級別
+            debug!(
                 "Tick #{}: {} market events, {} exec events, {} orders, snapshot: {}",
                 self.stats.cycle_count,
                 total_events,
@@ -660,7 +745,7 @@ impl Engine {
         }
 
         // 定期同步延遲統計到 Prometheus（每 100 個 tick 或有活動時）
-        if self.stats.cycle_count % 100 == 0 || total_events > 0 || exec_processed > 0 {
+        if self.stats.cycle_count.is_multiple_of(100) || total_events > 0 || exec_processed > 0 {
             self.sync_latency_metrics_to_prometheus();
         }
 
@@ -681,13 +766,15 @@ impl Engine {
         // 更新 Portfolio 的市場價格用於 mark-to-market（取任一場所的中間價）
         let mut market_prices =
             std::collections::HashMap::with_capacity(market_view.orderbooks.len());
-        for (vs, _) in &market_view.orderbooks {
+        for vs in market_view.orderbooks.keys() {
             if let Some(mid_price) = market_view.get_mid_price_for_venue(vs) {
                 market_prices.insert(vs.symbol.clone(), mid_price);
             }
         }
         if !market_prices.is_empty() {
-            self.portfolio.update_market_prices(&market_prices);
+            if let Some(pm) = &mut self.portfolio_manager {
+                pm.update_market_prices(&market_prices);
+            }
         }
 
         // 發佈快照
@@ -715,8 +802,10 @@ impl Engine {
     /// 發佈帳戶快照
     fn publish_account_snapshot(&mut self, result: &mut EngineTickResult) -> Result<(), HftError> {
         // Portfolio 內部已經自動更新快照，我們只需要獲取最新的
-        let account_view = self.portfolio.reader().load();
-        self.account_snapshots.store(account_view);
+        if let Some(pm) = &self.portfolio_manager {
+            let account_view = pm.reader().load();
+            self.account_snapshots.store(account_view);
+        }
 
         debug!("發佈帳戶快照 #{}", result.snapshot_sequence);
         Ok(())
@@ -741,22 +830,25 @@ impl Engine {
         } = event
         {
             // 註冊到 OMS 與 Portfolio（供後續 Fill 計算倉位/PnL）
-            self.oms_core.register_order(
-                order_id.clone(),
-                None,
-                symbol.clone(),
-                *side,
-                *quantity,
-                *venue,
-                Some(strategy_id.clone()),
-            );
+            if let Some(om) = &mut self.order_manager {
+                om.register_order(ports::RegisterOrderParams {
+                    order_id: order_id.clone(),
+                    client_order_id: None,
+                    symbol: symbol.clone(),
+                    side: *side,
+                    qty: *quantity,
+                    venue: *venue,
+                    strategy_id: Some(strategy_id.clone()),
+                });
+            }
             // 記錄訂單所屬帳戶（若有策略對應帳戶）
             if let Some(account) = self.strategy_account_mapping.get(strategy_id) {
                 self.order_account_map
                     .insert(order_id.clone(), account.clone());
             }
-            self.portfolio
-                .register_order(order_id.clone(), symbol.clone(), *side);
+            if let Some(pm) = &mut self.portfolio_manager {
+                pm.register_order(order_id.clone(), symbol.clone(), *side);
+            }
             self.stats.orders_submitted = self.stats.orders_submitted.saturating_add(1);
             #[cfg(feature = "metrics")]
             infra_metrics::MetricsRegistry::global().inc_orders_submitted();
@@ -771,12 +863,16 @@ impl Engine {
         }
 
         // 1. 更新 OMS 狀態機
-        if let Some(order_update) = self.oms_core.on_execution_event(event) {
+        let order_update = self
+            .order_manager
+            .as_mut()
+            .and_then(|om| om.on_execution_event(event));
+        if let Some(order_update) = order_update {
             debug!("訂單狀態更新: {:?}", order_update);
 
             // 檢查是否需要生成 OrderCompleted 事件（當訂單從非Filled變為Filled）
-            if order_update.status == oms_core::OrderStatus::Filled
-                && order_update.previous_status != oms_core::OrderStatus::Filled
+            if order_update.status == ports::OrderStatus::Filled
+                && order_update.previous_status != ports::OrderStatus::Filled
             {
                 // 創建 OrderCompleted 事件
                 let completed_event = ExecutionEvent::OrderCompleted {
@@ -854,7 +950,9 @@ impl Engine {
         }
 
         // 3. 更新 Portfolio 會計
-        self.portfolio.on_execution_event(event);
+        if let Some(pm) = &mut self.portfolio_manager {
+            pm.on_execution_event(event);
+        }
 
         // 4. 通知風控管理器
         if let Some(risk_manager) = &mut self.risk_manager {
@@ -862,14 +960,16 @@ impl Engine {
         }
 
         // 5. 讀取並打印最新 AccountView（驗證閉環）
-        let av = self.portfolio.reader().load();
-        info!(
-            cash = av.cash_balance,
-            pos_count = av.positions.len(),
-            unrealized = av.unrealized_pnl,
-            realized = av.realized_pnl,
-            "AccountView 已更新"
-        );
+        if let Some(pm) = &self.portfolio_manager {
+            let av = pm.reader().load();
+            info!(
+                cash = av.cash_balance,
+                pos_count = av.positions.len(),
+                unrealized = av.unrealized_pnl,
+                realized = av.realized_pnl,
+                "AccountView 已更新"
+            );
+        }
 
         Ok(())
     }
@@ -920,6 +1020,11 @@ impl Engine {
             // strategy_instance_ids 與 strategies Vec 順序對應
 
             for (strategy_idx, strategy) in self.strategies.iter_mut().enumerate() {
+                // 跳過已禁用的策略
+                if self.disabled_strategy_indices.contains(&strategy_idx) {
+                    continue;
+                }
+
                 // 使用策略實例 ID（而非類型名稱）進行事件過濾
                 let unknown_id = "unknown".to_string();
                 let strategy_instance_id = self
@@ -1208,16 +1313,87 @@ impl Engine {
 
     /// 獲取系統背壓狀態（用於運行時監控）
     pub fn get_backpressure_status(&self) -> Vec<BackpressureStatus> {
-        // 注意：由於當前架構限制，我們只能報告基本狀態
-        // 在生產環境中，需要從 EventConsumer 或相關組件獲取實際狀態
-        vec![BackpressureStatus {
-            utilization: 0.0, // 實際實施中需要從消費者獲取
-            is_under_pressure: false,
-            events_dropped_total: 0,
-            recommended_action: "Backpressure monitoring requires EventConsumer integration"
-                .to_string(),
-            queue_capacity: self.config.ingestion.queue_capacity,
-        }]
+        let mut statuses = Vec::new();
+
+        // 1. 從每個 EventConsumer 收集攝取背壓狀態
+        for (idx, consumer) in self.event_consumers.iter().enumerate() {
+            let utilization = consumer.utilization();
+            let is_under_pressure = utilization > 0.7;
+
+            let recommended_action = if utilization > 0.9 {
+                "Critical: Ingestion queue near capacity, consider scaling or reducing data flow"
+                    .to_string()
+            } else if utilization > 0.7 {
+                "Warning: High ingestion queue utilization, monitor closely".to_string()
+            } else {
+                "Normal operation".to_string()
+            };
+
+            statuses.push(BackpressureStatus {
+                utilization,
+                is_under_pressure,
+                events_dropped_total: self.stats.market_events_dropped,
+                recommended_action: format!("[Consumer {}] {}", idx, recommended_action),
+                queue_capacity: self.config.ingestion.queue_capacity,
+            });
+        }
+
+        // 2. 從執行隊列收集統計（如果存在）
+        if let Some(exec_queues) = &self.execution_queues {
+            let queue_stats = exec_queues.stats();
+            let intent_queue_full = queue_stats.intent_queue_full_count > 0;
+            let event_queue_full = queue_stats.event_queue_full_count > 0;
+
+            let is_under_pressure = intent_queue_full || event_queue_full;
+            let total_dropped = queue_stats.intent_queue_full_count
+                + queue_stats.event_queue_full_count
+                + self.stats.intents_dropped;
+
+            let recommended_action = if is_under_pressure {
+                format!(
+                    "Execution queue backpressure detected: intent_full={}, event_full={}, intents_dropped={}",
+                    queue_stats.intent_queue_full_count,
+                    queue_stats.event_queue_full_count,
+                    self.stats.intents_dropped
+                )
+            } else {
+                "Normal execution queue operation".to_string()
+            };
+
+            // 估計執行隊列的利用率（基於 full 計數和實際流量）
+            let utilization = if is_under_pressure {
+                0.95
+            } else {
+                // 基於發送/接收比率估算
+                let intent_ratio = if queue_stats.intents_sent > 0 {
+                    queue_stats.intents_received as f64 / queue_stats.intents_sent as f64
+                } else {
+                    0.0
+                };
+                intent_ratio.min(1.0)
+            };
+
+            statuses.push(BackpressureStatus {
+                utilization,
+                is_under_pressure,
+                events_dropped_total: total_dropped,
+                recommended_action: format!("[Execution Queue] {}", recommended_action),
+                queue_capacity: 0, // 執行隊列容量不在此處暴露
+            });
+        }
+
+        // 如果沒有任何消費者或隊列，返回一個默認狀態
+        if statuses.is_empty() {
+            statuses.push(BackpressureStatus {
+                utilization: 0.0,
+                is_under_pressure: false,
+                events_dropped_total: self.stats.market_events_dropped + self.stats.intents_dropped,
+                recommended_action: "No active event consumers or execution queues".to_string(),
+                queue_capacity: self.config.ingestion.queue_capacity,
+            });
+        }
+
+        statuses
     }
 }
 

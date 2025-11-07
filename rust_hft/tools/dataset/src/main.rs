@@ -32,6 +32,7 @@ enum Cmd {
         #[arg(long, default_value = "hft")]
         database: String,
     },
+    #[allow(non_snake_case)]
     Export {
         #[arg(long, default_value = "binance")]
         venue: String,
@@ -143,8 +144,9 @@ impl Book {
         }
         (bpx, bqt, apx, aqt)
     }
+    #[allow(dead_code)]
     fn mid(&self) -> Option<f64> {
-        let bb = self.bids.iter().rev().next().map(|(p, _)| p.0)?;
+        let bb = self.bids.iter().next_back().map(|(p, _)| p.0)?;
         let ba = self.asks.iter().next().map(|(p, _)| p.0)?;
         Some((bb + ba) / 2.0)
     }
@@ -162,6 +164,7 @@ struct GridRow {
     ask_qty: Vec<f64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_grid(
     venue: &str,
     symbol: &str,
@@ -194,8 +197,8 @@ async fn run_grid(
             bids_qty: Vec<f64>,
             asks_px: Vec<f64>,
             asks_qty: Vec<f64>,
-            u: Option<u64>,
-            pu: Option<u64>,
+            _u: Option<u64>,
+            _pu: Option<u64>,
         }
         let q = format!("SELECT event_ts, bids_px, bids_qty, asks_px, asks_qty, u, pu FROM {} WHERE symbol = ? AND event_ts >= ? AND event_ts <= ? {}", table, order);
         let mut cur = ch
@@ -230,7 +233,7 @@ async fn run_grid(
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct BitgetRow {
             event_ts: u64,
-            action: Option<String>,
+            _action: Option<String>,
             bids_px: Vec<f64>,
             bids_qty: Vec<f64>,
             asks_px: Vec<f64>,
@@ -305,6 +308,7 @@ async fn flush_grid(ch: &ChClient, rows: &mut Vec<GridRow>) -> Result<()> {
     Ok(())
 }
 
+#[allow(non_snake_case)]
 #[derive(clickhouse::Row, serde::Serialize)]
 struct SampleRow {
     ts: u64,
@@ -325,6 +329,7 @@ struct SampleRow {
     midH: f64,
 }
 
+#[allow(clippy::too_many_arguments, non_snake_case)]
 async fn run_export(
     venue: &str,
     symbol: &str,
@@ -387,18 +392,19 @@ async fn run_export(
         asks_px.push(truncate_pad(&apx, k));
         asks_qty.push(truncate_pad(&aqt, k));
     }
-    let step_us = step_ms as u64 * 1000;
-    let h_steps = (H_ms as u64 + step_ms as u64 - 1) / step_ms as u64; // 四捨五入
+    let _step_us = step_ms as u64 * 1000;
+    let h_steps = (H_ms as u64).div_ceil(step_ms as u64);
     let mut rows: Vec<SampleRow> = Vec::new();
     let tick = estimate_tick(&bids_px, &asks_px).unwrap_or(0.01);
 
     let mut i = 0usize;
     while i + L + (h_steps as usize) < ts.len() {
-        let mut mid0 = best_mid[i + L - 1];
+        let mid0 = best_mid[i + L - 1];
         if !mid0.is_finite() {
             i += 1;
             continue;
         }
+        #[allow(non_snake_case)]
         let midH = best_mid[i + L - 1 + (h_steps as usize)];
         if !midH.is_finite() {
             i += 1;
@@ -470,7 +476,7 @@ async fn run_export(
     Ok(())
 }
 
-fn truncate_pad(v: &Vec<f64>, k: usize) -> Vec<f64> {
+fn truncate_pad(v: &[f64], k: usize) -> Vec<f64> {
     let mut out = Vec::with_capacity(k);
     for i in 0..k {
         out.push(*v.get(i).unwrap_or(&0.0));
@@ -478,21 +484,21 @@ fn truncate_pad(v: &Vec<f64>, k: usize) -> Vec<f64> {
     out
 }
 
-fn estimate_tick(bpx: &Vec<Vec<f64>>, apx: &Vec<Vec<f64>>) -> Option<f64> {
+fn estimate_tick(bpx: &[Vec<f64>], apx: &[Vec<f64>]) -> Option<f64> {
     // 估算最常見的價差步長
     let mut last = None;
     let mut diffs = Vec::new();
     for i in 0..bpx.len() {
-        let bb = bpx[i].get(0).copied().unwrap_or(0.0);
-        let ba = apx[i].get(0).copied().unwrap_or(0.0);
+        let bb = bpx[i].first().copied().unwrap_or(0.0);
+        let ba = apx[i].first().copied().unwrap_or(0.0);
         if bb > 0.0 && ba > 0.0 {
             last = Some((bb, ba));
             break;
         }
     }
     for i in 1..bpx.len() {
-        let bb = bpx[i].get(0).copied().unwrap_or(0.0);
-        let ba = apx[i].get(0).copied().unwrap_or(0.0);
+        let bb = bpx[i].first().copied().unwrap_or(0.0);
+        let ba = apx[i].first().copied().unwrap_or(0.0);
         if bb > 0.0 && ba > 0.0 {
             if let Some((pbb, pba)) = last {
                 diffs.push((bb - pbb).abs());

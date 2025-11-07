@@ -85,7 +85,7 @@ impl ExecutionClient for OkxExecutionClient {
                 px: Option<String>,
             }
             let req = Req {
-                inst_id: &intent.symbol.as_str(),
+                inst_id: intent.symbol.as_str(),
                 td_mode: "cash",
                 side: match intent.side {
                     hft_core::Side::Buy => "buy",
@@ -129,8 +129,7 @@ impl ExecutionClient for OkxExecutionClient {
                 )));
             }
             let ord_id = r
-                .data
-                .get(0)
+                .data.first()
                 .and_then(|v| v.get("ordId"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
@@ -360,7 +359,7 @@ impl ExecutionClient for OkxExecutionClient {
                                         if let Some(data) = v
                                             .get("data")
                                             .and_then(|d| d.as_array())
-                                            .and_then(|arr| arr.get(0))
+                                            .and_then(|arr| arr.first())
                                         {
                                             let oid = data
                                                 .get("ordId")
@@ -474,17 +473,24 @@ impl ExecutionClient for OkxExecutionClient {
             .map_err(|e| HftError::Network(e.to_string()))?;
 
         #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
         struct Item {
-            ordId: String,
-            instId: String,
+            #[serde(rename = "ordId")]
+            ord_id: String,
+            #[serde(rename = "instId")]
+            inst_id: String,
             side: String,
-            ordType: String,
+            #[serde(rename = "ordType")]
+            ord_type: String,
             sz: String,
-            fillSz: String,
+            #[serde(rename = "fillSz")]
+            fill_sz: String,
             px: Option<String>,
             state: String,
-            cTime: String,
-            uTime: String,
+            #[serde(rename = "cTime")]
+            c_time: String,
+            #[serde(rename = "uTime")]
+            u_time: String,
         }
         #[derive(serde::Deserialize)]
         struct Resp {
@@ -509,12 +515,12 @@ impl ExecutionClient for OkxExecutionClient {
                     "buy" => hft_core::Side::Buy,
                     _ => hft_core::Side::Sell,
                 };
-                let order_type = match it.ordType.as_str() {
+                let order_type = match it.ord_type.as_str() {
                     "market" => hft_core::OrderType::Market,
                     _ => hft_core::OrderType::Limit,
                 };
                 let qty = Quantity::from_str(&it.sz).unwrap_or(Quantity::zero());
-                let filled = Quantity::from_str(&it.fillSz).unwrap_or(Quantity::zero());
+                let filled = Quantity::from_str(&it.fill_sz).unwrap_or(Quantity::zero());
                 let remaining = Quantity(qty.0 - filled.0);
                 let price = it.px.as_ref().and_then(|s| Price::from_str(s).ok());
                 let status = match it.state.as_str() {
@@ -525,11 +531,11 @@ impl ExecutionClient for OkxExecutionClient {
                     "rejected" => ports::OrderStatus::Rejected,
                     _ => ports::OrderStatus::Accepted,
                 };
-                let created_at = it.cTime.parse::<u64>().unwrap_or(0) * 1000;
-                let updated_at = it.uTime.parse::<u64>().unwrap_or(0) * 1000;
+                let created_at = it.c_time.parse::<u64>().unwrap_or(0) * 1000;
+                let updated_at = it.u_time.parse::<u64>().unwrap_or(0) * 1000;
                 out.push(OpenOrder {
-                    order_id: OrderId(it.ordId),
-                    symbol: hft_core::Symbol::from(it.instId),
+                    order_id: OrderId(it.ord_id),
+                    symbol: hft_core::Symbol::from(it.inst_id),
                     side,
                     order_type,
                     original_quantity: qty,

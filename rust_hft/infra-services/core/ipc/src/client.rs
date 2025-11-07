@@ -1,18 +1,16 @@
 //! IPC Client implementation
 
 use crate::{
-    Command, IPCError, IPCMessage, IPCPayload, IPCResult, Response, ResponseData, StatusUpdate,
+    Command, IPCError, IPCMessage, IPCPayload, IPCResult, Response, StatusUpdate,
     MAX_MESSAGE_SIZE,
 };
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
-use tracing::{debug, error, warn};
-use uuid::Uuid;
+use tracing::{debug, error};
 
 /// IPC Client for sending commands to the control plane
 pub struct IPCClient {

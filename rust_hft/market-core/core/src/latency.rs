@@ -5,6 +5,7 @@
 //! - 零分配延遲統計
 //! - 階段式延遲鏈追蹤
 
+#[cfg(feature = "histogram")]
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -365,6 +366,9 @@ impl LatencyStageStats {
     }
 
     /// 從 HDR Histogram 對象產生統計信息
+    ///
+    /// 注意：此方法需要啟用 `histogram` feature
+    #[cfg(feature = "histogram")]
     pub fn from_histogram(stage: LatencyStage, histogram: &Histogram<u64>) -> Self {
         if histogram.is_empty() {
             return Self {

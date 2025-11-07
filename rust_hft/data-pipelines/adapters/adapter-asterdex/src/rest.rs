@@ -26,7 +26,7 @@ impl AsterdexRestClient {
         let limit = limit.unwrap_or(100);
         let path = format!(
             "/fapi/v1/depth?symbol={}&limit={}",
-            symbol.to_string(),
+            symbol,
             limit
         );
 

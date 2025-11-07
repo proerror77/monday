@@ -100,10 +100,10 @@ impl AdapterBridge {
                             Some(Ok(event)) => {
                                 events_processed += 1;
 
-                                // 每個事件都記錄，以便調試
+                                // 🔥 降低日誌等級：事件級記錄改為 debug!（避免洪流）
                                 match &event {
                                     ports::MarketEvent::Bar(bar) => {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             seq = events_processed,
                                             event_kind = "bar",
                                             symbol = %bar.symbol,
@@ -113,7 +113,7 @@ impl AdapterBridge {
                                         );
                                     }
                                     ports::MarketEvent::Trade(trade) => {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             seq = events_processed,
                                             event_kind = "trade",
                                             symbol = %trade.symbol,
@@ -124,7 +124,7 @@ impl AdapterBridge {
                                         );
                                     }
                                     ports::MarketEvent::Snapshot(snap) => {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             seq = events_processed,
                                             event_kind = "snapshot",
                                             symbol = %snap.symbol,
@@ -134,7 +134,7 @@ impl AdapterBridge {
                                         );
                                     }
                                     _ => {
-                                        tracing::info!(
+                                        tracing::debug!(
                                             seq = events_processed,
                                             event_kind = "other",
                                             "AdapterBridge 收到事件"
@@ -149,8 +149,8 @@ impl AdapterBridge {
                                     tracing::debug!("事件成功攝取到 ring buffer");
                                 }
 
-                                // 每 10 個事件記錄一次統計（降低頻率以便調試）
-                                if events_processed % 10 == 0 {
+                                // 🔥 降低統計輸出頻率：每 1000 個事件記錄一次（避免洪流）
+                                if events_processed.is_multiple_of(1000) {
                                     let metrics = ingester.metrics();
                                     tracing::info!("攝取統計: 接收 {}, 丟棄 {}, 陳舊 {}, 最大利用率 {:.2}%",
                                            metrics.events_received,

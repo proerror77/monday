@@ -98,7 +98,7 @@ impl<R: BufRead> Iterator for EventStream<R> {
     type Item = anyhow::Result<EventEnvelope>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(line) = self.reader.next() {
+        for line in self.reader.by_ref() {
             self.line_no += 1;
             match line {
                 Ok(ref raw) if raw.trim().is_empty() => continue,

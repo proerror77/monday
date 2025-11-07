@@ -423,7 +423,7 @@ impl LobFlowGridStrategy {
         };
 
         let micro_price =
-            if let (Some(b_top), Some(a_top)) = (self.state.bids.get(0), self.state.asks.get(0)) {
+            if let (Some(b_top), Some(a_top)) = (self.state.bids.first(), self.state.asks.first()) {
                 let vb = bid_sum.max(1e-8);
                 let va = ask_sum.max(1e-8);
                 Some((va * b_top.0 + vb * a_top.0) / (va + vb))

@@ -1,12 +1,12 @@
 //! IPC Server implementation
 
 use crate::handlers::CommandHandler;
-use crate::{Command, IPCError, IPCMessage, IPCPayload, IPCResult, Response, MAX_MESSAGE_SIZE};
+use crate::{IPCError, IPCMessage, IPCPayload, IPCResult, Response, MAX_MESSAGE_SIZE};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 /// IPC Server for handling control plane commands

@@ -238,8 +238,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 测试健康检查端点
-        let health_url = "http://127.0.0.1:19091/health";
-        let client = reqwest::Client::new();
+        let _health_url = "http://127.0.0.1:19091/health";
+        let _client = reqwest::Client::new();
 
         // 注意：这个测试需要 reqwest，但为了保持依赖最小，我们先跳过实际的 HTTP 请求
         // 在实际使用中，可以用 curl 或其他工具测试

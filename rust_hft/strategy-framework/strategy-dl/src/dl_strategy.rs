@@ -196,7 +196,7 @@ impl DlStrategy {
         result: &InferenceResult,
         account: &AccountView,
     ) -> HftResult<Vec<OrderIntent>> {
-        let signal = result.output.get(0).copied().unwrap_or(0.0);
+        let signal = result.output.first().copied().unwrap_or(0.0);
         if signal.abs() < output_threshold as f32 {
             return Ok(Vec::new());
         }
@@ -288,5 +288,71 @@ impl Strategy for DlStrategy {
 
     fn name(&self) -> &str {
         &self.config.name
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl DlStrategy {
+    /// 热重载模型
+    pub async fn load_model(
+        &mut self,
+        model_path: std::path::PathBuf,
+        model_version: Option<String>,
+    ) -> HftResult<()> {
+        info!("热重载 DL 模型: {:?} (版本: {:?})", model_path, model_version);
+
+        // 更新配置
+        self.config.model.model_path = model_path;
+        self.config.model.model_version = model_version;
+
+        // 重新加载模型
+        let model_handle = ModelLoader::load_model(self.config.model.clone())?;
+
+        // 创建新的推理引擎
+        let new_inference_engine = InferenceEngine::new(
+            model_handle,
+            self.config.inference.clone(),
+            self.config.risk.clone(),
+            self.config.model.model_version.clone(),
+        )?;
+
+        // 原子性替换推理引擎
+        self.inference_engine = new_inference_engine;
+
+        info!("模型热重载完成");
+        Ok(())
+    }
+
+    /// 获取当前模型版本
+    pub fn get_model_version(&self) -> Option<String> {
+        self.config.model.model_version.clone()
+    }
+
+    /// 获取策略统计信息
+    pub fn get_stats(&self) -> Vec<DlStrategyStats> {
+        let now = Self::current_timestamp();
+        self.symbol_states
+            .iter()
+            .map(|(symbol_str, state)| {
+                let is_degraded = matches!(
+                    self.inference_engine.get_state(),
+                    InferenceEngineState::Degraded
+                );
+                DlStrategyStats {
+                    symbol: Symbol::new(symbol_str),
+                    is_degraded,
+                    last_inference_ts: state.last_inference_request,
+                    last_success_ts: state.last_successful_inference,
+                    consecutive_failures: state.consecutive_failures,
+                }
+            })
+            .collect()
     }
 }

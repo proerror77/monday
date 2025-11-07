@@ -592,6 +592,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_exchange_collector(
     exchange_name: String,
     symbols: Vec<String>,
@@ -767,6 +768,7 @@ async fn run_exchange_collector(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_exchange_session(
     session_label: String,
     exchange: Box<dyn Exchange + Send + Sync>,
@@ -822,7 +824,7 @@ async fn run_exchange_session(
                 use base64::Engine;
                 let mut nonce = [0u8; 16];
                 rand::thread_rng().fill(&mut nonce);
-                base64::engine::general_purpose::STANDARD.encode(&nonce)
+                base64::engine::general_purpose::STANDARD.encode(nonce)
             };
             req = req.header("Sec-WebSocket-Key", key);
 

@@ -1,4 +1,5 @@
 //! 市場數據聚合：TopN SoA + BarBuilder + 多交易所 Joiner
+use hft_core::latency::LatencyStage;
 use hft_core::*;
 use ports::*;
 use rust_decimal::prelude::ToPrimitive;
@@ -246,12 +247,12 @@ impl CrossExchangeJoiner {
                 // 計算最大可交易數量 (取兩邊最小值) - 转换为 Decimal 供边界使用
                 let bid_qty = self.exchanges[&best_bid.1]
                     .bid_quantities
-                    .get(0)
+                    .first()
                     .copied()
                     .unwrap_or(FixedQuantity::ZERO);
                 let ask_qty = self.exchanges[&best_ask.1]
                     .ask_quantities
-                    .get(0)
+                    .first()
                     .copied()
                     .unwrap_or(FixedQuantity::ZERO);
                 let max_qty = if bid_qty.raw() < ask_qty.raw() {
@@ -310,12 +311,12 @@ impl CrossExchangeJoiner {
                 // 计算最大可交易数量
                 let bid_qty = self.exchanges[&best_bid.1]
                     .bid_quantities
-                    .get(0)
+                    .first()
                     .copied()
                     .unwrap_or(FixedQuantity::ZERO);
                 let ask_qty = self.exchanges[&best_ask.1]
                     .ask_quantities
-                    .get(0)
+                    .first()
                     .copied()
                     .unwrap_or(FixedQuantity::ZERO);
                 let max_qty = if bid_qty.raw() < ask_qty.raw() {
@@ -353,6 +354,12 @@ pub struct AggregationEngine {
     pub snapshot_version: u64,
 }
 
+impl Default for AggregationEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AggregationEngine {
     pub fn new() -> Self {
         Self {
@@ -378,17 +385,15 @@ impl AggregationEngine {
         }
     }
 
+    /// 處理市場事件並生成輸出事件（不含延遲追蹤）
+    ///
+    /// 此方法用於處理原始 MarketEvent，不記錄延遲。
+    /// 如需延遲追蹤，請使用 `process_tracked_event_into`。
     pub fn process_market_event_into(
         &mut self,
         event: MarketEvent,
         output_events: &mut Vec<MarketEvent>,
     ) {
-        let _aggregation_start = now_micros();
-
-        // TODO: 從 TrackedMarketEvent 中提取延遲追蹤器，並記錄聚合階段
-        // let mut tracker = event.tracker;
-        // tracker.record_stage(LatencyStage::Aggregation);
-
         match event {
             MarketEvent::Snapshot(snapshot) => {
                 // 创建新的快照（不可变），替换旧的 Arc
@@ -496,20 +501,65 @@ impl AggregationEngine {
             .retain(|_, builder| current_time < builder.close_time + self.stale_threshold_us);
     }
 
-    /// 新增：處理單個事件並返回生成的事件
+    /// 處理帶延遲追蹤的市場事件（熱路徑優化版本）
+    ///
+    /// 此方法從 TrackedMarketEvent 中提取 tracker，記錄聚合階段延遲，
+    /// 然後處理事件並生成輸出。
+    ///
+    /// # Performance
+    ///
+    /// - 零拷貝：直接移動 event 所有權
+    /// - 延遲追蹤開銷：~5-10ns (單次 record_stage)
+    pub fn process_tracked_event_into(
+        &mut self,
+        mut tracked_event: TrackedMarketEvent,
+        output_events: &mut Vec<MarketEvent>,
+    ) {
+        // 記錄聚合階段開始
+        tracked_event.tracker.record_stage(LatencyStage::Aggregation);
+
+        // 處理事件（移動所有權）
+        self.process_market_event_into(tracked_event.event, output_events);
+
+        // TODO: 如果需要，可以將 tracker 附加到輸出事件
+        // 目前 output_events 是 Vec<MarketEvent>，不包含 tracker
+        // 未來可以考慮輸出 Vec<TrackedMarketEvent> 以保持延遲鏈
+    }
+
+    /// 處理單個事件並返回生成的事件（無延遲追蹤）
     pub fn handle_event(&mut self, event: MarketEvent) -> Result<Vec<MarketEvent>, HftError> {
         let mut events = Vec::with_capacity(4);
         self.handle_event_into(event, &mut events)?;
         Ok(events)
     }
 
-    /// 新增：處理事件並將結果寫入提供的緩衝
+    /// 處理事件並將結果寫入提供的緩衝（無延遲追蹤）
     pub fn handle_event_into(
         &mut self,
         event: MarketEvent,
         output_events: &mut Vec<MarketEvent>,
     ) -> Result<(), HftError> {
         self.process_market_event_into(event, output_events);
+        Ok(())
+    }
+
+    /// 處理帶追蹤的事件並返回生成的事件（含延遲追蹤）
+    pub fn handle_tracked_event(
+        &mut self,
+        tracked_event: TrackedMarketEvent,
+    ) -> Result<Vec<MarketEvent>, HftError> {
+        let mut events = Vec::with_capacity(4);
+        self.handle_tracked_event_into(tracked_event, &mut events)?;
+        Ok(events)
+    }
+
+    /// 處理帶追蹤的事件並將結果寫入提供的緩衝（含延遲追蹤）
+    pub fn handle_tracked_event_into(
+        &mut self,
+        tracked_event: TrackedMarketEvent,
+        output_events: &mut Vec<MarketEvent>,
+    ) -> Result<(), HftError> {
+        self.process_tracked_event_into(tracked_event, output_events);
         Ok(())
     }
 
@@ -576,16 +626,16 @@ impl MarketView {
     /// 獲取最佳買價 (边界方法：转换为 Decimal)
     pub fn get_best_bid_for_venue(&self, key: &VenueSymbol) -> Option<(Price, Quantity)> {
         let orderbook = self.get_orderbook(key)?;
-        let fixed_price = orderbook.bid_prices.get(0)?;
-        let fixed_qty = orderbook.bid_quantities.get(0)?;
+        let fixed_price = orderbook.bid_prices.first()?;
+        let fixed_qty = orderbook.bid_quantities.first()?;
         Some(((*fixed_price).into(), (*fixed_qty).into()))
     }
 
     /// 獲取最佳賣價 (边界方法：转换为 Decimal)
     pub fn get_best_ask_for_venue(&self, key: &VenueSymbol) -> Option<(Price, Quantity)> {
         let orderbook = self.get_orderbook(key)?;
-        let fixed_price = orderbook.ask_prices.get(0)?;
-        let fixed_qty = orderbook.ask_quantities.get(0)?;
+        let fixed_price = orderbook.ask_prices.first()?;
+        let fixed_qty = orderbook.ask_quantities.first()?;
         Some(((*fixed_price).into(), (*fixed_qty).into()))
     }
 
@@ -617,7 +667,7 @@ impl MarketView {
 
     /// 便利方法：取得任一場所的最佳賣價（僅供兼容舊接口使用）
     pub fn get_best_ask_any(&self, symbol: &Symbol) -> Option<(Price, Quantity)> {
-        for (k, _) in &self.orderbooks {
+        for k in self.orderbooks.keys() {
             if &k.symbol == symbol {
                 return self.get_best_ask_for_venue(k);
             }
@@ -626,7 +676,7 @@ impl MarketView {
     }
     /// 便利方法：取得任一場所的最佳買價（僅供兼容舊接口使用）
     pub fn get_best_bid_any(&self, symbol: &Symbol) -> Option<(Price, Quantity)> {
-        for (k, _) in &self.orderbooks {
+        for k in self.orderbooks.keys() {
             if &k.symbol == symbol {
                 return self.get_best_bid_for_venue(k);
             }
@@ -635,7 +685,7 @@ impl MarketView {
     }
     /// 便利方法：任一場所中間價
     pub fn get_mid_price_any(&self, symbol: &Symbol) -> Option<Price> {
-        for (k, _) in &self.orderbooks {
+        for k in self.orderbooks.keys() {
             if &k.symbol == symbol {
                 return self.get_mid_price_for_venue(k);
             }

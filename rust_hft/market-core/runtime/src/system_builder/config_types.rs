@@ -46,6 +46,15 @@ pub struct SystemEngineConfig {
     /// Auto-cancel exchange-only orders discovered in reconciliation
     #[serde(default)]
     pub auto_cancel_exchange_only: bool,
+    /// 執行隊列配置 - 意圖隊列容量 (power of 2)
+    #[serde(default = "default_intent_queue_capacity")]
+    pub intent_queue_capacity: usize,
+    /// 執行隊列配置 - 回報隊列容量 (power of 2)
+    #[serde(default = "default_event_queue_capacity")]
+    pub event_queue_capacity: usize,
+    /// 執行隊列配置 - 批處理大小
+    #[serde(default = "default_execution_batch_size")]
+    pub execution_batch_size: usize,
 }
 
 fn default_ack_timeout_ms() -> u64 {
@@ -53,6 +62,15 @@ fn default_ack_timeout_ms() -> u64 {
 }
 fn default_reconcile_interval_ms() -> u64 {
     5000
+}
+fn default_intent_queue_capacity() -> usize {
+    4096
+}
+fn default_event_queue_capacity() -> usize {
+    8192
+}
+fn default_execution_batch_size() -> usize {
+    32
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -145,6 +163,7 @@ pub struct EnhancedRiskSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct TradingWindow {
     pub start_hhmm: String,
     pub end_hhmm: String,
@@ -317,7 +336,7 @@ pub enum StrategyParams {
     },
     LobFlowGrid {
         #[serde(flatten)]
-        config: LobFlowGridParams,
+        config: Box<LobFlowGridParams>,
     },
 }
 

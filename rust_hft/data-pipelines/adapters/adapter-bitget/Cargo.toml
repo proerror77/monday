@@ -8,10 +8,9 @@ description = "Bitget 公有行情 adapter (實作 MarketStream)"
 hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
 integration = { package = "hft-integration", path = "../../../market-core/integration" }
-engine = { package = "hft-engine", path = "../../../market-core/engine" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-simd-json = "0.13"
+simd-json = { workspace = true, optional = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
@@ -22,7 +21,14 @@ crc32fast = "1"
 
 [features]
 default = []
+json-simd = ["dep:simd-json"]
 metrics = []
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
+chrono = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
 
 [lib]
 name = "data_adapter_bitget"

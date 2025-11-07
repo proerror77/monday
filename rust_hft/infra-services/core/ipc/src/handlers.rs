@@ -1,7 +1,7 @@
 //! Command handlers for IPC server
 
 use crate::{
-    AccountInfo, Command, Order, Position, Response, ResponseData, SystemStatus, TradingMode,
+    AccountInfo, Command, Response, ResponseData, SystemStatus, TradingMode,
 };
 use async_trait::async_trait;
 
@@ -44,7 +44,7 @@ impl CommandHandler for DefaultCommandHandler {
             Command::LoadModel {
                 model_path,
                 model_version,
-                sha256_hash,
+                sha256_hash: _,
             } => {
                 // TODO: Implement model loading
                 Response::Error {
@@ -135,14 +135,24 @@ impl CommandHandler for DefaultCommandHandler {
             }
             Command::SetSymbolLimits {
                 symbol,
-                max_position,
-                max_notional,
+                max_position: _,
+                max_notional: _,
             } => {
                 // TODO: Implement symbol limit updates
                 Response::Error {
                     message: format!(
                         "Set symbol limits for {} not implemented yet",
                         symbol.as_str()
+                    ),
+                    code: Some(501),
+                }
+            }
+            Command::UpdateStrategyParams { strategy_id, .. } => {
+                // TODO: Implement dynamic strategy parameter updates
+                Response::Error {
+                    message: format!(
+                        "Update strategy params for {} not implemented yet",
+                        strategy_id
                     ),
                     code: Some(501),
                 }
@@ -161,8 +171,9 @@ impl CommandHandler for MockCommandHandler {
             Command::Start => Response::Ok,
             Command::Stop => Response::Ok,
             Command::EmergencyStop => Response::Ok,
-            Command::LoadModel { model_version, .. } => Response::Ok,
+            Command::LoadModel {  .. } => Response::Ok,
             Command::UpdateRisk { .. } => Response::Ok,
+            Command::UpdateStrategyParams { .. } => Response::Ok,
             Command::GetStatus => {
                 let status = SystemStatus {
                     uptime_seconds: 3600,

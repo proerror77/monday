@@ -1,7 +1,12 @@
 //! Binance 消息格式轉換器
+//!
+//! 使用統一的 feature-gated JSON 解析接口（integration::json）
+//! - 默認使用 serde_json（穩定、成熟）
+//! - 啟用 json-simd feature 時使用 simd-json（2-4x 性能提升）
 
 use crate::message_types::*;
 use hft_core::{HftError, HftResult, Price, Quantity, Side, Symbol, Timestamp, VenueId};
+use integration::json::Value;
 use ports::events::*;
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
@@ -12,16 +17,49 @@ use tracing::{debug, warn};
 pub struct MessageConverter;
 
 impl MessageConverter {
+    /// 使用統一的 feature-gated JSON 解析
+    ///
+    /// 根據 json-simd feature 自動切換解析器：
+    /// - 默認: serde_json::from_str (穩定)
+    /// - json-simd: simd_json::from_slice (2-4x 更快)
+    ///
+    /// 注意：直接解析為目標類型，跳過中間 Value 步驟以提升性能
     #[inline]
-    fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, simd_json::Error> {
-        let mut bytes = text.as_bytes().to_vec();
-        simd_json::serde::from_slice(bytes.as_mut_slice())
+    fn parse_json<T: DeserializeOwned>(text: &str) -> HftResult<T> {
+        #[cfg(feature = "json-simd")]
+        {
+            // simd_json 需要可變緩衝區
+            let mut bytes = text.as_bytes().to_vec();
+            simd_json::from_slice(&mut bytes)
+                .map_err(|e| HftError::Parse(format!("SIMD 解析失敗: {}", e)))
+        }
+        #[cfg(not(feature = "json-simd"))]
+        {
+            serde_json::from_str(text)
+                .map_err(|e| HftError::Parse(format!("JSON 解析失敗: {}", e)))
+        }
     }
 
+    /// 從 Value 反序列化為目標類型
+    ///
+    /// 用於 StreamMessage 流程中已經有 Value 的情況
     #[inline]
-    fn parse_value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, simd_json::Error> {
-        let owned: simd_json::OwnedValue = value.try_into()?;
-        simd_json::serde::from_owned_value(owned)
+    fn parse_value<T: DeserializeOwned>(value: Value) -> HftResult<T> {
+        #[cfg(feature = "json-simd")]
+        {
+            // simd_json 沒有提供從 OwnedValue 直接反序列化的公開 API
+            // 需要先序列化回 JSON，然後重新解析（性能較差，但功能正確）
+            let json_str = simd_json::to_string(&value)
+                .map_err(|e| HftError::Parse(format!("SIMD 序列化失敗: {}", e)))?;
+            let mut bytes = json_str.as_bytes().to_vec();
+            simd_json::from_slice(&mut bytes)
+                .map_err(|e| HftError::Parse(format!("SIMD 反序列化失敗: {}", e)))
+        }
+        #[cfg(not(feature = "json-simd"))]
+        {
+            serde_json::from_value(value)
+                .map_err(|e| HftError::Parse(format!("JSON 反序列化失敗: {}", e)))
+        }
     }
 
     /// 轉換深度快照
@@ -185,9 +223,11 @@ impl MessageConverter {
     }
 
     /// 處理流數據
+    ///
+    /// 使用統一的 Value 類型（根據 json-simd feature 自動切換）
     fn process_stream_data(
         stream: &str,
-        data: &serde_json::Value,
+        data: &Value,
     ) -> HftResult<Option<MarketEvent>> {
         if stream.contains("@depth") {
             if let Ok(update) = Self::parse_value::<DepthUpdate>(data.clone()) {
@@ -293,10 +333,10 @@ mod tests {
     #[test]
     fn test_convert_depth_update() {
         let update = DepthUpdate {
-            event_type: "depthUpdate".to_string(),
+            _event_type: "depthUpdate".to_string(),
             event_time: 123456789,
             symbol: "BTCUSDT".to_string(),
-            first_update_id: 100,
+            _first_update_id: 100,
             final_update_id: 101,
             bids: vec![["45000.00".to_string(), "0.1".to_string()]],
             asks: vec![["45100.00".to_string(), "0.2".to_string()]],
@@ -315,17 +355,17 @@ mod tests {
     #[test]
     fn test_convert_trade_event() {
         let trade = TradeEvent {
-            event_type: "trade".to_string(),
-            event_time: 123456789,
+            _event_type: "trade".to_string(),
+            _event_time: 123456789,
             symbol: "BTCUSDT".to_string(),
             trade_id: 12345,
             price: "45000.00".to_string(),
             quantity: "0.1".to_string(),
-            buyer_order_id: 111,
-            seller_order_id: 222,
+            _buyer_order_id: 111,
+            _seller_order_id: 222,
             trade_time: 123456789,
             is_buyer_maker: false,
-            ignore: false,
+            _ignore: false,
         };
 
         let trade_event = MessageConverter::convert_trade_event(trade).unwrap();

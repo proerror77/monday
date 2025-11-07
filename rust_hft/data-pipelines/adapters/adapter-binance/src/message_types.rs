@@ -1,24 +1,7 @@
 //! Binance WebSocket 消息類型定義
 
-use serde::{Deserialize, Serialize};
-
-/// WebSocket 訂閱請求
-#[derive(Debug, Clone, Serialize)]
-pub struct SubscribeRequest {
-    pub method: String,
-    pub params: Vec<String>,
-    pub id: u64,
-}
-
-impl SubscribeRequest {
-    pub fn new(streams: Vec<String>) -> Self {
-        Self {
-            method: "SUBSCRIBE".to_string(),
-            params: streams,
-            id: 1,
-        }
-    }
-}
+use integration::json::Value;
+use serde::Deserialize;
 
 /// Binance 深度快照
 #[derive(Debug, Clone, Deserialize)]
@@ -33,13 +16,13 @@ pub struct DepthSnapshot {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DepthUpdate {
     #[serde(rename = "e")]
-    pub event_type: String, // "depthUpdate"
+    pub _event_type: String, // "depthUpdate"
     #[serde(rename = "E")]
     pub event_time: u64, // Event time
     #[serde(rename = "s")]
     pub symbol: String, // Symbol
     #[serde(rename = "U")]
-    pub first_update_id: u64, // First update ID in event
+    pub _first_update_id: u64, // First update ID in event
     #[serde(rename = "u")]
     pub final_update_id: u64, // Final update ID in event
     #[serde(rename = "b")]
@@ -52,9 +35,9 @@ pub struct DepthUpdate {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TradeEvent {
     #[serde(rename = "e")]
-    pub event_type: String, // "trade"
+    pub _event_type: String, // "trade"
     #[serde(rename = "E")]
-    pub event_time: u64, // Event time
+    pub _event_time: u64, // Event time
     #[serde(rename = "s")]
     pub symbol: String, // Symbol
     #[serde(rename = "t")]
@@ -64,24 +47,24 @@ pub struct TradeEvent {
     #[serde(rename = "q")]
     pub quantity: String, // Quantity
     #[serde(rename = "b")]
-    pub buyer_order_id: u64, // Buyer order ID
+    pub _buyer_order_id: u64, // Buyer order ID
     #[serde(rename = "a")]
-    pub seller_order_id: u64, // Seller order ID
+    pub _seller_order_id: u64, // Seller order ID
     #[serde(rename = "T")]
     pub trade_time: u64, // Trade time
     #[serde(rename = "m")]
     pub is_buyer_maker: bool, // Is the buyer the market maker?
     #[serde(rename = "M")]
-    pub ignore: bool, // Ignore
+    pub _ignore: bool, // Ignore
 }
 
 /// Binance K線事件
 #[derive(Debug, Clone, Deserialize)]
 pub struct KlineEvent {
     #[serde(rename = "e")]
-    pub event_type: String, // "kline"
+    pub _event_type: String, // "kline"
     #[serde(rename = "E")]
-    pub event_time: u64, // Event time
+    pub _event_time: u64, // Event time
     #[serde(rename = "s")]
     pub symbol: String, // Symbol
     #[serde(rename = "k")]
@@ -95,13 +78,13 @@ pub struct KlineData {
     #[serde(rename = "T")]
     pub close_time: u64, // Kline close time
     #[serde(rename = "s")]
-    pub symbol: String, // Symbol
+    pub _symbol: String, // Symbol
     #[serde(rename = "i")]
     pub interval: String, // Interval
     #[serde(rename = "f")]
-    pub first_trade_id: u64, // First trade ID
+    pub _first_trade_id: u64, // First trade ID
     #[serde(rename = "L")]
-    pub last_trade_id: u64, // Last trade ID
+    pub _last_trade_id: u64, // Last trade ID
     #[serde(rename = "o")]
     pub open_price: String, // Open price
     #[serde(rename = "c")]
@@ -115,29 +98,31 @@ pub struct KlineData {
     #[serde(rename = "n")]
     pub trade_count: u32, // Number of trades
     #[serde(rename = "x")]
-    pub is_closed: bool, // Is this kline closed?
+    pub _is_closed: bool, // Is this kline closed?
     #[serde(rename = "q")]
-    pub quote_volume: String, // Quote asset volume
+    pub _quote_volume: String, // Quote asset volume
     #[serde(rename = "V")]
-    pub taker_buy_volume: String, // Taker buy base asset volume
+    pub _taker_buy_volume: String, // Taker buy base asset volume
     #[serde(rename = "Q")]
-    pub taker_buy_quote_volume: String, // Taker buy quote asset volume
+    pub _taker_buy_quote_volume: String, // Taker buy quote asset volume
     #[serde(rename = "B")]
-    pub ignore: String, // Ignore
+    pub _ignore: String, // Ignore
 }
 
 /// WebSocket 流消息封裝
+///
+/// 使用統一的 Value 類型（根據 json-simd feature 自動切換）
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamMessage {
     pub stream: String,
-    pub data: serde_json::Value,
+    pub data: Value,
 }
 
 /// Binance L1 最優買賣（bookTicker）
 #[derive(Debug, Clone, Deserialize)]
 pub struct BookTickerEvent {
     #[serde(rename = "e")]
-    pub event_type: String, // "bookTicker"
+    pub _event_type: String, // "bookTicker"
     #[serde(rename = "E")]
     pub event_time: u64,
     #[serde(rename = "s")]

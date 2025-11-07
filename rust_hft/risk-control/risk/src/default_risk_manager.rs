@@ -183,7 +183,7 @@ impl DefaultRiskManager {
     }
 
     /// 更新风控状态
-    fn update_state(&mut self, symbol: &Symbol) {
+    pub fn update_state(&mut self, symbol: &Symbol) {
         let now_ms = Self::current_time_ms();
         let state = self.symbol_states.entry(symbol.clone()).or_default();
 
@@ -279,7 +279,7 @@ impl RiskManager for DefaultRiskManager {
         }
 
         // 记录统计
-        if self.total_orders_today % 100 == 0 && self.total_orders_today > 0 {
+        if self.total_orders_today.is_multiple_of(100) && self.total_orders_today > 0 {
             info!(
                 "风控统计: 今日下单 {}, 拒单 {}, 通过率 {:.1}%",
                 self.total_orders_today,
@@ -441,6 +441,7 @@ mod tests {
 
         // 第一单应该通过
         assert!(mgr.check_rate_limit(&symbol).is_ok());
+        mgr.update_state(&symbol); // 模拟订单已提交
 
         // 立即第二单应该被冷却期阻止
         assert!(mgr.check_rate_limit(&symbol).is_err());

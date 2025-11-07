@@ -13,8 +13,9 @@ pub struct MessageConverter;
 impl MessageConverter {
     #[inline]
     fn parse_value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, simd_json::Error> {
-        let owned: simd_json::OwnedValue = value.try_into()?;
-        simd_json::serde::from_owned_value(owned)
+        let json_str = value.to_string();
+        let mut bytes = json_str.into_bytes();
+        simd_json::serde::from_slice(bytes.as_mut_slice())
     }
     pub fn convert_depth_update(update: DepthUpdate) -> HftResult<BookUpdate> {
         let symbol = Symbol::from(update.symbol);

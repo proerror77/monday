@@ -30,7 +30,7 @@ hft-infer-onnx = { path = "../../strategy-framework/infer-onnx" }
 anyhow = "1"
 
 [features]
-default = ["bitget", "trend-strategy", "metrics"]
+default = ["bitget", "trend-strategy", "metrics", "simd"]
 
 # 交易所適配器 (轉發到 runtime)
 bitget = ["runtime/bitget"]
@@ -67,8 +67,8 @@ metrics = [
 ]
 full-infra = ["clickhouse", "redis", "metrics"]
 
-# SIMD 優化 (生產環境)
-simd = ["data/json-simd"]
+# SIMD 優化 (生產環境應默認啟用)
+simd = ["runtime/json-simd"]
 
 # 完整特性集
 full = ["all-exchanges", "all-strategies", "full-infra", "simd", "mock"]

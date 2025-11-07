@@ -88,6 +88,7 @@ pub struct ExchangeContext {
         allow(dead_code)
     )]
     pub depth_levels: usize,
+    #[allow(dead_code)]
     symbols_override: Option<Arc<Vec<String>>>,
     stream_profile: Option<StreamProfile>,
 }
@@ -106,6 +107,7 @@ impl ExchangeContext {
         }
     }
 
+    #[allow(dead_code)]
     pub fn symbols_override(&self) -> Option<Arc<Vec<String>>> {
         self.symbols_override.as_ref().map(Arc::clone)
     }
@@ -168,7 +170,7 @@ impl StreamProfile {
         let mut depth = false;
 
         let tokens: Vec<String> = raw
-            .split(|c: char| matches!(c, ',' | '|' | ';'))
+            .split([',', '|', ';'])
             .flat_map(|segment| segment.split_whitespace())
             .map(|token| token.trim().to_ascii_lowercase())
             .filter(|token| !token.is_empty())
@@ -467,73 +469,73 @@ pub fn create_exchange(
         "binance" => {
             #[cfg(feature = "collector-binance")]
             {
-                return Ok(Box::new(binance::BinanceExchange::new(ctx)));
+                Ok(Box::new(binance::BinanceExchange::new(ctx)))
             }
             #[cfg(not(feature = "collector-binance"))]
             {
-                return Err(anyhow::anyhow!("binance collector feature not enabled"));
+                Err(anyhow::anyhow!("binance collector feature not enabled"))
             }
         }
         "binance_futures" | "binance-futures" | "binancefutures" => {
             #[cfg(feature = "collector-binance-futures")]
             {
-                return Ok(Box::new(binance_futures::BinanceFuturesExchange::new(ctx)));
+                Ok(Box::new(binance_futures::BinanceFuturesExchange::new(ctx)))
             }
             #[cfg(not(feature = "collector-binance-futures"))]
             {
-                return Err(anyhow::anyhow!(
+                Err(anyhow::anyhow!(
                     "binance-futures collector feature not enabled"
-                ));
+                ))
             }
         }
         "bitget" => {
             #[cfg(feature = "collector-bitget")]
             {
-                return Ok(Box::new(bitget::BitgetExchange::new(ctx)));
+                Ok(Box::new(bitget::BitgetExchange::new(ctx)))
             }
             #[cfg(not(feature = "collector-bitget"))]
             {
-                return Err(anyhow::anyhow!("bitget collector feature not enabled"));
+                Err(anyhow::anyhow!("bitget collector feature not enabled"))
             }
         }
         "bybit" => {
             #[cfg(feature = "collector-bybit")]
             {
-                return Ok(Box::new(bybit::BybitExchange::new(ctx)));
+                Ok(Box::new(bybit::BybitExchange::new(ctx)))
             }
             #[cfg(not(feature = "collector-bybit"))]
             {
-                return Err(anyhow::anyhow!("bybit collector feature not enabled"));
+                Err(anyhow::anyhow!("bybit collector feature not enabled"))
             }
         }
         "asterdex" => {
             #[cfg(feature = "collector-asterdex")]
             {
-                return Ok(Box::new(asterdex::AsterdexExchange::new(ctx)));
+                Ok(Box::new(asterdex::AsterdexExchange::new(ctx)))
             }
             #[cfg(not(feature = "collector-asterdex"))]
             {
-                return Err(anyhow::anyhow!("asterdex collector feature not enabled"));
+                Err(anyhow::anyhow!("asterdex collector feature not enabled"))
             }
         }
         "hyperliquid" => {
             #[cfg(feature = "collector-hyperliquid")]
             {
-                return Ok(Box::new(hyperliquid::HyperliquidExchange::new(ctx)));
+                Ok(Box::new(hyperliquid::HyperliquidExchange::new(ctx)))
             }
             #[cfg(not(feature = "collector-hyperliquid"))]
             {
-                return Err(anyhow::anyhow!("hyperliquid collector feature not enabled"));
+                Err(anyhow::anyhow!("hyperliquid collector feature not enabled"))
             }
         }
         "okx" => {
             #[cfg(feature = "collector-okx")]
             {
-                return Ok(Box::new(okx::OkxExchange::new(ctx)));
+                Ok(Box::new(okx::OkxExchange::new(ctx)))
             }
             #[cfg(not(feature = "collector-okx"))]
             {
-                return Err(anyhow::anyhow!("okx collector feature not enabled"));
+                Err(anyhow::anyhow!("okx collector feature not enabled"))
             }
         }
         _ => Err(anyhow::anyhow!("Unsupported exchange: {}", exchange_name)),

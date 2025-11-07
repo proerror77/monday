@@ -1,33 +1,44 @@
-//! Bitget 零拷貝 WebSocket 適配器 - 直接寫入 SPSC
+//! Bitget 零拷貝 WebSocket 適配器 - 使用 channel 傳遞事件
 //!
 //! 優化要點：
-//! 1. 移除 tokio::mpsc 中間層，直接寫入 EventIngester
+//! 1. 使用 tokio::mpsc channel 解耦 adapter 與 engine
 //! 2. 使用 simd-json 借用模式減少分配
 //! 3. 復用緩衝區，統一時間戳處理
+//!
+//! 注意：不再直接依賴 engine::dataflow::EventIngester，保持 adapter 層獨立性
 
 #![allow(dead_code)]
 
 use async_trait::async_trait;
 use integration::latency::WsFrameMetrics;
-use simd_json::prelude::{ValueAsContainer, ValueAsScalar, ValueObjectAccess};
-use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
+
+#[cfg(feature = "json-simd")]
+use simd_json::prelude::{ValueAsContainer, ValueAsScalar, ValueObjectAccess};
 
 #[cfg(feature = "metrics")]
 use infra_metrics::MetricsRegistry;
 
-use engine::dataflow::EventIngester;
 use hft_core::*;
 use integration::ws::{MessageHandler, ReconnectingWsClient, WsClientConfig};
 use ports::*;
 
 /// 零拷貝 Bitget 市場流
+///
+/// 使用 tokio channel 傳遞事件，保持與 engine 層的解耦
 pub struct ZeroCopyBitgetStream {
     ws_client: Option<ReconnectingWsClient>,
-    event_ingester: Option<Arc<std::sync::Mutex<EventIngester>>>,
+    event_sender: Option<mpsc::UnboundedSender<MarketEvent>>,
     subscribed_symbols: Vec<Symbol>,
     /// 復用的 JSON 解析緩衝區
     parse_buffer: Vec<u8>,
+}
+
+impl Default for ZeroCopyBitgetStream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ZeroCopyBitgetStream {
@@ -35,15 +46,10 @@ impl ZeroCopyBitgetStream {
     pub fn new() -> Self {
         Self {
             ws_client: None,
-            event_ingester: None,
+            event_sender: None,
             subscribed_symbols: Vec::new(),
             parse_buffer: Vec::with_capacity(4096), // 預分配 4KB 緩衝
         }
-    }
-
-    /// 設置事件攝取器（直接寫入 SPSC）
-    pub fn set_ingester(&mut self, ingester: Arc<std::sync::Mutex<EventIngester>>) {
-        self.event_ingester = Some(ingester);
     }
 
     fn create_ws_config() -> WsClientConfig {
@@ -66,11 +72,20 @@ impl ZeroCopyBitgetStream {
         json_bytes: &[u8],
         symbol: &Symbol,
     ) -> Result<MarketSnapshot, HftError> {
-        // 使用 simd-json 借用模式解析
-        self.parse_buffer.clear();
-        self.parse_buffer.extend_from_slice(json_bytes);
+        #[cfg(feature = "json-simd")]
+        let value = {
+            // 使用 simd-json 借用模式解析
+            self.parse_buffer.clear();
+            self.parse_buffer.extend_from_slice(json_bytes);
+            simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| {
+                HftError::Generic {
+                    message: format!("JSON 解析失败: {}", e),
+                }
+            })?
+        };
 
-        let value = simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| {
+        #[cfg(not(feature = "json-simd"))]
+        let value: serde_json::Value = serde_json::from_slice(json_bytes).map_err(|e| {
             HftError::Generic {
                 message: format!("JSON 解析失败: {}", e),
             }
@@ -79,7 +94,7 @@ impl ZeroCopyBitgetStream {
         // 借用模式訪問，減少字符串分配
         let data = value
             .get("data")
-            .and_then(|d| d.as_array()?.get(0))
+            .and_then(|d| d.as_array()?.first())
             .ok_or_else(|| HftError::Generic {
                 message: "無效的訂單簿數據".to_string(),
             })?;
@@ -161,10 +176,19 @@ impl ZeroCopyBitgetStream {
 
     /// 零拷貝解析成交數據
     fn parse_trade_zero_copy(&mut self, json_bytes: &[u8]) -> Result<Trade, HftError> {
-        self.parse_buffer.clear();
-        self.parse_buffer.extend_from_slice(json_bytes);
+        #[cfg(feature = "json-simd")]
+        let value = {
+            self.parse_buffer.clear();
+            self.parse_buffer.extend_from_slice(json_bytes);
+            simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| {
+                HftError::Generic {
+                    message: format!("JSON 解析失败: {}", e),
+                }
+            })?
+        };
 
-        let value = simd_json::to_borrowed_value(&mut self.parse_buffer).map_err(|e| {
+        #[cfg(not(feature = "json-simd"))]
+        let value: serde_json::Value = serde_json::from_slice(json_bytes).map_err(|e| {
             HftError::Generic {
                 message: format!("JSON 解析失败: {}", e),
             }
@@ -172,7 +196,7 @@ impl ZeroCopyBitgetStream {
 
         let data = value
             .get("data")
-            .and_then(|d| d.as_array()?.get(0))
+            .and_then(|d| d.as_array()?.first())
             .ok_or_else(|| HftError::Generic {
                 message: "無效的成交數據".to_string(),
             })?;
@@ -233,36 +257,29 @@ impl ZeroCopyBitgetStream {
     }
 }
 
-/// 零拷貝消息處理器 - 直接寫入 EventIngester
+/// 零拷貝消息處理器 - 通過 channel 發送事件
+///
+/// 不再直接依賴 EventIngester，通過 channel 解耦
 pub struct ZeroCopyMessageHandler {
-    event_ingester: Arc<std::sync::Mutex<EventIngester>>,
+    event_sender: mpsc::UnboundedSender<MarketEvent>,
     subscribed_symbols: Vec<Symbol>,
     /// 復用緩衝區
     buffer: Vec<u8>,
 }
 
 impl ZeroCopyMessageHandler {
-    pub fn new(ingester: Arc<std::sync::Mutex<EventIngester>>, symbols: Vec<Symbol>) -> Self {
+    pub fn new(sender: mpsc::UnboundedSender<MarketEvent>, symbols: Vec<Symbol>) -> Self {
         Self {
-            event_ingester: ingester,
+            event_sender: sender,
             subscribed_symbols: symbols,
             buffer: Vec::with_capacity(4096),
         }
     }
 
-    /// 直接攝取市場事件，跳過 tokio::mpsc
-    fn ingest_event_direct(&self, event: MarketEvent, tracker: Option<LatencyTracker>) {
-        if let Ok(mut ingester) = self.event_ingester.lock() {
-            match ingester.ingest_with_tracker(event, tracker) {
-                Ok(()) => {
-                    trace!("零拷貝事件攝取成功");
-                }
-                Err(e) => {
-                    warn!("零拷貝事件攝取失敗: {}", e);
-                }
-            }
-        } else {
-            error!("無法獲取 EventIngester 鎖");
+    /// 發送市場事件到 channel
+    fn send_event(&self, event: MarketEvent) {
+        if let Err(e) = self.event_sender.send(event) {
+            warn!("事件發送失敗: {}", e);
         }
     }
 }
@@ -287,8 +304,11 @@ impl MessageHandler for ZeroCopyMessageHandler {
         message: String,
         mut metrics: WsFrameMetrics,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 零拷貝解析 JSON - 直接處理不存儲
+        // 零拷貝解析 JSON - 將 buffer 聲明在函數級別以延長生命週期
+        #[cfg(feature = "json-simd")]
         let mut buffer = message.into_bytes();
+
+        #[cfg(feature = "json-simd")]
         let value = match simd_json::to_borrowed_value(&mut buffer) {
             Ok(v) => {
                 metrics.mark_parsed();
@@ -298,6 +318,20 @@ impl MessageHandler for ZeroCopyMessageHandler {
                 metrics.mark_parsed();
                 let parse_latency = metrics.parsed_at_us.saturating_sub(metrics.received_at_us);
                 trace!("零拷貝解析失敗，耗時 {}μs", parse_latency);
+                return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+            }
+        };
+
+        #[cfg(not(feature = "json-simd"))]
+        let value: serde_json::Value = match serde_json::from_str(&message) {
+            Ok(v) => {
+                metrics.mark_parsed();
+                v
+            }
+            Err(e) => {
+                metrics.mark_parsed();
+                let parse_latency = metrics.parsed_at_us.saturating_sub(metrics.received_at_us);
+                trace!("JSON 解析失敗，耗時 {}μs", parse_latency);
                 return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
             }
         };
@@ -324,7 +358,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
                     // 提取交易所時間戳並創建統一時間戳
                     let exchange_ts = value
                         .get("data")
-                        .and_then(|data_array| data_array.as_array()?.get(0))
+                        .and_then(|data_array| data_array.as_array()?.first())
                         .and_then(|data_item| data_item.get("ts"))
                         .and_then(|ts| ts.as_str())
                         .and_then(|ts_str| ts_str.parse::<u64>().ok())
@@ -349,7 +383,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
                     };
 
                     let event = MarketEvent::Snapshot(snapshot);
-                    self.ingest_event_direct(event, Some(tracker.clone()));
+                    self.send_event(event);
                 }
                 "trade" | "trades" => {
                     // 處理成交數據
@@ -419,7 +453,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
                                 trade_id,
                                 source_venue: Some(VenueId::BITGET),
                             });
-                            self.ingest_event_direct(event, Some(tracker.clone()));
+                            self.send_event(event);
                         }
                     }
                 }
@@ -439,7 +473,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
             reason: "Connection lost".to_string(),
         };
 
-        self.ingest_event_direct(disconnect_event, None);
+        self.send_event(disconnect_event);
         Ok(())
     }
 }
@@ -449,7 +483,7 @@ impl MessageHandler for ZeroCopyMessageHandler {
 impl MarketStream for ZeroCopyBitgetStream {
     async fn health(&self) -> ConnectionHealth {
         // 簡單的健康檢查實現
-        if self.event_ingester.is_some() {
+        if self.event_sender.is_some() {
             ConnectionHealth {
                 connected: true,
                 latency_ms: None,
@@ -483,21 +517,15 @@ impl MarketStream for ZeroCopyBitgetStream {
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>> {
         info!("零拷貝 Bitget 流開始訂閱 {} 個符號", symbols.len());
 
-        if self.event_ingester.is_none() {
-            return Err(HftError::Generic {
-                message: "EventIngester 未設置".to_string(),
-            });
-        }
+        // 創建事件通道
+        let (tx, mut rx) = mpsc::unbounded_channel();
 
         // 創建 WebSocket 客戶端
         let ws_config = Self::create_ws_config();
         let mut ws_client = ReconnectingWsClient::new(ws_config);
 
         // 創建零拷貝消息處理器
-        let handler = ZeroCopyMessageHandler::new(
-            self.event_ingester.as_ref().unwrap().clone(),
-            symbols.clone(),
-        );
+        let handler = ZeroCopyMessageHandler::new(tx, symbols.clone());
 
         // 在後台任務中運行 WebSocket 客戶端
         tokio::spawn(async move {
@@ -506,17 +534,10 @@ impl MarketStream for ZeroCopyBitgetStream {
             }
         });
 
-        // 由於現在直接寫入 EventIngester，這裡返回一個狀態流
-        // 實際的事件會通過 SPSC 流向引擎
+        // 創建事件流
         let stream = async_stream::stream! {
-            // 這個流現在主要用於保持接口兼容和狀態報告
-            // 實際事件通過 EventIngester 直接進入引擎
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                // 定期發送健康檢查事件
-                yield Ok(MarketEvent::Disconnect {
-                    reason: "health_check".to_string()
-                });
+            while let Some(event) = rx.recv().await {
+                yield Ok(event);
             }
         };
 
@@ -527,12 +548,11 @@ impl MarketStream for ZeroCopyBitgetStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_zero_copy_stream_creation() {
         let stream = ZeroCopyBitgetStream::new();
-        assert!(stream.event_ingester.is_none());
+        assert!(stream.event_sender.is_none());
         assert_eq!(stream.subscribed_symbols.len(), 0);
         assert_eq!(stream.parse_buffer.capacity(), 4096);
     }
@@ -558,7 +578,8 @@ mod tests {
 
         let snapshot = result.unwrap();
         assert_eq!(snapshot.symbol.as_str(), "BTCUSDT");
-        assert_eq!(snapshot.timestamp, 1638360000000);
+        // Timestamp is converted from milliseconds to microseconds (multiply by 1000)
+        assert_eq!(snapshot.timestamp, 1638360000000 * 1000);
         assert_eq!(snapshot.bids.len(), 2);
         assert_eq!(snapshot.asks.len(), 2);
     }

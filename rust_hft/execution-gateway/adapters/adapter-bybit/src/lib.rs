@@ -9,7 +9,7 @@ use integration::{
 };
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionMode {
@@ -94,7 +94,7 @@ impl ExecutionClient for BybitExecutionClient {
             };
             let req = Req {
                 category: "spot",
-                symbol: &intent.symbol.as_str(),
+                symbol: intent.symbol.as_str(),
                 side,
                 order_type: typ,
                 qty: intent.quantity.0.to_string(),
@@ -116,6 +116,7 @@ impl ExecutionClient for BybitExecutionClient {
                 .await
                 .map_err(|e| HftError::Network(e.to_string()))?;
             #[derive(serde::Deserialize)]
+            #[allow(non_snake_case)]
             struct Resp {
                 retCode: i64,
                 retMsg: String,
@@ -197,6 +198,7 @@ impl ExecutionClient for BybitExecutionClient {
                 .await
                 .map_err(|e| HftError::Network(e.to_string()))?;
             #[derive(serde::Deserialize)]
+            #[allow(non_snake_case)]
             struct Resp {
                 retCode: i64,
                 retMsg: String,
@@ -268,6 +270,7 @@ impl ExecutionClient for BybitExecutionClient {
                 .await
                 .map_err(|e| HftError::Network(e.to_string()))?;
             #[derive(serde::Deserialize)]
+            #[allow(non_snake_case)]
             struct Resp {
                 retCode: i64,
                 retMsg: String,
@@ -364,7 +367,7 @@ impl ExecutionClient for BybitExecutionClient {
                                     if let Some(d) = v
                                         .get("data")
                                         .and_then(|d| d.as_array())
-                                        .and_then(|arr| arr.get(0))
+                                        .and_then(|arr| arr.first())
                                     {
                                         let status = d
                                             .get("orderStatus")
@@ -401,7 +404,7 @@ impl ExecutionClient for BybitExecutionClient {
                                     if let Some(d) = v
                                         .get("data")
                                         .and_then(|d| d.as_array())
-                                        .and_then(|arr| arr.get(0))
+                                        .and_then(|arr| arr.first())
                                     {
                                         let oid = d
                                             .get("orderId")
@@ -488,6 +491,7 @@ impl ExecutionClient for BybitExecutionClient {
             .map_err(|e| HftError::Network(e.to_string()))?;
 
         #[derive(serde::Deserialize)]
+        #[allow(non_snake_case)]
         struct RespDataItem {
             orderId: String,
             symbol: String,
@@ -505,6 +509,7 @@ impl ExecutionClient for BybitExecutionClient {
             list: Vec<RespDataItem>,
         }
         #[derive(serde::Deserialize)]
+        #[allow(non_snake_case)]
         struct Resp {
             retCode: i64,
             retMsg: String,

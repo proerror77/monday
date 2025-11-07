@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 struct InstrumentSpec {
     tick_size: Option<f64>,
     lot_size: Option<f64>,
-    min_notional: Option<f64>,
+    _min_notional: Option<f64>,
 }
 
 fn grvt_rest_base() -> String {
@@ -142,7 +142,7 @@ async fn fetch_instruments_spec() -> std::collections::HashMap<String, Instrumen
                 InstrumentSpec {
                     tick_size: tick,
                     lot_size: lot,
-                    min_notional,
+                    _min_notional: min_notional,
                 },
             );
         }
@@ -215,6 +215,12 @@ pub struct GrvtMarketStream {
     last_heartbeat: u64,
 }
 
+impl Default for GrvtMarketStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GrvtMarketStream {
     pub fn new() -> Self {
         Self {
@@ -270,7 +276,7 @@ impl MarketStream for GrvtMarketStream {
                         name if name.starts_with("v1.ticker") || name.starts_with("v1.mini") => {
                             format!("{}@{}", ins, ticker_rate)
                         }
-                        name if name == "v1.trade" => format!("{}@{}", ins, trade_limit),
+                        "v1.trade" => format!("{}@{}", ins, trade_limit),
                         _ => format!("{}@{}", ins, book_rate),
                     }
                 })
@@ -563,10 +569,8 @@ impl MarketStream for GrvtMarketStream {
                                         let _ = tx.send(Ok(ev));
                                     }
                                 }
-                            } else {
-                                if let Some(ev) = parse_trade_obj(&feed, &symbol) {
-                                    let _ = tx.send(Ok(ev));
-                                }
+                            } else if let Some(ev) = parse_trade_obj(&feed, &symbol) {
+                                let _ = tx.send(Ok(ev));
                             }
                         } else {
                             // 其他 stream 暫不處理

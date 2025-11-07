@@ -464,8 +464,6 @@ impl ExecutionClient for AsterdexExecutionClient {
                     }
                 });
             }
-        } else if self.mode == ExecutionMode::Live {
-            warn!("Aster DEX Live: 未提供 API 憑證，跳過私有 WS 建立");
         }
 
         Ok(())

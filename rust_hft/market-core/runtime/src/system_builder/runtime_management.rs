@@ -25,6 +25,7 @@ impl SystemRuntime {
             execution_client_venues: self.execution_client_venues.clone(),
             execution_client_accounts: self.execution_client_accounts.clone(),
             portfolio_manager: self.portfolio_manager.clone(),
+            adapter_bridge: None,           // IPC 專用實例不持有 bridge
         }
     }
 

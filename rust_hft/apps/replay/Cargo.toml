@@ -14,7 +14,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.0", features = ["derive"] }
 serde = { workspace = true }
 serde_yaml = "0.9"
-clickhouse = "0.12"
+clickhouse = { workspace = true, optional = true }
 anyhow = "1"
 crc32fast = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -23,9 +23,9 @@ prometheus = { workspace = true, optional = true }
 infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics", features = ["http-server"], optional = true }
 
 [features]
-default = ["mock"]
+default = ["mock", "clickhouse"]
 mock = ["runtime/adapter-mock-data"]
-clickhouse = ["runtime/clickhouse"]
+clickhouse = ["runtime/clickhouse", "dep:clickhouse"]
 bitget = ["runtime/adapter-bitget-data"]
 binance = ["runtime/adapter-binance-data"]
 bybit = ["runtime/adapter-bybit-data"]

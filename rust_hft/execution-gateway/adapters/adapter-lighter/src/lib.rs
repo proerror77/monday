@@ -2,12 +2,13 @@
 //! 注意：目前 Live 僅實作下單（place_order）。撤單/改單/查單因需要額外授權與索引，暫標記為未實作。
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use hft_core::{HftError, HftResult, OrderId, Price, Quantity};
 use integration::http::{HttpClient, HttpClientConfig};
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tracing::info;
+use urlencoding::encode;
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -39,56 +40,44 @@ struct StrOrErr {
 
 struct FfiSigner {
     _lib: libloading::Library,
-    create_client: libloading::Symbol<
-        'static,
-        unsafe extern "C" fn(
-            *const c_char,
-            *const c_char,
-            c_int,
-            c_int,
-            c_longlong,
-        ) -> *const c_char,
-    >,
-    switch_api_key: libloading::Symbol<'static, unsafe extern "C" fn(c_int) -> *const c_char>,
-    sign_create_order: libloading::Symbol<
-        'static,
-        unsafe extern "C" fn(
-            c_int,
-            c_longlong,
-            c_longlong,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_int,
-            c_longlong,
-            c_longlong,
-        ) -> StrOrErr,
-    >,
-    sign_cancel_order: libloading::Symbol<
-        'static,
-        unsafe extern "C" fn(c_int, c_longlong, c_longlong) -> StrOrErr,
-    >,
-    sign_modify_order: libloading::Symbol<
-        'static,
-        unsafe extern "C" fn(
-            c_int,
-            c_longlong,
-            c_longlong,
-            c_longlong,
-            c_longlong,
-            c_longlong,
-        ) -> StrOrErr,
-    >,
-    create_auth_token: libloading::Symbol<'static, unsafe extern "C" fn(c_longlong) -> StrOrErr>,
+    create_client: unsafe extern "C" fn(
+        *const c_char,
+        *const c_char,
+        c_int,
+        c_int,
+        c_longlong,
+    ) -> *const c_char,
+    switch_api_key: unsafe extern "C" fn(c_int) -> *const c_char,
+    sign_create_order: unsafe extern "C" fn(
+        c_int,
+        c_longlong,
+        c_longlong,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_longlong,
+        c_longlong,
+    ) -> StrOrErr,
+    sign_cancel_order: unsafe extern "C" fn(c_int, c_longlong, c_longlong) -> StrOrErr,
+    sign_modify_order: unsafe extern "C" fn(
+        c_int,
+        c_longlong,
+        c_longlong,
+        c_longlong,
+        c_longlong,
+        c_longlong,
+    ) -> StrOrErr,
+    create_auth_token: unsafe extern "C" fn(c_longlong) -> StrOrErr,
 }
 
 impl FfiSigner {
     unsafe fn load(lib_path: &str) -> HftResult<Self> {
         let lib = libloading::Library::new(lib_path)
             .map_err(|e| HftError::Config(format!("無法載入 signer 庫: {}", e)))?;
-        let create_client = lib
+        let create_client = *lib
             .get::<unsafe extern "C" fn(
                 *const c_char,
                 *const c_char,
@@ -96,13 +85,11 @@ impl FfiSigner {
                 c_int,
                 c_longlong,
             ) -> *const c_char>(b"CreateClient\0")
-            .map_err(|e| HftError::Config(format!("缺少 CreateClient: {}", e)))?
-            .into_raw();
-        let switch_api_key = lib
+            .map_err(|e| HftError::Config(format!("缺少 CreateClient: {}", e)))?;
+        let switch_api_key = *lib
             .get::<unsafe extern "C" fn(c_int) -> *const c_char>(b"SwitchAPIKey\0")
-            .map_err(|e| HftError::Config(format!("缺少 SwitchAPIKey: {}", e)))?
-            .into_raw();
-        let sign_create_order = lib
+            .map_err(|e| HftError::Config(format!("缺少 SwitchAPIKey: {}", e)))?;
+        let sign_create_order = *lib
             .get::<unsafe extern "C" fn(
                 c_int,
                 c_longlong,
@@ -116,15 +103,13 @@ impl FfiSigner {
                 c_longlong,
                 c_longlong,
             ) -> StrOrErr>(b"SignCreateOrder\0")
-            .map_err(|e| HftError::Config(format!("缺少 SignCreateOrder: {}", e)))?
-            .into_raw();
-        let sign_cancel_order = lib
+            .map_err(|e| HftError::Config(format!("缺少 SignCreateOrder: {}", e)))?;
+        let sign_cancel_order = *lib
             .get::<unsafe extern "C" fn(c_int, c_longlong, c_longlong) -> StrOrErr>(
                 b"SignCancelOrder\0",
             )
-            .map_err(|e| HftError::Config(format!("缺少 SignCancelOrder: {}", e)))?
-            .into_raw();
-        let sign_modify_order = lib
+            .map_err(|e| HftError::Config(format!("缺少 SignCancelOrder: {}", e)))?;
+        let sign_modify_order = *lib
             .get::<unsafe extern "C" fn(
                 c_int,
                 c_longlong,
@@ -133,12 +118,10 @@ impl FfiSigner {
                 c_longlong,
                 c_longlong,
             ) -> StrOrErr>(b"SignModifyOrder\0")
-            .map_err(|e| HftError::Config(format!("缺少 SignModifyOrder: {}", e)))?
-            .into_raw();
-        let create_auth_token = lib
+            .map_err(|e| HftError::Config(format!("缺少 SignModifyOrder: {}", e)))?;
+        let create_auth_token = *lib
             .get::<unsafe extern "C" fn(c_longlong) -> StrOrErr>(b"CreateAuthToken\0")
-            .map_err(|e| HftError::Config(format!("缺少 CreateAuthToken: {}", e)))?
-            .into_raw();
+            .map_err(|e| HftError::Config(format!("缺少 CreateAuthToken: {}", e)))?;
         Ok(Self {
             _lib: lib,
             create_client,
@@ -326,7 +309,7 @@ impl LighterExecutionClient {
             "/api/v1/accountActiveOrders?account_index={}&market_id={}&auth={}",
             account_index,
             market_id,
-            urlencoding::encode(auth)
+            encode(auth)
         );
         let resp = self
             .http
@@ -366,15 +349,11 @@ impl ExecutionClient for LighterExecutionClient {
             ExecutionMode::Live => {}
         }
 
-        // 參數檢查
-        let signer = match &self.signer {
-            Some(s) => s,
-            None => {
-                return Err(HftError::Config(
-                    "未載入 Lighter signer 庫或未 connect()".to_string(),
-                ))
-            }
-        };
+        if self.signer.is_none() {
+            return Err(HftError::Config(
+                "未載入 Lighter signer 庫或未 connect()".to_string(),
+            ));
+        }
         let api_key_index = self
             .cfg
             .api_key_index
@@ -385,13 +364,14 @@ impl ExecutionClient for LighterExecutionClient {
             .ok_or_else(|| HftError::Config("缺少 account_index".into()))?;
 
         let (market_id, size_dec, price_dec) =
-            self.ensure_market_meta(&intent.symbol.as_str()).await?;
+            self.ensure_market_meta(intent.symbol.as_str()).await?;
 
         // 取得 nonce
         let nonce = self.next_nonce(account_index, api_key_index).await?;
+        let signer = self.signer.as_ref().unwrap();
 
         // 映射欄位
-        let base_amount = Self::scale_qty(intent.quantity, size_dec) as i64;
+        let base_amount = Self::scale_qty(intent.quantity, size_dec);
         let price_i32 = Self::scale_price(intent.price, price_dec);
         let is_ask = match intent.side {
             hft_core::Side::Buy => 0,
@@ -614,8 +594,7 @@ impl ExecutionClient for LighterExecutionClient {
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
         if let Some(ref tx) = self.event_tx {
             let rx = tx.subscribe();
-            let s = tokio_stream::wrappers::BroadcastStream::new(rx)
-                .filter_map(|e| async move { e.ok().map(Ok) });
+            let s = BroadcastStream::new(rx).filter_map(|e| e.ok().map(Ok));
             return Ok(Box::pin(s));
         }
         Ok(Box::pin(futures::stream::empty()))
@@ -624,7 +603,7 @@ impl ExecutionClient for LighterExecutionClient {
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         match self.cfg.mode {
             ExecutionMode::Paper => Ok(Vec::new()),
-            ExecutionMode::Live => Err(HftError::Unsupported(
+            ExecutionMode::Live => Err(HftError::Config(
                 "Lighter list_open_orders 尚未實作".into(),
             )),
         }

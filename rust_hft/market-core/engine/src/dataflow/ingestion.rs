@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 const STALE_WARN_INTERVAL_US: u64 = 500_000; // 0.5 秒
 const LATENCY_HISTOGRAM_MAX_US: u64 = 60_000_000; // 60 秒上限，覆蓋慢速環境
@@ -138,8 +138,9 @@ impl IngestionMetrics {
     }
 
     pub fn record_latency(&mut self, latency: u64) {
-        if let Err(err) = self.latency_histogram.record(latency) {
-            warn!("记录摄取延迟失败: {}", err);
+        if let Err(_err) = self.latency_histogram.record(latency) {
+            // Hot path: histogram overflow is rare and metrics tracking is removed
+            // to keep the hot path clean
         }
         self.recent_latency_micros = Some(latency);
     }
@@ -164,14 +165,14 @@ impl IngestionMetrics {
     }
 
     pub fn average_latency(&self) -> Option<f64> {
-        if self.latency_histogram.len() == 0 {
+        if self.latency_histogram.is_empty() {
             return None;
         }
         Some(self.latency_histogram.mean())
     }
 
     pub fn latency_percentile(&self, percentile: f64) -> Option<u64> {
-        if self.latency_histogram.len() == 0 {
+        if self.latency_histogram.is_empty() {
             return None;
         }
         let pct = percentile.clamp(0.0, 100.0);
@@ -273,23 +274,16 @@ impl EventIngester {
                     infra_metrics::MetricsRegistry::global()
                         .record_staleness(delay as f64 / 1000.0);
                 }
+                // Hot path: Already throttled via record_stale_warn, use debug! for observability
                 if let Some(suppressed) =
                     self.metrics.record_stale_warn(now, STALE_WARN_INTERVAL_US)
                 {
-                    if suppressed > 0 {
-                        warn!(
-                            suppressed,
-                            "丟棄陳舊事件: {}μs 延遲 > {}μs 閾值（過去 {} 筆已合併）",
-                            delay,
-                            self.config.stale_threshold_us,
-                            suppressed
-                        );
-                    } else {
-                        warn!(
-                            "丟棄陳舊事件: {}μs 延遲 > {}μs 閾值",
-                            delay, self.config.stale_threshold_us
-                        );
-                    }
+                    debug!(
+                        "丟棄陳舊事件: {}μs 延遲 > {}μs 閾值（過去 {} 筆已合併）",
+                        delay,
+                        self.config.stale_threshold_us,
+                        suppressed
+                    );
                 }
                 return Ok(()); // 靜默丟棄陳舊事件
             }
@@ -332,7 +326,7 @@ impl EventIngester {
 
                 Ok(())
             }
-            Err(tracked_event) => {
+            Err(_tracked_event) => {
                 // Ring buffer 滿載，應用背壓策略
                 let current_utilization = self.producer.utilization();
 
@@ -364,34 +358,23 @@ impl EventIngester {
                         self.metrics.events_dropped += 1;
                         #[cfg(feature = "metrics")]
                         infra_metrics::MetricsRegistry::global().inc_events_dropped();
-                        warn!(
+                        // Hot path: Backpressure is tracked via metrics, use debug! for diagnostics
+                        debug!(
                             "Ring buffer 滿載 ({:.1}% 利用率)，丟棄新事件",
                             current_utilization * 100.0
                         );
                         Ok(())
                     }
                     BackpressurePolicy::LastWins => {
-                        // 使用 force_send 實現 Last-Wins：強制插入新事件，丟棄最舊事件
-                        if self.producer.force_send(tracked_event) {
-                            self.metrics.events_dropped += 1; // 有一個舊事件被丟棄
-                            #[cfg(feature = "metrics")]
-                            infra_metrics::MetricsRegistry::global().inc_events_dropped();
-                            warn!(
-                                "Last-wins ({:.1}% 利用率): 丟棄最舊事件，插入新事件",
-                                current_utilization * 100.0
-                            );
-                            // 成功入隊（丟棄舊事件），喚醒引擎處理
-                            if let Some(notify) = &self.engine_notify {
-                                notify.notify_one();
-                            }
-                            Ok(())
-                        } else {
-                            self.metrics.events_dropped += 1;
-                            #[cfg(feature = "metrics")]
-                            infra_metrics::MetricsRegistry::global().inc_events_dropped();
-                            error!("Last-wins force_send 失敗");
-                            Ok(())
-                        }
+                        // 安全起見：SPSC 實作不支持在 producer 側前移 tail，改為 DropNew
+                        self.metrics.events_dropped += 1;
+                        #[cfg(feature = "metrics")]
+                        infra_metrics::MetricsRegistry::global().inc_events_dropped();
+                        debug!(
+                            "Ring buffer 滿載 ({:.1}% 利用率)，LastWins 回退為 DropNew",
+                            current_utilization * 100.0
+                        );
+                        Ok(())
                     }
                     BackpressurePolicy::Block => {
                         error!("Ring buffer 滿載，阻塞模式暫不支援");
@@ -656,8 +639,10 @@ mod tests {
 
     #[test]
     fn test_stale_event_rejection() {
-        let mut config = IngestionConfig::default();
-        config.stale_threshold_us = 1000; // 1ms
+        let config = IngestionConfig {
+            stale_threshold_us: 1000, // 1ms
+            ..Default::default()
+        };
 
         let (mut ingester, _consumer) = EventIngester::new(config);
 

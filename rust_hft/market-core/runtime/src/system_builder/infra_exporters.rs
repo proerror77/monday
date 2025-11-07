@@ -2,8 +2,6 @@
 //! - Redis 導出（條件編譯 feature = "redis"）
 //! - ClickHouse 導出與資料列結構（條件編譯 feature = "clickhouse"）
 
-// use super::SystemRuntime; // 未使用，移除
-
 #[cfg(feature = "redis")]
 mod redis_export {
     use super::*;
@@ -128,9 +126,12 @@ mod redis_export {
 
 #[cfg(feature = "clickhouse")]
 mod clickhouse_export {
-    use super::*;
+    use crate::system_builder::{SystemRuntime, ClickHouseConfig};
     use clickhouse::Client;
     use tracing::info;
+
+    // 市場狀態快照映射類型（用於 OFI 計算）
+    type MarketStateMap = std::collections::HashMap<String, (f64, f64, f64, f64, f64, f64, f64)>;
 
     // ClickHouse 插入行結構（從 system_builder.rs 移動至此）
     #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
@@ -173,7 +174,7 @@ mod clickhouse_export {
     /// 啟動 ClickHouse Writer 任務（從 system_builder.rs 拆分）
     pub async fn spawn_clickhouse_writer(
         this: &mut SystemRuntime,
-        clickhouse_config: super::ClickHouseConfig,
+        clickhouse_config: ClickHouseConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let ch_url = clickhouse_config.url.clone();
         let ch_db = clickhouse_config
@@ -182,9 +183,9 @@ mod clickhouse_export {
             .unwrap_or_else(|| "default".into());
         let client = Client::default().with_url(&ch_url).with_database(&ch_db);
 
-        // 檢查連線
-        if let Err(e) = client.ping().await {
-            tracing::warn!("ClickHouse Writer: ping 失敗: {}", e);
+        // 檢查連線（執行簡單查詢測試）
+        if let Err(e) = client.query("SELECT 1").fetch_all::<u8>().await {
+            tracing::warn!("ClickHouse Writer: 連線測試失敗: {}", e);
         }
 
         // LOB 深度 Writer（每 200ms）
@@ -192,10 +193,7 @@ mod clickhouse_export {
         let client_for_lob = Client::default().with_url(&ch_url).with_database(&ch_db);
         let l1_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(200));
-            let mut prev_map: std::collections::HashMap<
-                String,
-                (f64, f64, f64, f64, f64, f64, f64),
-            > = Default::default();
+            let mut _prev_map: MarketStateMap = Default::default();
             loop {
                 ticker.tick().await;
                 // 若引擎停止則退出
@@ -221,7 +219,7 @@ mod clickhouse_export {
                             side: "bid".into(),
                             level: 0,
                             price: orderbook.bid_prices[0].to_f64(),
-                            quantity: orderbook.bid_qtys[0].to_f64(),
+                            quantity: orderbook.bid_quantities[0].to_f64(),
                         });
                     }
                     if !orderbook.ask_prices.is_empty() {
@@ -232,7 +230,7 @@ mod clickhouse_export {
                             side: "ask".into(),
                             level: 0,
                             price: orderbook.ask_prices[0].to_f64(),
-                            quantity: orderbook.ask_qtys[0].to_f64(),
+                            quantity: orderbook.ask_quantities[0].to_f64(),
                         });
                     }
                 }
@@ -257,11 +255,8 @@ mod clickhouse_export {
         let handle = tokio::spawn(async move {
             let mut prev_submitted: u64 = 0;
             let mut prev_filled: u64 = 0;
-            let mut prev_exec_processed: u64 = 0;
-            let mut prev_map: std::collections::HashMap<
-                String,
-                (f64, f64, f64, f64, f64, f64, f64),
-            > = Default::default();
+            let mut _prev_exec_processed: u64 = 0;
+            let mut prev_map: MarketStateMap = Default::default();
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
             loop {
                 ticker.tick().await;
@@ -286,17 +281,17 @@ mod clickhouse_export {
                     let mut ask_qty_l5 = 0.0;
                     if !ob.bid_prices.is_empty() {
                         bid_px = ob.bid_prices[0].to_f64();
-                        bid_qty = ob.bid_qtys[0].to_f64();
+                        bid_qty = ob.bid_quantities[0].to_f64();
                     }
                     if !ob.ask_prices.is_empty() {
                         ask_px = ob.ask_prices[0].to_f64();
-                        ask_qty = ob.ask_qtys[0].to_f64();
+                        ask_qty = ob.ask_quantities[0].to_f64();
                     }
                     for i in 0..ob.bid_prices.len().min(5) {
-                        bid_qty_l5 += ob.bid_qtys[i].to_f64();
+                        bid_qty_l5 += ob.bid_quantities[i].to_f64();
                     }
                     for i in 0..ob.ask_prices.len().min(5) {
-                        ask_qty_l5 += ob.ask_qtys[i].to_f64();
+                        ask_qty_l5 += ob.ask_quantities[i].to_f64();
                     }
                     let mid = if bid_px > 0.0 && ask_px > 0.0 {
                         (bid_px + ask_px) / 2.0
@@ -320,9 +315,9 @@ mod clickhouse_export {
                     };
                     let (mut ofi1, mut ofi5, mut mid_change_bps) = (0.0, 0.0, 0.0);
                     if let Some((pb, pa, qb, qa, qb5, qa5, pmid)) = prev_map.get(&key).copied() {
-                        ofi1 = (bid_px - pb) * qb + (qb - qb) * pb
+                        ofi1 = (bid_px - pb) * qb + (bid_qty - qb) * pb
                             - (ask_px - pa) * qa
-                            - (qa - qa) * pa;
+                            - (ask_qty - qa) * pa;
                         ofi5 = (bid_qty_l5 - qb5) - (ask_qty_l5 - qa5);
                         if pmid > 0.0 && mid > 0.0 {
                             mid_change_bps = (mid - pmid) / pmid * 10000.0;
@@ -388,7 +383,7 @@ mod clickhouse_export {
                 };
                 prev_submitted = stats.orders_submitted;
                 prev_filled = stats.orders_filled;
-                prev_exec_processed = stats.execution_events_processed;
+                _prev_exec_processed = stats.execution_events_processed;
 
                 if let Ok(mut inserter) = client.insert::<EngineStatsRow>("hft.engine_stats") {
                     let _ = inserter.write(&row).await;
@@ -424,7 +419,16 @@ mod clickhouse_export {
                     recv = rx.recv() => {
                         match recv {
                             Ok(tr) => {
-                                batch.push((tr.ts, tr.symbol.as_str().to_string(), tr.venue.as_str().into(), tr.side.as_str().into(), tr.price.to_f64(), tr.quantity.to_f64(), tr.liq.as_str().into()));
+                                let venue = tr.source_venue.as_ref().map(|v| v.as_str()).unwrap_or("unknown");
+                                batch.push((
+                                    tr.timestamp,
+                                    tr.symbol.as_str().to_string(),
+                                    venue.to_string(),
+                                    format!("{:?}", tr.side),
+                                    tr.price.to_f64().unwrap_or(0.0),
+                                    tr.quantity.to_f64().unwrap_or(0.0),
+                                    tr.trade_id.clone()
+                                ));
                             }
                             Err(_) => break,
                         }
@@ -440,7 +444,7 @@ mod clickhouse_export {
         #[cfg(feature = "clickhouse")]
         pub async fn spawn_clickhouse_writer(
             &mut self,
-            clickhouse_config: super::ClickHouseConfig,
+            clickhouse_config: ClickHouseConfig,
         ) -> Result<(), Box<dyn std::error::Error>> {
             spawn_clickhouse_writer(self, clickhouse_config).await
         }

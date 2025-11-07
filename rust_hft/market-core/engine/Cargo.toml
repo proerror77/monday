@@ -5,10 +5,8 @@ edition = "2021"
 description = "單 writer 事件循環：Scheduler/Joiner/BarBuilder/Router"
 
 [dependencies]
-hft-core = { package = "hft-core", path = "../core" }
+hft-core = { package = "hft-core", path = "../core", features = ["histogram"] }
 snapshot = { package = "hft-snapshot", path = "../snapshot" }
-oms-core = { package = "hft-oms-core", path = "../../risk-control/oms-core" }
-portfolio-core = { package = "hft-portfolio-core", path = "../../risk-control/portfolio-core" }
 crossbeam = { workspace = true }
 crossbeam-utils = { version = "0.8", default-features = false }
 serde = { workspace = true }
@@ -41,6 +39,7 @@ num-traits = "0.2"
 serde_yaml = "0.9"
 async-trait = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
+loom = { version = "0.7", features = ["checkpoint"] }
 
 [lib]
 name = "engine"

@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(builder.market_stream_plans.len(), 1);
         let (venue, _name, symbols) = &builder.market_stream_plans[0];
         assert_eq!(*venue, VenueType::Binance);
-        let collected: Vec<_> = symbols.iter().map(|s| s.0.as_str()).collect();
+        let collected: Vec<_> = symbols.iter().map(|s| s.as_str()).collect();
         assert_eq!(collected, vec!["BTCUSDT", "ETHUSDT"]);
     }
 
@@ -199,6 +199,6 @@ mod tests {
         assert_eq!(builder.market_stream_plans.len(), 1);
         let (_, _name, symbols) = &builder.market_stream_plans[0];
         assert_eq!(symbols.len(), 1);
-        assert_eq!(symbols[0].0, "BTCUSDT");
+        assert_eq!(symbols[0].as_str(), "BTCUSDT");
     }
 }

@@ -329,7 +329,7 @@ mod tests {
         available.insert(VenueId::BINANCE, 0);
         available.insert(VenueId::BITGET, 1);
 
-        let mut intent = OrderIntent {
+        let intent = OrderIntent {
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             quantity: Quantity::from_f64(1.0).unwrap(),

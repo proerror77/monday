@@ -210,7 +210,7 @@ impl DbSink for ClickHouseHttpSink {
             // Best Effort：5s 超时，不重试；失败计数并继续
             let resp = self
                 .http
-                .post(&format!(
+                .post(format!(
                     "{}/?query={}",
                     self.url,
                     urlencoding::encode(&query)

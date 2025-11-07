@@ -7,6 +7,7 @@ description = "Backpack Exchange market data adapter"
 [dependencies]
 hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
+adapters_common = { package = "hft-data-adapters-common", path = "../../adapters-common" }
 
 async-trait = "0.1"
 async-stream = "0.3"
@@ -16,7 +17,11 @@ serde = { workspace = true }
 serde_json = { version = "1.0" }
 tokio = { workspace = true, features = ["full"] }
 tokio-tungstenite = { workspace = true }
-simd-json = { workspace = true }
+simd-json = { workspace = true, optional = true }
+
+[features]
+default = []
+json-simd = ["dep:simd-json"]
 
 [lib]
 name = "adapter_backpack_data"

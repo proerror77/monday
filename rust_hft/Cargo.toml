@@ -68,7 +68,6 @@ members = [
     "infra-services/core/venue",
     "infra-services/core/ipc",
     "infra-services/testing",
-    "infra-services/recovery",
 
     # Applications
     "apps/live",
@@ -109,7 +108,7 @@ default-members = [
 serde_json = { workspace = true, optional = true }
 simd-json = { workspace = true, optional = true }
 arc-swap = { workspace = true, optional = true }
-left-right = { workspace = true, optional = true }
+# left-right removed: not suitable for HFT (high write cost, lacks Sync)
 clickhouse = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
@@ -121,12 +120,13 @@ thiserror = "1.0"
 
 # 非同步 (只在需要的 crate 開)
 tokio = { version = "1.0", default-features = false }
+tokio-stream = "0.1"
 futures = "0.3"
 
 # 高性能 (只在 integration/apps 開)
 crossbeam = { version = "0.8", default-features = false }
 arc-swap = "1.6"
-left-right = "0.11"
+# left-right = "0.11"  # Removed: incompatible with Sync requirement
 crossbeam-utils = { version = "0.8", default-features = false }
 
 # 網路 (只在 integration 開，其他復用)
@@ -184,7 +184,7 @@ json-simd = ["dep:simd-json"]
 
 # 快照策略（二選一）
 snapshot-arcswap = ["dep:arc-swap"]
-snapshot-left-right = ["dep:left-right"]
+# snapshot-left-right removed: ArcSwap is the optimal choice for HFT
 
 # 冷路徑可自由組合的特性
 clickhouse = ["dep:clickhouse"]
@@ -199,6 +199,11 @@ harness = true
 [[bench]]
 name = "strategy_dispatch"
 path = "benches/strategy_dispatch.rs"
+harness = false
+
+[[bench]]
+name = "ultra_components"
+path = "benches/ultra_components.rs"
 harness = false
 
 [profile.dev]

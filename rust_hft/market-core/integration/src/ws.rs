@@ -1,6 +1,7 @@
 //! WebSocket 基元 - 高性能 WebSocket 客戶端
-//! 專為 HFT 場景優化：TCP_NODELAY + 禁用壓縮 + 持久連接
+//! 專為 HFT 場景優化：TCP_NODELAY + 禁用壓縮 + 持久連接 + 零拷貝消息接口
 use crate::latency::WsFrameMetrics;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -193,6 +194,62 @@ impl WsClient {
         }
     }
 
+    /// 零拷貝消息接收接口 - 返回 Bytes 而非 String
+    ///
+    /// 相比 receive_message()，此接口避免了 String 分配和 UTF-8 驗證開銷。
+    /// 適合需要直接在原始字節上進行 JSON 解析的高性能場景。
+    ///
+    /// # 性能特性
+    /// - 零數據拷貝：直接返回 WebSocket 幀的底層緩衝區
+    /// - 延遲 UTF-8 驗證：由調用方決定何時進行字符串轉換
+    /// - SIMD JSON 友好：可直接傳遞給 simd-json 進行解析
+    pub async fn receive_message_bytes(
+        &mut self,
+    ) -> Result<Option<(Bytes, WsFrameMetrics)>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(conn) = &mut self.connection {
+            if let Some(msg) = conn.next().await {
+                match msg? {
+                    Message::Text(text) => {
+                        self.metrics.messages_received += 1;
+                        trace!("接收到文本消息 (零拷貝)");
+                        let metrics = WsFrameMetrics::record_receive();
+                        // 將 String 轉為 Bytes（一次性分配，無需二次拷貝）
+                        Ok(Some((Bytes::from(text), metrics)))
+                    }
+                    Message::Binary(data) => {
+                        self.metrics.messages_received += 1;
+                        trace!("接收到二進制消息 (零拷貝)");
+                        let metrics = WsFrameMetrics::record_receive();
+                        // 直接包裝為 Bytes（零拷貝）
+                        Ok(Some((Bytes::from(data), metrics)))
+                    }
+                    Message::Ping(payload) => {
+                        // 自動回應 Ping
+                        conn.send(Message::Pong(payload)).await?;
+                        self.metrics.last_heartbeat = Some(Instant::now());
+                        Ok(None)
+                    }
+                    Message::Pong(_) => {
+                        self.metrics.last_heartbeat = Some(Instant::now());
+                        Ok(None)
+                    }
+                    Message::Close(_) => {
+                        warn!("WebSocket 連接被遠程關閉");
+                        self.connection = None;
+                        Ok(None)
+                    }
+                    Message::Frame(_) => Ok(None),
+                }
+            } else {
+                // 連接已斷開
+                self.connection = None;
+                Ok(None)
+            }
+        } else {
+            Err("WebSocket 未連接".into())
+        }
+    }
+
     pub fn is_connected(&self) -> bool {
         self.connection.is_some()
     }
@@ -208,7 +265,7 @@ impl WsClient {
     }
 }
 
-/// WebSocket 消息處理器特質
+/// WebSocket 消息處理器特質（String 接口 - 向後兼容）
 pub trait MessageHandler: Send + Sync {
     fn handle_message(
         &mut self,
@@ -227,6 +284,47 @@ pub trait MessageHandler: Send + Sync {
     }
 
     /// 連接建立後的異步初始化，可用於發送訂閱消息
+    #[allow(clippy::type_complexity)]
+    fn handle_connected_async<'a>(
+        &'a mut self,
+        client: &'a mut WsClient,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            // 默認調用同步版本
+            self.handle_connected(client)
+        })
+    }
+}
+
+/// 零拷貝 WebSocket 消息處理器特質（Bytes 接口 - 高性能）
+///
+/// 此接口直接處理原始字節，避免 String 分配和 UTF-8 驗證開銷。
+/// 適合需要在熱路徑上進行 JSON 解析的高頻交易場景。
+pub trait BytesMessageHandler: Send + Sync {
+    fn handle_message_bytes(
+        &mut self,
+        message: Bytes,
+        metrics: WsFrameMetrics,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    fn handle_disconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// 連接建立後調用，可用於發送訂閱消息
+    fn handle_connected(
+        &mut self,
+        client: &mut WsClient,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _ = client; // 默認實現不做任何事
+        Ok(())
+    }
+
+    /// 連接建立後的異步初始化，可用於發送訂閱消息
+    #[allow(clippy::type_complexity)]
     fn handle_connected_async<'a>(
         &'a mut self,
         client: &'a mut WsClient,

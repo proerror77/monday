@@ -25,7 +25,7 @@ pub fn parse_owned_value<T: serde::de::DeserializeOwned>(
     {
         let owned: simd_json::OwnedValue = value
             .try_into()
-            .map_err(|e| AdapterError::Serde(e.to_string()))?;
+            .map_err(|e: simd_json::Error| AdapterError::Serde(e.to_string()))?;
         let val: T = simd_json::serde::from_owned_value(owned)
             .map_err(|e| AdapterError::Serde(e.to_string()))?;
         Ok(val)

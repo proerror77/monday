@@ -129,17 +129,21 @@ impl ExecutionClient for BinanceExecutionClient {
                 .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
 
             #[derive(Debug, serde::Deserialize)]
+            #[allow(dead_code)]
             struct PlaceResp {
                 symbol: String,
-                orderId: u64,
-                clientOrderId: String,
-                transactTime: u64,
+                #[serde(rename = "orderId")]
+                order_id: u64,
+                #[serde(rename = "clientOrderId")]
+                client_order_id: String,
+                #[serde(rename = "transactTime")]
+                transact_time: u64,
             }
             let pr: PlaceResp = integration::http::HttpClient::parse_json(resp)
                 .await
                 .map_err(|e| hft_core::HftError::Serialization(e.to_string()))?;
 
-            let oid = OrderId(pr.orderId.to_string());
+            let oid = OrderId(pr.order_id.to_string());
             self.order_symbol.insert(oid.0.clone(), pr.symbol);
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(ExecutionEvent::OrderAck {
@@ -246,7 +250,7 @@ impl ExecutionClient for BinanceExecutionClient {
             if new_quantity.is_none() && new_price.is_none() {
                 return Ok(());
             }
-            let symbol = self
+            let _symbol = self
                 .order_symbol
                 .get(&order_id.0)
                 .cloned()
@@ -325,18 +329,19 @@ impl ExecutionClient for BinanceExecutionClient {
                 .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
             #[derive(serde::Deserialize)]
             struct Lk {
-                listenKey: String,
+                #[serde(rename = "listenKey")]
+                listen_key: String,
             }
             let lk: Lk = integration::http::HttpClient::parse_json(resp)
                 .await
                 .map_err(|e| hft_core::HftError::Serialization(e.to_string()))?;
-            self.listen_key = Some(lk.listenKey.clone());
+            self.listen_key = Some(lk.listen_key.clone());
 
             // 2) 連線 WS
             let url = format!(
                 "{}/{}",
                 self.ws_base_url.trim_end_matches('/'),
-                lk.listenKey
+                lk.listen_key
             );
             let ws_tx = tx.clone();
             tokio::spawn(async move {
@@ -463,8 +468,8 @@ impl ExecutionClient for BinanceExecutionClient {
                     }
                 });
             }
-        } else if self.mode == ExecutionMode::Live {
-            warn!("Binance Live: 未提供 API 憑證，跳過私有 WS 建立");
+        } else {
+            warn!("Binance Paper mode: 跳過私有 WS 建立");
         }
 
         Ok(())
@@ -526,16 +531,22 @@ impl ExecutionClient for BinanceExecutionClient {
 
         // 響應為陣列
         #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
         struct BinanceOrder {
             symbol: String,
-            orderId: u64,
-            clientOrderId: String,
+            #[serde(rename = "orderId")]
+            order_id: u64,
+            #[serde(rename = "clientOrderId")]
+            client_order_id: String,
             price: String,
-            origQty: String,
-            executedQty: String,
+            #[serde(rename = "origQty")]
+            orig_qty: String,
+            #[serde(rename = "executedQty")]
+            executed_qty: String,
             status: String,
             time: u64,
-            updateTime: u64,
+            #[serde(rename = "updateTime")]
+            update_time: u64,
             side: String,
             r#type: String,
         }
@@ -556,9 +567,9 @@ impl ExecutionClient for BinanceExecutionClient {
                 _ => hft_core::OrderType::Limit,
             };
             let qty =
-                hft_core::Quantity::from_str(&it.origQty).unwrap_or(hft_core::Quantity::zero());
+                hft_core::Quantity::from_str(&it.orig_qty).unwrap_or(hft_core::Quantity::zero());
             let filled =
-                hft_core::Quantity::from_str(&it.executedQty).unwrap_or(hft_core::Quantity::zero());
+                hft_core::Quantity::from_str(&it.executed_qty).unwrap_or(hft_core::Quantity::zero());
             let remaining = hft_core::Quantity(qty.0 - filled.0);
             let price = hft_core::Price::from_str(&it.price).ok();
             let status = match it.status.as_str() {
@@ -572,7 +583,7 @@ impl ExecutionClient for BinanceExecutionClient {
             };
 
             out.push(OpenOrder {
-                order_id: hft_core::OrderId(it.orderId.to_string()),
+                order_id: hft_core::OrderId(it.order_id.to_string()),
                 symbol: hft_core::Symbol::from(it.symbol),
                 side,
                 order_type,
@@ -582,7 +593,7 @@ impl ExecutionClient for BinanceExecutionClient {
                 price,
                 status,
                 created_at: it.time * 1000,       // ms -> μs
-                updated_at: it.updateTime * 1000, // ms -> μs
+                updated_at: it.update_time * 1000, // ms -> μs
             });
         }
 

@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind(snapshot.ts)
         .bind(end_us)
         .fetch::<EventRecord>()?;
-    let speed = if args.speed <= 0.0 { 1.0 } else { args.speed } as f64;
+    let speed = if args.speed <= 0.0 { 1.0 } else { args.speed };
     let mut last_ts = snapshot.ts;
     let mut prev_u: Option<u64> = None; // Binance U/u/pu 連續性
     let mut seq: u64 = 0;
@@ -189,10 +189,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Bitget 校驗：優先使用原始字串，否則以固定小數位格式化
                 if let Some(cs) = checksum {
                     let crc = compute_bitget_crc(
-                        bids_px_s.as_ref().map(|v| v.as_slice()),
-                        bids_qty_s.as_ref().map(|v| v.as_slice()),
-                        asks_px_s.as_ref().map(|v| v.as_slice()),
-                        asks_qty_s.as_ref().map(|v| v.as_slice()),
+                        bids_px_s.as_deref(),
+                        bids_qty_s.as_deref(),
+                        asks_px_s.as_deref(),
+                        asks_qty_s.as_deref(),
                         &bids_px,
                         &bids_qty,
                         &asks_px,
@@ -306,7 +306,7 @@ impl OrderBookState {
         }
     }
     fn best_bid(&self) -> Option<f64> {
-        self.bids.keys().rev().next().map(|k| k.0)
+        self.bids.keys().next_back().map(|k| k.0)
     }
     fn best_ask(&self) -> Option<f64> {
         self.asks.keys().next().map(|k| k.0)
@@ -461,6 +461,7 @@ fn to_event_row(venue: &str, r: EventRecord) -> EventRow {
 }
 
 // ----- 校驗 & 插入工具 -----
+#[allow(clippy::too_many_arguments)]
 fn compute_bitget_crc(
     bids_px_s: Option<&[String]>,
     bids_qty_s: Option<&[String]>,
@@ -601,5 +602,5 @@ fn to_dt64(ts_ms: u64) -> DateTime<Utc> {
     // event_ts 是毫秒，轉為 DateTime64(6) 的秒+納秒
     let secs = (ts_ms / 1000) as i64;
     let nanos = ((ts_ms % 1000) * 1_000_000) as u32;
-    DateTime::<Utc>::from_timestamp(secs, nanos).unwrap_or_else(|| DateTime::<Utc>::UNIX_EPOCH)
+    DateTime::<Utc>::from_timestamp(secs, nanos).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }

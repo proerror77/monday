@@ -3,8 +3,8 @@
 //! 测试 Paper 和 Live 模式的基础功能
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
-    use super::*;
     use crate::{
         Eip712Signer, ExecutionMode, HyperliquidExecutionClient, HyperliquidExecutionConfig,
     };

@@ -35,8 +35,8 @@ pub struct Portfolio {
     processed_fill_ids: HashMap<hft_core::OrderId, HashSet<String>>,
 }
 
-impl Portfolio {
-    pub fn new() -> Self {
+impl Default for Portfolio {
+    fn default() -> Self {
         let view = AccountView::default();
         let snapshot = SnapshotContainer::new(view.clone());
         Self {
@@ -47,6 +47,12 @@ impl Portfolio {
             processed_fill_ids: HashMap::new(),
         }
     }
+}
+
+impl Portfolio {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// 註冊下單元資訊（供 fill 時查找 symbol/side）
     pub fn register_order(&mut self, order_id: hft_core::OrderId, symbol: Symbol, side: Side) {
@@ -55,37 +61,35 @@ impl Portfolio {
 
     /// 處理執行事件，僅處理 Fill/Balance 類事件
     pub fn on_execution_event(&mut self, event: &ExecutionEvent) {
-        match event {
-            ExecutionEvent::Fill {
-                order_id,
-                price,
-                quantity,
-                fill_id,
-                ..
-            } => {
-                if let Some((symbol, side)) = self.order_meta.get(order_id).cloned() {
-                    // De-duplication: skip duplicated fill_id for this order
-                    let set = self
-                        .processed_fill_ids
-                        .entry(order_id.clone())
-                        .or_insert_with(HashSet::new);
-                    if !fill_id.is_empty() && set.contains(fill_id) {
-                        // duplicate, ignore
-                    } else {
-                        if !fill_id.is_empty() {
-                            set.insert(fill_id.clone());
-                        }
-                        self.apply_fill(&symbol, side, *price, *quantity);
+        if let ExecutionEvent::Fill {
+            order_id,
+            price,
+            quantity,
+            fill_id,
+            ..
+        } = event
+        {
+            if let Some((symbol, side)) = self.order_meta.get(order_id).cloned() {
+                // De-duplication: skip duplicated fill_id for this order
+                let set = self
+                    .processed_fill_ids
+                    .entry(order_id.clone())
+                    .or_default();
+                if !fill_id.is_empty() && set.contains(fill_id) {
+                    // duplicate, ignore
+                } else {
+                    if !fill_id.is_empty() {
+                        set.insert(fill_id.clone());
                     }
-                    // 更新該品種的市場價格為成交價（如果沒有更好的市場價格）
-                    if !self.market_prices.contains_key(&symbol) {
-                        self.market_prices.insert(symbol.clone(), *price);
-                    }
-                    // 重新計算未實現盈虧
-                    self.recalculate_unrealized_pnl();
+                    self.apply_fill(&symbol, side, *price, *quantity);
                 }
+                // 更新該品種的市場價格為成交價（如果沒有更好的市場價格）
+                if !self.market_prices.contains_key(&symbol) {
+                    self.market_prices.insert(symbol.clone(), *price);
+                }
+                // 重新計算未實現盈虧
+                self.recalculate_unrealized_pnl();
             }
-            _ => {}
         }
         // 每次更新後發佈只讀快照
         self.snapshot.store(Arc::new(self.view.clone()));
@@ -206,6 +210,51 @@ impl Portfolio {
     }
 }
 
+/// 實現 PortfolioManager trait - 將現有方法適配為 trait 接口
+impl ports::PortfolioManager for Portfolio {
+    fn register_order(&mut self, order_id: hft_core::OrderId, symbol: Symbol, side: Side) {
+        // 直接調用現有實現
+        self.register_order(order_id, symbol, side);
+    }
+
+    fn on_execution_event(&mut self, event: &ExecutionEvent) {
+        // 直接調用現有實現
+        self.on_execution_event(event);
+    }
+
+    fn reader(&self) -> Arc<dyn snapshot::SnapshotReader<AccountView>> {
+        // 直接調用現有實現
+        self.reader()
+    }
+
+    fn update_market_prices(&mut self, prices: &HashMap<Symbol, Price>) {
+        // 直接調用現有實現
+        self.update_market_prices(prices);
+    }
+
+    fn export_state(&self) -> ports::PortfolioState {
+        // 轉換內部 PortfolioState 為 ports::PortfolioState
+        let internal_state = self.export_state();
+        ports::PortfolioState {
+            account_view: internal_state.account_view,
+            order_meta: internal_state.order_meta,
+            market_prices: internal_state.market_prices,
+            processed_fill_ids: internal_state.processed_fill_ids,
+        }
+    }
+
+    fn import_state(&mut self, state: ports::PortfolioState) {
+        // 轉換 ports::PortfolioState 為內部 PortfolioState
+        let internal_state = PortfolioState {
+            account_view: state.account_view,
+            order_meta: state.order_meta,
+            market_prices: state.market_prices,
+            processed_fill_ids: state.processed_fill_ids,
+        };
+        self.import_state(internal_state);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +277,6 @@ mod tests {
         pf.on_execution_event(&ev);
 
         let view = pf.reader().load();
-        assert!(view.positions.get(&sym).is_some());
+        assert!(view.positions.contains_key(&sym));
     }
 }

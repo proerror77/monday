@@ -81,6 +81,7 @@ fn parse_levels(side: &serde_json::Value) -> Vec<BookLevel> {
 }
 
 /// Lighter 市場數據流
+#[derive(Default)]
 pub struct LighterMarketStream {
     is_connected: bool,
     last_heartbeat: u64,
@@ -88,10 +89,7 @@ pub struct LighterMarketStream {
 
 impl LighterMarketStream {
     pub fn new() -> Self {
-        Self {
-            is_connected: false,
-            last_heartbeat: 0,
-        }
+        Self::default()
     }
 }
 

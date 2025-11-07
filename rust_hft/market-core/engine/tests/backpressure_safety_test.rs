@@ -118,7 +118,7 @@ fn test_backpressure_status_fields() {
     };
 
     assert_eq!(status.utilization, 0.75);
-    assert_eq!(status.is_under_pressure, true);
+    assert!(status.is_under_pressure);
     assert_eq!(status.events_dropped_total, 100);
     assert_eq!(status.queue_capacity, 32768);
     assert!(!status.recommended_action.is_empty());

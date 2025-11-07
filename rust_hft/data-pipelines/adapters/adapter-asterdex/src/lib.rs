@@ -27,6 +27,12 @@ pub struct AsterdexMarketStream {
     last_heartbeat: u64,
 }
 
+impl Default for AsterdexMarketStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AsterdexMarketStream {
     pub fn new() -> Self {
         Self {

@@ -55,11 +55,11 @@ impl VenueSnapshot {
     pub fn from_market_snapshot(venue: String, snapshot: &MarketSnapshot) -> Self {
         let best_bid = snapshot
             .bids
-            .get(0)
+            .first()
             .map(|level| (level.price, level.quantity));
         let best_ask = snapshot
             .asks
-            .get(0)
+            .first()
             .map(|level| (level.price, level.quantity));
 
         Self {

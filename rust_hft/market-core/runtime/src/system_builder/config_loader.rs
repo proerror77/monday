@@ -103,7 +103,7 @@ fn legacy_load_with_templates(content: &str) -> Result<SystemConfig, Box<dyn std
                 YamlValue::from("strategies"),
                 serde_yaml::to_value(&expanded)?,
             );
-            map.remove(&YamlValue::from("instruments"));
+            map.remove(YamlValue::from("instruments"));
         }
     }
     let mut config: SystemConfig = serde_yaml::from_value(root)?;
@@ -121,6 +121,9 @@ fn convert_shared_config(shared_cfg: SharedSystemConfig) -> Result<SystemConfig,
         ack_timeout_ms: shared_cfg.engine.ack_timeout_ms,
         reconcile_interval_ms: shared_cfg.engine.reconcile_interval_ms,
         auto_cancel_exchange_only: shared_cfg.engine.auto_cancel_exchange_only,
+        intent_queue_capacity: 4096,
+        event_queue_capacity: 8192,
+        execution_batch_size: 32,
     };
 
     let strict = is_strict_mode();
@@ -454,7 +457,9 @@ pub(super) fn convert_strategy_params(
                 .ok()
                 .and_then(|value| serde_yaml::from_value(value).ok())
                 .unwrap_or_default();
-            Ok(StrategyParams::LobFlowGrid { config: lob_params })
+            Ok(StrategyParams::LobFlowGrid {
+                config: Box::new(lob_params),
+            })
         }
         (shared::StrategyType::Arbitrage, _) => Ok(StrategyParams::Arbitrage {
             min_spread_bps: Decimal::ZERO,
@@ -774,10 +779,12 @@ fn allow_autofill_symbols() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use tempfile::tempdir;
 
     // 初始化 tracing subscriber，避免測試卡住
+    #[allow(dead_code)]
     fn init_test_tracing() {
         let _ = tracing_subscriber::fmt()
             .with_test_writer()
@@ -803,6 +810,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn load_v2_config_uses_instrument_catalog() {
         let dir = tempdir().expect("temp dir");
         let catalog_path = dir.path().join("catalog.yaml");
@@ -885,14 +893,15 @@ risk:
         assert!(venue.capabilities.use_incremental_books);
         assert_eq!(venue.symbol_catalog.len(), 1);
         assert_eq!(
-            venue.symbol_catalog[0].symbol().expect("catalog symbol").0,
+            venue.symbol_catalog[0].symbol().expect("catalog symbol").as_str(),
             "BTCUSDT"
         );
         assert_eq!(config.strategies.len(), 1);
-        assert_eq!(config.strategies[0].symbols[0].0, "BTCUSDT");
+        assert_eq!(config.strategies[0].symbols[0].as_str(), "BTCUSDT");
     }
 
     #[test]
+    #[serial]
     fn load_v2_config_uses_venue_catalog_when_instrument_catalog_missing() {
         let dir = tempdir().expect("temp dir");
         let venue_catalog_path = dir.path().join("venues.yaml");
@@ -964,6 +973,7 @@ risk:
     }
 
     #[test]
+    #[serial]
     fn load_v2_config_populates_symbol_catalog_from_instrument_catalog() {
         let dir = tempdir().expect("temp dir");
         let instrument_catalog_path = dir.path().join("inst.yaml");
@@ -1031,13 +1041,14 @@ risk:
         let ids: Vec<_> = venue
             .symbol_catalog
             .iter()
-            .map(|id| id.symbol().unwrap().0)
+            .map(|id| id.symbol().unwrap().as_str().to_string())
             .collect();
         assert!(ids.contains(&"BTCUSDT".to_string()));
         assert!(ids.contains(&"ETHUSDT".to_string()));
     }
 
     #[test]
+    #[serial]
     fn strict_mode_reports_unknown_strategy_symbol() {
         let dir = tempdir().expect("temp dir");
         let instrument_catalog_path = dir.path().join("inst.yaml");

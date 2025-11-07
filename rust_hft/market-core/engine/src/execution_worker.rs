@@ -22,18 +22,13 @@ use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// 客户端选择策略
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum ClientSelectionStrategy {
     /// 基于符号名称的一致性哈希（确保同一品种总是路由到同一客户端）
+    #[default]
     ConsistentHash,
     /// 轮询策略（负载均衡，但可能将同品种分散到不同客户端）
     RoundRobin,
-}
-
-impl Default for ClientSelectionStrategy {
-    fn default() -> Self {
-        Self::ConsistentHash
-    }
 }
 
 /// 执行 Worker 配置
@@ -81,12 +76,13 @@ impl Default for ExecutionWorkerConfig {
 impl ExecutionWorkerConfig {
     /// 高性能預設：降低批量系統調用開銷與空閒睡眠延遲
     pub fn high_performance() -> Self {
-        let mut cfg = Self::default();
-        cfg.batch_size = 64;
-        cfg.idle_sleep_ms = 0;
-        cfg.ack_timeout_ms = 2000;
-        cfg.retry_delay_ms = 50;
-        cfg
+        Self {
+            batch_size: 64,
+            idle_sleep_ms: 0,
+            ack_timeout_ms: 2000,
+            retry_delay_ms: 50,
+            ..Default::default()
+        }
     }
 }
 
@@ -755,7 +751,7 @@ impl ExecutionWorker {
                 };
                 if let Some(client) = self.execution_clients.get_mut(client_idx) {
                     match client
-                        .modify_order(&order_id, new_quantity.clone(), new_price.clone())
+                        .modify_order(&order_id, new_quantity, new_price)
                         .await
                     {
                         Ok(()) => {
@@ -806,123 +802,6 @@ pub enum ControlCommand {
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
-    use ports::OrderIntent;
-    use std::collections::HashSet;
-
-    fn create_test_intent(symbol: &str) -> OrderIntent {
-        OrderIntent {
-            symbol: Symbol::new(symbol),
-            side: Side::Buy,
-            order_type: OrderType::Market,
-            quantity: Quantity::from_f64(1.0).unwrap(),
-            price: Some(Price::from_f64(100.0).unwrap()),
-            time_in_force: TimeInForce::IOC,
-            strategy_id: "test".to_string(),
-            target_venue: None,
-        }
-    }
-
-    #[test]
-    fn test_consistent_hash_selection() {
-        let client_count = 3;
-        let symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOTUSDT"];
-
-        // 測試一致性哈希：相同的符號應該總是選擇相同的客戶端
-        for symbol in &symbols {
-            // 模擬一致性哈希計算
-            let mut hash: u32 = 2166136261;
-            for byte in symbol.as_bytes() {
-                hash ^= *byte as u32;
-                hash = hash.wrapping_mul(16777619);
-            }
-            let expected_client = (hash as usize) % client_count;
-
-            // 多次計算應該得到相同結果
-            for _ in 0..10 {
-                let mut test_hash: u32 = 2166136261;
-                for byte in symbol.as_bytes() {
-                    test_hash ^= *byte as u32;
-                    test_hash = test_hash.wrapping_mul(16777619);
-                }
-                let actual_client = (test_hash as usize) % client_count;
-                assert_eq!(
-                    expected_client, actual_client,
-                    "一致性哈希對於符號 '{}' 應該總是返回相同的客戶端",
-                    symbol
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_round_robin_distribution() {
-        let client_count = 3;
-        let rounds = 9; // 3 輪循環
-
-        // 模擬輪詢分配
-        let mut distribution = vec![0; client_count];
-        for i in 0..rounds {
-            let client_idx = i % client_count;
-            distribution[client_idx] += 1;
-        }
-
-        // 驗證分配均勻性
-        let expected_per_client = rounds / client_count;
-        for (client_idx, count) in distribution.iter().enumerate() {
-            assert_eq!(
-                *count, expected_per_client,
-                "輪詢策略應該均勻分配負載，客戶端 {} 期望 {} 次，實際 {} 次",
-                client_idx, expected_per_client, count
-            );
-        }
-    }
-
-    #[test]
-    fn test_hash_distribution_quality() {
-        // 測試哈希分佈質量
-        let client_count = 4;
-        let symbols = [
-            "BTCUSDT",
-            "ETHUSDT",
-            "ADAUSDT",
-            "DOTUSDT",
-            "BNBUSDT",
-            "XRPUSDT",
-            "SOLUSDT",
-            "LINKUSDT",
-            "AVAXUSDT",
-            "MATICUSDT",
-        ];
-
-        let mut distribution = vec![0; client_count];
-        let mut used_clients = HashSet::new();
-
-        for symbol in &symbols {
-            let mut hash: u32 = 2166136261;
-            for byte in symbol.as_bytes() {
-                hash ^= *byte as u32;
-                hash = hash.wrapping_mul(16777619);
-            }
-            let client_idx = (hash as usize) % client_count;
-            distribution[client_idx] += 1;
-            used_clients.insert(client_idx);
-        }
-
-        // 應該至少使用 2 個不同的客戶端（避免所有流量集中在單個客戶端）
-        assert!(
-            used_clients.len() >= 2,
-            "哈希分佈應該使用多個客戶端，實際只使用了 {} 個",
-            used_clients.len()
-        );
-
-        // 列印分佈以供調試
-        println!("哈希分佈: {:?}", distribution);
-    }
 }
 
 /// 创建并启动执行 Worker 任务
@@ -1056,5 +935,123 @@ impl ExecutionWorker {
             debug!("對帳：未發現交換端獨有訂單（總未結={}）", total_open);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
+    use ports::OrderIntent;
+    use std::collections::HashSet;
+
+    #[allow(dead_code)]
+    fn create_test_intent(symbol: &str) -> OrderIntent {
+        OrderIntent {
+            symbol: Symbol::new(symbol),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            price: Some(Price::from_f64(100.0).unwrap()),
+            time_in_force: TimeInForce::IOC,
+            strategy_id: "test".to_string(),
+            target_venue: None,
+        }
+    }
+
+    #[test]
+    fn test_consistent_hash_selection() {
+        let client_count = 3;
+        let symbols = ["BTCUSDT", "ETHUSDT", "ADAUSDT", "DOTUSDT"];
+
+        // 測試一致性哈希：相同的符號應該總是選擇相同的客戶端
+        for symbol in &symbols {
+            // 模擬一致性哈希計算
+            let mut hash: u32 = 2166136261;
+            for byte in symbol.as_bytes() {
+                hash ^= *byte as u32;
+                hash = hash.wrapping_mul(16777619);
+            }
+            let expected_client = (hash as usize) % client_count;
+
+            // 多次計算應該得到相同結果
+            for _ in 0..10 {
+                let mut test_hash: u32 = 2166136261;
+                for byte in symbol.as_bytes() {
+                    test_hash ^= *byte as u32;
+                    test_hash = test_hash.wrapping_mul(16777619);
+                }
+                let actual_client = (test_hash as usize) % client_count;
+                assert_eq!(
+                    expected_client, actual_client,
+                    "一致性哈希對於符號 '{}' 應該總是返回相同的客戶端",
+                    symbol
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_round_robin_distribution() {
+        let client_count = 3;
+        let rounds = 9; // 3 輪循環
+
+        // 模擬輪詢分配
+        let mut distribution = vec![0; client_count];
+        for i in 0..rounds {
+            let client_idx = i % client_count;
+            distribution[client_idx] += 1;
+        }
+
+        // 驗證分配均勻性
+        let expected_per_client = rounds / client_count;
+        for (client_idx, count) in distribution.iter().enumerate() {
+            assert_eq!(
+                *count, expected_per_client,
+                "輪詢策略應該均勻分配負載，客戶端 {} 期望 {} 次，實際 {} 次",
+                client_idx, expected_per_client, count
+            );
+        }
+    }
+
+    #[test]
+    fn test_hash_distribution_quality() {
+        // 測試哈希分佈質量
+        let client_count = 4;
+        let symbols = [
+            "BTCUSDT",
+            "ETHUSDT",
+            "ADAUSDT",
+            "DOTUSDT",
+            "BNBUSDT",
+            "XRPUSDT",
+            "SOLUSDT",
+            "LINKUSDT",
+            "AVAXUSDT",
+            "MATICUSDT",
+        ];
+
+        let mut distribution = vec![0; client_count];
+        let mut used_clients = HashSet::new();
+
+        for symbol in &symbols {
+            let mut hash: u32 = 2166136261;
+            for byte in symbol.as_bytes() {
+                hash ^= *byte as u32;
+                hash = hash.wrapping_mul(16777619);
+            }
+            let client_idx = (hash as usize) % client_count;
+            distribution[client_idx] += 1;
+            used_clients.insert(client_idx);
+        }
+
+        // 應該至少使用 2 個不同的客戶端（避免所有流量集中在單個客戶端）
+        assert!(
+            used_clients.len() >= 2,
+            "哈希分佈應該使用多個客戶端，實際只使用了 {} 個",
+            used_clients.len()
+        );
+
+        // 列印分佈以供調試
+        println!("哈希分佈: {:?}", distribution);
     }
 }

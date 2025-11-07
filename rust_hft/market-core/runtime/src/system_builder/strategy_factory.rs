@@ -97,10 +97,12 @@ fn create_trend_strategies(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn St
 
         let mut instances: Vec<Box<dyn StrategyTrait>> = Vec::new();
         for sym in &_config.symbols {
-            let mut cfg = strategy_trend::TrendStrategyConfig::default();
-            cfg.ema_fast_period = ema_fast;
-            cfg.ema_slow_period = ema_slow;
-            cfg.rsi_period = rsi_period;
+            let cfg = strategy_trend::TrendStrategyConfig {
+                ema_fast_period: ema_fast,
+                ema_slow_period: ema_slow,
+                rsi_period,
+                ..Default::default()
+            };
             let instance_id = format!("{}:{}", _config.name, sym.as_str());
             let strat = strategy_trend::TrendStrategy::with_name(sym.clone(), cfg, instance_id);
             instances.push(Box::new(strat));
@@ -150,7 +152,7 @@ fn create_lob_flow_grid_strategies(
     {
         use strategy_lob_flow_grid::LobFlowGridStrategy;
         let params = match &_config.params {
-            StrategyParams::LobFlowGrid { config } => config.clone(),
+            StrategyParams::LobFlowGrid { config } => (**config).clone(),
             _ => super::LobFlowGridParams::default(),
         };
 

@@ -67,8 +67,8 @@ impl ExecutionClient for SimulatedExecutionClient {
             order_id: order_id.clone(),
             symbol: intent.symbol.clone(),
             side: intent.side,
-            quantity: intent.quantity.clone(),
-            requested_price: intent.price.clone(),
+            quantity: intent.quantity,
+            requested_price: intent.price,
             timestamp: now,
             venue: Some(self.venue),
             strategy_id: intent.strategy_id.clone(),
@@ -80,10 +80,9 @@ impl ExecutionClient for SimulatedExecutionClient {
         });
 
         let sender = self.events_tx.clone();
-        let qty = intent.quantity.clone();
+        let qty = intent.quantity;
         let price = intent
             .price
-            .clone()
             .unwrap_or_else(|| Price::from_f64(0.0).expect("valid price"));
         let delay = Duration::from_millis(self.fill_delay_ms);
         let order_id_in_flight = order_id.clone();
@@ -94,8 +93,8 @@ impl ExecutionClient for SimulatedExecutionClient {
             let fill_id = format!("sim_fill_{}", ts);
             let _ = sender.send(ExecutionEvent::Fill {
                 order_id: order_id_in_flight.clone(),
-                price: price.clone(),
-                quantity: qty.clone(),
+                price,
+                quantity: qty,
                 timestamp: ts,
                 fill_id,
             });
@@ -142,7 +141,7 @@ impl ExecutionClient for SimulatedExecutionClient {
         let rx = guard
             .take()
             .ok_or_else(|| HftError::new("Simulated execution stream already taken"))?;
-        let stream = UnboundedReceiverStream::new(rx).map(|evt| Ok(evt));
+        let stream = UnboundedReceiverStream::new(rx).map(Ok);
         Ok(Box::pin(stream))
     }
 

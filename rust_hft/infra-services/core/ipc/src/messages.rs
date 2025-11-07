@@ -7,23 +7,47 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use shared_config::StrategyParams as SharedStrategyParams;
 use std::collections::HashMap;
+
+#[cfg(feature = "ipc")]
 use uuid::Uuid;
+
+/// Request ID type - uses UUID when IPC feature enabled, String otherwise
+#[cfg(feature = "ipc")]
+pub type RequestId = Uuid;
+
+#[cfg(not(feature = "ipc"))]
+pub type RequestId = String;
 
 /// Top-level IPC message envelope
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IPCMessage {
     /// Unique request ID for correlation
-    pub id: Uuid,
+    pub id: RequestId,
     /// Message timestamp (Unix epoch nanos)
     pub timestamp: u64,
     /// Message payload
     pub payload: IPCPayload,
 }
 
+#[cfg(feature = "ipc")]
 impl IPCMessage {
     pub fn new(payload: IPCPayload) -> Self {
         Self {
             id: Uuid::new_v4(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64,
+            payload,
+        }
+    }
+}
+
+#[cfg(not(feature = "ipc"))]
+impl IPCMessage {
+    pub fn new(payload: IPCPayload) -> Self {
+        Self {
+            id: String::new(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

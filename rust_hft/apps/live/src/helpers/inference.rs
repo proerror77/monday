@@ -7,6 +7,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+// Type alias for complex window data structure
+type WindowEntry = Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>;
+
 pub fn spawn_inference_worker(
     engine_arc: Arc<Mutex<Engine>>,
     model_path: String,
@@ -34,8 +37,7 @@ async fn run_infer_worker(
     step_ms: u64,
 ) -> anyhow::Result<()> {
     let predictor = OnnxPredictor::load(model_path, (1, 4, l, k))?;
-    let mut windows: HashMap<String, Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>> =
-        HashMap::new();
+    let mut windows: HashMap<String, WindowEntry> = HashMap::new();
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(step_ms));
 
     loop {
@@ -69,8 +71,8 @@ async fn run_infer_worker(
                 let bq = ob.bid_quantities.get(i).map(|q| q.to_f64()).unwrap_or(0.0) as f32;
                 let ap = ob.ask_prices.get(i).map(|p| p.to_f64()).unwrap_or(0.0) as f32;
                 let aq = ob.ask_quantities.get(i).map(|q| q.to_f64()).unwrap_or(0.0) as f32;
-                bid_px_rel.push((bp - mid as f32) as f32);
-                ask_px_rel.push((ap - mid as f32) as f32);
+                bid_px_rel.push(bp - mid as f32);
+                ask_px_rel.push(ap - mid as f32);
                 bid_qty_log.push((1.0 + bq).ln());
                 ask_qty_log.push((1.0 + aq).ln());
             }
@@ -83,12 +85,11 @@ async fn run_infer_worker(
 
             if entry.len() == l {
                 let mut flat = Vec::with_capacity(4 * l * k);
-                for t in 0..l {
-                    let (ref bpr, ref bql, ref apr, ref aql) = entry[t];
-                    flat.extend_from_slice(&bpr[..]);
-                    flat.extend_from_slice(&bql[..]);
-                    flat.extend_from_slice(&apr[..]);
-                    flat.extend_from_slice(&aql[..]);
+                for (bpr, bql, apr, aql) in entry.iter() {
+                    flat.extend_from_slice(bpr);
+                    flat.extend_from_slice(bql);
+                    flat.extend_from_slice(apr);
+                    flat.extend_from_slice(aql);
                 }
 
                 match predictor.infer(&flat) {

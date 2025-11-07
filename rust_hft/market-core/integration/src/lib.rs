@@ -4,6 +4,7 @@
 //! - 僅供 adapters 復用
 
 pub mod http;
+pub mod json;
 pub mod latency;
 pub mod rate_limit;
 pub mod reconnect;

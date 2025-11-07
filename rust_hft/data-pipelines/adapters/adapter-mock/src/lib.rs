@@ -41,7 +41,7 @@ impl MarketStream for MockMarketStream {
         let stream = IntervalStream::new(interval).map(move |_| {
             counter += 1;
             let ts = current_ts();
-            let sym = symbols.get(0).cloned().unwrap_or(Symbol::new("BTCUSDT"));
+            let sym = symbols.first().cloned().unwrap_or(Symbol::new("BTCUSDT"));
 
             // 生成更加波動的價格數據以觸發策略信號
             let base_price = 67000.0;

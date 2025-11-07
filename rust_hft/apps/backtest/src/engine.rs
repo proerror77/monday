@@ -55,11 +55,11 @@ impl BacktestEngine {
         self.run_with_stream(stream)
     }
 
-    pub fn run_with_stream<I>(&mut self, mut stream: I) -> Result<BacktestResult>
+    pub fn run_with_stream<I>(&mut self, stream: I) -> Result<BacktestResult>
     where
         I: Iterator<Item = anyhow::Result<EventEnvelope>>,
     {
-        while let Some(evt) = stream.next() {
+        for evt in stream {
             let event = evt?;
             self.process_event(&event)?;
         }
@@ -282,8 +282,7 @@ impl OrderBook {
     fn best_bid(&self) -> Option<(f64, f64)> {
         self.bids
             .iter()
-            .rev()
-            .next()
+            .next_back()
             .map(|(p, q)| (p.into_inner(), *q))
     }
 

@@ -192,19 +192,11 @@ impl WorkerQueues {
         }
     }
 
-    /// 强制发送回报 (使用 force_send)
+    /// 尝试发送执行回报；满载时丢弃（DropNew）
     pub fn send_event_force(&mut self, event: ExecutionEvent) -> bool {
-        if self.event_producer.force_send(event) {
-            self.stats.events_sent += 1;
-            // 唤醒引擎处理新的执行事件
-            if let Some(notify) = &self.engine_notify {
-                notify.notify_one();
-            }
-            true
-        } else {
-            self.stats.event_queue_full_count += 1;
-            warn!("回报队列 force_send 失败");
-            false
+        match self.send_event(event) {
+            Ok(()) => true,
+            Err(_) => false,
         }
     }
 

@@ -1,4 +1,5 @@
 //! 高性能定点数运算
+#![allow(clippy::should_implement_trait)]
 //!
 //! 为热路径提供快速的定点数算术，精度固定为6位小数
 //! 内部使用 i64 表示，避免 Decimal 的堆分配和复杂运算

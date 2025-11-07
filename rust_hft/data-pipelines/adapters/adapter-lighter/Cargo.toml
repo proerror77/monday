@@ -19,7 +19,7 @@ reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-feature
 # Serialization
 serde = { workspace = true }
 serde_json = { version = "1.0" }
-simd-json = { workspace = true }
+simd-json = { workspace = true, optional = true }
 
 # Utilities
 tracing = { workspace = true }
@@ -27,6 +27,10 @@ url = "2.4"
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 async-trait = "0.1"
+
+[features]
+default = []
+json-simd = ["dep:simd-json"]
 
 [lib]
 name = "adapter_lighter_data"

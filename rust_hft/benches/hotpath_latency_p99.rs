@@ -98,8 +98,8 @@ fn bench_hotpath_latency() {
 
     // Prepare N synthetic snapshots with multi-venue data
     let n = 50_000u32;
-    let venues = vec![VenueId::BINANCE, VenueId::BITGET];
-    let symbols = vec!["BTCUSDT", "ETHUSDT"];
+    let venues = [VenueId::BINANCE, VenueId::BITGET];
+    let symbols = ["BTCUSDT", "ETHUSDT"];
 
     info!("生成 {} 个测试快照", n);
     {
@@ -148,7 +148,7 @@ fn bench_hotpath_latency() {
                 }
 
                 // Print progress every 1000 ticks
-                if processed_ticks > 0 && processed_ticks % 1000 == 0 {
+                if processed_ticks > 0 && processed_ticks.is_multiple_of(1000) {
                     debug!("已处理 {} 个tick", processed_ticks);
                 }
             }
@@ -252,7 +252,7 @@ fn bench_multi_venue_latency() {
 
     // Generate interleaved venue snapshots
     let n_per_venue = 10_000u32;
-    let venues = vec![VenueId::BINANCE, VenueId::BITGET];
+    let venues = [VenueId::BINANCE, VenueId::BITGET];
 
     {
         let mut guard = ingester.lock().unwrap();

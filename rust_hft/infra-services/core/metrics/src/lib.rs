@@ -91,7 +91,7 @@ pub struct EngineStatisticsExport {
 impl MetricsRegistry {
     /// 初始化全局指標註冊表
     pub fn init() -> &'static Self {
-        METRICS_REGISTRY.get_or_init(|| Self::create_with_prometheus())
+        METRICS_REGISTRY.get_or_init(Self::create_with_prometheus)
     }
 
     /// 獲取全局指標註冊表
@@ -462,56 +462,48 @@ impl MetricsRegistry {
     /// 記錄 WS 接收延遲
     pub fn record_ws_receive_latency(&self, latency_us: f64) {
         self.latency_ws_receive.observe(latency_us);
-        debug!("記錄 WS 接收延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
     /// 記錄解析階段延遲
     pub fn record_parsing_latency(&self, latency_us: f64) {
         self.latency_parsing.observe(latency_us);
-        debug!("記錄解析延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
     /// 記錄攝取階段延遲
     pub fn record_ingestion_latency(&self, latency_us: f64) {
         self.latency_ingestion.observe(latency_us);
-        debug!("記錄攝取延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
     /// 記錄聚合階段延遲
     pub fn record_aggregation_latency(&self, latency_us: f64) {
         self.latency_aggregation.observe(latency_us);
-        debug!("記錄聚合延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
     /// 記錄策略階段延遲
     pub fn record_strategy_latency(&self, latency_us: f64) {
         self.latency_strategy.observe(latency_us);
-        debug!("記錄策略延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
     /// 記錄風控階段延遲
     pub fn record_risk_latency(&self, latency_us: f64) {
         self.latency_risk.observe(latency_us);
-        debug!("記錄風控延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
     /// 記錄執行階段延遲
     pub fn record_execution_latency(&self, latency_us: f64) {
         self.latency_execution.observe(latency_us);
-        debug!("記錄執行延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
     /// 記錄提交階段延遲
     pub fn record_submission_latency(&self, latency_us: f64) {
         self.latency_submission.observe(latency_us);
-        debug!("記錄提交延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
@@ -528,7 +520,6 @@ impl MetricsRegistry {
     /// 記錄端到端延遲
     pub fn record_end_to_end_latency(&self, latency_us: f64) {
         self.latency_end_to_end.observe(latency_us);
-        debug!("記錄端到端延遲: {:.2}μs", latency_us);
         self.note_activity();
     }
 
@@ -536,7 +527,7 @@ impl MetricsRegistry {
     pub fn update_queue_utilization(&self, ratio: f64) {
         self.queue_utilization.set(ratio);
         // ppm 儲存避免 f64 原子
-        let ppm = (ratio.max(0.0).min(1.0) * 1_000_000.0) as u64;
+        let ppm = (ratio.clamp(0.0, 1.0) * 1_000_000.0) as u64;
         self.last_queue_utilization_ppm
             .store(ppm, Ordering::Relaxed);
         self.note_activity();

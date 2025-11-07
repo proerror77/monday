@@ -6,6 +6,7 @@ use futures::Stream;
 use hft_core::*;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::sync::Arc;
 
 /// 裝箱的事件流
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = HftResult<T>> + Send>>;
@@ -139,6 +140,16 @@ pub trait Strategy: Send + Sync {
     /// 策略清理
     fn shutdown(&mut self) -> HftResult<()> {
         Ok(())
+    }
+
+    /// 向下转型支持（用于运行时类型检查）
+    fn as_any(&self) -> &dyn std::any::Any {
+        panic!("as_any not implemented for this strategy")
+    }
+
+    /// 向下转型支持（可变引用）
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        panic!("as_any_mut not implemented for this strategy")
     }
 }
 
@@ -399,4 +410,92 @@ pub struct RiskMetrics {
     pub concentration_risk: f64,
     pub order_rate: f64, // 訂單頻率
     pub last_update: Timestamp,
+}
+
+// OrderStatus 已在 events 模組定義，此處直接使用 pub use crate::events::OrderStatus;
+
+/// 訂單更新資訊
+#[derive(Debug, Clone)]
+pub struct OrderUpdate {
+    pub order_id: OrderId,
+    pub status: OrderStatus,
+    pub cum_qty: Quantity,
+    pub avg_price: Option<Price>,
+    pub previous_status: OrderStatus,
+}
+
+/// 註冊訂單參數
+#[derive(Debug, Clone)]
+pub struct RegisterOrderParams {
+    pub order_id: OrderId,
+    pub client_order_id: Option<String>,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub qty: Quantity,
+    pub venue: Option<hft_core::VenueId>,
+    pub strategy_id: Option<String>,
+}
+
+/// 訂單記錄
+#[derive(Debug, Clone)]
+pub struct OrderRecord {
+    pub order_id: OrderId,
+    pub client_order_id: Option<String>,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub qty: Quantity,
+    pub cum_qty: Quantity,
+    pub avg_price: Option<Price>,
+    pub status: OrderStatus,
+    pub venue: Option<hft_core::VenueId>,
+    pub strategy_id: Option<String>,
+}
+
+/// 訂單管理器 trait - 提供訂單生命週期管理能力
+pub trait OrderManager: Send + Sync {
+    /// 註冊新訂單
+    fn register_order(&mut self, params: RegisterOrderParams);
+
+    /// 處理執行事件，返回訂單狀態更新
+    fn on_execution_event(&mut self, event: &ExecutionEvent) -> Option<OrderUpdate>;
+
+    /// 導出 OMS 狀態（供恢復/持久化使用）
+    fn export_state(&self) -> std::collections::HashMap<OrderId, OrderRecord>;
+
+    /// 導入 OMS 狀態（供恢復/持久化使用）
+    fn import_state(&mut self, state: std::collections::HashMap<OrderId, OrderRecord>);
+
+    /// 取得指定策略的未結訂單
+    fn open_order_pairs_by_strategy(&self, strategy_id: &str) -> Vec<(OrderId, Symbol)>;
+}
+
+/// Portfolio 狀態（供持久化使用）
+#[derive(Debug, Clone)]
+pub struct PortfolioState {
+    pub account_view: AccountView,
+    pub order_meta: std::collections::HashMap<OrderId, (Symbol, Side)>,
+    pub market_prices: std::collections::HashMap<Symbol, Price>,
+    /// 已處理的成交ID（去重），恢復後避免重覆累計
+    pub processed_fill_ids: std::collections::HashMap<OrderId, std::collections::HashSet<String>>,
+}
+
+/// Portfolio 管理器 trait - 提供帳戶會計能力
+pub trait PortfolioManager: Send + Sync {
+    /// 註冊訂單元資訊（供 fill 時查找 symbol/side）
+    fn register_order(&mut self, order_id: OrderId, symbol: Symbol, side: Side);
+
+    /// 處理執行事件
+    fn on_execution_event(&mut self, event: &ExecutionEvent);
+
+    /// 獲取帳戶視圖讀取器
+    fn reader(&self) -> Arc<dyn hft_snapshot::SnapshotReader<AccountView>>;
+
+    /// 更新市場價格並重新計算未實現盈虧
+    fn update_market_prices(&mut self, prices: &std::collections::HashMap<Symbol, Price>);
+
+    /// 導出 Portfolio 狀態（供恢復/持久化使用）
+    fn export_state(&self) -> PortfolioState;
+
+    /// 導入 Portfolio 狀態（供恢復/持久化使用）
+    fn import_state(&mut self, state: PortfolioState);
 }

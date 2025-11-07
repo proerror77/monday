@@ -139,8 +139,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| Symbol::from(s.clone()))
         .collect();
 
-    let mut market_config = HyperliquidMarketConfig::default();
-    market_config.symbols = symbols.clone();
+    let market_config = HyperliquidMarketConfig {
+        symbols: symbols.clone(),
+        ..Default::default()
+    };
 
     let market_stream = HyperliquidMarketStream::new(market_config);
 
@@ -309,13 +311,13 @@ mod tests {
     #[test]
     fn test_args_parsing() {
         // 測試默認參數
-        let args = Args::parse_from(&["test"]);
+        let args = Args::parse_from(["test"]);
         assert!(matches!(args.mode, TradingMode::Paper));
         assert_eq!(args.duration, 30);
         assert_eq!(args.symbols, vec!["BTC-PERP", "ETH-PERP"]);
 
         // 測試自定義參數
-        let args = Args::parse_from(&[
+        let args = Args::parse_from([
             "test",
             "--mode",
             "live",

@@ -53,6 +53,7 @@ struct WsSubscription {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::enum_variant_names)]
 enum WsSubscriptionType {
     #[serde(rename = "userEvents")]
     UserEvents { user: String },
@@ -63,6 +64,7 @@ enum WsSubscriptionType {
 }
 
 // Hyperliquid 私有 WebSocket 响应消息
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct WsResponse {
     channel: String,
@@ -70,6 +72,7 @@ struct WsResponse {
 }
 
 // 订单状态更新事件
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum UserEvent {
@@ -81,6 +84,7 @@ enum UserEvent {
     Liquidation { liq: LiquidationUpdate },
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct OrderUpdate {
     coin: String, // 资产名称 (e.g., "BTC")
@@ -99,6 +103,7 @@ struct OrderUpdate {
     reduce_only: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 struct FillUpdate {
     coin: String, // 资产名称
@@ -117,12 +122,18 @@ struct FillUpdate {
     fee: String, // 手续费
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct LiquidationUpdate {
-    // 清算事件结构 - 暂时简化
-    coin: String,
+    coin: String,              // 资产名称 (e.g., "BTC")
     #[serde(rename = "liqPx")]
-    liq_px: String,
+    liq_px: String,            // 清算价格
+    #[serde(rename = "sz")]
+    sz: String,                // 清算数量
+    side: String,              // "A" (ask/sell) | "B" (bid/buy)
+    time: u64,                 // 清算时间戳
+    #[serde(rename = "markPx", default)]
+    mark_px: Option<String>,   // 标记价格
 }
 
 // Hyperliquid 未结订单查询请求
@@ -146,8 +157,10 @@ struct HyperliquidOpenOrder {
     filled: String, // 已成交数量
     oid: u64,     // Hyperliquid 订单 ID
     timestamp: u64, // 创建时间
+    #[allow(dead_code)]
     #[serde(rename = "tif")]
     tif: String, // 时效类型
+    #[allow(dead_code)]
     #[serde(rename = "reduceOnly")]
     reduce_only: bool,
 }
@@ -246,6 +259,62 @@ struct ModifyRequest {
     size: String, // new size
 }
 
+// Hyperliquid 下单响应结构
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ExchangeResponse {
+    Success {
+        #[allow(dead_code)]
+        status: String,  // "ok"
+        response: ExchangeResponseData,
+    },
+    Error {
+        #[allow(dead_code)]
+        status: String,  // "err"
+        #[serde(default)]
+        response: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeResponseData {
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    response_type: String,  // "order" | "cancel" | "modify"
+    data: Option<OrderResponseData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderResponseData {
+    statuses: Vec<OrderStatusResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrderStatusResponse {
+    #[serde(default)]
+    resting: Option<RestingOrderInfo>,
+    #[serde(default)]
+    filled: Option<FilledOrderInfo>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestingOrderInfo {
+    oid: u64,  // Hyperliquid order ID
+}
+
+#[derive(Debug, Deserialize)]
+struct FilledOrderInfo {
+    oid: u64,
+    #[serde(rename = "totalSz")]
+    #[allow(dead_code)]
+    total_sz: String,
+    #[serde(rename = "avgPx")]
+    #[allow(dead_code)]
+    avg_px: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct EthSignature {
     r: String,
@@ -286,7 +355,7 @@ impl Eip712Signer {
         let action_hash = self.hash_action(action, nonce)?;
 
         let digest = keccak256(
-            &[
+            [
                 &[0x19, 0x01], // EIP-191 prefix
                 domain_separator.as_bytes(),
                 action_hash.as_bytes(),
@@ -512,7 +581,7 @@ impl HyperliquidExecutionClient {
             b: intent.side == Side::Buy,
             p: intent
                 .price
-                .unwrap_or_else(|| Price(Decimal::ZERO))
+                .unwrap_or(Price(Decimal::ZERO))
                 .to_string(),
             s: intent.quantity.to_string(),
             r: false, // reduce_only
@@ -552,7 +621,7 @@ impl HyperliquidExecutionClient {
 
         let response = self
             .http_client
-            .post(&format!("{}/exchange", self.cfg.rest_base_url))
+            .post(format!("{}/exchange", self.cfg.rest_base_url))
             .json(&request_body)
             .send()
             .await
@@ -565,9 +634,41 @@ impl HyperliquidExecutionClient {
 
         debug!("Hyperliquid 响应: {}", response_text);
 
-        // 简化的响应解析 - 实际需要根据 Hyperliquid API 文档完善
-        // TODO: 从响应中提取真实的 Hyperliquid order ID
-        let hyperliquid_oid = now_micros(); // 临时使用时间戳
+        // 解析 Hyperliquid 下单响应
+        let exchange_response: ExchangeResponse = parse_json(&response_text)
+            .map_err(|e| HftError::Exchange(format!("解析响应失败: {}, 原始响应: {}", e, response_text)))?;
+
+        let hyperliquid_oid = match exchange_response {
+            ExchangeResponse::Success { response, .. } => {
+                if let Some(data) = response.data {
+                    if let Some(status) = data.statuses.first() {
+                        // 检查是否有错误
+                        if let Some(error) = &status.error {
+                            return Err(HftError::Exchange(format!("Hyperliquid 拒绝订单: {}", error)));
+                        }
+
+                        // 优先从 resting 获取 OID (挂单)
+                        if let Some(resting) = &status.resting {
+                            resting.oid
+                        }
+                        // 其次从 filled 获取 OID (立即成交)
+                        else if let Some(filled) = &status.filled {
+                            filled.oid
+                        } else {
+                            return Err(HftError::Exchange("响应中没有订单 ID".to_string()));
+                        }
+                    } else {
+                        return Err(HftError::Exchange("响应中没有状态信息".to_string()));
+                    }
+                } else {
+                    return Err(HftError::Exchange("响应中没有数据".to_string()));
+                }
+            }
+            ExchangeResponse::Error { response, .. } => {
+                return Err(HftError::Exchange(format!("下单失败: {}", response)));
+            }
+        };
+
         let order_id = OrderId(format!("HL_{}", hyperliquid_oid));
 
         // 记录订单映射（双向）
@@ -642,7 +743,7 @@ impl HyperliquidExecutionClient {
 
         let response = self
             .http_client
-            .post(&format!("{}/exchange", self.cfg.rest_base_url))
+            .post(format!("{}/exchange", self.cfg.rest_base_url))
             .json(&request_body)
             .send()
             .await
@@ -736,7 +837,7 @@ impl HyperliquidExecutionClient {
 
         let response = self
             .http_client
-            .post(&format!("{}/exchange", self.cfg.rest_base_url))
+            .post(format!("{}/exchange", self.cfg.rest_base_url))
             .json(&request_body)
             .send()
             .await
@@ -789,7 +890,7 @@ impl HyperliquidExecutionClient {
         // 发送 HTTP 请求到 info 端点（只读，不需要签名）
         let response = self
             .http_client
-            .post(&format!("{}/info", self.cfg.rest_base_url))
+            .post(format!("{}/info", self.cfg.rest_base_url))
             .json(&request_body)
             .send()
             .await
@@ -844,19 +945,19 @@ impl HyperliquidExecutionClient {
             .parse::<f64>()
             .ok()
             .and_then(|p| rust_decimal::Decimal::try_from(p).ok())
-            .map(|d| Price(d))?;
+            .map(Price)?;
         let original_quantity = hl_order
             .sz
             .parse::<f64>()
             .ok()
             .and_then(|q| rust_decimal::Decimal::try_from(q).ok())
-            .map(|d| Quantity(d))?;
+            .map(Quantity)?;
         let filled_quantity = hl_order
             .filled
             .parse::<f64>()
             .ok()
             .and_then(|q| rust_decimal::Decimal::try_from(q).ok())
-            .map(|d| Quantity(d))
+            .map(Quantity)
             .unwrap_or_else(|| Quantity(rust_decimal::Decimal::ZERO));
 
         // 计算剩余数量
@@ -1028,6 +1129,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
 impl HyperliquidExecutionClient {
     // 解析私有 WebSocket 消息并生成统一事件
+    #[allow(dead_code)]
     fn parse_private_ws_message(&mut self, message: &str) -> Option<ExecutionEvent> {
         let parsed: Result<WsResponse, _> = parse_json(message);
 
@@ -1052,6 +1154,7 @@ impl HyperliquidExecutionClient {
     }
 
     // 解析用户事件 (订单状态更新)
+    #[allow(dead_code)]
     fn parse_user_events(&mut self, data: &Value) -> Option<ExecutionEvent> {
         if let Ok(events) = parse_value::<Vec<UserEvent>>(data.clone()) {
             for event in events {
@@ -1063,8 +1166,7 @@ impl HyperliquidExecutionClient {
                         return self.handle_fill_update(fill);
                     }
                     UserEvent::Liquidation { liq } => {
-                        warn!("收到清算事件: {:?}", liq);
-                        // TODO: 处理清算事件
+                        return self.handle_liquidation_event(liq);
                     }
                 }
             }
@@ -1073,6 +1175,7 @@ impl HyperliquidExecutionClient {
     }
 
     // 解析用户成交事件
+    #[allow(dead_code)]
     fn parse_user_fills(&mut self, data: &Value) -> Option<ExecutionEvent> {
         if let Ok(fills) = parse_value::<Vec<FillUpdate>>(data.clone()) {
             if let Some(fill) = fills.first() {
@@ -1083,6 +1186,7 @@ impl HyperliquidExecutionClient {
     }
 
     // 处理订单状态更新
+    #[allow(dead_code)]
     fn handle_order_update(&mut self, order: OrderUpdate) -> Option<ExecutionEvent> {
         // 查找内部订单 ID
         let our_order_id = self.reverse_order_map.get(&order.oid)?;
@@ -1096,13 +1200,13 @@ impl HyperliquidExecutionClient {
             .parse::<f64>()
             .ok()
             .and_then(|p| rust_decimal::Decimal::try_from(p).ok())
-            .map(|d| Price(d))?;
+            .map(Price)?;
         let _quantity = order
             .sz
             .parse::<f64>()
             .ok()
             .and_then(|q| rust_decimal::Decimal::try_from(q).ok())
-            .map(|d| Quantity(d))?;
+            .map(Quantity)?;
         let _side = match order.side.as_str() {
             "B" => Side::Buy,
             "A" => Side::Sell,
@@ -1117,6 +1221,7 @@ impl HyperliquidExecutionClient {
     }
 
     // 处理成交更新
+    #[allow(dead_code)]
     fn handle_fill_update(&mut self, fill: FillUpdate) -> Option<ExecutionEvent> {
         // 查找内部订单 ID
         let our_order_id = self.reverse_order_map.get(&fill.oid)?;
@@ -1130,13 +1235,13 @@ impl HyperliquidExecutionClient {
             .parse::<f64>()
             .ok()
             .and_then(|p| rust_decimal::Decimal::try_from(p).ok())
-            .map(|d| Price(d))?;
+            .map(Price)?;
         let quantity = fill
             .sz
             .parse::<f64>()
             .ok()
             .and_then(|q| rust_decimal::Decimal::try_from(q).ok())
-            .map(|d| Quantity(d))?;
+            .map(Quantity)?;
         let _side = match fill.side.as_str() {
             "B" => Side::Buy,
             "A" => Side::Sell,
@@ -1158,6 +1263,53 @@ impl HyperliquidExecutionClient {
             timestamp: fill.time * 1000, // 转换为微秒
             fill_id: format!("HL_FILL_{}", fill.time),
         })
+    }
+
+    // 处理清算事件
+    fn handle_liquidation_event(&self, liq: LiquidationUpdate) -> Option<ExecutionEvent> {
+        // 解析清算价格
+        let liq_price = liq.liq_px.parse::<f64>()
+            .ok()
+            .and_then(|p| rust_decimal::Decimal::try_from(p).ok())
+            .map(Price);
+
+        // 解析清算数量
+        let liq_quantity = liq.sz.parse::<f64>()
+            .ok()
+            .and_then(|q| rust_decimal::Decimal::try_from(q).ok())
+            .map(Quantity);
+
+        // 解析方向
+        let side = match liq.side.as_str() {
+            "B" => Side::Buy,
+            "A" => Side::Sell,
+            _ => Side::Buy,
+        };
+
+        // 构建符号
+        let symbol = Symbol::from(format!("{}-PERP", liq.coin));
+
+        // 记录严重警告
+        warn!(
+            "⚠️  CRITICAL: 清算事件 - 资产: {}, 价格: {:?}, 数量: {:?}, 方向: {:?}, 时间: {}",
+            symbol, liq_price, liq_quantity, side, liq.time
+        );
+
+        if let Some(mark_px) = &liq.mark_px {
+            warn!(
+                "   标记价格: {}, 清算价格: {}",
+                mark_px, liq.liq_px
+            );
+        }
+
+        // 清算事件通常伴随强制平仓
+        // 这里我们记录事件并返回 None，让上层系统通过日志或监控系统处理
+        // 如果需要发送事件到上层，可以扩展 ExecutionEvent 枚举添加 Liquidation 变体
+
+        // 注意：清算后的实际成交会通过 Fill 事件单独推送
+        // 这里只是清算警告，不需要重复发送 Fill 事件
+
+        None
     }
 }
 
