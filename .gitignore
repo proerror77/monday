@@ -114,3 +114,4 @@ hft_ui_nextjs/**/*.log
 .claude/epics/
 .claude/prds/drafts/
 .claude/context/sensitive/
+tools/collector/clickhouse
