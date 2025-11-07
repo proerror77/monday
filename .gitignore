@@ -114,4 +114,15 @@ hft_ui_nextjs/**/*.log
 .claude/epics/
 .claude/prds/drafts/
 .claude/context/sensitive/
+
+# Binary artifacts (should not be in git)
 tools/collector/clickhouse
+hft-collector-*
+AWSCLIV2.pkg
+*.dmg
+*.exe
+*.app/
+
+# Compiled binaries in root
+/hft-collector-linux*
+/hft-collector-darwin*
