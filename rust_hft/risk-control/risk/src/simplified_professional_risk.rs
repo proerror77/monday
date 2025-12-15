@@ -568,6 +568,7 @@ mod tests {
             positions: std::collections::HashMap::new(),
             unrealized_pnl: Decimal::ZERO,
             realized_pnl: Decimal::ZERO,
+            ..Default::default()
         };
 
         // 第一筆訂單應該通過
@@ -653,5 +654,191 @@ mod tests {
 
         assert_eq!(risk_manager.stats.orders_allowed, 1);
         assert_eq!(risk_manager.stats.orders_rejected, 1);
+    }
+
+    // ============================================================================
+    // Dynamic config update tests
+    // ============================================================================
+
+    #[test]
+    fn test_update_config_max_drawdown_pct() {
+        let config = SimplifiedRiskConfig::default();
+        let mut risk_manager = SimplifiedProfessionalRiskManager::new(config);
+
+        assert_eq!(risk_manager.config.max_drawdown_pct, Decimal::from(5)); // default
+
+        let update = RiskConfigUpdate {
+            max_drawdown_pct: Some(10.0),
+            ..Default::default()
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(risk_manager.config.max_drawdown_pct, Decimal::from(10));
+    }
+
+    #[test]
+    fn test_update_config_max_global_notional() {
+        let config = SimplifiedRiskConfig::default();
+        let mut risk_manager = SimplifiedProfessionalRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_position_usd: Some(2000000.0),
+            ..Default::default()
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(
+            risk_manager.config.max_global_notional,
+            Decimal::from(2000000)
+        );
+    }
+
+    #[test]
+    fn test_update_config_max_order_notional() {
+        let config = SimplifiedRiskConfig::default();
+        let mut risk_manager = SimplifiedProfessionalRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_order_size_usd: Some(100000.0),
+            ..Default::default()
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(risk_manager.config.max_order_notional, Decimal::from(100000));
+    }
+
+    #[test]
+    fn test_update_config_max_orders_per_second() {
+        let config = SimplifiedRiskConfig::default();
+        let mut risk_manager = SimplifiedProfessionalRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_orders_per_second: Some(200),
+            ..Default::default()
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(risk_manager.config.max_orders_per_second, 200);
+    }
+
+    #[test]
+    fn test_update_config_multiple_fields() {
+        let config = SimplifiedRiskConfig::default();
+        let mut risk_manager = SimplifiedProfessionalRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_drawdown_pct: Some(7.5),
+            max_position_usd: Some(1500000.0),
+            max_order_size_usd: Some(75000.0),
+            max_orders_per_second: Some(150),
+            latency_threshold_us: None, // Not used in this impl
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+
+        // 7.5 as Decimal
+        let expected_drawdown = Decimal::from_f64_retain(7.5).unwrap();
+        assert_eq!(risk_manager.config.max_drawdown_pct, expected_drawdown);
+        assert_eq!(
+            risk_manager.config.max_global_notional,
+            Decimal::from(1500000)
+        );
+        assert_eq!(risk_manager.config.max_order_notional, Decimal::from(75000));
+        assert_eq!(risk_manager.config.max_orders_per_second, 150);
+    }
+
+    #[test]
+    fn test_get_config_snapshot() {
+        let config = SimplifiedRiskConfig {
+            max_order_notional: Decimal::from(50000),
+            max_global_notional: Decimal::from(1000000),
+            max_orders_per_second: 100,
+            max_drawdown_pct: Decimal::from(5),
+            ..Default::default()
+        };
+        let risk_manager = SimplifiedProfessionalRiskManager::new(config);
+
+        let snapshot = risk_manager.get_config_snapshot();
+
+        assert_eq!(snapshot.max_order_size_usd, 50000.0);
+        assert_eq!(snapshot.max_position_usd, 1000000.0);
+        assert_eq!(snapshot.max_orders_per_second, 100);
+        assert_eq!(snapshot.max_drawdown_pct, 5.0);
+        assert_eq!(snapshot.latency_threshold_us, 0); // Not used in this impl
+    }
+
+    #[test]
+    fn test_config_update_then_snapshot() {
+        let config = SimplifiedRiskConfig::default();
+        let mut risk_manager = SimplifiedProfessionalRiskManager::new(config);
+
+        // Update config
+        let update = RiskConfigUpdate {
+            max_drawdown_pct: Some(8.0),
+            max_position_usd: Some(800000.0),
+            max_order_size_usd: Some(80000.0),
+            max_orders_per_second: Some(80),
+            ..Default::default()
+        };
+
+        risk_manager.update_config(update).unwrap();
+
+        // Get snapshot and verify
+        let snapshot = risk_manager.get_config_snapshot();
+
+        assert_eq!(snapshot.max_drawdown_pct, 8.0);
+        assert_eq!(snapshot.max_position_usd, 800000.0);
+        assert_eq!(snapshot.max_order_size_usd, 80000.0);
+        assert_eq!(snapshot.max_orders_per_second, 80);
+    }
+
+    #[test]
+    fn test_config_update_applies_to_risk_checks() {
+        let config = SimplifiedRiskConfig {
+            max_order_notional: Decimal::from(100), // Very low limit
+            ..Default::default()
+        };
+        let mut risk_manager = SimplifiedProfessionalRiskManager::new(config);
+
+        let intent = OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Quantity(Decimal::from(1)),
+            price: Some(Price(Decimal::from(1000))), // 1000 > 100, should be rejected
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test".to_string(),
+            target_venue: Some(VenueId::BINANCE),
+        };
+
+        let account = AccountView::default();
+
+        // First check - should be rejected
+        match risk_manager.execute_risk_check(&intent, &account) {
+            SimplifiedRiskDecision::Reject(reason) => {
+                assert!(reason.contains("單筆訂單名義價值超限"));
+            }
+            other => panic!("Expected Reject, got {:?}", other),
+        }
+
+        // Update config to allow larger orders
+        let update = RiskConfigUpdate {
+            max_order_size_usd: Some(10000.0),
+            ..Default::default()
+        };
+        risk_manager.update_config(update).unwrap();
+
+        // Second check - should pass now
+        match risk_manager.execute_risk_check(&intent, &account) {
+            SimplifiedRiskDecision::Allow => {
+                // Expected
+            }
+            other => panic!("Expected Allow after config update, got {:?}", other),
+        }
     }
 }

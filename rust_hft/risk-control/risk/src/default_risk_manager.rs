@@ -527,6 +527,7 @@ mod tests {
             positions,
             unrealized_pnl: Decimal::from(100),
             realized_pnl: Decimal::from(500),
+            ..Default::default()
         }
     }
 
@@ -820,5 +821,145 @@ mod tests {
 
         let approved = mgr.review(vec![intent1, intent2], &account, &venue);
         assert_eq!(approved.len(), 2);
+    }
+
+    // ============================================================================
+    // Dynamic config update tests
+    // ============================================================================
+
+    #[test]
+    fn test_update_config_max_orders_per_second() {
+        let config = RiskConfig::default();
+        let mut mgr = DefaultRiskManager::new(config);
+
+        assert_eq!(mgr.config.max_orders_per_second, 10); // default
+
+        let update = RiskConfigUpdate {
+            max_orders_per_second: Some(50),
+            ..Default::default()
+        };
+
+        let result = mgr.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(mgr.config.max_orders_per_second, 50);
+    }
+
+    #[test]
+    fn test_update_config_latency_threshold() {
+        let config = RiskConfig::default();
+        let mut mgr = DefaultRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            latency_threshold_us: Some(10000),
+            ..Default::default()
+        };
+
+        let result = mgr.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(mgr.config.staleness_threshold_us, 10000);
+    }
+
+    #[test]
+    fn test_update_config_max_position() {
+        let config = RiskConfig::default();
+        let mut mgr = DefaultRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_position_usd: Some(500000.0),
+            ..Default::default()
+        };
+
+        let result = mgr.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(mgr.config.max_global_notional, Decimal::from(500000));
+    }
+
+    #[test]
+    fn test_update_config_max_drawdown() {
+        let config = RiskConfig {
+            max_daily_loss: Decimal::from(10000), // 10K
+            ..Default::default()
+        };
+        let mut mgr = DefaultRiskManager::new(config);
+
+        // Update drawdown to 10% (implied capital is 20x max_daily_loss = 200K, so 10% = 20K)
+        let update = RiskConfigUpdate {
+            max_drawdown_pct: Some(10.0),
+            ..Default::default()
+        };
+
+        let result = mgr.update_config(update);
+        assert!(result.is_ok());
+        // New max_daily_loss should be 10% of 200K = 20K
+        // Use approximate comparison due to floating point precision
+        let expected = Decimal::from(20000);
+        let diff = (mgr.config.max_daily_loss - expected).abs();
+        assert!(diff < Decimal::from_str_exact("0.01").unwrap(),
+            "max_daily_loss {} should be approximately {}", mgr.config.max_daily_loss, expected);
+    }
+
+    #[test]
+    fn test_update_config_multiple_fields() {
+        let config = RiskConfig::default();
+        let mut mgr = DefaultRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_orders_per_second: Some(100),
+            latency_threshold_us: Some(20000),
+            max_position_usd: Some(2000000.0),
+            max_order_size_usd: None, // Not updated
+            max_drawdown_pct: None,   // Not updated
+        };
+
+        let result = mgr.update_config(update);
+        assert!(result.is_ok());
+
+        assert_eq!(mgr.config.max_orders_per_second, 100);
+        assert_eq!(mgr.config.staleness_threshold_us, 20000);
+        assert_eq!(mgr.config.max_global_notional, Decimal::from(2000000));
+    }
+
+    #[test]
+    fn test_get_config_snapshot() {
+        let config = RiskConfig {
+            max_position_per_symbol: Quantity::from_f64(50.0).unwrap(),
+            max_global_notional: Decimal::from(1000000),
+            max_orders_per_second: 25,
+            staleness_threshold_us: 8000,
+            max_daily_loss: Decimal::from(5000),
+            ..Default::default()
+        };
+        let mgr = DefaultRiskManager::new(config);
+
+        let snapshot = mgr.get_config_snapshot();
+
+        assert_eq!(snapshot.max_position_usd, 1000000.0);
+        assert_eq!(snapshot.max_orders_per_second, 25);
+        assert_eq!(snapshot.latency_threshold_us, 8000);
+        // max_order_size_usd comes from max_position_per_symbol
+        assert_eq!(snapshot.max_order_size_usd, 50.0);
+    }
+
+    #[test]
+    fn test_config_update_then_snapshot() {
+        let config = RiskConfig::default();
+        let mut mgr = DefaultRiskManager::new(config);
+
+        // Update config
+        let update = RiskConfigUpdate {
+            max_orders_per_second: Some(75),
+            latency_threshold_us: Some(15000),
+            max_position_usd: Some(750000.0),
+            ..Default::default()
+        };
+
+        mgr.update_config(update).unwrap();
+
+        // Get snapshot and verify
+        let snapshot = mgr.get_config_snapshot();
+
+        assert_eq!(snapshot.max_orders_per_second, 75);
+        assert_eq!(snapshot.latency_threshold_us, 15000);
+        assert_eq!(snapshot.max_position_usd, 750000.0);
     }
 }

@@ -790,3 +790,244 @@ impl EnhancedRiskManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ports::RiskConfigUpdate;
+
+    fn create_test_config() -> EnhancedRiskConfig {
+        EnhancedRiskConfig {
+            max_position_per_symbol: Quantity::from_f64(100.0).unwrap(),
+            max_global_notional: Decimal::from(1_000_000),
+            max_order_notional: Decimal::from(100_000),
+            max_orders_per_second: 100,
+            max_orders_per_minute: 1000,
+            max_orders_per_hour: 10000,
+            global_order_cooldown_ms: 1,
+            symbol_order_cooldown_ms: 5,
+            failed_order_penalty_ms: 2000,
+            market_data_staleness_us: 10_000,
+            inference_staleness_us: 10_000,
+            execution_report_staleness_us: 3_000,
+            max_daily_loss: Decimal::from(5000),
+            max_drawdown_pct: 5.0,
+            max_consecutive_losses: 3,
+            max_position_loss_pct: 2.0,
+            circuit_breaker_enabled: true,
+            cb_daily_loss_threshold: Decimal::from(3000),
+            cb_drawdown_threshold: 2.0,
+            cb_consecutive_losses: 3,
+            cb_recovery_time_minutes: 15,
+            trading_window: None,
+            aggressive_mode: false,
+            dry_run_mode: false,
+        }
+    }
+
+    #[test]
+    fn test_enhanced_risk_manager_creation() {
+        let config = create_test_config();
+        let risk_manager = EnhancedRiskManager::new(config);
+
+        assert_eq!(risk_manager.config.max_orders_per_second, 100);
+        assert_eq!(risk_manager.config.max_drawdown_pct, 5.0);
+    }
+
+    #[test]
+    fn test_update_config_max_drawdown_pct() {
+        let config = create_test_config();
+        let mut risk_manager = EnhancedRiskManager::new(config);
+
+        assert_eq!(risk_manager.config.max_drawdown_pct, 5.0);
+
+        let update = RiskConfigUpdate {
+            max_drawdown_pct: Some(10.0),
+            ..Default::default()
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(risk_manager.config.max_drawdown_pct, 10.0);
+    }
+
+    #[test]
+    fn test_update_config_max_global_notional() {
+        let config = create_test_config();
+        let mut risk_manager = EnhancedRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_position_usd: Some(2_000_000.0),
+            ..Default::default()
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(
+            risk_manager.config.max_global_notional,
+            Decimal::from(2_000_000)
+        );
+    }
+
+    #[test]
+    fn test_update_config_max_order_notional() {
+        let config = create_test_config();
+        let mut risk_manager = EnhancedRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_order_size_usd: Some(200_000.0),
+            ..Default::default()
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(
+            risk_manager.config.max_order_notional,
+            Decimal::from(200_000)
+        );
+    }
+
+    #[test]
+    fn test_update_config_latency_threshold() {
+        let config = create_test_config();
+        let mut risk_manager = EnhancedRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            latency_threshold_us: Some(20_000),
+            ..Default::default()
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(risk_manager.config.market_data_staleness_us, 20_000);
+    }
+
+    #[test]
+    fn test_update_config_max_orders_per_second() {
+        let config = create_test_config();
+        let mut risk_manager = EnhancedRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_orders_per_second: Some(200),
+            ..Default::default()
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+        assert_eq!(risk_manager.config.max_orders_per_second, 200);
+    }
+
+    #[test]
+    fn test_update_config_multiple_fields() {
+        let config = create_test_config();
+        let mut risk_manager = EnhancedRiskManager::new(config);
+
+        let update = RiskConfigUpdate {
+            max_drawdown_pct: Some(7.5),
+            max_position_usd: Some(1_500_000.0),
+            max_order_size_usd: Some(150_000.0),
+            latency_threshold_us: Some(15_000),
+            max_orders_per_second: Some(150),
+        };
+
+        let result = risk_manager.update_config(update);
+        assert!(result.is_ok());
+
+        assert_eq!(risk_manager.config.max_drawdown_pct, 7.5);
+        assert_eq!(
+            risk_manager.config.max_global_notional,
+            Decimal::from(1_500_000)
+        );
+        assert_eq!(
+            risk_manager.config.max_order_notional,
+            Decimal::from(150_000)
+        );
+        assert_eq!(risk_manager.config.market_data_staleness_us, 15_000);
+        assert_eq!(risk_manager.config.max_orders_per_second, 150);
+    }
+
+    #[test]
+    fn test_get_config_snapshot() {
+        let config = EnhancedRiskConfig {
+            max_order_notional: Decimal::from(50_000),
+            max_global_notional: Decimal::from(500_000),
+            max_orders_per_second: 50,
+            market_data_staleness_us: 8_000,
+            max_drawdown_pct: 3.0,
+            ..create_test_config()
+        };
+        let risk_manager = EnhancedRiskManager::new(config);
+
+        let snapshot = risk_manager.get_config_snapshot();
+
+        assert_eq!(snapshot.max_order_size_usd, 50_000.0);
+        assert_eq!(snapshot.max_position_usd, 500_000.0);
+        assert_eq!(snapshot.max_orders_per_second, 50);
+        assert_eq!(snapshot.latency_threshold_us, 8_000);
+        assert_eq!(snapshot.max_drawdown_pct, 3.0);
+    }
+
+    #[test]
+    fn test_config_update_then_snapshot() {
+        let config = create_test_config();
+        let mut risk_manager = EnhancedRiskManager::new(config);
+
+        // Update config
+        let update = RiskConfigUpdate {
+            max_drawdown_pct: Some(6.0),
+            max_position_usd: Some(600_000.0),
+            max_order_size_usd: Some(60_000.0),
+            latency_threshold_us: Some(12_000),
+            max_orders_per_second: Some(60),
+        };
+
+        risk_manager.update_config(update).unwrap();
+
+        // Get snapshot and verify
+        let snapshot = risk_manager.get_config_snapshot();
+
+        assert_eq!(snapshot.max_drawdown_pct, 6.0);
+        assert_eq!(snapshot.max_position_usd, 600_000.0);
+        assert_eq!(snapshot.max_order_size_usd, 60_000.0);
+        assert_eq!(snapshot.latency_threshold_us, 12_000);
+        assert_eq!(snapshot.max_orders_per_second, 60);
+    }
+
+    #[test]
+    fn test_emergency_stop_activates_circuit_breaker() {
+        let config = create_test_config();
+        let mut risk_manager = EnhancedRiskManager::new(config);
+
+        assert!(!risk_manager.circuit_breaker.is_active);
+
+        let result = risk_manager.emergency_stop();
+        assert!(result.is_ok());
+        assert!(risk_manager.circuit_breaker.is_active);
+        assert!(risk_manager.circuit_breaker.trigger_reason.is_some());
+    }
+
+    #[test]
+    fn test_should_halt_trading_after_emergency() {
+        let config = create_test_config();
+        let mut risk_manager = EnhancedRiskManager::new(config);
+        let account = AccountView::default();
+
+        assert!(!risk_manager.should_halt_trading(&account));
+
+        risk_manager.emergency_stop().unwrap();
+
+        assert!(risk_manager.should_halt_trading(&account));
+    }
+
+    #[test]
+    fn test_risk_metrics_tracking() {
+        let config = create_test_config();
+        let risk_manager = EnhancedRiskManager::new(config);
+
+        let metrics = risk_manager.get_risk_metrics();
+
+        assert!(metrics.contains_key("orders_this_second"));
+        assert!(metrics.contains_key("orders_this_minute"));
+        assert!(metrics.contains_key("orders_this_hour"));
+    }
+}
