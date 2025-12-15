@@ -4,15 +4,13 @@
 //! - `receive_message()`: 返回 String，向後兼容，易於使用
 //! - `receive_message_bytes()`: 返回 Bytes，零拷貝，高性能
 
+use adapters_common::ws_helpers::constants;
 use bytes::Bytes;
 use hft_core::{HftError, HftResult, Symbol};
 use integration::ws::{WsClient, WsClientConfig};
-use tokio::time::Duration;
 use tracing::info;
 
 pub const WS_BASE_URL: &str = "wss://stream.binance.com:9443/ws";
-const PING_INTERVAL: Duration = Duration::from_secs(20);
-const _PONG_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct BinanceWebSocket {
     client: WsClient,
@@ -30,7 +28,7 @@ impl BinanceWebSocket {
         let url_string = url.into();
         let config = WsClientConfig {
             url: url_string.clone(),
-            heartbeat_interval: PING_INTERVAL,
+            heartbeat_interval: constants::ping_interval(),
             ..Default::default()
         };
         Self {

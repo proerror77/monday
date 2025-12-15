@@ -9,6 +9,7 @@
 
 #![allow(dead_code)]
 
+use adapters_common::ws_helpers::constants;
 use async_trait::async_trait;
 use integration::latency::WsFrameMetrics;
 use tokio::sync::mpsc;
@@ -56,8 +57,8 @@ impl ZeroCopyBitgetStream {
         // 放寬訊息/幀上限以容納多品種 LOB/Trade 聚合
         WsClientConfig {
             url: "wss://ws.bitget.com/v2/ws/public".to_string(),
-            heartbeat_interval: std::time::Duration::from_secs(30),
-            reconnect_interval: std::time::Duration::from_secs(5),
+            heartbeat_interval: constants::heartbeat_interval(),
+            reconnect_interval: constants::reconnect_interval(),
             max_reconnect_attempts: 10,
             tcp_nodelay: true,            // HFT 必須啟用
             disable_compression: true,    // HFT 必須禁用壓縮

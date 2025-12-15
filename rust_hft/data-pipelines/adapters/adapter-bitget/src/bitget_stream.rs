@@ -1,6 +1,7 @@
 //! Bitget WebSocket 行情流實現
 
 #![allow(dead_code)]
+use adapters_common::ws_helpers::constants;
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -168,8 +169,8 @@ impl BitgetMarketStream {
 
         WsClientConfig {
             url,
-            heartbeat_interval: std::time::Duration::from_secs(30),
-            reconnect_interval: std::time::Duration::from_secs(5),
+            heartbeat_interval: constants::heartbeat_interval(),
+            reconnect_interval: constants::reconnect_interval(),
             max_reconnect_attempts: 10,
             tcp_nodelay: true,            // HFT 必須啟用
             disable_compression: true,    // HFT 必須禁用壓縮

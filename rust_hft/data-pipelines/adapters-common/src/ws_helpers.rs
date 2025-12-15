@@ -80,14 +80,46 @@ pub fn calculate_exponential_backoff(attempt: u32, base_delay_ms: u64) -> Durati
     Duration::from_millis(delay_ms)
 }
 
-/// Standard reconnection constants used across adapters.
+/// Standard WebSocket constants used across adapters.
 pub mod constants {
+    use std::time::Duration;
+
+    // === Reconnection Constants ===
     /// Default maximum reconnection attempts.
     pub const DEFAULT_MAX_ATTEMPTS: u32 = 5;
     /// Default base delay in milliseconds.
     pub const DEFAULT_BASE_DELAY_MS: u64 = 500;
     /// Default fixed reconnect interval in milliseconds (for non-exponential backoff).
     pub const DEFAULT_RECONNECT_INTERVAL_MS: u64 = 5000;
+
+    // === Heartbeat/Keepalive Constants ===
+    /// Default heartbeat interval (30 seconds) - common across most exchanges.
+    pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+    /// Default ping interval for WebSocket keepalive (20 seconds).
+    pub const DEFAULT_PING_INTERVAL_SECS: u64 = 20;
+    /// Default timeout waiting for pong response (5 seconds).
+    pub const DEFAULT_PONG_TIMEOUT_SECS: u64 = 5;
+
+    // === Duration Helpers ===
+    /// Default heartbeat interval as Duration.
+    pub const fn heartbeat_interval() -> Duration {
+        Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS)
+    }
+
+    /// Default reconnect interval as Duration.
+    pub const fn reconnect_interval() -> Duration {
+        Duration::from_millis(DEFAULT_RECONNECT_INTERVAL_MS)
+    }
+
+    /// Default ping interval as Duration.
+    pub const fn ping_interval() -> Duration {
+        Duration::from_secs(DEFAULT_PING_INTERVAL_SECS)
+    }
+
+    /// Default pong timeout as Duration.
+    pub const fn pong_timeout() -> Duration {
+        Duration::from_secs(DEFAULT_PONG_TIMEOUT_SECS)
+    }
 }
 
 #[cfg(test)]
