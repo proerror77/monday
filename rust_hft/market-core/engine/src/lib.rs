@@ -1380,6 +1380,9 @@ impl Engine {
 
     /// 獲取引擎統計
     pub fn get_statistics(&self) -> EngineStatistics {
+        // 從延遲監控器收集各階段延遲統計
+        let latency = self.collect_latency_stats();
+
         EngineStatistics {
             cycle_count: self.stats.cycle_count,
             consumers_count: self.event_consumers.len(),
@@ -1392,7 +1395,42 @@ impl Engine {
             orders_filled: self.stats.orders_filled,
             orders_rejected: self.stats.orders_rejected,
             orders_canceled: self.stats.orders_canceled,
+            latency,
         }
+    }
+
+    /// 收集延遲統計數據
+    fn collect_latency_stats(&self) -> EngineLatencyStats {
+        use hft_core::LatencyStage;
+
+        let mut stats = EngineLatencyStats::default();
+
+        // 端到端延遲 (最重要的指標)
+        if let Some(e2e) = self.latency_monitor.get_stage_stats(LatencyStage::EndToEnd) {
+            stats.end_to_end_p50_us = e2e.p50_micros;
+            stats.end_to_end_p95_us = e2e.p95_micros;
+            stats.end_to_end_p99_us = e2e.p99_micros;
+            stats.sample_count = e2e.count;
+        }
+
+        // 各階段 p99 延遲
+        if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Ingestion) {
+            stats.ingestion_p99_us = s.p99_micros;
+        }
+        if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Aggregation) {
+            stats.aggregation_p99_us = s.p99_micros;
+        }
+        if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Strategy) {
+            stats.strategy_p99_us = s.p99_micros;
+        }
+        if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Risk) {
+            stats.risk_p99_us = s.p99_micros;
+        }
+        if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Execution) {
+            stats.execution_p99_us = s.p99_micros;
+        }
+
+        stats
     }
 
     /// 根據訂單查詢帳戶（Phase 1）
@@ -1487,6 +1525,29 @@ pub struct EngineTickResult {
     pub orders_generated: u32,
 }
 
+/// 引擎延遲統計信息
+#[derive(Debug, Clone, Default)]
+pub struct EngineLatencyStats {
+    /// 端到端延遲 p50 (微秒)
+    pub end_to_end_p50_us: u64,
+    /// 端到端延遲 p95 (微秒)
+    pub end_to_end_p95_us: u64,
+    /// 端到端延遲 p99 (微秒)
+    pub end_to_end_p99_us: u64,
+    /// 數據攝取延遲 p99 (微秒)
+    pub ingestion_p99_us: u64,
+    /// 聚合階段延遲 p99 (微秒)
+    pub aggregation_p99_us: u64,
+    /// 策略階段延遲 p99 (微秒)
+    pub strategy_p99_us: u64,
+    /// 風控階段延遲 p99 (微秒)
+    pub risk_p99_us: u64,
+    /// 執行階段延遲 p99 (微秒)
+    pub execution_p99_us: u64,
+    /// 樣本數量
+    pub sample_count: u64,
+}
+
 /// 引擎統計信息
 #[derive(Debug)]
 pub struct EngineStatistics {
@@ -1501,6 +1562,8 @@ pub struct EngineStatistics {
     pub orders_filled: u64,
     pub orders_rejected: u64,
     pub orders_canceled: u64,
+    /// 延遲統計
+    pub latency: EngineLatencyStats,
 }
 
 #[cfg(test)]
