@@ -391,7 +391,8 @@ impl MarketStream for HyperliquidMarketStream {
     async fn health(&self) -> ConnectionHealth {
         ConnectionHealth {
             connected: self.connected,
-            latency_ms: Some(1.0), // TODO: 计算实际延迟
+            // 延遲需要主動 ping 測量，目前僅被動回應 ping，無法計算 RTT
+            latency_ms: None,
             last_heartbeat: self.last_heartbeat,
         }
     }
