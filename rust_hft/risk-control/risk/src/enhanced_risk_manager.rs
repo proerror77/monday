@@ -10,7 +10,10 @@
 use chrono::{DateTime, Utc, Weekday};
 use chrono::{Datelike, Timelike};
 use hft_core::{HftError, Quantity, Symbol, Timestamp};
-use ports::{AccountView, ExecutionEvent, OrderIntent, RiskManager, RiskMetrics, VenueSpec};
+use ports::{
+    AccountView, ExecutionEvent, OrderIntent, RiskConfigSnapshot, RiskConfigUpdate, RiskManager,
+    RiskMetrics, VenueSpec,
+};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -684,6 +687,69 @@ impl RiskManager for EnhancedRiskManager {
         venue_specs.insert(venue.name.clone(), venue.clone());
 
         self.review_orders(intents, account, &venue_specs)
+    }
+
+    fn update_config(&mut self, update: RiskConfigUpdate) -> Result<(), HftError> {
+        if let Some(max_drawdown_pct) = update.max_drawdown_pct {
+            self.config.max_drawdown_pct = max_drawdown_pct;
+            info!("風控配置更新: max_drawdown_pct = {}", self.config.max_drawdown_pct);
+        }
+
+        if let Some(max_position_usd) = update.max_position_usd {
+            self.config.max_global_notional =
+                Decimal::from_f64_retain(max_position_usd).unwrap_or(Decimal::ZERO);
+            info!(
+                "風控配置更新: max_global_notional = {}",
+                self.config.max_global_notional
+            );
+        }
+
+        if let Some(max_order_size_usd) = update.max_order_size_usd {
+            self.config.max_order_notional =
+                Decimal::from_f64_retain(max_order_size_usd).unwrap_or(Decimal::ZERO);
+            info!(
+                "風控配置更新: max_order_notional = {}",
+                self.config.max_order_notional
+            );
+        }
+
+        if let Some(latency_threshold_us) = update.latency_threshold_us {
+            self.config.market_data_staleness_us = latency_threshold_us as u64;
+            info!(
+                "風控配置更新: market_data_staleness_us = {}",
+                self.config.market_data_staleness_us
+            );
+        }
+
+        if let Some(max_orders_per_second) = update.max_orders_per_second {
+            self.config.max_orders_per_second = max_orders_per_second as u32;
+            info!(
+                "風控配置更新: max_orders_per_second = {}",
+                self.config.max_orders_per_second
+            );
+        }
+
+        Ok(())
+    }
+
+    fn get_config_snapshot(&self) -> RiskConfigSnapshot {
+        RiskConfigSnapshot {
+            max_drawdown_pct: self.config.max_drawdown_pct,
+            max_position_usd: self
+                .config
+                .max_global_notional
+                .to_string()
+                .parse()
+                .unwrap_or(0.0),
+            max_order_size_usd: self
+                .config
+                .max_order_notional
+                .to_string()
+                .parse()
+                .unwrap_or(0.0),
+            latency_threshold_us: self.config.market_data_staleness_us as i64,
+            max_orders_per_second: self.config.max_orders_per_second as i32,
+        }
     }
 }
 

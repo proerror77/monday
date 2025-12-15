@@ -564,6 +564,23 @@ impl Engine {
         self.risk_manager.as_ref().map(|rm| rm.risk_metrics())
     }
 
+    /// 動態更新風控配置
+    pub fn update_risk_config(
+        &mut self,
+        update: ports::RiskConfigUpdate,
+    ) -> Result<(), HftError> {
+        if let Some(rm) = &mut self.risk_manager {
+            rm.update_config(update)
+        } else {
+            Err(HftError::Config("未註冊風控管理器".to_string()))
+        }
+    }
+
+    /// 獲取當前風控配置快照
+    pub fn get_risk_config_snapshot(&self) -> Option<ports::RiskConfigSnapshot> {
+        self.risk_manager.as_ref().map(|rm| rm.get_config_snapshot())
+    }
+
     /// 獲取市場快照讀取者
     pub fn market_reader(&self) -> Arc<dyn snapshot::SnapshotReader<MarketView>> {
         self.market_snapshots.reader()

@@ -15,6 +15,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Internal crates
 hft-core = { path = "../../../market-core/core" }
 engine = { path = "../../../market-core/engine", package = "hft-engine" }
+ports = { path = "../../../market-core/ports", package = "hft-ports" }
 risk = { path = "../../../risk-control/risk", package = "hft-risk" }
 
 # Utilities

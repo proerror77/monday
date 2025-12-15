@@ -438,6 +438,49 @@ pub trait RiskManager: Send + Sync {
 
     /// 風控指標
     fn risk_metrics(&self) -> RiskMetrics;
+
+    /// 動態更新風控配置
+    ///
+    /// 只更新提供的參數（Some 值），其他參數保持不變
+    fn update_config(&mut self, update: RiskConfigUpdate) -> Result<(), HftError> {
+        // 默認實現：不支持動態更新
+        let _ = update;
+        Err(HftError::Config(
+            "此風控管理器不支持動態配置更新".to_string(),
+        ))
+    }
+
+    /// 獲取當前風控配置（用於調試和狀態查詢）
+    fn get_config_snapshot(&self) -> RiskConfigSnapshot {
+        RiskConfigSnapshot::default()
+    }
+}
+
+/// 風控配置更新請求
+///
+/// 所有字段都是可選的，只更新提供的值
+#[derive(Debug, Clone, Default)]
+pub struct RiskConfigUpdate {
+    /// 最大回撤百分比 (0.0 - 100.0)
+    pub max_drawdown_pct: Option<f64>,
+    /// 最大持倉價值 (USD)
+    pub max_position_usd: Option<f64>,
+    /// 最大單筆訂單價值 (USD)
+    pub max_order_size_usd: Option<f64>,
+    /// 延遲閾值 (微秒)
+    pub latency_threshold_us: Option<i64>,
+    /// 最大訂單頻率 (每秒)
+    pub max_orders_per_second: Option<i32>,
+}
+
+/// 風控配置快照（用於狀態查詢）
+#[derive(Debug, Clone, Default)]
+pub struct RiskConfigSnapshot {
+    pub max_drawdown_pct: f64,
+    pub max_position_usd: f64,
+    pub max_order_size_usd: f64,
+    pub latency_threshold_us: i64,
+    pub max_orders_per_second: i32,
 }
 
 /// 風控指標

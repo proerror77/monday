@@ -244,14 +244,34 @@ impl HftControl for HftControlService {
         let req = request.into_inner();
         info!("收到風控參數更新請求: {:?}", req);
 
-        // TODO: 實現風控參數更新
-        // 需要在 Engine 中添加相應的方法
+        // 轉換 proto RiskConfigUpdate 到 ports RiskConfigUpdate
+        let update = ports::RiskConfigUpdate {
+            max_drawdown_pct: req.max_drawdown_pct,
+            max_position_usd: req.max_position_usd,
+            max_order_size_usd: req.max_order_size_usd,
+            latency_threshold_us: req.latency_threshold_us,
+            max_orders_per_second: req.max_orders_per_second,
+        };
 
-        Ok(Response::new(Ack {
-            ok: true,
-            message: "風控參數已更新".to_string(),
-            timestamp_us: Self::now_us(),
-        }))
+        let mut engine = self.engine.lock().await;
+        match engine.update_risk_config(update) {
+            Ok(()) => {
+                info!("風控參數更新成功");
+                Ok(Response::new(Ack {
+                    ok: true,
+                    message: "風控參數已更新".to_string(),
+                    timestamp_us: Self::now_us(),
+                }))
+            }
+            Err(e) => {
+                error!("風控參數更新失敗: {}", e);
+                Ok(Response::new(Ack {
+                    ok: false,
+                    message: format!("風控參數更新失敗: {}", e),
+                    timestamp_us: Self::now_us(),
+                }))
+            }
+        }
     }
 
     /// 取消所有訂單

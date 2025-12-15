@@ -7,7 +7,10 @@
 //! - 数据陈旧度检查
 
 use hft_core::{HftError, Price, Quantity, Symbol};
-use ports::{AccountView, ExecutionEvent, OrderIntent, RiskManager, RiskMetrics, VenueSpec};
+use ports::{
+    AccountView, ExecutionEvent, OrderIntent, RiskConfigSnapshot, RiskConfigUpdate, RiskManager,
+    RiskMetrics, VenueSpec,
+};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -364,6 +367,73 @@ impl RiskManager for DefaultRiskManager {
             concentration_risk: Decimal::ZERO,
             order_rate: Decimal::ZERO,
             last_update: 0,
+        }
+    }
+
+    fn update_config(&mut self, update: RiskConfigUpdate) -> Result<(), HftError> {
+        if let Some(max_drawdown_pct) = update.max_drawdown_pct {
+            // 将百分比转换为绝对值（假设初始资金为 max_daily_loss 的 20 倍）
+            let implied_capital = self.config.max_daily_loss * Decimal::from(20);
+            self.config.max_daily_loss =
+                implied_capital * Decimal::from_f64_retain(max_drawdown_pct / 100.0)
+                    .unwrap_or(Decimal::ZERO);
+            info!(
+                "风控配置更新: max_daily_loss = {}",
+                self.config.max_daily_loss
+            );
+        }
+
+        if let Some(max_position_usd) = update.max_position_usd {
+            self.config.max_global_notional =
+                Decimal::from_f64_retain(max_position_usd).unwrap_or(Decimal::ZERO);
+            info!(
+                "风控配置更新: max_global_notional = {}",
+                self.config.max_global_notional
+            );
+        }
+
+        if let Some(max_orders_per_second) = update.max_orders_per_second {
+            self.config.max_orders_per_second = max_orders_per_second as u32;
+            info!(
+                "风控配置更新: max_orders_per_second = {}",
+                self.config.max_orders_per_second
+            );
+        }
+
+        if let Some(latency_threshold_us) = update.latency_threshold_us {
+            self.config.staleness_threshold_us = latency_threshold_us as u64;
+            info!(
+                "风控配置更新: staleness_threshold_us = {}",
+                self.config.staleness_threshold_us
+            );
+        }
+
+        Ok(())
+    }
+
+    fn get_config_snapshot(&self) -> RiskConfigSnapshot {
+        RiskConfigSnapshot {
+            max_drawdown_pct: (self.config.max_daily_loss
+                / (self.config.max_daily_loss * Decimal::from(20))
+                * Decimal::from(100))
+            .to_string()
+            .parse()
+            .unwrap_or(5.0),
+            max_position_usd: self
+                .config
+                .max_global_notional
+                .to_string()
+                .parse()
+                .unwrap_or(0.0),
+            max_order_size_usd: self
+                .config
+                .max_position_per_symbol
+                .0
+                .to_string()
+                .parse()
+                .unwrap_or(0.0),
+            latency_threshold_us: self.config.staleness_threshold_us as i64,
+            max_orders_per_second: self.config.max_orders_per_second as i32,
         }
     }
 }

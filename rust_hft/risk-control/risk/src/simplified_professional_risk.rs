@@ -2,7 +2,10 @@
 //! 基於現有 ports 定義的實際接口實現
 
 use hft_core::{now_micros, HftError, Timestamp};
-use ports::{AccountView, ExecutionEvent, OrderIntent, RiskManager, RiskMetrics, VenueSpec};
+use ports::{
+    AccountView, ExecutionEvent, OrderIntent, RiskConfigSnapshot, RiskConfigUpdate, RiskManager,
+    RiskMetrics, VenueSpec,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -478,6 +481,62 @@ impl RiskManager for SimplifiedProfessionalRiskManager {
             concentration_risk: Decimal::ZERO,                                 // 簡化
             order_rate: Decimal::from(self.stats.orders_submitted) / Decimal::from(3600), // 每小時訂單數
             last_update: now_micros(),
+        }
+    }
+
+    fn update_config(&mut self, update: RiskConfigUpdate) -> Result<(), HftError> {
+        if let Some(max_drawdown_pct) = update.max_drawdown_pct {
+            self.config.max_drawdown_pct =
+                Decimal::from_f64_retain(max_drawdown_pct).unwrap_or(Decimal::from(5));
+            info!("風控配置更新: max_drawdown_pct = {}", self.config.max_drawdown_pct);
+        }
+
+        if let Some(max_position_usd) = update.max_position_usd {
+            self.config.max_global_notional =
+                Decimal::from_f64_retain(max_position_usd).unwrap_or(Decimal::ZERO);
+            info!(
+                "風控配置更新: max_global_notional = {}",
+                self.config.max_global_notional
+            );
+        }
+
+        if let Some(max_order_size_usd) = update.max_order_size_usd {
+            self.config.max_order_notional =
+                Decimal::from_f64_retain(max_order_size_usd).unwrap_or(Decimal::ZERO);
+            info!(
+                "風控配置更新: max_order_notional = {}",
+                self.config.max_order_notional
+            );
+        }
+
+        if let Some(max_orders_per_second) = update.max_orders_per_second {
+            self.config.max_orders_per_second = max_orders_per_second as u32;
+            info!(
+                "風控配置更新: max_orders_per_second = {}",
+                self.config.max_orders_per_second
+            );
+        }
+
+        Ok(())
+    }
+
+    fn get_config_snapshot(&self) -> RiskConfigSnapshot {
+        RiskConfigSnapshot {
+            max_drawdown_pct: self.config.max_drawdown_pct.to_string().parse().unwrap_or(5.0),
+            max_position_usd: self
+                .config
+                .max_global_notional
+                .to_string()
+                .parse()
+                .unwrap_or(0.0),
+            max_order_size_usd: self
+                .config
+                .max_order_notional
+                .to_string()
+                .parse()
+                .unwrap_or(0.0),
+            latency_threshold_us: 0, // 此實現不使用延遲閾值
+            max_orders_per_second: self.config.max_orders_per_second as i32,
         }
     }
 }
