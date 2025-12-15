@@ -8,7 +8,6 @@ use hft_core::{HftError, HftResult, Symbol, Timestamp};
 use ports::events::MarketSnapshot;
 use ports::{BoxStream, ConnectionHealth, MarketEvent, MarketStream};
 use tokio::sync::mpsc;
-use tokio::time::Duration;
 use tracing::{error, info, warn};
 
 mod converter;
@@ -143,10 +142,11 @@ impl MarketStream for BinanceMarketStream {
         let symbols_clone = symbols.clone();
 
         tokio::spawn(async move {
-            // 簡易自動重連循環
+            // 使用共用重連配置
+            use adapters_common::ws_helpers::constants::{DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS};
+            use adapters_common::calculate_exponential_backoff;
+
             let mut attempts: u32 = 0;
-            const MAX_ATTEMPTS: u32 = 5;
-            const BASE_DELAY_MS: u64 = 500;
 
             loop {
                 match ws_client.connect_and_subscribe(symbols_clone.clone()).await {
@@ -175,7 +175,6 @@ impl MarketStream for BinanceMarketStream {
                                     error!("Binance WS 錯誤: {}，準備重連", e);
                                     let _ = tx.send(Err(e));
                                     break;
-                                    // 其他控制訊息：忽略並繼續
                                 }
                             }
                         }
@@ -183,27 +182,27 @@ impl MarketStream for BinanceMarketStream {
                     Err(e) => {
                         error!("Binance WS 連接失敗: {}", e);
                         attempts += 1;
-                        if attempts > MAX_ATTEMPTS {
+                        if attempts > DEFAULT_MAX_ATTEMPTS {
                             let _ = tx.send(Err(HftError::Network(format!(
                                 "WS 重連失敗次數過多: {}",
                                 e
                             ))));
                             return;
                         }
-                        let delay = BASE_DELAY_MS * (1 << (attempts - 1).min(6)) as u64;
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        let delay = calculate_exponential_backoff(attempts, DEFAULT_BASE_DELAY_MS);
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                 }
 
                 // 斷開後的退避重連
                 attempts += 1;
-                if attempts > MAX_ATTEMPTS {
+                if attempts > DEFAULT_MAX_ATTEMPTS {
                     let _ = tx.send(Err(HftError::Network("WS 重連失敗次數過多".to_string())));
                     return;
                 }
-                let delay = BASE_DELAY_MS * (1 << (attempts - 1).min(6)) as u64;
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+                let delay = calculate_exponential_backoff(attempts, DEFAULT_BASE_DELAY_MS);
+                tokio::time::sleep(delay).await;
             }
         });
 

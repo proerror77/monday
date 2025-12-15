@@ -13,3 +13,4 @@ pub mod ws_helpers;
 pub use converter::{parse_bytes, parse_json, parse_owned_value, parse_price, parse_quantity};
 pub use errors::{AdapterError, AdapterResult};
 pub use subscriptions::{Subscription, SubscriptionBuilder, SubscriptionKind};
+pub use ws_helpers::{calculate_exponential_backoff, ReconnectConfig};
