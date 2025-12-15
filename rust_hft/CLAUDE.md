@@ -1,318 +1,335 @@
-# HFT 系統專業實施計劃 (CLAUDE.md)
+# HFT 系統狀態與設計總覽 (CLAUDE.md)
 
-**版本**: 5.0 (2025-08-19)
-**狀態**: 🚀 **專業架構設計確認，進入核心實施階段**
+**版本**: 6.0 (2025-12-15)
+**狀態**: 🟢 **Rust-Centric 閉環架構完成，端到端測試通過**
 
 ---
 
 ## 1. Executive Summary
 
-基於與 HFT 專家深度討論後的架構對齊，系統現已確認最終技術方案並進入核心實施階段。
+系統已完成從「Python 多服務架構」到「Rust-Centric 閉環架構」的重構。
 
-經過架構對比分析，確認當前基礎重構方向正確，但需要按照專業 HFT 架構建議完善 8 個關鍵 crates，以實現產品級的高頻交易系統。
+**核心變更**:
+- ❌ 移除 `control_ws` (Python 控制工作區)
+- ✅ 新增 `Sentinel` (Rust 自動化風控哨兵)
+- ✅ 新增 `ModelManager` (Rust 模型熱加載)
+- ✅ 新增真實延遲統計 (p50/p95/p99)
+- ✅ 新增 PnL/DD 回撤追蹤整合 Sentinel
 
-**核心目標**:
-- **p99 延遲 ≤ 25μs** (最終目標)
-- **多交易所套利能力**  
-- **完整可觀測性**
-- **生產環境就緒**
-
-**技術架構**: 完全對齊專業建議的 11 crates + 3 apps 結構
-
----
-
-## 2. 架構對比結果
-
-### 2.1. 一致性確認
-
-✅ **架構一致性**: 99% 匹配專業建議
-- 11 個 crates 結構完全一致  
-- 核心技術選型高度匹配
-- Live/Paper/Replay 三態架構一致
-- 性能優化路徑正確
-
-### 2.2. 當前狀態
-
-**已完成基礎架構 (重構階段)**:
-```
-✅ hft-core     - 零依賴基礎類型 (已實現)
-✅ hft-snapshot - ArcSwap 快照容器 (已實現)
-✅ hft-engine   - 單 writer 事件循環框架 (已實現)
-✅ apps/        - Live/Paper/Replay 三態應用 (已實現)
-```
-
-**待實現專業模組**:
-```
-🔥 hft-integration - 低階網路層 (tokio-tungstenite + rustls)
-🔥 hft-data        - 多交易所 WS 連接器 + feature gates
-🔥 hft-strategy    - Strategy/RiskManager traits + 策略實現
-🔥 hft-risk        - 事前風控系統
-🔥 hft-execution   - OMS/ExecutionClient (Live/Sim 接口)
-🔥 hft-accounting  - 會計系統 (多帳戶 PNL/DD)
-🔥 hft-infra       - ClickHouse/Redis/Prometheus 集成
-🔥 hft-testing     - 回放/壓測工具
-```
+**新架構優勢**:
+- **微秒級響應**: Sentinel 完全在 Rust 內執行，無 Python/gRPC 延遲
+- **文件系統通訊**: 模型通過文件系統熱加載，取代複雜的 Redis Pub/Sub
+- **簡化部署**: 單一 Rust 二進制 + 定時訓練任務
+- **完整可觀測性**: 延遲分階段統計、回撤追蹤、uptime 監控
 
 ---
 
-## 3. 精準實施路線圖
+## 2. 系統架構
 
-### 3.1. 第一階段 - 核心熱路徑 (2-3週)
-
-**目標**: 實現單交易所完整數據流，達到 L2/diff p99 < 1.5ms
-
-#### 核心任務
-```yaml
-hft-integration:
-  技術: tokio-tungstenite + rustls (持久連，禁壓縮)
-  功能: WS/HTTP/TLS 基礎網路層 + 心跳重連
-
-hft-data:  
-  技術: simd-json feature gates
-  功能: Bitget WS 連接器 + 統一 MarketStream
-  
-hft-execution:
-  技術: Live(REST+私有WS)/Sim(queue) 接口
-  功能: 基礎 OMS + ExecutionClient traits
-  
-hft-strategy:
-  技術: Strategy/RiskManager traits
-  功能: 簡單趨勢策略實現
 ```
-
-#### 性能目標
-- L1/Trades: p99 < 0.8ms
-- L2/diff: p99 < 1.5ms  
-- 數據完整性: > 99.9%
-
-### 3.2. 第二階段 - 跨交易所套利 (2-3週)
-
-**目標**: 實現多交易所套利策略 + 完整風控
-
-#### 核心任務
-```yaml
-擴展 hft-data:
-  功能: Binance 連接器 + 雙邊 Joiner
-  結構: TopN{bid_px[N],bid_qty[N],ask_px[N],ask_qty[N]} SoA
-  
-hft-risk:
-  功能: 限額/速率/冷卻/交易窗/陳舊度/滑點控制
-  
-hft-accounting:
-  功能: 多帳戶資金/持倉/PNL/DD 唯一真相源
-  
-套利策略:
-  功能: 淨後價差計算 + 雙腿同步執行 (IOC/FOK)
-```
-
-#### 業務目標
-- 跨交易所套利策略運行
-- 完整風控體系生效
-- 多帳戶會計準確性
-
-### 3.3. 第三階段 - 基礎設施完善 (1-2週)
-
-**目標**: 完整可觀測性 + 數據持久化
-
-#### 核心任務
-```yaml
-hft-infra:
-  ClickHouse: RowBinary 批量寫入 (旁路，不阻塞主循環)
-  Redis: Pub/Sub 事件通道
-  Prometheus: 核心指標導出
-  
-hft-testing:
-  回放: 歷史數據重放框架
-  壓測: 性能基準測試
-  基準: ArcSwap 發佈直方圖監控
-  
-可觀測性:
-  Grafana 儀表板 + 告警規則
-  核心 KPIs 監控體系
-```
-
-### 3.4. 第四階段 - 性能調優 (1-2週)
-
-**目標**: 達到最終性能目標 p99 50-100μs
-
-#### 核心任務
-```yaml
-性能優化:
-  TX路徑: SPSC crossbeam::ArrayQueue 
-  網路: TCP_NODELAY + 單次 writev
-  調度: 釘核 + RT 排程
-  
-性能驗證:  
-  工具: eBPF tcp_sendmsg 直方圖測量
-  目標: 本地送出 p50 15-40μs, p99 50-100μs
-  
-生產化:
-  Docker 容器化 + K8s 部署
-  CI/CD 管線 + 自動化測試
-  配置管理 + 安全加固
+┌─────────────────────────────────────────────────────────────┐
+│                    Rust HFT 核心引擎                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────────┐  │
+│  │  數據接入 │→│  訂單簿   │→│  策略執行 │→│   執行網關   │  │
+│  │ (WS/REST)│  │ (Engine) │  │(Strategy)│  │(Execution) │  │
+│  └──────────┘  └──────────┘  └──────────┘  └─────────────┘  │
+│       ↓              ↓             ↓              ↓         │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │              Sentinel (自動化風控)                    │   │
+│  │  • 延遲監控 (latency_guard) - p50/p95/p99            │   │
+│  │  • 回撤監控 (dd_guard) - 實時 PnL/DD 追蹤            │   │
+│  │  • 自動 Degrade/Stop/EmergencyExit                   │   │
+│  └──────────────────────────────────────────────────────┘   │
+│       ↓                                                     │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │           ModelManager (模型熱加載)                   │   │
+│  │  • 監控 models/current/ 目錄                         │   │
+│  │  • 自動加載 .pt/.onnx 模型                           │   │
+│  │  • 版本管理和回滾                                    │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                              ↑
+                    (文件系統熱加載)
+                              ↑
+┌─────────────────────────────────────────────────────────────┐
+│                 ml_trainer (定時訓練)                        │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │  ClickHouse → 特徵工程 → LSTM+Attention → 評估 → 部署  │   │
+│  │                                                      │   │
+│  │  部署條件: IC ≥ 0.03 ∧ IR ≥ 1.2 ∧ MaxDD ≤ 5%         │   │
+│  │  輸出: models/current/strategy_dl.pt                 │   │
+│  └──────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                              ↑
+                     (每日批次查詢)
+                              ↑
+┌─────────────────────────────────────────────────────────────┐
+│                    ClickHouse (數據存儲)                     │
+│  • spot_books15: 訂單簿快照                                 │
+│  • spot_trades: 成交記錄                                    │
+│  • hft_features_*: 39維本地訂單簿特徵                       │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 4. 關鍵技術規格
+## 3. 核心模組狀態
 
-### 4.1. Feature Gates 設計
+| 模組 | 路徑 | 狀態 | 說明 |
+|------|------|------|------|
+| **Sentinel** | `risk-control/risk/src/sentinel.rs` | ✅ 完成 | Rust 自動化風控，取代 Python control_ws |
+| **ModelManager** | `infra-services/core/model-manager/` | ✅ 完成 | 模型目錄監控、熱加載、版本管理 |
+| **Live App 整合** | `apps/live/src/helpers/` | ✅ 完成 | Sentinel + ModelManager 已整合 |
+| **延遲統計** | `market-core/engine/src/lib.rs` | ✅ 完成 | EngineLatencyStats (p50/p95/p99) |
+| **回撤追蹤** | `risk-control/portfolio-core/src/lib.rs` | ✅ 完成 | AccountView 整合 high_water_mark/drawdown |
+| **ml_trainer** | `ml_trainer/` | ✅ 完成 | 精簡訓練腳本，支持 ClickHouse 和合成數據 |
+| **Docker 部署** | `deploy/docker-compose.yml` | ✅ 完成 | ClickHouse + 可選 Redis |
 
-```toml
-[features]
-default = ["json-std"]
+---
 
-# JSON 解析優化
-json-std = ["serde_json"]  
-json-simd = ["simd-json"]
+## 4. 最新實現功能
 
-# 快照容器選擇
-snapshot-arcswap = ["arc-swap"]
-snapshot-left-right = ["left-right"]  
-
-# 執行模式
-engine-ultra-local = ["crossbeam"]  # 回放/壓測 SPSC ArrayQueue
-
-# 基礎設施模組 (可選，不進熱路徑)
-clickhouse = ["clickhouse"]
-redis = ["redis"] 
-metrics = ["metrics-exporter-prometheus"]
-
-# 運行模式
-live = []
-paper = []  
-replay = []
-```
-
-### 4.2. 核心 Traits 設計
+### 4.1. 延遲統計 (EngineLatencyStats)
 
 ```rust
-// 統一市場數據接口
-pub trait MarketStream {
-    fn subscribe(&self, symbols: Vec<InstrumentId>) -> Stream<MarketEvent>;
-}
-
-// 快照發佈接口 (可替換 ArcSwap/left-right)
-pub trait SnapshotPublisher<T> {
-    fn store(&self, view: Arc<T>);
-    fn load(&self) -> Arc<T>;
-}
-
-// 策略接口 (純函數 + 小狀態機)  
-pub trait Strategy {
-    fn on_tick(&mut self, ts: u64, view: &MarketView, account: &AccountView) -> Vec<OrderIntent>;
-}
-
-// 風控接口
-pub trait RiskManager {
-    fn review(&self, intents: Vec<OrderIntent>, account: &AccountView, venue: &VenueSpec) -> Vec<OrderIntent>;
-}
-
-// 執行接口 (Live/Sim 統一)
-pub trait ExecutionClient {
-    fn submit(&self, intent: OrderIntent) -> Result<OrderId>;
-    fn fills(&self) -> Stream<ExecutionEvent>;
-}
-
-// 會計接口
-pub trait Accounting {
-    fn on_fill(&mut self, event: ExecutionEvent);
-    fn account_view(&self) -> Arc<AccountView>;
+pub struct EngineLatencyStats {
+    pub end_to_end_p50_us: u64,
+    pub end_to_end_p95_us: u64,
+    pub end_to_end_p99_us: u64,
+    pub ingestion_p99_us: u64,
+    pub aggregation_p99_us: u64,
+    pub strategy_p99_us: u64,
+    pub risk_p99_us: u64,
+    pub execution_p99_us: u64,
+    pub sample_count: u64,
 }
 ```
 
-### 4.3. 配置系統設計
+### 4.2. Sentinel 統計 (SentinelStats)
 
-**trading_config.yaml 範例**:
+```rust
+pub struct SentinelStats {
+    pub latency_p99_us: u64,
+    pub latency_p50_us: u64,
+    pub pnl: f64,
+    pub unrealized_pnl: f64,
+    pub drawdown_pct: f64,
+    pub max_drawdown_pct: f64,
+    pub high_water_mark: f64,
+}
+```
+
+### 4.3. 回撤追蹤 (AccountView)
+
+```rust
+pub struct AccountView {
+    pub cash_balance: Decimal,
+    pub positions: HashMap<Symbol, Position>,
+    pub unrealized_pnl: Decimal,
+    pub realized_pnl: Decimal,
+    pub high_water_mark: Decimal,      // 新增
+    pub drawdown_pct: f64,             // 新增
+    pub max_drawdown_pct: f64,         // 新增
+    pub session_start_us: u64,         // 新增
+}
+```
+
+---
+
+## 5. 閉環流程
+
+### 5.1. 訓練流程 (Cron Job)
+
+```bash
+# 每日凌晨 2:00 執行
+0 2 * * * cd /opt/hft && python ml_trainer/train.py >> /var/log/hft-trainer.log 2>&1
+```
+
+1. 從 ClickHouse 加載 T-7 日數據
+2. 計算 39 維本地訂單簿特徵
+3. 訓練 LSTM+Attention 模型
+4. 評估 IC/IR/Sharpe/MaxDD
+5. 達標後部署到 `models/current/strategy_dl.pt`
+6. 更新 `models/metadata.json`
+
+### 5.2. 熱加載流程 (Real-time)
+
+1. `ModelWatcher` 監控 `models/current/` 目錄
+2. 檢測到新 `.pt` 或 `.onnx` 文件
+3. 驗證版本號
+4. 加載到 ONNX Runtime / tch-rs
+5. 原子切換模型引用
+
+### 5.3. 風控流程 (100ms 間隔)
+
+1. `Sentinel` 每 100ms 檢查系統狀態
+2. 從 Engine 獲取 `SentinelStats` (延遲 + PnL/DD)
+3. 根據閾值觸發動作:
+   - `Continue`: 正常運行
+   - `Warn`: 記錄警告
+   - `Degrade`: 降頻模式 (減少交易頻率)
+   - `Stop`: 停止交易
+   - `EmergencyExit`: 緊急平倉
+
+---
+
+## 6. 配置參數
+
+### 6.1. Sentinel 配置
+
+```rust
+SentinelConfig {
+    // 延遲閾值 (microseconds)
+    latency_warn_us: 15_000,      // 15ms 警告
+    latency_degrade_us: 25_000,   // 25ms 降頻
+    latency_stop_us: 50_000,      // 50ms 停止
+
+    // 回撤閾值 (百分比)
+    drawdown_warn_pct: 2.0,       // 2% 警告
+    drawdown_degrade_pct: 3.0,    // 3% 降頻
+    drawdown_stop_pct: 5.0,       // 5% 停止
+    drawdown_emergency_pct: 7.0,  // 7% 緊急平倉
+
+    // 恢復條件
+    recovery_latency_below_us: 10_000,
+    recovery_cooldown_secs: 300,
+}
+```
+
+### 6.2. 模型部署條件
+
 ```yaml
-engine:
-  queue_capacity: 32768
-  stale_us: 3000  
-  top_n: 10
-  bar_symbols: ["BINANCE:ETHUSDT"]
-  ob_pairs:
-    - ["BINANCE:BTCUSDT", "BITGET:BTCUSDT"]
+deployment:
+  min_ic: 0.03        # 最小 Information Coefficient
+  min_ir: 1.2         # 最小 Information Ratio
+  max_drawdown: 0.05  # 最大回撤 5%
+```
 
-strategy:
-  - name: trend_k1m
-    symbols: ["BINANCE:ETHUSDT"] 
-    params: { ema_fast: 12, ema_slow: 26, rsi: 14 }
-    risk: { max_notional: 20000, max_pos: 5, cooldown_ms: 1000 }
-    
-  - name: cross_cex_ob_arb
-    legs:
-      - { venue: BINANCE, inst: BTCUSDT }
-      - { venue: BITGET, inst: BTCUSDT }
-    params: { net_spread_bps: 1.2, min_qty: 0.002, tif: "IOC" }
-    risk: { max_stale_us: 3000, leg_skew_ms: 5, rate_limit: { binance: 50, bitget: 50 } }
+### 6.3. Live App 命令行參數
+
+```bash
+cargo run -p hft-live -- \
+  --sentinel-enable=true \
+  --sentinel-interval-ms=100 \
+  --sentinel-latency-warn-us=15000 \
+  --sentinel-drawdown-stop-pct=5.0 \
+  --ml-enable=true \
+  --ml-model=models/current/strategy_dl.onnx
 ```
 
 ---
 
-## 5. 性能指標與驗證
+## 7. 目錄結構
 
-### 5.1. 階段性性能目標
-
-| 階段 | 指標 | 目標值 | 驗證方法 |
-|------|------|--------|----------|
-| 第一階段 | L1/Trades p99 | < 0.8ms | 直方圖統計 |
-| 第一階段 | L2/diff p99 | < 1.5ms | 直方圖統計 |  
-| 第四階段 | 本地送出 p50 | 15-40μs | eBPF tcp_sendmsg |
-| 第四階段 | 本地送出 p99 | 50-100μs | eBPF tcp_sendmsg |
-| 最終目標 | 端到端 p99 | ≤ 25μs | 完整鏈路測量 |
-
-### 5.2. 業務指標
-
-```yaml
-交易指標:
-  realized_ic: ≥ 0.02
-  max_drawdown: ≤ 5%
-  sharpe_ratio: ≥ 1.0
-  
-系統指標: 
-  uptime: ≥ 99.9%
-  ws_reconnect_rate: ≤ 3/hour
-  data_completeness: ≥ 99.9%
+```
+monday/
+├── rust_hft/                          # Rust HFT 核心
+│   ├── apps/live/                     # 真盤應用
+│   │   └── src/helpers/
+│   │       ├── inference.rs           # ONNX 推理 + 熱加載
+│   │       ├── sentinel.rs            # Sentinel 整合
+│   │       └── metrics.rs             # Prometheus 指標
+│   ├── market-core/engine/
+│   │   └── src/lib.rs                 # EngineLatencyStats, SentinelStats
+│   ├── risk-control/
+│   │   ├── risk/src/sentinel.rs       # Sentinel 核心邏輯
+│   │   └── portfolio-core/src/lib.rs  # 回撤追蹤
+│   └── infra-services/core/
+│       └── model-manager/             # 模型熱加載管理
+│
+├── ml_trainer/                        # Python 訓練腳本
+│   ├── train.py                       # 主訓練腳本
+│   ├── config.yaml                    # 配置文件
+│   ├── test_e2e.py                    # 端到端測試
+│   └── requirements.txt               # 依賴
+│
+├── models/                            # 模型目錄
+│   ├── current/                       # 當前使用的模型
+│   │   └── strategy_dl.pt
+│   ├── archive/                       # 歷史版本
+│   └── metadata.json                  # 模型元數據
+│
+└── deploy/
+    └── docker-compose.yml             # 部署配置
 ```
 
-### 5.3. 驗證方法論
+---
 
-**第一階段驗證**:
-1. 接一所一品種 (ETHUSDT) 跑 K 線鏈
-2. 觀測解析 + BarBuilder + ArcSwap 發佈直方圖
+## 8. 運維指南
 
-**第二階段驗證**:  
-1. 加入 OB 套利鏈 (BINANCE/BITGET, TopN=10)
-2. 測試 Joiner 門檻觸發頻率與快照翻轉成本
+### 8.1. 啟動流程
 
-**第三階段驗證**:
-1. ClickHouse RowBinary 批量寫入 (旁路)
-2. 確保不阻塞主循環性能
+```bash
+# 1. 啟動基礎設施
+cd deploy && docker compose up -d clickhouse
 
-**第四階段驗證**:
-1. 切換 SPSC TX + TCP_NODELAY + 單 writev  
-2. 使用 eBPF 測量 tcp_sendmsg 直方圖確認分佈
+# 2. 編譯並啟動 Rust 核心
+cd rust_hft && cargo run -p hft-live --release
+
+# 3. 設置定時訓練
+crontab -e
+# 添加: 0 2 * * * cd /opt/hft && python ml_trainer/train.py
+```
+
+### 8.2. 手動訓練
+
+```bash
+cd ml_trainer
+source .venv/bin/activate
+python train.py --dry-run  # 測試模式
+python train.py            # 正式訓練
+```
+
+### 8.3. 模型回滾
+
+```bash
+# 查看歷史版本
+ls models/archive/
+
+# 手動回滾
+cp models/archive/strategy_dl_20251213_100000.pt models/current/strategy_dl.pt
+```
 
 ---
 
-## 6. 風險管控
+## 9. 測試狀態
 
-### 6.1. 技術風險
-- **性能風險**: 每階段都設置具體性能門檻
-- **複雜度風險**: 使用 feature gates 控制複雜度
-- **集成風險**: 分階段實施，每階段獨立驗證
-
-### 6.2. 業務風險  
-- **熔斷機制**: 異常情況自動降級
-- **實時監控**: 關鍵指標實時告警
-- **回滾能力**: 快速回滾到穩定版本
+| 測試 | 狀態 | 說明 |
+|------|------|------|
+| Sentinel 單元測試 | ✅ 5/5 通過 | `cargo test -p hft-risk sentinel` |
+| ModelManager 單元測試 | ✅ 3/3 通過 | `cargo test -p hft-model-manager` |
+| ml_trainer dry-run | ✅ 通過 | 使用合成數據測試 |
+| E2E 測試 | ✅ 通過 | 訓練→部署→驗證完整流程 |
+| Release Build | ✅ 通過 | `cargo build -p hft-live --release` |
+| Clippy 檢查 | ✅ 0 警告 | `cargo clippy --workspace` |
 
 ---
 
-## 7. 總結
+## 10. 代碼質量
 
-**總時程**: 6-8 週完整實施
-**核心創新**: SoA TopN 結構 + SPSC ArrayQueue + Feature Gates + ArcSwap 快照
-**技術保證**: 與專業 HFT 建議 99% 對齊，技術路線經過驗證
+### 10.1. 已完成優化
 
-系統已從"架構重構"階段成功進入"專業實施"階段，具備了構建產品級 HFT 系統的堅實基礎。
+- ✅ 所有 clippy 警告已修復
+- ✅ unsafe 函數添加 Safety 文檔
+- ✅ 複雜類型使用 type alias 簡化
+- ✅ 適當使用 derive macros
+- ✅ WebSocket 常量集中管理
+
+### 10.2. 剩餘 TODO 項目
+
+| 類別 | 數量 | 說明 |
+|------|------|------|
+| Phase 2 功能 | 3 | secrets 後端 (Vault/AWS/Local) |
+| 測試框架 | 15 | adapter 和 e2e 測試存根 |
+| IPC 處理器 | 10 | 系統控制命令 (DefaultHandler) |
+| gRPC 服務 | 2 | 模型加載和風控更新 |
+
+---
+
+## 11. 下一步計劃
+
+1. **gRPC 模型加載**: 實現下載、驗證、加載完整流程
+2. **風控參數動態更新**: 添加 RiskManager trait 方法
+3. **測試覆蓋**: 完善 adapter 和 e2e 測試
+4. **ONNX 推理優化**: GPU 加速支持
+5. **生產部署**: K8s Helm Chart
