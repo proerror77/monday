@@ -1,0 +1,241 @@
+# Market Data Service Deployment
+# 市場數據接入 - 按交易所拆分，支持水平擴展
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: market-data-bitget
+  namespace: hft-trading
+  labels:
+    app: market-data
+    exchange: bitget
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: market-data
+      exchange: bitget
+  template:
+    metadata:
+      labels:
+        app: market-data
+        exchange: bitget
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9093"
+    spec:
+      nodeSelector:
+        node-type: low-latency
+
+      containers:
+      - name: market-data
+        image: ${ECR_REGISTRY}/hft-market-data:${IMAGE_TAG}
+        imagePullPolicy: Always
+
+        env:
+        - name: RUST_LOG
+          value: "info"
+        - name: EXCHANGE
+          value: "bitget"
+        - name: SYMBOLS
+          valueFrom:
+            configMapKeyRef:
+              name: trading-config
+              key: bitget-symbols
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: redis-url
+
+        ports:
+        - name: metrics
+          containerPort: 9093
+
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9093
+          initialDelaySeconds: 10
+          periodSeconds: 10
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9093
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: market-data-binance
+  namespace: hft-trading
+  labels:
+    app: market-data
+    exchange: binance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: market-data
+      exchange: binance
+  template:
+    metadata:
+      labels:
+        app: market-data
+        exchange: binance
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9093"
+    spec:
+      nodeSelector:
+        node-type: low-latency
+
+      containers:
+      - name: market-data
+        image: ${ECR_REGISTRY}/hft-market-data:${IMAGE_TAG}
+        imagePullPolicy: Always
+
+        env:
+        - name: RUST_LOG
+          value: "info"
+        - name: EXCHANGE
+          value: "binance"
+        - name: SYMBOLS
+          valueFrom:
+            configMapKeyRef:
+              name: trading-config
+              key: binance-symbols
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: redis-url
+
+        ports:
+        - name: metrics
+          containerPort: 9093
+
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9093
+          initialDelaySeconds: 10
+          periodSeconds: 10
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9093
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: market-data-bybit
+  namespace: hft-trading
+  labels:
+    app: market-data
+    exchange: bybit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: market-data
+      exchange: bybit
+  template:
+    metadata:
+      labels:
+        app: market-data
+        exchange: bybit
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9093"
+    spec:
+      nodeSelector:
+        node-type: low-latency
+
+      containers:
+      - name: market-data
+        image: ${ECR_REGISTRY}/hft-market-data:${IMAGE_TAG}
+        imagePullPolicy: Always
+
+        env:
+        - name: RUST_LOG
+          value: "info"
+        - name: EXCHANGE
+          value: "bybit"
+        - name: SYMBOLS
+          valueFrom:
+            configMapKeyRef:
+              name: trading-config
+              key: bybit-symbols
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: redis-url
+
+        ports:
+        - name: metrics
+          containerPort: 9093
+
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9093
+          initialDelaySeconds: 10
+          periodSeconds: 10
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9093
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+# Service for all market data pods
+apiVersion: v1
+kind: Service
+metadata:
+  name: market-data
+  namespace: hft-trading
+  labels:
+    app: market-data
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 9093
+    targetPort: metrics
+  selector:
+    app: market-data

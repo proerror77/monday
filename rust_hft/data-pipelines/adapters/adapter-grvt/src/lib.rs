@@ -21,6 +21,19 @@ use ports::{
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+/// 統一的 JSON 解析函數，支援 simd-json feature gate
+#[inline]
+fn parse_json(bytes: &mut [u8]) -> Result<serde_json::Value, HftError> {
+    #[cfg(feature = "json-simd")]
+    {
+        simd_json::serde::from_slice(bytes).map_err(|e| HftError::Serialization(e.to_string()))
+    }
+    #[cfg(not(feature = "json-simd"))]
+    {
+        serde_json::from_slice(bytes).map_err(|e| HftError::Serialization(e.to_string()))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct InstrumentSpec {
     tick_size: Option<f64>,
@@ -68,7 +81,7 @@ async fn fetch_instruments_spec() -> std::collections::HashMap<String, Instrumen
         Err(_) => return map,
     };
     let mut bytes = text.into_bytes();
-    let v: serde_json::Value = match simd_json::serde::from_slice(bytes.as_mut_slice()) {
+    let v: serde_json::Value = match parse_json(bytes.as_mut_slice()) {
         Ok(x) => x,
         Err(_) => return map,
     };
@@ -330,14 +343,13 @@ impl MarketStream for GrvtMarketStream {
                 match msg {
                     Ok(Message::Text(txt)) => {
                         let mut bytes = txt.into_bytes();
-                        let v: serde_json::Value =
-                            match simd_json::serde::from_slice(bytes.as_mut_slice()) {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    let _ = tx.send(Err(HftError::Serialization(e.to_string())));
-                                    continue;
-                                }
-                            };
+                        let v: serde_json::Value = match parse_json(bytes.as_mut_slice()) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                continue;
+                            }
+                        };
 
                         // 訂閱回覆包裝：有 result/stream/subs
                         if v.get("result").is_some() && v.get("method").is_some() {

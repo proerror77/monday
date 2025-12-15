@@ -16,7 +16,6 @@ mod message_types;
 mod rest;
 mod websocket;
 
-use converter::*;
 use rest::*;
 use websocket::*;
 

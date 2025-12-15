@@ -1,0 +1,28 @@
+[package]
+name = "hft-model-manager"
+version = "0.1.0"
+edition = "2021"
+description = "Model hot-reload manager for HFT system"
+publish = false
+
+[dependencies]
+# Core
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Async
+tokio = { workspace = true, features = ["fs", "sync", "time", "rt"] }
+
+# File watching
+notify = { version = "6.1", default-features = false, features = ["macos_fsevent"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3.10"

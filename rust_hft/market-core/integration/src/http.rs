@@ -22,7 +22,7 @@ impl Default for HttpClientConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct HttpClient {
     pub cfg: HttpClientConfig,
     client: Client,

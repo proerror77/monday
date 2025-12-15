@@ -2,6 +2,12 @@
 //! - 支援 Paper 模式（模擬 ACK/Fill）與 Live 模式（REST 下單 + 私有 WS 回報）
 
 use async_trait::async_trait;
+use execution::{
+    resilience::CircuitBreakerAlert, AlertCallback, CircuitBreakerConfig, CircuitState,
+    ExecutionAlert, ExecutionAlertType, ExecutorStats, ResilientExecutor, RetryConfig,
+};
+// Re-export ExecutionMode for backwards compatibility
+pub use execution::ExecutionMode;
 use futures::{stream, StreamExt};
 use hft_core::{HftResult, OrderId, Price, Quantity};
 use integration::{
@@ -10,14 +16,9 @@ use integration::{
 };
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    Paper,
-    Live,
-}
 
 #[derive(Debug, Clone)]
 pub struct AsterdexExecutionConfig {
@@ -40,6 +41,9 @@ pub struct AsterdexExecutionClient {
     order_symbol: HashMap<String, String>,
     // listenKey 維護
     listen_key: Option<String>,
+    // Resilience 相關
+    resilient_executor: Option<Arc<ResilientExecutor>>,
+    alert_callback: Option<AlertCallback>,
 }
 
 impl AsterdexExecutionClient {
@@ -61,6 +65,64 @@ impl AsterdexExecutionClient {
             mode: cfg.mode,
             order_symbol: HashMap::new(),
             listen_key: None,
+            resilient_executor: None,
+            alert_callback: None,
+        }
+    }
+
+    /// 設置告警回調函數
+    pub fn with_alert_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ExecutionAlert) + Send + Sync + 'static,
+    {
+        self.alert_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// 獲取 resilience 統計資訊
+    pub fn resilience_stats(&self) -> Option<ExecutorStats> {
+        if let Some(ref executor) = self.resilient_executor {
+            Some(executor.stats())
+        } else {
+            None
+        }
+    }
+
+    /// 獲取熔斷器狀態
+    pub async fn circuit_state(&self) -> Option<CircuitState> {
+        if let Some(ref executor) = self.resilient_executor {
+            Some(executor.circuit_breaker.state().await)
+        } else {
+            None
+        }
+    }
+
+    /// 重置熔斷器
+    pub async fn reset_circuit_breaker(&self) {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.circuit_breaker.reset().await;
+            info!("AsterDex 熔斷器已重置");
+        }
+    }
+
+    /// 帶 resilience 執行操作
+    async fn execute_with_resilience<F, Fut, T>(&self, mut operation: F) -> HftResult<T>
+    where
+        F: FnMut() -> Fut + Clone + Send + Sync,
+        Fut: std::future::Future<Output = HftResult<T>> + Send,
+        T: Send,
+    {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.execute(operation).await
+        } else {
+            operation().await
+        }
+    }
+
+    /// 發送執行告警
+    fn send_execution_alert(&self, alert: ExecutionAlert) {
+        if let Some(ref callback) = self.alert_callback {
+            callback(alert);
         }
     }
 
@@ -76,6 +138,22 @@ impl AsterdexExecutionClient {
         }
         Ok(())
     }
+
+    /// 獲取 HTTP 客戶端引用
+    #[inline]
+    fn get_http(&self) -> HftResult<&HttpClient> {
+        self.http_client
+            .as_ref()
+            .ok_or_else(|| hft_core::HftError::Execution("HTTP client not initialized".to_string()))
+    }
+
+    /// 獲取 Signer 引用
+    #[inline]
+    fn get_signer(&self) -> HftResult<&AsterdexSigner> {
+        self.signer
+            .as_ref()
+            .ok_or_else(|| hft_core::HftError::Execution("Signer not initialized - missing credentials".to_string()))
+    }
 }
 
 #[async_trait]
@@ -86,8 +164,8 @@ impl ExecutionClient for AsterdexExecutionClient {
             if self.http_client.is_none() {
                 self.ensure_http()?;
             }
-            let signer = self.signer.as_ref().unwrap();
-            let http = self.http_client.as_ref().unwrap();
+            let signer = self.get_signer()?;
+            let http = self.get_http()?;
 
             // 構建參數
             let mut params: HashMap<String, String> = HashMap::new();
@@ -201,28 +279,63 @@ impl ExecutionClient for AsterdexExecutionClient {
             if self.http_client.is_none() {
                 self.ensure_http()?;
             }
-            let signer = self
+            let signer_clone = self
                 .signer
-                .as_ref()
+                .clone()
                 .ok_or_else(|| hft_core::HftError::Authentication("缺少API憑證".to_string()))?;
-            let http = self.http_client.as_ref().unwrap();
+            let http_client = self
+                .http_client
+                .clone()
+                .ok_or_else(|| hft_core::HftError::Execution("HTTP client not initialized".to_string()))?;
             let symbol = self
                 .order_symbol
                 .get(&order_id.0)
                 .cloned()
                 .unwrap_or_else(|| "BTCUSDT".to_string());
+            let order_id_str = order_id.0.clone();
 
-            let mut params: HashMap<String, String> = HashMap::new();
-            params.insert("symbol".to_string(), symbol);
-            params.insert("orderId".to_string(), order_id.0.clone());
-            params.insert("recvWindow".to_string(), "5000".to_string());
-            let signed_query = signer.sign_request(&mut params);
-            let path = format!("/fapi/v1/order?{}", signed_query);
-            let headers = signer.generate_headers();
-            let _ = http
-                .signed_request(reqwest::Method::DELETE, &path, Some(headers), None)
-                .await
-                .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
+            // 使用 resilience 執行撤單
+            let result = self
+                .execute_with_resilience(|| {
+                    let http = http_client.clone();
+                    let sig = signer_clone.clone();
+                    let sym = symbol.clone();
+                    let oid = order_id_str.clone();
+                    async move {
+                        let mut params: HashMap<String, String> = HashMap::new();
+                        params.insert("symbol".to_string(), sym);
+                        params.insert("orderId".to_string(), oid);
+                        params.insert("recvWindow".to_string(), "5000".to_string());
+                        let signed_query = sig.sign_request(&mut params);
+                        let path = format!("/fapi/v1/order?{}", signed_query);
+                        let headers = sig.generate_headers();
+                        http.signed_request(reqwest::Method::DELETE, &path, Some(headers), None)
+                            .await
+                            .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
+                        Ok(())
+                    }
+                })
+                .await;
+
+            // 熔斷器開啟時發送告警
+            if let Err(ref e) = result {
+                if let Some(ref executor) = self.resilient_executor {
+                    if executor.circuit_breaker.state().await == CircuitState::Open {
+                        self.send_execution_alert(
+                            ExecutionAlert::new(
+                                ExecutionAlertType::CircuitOpen,
+                                "asterdex",
+                                "cancel_order",
+                                &format!("撤單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
+                            )
+                            .with_error(e.to_string()),
+                        );
+                    }
+                }
+            }
+
+            result?;
+
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(ExecutionEvent::OrderCanceled {
                     order_id: order_id.clone(),
@@ -251,10 +364,29 @@ impl ExecutionClient for AsterdexExecutionClient {
             if new_quantity.is_none() && new_price.is_none() {
                 return Ok(());
             }
-            // 取消原單
-            self.cancel_order(order_id).await.ok();
+            // 取消原單（使用 resilience，處理錯誤）
+            let cancel_result = self.cancel_order(order_id).await;
+            if let Err(ref e) = cancel_result {
+                warn!(
+                    "AsterDex 修改訂單時撤單失敗 (order_id={}): {}",
+                    order_id.0, e
+                );
+                // 發送告警
+                self.send_execution_alert(
+                    ExecutionAlert::new(
+                        ExecutionAlertType::RetriesExhausted,
+                        "asterdex",
+                        "modify_order",
+                        &format!(
+                            "修改訂單時撤單失敗 (order_id={}): {}",
+                            order_id.0, e
+                        ),
+                    )
+                    .with_error(e.to_string()),
+                );
+            }
             // 簡化：按剩餘資料重下一張限價/市價單（需由上層提供完整 intent 更佳）
-            warn!("Aster DEX 修改訂單以撤單重下實現: order_id={}", order_id.0);
+            warn!("AsterDex 修改訂單以撤單重下實現: order_id={}", order_id.0);
             if let Some(q) = new_quantity {
                 let _ = q;
             }
@@ -309,11 +441,45 @@ impl ExecutionClient for AsterdexExecutionClient {
         // 惰性初始化 HTTP 客戶端
         let _ = self.ensure_http();
 
+        // 初始化 Resilient Executor（帶告警回調）
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+            retry_on_init_error: false,
+        };
+        let circuit_config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+            half_open_max_requests: 3,
+            half_open_success_threshold: 2,
+        };
+        let alert_cb = self.alert_callback.clone();
+        self.resilient_executor = Some(Arc::new(
+            ResilientExecutor::new("asterdex", retry_config, circuit_config).with_alert_callback(
+                move |cb_alert: CircuitBreakerAlert| {
+                    if let Some(ref cb) = alert_cb {
+                        // 將熔斷器告警轉換為執行告警
+                        let exec_alert = ExecutionAlert::new(
+                            ExecutionAlertType::CircuitOpen,
+                            "asterdex",
+                            "circuit_breaker",
+                            &cb_alert.message,
+                        )
+                        .with_failure_count(cb_alert.failure_count);
+                        cb(exec_alert);
+                    }
+                },
+            ),
+        ));
+        info!("AsterDex resilience executor 已初始化");
+
         // 啟動私有 WS（Live）
         if self.mode == ExecutionMode::Live {
             // 1) 創建 listenKey
-            let http = self.http_client.as_ref().unwrap();
-            let headers = self.signer.as_ref().map(|s| s.generate_headers()).unwrap();
+            let http = self.get_http()?;
+            let headers = self.get_signer()?.generate_headers();
             let resp = http
                 .signed_request(
                     reqwest::Method::POST,

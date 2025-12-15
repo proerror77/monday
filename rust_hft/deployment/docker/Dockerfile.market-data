@@ -1,0 +1,93 @@
+# Market Data Ingestion Dockerfile
+# 市場數據接入服務
+
+# ============================================
+# Stage 1: 構建環境
+# ============================================
+FROM rust:1.75-bookworm AS builder
+
+ARG EXCHANGE=bitget
+
+WORKDIR /app
+
+# 安裝構建依賴
+RUN apt-get update && apt-get install -y \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 複製 workspace 配置
+COPY Cargo.toml Cargo.lock ./
+
+# 複製所有 crate 的 Cargo.toml
+COPY market-core/core/Cargo.toml market-core/core/
+COPY market-core/ports/Cargo.toml market-core/ports/
+COPY market-core/engine/Cargo.toml market-core/engine/
+COPY market-core/runtime/Cargo.toml market-core/runtime/
+COPY market-core/integration/Cargo.toml market-core/integration/
+COPY market-core/snapshot/Cargo.toml market-core/snapshot/
+COPY market-core/instrument/Cargo.toml market-core/instrument/
+
+COPY data-pipelines/core/Cargo.toml data-pipelines/core/
+COPY data-pipelines/adapters-common/Cargo.toml data-pipelines/adapters-common/
+COPY data-pipelines/adapters/adapter-bitget/Cargo.toml data-pipelines/adapters/adapter-bitget/
+COPY data-pipelines/adapters/adapter-binance/Cargo.toml data-pipelines/adapters/adapter-binance/
+COPY data-pipelines/adapters/adapter-bybit/Cargo.toml data-pipelines/adapters/adapter-bybit/
+
+COPY shared/config/Cargo.toml shared/config/
+COPY shared/instrument/Cargo.toml shared/instrument/
+
+COPY infra-services/core/redis/Cargo.toml infra-services/core/redis/
+COPY infra-services/core/metrics/Cargo.toml infra-services/core/metrics/
+
+# 創建空的 lib.rs 文件用於緩存依賴
+RUN mkdir -p market-core/core/src && echo "" > market-core/core/src/lib.rs
+RUN mkdir -p data-pipelines/adapters/adapter-${EXCHANGE}/src && echo "" > data-pipelines/adapters/adapter-${EXCHANGE}/src/lib.rs
+
+# 構建依賴 (這層會被緩存)
+RUN cargo build --release 2>/dev/null || true
+
+# 複製實際源代碼
+COPY . .
+
+# 構建發布版本 (根據 EXCHANGE 選擇適配器)
+RUN cargo build --release -p adapter-${EXCHANGE} --features "metrics"
+
+# ============================================
+# Stage 2: 運行環境
+# ============================================
+FROM debian:bookworm-slim AS runtime
+
+ARG EXCHANGE=bitget
+
+# 安裝運行時依賴
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 創建非 root 用戶
+RUN useradd -m -u 1000 hft
+WORKDIR /app
+
+# 複製二進制文件
+COPY --from=builder /app/target/release/market-data-${EXCHANGE} /app/market-data
+
+# 設置權限
+RUN chown -R hft:hft /app
+USER hft
+
+# 環境變數
+ENV RUST_LOG=info
+ENV EXCHANGE=${EXCHANGE}
+
+# 健康檢查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9093/health || exit 1
+
+# 暴露端口
+EXPOSE 9093
+
+# 啟動命令
+ENTRYPOINT ["/app/market-data"]

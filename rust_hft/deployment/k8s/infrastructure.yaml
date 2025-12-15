@@ -1,0 +1,262 @@
+# Infrastructure Services for HFT System
+# 基礎設施服務 - Redis 和 ClickHouse
+# 注意: 生產環境建議使用托管服務 (ElastiCache, ClickHouse Cloud)
+
+---
+# ============================================
+# Redis - 用於實時數據和事件
+# ============================================
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: hft-trading
+  labels:
+    app: redis
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        command:
+        - redis-server
+        - --appendonly
+        - "yes"
+        - --maxmemory
+        - "2gb"
+        - --maxmemory-policy
+        - allkeys-lru
+        resources:
+          requests:
+            cpu: "1"
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3
+      resources:
+        requests:
+          storage: 10Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: hft-trading
+spec:
+  type: ClusterIP
+  ports:
+  - port: 6379
+    targetPort: 6379
+  selector:
+    app: redis
+
+---
+# ============================================
+# ClickHouse - 用於時序數據存儲
+# ============================================
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: clickhouse
+  namespace: hft-trading
+  labels:
+    app: clickhouse
+spec:
+  serviceName: clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clickhouse
+  template:
+    metadata:
+      labels:
+        app: clickhouse
+    spec:
+      containers:
+      - name: clickhouse
+        image: clickhouse/clickhouse-server:24.1
+        ports:
+        - containerPort: 8123
+          name: http
+        - containerPort: 9000
+          name: native
+        env:
+        - name: CLICKHOUSE_DB
+          value: "hft"
+        - name: CLICKHOUSE_USER
+          value: "default"
+        - name: CLICKHOUSE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: clickhouse-password
+              optional: true
+        resources:
+          requests:
+            cpu: "2"
+            memory: 8Gi
+          limits:
+            cpu: "4"
+            memory: 16Gi
+        volumeMounts:
+        - name: clickhouse-data
+          mountPath: /var/lib/clickhouse
+        - name: clickhouse-config
+          mountPath: /etc/clickhouse-server/config.d
+        livenessProbe:
+          httpGet:
+            path: /ping
+            port: 8123
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ping
+            port: 8123
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: clickhouse-config
+        configMap:
+          name: clickhouse-config
+  volumeClaimTemplates:
+  - metadata:
+      name: clickhouse-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: gp3
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clickhouse
+  namespace: hft-trading
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8123
+    targetPort: 8123
+  - name: native
+    port: 9000
+    targetPort: 9000
+  selector:
+    app: clickhouse
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-config
+  namespace: hft-trading
+data:
+  performance.xml: |
+    <clickhouse>
+      <max_memory_usage>10000000000</max_memory_usage>
+      <max_bytes_before_external_group_by>5000000000</max_bytes_before_external_group_by>
+      <max_threads>8</max_threads>
+    </clickhouse>
+
+---
+# ============================================
+# PersistentVolumeClaim for Models
+# ============================================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: models-pvc
+  namespace: hft-trading
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: efs  # AWS EFS for shared access
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# ============================================
+# ServiceAccount for HFT Trading
+# ============================================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hft-trading
+  namespace: hft-trading
+  annotations:
+    # AWS IRSA (IAM Roles for Service Accounts)
+    eks.amazonaws.com/role-arn: arn:aws:iam::${AWS_ACCOUNT_ID}:role/hft-trading-role
+
+---
+# RBAC for ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hft-trading-role
+  namespace: hft-trading
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hft-trading-binding
+  namespace: hft-trading
+subjects:
+- kind: ServiceAccount
+  name: hft-trading
+  namespace: hft-trading
+roleRef:
+  kind: Role
+  name: hft-trading-role
+  apiGroup: rbac.authorization.k8s.io

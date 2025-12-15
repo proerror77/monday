@@ -14,8 +14,6 @@ use runtime::{
     VenueConfig as RtVenueConfig, VenueType,
 };
 use runtime::{ShardConfig, ShardStrategy, SystemBuilder, SystemConfig};
-use serde::Deserialize;
-use std::fs;
 use tracing::{info, warn};
 
 #[derive(Parser)]
@@ -82,6 +80,24 @@ struct Args {
     /// 對齊步長（毫秒）
     #[arg(long, default_value_t = 100)]
     ml_step_ms: u64,
+
+    /// 啟用 Sentinel 自動化風控
+    #[arg(long, default_value_t = true)]
+    sentinel_enable: bool,
+    /// Sentinel 檢查間隔（毫秒）
+    #[arg(long, default_value_t = 100)]
+    sentinel_interval_ms: u64,
+    /// Sentinel 延遲警告閾值（微秒）
+    #[arg(long, default_value_t = 15000)]
+    sentinel_latency_warn_us: u64,
+    /// Sentinel 回撤停止閾值（百分比）
+    #[arg(long, default_value_t = 5.0)]
+    sentinel_drawdown_stop_pct: f64,
+
+    /// gRPC 控制服務端口（啟用 grpc feature 時生效）
+    #[cfg(feature = "grpc")]
+    #[arg(long, default_value = "9092")]
+    grpc_port: u16,
 }
 
 #[tokio::main]
@@ -268,6 +284,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("系統正在運行...");
 
+    // 啟動 Sentinel 風控 worker（默認啟用）
+    let _sentinel_handle = if args.sentinel_enable {
+        let sentinel_config = helpers::SentinelWorkerConfig {
+            check_interval_ms: args.sentinel_interval_ms,
+            latency_warn_us: args.sentinel_latency_warn_us,
+            latency_degrade_us: args.sentinel_latency_warn_us * 2, // 降頻閾值 = 警告閾值 * 2
+            drawdown_warn_pct: args.sentinel_drawdown_stop_pct * 0.4, // 警告 = 停止 * 0.4
+            drawdown_stop_pct: args.sentinel_drawdown_stop_pct,
+        };
+        Some(helpers::spawn_sentinel_worker(
+            system.engine.clone(),
+            sentinel_config,
+        ))
+    } else {
+        None
+    };
+
     // 啟動推理 worker（可選）
     let _inference_handle = if args.ml_enable {
         Some(helpers::spawn_inference_worker(
@@ -284,6 +317,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 啟動 metrics HTTP 服務器（如果啟用 metrics feature）
     #[cfg(feature = "metrics")]
     let _metrics_handle = helpers::spawn_metrics_server(system.engine.clone(), args.metrics_port);
+
+    // 啟動 gRPC 控制服務（如果啟用 grpc feature）
+    #[cfg(feature = "grpc")]
+    let _grpc_handle = helpers::spawn_grpc_server(system.engine.clone(), args.grpc_port);
 
     // 可選：dry-run 下單驗證
     helpers::run_dry_run_if_enabled(&system, args.dry_run_order, &args.dry_run_symbol).await;
@@ -340,168 +377,4 @@ fn show_available_adapters() {
     info!("  ✓ Redis 快取");
 }
 
-// Removed dead code: register_adapters() was never called
-// This functionality is now handled by SystemBuilder
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct Config {
-    engine: EngineConfig,
-    venues: Vec<VenueConfig>,
-    infra: Option<InfraConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct EngineConfig {
-    queue_capacity: usize,
-    stale_us: u64,
-    top_n: usize,
-    #[allow(dead_code)]
-    flip_policy: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct VenueConfig {
-    name: String,
-    ws_public: Option<String>,
-    ws_private: Option<String>,
-    rest: Option<String>,
-    api_key: Option<String>,
-    secret: Option<String>,
-    #[allow(dead_code)]
-    capabilities: Option<CapabilitiesConfig>,
-    #[allow(dead_code)]
-    #[serde(default)]
-    simulate_execution: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct CapabilitiesConfig {
-    #[allow(dead_code)]
-    ws_order: Option<bool>,
-    #[allow(dead_code)]
-    snapshot_crc: Option<bool>,
-    #[allow(dead_code)]
-    all_in_one_topics: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct InfraConfig {
-    #[allow(dead_code)]
-    clickhouse: Option<ClickhouseCfg>,
-    #[allow(dead_code)]
-    redis: Option<RedisCfg>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct ClickhouseCfg {
-    #[allow(dead_code)]
-    url: String,
-    #[allow(dead_code)]
-    auth: Option<String>,
-    #[allow(dead_code)]
-    table_map: Option<String>,
-    #[allow(dead_code)]
-    batch_bytes: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct RedisCfg {
-    #[allow(dead_code)]
-    url: String,
-}
-
-#[allow(dead_code)]
-fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
-    let s = fs::read_to_string(path)?;
-    let cfg: Config = serde_yaml::from_str(&s)?;
-    Ok(cfg)
-}
-
-/// 轉換舊配置格式到新的 SystemConfig
-#[allow(dead_code)]
-fn convert_legacy_config(legacy: Config) -> SystemConfig {
-    use engine::dataflow::FlipPolicy;
-    use runtime::{
-        ExecutionQueueSettings, RiskConfig, SystemEngineConfig, VenueCapabilities, VenueConfig,
-        VenueType,
-    };
-
-    SystemConfig {
-        engine: SystemEngineConfig {
-            queue_capacity: legacy.engine.queue_capacity,
-            stale_us: legacy.engine.stale_us,
-            top_n: legacy.engine.top_n,
-            flip_policy: FlipPolicy::OnUpdate,
-            cpu_affinity: runtime::system_builder::CpuAffinityConfig::default(),
-            ack_timeout_ms: 3000,
-            reconcile_interval_ms: 5000,
-            auto_cancel_exchange_only: false,
-            execution_queue: ExecutionQueueSettings::default(),
-        },
-        venues: legacy
-            .venues
-            .into_iter()
-            .map(|v| {
-                let venue_type = match v.name.to_lowercase().as_str() {
-                    "bitget" => VenueType::Bitget,
-                    "binance" => VenueType::Binance,
-                    "bybit" => VenueType::Bybit,
-                    "grvt" => VenueType::Grvt,
-                    "hyperliquid" => VenueType::Hyperliquid,
-                    "backpack" => VenueType::Backpack,
-                    "asterdex" | "aster" => VenueType::Asterdex,
-                    _ => {
-                        warn!("未知交易所類型: {}, 默認為 Bitget", v.name);
-                        VenueType::Bitget
-                    }
-                };
-
-                VenueConfig {
-                    name: v.name,
-                    account_id: None,
-                    venue_type,
-                    ws_public: v.ws_public,
-                    ws_private: v.ws_private,
-                    rest: v.rest,
-                    api_key: v.api_key,
-                    secret: v.secret,
-                    passphrase: None, // 新增字段：預設為 None
-                    execution_mode: Some("Paper".to_string()), // 新增字段：預設為 Paper
-                    capabilities: VenueCapabilities::default(),
-                    inst_type: None,
-                    simulate_execution: v.simulate_execution.unwrap_or(false),
-                    symbol_catalog: Vec::new(),
-                    data_config: None,
-                    execution_config: None,
-                    secret_ref_api_key: None,
-                    secret_ref_secret: None,
-                    secret_ref_passphrase: None,
-                }
-            })
-            .collect(),
-        strategies: Vec::new(), // 稍後從 YAML 讀取
-        risk: RiskConfig {
-            risk_type: "Default".to_string(),
-            global_position_limit: rust_decimal::Decimal::from(1000000),
-            global_notional_limit: rust_decimal::Decimal::from(10000000),
-            max_daily_trades: 10000,
-            max_orders_per_second: 100,
-            staleness_threshold_us: 5000,
-            enhanced: None,
-            strategy_overrides: Default::default(),
-        },
-        router: None,
-        infra: None,
-        quotes_only: false,
-        strategy_accounts: std::collections::HashMap::new(),
-        accounts: Vec::new(),
-        portfolios: Vec::new(),
-    }
-}
+// Legacy config structs removed - now using SystemBuilder from YAML directly

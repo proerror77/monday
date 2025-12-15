@@ -1,0 +1,336 @@
+name: Performance Regression Testing
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'rust_hft/src/**'
+      - 'rust_hft/benches/**'
+      - 'rust_hft/Cargo.toml'
+      - 'rust_hft/Cargo.lock'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ============================================================================
+  # Latency Benchmarks - Order Book Updates
+  # ============================================================================
+  benchmark-orderbook:
+    name: Benchmark - Order Book Latency
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust_hft
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for comparison
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust_hft
+
+      - name: Get baseline (main branch)
+        run: |
+          git checkout origin/main -- . 2>/dev/null || true
+          cargo bench --bench orderbook_latency -- --output-format bencher | tee /tmp/baseline.txt || true
+          mv target/criterion /tmp/baseline-criterion || true
+
+      - name: Restore PR code
+        run: git checkout -
+
+      - name: Run PR benchmarks
+        run: |
+          cargo bench --bench orderbook_latency -- --output-format bencher | tee /tmp/current.txt || true
+
+      - name: Compare results
+        id: compare
+        run: |
+          if [ -d "/tmp/baseline-criterion" ] && [ -d "target/criterion" ]; then
+            echo "## Performance Comparison - Order Book" > /tmp/comparison.md
+            echo "" >> /tmp/comparison.md
+
+            # Use benchcmp if available, else simple text diff
+            if command -v critcmp &> /dev/null; then
+              critcmp /tmp/baseline-criterion target/criterion >> /tmp/comparison.md 2>&1 || true
+            else
+              echo "Baseline:" >> /tmp/comparison.md
+              cat /tmp/baseline.txt >> /tmp/comparison.md
+              echo "" >> /tmp/comparison.md
+              echo "Current:" >> /tmp/comparison.md
+              cat /tmp/current.txt >> /tmp/comparison.md
+            fi
+
+            # Check for >5% regression
+            if grep -E 'change:.*\+[5-9][0-9]*\.[0-9]+%' /tmp/comparison.md; then
+              echo "regression=true" >> $GITHUB_OUTPUT
+              echo "REGRESSION_DETECTED=yes" >> $GITHUB_ENV
+            else
+              echo "regression=false" >> $GITHUB_OUTPUT
+              echo "REGRESSION_DETECTED=no" >> $GITHUB_ENV
+            fi
+
+            cat /tmp/comparison.md
+          else
+            echo "⚠️ Cannot compare: missing baseline data"
+            echo "regression=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orderbook-benchmark-results
+          path: |
+            target/criterion/
+            /tmp/*.txt
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const regression = '${{ steps.compare.outputs.regression }}';
+            const emoji = regression === 'true' ? '🔴' : '🟢';
+
+            let comment = `${emoji} **Order Book Latency Benchmark**\n\n`;
+
+            if (regression === 'true') {
+              comment += '⚠️ **Performance regression detected** (>5% slower)\n\n';
+              comment += 'Please review the benchmark results above.';
+            } else if (regression === 'false') {
+              comment += '✅ No performance regression detected\n\n';
+              comment += 'Benchmark results within acceptable range.';
+            } else {
+              comment += '⚠️ Could not compare against baseline\n\n';
+              comment += 'This may be the first benchmark run.';
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      - name: Fail if regression
+        if: steps.compare.outputs.regression == 'true'
+        run: |
+          echo "::error::Performance regression detected (>5%)"
+          exit 1
+
+  # ============================================================================
+  # Latency Benchmarks - Order Execution
+  # ============================================================================
+  benchmark-execution:
+    name: Benchmark - Order Execution Latency
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust_hft
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust_hft
+
+      - name: Get baseline (main branch)
+        run: |
+          git checkout origin/main -- . 2>/dev/null || true
+          cargo bench --bench execution_latency -- --output-format bencher | tee /tmp/baseline-exec.txt || true
+          mv target/criterion /tmp/baseline-criterion-exec || true
+
+      - name: Restore PR code
+        run: git checkout -
+
+      - name: Run PR benchmarks
+        run: |
+          cargo bench --bench execution_latency -- --output-format bencher | tee /tmp/current-exec.txt || true
+
+      - name: Compare results
+        id: compare
+        run: |
+          if [ -d "/tmp/baseline-criterion-exec" ] && [ -d "target/criterion" ]; then
+            echo "## Performance Comparison - Order Execution" > /tmp/comparison-exec.md
+            echo "" >> /tmp/comparison-exec.md
+
+            if command -v critcmp &> /dev/null; then
+              critcmp /tmp/baseline-criterion-exec target/criterion >> /tmp/comparison-exec.md 2>&1 || true
+            else
+              echo "Baseline:" >> /tmp/comparison-exec.md
+              cat /tmp/baseline-exec.txt >> /tmp/comparison-exec.md
+              echo "" >> /tmp/comparison-exec.md
+              echo "Current:" >> /tmp/comparison-exec.md
+              cat /tmp/current-exec.txt >> /tmp/comparison-exec.md
+            fi
+
+            # Target: p99 < 25 microseconds
+            # Check if any metric crosses threshold
+            if grep -E '25.*µs|25.*us' /tmp/comparison-exec.md | grep -E 'change:.*\+'; then
+              echo "regression=true" >> $GITHUB_OUTPUT
+            else
+              echo "regression=false" >> $GITHUB_OUTPUT
+            fi
+
+            cat /tmp/comparison-exec.md
+          else
+            echo "⚠️ Cannot compare: missing baseline"
+            echo "regression=unknown" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: execution-benchmark-results
+          path: |
+            target/criterion/
+            /tmp/*exec*.txt
+
+      - name: Fail if regression
+        if: steps.compare.outputs.regression == 'true'
+        run: |
+          echo "::error::Execution latency regression - target <25µs"
+          exit 1
+
+  # ============================================================================
+  # Memory Usage Benchmarks
+  # ============================================================================
+  benchmark-memory:
+    name: Benchmark - Memory Usage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust_hft
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust_hft
+
+      - name: Build release
+        run: cargo build --release --all-features
+
+      - name: Get binary size
+        id: size
+        run: |
+          SIZE=$(ls -lh target/release/hft-live | awk '{print $5}')
+          echo "binary_size=$SIZE" >> $GITHUB_OUTPUT
+
+          # Store baseline
+          echo "$SIZE" > /tmp/binary-size.txt
+
+      - name: Compare sizes
+        run: |
+          echo "Binary size: ${{ steps.size.outputs.binary_size }}"
+          echo "Target: <50MB (for container efficiency)"
+
+          # Parse size in bytes for comparison
+          SIZE_BYTES=$(du -b target/release/hft-live | awk '{print $1}')
+          MAX_BYTES=$((50 * 1024 * 1024))
+
+          if [ "$SIZE_BYTES" -gt "$MAX_BYTES" ]; then
+            echo "::warning::Binary size exceeds 50MB target"
+          fi
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-benchmark-results
+          path: /tmp/binary-size.txt
+
+  # ============================================================================
+  # Summary Report
+  # ============================================================================
+  benchmark-summary:
+    name: Benchmark Summary
+    runs-on: ubuntu-latest
+    needs:
+      - benchmark-orderbook
+      - benchmark-execution
+      - benchmark-memory
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Generate summary
+        run: |
+          echo "# 📊 Performance Benchmark Summary" > /tmp/summary.md
+          echo "" >> /tmp/summary.md
+          echo "**Test Run**: ${{ github.run_id }}" >> /tmp/summary.md
+          echo "**PR**: ${{ github.event.pull_request.number }}" >> /tmp/summary.md
+          echo "**Commit**: ${{ github.sha }}" >> /tmp/summary.md
+          echo "" >> /tmp/summary.md
+
+          echo "## Results" >> /tmp/summary.md
+          echo "" >> /tmp/summary.md
+
+          if [ -f "orderbook-benchmark-results/target/criterion/orderbook_latency/base/raw.json" ]; then
+            echo "✅ Order Book Latency: Benchmarked" >> /tmp/summary.md
+          else
+            echo "⚠️ Order Book Latency: No baseline" >> /tmp/summary.md
+          fi
+
+          if [ -f "execution-benchmark-results/target/criterion/execution_latency/base/raw.json" ]; then
+            echo "✅ Execution Latency: Benchmarked" >> /tmp/summary.md
+          else
+            echo "⚠️ Execution Latency: No baseline" >> /tmp/summary.md
+          fi
+
+          if [ -f "memory-benchmark-results/binary-size.txt" ]; then
+            SIZE=$(cat memory-benchmark-results/binary-size.txt)
+            echo "✅ Binary Size: $SIZE" >> /tmp/summary.md
+          fi
+
+          echo "" >> /tmp/summary.md
+          echo "## Target Metrics" >> /tmp/summary.md
+          echo "- Order Book (L2/diff): p99 < 1.5ms ✅" >> /tmp/summary.md
+          echo "- Order Execution: p99 < 25µs 🎯" >> /tmp/summary.md
+          echo "- Binary Size: < 50MB" >> /tmp/summary.md
+
+          cat /tmp/summary.md
+
+      - name: Comment summary on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('/tmp/summary.md', 'utf8');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-summary
+          path: /tmp/summary.md

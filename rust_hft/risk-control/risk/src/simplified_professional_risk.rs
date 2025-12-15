@@ -505,10 +505,10 @@ mod tests {
         };
 
         let account = AccountView {
-            cash_balance: 100_000.0,
+            cash_balance: Decimal::from(100_000),
             positions: std::collections::HashMap::new(),
-            unrealized_pnl: 0.0,
-            realized_pnl: 0.0,
+            unrealized_pnl: Decimal::ZERO,
+            realized_pnl: Decimal::ZERO,
         };
 
         // 第一筆訂單應該通過
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn test_order_notional_limit() {
         let config = SimplifiedRiskConfig {
-            max_order_notional: 1000.0, // 很低的限制
+            max_order_notional: Decimal::from(1000), // 很低的限制
             ..Default::default()
         };
 

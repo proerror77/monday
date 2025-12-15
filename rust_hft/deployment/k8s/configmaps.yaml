@@ -1,0 +1,205 @@
+# ConfigMaps for HFT System
+# 配置文件 - 非敏感配置數據
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-config
+  namespace: hft-trading
+  labels:
+    app: hft-trading
+data:
+  # 交易對配置
+  bitget-symbols: "BTCUSDT,ETHUSDT,SOLUSDT"
+  binance-symbols: "BTCUSDT,ETHUSDT,SOLUSDT"
+  bybit-symbols: "BTCUSDT,ETHUSDT,SOLUSDT"
+  hyperliquid-symbols: "BTC,ETH,SOL"
+
+  # 交易引擎配置
+  trading.yaml: |
+    engine:
+      mode: production
+      log_level: info
+
+    market_data:
+      buffer_size: 10000
+      snapshot_interval_ms: 100
+
+    execution:
+      max_orders_per_second: 100
+      order_timeout_ms: 5000
+      retry_attempts: 3
+
+    strategy:
+      enabled: true
+      model_path: /app/models/latest.pt
+
+    risk:
+      enabled: true
+      max_position_usd: 100000
+      max_order_size_usd: 10000
+
+    metrics:
+      enabled: true
+      port: 9091
+      path: /metrics
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: risk-config
+  namespace: hft-trading
+  labels:
+    app: hft-trading
+data:
+  # 風控參數
+  max-drawdown-pct: "5"
+  max-position-usd: "100000"
+  max-order-size-usd: "10000"
+  latency-threshold-ms: "25"
+
+  # Kill Switch 觸發條件
+  kill-switch-drawdown-pct: "10"
+  kill-switch-loss-usd: "5000"
+
+  # 監控間隔
+  check-interval-ms: "100"
+
+  # 風控規則配置
+  risk-rules.yaml: |
+    rules:
+      - name: max_drawdown
+        type: drawdown
+        threshold: 0.05
+        action: alert
+
+      - name: critical_drawdown
+        type: drawdown
+        threshold: 0.10
+        action: kill_switch
+
+      - name: position_limit
+        type: position
+        max_usd: 100000
+        action: reject_order
+
+      - name: latency_alert
+        type: latency
+        p99_threshold_ms: 25
+        action: alert
+
+      - name: latency_degrade
+        type: latency
+        p99_threshold_ms: 50
+        action: degrade
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: hft-trading
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+
+    alerting:
+      alertmanagers:
+      - static_configs:
+        - targets: ['alertmanager:9093']
+
+    rule_files:
+      - /etc/prometheus/alerts.yml
+
+    scrape_configs:
+      - job_name: 'trading-engine'
+        static_configs:
+          - targets: ['trading-engine:9091']
+
+      - job_name: 'market-data'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: market-data
+            action: keep
+
+      - job_name: 'sentinel'
+        static_configs:
+          - targets: ['sentinel:9094']
+
+  alerts.yml: |
+    groups:
+    - name: hft-critical
+      rules:
+      - alert: TradingEngineDown
+        expr: up{job="trading-engine"} == 0
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trading engine is down"
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.99, rate(hft_exec_latency_bucket[1m])) > 0.025
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Execution latency p99 > 25ms"
+
+      - alert: DrawdownExceeded
+        expr: hft_portfolio_drawdown > 0.05
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Portfolio drawdown > 5%"
+
+      - alert: WebSocketDisconnected
+        expr: hft_ws_connected == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "WebSocket connection lost"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: hft-trading
+data:
+  hft-overview.json: |
+    {
+      "dashboard": {
+        "title": "HFT System Overview",
+        "panels": [
+          {
+            "title": "Execution Latency",
+            "type": "graph",
+            "targets": [
+              {"expr": "histogram_quantile(0.99, rate(hft_exec_latency_bucket[1m]))"}
+            ]
+          },
+          {
+            "title": "Portfolio PnL",
+            "type": "stat",
+            "targets": [
+              {"expr": "hft_portfolio_pnl"}
+            ]
+          },
+          {
+            "title": "Active Positions",
+            "type": "table",
+            "targets": [
+              {"expr": "hft_position_size"}
+            ]
+          }
+        ]
+      }
+    }

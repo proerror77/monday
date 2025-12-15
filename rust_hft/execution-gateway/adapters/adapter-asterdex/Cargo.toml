@@ -8,6 +8,7 @@ description = "Aster DEX 私有WS/REST adapter (實作 ExecutionClient)"
 hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
 integration = { package = "hft-integration", path = "../../../market-core/integration" }
+execution = { package = "hft-execution", path = "../../execution" }
 serde = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }

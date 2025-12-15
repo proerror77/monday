@@ -11,6 +11,7 @@ name = "adapter_bybit_execution"
 hft_core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
 integration = { package = "hft-integration", path = "../../../market-core/integration" }
+execution = { package = "hft-execution", path = "../../execution" }
 
 # Async and networking
 tokio = { workspace = true, features = ["full"] }

@@ -1,0 +1,229 @@
+# HFT Trading Engine Deployment
+# 核心交易引擎 - 需要低延遲和高可用
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trading-engine
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+    tier: critical
+spec:
+  replicas: 1  # 單實例運行，避免狀態衝突
+  strategy:
+    type: Recreate  # 確保只有一個實例運行
+  selector:
+    matchLabels:
+      app: trading-engine
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+        tier: critical
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: "/metrics"
+    spec:
+      # 優先級最高
+      priorityClassName: system-node-critical
+
+      # 節點選擇 - 使用低延遲節點
+      nodeSelector:
+        node-type: low-latency
+        # kubernetes.io/arch: amd64
+
+      # 容忍污點
+      tolerations:
+      - key: "dedicated"
+        operator: "Equal"
+        value: "trading"
+        effect: "NoSchedule"
+
+      # 親和性 - 避免與其他 Pod 共存
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - trading-engine
+            topologyKey: "kubernetes.io/hostname"
+
+      # 服務帳戶
+      serviceAccountName: hft-trading
+
+      # 安全上下文
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+      - name: trading-engine
+        image: ${ECR_REGISTRY}/hft-trading:${IMAGE_TAG}
+        imagePullPolicy: Always
+
+        ports:
+        - name: metrics
+          containerPort: 9091
+        - name: grpc
+          containerPort: 9092
+        - name: health
+          containerPort: 9090
+
+        # 環境變數
+        env:
+        - name: RUST_LOG
+          value: "info"
+        - name: HFT_ENV
+          value: "production"
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: redis-url
+        - name: CLICKHOUSE_URL
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: clickhouse-url
+        - name: BITGET_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: exchange-secrets
+              key: bitget-api-key
+        - name: BITGET_API_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: exchange-secrets
+              key: bitget-api-secret
+        - name: BITGET_PASSPHRASE
+          valueFrom:
+            secretKeyRef:
+              name: exchange-secrets
+              key: bitget-passphrase
+
+        # 資源限制
+        resources:
+          requests:
+            cpu: "2"
+            memory: 4Gi
+          limits:
+            cpu: "4"
+            memory: 8Gi
+
+        # 卷掛載
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: models
+          mountPath: /app/models
+          readOnly: true
+        - name: logs
+          mountPath: /app/logs
+
+        # 健康檢查
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # 啟動探針 (給予更多啟動時間)
+        startupProbe:
+          httpGet:
+            path: /health
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 30  # 最多 150 秒啟動時間
+
+      volumes:
+      - name: config
+        configMap:
+          name: trading-config
+      - name: models
+        persistentVolumeClaim:
+          claimName: models-pvc
+      - name: logs
+        emptyDir:
+          sizeLimit: 1Gi
+
+      # 優雅關閉
+      terminationGracePeriodSeconds: 60
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-engine
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 9091
+    targetPort: metrics
+  - name: grpc
+    port: 9092
+    targetPort: grpc
+  - name: health
+    port: 9090
+    targetPort: health
+  selector:
+    app: trading-engine
+
+---
+# PodDisruptionBudget - 確保始終有實例運行
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: trading-engine-pdb
+  namespace: hft-trading
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: trading-engine
+
+---
+# HorizontalPodAutoscaler (可選，通常不用於核心交易)
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: trading-engine-hpa
+#   namespace: hft-trading
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: trading-engine
+#   minReplicas: 1
+#   maxReplicas: 1
+#   metrics:
+#   - type: Resource
+#     resource:
+#       name: cpu
+#       target:
+#         type: Utilization
+#         averageUtilization: 80

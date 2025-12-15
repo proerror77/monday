@@ -114,6 +114,7 @@ impl BinanceCredentials {
 }
 
 /// Binance API 签名生成器
+#[derive(Clone)]
 pub struct BinanceSigner {
     credentials: BinanceCredentials,
 }
@@ -196,6 +197,7 @@ impl BybitCredentials {
 }
 
 /// Bybit API 签名生成器
+#[derive(Clone)]
 pub struct BybitSigner {
     credentials: BybitCredentials,
 }

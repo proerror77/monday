@@ -27,6 +27,9 @@ prometheus = { workspace = true, optional = true }
 infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics", features = ["http-server"], optional = true }
 ndarray = "0.15"
 hft-infer-onnx = { path = "../../strategy-framework/infer-onnx" }
+hft-model-manager = { path = "../../infra-services/core/model-manager" }
+risk = { package = "hft-risk", path = "../../risk-control/risk" }
+hft-grpc-server = { path = "../../infra-services/core/grpc-server", optional = true }
 anyhow = "1"
 
 [features]
@@ -65,7 +68,8 @@ metrics = [
   "dep:infra-metrics",
   "infra-metrics/http-server"
 ]
-full-infra = ["clickhouse", "redis", "metrics"]
+grpc = ["dep:hft-grpc-server"]
+full-infra = ["clickhouse", "redis", "metrics", "grpc"]
 
 # SIMD 優化 (生產環境應默認啟用)
 simd = ["runtime/json-simd"]

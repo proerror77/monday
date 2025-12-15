@@ -11,11 +11,10 @@ use tracing::debug;
 pub struct MessageConverter;
 
 impl MessageConverter {
+    /// 從 serde_json::Value 解析為指定類型
     #[inline]
-    fn parse_value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, simd_json::Error> {
-        let json_str = value.to_string();
-        let mut bytes = json_str.into_bytes();
-        simd_json::serde::from_slice(bytes.as_mut_slice())
+    fn parse_value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, serde_json::Error> {
+        serde_json::from_value(value)
     }
     pub fn convert_depth_update(update: DepthUpdate) -> HftResult<BookUpdate> {
         let symbol = Symbol::from(update.symbol);
@@ -200,10 +199,19 @@ impl MessageConverter {
         Ok(None)
     }
 
+    /// 統一的 JSON 解析函數，支援 simd-json feature gate
     #[inline]
-    fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, simd_json::Error> {
-        let mut bytes = text.as_bytes().to_vec();
-        simd_json::serde::from_slice(bytes.as_mut_slice())
+    fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
+        #[cfg(feature = "json-simd")]
+        {
+            let mut bytes = text.as_bytes().to_vec();
+            simd_json::serde::from_slice(bytes.as_mut_slice())
+                .map_err(|e| serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))
+        }
+        #[cfg(not(feature = "json-simd"))]
+        {
+            serde_json::from_str(text)
+        }
     }
 }
 

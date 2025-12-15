@@ -1,7 +1,14 @@
 //! Binance 執行 adapter（實作 `ports::ExecutionClient`）
 //! - 支援 Paper 模式（模擬 ACK/Fill）與 Live 模式（REST 下單 + 私有 WS 回報）
+//! - 韌性機制：重試、熔斷器、告警通知
 
 use async_trait::async_trait;
+use execution::{
+    AlertCallback, CircuitBreakerConfig, CircuitState, ExecutionAlert, ExecutionAlertType,
+    ExecutorStats, ResilientExecutor, RetryConfig,
+};
+// Re-export ExecutionMode for backwards compatibility
+pub use execution::ExecutionMode;
 use futures::{stream, StreamExt};
 use hft_core::{HftResult, OrderId, Price, Quantity};
 use integration::{
@@ -10,14 +17,9 @@ use integration::{
 };
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    Paper,
-    Live,
-}
 
 #[derive(Debug, Clone)]
 pub struct BinanceExecutionConfig {
@@ -40,6 +42,10 @@ pub struct BinanceExecutionClient {
     order_symbol: HashMap<String, String>,
     // listenKey 維護
     listen_key: Option<String>,
+    // 韌性執行器 (重試 + 熔斷器)
+    resilient_executor: Option<Arc<ResilientExecutor>>,
+    // 告警回調
+    alert_callback: Option<AlertCallback>,
 }
 
 impl BinanceExecutionClient {
@@ -61,6 +67,39 @@ impl BinanceExecutionClient {
             mode: cfg.mode,
             order_symbol: HashMap::new(),
             listen_key: None,
+            resilient_executor: None,
+            alert_callback: None,
+        }
+    }
+
+    /// 設置告警回調
+    pub fn with_alert_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ExecutionAlert) + Send + Sync + 'static,
+    {
+        self.alert_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// 獲取韌性執行器統計信息
+    pub fn resilience_stats(&self) -> Option<ExecutorStats> {
+        self.resilient_executor.as_ref().map(|e| e.stats())
+    }
+
+    /// 獲取熔斷器狀態
+    pub async fn circuit_state(&self) -> Option<CircuitState> {
+        if let Some(ref executor) = self.resilient_executor {
+            Some(executor.circuit_breaker.state().await)
+        } else {
+            None
+        }
+    }
+
+    /// 強制重置熔斷器
+    pub async fn reset_circuit_breaker(&self) {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.circuit_breaker.reset().await;
+            info!("[Binance] 熔斷器已手動重置");
         }
     }
 
@@ -76,6 +115,43 @@ impl BinanceExecutionClient {
         }
         Ok(())
     }
+
+    /// 獲取 HTTP 客戶端引用
+    #[inline]
+    fn get_http(&self) -> HftResult<&HttpClient> {
+        self.http_client
+            .as_ref()
+            .ok_or_else(|| hft_core::HftError::Execution("HTTP client not initialized".to_string()))
+    }
+
+    /// 獲取 Signer 引用
+    #[inline]
+    fn get_signer(&self) -> HftResult<&BinanceSigner> {
+        self.signer
+            .as_ref()
+            .ok_or_else(|| hft_core::HftError::Execution("Signer not initialized - missing credentials".to_string()))
+    }
+
+    /// 執行帶韌性保護的操作
+    async fn execute_with_resilience<T, F, Fut>(&self, operation: F) -> HftResult<T>
+    where
+        F: FnMut() -> Fut + Clone,
+        Fut: std::future::Future<Output = HftResult<T>>,
+    {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.execute(operation).await
+        } else {
+            let mut op = operation;
+            op().await
+        }
+    }
+
+    /// 發送執行告警
+    fn send_execution_alert(&self, alert: ExecutionAlert) {
+        if let Some(ref callback) = self.alert_callback {
+            callback(alert);
+        }
+    }
 }
 
 #[async_trait]
@@ -86,8 +162,8 @@ impl ExecutionClient for BinanceExecutionClient {
             if self.http_client.is_none() {
                 self.ensure_http()?;
             }
-            let signer = self.signer.as_ref().unwrap();
-            let http = self.http_client.as_ref().unwrap();
+            let signer = self.get_signer()?;
+            let http = self.get_http()?;
 
             // 構建參數
             let mut params: HashMap<String, String> = HashMap::new();
@@ -204,31 +280,63 @@ impl ExecutionClient for BinanceExecutionClient {
                 .signer
                 .as_ref()
                 .ok_or_else(|| hft_core::HftError::Authentication("缺少API憑證".to_string()))?;
-            let http = self.http_client.as_ref().unwrap();
+            let http_client = self.get_http()?.clone();
             let symbol = self
                 .order_symbol
                 .get(&order_id.0)
                 .cloned()
                 .unwrap_or_else(|| "BTCUSDT".to_string());
+            let order_id_str = order_id.0.clone();
+            let signer_clone = signer.clone();
 
-            let mut params: HashMap<String, String> = HashMap::new();
-            params.insert("symbol".to_string(), symbol);
-            params.insert("orderId".to_string(), order_id.0.clone());
-            params.insert("recvWindow".to_string(), "5000".to_string());
-            let signed_query = signer.sign_request(&mut params);
-            let path = format!("/api/v3/order?{}", signed_query);
-            let headers = signer.generate_headers();
-            let _ = http
-                .signed_request(reqwest::Method::DELETE, &path, Some(headers), None)
-                .await
-                .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(ExecutionEvent::OrderCanceled {
-                    order_id: order_id.clone(),
-                    timestamp: hft_core::now_micros(),
-                });
+            let result = self
+                .execute_with_resilience(|| {
+                    let http = http_client.clone();
+                    let sym = symbol.clone();
+                    let oid = order_id_str.clone();
+                    let sig = signer_clone.clone();
+                    async move {
+                        let mut params: HashMap<String, String> = HashMap::new();
+                        params.insert("symbol".to_string(), sym);
+                        params.insert("orderId".to_string(), oid);
+                        params.insert("recvWindow".to_string(), "5000".to_string());
+                        let signed_query = sig.sign_request(&mut params);
+                        let path = format!("/api/v3/order?{}", signed_query);
+                        let headers = sig.generate_headers();
+                        http.signed_request(reqwest::Method::DELETE, &path, Some(headers), None)
+                            .await
+                            .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
+                        Ok(())
+                    }
+                })
+                .await;
+
+            // 如果熔斷器開啟，發送告警
+            if let Err(ref e) = result {
+                if let Some(ref executor) = self.resilient_executor {
+                    if executor.circuit_breaker.state().await == CircuitState::Open {
+                        self.send_execution_alert(
+                            ExecutionAlert::new(
+                                ExecutionAlertType::CircuitOpen,
+                                "binance",
+                                "cancel_order",
+                                &format!("撤單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
+                            )
+                            .with_error(e.to_string()),
+                        );
+                    }
+                }
             }
-            return Ok(());
+
+            if result.is_ok() {
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(ExecutionEvent::OrderCanceled {
+                        order_id: order_id.clone(),
+                        timestamp: hft_core::now_micros(),
+                    });
+                }
+            }
+            return result;
         }
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderCanceled {
@@ -255,16 +363,29 @@ impl ExecutionClient for BinanceExecutionClient {
                 .get(&order_id.0)
                 .cloned()
                 .unwrap_or_else(|| "BTCUSDT".to_string());
-            // 取消原單
-            self.cancel_order(order_id).await.ok();
+
+            // 取消原單（已帶韌性機制）
+            let cancel_result = self.cancel_order(order_id).await;
+
             // 簡化：按剩餘資料重下一張限價/市價單（需由上層提供完整 intent 更佳）
             warn!("Binance 修改訂單以撤單重下實現: order_id={}", order_id.0);
-            if let Some(q) = new_quantity {
-                let _ = q;
+
+            // 處理撤單結果
+            if let Err(ref e) = cancel_result {
+                // 發送修改失敗告警
+                self.send_execution_alert(
+                    ExecutionAlert::new(
+                        ExecutionAlertType::RetriesExhausted,
+                        "binance",
+                        "modify_order",
+                        &format!("修改訂單時撤單失敗 (order_id={}): {}", order_id.0, e),
+                    )
+                    .with_error(e.to_string()),
+                );
+                return cancel_result;
             }
-            if let Some(p) = new_price {
-                let _ = p;
-            }
+
+            // 撤單成功，發送修改事件
             // 無法重建完整意圖，僅回傳修改事件以避免阻塞（可後續改為攜帶原意圖）
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(ExecutionEvent::OrderModified {
@@ -307,17 +428,60 @@ impl ExecutionClient for BinanceExecutionClient {
     }
 
     async fn connect(&mut self) -> HftResult<()> {
+        // 初始化韌性執行器
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+            retry_on_init_error: true,
+        };
+        let cb_config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+            half_open_max_requests: 3,
+            half_open_success_threshold: 2,
+        };
+
+        let mut executor = ResilientExecutor::new("binance", retry_config, cb_config);
+
+        // 設置熔斷器告警回調
+        if let Some(ref alert_cb) = self.alert_callback {
+            let alert_cb = Arc::clone(alert_cb);
+            executor = executor.with_alert_callback(move |cb_alert| {
+                let alert_type = match cb_alert.state {
+                    CircuitState::Open => ExecutionAlertType::CircuitOpen,
+                    CircuitState::Closed => ExecutionAlertType::CircuitRecovered,
+                    CircuitState::HalfOpen => return,
+                };
+
+                let alert = ExecutionAlert::new(
+                    alert_type,
+                    "binance",
+                    "execution",
+                    &cb_alert.message,
+                )
+                .with_failure_count(cb_alert.failure_count);
+
+                alert_cb(alert);
+            });
+        }
+
+        self.resilient_executor = Some(Arc::new(executor));
+
         let (tx, _rx) = broadcast::channel(1000);
         self.event_tx = Some(tx.clone());
         self.connected = true;
         // 惰性初始化 HTTP 客戶端
         let _ = self.ensure_http();
 
+        info!("[Binance] 執行客戶端連接成功");
+
         // 啟動私有 WS（Live）
         if self.mode == ExecutionMode::Live {
             // 1) 創建 listenKey
-            let http = self.http_client.as_ref().unwrap();
-            let headers = self.signer.as_ref().map(|s| s.generate_headers()).unwrap();
+            let http = self.get_http()?;
+            let headers = self.get_signer()?.generate_headers();
             let resp = http
                 .signed_request(
                     reqwest::Method::POST,

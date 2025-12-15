@@ -10,6 +10,7 @@ name = "adapter_okx_execution"
 hft_core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
 integration = { package = "hft-integration", path = "../../../market-core/integration" }
+execution = { package = "hft-execution", path = "../../execution" }
 async-trait = "0.1"
 futures = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

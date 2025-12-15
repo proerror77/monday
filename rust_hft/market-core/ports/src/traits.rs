@@ -68,10 +68,31 @@ pub trait ExecutionClient: Send + Sync {
     /// 獲取未結訂單列表 (用於對賬)
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>>;
 
+    /// 獲取帳戶餘額 (用於餘額同步)
+    async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
+        // 默認實現：返回空列表（向後兼容）
+        Ok(Vec::new())
+    }
+
     /// 連線管理
     async fn connect(&mut self) -> HftResult<()>;
     async fn disconnect(&mut self) -> HftResult<()>;
     async fn health(&self) -> ConnectionHealth;
+}
+
+/// 帳戶餘額信息（從交易所同步）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountBalance {
+    /// 資產名稱 (如 USDT, BTC)
+    pub asset: String,
+    /// 可用餘額
+    pub available: rust_decimal::Decimal,
+    /// 凍結餘額（掛單佔用）
+    pub frozen: rust_decimal::Decimal,
+    /// 總餘額
+    pub total: rust_decimal::Decimal,
+    /// 估值（以報價幣計價，如 USD）
+    pub usd_value: Option<rust_decimal::Decimal>,
 }
 
 /// 帳戶視圖 (策略決策用)

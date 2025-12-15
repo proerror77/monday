@@ -440,6 +440,172 @@ mod clickhouse_export {
         Ok(())
     }
 
+    // 訂單歷史行結構
+    #[derive(clickhouse::Row, serde::Serialize, serde::Deserialize, Debug)]
+    struct OrderHistoryRow {
+        timestamp: u64,
+        order_id: String,
+        event_type: String, // "ack", "fill", "canceled", "rejected", "modified"
+        symbol: String,
+        side: String,
+        price: f64,
+        quantity: f64,
+        fill_id: String,
+        strategy_id: String,
+        venue: String,
+    }
+
+    /// 啟動訂單歷史 ClickHouse Writer
+    pub async fn spawn_order_history_writer(
+        this: &mut SystemRuntime,
+        clickhouse_config: ClickHouseConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ch_url = clickhouse_config.url.clone();
+        let ch_db = clickhouse_config
+            .database
+            .clone()
+            .unwrap_or_else(|| "default".into());
+
+        let engine_arc = this.engine.clone();
+        let order_client = Client::default().with_url(&ch_url).with_database(&ch_db);
+
+        let handle = tokio::spawn(async move {
+            // 訂閱執行事件
+            let mut rx = {
+                let eng = engine_arc.lock().await;
+                eng.subscribe_execution_events()
+            };
+
+            let mut batch: Vec<OrderHistoryRow> = Vec::with_capacity(256);
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(500));
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        // 定期刷新批量到 ClickHouse
+                        if !batch.is_empty() {
+                            if let Ok(mut inserter) = order_client.insert::<OrderHistoryRow>("hft.order_history") {
+                                for row in &batch {
+                                    let _ = inserter.write(row).await;
+                                }
+                                if let Err(e) = inserter.end().await {
+                                    tracing::warn!("訂單歷史寫入失敗: {}", e);
+                                }
+                            }
+                            batch.clear();
+                        }
+
+                        // 檢查引擎是否仍在運行
+                        let running = {
+                            let eng = engine_arc.lock().await;
+                            eng.get_statistics().is_running
+                        };
+                        if !running {
+                            break;
+                        }
+                    }
+                    recv = rx.recv() => {
+                        match recv {
+                            Ok(event) => {
+                                let row = match &event {
+                                    ports::ExecutionEvent::OrderAck { order_id, timestamp } => {
+                                        OrderHistoryRow {
+                                            timestamp: *timestamp,
+                                            order_id: order_id.0.clone(),
+                                            event_type: "ack".to_string(),
+                                            symbol: String::new(),
+                                            side: String::new(),
+                                            price: 0.0,
+                                            quantity: 0.0,
+                                            fill_id: String::new(),
+                                            strategy_id: String::new(),
+                                            venue: String::new(),
+                                        }
+                                    }
+                                    ports::ExecutionEvent::Fill { order_id, price, quantity, timestamp, fill_id } => {
+                                        OrderHistoryRow {
+                                            timestamp: *timestamp,
+                                            order_id: order_id.0.clone(),
+                                            event_type: "fill".to_string(),
+                                            symbol: String::new(),
+                                            side: String::new(),
+                                            price: price.to_f64().unwrap_or(0.0),
+                                            quantity: quantity.to_f64().unwrap_or(0.0),
+                                            fill_id: fill_id.clone(),
+                                            strategy_id: String::new(),
+                                            venue: String::new(),
+                                        }
+                                    }
+                                    ports::ExecutionEvent::OrderCanceled { order_id, timestamp } => {
+                                        OrderHistoryRow {
+                                            timestamp: *timestamp,
+                                            order_id: order_id.0.clone(),
+                                            event_type: "canceled".to_string(),
+                                            symbol: String::new(),
+                                            side: String::new(),
+                                            price: 0.0,
+                                            quantity: 0.0,
+                                            fill_id: String::new(),
+                                            strategy_id: String::new(),
+                                            venue: String::new(),
+                                        }
+                                    }
+                                    ports::ExecutionEvent::OrderReject { order_id, reason, timestamp } => {
+                                        OrderHistoryRow {
+                                            timestamp: *timestamp,
+                                            order_id: order_id.0.clone(),
+                                            event_type: format!("rejected:{}", reason),
+                                            symbol: String::new(),
+                                            side: String::new(),
+                                            price: 0.0,
+                                            quantity: 0.0,
+                                            fill_id: String::new(),
+                                            strategy_id: String::new(),
+                                            venue: String::new(),
+                                        }
+                                    }
+                                    ports::ExecutionEvent::OrderModified { order_id, new_quantity, new_price, timestamp } => {
+                                        OrderHistoryRow {
+                                            timestamp: *timestamp,
+                                            order_id: order_id.0.clone(),
+                                            event_type: "modified".to_string(),
+                                            symbol: String::new(),
+                                            side: String::new(),
+                                            price: new_price.map(|p| p.to_f64().unwrap_or(0.0)).unwrap_or(0.0),
+                                            quantity: new_quantity.map(|q| q.to_f64().unwrap_or(0.0)).unwrap_or(0.0),
+                                            fill_id: String::new(),
+                                            strategy_id: String::new(),
+                                            venue: String::new(),
+                                        }
+                                    }
+                                    _ => continue,
+                                };
+                                batch.push(row);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+
+            // 最後刷新剩餘批量
+            if !batch.is_empty() {
+                if let Ok(mut inserter) = order_client.insert::<OrderHistoryRow>("hft.order_history") {
+                    for row in &batch {
+                        let _ = inserter.write(row).await;
+                    }
+                    let _ = inserter.end().await;
+                }
+            }
+
+            info!("訂單歷史 Writer 已停止");
+        });
+
+        this.tasks.push(handle);
+        info!("訂單歷史 ClickHouse Writer 已啟動（hft.order_history）");
+        Ok(())
+    }
+
     impl SystemRuntime {
         #[cfg(feature = "clickhouse")]
         pub async fn spawn_clickhouse_writer(
@@ -447,6 +613,14 @@ mod clickhouse_export {
             clickhouse_config: ClickHouseConfig,
         ) -> Result<(), Box<dyn std::error::Error>> {
             spawn_clickhouse_writer(self, clickhouse_config).await
+        }
+
+        #[cfg(feature = "clickhouse")]
+        pub async fn spawn_order_history_writer(
+            &mut self,
+            clickhouse_config: ClickHouseConfig,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            spawn_order_history_writer(self, clickhouse_config).await
         }
     }
 }

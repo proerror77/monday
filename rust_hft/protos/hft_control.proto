@@ -1,0 +1,165 @@
+// HFT Control Service Protocol Buffer Definition
+// 用於控制交易引擎的 gRPC 接口
+
+syntax = "proto3";
+
+package hft.control;
+
+option go_package = "hft/control";
+
+// HFT 控制服務
+service HftControl {
+  // 加載新模型
+  rpc LoadModel(LoadModelRequest) returns (Ack);
+
+  // 暫停交易
+  rpc PauseTrading(Empty) returns (Ack);
+
+  // 恢復交易
+  rpc ResumeTrading(Empty) returns (Ack);
+
+  // 進入降頻模式
+  rpc EnterDegradeMode(Empty) returns (Ack);
+
+  // 緊急停止 (Kill Switch)
+  rpc EmergencyStop(EmergencyStopRequest) returns (Ack);
+
+  // 獲取系統狀態
+  rpc GetStatus(Empty) returns (SystemStatus);
+
+  // 獲取 Portfolio 狀態
+  rpc GetPortfolioStatus(Empty) returns (PortfolioStatus);
+
+  // 更新風控參數
+  rpc UpdateRiskConfig(RiskConfigUpdate) returns (Ack);
+
+  // 取消所有訂單
+  rpc CancelAllOrders(CancelAllOrdersRequest) returns (CancelAllOrdersResponse);
+
+  // 健康檢查
+  rpc HealthCheck(Empty) returns (HealthResponse);
+}
+
+// 空請求
+message Empty {}
+
+// 通用確認響應
+message Ack {
+  bool ok = 1;
+  string message = 2;
+  int64 timestamp_us = 3;
+}
+
+// 加載模型請求
+message LoadModelRequest {
+  string url = 1;           // 模型 URL (file:// 或 http://)
+  string sha256 = 2;        // 模型校驗碼
+  string version = 3;       // 模型版本
+  string model_type = 4;    // 模型類型 (onnx, pt, etc.)
+}
+
+// 緊急停止請求
+message EmergencyStopRequest {
+  string reason = 1;        // 停止原因
+  bool cancel_orders = 2;   // 是否取消所有訂單
+  bool close_positions = 3; // 是否平倉
+}
+
+// 系統狀態
+message SystemStatus {
+  // 運行狀態
+  bool is_running = 1;
+  string trading_mode = 2;  // Normal, Degraded, Paused, Emergency
+
+  // 延遲統計 (微秒)
+  int64 latency_p50_us = 10;
+  int64 latency_p99_us = 11;
+  int64 latency_max_us = 12;
+
+  // 交易統計
+  int64 orders_submitted = 20;
+  int64 orders_filled = 21;
+  int64 orders_canceled = 22;
+  int64 orders_rejected = 23;
+  int64 active_orders = 24;
+
+  // 數據統計
+  int64 events_received = 30;
+  int64 events_processed = 31;
+  int64 events_dropped = 32;
+
+  // WebSocket 狀態
+  int32 ws_connections_active = 40;
+  int32 ws_reconnect_count = 41;
+
+  // 時間戳
+  int64 uptime_seconds = 50;
+  int64 timestamp_us = 51;
+}
+
+// Portfolio 狀態
+message PortfolioStatus {
+  // 資金
+  double cash_balance = 1;
+  double total_equity = 2;
+  double unrealized_pnl = 3;
+  double realized_pnl = 4;
+
+  // 回撤
+  double high_water_mark = 10;
+  double drawdown_pct = 11;
+  double max_drawdown_pct = 12;
+
+  // 持倉
+  repeated Position positions = 20;
+
+  // 時間戳
+  int64 timestamp_us = 30;
+}
+
+// 持倉信息
+message Position {
+  string symbol = 1;
+  string venue = 2;
+  double quantity = 3;
+  double avg_price = 4;
+  double unrealized_pnl = 5;
+  double notional_value = 6;
+}
+
+// 風控參數更新
+message RiskConfigUpdate {
+  optional double max_drawdown_pct = 1;
+  optional double max_position_usd = 2;
+  optional double max_order_size_usd = 3;
+  optional int64 latency_threshold_us = 4;
+  optional int32 max_orders_per_second = 5;
+}
+
+// 取消訂單請求
+message CancelAllOrdersRequest {
+  optional string symbol = 1;   // 可選：只取消特定交易對
+  optional string venue = 2;    // 可選：只取消特定交易所
+}
+
+// 取消訂單響應
+message CancelAllOrdersResponse {
+  bool ok = 1;
+  int32 orders_canceled = 2;
+  int32 orders_failed = 3;
+  repeated string failed_order_ids = 4;
+}
+
+// 健康檢查響應
+message HealthResponse {
+  bool healthy = 1;
+  string status = 2;  // "healthy", "degraded", "unhealthy"
+  map<string, ComponentHealth> components = 3;
+}
+
+// 組件健康狀態
+message ComponentHealth {
+  bool healthy = 1;
+  string message = 2;
+  int64 last_check_us = 3;
+}

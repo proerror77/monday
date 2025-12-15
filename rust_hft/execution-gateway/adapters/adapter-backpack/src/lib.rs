@@ -12,6 +12,12 @@ use std::{
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
+use execution::{
+    resilience::CircuitBreakerAlert, AlertCallback, CircuitBreakerConfig, CircuitState,
+    ExecutionAlert, ExecutionAlertType, ExecutorStats, ResilientExecutor, RetryConfig,
+};
+// Re-export ExecutionMode for backwards compatibility
+pub use execution::ExecutionMode;
 use futures::StreamExt;
 use hft_core::{
     now_micros, HftError, HftResult, OrderId, OrderType, Price, Quantity, Side, Symbol,
@@ -25,15 +31,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_WINDOW_MS: u64 = 5_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    Paper,
-    Live,
-}
 
 #[derive(Debug, Clone)]
 pub struct BackpackExecutionConfig {
@@ -130,6 +130,9 @@ pub struct BackpackExecutionClient {
     connected: Arc<AtomicBool>,
     last_heartbeat: Arc<AtomicU64>,
     order_symbols: HashMap<String, String>,
+    // Resilience 相關
+    resilient_executor: Option<Arc<ResilientExecutor>>,
+    alert_callback: Option<AlertCallback>,
 }
 
 impl BackpackExecutionClient {
@@ -164,7 +167,59 @@ impl BackpackExecutionClient {
             connected: Arc::new(AtomicBool::new(false)),
             last_heartbeat: Arc::new(AtomicU64::new(now_micros())),
             order_symbols: HashMap::new(),
+            resilient_executor: None,
+            alert_callback: None,
         })
+    }
+
+    /// 設置 alert callback
+    pub fn with_alert_callback(mut self, callback: AlertCallback) -> Self {
+        self.alert_callback = Some(callback);
+        self
+    }
+
+    /// 獲取 resilience 統計數據
+    pub fn resilience_stats(&self) -> Option<ExecutorStats> {
+        self.resilient_executor.as_ref().map(|e| e.stats())
+    }
+
+    /// 獲取 circuit breaker 狀態
+    pub async fn circuit_state(&self) -> Option<CircuitState> {
+        if let Some(ref executor) = self.resilient_executor {
+            Some(executor.circuit_breaker.state().await)
+        } else {
+            None
+        }
+    }
+
+    /// 重置 circuit breaker
+    pub async fn reset_circuit_breaker(&self) {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.circuit_breaker.reset().await;
+            info!("Backpack 熔斷器已重置");
+        }
+    }
+
+    /// 使用 resilience 執行操作
+    async fn execute_with_resilience<F, Fut, T>(&self, mut operation: F) -> HftResult<T>
+    where
+        F: FnMut() -> Fut + Clone + Send + Sync,
+        Fut: std::future::Future<Output = HftResult<T>> + Send,
+        T: Send,
+    {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.execute(operation).await
+        } else {
+            operation().await
+        }
+    }
+
+    /// 發送執行告警
+    fn send_execution_alert(&self, alert_type: ExecutionAlertType, operation: &str, message: &str) {
+        if let Some(ref callback) = self.alert_callback {
+            let alert = ExecutionAlert::new(alert_type, "backpack", operation, message);
+            callback(alert);
+        }
     }
 
     fn base_url(&self) -> String {
@@ -370,7 +425,7 @@ impl BackpackExecutionClient {
     async fn cancel_order_live(&mut self, order_id: &OrderId) -> HftResult<()> {
         let credentials = self
             .credentials
-            .as_ref()
+            .clone()
             .ok_or_else(|| HftError::Authentication("Backpack credentials missing".into()))?;
 
         let symbol = self
@@ -379,50 +434,82 @@ impl BackpackExecutionClient {
             .cloned()
             .ok_or_else(|| HftError::Config("Unknown order symbol for cancellation".into()))?;
 
-        let mut body = Map::new();
-        body.insert("symbol".to_string(), Value::String(symbol.clone()));
-        body.insert("orderId".to_string(), Value::String(order_id.0.clone()));
-
-        let mut sign_params = BTreeMap::new();
-        sign_params.insert("orderId".to_string(), order_id.0.clone());
-        sign_params.insert("symbol".to_string(), symbol.clone());
-
-        let payload = Value::Object(body);
-        let timestamp_ms = Self::current_timestamp_ms();
-        let window_ms = self.window_ms();
-        let signature = credentials.sign("orderCancel", &sign_params, timestamp_ms, window_ms);
-
+        let http_client = self.http_client.clone();
         let url = self.rest_url("/api/v1/order");
-        let response = self
-            .http_client
-            .delete(&url)
-            .header("X-API-KEY", credentials.api_key())
-            .header("X-SIGNATURE", signature)
-            .header("X-TIMESTAMP", timestamp_ms.to_string())
-            .header("X-WINDOW", window_ms.to_string())
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| HftError::Network(format!("Backpack cancel failed: {e}")))?;
+        let window_ms = self.window_ms();
+        let order_id_str = order_id.0.clone();
+        let symbol_clone = symbol.clone();
 
-        let status = response.status();
-        if !status.is_success() && status != StatusCode::ACCEPTED {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unavailable>".to_string());
-            return Err(HftError::Exchange(format!(
-                "Backpack cancel failed ({status}): {body}"
-            )));
+        let result = self
+            .execute_with_resilience(|| {
+                let client = http_client.clone();
+                let target_url = url.clone();
+                let creds = credentials.clone();
+                let sym = symbol_clone.clone();
+                let oid = order_id_str.clone();
+                let win_ms = window_ms;
+
+                async move {
+                    let mut body = Map::new();
+                    body.insert("symbol".to_string(), Value::String(sym.clone()));
+                    body.insert("orderId".to_string(), Value::String(oid.clone()));
+
+                    let mut sign_params = BTreeMap::new();
+                    sign_params.insert("orderId".to_string(), oid.clone());
+                    sign_params.insert("symbol".to_string(), sym.clone());
+
+                    let payload = Value::Object(body);
+                    let timestamp_ms = BackpackExecutionClient::current_timestamp_ms();
+                    let signature = creds.sign("orderCancel", &sign_params, timestamp_ms, win_ms);
+
+                    let response = client
+                        .delete(&target_url)
+                        .header("X-API-KEY", creds.api_key())
+                        .header("X-SIGNATURE", signature)
+                        .header("X-TIMESTAMP", timestamp_ms.to_string())
+                        .header("X-WINDOW", win_ms.to_string())
+                        .json(&payload)
+                        .send()
+                        .await
+                        .map_err(|e| HftError::Network(format!("Backpack cancel failed: {e}")))?;
+
+                    let status = response.status();
+                    if !status.is_success() && status != StatusCode::ACCEPTED {
+                        let body = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "<unavailable>".to_string());
+                        return Err(HftError::Exchange(format!(
+                            "Backpack cancel failed ({status}): {body}"
+                        )));
+                    }
+
+                    Ok(())
+                }
+            })
+            .await;
+
+        // 發送 circuit open 警報如果需要
+        if let Some(ref executor) = self.resilient_executor {
+            if executor.circuit_breaker.state().await == CircuitState::Open {
+                self.send_execution_alert(
+                    ExecutionAlertType::CircuitOpen,
+                    "cancel_order",
+                    "Circuit breaker is open after cancel order failures",
+                );
+            }
         }
 
-        self.order_symbols.remove(&order_id.0);
-        self.update_heartbeat();
-        self.emit_event(ExecutionEvent::OrderCanceled {
-            order_id: order_id.clone(),
-            timestamp: now_micros(),
-        });
-        Ok(())
+        if result.is_ok() {
+            self.order_symbols.remove(&order_id.0);
+            self.update_heartbeat();
+            self.emit_event(ExecutionEvent::OrderCanceled {
+                order_id: order_id.clone(),
+                timestamp: now_micros(),
+            });
+        }
+
+        result
     }
 
     fn parse_decimal(value: Option<&String>) -> Option<Decimal> {
@@ -527,14 +614,14 @@ impl ExecutionClient for BackpackExecutionClient {
     async fn place_order(&mut self, intent: OrderIntent) -> HftResult<OrderId> {
         match self.cfg.mode {
             ExecutionMode::Live => self.place_order_live(intent).await,
-            ExecutionMode::Paper => self.place_order_paper(intent).await,
+            ExecutionMode::Paper | ExecutionMode::Testnet => self.place_order_paper(intent).await,
         }
     }
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
         match self.cfg.mode {
             ExecutionMode::Live => self.cancel_order_live(order_id).await,
-            ExecutionMode::Paper => {
+            ExecutionMode::Paper | ExecutionMode::Testnet => {
                 self.order_symbols.remove(&order_id.0);
                 self.emit_event(ExecutionEvent::OrderCanceled {
                     order_id: order_id.clone(),
@@ -568,9 +655,9 @@ impl ExecutionClient for BackpackExecutionClient {
     }
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
-        let credentials = match (&self.credentials, self.cfg.mode) {
+        let credentials = match (&self.credentials, &self.cfg.mode) {
             (Some(creds), ExecutionMode::Live) => creds,
-            _ => {
+            (_, ExecutionMode::Paper) | (_, ExecutionMode::Testnet) | (None, _) => {
                 warn!("Backpack list_open_orders called without live credentials");
                 return Ok(Vec::new());
             }
@@ -621,6 +708,39 @@ impl ExecutionClient for BackpackExecutionClient {
     }
 
     async fn connect(&mut self) -> HftResult<()> {
+        // 初始化 resilience executor
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+            retry_on_init_error: false,
+        };
+        let circuit_config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+            half_open_max_requests: 3,
+            half_open_success_threshold: 2,
+        };
+
+        let alert_cb = self.alert_callback.clone();
+        self.resilient_executor = Some(Arc::new(
+            ResilientExecutor::new("backpack", retry_config, circuit_config).with_alert_callback(
+                move |cb_alert: CircuitBreakerAlert| {
+                    if let Some(ref cb) = alert_cb {
+                        let exec_alert = ExecutionAlert::new(
+                            ExecutionAlertType::CircuitOpen,
+                            "backpack",
+                            "circuit_breaker",
+                            &cb_alert.message,
+                        )
+                        .with_failure_count(cb_alert.failure_count);
+                        cb(exec_alert);
+                    }
+                },
+            ),
+        ));
+
         self.connected.store(true, Ordering::SeqCst);
         self.update_heartbeat();
         Ok(())

@@ -1,0 +1,32 @@
+# ML Trainer Dockerfile
+# Python 環境用於模型訓練
+
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+# 安裝系統依賴
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 複製依賴文件
+COPY ml_trainer/requirements.txt ./
+
+# 安裝 Python 依賴
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 複製訓練代碼
+COPY ml_trainer/ ./
+
+# 創建模型輸出目錄
+RUN mkdir -p /models/current /models/archive
+
+# 非 root 用戶
+RUN groupadd -r trainer && useradd -r -g trainer trainer && \
+    chown -R trainer:trainer /app /models
+
+USER trainer
+
+# 默認命令
+CMD ["python", "train.py"]

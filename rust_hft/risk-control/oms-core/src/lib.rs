@@ -387,6 +387,101 @@ impl OmsCore {
         }
         None
     }
+
+    /// 對帳：比較交易所未結訂單與本地 OMS 狀態，返回差異報告
+    ///
+    /// Returns:
+    /// - exchange_only: 訂單在交易所存在但本地未追蹤
+    /// - local_only: 訂單在本地存在但交易所沒有（可能已被撤銷）
+    /// - qty_mismatch: 訂單存在但成交量不一致
+    pub fn reconcile_with_exchange(
+        &self,
+        exchange_orders: &[ports::OpenOrder],
+    ) -> ReconciliationReport {
+        let mut report = ReconciliationReport::default();
+
+        // Build a set of exchange order IDs for quick lookup
+        let exchange_ids: HashSet<_> = exchange_orders.iter().map(|o| &o.order_id).collect();
+
+        // Check for exchange-only and quantity mismatches
+        for ex_order in exchange_orders {
+            if let Some(local_order) = self.orders.get(&ex_order.order_id) {
+                // Order exists in both - check for quantity mismatch
+                let exchange_filled = ex_order.filled_quantity;
+                let local_filled = local_order.cum_qty;
+                if exchange_filled != local_filled {
+                    report.qty_mismatch.push(QuantityMismatch {
+                        order_id: ex_order.order_id.clone(),
+                        symbol: ex_order.symbol.clone(),
+                        exchange_filled,
+                        local_filled,
+                    });
+                }
+            } else {
+                // Order exists on exchange but not locally
+                report.exchange_only.push(ex_order.order_id.clone());
+            }
+        }
+
+        // Check for local-only orders (orders we think are open but exchange doesn't have)
+        for (order_id, record) in &self.orders {
+            if matches!(
+                record.status,
+                OrderStatus::New | OrderStatus::Acknowledged | OrderStatus::PartiallyFilled
+            ) && !exchange_ids.contains(order_id)
+            {
+                report.local_only.push(LocalOnlyOrder {
+                    order_id: order_id.clone(),
+                    symbol: record.symbol.clone(),
+                    status: record.status,
+                });
+            }
+        }
+
+        report
+    }
+}
+
+/// 對帳報告
+#[derive(Debug, Clone, Default)]
+pub struct ReconciliationReport {
+    /// 訂單在交易所存在但本地未追蹤
+    pub exchange_only: Vec<OrderId>,
+    /// 訂單在本地存在但交易所沒有
+    pub local_only: Vec<LocalOnlyOrder>,
+    /// 訂單存在但成交量不一致
+    pub qty_mismatch: Vec<QuantityMismatch>,
+}
+
+impl ReconciliationReport {
+    /// 是否有差異需要處理
+    pub fn has_discrepancies(&self) -> bool {
+        !self.exchange_only.is_empty()
+            || !self.local_only.is_empty()
+            || !self.qty_mismatch.is_empty()
+    }
+
+    /// 總差異數量
+    pub fn total_discrepancies(&self) -> usize {
+        self.exchange_only.len() + self.local_only.len() + self.qty_mismatch.len()
+    }
+}
+
+/// 本地獨有訂單
+#[derive(Debug, Clone)]
+pub struct LocalOnlyOrder {
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub status: OrderStatus,
+}
+
+/// 成交量不一致
+#[derive(Debug, Clone)]
+pub struct QuantityMismatch {
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub exchange_filled: Quantity,
+    pub local_filled: Quantity,
 }
 
 // 實現 OrderManager trait
@@ -592,5 +687,550 @@ mod tests {
         let counts = oms.open_counts_by_strategy();
         assert_eq!(counts.get("stratA"), Some(&2));
         assert!(!counts.contains_key("stratB"));
+    }
+
+    #[test]
+    fn test_update_filled_quantity_reconciliation() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("RECON-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(2.0).unwrap(),
+            venue: None,
+            strategy_id: Some("test".into()),
+        });
+
+        // Simulate OMS has 0.5 filled, but exchange says 1.5 filled
+        let fill = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(0.5).unwrap(),
+            timestamp: 0,
+            fill_id: "f1".into(),
+        };
+        let _ = oms.on_execution_event(&fill);
+
+        // Reconciliation: update to exchange's truth
+        let update = oms
+            .update_filled_quantity(
+                &oid,
+                Quantity::from_f64(1.5).unwrap(),
+                Some(Price::from_f64(101.0).unwrap()),
+            )
+            .unwrap();
+
+        assert_eq!(update.status, OrderStatus::PartiallyFilled);
+        assert_eq!(update.cum_qty, Quantity::from_f64(1.5).unwrap());
+        assert_eq!(update.avg_price, Some(Price::from_f64(101.0).unwrap()));
+    }
+
+    #[test]
+    fn test_update_status_reconciliation() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("RECON-2".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("ETHUSDT"),
+            side: Side::Sell,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: Some("test".into()),
+        });
+
+        // Order is New locally, but exchange says it's Canceled
+        let update = oms.update_status(&oid, OrderStatus::Canceled).unwrap();
+        assert_eq!(update.previous_status, OrderStatus::New);
+        assert_eq!(update.status, OrderStatus::Canceled);
+
+        // Verify the order is no longer in open orders
+        let open = oms.get_open_orders();
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_fill_deduplication() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("DEDUP-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+
+        let fill = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(0.3).unwrap(),
+            timestamp: 0,
+            fill_id: "fill-123".into(),
+        };
+
+        // First fill should be processed
+        let result1 = oms.on_execution_event(&fill);
+        assert!(result1.is_some());
+        assert_eq!(result1.unwrap().cum_qty, Quantity::from_f64(0.3).unwrap());
+
+        // Duplicate fill with same fill_id should be ignored
+        let result2 = oms.on_execution_event(&fill);
+        assert!(result2.is_none());
+
+        // Verify cum_qty didn't change
+        let order = oms.get(&oid).unwrap();
+        assert_eq!(order.cum_qty, Quantity::from_f64(0.3).unwrap());
+    }
+
+    #[test]
+    fn test_full_fill_completes_order() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("FULL-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+
+        // Partial fill
+        let fill1 = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(0.6).unwrap(),
+            timestamp: 0,
+            fill_id: "f1".into(),
+        };
+        let r1 = oms.on_execution_event(&fill1).unwrap();
+        assert_eq!(r1.status, OrderStatus::PartiallyFilled);
+
+        // Complete fill
+        let fill2 = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(101.0).unwrap(),
+            quantity: Quantity::from_f64(0.4).unwrap(),
+            timestamp: 0,
+            fill_id: "f2".into(),
+        };
+        let r2 = oms.on_execution_event(&fill2).unwrap();
+        assert_eq!(r2.status, OrderStatus::Filled);
+
+        // Verify order is no longer in open orders
+        let open = oms.get_open_orders();
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn test_export_import_state() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("EXP-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: Some("client-1".into()),
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(2.0).unwrap(),
+            venue: Some(hft_core::VenueId::BITGET),
+            strategy_id: Some("strat-a".into()),
+        });
+
+        // Add some fills
+        let fill = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(0.5).unwrap(),
+            timestamp: 0,
+            fill_id: "f1".into(),
+        };
+        let _ = oms.on_execution_event(&fill);
+
+        // Export state
+        let state = oms.export_state();
+        assert_eq!(state.len(), 1);
+
+        // Import to new OMS
+        let mut oms2 = OmsCore::new();
+        oms2.import_state(state);
+
+        // Verify state is preserved
+        let order = oms2.get(&oid).unwrap();
+        assert_eq!(order.client_order_id, Some("client-1".into()));
+        assert_eq!(order.cum_qty, Quantity::from_f64(0.5).unwrap());
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.venue, Some(hft_core::VenueId::BITGET));
+        assert_eq!(order.strategy_id, Some("strat-a".into()));
+    }
+
+    #[test]
+    fn test_order_rejected_removes_from_open() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("REJ-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: Some("test".into()),
+        });
+
+        // Verify order is in open orders
+        assert_eq!(oms.get_open_orders().len(), 1);
+
+        // Reject the order
+        let reject = ExecutionEvent::OrderReject {
+            order_id: oid.clone(),
+            reason: "Insufficient funds".into(),
+            timestamp: 0,
+        };
+        let _ = oms.on_execution_event(&reject);
+
+        // Verify order is no longer in open orders
+        assert!(oms.get_open_orders().is_empty());
+    }
+
+    #[test]
+    fn test_order_canceled_removes_from_open() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("CAN-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: Some("test".into()),
+        });
+
+        // ACK first
+        let ack = ExecutionEvent::OrderAck {
+            order_id: oid.clone(),
+            timestamp: 0,
+        };
+        let _ = oms.on_execution_event(&ack);
+
+        // Verify order is in open orders
+        assert_eq!(oms.get_open_orders().len(), 1);
+
+        // Cancel
+        let cancel = ExecutionEvent::OrderCanceled {
+            order_id: oid.clone(),
+            timestamp: 0,
+        };
+        let _ = oms.on_execution_event(&cancel);
+
+        // Verify order is no longer in open orders
+        assert!(oms.get_open_orders().is_empty());
+    }
+
+    #[test]
+    fn test_weighted_avg_price_calculation() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("AVG-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+
+        // Fill 0.4 at 100
+        let fill1 = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(0.4).unwrap(),
+            timestamp: 0,
+            fill_id: "f1".into(),
+        };
+        let _ = oms.on_execution_event(&fill1);
+
+        // Fill 0.6 at 110
+        let fill2 = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(110.0).unwrap(),
+            quantity: Quantity::from_f64(0.6).unwrap(),
+            timestamp: 0,
+            fill_id: "f2".into(),
+        };
+        let _ = oms.on_execution_event(&fill2);
+
+        // Expected avg: (0.4*100 + 0.6*110) / 1.0 = 106
+        let order = oms.get(&oid).unwrap();
+        let avg = order.avg_price.unwrap().0;
+        let expected = rust_decimal::Decimal::from(106);
+        let tolerance = rust_decimal::Decimal::new(1, 3); // 0.001
+        assert!(
+            (avg - expected).abs() < tolerance,
+            "Expected avg_price ~106, got {}",
+            avg
+        );
+    }
+
+    #[test]
+    fn test_order_modify_updates_quantity() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("MOD-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(2.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+
+        // ACK
+        let ack = ExecutionEvent::OrderAck {
+            order_id: oid.clone(),
+            timestamp: 0,
+        };
+        let _ = oms.on_execution_event(&ack);
+
+        // Partial fill
+        let fill = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(0.5).unwrap(),
+            timestamp: 0,
+            fill_id: "f1".into(),
+        };
+        let _ = oms.on_execution_event(&fill);
+
+        // Modify to reduce quantity to 0.5 (matching filled amount)
+        let modify = ExecutionEvent::OrderModified {
+            order_id: oid.clone(),
+            new_quantity: Some(Quantity::from_f64(0.5).unwrap()),
+            new_price: None,
+            timestamp: 0,
+        };
+        let update = oms.on_execution_event(&modify).unwrap();
+
+        // Order should now be Filled since cum_qty >= qty
+        assert_eq!(update.status, OrderStatus::Filled);
+    }
+
+    fn create_exchange_order(id: &str, symbol: &str, filled: f64) -> ports::OpenOrder {
+        ports::OpenOrder {
+            order_id: OrderId(id.into()),
+            symbol: Symbol::new(symbol),
+            side: Side::Buy,
+            order_type: hft_core::OrderType::Limit,
+            original_quantity: Quantity::from_f64(1.0).unwrap(),
+            remaining_quantity: Quantity::from_f64(1.0 - filled).unwrap(),
+            filled_quantity: Quantity::from_f64(filled).unwrap(),
+            price: Some(Price::from_f64(100.0).unwrap()),
+            status: ports::OrderStatus::Acknowledged,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn test_reconcile_no_discrepancies() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("R-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+
+        // ACK the order
+        let ack = ExecutionEvent::OrderAck {
+            order_id: oid.clone(),
+            timestamp: 0,
+        };
+        let _ = oms.on_execution_event(&ack);
+
+        // Exchange has same order with no fills
+        let exchange_orders = vec![create_exchange_order("R-1", "BTCUSDT", 0.0)];
+        let report = oms.reconcile_with_exchange(&exchange_orders);
+
+        assert!(!report.has_discrepancies());
+        assert_eq!(report.total_discrepancies(), 0);
+    }
+
+    #[test]
+    fn test_reconcile_exchange_only() {
+        let oms = OmsCore::new();
+
+        // Exchange has order that OMS doesn't know about
+        let exchange_orders = vec![create_exchange_order("UNKNOWN-1", "BTCUSDT", 0.0)];
+        let report = oms.reconcile_with_exchange(&exchange_orders);
+
+        assert!(report.has_discrepancies());
+        assert_eq!(report.exchange_only.len(), 1);
+        assert_eq!(report.exchange_only[0].0, "UNKNOWN-1");
+    }
+
+    #[test]
+    fn test_reconcile_local_only() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("LOCAL-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+
+        // ACK the order locally
+        let ack = ExecutionEvent::OrderAck {
+            order_id: oid.clone(),
+            timestamp: 0,
+        };
+        let _ = oms.on_execution_event(&ack);
+
+        // Exchange has no orders
+        let exchange_orders: Vec<ports::OpenOrder> = vec![];
+        let report = oms.reconcile_with_exchange(&exchange_orders);
+
+        assert!(report.has_discrepancies());
+        assert_eq!(report.local_only.len(), 1);
+        assert_eq!(report.local_only[0].order_id.0, "LOCAL-1");
+    }
+
+    #[test]
+    fn test_reconcile_quantity_mismatch() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("QTY-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+
+        // OMS thinks 0.3 filled
+        let fill = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(0.3).unwrap(),
+            timestamp: 0,
+            fill_id: "f1".into(),
+        };
+        let _ = oms.on_execution_event(&fill);
+
+        // Exchange says 0.5 filled
+        let exchange_orders = vec![create_exchange_order("QTY-1", "BTCUSDT", 0.5)];
+        let report = oms.reconcile_with_exchange(&exchange_orders);
+
+        assert!(report.has_discrepancies());
+        assert_eq!(report.qty_mismatch.len(), 1);
+        let mismatch = &report.qty_mismatch[0];
+        assert_eq!(mismatch.order_id.0, "QTY-1");
+        assert_eq!(mismatch.local_filled, Quantity::from_f64(0.3).unwrap());
+        assert_eq!(mismatch.exchange_filled, Quantity::from_f64(0.5).unwrap());
+    }
+
+    #[test]
+    fn test_reconcile_mixed_discrepancies() {
+        let mut oms = OmsCore::new();
+
+        // Order 1: exists in both with quantity mismatch
+        let oid1 = OrderId("MIX-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid1.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+        let fill = ExecutionEvent::Fill {
+            order_id: oid1.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(0.2).unwrap(),
+            timestamp: 0,
+            fill_id: "f1".into(),
+        };
+        let _ = oms.on_execution_event(&fill);
+
+        // Order 2: local only
+        let oid2 = OrderId("MIX-2".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid2.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("ETHUSDT"),
+            side: Side::Sell,
+            qty: Quantity::from_f64(2.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+        let ack = ExecutionEvent::OrderAck {
+            order_id: oid2.clone(),
+            timestamp: 0,
+        };
+        let _ = oms.on_execution_event(&ack);
+
+        // Exchange has MIX-1 with different fill + MIX-3 (unknown to OMS)
+        let exchange_orders = vec![
+            create_exchange_order("MIX-1", "BTCUSDT", 0.4), // qty mismatch
+            create_exchange_order("MIX-3", "SOLUSDT", 0.0), // exchange only
+        ];
+        let report = oms.reconcile_with_exchange(&exchange_orders);
+
+        assert!(report.has_discrepancies());
+        assert_eq!(report.total_discrepancies(), 3);
+        assert_eq!(report.exchange_only.len(), 1); // MIX-3
+        assert_eq!(report.local_only.len(), 1); // MIX-2
+        assert_eq!(report.qty_mismatch.len(), 1); // MIX-1
+    }
+
+    #[test]
+    fn test_reconcile_ignores_filled_orders() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("FILLED-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+
+        // Fully fill the order locally
+        let fill = ExecutionEvent::Fill {
+            order_id: oid.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            timestamp: 0,
+            fill_id: "f1".into(),
+        };
+        let _ = oms.on_execution_event(&fill);
+
+        // Exchange has no orders (filled orders are removed)
+        let exchange_orders: Vec<ports::OpenOrder> = vec![];
+        let report = oms.reconcile_with_exchange(&exchange_orders);
+
+        // Filled orders should not be reported as local-only
+        assert!(!report.has_discrepancies());
     }
 }

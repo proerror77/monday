@@ -1,0 +1,119 @@
+# Sentinel Monitor Deployment
+# 風控監控服務 - 實時監控交易引擎狀態
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel
+  namespace: hft-trading
+  labels:
+    app: sentinel
+    tier: monitoring
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sentinel
+  template:
+    metadata:
+      labels:
+        app: sentinel
+        tier: monitoring
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9094"
+    spec:
+      priorityClassName: system-cluster-critical
+
+      serviceAccountName: hft-trading
+
+      containers:
+      - name: sentinel
+        image: ${ECR_REGISTRY}/hft-sentinel:${IMAGE_TAG}
+        imagePullPolicy: Always
+
+        env:
+        - name: RUST_LOG
+          value: "info"
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: redis-url
+        # 風控參數
+        - name: MAX_DRAWDOWN_PCT
+          valueFrom:
+            configMapKeyRef:
+              name: risk-config
+              key: max-drawdown-pct
+        - name: MAX_POSITION_USD
+          valueFrom:
+            configMapKeyRef:
+              name: risk-config
+              key: max-position-usd
+        - name: KILL_SWITCH_ENABLED
+          value: "true"
+        - name: LATENCY_THRESHOLD_MS
+          valueFrom:
+            configMapKeyRef:
+              name: risk-config
+              key: latency-threshold-ms
+        # 告警配置
+        - name: ALERT_WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: alert-secrets
+              key: webhook-url
+              optional: true
+
+        ports:
+        - name: metrics
+          containerPort: 9094
+        - name: grpc
+          containerPort: 9095
+
+        resources:
+          requests:
+            cpu: "500m"
+            memory: 1Gi
+          limits:
+            cpu: "1"
+            memory: 2Gi
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9094
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9094
+          initialDelaySeconds: 3
+          periodSeconds: 5
+
+      terminationGracePeriodSeconds: 30
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel
+  namespace: hft-trading
+  labels:
+    app: sentinel
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 9094
+    targetPort: metrics
+  - name: grpc
+    port: 9095
+    targetPort: grpc
+  selector:
+    app: sentinel

@@ -7,12 +7,19 @@
 //! 3. Live/Paper 模式切換
 //! 4. 精度保護與錯誤處理
 //! 5. 完整的可觀測性與指標
+//! 6. 韌性機制：重試、熔斷器、告警通知
 
 #![allow(dead_code)]
 #[cfg(feature = "metrics")]
 pub mod metrics;
 
 use async_trait::async_trait;
+use execution::{
+    AlertCallback, CircuitBreakerConfig, CircuitState, ExecutionAlert, ExecutionAlertType,
+    ExecutorStats, ResilientExecutor, RetryConfig,
+};
+// Re-export ExecutionMode for backwards compatibility
+pub use execution::ExecutionMode;
 use futures::{SinkExt, StreamExt};
 use hft_core::{
     HftError, HftResult, OrderId, OrderType, Price, Quantity, Side, TimeInForce, Timestamp,
@@ -23,10 +30,12 @@ use integration::{
     signing::{BitgetCredentials, BitgetSigner},
 };
 use ports::{
-    BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntent, VenueSpec,
+    AccountBalance, BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, OpenOrder,
+    OrderIntent, VenueSpec,
 };
 use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
@@ -67,13 +76,6 @@ pub struct BitgetExecutionConfig {
     pub timeout_ms: u64,
 }
 
-/// 執行模式
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecutionMode {
-    Live,  // 真實交易
-    Paper, // 模擬交易
-}
-
 impl Default for BitgetExecutionConfig {
     fn default() -> Self {
         Self {
@@ -104,7 +106,7 @@ struct PlaceOrderRequest {
 }
 
 /// Bitget 撤單請求
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CancelOrderRequest {
     symbol: String,
@@ -113,7 +115,7 @@ struct CancelOrderRequest {
 }
 
 /// Bitget 修改訂單請求
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ModifyOrderRequest {
     symbol: String,
@@ -246,6 +248,10 @@ pub struct BitgetExecutionClient {
     // WebSocket 延遲測量
     last_ping_sent: std::sync::Arc<std::sync::Mutex<Option<Timestamp>>>,
     measured_latency_ms: std::sync::Arc<std::sync::Mutex<Option<f64>>>,
+    // 韌性執行器 (重試 + 熔斷器)
+    resilient_executor: Option<Arc<ResilientExecutor>>,
+    // 告警回調
+    alert_callback: Option<AlertCallback>,
 }
 
 impl BitgetExecutionClient {
@@ -266,7 +272,54 @@ impl BitgetExecutionClient {
             last_cache_cleanup: Self::current_timestamp(),
             last_ping_sent: std::sync::Arc::new(std::sync::Mutex::new(None)),
             measured_latency_ms: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            resilient_executor: None,
+            alert_callback: None,
         })
+    }
+
+    /// 設置告警回調
+    ///
+    /// 告警回調會在以下情況被調用：
+    /// - 初始化失敗
+    /// - 連續失敗達到閾值
+    /// - 熔斷器開啟/恢復
+    /// - 重試耗盡
+    ///
+    /// # 範例
+    /// ```ignore
+    /// client.with_alert_callback(|alert| {
+    ///     // 發送到 Redis ops.alert
+    ///     redis.publish("ops.alert", alert.to_ops_alert_json());
+    /// });
+    /// ```
+    pub fn with_alert_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ExecutionAlert) + Send + Sync + 'static,
+    {
+        self.alert_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// 獲取韌性執行器統計信息
+    pub fn resilience_stats(&self) -> Option<ExecutorStats> {
+        self.resilient_executor.as_ref().map(|e| e.stats())
+    }
+
+    /// 獲取熔斷器狀態
+    pub async fn circuit_state(&self) -> Option<CircuitState> {
+        if let Some(ref executor) = self.resilient_executor {
+            Some(executor.circuit_breaker.state().await)
+        } else {
+            None
+        }
+    }
+
+    /// 強制重置熔斷器
+    pub async fn reset_circuit_breaker(&self) {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.circuit_breaker.reset().await;
+            info!("[Bitget] 熔斷器已手動重置");
+        }
     }
 
     /// 生成客戶端訂單 ID (用於幂等性)
@@ -287,45 +340,28 @@ impl BitgetExecutionClient {
         }
     }
 
-    /// 實現退避重試策略
-    async fn retry_with_backoff<T, F, Fut>(
-        &self,
-        mut operation: F,
-        max_retries: usize,
-    ) -> HftResult<T>
+    /// 執行帶韌性保護的操作
+    ///
+    /// 如果韌性執行器已初始化，使用熔斷器 + 重試機制
+    /// 否則直接執行操作
+    async fn execute_with_resilience<T, F, Fut>(&self, operation: F) -> HftResult<T>
     where
-        F: FnMut() -> Fut,
+        F: FnMut() -> Fut + Clone,
         Fut: std::future::Future<Output = HftResult<T>>,
     {
-        let mut attempts = 0;
-        let mut delay_ms = 100; // 起始延遲 100ms
+        if let Some(ref executor) = self.resilient_executor {
+            executor.execute(operation).await
+        } else {
+            // 未初始化時直接執行
+            let mut op = operation;
+            op().await
+        }
+    }
 
-        loop {
-            match operation().await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= max_retries {
-                        return Err(e);
-                    }
-
-                    // 根據錯誤類型決定是否重試
-                    match &e {
-                        HftError::RateLimit(_) | HftError::Network(_) => {
-                            warn!(
-                                "操作失敗，{}ms 後重試 ({}/{})：{}",
-                                delay_ms, attempts, max_retries, e
-                            );
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            delay_ms = (delay_ms * 2).min(5000); // 指數退避，最大 5s
-                        }
-                        _ => {
-                            // 不可重試的錯誤
-                            return Err(e);
-                        }
-                    }
-                }
-            }
+    /// 發送執行告警
+    fn send_execution_alert(&self, alert: ExecutionAlert) {
+        if let Some(ref callback) = self.alert_callback {
+            callback(alert);
         }
     }
 
@@ -391,6 +427,14 @@ impl BitgetExecutionClient {
             Some(HttpClient::new(http_config).map_err(|e| HftError::Network(e.to_string()))?);
 
         Ok(())
+    }
+
+    /// 獲取 HTTP 客戶端引用（確保已初始化）
+    #[inline]
+    fn get_http_client(&self) -> HftResult<&HttpClient> {
+        self.http_client
+            .as_ref()
+            .ok_or_else(|| HftError::Execution("HTTP client not initialized".to_string()))
     }
 
     /// 啟動私有 WebSocket 連接
@@ -993,7 +1037,7 @@ impl ExecutionClient for BitgetExecutionClient {
             self.init_http_client()?;
         }
 
-        let http_client = self.http_client.as_ref().unwrap();
+        let http_client = self.get_http_client()?;
 
         let request = PlaceOrderRequest {
             symbol: intent.symbol.as_str().to_string(),
@@ -1072,39 +1116,42 @@ impl ExecutionClient for BitgetExecutionClient {
             self.init_http_client()?;
         }
 
-        let http_client = self.http_client.as_ref().unwrap();
+        // 提前提取所有需要的數據，避免在閉包中借用 self
+        let symbol = self
+            .order_records
+            .get(&order_id.0)
+            .map(|record| record.symbol.clone())
+            .unwrap_or_else(|| "BTCUSDT".to_string());
 
-        // 撤單操作帶重試
+        let request = CancelOrderRequest {
+            symbol,
+            order_id: Some(order_id.0.clone()),
+            client_order_id: None,
+        };
+
+        let body = serde_json::to_string(&request)
+            .map_err(|e| HftError::Serialization(e.to_string()))?;
+
+        let headers = self
+            .signer
+            .generate_headers("POST", "/api/v2/spot/trade/cancel-order", &body, None);
+
+        let http_client = self.get_http_client()?.clone();
+        let order_id_clone = order_id.clone();
+        let event_tx = self.event_tx.clone();
+
+        // 使用韌性執行器執行撤單操作
         let result = self
-            .retry_with_backoff(
-                || async {
-                    // 假設我們有 symbol 資訊，這裡需要從某處獲取
-                    // 實際實現中可能需要維護 order_id -> symbol 的映射
-                    // 從訂單記錄中獲取 symbol
-                    let symbol = self
-                        .order_records
-                        .get(&order_id.0)
-                        .map(|record| record.symbol.clone())
-                        .unwrap_or_else(|| "BTCUSDT".to_string()); // 備用默認值
+            .execute_with_resilience(|| {
+                let http = http_client.clone();
+                let req = request.clone();
+                let hdrs = headers.clone();
+                let oid = order_id_clone.clone();
+                let tx = event_tx.clone();
 
-                    let request = CancelOrderRequest {
-                        symbol,
-                        order_id: Some(order_id.0.clone()),
-                        client_order_id: None,
-                    };
-
-                    let body = serde_json::to_string(&request)
-                        .map_err(|e| HftError::Serialization(e.to_string()))?;
-
-                    let headers = self.signer.generate_headers(
-                        "POST",
-                        "/api/v2/spot/trade/cancel-order",
-                        &body,
-                        None,
-                    );
-
-                    let response = http_client
-                        .post("/api/v2/spot/trade/cancel-order", Some(headers), &request)
+                async move {
+                    let response = http
+                        .post("/api/v2/spot/trade/cancel-order", Some(hdrs), &req)
                         .await
                         .map_err(|e| HftError::Network(e.to_string()))?;
 
@@ -1113,24 +1160,43 @@ impl ExecutionClient for BitgetExecutionClient {
                         .map_err(|e| HftError::Serialization(e.to_string()))?;
 
                     if result.code == "00000" {
-                        info!("撤單成功: order_id={}", order_id.0);
+                        info!("撤單成功: order_id={}", oid.0);
 
                         // 發送撤單確認事件
-                        if let Some(ref tx) = self.event_tx {
+                        if let Some(ref tx) = tx {
                             let _ = tx.send(ExecutionEvent::OrderCanceled {
-                                order_id: order_id.clone(),
-                                timestamp: Self::current_timestamp(),
+                                order_id: oid,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_micros() as u64,
                             });
                         }
 
                         Ok(())
                     } else {
-                        Err(Self::classify_error(&result.code, &result.msg))
+                        Err(BitgetExecutionClient::classify_error(&result.code, &result.msg))
                     }
-                },
-                3,
-            )
-            .await; // 最多重試 3 次
+                }
+            })
+            .await;
+
+        // 如果執行失敗且熔斷器開啟，發送告警
+        if let Err(ref e) = result {
+            if let Some(ref executor) = self.resilient_executor {
+                if executor.circuit_breaker.state().await == CircuitState::Open {
+                    self.send_execution_alert(
+                        ExecutionAlert::new(
+                            ExecutionAlertType::RetriesExhausted,
+                            "bitget",
+                            "cancel_order",
+                            format!("撤單失敗: {}", e),
+                        )
+                        .with_error(e.to_string()),
+                    );
+                }
+            }
+        }
 
         result
     }
@@ -1164,39 +1230,46 @@ impl ExecutionClient for BitgetExecutionClient {
             self.init_http_client()?;
         }
 
-        let http_client = self.http_client.as_ref().unwrap();
+        // 提前提取所有需要的數據
+        let symbol = self
+            .order_records
+            .get(&order_id.0)
+            .map(|record| record.symbol.clone())
+            .unwrap_or_else(|| "BTCUSDT".to_string());
 
-        // 修改訂單操作帶重試
+        let request = ModifyOrderRequest {
+            symbol,
+            order_id: order_id.0.clone(),
+            client_order_id: None,
+            new_size: new_quantity.map(|q| q.0.to_string()),
+            price: new_price.map(|p| p.0.to_string()),
+        };
+
+        let body = serde_json::to_string(&request)
+            .map_err(|e| HftError::Serialization(e.to_string()))?;
+
+        let headers = self
+            .signer
+            .generate_headers("POST", "/api/v2/spot/trade/modify-order", &body, None);
+
+        let http_client = self.get_http_client()?.clone();
+        let order_id_clone = order_id.clone();
+        let event_tx = self.event_tx.clone();
+
+        // 使用韌性執行器執行修改操作
         let result = self
-            .retry_with_backoff(
-                || async {
-                    // 從訂單記錄中獲取 symbol
-                    let symbol = self
-                        .order_records
-                        .get(&order_id.0)
-                        .map(|record| record.symbol.clone())
-                        .unwrap_or_else(|| "BTCUSDT".to_string()); // 備用默認值
+            .execute_with_resilience(|| {
+                let http = http_client.clone();
+                let req = request.clone();
+                let hdrs = headers.clone();
+                let oid = order_id_clone.clone();
+                let tx = event_tx.clone();
+                let qty = new_quantity;
+                let px = new_price;
 
-                    let request = ModifyOrderRequest {
-                        symbol,
-                        order_id: order_id.0.clone(),
-                        client_order_id: None,
-                        new_size: new_quantity.map(|q| q.0.to_string()),
-                        price: new_price.map(|p| p.0.to_string()),
-                    };
-
-                    let body = serde_json::to_string(&request)
-                        .map_err(|e| HftError::Serialization(e.to_string()))?;
-
-                    let headers = self.signer.generate_headers(
-                        "POST",
-                        "/api/v2/spot/trade/modify-order",
-                        &body,
-                        None,
-                    );
-
-                    let response = http_client
-                        .post("/api/v2/spot/trade/modify-order", Some(headers), &request)
+                async move {
+                    let response = http
+                        .post("/api/v2/spot/trade/modify-order", Some(hdrs), &req)
                         .await
                         .map_err(|e| HftError::Network(e.to_string()))?;
 
@@ -1207,27 +1280,46 @@ impl ExecutionClient for BitgetExecutionClient {
                     if result.code == "00000" {
                         info!(
                             "修改訂單成功: order_id={}, new_qty={:?}, new_price={:?}",
-                            order_id.0, new_quantity, new_price
+                            oid.0, qty, px
                         );
 
                         // 發送修改確認事件
-                        if let Some(ref tx) = self.event_tx {
+                        if let Some(ref tx) = tx {
                             let _ = tx.send(ExecutionEvent::OrderModified {
-                                order_id: order_id.clone(),
-                                new_quantity,
-                                new_price,
-                                timestamp: Self::current_timestamp(),
+                                order_id: oid,
+                                new_quantity: qty,
+                                new_price: px,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_micros() as u64,
                             });
                         }
 
                         Ok(())
                     } else {
-                        Err(Self::classify_error(&result.code, &result.msg))
+                        Err(BitgetExecutionClient::classify_error(&result.code, &result.msg))
                     }
-                },
-                3,
-            )
-            .await; // 最多重試 3 次
+                }
+            })
+            .await;
+
+        // 如果執行失敗且熔斷器開啟，發送告警
+        if let Err(ref e) = result {
+            if let Some(ref executor) = self.resilient_executor {
+                if executor.circuit_breaker.state().await == CircuitState::Open {
+                    self.send_execution_alert(
+                        ExecutionAlert::new(
+                            ExecutionAlertType::RetriesExhausted,
+                            "bitget",
+                            "modify_order",
+                            format!("修改訂單失敗: {}", e),
+                        )
+                        .with_error(e.to_string()),
+                    );
+                }
+            }
+        }
 
         result
     }
@@ -1256,6 +1348,47 @@ impl ExecutionClient for BitgetExecutionClient {
         info!("連接 Bitget 執行客戶端");
 
         self.init_http_client()?;
+
+        // 初始化韌性執行器
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+            retry_on_init_error: true,
+        };
+        let cb_config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+            half_open_max_requests: 3,
+            half_open_success_threshold: 2,
+        };
+
+        let mut executor = ResilientExecutor::new("bitget", retry_config, cb_config);
+
+        // 設置熔斷器告警回調
+        if let Some(ref alert_cb) = self.alert_callback {
+            let alert_cb = Arc::clone(alert_cb);
+            executor = executor.with_alert_callback(move |cb_alert| {
+                let alert_type = match cb_alert.state {
+                    CircuitState::Open => ExecutionAlertType::CircuitOpen,
+                    CircuitState::Closed => ExecutionAlertType::CircuitRecovered,
+                    CircuitState::HalfOpen => return, // 半開狀態不發送告警
+                };
+
+                let alert = ExecutionAlert::new(
+                    alert_type,
+                    "bitget",
+                    "execution",
+                    &cb_alert.message,
+                )
+                .with_failure_count(cb_alert.failure_count);
+
+                alert_cb(alert);
+            });
+        }
+
+        self.resilient_executor = Some(Arc::new(executor));
 
         // 創建事件廣播通道
         let (tx, _) = broadcast::channel(1000);
@@ -1730,6 +1863,152 @@ impl ExecutionClient for BitgetExecutionClient {
         }
 
         Ok(out)
+    }
+
+    async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
+        // 模擬模式返回虛擬餘額
+        if self.config.mode == ExecutionMode::Paper {
+            return Ok(vec![
+                AccountBalance {
+                    asset: "USDT".to_string(),
+                    available: Decimal::from(10000),
+                    frozen: Decimal::ZERO,
+                    total: Decimal::from(10000),
+                    usd_value: Some(Decimal::from(10000)),
+                },
+            ]);
+        }
+
+        // 真實模式：調用 Bitget API
+        let http_cfg = HttpClientConfig {
+            base_url: self.config.rest_base_url.clone(),
+            timeout_ms: self.config.timeout_ms,
+            user_agent: "hft-bitget-exec/1.0".to_string(),
+        };
+        let http = HttpClient::new(http_cfg).map_err(|e| HftError::Network(e.to_string()))?;
+
+        // 獲取 Spot 帳戶餘額
+        let path = "/api/v2/spot/account/assets";
+        let headers = self.signer.generate_headers("GET", path, "", None);
+
+        let resp = http
+            .get(path, Some(headers))
+            .await
+            .map_err(|e| HftError::Network(e.to_string()))?;
+
+        #[derive(Debug, Deserialize)]
+        struct ApiResp<T> {
+            code: String,
+            msg: String,
+            data: Option<T>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct AssetInfo {
+            #[serde(alias = "coin", alias = "coinName")]
+            coin: String,
+            #[serde(alias = "available")]
+            available: String,
+            #[serde(alias = "frozen", alias = "lock")]
+            frozen: Option<String>,
+            #[serde(alias = "usdtValue")]
+            usdt_value: Option<String>,
+        }
+
+        let parsed: ApiResp<Vec<AssetInfo>> = HttpClient::parse_json(resp)
+            .await
+            .map_err(|e| HftError::Serialization(e.to_string()))?;
+
+        let mut balances = Vec::new();
+
+        if parsed.code == "00000" {
+            if let Some(assets) = parsed.data {
+                for asset in assets {
+                    let available = asset.available.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                    let frozen = asset
+                        .frozen
+                        .as_ref()
+                        .and_then(|s| s.parse::<Decimal>().ok())
+                        .unwrap_or(Decimal::ZERO);
+                    let total = available + frozen;
+                    let usd_value = asset
+                        .usdt_value
+                        .as_ref()
+                        .and_then(|s| s.parse::<Decimal>().ok());
+
+                    // 只保留有餘額的資產
+                    if total > Decimal::ZERO {
+                        balances.push(AccountBalance {
+                            asset: asset.coin,
+                            available,
+                            frozen,
+                            total,
+                            usd_value,
+                        });
+                    }
+                }
+            }
+        } else {
+            warn!(
+                "Bitget 餘額查詢失敗: {} - {}",
+                parsed.code, parsed.msg
+            );
+        }
+
+        // 可選：也獲取合約帳戶餘額
+        let mix_path = "/api/v2/mix/account/accounts?productType=USDT-FUTURES";
+        let mix_headers = self.signer.generate_headers("GET", mix_path, "", None);
+
+        if let Ok(mix_resp) = http.get(mix_path, Some(mix_headers)).await {
+            #[derive(Debug, Deserialize)]
+            struct MixAccountInfo {
+                #[serde(alias = "marginCoin")]
+                margin_coin: String,
+                #[serde(alias = "available")]
+                available: String,
+                #[serde(alias = "frozen", alias = "locked")]
+                frozen: Option<String>,
+                #[serde(alias = "equity")]
+                equity: Option<String>,
+            }
+
+            if let Ok(mix_parsed) =
+                HttpClient::parse_json::<ApiResp<Vec<MixAccountInfo>>>(mix_resp).await
+            {
+                if mix_parsed.code == "00000" {
+                    if let Some(accounts) = mix_parsed.data {
+                        for acc in accounts {
+                            let available =
+                                acc.available.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                            let frozen = acc
+                                .frozen
+                                .as_ref()
+                                .and_then(|s| s.parse::<Decimal>().ok())
+                                .unwrap_or(Decimal::ZERO);
+                            let total = acc
+                                .equity
+                                .as_ref()
+                                .and_then(|s| s.parse::<Decimal>().ok())
+                                .unwrap_or(available + frozen);
+
+                            if total > Decimal::ZERO {
+                                // 為合約帳戶添加前綴以區分
+                                balances.push(AccountBalance {
+                                    asset: format!("MIX:{}", acc.margin_coin),
+                                    available,
+                                    frozen,
+                                    total,
+                                    usd_value: Some(total), // 合約帳戶通常以 USDT 計價
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!("Bitget 餘額同步完成: {} 個資產", balances.len());
+        Ok(balances)
     }
 
     async fn health(&self) -> ConnectionHealth {

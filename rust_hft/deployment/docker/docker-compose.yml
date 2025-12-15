@@ -1,0 +1,222 @@
+# HFT 系統 Docker Compose 配置
+# 用於本地開發和測試
+
+version: '3.8'
+
+services:
+  # ============================================
+  # 基礎設施層
+  # ============================================
+
+  redis:
+    image: redis:7-alpine
+    container_name: hft-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hft-network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    container_name: hft-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      CLICKHOUSE_DB: hft
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hft-network
+
+  # ============================================
+  # 監控層
+  # ============================================
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: hft-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hft-network
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: hft-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - prometheus
+    networks:
+      - hft-network
+
+  # ============================================
+  # 交易層 (開發模式)
+  # ============================================
+
+  trading-engine:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.trading
+    container_name: hft-trading
+    ports:
+      - "9091:9091"  # Metrics
+      - "9092:9092"  # gRPC
+    volumes:
+      - ./config:/app/config:ro
+      - ./models:/app/models:ro
+      - trading-logs:/app/logs
+    environment:
+      RUST_LOG: info
+      HFT_ENV: development
+      REDIS_URL: redis://redis:6379
+      CLICKHOUSE_URL: http://clickhouse:8123
+      # 交易所 API (使用 .env 文件)
+      BITGET_API_KEY: ${BITGET_API_KEY}
+      BITGET_API_SECRET: ${BITGET_API_SECRET}
+      BITGET_PASSPHRASE: ${BITGET_PASSPHRASE}
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - hft-network
+    # 性能優化
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # CPU 親和性 (生產環境使用)
+    # cpuset: "0,1"
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+
+  # ============================================
+  # 市場數據層 (可選, 獨立運行)
+  # ============================================
+
+  market-data-bitget:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.market-data
+      args:
+        EXCHANGE: bitget
+    container_name: hft-market-data-bitget
+    environment:
+      RUST_LOG: info
+      EXCHANGE: bitget
+      REDIS_URL: redis://redis:6379
+      SYMBOLS: BTCUSDT,ETHUSDT
+    depends_on:
+      - redis
+    networks:
+      - hft-network
+    profiles:
+      - market-data
+
+  market-data-binance:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.market-data
+      args:
+        EXCHANGE: binance
+    container_name: hft-market-data-binance
+    environment:
+      RUST_LOG: info
+      EXCHANGE: binance
+      REDIS_URL: redis://redis:6379
+      SYMBOLS: BTCUSDT,ETHUSDT
+    depends_on:
+      - redis
+    networks:
+      - hft-network
+    profiles:
+      - market-data
+
+  # ============================================
+  # Sentinel 監控 (可選)
+  # ============================================
+
+  sentinel:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.sentinel
+    container_name: hft-sentinel
+    environment:
+      RUST_LOG: info
+      REDIS_URL: redis://redis:6379
+      MAX_DRAWDOWN_PCT: 5
+      KILL_SWITCH_ENABLED: "true"
+    depends_on:
+      - redis
+      - trading-engine
+    networks:
+      - hft-network
+    profiles:
+      - sentinel
+
+# ============================================
+# 網路和卷
+# ============================================
+
+networks:
+  hft-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  redis-data:
+  clickhouse-data:
+  prometheus-data:
+  grafana-data:
+  trading-logs:

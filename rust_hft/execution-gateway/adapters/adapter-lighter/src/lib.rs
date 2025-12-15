@@ -2,9 +2,16 @@
 //! 注意：目前 Live 僅實作下單（place_order）。撤單/改單/查單因需要額外授權與索引，暫標記為未實作。
 
 use async_trait::async_trait;
+use execution::{
+    resilience::CircuitBreakerAlert, AlertCallback, CircuitBreakerConfig, CircuitState,
+    ExecutionAlert, ExecutionAlertType, ExecutorStats, ResilientExecutor, RetryConfig,
+};
+// Re-export ExecutionMode for backwards compatibility
+pub use execution::ExecutionMode;
 use hft_core::{HftError, HftResult, OrderId, Price, Quantity};
 use integration::http::{HttpClient, HttpClientConfig};
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::info;
@@ -13,12 +20,6 @@ use urlencoding::encode;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_longlong};
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecutionMode {
-    Live,
-    Paper,
-}
 
 #[derive(Debug, Clone)]
 pub struct LighterExecutionConfig {
@@ -152,6 +153,9 @@ pub struct LighterExecutionClient {
     market_meta: HashMap<String, (i64, i32, i32)>, // symbol -> (market_id, size_decimals, price_decimals)
     // tx_hash -> (symbol, market_id, client_order_index)
     order_map: HashMap<String, (String, i64, i64)>,
+    // Resilience 相關
+    resilient_executor: Option<Arc<ResilientExecutor>>,
+    alert_callback: Option<AlertCallback>,
 }
 
 impl LighterExecutionClient {
@@ -171,7 +175,59 @@ impl LighterExecutionClient {
             signer: None,
             market_meta: HashMap::new(),
             order_map: HashMap::new(),
+            resilient_executor: None,
+            alert_callback: None,
         })
+    }
+
+    /// 設置 alert callback
+    pub fn with_alert_callback(mut self, callback: AlertCallback) -> Self {
+        self.alert_callback = Some(callback);
+        self
+    }
+
+    /// 獲取 resilience 統計數據
+    pub fn resilience_stats(&self) -> Option<ExecutorStats> {
+        self.resilient_executor.as_ref().map(|e| e.stats())
+    }
+
+    /// 獲取 circuit breaker 狀態
+    pub async fn circuit_state(&self) -> Option<CircuitState> {
+        if let Some(ref executor) = self.resilient_executor {
+            Some(executor.circuit_breaker.state().await)
+        } else {
+            None
+        }
+    }
+
+    /// 重置 circuit breaker
+    pub async fn reset_circuit_breaker(&self) {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.circuit_breaker.reset().await;
+            info!("Lighter 熔斷器已重置");
+        }
+    }
+
+    /// 使用 resilience 執行操作
+    async fn execute_with_resilience<F, Fut, T>(&self, mut operation: F) -> HftResult<T>
+    where
+        F: FnMut() -> Fut + Clone + Send + Sync,
+        Fut: std::future::Future<Output = HftResult<T>> + Send,
+        T: Send,
+    {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.execute(operation).await
+        } else {
+            operation().await
+        }
+    }
+
+    /// 發送執行告警
+    fn send_execution_alert(&self, alert_type: ExecutionAlertType, operation: &str, message: &str) {
+        if let Some(ref callback) = self.alert_callback {
+            let alert = ExecutionAlert::new(alert_type, "lighter", operation, message);
+            callback(alert);
+        }
     }
 
     async fn ensure_market_meta(&mut self, symbol: &str) -> HftResult<(i64, i32, i32)> {
@@ -257,33 +313,58 @@ impl LighterExecutionClient {
             "tx_type": tx_type,
             "tx_info": tx_info,
         });
-        let resp = client
-            .post(url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| HftError::Network(e.to_string()))?;
-        let status = resp.status();
-        let v: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| HftError::Serialization(e.to_string()))?;
-        if !status.is_success() {
-            return Err(HftError::Exchange(format!("sendTx HTTP {}: {}", status, v)));
+        let body_clone = body.clone();
+        let url_clone = url.clone();
+
+        let result = self
+            .execute_with_resilience(|| {
+                let c = client.clone();
+                let u = url_clone.clone();
+                let b = body_clone.clone();
+                async move {
+                    let resp = c
+                        .post(&u)
+                        .json(&b)
+                        .send()
+                        .await
+                        .map_err(|e| HftError::Network(e.to_string()))?;
+                    let status = resp.status();
+                    let v: serde_json::Value = resp
+                        .json()
+                        .await
+                        .map_err(|e| HftError::Serialization(e.to_string()))?;
+                    if !status.is_success() {
+                        return Err(HftError::Exchange(format!("sendTx HTTP {}: {}", status, v)));
+                    }
+                    let code = v.get("code").and_then(|x| x.as_i64()).unwrap_or_default();
+                    if code != 200 {
+                        return Err(HftError::Exchange(format!(
+                            "sendTx ret code {}: {}",
+                            code, v
+                        )));
+                    }
+                    let txh = v
+                        .get("tx_hash")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Ok(txh)
+                }
+            })
+            .await;
+
+        // 發送 circuit open 警報如果需要
+        if let Some(ref executor) = self.resilient_executor {
+            if executor.circuit_breaker.state().await == CircuitState::Open {
+                self.send_execution_alert(
+                    ExecutionAlertType::CircuitOpen,
+                    "send_tx",
+                    "Circuit breaker is open after sendTx failures",
+                );
+            }
         }
-        let code = v.get("code").and_then(|x| x.as_i64()).unwrap_or_default();
-        if code != 200 {
-            return Err(HftError::Exchange(format!(
-                "sendTx ret code {}: {}",
-                code, v
-            )));
-        }
-        let txh = v
-            .get("tx_hash")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        Ok(txh)
+
+        result
     }
 
     async fn create_auth_token(&self, deadline_secs: i64) -> HftResult<String> {
@@ -327,7 +408,7 @@ impl LighterExecutionClient {
 impl ExecutionClient for LighterExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
         match self.cfg.mode {
-            ExecutionMode::Paper => {
+            ExecutionMode::Paper | ExecutionMode::Testnet => {
                 let oid = OrderId(format!("LIGHTER_PAPER_{}", hft_core::now_micros()));
                 if let Some(ref tx) = self.event_tx {
                     let _ = tx.send(ExecutionEvent::OrderAck {
@@ -441,7 +522,7 @@ impl ExecutionClient for LighterExecutionClient {
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
         match self.cfg.mode {
-            ExecutionMode::Paper => return Ok(()),
+            ExecutionMode::Paper | ExecutionMode::Testnet => return Ok(()),
             ExecutionMode::Live => {}
         }
         let (symbol, market_id, client_order_index) = self
@@ -510,7 +591,7 @@ impl ExecutionClient for LighterExecutionClient {
         new_price: Option<Price>,
     ) -> HftResult<()> {
         match self.cfg.mode {
-            ExecutionMode::Paper => return Ok(()),
+            ExecutionMode::Paper | ExecutionMode::Testnet => return Ok(()),
             ExecutionMode::Live => {}
         }
         let (symbol, market_id, client_order_index) = self
@@ -602,7 +683,7 @@ impl ExecutionClient for LighterExecutionClient {
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         match self.cfg.mode {
-            ExecutionMode::Paper => Ok(Vec::new()),
+            ExecutionMode::Paper | ExecutionMode::Testnet => Ok(Vec::new()),
             ExecutionMode::Live => {
                 Err(HftError::Config("Lighter list_open_orders 尚未實作".into()))
             }
@@ -610,6 +691,39 @@ impl ExecutionClient for LighterExecutionClient {
     }
 
     async fn connect(&mut self) -> HftResult<()> {
+        // 初始化 resilience executor
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+            retry_on_init_error: false,
+        };
+        let circuit_config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+            half_open_max_requests: 3,
+            half_open_success_threshold: 2,
+        };
+
+        let alert_cb = self.alert_callback.clone();
+        self.resilient_executor = Some(Arc::new(
+            ResilientExecutor::new("lighter", retry_config, circuit_config).with_alert_callback(
+                move |cb_alert: CircuitBreakerAlert| {
+                    if let Some(ref cb) = alert_cb {
+                        let exec_alert = ExecutionAlert::new(
+                            ExecutionAlertType::CircuitOpen,
+                            "lighter",
+                            "circuit_breaker",
+                            &cb_alert.message,
+                        )
+                        .with_failure_count(cb_alert.failure_count);
+                        cb(exec_alert);
+                    }
+                },
+            ),
+        ));
+
         let (tx, _) = broadcast::channel(1000);
         self.event_tx = Some(tx);
         self.connected = true;

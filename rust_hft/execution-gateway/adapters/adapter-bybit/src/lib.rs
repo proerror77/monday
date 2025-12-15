@@ -1,6 +1,14 @@
 //! Bybit 執行適配器（v5 REST + 私有 WS）
+//! - 支援 Live/Testnet/Paper 三種模式
+//! - 韌性機制：重試、熔斷器、告警通知
 
 use async_trait::async_trait;
+use execution::{
+    AlertCallback, CircuitBreakerConfig, CircuitState, ExecutionAlert, ExecutionAlertType,
+    ExecutorStats, ResilientExecutor, RetryConfig,
+};
+// Re-export ExecutionMode for backwards compatibility
+pub use execution::ExecutionMode;
 use futures::{SinkExt, StreamExt};
 use hft_core::{HftError, HftResult, OrderId, Price, Quantity};
 use integration::{
@@ -8,15 +16,9 @@ use integration::{
     signing::{BybitCredentials, BybitSigner},
 };
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
+use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::warn;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecutionMode {
-    Live,
-    Paper,
-    Testnet,
-}
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct BybitExecutionConfig {
@@ -33,6 +35,10 @@ pub struct BybitExecutionClient {
     signer: BybitSigner,
     event_tx: Option<broadcast::Sender<ExecutionEvent>>,
     connected: bool,
+    // 韌性執行器 (重試 + 熔斷器)
+    resilient_executor: Option<Arc<ResilientExecutor>>,
+    // 告警回調
+    alert_callback: Option<AlertCallback>,
 }
 
 impl BybitExecutionClient {
@@ -43,7 +49,40 @@ impl BybitExecutionClient {
             config,
             event_tx: None,
             connected: false,
+            resilient_executor: None,
+            alert_callback: None,
         })
+    }
+
+    /// 設置告警回調
+    pub fn with_alert_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ExecutionAlert) + Send + Sync + 'static,
+    {
+        self.alert_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// 獲取韌性執行器統計信息
+    pub fn resilience_stats(&self) -> Option<ExecutorStats> {
+        self.resilient_executor.as_ref().map(|e| e.stats())
+    }
+
+    /// 獲取熔斷器狀態
+    pub async fn circuit_state(&self) -> Option<CircuitState> {
+        if let Some(ref executor) = self.resilient_executor {
+            Some(executor.circuit_breaker.state().await)
+        } else {
+            None
+        }
+    }
+
+    /// 強制重置熔斷器
+    pub async fn reset_circuit_breaker(&self) {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.circuit_breaker.reset().await;
+            info!("[Bybit] 熔斷器已手動重置");
+        }
     }
 
     fn ensure_http(&mut self) -> HftResult<()> {
@@ -57,6 +96,35 @@ impl BybitExecutionClient {
         }
         Ok(())
     }
+
+    /// 獲取 HTTP 客戶端引用（呼叫前需先 ensure_http）
+    #[inline]
+    fn get_http(&self) -> HftResult<&HttpClient> {
+        self.http
+            .as_ref()
+            .ok_or_else(|| HftError::Execution("HTTP client not initialized".to_string()))
+    }
+
+    /// 執行帶韌性保護的操作
+    async fn execute_with_resilience<T, F, Fut>(&self, operation: F) -> HftResult<T>
+    where
+        F: FnMut() -> Fut + Clone,
+        Fut: std::future::Future<Output = HftResult<T>>,
+    {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.execute(operation).await
+        } else {
+            let mut op = operation;
+            op().await
+        }
+    }
+
+    /// 發送執行告警
+    fn send_execution_alert(&self, alert: ExecutionAlert) {
+        if let Some(ref callback) = self.alert_callback {
+            callback(alert);
+        }
+    }
 }
 
 #[async_trait]
@@ -67,7 +135,7 @@ impl ExecutionClient for BybitExecutionClient {
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
             self.ensure_http()?;
-            let http = self.http.as_ref().unwrap();
+            let http = self.get_http()?;
             #[derive(serde::Serialize)]
             #[serde(rename_all = "camelCase")]
             struct Req<'a> {
@@ -172,53 +240,84 @@ impl ExecutionClient for BybitExecutionClient {
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
             self.ensure_http()?;
-            let http = self.http.as_ref().unwrap();
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct Req<'a> {
-                category: &'a str,
-                order_id: &'a str,
+            let http_client = self.get_http()?.clone();
+            let order_id_str = order_id.0.clone();
+            let signer_clone = self.signer.clone();
+
+            let result = self
+                .execute_with_resilience(|| {
+                    let http = http_client.clone();
+                    let oid = order_id_str.clone();
+                    let sig = signer_clone.clone();
+                    async move {
+                        #[derive(serde::Serialize)]
+                        #[serde(rename_all = "camelCase")]
+                        struct Req {
+                            category: String,
+                            order_id: String,
+                        }
+                        let req = Req {
+                            category: "spot".to_string(),
+                            order_id: oid,
+                        };
+                        let body = serde_json::to_string(&req)
+                            .map_err(|e| HftError::Serialization(e.to_string()))?;
+                        let headers = sig.generate_headers("POST", "/v5/order/cancel", &body, None);
+                        let resp = http
+                            .signed_request(
+                                reqwest::Method::POST,
+                                "/v5/order/cancel",
+                                Some(headers),
+                                Some(body),
+                            )
+                            .await
+                            .map_err(|e| HftError::Network(e.to_string()))?;
+                        #[derive(serde::Deserialize)]
+                        #[allow(non_snake_case)]
+                        struct Resp {
+                            retCode: i64,
+                            retMsg: String,
+                        }
+                        let r: Resp = HttpClient::parse_json(resp)
+                            .await
+                            .map_err(|e| HftError::Serialization(e.to_string()))?;
+                        if r.retCode != 0 {
+                            return Err(HftError::Exchange(format!(
+                                "Bybit 撤單失敗: {} {}",
+                                r.retCode, r.retMsg
+                            )));
+                        }
+                        Ok(())
+                    }
+                })
+                .await;
+
+            // 如果熔斷器開啟，發送告警
+            if let Err(ref e) = result {
+                if let Some(ref executor) = self.resilient_executor {
+                    if executor.circuit_breaker.state().await == CircuitState::Open {
+                        self.send_execution_alert(
+                            ExecutionAlert::new(
+                                ExecutionAlertType::CircuitOpen,
+                                "bybit",
+                                "cancel_order",
+                                &format!("撤單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
+                            )
+                            .with_error(e.to_string()),
+                        );
+                    }
+                }
             }
-            let req = Req {
-                category: "spot",
-                order_id: &order_id.0,
-            };
-            let body =
-                serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
-            let headers = self
-                .signer
-                .generate_headers("POST", "/v5/order/cancel", &body, None);
-            let resp = http
-                .signed_request(
-                    reqwest::Method::POST,
-                    "/v5/order/cancel",
-                    Some(headers),
-                    Some(body),
-                )
-                .await
-                .map_err(|e| HftError::Network(e.to_string()))?;
-            #[derive(serde::Deserialize)]
-            #[allow(non_snake_case)]
-            struct Resp {
-                retCode: i64,
-                retMsg: String,
+
+            if result.is_ok() {
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(ExecutionEvent::OrderCanceled {
+                        order_id: order_id.clone(),
+                        timestamp: hft_core::now_micros(),
+                    });
+                }
             }
-            let r: Resp = HttpClient::parse_json(resp)
-                .await
-                .map_err(|e| HftError::Serialization(e.to_string()))?;
-            if r.retCode != 0 {
-                return Err(HftError::Exchange(format!(
-                    "Bybit 撤單失敗: {} {}",
-                    r.retCode, r.retMsg
-                )));
-            }
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(ExecutionEvent::OrderCanceled {
-                    order_id: order_id.clone(),
-                    timestamp: hft_core::now_micros(),
-                });
-            }
-            return Ok(());
+            return result;
         }
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderCanceled {
@@ -240,59 +339,94 @@ impl ExecutionClient for BybitExecutionClient {
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
             self.ensure_http()?;
-            let http = self.http.as_ref().unwrap();
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct Req<'a> {
-                category: &'a str,
-                order_id: &'a str,
-                qty: Option<String>,
-                price: Option<String>,
+            let http_client = self.get_http()?.clone();
+            let order_id_str = order_id.0.clone();
+            let signer_clone = self.signer.clone();
+            let qty_str = new_quantity.map(|q| q.0.to_string());
+            let price_str = new_price.map(|p| p.0.to_string());
+
+            let result = self
+                .execute_with_resilience(|| {
+                    let http = http_client.clone();
+                    let oid = order_id_str.clone();
+                    let sig = signer_clone.clone();
+                    let qty = qty_str.clone();
+                    let px = price_str.clone();
+                    async move {
+                        #[derive(serde::Serialize)]
+                        #[serde(rename_all = "camelCase")]
+                        struct Req {
+                            category: String,
+                            order_id: String,
+                            qty: Option<String>,
+                            price: Option<String>,
+                        }
+                        let req = Req {
+                            category: "spot".to_string(),
+                            order_id: oid,
+                            qty,
+                            price: px,
+                        };
+                        let body = serde_json::to_string(&req)
+                            .map_err(|e| HftError::Serialization(e.to_string()))?;
+                        let headers = sig.generate_headers("POST", "/v5/order/amend", &body, None);
+                        let resp = http
+                            .signed_request(
+                                reqwest::Method::POST,
+                                "/v5/order/amend",
+                                Some(headers),
+                                Some(body),
+                            )
+                            .await
+                            .map_err(|e| HftError::Network(e.to_string()))?;
+                        #[derive(serde::Deserialize)]
+                        #[allow(non_snake_case)]
+                        struct Resp {
+                            retCode: i64,
+                            retMsg: String,
+                        }
+                        let r: Resp = HttpClient::parse_json(resp)
+                            .await
+                            .map_err(|e| HftError::Serialization(e.to_string()))?;
+                        if r.retCode != 0 {
+                            return Err(HftError::Exchange(format!(
+                                "Bybit 改單失敗: {} {}",
+                                r.retCode, r.retMsg
+                            )));
+                        }
+                        Ok(())
+                    }
+                })
+                .await;
+
+            // 如果熔斷器開啟，發送告警
+            if let Err(ref e) = result {
+                if let Some(ref executor) = self.resilient_executor {
+                    if executor.circuit_breaker.state().await == CircuitState::Open {
+                        self.send_execution_alert(
+                            ExecutionAlert::new(
+                                ExecutionAlertType::CircuitOpen,
+                                "bybit",
+                                "modify_order",
+                                &format!("改單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
+                            )
+                            .with_error(e.to_string()),
+                        );
+                    }
+                }
             }
-            let req = Req {
-                category: "spot",
-                order_id: &order_id.0,
-                qty: new_quantity.map(|q| q.0.to_string()),
-                price: new_price.map(|p| p.0.to_string()),
-            };
-            let body =
-                serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
-            let headers = self
-                .signer
-                .generate_headers("POST", "/v5/order/amend", &body, None);
-            let resp = http
-                .signed_request(
-                    reqwest::Method::POST,
-                    "/v5/order/amend",
-                    Some(headers),
-                    Some(body),
-                )
-                .await
-                .map_err(|e| HftError::Network(e.to_string()))?;
-            #[derive(serde::Deserialize)]
-            #[allow(non_snake_case)]
-            struct Resp {
-                retCode: i64,
-                retMsg: String,
+
+            if result.is_ok() {
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx.send(ExecutionEvent::OrderModified {
+                        order_id: order_id.clone(),
+                        new_quantity,
+                        new_price,
+                        timestamp: hft_core::now_micros(),
+                    });
+                }
             }
-            let r: Resp = HttpClient::parse_json(resp)
-                .await
-                .map_err(|e| HftError::Serialization(e.to_string()))?;
-            if r.retCode != 0 {
-                return Err(HftError::Exchange(format!(
-                    "Bybit 改單失敗: {} {}",
-                    r.retCode, r.retMsg
-                )));
-            }
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(ExecutionEvent::OrderModified {
-                    order_id: order_id.clone(),
-                    new_quantity,
-                    new_price,
-                    timestamp: hft_core::now_micros(),
-                });
-            }
-            return Ok(());
+            return result;
         }
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderModified {
@@ -316,10 +450,54 @@ impl ExecutionClient for BybitExecutionClient {
     }
 
     async fn connect(&mut self) -> HftResult<()> {
+        // 初始化韌性執行器
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+            retry_on_init_error: true,
+        };
+        let cb_config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+            half_open_max_requests: 3,
+            half_open_success_threshold: 2,
+        };
+
+        let mut executor = ResilientExecutor::new("bybit", retry_config, cb_config);
+
+        // 設置熔斷器告警回調
+        if let Some(ref alert_cb) = self.alert_callback {
+            let alert_cb = Arc::clone(alert_cb);
+            executor = executor.with_alert_callback(move |cb_alert| {
+                let alert_type = match cb_alert.state {
+                    CircuitState::Open => ExecutionAlertType::CircuitOpen,
+                    CircuitState::Closed => ExecutionAlertType::CircuitRecovered,
+                    CircuitState::HalfOpen => return,
+                };
+
+                let alert = ExecutionAlert::new(
+                    alert_type,
+                    "bybit",
+                    "execution",
+                    &cb_alert.message,
+                )
+                .with_failure_count(cb_alert.failure_count);
+
+                alert_cb(alert);
+            });
+        }
+
+        self.resilient_executor = Some(Arc::new(executor));
+
         let (tx, _) = broadcast::channel(1000);
         self.event_tx = Some(tx.clone());
         self.connected = true;
         self.ensure_http()?;
+
+        info!("[Bybit] 執行客戶端連接成功");
+
         if matches!(
             self.config.mode,
             ExecutionMode::Live | ExecutionMode::Testnet
@@ -339,7 +517,8 @@ impl ExecutionClient for BybitExecutionClient {
                         use hmac::{Hmac, Mac};
                         use sha2::Sha256;
                         type HmacSha256 = Hmac<Sha256>;
-                        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+                        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+                            .expect("HMAC accepts any key length");
                         mac.update(msg.as_bytes());
                         hex::encode(mac.finalize().into_bytes())
                     };

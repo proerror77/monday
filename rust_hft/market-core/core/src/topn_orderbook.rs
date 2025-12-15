@@ -538,4 +538,205 @@ mod tests {
         assert!(venue_a_buy); // Venue A (Binance) 買入
         assert!(profit_bps > 0.2); // 利潤超過 0.2 bps
     }
+
+    // ============================================================================
+    // Additional edge case tests
+    // ============================================================================
+
+    #[test]
+    fn test_empty_orderbook() {
+        let book = TopNOrderBook::<5>::new(Symbol::new("BTCUSDT"));
+
+        assert!(book.best_bid().is_none());
+        assert!(book.best_ask().is_none());
+        assert!(book.spread().is_none());
+        assert!(book.mid_price().is_none());
+        assert!(!book.is_valid());
+        assert_eq!(book.bid_count, 0);
+        assert_eq!(book.ask_count, 0);
+    }
+
+    #[test]
+    fn test_snapshot_overwrites_previous() {
+        let mut book = TopNOrderBook::<5>::new(Symbol::new("ETHUSDT"));
+
+        // First snapshot
+        let bids1 = vec![(3500.0, 10.0)];
+        let asks1 = vec![(3501.0, 8.0)];
+        book.apply_snapshot(&bids1, &asks1, 1000).unwrap();
+
+        assert_eq!(book.best_bid(), Some(3500.0));
+        assert_eq!(book.version, 1);
+
+        // Second snapshot should completely overwrite
+        let bids2 = vec![(4000.0, 5.0), (3999.0, 3.0)];
+        let asks2 = vec![(4001.0, 4.0)];
+        book.apply_snapshot(&bids2, &asks2, 2000).unwrap();
+
+        assert_eq!(book.best_bid(), Some(4000.0));
+        assert_eq!(book.bid_count, 2);
+        assert_eq!(book.ask_count, 1);
+        assert_eq!(book.version, 2);
+    }
+
+    #[test]
+    fn test_update_removes_level_on_zero_quantity() {
+        let mut book = TopNOrderBook::<5>::new(Symbol::new("BTCUSDT"));
+
+        let bids = vec![(67200.0, 1.5), (67199.0, 2.0)];
+        let asks = vec![(67201.0, 1.2)];
+        book.apply_snapshot(&bids, &asks, 1000).unwrap();
+
+        assert_eq!(book.bid_count, 2);
+
+        // Remove first bid level by setting quantity to 0
+        let bid_updates = vec![(67200.0, 0.0)];
+        book.apply_update(&bid_updates, &[], 2000).unwrap();
+
+        assert_eq!(book.bid_count, 1);
+        assert_eq!(book.best_bid(), Some(67199.0));
+    }
+
+    #[test]
+    fn test_update_inserts_new_level_in_order() {
+        let mut book = TopNOrderBook::<5>::new(Symbol::new("BTCUSDT"));
+
+        let bids = vec![(67200.0, 1.0), (67198.0, 1.0)];
+        let asks = vec![(67201.0, 1.0)];
+        book.apply_snapshot(&bids, &asks, 1000).unwrap();
+
+        // Insert new bid in the middle
+        let bid_updates = vec![(67199.0, 2.0)];
+        book.apply_update(&bid_updates, &[], 2000).unwrap();
+
+        assert_eq!(book.bid_count, 3);
+        // Should be ordered: 67200, 67199, 67198
+        assert_eq!(book.bid_prices[0], 67200.0);
+        assert_eq!(book.bid_prices[1], 67199.0);
+        assert_eq!(book.bid_prices[2], 67198.0);
+    }
+
+    #[test]
+    fn test_topn_capacity_limit() {
+        let mut book = TopNOrderBook::<3>::new(Symbol::new("BTCUSDT"));
+
+        // Try to insert more than 3 levels
+        let bids = vec![
+            (67200.0, 1.0),
+            (67199.0, 1.0),
+            (67198.0, 1.0),
+            (67197.0, 1.0), // Should be ignored
+            (67196.0, 1.0), // Should be ignored
+        ];
+        book.apply_snapshot(&bids, &[], 1000).unwrap();
+
+        assert_eq!(book.bid_count, 3);
+        assert_eq!(book.bid_prices[2], 67198.0); // Lowest kept bid
+    }
+
+    #[test]
+    fn test_vwap_calculation() {
+        let mut book = TopNOrderBook::<5>::new(Symbol::new("BTCUSDT"));
+
+        let bids = vec![
+            (100.0, 10.0), // 10 units at 100
+            (99.0, 20.0),  // 20 units at 99
+            (98.0, 30.0),  // 30 units at 98
+        ];
+        book.apply_snapshot(&bids, &[], 1000).unwrap();
+
+        // VWAP for 15 units: (10*100 + 5*99) / 15 = 1495/15 = 99.666...
+        let vwap = book.vwap_bid(15.0).unwrap();
+        assert!((vwap - 99.666666).abs() < 0.001);
+
+        // VWAP for 5 units: all at best bid
+        let vwap_small = book.vwap_bid(5.0).unwrap();
+        assert_eq!(vwap_small, 100.0);
+    }
+
+    #[test]
+    fn test_vwap_insufficient_liquidity() {
+        let mut book = TopNOrderBook::<5>::new(Symbol::new("BTCUSDT"));
+
+        let bids = vec![(100.0, 5.0)];
+        book.apply_snapshot(&bids, &[], 1000).unwrap();
+
+        // Request more than available: should return VWAP of available
+        let vwap = book.vwap_bid(100.0).unwrap();
+        assert_eq!(vwap, 100.0);
+    }
+
+    #[test]
+    fn test_dual_joiner_no_arbitrage() {
+        let mut joiner = DualTopNJoiner::<5>::new(
+            Symbol::new("BTCUSDT_A"),
+            Symbol::new("BTCUSDT_B"),
+            1.0, // 1 bps minimum
+        );
+
+        // Same prices - no arbitrage
+        joiner
+            .venue_a
+            .apply_snapshot(&[(100.0, 1.0)], &[(101.0, 1.0)], 1000)
+            .unwrap();
+        joiner
+            .venue_b
+            .apply_snapshot(&[(100.0, 1.0)], &[(101.0, 1.0)], 1000)
+            .unwrap();
+
+        assert!(joiner.check_arbitrage(1500).is_none());
+    }
+
+    #[test]
+    fn test_dual_joiner_stale_data_rejection() {
+        let mut joiner = DualTopNJoiner::<5>::new(
+            Symbol::new("BTCUSDT_A"),
+            Symbol::new("BTCUSDT_B"),
+            0.1,
+        );
+        joiner.max_stale_us = 1000; // 1ms staleness limit
+
+        // Venue A is fresh, Venue B is stale
+        joiner
+            .venue_a
+            .apply_snapshot(&[(100.0, 1.0)], &[(101.0, 1.0)], 2000)
+            .unwrap();
+        joiner
+            .venue_b
+            .apply_snapshot(&[(99.0, 1.0)], &[(100.5, 1.0)], 500)
+            .unwrap(); // Old timestamp
+
+        // Current time is 2500, Venue B data is 2000us old (stale)
+        assert!(joiner.check_arbitrage(2500).is_none());
+    }
+
+    #[test]
+    fn test_bid_level_access() {
+        let mut book = TopNOrderBook::<5>::new(Symbol::new("BTCUSDT"));
+
+        let bids = vec![(100.0, 1.0), (99.0, 2.0), (98.0, 3.0)];
+        book.apply_snapshot(&bids, &[], 1000).unwrap();
+
+        assert_eq!(book.bid_level(0), Some((100.0, 1.0)));
+        assert_eq!(book.bid_level(1), Some((99.0, 2.0)));
+        assert_eq!(book.bid_level(2), Some((98.0, 3.0)));
+        assert_eq!(book.bid_level(3), None);
+    }
+
+    #[test]
+    fn test_clear_orderbook() {
+        let mut book = TopNOrderBook::<5>::new(Symbol::new("BTCUSDT"));
+
+        let bids = vec![(100.0, 1.0)];
+        let asks = vec![(101.0, 1.0)];
+        book.apply_snapshot(&bids, &asks, 1000).unwrap();
+
+        assert!(book.is_valid());
+
+        book.clear();
+
+        assert!(!book.is_valid());
+        assert_eq!(book.bid_count, 0);
+        assert_eq!(book.ask_count, 0);
+    }
 }

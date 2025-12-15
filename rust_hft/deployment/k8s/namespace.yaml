@@ -1,0 +1,38 @@
+# HFT 系統 Kubernetes Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hft-trading
+  labels:
+    app.kubernetes.io/name: hft-trading
+    app.kubernetes.io/part-of: hft-system
+---
+# ResourceQuota 限制
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: hft-quota
+  namespace: hft-trading
+spec:
+  hard:
+    requests.cpu: "16"
+    requests.memory: 32Gi
+    limits.cpu: "32"
+    limits.memory: 64Gi
+    pods: "20"
+---
+# LimitRange 默認限制
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: hft-limits
+  namespace: hft-trading
+spec:
+  limits:
+  - default:
+      cpu: "1"
+      memory: 2Gi
+    defaultRequest:
+      cpu: "500m"
+      memory: 1Gi
+    type: Container

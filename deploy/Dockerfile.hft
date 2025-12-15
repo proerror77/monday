@@ -1,0 +1,62 @@
+# HFT Rust Services Dockerfile
+# 多階段構建，優化最終鏡像大小
+
+# ============================================
+# Stage 1: Builder
+# ============================================
+FROM rust:1.75-bookworm AS builder
+
+WORKDIR /app
+
+# 安裝依賴
+RUN apt-get update && apt-get install -y \
+    cmake \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# 複製 workspace 配置
+COPY rust_hft/Cargo.toml rust_hft/Cargo.lock ./
+COPY rust_hft/ ./
+
+# 構建參數
+ARG TARGET=live
+
+# 構建指定的目標
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --bin hft-${TARGET} && \
+    cp /app/target/release/hft-${TARGET} /app/hft-binary
+
+# ============================================
+# Stage 2: Runtime
+# ============================================
+FROM debian:bookworm-slim AS runtime
+
+# 安裝運行時依賴
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 創建非 root 用戶
+RUN groupadd -r hft && useradd -r -g hft hft
+
+WORKDIR /app
+
+# 複製構建產物
+COPY --from=builder /app/hft-binary /app/hft
+
+# 創建配置和模型目錄
+RUN mkdir -p /config /models && chown -R hft:hft /app /config /models
+
+USER hft
+
+# 健康檢查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# 默認暴露端口
+EXPOSE 8080
+
+ENTRYPOINT ["/app/hft"]

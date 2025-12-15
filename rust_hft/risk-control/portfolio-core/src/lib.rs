@@ -1,6 +1,14 @@
 //! Portfolio Core（會計真相源）
 //! - 根據 ExecutionEvent（fills/fees/funding）更新帳戶狀態
 //! - 發佈只讀 AccountView 快照（Arc 快照）
+//! - 多帳戶 PnL 聚合（跨交易所）
+
+pub mod multi_account;
+
+pub use multi_account::{
+    AccountId, AccountPnl, AggregatedAccountView, AggregatedPosition, MultiAccountPortfolio,
+    MultiAccountState, PnlReport,
+};
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

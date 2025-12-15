@@ -7,6 +7,7 @@ description = "Backpack Exchange execution adapter"
 [dependencies]
 hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
+execution = { package = "hft-execution", path = "../../execution" }
 async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { version = "1.0" }

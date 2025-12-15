@@ -1,6 +1,17 @@
 //! OKX 執行適配器（REST + 私有 WS）
+//!
+//! 功能：
+//! - REST API 下單、撤單、修改訂單
+//! - 私有 WebSocket 接收成交回報
+//! - 韌性機制：重試、熔斷器、告警通知
 
 use async_trait::async_trait;
+use execution::{
+    AlertCallback, CircuitBreakerConfig, CircuitState, ExecutionAlert, ExecutionAlertType,
+    ExecutorStats, ResilientExecutor, RetryConfig,
+};
+// Re-export ExecutionMode for backwards compatibility
+pub use execution::ExecutionMode;
 use futures::{SinkExt, StreamExt};
 use hft_core::{HftError, HftResult, OrderId, Price, Quantity};
 use integration::{
@@ -10,19 +21,14 @@ use integration::{
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::warn;
+use tracing::{info, warn};
 
 fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, HftError> {
     let mut bytes = text.as_bytes().to_vec();
     simd_json::serde::from_slice(bytes.as_mut_slice())
         .map_err(|e| HftError::Serialization(e.to_string()))
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecutionMode {
-    Live,
-    Paper,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +47,10 @@ pub struct OkxExecutionClient {
     event_tx: Option<broadcast::Sender<ExecutionEvent>>,
     connected: bool,
     order_inst: std::collections::HashMap<String, String>,
+    // 韌性執行器 (重試 + 熔斷器)
+    resilient_executor: Option<Arc<ResilientExecutor>>,
+    // 告警回調
+    alert_callback: Option<AlertCallback>,
 }
 
 impl OkxExecutionClient {
@@ -52,7 +62,40 @@ impl OkxExecutionClient {
             event_tx: None,
             connected: false,
             order_inst: std::collections::HashMap::new(),
+            resilient_executor: None,
+            alert_callback: None,
         })
+    }
+
+    /// 設置告警回調
+    pub fn with_alert_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ExecutionAlert) + Send + Sync + 'static,
+    {
+        self.alert_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// 獲取韌性執行器統計信息
+    pub fn resilience_stats(&self) -> Option<ExecutorStats> {
+        self.resilient_executor.as_ref().map(|e| e.stats())
+    }
+
+    /// 獲取熔斷器狀態
+    pub async fn circuit_state(&self) -> Option<CircuitState> {
+        if let Some(ref executor) = self.resilient_executor {
+            Some(executor.circuit_breaker.state().await)
+        } else {
+            None
+        }
+    }
+
+    /// 強制重置熔斷器
+    pub async fn reset_circuit_breaker(&self) {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.circuit_breaker.reset().await;
+            info!("[OKX] 熔斷器已手動重置");
+        }
     }
 
     fn ensure_http(&mut self) -> HftResult<()> {
@@ -66,6 +109,35 @@ impl OkxExecutionClient {
         }
         Ok(())
     }
+
+    /// 獲取 HTTP 客戶端引用
+    #[inline]
+    fn get_http(&self) -> HftResult<&HttpClient> {
+        self.http
+            .as_ref()
+            .ok_or_else(|| HftError::Execution("HTTP client not initialized".to_string()))
+    }
+
+    /// 執行帶韌性保護的操作
+    async fn execute_with_resilience<T, F, Fut>(&self, operation: F) -> HftResult<T>
+    where
+        F: FnMut() -> Fut + Clone,
+        Fut: std::future::Future<Output = HftResult<T>>,
+    {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.execute(operation).await
+        } else {
+            let mut op = operation;
+            op().await
+        }
+    }
+
+    /// 發送執行告警
+    fn send_execution_alert(&self, alert: ExecutionAlert) {
+        if let Some(ref callback) = self.alert_callback {
+            callback(alert);
+        }
+    }
 }
 
 #[async_trait]
@@ -73,7 +145,7 @@ impl ExecutionClient for OkxExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
         if self.cfg.mode == ExecutionMode::Live {
             self.ensure_http()?;
-            let http = self.http.as_ref().unwrap();
+            let http = self.get_http()?;
             #[derive(serde::Serialize)]
             #[serde(rename_all = "camelCase")]
             struct Req<'a> {
@@ -166,53 +238,7 @@ impl ExecutionClient for OkxExecutionClient {
     }
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
-        if self.cfg.mode == ExecutionMode::Live {
-            self.ensure_http()?;
-            let http = self.http.as_ref().unwrap();
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct Req<'a> {
-                inst_id: &'a str,
-                ord_id: &'a str,
-            }
-            // 注意：OKX 撤單需要 instId，這裡假設 symbol 即 instId（配置需對齊 OKX 命名，例如 BTC-USDT）
-            let inst = self
-                .order_inst
-                .get(&order_id.0)
-                .cloned()
-                .unwrap_or_else(|| "BTC-USDT".to_string());
-            let req = Req {
-                inst_id: &inst,
-                ord_id: &order_id.0,
-            };
-            let body =
-                serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
-            let headers =
-                self.signer
-                    .generate_headers("POST", "/api/v5/trade/cancel-order", &body, None);
-            let resp = http
-                .signed_request(
-                    reqwest::Method::POST,
-                    "/api/v5/trade/cancel-order",
-                    Some(headers),
-                    Some(body),
-                )
-                .await
-                .map_err(|e| HftError::Network(e.to_string()))?;
-            #[derive(serde::Deserialize)]
-            struct Resp {
-                code: String,
-                msg: String,
-            }
-            let r: Resp = HttpClient::parse_json(resp)
-                .await
-                .map_err(|e| HftError::Serialization(e.to_string()))?;
-            if r.code != "0" {
-                return Err(HftError::Exchange(format!(
-                    "OKX 撤單失敗: {} {}",
-                    r.code, r.msg
-                )));
-            }
+        if self.cfg.mode != ExecutionMode::Live {
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(ExecutionEvent::OrderCanceled {
                     order_id: order_id.clone(),
@@ -221,13 +247,101 @@ impl ExecutionClient for OkxExecutionClient {
             }
             return Ok(());
         }
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx.send(ExecutionEvent::OrderCanceled {
-                order_id: order_id.clone(),
-                timestamp: hft_core::now_micros(),
-            });
+
+        self.ensure_http()?;
+
+        // 提前提取所有需要的數據
+        let inst = self
+            .order_inst
+            .get(&order_id.0)
+            .cloned()
+            .unwrap_or_else(|| "BTC-USDT".to_string());
+
+        #[derive(Clone, serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Req {
+            inst_id: String,
+            ord_id: String,
         }
-        Ok(())
+
+        let req = Req {
+            inst_id: inst,
+            ord_id: order_id.0.clone(),
+        };
+
+        let body = serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
+        let headers = self
+            .signer
+            .generate_headers("POST", "/api/v5/trade/cancel-order", &body, None);
+
+        let http_client = self.get_http()?.clone();
+        let order_id_clone = order_id.clone();
+        let event_tx = self.event_tx.clone();
+
+        // 使用韌性執行器執行撤單操作
+        let result = self
+            .execute_with_resilience(|| {
+                let http = http_client.clone();
+                let hdrs = headers.clone();
+                let bd = body.clone();
+                let oid = order_id_clone.clone();
+                let tx = event_tx.clone();
+
+                async move {
+                    #[derive(serde::Deserialize)]
+                    struct Resp {
+                        code: String,
+                        msg: String,
+                    }
+
+                    let resp = http
+                        .signed_request(
+                            reqwest::Method::POST,
+                            "/api/v5/trade/cancel-order",
+                            Some(hdrs),
+                            Some(bd),
+                        )
+                        .await
+                        .map_err(|e| HftError::Network(e.to_string()))?;
+
+                    let r: Resp = HttpClient::parse_json(resp)
+                        .await
+                        .map_err(|e| HftError::Serialization(e.to_string()))?;
+
+                    if r.code != "0" {
+                        return Err(HftError::Exchange(format!("OKX 撤單失敗: {} {}", r.code, r.msg)));
+                    }
+
+                    if let Some(ref tx) = tx {
+                        let _ = tx.send(ExecutionEvent::OrderCanceled {
+                            order_id: oid,
+                            timestamp: hft_core::now_micros(),
+                        });
+                    }
+
+                    Ok(())
+                }
+            })
+            .await;
+
+        // 如果執行失敗且熔斷器開啟，發送告警
+        if let Err(ref e) = result {
+            if let Some(ref executor) = self.resilient_executor {
+                if executor.circuit_breaker.state().await == CircuitState::Open {
+                    self.send_execution_alert(
+                        ExecutionAlert::new(
+                            ExecutionAlertType::RetriesExhausted,
+                            "okx",
+                            "cancel_order",
+                            format!("撤單失敗: {}", e),
+                        )
+                        .with_error(e.to_string()),
+                    );
+                }
+            }
+        }
+
+        result
     }
 
     async fn modify_order(
@@ -236,56 +350,7 @@ impl ExecutionClient for OkxExecutionClient {
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
     ) -> HftResult<()> {
-        if self.cfg.mode == ExecutionMode::Live {
-            self.ensure_http()?;
-            let http = self.http.as_ref().unwrap();
-            #[derive(serde::Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct Req<'a> {
-                inst_id: &'a str,
-                ord_id: &'a str,
-                new_sz: Option<String>,
-                new_px: Option<String>,
-            }
-            let inst = self
-                .order_inst
-                .get(&order_id.0)
-                .cloned()
-                .unwrap_or_else(|| "BTC-USDT".to_string());
-            let req = Req {
-                inst_id: &inst,
-                ord_id: &order_id.0,
-                new_sz: new_quantity.map(|q| q.0.to_string()),
-                new_px: new_price.map(|p| p.0.to_string()),
-            };
-            let body =
-                serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
-            let headers =
-                self.signer
-                    .generate_headers("POST", "/api/v5/trade/amend-order", &body, None);
-            let resp = http
-                .signed_request(
-                    reqwest::Method::POST,
-                    "/api/v5/trade/amend-order",
-                    Some(headers),
-                    Some(body),
-                )
-                .await
-                .map_err(|e| HftError::Network(e.to_string()))?;
-            #[derive(serde::Deserialize)]
-            struct Resp {
-                code: String,
-                msg: String,
-            }
-            let r: Resp = HttpClient::parse_json(resp)
-                .await
-                .map_err(|e| HftError::Serialization(e.to_string()))?;
-            if r.code != "0" {
-                return Err(HftError::Exchange(format!(
-                    "OKX 改單失敗: {} {}",
-                    r.code, r.msg
-                )));
-            }
+        if self.cfg.mode != ExecutionMode::Live {
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(ExecutionEvent::OrderModified {
                     order_id: order_id.clone(),
@@ -296,15 +361,109 @@ impl ExecutionClient for OkxExecutionClient {
             }
             return Ok(());
         }
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx.send(ExecutionEvent::OrderModified {
-                order_id: order_id.clone(),
-                new_quantity,
-                new_price,
-                timestamp: hft_core::now_micros(),
-            });
+
+        self.ensure_http()?;
+
+        // 提前提取所有需要的數據
+        let inst = self
+            .order_inst
+            .get(&order_id.0)
+            .cloned()
+            .unwrap_or_else(|| "BTC-USDT".to_string());
+
+        #[derive(Clone, serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Req {
+            inst_id: String,
+            ord_id: String,
+            new_sz: Option<String>,
+            new_px: Option<String>,
         }
-        Ok(())
+
+        let req = Req {
+            inst_id: inst,
+            ord_id: order_id.0.clone(),
+            new_sz: new_quantity.map(|q| q.0.to_string()),
+            new_px: new_price.map(|p| p.0.to_string()),
+        };
+
+        let body = serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
+        let headers = self
+            .signer
+            .generate_headers("POST", "/api/v5/trade/amend-order", &body, None);
+
+        let http_client = self.get_http()?.clone();
+        let order_id_clone = order_id.clone();
+        let event_tx = self.event_tx.clone();
+
+        // 使用韌性執行器執行修改操作
+        let result = self
+            .execute_with_resilience(|| {
+                let http = http_client.clone();
+                let hdrs = headers.clone();
+                let bd = body.clone();
+                let oid = order_id_clone.clone();
+                let tx = event_tx.clone();
+                let qty = new_quantity;
+                let px = new_price;
+
+                async move {
+                    #[derive(serde::Deserialize)]
+                    struct Resp {
+                        code: String,
+                        msg: String,
+                    }
+
+                    let resp = http
+                        .signed_request(
+                            reqwest::Method::POST,
+                            "/api/v5/trade/amend-order",
+                            Some(hdrs),
+                            Some(bd),
+                        )
+                        .await
+                        .map_err(|e| HftError::Network(e.to_string()))?;
+
+                    let r: Resp = HttpClient::parse_json(resp)
+                        .await
+                        .map_err(|e| HftError::Serialization(e.to_string()))?;
+
+                    if r.code != "0" {
+                        return Err(HftError::Exchange(format!("OKX 改單失敗: {} {}", r.code, r.msg)));
+                    }
+
+                    if let Some(ref tx) = tx {
+                        let _ = tx.send(ExecutionEvent::OrderModified {
+                            order_id: oid,
+                            new_quantity: qty,
+                            new_price: px,
+                            timestamp: hft_core::now_micros(),
+                        });
+                    }
+
+                    Ok(())
+                }
+            })
+            .await;
+
+        // 如果執行失敗且熔斷器開啟，發送告警
+        if let Err(ref e) = result {
+            if let Some(ref executor) = self.resilient_executor {
+                if executor.circuit_breaker.state().await == CircuitState::Open {
+                    self.send_execution_alert(
+                        ExecutionAlert::new(
+                            ExecutionAlertType::RetriesExhausted,
+                            "okx",
+                            "modify_order",
+                            format!("改單失敗: {}", e),
+                        )
+                        .with_error(e.to_string()),
+                    );
+                }
+            }
+        }
+
+        result
     }
 
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
@@ -318,10 +477,54 @@ impl ExecutionClient for OkxExecutionClient {
     }
 
     async fn connect(&mut self) -> HftResult<()> {
+        // 初始化韌性執行器
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+            retry_on_init_error: true,
+        };
+        let cb_config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+            half_open_max_requests: 3,
+            half_open_success_threshold: 2,
+        };
+
+        let mut executor = ResilientExecutor::new("okx", retry_config, cb_config);
+
+        // 設置熔斷器告警回調
+        if let Some(ref alert_cb) = self.alert_callback {
+            let alert_cb = Arc::clone(alert_cb);
+            executor = executor.with_alert_callback(move |cb_alert| {
+                let alert_type = match cb_alert.state {
+                    CircuitState::Open => ExecutionAlertType::CircuitOpen,
+                    CircuitState::Closed => ExecutionAlertType::CircuitRecovered,
+                    CircuitState::HalfOpen => return,
+                };
+
+                let alert = ExecutionAlert::new(
+                    alert_type,
+                    "okx",
+                    "execution",
+                    &cb_alert.message,
+                )
+                .with_failure_count(cb_alert.failure_count);
+
+                alert_cb(alert);
+            });
+        }
+
+        self.resilient_executor = Some(Arc::new(executor));
+
         let (tx, _) = broadcast::channel(1000);
         self.event_tx = Some(tx.clone());
         self.connected = true;
         self.ensure_http()?;
+
+        info!("[OKX] 執行客戶端連接成功");
+
         if self.cfg.mode == ExecutionMode::Live {
             let url = self.cfg.ws_private_url.clone();
             let api_key = self.cfg.credentials.api_key.clone();

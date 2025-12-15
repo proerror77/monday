@@ -1,0 +1,60 @@
+# ML Trainer Configuration
+# 精簡的模型訓練配置
+
+# ClickHouse 連接
+clickhouse:
+  host: localhost
+  port: 8123
+  database: hft
+  user: default
+  password: ""
+
+# 數據配置
+data:
+  table: hft_features_eth_local_ob
+  symbol: ETHUSDT
+  # 訓練數據天數
+  lookback_days: 7
+  # 序列長度
+  sequence_length: 100
+  # 預測標籤 (未來 N 個 tick 的價格變化)
+  label_horizon: 10
+
+# 特徵配置
+features:
+  # 39 維本地訂單簿特徵
+  input_dim: 39
+  # 歸一化方法
+  normalize: standard
+
+# 模型配置
+model:
+  type: lstm_attention  # lstm_attention, tcn, deep_lob
+  hidden_dim: 64
+  num_layers: 2
+  dropout: 0.2
+  attention_heads: 4
+
+# 訓練配置
+training:
+  batch_size: 256
+  epochs: 50
+  learning_rate: 0.001
+  early_stopping_patience: 5
+  # 驗證集比例
+  val_ratio: 0.2
+
+# 部署條件
+deployment:
+  # 最小 IC (Information Coefficient)
+  min_ic: 0.03
+  # 最小 IR (Information Ratio)
+  min_ir: 1.2
+  # 最大回撤
+  max_drawdown: 0.05
+
+# 輸出配置
+output:
+  model_dir: ../models/current
+  archive_dir: ../models/archive
+  metadata_file: ../models/metadata.json

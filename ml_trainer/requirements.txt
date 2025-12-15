@@ -1,0 +1,15 @@
+# ML Trainer Dependencies
+# 精簡的依賴列表
+
+# Core ML
+torch>=2.0.0
+numpy>=1.24.0
+
+# Database
+clickhouse-connect>=0.7.0
+
+# Configuration
+pyyaml>=6.0
+
+# Optional: GPU support
+# pip install torch --index-url https://download.pytorch.org/whl/cu118

@@ -25,6 +25,19 @@ use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
+/// 統一的 JSON 解析函數，支援 simd-json feature gate
+#[inline]
+fn parse_json<T: serde::de::DeserializeOwned>(bytes: &mut [u8]) -> Result<T, HftError> {
+    #[cfg(feature = "json-simd")]
+    {
+        simd_json::serde::from_slice(bytes).map_err(|e| HftError::Serialization(e.to_string()))
+    }
+    #[cfg(not(feature = "json-simd"))]
+    {
+        serde_json::from_slice(bytes).map_err(|e| HftError::Serialization(e.to_string()))
+    }
+}
+
 pub const DEFAULT_WS_URL: &str = "wss://ws.backpack.exchange";
 
 fn default_ws_url() -> String {
@@ -261,7 +274,7 @@ impl MarketStream for BackpackMarketStream {
                                         .store(now_micros(), Ordering::SeqCst);
 
                                     let mut bytes = text.into_bytes();
-                                    let envelope: WsEnvelope = match simd_json::serde::from_slice(bytes.as_mut_slice()) {
+                                    let envelope: WsEnvelope = match parse_json(bytes.as_mut_slice()) {
                                         Ok(env) => env,
                                         Err(e) => {
                                             warn!("Backpack envelope parse error: {}", e);

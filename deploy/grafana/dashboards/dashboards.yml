@@ -1,0 +1,14 @@
+# Grafana Dashboard Provisioning
+
+apiVersion: 1
+
+providers:
+  - name: 'HFT Dashboards'
+    orgId: 1
+    folder: 'HFT System'
+    folderUid: 'hft'
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json

@@ -5,13 +5,20 @@ edition = "2021"
 description = "Redis 整合：Streams / Rate-Limit / KV & PubSub（旁路）"
 
 [dependencies]
-redis = { workspace = true, optional = true, features = ["tokio-comp"] }
 serde = { workspace = true }
 tracing = { workspace = true }
 
+# Redis feature dependencies
+redis = { workspace = true, optional = true, features = ["tokio-comp", "aio"] }
+tokio = { workspace = true, optional = true, features = ["sync", "rt"] }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+chrono = { version = "0.4", optional = true }
+futures-util = { workspace = true, optional = true }
+
 [features]
 default = []
-redis = ["dep:redis"]
+redis = ["dep:redis", "dep:tokio", "dep:serde_json", "dep:thiserror", "dep:chrono", "dep:futures-util"]
 
 [lib]
 name = "infra_redis"

@@ -37,6 +37,20 @@ pub use dataflow::{BackpressurePolicy, BackpressureStatus, FlipPolicy};
 pub use execution_queues::{create_execution_queues, ExecutionQueueConfig, WorkerQueues};
 pub use execution_worker::{spawn_execution_worker, ExecutionWorker, ExecutionWorkerConfig};
 
+/// 交易狀態模式（由 Sentinel 控制）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TradingMode {
+    /// 正常交易
+    #[default]
+    Normal,
+    /// 降頻模式 - 減少交易頻率
+    Degraded,
+    /// 暫停交易 - 不生成新訂單
+    Paused,
+    /// 緊急模式 - 準備平倉
+    Emergency,
+}
+
 /// 引擎運行統計（內部狀態）
 #[derive(Debug, Default)]
 pub struct EngineStats {
@@ -52,6 +66,8 @@ pub struct EngineStats {
     pub market_events_dropped: u64,
     pub intents_dropped: u64,
     pub snapshot_publish_failed: u64,
+    // Sentinel 控制
+    pub trading_mode: TradingMode,
 }
 
 /// 事件廣播器集合
@@ -189,6 +205,7 @@ impl Engine {
                 market_events_dropped: 0,
                 intents_dropped: 0,
                 snapshot_publish_failed: 0,
+                trading_mode: TradingMode::Normal,
             },
             pending_market_events: Vec::new(),
             intents_work_buf: Vec::new(),
@@ -1276,6 +1293,78 @@ impl Engine {
         self.stats.is_running = false;
         // 確保喚醒 run() 內的等待者，讓其能夠立即退出
         self.wakeup_notify.notify_waiters();
+    }
+
+    // === Sentinel 控制方法 ===
+
+    /// 獲取當前交易模式
+    pub fn trading_mode(&self) -> TradingMode {
+        self.stats.trading_mode
+    }
+
+    /// 設置交易模式（由 Sentinel 調用）
+    pub fn set_trading_mode(&mut self, mode: TradingMode) {
+        if self.stats.trading_mode != mode {
+            info!("交易模式變更: {:?} -> {:?}", self.stats.trading_mode, mode);
+            self.stats.trading_mode = mode;
+        }
+    }
+
+    /// 暫停交易（不生成新訂單）
+    pub fn pause_trading(&mut self) {
+        warn!("Sentinel: 暫停交易");
+        self.stats.trading_mode = TradingMode::Paused;
+    }
+
+    /// 恢復正常交易
+    pub fn resume_trading(&mut self) {
+        info!("Sentinel: 恢復正常交易");
+        self.stats.trading_mode = TradingMode::Normal;
+    }
+
+    /// 進入降頻模式
+    pub fn enter_degrade_mode(&mut self) {
+        warn!("Sentinel: 進入降頻模式");
+        self.stats.trading_mode = TradingMode::Degraded;
+    }
+
+    /// 觸發緊急平倉
+    pub fn emergency_exit(&mut self) -> Vec<(hft_core::OrderId, hft_core::Symbol)> {
+        error!("Sentinel: 緊急平倉觸發！");
+        self.stats.trading_mode = TradingMode::Emergency;
+
+        // 收集所有策略的未結訂單用於平倉
+        let mut all_open_orders = Vec::new();
+        for strategy_id in &self.strategy_instance_ids {
+            let orders = self.open_order_pairs_by_strategy(strategy_id);
+            all_open_orders.extend(orders);
+        }
+
+        info!("緊急平倉: 發現 {} 個待取消訂單", all_open_orders.len());
+        all_open_orders
+    }
+
+    /// 獲取系統統計用於 Sentinel（延遲 + PnL）
+    pub fn get_sentinel_stats(&self) -> (u64, u64, f64, f64) {
+        // 從延遲監控器獲取真實延遲
+        let latency_stats = self.latency_monitor.get_stage_stats(hft_core::LatencyStage::EndToEnd);
+        let (latency_p99_us, latency_p50_us) = latency_stats
+            .map(|s| (s.p99_micros, s.p50_micros))
+            .unwrap_or((0, 0));
+
+        // 從 Portfolio 獲取 PnL（如果有）
+        let (pnl, unrealized_pnl) = if let Some(pm) = &self.portfolio_manager {
+            let av = pm.reader().load();
+            let total_pnl = av.realized_pnl + av.unrealized_pnl;
+            (
+                total_pnl.to_string().parse::<f64>().unwrap_or(0.0),
+                av.unrealized_pnl.to_string().parse::<f64>().unwrap_or(0.0),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+
+        (latency_p99_us, latency_p50_us, pnl, unrealized_pnl)
     }
 
     /// 從市場事件中提取時間戳

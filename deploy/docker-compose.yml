@@ -1,0 +1,190 @@
+# HFT System Docker Compose
+# 精簡部署配置 - ClickHouse + 可選 Redis
+
+version: '3.8'
+
+services:
+  # ============================================
+  # 數據存儲 (唯一)
+  # ============================================
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: hft-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/custom.xml:ro
+    environment:
+      CLICKHOUSE_DB: hft
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ============================================
+  # 可選: Redis 事件通道 (分布式部署時啟用)
+  # ============================================
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: hft-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    profiles:
+      - distributed  # 只在分布式模式啟用
+    restart: unless-stopped
+
+  # ============================================
+  # 監控服務
+  # ============================================
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: hft-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts:/etc/prometheus/alerts:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: hft-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: hft_grafana_2025
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+    depends_on:
+      - prometheus
+      - clickhouse
+    restart: unless-stopped
+
+  # ============================================
+  # 數據收集服務
+  # ============================================
+
+  collector:
+    build:
+      context: ../rust_hft
+      dockerfile: ../deploy/Dockerfile.hft
+      args:
+        - TARGET=collector
+    container_name: hft-collector
+    command: ["hft-collector", "--config", "/config/collector.yaml"]
+    volumes:
+      - ../rust_hft/config:/config:ro
+      - ../models:/models:ro
+    environment:
+      RUST_LOG: info
+      CLICKHOUSE_URL: http://clickhouse:8123
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================
+  # 交易引擎服務
+  # ============================================
+
+  trader:
+    build:
+      context: ../rust_hft
+      dockerfile: ../deploy/Dockerfile.hft
+      args:
+        - TARGET=live
+    container_name: hft-trader
+    command: ["hft-live", "--config", "/config/prod/system.yaml"]
+    volumes:
+      - ../rust_hft/config:/config:ro
+      - ../models:/models:ro
+    environment:
+      RUST_LOG: info
+      CLICKHOUSE_URL: http://clickhouse:8123
+      MODEL_DIR: /models
+    ports:
+      - "8080:8080"
+    depends_on:
+      - clickhouse
+      - collector
+    restart: unless-stopped
+
+  # ============================================
+  # 紙盤交易服務 (測試用)
+  # ============================================
+
+  paper-trader:
+    build:
+      context: ../rust_hft
+      dockerfile: ../deploy/Dockerfile.hft
+      args:
+        - TARGET=paper
+    container_name: hft-paper
+    command: ["hft-paper", "--config", "/config/dev/paper.yaml"]
+    volumes:
+      - ../rust_hft/config:/config:ro
+      - ../models:/models:ro
+    environment:
+      RUST_LOG: info
+    profiles:
+      - dev
+    restart: unless-stopped
+
+  # ============================================
+  # 模型訓練服務 (定時運行)
+  # ============================================
+
+  trainer:
+    build:
+      context: ../ml_trainer
+      dockerfile: ../deploy/Dockerfile.trainer
+    container_name: hft-trainer
+    command: ["python", "train.py"]
+    volumes:
+      - ../ml_trainer:/app:ro
+      - ../models:/models:rw
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    profiles:
+      - training
+    restart: "no"
+
+volumes:
+  clickhouse_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  default:
+    name: hft-network

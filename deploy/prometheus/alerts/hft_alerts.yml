@@ -1,0 +1,92 @@
+# HFT System Alert Rules
+
+groups:
+  - name: hft_latency
+    rules:
+      # 執行延遲過高告警
+      - alert: ExecLatencyP99High
+        expr: histogram_quantile(0.99, rate(hft_exec_latency_bucket[1m])) > 0.025
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "撮合延遲 p99 過高 (>25µs)"
+          description: "當前 p99 延遲: {{ $value }}ms"
+
+      # 數據接入延遲告警
+      - alert: IngestLagHigh
+        expr: hft_ingest_lag_ms > 500
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "數據接入延遲過高 (>500ms)"
+
+  - name: hft_risk
+    rules:
+      # 回撤超標告警 (Warning)
+      - alert: DrawdownWarning
+        expr: hft_position_drawdown > 0.03
+        for: 10s
+        labels:
+          severity: warning
+        annotations:
+          summary: "實盤回撤 > 3%"
+          description: "當前回撤: {{ $value | humanizePercentage }}"
+
+      # 回撤超標告警 (Critical)
+      - alert: DrawdownCritical
+        expr: hft_position_drawdown > 0.05
+        for: 5s
+        labels:
+          severity: critical
+        annotations:
+          summary: "實盤回撤 > 5%，觸發 kill-switch"
+
+      # 持倉超限告警
+      - alert: PositionLimitExceeded
+        expr: hft_position_value > 100000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "持倉市值超過限制"
+
+  - name: hft_model
+    rules:
+      # 模型 IC 下降告警
+      - alert: ModelICDegraded
+        expr: hft_realized_ic < 0.02
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "模型預測能力下降"
+          description: "實現 IC: {{ $value }}"
+
+      # 模型加載失敗告警
+      - alert: ModelLoadFailed
+        expr: increase(hft_model_load_errors_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "模型加載失敗"
+
+  - name: hft_infra
+    rules:
+      # ClickHouse 連接告警
+      - alert: ClickHouseDown
+        expr: up{job="clickhouse"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ClickHouse 服務不可用"
+
+      # WebSocket 重連頻繁
+      - alert: WebSocketReconnectFrequent
+        expr: increase(hft_ws_reconnect_total[1h]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "WebSocket 重連頻繁"

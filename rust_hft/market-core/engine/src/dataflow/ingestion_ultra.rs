@@ -393,6 +393,11 @@ impl UltraEventConsumer {
     pub fn utilization(&self) -> f64 {
         self.consumer.utilization()
     }
+
+    /// 獲取配置引用（用於診斷和監控）
+    pub fn config(&self) -> &UltraIngestionConfig {
+        &self.config
+    }
 }
 
 // ============================================================================

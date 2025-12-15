@@ -11,6 +11,21 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
+/// 統一的 JSON 解析函數，支援 simd-json feature gate
+#[inline]
+fn parse_json(bytes: &mut [u8]) -> Result<serde_json::Value, HftError> {
+    #[cfg(feature = "json-simd")]
+    {
+        simd_json::serde::from_slice(bytes)
+            .map_err(|e| HftError::Serialization(e.to_string()))
+    }
+    #[cfg(not(feature = "json-simd"))]
+    {
+        serde_json::from_slice(bytes)
+            .map_err(|e| HftError::Serialization(e.to_string()))
+    }
+}
+
 #[derive(Clone, Debug)]
 struct MarketMeta {
     symbol: String,
@@ -38,8 +53,7 @@ async fn fetch_order_books_meta(rest_base: &str) -> HftResult<Vec<MarketMeta>> {
         )));
     }
     let mut bytes = text.into_bytes();
-    let v: serde_json::Value = simd_json::serde::from_slice(bytes.as_mut_slice())
-        .map_err(|e| HftError::Serialization(e.to_string()))?;
+    let v: serde_json::Value = parse_json(bytes.as_mut_slice())?;
     let mut out = Vec::new();
     if let Some(books) = v.get("order_books").and_then(|x| x.as_array()) {
         for it in books {
@@ -147,14 +161,13 @@ impl MarketStream for LighterMarketStream {
                 match msg {
                     Ok(Message::Text(text)) => {
                         let mut bytes = text.into_bytes();
-                        let parsed: serde_json::Value =
-                            match simd_json::serde::from_slice(bytes.as_mut_slice()) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    let _ = tx.send(Err(HftError::Serialization(e.to_string())));
-                                    continue;
-                                }
-                            };
+                        let parsed: serde_json::Value = match parse_json(bytes.as_mut_slice()) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                continue;
+                            }
+                        };
                         let typ = parsed.get("type").and_then(|x| x.as_str()).unwrap_or("");
                         match typ {
                             "connected" => {

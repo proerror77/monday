@@ -1,0 +1,50 @@
+# Prometheus Configuration for HFT System
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# Rule files
+rule_files:
+  - "alerts/*.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # HFT Trader metrics
+  - job_name: 'hft-trader'
+    static_configs:
+      - targets: ['trader:8080']
+    metrics_path: /metrics
+    scrape_interval: 1s  # 高頻採集
+
+  # HFT Collector metrics
+  - job_name: 'hft-collector'
+    static_configs:
+      - targets: ['collector:8080']
+    metrics_path: /metrics
+
+  # ClickHouse metrics
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse:9363']
+
+  # Redis metrics (via redis_exporter if deployed)
+  # - job_name: 'redis'
+  #   static_configs:
+  #     - targets: ['redis-exporter:9121']
+
+  # TimescaleDB metrics (via postgres_exporter if deployed)
+  # - job_name: 'timescaledb'
+  #   static_configs:
+  #     - targets: ['postgres-exporter:9187']

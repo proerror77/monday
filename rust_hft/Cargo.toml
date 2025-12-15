@@ -68,6 +68,8 @@ members = [
     "infra-services/core/secrets",
     "infra-services/core/venue",
     "infra-services/core/ipc",
+    "infra-services/core/model-manager",
+    "infra-services/core/grpc-server",
     "infra-services/testing",
 
     # Applications
@@ -86,6 +88,7 @@ members = [
     "tools/dataset",
     "tools/infer-cli",
     "tools/hyperliquid-demo",
+    "tools/ws_test",
 
     # Examples
     "examples"
@@ -123,6 +126,7 @@ thiserror = "1.0"
 tokio = { version = "1.0", default-features = false }
 tokio-stream = "0.1"
 futures = "0.3"
+futures-util = "0.3"
 
 # 高性能 (只在 integration/apps 開)
 crossbeam = { version = "0.8", default-features = false }

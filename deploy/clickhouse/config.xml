@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!-- ClickHouse Custom Configuration for HFT System -->
+<clickhouse>
+    <!-- 性能優化 -->
+    <max_connections>100</max_connections>
+    <max_concurrent_queries>50</max_concurrent_queries>
+
+    <!-- 內存設置 -->
+    <max_memory_usage>8000000000</max_memory_usage>
+    <max_memory_usage_for_user>4000000000</max_memory_usage_for_user>
+
+    <!-- 壓縮設置 -->
+    <compression>
+        <case>
+            <min_part_size>10000000000</min_part_size>
+            <min_part_size_ratio>0.01</min_part_size_ratio>
+            <method>lz4</method>
+        </case>
+    </compression>
+
+    <!-- 合併設置 -->
+    <merge_tree>
+        <max_suspicious_broken_parts>5</max_suspicious_broken_parts>
+        <parts_to_delay_insert>150</parts_to_delay_insert>
+        <parts_to_throw_insert>300</parts_to_throw_insert>
+        <max_delay_to_insert>1</max_delay_to_insert>
+    </merge_tree>
+
+    <!-- Prometheus metrics -->
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+        <metrics>true</metrics>
+        <events>true</events>
+        <asynchronous_metrics>true</asynchronous_metrics>
+    </prometheus>
+
+    <!-- 日誌設置 -->
+    <logger>
+        <level>warning</level>
+        <console>1</console>
+    </logger>
+</clickhouse>

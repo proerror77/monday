@@ -424,6 +424,41 @@ impl PrecisionNormalizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hft_core::{OrderId, OrderType, Side, TimeInForce};
+    use ports::Position;
+
+    fn create_test_intent(symbol: &str, side: Side, qty: f64, price: Option<f64>) -> OrderIntent {
+        OrderIntent {
+            symbol: Symbol::new(symbol),
+            side,
+            quantity: Quantity::from_f64(qty).unwrap(),
+            price: price.map(|p| Price::from_f64(p).unwrap()),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: Some(hft_core::VenueId::BITGET),
+        }
+    }
+
+    fn create_test_account() -> AccountView {
+        let mut positions = HashMap::new();
+        positions.insert(
+            Symbol::new("BTCUSDT"),
+            Position {
+                symbol: Symbol::new("BTCUSDT"),
+                quantity: Quantity::from_f64(0.5).unwrap(),
+                avg_price: Price::from_f64(67000.0).unwrap(),
+                unrealized_pnl: Decimal::from(100),
+            },
+        );
+
+        AccountView {
+            cash_balance: Decimal::from(100000),
+            positions,
+            unrealized_pnl: Decimal::from(100),
+            realized_pnl: Decimal::from(500),
+        }
+    }
 
     #[test]
     fn test_rate_limit() {
@@ -461,5 +496,259 @@ mod tests {
 
         let normalized = PrecisionNormalizer::normalize_quantity(quantity, lot_size);
         assert_eq!(normalized.0.to_string(), "1.234");
+    }
+
+    // ============================================================================
+    // Additional risk manager tests
+    // ============================================================================
+
+    #[test]
+    fn test_position_limit_exceeded() {
+        let config = RiskConfig {
+            max_position_per_symbol: Quantity::from_f64(1.0).unwrap(),
+            ..Default::default()
+        };
+        let mgr = DefaultRiskManager::new(config);
+        let account = create_test_account();
+
+        // Try to buy 0.6 BTC when already holding 0.5 (total 1.1 > 1.0 limit)
+        let intent = create_test_intent("BTCUSDT", Side::Buy, 0.6, Some(67000.0));
+
+        let result = mgr.check_position_limits(&intent, &account);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("持仓限额"));
+    }
+
+    #[test]
+    fn test_position_limit_passed() {
+        let config = RiskConfig {
+            max_position_per_symbol: Quantity::from_f64(2.0).unwrap(),
+            ..Default::default()
+        };
+        let mgr = DefaultRiskManager::new(config);
+        let account = create_test_account();
+
+        // Buy 0.5 BTC when holding 0.5 (total 1.0 < 2.0 limit)
+        let intent = create_test_intent("BTCUSDT", Side::Buy, 0.5, Some(67000.0));
+
+        let result = mgr.check_position_limits(&intent, &account);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_daily_loss_limit() {
+        let config = RiskConfig {
+            max_daily_loss: Decimal::from(1000),
+            ..Default::default()
+        };
+        let mgr = DefaultRiskManager::new(config);
+
+        // Account with large loss
+        let mut account = create_test_account();
+        account.realized_pnl = Decimal::from(-800);
+        account.unrealized_pnl = Decimal::from(-300); // Total -1100
+
+        let result = mgr.check_daily_loss(&account);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("日内最大亏损"));
+    }
+
+    #[test]
+    fn test_global_notional_limit() {
+        let config = RiskConfig {
+            max_global_notional: Decimal::from(100000),
+            max_position_per_symbol: Quantity::from_f64(100.0).unwrap(),
+            ..Default::default()
+        };
+        let mgr = DefaultRiskManager::new(config);
+
+        // Account already has ~33500 notional (0.5 * 67000)
+        let account = create_test_account();
+
+        // Try to add 70000 notional (20 * 3500), total would exceed 100000
+        let intent = create_test_intent("ETHUSDT", Side::Buy, 20.0, Some(3500.0));
+
+        let result = mgr.check_position_limits(&intent, &account);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("全局名义价值限额"));
+    }
+
+    #[test]
+    fn test_aggressive_mode_bypasses_rate_limit() {
+        let config = RiskConfig {
+            aggressive_mode: true,
+            max_orders_per_second: 1,
+            order_cooldown_ms: 1000,
+            ..Default::default()
+        };
+        let mut mgr = DefaultRiskManager::new(config);
+        let account = create_test_account();
+        let venue = VenueSpec::default();
+
+        let intent1 = create_test_intent("BTCUSDT", Side::Buy, 0.01, Some(67000.0));
+        let intent2 = create_test_intent("BTCUSDT", Side::Buy, 0.01, Some(67000.0));
+
+        // Both should pass in aggressive mode
+        let approved = mgr.review(vec![intent1, intent2], &account, &venue);
+        assert_eq!(approved.len(), 2);
+    }
+
+    #[test]
+    fn test_emergency_stop() {
+        let config = RiskConfig::default();
+        let mut mgr = DefaultRiskManager::new(config);
+
+        mgr.emergency_stop().unwrap();
+
+        // After emergency stop, all limits should be zero
+        assert_eq!(mgr.config.max_position_per_symbol, Quantity::zero());
+        assert_eq!(mgr.config.max_global_notional, Decimal::ZERO);
+        assert_eq!(mgr.config.max_orders_per_second, 0);
+    }
+
+    #[test]
+    fn test_zero_tick_size_passthrough() {
+        let price = Price::from_f64(67123.456789).unwrap();
+        let tick_size = Price::from_f64(0.0).unwrap();
+
+        let normalized = PrecisionNormalizer::normalize_price(price, tick_size);
+        assert_eq!(normalized.0, price.0);
+    }
+
+    #[test]
+    fn test_order_minimum_qty_validation() {
+        let intent = OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            quantity: Quantity::from_f64(0.001).unwrap(),
+            price: Some(Price::from_f64(67000.0).unwrap()),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test".to_string(),
+            target_venue: None,
+        };
+
+        // Minimum qty is 0.01, intent has 0.001
+        let result = PrecisionNormalizer::validate_order_minimums(
+            &intent,
+            Quantity::from_f64(0.01).unwrap(),
+            Decimal::from(10),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("数量低于最小值"));
+    }
+
+    #[test]
+    fn test_order_minimum_notional_validation() {
+        let intent = OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            quantity: Quantity::from_f64(0.0001).unwrap(), // 0.0001 * 67000 = 6.7 notional
+            price: Some(Price::from_f64(67000.0).unwrap()),
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test".to_string(),
+            target_venue: None,
+        };
+
+        // Minimum notional is 10
+        let result = PrecisionNormalizer::validate_order_minimums(
+            &intent,
+            Quantity::from_f64(0.0001).unwrap(), // qty check passes
+            Decimal::from(10),                    // notional check fails
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("名义价值低于最小值"));
+    }
+
+    #[test]
+    fn test_fill_event_updates_daily_pnl() {
+        let config = RiskConfig::default();
+        let mut mgr = DefaultRiskManager::new(config);
+
+        let fill_event = ExecutionEvent::Fill {
+            order_id: OrderId("1".to_string()),
+            fill_id: "fill_001".to_string(),
+            price: Price::from_f64(67000.0).unwrap(),
+            quantity: Quantity::from_f64(0.1).unwrap(),
+            timestamp: 1000000,
+        };
+
+        mgr.on_execution_event(&fill_event);
+
+        // daily_pnl should be updated
+        assert!(mgr.daily_pnl > Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_risk_metrics_tracking() {
+        let config = RiskConfig::default();
+        let mut mgr = DefaultRiskManager::new(config);
+        let symbol = Symbol::new("BTCUSDT");
+
+        // Simulate some orders
+        for _ in 0..5 {
+            mgr.update_state(&symbol);
+        }
+
+        let metrics = mgr.get_risk_metrics();
+        assert_eq!(*metrics.get("total_orders_today").unwrap(), Decimal::from(5));
+    }
+
+    #[test]
+    fn test_should_halt_trading() {
+        let config = RiskConfig {
+            max_daily_loss: Decimal::from(1000),
+            ..Default::default()
+        };
+        let mgr = DefaultRiskManager::new(config);
+
+        // Account with acceptable loss
+        let mut account = AccountView::default();
+        account.realized_pnl = Decimal::from(-500);
+        account.unrealized_pnl = Decimal::from(-400);
+        assert!(!mgr.should_halt_trading(&account));
+
+        // Account with excessive loss
+        account.realized_pnl = Decimal::from(-600);
+        account.unrealized_pnl = Decimal::from(-500);
+        assert!(mgr.should_halt_trading(&account));
+    }
+
+    #[test]
+    fn test_sell_reduces_position() {
+        let config = RiskConfig {
+            max_position_per_symbol: Quantity::from_f64(1.0).unwrap(),
+            ..Default::default()
+        };
+        let mgr = DefaultRiskManager::new(config);
+        let account = create_test_account(); // Has 0.5 BTC
+
+        // Sell 0.3 BTC should pass (reduces position to 0.2)
+        let intent = create_test_intent("BTCUSDT", Side::Sell, 0.3, Some(67000.0));
+
+        let result = mgr.check_position_limits(&intent, &account);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_multiple_symbols_independent() {
+        let config = RiskConfig {
+            max_position_per_symbol: Quantity::from_f64(1.0).unwrap(),
+            order_cooldown_ms: 10,
+            ..Default::default()
+        };
+        let mut mgr = DefaultRiskManager::new(config);
+        let account = AccountView::default();
+        let venue = VenueSpec::default();
+
+        // Orders for different symbols should be independent
+        let intent1 = create_test_intent("BTCUSDT", Side::Buy, 0.5, Some(67000.0));
+        let intent2 = create_test_intent("ETHUSDT", Side::Buy, 0.5, Some(3500.0));
+
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
+        let approved = mgr.review(vec![intent1, intent2], &account, &venue);
+        assert_eq!(approved.len(), 2);
     }
 }

@@ -1,0 +1,25 @@
+[package]
+name = "hft-grpc-server"
+version = "0.1.0"
+edition = "2021"
+description = "HFT gRPC Control Service"
+
+[dependencies]
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# Internal crates
+hft-core = { path = "../../../market-core/core" }
+engine = { path = "../../../market-core/engine", package = "hft-engine" }
+risk = { path = "../../../risk-control/risk", package = "hft-risk" }
+
+# Utilities
+tracing = "0.1"
+anyhow = "1"
+
+[build-dependencies]
+tonic-build = "0.12"

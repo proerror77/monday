@@ -5,13 +5,19 @@ edition = "2021"
 description = "ClickHouse 整合：RowBinary 批量插入（旁路）"
 
 [dependencies]
-clickhouse = { workspace = true, optional = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 
+# ClickHouse feature dependencies
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"], optional = true }
+tokio = { workspace = true, optional = true, features = ["sync", "rt"] }
+lz4 = { version = "1", optional = true }
+urlencoding = { version = "2", optional = true }
+thiserror = { workspace = true, optional = true }
+
 [features]
 default = []
-clickhouse = ["dep:clickhouse"]
+clickhouse = ["dep:reqwest", "dep:tokio", "dep:lz4", "dep:urlencoding", "dep:thiserror"]
 
 [lib]
 name = "infra_clickhouse"

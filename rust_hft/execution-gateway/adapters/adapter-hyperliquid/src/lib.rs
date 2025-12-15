@@ -9,6 +9,12 @@
 use async_trait::async_trait;
 use ethers_core::types::{Address, H256, U256};
 use ethers_core::utils::keccak256;
+use execution::{
+    resilience::CircuitBreakerAlert, AlertCallback, CircuitBreakerConfig, CircuitState,
+    ExecutionAlert, ExecutionAlertType, ExecutorStats, ResilientExecutor, RetryConfig,
+};
+// Re-export ExecutionMode for backwards compatibility
+pub use execution::ExecutionMode;
 use futures::{SinkExt, StreamExt};
 use hft_core::{now_micros, HftError, HftResult, OrderId, Price, Quantity, Side, Symbol};
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntent, OrderStatus};
@@ -16,6 +22,7 @@ use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
@@ -36,12 +43,6 @@ fn parse_value<T: DeserializeOwned>(value: Value) -> Result<T, HftError> {
         Err(e) => return Err(HftError::Serialization(e.to_string())),
     };
     simd_json::serde::from_owned_value(owned).map_err(|e| HftError::Serialization(e.to_string()))
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecutionMode {
-    Live,
-    Paper,
 }
 
 // Hyperliquid 私有 WebSocket 订阅消息
@@ -449,6 +450,9 @@ pub struct HyperliquidExecutionClient {
     reverse_order_map: HashMap<u64, OrderId>, // hyperliquid_oid -> our_order_id
     next_nonce: u64,
     ws_stream: Option<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    // Resilience 相關
+    resilient_executor: Option<Arc<ResilientExecutor>>,
+    alert_callback: Option<AlertCallback>,
 }
 
 impl HyperliquidExecutionClient {
@@ -479,6 +483,60 @@ impl HyperliquidExecutionClient {
                 .unwrap_or_default()
                 .as_millis() as u64,
             ws_stream: None,
+            resilient_executor: None,
+            alert_callback: None,
+        }
+    }
+
+    /// 設置告警回調函數
+    pub fn with_alert_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ExecutionAlert) + Send + Sync + 'static,
+    {
+        self.alert_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// 獲取 resilience 統計資訊
+    pub fn resilience_stats(&self) -> Option<ExecutorStats> {
+        self.resilient_executor.as_ref().map(|e| e.stats())
+    }
+
+    /// 獲取熔斷器狀態
+    pub async fn circuit_state(&self) -> Option<CircuitState> {
+        if let Some(ref executor) = self.resilient_executor {
+            Some(executor.circuit_breaker.state().await)
+        } else {
+            None
+        }
+    }
+
+    /// 重置熔斷器
+    pub async fn reset_circuit_breaker(&self) {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.circuit_breaker.reset().await;
+            info!("Hyperliquid 熔斷器已重置");
+        }
+    }
+
+    /// 帶 resilience 執行操作
+    async fn execute_with_resilience<F, Fut, T>(&self, mut operation: F) -> HftResult<T>
+    where
+        F: FnMut() -> Fut + Clone + Send + Sync,
+        Fut: std::future::Future<Output = HftResult<T>> + Send,
+        T: Send,
+    {
+        if let Some(ref executor) = self.resilient_executor {
+            executor.execute(operation).await
+        } else {
+            operation().await
+        }
+    }
+
+    /// 發送執行告警
+    fn send_execution_alert(&self, alert: ExecutionAlert) {
+        if let Some(ref callback) = self.alert_callback {
+            callback(alert);
         }
     }
 
@@ -742,20 +800,53 @@ impl HyperliquidExecutionClient {
 
         debug!("发送 Hyperliquid 撤单请求: {}", request_body);
 
-        let response = self
-            .http_client
-            .post(format!("{}/exchange", self.cfg.rest_base_url))
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| HftError::Network(format!("撤单 HTTP 请求失败: {}", e)))?;
+        // 使用 resilience 執行 HTTP 呼叫
+        let http_client = self.http_client.clone();
+        let url = format!("{}/exchange", self.cfg.rest_base_url);
+        let order_id_str = order_id.0.clone();
 
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| HftError::Network(format!("读取撤单响应失败: {}", e)))?;
+        let result = self
+            .execute_with_resilience(|| {
+                let client = http_client.clone();
+                let target_url = url.clone();
+                let body = request_body.clone();
+                async move {
+                    let response = client
+                        .post(&target_url)
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(|e| HftError::Network(format!("撤单 HTTP 请求失败: {}", e)))?;
 
-        debug!("Hyperliquid 撤单响应: {}", response_text);
+                    let _response_text = response
+                        .text()
+                        .await
+                        .map_err(|e| HftError::Network(format!("读取撤单响应失败: {}", e)))?;
+
+                    debug!("Hyperliquid 撤单响应: {}", _response_text);
+                    Ok(())
+                }
+            })
+            .await;
+
+        // 熔斷器開啟時發送告警
+        if let Err(ref e) = result {
+            if let Some(ref executor) = self.resilient_executor {
+                if executor.circuit_breaker.state().await == CircuitState::Open {
+                    self.send_execution_alert(
+                        ExecutionAlert::new(
+                            ExecutionAlertType::CircuitOpen,
+                            "hyperliquid",
+                            "cancel_order",
+                            &format!("撤单失败且熔断器已开启 (order_id={}): {}", order_id_str, e),
+                        )
+                        .with_error(e.to_string()),
+                    );
+                }
+            }
+        }
+
+        result?;
 
         // 删除订单映射（双向）
         if let Some((_, hyperliquid_oid)) = self.order_map.remove(order_id) {
@@ -836,20 +927,53 @@ impl HyperliquidExecutionClient {
 
         debug!("发送 Hyperliquid 改单请求: {}", request_body);
 
-        let response = self
-            .http_client
-            .post(format!("{}/exchange", self.cfg.rest_base_url))
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| HftError::Network(format!("改单 HTTP 请求失败: {}", e)))?;
+        // 使用 resilience 執行 HTTP 呼叫
+        let http_client = self.http_client.clone();
+        let url = format!("{}/exchange", self.cfg.rest_base_url);
+        let order_id_str = order_id.0.clone();
 
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| HftError::Network(format!("读取改单响应失败: {}", e)))?;
+        let result = self
+            .execute_with_resilience(|| {
+                let client = http_client.clone();
+                let target_url = url.clone();
+                let body = request_body.clone();
+                async move {
+                    let response = client
+                        .post(&target_url)
+                        .json(&body)
+                        .send()
+                        .await
+                        .map_err(|e| HftError::Network(format!("改单 HTTP 请求失败: {}", e)))?;
 
-        debug!("Hyperliquid 改单响应: {}", response_text);
+                    let _response_text = response
+                        .text()
+                        .await
+                        .map_err(|e| HftError::Network(format!("读取改单响应失败: {}", e)))?;
+
+                    debug!("Hyperliquid 改单响应: {}", _response_text);
+                    Ok(())
+                }
+            })
+            .await;
+
+        // 熔斷器開啟時發送告警
+        if let Err(ref e) = result {
+            if let Some(ref executor) = self.resilient_executor {
+                if executor.circuit_breaker.state().await == CircuitState::Open {
+                    self.send_execution_alert(
+                        ExecutionAlert::new(
+                            ExecutionAlertType::CircuitOpen,
+                            "hyperliquid",
+                            "modify_order",
+                            &format!("改单失败且熔断器已开启 (order_id={}): {}", order_id_str, e),
+                        )
+                        .with_error(e.to_string()),
+                    );
+                }
+            }
+        }
+
+        result?;
 
         // 发送改单确认事件
         if let Some(ref tx) = self.event_tx {
@@ -1003,7 +1127,7 @@ impl HyperliquidExecutionClient {
 impl ExecutionClient for HyperliquidExecutionClient {
     async fn place_order(&mut self, intent: OrderIntent) -> HftResult<OrderId> {
         match self.cfg.mode {
-            ExecutionMode::Paper => {
+            ExecutionMode::Paper | ExecutionMode::Testnet => {
                 let oid = OrderId(format!("HL_PAPER_{}", now_micros()));
                 if let Some(ref tx) = self.event_tx {
                     let _ = tx.send(ExecutionEvent::OrderAck {
@@ -1030,7 +1154,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
         match self.cfg.mode {
-            ExecutionMode::Paper => {
+            ExecutionMode::Paper | ExecutionMode::Testnet => {
                 if let Some(ref tx) = self.event_tx {
                     let _ = tx.send(ExecutionEvent::OrderCanceled {
                         order_id: order_id.clone(),
@@ -1050,7 +1174,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         new_price: Option<Price>,
     ) -> HftResult<()> {
         match self.cfg.mode {
-            ExecutionMode::Paper => {
+            ExecutionMode::Paper | ExecutionMode::Testnet => {
                 if let Some(ref tx) = self.event_tx {
                     let _ = tx.send(ExecutionEvent::OrderModified {
                         order_id: order_id.clone(),
@@ -1080,7 +1204,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         match self.cfg.mode {
-            ExecutionMode::Paper => {
+            ExecutionMode::Paper | ExecutionMode::Testnet => {
                 // Paper 模式直接返回空列表（模拟所有订单都已成交）
                 Ok(Vec::new())
             }
@@ -1093,6 +1217,39 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
         let (tx, _rx) = broadcast::channel(1000);
         self.event_tx = Some(tx);
+
+        // 初始化 Resilient Executor（帶告警回調）
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 5000,
+            backoff_multiplier: 2.0,
+            retry_on_init_error: false,
+        };
+        let circuit_config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration_secs: 30,
+            half_open_max_requests: 3,
+            half_open_success_threshold: 2,
+        };
+        let alert_cb = self.alert_callback.clone();
+        self.resilient_executor = Some(Arc::new(
+            ResilientExecutor::new("hyperliquid", retry_config, circuit_config).with_alert_callback(
+                move |cb_alert: CircuitBreakerAlert| {
+                    if let Some(ref cb) = alert_cb {
+                        let exec_alert = ExecutionAlert::new(
+                            ExecutionAlertType::CircuitOpen,
+                            "hyperliquid",
+                            "circuit_breaker",
+                            &cb_alert.message,
+                        )
+                        .with_failure_count(cb_alert.failure_count);
+                        cb(exec_alert);
+                    }
+                },
+            ),
+        ));
+        info!("Hyperliquid resilience executor 已初始化");
 
         // 如果是 Live 模式，建立私有 WebSocket 连接
         if self.cfg.mode == ExecutionMode::Live && self.signer.is_some() {

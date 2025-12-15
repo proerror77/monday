@@ -340,7 +340,6 @@ impl DlStrategy {
 
     /// 获取策略统计信息
     pub fn get_stats(&self) -> Vec<DlStrategyStats> {
-        let now = Self::current_timestamp();
         self.symbol_states
             .iter()
             .map(|(symbol_str, state)| {

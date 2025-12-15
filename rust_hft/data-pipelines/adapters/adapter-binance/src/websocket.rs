@@ -20,6 +20,7 @@ pub struct BinanceWebSocket {
     ws_base_url: String,
 }
 
+#[allow(dead_code)]
 impl BinanceWebSocket {
     pub fn new() -> Self {
         Self::with_base_url(WS_BASE_URL.to_string())
