@@ -1,6 +1,6 @@
 //! File system watcher for model hot-reload
 
-use crate::{ModelError, ModelHandle, ModelMetadata, ModelResult};
+use crate::{ModelError, ModelHandle, ModelLoadedCallback, ModelMetadata, ModelResult};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ impl ModelWatcher {
     pub fn new(
         watch_dir: PathBuf,
         current_model: Arc<RwLock<Option<ModelHandle>>>,
-        _on_loaded: Option<Box<dyn Fn(&ModelHandle) + Send + Sync>>,
+        _on_loaded: Option<ModelLoadedCallback>,
     ) -> ModelResult<Self> {
         let (event_tx, event_rx) = mpsc::channel(100);
 

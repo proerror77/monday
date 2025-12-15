@@ -68,23 +68,12 @@ async fn main() {
     println!("\n  總計: {}/{} 交易所連線成功\n", success_count, total);
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct TestResult {
     success: bool,
     connect_latency_ms: u64,
     messages_received: usize,
     error: Option<String>,
-}
-
-impl Default for TestResult {
-    fn default() -> Self {
-        Self {
-            success: false,
-            connect_latency_ms: 0,
-            messages_received: 0,
-            error: None,
-        }
-    }
 }
 
 async fn test_bitget() -> TestResult {

@@ -463,6 +463,7 @@ impl Engine {
     }
 
     /// 通过策略 ID 获取策略的不可变引用
+    #[allow(clippy::borrowed_box)]
     pub fn get_strategy_by_id(&self, strategy_id: &str) -> Option<&Box<dyn Strategy>> {
         let index = self
             .strategy_instance_ids
@@ -472,6 +473,7 @@ impl Engine {
     }
 
     /// 通过策略 ID 获取策略的可变引用
+    #[allow(clippy::borrowed_box)]
     pub fn get_strategy_mut_by_id(&mut self, strategy_id: &str) -> Option<&mut Box<dyn Strategy>> {
         let index = self
             .strategy_instance_ids

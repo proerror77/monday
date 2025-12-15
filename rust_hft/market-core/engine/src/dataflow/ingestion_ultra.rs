@@ -137,6 +137,11 @@ impl UltraEventIngester {
     /// | 日誌 | ✅ | ❌ |
     /// | 指標 | ✅ | ❌ |
     /// | 錯誤處理 | Result | 靜默丟棄 |
+    ///
+    /// # Safety
+    ///
+    /// 調用者必須確保隊列未滿（調用前檢查 `is_full()`）。
+    /// 如果隊列已滿，行為未定義（可能覆蓋數據或 panic）。
     #[inline(always)]
     pub unsafe fn ingest_fast(&self, event: MarketEvent) {
         // 1. 提取時間戳（內聯後 ~2-3ns）
@@ -330,6 +335,11 @@ impl UltraEventConsumer {
     ///     // 處理事件（零拷貝）
     /// }
     /// ```
+    ///
+    /// # Safety
+    ///
+    /// 調用者必須確保消費者處於有效狀態，且無其他線程同時消費。
+    /// 底層使用無鎖 SPSC 隊列，如果違反單消費者約定可能導致數據競爭。
     #[inline(always)]
     pub unsafe fn consume_batch_unchecked(&self, max_batch: usize) -> Vec<TrackedMarketEvent> {
         let mut batch = Vec::with_capacity(max_batch);

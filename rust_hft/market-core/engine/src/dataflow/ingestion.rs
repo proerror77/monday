@@ -75,20 +75,15 @@ impl IngestionConfig {
 }
 
 /// 快照發佈策略
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum FlipPolicy {
     /// 每次更新都發佈
+    #[default]
     OnUpdate,
     /// 定時發佈 (微秒間隔)
     OnTimer(u64),
     /// 利用率閾值觸發 (0.0-1.0)
     OnUtilization(f64),
-}
-
-impl Default for FlipPolicy {
-    fn default() -> Self {
-        FlipPolicy::OnUpdate
-    }
 }
 
 /// 背壓策略

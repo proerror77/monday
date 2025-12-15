@@ -19,6 +19,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+/// 模型加載回調類型別名
+pub type ModelLoadedCallback = Box<dyn Fn(&ModelHandle) + Send + Sync>;
+
 /// 模型句柄 - 包含模型路徑和元數據
 #[derive(Debug, Clone)]
 pub struct ModelHandle {
@@ -42,7 +45,7 @@ pub struct ModelManager {
     current_model: Arc<RwLock<Option<ModelHandle>>>,
 
     /// 模型加載回調（用於通知策略層）
-    on_model_loaded: Option<Box<dyn Fn(&ModelHandle) + Send + Sync>>,
+    on_model_loaded: Option<ModelLoadedCallback>,
 }
 
 impl ModelManager {

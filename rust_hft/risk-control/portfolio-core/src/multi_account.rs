@@ -242,11 +242,13 @@ impl MultiAccountPortfolio {
 
     /// 更新聚合視圖
     fn update_aggregated_view(&mut self) {
-        let mut agg = AggregatedAccountView::default();
-        agg.last_update = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let mut agg = AggregatedAccountView {
+            last_update: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            ..Default::default()
+        };
 
         // 遍歷所有帳戶
         for (account_id, portfolio) in &self.accounts {
