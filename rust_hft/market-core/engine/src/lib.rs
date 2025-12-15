@@ -68,6 +68,8 @@ pub struct EngineStats {
     pub snapshot_publish_failed: u64,
     // Sentinel 控制
     pub trading_mode: TradingMode,
+    /// 引擎啟動時間 (微秒時間戳)
+    pub start_time_us: u64,
 }
 
 /// 事件廣播器集合
@@ -206,6 +208,7 @@ impl Engine {
                 intents_dropped: 0,
                 snapshot_publish_failed: 0,
                 trading_mode: TradingMode::Normal,
+                start_time_us: now_micros(),
             },
             pending_market_events: Vec::new(),
             intents_work_buf: Vec::new(),
@@ -1395,6 +1398,10 @@ impl Engine {
         // 從延遲監控器收集各階段延遲統計
         let latency = self.collect_latency_stats();
 
+        // 計算運行時間
+        let uptime_us = now_micros().saturating_sub(self.stats.start_time_us);
+        let uptime_seconds = uptime_us / 1_000_000;
+
         EngineStatistics {
             cycle_count: self.stats.cycle_count,
             consumers_count: self.event_consumers.len(),
@@ -1408,6 +1415,7 @@ impl Engine {
             orders_rejected: self.stats.orders_rejected,
             orders_canceled: self.stats.orders_canceled,
             latency,
+            uptime_seconds,
         }
     }
 
@@ -1595,6 +1603,8 @@ pub struct EngineStatistics {
     pub orders_canceled: u64,
     /// 延遲統計
     pub latency: EngineLatencyStats,
+    /// 引擎運行時間（秒）
+    pub uptime_seconds: u64,
 }
 
 #[cfg(test)]

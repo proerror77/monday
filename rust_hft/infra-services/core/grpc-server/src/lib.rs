@@ -184,7 +184,7 @@ impl HftControl for HftControlService {
             events_dropped: 0,
             ws_connections_active: 0,
             ws_reconnect_count: 0,
-            uptime_seconds: 0, // TODO: 需要在 Engine 中添加 start_time
+            uptime_seconds: stats.uptime_seconds as i64,
             timestamp_us: Self::now_us(),
         }))
     }
