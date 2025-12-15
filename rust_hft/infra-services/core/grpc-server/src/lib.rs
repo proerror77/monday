@@ -220,6 +220,7 @@ impl HftControl for HftControlService {
         let cash: f64 = state.account_view.cash_balance.to_string().parse().unwrap_or(0.0);
         let unrealized: f64 = state.account_view.unrealized_pnl.to_string().parse().unwrap_or(0.0);
         let realized: f64 = state.account_view.realized_pnl.to_string().parse().unwrap_or(0.0);
+        let high_water: f64 = state.account_view.high_water_mark.to_string().parse().unwrap_or(0.0);
         let total_equity = cash + unrealized;
 
         Ok(Response::new(PortfolioStatus {
@@ -227,9 +228,9 @@ impl HftControl for HftControlService {
             total_equity,
             unrealized_pnl: unrealized,
             realized_pnl: realized,
-            high_water_mark: 0.0,   // TODO: 需要從 Portfolio 獲取
-            drawdown_pct: 0.0,      // TODO: 需要從 Portfolio 獲取
-            max_drawdown_pct: 0.0,  // TODO: 需要從 Portfolio 獲取
+            high_water_mark: high_water,
+            drawdown_pct: state.account_view.drawdown_pct,
+            max_drawdown_pct: state.account_view.max_drawdown_pct,
             positions,
             timestamp_us: Self::now_us(),
         }))
