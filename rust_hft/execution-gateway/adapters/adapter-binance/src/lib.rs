@@ -320,7 +320,7 @@ impl ExecutionClient for BinanceExecutionClient {
                                 ExecutionAlertType::CircuitOpen,
                                 "binance",
                                 "cancel_order",
-                                &format!("撤單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
+                                format!("撤單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
                             )
                             .with_error(e.to_string()),
                         );
@@ -378,7 +378,7 @@ impl ExecutionClient for BinanceExecutionClient {
                         ExecutionAlertType::RetriesExhausted,
                         "binance",
                         "modify_order",
-                        &format!("修改訂單時撤單失敗 (order_id={}): {}", order_id.0, e),
+                        format!("修改訂單時撤單失敗 (order_id={}): {}", order_id.0, e),
                     )
                     .with_error(e.to_string()),
                 );

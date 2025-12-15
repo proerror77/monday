@@ -146,7 +146,7 @@ impl MultiAccountPortfolio {
     pub fn get_or_create_account(&mut self, account_id: AccountId) -> &mut crate::Portfolio {
         self.accounts
             .entry(account_id)
-            .or_insert_with(crate::Portfolio::new)
+            .or_default()
     }
 
     /// 獲取帳戶（只讀）

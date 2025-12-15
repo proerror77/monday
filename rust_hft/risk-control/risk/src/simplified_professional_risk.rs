@@ -425,30 +425,30 @@ impl RiskManager for SimplifiedProfessionalRiskManager {
 
         metrics.insert(
             "orders_submitted".to_string(),
-            Decimal::from(self.stats.orders_submitted as u64),
+            Decimal::from(self.stats.orders_submitted),
         );
         metrics.insert(
             "orders_allowed".to_string(),
-            Decimal::from(self.stats.orders_allowed as u64),
+            Decimal::from(self.stats.orders_allowed),
         );
         metrics.insert(
             "orders_rejected".to_string(),
-            Decimal::from(self.stats.orders_rejected as u64),
+            Decimal::from(self.stats.orders_rejected),
         );
         metrics.insert(
             "orders_delayed".to_string(),
-            Decimal::from(self.stats.orders_delayed as u64),
+            Decimal::from(self.stats.orders_delayed),
         );
 
-        let total = Decimal::from(self.stats.orders_submitted as u64);
+        let total = Decimal::from(self.stats.orders_submitted);
         if total > Decimal::ZERO {
             metrics.insert(
                 "approval_rate".to_string(),
-                Decimal::from(self.stats.orders_allowed as u64) / total,
+                Decimal::from(self.stats.orders_allowed) / total,
             );
             metrics.insert(
                 "rejection_rate".to_string(),
-                Decimal::from(self.stats.orders_rejected as u64) / total,
+                Decimal::from(self.stats.orders_rejected) / total,
             );
         }
 
@@ -476,7 +476,7 @@ impl RiskManager for SimplifiedProfessionalRiskManager {
             var_1d: self.daily_pnl * Decimal::from_str_exact("0.05").unwrap(), // 簡化的 VaR 計算
             leverage: Decimal::ONE,                                            // 簡化
             concentration_risk: Decimal::ZERO,                                 // 簡化
-            order_rate: Decimal::from(self.stats.orders_submitted as u64) / Decimal::from(3600), // 每小時訂單數
+            order_rate: Decimal::from(self.stats.orders_submitted) / Decimal::from(3600), // 每小時訂單數
             last_update: now_micros(),
         }
     }

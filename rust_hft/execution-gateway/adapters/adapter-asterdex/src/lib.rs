@@ -81,11 +81,7 @@ impl AsterdexExecutionClient {
 
     /// 獲取 resilience 統計資訊
     pub fn resilience_stats(&self) -> Option<ExecutorStats> {
-        if let Some(ref executor) = self.resilient_executor {
-            Some(executor.stats())
-        } else {
-            None
-        }
+        self.resilient_executor.as_ref().map(|executor| executor.stats())
     }
 
     /// 獲取熔斷器狀態
@@ -326,7 +322,7 @@ impl ExecutionClient for AsterdexExecutionClient {
                                 ExecutionAlertType::CircuitOpen,
                                 "asterdex",
                                 "cancel_order",
-                                &format!("撤單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
+                                format!("撤單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
                             )
                             .with_error(e.to_string()),
                         );
@@ -377,7 +373,7 @@ impl ExecutionClient for AsterdexExecutionClient {
                         ExecutionAlertType::RetriesExhausted,
                         "asterdex",
                         "modify_order",
-                        &format!(
+                        format!(
                             "修改訂單時撤單失敗 (order_id={}): {}",
                             order_id.0, e
                         ),

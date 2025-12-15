@@ -301,7 +301,7 @@ impl ExecutionClient for BybitExecutionClient {
                                 ExecutionAlertType::CircuitOpen,
                                 "bybit",
                                 "cancel_order",
-                                &format!("撤單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
+                                format!("撤單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
                             )
                             .with_error(e.to_string()),
                         );
@@ -408,7 +408,7 @@ impl ExecutionClient for BybitExecutionClient {
                                 ExecutionAlertType::CircuitOpen,
                                 "bybit",
                                 "modify_order",
-                                &format!("改單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
+                                format!("改單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
                             )
                             .with_error(e.to_string()),
                         );

@@ -236,12 +236,11 @@ impl Sentinel {
         self.update_state(action);
 
         // 檢查恢復條件
-        if self.state == SentinelState::Degraded || self.state == SentinelState::Recovering {
-            if self.should_recover(stats) {
+        if (self.state == SentinelState::Degraded || self.state == SentinelState::Recovering)
+            && self.should_recover(stats) {
                 self.recover();
                 return SentinelAction::Continue;
             }
-        }
 
         action
     }

@@ -838,7 +838,7 @@ impl HyperliquidExecutionClient {
                             ExecutionAlertType::CircuitOpen,
                             "hyperliquid",
                             "cancel_order",
-                            &format!("撤单失败且熔断器已开启 (order_id={}): {}", order_id_str, e),
+                            format!("撤单失败且熔断器已开启 (order_id={}): {}", order_id_str, e),
                         )
                         .with_error(e.to_string()),
                     );
@@ -965,7 +965,7 @@ impl HyperliquidExecutionClient {
                             ExecutionAlertType::CircuitOpen,
                             "hyperliquid",
                             "modify_order",
-                            &format!("改单失败且熔断器已开启 (order_id={}): {}", order_id_str, e),
+                            format!("改单失败且熔断器已开启 (order_id={}): {}", order_id_str, e),
                         )
                         .with_error(e.to_string()),
                     );
@@ -1314,22 +1314,14 @@ impl HyperliquidExecutionClient {
     // 解析用户事件 (订单状态更新)
     #[allow(dead_code)]
     fn parse_user_events(&mut self, data: &Value) -> Option<ExecutionEvent> {
-        if let Ok(events) = parse_value::<Vec<UserEvent>>(data.clone()) {
-            for event in events {
-                match event {
-                    UserEvent::Order { order } => {
-                        return self.handle_order_update(order);
-                    }
-                    UserEvent::Fill { fill } => {
-                        return self.handle_fill_update(fill);
-                    }
-                    UserEvent::Liquidation { liq } => {
-                        return self.handle_liquidation_event(liq);
-                    }
-                }
-            }
+        let events = parse_value::<Vec<UserEvent>>(data.clone()).ok()?;
+        // 處理第一個事件 (後續事件在下次調用時處理)
+        let event = events.into_iter().next()?;
+        match event {
+            UserEvent::Order { order } => self.handle_order_update(order),
+            UserEvent::Fill { fill } => self.handle_fill_update(fill),
+            UserEvent::Liquidation { liq } => self.handle_liquidation_event(liq),
         }
-        None
     }
 
     // 解析用户成交事件
