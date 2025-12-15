@@ -102,6 +102,14 @@ pub struct AccountView {
     pub positions: std::collections::HashMap<Symbol, Position>,
     pub unrealized_pnl: rust_decimal::Decimal,
     pub realized_pnl: rust_decimal::Decimal,
+    /// 高水位標記 (總 PnL 歷史最高值)
+    pub high_water_mark: rust_decimal::Decimal,
+    /// 當前回撤百分比 ((high_water_mark - current_pnl) / high_water_mark * 100)
+    pub drawdown_pct: f64,
+    /// 歷史最大回撤百分比
+    pub max_drawdown_pct: f64,
+    /// 會話開始時間 (微秒時間戳)
+    pub session_start_us: u64,
 }
 
 impl Default for AccountView {
@@ -111,7 +119,18 @@ impl Default for AccountView {
             positions: std::collections::HashMap::new(),
             unrealized_pnl: rust_decimal::Decimal::ZERO,
             realized_pnl: rust_decimal::Decimal::ZERO,
+            high_water_mark: rust_decimal::Decimal::ZERO,
+            drawdown_pct: 0.0,
+            max_drawdown_pct: 0.0,
+            session_start_us: 0,
         }
+    }
+}
+
+impl AccountView {
+    /// 總 PnL (已實現 + 未實現)
+    pub fn total_pnl(&self) -> rust_decimal::Decimal {
+        self.realized_pnl + self.unrealized_pnl
     }
 }
 

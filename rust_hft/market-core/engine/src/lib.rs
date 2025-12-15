@@ -1345,26 +1345,38 @@ impl Engine {
     }
 
     /// 獲取系統統計用於 Sentinel（延遲 + PnL）
-    pub fn get_sentinel_stats(&self) -> (u64, u64, f64, f64) {
+    pub fn get_sentinel_stats(&self) -> SentinelStats {
         // 從延遲監控器獲取真實延遲
         let latency_stats = self.latency_monitor.get_stage_stats(hft_core::LatencyStage::EndToEnd);
         let (latency_p99_us, latency_p50_us) = latency_stats
             .map(|s| (s.p99_micros, s.p50_micros))
             .unwrap_or((0, 0));
 
-        // 從 Portfolio 獲取 PnL（如果有）
-        let (pnl, unrealized_pnl) = if let Some(pm) = &self.portfolio_manager {
-            let av = pm.reader().load();
-            let total_pnl = av.realized_pnl + av.unrealized_pnl;
-            (
-                total_pnl.to_string().parse::<f64>().unwrap_or(0.0),
-                av.unrealized_pnl.to_string().parse::<f64>().unwrap_or(0.0),
-            )
-        } else {
-            (0.0, 0.0)
-        };
+        // 從 Portfolio 獲取 PnL 和回撤（如果有）
+        let (pnl, unrealized_pnl, drawdown_pct, max_drawdown_pct, high_water_mark) =
+            if let Some(pm) = &self.portfolio_manager {
+                let av = pm.reader().load();
+                let total_pnl = av.total_pnl();
+                (
+                    total_pnl.to_string().parse::<f64>().unwrap_or(0.0),
+                    av.unrealized_pnl.to_string().parse::<f64>().unwrap_or(0.0),
+                    av.drawdown_pct,
+                    av.max_drawdown_pct,
+                    av.high_water_mark.to_string().parse::<f64>().unwrap_or(0.0),
+                )
+            } else {
+                (0.0, 0.0, 0.0, 0.0, 0.0)
+            };
 
-        (latency_p99_us, latency_p50_us, pnl, unrealized_pnl)
+        SentinelStats {
+            latency_p99_us,
+            latency_p50_us,
+            pnl,
+            unrealized_pnl,
+            drawdown_pct,
+            max_drawdown_pct,
+            high_water_mark,
+        }
     }
 
     /// 從市場事件中提取時間戳
@@ -1523,6 +1535,25 @@ pub struct EngineTickResult {
     pub snapshot_published: bool,
     pub snapshot_sequence: u64,
     pub orders_generated: u32,
+}
+
+/// Sentinel 監控所需的統計數據
+#[derive(Debug, Clone, Default)]
+pub struct SentinelStats {
+    /// 端到端延遲 p99 (微秒)
+    pub latency_p99_us: u64,
+    /// 端到端延遲 p50 (微秒)
+    pub latency_p50_us: u64,
+    /// 總 PnL (已實現 + 未實現)
+    pub pnl: f64,
+    /// 未實現 PnL
+    pub unrealized_pnl: f64,
+    /// 當前回撤百分比
+    pub drawdown_pct: f64,
+    /// 歷史最大回撤百分比
+    pub max_drawdown_pct: f64,
+    /// 高水位標記
+    pub high_water_mark: f64,
 }
 
 /// 引擎延遲統計信息

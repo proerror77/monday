@@ -76,8 +76,6 @@ async fn run_sentinel_loop(
     let mut sentinel = Sentinel::new(config);
     let mut interval = tokio::time::interval(Duration::from_millis(check_interval_ms));
 
-    // 追蹤 PnL 高水位
-    let mut high_water_mark: f64 = 0.0;
     let mut last_state = SentinelState::Normal;
 
     loop {
@@ -88,18 +86,8 @@ async fn run_sentinel_loop(
             let engine = engine_arc.lock().await;
             let engine_stats = engine.get_statistics();
 
-            // 從引擎獲取真實 PnL 和延遲統計
-            let (latency_p99_us, latency_p50_us, pnl, _unrealized_pnl) = engine.get_sentinel_stats();
-
-            if pnl > high_water_mark {
-                high_water_mark = pnl;
-            }
-
-            let drawdown_pct = if high_water_mark > 0.0 {
-                ((high_water_mark - pnl) / high_water_mark) * 100.0
-            } else {
-                0.0
-            };
+            // 從引擎獲取真實 PnL、延遲和回撤統計 (drawdown 現在由 Portfolio 計算)
+            let sentinel_stats = engine.get_sentinel_stats();
 
             // 估算活躍訂單數：提交 - 完成 - 取消 - 拒絕
             let active_orders = engine_stats.orders_submitted
@@ -108,11 +96,11 @@ async fn run_sentinel_loop(
                 .saturating_sub(engine_stats.orders_rejected);
 
             let stats = SystemStats {
-                latency_p99_us,
-                latency_p50_us,
-                drawdown_pct,
-                pnl,
-                high_water_mark,
+                latency_p99_us: sentinel_stats.latency_p99_us,
+                latency_p50_us: sentinel_stats.latency_p50_us,
+                drawdown_pct: sentinel_stats.drawdown_pct,
+                pnl: sentinel_stats.pnl,
+                high_water_mark: sentinel_stats.high_water_mark,
                 position_count: active_orders as i64,
                 notional_value: 0.0,
                 order_rate: 0.0,

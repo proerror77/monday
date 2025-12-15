@@ -153,7 +153,7 @@ impl HftControl for HftControlService {
     ) -> Result<Response<SystemStatus>, Status> {
         let engine = self.engine.lock().await;
         let stats = engine.get_statistics();
-        let (latency_p99, latency_p50, _, _) = engine.get_sentinel_stats();
+        let sentinel_stats = engine.get_sentinel_stats();
 
         let trading_mode = match engine.trading_mode() {
             engine::TradingMode::Normal => "Normal",
@@ -171,8 +171,8 @@ impl HftControl for HftControlService {
         Ok(Response::new(SystemStatus {
             is_running: stats.is_running,
             trading_mode: trading_mode.to_string(),
-            latency_p50_us: latency_p50 as i64,
-            latency_p99_us: latency_p99 as i64,
+            latency_p50_us: sentinel_stats.latency_p50_us as i64,
+            latency_p99_us: sentinel_stats.latency_p99_us as i64,
             latency_max_us: 0,
             orders_submitted: stats.orders_submitted as i64,
             orders_filled: stats.orders_filled as i64,

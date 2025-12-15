@@ -133,6 +133,37 @@ impl Portfolio {
         }
 
         self.view.unrealized_pnl = total_unrealized;
+
+        // 更新回撤統計
+        self.update_drawdown_stats();
+    }
+
+    /// 更新回撤統計 (高水位、當前回撤、最大回撤)
+    fn update_drawdown_stats(&mut self) {
+        let total_pnl = self.view.total_pnl();
+
+        // 更新高水位標記
+        if total_pnl > self.view.high_water_mark {
+            self.view.high_water_mark = total_pnl;
+        }
+
+        // 計算當前回撤百分比
+        if self.view.high_water_mark > Decimal::ZERO {
+            let drawdown = self.view.high_water_mark - total_pnl;
+            // 避免除以零，計算回撤百分比
+            let dd_pct = (drawdown / self.view.high_water_mark * Decimal::from(100))
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0);
+            self.view.drawdown_pct = dd_pct.max(0.0); // 確保非負
+
+            // 更新歷史最大回撤
+            if self.view.drawdown_pct > self.view.max_drawdown_pct {
+                self.view.max_drawdown_pct = self.view.drawdown_pct;
+            }
+        } else {
+            self.view.drawdown_pct = 0.0;
+        }
     }
 
     fn apply_fill(&mut self, symbol: &Symbol, side: Side, price: Price, qty: Quantity) {
