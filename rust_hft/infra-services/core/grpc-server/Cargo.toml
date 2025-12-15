@@ -10,13 +10,19 @@ tonic = "0.12"
 prost = "0.13"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 
 # Internal crates
 hft-core = { path = "../../../market-core/core" }
 engine = { path = "../../../market-core/engine", package = "hft-engine" }
 ports = { path = "../../../market-core/ports", package = "hft-ports" }
 risk = { path = "../../../risk-control/risk", package = "hft-risk" }
+model-manager = { path = "../model-manager", package = "hft-model-manager" }
+
+# Model loading
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+sha2 = "0.10"
+hex = "0.4"
 
 # Utilities
 tracing = "0.1"

@@ -2,10 +2,13 @@
 //!
 //! 提供遠程控制交易引擎的 gRPC 接口
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use engine::Engine;
+use model_manager::ModelManager;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
@@ -21,12 +24,27 @@ use proto::*;
 /// gRPC 控制服務實現
 pub struct HftControlService {
     engine: Arc<Mutex<Engine>>,
+    model_manager: Option<Arc<Mutex<ModelManager>>>,
 }
 
 impl HftControlService {
     /// 創建新的控制服務
     pub fn new(engine: Arc<Mutex<Engine>>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            model_manager: None,
+        }
+    }
+
+    /// 創建帶模型管理器的控制服務
+    pub fn with_model_manager(
+        engine: Arc<Mutex<Engine>>,
+        model_manager: Arc<Mutex<ModelManager>>,
+    ) -> Self {
+        Self {
+            engine,
+            model_manager: Some(model_manager),
+        }
     }
 
     /// 創建 gRPC 服務器
@@ -40,6 +58,96 @@ impl HftControlService {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as i64
+    }
+
+    /// 下載模型文件
+    async fn download_model(url: &str) -> Result<Vec<u8>, String> {
+        if url.starts_with("file://") {
+            // 本地文件
+            let path = url.strip_prefix("file://").unwrap_or(url);
+            tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("讀取本地文件失敗: {}", e))
+        } else if url.starts_with("http://") || url.starts_with("https://") {
+            // HTTP/HTTPS 下載
+            let response = reqwest::get(url)
+                .await
+                .map_err(|e| format!("下載失敗: {}", e))?;
+
+            if !response.status().is_success() {
+                return Err(format!("HTTP 錯誤: {}", response.status()));
+            }
+
+            response
+                .bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|e| format!("讀取響應失敗: {}", e))
+        } else {
+            Err(format!("不支持的 URL 協議: {}", url))
+        }
+    }
+
+    /// 驗證 SHA256
+    fn verify_sha256(data: &[u8], expected_hash: &str) -> bool {
+        if expected_hash.is_empty() {
+            // 如果沒有提供 hash，跳過驗證
+            return true;
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let result = hasher.finalize();
+        let computed_hash = hex::encode(result);
+
+        computed_hash.eq_ignore_ascii_case(expected_hash)
+    }
+
+    /// 部署模型到 models/current 目錄
+    async fn deploy_model(
+        model_manager: &ModelManager,
+        data: &[u8],
+        model_type: &str,
+        version: &str,
+    ) -> Result<PathBuf, String> {
+        // 確定文件擴展名
+        let extension = match model_type.to_lowercase().as_str() {
+            "onnx" => "onnx",
+            "pt" | "pytorch" => "pt",
+            _ => "pt", // 默認
+        };
+
+        // 生成文件名
+        let filename = format!("strategy_dl_{}.{}", version, extension);
+        let target_path = model_manager.current_dir().join(&filename);
+
+        // 歸檔舊模型
+        if let Err(e) = model_manager.archive_current().await {
+            warn!("歸檔舊模型失敗: {}", e);
+        }
+
+        // 清理 current 目錄中的舊模型文件
+        let current_dir = model_manager.current_dir();
+        if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    if ext == "pt" || ext == "onnx" {
+                        if let Err(e) = tokio::fs::remove_file(&path).await {
+                            warn!("刪除舊模型文件失敗: {:?} - {}", path, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 寫入新模型
+        tokio::fs::write(&target_path, data)
+            .await
+            .map_err(|e| format!("寫入模型文件失敗: {}", e))?;
+
+        info!("模型已部署到: {:?}", target_path);
+        Ok(target_path)
     }
 }
 
@@ -56,16 +164,91 @@ impl HftControl for HftControlService {
             req.url, req.version, req.model_type
         );
 
-        // TODO: 實現模型加載邏輯
-        // 1. 下載模型文件
-        // 2. 驗證 SHA256
-        // 3. 加載到推理引擎
+        // 檢查是否有 ModelManager
+        let model_manager = match &self.model_manager {
+            Some(mm) => mm,
+            None => {
+                return Ok(Response::new(Ack {
+                    ok: false,
+                    message: "未配置 ModelManager，無法加載模型".to_string(),
+                    timestamp_us: Self::now_us(),
+                }));
+            }
+        };
 
-        Ok(Response::new(Ack {
-            ok: true,
-            message: format!("模型 {} 加載成功", req.version),
-            timestamp_us: Self::now_us(),
-        }))
+        // 1. 下載模型文件
+        info!("開始下載模型: {}", req.url);
+        let data = match Self::download_model(&req.url).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("下載模型失敗: {}", e);
+                return Ok(Response::new(Ack {
+                    ok: false,
+                    message: format!("下載模型失敗: {}", e),
+                    timestamp_us: Self::now_us(),
+                }));
+            }
+        };
+        info!("模型下載完成，大小: {} bytes", data.len());
+
+        // 2. 驗證 SHA256
+        if !Self::verify_sha256(&data, &req.sha256) {
+            error!("SHA256 驗證失敗: expected={}", req.sha256);
+            return Ok(Response::new(Ack {
+                ok: false,
+                message: format!("SHA256 驗證失敗，模型文件可能損壞"),
+                timestamp_us: Self::now_us(),
+            }));
+        }
+        info!("SHA256 驗證通過");
+
+        // 3. 部署模型
+        let mm = model_manager.lock().await;
+        match Self::deploy_model(&mm, &data, &req.model_type, &req.version).await {
+            Ok(path) => {
+                info!("模型部署成功: {:?}", path);
+
+                // 4. 觸發熱加載
+                match mm.load_current().await {
+                    Ok(Some(handle)) => {
+                        info!(
+                            "模型熱加載成功: version={}, path={:?}",
+                            handle.version, handle.path
+                        );
+                        Ok(Response::new(Ack {
+                            ok: true,
+                            message: format!(
+                                "模型 {} 加載成功 ({} bytes)",
+                                req.version,
+                                data.len()
+                            ),
+                            timestamp_us: Self::now_us(),
+                        }))
+                    }
+                    Ok(None) => Ok(Response::new(Ack {
+                        ok: true,
+                        message: format!("模型 {} 已部署，等待熱加載", req.version),
+                        timestamp_us: Self::now_us(),
+                    })),
+                    Err(e) => {
+                        error!("模型熱加載失敗: {}", e);
+                        Ok(Response::new(Ack {
+                            ok: false,
+                            message: format!("模型已部署但熱加載失敗: {}", e),
+                            timestamp_us: Self::now_us(),
+                        }))
+                    }
+                }
+            }
+            Err(e) => {
+                error!("模型部署失敗: {}", e);
+                Ok(Response::new(Ack {
+                    ok: false,
+                    message: format!("模型部署失敗: {}", e),
+                    timestamp_us: Self::now_us(),
+                }))
+            }
+        }
     }
 
     /// 暫停交易
@@ -345,6 +528,24 @@ pub async fn start_grpc_server(
     Ok(())
 }
 
+/// 啟動帶模型管理器的 gRPC 服務器
+pub async fn start_grpc_server_with_model_manager(
+    engine: Arc<Mutex<Engine>>,
+    model_manager: Arc<Mutex<ModelManager>>,
+    addr: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    let service = HftControlService::with_model_manager(engine, model_manager);
+
+    info!("啟動 gRPC 控制服務 (帶模型管理): {}", addr);
+
+    tonic::transport::Server::builder()
+        .add_service(service.into_server())
+        .serve(addr)
+        .await?;
+
+    Ok(())
+}
+
 /// 在後台啟動 gRPC 服務器
 pub fn spawn_grpc_server(
     engine: Arc<Mutex<Engine>>,
@@ -359,6 +560,21 @@ pub fn spawn_grpc_server(
     })
 }
 
+/// 在後台啟動帶模型管理器的 gRPC 服務器
+pub fn spawn_grpc_server_with_model_manager(
+    engine: Arc<Mutex<Engine>>,
+    model_manager: Arc<Mutex<ModelManager>>,
+    port: u16,
+) -> tokio::task::JoinHandle<()> {
+    let addr = format!("0.0.0.0:{}", port).parse().unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = start_grpc_server_with_model_manager(engine, model_manager, addr).await {
+            error!("gRPC 服務器錯誤: {}", e);
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +583,51 @@ mod tests {
     fn test_now_us() {
         let ts = HftControlService::now_us();
         assert!(ts > 0);
+    }
+
+    #[test]
+    fn test_verify_sha256_valid() {
+        let data = b"hello world";
+        // SHA256 of "hello world"
+        let expected_hash = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+        assert!(HftControlService::verify_sha256(data, expected_hash));
+    }
+
+    #[test]
+    fn test_verify_sha256_invalid() {
+        let data = b"hello world";
+        let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        assert!(!HftControlService::verify_sha256(data, wrong_hash));
+    }
+
+    #[test]
+    fn test_verify_sha256_empty_hash_skips() {
+        let data = b"any data";
+        // Empty hash should skip verification
+        assert!(HftControlService::verify_sha256(data, ""));
+    }
+
+    #[test]
+    fn test_verify_sha256_case_insensitive() {
+        let data = b"hello world";
+        let upper_hash = "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
+
+        assert!(HftControlService::verify_sha256(data, upper_hash));
+    }
+
+    #[tokio::test]
+    async fn test_download_model_invalid_protocol() {
+        let result = HftControlService::download_model("ftp://example.com/model.pt").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("不支持的 URL 協議"));
+    }
+
+    #[tokio::test]
+    async fn test_download_model_local_file_not_found() {
+        let result = HftControlService::download_model("file:///nonexistent/model.pt").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("讀取本地文件失敗"));
     }
 }
