@@ -314,7 +314,6 @@ impl SystemBuilder {
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) fn register_simulated_execution_client(mut self, venue: VenueId) -> Self {
         let client = simulated_execution::SimulatedExecutionClient::new(venue);
         self = self.register_execution_client_with_venue(client, venue);
@@ -1124,109 +1123,10 @@ impl SystemRuntime {
         Ok(())
     }
 
-    /// 獲取市場視圖快照（已遷移至 runtime_management）
-    #[allow(dead_code)]
-    pub async fn get_market_view_legacy(&self) -> Arc<engine::aggregation::MarketView> {
-        self.engine.lock().await.get_market_view()
-    }
-
-    /// 獲取賬戶視圖快照（已遷移至 runtime_management）
-    #[allow(dead_code)]
-    pub async fn get_account_view_legacy(&self) -> Arc<ports::AccountView> {
-        self.engine.lock().await.get_account_view()
-    }
-
     pub fn portfolio_manager(&self) -> Option<&PortfolioManager> {
         self.portfolio_manager.as_ref()
     }
-
-    /// 取消指定策略的所有未結訂單（非阻塞）：
-    /// 返回已下發取消請求的訂單數量
-    #[allow(dead_code)]
-    pub async fn cancel_orders_for_strategy_legacy(&self, strategy_id: &str) -> usize {
-        // 收集該策略未結訂單 (order_id, symbol)
-        let pairs = {
-            let eng = self.engine.lock().await;
-            eng.open_order_pairs_by_strategy(strategy_id)
-        };
-        if pairs.is_empty() {
-            return 0;
-        }
-        // 發送取消請求到所有執行 worker
-        for tx in &self.exec_control_txs {
-            let _ = tx.send(engine::execution_worker::ControlCommand::CancelOrders(
-                pairs.clone(),
-            ));
-        }
-        pairs.len()
-    }
-
-    /// 熱更新風控配置：替換風控管理器並應用新的策略覆蓋
-    #[allow(dead_code)]
-    pub async fn update_risk_config_legacy(
-        &mut self,
-        new_risk: RiskConfig,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        tracing::info!(
-            "更新風控配置: 風控類型={}, 覆蓋策略數={}",
-            new_risk.risk_type,
-            new_risk.strategy_overrides.len()
-        );
-        // 更新運行時配置
-        self.config.risk = new_risk;
-
-        // 重新創建風控管理器（帶策略覆蓋）
-        let new_manager =
-            crate::RiskManagerFactory::create_strategy_aware_risk_manager(&self.config.risk);
-
-        // 註冊到引擎（覆蓋舊的風控管理器）
-        let mut eng = self.engine.lock().await;
-        eng.register_risk_manager_boxed(new_manager);
-
-        tracing::info!("風控配置已更新並生效");
-        Ok(())
-    }
-
-    /// 測試：通过执行队列发送订单意图 (异步处理)
-    #[allow(dead_code)]
-    pub async fn place_test_order_legacy(
-        &self,
-        symbol: &str,
-    ) -> Result<hft_core::OrderId, Box<dyn std::error::Error>> {
-        use hft_core::{OrderType, Quantity, Side, Symbol, TimeInForce};
-        let intent = ports::OrderIntent {
-            symbol: Symbol::new(symbol),
-            side: Side::Buy,
-            quantity: Quantity::from_f64(0.001)?,
-            order_type: OrderType::Market,
-            price: None,
-            time_in_force: TimeInForce::GTC,
-            strategy_id: "test_order".to_string(),
-            target_venue: None,
-        };
-
-        // 提交訂單意圖到執行隊列
-        {
-            let mut engine_lock = self.engine.lock().await;
-            engine_lock.submit_order_intent(intent)?;
-        }
-
-        // 生成測試用的 OrderId，實際執行結果通過 ExecutionEvent 異步回報
-        let test_order_id = hft_core::OrderId(format!(
-            "test_{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-        ));
-        info!(
-            "測試訂單已成功提交到執行隊列: {} {}",
-            symbol, test_order_id.0
-        );
-        Ok(test_order_id)
-    }
-
-    // legacy Redis exporter 已移除（請使用 infra_exporters 版本）
-
-    // legacy ClickHouse exporter 已移除（請使用 infra_exporters 版本）
-    // clone_for_ipc 已移至 runtime_management 模組
+    // Legacy 方法已移至 runtime_management 模組
 }
 
 #[cfg(feature = "adapter-binance-data")]

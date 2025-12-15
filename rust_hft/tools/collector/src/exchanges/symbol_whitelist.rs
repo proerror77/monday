@@ -4,6 +4,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 
+// NOTE: These items are used by feature-gated functions (e.g., binance_spot_pairs, bitget_spot_pairs)
+// When specific collector-* features are disabled, the compiler may flag them as dead code.
 #[allow(dead_code)]
 const DEFAULT_WHITELIST_PATH: &str = "config/symbol_whitelist.json";
 
@@ -139,7 +141,7 @@ pub fn binance_futures_pairs() -> Vec<String> {
 }
 
 #[cfg(feature = "collector-bitget")]
-#[allow(dead_code)]
+#[allow(dead_code)] // Used when collector-bitget feature is enabled
 pub fn bitget_spot_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()
@@ -148,7 +150,7 @@ pub fn bitget_spot_pairs() -> Vec<String> {
 }
 
 #[cfg(feature = "collector-bitget")]
-#[allow(dead_code)]
+#[allow(dead_code)] // Used when collector-bitget feature is enabled
 pub fn bitget_futures_pairs() -> Vec<String> {
     base_tokens()
         .into_iter()

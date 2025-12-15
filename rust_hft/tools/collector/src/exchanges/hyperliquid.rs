@@ -31,7 +31,6 @@ struct OrderBookState {
 }
 
 pub struct HyperliquidExchange {
-    #[allow(dead_code)]
     ctx: Arc<ExchangeContext>,
     ob: RwLock<HashMap<String, OrderBookState>>, // 內存訂單簿狀態（保證 L1 穩定）
 }

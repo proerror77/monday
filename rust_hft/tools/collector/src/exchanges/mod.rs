@@ -88,7 +88,7 @@ pub struct ExchangeContext {
         allow(dead_code)
     )]
     pub depth_levels: usize,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used by feature-gated exchange implementations
     symbols_override: Option<Arc<Vec<String>>>,
     stream_profile: Option<StreamProfile>,
 }
@@ -107,7 +107,7 @@ impl ExchangeContext {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used by feature-gated exchange implementations
     pub fn symbols_override(&self) -> Option<Arc<Vec<String>>> {
         self.symbols_override.as_ref().map(Arc::clone)
     }
