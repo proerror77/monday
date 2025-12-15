@@ -1,3 +1,4 @@
+use hft_core::HftError;
 use thiserror::Error;
 
 pub type AdapterResult<T> = Result<T, AdapterError>;
@@ -24,5 +25,16 @@ impl From<serde_json::Error> for AdapterError {
 impl From<simd_json::Error> for AdapterError {
     fn from(e: simd_json::Error) -> Self {
         AdapterError::Serde(e.to_string())
+    }
+}
+
+impl From<AdapterError> for HftError {
+    fn from(e: AdapterError) -> Self {
+        match e {
+            AdapterError::Parse(msg) => HftError::Parse(msg),
+            AdapterError::Serde(msg) => HftError::Serialization(msg),
+            AdapterError::Io(msg) => HftError::Io { message: msg },
+            AdapterError::Other(msg) => HftError::Generic { message: msg },
+        }
     }
 }

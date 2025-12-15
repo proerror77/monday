@@ -42,9 +42,10 @@ struct BybitWsMsg {
     data: Option<serde_json::Value>,
 }
 
+/// 使用共用的 JSON 解析函數
 #[inline]
-fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
-    serde_json::from_str(text)
+fn parse_json<T: DeserializeOwned>(text: &str) -> hft_core::HftResult<T> {
+    adapters_common::parse_json(text).map_err(Into::into)
 }
 
 #[derive(Default)]

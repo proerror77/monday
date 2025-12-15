@@ -21,17 +21,10 @@ use ports::{
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-/// 統一的 JSON 解析函數，支援 simd-json feature gate
+/// 使用共用的 JSON 解析函數
 #[inline]
-fn parse_json(bytes: &mut [u8]) -> Result<serde_json::Value, HftError> {
-    #[cfg(feature = "json-simd")]
-    {
-        simd_json::serde::from_slice(bytes).map_err(|e| HftError::Serialization(e.to_string()))
-    }
-    #[cfg(not(feature = "json-simd"))]
-    {
-        serde_json::from_slice(bytes).map_err(|e| HftError::Serialization(e.to_string()))
-    }
+fn parse_bytes(bytes: &mut [u8]) -> Result<serde_json::Value, HftError> {
+    adapters_common::parse_bytes(bytes).map_err(Into::into)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,7 +74,7 @@ async fn fetch_instruments_spec() -> std::collections::HashMap<String, Instrumen
         Err(_) => return map,
     };
     let mut bytes = text.into_bytes();
-    let v: serde_json::Value = match parse_json(bytes.as_mut_slice()) {
+    let v: serde_json::Value = match parse_bytes(bytes.as_mut_slice()) {
         Ok(x) => x,
         Err(_) => return map,
     };
@@ -343,7 +336,7 @@ impl MarketStream for GrvtMarketStream {
                 match msg {
                     Ok(Message::Text(txt)) => {
                         let mut bytes = txt.into_bytes();
-                        let v: serde_json::Value = match parse_json(bytes.as_mut_slice()) {
+                        let v: serde_json::Value = match parse_bytes(bytes.as_mut_slice()) {
                             Ok(x) => x,
                             Err(e) => {
                                 let _ = tx.send(Err(e));

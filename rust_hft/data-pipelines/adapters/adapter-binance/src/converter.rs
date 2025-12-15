@@ -1,6 +1,6 @@
 //! Binance 消息格式轉換器
 //!
-//! 使用統一的 feature-gated JSON 解析接口（integration::json）
+//! 使用統一的 feature-gated JSON 解析接口（adapters_common）
 //! - 默認使用 serde_json（穩定、成熟）
 //! - 啟用 json-simd feature 時使用 simd-json（2-4x 性能提升）
 
@@ -17,48 +17,16 @@ use tracing::{debug, warn};
 pub struct MessageConverter;
 
 impl MessageConverter {
-    /// 使用統一的 feature-gated JSON 解析
-    ///
-    /// 根據 json-simd feature 自動切換解析器：
-    /// - 默認: serde_json::from_str (穩定)
-    /// - json-simd: simd_json::from_slice (2-4x 更快)
-    ///
-    /// 注意：直接解析為目標類型，跳過中間 Value 步驟以提升性能
+    /// 使用共用的 feature-gated JSON 解析
     #[inline]
     fn parse_json<T: DeserializeOwned>(text: &str) -> HftResult<T> {
-        #[cfg(feature = "json-simd")]
-        {
-            // simd_json 需要可變緩衝區
-            let mut bytes = text.as_bytes().to_vec();
-            simd_json::from_slice(&mut bytes)
-                .map_err(|e| HftError::Parse(format!("SIMD 解析失敗: {}", e)))
-        }
-        #[cfg(not(feature = "json-simd"))]
-        {
-            serde_json::from_str(text).map_err(|e| HftError::Parse(format!("JSON 解析失敗: {}", e)))
-        }
+        adapters_common::parse_json(text).map_err(Into::into)
     }
 
     /// 從 Value 反序列化為目標類型
-    ///
-    /// 用於 StreamMessage 流程中已經有 Value 的情況
     #[inline]
     fn parse_value<T: DeserializeOwned>(value: Value) -> HftResult<T> {
-        #[cfg(feature = "json-simd")]
-        {
-            // simd_json 沒有提供從 OwnedValue 直接反序列化的公開 API
-            // 需要先序列化回 JSON，然後重新解析（性能較差，但功能正確）
-            let json_str = simd_json::to_string(&value)
-                .map_err(|e| HftError::Parse(format!("SIMD 序列化失敗: {}", e)))?;
-            let mut bytes = json_str.as_bytes().to_vec();
-            simd_json::from_slice(&mut bytes)
-                .map_err(|e| HftError::Parse(format!("SIMD 反序列化失敗: {}", e)))
-        }
-        #[cfg(not(feature = "json-simd"))]
-        {
-            serde_json::from_value(value)
-                .map_err(|e| HftError::Parse(format!("JSON 反序列化失敗: {}", e)))
-        }
+        adapters_common::parse_owned_value(value).map_err(Into::into)
     }
 
     /// 轉換深度快照

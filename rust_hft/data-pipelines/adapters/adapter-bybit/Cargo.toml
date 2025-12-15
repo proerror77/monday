@@ -11,6 +11,7 @@ name = "adapter_bybit_data"
 hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
 integration = { package = "hft-integration", path = "../../../market-core/integration" }
+adapters-common = { package = "hft-data-adapters-common", path = "../../adapters-common" }
 
 # Async and networking
 tokio = { workspace = true, features = ["full"] }

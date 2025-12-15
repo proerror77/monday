@@ -27,49 +27,31 @@ pub struct BitgetWsMessage {
     pub msg: Option<String>,
 }
 
-#[cfg(feature = "json-simd")]
-type JsonError = simd_json::Error;
-#[cfg(not(feature = "json-simd"))]
-type JsonError = serde_json::Error;
-
+/// 使用共用的 JSON 解析函數
 #[inline]
-#[cfg(feature = "json-simd")]
-fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, JsonError> {
-    let mut bytes = text.as_bytes().to_vec();
-    simd_json::serde::from_slice(bytes.as_mut_slice())
+fn parse_json<T: DeserializeOwned>(text: &str) -> HftResult<T> {
+    adapters_common::parse_json(text).map_err(Into::into)
 }
 
+/// 使用共用的 Value 解析函數
 #[inline]
-#[cfg(not(feature = "json-simd"))]
-fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, JsonError> {
-    serde_json::from_str(text)
+fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> HftResult<T> {
+    adapters_common::parse_owned_value(value).map_err(Into::into)
 }
 
+/// JSON 序列化函數
 #[inline]
-#[cfg(feature = "json-simd")]
-fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, JsonError> {
-    let owned: simd_json::OwnedValue = value
-        .try_into()
-        .map_err(|e| simd_json::Error::generic(simd_json::ErrorType::Serde(format!("{:?}", e))))?;
-    simd_json::serde::from_owned_value(owned)
-}
-
-#[inline]
-#[cfg(not(feature = "json-simd"))]
-fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, JsonError> {
-    serde_json::from_value(value)
-}
-
-#[inline]
-#[cfg(feature = "json-simd")]
-fn to_json_string<T: Serialize>(value: &T) -> Result<String, JsonError> {
-    simd_json::serde::to_string(value)
-}
-
-#[inline]
-#[cfg(not(feature = "json-simd"))]
-fn to_json_string<T: Serialize>(value: &T) -> Result<String, JsonError> {
-    serde_json::to_string(value)
+fn to_json_string<T: Serialize>(value: &T) -> HftResult<String> {
+    #[cfg(feature = "json-simd")]
+    {
+        simd_json::serde::to_string(value)
+            .map_err(|e| HftError::Serialization(e.to_string()))
+    }
+    #[cfg(not(feature = "json-simd"))]
+    {
+        serde_json::to_string(value)
+            .map_err(|e| HftError::Serialization(e.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

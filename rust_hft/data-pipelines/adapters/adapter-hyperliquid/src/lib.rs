@@ -68,17 +68,10 @@ struct SubscriptionResponse {
     data: Value,
 }
 
-#[cfg(feature = "json-simd")]
+/// 使用共用的 JSON 解析函數
 #[inline]
-fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, simd_json::Error> {
-    let mut bytes = text.as_bytes().to_vec();
-    simd_json::serde::from_slice(bytes.as_mut_slice())
-}
-
-#[cfg(not(feature = "json-simd"))]
-#[inline]
-fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
-    serde_json::from_str(text)
+fn parse_json<T: DeserializeOwned>(text: &str) -> HftResult<T> {
+    adapters_common::parse_json(text).map_err(Into::into)
 }
 
 // Hyperliquid L2 订单簿数据结构

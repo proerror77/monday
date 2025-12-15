@@ -101,20 +101,10 @@ impl BinanceRestClient {
         }
     }
 
-    /// 使用 SIMD-optimized JSON 解析（如果啟用 json-simd feature）
+    /// 使用共用的 feature-gated JSON 解析
     #[inline]
     fn parse_json<T: DeserializeOwned>(text: &str) -> HftResult<T> {
-        #[cfg(feature = "json-simd")]
-        {
-            // SIMD 優化：需要 &mut [u8]
-            let mut bytes = text.as_bytes().to_vec();
-            simd_json::serde::from_slice(&mut bytes)
-                .map_err(|e| HftError::Parse(format!("SIMD JSON 解析失敗: {}", e)))
-        }
-        #[cfg(not(feature = "json-simd"))]
-        {
-            serde_json::from_str(text).map_err(|e| HftError::Parse(format!("JSON 解析失敗: {}", e)))
-        }
+        adapters_common::parse_json(text).map_err(Into::into)
     }
 }
 

@@ -11,19 +11,10 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
-/// 統一的 JSON 解析函數，支援 simd-json feature gate
+/// 使用共用的 JSON 解析函數
 #[inline]
-fn parse_json(bytes: &mut [u8]) -> Result<serde_json::Value, HftError> {
-    #[cfg(feature = "json-simd")]
-    {
-        simd_json::serde::from_slice(bytes)
-            .map_err(|e| HftError::Serialization(e.to_string()))
-    }
-    #[cfg(not(feature = "json-simd"))]
-    {
-        serde_json::from_slice(bytes)
-            .map_err(|e| HftError::Serialization(e.to_string()))
-    }
+fn parse_bytes(bytes: &mut [u8]) -> Result<serde_json::Value, HftError> {
+    adapters_common::parse_bytes(bytes).map_err(Into::into)
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +44,7 @@ async fn fetch_order_books_meta(rest_base: &str) -> HftResult<Vec<MarketMeta>> {
         )));
     }
     let mut bytes = text.into_bytes();
-    let v: serde_json::Value = parse_json(bytes.as_mut_slice())?;
+    let v: serde_json::Value = parse_bytes(bytes.as_mut_slice())?;
     let mut out = Vec::new();
     if let Some(books) = v.get("order_books").and_then(|x| x.as_array()) {
         for it in books {
@@ -161,7 +152,7 @@ impl MarketStream for LighterMarketStream {
                 match msg {
                     Ok(Message::Text(text)) => {
                         let mut bytes = text.into_bytes();
-                        let parsed: serde_json::Value = match parse_json(bytes.as_mut_slice()) {
+                        let parsed: serde_json::Value = match parse_bytes(bytes.as_mut_slice()) {
                             Ok(v) => v,
                             Err(e) => {
                                 let _ = tx.send(Err(e));

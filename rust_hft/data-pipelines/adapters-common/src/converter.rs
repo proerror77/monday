@@ -1,6 +1,21 @@
 use crate::{AdapterError, AdapterResult};
 use hft_core::{Price, Quantity};
 
+/// Parse JSON from mutable bytes slice using either simd-json (if enabled) or serde_json.
+/// This is useful for WebSocket message handlers that receive bytes directly.
+pub fn parse_bytes<T: serde::de::DeserializeOwned>(bytes: &mut [u8]) -> AdapterResult<T> {
+    #[cfg(feature = "json-simd")]
+    {
+        let val: T = simd_json::serde::from_slice(bytes)?;
+        Ok(val)
+    }
+    #[cfg(not(feature = "json-simd"))]
+    {
+        let val: T = serde_json::from_slice(bytes)?;
+        Ok(val)
+    }
+}
+
 /// Parse JSON text into a type using either simd-json (if enabled) or serde_json.
 pub fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> AdapterResult<T> {
     #[cfg(feature = "json-simd")]

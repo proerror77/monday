@@ -10,6 +10,6 @@ pub mod rest_helpers;
 pub mod subscriptions;
 pub mod ws_helpers;
 
-pub use converter::{parse_json, parse_owned_value, parse_price, parse_quantity};
+pub use converter::{parse_bytes, parse_json, parse_owned_value, parse_price, parse_quantity};
 pub use errors::{AdapterError, AdapterResult};
 pub use subscriptions::{Subscription, SubscriptionBuilder, SubscriptionKind};

@@ -199,19 +199,10 @@ impl MessageConverter {
         Ok(None)
     }
 
-    /// 統一的 JSON 解析函數，支援 simd-json feature gate
+    /// 使用共用的 JSON 解析函數
     #[inline]
-    fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
-        #[cfg(feature = "json-simd")]
-        {
-            let mut bytes = text.as_bytes().to_vec();
-            simd_json::serde::from_slice(bytes.as_mut_slice())
-                .map_err(|e| serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))
-        }
-        #[cfg(not(feature = "json-simd"))]
-        {
-            serde_json::from_str(text)
-        }
+    fn parse_json<T: DeserializeOwned>(text: &str) -> HftResult<T> {
+        adapters_common::parse_json(text).map_err(Into::into)
     }
 }
 

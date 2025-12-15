@@ -7,6 +7,7 @@ edition = "2021"
 hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
 integration = { package = "hft-integration", path = "../../../market-core/integration" }
+adapters-common = { package = "hft-data-adapters-common", path = "../../adapters-common" }
 async-trait = "0.1"
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tracing = { workspace = true }
