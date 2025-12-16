@@ -1,0 +1,69 @@
+# HFT Ops Agent Configuration
+# ============================
+# This file configures the LLM-powered autonomous operations agent.
+
+[anthropic]
+# API key can also be set via ANTHROPIC_API_KEY environment variable
+# api_key = "sk-ant-..."
+model = "claude-sonnet-4-20250514"
+max_tokens = 4096
+temperature = 0.0
+api_url = "https://api.anthropic.com"
+
+[grpc]
+# gRPC server address for HFT Control Service
+address = "http://127.0.0.1:50051"
+connect_timeout_secs = 5
+request_timeout_secs = 30
+
+[agent]
+# Monitoring interval in seconds
+monitor_interval_secs = 60
+
+# Enable automatic anomaly handling
+auto_handle_anomalies = true
+
+# Dry run mode - log actions without executing
+dry_run = false
+
+# Maximum consecutive errors before alerting
+max_consecutive_errors = 3
+
+[agent.thresholds]
+# Latency p99 threshold in microseconds (25ms default)
+latency_p99_us = 25000
+
+# Drawdown warning threshold percentage
+drawdown_warn_pct = 3.0
+
+# Drawdown critical threshold percentage (triggers degrade mode)
+drawdown_critical_pct = 5.0
+
+# Maximum WebSocket reconnects before alerting
+max_ws_reconnects = 5
+
+# Order rejection rate threshold (percentage)
+order_rejection_rate_pct = 10.0
+
+[alerts]
+# Enable alerting
+enabled = true
+
+# Webhook URL for alerts (Slack, Discord, etc.)
+# webhook_url = "https://hooks.slack.com/services/..."
+
+# Email for critical alerts
+# email = "ops@example.com"
+
+# Minimum interval between alerts of same type (seconds)
+cooldown_secs = 300
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log file path (optional, stdout if not set)
+# file = "/var/log/hft-agent.log"
+
+# Enable JSON logging format
+json = false

@@ -1,0 +1,42 @@
+[package]
+name = "hft-agent"
+version = "0.1.0"
+edition = "2021"
+description = "HFT Ops Agent - LLM-powered autonomous trading system operations"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+
+# gRPC client
+tonic = "0.12"
+prost = "0.13"
+
+# HTTP client for Anthropic API
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Utilities
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async trait
+async-trait = "0.1"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[[bin]]
+name = "hft-agent"
+path = "src/main.rs"

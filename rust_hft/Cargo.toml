@@ -89,6 +89,7 @@ members = [
     "tools/infer-cli",
     "tools/hyperliquid-demo",
     "tools/ws_test",
+    "tools/hft-agent",
 
     # Examples
     "examples"

@@ -1,7 +1,7 @@
 # HFT 系統狀態與設計總覽 (CLAUDE.md)
 
-**版本**: 6.0 (2025-12-15)
-**狀態**: 🟢 **Rust-Centric 閉環架構完成，端到端測試通過**
+**版本**: 7.0 (2025-12-16)
+**狀態**: 🟢 **Rust-Centric 閉環架構完成，LLM Ops Agent 已整合**
 
 ---
 
@@ -15,12 +15,14 @@
 - ✅ 新增 `ModelManager` (Rust 模型熱加載)
 - ✅ 新增真實延遲統計 (p50/p95/p99)
 - ✅ 新增 PnL/DD 回撤追蹤整合 Sentinel
+- ✅ 新增 `HFT Ops Agent` (LLM 驅動的自動化運維代理)
 
 **新架構優勢**:
 - **微秒級響應**: Sentinel 完全在 Rust 內執行，無 Python/gRPC 延遲
 - **文件系統通訊**: 模型通過文件系統熱加載，取代複雜的 Redis Pub/Sub
 - **簡化部署**: 單一 Rust 二進制 + 定時訓練任務
 - **完整可觀測性**: 延遲分階段統計、回撤追蹤、uptime 監控
+- **智能運維**: LLM Agent 自動監控、異常處理、策略管理
 
 ---
 
@@ -82,6 +84,7 @@
 | **Live App 整合** | `apps/live/src/helpers/` | ✅ 完成 | Sentinel + ModelManager 已整合 |
 | **延遲統計** | `market-core/engine/src/lib.rs` | ✅ 完成 | EngineLatencyStats (p50/p95/p99) |
 | **回撤追蹤** | `risk-control/portfolio-core/src/lib.rs` | ✅ 完成 | AccountView 整合 high_water_mark/drawdown |
+| **HFT Ops Agent** | `tools/hft-agent/` | ✅ 完成 | LLM 驅動的自動化運維代理 (Claude API) |
 | **ml_trainer** | `ml_trainer/` | ✅ 完成 | 精簡訓練腳本，支持 ClickHouse 和合成數據 |
 | **Docker 部署** | `deploy/docker-compose.yml` | ✅ 完成 | ClickHouse + 可選 Redis |
 
@@ -133,6 +136,42 @@ pub struct AccountView {
     pub session_start_us: u64,         // 新增
 }
 ```
+
+### 4.4. HFT Ops Agent (LLM 驅動的運維代理)
+
+```rust
+pub struct HftOpsAgent {
+    config: AgentConfig,              // 配置
+    http_client: Client,              // Anthropic API 客戶端
+    grpc_client: Arc<Mutex<HftClient>>, // gRPC 控制客戶端
+    tools: Vec<Tool>,                 // 可用工具列表
+    system_prompt: String,            // 系統提示詞
+}
+```
+
+**可用工具 (Tools)**:
+| 工具 | 說明 |
+|------|------|
+| `get_system_status` | 獲取系統狀態 (延遲、訂單、連接) |
+| `get_portfolio_status` | 獲取組合狀態 (PnL、DD、持倉) |
+| `health_check` | 組件健康檢查 |
+| `pause_trading` | 暫停交易 |
+| `resume_trading` | 恢復交易 |
+| `enter_degrade_mode` | 進入降頻模式 |
+| `emergency_stop` | 緊急停止 + 可選平倉 |
+| `cancel_all_orders` | 取消所有訂單 |
+| `update_risk_config` | 更新風控參數 |
+| `load_model` | 加載新 ML 模型 |
+| `send_alert` | 發送告警通知 |
+| `log_decision` | 記錄決策日誌 |
+
+**決策規則**:
+- 延遲 p99 > 25ms → 進入 DEGRADE 模式
+- 延遲 p99 > 50ms → PAUSE 交易
+- 回撤 > 3% → 發送 WARNING 告警
+- 回撤 > 5% → 進入 DEGRADE 模式
+- 回撤 > 7% → EMERGENCY STOP + 平倉
+- WebSocket 重連 > 5 次 → 發送告警
 
 ---
 
@@ -234,8 +273,17 @@ monday/
 │   ├── risk-control/
 │   │   ├── risk/src/sentinel.rs       # Sentinel 核心邏輯
 │   │   └── portfolio-core/src/lib.rs  # 回撤追蹤
-│   └── infra-services/core/
-│       └── model-manager/             # 模型熱加載管理
+│   ├── infra-services/core/
+│   │   └── model-manager/             # 模型熱加載管理
+│   └── tools/hft-agent/               # LLM Ops Agent
+│       ├── src/
+│       │   ├── main.rs                # 入口點
+│       │   ├── lib.rs                 # 庫導出
+│       │   ├── agent.rs               # Agent 核心邏輯
+│       │   ├── config.rs              # 配置管理
+│       │   ├── grpc_client.rs         # gRPC 客戶端
+│       │   └── tools/mod.rs           # Tool 定義
+│       └── Cargo.toml
 │
 ├── ml_trainer/                        # Python 訓練腳本
 │   ├── train.py                       # 主訓練腳本
@@ -290,6 +338,50 @@ ls models/archive/
 cp models/archive/strategy_dl_20251213_100000.pt models/current/strategy_dl.pt
 ```
 
+### 8.4. HFT Ops Agent
+
+```bash
+# 設置 API Key
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# 啟動 Agent (需要先啟動 hft-live)
+cargo run -p hft-agent -- --config config/agent.toml
+
+# 測試模式 (不執行實際操作)
+cargo run -p hft-agent -- --dry-run
+
+# 單次監控 (執行一輪後退出)
+cargo run -p hft-agent -- --once
+
+# 自定義監控間隔
+cargo run -p hft-agent -- --interval 30
+```
+
+**配置文件**: `config/agent.toml`
+
+```toml
+[anthropic]
+model = "claude-sonnet-4-20250514"
+max_tokens = 4096
+
+[grpc]
+address = "http://127.0.0.1:50051"
+
+[agent]
+monitor_interval_secs = 60
+auto_handle_anomalies = true
+dry_run = false
+
+[agent.thresholds]
+latency_p99_us = 25000
+drawdown_warn_pct = 3.0
+drawdown_critical_pct = 5.0
+
+[alerts]
+enabled = true
+# webhook_url = "https://hooks.slack.com/..."
+```
+
 ---
 
 ## 9. 測試狀態
@@ -298,6 +390,7 @@ cp models/archive/strategy_dl_20251213_100000.pt models/current/strategy_dl.pt
 |------|------|------|
 | Sentinel 單元測試 | ✅ 5/5 通過 | `cargo test -p hft-risk sentinel` |
 | ModelManager 單元測試 | ✅ 3/3 通過 | `cargo test -p hft-model-manager` |
+| HFT Ops Agent 測試 | ✅ 7/7 通過 | `cargo test -p hft-agent` |
 | ml_trainer dry-run | ✅ 通過 | 使用合成數據測試 |
 | E2E 測試 | ✅ 通過 | 訓練→部署→驗證完整流程 |
 | Release Build | ✅ 通過 | `cargo build -p hft-live --release` |
