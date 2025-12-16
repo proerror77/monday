@@ -9,7 +9,7 @@ hft-core = { package = "hft-core", path = "../../../market-core/core" }
 ports = { package = "hft-ports", path = "../../../market-core/ports" }
 async-trait = "0.1"
 futures = { workspace = true }
-tokio = { workspace = true, features = ["time", "macros"] }
+tokio = { workspace = true, features = ["time", "macros", "rt"] }
 tokio-stream = "0.1"
 serde = { workspace = true }
 tracing = { workspace = true }

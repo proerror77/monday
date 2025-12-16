@@ -106,3 +106,222 @@ fn current_ts() -> Timestamp {
         .unwrap_or_default()
         .as_micros() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[test]
+    fn test_mock_market_stream_default() {
+        let stream = MockMarketStream::default();
+        assert_eq!(stream.interval_ms, 200);
+    }
+
+    #[test]
+    fn test_mock_market_stream_new() {
+        let stream = MockMarketStream::new();
+        assert_eq!(stream.interval_ms, 200);
+    }
+
+    #[test]
+    fn test_mock_market_stream_with_interval() {
+        let stream = MockMarketStream::with_interval_ms(100);
+        assert_eq!(stream.interval_ms, 100);
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let stream = MockMarketStream::new();
+        let health = stream.health().await;
+
+        assert!(health.connected);
+        assert_eq!(health.latency_ms, Some(0.1));
+        assert!(health.last_heartbeat > 0);
+    }
+
+    #[tokio::test]
+    async fn test_connect_disconnect() {
+        let mut stream = MockMarketStream::new();
+
+        // Connect should succeed
+        let connect_result = stream.connect().await;
+        assert!(connect_result.is_ok());
+
+        // Disconnect should succeed
+        let disconnect_result = stream.disconnect().await;
+        assert!(disconnect_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_returns_stream() {
+        let stream = MockMarketStream::with_interval_ms(50);
+        let symbols = vec![Symbol::new("BTCUSDT")];
+
+        let result = stream.subscribe(symbols).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_produces_bar_events() {
+        let stream = MockMarketStream::with_interval_ms(10);
+        let symbols = vec![Symbol::new("ETHUSDT")];
+
+        let mut event_stream = stream.subscribe(symbols).await.unwrap();
+
+        // Get first event
+        let event = tokio::time::timeout(
+            Duration::from_millis(100),
+            event_stream.next(),
+        )
+        .await
+        .expect("Timeout waiting for event")
+        .expect("Stream ended unexpectedly");
+
+        match event {
+            Ok(MarketEvent::Bar(bar)) => {
+                assert_eq!(bar.symbol, Symbol::new("ETHUSDT"));
+                assert_eq!(bar.interval_ms, 60_000);
+                assert_eq!(bar.source_venue, Some(VenueId::MOCK));
+                assert!(bar.high >= bar.low);
+                assert!(bar.high >= bar.open);
+                assert!(bar.high >= bar.close);
+                assert!(bar.low <= bar.open);
+                assert!(bar.low <= bar.close);
+            }
+            Ok(other) => panic!("Expected Bar event, got {:?}", other),
+            Err(e) => panic!("Event error: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_multiple_events() {
+        let stream = MockMarketStream::with_interval_ms(10);
+        let symbols = vec![Symbol::new("BTCUSDT")];
+
+        let mut event_stream = stream.subscribe(symbols).await.unwrap();
+
+        // Collect 3 events
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let event = tokio::time::timeout(
+                Duration::from_millis(100),
+                event_stream.next(),
+            )
+            .await
+            .expect("Timeout waiting for event")
+            .expect("Stream ended unexpectedly");
+            events.push(event);
+        }
+
+        assert_eq!(events.len(), 3);
+
+        // All events should be Ok Bar events
+        for event in events {
+            assert!(matches!(event, Ok(MarketEvent::Bar(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_empty_symbols_uses_default() {
+        let stream = MockMarketStream::with_interval_ms(10);
+        let symbols: Vec<Symbol> = vec![];
+
+        let mut event_stream = stream.subscribe(symbols).await.unwrap();
+
+        let event = tokio::time::timeout(
+            Duration::from_millis(100),
+            event_stream.next(),
+        )
+        .await
+        .expect("Timeout waiting for event")
+        .expect("Stream ended unexpectedly");
+
+        match event {
+            Ok(MarketEvent::Bar(bar)) => {
+                // When no symbols provided, defaults to BTCUSDT
+                assert_eq!(bar.symbol, Symbol::new("BTCUSDT"));
+            }
+            _ => panic!("Expected Bar event with default symbol"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bar_price_volatility() {
+        let stream = MockMarketStream::with_interval_ms(10);
+        let symbols = vec![Symbol::new("BTCUSDT")];
+
+        let mut event_stream = stream.subscribe(symbols).await.unwrap();
+
+        // Collect multiple bars and verify prices change
+        let mut prices = Vec::new();
+        for _ in 0..5 {
+            let event = tokio::time::timeout(
+                Duration::from_millis(100),
+                event_stream.next(),
+            )
+            .await
+            .expect("Timeout waiting for event")
+            .expect("Stream ended unexpectedly");
+
+            if let Ok(MarketEvent::Bar(bar)) = event {
+                prices.push(bar.close.to_f64().unwrap());
+            }
+        }
+
+        // Prices should vary (not all the same)
+        let first = prices[0];
+        let has_variation = prices.iter().any(|p| (*p - first).abs() > 0.01);
+        assert!(has_variation, "Mock stream should produce varying prices");
+    }
+
+    #[tokio::test]
+    async fn test_bar_volume_and_trade_count() {
+        let stream = MockMarketStream::with_interval_ms(10);
+        let symbols = vec![Symbol::new("BTCUSDT")];
+
+        let mut event_stream = stream.subscribe(symbols).await.unwrap();
+
+        let event = tokio::time::timeout(
+            Duration::from_millis(100),
+            event_stream.next(),
+        )
+        .await
+        .expect("Timeout waiting for event")
+        .expect("Stream ended unexpectedly");
+
+        if let Ok(MarketEvent::Bar(bar)) = event {
+            // Volume should be positive
+            assert!(bar.volume.to_f64().unwrap() > 0.0);
+            // Trade count should be positive
+            assert!(bar.trade_count > 0);
+        } else {
+            panic!("Expected Bar event");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bar_timestamp_ordering() {
+        let stream = MockMarketStream::with_interval_ms(10);
+        let symbols = vec![Symbol::new("BTCUSDT")];
+
+        let mut event_stream = stream.subscribe(symbols).await.unwrap();
+
+        let event = tokio::time::timeout(
+            Duration::from_millis(100),
+            event_stream.next(),
+        )
+        .await
+        .expect("Timeout waiting for event")
+        .expect("Stream ended unexpectedly");
+
+        if let Ok(MarketEvent::Bar(bar)) = event {
+            // close_time should be after open_time
+            assert!(bar.close_time > bar.open_time);
+            // The difference should be interval_ms in microseconds
+            assert_eq!(bar.close_time - bar.open_time, 60_000_000);
+        } else {
+            panic!("Expected Bar event");
+        }
+    }
+}

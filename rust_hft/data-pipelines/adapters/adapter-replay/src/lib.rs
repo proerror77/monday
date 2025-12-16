@@ -257,3 +257,142 @@ impl MarketStream for ClickhouseReplayStream {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ports::MarketStream;
+
+    #[test]
+    fn test_replay_venue_from_str() {
+        let binance = ReplayVenue::from_str("binance");
+        assert!(matches!(binance, ReplayVenue::Binance));
+
+        let binance_upper = ReplayVenue::from_str("BINANCE");
+        assert!(matches!(binance_upper, ReplayVenue::Binance));
+
+        let bitget = ReplayVenue::from_str("bitget");
+        assert!(matches!(bitget, ReplayVenue::Bitget));
+
+        // Unknown venue defaults to Bitget
+        let unknown = ReplayVenue::from_str("unknown");
+        assert!(matches!(unknown, ReplayVenue::Bitget));
+    }
+
+    #[test]
+    fn test_replay_config_default() {
+        let config = ReplayConfig::default();
+
+        assert_eq!(config.ch_url, "http://localhost:8123");
+        assert_eq!(config.database, "hft");
+        assert!(matches!(config.venue, ReplayVenue::Bitget));
+        assert_eq!(config.start_us, 0);
+        assert_eq!(config.end_us, None);
+        assert_eq!(config.speed, 0.0);
+    }
+
+    #[test]
+    fn test_replay_config_custom() {
+        let config = ReplayConfig {
+            ch_url: "http://clickhouse:8123".to_string(),
+            database: "trading".to_string(),
+            venue: ReplayVenue::Binance,
+            start_us: 1000000,
+            end_us: Some(2000000),
+            speed: 2.0,
+        };
+
+        assert_eq!(config.ch_url, "http://clickhouse:8123");
+        assert_eq!(config.database, "trading");
+        assert!(matches!(config.venue, ReplayVenue::Binance));
+        assert_eq!(config.start_us, 1000000);
+        assert_eq!(config.end_us, Some(2000000));
+        assert_eq!(config.speed, 2.0);
+    }
+
+    #[test]
+    fn test_clickhouse_replay_stream_creation() {
+        let config = ReplayConfig::default();
+        let stream = ClickhouseReplayStream::new(config.clone());
+
+        assert_eq!(stream.cfg.ch_url, config.ch_url);
+        assert_eq!(stream.cfg.database, config.database);
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let config = ReplayConfig::default();
+        let stream = ClickhouseReplayStream::new(config);
+
+        let health = stream.health().await;
+        assert!(health.connected);
+        assert!(health.latency_ms.is_none());
+        assert!(health.last_heartbeat > 0);
+    }
+
+    #[tokio::test]
+    async fn test_connect_disconnect() {
+        let config = ReplayConfig::default();
+        let mut stream = ClickhouseReplayStream::new(config);
+
+        // Connect should succeed
+        let connect_result = stream.connect().await;
+        assert!(connect_result.is_ok());
+
+        // Disconnect should succeed
+        let disconnect_result = stream.disconnect().await;
+        assert!(disconnect_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_empty_symbols_fails() {
+        let config = ReplayConfig::default();
+        let stream = ClickhouseReplayStream::new(config);
+
+        let result = stream.subscribe(vec![]).await;
+        assert!(result.is_err());
+
+        if let Err(HftError::Generic { message }) = result {
+            assert!(message.contains("symbol"));
+        } else {
+            panic!("Expected Generic error with symbol message");
+        }
+    }
+
+    #[test]
+    fn test_replay_venue_debug() {
+        let binance = ReplayVenue::Binance;
+        let bitget = ReplayVenue::Bitget;
+
+        // Debug trait should be implemented
+        assert_eq!(format!("{:?}", binance), "Binance");
+        assert_eq!(format!("{:?}", bitget), "Bitget");
+    }
+
+    #[test]
+    fn test_replay_venue_clone() {
+        let original = ReplayVenue::Binance;
+        let cloned = original.clone();
+
+        assert!(matches!(cloned, ReplayVenue::Binance));
+    }
+
+    #[test]
+    fn test_replay_config_clone() {
+        let config = ReplayConfig {
+            ch_url: "http://test:8123".to_string(),
+            database: "testdb".to_string(),
+            venue: ReplayVenue::Binance,
+            start_us: 100,
+            end_us: Some(200),
+            speed: 1.5,
+        };
+
+        let cloned = config.clone();
+        assert_eq!(cloned.ch_url, config.ch_url);
+        assert_eq!(cloned.database, config.database);
+        assert_eq!(cloned.start_us, config.start_us);
+        assert_eq!(cloned.end_us, config.end_us);
+        assert_eq!(cloned.speed, config.speed);
+    }
+}

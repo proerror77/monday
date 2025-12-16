@@ -764,3 +764,283 @@ impl ExecutionClient for BinanceExecutionClient {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hft_core::{OrderType, Side, Symbol, TimeInForce};
+    use integration::signing::BinanceCredentials;
+    use ports::{ExecutionClient, OrderIntent};
+
+    fn make_test_config(mode: ExecutionMode) -> BinanceExecutionConfig {
+        BinanceExecutionConfig {
+            credentials: BinanceCredentials {
+                api_key: String::new(),
+                secret_key: String::new(),
+            },
+            rest_base_url: "https://api.binance.com".to_string(),
+            ws_base_url: "wss://stream.binance.com:9443/ws".to_string(),
+            timeout_ms: 5000,
+            mode,
+        }
+    }
+
+    #[test]
+    fn test_config_creation() {
+        let config = make_test_config(ExecutionMode::Paper);
+        assert_eq!(config.rest_base_url, "https://api.binance.com");
+        assert_eq!(config.ws_base_url, "wss://stream.binance.com:9443/ws");
+        assert_eq!(config.timeout_ms, 5000);
+        assert_eq!(config.mode, ExecutionMode::Paper);
+    }
+
+    #[test]
+    fn test_config_clone() {
+        let config = make_test_config(ExecutionMode::Live);
+        let cloned = config.clone();
+        assert_eq!(cloned.rest_base_url, config.rest_base_url);
+        assert_eq!(cloned.mode, config.mode);
+    }
+
+    #[test]
+    fn test_config_debug() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("BinanceExecutionConfig"));
+    }
+
+    #[test]
+    fn test_client_creation() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let client = BinanceExecutionClient::new(config);
+        assert!(!client.connected);
+        assert!(client.event_tx.is_none());
+        assert!(client.http_client.is_none());
+    }
+
+    #[test]
+    fn test_client_creation_with_empty_credentials() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let client = BinanceExecutionClient::new(config);
+        // Empty credentials should result in None signer
+        assert!(client.signer.is_none());
+    }
+
+    #[test]
+    fn test_client_creation_with_credentials() {
+        let config = BinanceExecutionConfig {
+            credentials: BinanceCredentials {
+                api_key: "test_key".to_string(),
+                secret_key: "test_secret".to_string(),
+            },
+            rest_base_url: "https://api.binance.com".to_string(),
+            ws_base_url: "wss://stream.binance.com:9443/ws".to_string(),
+            timeout_ms: 5000,
+            mode: ExecutionMode::Paper,
+        };
+        let client = BinanceExecutionClient::new(config);
+        // With credentials, signer should be Some
+        assert!(client.signer.is_some());
+    }
+
+    #[test]
+    fn test_execution_mode_reexport() {
+        // Verify ExecutionMode is properly re-exported
+        let paper = ExecutionMode::Paper;
+        let live = ExecutionMode::Live;
+        let testnet = ExecutionMode::Testnet;
+        assert_eq!(paper, ExecutionMode::Paper);
+        assert_eq!(live, ExecutionMode::Live);
+        assert_eq!(testnet, ExecutionMode::Testnet);
+    }
+
+    #[test]
+    fn test_resilience_stats_none_before_connect() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let client = BinanceExecutionClient::new(config);
+        assert!(client.resilience_stats().is_none());
+    }
+
+    #[test]
+    fn test_with_alert_callback() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let config = make_test_config(ExecutionMode::Paper);
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+
+        let client = BinanceExecutionClient::new(config)
+            .with_alert_callback(move |_alert| {
+                called_clone.store(true, Ordering::SeqCst);
+            });
+
+        // Alert callback should be set
+        assert!(client.alert_callback.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_initial() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let client = BinanceExecutionClient::new(config);
+        let health = client.health().await;
+
+        assert!(!health.connected);
+        assert!(health.latency_ms.is_some());
+        assert!(health.last_heartbeat > 0);
+    }
+
+    #[tokio::test]
+    async fn test_connect_paper_mode() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+
+        let result = client.connect().await;
+        assert!(result.is_ok());
+        assert!(client.connected);
+        assert!(client.event_tx.is_some());
+        assert!(client.resilient_executor.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_disconnect() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+
+        // Connect first
+        client.connect().await.unwrap();
+        assert!(client.connected);
+
+        // Disconnect
+        let result = client.disconnect().await;
+        assert!(result.is_ok());
+        assert!(!client.connected);
+        assert!(client.event_tx.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_after_connect() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+
+        client.connect().await.unwrap();
+        let health = client.health().await;
+
+        assert!(health.connected);
+    }
+
+    #[tokio::test]
+    async fn test_paper_mode_place_order() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let intent = OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Quantity::from_f64(0.001).unwrap(),
+            price: Some(Price::from_f64(50000.0).unwrap()),
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: None,
+        };
+
+        let result = client.place_order(intent).await;
+        assert!(result.is_ok());
+
+        let order_id = result.unwrap();
+        assert!(order_id.0.starts_with("BINANCE_PAPER_"));
+    }
+
+    #[tokio::test]
+    async fn test_paper_mode_cancel_order() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let order_id = OrderId("test_order_123".to_string());
+        let result = client.cancel_order(&order_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_paper_mode_modify_order() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let order_id = OrderId("test_order_123".to_string());
+        let result = client.modify_order(
+            &order_id,
+            Some(Quantity::from_f64(0.002).unwrap()),
+            Some(Price::from_f64(51000.0).unwrap()),
+        ).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execution_stream_before_connect() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let client = BinanceExecutionClient::new(config);
+
+        let result = client.execution_stream().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execution_stream_after_connect() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let result = client.execution_stream().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_circuit_state_before_connect() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let client = BinanceExecutionClient::new(config);
+        let state = client.circuit_state().await;
+        assert!(state.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_circuit_state_after_connect() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let state = client.circuit_state().await;
+        assert!(state.is_some());
+        assert_eq!(state.unwrap(), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn test_reset_circuit_breaker() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        // Should not panic
+        client.reset_circuit_breaker().await;
+
+        // State should still be closed
+        let state = client.circuit_state().await;
+        assert_eq!(state.unwrap(), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn test_resilience_stats_after_connect() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let stats = client.resilience_stats();
+        assert!(stats.is_some());
+        let stats = stats.unwrap();
+        assert_eq!(stats.total_calls, 0);
+        assert_eq!(stats.failed_calls, 0);
+    }
+}

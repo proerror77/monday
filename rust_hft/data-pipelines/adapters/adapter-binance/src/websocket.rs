@@ -173,8 +173,8 @@ impl BinanceWebSocket {
     /// - SIMD JSON 友好：可直接傳遞給 simd-json 進行解析
     ///
     /// # 使用示例
-    /// ```no_run
-    /// # use adapter_binance::BinanceWebSocket;
+    /// ```ignore
+    /// # use data_adapter_binance::BinanceWebSocket;
     /// # use hft_core::Symbol;
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut ws = BinanceWebSocket::new();

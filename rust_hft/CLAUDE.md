@@ -421,8 +421,9 @@ enabled = true
 
 ## 11. 下一步計劃
 
-1. **gRPC 模型加載**: 實現下載、驗證、加載完整流程
-2. **風控參數動態更新**: 添加 RiskManager trait 方法
-3. **測試覆蓋**: 完善 adapter 和 e2e 測試
-4. **ONNX 推理優化**: GPU 加速支持
-5. **生產部署**: K8s Helm Chart
+1. ~~**gRPC 模型加載**: 實現下載、驗證、加載完整流程~~ ✅ 已完成
+2. ~~**風控參數動態更新**: 添加 RiskManager trait 方法~~ ✅ 已完成
+3. ~~**HFT Ops Agent**: LLM 驅動的自動化運維~~ ✅ 已完成
+4. **測試覆蓋**: 完善 adapter 和 e2e 測試
+5. **ONNX 推理優化**: GPU 加速支持
+6. **生產部署**: K8s Helm Chart

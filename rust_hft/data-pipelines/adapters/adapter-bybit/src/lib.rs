@@ -350,3 +350,297 @@ impl MarketStream for BybitMarketStream {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ports::MarketStream;
+
+    // Category tests
+    #[test]
+    fn test_category_default_is_spot() {
+        // Clear any env var that might affect the test
+        std::env::remove_var("BYBIT_CATEGORY");
+        let category = Category::from_env();
+        assert_eq!(category, Category::Spot);
+    }
+
+    #[test]
+    fn test_category_linear_from_env() {
+        std::env::set_var("BYBIT_CATEGORY", "linear");
+        let category = Category::from_env();
+        assert_eq!(category, Category::Linear);
+        std::env::remove_var("BYBIT_CATEGORY");
+    }
+
+    #[test]
+    fn test_category_usdt_maps_to_linear() {
+        std::env::set_var("BYBIT_CATEGORY", "usdt");
+        let category = Category::from_env();
+        assert_eq!(category, Category::Linear);
+        std::env::remove_var("BYBIT_CATEGORY");
+    }
+
+    #[test]
+    fn test_category_perp_maps_to_linear() {
+        std::env::set_var("BYBIT_CATEGORY", "perp");
+        let category = Category::from_env();
+        assert_eq!(category, Category::Linear);
+        std::env::remove_var("BYBIT_CATEGORY");
+    }
+
+    #[test]
+    fn test_category_unknown_defaults_to_spot() {
+        std::env::set_var("BYBIT_CATEGORY", "unknown_value");
+        let category = Category::from_env();
+        assert_eq!(category, Category::Spot);
+        std::env::remove_var("BYBIT_CATEGORY");
+    }
+
+    #[test]
+    fn test_category_ws_base_spot() {
+        let category = Category::Spot;
+        assert_eq!(category.ws_base(), "wss://stream.bybit.com/v5/public/spot");
+    }
+
+    #[test]
+    fn test_category_ws_base_linear() {
+        let category = Category::Linear;
+        assert_eq!(category.ws_base(), "wss://stream.bybit.com/v5/public/linear");
+    }
+
+    #[test]
+    fn test_category_clone() {
+        let original = Category::Linear;
+        let cloned = original;
+        assert_eq!(cloned, Category::Linear);
+    }
+
+    #[test]
+    fn test_category_debug() {
+        let category = Category::Spot;
+        let debug_str = format!("{:?}", category);
+        assert!(debug_str.contains("Spot"));
+    }
+
+    // OrderBookState tests
+    #[test]
+    fn test_order_book_state_default() {
+        let state = OrderBookState::default();
+        assert!(state.bids.is_empty());
+        assert!(state.asks.is_empty());
+        assert_eq!(state.seq, 0);
+    }
+
+    #[test]
+    fn test_order_book_state_apply_snapshot() {
+        let mut state = OrderBookState::default();
+        let bids = vec![
+            ["100.5".to_string(), "1.0".to_string()],
+            ["100.0".to_string(), "2.0".to_string()],
+        ];
+        let asks = vec![
+            ["101.0".to_string(), "1.5".to_string()],
+            ["101.5".to_string(), "2.5".to_string()],
+        ];
+
+        state.apply_snapshot(&bids, &asks, 1000);
+
+        assert_eq!(state.bids.len(), 2);
+        assert_eq!(state.asks.len(), 2);
+        assert_eq!(state.seq, 1000);
+    }
+
+    #[test]
+    fn test_order_book_state_apply_delta() {
+        let mut state = OrderBookState::default();
+        // First apply a snapshot
+        let bids = vec![["100.0".to_string(), "1.0".to_string()]];
+        let asks = vec![["101.0".to_string(), "1.0".to_string()]];
+        state.apply_snapshot(&bids, &asks, 1000);
+
+        // Apply delta
+        let delta_bids = vec![["100.5".to_string(), "0.5".to_string()]];
+        let delta_asks = vec![["100.8".to_string(), "0.8".to_string()]];
+        state.apply_delta(&delta_bids, &delta_asks, 1001);
+
+        assert_eq!(state.bids.len(), 2); // Now has 2 bid levels
+        assert_eq!(state.asks.len(), 2); // Now has 2 ask levels
+        assert_eq!(state.seq, 1001);
+    }
+
+    #[test]
+    fn test_order_book_state_remove_level_with_zero_size() {
+        let mut state = OrderBookState::default();
+        let bids = vec![
+            ["100.0".to_string(), "1.0".to_string()],
+            ["99.5".to_string(), "2.0".to_string()],
+        ];
+        let asks = vec![];
+        state.apply_snapshot(&bids, &asks, 1000);
+        assert_eq!(state.bids.len(), 2);
+
+        // Remove level by setting size to 0
+        let delta_bids = vec![["100.0".to_string(), "0".to_string()]];
+        let empty: Vec<[String; 2]> = vec![];
+        state.apply_delta(&delta_bids, &empty, 1001);
+        assert_eq!(state.bids.len(), 1);
+    }
+
+    #[test]
+    fn test_order_book_state_ignore_empty_strings() {
+        let mut state = OrderBookState::default();
+        let bids = vec![
+            ["".to_string(), "1.0".to_string()],     // Empty price
+            ["100.0".to_string(), "".to_string()],   // Empty size
+            ["100.5".to_string(), "1.0".to_string()], // Valid
+        ];
+        let empty: Vec<[String; 2]> = vec![];
+        state.apply_snapshot(&bids, &empty, 1000);
+
+        // Only the valid level should be added
+        assert_eq!(state.bids.len(), 1);
+    }
+
+    #[test]
+    fn test_order_book_state_to_snapshot() {
+        let mut state = OrderBookState::default();
+        let bids = vec![
+            ["100.5".to_string(), "1.0".to_string()],
+            ["100.0".to_string(), "2.0".to_string()],
+        ];
+        let asks = vec![
+            ["101.0".to_string(), "1.5".to_string()],
+            ["101.5".to_string(), "2.5".to_string()],
+        ];
+        state.apply_snapshot(&bids, &asks, 1000);
+
+        let snapshot = state.to_snapshot(Symbol::new("BTCUSDT"), 1234567890);
+
+        assert_eq!(snapshot.symbol, Symbol::new("BTCUSDT"));
+        assert_eq!(snapshot.timestamp, 1234567890 * 1000); // ms to us conversion
+        assert_eq!(snapshot.bids.len(), 2);
+        assert_eq!(snapshot.asks.len(), 2);
+        assert_eq!(snapshot.source_venue, Some(VenueId::BYBIT));
+    }
+
+    #[test]
+    fn test_order_book_state_bids_sorted_descending() {
+        let mut state = OrderBookState::default();
+        let bids = vec![
+            ["99.0".to_string(), "1.0".to_string()],
+            ["100.0".to_string(), "1.0".to_string()],
+            ["99.5".to_string(), "1.0".to_string()],
+        ];
+        let empty: Vec<[String; 2]> = vec![];
+        state.apply_snapshot(&bids, &empty, 1000);
+
+        let snapshot = state.to_snapshot(Symbol::new("BTCUSDT"), 1000);
+
+        // Bids should be sorted highest to lowest
+        assert!(snapshot.bids[0].price.0 > snapshot.bids[1].price.0);
+        assert!(snapshot.bids[1].price.0 > snapshot.bids[2].price.0);
+    }
+
+    #[test]
+    fn test_order_book_state_asks_sorted_ascending() {
+        let mut state = OrderBookState::default();
+        let asks = vec![
+            ["102.0".to_string(), "1.0".to_string()],
+            ["100.0".to_string(), "1.0".to_string()],
+            ["101.0".to_string(), "1.0".to_string()],
+        ];
+        let empty: Vec<[String; 2]> = vec![];
+        state.apply_snapshot(&empty, &asks, 1000);
+
+        let snapshot = state.to_snapshot(Symbol::new("BTCUSDT"), 1000);
+
+        // Asks should be sorted lowest to highest
+        assert!(snapshot.asks[0].price.0 < snapshot.asks[1].price.0);
+        assert!(snapshot.asks[1].price.0 < snapshot.asks[2].price.0);
+    }
+
+    // BybitMarketStream tests
+    #[test]
+    fn test_bybit_market_stream_new() {
+        let stream = BybitMarketStream::new();
+        // BybitMarketStream is a unit struct, just verify construction works
+        let _ = stream;
+    }
+
+    #[test]
+    fn test_bybit_market_stream_default() {
+        let stream = BybitMarketStream::default();
+        let _ = stream;
+    }
+
+    #[tokio::test]
+    async fn test_health_check() {
+        let stream = BybitMarketStream::new();
+        let health = stream.health().await;
+
+        assert!(health.connected);
+        assert!(health.latency_ms.is_none());
+        assert!(health.last_heartbeat > 0);
+    }
+
+    #[tokio::test]
+    async fn test_connect() {
+        let mut stream = BybitMarketStream::new();
+        let result = stream.connect().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_disconnect() {
+        let mut stream = BybitMarketStream::new();
+        let result = stream.disconnect().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_empty_symbols_fails() {
+        let stream = BybitMarketStream::new();
+        let result = stream.subscribe(vec![]).await;
+
+        assert!(result.is_err());
+        if let Err(e) = result {
+            let error_msg = format!("{}", e);
+            assert!(error_msg.contains("empty"));
+        }
+    }
+
+    // BybitWsMsg parsing tests
+    #[test]
+    fn test_parse_bybit_ws_msg_with_topic() {
+        let json = r#"{"topic":"orderbook.50.BTCUSDT","type":"snapshot","data":{}}"#;
+        let result: Result<BybitWsMsg, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
+        let msg = result.unwrap();
+        assert_eq!(msg.topic, Some("orderbook.50.BTCUSDT".to_string()));
+        assert_eq!(msg.ty, Some("snapshot".to_string()));
+    }
+
+    #[test]
+    fn test_parse_bybit_ws_msg_without_topic() {
+        let json = r#"{"success":true,"ret_msg":"subscribe"}"#;
+        let result: Result<BybitWsMsg, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
+        let msg = result.unwrap();
+        assert!(msg.topic.is_none());
+    }
+
+    #[test]
+    fn test_parse_json_function() {
+        let json = r#"{"topic":"test","type":"delta"}"#;
+        let result: HftResult<BybitWsMsg> = parse_json(json);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_json_invalid() {
+        let json = "not valid json";
+        let result: HftResult<BybitWsMsg> = parse_json(json);
+        assert!(result.is_err());
+    }
+}

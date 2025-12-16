@@ -239,3 +239,123 @@ impl MarketStream for BinanceMarketStream {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use capabilities::BinanceCapabilities;
+
+    #[test]
+    fn test_binance_market_stream_default() {
+        let stream = BinanceMarketStream::default();
+        assert!(!stream.is_connected);
+        assert_eq!(stream.last_heartbeat, 0);
+        assert!(stream.caps.snapshot_crc);
+        assert!(stream.caps.rest_fallback);
+        assert!(stream.caps.auto_reconnect);
+    }
+
+    #[test]
+    fn test_binance_market_stream_new() {
+        let stream = BinanceMarketStream::new();
+        assert!(!stream.is_connected);
+        assert_eq!(stream.ws_base_url, websocket::WS_BASE_URL);
+    }
+
+    #[test]
+    fn test_binance_capabilities_default() {
+        let caps = BinanceCapabilities::default();
+        assert!(caps.snapshot_crc);
+        assert!(caps.rest_fallback);
+        assert!(caps.auto_reconnect);
+    }
+
+    #[test]
+    fn test_binance_capabilities_custom() {
+        let caps = BinanceCapabilities {
+            snapshot_crc: false,
+            rest_fallback: false,
+            auto_reconnect: true,
+        };
+        assert!(!caps.snapshot_crc);
+        assert!(!caps.rest_fallback);
+        assert!(caps.auto_reconnect);
+    }
+
+    #[test]
+    fn test_with_capabilities() {
+        let caps = BinanceCapabilities {
+            snapshot_crc: false,
+            rest_fallback: true,
+            auto_reconnect: false,
+        };
+        let stream = BinanceMarketStream::with_capabilities(caps.clone());
+        assert_eq!(stream.caps.snapshot_crc, caps.snapshot_crc);
+        assert_eq!(stream.caps.rest_fallback, caps.rest_fallback);
+        assert_eq!(stream.caps.auto_reconnect, caps.auto_reconnect);
+    }
+
+    #[test]
+    fn test_with_ws_base_url() {
+        let stream = BinanceMarketStream::new()
+            .with_ws_base_url("wss://custom.binance.com/ws");
+        assert_eq!(stream.ws_base_url, "wss://custom.binance.com/ws");
+    }
+
+    #[test]
+    fn test_with_rest_base_url() {
+        let stream = BinanceMarketStream::new()
+            .with_rest_base_url("https://custom.binance.com");
+        // The rest_client is updated internally
+        assert!(!stream.is_connected);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_initial_state() {
+        let stream = BinanceMarketStream::new();
+        let health = stream.health().await;
+
+        assert!(!health.connected);
+        assert!(health.latency_ms.is_none());
+        assert_eq!(health.last_heartbeat, 0);
+    }
+
+    #[tokio::test]
+    async fn test_disconnect() {
+        let mut stream = BinanceMarketStream::new();
+        stream.is_connected = true;
+
+        let result = stream.disconnect().await;
+        assert!(result.is_ok());
+        assert!(!stream.is_connected);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_empty_symbols_fails() {
+        let stream = BinanceMarketStream::new();
+        let result = stream.subscribe(vec![]).await;
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_capabilities_debug() {
+        let caps = BinanceCapabilities::default();
+        let debug_str = format!("{:?}", caps);
+        assert!(debug_str.contains("BinanceCapabilities"));
+        assert!(debug_str.contains("snapshot_crc"));
+    }
+
+    #[test]
+    fn test_capabilities_clone() {
+        let caps = BinanceCapabilities {
+            snapshot_crc: false,
+            rest_fallback: true,
+            auto_reconnect: true,
+        };
+        let cloned = caps.clone();
+        assert_eq!(cloned.snapshot_crc, caps.snapshot_crc);
+        assert_eq!(cloned.rest_fallback, caps.rest_fallback);
+        assert_eq!(cloned.auto_reconnect, caps.auto_reconnect);
+    }
+}
