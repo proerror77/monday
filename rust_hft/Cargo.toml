@@ -90,6 +90,7 @@ members = [
     "tools/hyperliquid-demo",
     "tools/ws_test",
     "tools/hft-agent",
+    "tools/listing-monitor",
 
     # Examples
     "examples"
@@ -121,7 +122,7 @@ metrics-exporter-prometheus = { workspace = true, optional = true }
 [workspace.dependencies]
 # 核心零依賴
 serde = { version = "1.0", features = ["derive", "rc"] }
-thiserror = "1.0"
+thiserror = "2.0"
 
 # 非同步 (只在需要的 crate 開)
 tokio = { version = "1.0", default-features = false }
@@ -136,17 +137,17 @@ arc-swap = "1.6"
 crossbeam-utils = { version = "0.8", default-features = false }
 
 # 網路 (只在 integration 開，其他復用)
-tokio-tungstenite = { version = "0.20", default-features = false, features = ["connect", "stream", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "stream", "rustls-tls-webpki-roots"] }
 rustls = { version = "0.21", default-features = false, features = ["dangerous_configuration"] }
 axum = "0.7"
 
 # JSON (熱點可選 SIMD)
 serde_json = "1.0"
-simd-json = "0.13"
+simd-json = "0.14"
 
 # 基礎設施（版本統一於 workspace；是否 optional 由各 crate 自己決定）
-clickhouse = "0.11"
-redis = "0.24"
+clickhouse = "0.14"
+redis = "1.0"
 prometheus = "0.13"
 
 parking_lot = "0.12"

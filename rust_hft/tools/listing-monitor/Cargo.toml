@@ -1,0 +1,23 @@
+[package]
+name = "listing-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "Binance new listing monitor with Feishu notifications"
+
+[[bin]]
+name = "listing-monitor-alpha"
+path = "src/bin/alpha.rs"
+
+[[bin]]
+name = "listing-monitor-spot"
+path = "src/bin/spot.rs"
+
+[dependencies]
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }

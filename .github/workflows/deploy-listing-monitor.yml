@@ -1,0 +1,113 @@
+name: Deploy Listing Monitor
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rust_hft/tools/listing-monitor/**'
+      - '.github/workflows/deploy-listing-monitor.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REGISTRY: public.ecr.aws/l7l6w6q5
+  IMAGE_NAME: listing-monitor
+  ECS_CLUSTER: test-cluster-check
+  ECS_SERVICE: listing-monitor
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to ECR Public
+        run: |
+          aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+
+      - name: Build and push image
+        working-directory: rust_hft/tools/listing-monitor
+        run: |
+          docker build -t $IMAGE_NAME:latest .
+          docker tag $IMAGE_NAME:latest $ECR_REGISTRY/$IMAGE_NAME:latest
+          docker tag $IMAGE_NAME:latest $ECR_REGISTRY/$IMAGE_NAME:${{ github.sha }}
+          docker push $ECR_REGISTRY/$IMAGE_NAME:latest
+          docker push $ECR_REGISTRY/$IMAGE_NAME:${{ github.sha }}
+
+      - name: Update ECS Task Definition
+        run: |
+          cat > /tmp/task-def.json << 'EOF'
+          {
+            "family": "listing-monitor",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "containerDefinitions": [
+              {
+                "name": "alpha-monitor",
+                "image": "${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}",
+                "command": ["python", "alpha_monitor.py"],
+                "essential": true,
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/listing-monitor",
+                    "awslogs-region": "ap-northeast-1",
+                    "awslogs-stream-prefix": "alpha",
+                    "awslogs-create-group": "true"
+                  }
+                }
+              },
+              {
+                "name": "spot-monitor",
+                "image": "${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}",
+                "command": ["python", "spot_monitor.py"],
+                "essential": true,
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/listing-monitor",
+                    "awslogs-region": "ap-northeast-1",
+                    "awslogs-stream-prefix": "spot",
+                    "awslogs-create-group": "true"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Register Task Definition
+        id: task-def
+        run: |
+          aws configure set region ap-northeast-1
+          TASK_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --task-definition ${{ steps.task-def.outputs.task_arn }} \
+            --force-new-deployment \
+            --region $AWS_REGION
+
+      - name: Wait for deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --region $AWS_REGION
+          echo "Deployment completed!"
