@@ -9,11 +9,11 @@ on:
   workflow_dispatch:
 
 env:
-  AWS_REGION: ap-northeast-1
   ECR_REGISTRY: public.ecr.aws/l7l6w6q5
   IMAGE_NAME: listing-monitor
   ECS_CLUSTER: test-cluster-check
   ECS_SERVICE: listing-monitor
+  ECS_REGION: ap-northeast-1
 
 jobs:
   deploy:
@@ -43,9 +43,10 @@ jobs:
           docker push $ECR_REGISTRY/$IMAGE_NAME:latest
           docker push $ECR_REGISTRY/$IMAGE_NAME:${{ github.sha }}
 
-      - name: Update ECS Task Definition
+      - name: Register Task Definition
+        id: task-def
         run: |
-          cat > /tmp/task-def.json << 'EOF'
+          cat > /tmp/task-def.json << EOF
           {
             "family": "listing-monitor",
             "networkMode": "awsvpc",
@@ -63,7 +64,7 @@ jobs:
                   "logDriver": "awslogs",
                   "options": {
                     "awslogs-group": "/ecs/listing-monitor",
-                    "awslogs-region": "ap-northeast-1",
+                    "awslogs-region": "${{ env.ECS_REGION }}",
                     "awslogs-stream-prefix": "alpha",
                     "awslogs-create-group": "true"
                   }
@@ -78,7 +79,7 @@ jobs:
                   "logDriver": "awslogs",
                   "options": {
                     "awslogs-group": "/ecs/listing-monitor",
-                    "awslogs-region": "ap-northeast-1",
+                    "awslogs-region": "${{ env.ECS_REGION }}",
                     "awslogs-stream-prefix": "spot",
                     "awslogs-create-group": "true"
                   }
@@ -87,27 +88,22 @@ jobs:
             ]
           }
           EOF
-
-      - name: Register Task Definition
-        id: task-def
-        run: |
-          aws configure set region ap-northeast-1
-          TASK_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --query 'taskDefinition.taskDefinitionArn' --output text)
+          TASK_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/task-def.json --region ${{ env.ECS_REGION }} --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
 
       - name: Deploy to ECS
         run: |
           aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
             --task-definition ${{ steps.task-def.outputs.task_arn }} \
             --force-new-deployment \
-            --region $AWS_REGION
+            --region ${{ env.ECS_REGION }}
 
       - name: Wait for deployment
         run: |
           aws ecs wait services-stable \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
-            --region $AWS_REGION
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.ECS_REGION }}
           echo "Deployment completed!"
