@@ -1,17 +1,15 @@
-name: Release Rust Binaries
+name: Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*.*.*"
+  release:
+    types: [created]
   workflow_dispatch:
 
 permissions:
   contents: write
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,15 +19,12 @@ env:
   TZ: UTC
   LC_ALL: C
   LANG: C
-  RELEASE_PACKAGES: hft-live hft-paper hft-all-in-one hft-replay hft-backtest hft-collector
+  RELEASE_PACKAGES: hft-live hft-paper hft-replay hft-backtest hft-collector
 
 jobs:
-  build:
+  build-binaries:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        working-directory: rust_hft
     strategy:
       fail-fast: false
       matrix:
@@ -51,7 +46,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -74,18 +69,16 @@ jobs:
           echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
           echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Rust
+      - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            rust_hft
-          key: release-${{ matrix.target }}-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/Cargo.lock') }}
+          key: release-${{ matrix.target }}-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('Cargo.lock') }}
           cache-all-crates: true
 
       - name: Set reproducible build metadata
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
 
-      - name: Build apps
+      - name: Build release binaries
         shell: bash
         run: |
           set -euo pipefail
@@ -97,7 +90,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
           package_dir="rust-hft-${{ matrix.name }}"
           mkdir -p "${package_dir}/bin" "${package_dir}/docs"
 
@@ -117,16 +109,16 @@ jobs:
             echo "Packages: ${RELEASE_PACKAGES}"
           } > "${package_dir}/VERSION.txt"
 
-          tar -czf "dist/${package_dir}.tar.gz" "${package_dir}"
-          shasum -a 256 "dist/${package_dir}.tar.gz" > "dist/${package_dir}.tar.gz.sha256"
+          tar -czf "${package_dir}.tar.gz" "${package_dir}"
+          shasum -a 256 "${package_dir}.tar.gz" > "${package_dir}.tar.gz.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: rust-hft-${{ matrix.name }}
           path: |
-            rust_hft/dist/*.tar.gz
-            rust_hft/dist/*.sha256
+            rust-hft-${{ matrix.name }}.tar.gz
+            rust-hft-${{ matrix.name }}.tar.gz.sha256
           retention-days: 14
 
       - name: sccache stats
@@ -135,9 +127,9 @@ jobs:
 
   github-release:
     name: Publish GitHub Release
-    needs: [build]
+    needs: [build-binaries]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
 
     steps:
       - name: Download release artifacts
@@ -146,11 +138,11 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create GitHub Release
+      - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
             dist/*.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

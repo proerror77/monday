@@ -17,6 +17,11 @@ jobs:
   rust:
     name: Rust Workspace
     runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     defaults:
       run:
         working-directory: rust_hft
@@ -29,11 +34,27 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install Linux linker
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             rust_hft
+          key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/Cargo.lock') }}
+          cache-all-crates: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Format check (non-blocking)
         run: cargo fmt --all -- --check
@@ -47,30 +68,36 @@ jobs:
             -W clippy::suspicious
         continue-on-error: true
 
-      - name: Build (release)
-        run: cargo build --workspace --release
+      - name: Build
+        run: cargo build --workspace --locked
 
       - name: Package binaries (if present)
+        if: github.event_name == 'push'
         run: |
           mkdir -p dist
           for bin in hft-live hft-paper hft-all-in-one hft-replay; do
-            if [ -f target/release/$bin ]; then
-              cp target/release/$bin dist/
+            if [ -f target/debug/$bin ]; then
+              cp target/debug/$bin dist/
             fi
           done
           ls -la dist || true
 
       - name: Upload artifacts
-        if: success()
+        if: success() && github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: rust-binaries-${{ github.sha }}
+          name: rust-dev-binaries-${{ github.sha }}
           path: rust_hft/dist/*
           if-no-files-found: ignore
 
   rust_extra_standalone:
     name: Rust Standalone (test_bitget_standalone)
     runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     defaults:
       run:
         working-directory: test_bitget_standalone
@@ -81,11 +108,24 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
       - name: Cache Rust (standalone)
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             test_bitget_standalone
+          key: bitget-standalone-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('test_bitget_standalone/Cargo.lock', 'test_bitget_standalone/Cargo.toml') }}
+          cache-all-crates: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Build (release)
         run: cargo build --release

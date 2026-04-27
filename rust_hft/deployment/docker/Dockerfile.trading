@@ -4,19 +4,21 @@
 # ============================================
 # Stage 1: 構建環境
 # ============================================
-FROM rust:1.75-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /app
 
 # 安裝構建依賴
 RUN apt-get update && apt-get install -y \
+    clang \
     cmake \
+    mold \
     pkg-config \
-    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 複製 workspace 配置
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
 
 # 複製所有 crate 的 Cargo.toml (用於緩存依賴)
 COPY market-core/core/Cargo.toml market-core/core/
@@ -62,13 +64,13 @@ RUN mkdir -p market-core/instrument/src && echo "" > market-core/instrument/src/
 RUN mkdir -p apps/live/src && echo "fn main() {}" > apps/live/src/main.rs
 
 # 構建依賴 (這層會被緩存)
-RUN cargo build --release -p hft-live 2>/dev/null || true
+RUN cargo --config 'build.rustc-wrapper=""' build --release -p hft-live 2>/dev/null || true
 
 # 複製實際源代碼
 COPY . .
 
 # 構建發布版本
-RUN cargo build --release -p hft-live --features "metrics,clickhouse,redis"
+RUN cargo --config 'build.rustc-wrapper=""' build --release --locked -p hft-live --features "metrics,clickhouse,redis"
 
 # ============================================
 # Stage 2: 運行環境
@@ -78,6 +80,7 @@ FROM debian:bookworm-slim AS runtime
 # 安裝運行時依賴
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 

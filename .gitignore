@@ -21,6 +21,7 @@ pip-delete-this-directory.txt
 **/*.rs.bk
 *.pdb
 Cargo.lock
+!/rust_hft/Cargo.lock
 
 # IDE files
 .vscode/
@@ -126,3 +127,4 @@ AWSCLIV2.pkg
 # Compiled binaries in root
 /hft-collector-linux*
 /hft-collector-darwin*
+.omx/

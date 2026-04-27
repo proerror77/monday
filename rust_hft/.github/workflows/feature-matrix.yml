@@ -9,6 +9,12 @@ on:
     # 每週日凌晨 2 點運行完整測試矩陣
     - cron: '0 2 * * 0'
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
 jobs:
   # 快速矩陣：PR 時運行核心組合
   quick-matrix:
@@ -33,11 +39,25 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install Linux linker
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: quick-${{ matrix.features }}
+          key: quick-${{ matrix.features }}-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('Cargo.lock') }}
           cache-all-crates: true
+          save-if: false
 
       - name: Check workspace
         run: |
@@ -64,6 +84,10 @@ jobs:
           else
             cargo test --workspace --features "${{ matrix.features }}"
           fi
+
+      - name: sccache stats
+        if: always()
+        run: ${SCCACHE_PATH:-sccache} --show-stats
 
   # 完整矩陣：定時或手動觸發時運行所有組合
   full-matrix:
@@ -94,11 +118,26 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Install Linux linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: full-${{ matrix.os }}-${{ matrix.features }}
+          key: full-${{ matrix.os }}-${{ matrix.features }}-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('Cargo.lock') }}
           cache-all-crates: true
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check all targets
         run: |
@@ -132,6 +171,10 @@ jobs:
             cargo test --doc --workspace --features "${{ matrix.features }}"
           fi
 
+      - name: sccache stats
+        if: always()
+        run: ${SCCACHE_PATH:-sccache} --show-stats
+
   # 核心 crates 專項測試
   core-crates:
     name: Core Crate - ${{ matrix.crate }}
@@ -153,10 +196,24 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Linux linker
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: core-${{ matrix.crate }}
+          key: core-${{ matrix.crate }}-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('Cargo.lock') }}
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Check ${{ matrix.crate }}
         run: cargo check -p ${{ matrix.crate }} --all-features
@@ -166,6 +223,10 @@ jobs:
 
       - name: Doc ${{ matrix.crate }}
         run: cargo doc -p ${{ matrix.crate }} --all-features --no-deps
+
+      - name: sccache stats
+        if: always()
+        run: ${SCCACHE_PATH:-sccache} --show-stats
 
   # 編譯時間監控
   compile-time:
@@ -178,6 +239,12 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux linker
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Clean build
         run: |
@@ -202,6 +269,10 @@ jobs:
           name: build-log
           path: build.log
           retention-days: 7
+
+      - name: sccache stats
+        if: always()
+        run: ${SCCACHE_PATH:-sccache} --show-stats
 
   # 總結報告
   summary:

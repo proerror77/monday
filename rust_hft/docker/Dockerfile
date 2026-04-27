@@ -1,13 +1,11 @@
-## Minimal multi-stage Dockerfile for k8s deployment
-FROM rust:1.80-bullseye AS builder
+## Minimal multi-stage Dockerfile for collector deployment
+FROM rust:1.91-bookworm AS builder
 WORKDIR /work
 COPY . .
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && \
-    cd apps/collector && cargo build --release
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config clang mold && \
+    rm -rf /var/lib/apt/lists/* && \
+    cargo --config 'build.rustc-wrapper=""' build --release --locked -p hft-collector
 
-FROM debian:bullseye-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-WORKDIR /root
-COPY --from=builder /work/apps/collector/target/release/hft-collector /root/hft-collector
-ENTRYPOINT ["/root/hft-collector"]
-
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /work/target/release/hft-collector /usr/local/bin/hft-collector
+ENTRYPOINT ["/usr/local/bin/hft-collector"]
