@@ -183,16 +183,52 @@ jobs:
   node_install:
     name: Node Install (root)
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('package-lock.json') != '' || hashFiles('pnpm-lock.yaml') != '' || hashFiles('yarn.lock') != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Detect Node lockfile
+        id: node-lock
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "manager=npm" >> "$GITHUB_OUTPUT"
+            echo "cache=npm" >> "$GITHUB_OUTPUT"
+          elif [ -f pnpm-lock.yaml ]; then
+            echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+            echo "cache=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f yarn.lock ]; then
+            echo "manager=yarn" >> "$GITHUB_OUTPUT"
+            echo "cache=yarn" >> "$GITHUB_OUTPUT"
+          else
+            echo "manager=none" >> "$GITHUB_OUTPUT"
+            echo "cache=npm" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Node
+        if: steps.node-lock.outputs.manager != 'none'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+          cache: ${{ steps.node-lock.outputs.cache }}
 
       - name: Install dependencies
-        run: npm ci --prefer-offline --no-audit --fund=false
+        if: steps.node-lock.outputs.manager != 'none'
+        run: |
+          case "${{ steps.node-lock.outputs.manager }}" in
+            npm)
+              npm ci --prefer-offline --no-audit --fund=false
+              ;;
+            pnpm)
+              corepack enable
+              pnpm install --frozen-lockfile
+              ;;
+            yarn)
+              corepack enable
+              yarn install --immutable || yarn install --frozen-lockfile
+              ;;
+          esac
+
+      - name: Skip Node install
+        if: steps.node-lock.outputs.manager == 'none'
+        run: echo "No root Node lockfile found; skipping Node install."

@@ -21,15 +21,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: ml-workspace
-            context: .
-            file: deployment/docker/Dockerfile.ml_workspace
           - name: hft
             context: rust_hft
             file: rust_hft/docker/Dockerfile
-          - name: ops-workspace
-            context: .
-            file: deployment/docker/Dockerfile.ops_workspace
 
     steps:
       - name: Checkout
@@ -71,4 +65,3 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             PYTHON_VERSION=3.11
-
