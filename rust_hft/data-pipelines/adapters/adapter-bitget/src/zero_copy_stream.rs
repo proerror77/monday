@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "json-simd")]
-use simd_json::prelude::{ValueAsContainer, ValueAsScalar, ValueObjectAccess};
+use simd_json::prelude::{ValueAsArray, ValueAsScalar, ValueObjectAccess};
 
 #[cfg(feature = "metrics")]
 use infra_metrics::MetricsRegistry;

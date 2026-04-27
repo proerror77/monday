@@ -39,7 +39,6 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
-use url::Url;
 
 fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, HftError> {
     let mut bytes = text.as_bytes().to_vec();
@@ -472,8 +471,7 @@ impl BitgetExecutionClient {
         event_tx: broadcast::Sender<ExecutionEvent>,
         latency_tracker: std::sync::Arc<std::sync::Mutex<Option<f64>>>,
     ) -> HftResult<()> {
-        let url = Url::parse(&ws_url).map_err(|e| HftError::Network(e.to_string()))?;
-        let (ws_stream, _) = connect_async(url)
+        let (ws_stream, _) = connect_async(ws_url.as_str())
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
 
@@ -501,7 +499,7 @@ impl BitgetExecutionClient {
             }]
         });
         write
-            .send(Message::Text(login_msg.to_string()))
+            .send(Message::Text(login_msg.to_string().into()))
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
 
@@ -532,7 +530,7 @@ impl BitgetExecutionClient {
             .map_err(|e| HftError::Serialization(e.to_string()))?;
 
         write
-            .send(Message::Text(sub_msg))
+            .send(Message::Text(sub_msg.into()))
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
 
