@@ -218,13 +218,16 @@ harness = false
 opt-level = 0
 debug = true
 incremental = true
+lto = false
 
 [profile.release]
-# 發布模式：執行快優先 
+# 發布模式：執行快優先，並保持可分發產物精簡
 opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+strip = "symbols"
+split-debuginfo = "packed"
 
 [profile.bench]
 # 基準測試：最高優化

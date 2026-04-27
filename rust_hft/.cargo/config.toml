@@ -3,17 +3,10 @@
 [build]
 # 開發時並行度 (根據 CPU 核數調整)
 jobs = 8
+# Rust 編譯快取；本地需先安裝 sccache
+rustc-wrapper = "sccache"
 
-# 針對不同平台的快速 linker
+# Linux 使用 clang 驅動 mold，避免直接調用 ld 時找不到 mold。
 [target.x86_64-unknown-linux-gnu]
+linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-[target.x86_64-apple-darwin] 
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
-
-# 環境變數
-[env]
-# sccache 快取編譯結果 (安裝: cargo install sccache)
-RUSTC_WRAPPER = "sccache"
-# 增量編譯
-CARGO_INCREMENTAL = "1"
