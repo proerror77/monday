@@ -34,8 +34,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install Linux linker
-        run: sudo apt-get update && sudo apt-get install -y clang mold
+      - name: Install Linux build tools
+        run: sudo apt-get update && sudo apt-get install -y clang mold protobuf-compiler
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.10
