@@ -133,7 +133,7 @@ impl HyperliquidMarketStream {
 
         debug!("连接到 Hyperliquid WebSocket: {}", url);
 
-        let (ws_stream, _) = connect_async(url)
+        let (ws_stream, _) = connect_async(url.as_str())
             .await
             .map_err(|e| HftError::Network(format!("WebSocket 连接失败: {}", e)))?;
 
@@ -160,7 +160,7 @@ impl HyperliquidMarketStream {
                 let l2_message = serde_json::to_string(&l2_request)
                     .map_err(|e| HftError::Serialization(format!("序列化订阅请求失败: {}", e)))?;
 
-                ws.send(Message::Text(l2_message))
+                ws.send(Message::Text(l2_message.into()))
                     .await
                     .map_err(|e| HftError::Network(format!("发送订阅请求失败: {}", e)))?;
 
@@ -176,7 +176,7 @@ impl HyperliquidMarketStream {
                     HftError::Serialization(format!("序列化交易订阅请求失败: {}", e))
                 })?;
 
-                ws.send(Message::Text(trades_message))
+                ws.send(Message::Text(trades_message.into()))
                     .await
                     .map_err(|e| HftError::Network(format!("发送交易订阅请求失败: {}", e)))?;
 

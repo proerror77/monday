@@ -326,7 +326,7 @@ impl MarketStream for GrvtMarketStream {
                     "id": req_id,
                 });
                 req_id += 1;
-                if let Err(e) = socket.send(Message::Text(subscribe.to_string())).await {
+                if let Err(e) = socket.send(Message::Text(subscribe.to_string().into())).await {
                     let _ = tx.send(Err(HftError::Network(format!("GRVT WS 訂閱失敗: {}", e))));
                     return;
                 }
@@ -335,7 +335,7 @@ impl MarketStream for GrvtMarketStream {
             while let Some(msg) = socket.next().await {
                 match msg {
                     Ok(Message::Text(txt)) => {
-                        let mut bytes = txt.into_bytes();
+                        let mut bytes = txt.to_string().into_bytes();
                         let v: serde_json::Value = match parse_bytes(bytes.as_mut_slice()) {
                             Ok(x) => x,
                             Err(e) => {

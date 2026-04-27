@@ -557,7 +557,7 @@ impl HyperliquidExecutionClient {
 
         debug!("连接到 Hyperliquid 私有 WebSocket: {}", url);
 
-        let (ws_stream, _) = connect_async(url)
+        let (ws_stream, _) = connect_async(url.as_str())
             .await
             .map_err(|e| HftError::Network(format!("私有 WebSocket 连接失败: {}", e)))?;
 
@@ -616,7 +616,7 @@ impl HyperliquidExecutionClient {
                 HftError::Serialization(format!("序列化 WebSocket 消息失败: {}", e))
             })?;
 
-            ws.send(Message::Text(message_text))
+            ws.send(Message::Text(message_text.into()))
                 .await
                 .map_err(|e| HftError::Network(format!("发送 WebSocket 消息失败: {}", e)))?;
         }

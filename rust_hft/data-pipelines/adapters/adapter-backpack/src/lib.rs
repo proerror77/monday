@@ -249,7 +249,7 @@ impl MarketStream for BackpackMarketStream {
                                 "method": "SUBSCRIBE",
                                 "params": streams,
                             });
-                            if let Err(e) = ws.send(Message::Text(payload.to_string())).await {
+                            if let Err(e) = ws.send(Message::Text(payload.to_string().into())).await {
                                 state.connected.store(false, Ordering::SeqCst);
                                 yield Err(HftError::Network(format!(
                                     "Backpack subscription failed: {e}"
@@ -266,7 +266,7 @@ impl MarketStream for BackpackMarketStream {
                                         .last_heartbeat
                                         .store(now_micros(), Ordering::SeqCst);
 
-                                    let mut bytes = text.into_bytes();
+                                    let mut bytes = text.to_string().into_bytes();
                                     let envelope: WsEnvelope = match parse_bytes(bytes.as_mut_slice()) {
                                         Ok(env) => env,
                                         Err(e) => {
