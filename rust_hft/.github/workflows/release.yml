@@ -97,7 +97,7 @@ jobs:
             cp "target/${{ matrix.target }}/release/${package}" "${package_dir}/bin/${package}"
           done
 
-          cp README.md "${package_dir}/README.md"
+          cp docs/README.md "${package_dir}/README.md"
           cp docs/guides/RUST_BUILD_RELEASE.md "${package_dir}/docs/RUST_BUILD_RELEASE.md"
 
           {
