@@ -13,9 +13,8 @@ use ports::{MarketEvent, TrackedMarketEvent};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 const STALE_WARN_INTERVAL_US: u64 = 500_000; // 0.5 秒
 const LATENCY_HISTOGRAM_MAX_US: u64 = 60_000_000; // 60 秒上限，覆蓋慢速環境
@@ -262,9 +261,10 @@ impl EventIngester {
             // Prometheus 直方圖打點（可選）
 
             // 記錄每個事件的延遲情況
-            debug!(
+            trace!(
                 "EventIngester 攝取延遲: {}μs, 閾值: {}μs",
-                delay, self.config.stale_threshold_us
+                delay,
+                self.config.stale_threshold_us
             );
 
             if delay > self.config.stale_threshold_us {
@@ -275,13 +275,15 @@ impl EventIngester {
                     infra_metrics::MetricsRegistry::global()
                         .record_staleness(delay as f64 / 1000.0);
                 }
-                // Hot path: Already throttled via record_stale_warn, use debug! for observability
+                // Hot path: already throttled via record_stale_warn; trace only for deep diagnostics.
                 if let Some(suppressed) =
                     self.metrics.record_stale_warn(now, STALE_WARN_INTERVAL_US)
                 {
-                    debug!(
+                    trace!(
                         "丟棄陳舊事件: {}μs 延遲 > {}μs 閾值（過去 {} 筆已合併）",
-                        delay, self.config.stale_threshold_us, suppressed
+                        delay,
+                        self.config.stale_threshold_us,
+                        suppressed
                     );
                 }
                 return Ok(()); // 靜默丟棄陳舊事件
@@ -310,7 +312,7 @@ impl EventIngester {
         // 嘗試發送，應用背壓策略
         match self.producer.send(tracked_event) {
             Ok(()) => {
-                debug!("EventIngester 事件成功入隊到 ring buffer");
+                trace!("EventIngester 事件成功入隊到 ring buffer");
 
                 // 更新利用率統計
                 let utilization = self.producer.utilization();
@@ -600,10 +602,7 @@ impl EventConsumer {
 
 /// 獲取當前時間戳 (微秒)
 fn current_timestamp_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
+    now_micros()
 }
 
 #[cfg(test)]

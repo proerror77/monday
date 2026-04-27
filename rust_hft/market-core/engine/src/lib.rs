@@ -565,10 +565,7 @@ impl Engine {
     }
 
     /// 動態更新風控配置
-    pub fn update_risk_config(
-        &mut self,
-        update: ports::RiskConfigUpdate,
-    ) -> Result<(), HftError> {
+    pub fn update_risk_config(&mut self, update: ports::RiskConfigUpdate) -> Result<(), HftError> {
         if let Some(rm) = &mut self.risk_manager {
             rm.update_config(update)
         } else {
@@ -578,7 +575,9 @@ impl Engine {
 
     /// 獲取當前風控配置快照
     pub fn get_risk_config_snapshot(&self) -> Option<ports::RiskConfigSnapshot> {
-        self.risk_manager.as_ref().map(|rm| rm.get_config_snapshot())
+        self.risk_manager
+            .as_ref()
+            .map(|rm| rm.get_config_snapshot())
     }
 
     /// 獲取市場快照讀取者
@@ -1004,7 +1003,7 @@ impl Engine {
         // 5. 讀取並打印最新 AccountView（驗證閉環）
         if let Some(pm) = &self.portfolio_manager {
             let av = pm.reader().load();
-            info!(
+            debug!(
                 cash = %av.cash_balance,
                 pos_count = av.positions.len(),
                 unrealized = %av.unrealized_pnl,
@@ -1369,7 +1368,9 @@ impl Engine {
     /// 獲取系統統計用於 Sentinel（延遲 + PnL）
     pub fn get_sentinel_stats(&self) -> SentinelStats {
         // 從延遲監控器獲取真實延遲
-        let latency_stats = self.latency_monitor.get_stage_stats(hft_core::LatencyStage::EndToEnd);
+        let latency_stats = self
+            .latency_monitor
+            .get_stage_stats(hft_core::LatencyStage::EndToEnd);
         let (latency_p99_us, latency_p50_us) = latency_stats
             .map(|s| (s.p99_micros, s.p50_micros))
             .unwrap_or((0, 0));
@@ -1453,10 +1454,16 @@ impl Engine {
         }
 
         // 各階段 p99 延遲
-        if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Ingestion) {
+        if let Some(s) = self
+            .latency_monitor
+            .get_stage_stats(LatencyStage::Ingestion)
+        {
             stats.ingestion_p99_us = s.p99_micros;
         }
-        if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Aggregation) {
+        if let Some(s) = self
+            .latency_monitor
+            .get_stage_stats(LatencyStage::Aggregation)
+        {
             stats.aggregation_p99_us = s.p99_micros;
         }
         if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Strategy) {
@@ -1465,7 +1472,10 @@ impl Engine {
         if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Risk) {
             stats.risk_p99_us = s.p99_micros;
         }
-        if let Some(s) = self.latency_monitor.get_stage_stats(LatencyStage::Execution) {
+        if let Some(s) = self
+            .latency_monitor
+            .get_stage_stats(LatencyStage::Execution)
+        {
             stats.execution_p99_us = s.p99_micros;
         }
 

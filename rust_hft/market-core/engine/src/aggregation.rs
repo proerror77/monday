@@ -396,52 +396,58 @@ impl AggregationEngine {
     ) {
         match event {
             MarketEvent::Snapshot(snapshot) => {
+                let symbol = snapshot.symbol.clone();
+                let source_venue = snapshot.source_venue;
+
                 // 创建新的快照（不可变），替换旧的 Arc
-                let mut new_topn = if let Some(venue) = snapshot.source_venue {
+                let mut new_topn = if let Some(venue) = source_venue {
                     if let Some(existing) = self
                         .orderbooks
-                        .get(&VenueSymbol::new(venue, snapshot.symbol.clone()))
+                        .get(&VenueSymbol::new(venue, symbol.clone()))
                     {
                         // 复用现有容量，避免频繁分配
                         (**existing).clone()
                     } else {
-                        TopNSnapshot::new(snapshot.symbol.clone(), self.top_n)
+                        TopNSnapshot::new(symbol.clone(), self.top_n)
                     }
                 } else {
-                    TopNSnapshot::new(snapshot.symbol.clone(), self.top_n)
+                    TopNSnapshot::new(symbol.clone(), self.top_n)
                 };
 
                 new_topn.update_from_snapshot(&snapshot);
 
                 // 替换为新的 Arc（需要 source_venue 才能寫入 per-venue 訂單簿）
-                if let Some(venue) = snapshot.source_venue {
-                    let key = VenueSymbol::new(venue, snapshot.symbol.clone());
+                if let Some(venue) = source_venue {
+                    let key = VenueSymbol::new(venue, symbol.clone());
                     self.orderbooks.insert(key, Arc::new(new_topn));
                 }
 
                 // 标记该 symbol 已变更
-                self.changed_symbols.insert(snapshot.symbol.clone());
-
-                // 將原始快照事件透傳給策略（允許策略基於 LOB 做決策，如 OBI）
-                output_events.push(MarketEvent::Snapshot(snapshot.clone()));
+                self.changed_symbols.insert(symbol.clone());
 
                 // 更新 Joiner：改用 source_venue（不再依賴 symbol 前綴）
-                if let Some(venue_id) = snapshot.source_venue {
-                    let base_symbol = snapshot.symbol.clone(); // 當前事件使用純 base symbol
+                let mut arbitrage_opportunity = None;
+                if let Some(venue_id) = source_venue {
+                    let base_symbol = symbol.clone(); // 當前事件使用純 base symbol
                     let joiner = self
                         .joiners
                         .entry(base_symbol.clone())
                         .or_insert_with(|| CrossExchangeJoiner::new(base_symbol));
                     if let Some(topn_arc) = self
                         .orderbooks
-                        .get(&VenueSymbol::new(venue_id, snapshot.symbol.clone()))
+                        .get(&VenueSymbol::new(venue_id, symbol.clone()))
                     {
                         joiner.update_exchange(venue_id, (**topn_arc).clone());
-                        if let Some(arb_opp) = joiner.check_arbitrage_opportunity(Decimal::from(5))
-                        {
-                            output_events.push(MarketEvent::Arbitrage(arb_opp));
-                        }
+                        arbitrage_opportunity =
+                            joiner.check_arbitrage_opportunity_fast(FixedBps::from_f64(5.0));
                     }
+                }
+
+                // 將原始快照事件透傳給策略（允許策略基於 LOB 做決策，如 OBI）。
+                // 保留所有權移動，避免克隆整個 L2 snapshot。
+                output_events.push(MarketEvent::Snapshot(snapshot));
+                if let Some(arb_opp) = arbitrage_opportunity {
+                    output_events.push(MarketEvent::Arbitrage(arb_opp));
                 }
             }
 
@@ -590,8 +596,9 @@ impl AggregationEngine {
     /// 獲取所有套利機會
     fn get_all_arbitrage_opportunities(&self) -> Vec<ArbitrageOpportunity> {
         let mut opportunities = Vec::with_capacity(self.joiners.len());
+        let min_spread_bps = FixedBps::from_f64(5.0);
         for joiner in self.joiners.values() {
-            if let Some(opp) = joiner.check_arbitrage_opportunity(Decimal::from(5)) {
+            if let Some(opp) = joiner.check_arbitrage_opportunity_fast(min_spread_bps) {
                 opportunities.push(opp);
             }
         }
@@ -697,10 +704,7 @@ impl MarketView {
 
     /// 檢查數據是否陳舊
     pub fn is_stale(&self, threshold_us: u64) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
+        let now = now_micros();
         now.saturating_sub(self.timestamp) > threshold_us
     }
 }

@@ -1,11 +1,12 @@
 //! 高性能SPSC (Single Producer Single Consumer) Ring Buffer（從 src/ 平移骨架）
 use crossbeam_utils::CachePadded;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[repr(align(64))]
 pub struct SpscRingBuffer<T> {
-    buffer: Box<[Option<T>]>,
+    buffer: Box<[UnsafeCell<Option<T>>]>,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
     capacity: usize,
@@ -16,7 +17,7 @@ impl<T> SpscRingBuffer<T> {
         let actual_capacity = capacity.next_power_of_two();
         let mut buffer = Vec::with_capacity(actual_capacity);
         for _ in 0..actual_capacity {
-            buffer.push(None);
+            buffer.push(UnsafeCell::new(None));
         }
         Self {
             buffer: buffer.into_boxed_slice(),
@@ -33,7 +34,7 @@ impl<T> SpscRingBuffer<T> {
             return Err(item);
         }
         unsafe {
-            let slot = &mut *self.buffer.as_ptr().add(head).cast_mut();
+            let slot = &mut *self.buffer.get_unchecked(head).get();
             *slot = Some(item);
         }
         // Memory fence to ensure data write completes before head update is visible
@@ -50,7 +51,7 @@ impl<T> SpscRingBuffer<T> {
             return None;
         }
         let item = unsafe {
-            let slot = &mut *self.buffer.as_ptr().add(tail).cast_mut();
+            let slot = &mut *self.buffer.get_unchecked(tail).get();
             slot.take()
         };
         let next_tail = (tail + 1) & (self.capacity - 1);
