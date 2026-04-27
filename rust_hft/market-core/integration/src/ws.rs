@@ -79,19 +79,16 @@ impl WsClient {
         );
 
         // 配置專為 HFT 優化的 WebSocket 設置
-        #[allow(deprecated)]
-        let ws_config = Some(WebSocketConfig {
-            // 消息和幀大小限制
-            max_message_size: Some(self.cfg.max_message_size),
-            max_frame_size: Some(self.cfg.max_frame_size),
-            // 增大寫入緩衝區以提高批量寫入效率
-            write_buffer_size: self.cfg.max_frame_size,
-            max_write_buffer_size: self.cfg.max_message_size,
-            // 發送隊列大小限制（保留欄位以兼容現有版本）
-            max_send_queue: None,
-            // 不接受未遮罩幀（安全考慮）
-            accept_unmasked_frames: false,
-        });
+        let mut ws_config = WebSocketConfig::default();
+        // 消息和幀大小限制
+        ws_config.max_message_size = Some(self.cfg.max_message_size);
+        ws_config.max_frame_size = Some(self.cfg.max_frame_size);
+        // 增大寫入緩衝區以提高批量寫入效率
+        ws_config.write_buffer_size = self.cfg.max_frame_size;
+        ws_config.max_write_buffer_size = self.cfg.max_message_size;
+        // 不接受未遮罩幀（安全考慮）
+        ws_config.accept_unmasked_frames = false;
+        let ws_config = Some(ws_config);
 
         match connect_async_with_config(&self.cfg.url, ws_config, false).await {
             Ok((ws_stream, response)) => {
@@ -132,7 +129,7 @@ impl WsClient {
         message: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(conn) = &mut self.connection {
-            conn.send(Message::Text(message.to_string())).await?;
+            conn.send(Message::Text(message.to_string().into())).await?;
             self.metrics.messages_sent += 1;
             trace!("發送消息: {}", message);
             Ok(())
@@ -151,7 +148,7 @@ impl WsClient {
                         self.metrics.messages_received += 1;
                         trace!("接收到消息: {}", text);
                         let metrics = WsFrameMetrics::record_receive();
-                        Ok(Some((text, metrics)))
+                        Ok(Some((text.to_string(), metrics)))
                     }
                     Message::Ping(payload) => {
                         // 自動回應 Ping
@@ -170,7 +167,7 @@ impl WsClient {
                     }
                     Message::Binary(data) => {
                         // 對於二進制數據，轉換為 UTF-8
-                        match String::from_utf8(data) {
+                        match String::from_utf8(data.to_vec()) {
                             Ok(text) => {
                                 self.metrics.messages_received += 1;
                                 let metrics = WsFrameMetrics::record_receive();
@@ -214,14 +211,14 @@ impl WsClient {
                         trace!("接收到文本消息 (零拷貝)");
                         let metrics = WsFrameMetrics::record_receive();
                         // 將 String 轉為 Bytes（一次性分配，無需二次拷貝）
-                        Ok(Some((Bytes::from(text), metrics)))
+                        Ok(Some((Bytes::from(text.to_string()), metrics)))
                     }
                     Message::Binary(data) => {
                         self.metrics.messages_received += 1;
                         trace!("接收到二進制消息 (零拷貝)");
                         let metrics = WsFrameMetrics::record_receive();
                         // 直接包裝為 Bytes（零拷貝）
-                        Ok(Some((Bytes::from(data), metrics)))
+                        Ok(Some((data, metrics)))
                     }
                     Message::Ping(payload) => {
                         // 自動回應 Ping
@@ -256,7 +253,7 @@ impl WsClient {
 
     pub async fn send_ping(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(conn) = &mut self.connection {
-            conn.send(Message::Ping(vec![])).await?;
+            conn.send(Message::Ping(Vec::new().into())).await?;
             trace!("發送心跳 ping");
             Ok(())
         } else {
