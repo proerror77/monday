@@ -559,7 +559,7 @@ async fn insert_gap(
         reason: reason.to_string(),
         detail,
     };
-    let mut ins = ch.insert::<GapRow>("gap_log")?;
+    let mut ins = ch.insert::<GapRow>("gap_log").await?;
     ins.write(&row).await?;
     ins.end().await?;
     Ok(())
@@ -584,7 +584,7 @@ struct LobDepthRow {
 }
 
 async fn insert_lob_depth(ch: &ChClient, row: LobDepthRow) -> anyhow::Result<()> {
-    let mut ins = ch.insert::<LobDepthRow>("lob_depth")?;
+    let mut ins = ch.insert::<LobDepthRow>("lob_depth").await?;
     ins.write(&row).await?;
     ins.end().await?;
     Ok(())
