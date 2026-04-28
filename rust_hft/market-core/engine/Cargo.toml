@@ -10,6 +10,7 @@ snapshot = { package = "hft-snapshot", path = "../snapshot" }
 crossbeam = { workspace = true }
 crossbeam-utils = { version = "0.8", default-features = false }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync", "rt", "macros"] }
 futures = { workspace = true }

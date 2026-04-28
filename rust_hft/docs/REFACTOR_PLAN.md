@@ -2,6 +2,42 @@
 
 此文件紀錄我們的長期重構方向與待辦事項，目標是將現有高頻交易系統整理為結構清晰、易於擴展與維護的架構。每次改動請同步更新本計畫。
 
+## 2026-04-28 計畫修正：當前主線收窄到 Binance Market Data + Signal Engine
+
+本文件原本描述的是「完整交易平台」的長期重構方向。這個方向可以保留，但不再作為當前 P0/P1 執行主線。下一階段以 [`docs/architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md`](architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md) 為準。
+
+當前主線不是先做泛化 HFT 系統，而是先做：
+
+```text
+Binance raw market data
+  -> local order book correctness
+  -> microstructure features
+  -> signal generation
+  -> latency trace
+  -> replay
+  -> paper trading
+```
+
+因此，以下工作暫時降級為後續平台化任務，不應阻塞 Binance fast lane：
+
+- 泛化 `sdk` crate / CLI。
+- 多交易所 adapter 大重構。
+- 完整 Strategy -> Risk -> Execution 實盤下單鏈路。
+- 跨交易所套利與完整 OMS。
+- Generic BTreeMap + Decimal 訂單簿全量替換。
+
+新的優先級：
+
+| 優先級 | 目標 | 驗收 |
+|--------|------|------|
+| P0 | Binance depth stream + snapshot/diff bridge | update id 連續、gap 可檢測、reconnect 可 rebuild |
+| P1 | 本地 order book + TopN fast view | best bid/ask 與 Binance bookTicker sanity check 對齊 |
+| P2 | OBI/microprice/spread/staleness + `Signal` | signal 有 timestamp、expiry，策略不直接下單 |
+| P3 | per-stage latency trace + replay | live/replay 對同一輸入產生同一 book/features/signals |
+| P4 | remote/CI benchmark + paper trading | 不依賴本機重編譯；p50/p95/p99/p999/max 有證據 |
+
+舊里程碑 M2-M7 仍是長期平台治理方向，但需要等 Binance market-data lane 可測、可回放、可穩定運行後再恢復。
+
 ---
 
 ## 核心原則

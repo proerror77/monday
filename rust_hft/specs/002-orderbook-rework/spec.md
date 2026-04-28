@@ -2,8 +2,17 @@
 
 **Feature Branch**: `[002-orderbook-rework]`  
 **Created**: 2025-10-08  
-**Status**: Draft  
+**Status**: Superseded / Frozen as of 2026-04-28
+
 **Input**: Internal review discovered the current TopN order book and engine structure cannot meet latency targets; we must redesign data structures, unify numeric types, and simplify engine layering to restore determinism and maintainability.
+
+> **Superseded by**: `docs/architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md`
+>
+> This specification is no longer the active implementation contract for the
+> next phase. Its BTreeMap/Decimal-first design is too generic for the current
+> Binance low-latency market-data objective. Use the new plan for active work:
+> Binance depth stream correctness, snapshot/diff sequence bridge, fixed-point
+> TopN feature path, signal expiry, replay, and remote/CI latency evidence.
 
 ## User Scenarios & Testing *(mandatory)*
 

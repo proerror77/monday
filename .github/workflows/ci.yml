@@ -90,6 +90,57 @@ jobs:
           path: rust_hft/dist/*
           if-no-files-found: ignore
 
+  rust_hft_engine_fast_lane:
+    name: Rust HFT Engine Fast Lane
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    defaults:
+      run:
+        working-directory: rust_hft
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install Linux build tools
+        run: sudo apt-get update && sudo apt-get install -y clang mold protobuf-compiler
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Record cache dimensions
+        id: cache-info
+        shell: bash
+        run: |
+          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
+          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust_hft
+          key: hft-engine-fast-lane-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/Cargo.lock') }}
+          cache-all-crates: true
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Format hft-engine
+        run: cargo fmt --check --package hft-engine
+
+      - name: Check hft-engine
+        run: cargo check -p hft-engine --locked
+
+      - name: Test Binance MD fast lane
+        run: cargo test -p hft-engine --locked binance_md
+
   rust_extra_standalone:
     name: Rust Standalone (test_bitget_standalone)
     runs-on: ubuntu-latest

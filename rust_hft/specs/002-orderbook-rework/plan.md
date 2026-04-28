@@ -2,6 +2,19 @@
 
 **Branch**: `[002-orderbook-rework]` | **Date**: 2025-10-08 | **Spec**: specs/002-orderbook-rework/spec.md
 
+> **2026-04-28 Superseded / Frozen**
+>
+> This plan is kept as historical context, but it should not drive the next
+> implementation phase. The current execution plan is
+> `docs/architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md`.
+>
+> Main correction: the next milestone is Binance market data correctness,
+> feature computation, signal generation, latency trace, replay, and paper
+> trading. A generic BTreeMap + Decimal order book rework is not the hot-path
+> target. It may remain useful for cold-path correctness or compatibility, but
+> the Binance lane should use fixed-point integers, explicit sequence handling,
+> and a fixed-size TopN fast view.
+
 ## Summary
 
 重構訂單簿資料結構、統一 Decimal 型別、拆分 Engine 分層，並提供壓測與指標驗證，確保在高頻行情下仍維持 p99 ≤ 10 μs。

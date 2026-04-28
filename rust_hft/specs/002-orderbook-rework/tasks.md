@@ -7,6 +7,14 @@ description: "Tasks for Order Book & Engine Rework"
 **Input**: Design documents from `/specs/002-orderbook-rework/`
 **Prerequisites**: plan.md、research.md、現有 benchmark
 
+> **2026-04-28 Superseded / Frozen**
+>
+> Do not execute this task list as the active P0/P1 roadmap. The next active
+> task list lives in `docs/architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md`.
+> In particular, T101/T202/T203 are no longer the preferred first moves for the
+> low-latency Binance lane; start with Binance depth sequence correctness,
+> fixed-point TopN features, latency trace, replay, and remote/CI verification.
+
 ## Format: `[ID] [P?] Description`
 - `[P]`: 可平行執行
 - 任務依優先度排序，先重構資料結構，再進行分層
