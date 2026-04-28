@@ -6,8 +6,8 @@ mod zero_copy_stream;
 // cleanup: avoid duplicate helper modules; keep adapter self-contained
 
 pub use bitget_stream::{
-    parse_bitget_orderbook_frame, parse_bitget_trade_frame, parse_bitget_ws_envelope,
-    BitgetMarketStream,
+    parse_bitget_orderbook_frame, parse_bitget_orderbook_snapshot, parse_bitget_trade_event,
+    parse_bitget_trade_frame, parse_bitget_ws_envelope, BitgetMarketStream,
 };
 pub use zero_copy_stream::{ZeroCopyBitgetStream, ZeroCopyMessageHandler};
 

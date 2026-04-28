@@ -191,6 +191,129 @@ fn selected_depth_channel(use_incremental_books: bool, depth_channel: &str) -> &
     }
 }
 
+#[inline]
+pub fn parse_bitget_orderbook_snapshot(text: &str) -> HftResult<Option<MarketSnapshot>> {
+    let frame = parse_bitget_orderbook_frame(text)?;
+    let Some(arg) = &frame.arg else {
+        return Ok(None);
+    };
+    if !(arg.channel == "depth" || arg.channel.starts_with("books")) {
+        return Ok(None);
+    }
+    let Some(data) = frame.data.first() else {
+        return Ok(None);
+    };
+    orderbook_data_ref_to_snapshot(data, arg.inst_id).map(Some)
+}
+
+#[inline]
+pub fn parse_bitget_trade_event(text: &str) -> HftResult<Option<Trade>> {
+    let frame = parse_bitget_trade_frame(text)?;
+    let fallback_inst = frame.arg.as_ref().map(|a| a.inst_id).unwrap_or("");
+    let Some(data) = frame.data.first() else {
+        return Ok(None);
+    };
+    trade_data_ref_to_trade(data, fallback_inst).map(Some)
+}
+
+#[inline]
+fn orderbook_data_ref_to_snapshot(
+    data: &BitgetOrderBookDataRef<'_>,
+    symbol: &str,
+) -> HftResult<MarketSnapshot> {
+    let ts_ms = data.ts.parse::<u64>().map_err(|_| HftError::Generic {
+        message: "Invalid timestamp".to_string(),
+    })?;
+    let timestamp = ts_ms.saturating_mul(1000);
+
+    let mut bids = Vec::with_capacity(data.bids.len());
+    let mut asks = Vec::with_capacity(data.asks.len());
+
+    for bid in &data.bids {
+        let price = Price::from_str(bid.price).map_err(|_| HftError::Generic {
+            message: format!("Invalid bid price: {}", bid.price),
+        })?;
+        let quantity = Quantity::from_str(bid.size).map_err(|_| HftError::Generic {
+            message: format!("Invalid bid quantity: {}", bid.size),
+        })?;
+        bids.push(BookLevel { price, quantity });
+    }
+
+    for ask in &data.asks {
+        let price = Price::from_str(ask.price).map_err(|_| HftError::Generic {
+            message: format!("Invalid ask price: {}", ask.price),
+        })?;
+        let quantity = Quantity::from_str(ask.size).map_err(|_| HftError::Generic {
+            message: format!("Invalid ask quantity: {}", ask.size),
+        })?;
+        asks.push(BookLevel { price, quantity });
+    }
+
+    Ok(MarketSnapshot {
+        symbol: Symbol::from(symbol),
+        timestamp,
+        bids,
+        asks,
+        sequence: 0,
+        source_venue: Some(VenueId::BITGET),
+    })
+}
+
+#[inline]
+fn trade_data_ref_to_trade(data: &BitgetTradeDataRef<'_>, fallback_inst: &str) -> HftResult<Trade> {
+    let symbol = data.inst_id.unwrap_or(fallback_inst);
+    if symbol.is_empty() {
+        return Err(HftError::Generic {
+            message: "Missing Bitget trade symbol".to_string(),
+        });
+    }
+
+    let ts_ms = data.ts.parse::<u64>().map_err(|_| HftError::Generic {
+        message: "Invalid timestamp".to_string(),
+    })?;
+    let timestamp = ts_ms.saturating_mul(1000);
+
+    let price_str = data
+        .price
+        .or(data.price_alt)
+        .ok_or_else(|| HftError::Generic {
+            message: "Missing Bitget trade price".to_string(),
+        })?;
+    let price = Price::from_str(price_str).map_err(|_| HftError::Generic {
+        message: format!("Invalid trade price: {}", price_str),
+    })?;
+
+    let size_str = data
+        .size
+        .or(data.size_alt)
+        .ok_or_else(|| HftError::Generic {
+            message: "Missing Bitget trade size".to_string(),
+        })?;
+    let quantity = Quantity::from_str(size_str).map_err(|_| HftError::Generic {
+        message: format!("Invalid trade size: {}", size_str),
+    })?;
+
+    let side = match data.side.unwrap_or("buy") {
+        "buy" | "BUY" => Side::Buy,
+        "sell" | "SELL" => Side::Sell,
+        other => {
+            return Err(HftError::Generic {
+                message: format!("Invalid trade side: {}", other),
+            })
+        }
+    };
+
+    Ok(Trade {
+        symbol: Symbol::from(symbol),
+        timestamp,
+        price,
+        quantity,
+        side,
+        trade_id: data.trade_id.unwrap_or("").to_string(),
+        source_venue: Some(VenueId::BITGET),
+    })
+}
+
 /// 使用共用的 Value 解析函數
 #[inline]
 fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> HftResult<T> {
@@ -890,49 +1013,14 @@ impl BitgetMessageHandler {
         let fallback_inst = frame.arg.as_ref().map(|a| a.inst_id).unwrap_or("");
 
         for item in &frame.data {
-            let symbol = item.inst_id.unwrap_or(fallback_inst);
-            if symbol.is_empty() {
-                continue;
+            match trade_data_ref_to_trade(item, fallback_inst) {
+                Ok(trade) => {
+                    let _ = self.event_sender.send(MarketEvent::Trade(trade));
+                }
+                Err(e) => {
+                    trace!("忽略無效 Bitget trade frame: {}", e);
+                }
             }
-
-            let Ok(ts_ms) = item.ts.parse::<u64>() else {
-                continue;
-            };
-            let ts_us = ts_ms.saturating_mul(1000);
-            if ts_us == 0 {
-                continue;
-            }
-
-            let Some(price_str) = item.price.or(item.price_alt) else {
-                continue;
-            };
-            let Ok(price) = Price::from_str(price_str) else {
-                continue;
-            };
-
-            let Some(size_str) = item.size.or(item.size_alt) else {
-                continue;
-            };
-            let Ok(quantity) = Quantity::from_str(size_str) else {
-                continue;
-            };
-
-            let side = match item.side.unwrap_or("buy") {
-                "buy" | "BUY" => Side::Buy,
-                "sell" | "SELL" => Side::Sell,
-                _ => Side::Buy,
-            };
-
-            let trade = Trade {
-                symbol: Symbol::from(symbol),
-                timestamp: ts_us,
-                price,
-                quantity,
-                side,
-                trade_id: item.trade_id.unwrap_or("").to_string(),
-                source_venue: Some(VenueId::BITGET),
-            };
-            let _ = self.event_sender.send(MarketEvent::Trade(trade));
         }
 
         Ok(())
@@ -1254,42 +1342,7 @@ impl BitgetMessageHandler {
         data: &BitgetOrderBookDataRef<'_>,
         symbol: &Symbol,
     ) -> Result<MarketSnapshot, HftError> {
-        let ts_ms = data.ts.parse::<u64>().map_err(|_| HftError::Generic {
-            message: "Invalid timestamp".to_string(),
-        })?;
-        let timestamp = ts_ms.saturating_mul(1000);
-
-        let mut bids = Vec::with_capacity(data.bids.len());
-        let mut asks = Vec::with_capacity(data.asks.len());
-
-        for bid in &data.bids {
-            let price = Price::from_str(bid.price).map_err(|_| HftError::Generic {
-                message: format!("Invalid bid price: {}", bid.price),
-            })?;
-            let quantity = Quantity::from_str(bid.size).map_err(|_| HftError::Generic {
-                message: format!("Invalid bid quantity: {}", bid.size),
-            })?;
-            bids.push(BookLevel { price, quantity });
-        }
-
-        for ask in &data.asks {
-            let price = Price::from_str(ask.price).map_err(|_| HftError::Generic {
-                message: format!("Invalid ask price: {}", ask.price),
-            })?;
-            let quantity = Quantity::from_str(ask.size).map_err(|_| HftError::Generic {
-                message: format!("Invalid ask quantity: {}", ask.size),
-            })?;
-            asks.push(BookLevel { price, quantity });
-        }
-
-        Ok(MarketSnapshot {
-            symbol: symbol.clone(),
-            timestamp,
-            bids,
-            asks,
-            sequence: 0,
-            source_venue: Some(VenueId::BITGET),
-        })
+        orderbook_data_ref_to_snapshot(data, symbol.as_str())
     }
 
     fn parse_trade_data(
@@ -1543,5 +1596,33 @@ mod tests {
         assert_eq!(selected_depth_channel(true, "books15"), "books");
         assert_eq!(selected_depth_channel(false, "books1"), "books1");
         assert_eq!(selected_depth_channel(false, "books15"), "books15");
+    }
+
+    #[test]
+    fn parses_orderbook_snapshot_event_with_decimal_levels() {
+        let snapshot = parse_bitget_orderbook_snapshot(ORDERBOOK_FRAME)
+            .expect("valid orderbook")
+            .expect("snapshot");
+
+        assert_eq!(snapshot.symbol.as_str(), "BTCUSDT");
+        assert_eq!(snapshot.timestamp, 1_777_353_243_014_000);
+        assert_eq!(snapshot.bids.len(), 2);
+        assert_eq!(snapshot.asks.len(), 2);
+        assert_eq!(snapshot.bids[0].price.to_string(), "67188.1");
+        assert_eq!(snapshot.bids[0].quantity.to_string(), "0.12");
+    }
+
+    #[test]
+    fn parses_trade_event_with_decimal_price_quantity() {
+        let trade = parse_bitget_trade_event(TRADE_FRAME)
+            .expect("valid trade")
+            .expect("trade");
+
+        assert_eq!(trade.symbol.as_str(), "BTCUSDT");
+        assert_eq!(trade.timestamp, 1_777_353_243_014_000);
+        assert_eq!(trade.price.to_string(), "67188.1");
+        assert_eq!(trade.quantity.to_string(), "0.12");
+        assert_eq!(trade.side, Side::Buy);
+        assert_eq!(trade.trade_id, "t-1");
     }
 }

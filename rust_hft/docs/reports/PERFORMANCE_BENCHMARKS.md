@@ -31,9 +31,11 @@ cargo bench -p hft-engine --bench bitget_md_hotpath --locked
 
 | 組件 | Benchmark | 實測區間 | 說明 |
 |------|-----------|----------|------|
-| **Bitget WS envelope parser** | `bitget_md/parse_ws_envelope` | 358.48ns - 372.27ns | 只解析 `arg/channel/code/msg/action`，用於快速分流 |
-| **Bitget books parser** | `bitget_md/parse_orderbook_frame_borrowed` | 458.71ns - 463.56ns | borrowed typed parser，避免 `serde_json::Value` clone |
-| **Bitget trade parser** | `bitget_md/parse_trade_frame_borrowed` | 245.29ns - 247.40ns | borrowed typed parser，解析官方 `trade` channel |
+| **Bitget WS envelope parser** | `bitget_md/parse_ws_envelope` | 354.93ns - 381.17ns | 只解析 `arg/channel/code/msg/action`，用於快速分流 |
+| **Bitget books parser** | `bitget_md/parse_orderbook_frame_borrowed` | 464.40ns - 556.06ns | borrowed typed parser，避免 `serde_json::Value` clone |
+| **Bitget trade parser** | `bitget_md/parse_trade_frame_borrowed` | 250.94ns - 265.48ns | borrowed typed parser，解析官方 `trade` channel |
+| **Bitget snapshot event** | `bitget_md/full_orderbook_snapshot_event` | 547.37ns - 588.51ns | raw frame -> typed parse -> Decimal `Price/Quantity` -> `MarketSnapshot` |
+| **Bitget trade event** | `bitget_md/full_trade_event` | 297.23ns - 315.11ns | raw frame -> typed parse -> Decimal `Price/Quantity` -> `Trade` |
 
 Bitget WebSocket 接口注意事項：
 - 公共行情端點：`wss://ws.bitget.com/v2/ws/public`

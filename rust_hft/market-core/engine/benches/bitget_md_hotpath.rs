@@ -1,6 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use data_adapter_bitget::{
-    parse_bitget_orderbook_frame, parse_bitget_trade_frame, parse_bitget_ws_envelope,
+    parse_bitget_orderbook_frame, parse_bitget_orderbook_snapshot, parse_bitget_trade_event,
+    parse_bitget_trade_frame, parse_bitget_ws_envelope,
 };
 
 const ORDERBOOK_FRAME: &str = r#"{
@@ -42,5 +43,24 @@ fn bench_trade(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_envelope, bench_orderbook, bench_trade);
+fn bench_orderbook_snapshot_event(c: &mut Criterion) {
+    c.bench_function("bitget_md/full_orderbook_snapshot_event", |b| {
+        b.iter(|| black_box(parse_bitget_orderbook_snapshot(black_box(ORDERBOOK_FRAME))))
+    });
+}
+
+fn bench_trade_event(c: &mut Criterion) {
+    c.bench_function("bitget_md/full_trade_event", |b| {
+        b.iter(|| black_box(parse_bitget_trade_event(black_box(TRADE_FRAME))))
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_envelope,
+    bench_orderbook,
+    bench_trade,
+    bench_orderbook_snapshot_event,
+    bench_trade_event
+);
 criterion_main!(benches);
