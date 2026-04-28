@@ -21,6 +21,27 @@
 
 ## ⚡ 延遲基準測試
 
+### 交易所行情 hot path parser
+
+以下數據來自本機 release/bench profile，命令：
+
+```bash
+cargo bench -p hft-engine --bench bitget_md_hotpath --locked
+```
+
+| 組件 | Benchmark | 實測區間 | 說明 |
+|------|-----------|----------|------|
+| **Bitget WS envelope parser** | `bitget_md/parse_ws_envelope` | 358.48ns - 372.27ns | 只解析 `arg/channel/code/msg/action`，用於快速分流 |
+| **Bitget books parser** | `bitget_md/parse_orderbook_frame_borrowed` | 458.71ns - 463.56ns | borrowed typed parser，避免 `serde_json::Value` clone |
+| **Bitget trade parser** | `bitget_md/parse_trade_frame_borrowed` | 245.29ns - 247.40ns | borrowed typed parser，解析官方 `trade` channel |
+
+Bitget WebSocket 接口注意事項：
+- 公共行情端點：`wss://ws.bitget.com/v2/ws/public`
+- 深度 channel：`books/books1/books5/books15`；增量本地簿使用 `books`
+- 成交 channel：`trade`
+- 心跳：客戶端定期發送文本 `"ping"`，服務端返回文本 `"pong"`
+- `pong` 只更新連線健康狀態，不進入行情 parser
+
 ### 核心組件延遲 (單次操作)
 
 | 組件 | 目標延遲 | 實際P50 | 實際P95 | 實際P99 | 狀態 |

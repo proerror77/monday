@@ -117,7 +117,18 @@ cargo run -p hft-binance-md --locked -- paper \
 
 這條 fast lane 的當前邊界是：Binance WebSocket / REST snapshot -> 本地訂單簿 -> OBI/microprice/spread/staleness -> expiring signal -> replay/paper。真實下單、OMS、風控與跨交易所套利仍是後續階段。
 
-### 4. 開始交易
+### 4. Bitget Market Data Adapter
+```bash
+# 驗證 Bitget adapter 的 books/trade parser、mock WS、重連與心跳
+cargo test -p hft-data-adapter-bitget --locked -- --test-threads=1
+
+# 跑 Bitget borrowed parser hot-path benchmark
+cargo bench -p hft-engine --bench bitget_md_hotpath --locked
+```
+
+Bitget adapter 的行情接口按官方 v2 WebSocket 行為處理：公共端點使用 `wss://ws.bitget.com/v2/ws/public`，深度 channel 使用 `books/books1/books5/books15`，增量模式使用 `books`；心跳使用文本 `"ping"`/`"pong"`，不是只依賴 WebSocket ping frame。books/trade 熱路徑使用 borrowed typed JSON parser，非標準格式才回退 legacy `serde_json::Value` path。
+
+### 5. 開始交易
 ```bash
 # 啟動實時交易
 cargo run --release --bin hft_trader -- \

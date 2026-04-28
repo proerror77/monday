@@ -115,13 +115,17 @@ mod bitget_adapter_tests {
                                 let _ = ws.send(Message::Pong(payload)).await;
                             }
                             Ok(Message::Text(text)) => {
+                                if text == "ping" {
+                                    let _ = ws.send(Message::Text("pong".into())).await;
+                                    continue;
+                                }
                                 // 處理訂閱請求
                                 if text.contains("\"op\":\"subscribe\"") {
                                     let ack = json!({
                                         "code": "0",
                                         "msg": "success"
                                     });
-                                    let _ = ws.send(Message::Text(ack.to_string())).await;
+                                    let _ = ws.send(Message::Text(ack.to_string().into())).await;
                                     subscribed = true;
                                 }
                             }
@@ -145,7 +149,7 @@ mod bitget_adapter_tests {
 
                         // 發送心跳
                         if last_heartbeat.elapsed() >= heartbeat_interval {
-                            if let Err(_) = ws.send(Message::Ping(vec![])).await {
+                            if let Err(_) = ws.send(Message::Ping(vec![].into())).await {
                                 break;
                             }
                             last_heartbeat = Instant::now();
@@ -182,7 +186,7 @@ mod bitget_adapter_tests {
             });
 
             let mut queue = self.message_queue.lock().await;
-            queue.push(Message::Text(msg.to_string()));
+            queue.push(Message::Text(msg.to_string().into()));
         }
 
         /// 預設 OrderBook 增量更新消息
@@ -202,7 +206,7 @@ mod bitget_adapter_tests {
             });
 
             let mut queue = self.message_queue.lock().await;
-            queue.push(Message::Text(msg.to_string()));
+            queue.push(Message::Text(msg.to_string().into()));
         }
 
         /// 預設 Trade 消息
@@ -223,7 +227,7 @@ mod bitget_adapter_tests {
             });
 
             let mut queue = self.message_queue.lock().await;
-            queue.push(Message::Text(msg.to_string()));
+            queue.push(Message::Text(msg.to_string().into()));
         }
 
         /// 預設 Ticker 消息
@@ -243,7 +247,7 @@ mod bitget_adapter_tests {
             });
 
             let mut queue = self.message_queue.lock().await;
-            queue.push(Message::Text(msg.to_string()));
+            queue.push(Message::Text(msg.to_string().into()));
         }
 
         /// 計劃在指定時間後斷線

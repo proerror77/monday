@@ -3,8 +3,13 @@
 #![allow(dead_code)]
 use adapters_common::ws_helpers::constants;
 use async_trait::async_trait;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{
+    de::{DeserializeOwned, IgnoredAny, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::marker::PhantomData;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -28,10 +33,162 @@ pub struct BitgetWsMessage {
     pub msg: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BitgetWsEnvelope<'a> {
+    #[serde(borrow)]
+    pub action: Option<&'a str>,
+    #[serde(borrow)]
+    pub arg: Option<BitgetSubscriptionArgRef<'a>>,
+    #[serde(borrow)]
+    pub code: Option<BitgetCode<'a>>,
+    #[serde(borrow)]
+    pub msg: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum BitgetCode<'a> {
+    String(&'a str),
+    Number(i64),
+}
+
+impl BitgetCode<'_> {
+    #[inline]
+    fn is_ok(&self) -> bool {
+        match self {
+            Self::String(code) => *code == "0",
+            Self::Number(code) => *code == 0,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BitgetSubscriptionArgRef<'a> {
+    #[serde(rename = "instType", borrow)]
+    pub inst_type: &'a str,
+    #[serde(rename = "channel", borrow)]
+    pub channel: &'a str,
+    #[serde(rename = "instId", borrow)]
+    pub inst_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BitgetOrderBookFrame<'a> {
+    #[serde(borrow)]
+    pub action: Option<&'a str>,
+    #[serde(borrow)]
+    pub arg: Option<BitgetSubscriptionArgRef<'a>>,
+    #[serde(borrow)]
+    pub data: Vec<BitgetOrderBookDataRef<'a>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BitgetOrderBookDataRef<'a> {
+    #[serde(rename = "asks", borrow)]
+    pub asks: Vec<BitgetLevelRef<'a>>,
+    #[serde(rename = "bids", borrow)]
+    pub bids: Vec<BitgetLevelRef<'a>>,
+    #[serde(rename = "checksum")]
+    pub checksum: Option<i64>,
+    #[serde(rename = "ts", borrow)]
+    pub ts: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BitgetLevelRef<'a> {
+    pub price: &'a str,
+    pub size: &'a str,
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for BitgetLevelRef<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct LevelVisitor<'a>(PhantomData<&'a ()>);
+
+        impl<'de: 'a, 'a> Visitor<'de> for LevelVisitor<'a> {
+            type Value = BitgetLevelRef<'a>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Bitget price level [price, size, ...]")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let price = seq
+                    .next_element::<&'a str>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &"price at index 0"))?;
+                let size = seq
+                    .next_element::<&'a str>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &"size at index 1"))?;
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(BitgetLevelRef { price, size })
+            }
+        }
+
+        deserializer.deserialize_seq(LevelVisitor(PhantomData))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BitgetTradeFrame<'a> {
+    #[serde(borrow)]
+    pub arg: Option<BitgetSubscriptionArgRef<'a>>,
+    #[serde(borrow)]
+    pub data: Vec<BitgetTradeDataRef<'a>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BitgetTradeDataRef<'a> {
+    #[serde(rename = "instId", borrow)]
+    pub inst_id: Option<&'a str>,
+    #[serde(rename = "tradeId", borrow)]
+    pub trade_id: Option<&'a str>,
+    #[serde(rename = "px", borrow)]
+    pub price: Option<&'a str>,
+    #[serde(rename = "price", borrow)]
+    pub price_alt: Option<&'a str>,
+    #[serde(rename = "sz", borrow)]
+    pub size: Option<&'a str>,
+    #[serde(rename = "size", borrow)]
+    pub size_alt: Option<&'a str>,
+    #[serde(rename = "side", borrow)]
+    pub side: Option<&'a str>,
+    #[serde(rename = "ts", borrow)]
+    pub ts: &'a str,
+}
+
 /// 使用共用的 JSON 解析函數
 #[inline]
 fn parse_json<T: DeserializeOwned>(text: &str) -> HftResult<T> {
     adapters_common::parse_json(text).map_err(Into::into)
+}
+
+#[inline]
+pub fn parse_bitget_ws_envelope(text: &str) -> HftResult<BitgetWsEnvelope<'_>> {
+    serde_json::from_str(text).map_err(|e| HftError::Parse(e.to_string()))
+}
+
+#[inline]
+pub fn parse_bitget_orderbook_frame(text: &str) -> HftResult<BitgetOrderBookFrame<'_>> {
+    serde_json::from_str(text).map_err(|e| HftError::Parse(e.to_string()))
+}
+
+#[inline]
+pub fn parse_bitget_trade_frame(text: &str) -> HftResult<BitgetTradeFrame<'_>> {
+    serde_json::from_str(text).map_err(|e| HftError::Parse(e.to_string()))
+}
+
+#[inline]
+fn selected_depth_channel(use_incremental_books: bool, depth_channel: &str) -> &str {
+    if use_incremental_books {
+        "books"
+    } else {
+        depth_channel
+    }
 }
 
 /// 使用共用的 Value 解析函數
@@ -45,13 +202,11 @@ fn parse_value_owned<T: DeserializeOwned>(value: serde_json::Value) -> HftResult
 fn to_json_string<T: Serialize>(value: &T) -> HftResult<String> {
     #[cfg(feature = "json-simd")]
     {
-        simd_json::serde::to_string(value)
-            .map_err(|e| HftError::Serialization(e.to_string()))
+        simd_json::serde::to_string(value).map_err(|e| HftError::Serialization(e.to_string()))
     }
     #[cfg(not(feature = "json-simd"))]
     {
-        serde_json::to_string(value)
-            .map_err(|e| HftError::Serialization(e.to_string()))
+        serde_json::to_string(value).map_err(|e| HftError::Serialization(e.to_string()))
     }
 }
 
@@ -176,6 +331,7 @@ impl BitgetMarketStream {
             disable_compression: true,    // HFT 必須禁用壓縮
             max_message_size: 512 * 1024, // 512KB 訊息上限
             max_frame_size: 256 * 1024,   // 256KB 幀上限
+            heartbeat_text: Some("ping".to_string()),
         }
     }
 
@@ -276,12 +432,14 @@ impl BitgetMarketStream {
 
     async fn send_subscription(&mut self, symbols: &[Symbol]) -> Result<(), HftError> {
         if let Some(ref mut client) = self.ws_client {
+            let orderbook_channel =
+                selected_depth_channel(self.use_incremental_books, &self.depth_channel);
             // 訂閱 L2 深度數據
             let orderbook_args: Vec<BitgetSubscriptionArg> = symbols
                 .iter()
                 .map(|s| BitgetSubscriptionArg {
                     inst_type: self.inst_type.clone(),
-                    channel: "depth".to_string(),
+                    channel: orderbook_channel.to_string(),
                     inst_id: s.as_str().to_string(),
                 })
                 .collect();
@@ -301,7 +459,7 @@ impl BitgetMarketStream {
                 .iter()
                 .map(|s| BitgetSubscriptionArg {
                     inst_type: self.inst_type.clone(),
-                    channel: "trades".to_string(),
+                    channel: "trade".to_string(),
                     inst_id: s.as_str().to_string(),
                 })
                 .collect();
@@ -472,58 +630,64 @@ impl MessageHandler for BitgetMessageHandler {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         debug!("收到 Bitget 消息: {}", message);
 
-        // 解析 WebSocket 消息
-        let ws_msg: BitgetWsMessage = match parse_json(&message) {
-            Ok(msg) => {
-                metrics.mark_parsed();
-                msg
-            }
+        let envelope = match parse_bitget_ws_envelope(&message) {
+            Ok(msg) => msg,
             Err(e) => {
                 metrics.mark_parsed();
                 let parse_latency = metrics.parsed_at_us.saturating_sub(metrics.received_at_us);
-                trace!("Bitget JSON 解析失敗，耗時 {}μs", parse_latency);
+                trace!("Bitget envelope 解析失敗，耗時 {}μs", parse_latency);
                 return Err(Box::new(e));
             }
         };
+
+        // 優先依據 arg.channel 分流處理
+        if let Some(arg) = &envelope.arg {
+            match arg.channel {
+                c if c.starts_with("books") || c == "depth" => {
+                    match parse_bitget_orderbook_frame(&message) {
+                        Ok(frame) => {
+                            metrics.mark_parsed();
+                            self.handle_orderbook_frame(&frame)?;
+                        }
+                        Err(e) => {
+                            metrics.mark_parsed();
+                            trace!("Bitget typed orderbook 解析失敗，回退 Value path: {}", e);
+                            self.handle_message_legacy(&message)?;
+                        }
+                    }
+                }
+                "trade" | "trades" => match parse_bitget_trade_frame(&message) {
+                    Ok(frame) => {
+                        metrics.mark_parsed();
+                        self.handle_trade_frame(&frame)?;
+                    }
+                    Err(e) => {
+                        metrics.mark_parsed();
+                        trace!("Bitget typed trade 解析失敗，回退 Value path: {}", e);
+                        self.handle_message_legacy(&message)?;
+                    }
+                },
+                other => {
+                    metrics.mark_parsed();
+                    debug!("未處理的頻道: {}", other);
+                }
+            }
+        } else if let Some(code) = &envelope.code {
+            metrics.mark_parsed();
+            if code.is_ok() {
+                info!("訂閱成功");
+            } else {
+                warn!("收到錯誤代碼: {:?}, 消息: {:?}", code, envelope.msg);
+            }
+        } else {
+            metrics.mark_parsed();
+        }
 
         let parse_latency = metrics.parsed_at_us.saturating_sub(metrics.received_at_us);
         trace!("Bitget JSON 解析完成，耗時 {}μs", parse_latency);
 
         #[cfg(feature = "metrics")]
         MetricsRegistry::global().record_parsing_latency(parse_latency as f64);
-
-        // 優先依據 arg.channel 分流處理
-        if let Some(arg) = &ws_msg.arg {
-            if let Some(data) = &ws_msg.data {
-                match arg.channel.as_str() {
-                    c if c.starts_with("books") || c == "depth" => {
-                        self.handle_orderbook_data_with_action(
-                            data,
-                            &ws_msg.arg,
-                            ws_msg.action.as_deref(),
-                        )?;
-                    }
-                    "trade" | "trades" => {
-                        self.handle_trade_data(data, &ws_msg.arg)?;
-                    }
-                    other => {
-                        debug!("未處理的頻道: {}", other);
-                    }
-                }
-            }
-        } else if let Some(code) = &ws_msg.code {
-            // 兼容數字/字串的錯誤碼格式
-            let is_ok = match code {
-                serde_json::Value::Number(n) => n.as_i64() == Some(0),
-                serde_json::Value::String(s) => s == "0",
-                _ => false,
-            };
-            if is_ok {
-                info!("訂閱成功");
-            } else {
-                warn!("收到錯誤代碼: {:?}, 消息: {:?}", code, ws_msg.msg);
-            }
-        }
 
         Ok(())
     }
@@ -555,12 +719,8 @@ impl MessageHandler for BitgetMessageHandler {
             // 採用明確且兼容的訂閱參數：
             // - 增量模式：books（先 snapshot 後 update）
             // - 否則：books15 快照
-            let lob_channel = if self.use_incremental_books {
-                "books"
-            } else {
-                // 非增量模式，使用指定的快照頻道
-                self.depth_channel.as_str()
-            };
+            let lob_channel =
+                selected_depth_channel(self.use_incremental_books, &self.depth_channel);
             let lob_args: Vec<BitgetSubscriptionArg> = self
                 .subscribed_symbols
                 .iter()
@@ -616,6 +776,166 @@ impl BitgetMessageHandler {
     // LOB 狀態（僅增量模式）
     fn get_state_mut(&mut self, sym: &str) -> &mut OrderBookState {
         self.ob_state.entry(sym.to_string()).or_default()
+    }
+
+    fn handle_message_legacy(
+        &mut self,
+        message: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ws_msg: BitgetWsMessage = parse_json(message)?;
+
+        if let Some(arg) = &ws_msg.arg {
+            if let Some(data) = &ws_msg.data {
+                match arg.channel.as_str() {
+                    c if c.starts_with("books") || c == "depth" => {
+                        self.handle_orderbook_data_with_action(
+                            data,
+                            &ws_msg.arg,
+                            ws_msg.action.as_deref(),
+                        )?;
+                    }
+                    "trade" | "trades" => {
+                        self.handle_trade_data(data, &ws_msg.arg)?;
+                    }
+                    other => {
+                        debug!("未處理的頻道: {}", other);
+                    }
+                }
+            }
+        } else if let Some(code) = &ws_msg.code {
+            let is_ok = match code {
+                serde_json::Value::Number(n) => n.as_i64() == Some(0),
+                serde_json::Value::String(s) => s == "0",
+                _ => false,
+            };
+            if is_ok {
+                info!("訂閱成功");
+            } else {
+                warn!("收到錯誤代碼: {:?}, 消息: {:?}", code, ws_msg.msg);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_orderbook_frame(
+        &mut self,
+        frame: &BitgetOrderBookFrame<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(arg) = &frame.arg else {
+            return Ok(());
+        };
+        if !(arg.channel == "depth" || arg.channel.starts_with("books")) {
+            return Ok(());
+        }
+
+        if !self.use_incremental_books {
+            for orderbook_data in &frame.data {
+                if let Some(cs) = orderbook_data.checksum {
+                    if let Some(calc) = Self::calc_checksum_ref(orderbook_data) {
+                        if calc != cs {
+                            warn!("Bitget checksum mismatch: expected={}, got={}", cs, calc);
+                        }
+                    }
+                }
+
+                let symbol = Symbol::from(arg.inst_id);
+                match self.parse_orderbook_data_ref(orderbook_data, &symbol) {
+                    Ok(snapshot) => {
+                        let _ = self.event_sender.send(MarketEvent::Snapshot(snapshot));
+                    }
+                    Err(e) => {
+                        error!("解析訂單簿數據失敗: {}", e);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let sym = arg.inst_id;
+        let is_snapshot = matches!(frame.action, Some("snapshot"));
+
+        {
+            let state = self.get_state_mut(sym);
+            for ob in &frame.data {
+                if is_snapshot {
+                    state.apply_snapshot_ref(ob)?;
+                } else {
+                    state.apply_update_ref(ob)?;
+                }
+                if let Some(cs) = ob.checksum {
+                    if let Some(calc) = Self::calc_checksum_ref(ob) {
+                        if calc != cs {
+                            warn!(
+                                "Bitget incremental checksum mismatch: expected={}, got={}",
+                                cs, calc
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let snapshot = self
+            .get_state_mut(sym)
+            .to_snapshot(Symbol::new(sym), frame.data.last().map(|e| e.ts))?;
+        let _ = self.event_sender.send(MarketEvent::Snapshot(snapshot));
+        Ok(())
+    }
+
+    fn handle_trade_frame(
+        &mut self,
+        frame: &BitgetTradeFrame<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fallback_inst = frame.arg.as_ref().map(|a| a.inst_id).unwrap_or("");
+
+        for item in &frame.data {
+            let symbol = item.inst_id.unwrap_or(fallback_inst);
+            if symbol.is_empty() {
+                continue;
+            }
+
+            let Ok(ts_ms) = item.ts.parse::<u64>() else {
+                continue;
+            };
+            let ts_us = ts_ms.saturating_mul(1000);
+            if ts_us == 0 {
+                continue;
+            }
+
+            let Some(price_str) = item.price.or(item.price_alt) else {
+                continue;
+            };
+            let Ok(price) = Price::from_str(price_str) else {
+                continue;
+            };
+
+            let Some(size_str) = item.size.or(item.size_alt) else {
+                continue;
+            };
+            let Ok(quantity) = Quantity::from_str(size_str) else {
+                continue;
+            };
+
+            let side = match item.side.unwrap_or("buy") {
+                "buy" | "BUY" => Side::Buy,
+                "sell" | "SELL" => Side::Sell,
+                _ => Side::Buy,
+            };
+
+            let trade = Trade {
+                symbol: Symbol::from(symbol),
+                timestamp: ts_us,
+                price,
+                quantity,
+                side,
+                trade_id: item.trade_id.unwrap_or("").to_string(),
+                source_venue: Some(VenueId::BITGET),
+            };
+            let _ = self.event_sender.send(MarketEvent::Trade(trade));
+        }
+
+        Ok(())
     }
 
     fn handle_orderbook_data(
@@ -694,7 +1014,8 @@ impl BitgetMessageHandler {
         }
 
         // 生成快照事件（從狀態構建）
-        let snapshot = state.to_snapshot(Symbol::new(sym), entries.last().map(|e| &e.ts))?;
+        let snapshot =
+            state.to_snapshot(Symbol::new(sym), entries.last().map(|e| e.ts.as_str()))?;
         let _ = self.event_sender.send(MarketEvent::Snapshot(snapshot));
         Ok(())
     }
@@ -727,6 +1048,39 @@ impl BitgetMessageHandler {
         hasher.update(s.as_bytes());
         let crc = hasher.finalize() as i64;
         Some(crc)
+    }
+
+    /// 根據借用資料計算 CRC32，避免 hot path 先建立 owned JSON/字串層級。
+    fn calc_checksum_ref(data: &BitgetOrderBookDataRef<'_>) -> Option<i64> {
+        use crc32fast::Hasher;
+        let max_n = std::cmp::min(25, std::cmp::max(data.bids.len(), data.asks.len()));
+        if max_n == 0 {
+            return Some(0);
+        }
+
+        let mut hasher = Hasher::new();
+        let mut first = true;
+        for i in 0..max_n {
+            if let Some(b) = data.bids.get(i) {
+                Self::checksum_push_level(&mut hasher, &mut first, b.price, b.size);
+            }
+            if let Some(a) = data.asks.get(i) {
+                Self::checksum_push_level(&mut hasher, &mut first, a.price, a.size);
+            }
+        }
+        Some(hasher.finalize() as i64)
+    }
+
+    #[inline]
+    fn checksum_push_level(hasher: &mut crc32fast::Hasher, first: &mut bool, px: &str, sz: &str) {
+        if *first {
+            *first = false;
+        } else {
+            hasher.update(b":");
+        }
+        hasher.update(px.as_bytes());
+        hasher.update(b":");
+        hasher.update(sz.as_bytes());
     }
 
     fn handle_trade_data(
@@ -895,6 +1249,49 @@ impl BitgetMessageHandler {
         })
     }
 
+    fn parse_orderbook_data_ref(
+        &self,
+        data: &BitgetOrderBookDataRef<'_>,
+        symbol: &Symbol,
+    ) -> Result<MarketSnapshot, HftError> {
+        let ts_ms = data.ts.parse::<u64>().map_err(|_| HftError::Generic {
+            message: "Invalid timestamp".to_string(),
+        })?;
+        let timestamp = ts_ms.saturating_mul(1000);
+
+        let mut bids = Vec::with_capacity(data.bids.len());
+        let mut asks = Vec::with_capacity(data.asks.len());
+
+        for bid in &data.bids {
+            let price = Price::from_str(bid.price).map_err(|_| HftError::Generic {
+                message: format!("Invalid bid price: {}", bid.price),
+            })?;
+            let quantity = Quantity::from_str(bid.size).map_err(|_| HftError::Generic {
+                message: format!("Invalid bid quantity: {}", bid.size),
+            })?;
+            bids.push(BookLevel { price, quantity });
+        }
+
+        for ask in &data.asks {
+            let price = Price::from_str(ask.price).map_err(|_| HftError::Generic {
+                message: format!("Invalid ask price: {}", ask.price),
+            })?;
+            let quantity = Quantity::from_str(ask.size).map_err(|_| HftError::Generic {
+                message: format!("Invalid ask quantity: {}", ask.size),
+            })?;
+            asks.push(BookLevel { price, quantity });
+        }
+
+        Ok(MarketSnapshot {
+            symbol: symbol.clone(),
+            timestamp,
+            bids,
+            asks,
+            sequence: 0,
+            source_venue: Some(VenueId::BITGET),
+        })
+    }
+
     fn parse_trade_data(
         &self,
         data: &BitgetTradeData,
@@ -955,9 +1352,23 @@ impl OrderBookState {
         Ok(())
     }
 
+    fn apply_snapshot_ref(&mut self, data: &BitgetOrderBookDataRef<'_>) -> Result<(), HftError> {
+        self.bids.clear();
+        self.asks.clear();
+        self.ingest_levels_ref(&data.bids, true)?;
+        self.ingest_levels_ref(&data.asks, false)?;
+        Ok(())
+    }
+
     fn apply_update(&mut self, data: &BitgetOrderBookData) -> Result<(), HftError> {
         self.ingest_levels(&data.bids, true)?;
         self.ingest_levels(&data.asks, false)?;
+        Ok(())
+    }
+
+    fn apply_update_ref(&mut self, data: &BitgetOrderBookDataRef<'_>) -> Result<(), HftError> {
+        self.ingest_levels_ref(&data.bids, true)?;
+        self.ingest_levels_ref(&data.asks, false)?;
         Ok(())
     }
 
@@ -997,10 +1408,47 @@ impl OrderBookState {
         Ok(())
     }
 
+    fn ingest_levels_ref(
+        &mut self,
+        levels: &[BitgetLevelRef<'_>],
+        is_bid: bool,
+    ) -> Result<(), HftError> {
+        for lvl in levels {
+            let px = rust_decimal::Decimal::from_str_exact(lvl.price)
+                .or_else(|_| {
+                    lvl.price.parse::<f64>().map(|v| {
+                        rust_decimal::Decimal::try_from(v).unwrap_or(rust_decimal::Decimal::ZERO)
+                    })
+                })
+                .unwrap_or(rust_decimal::Decimal::ZERO);
+            let sz = rust_decimal::Decimal::from_str_exact(lvl.size)
+                .or_else(|_| {
+                    lvl.size.parse::<f64>().map(|v| {
+                        rust_decimal::Decimal::try_from(v).unwrap_or(rust_decimal::Decimal::ZERO)
+                    })
+                })
+                .unwrap_or(rust_decimal::Decimal::ZERO);
+            if px.is_zero() {
+                continue;
+            }
+            let book = if is_bid {
+                &mut self.bids
+            } else {
+                &mut self.asks
+            };
+            if sz.is_zero() {
+                book.remove(&px);
+            } else {
+                book.insert(px, sz);
+            }
+        }
+        Ok(())
+    }
+
     fn to_snapshot(
         &self,
         symbol: Symbol,
-        ts_str: Option<&String>,
+        ts_str: Option<&str>,
     ) -> Result<MarketSnapshot, HftError> {
         let ts_ms = if let Some(s) = ts_str {
             s.parse::<u64>().unwrap_or(0)
@@ -1037,5 +1485,63 @@ impl OrderBookState {
             sequence: 0,
             source_venue: Some(VenueId::BITGET),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ORDERBOOK_FRAME: &str = r#"{
+        "action":"snapshot",
+        "arg":{"instType":"SPOT","channel":"books15","instId":"BTCUSDT"},
+        "data":[{
+            "asks":[["67189.5","0.25","1"],["67190.0","0.30"]],
+            "bids":[["67188.1","0.12","2"],["67187.5","0.15"]],
+            "ts":"1777353243014"
+        }]
+    }"#;
+
+    const TRADE_FRAME: &str = r#"{
+        "arg":{"instType":"SPOT","channel":"trade","instId":"BTCUSDT"},
+        "data":[{
+            "px":"67188.1",
+            "sz":"0.12",
+            "side":"buy",
+            "ts":"1777353243014",
+            "tradeId":"t-1"
+        }]
+    }"#;
+
+    #[test]
+    fn borrowed_orderbook_parser_ignores_level_count_without_allocating_strings() {
+        let frame = parse_bitget_orderbook_frame(ORDERBOOK_FRAME).expect("valid orderbook");
+
+        let arg = frame.arg.expect("arg");
+        assert_eq!(arg.channel, "books15");
+        assert_eq!(arg.inst_id, "BTCUSDT");
+        assert_eq!(frame.data.len(), 1);
+        assert_eq!(frame.data[0].asks[0].price, "67189.5");
+        assert_eq!(frame.data[0].asks[0].size, "0.25");
+        assert_eq!(frame.data[0].bids[0].price, "67188.1");
+        assert_eq!(frame.data[0].ts, "1777353243014");
+    }
+
+    #[test]
+    fn borrowed_trade_parser_accepts_official_trade_channel() {
+        let frame = parse_bitget_trade_frame(TRADE_FRAME).expect("valid trade");
+
+        let arg = frame.arg.expect("arg");
+        assert_eq!(arg.channel, "trade");
+        assert_eq!(frame.data[0].price, Some("67188.1"));
+        assert_eq!(frame.data[0].size, Some("0.12"));
+        assert_eq!(frame.data[0].trade_id, Some("t-1"));
+    }
+
+    #[test]
+    fn selected_depth_channel_never_uses_legacy_depth_subscription() {
+        assert_eq!(selected_depth_channel(true, "books15"), "books");
+        assert_eq!(selected_depth_channel(false, "books1"), "books1");
+        assert_eq!(selected_depth_channel(false, "books15"), "books15");
     }
 }

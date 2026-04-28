@@ -27,6 +27,8 @@ pub struct WsClientConfig {
     pub max_message_size: usize,
     /// WebSocket 幀大小限制（字節）
     pub max_frame_size: usize,
+    /// Optional text heartbeat payload for exchanges that require application-level ping.
+    pub heartbeat_text: Option<String>,
 }
 
 impl Default for WsClientConfig {
@@ -42,6 +44,7 @@ impl Default for WsClientConfig {
             // 提升上限以避免 "Space limit exceeded" 斷線
             max_message_size: 512 * 1024, // 512KB 訊息上限
             max_frame_size: 256 * 1024,   // 256KB 幀上限
+            heartbeat_text: None,
         }
     }
 }
@@ -145,6 +148,10 @@ impl WsClient {
             if let Some(msg) = conn.next().await {
                 match msg? {
                     Message::Text(text) => {
+                        if self.cfg.heartbeat_text.is_some() && text == "pong" {
+                            self.metrics.last_heartbeat = Some(Instant::now());
+                            return Ok(None);
+                        }
                         self.metrics.messages_received += 1;
                         trace!("接收到消息: {}", text);
                         let metrics = WsFrameMetrics::record_receive();
@@ -207,6 +214,10 @@ impl WsClient {
             if let Some(msg) = conn.next().await {
                 match msg? {
                     Message::Text(text) => {
+                        if self.cfg.heartbeat_text.is_some() && text == "pong" {
+                            self.metrics.last_heartbeat = Some(Instant::now());
+                            return Ok(None);
+                        }
                         self.metrics.messages_received += 1;
                         trace!("接收到文本消息 (零拷貝)");
                         let metrics = WsFrameMetrics::record_receive();
@@ -253,8 +264,13 @@ impl WsClient {
 
     pub async fn send_ping(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(conn) = &mut self.connection {
-            conn.send(Message::Ping(Vec::new().into())).await?;
-            trace!("發送心跳 ping");
+            if let Some(text) = &self.cfg.heartbeat_text {
+                conn.send(Message::Text(text.clone().into())).await?;
+                trace!("發送文本心跳: {}", text);
+            } else {
+                conn.send(Message::Ping(Vec::new().into())).await?;
+                trace!("發送心跳 ping");
+            }
             Ok(())
         } else {
             Err("WebSocket 未連接".into())

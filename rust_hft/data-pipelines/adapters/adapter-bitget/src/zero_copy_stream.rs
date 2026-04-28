@@ -64,6 +64,7 @@ impl ZeroCopyBitgetStream {
             disable_compression: true,    // HFT 必須禁用壓縮
             max_message_size: 512 * 1024, // 512KB 訊息上限
             max_frame_size: 256 * 1024,   // 256KB 幀上限
+            heartbeat_text: Some("ping".to_string()),
         }
     }
 
