@@ -15,11 +15,11 @@ mod message_types;
 mod rest;
 mod websocket;
 
-use rest::*;
-use websocket::*;
-
 // Re-export for benchmarks and external use
 pub use converter::MessageConverter;
+pub use message_types::{BookTickerEvent, DepthSnapshot};
+pub use rest::BinanceRestClient;
+pub use websocket::BinanceWebSocket;
 
 pub mod capabilities {
     #[derive(Debug, Clone)]
@@ -143,8 +143,10 @@ impl MarketStream for BinanceMarketStream {
 
         tokio::spawn(async move {
             // 使用共用重連配置
-            use adapters_common::ws_helpers::constants::{DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS};
             use adapters_common::calculate_exponential_backoff;
+            use adapters_common::ws_helpers::constants::{
+                DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS,
+            };
 
             let mut attempts: u32 = 0;
 
@@ -297,15 +299,13 @@ mod tests {
 
     #[test]
     fn test_with_ws_base_url() {
-        let stream = BinanceMarketStream::new()
-            .with_ws_base_url("wss://custom.binance.com/ws");
+        let stream = BinanceMarketStream::new().with_ws_base_url("wss://custom.binance.com/ws");
         assert_eq!(stream.ws_base_url, "wss://custom.binance.com/ws");
     }
 
     #[test]
     fn test_with_rest_base_url() {
-        let stream = BinanceMarketStream::new()
-            .with_rest_base_url("https://custom.binance.com");
+        let stream = BinanceMarketStream::new().with_rest_base_url("https://custom.binance.com");
         // The rest_client is updated internally
         assert!(!stream.is_connected);
     }

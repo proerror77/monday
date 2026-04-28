@@ -75,6 +75,7 @@ members = [
     # Applications
     "apps/live",
     "apps/all-in-one",
+    "apps/binance-md",
     "apps/paper",
     "apps/replay",
     "apps/backtest",

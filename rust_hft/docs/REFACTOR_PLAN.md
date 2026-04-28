@@ -4,7 +4,7 @@
 
 ## 2026-04-28 計畫修正：當前主線收窄到 Binance Market Data + Signal Engine
 
-本文件原本描述的是「完整交易平台」的長期重構方向。這個方向可以保留，但不再作為當前 P0/P1 執行主線。下一階段以 [`docs/architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md`](architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md) 為準。
+本文件原本描述的是「完整交易平台」的長期重構方向。這個方向可以保留，但不再作為當前 P0/P1 執行主線。下一階段以 [`docs/architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md`](architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md) 為高層藍圖，具體執行順序以 [`docs/architecture/BINANCE_MD_REFACTOR_EXECUTION_PLAN.md`](architecture/BINANCE_MD_REFACTOR_EXECUTION_PLAN.md) 為準。
 
 當前主線不是先做泛化 HFT 系統，而是先做：
 

@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateMeta {
     pub first_update_id: u64,
     pub final_update_id: u64,
@@ -19,7 +21,7 @@ impl UpdateMeta {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SequenceDecision {
     Apply,
     IgnoreStale,
@@ -27,7 +29,7 @@ pub enum SequenceDecision {
     InvalidRange,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BookSyncState {
     Disconnected,
     BufferingDiffs,
@@ -37,14 +39,14 @@ pub enum BookSyncState {
     RebuildRequired,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferedDecision {
     pub index: usize,
     pub update: UpdateMeta,
     pub decision: SequenceDecision,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferedApplyResult {
     pub applied: usize,
     pub ignored_stale: usize,
@@ -99,6 +101,12 @@ impl BookSync {
             self.start_buffering();
         }
         self.state = BookSyncState::FetchingSnapshot;
+    }
+
+    pub fn load_snapshot_for_replay(&mut self, snapshot_last_update_id: u64) {
+        self.state = BookSyncState::Live;
+        self.last_update_id = snapshot_last_update_id;
+        self.buffered.clear();
     }
 
     pub fn buffer_diff(&mut self, update: UpdateMeta) {
@@ -206,11 +214,7 @@ impl BookSync {
         }
 
         self.buffered.clear();
-        self.state = if bridged {
-            BookSyncState::Live
-        } else {
-            BookSyncState::RebuildRequired
-        };
+        self.state = BookSyncState::Live;
 
         result
     }
@@ -355,5 +359,20 @@ mod tests {
 
         assert_eq!(sync.state(), BookSyncState::RebuildRequired);
         assert_eq!(result.gap, Some((101, 102)));
+    }
+
+    #[test]
+    fn stale_only_buffer_enters_live_after_snapshot() {
+        let mut sync = BookSync::new();
+        sync.start_buffering();
+        sync.buffer_diff(UpdateMeta::new(95, 100));
+
+        let result = sync.apply_snapshot(100);
+
+        assert_eq!(sync.state(), BookSyncState::Live);
+        assert_eq!(sync.last_update_id(), 100);
+        assert_eq!(result.applied, 0);
+        assert_eq!(result.ignored_stale, 1);
+        assert_eq!(result.gap, None);
     }
 }

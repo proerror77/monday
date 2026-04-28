@@ -1,0 +1,24 @@
+[package]
+name = "hft-binance-md"
+version = "0.1.0"
+edition = "2021"
+description = "Binance low-latency market-data fast-lane runner"
+
+[dependencies]
+engine = { package = "hft-engine", path = "../../market-core/engine" }
+hft-core = { package = "hft-core", path = "../../market-core/core" }
+data-adapter-binance = { package = "hft-data-adapter-binance", path = "../../data-pipelines/adapters/adapter-binance" }
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hdrhistogram = "7"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[[bin]]
+name = "hft-binance-md"
+path = "src/main.rs"

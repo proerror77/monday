@@ -1,7 +1,8 @@
 use super::book::TopBook;
+use serde::{Deserialize, Serialize};
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureSnapshot {
     pub symbol_id: u32,
     pub mid: i64,
@@ -14,7 +15,7 @@ pub struct FeatureSnapshot {
     pub ts_ns: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureView {
     pub snapshot: FeatureSnapshot,
     pub book_update_id: u64,
@@ -64,7 +65,7 @@ pub fn compute_features<const N: usize>(
             obi3_fp,
             microgap: micro - mid,
             flow_1s,
-            book_staleness_ns: ts_ns.saturating_sub(book.last_update_ns),
+            book_staleness_ns: ts_ns.saturating_sub(book.last_update_ns).max(0),
             ts_ns,
         },
         book_update_id: book.last_update_id,
@@ -111,5 +112,15 @@ mod tests {
         assert_eq!(view.snapshot.obi1_fp, 500_000);
         assert_eq!(view.snapshot.microgap, 0);
         assert_eq!(view.snapshot.book_staleness_ns, 1_000);
+    }
+
+    #[test]
+    fn staleness_never_goes_negative() {
+        let mut book = TopBook::<3>::new();
+        book.apply_update(&[(100, 150)], &[(102, 50)], 10, 2_000);
+
+        let view = compute_features(1, &book, 0, 1_000).unwrap();
+
+        assert_eq!(view.snapshot.book_staleness_ns, 0);
     }
 }

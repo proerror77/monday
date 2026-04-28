@@ -225,13 +225,21 @@ pub fn normalize_depth_update(
 
     Ok(ParsedDepthUpdate {
         symbol_id,
-        exchange_ts_ns: (update.event_time_ms as i64) * 1_000_000,
+        exchange_ts_ns: binance_event_time_to_ns(update.event_time_ms),
         receive_ts_ns,
         first_update_id: update.first_update_id,
         final_update_id: update.final_update_id,
         bids,
         asks,
     })
+}
+
+fn binance_event_time_to_ns(event_time: u64) -> i64 {
+    if event_time >= 10_000_000_000_000 {
+        (event_time as i64) * 1_000
+    } else {
+        (event_time as i64) * 1_000_000
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +286,22 @@ mod tests {
         assert_eq!(update.final_update_id, 102);
         assert_eq!(update.bids, vec![(60_000_120_000, 1_234)]);
         assert_eq!(update.asks, vec![(60_001_000_000, 2_000)]);
+    }
+
+    #[test]
+    fn supports_microsecond_time_unit() {
+        let raw = br#"{
+            "e":"depthUpdate",
+            "E":1700000000123456,
+            "s":"BTCUSDT",
+            "U":100,
+            "u":102,
+            "b":[["60000.12","0.001234"]],
+            "a":[["60001.00","0.002000"]]
+        }"#;
+
+        let update = parse_depth_update(raw, 1, 999).unwrap();
+
+        assert_eq!(update.exchange_ts_ns, 1_700_000_000_123_456_000);
     }
 }

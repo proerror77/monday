@@ -1808,6 +1808,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-binance-md"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures-util",
+ "hdrhistogram",
+ "hft-core",
+ "hft-data-adapter-binance",
+ "hft-engine",
+ "rustls 0.23.39",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hft-collector"
 version = "0.2.0"
 dependencies = [

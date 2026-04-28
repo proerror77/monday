@@ -26,5 +26,8 @@ pub use parser::{
 };
 pub use pipeline::{BridgeOutcome, MarketDataLane, ProcessOutcome};
 pub use raw::{RawFrameBuf, RawFrameRef};
-pub use replay::{ReplayBatch, ReplayKind, ReplayPayload, ReplayRecord};
+pub use replay::{
+    read_replay_records, write_replay_batch, ReplayBatch, ReplayBridgeUpdate, ReplayKind,
+    ReplayPayload, ReplayRecord,
+};
 pub use signal::{Signal, SignalRules, SignalSide};
