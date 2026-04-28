@@ -87,12 +87,6 @@ struct PaperArgs {
 }
 
 #[derive(Debug, Deserialize)]
-struct Envelope<'a> {
-    #[serde(borrow)]
-    stream: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
 struct DepthEnvelope<'a> {
     #[serde(borrow)]
     data: BinanceDepthUpdate<'a>,
@@ -116,6 +110,13 @@ struct BookTicker<'a> {
 struct BookTickerSnapshot {
     best_bid_price: i64,
     best_ask_price: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Depth,
+    BookTicker,
+    Other,
 }
 
 struct LatencyHistograms {
@@ -274,27 +275,23 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
                 break;
             }
         };
+        let recv_ts_ns = now_ns();
+        let recv_latency_ns = elapsed_ns(&start);
 
-        let envelope: Envelope<'_> = match serde_json::from_slice(&bytes) {
-            Ok(envelope) => envelope,
-            Err(err) => {
-                warn!("skipping malformed Binance frame: {}", err);
+        match classify_stream(&bytes) {
+            StreamKind::BookTicker => {
+                stats.book_ticker_messages += 1;
+                let ticker: BookTickerEnvelope<'_> = serde_json::from_slice(&bytes)?;
+                latest_book_ticker = Some(parse_book_ticker(&ticker.data)?);
                 continue;
             }
-        };
-
-        if envelope.stream.ends_with("@bookTicker") {
-            stats.book_ticker_messages += 1;
-            let ticker: BookTickerEnvelope<'_> = serde_json::from_slice(&bytes)?;
-            latest_book_ticker = Some(parse_book_ticker(&ticker.data)?);
-            continue;
-        }
-        if !is_depth_stream(envelope.stream) {
-            debug!("skipping non-depth stream: {}", envelope.stream);
-            continue;
+            StreamKind::Depth => {}
+            StreamKind::Other => {
+                debug!("skipping non-depth Binance frame");
+                continue;
+            }
         }
 
-        let recv_ts_ns = now_ns();
         let depth: DepthEnvelope<'_> = serde_json::from_slice(&bytes)?;
         let update = normalize_depth_update(depth.data, args.symbol_id, recv_ts_ns)?;
 
@@ -327,11 +324,11 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         let outcome = lane.process_depth_update_with_clock(
             &update,
             LatencyTrace {
-                recv_ns: recv_ts_ns,
-                parse_done_ns: now_ns(),
+                recv_ns: recv_latency_ns,
+                parse_done_ns: elapsed_ns(&start),
                 ..LatencyTrace::default()
             },
-            &mut now_ns,
+            &mut || elapsed_ns(&start),
         )?;
 
         stats.depth_messages += 1;
@@ -641,12 +638,28 @@ fn build_stream_url(base_url: &str, symbol: &str) -> String {
     )
 }
 
-fn is_depth_stream(stream: &str) -> bool {
-    stream.ends_with("@depth") || stream.ends_with("@depth@100ms")
+fn classify_stream(raw: &[u8]) -> StreamKind {
+    if contains_bytes(raw, b"@depth") {
+        StreamKind::Depth
+    } else if contains_bytes(raw, b"@bookTicker") {
+        StreamKind::BookTicker
+    } else {
+        StreamKind::Other
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn now_ns() -> i64 {
     (now_micros() as i64) * 1_000
+}
+
+fn elapsed_ns(origin: &Instant) -> i64 {
+    origin.elapsed().as_nanos() as i64
 }
 
 fn record_non_negative(histogram: &mut Histogram<u64>, value: i64) {
@@ -964,9 +977,22 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_default_and_fast_depth_stream_names() {
-        assert!(is_depth_stream("btcusdt@depth"));
-        assert!(is_depth_stream("btcusdt@depth@100ms"));
-        assert!(!is_depth_stream("btcusdt@bookTicker"));
+    fn classifies_combined_stream_names_without_json_parsing() {
+        assert_eq!(
+            classify_stream(br#"{"stream":"btcusdt@depth","data":{}}"#),
+            StreamKind::Depth
+        );
+        assert_eq!(
+            classify_stream(br#"{"stream":"btcusdt@depth@100ms","data":{}}"#),
+            StreamKind::Depth
+        );
+        assert_eq!(
+            classify_stream(br#"{"stream":"btcusdt@bookTicker","data":{}}"#),
+            StreamKind::BookTicker
+        );
+        assert_eq!(
+            classify_stream(br#"{"stream":"btcusdt@trade","data":{}}"#),
+            StreamKind::Other
+        );
     }
 }

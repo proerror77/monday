@@ -153,11 +153,13 @@ impl<const N: usize> CorrectnessBook<N> {
     fn refresh_top(&mut self, final_update_id: u64, update_ns: i64) {
         self.top.clear();
 
-        for (&price, &qty) in self.bids.iter().rev().take(N) {
-            self.top.apply_bid(price, qty);
+        for (idx, (&price, &qty)) in self.bids.iter().rev().take(N).enumerate() {
+            self.top.bids[idx] = Level { price, qty };
+            self.top.bid_len += 1;
         }
-        for (&price, &qty) in self.asks.iter().take(N) {
-            self.top.apply_ask(price, qty);
+        for (idx, (&price, &qty)) in self.asks.iter().take(N).enumerate() {
+            self.top.asks[idx] = Level { price, qty };
+            self.top.ask_len += 1;
         }
 
         self.top.last_update_id = final_update_id;
