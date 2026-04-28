@@ -1,0 +1,108 @@
+# HFT Production Readiness Checklist
+
+這份清單把系統從「低延遲行情處理」推進到「可上線交易內核」。目標不是每個局部都追絕對最快，而是讓路徑短、隊列可控、抖動可定位、過載可降級，並且永遠不要在狀態未知時交易。
+
+## 1. Low Latency Path
+
+範圍：`WebSocket -> raw queue -> parser -> order book -> feature -> signal`
+
+P0 必須完成：
+- 行情隊列和訂單回報隊列分離。
+- hot path 禁止日志、DB、await、動態分配、`serde_json::Value`、大對象 clone。
+- 所有跨線程隊列使用 bounded queue。
+- 隊列滿時有明確策略：行情 latest-wins，signal 過期丟棄，日志 drop when full，訂單回報不可丟。
+- 每條消息記錄 `recv -> queue wait -> parse -> book -> feature -> signal` 的 p50/p95/p99/p999/max。
+- 本地 order book 遇到 sequence gap 必須自動 rebuild。
+
+P1 低延遲核心：
+- WebSocket receiver 和 engine thread 分離。
+- engine thread 固定 CPU core，避免被日志、metrics、IRQ 打斷。
+- typed/borrowed parser 替代 `serde_json::Value`。
+- 價格和數量用 fixed-point 或受控 Decimal，不用 `f64` 存交易價格。
+- `OrderBook<50>` 使用預分配結構，避免 hot path HashMap 和 Vec 增長。
+- metrics 采樣，hot path 只寫輕量 trace buffer。
+
+P2 抖動治理：
+- 記錄 queue depth、queue wait time、dropped count。
+- 拆分 fast strategy 和 slow strategy。
+- slow strategy、ML、DTW、research signal 不得阻塞行情主鏈路。
+- 加 overload mode：降采樣 metrics、丟 debug log、停 slow strategy、只維護 book、暫停開倉、cancel all。
+- 加 allocation audit 和 latency regression test。
+
+## 2. Trading Correctness Path
+
+範圍：`signal -> risk -> order -> ack/fill/cancel -> position -> reconciliation`
+
+P0 必須完成：
+- OrderManager 單線程擁有訂單狀態。
+- RiskEngine 單線程擁有 position/exposure。
+- 策略只能產生 Signal 或 OrderIntent，不能直接改訂單和倉位。
+- execution report / order ack / fill event 不和 market data 共用隊列。
+- 訂單狀態機覆蓋：`pending_new`、`acknowledged`、`partially_filled`、`filled`、`pending_cancel`、`cancelled`、`cancel_rejected`、`rejected`、`expired`、`unknown`。
+- 處理 fill 先於 ack、cancel/fill 競態、重複回報、亂序回報、本地與交易所狀態不一致。
+
+P1 上線安全：
+- PositionManager、BalanceManager、ExposureManager 定期和交易所 REST / user stream 對賬。
+- RateLimitManager 管理 REST weight、order rate、cancel rate、snapshot rate、WebSocket connection limit。
+- ExchangeRuleManager 快速校驗 `tick_size`、`step_size`、`min_qty`、`min_notional`、fee tier、contract multiplier。
+- CostModel 要求 `expected_edge > fee + spread + slippage + latency risk + safety_margin`。
+- SignalLifecycleManager 管理 `created_ts`、`valid_until`、`source_book_seq`、`confidence`、`cancel_condition`、`max_slippage`、`max_latency`。
+- Cancel / Replace 策略必須限制 cancel storm、replace storm 和 self-induced rate limit。
+
+P2 多策略：
+- StrategyCoordinator 防止多策略方向沖突。
+- SelfTradePrevention 防止自成交。
+- RiskBudgetManager 分配 capital、risk、symbol、order-rate budget。
+- ShadowTradingEngine 支持 replay、paper、shadow live、small live、full live。
+
+## 3. Safety & Observability Path
+
+範圍：`time -> network -> metrics -> alert -> degrade -> recovery`
+
+P0 必須完成：
+- 延遲統計使用 monotonic clock，交易事件同時保存 wall clock。
+- 記錄 `exchange_ts - local_recv_ts`，監控 clock drift。
+- chrony/NTP 基線；多機或跨交易所套利再上 PTP。
+- 監控 p99 latency spike、queue depth high、book gap、disconnect、order reject spike、position mismatch、PnL drawdown、rate limit nearing、clock drift、data stale。
+- SecretManager 確保 API key 最小權限、無提現權限、secret 不進日志。
+- RecoveryManager 預設崩潰/重連/狀態未知流程：停止開新倉、拉 account/open orders/position、重建 order book、對賬、確認無未知訂單後再交易。
+
+P1 運維穩定：
+- NetworkPathBenchmark 實測 Tokyo / Singapore / Hong Kong / Frankfurt 等 region 的 WebSocket delay、REST order ack、user stream ack、disconnect、packet loss、p99/p999 RTT。
+- ReconnectManager 管理 DNS cache、TLS handshake、WebSocket reconnect、24h 主動輪換、重連後 book rebuild。
+- MarketDataSanityChecker 過濾亂序、重複、gap、bid > ask、spread 異常、價格跳變、stale book、交易所局部故障。
+- MonitoringAlerting 分級：warning、degrade、stop opening、cancel all、shutdown。
+- 數據存儲拆分：RawMsg append-only，MarketEvent binary/parquet，FeatureSnapshot parquet，Signal parquet/ClickHouse，Order/Trade event log。
+
+P2 系統層：
+- 生產 Linux 固定 Rust version、target CPU、compiler flags、kernel version、instance type、CPU governor、config version。
+- CPU governor performance，關閉 swap。
+- CPU isolation、IRQ affinity、NUMA bind。
+- receiver core 和 engine core 分離，hot path core 不處理網卡中斷。
+- AWS ENA / NIC queue 綁定單獨驗證。
+
+## Current Bitget Audit Evidence
+
+命令：
+
+```bash
+cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
+  --symbol BTCUSDT \
+  --depth-channel books1 \
+  --queue-capacity 1024 \
+  --max-messages 500 \
+  --max-runtime-secs 30
+```
+
+結果：
+
+| Metric | p50 | p95 | p99 | p999 / max | Notes |
+|--------|-----|-----|-----|------------|-------|
+| `ws_receive_gap` | 8,923,042ns | 166,210,792ns | 381,230,416ns | 726,807,916ns | 真實消息到達間隔，不是本地處理延遲 |
+| `raw_queue_depth` | 0 | 3 | 6 | 8 | 1024 容量下無擁塞 |
+| `raw_queue_wait` | 13,708ns | 37,000ns | 557,125ns | 614,792ns | queue/scheduler tail 是當前主要尖刺 |
+| `envelope_parse` | 3,125ns | 7,792ns | 11,791ns | 26,625ns | parser 本身不是主瓶頸 |
+| `event_convert` | 4,584ns | 13,333ns | 32,291ns | 58,250ns | Decimal/event conversion 可接受 |
+| `engine_total` | 23,584ns | 53,625ns | 567,291ns | 627,125ns | 被 queue wait p99 主導 |
+
+解讀：Bitget 本地 parser/convert 路徑的 p99 仍在數十微秒級，但 receiver -> engine 的 bounded queue wait 在這次測試中出現約 0.56ms p99 尖刺。下一步優先優化 receiver/engine 調度模型，而不是繼續微調 JSON parser。

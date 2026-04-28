@@ -10,6 +10,7 @@
 - [**性能優化架構**](architecture/PERFORMANCE_ARCHITECTURE.md) - SIMD、CPU親和性、內存優化
 - [**Binance 低延遲 Market Data 藍圖**](architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md) - 行情接收、本地訂單簿、特徵與信號路線圖
 - [**Binance MD 執行計畫**](architecture/BINANCE_MD_REFACTOR_EXECUTION_PLAN.md) - fast-lane 實作、驗證命令、剩餘風險
+- [**HFT Production Readiness Checklist**](architecture/HFT_PRODUCTION_READINESS_CHECKLIST.md) - low latency、交易正確性、安全觀測三條主線的上線檢查表
 
 ### 📖 [用戶指南](guides/)
 - [**快速開始**](guides/QUICK_START.md) - 10分鐘上手指南
@@ -129,6 +130,14 @@ cargo bench -p hft-engine --bench bitget_md_hotpath --locked
 cargo run -p hft-data-adapter-bitget --example live_p99 --release -- \
   --symbol BTCUSDT \
   --depth-channel books1 \
+  --max-messages 500 \
+  --max-runtime-secs 30
+
+# 真實連 Bitget public WS，拆出 ws gap / queue wait / parse / convert / engine p99
+cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
+  --symbol BTCUSDT \
+  --depth-channel books1 \
+  --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 30
 ```

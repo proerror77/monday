@@ -65,6 +65,30 @@ cargo run -p hft-data-adapter-bitget --example live_p99 --release -- \
 | `total_local` | 5,917ns | 17,292ns | 35,542ns | 92,667ns | `receive -> envelope parse -> event conversion` |
 | `inter_arrival` | 3,488,167ns | 57,987,875ns | 141,756,833ns | 272,056,291ns | 真實消息到達間隔，不是本地處理延遲 |
 
+### Bitget latency audit with bounded queue
+
+以下數據把 WebSocket receiver 和 engine consumer 拆開，中間使用 bounded raw queue，命令：
+
+```bash
+cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
+  --symbol BTCUSDT \
+  --depth-channel books1 \
+  --queue-capacity 1024 \
+  --max-messages 500 \
+  --max-runtime-secs 30
+```
+
+采樣結果：`samples=500 books=416 trades=84 ignored=2 dropped=0 queue_capacity=1024`
+
+| Stage | p50 | p95 | p99 | p999 / max | 說明 |
+|-------|-----|-----|-----|------------|------|
+| `ws_receive_gap` | 8,923,042ns | 166,210,792ns | 381,230,416ns | 726,807,916ns | 真實消息到達間隔 |
+| `raw_queue_depth` | 0 | 3 | 6 | 8 | 1024 容量下無擁塞 |
+| `raw_queue_wait` | 13,708ns | 37,000ns | 557,125ns | 614,792ns | receiver -> engine 的等待時間 |
+| `envelope_parse` | 3,125ns | 7,792ns | 11,791ns | 26,625ns | parser 本身成本 |
+| `event_convert` | 4,584ns | 13,333ns | 32,291ns | 58,250ns | `MarketSnapshot` / `Trade` 轉換 |
+| `engine_total` | 23,584ns | 53,625ns | 567,291ns | 627,125ns | 被 queue wait p99 主導 |
+
 ### 核心組件延遲 (單次操作)
 
 | 組件 | 目標延遲 | 實際P50 | 實際P95 | 實際P99 | 狀態 |
