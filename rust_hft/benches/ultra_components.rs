@@ -6,7 +6,9 @@
 //!
 //! Run with: cargo bench --bench ultra_components
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+};
 use engine::dataflow::ring_buffer::SpscRingBuffer;
 use engine::dataflow::UltraRingBuffer;
 use ports::MarketEvent;
@@ -39,26 +41,20 @@ fn bench_ring_buffer_push(c: &mut Criterion) {
 
     // 標準版本 - Option<T>
     group.bench_function("standard", |b| {
-        let buffer = SpscRingBuffer::new(1024);
-        let mut counter = 0u64;
-
-        b.iter(|| {
-            let event = create_test_event(counter);
-            counter += 1;
-            black_box(buffer.try_push(event))
-        });
+        b.iter_batched(
+            || (SpscRingBuffer::new(1024), create_test_event(0)),
+            |(buffer, event)| black_box(buffer.try_push(event)),
+            BatchSize::SmallInput,
+        );
     });
 
     // Ultra 版本 - MaybeUninit<T>
     group.bench_function("ultra", |b| {
-        let buffer = UltraRingBuffer::new(1024);
-        let mut counter = 0u64;
-
-        b.iter(|| {
-            let event = create_test_event(counter);
-            counter += 1;
-            unsafe { black_box(buffer.push_unchecked(event)) }
-        });
+        b.iter_batched(
+            || (UltraRingBuffer::new(1024), create_test_event(0)),
+            |(buffer, event)| unsafe { black_box(buffer.push_unchecked(event)) },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();
@@ -71,30 +67,30 @@ fn bench_ring_buffer_pop(c: &mut Criterion) {
 
     // 標準版本 - 使用 roundtrip 模式確保 buffer 始終有數據
     group.bench_function("standard", |b| {
-        let buffer = SpscRingBuffer::new(1024);
-        let mut counter = 0u64;
-
-        b.iter(|| {
-            // Push one item
-            buffer.try_push(create_test_event(counter)).ok();
-            counter += 1;
-            // Pop it back (測量 pop 性能)
-            black_box(buffer.try_pop())
-        });
+        b.iter_batched(
+            || {
+                let buffer = SpscRingBuffer::new(1024);
+                buffer.try_push(create_test_event(0)).ok();
+                buffer
+            },
+            |buffer| black_box(buffer.try_pop()),
+            BatchSize::SmallInput,
+        );
     });
 
     // Ultra 版本 - 使用 roundtrip 模式確保 buffer 始終有數據
     group.bench_function("ultra", |b| {
-        let buffer = UltraRingBuffer::new(1024);
-        let mut counter = 0u64;
-
-        b.iter(|| unsafe {
-            // Push one item
-            buffer.push_unchecked(create_test_event(counter));
-            counter += 1;
-            // Pop it back (測量 pop 性能)
-            black_box(buffer.pop_unchecked())
-        });
+        b.iter_batched(
+            || {
+                let buffer = UltraRingBuffer::new(1024);
+                unsafe {
+                    buffer.push_unchecked(create_test_event(0));
+                }
+                buffer
+            },
+            |buffer| unsafe { black_box(buffer.pop_unchecked()) },
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();

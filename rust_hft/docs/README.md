@@ -8,10 +8,13 @@
 - [**系統架構總覽**](architecture/SYSTEM_ARCHITECTURE.md) - 雙平面架構設計
 - [**多層訂單簿架構**](architecture/MULTI_LEVEL_ORDERBOOK_ARCHITECTURE.md) - 高性能OrderBook設計
 - [**性能優化架構**](architecture/PERFORMANCE_ARCHITECTURE.md) - SIMD、CPU親和性、內存優化
+- [**Binance 低延遲 Market Data 藍圖**](architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md) - 行情接收、本地訂單簿、特徵與信號路線圖
+- [**Binance MD 執行計畫**](architecture/BINANCE_MD_REFACTOR_EXECUTION_PLAN.md) - fast-lane 實作、驗證命令、剩餘風險
 
 ### 📖 [用戶指南](guides/)
 - [**快速開始**](guides/QUICK_START.md) - 10分鐘上手指南
 - [**安裝配置**](guides/INSTALLATION.md) - 詳細安裝說明
+- [**Rust 構建與發布**](guides/RUST_BUILD_RELEASE.md) - 快速迭代、CI 快取、精簡 release 產物
 - [**交易策略開發**](guides/TRADING_STRATEGIES.md) - ML策略開發教程
 - [**回測與評估**](guides/BACKTESTING.md) - 策略回測框架
 - [**部署指南**](guides/DEPLOYMENT.md) - 生產環境部署
@@ -95,7 +98,26 @@ cargo run --example 00_quickstart
 cargo run --example comprehensive_db_stress_test
 ```
 
-### 3. 開始交易
+### 3. Binance Market Data Fast Lane
+```bash
+# 接 Binance BTCUSDT depth/bookTicker，橋接 REST snapshot，寫入 replay NDJSON
+cargo run -p hft-binance-md --locked -- live \
+  --symbol BTCUSDT \
+  --max-messages 100 \
+  --replay-out /tmp/binance-md.ndjson
+
+# 用同一份 replay 文件重放並檢查 feature/signal parity
+cargo run -p hft-binance-md --locked -- replay \
+  --replay-in /tmp/binance-md.ndjson
+
+# 基於 replay 文件做 paper evaluation，不啟用真實下單
+cargo run -p hft-binance-md --locked -- paper \
+  --replay-in /tmp/binance-md.ndjson
+```
+
+這條 fast lane 的當前邊界是：Binance WebSocket / REST snapshot -> 本地訂單簿 -> OBI/microprice/spread/staleness -> expiring signal -> replay/paper。真實下單、OMS、風控與跨交易所套利仍是後續階段。
+
+### 4. 開始交易
 ```bash
 # 啟動實時交易
 cargo run --release --bin hft_trader -- \
@@ -207,4 +229,4 @@ MIT License - 詳見 [LICENSE](../LICENSE) 文件
 
 ---
 
-*最後更新: 2025-07-22 | 版本: v3.0*
+*最後更新: 2026-04-28 | 版本: v3.0*
