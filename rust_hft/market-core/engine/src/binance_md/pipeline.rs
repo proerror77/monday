@@ -16,6 +16,14 @@ pub struct ProcessOutcome {
     pub replay: ReplayBatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastOutcome {
+    pub decision: SequenceDecision,
+    pub feature: Option<FeatureView>,
+    pub signal: Option<Signal>,
+    pub latency: LatencyTrace,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeOutcome {
     pub result: BufferedApplyResult,
@@ -243,6 +251,18 @@ impl<const N: usize> MarketDataLane<N> {
         self.process_depth_update_inner(update, latency, Some(clock))
     }
 
+    pub fn process_depth_update_fast_with_clock<C>(
+        &mut self,
+        update: &ParsedDepthUpdate,
+        latency: LatencyTrace,
+        clock: &mut C,
+    ) -> FastOutcome
+    where
+        C: FnMut() -> i64,
+    {
+        self.process_depth_update_fast_inner(update, latency, Some(clock))
+    }
+
     pub fn apply_bridge_update_for_replay(
         &mut self,
         update: &ParsedDepthUpdate,
@@ -363,6 +383,66 @@ impl<const N: usize> MarketDataLane<N> {
             latency,
             replay,
         })
+    }
+
+    fn process_depth_update_fast_inner(
+        &mut self,
+        update: &ParsedDepthUpdate,
+        mut latency: LatencyTrace,
+        mut clock: Option<&mut dyn FnMut() -> i64>,
+    ) -> FastOutcome {
+        let meta = UpdateMeta::new(update.first_update_id, update.final_update_id);
+        let decision = self.sync.classify_live_update(meta);
+
+        if decision != SequenceDecision::Apply {
+            if let Some(done_ns) = stamp(&mut clock) {
+                latency.book_done_ns = done_ns;
+                latency.feature_done_ns = done_ns;
+                latency.signal_done_ns = done_ns;
+            }
+
+            return FastOutcome {
+                decision,
+                feature: None,
+                signal: None,
+                latency,
+            };
+        }
+
+        self.book.apply_diff(
+            &update.bids,
+            &update.asks,
+            update.final_update_id,
+            update.exchange_ts_ns,
+        );
+
+        if let Some(book_done_ns) = stamp(&mut clock) {
+            latency.book_done_ns = book_done_ns;
+        }
+
+        let feature = compute_features(
+            update.symbol_id,
+            self.book.top(),
+            self.flow_1s,
+            update.receive_ts_ns,
+        );
+        if let Some(feature_done_ns) = stamp(&mut clock) {
+            latency.feature_done_ns = feature_done_ns;
+        }
+
+        let signal = feature
+            .as_ref()
+            .and_then(|view| self.signal_rules.evaluate(&view.snapshot));
+        if let Some(signal_done_ns) = stamp(&mut clock) {
+            latency.signal_done_ns = signal_done_ns;
+        }
+
+        FastOutcome {
+            decision,
+            feature,
+            signal,
+            latency,
+        }
     }
 
     fn replay_record(

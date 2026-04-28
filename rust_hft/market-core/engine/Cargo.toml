@@ -86,5 +86,9 @@ name = "engine_hotpath"
 harness = false
 
 [[bench]]
+name = "binance_md_hotpath"
+harness = false
+
+[[bench]]
 name = "strategy_dispatch"
 harness = false

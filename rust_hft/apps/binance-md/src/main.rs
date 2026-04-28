@@ -235,6 +235,7 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         Some(path) => Some(BufWriter::new(File::create(path)?)),
         None => None,
     };
+    let record_replay = replay_writer.is_some();
 
     lane.start_buffering();
     let ws_url = build_stream_url(&args.ws_base_url, &symbol);
@@ -320,16 +321,52 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
             continue;
         }
 
-        let raw_record_update = update.clone();
-        let outcome = lane.process_depth_update_with_clock(
-            &update,
-            LatencyTrace {
-                recv_ns: recv_latency_ns,
-                parse_done_ns: elapsed_ns(&start),
-                ..LatencyTrace::default()
-            },
-            &mut || elapsed_ns(&start),
-        )?;
+        let latency = LatencyTrace {
+            recv_ns: recv_latency_ns,
+            parse_done_ns: elapsed_ns(&start),
+            ..LatencyTrace::default()
+        };
+        let outcome = if record_replay {
+            let raw_record_update = update.clone();
+            let mut outcome =
+                lane.process_depth_update_with_clock(&update, latency, &mut || elapsed_ns(&start))?;
+            outcome.replay.raw = Some(raw_replay_record(
+                args.symbol_id,
+                &raw_record_update,
+                outcome.latency,
+                lane.sync().state(),
+                lane.sync().last_update_id(),
+                bytes,
+            ));
+            Some(outcome)
+        } else {
+            let outcome = lane
+                .process_depth_update_fast_with_clock(&update, latency, &mut || elapsed_ns(&start));
+            stats.depth_messages += 1;
+            histograms.record(outcome.latency);
+            if outcome.signal.is_some() {
+                stats.signals += 1;
+            }
+            if let Some(ticker) = latest_book_ticker {
+                stats.book_ticker_checks += 1;
+                if book_ticker_mismatch(&lane, ticker) {
+                    stats.book_ticker_mismatches += 1;
+                }
+            }
+            if lane.sync().state() == BookSyncState::RebuildRequired {
+                stats.rebuilds += 1;
+                let snapshot = fetch_snapshot(&symbol, args.depth_levels).await?;
+                let replay = lane.apply_replay_snapshot(
+                    snapshot.last_update_id,
+                    &snapshot.bids,
+                    &snapshot.asks,
+                    now_ns(),
+                );
+                write_batch(&mut replay_writer, &replay, &mut stats)?;
+            }
+            continue;
+        };
+        let outcome = outcome.expect("record_replay path produces process outcome");
 
         stats.depth_messages += 1;
         histograms.record(outcome.latency);
@@ -343,16 +380,7 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
             }
         }
 
-        let mut replay = outcome.replay;
-        replay.raw = Some(raw_replay_record(
-            args.symbol_id,
-            &raw_record_update,
-            outcome.latency,
-            lane.sync().state(),
-            lane.sync().last_update_id(),
-            bytes,
-        ));
-        write_batch(&mut replay_writer, &replay, &mut stats)?;
+        write_batch(&mut replay_writer, &outcome.replay, &mut stats)?;
 
         if lane.sync().state() == BookSyncState::RebuildRequired {
             stats.rebuilds += 1;

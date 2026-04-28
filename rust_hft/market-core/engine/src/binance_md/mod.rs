@@ -24,7 +24,7 @@ pub use parser::{
     normalize_depth_update, parse_depth_update, parse_fixed_6, BinanceDepthUpdate, ParseDepthError,
     ParseFixedError, ParsedDepthUpdate,
 };
-pub use pipeline::{BridgeOutcome, MarketDataLane, ProcessOutcome};
+pub use pipeline::{BridgeOutcome, FastOutcome, MarketDataLane, ProcessOutcome};
 pub use raw::{RawFrameBuf, RawFrameRef};
 pub use replay::{
     read_replay_records, write_replay_batch, ReplayBatch, ReplayBridgeUpdate, ReplayKind,

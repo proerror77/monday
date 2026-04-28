@@ -298,6 +298,7 @@ Release benchmark gate:
 ```bash
 cd rust_hft
 RUSTFLAGS="-C target-cpu=native" cargo bench -p hft-engine --bench engine_hotpath
+RUSTFLAGS="-C target-cpu=native" cargo bench -p hft-engine --bench binance_md_hotpath
 ```
 
 Remote or CI benchmark output must include:
@@ -363,3 +364,55 @@ Known remaining follow-ups:
   partial-fill, queue-position, latency, cancel-delay simulator.
 - Replay schema versioning still needs an explicit version field before wider
   persisted-data compatibility is promised.
+
+## 2026-04-28 Hot-Path Optimization Snapshot
+
+Optimizations applied after the first live/replay baseline:
+
+- Live receiver classifies combined stream frames with a byte scan instead of a
+  serde envelope parse before the typed depth parse.
+- Live receiver has a latency mode: when `--replay-out` is omitted it uses a
+  no-replay fast path and avoids replay batch construction/cloning.
+- Latency stage timestamps use monotonic elapsed time; wall-clock receive
+  timestamps remain available for replay/event semantics.
+- `CorrectnessBook::refresh_top` fills the already-sorted `TopBook` directly
+  from `BTreeMap` iterators instead of re-inserting sorted levels.
+- `binance_md_hotpath` Criterion bench was added for repeatable parser/book
+  hot-path measurements.
+
+Local Criterion result on this Mac development host:
+
+```text
+binance_md/parse_depth_update                    ~0.54 us
+binance_md/book_feature_signal_fast              ~0.20 us
+binance_md/full_parse_book_feature_signal_no_replay ~0.81 us
+```
+
+Release live latency-mode smoke:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" \
+cargo run --release -p hft-binance-md --locked -- live \
+  --symbol BTCUSDT \
+  --max-messages 500 \
+  --max-runtime-secs 60
+```
+
+Observed result:
+
+- `depth=500`
+- `rebuilds=0`
+- `bookTicker_mismatch=0/500`
+- `replay_records=0`
+- `total p50=15543ns`
+- `total p95=37727ns`
+- `total p99=57919ns`
+- `total p999=159615ns`
+
+Release record/replay smoke:
+
+- `depth=200`
+- `replay_records=752`
+- `total p99=39007ns`
+- replay `parity_mismatches=0`
+- paper summary loaded the replay file successfully
