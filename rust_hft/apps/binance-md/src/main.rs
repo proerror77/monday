@@ -112,6 +112,12 @@ struct BookTicker<'a> {
     best_ask_price: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BookTickerSnapshot {
+    best_bid_price: i64,
+    best_ask_price: i64,
+}
+
 struct LatencyHistograms {
     parse: Histogram<u64>,
     book: Histogram<u64>,
@@ -153,6 +159,7 @@ struct LiveStats {
     book_ticker_messages: u64,
     signals: u64,
     rebuilds: u64,
+    book_ticker_checks: u64,
     book_ticker_mismatches: u64,
     replay_records: u64,
 }
@@ -164,6 +171,7 @@ impl LiveStats {
             book_ticker_messages: 0,
             signals: 0,
             rebuilds: 0,
+            book_ticker_checks: 0,
             book_ticker_mismatches: 0,
             replay_records: 0,
         }
@@ -236,6 +244,7 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
     let start = Instant::now();
     let mut last_report = Instant::now();
     let mut snapshot_bridged = false;
+    let mut latest_book_ticker: Option<BookTickerSnapshot> = None;
 
     loop {
         if args
@@ -277,12 +286,10 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         if envelope.stream.ends_with("@bookTicker") {
             stats.book_ticker_messages += 1;
             let ticker: BookTickerEnvelope<'_> = serde_json::from_slice(&bytes)?;
-            if book_ticker_mismatch(&lane, &ticker.data)? {
-                stats.book_ticker_mismatches += 1;
-            }
+            latest_book_ticker = Some(parse_book_ticker(&ticker.data)?);
             continue;
         }
-        if !envelope.stream.ends_with("@depth") {
+        if !is_depth_stream(envelope.stream) {
             debug!("skipping non-depth stream: {}", envelope.stream);
             continue;
         }
@@ -331,6 +338,12 @@ async fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error + Send
         histograms.record(outcome.latency);
         if outcome.signal.is_some() {
             stats.signals += 1;
+        }
+        if let Some(ticker) = latest_book_ticker {
+            stats.book_ticker_checks += 1;
+            if book_ticker_mismatch(&lane, ticker) {
+                stats.book_ticker_mismatches += 1;
+            }
         }
 
         let mut replay = outcome.replay;
@@ -623,9 +636,13 @@ fn parse_levels(
 fn build_stream_url(base_url: &str, symbol: &str) -> String {
     let symbol = symbol.to_lowercase();
     format!(
-        "{}?streams={}@depth/{}@bookTicker&timeUnit=MICROSECOND",
+        "{}?streams={}@depth@100ms/{}@bookTicker&timeUnit=MICROSECOND",
         base_url, symbol, symbol
     )
+}
+
+fn is_depth_stream(stream: &str) -> bool {
+    stream.ends_with("@depth") || stream.ends_with("@depth@100ms")
 }
 
 fn now_ns() -> i64 {
@@ -661,7 +678,10 @@ fn report_live(stats: &LiveStats, histograms: &LatencyHistograms) {
         stats.book_ticker_messages,
         stats.signals,
         stats.rebuilds,
-        stats.book_ticker_mismatches,
+        format_args!(
+            "{}/{}",
+            stats.book_ticker_mismatches, stats.book_ticker_checks
+        ),
         stats.replay_records
     );
     histograms.print("live");
@@ -702,17 +722,24 @@ fn raw_replay_record(
 
 fn book_ticker_mismatch<const N: usize>(
     lane: &MarketDataLane<N>,
-    ticker: &BookTicker<'_>,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    ticker: BookTickerSnapshot,
+) -> bool {
     let Some(best_bid) = lane.book().best_bid() else {
-        return Ok(false);
+        return false;
     };
     let Some(best_ask) = lane.book().best_ask() else {
-        return Ok(false);
+        return false;
     };
-    let ticker_bid = parse_fixed_6(ticker.best_bid_price)?;
-    let ticker_ask = parse_fixed_6(ticker.best_ask_price)?;
-    Ok(best_bid.price != ticker_bid || best_ask.price != ticker_ask)
+    best_bid.price != ticker.best_bid_price || best_ask.price != ticker.best_ask_price
+}
+
+fn parse_book_ticker(
+    ticker: &BookTicker<'_>,
+) -> Result<BookTickerSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(BookTickerSnapshot {
+        best_bid_price: parse_fixed_6(ticker.best_bid_price)?,
+        best_ask_price: parse_fixed_6(ticker.best_ask_price)?,
+    })
 }
 
 fn fixed_to_float(value: i64) -> f64 {
@@ -924,5 +951,22 @@ mod tests {
         assert_eq!(summary.depth_updates, 0);
         assert_eq!(summary.parity_mismatches, 0);
         assert_eq!(summary.final_update_id, 101);
+    }
+
+    #[test]
+    fn stream_url_uses_fast_depth_and_microsecond_time_unit() {
+        let url = build_stream_url(BINANCE_SPOT_WS, "BTCUSDT");
+
+        assert_eq!(
+            url,
+            "wss://stream.binance.com:9443/stream?streams=btcusdt@depth@100ms/btcusdt@bookTicker&timeUnit=MICROSECOND"
+        );
+    }
+
+    #[test]
+    fn recognizes_default_and_fast_depth_stream_names() {
+        assert!(is_depth_stream("btcusdt@depth"));
+        assert!(is_depth_stream("btcusdt@depth@100ms"));
+        assert!(!is_depth_stream("btcusdt@bookTicker"));
     }
 }
