@@ -124,6 +124,13 @@ cargo test -p hft-data-adapter-bitget --locked -- --test-threads=1
 
 # 跑 Bitget borrowed parser hot-path benchmark
 cargo bench -p hft-engine --bench bitget_md_hotpath --locked
+
+# 真實連 Bitget public WS，測本地 receive->parse->event conversion p99
+cargo run -p hft-data-adapter-bitget --example live_p99 --release -- \
+  --symbol BTCUSDT \
+  --depth-channel books1 \
+  --max-messages 500 \
+  --max-runtime-secs 30
 ```
 
 Bitget adapter 的行情接口按官方 v2 WebSocket 行為處理：公共端點使用 `wss://ws.bitget.com/v2/ws/public`，深度 channel 使用 `books/books1/books5/books15`，增量模式使用 `books`；心跳使用文本 `"ping"`/`"pong"`，不是只依賴 WebSocket ping frame。books/trade 熱路徑使用 borrowed typed JSON parser，非標準格式才回退 legacy `serde_json::Value` path。

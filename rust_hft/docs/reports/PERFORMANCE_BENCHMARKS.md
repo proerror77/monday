@@ -44,6 +44,27 @@ Bitget WebSocket 接口注意事項：
 - 心跳：客戶端定期發送文本 `"ping"`，服務端返回文本 `"pong"`
 - `pong` 只更新連線健康狀態，不進入行情 parser
 
+### Bitget live local p99
+
+以下數據來自真實 Bitget public WebSocket 連線，命令：
+
+```bash
+cargo run -p hft-data-adapter-bitget --example live_p99 --release -- \
+  --symbol BTCUSDT \
+  --depth-channel books1 \
+  --max-messages 500 \
+  --max-runtime-secs 30
+```
+
+采樣結果：`samples=500 books=378 trades=122 ignored=2`
+
+| Stage | p50 | p95 | p99 | p999 / max | 說明 |
+|-------|-----|-----|-----|------------|------|
+| `envelope_parse` | 1,916ns | 7,000ns | 10,875ns | 19,125ns | 收到 WS text frame 後解析 envelope/channel |
+| `event_convert` | 3,667ns | 10,167ns | 29,125ns | 83,834ns | 轉為 `MarketSnapshot` / `Trade` |
+| `total_local` | 5,917ns | 17,292ns | 35,542ns | 92,667ns | `receive -> envelope parse -> event conversion` |
+| `inter_arrival` | 3,488,167ns | 57,987,875ns | 141,756,833ns | 272,056,291ns | 真實消息到達間隔，不是本地處理延遲 |
+
 ### 核心組件延遲 (單次操作)
 
 | 組件 | 目標延遲 | 實際P50 | 實際P95 | 實際P99 | 狀態 |
