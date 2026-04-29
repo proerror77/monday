@@ -22,6 +22,8 @@ use integration::latency::WsFrameMetrics;
 use integration::ws::{MessageHandler, ReconnectingWsClient, WsClientConfig};
 use ports::*;
 
+const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 4096;
+
 /// Bitget WebSocket 消息結構
 #[derive(Debug, Clone, Deserialize)]
 pub struct BitgetWsMessage {
@@ -382,7 +384,7 @@ pub struct BitgetSubscriptionRequest {
 
 pub struct BitgetMarketStream {
     ws_client: Option<ReconnectingWsClient>,
-    event_sender: Option<mpsc::UnboundedSender<MarketEvent>>,
+    event_sender: Option<mpsc::Sender<MarketEvent>>,
     subscribed_symbols: Vec<Symbol>,
     use_incremental_books: bool,
     ws_url: Option<String>,
@@ -456,6 +458,14 @@ impl BitgetMarketStream {
             max_frame_size: 256 * 1024,   // 256KB 幀上限
             heartbeat_text: Some("ping".to_string()),
         }
+    }
+
+    fn event_queue_capacity() -> usize {
+        std::env::var("BITGET_EVENT_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|capacity| *capacity > 0)
+            .unwrap_or(DEFAULT_EVENT_QUEUE_CAPACITY)
     }
 
     fn parse_orderbook_data(
@@ -626,7 +636,7 @@ impl BitgetMarketStream {
 #[async_trait]
 impl MarketStream for BitgetMarketStream {
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>> {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(Self::event_queue_capacity());
 
         // 創建 WebSocket 客戶端
         let ws_config = self.create_ws_config();
@@ -645,9 +655,14 @@ impl MarketStream for BitgetMarketStream {
         tokio::spawn(async move {
             if let Err(e) = ws_client.run_with_handler(handler).await {
                 error!("Bitget WebSocket 客戶端錯誤: {}", e);
-                let _ = tx.send(MarketEvent::Disconnect {
-                    reason: format!("WebSocket error: {}", e),
-                });
+                if tx
+                    .try_send(MarketEvent::Disconnect {
+                        reason: format!("WebSocket error: {}", e),
+                    })
+                    .is_err()
+                {
+                    warn!("Bitget event queue full/closed, disconnect event dropped");
+                }
             }
         });
 
@@ -712,7 +727,7 @@ impl MarketStream for BitgetMarketStream {
 
 /// Bitget 消息處理器
 struct BitgetMessageHandler {
-    event_sender: mpsc::UnboundedSender<MarketEvent>,
+    event_sender: mpsc::Sender<MarketEvent>,
     subscribed_symbols: Vec<Symbol>,
     subscription_sent: bool,
     pending_subscriptions: Option<(String, String)>,
@@ -726,7 +741,7 @@ struct BitgetMessageHandler {
 
 impl BitgetMessageHandler {
     fn new(
-        event_sender: mpsc::UnboundedSender<MarketEvent>,
+        event_sender: mpsc::Sender<MarketEvent>,
         subscribed_symbols: Vec<Symbol>,
         use_incremental_books: bool,
         inst_type: String,
@@ -741,6 +756,18 @@ impl BitgetMessageHandler {
             ob_state: HashMap::new(),
             inst_type,
             depth_channel,
+        }
+    }
+
+    fn try_send_event(&self, event: MarketEvent) {
+        match self.event_sender.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("Bitget event queue full, dropping stale market event");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("Bitget event queue closed, dropping market event");
+            }
         }
     }
 }
@@ -818,7 +845,7 @@ impl MessageHandler for BitgetMessageHandler {
     fn handle_disconnect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         warn!("Bitget WebSocket 連接斷開");
         self.subscription_sent = false; // 重置訂閱狀態，重連後需要重新訂閱
-        let _ = self.event_sender.send(MarketEvent::Disconnect {
+        self.try_send_event(MarketEvent::Disconnect {
             reason: "Connection lost".to_string(),
         });
         Ok(())
@@ -965,7 +992,7 @@ impl BitgetMessageHandler {
                 let symbol = Symbol::from(arg.inst_id);
                 match self.parse_orderbook_data_ref(orderbook_data, &symbol) {
                     Ok(snapshot) => {
-                        let _ = self.event_sender.send(MarketEvent::Snapshot(snapshot));
+                        self.try_send_event(MarketEvent::Snapshot(snapshot));
                     }
                     Err(e) => {
                         error!("解析訂單簿數據失敗: {}", e);
@@ -1002,7 +1029,7 @@ impl BitgetMessageHandler {
         let snapshot = self
             .get_state_mut(sym)
             .to_snapshot(Symbol::new(sym), frame.data.last().map(|e| e.ts))?;
-        let _ = self.event_sender.send(MarketEvent::Snapshot(snapshot));
+        self.try_send_event(MarketEvent::Snapshot(snapshot));
         Ok(())
     }
 
@@ -1015,7 +1042,7 @@ impl BitgetMessageHandler {
         for item in &frame.data {
             match trade_data_ref_to_trade(item, fallback_inst) {
                 Ok(trade) => {
-                    let _ = self.event_sender.send(MarketEvent::Trade(trade));
+                    self.try_send_event(MarketEvent::Trade(trade));
                 }
                 Err(e) => {
                     trace!("忽略無效 Bitget trade frame: {}", e);
@@ -1048,7 +1075,7 @@ impl BitgetMessageHandler {
 
                     match self.parse_orderbook_data(&orderbook_data, &symbol) {
                         Ok(snapshot) => {
-                            let _ = self.event_sender.send(MarketEvent::Snapshot(snapshot));
+                            self.try_send_event(MarketEvent::Snapshot(snapshot));
                         }
                         Err(e) => {
                             error!("解析訂單簿數據失敗: {}", e);
@@ -1104,7 +1131,7 @@ impl BitgetMessageHandler {
         // 生成快照事件（從狀態構建）
         let snapshot =
             state.to_snapshot(Symbol::new(sym), entries.last().map(|e| e.ts.as_str()))?;
-        let _ = self.event_sender.send(MarketEvent::Snapshot(snapshot));
+        self.try_send_event(MarketEvent::Snapshot(snapshot));
         Ok(())
     }
 
@@ -1280,7 +1307,7 @@ impl BitgetMessageHandler {
                 trade_id,
                 source_venue: Some(VenueId::BITGET),
             };
-            let _ = self.event_sender.send(MarketEvent::Trade(trade));
+            self.try_send_event(MarketEvent::Trade(trade));
         }
 
         Ok(())

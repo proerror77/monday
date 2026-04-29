@@ -33,7 +33,7 @@ Side paths:
 
 | Queue | Producer | Consumer | Capacity owner | Full behavior | Current code / status | Test command |
 | --- | --- | --- | --- | --- | --- | --- |
-| `raw_market_data_queue` | WS receiver | market-data engine | adapter/runner config | bounded; latest-wins or rebuild; never block engine | Bitget `latency_audit` uses bounded queue and records depth/wait; Binance app path still needs the same runner parity | `cargo check -p hft-data-adapter-bitget --example latency_audit --locked` |
+| `raw_market_data_queue` | WS receiver | market-data engine | adapter/runner config | bounded; latest-wins or rebuild; never block engine | Bitget `latency_audit` and generic Bitget `MarketStream` are bounded; Binance app path still needs the same runner parity | `cargo check -p hft-data-adapter-bitget --example latency_audit --locked` |
 | `signal_queue` | market-data engine | strategy/risk boundary | strategy runtime config | bounded; drop expired first, then old signals | Binance fast lane has expiring `Signal`; generic strategy path now has `OrderIntentEnvelope` lifecycle but not a dedicated signal queue | `cargo test -p hft-engine --locked binance_md` |
 | `execution_intent_queue` | engine/risk boundary | execution worker | `ExecutionQueueConfig.intent_queue_capacity` | bounded; reject new intent on full, surface counter; no silent order loss | `market-core/engine/src/execution_queues.rs` | `cargo test -p hft-engine --locked test_execution_intent_queue_full_rejects_new_intent` |
 | `execution_event_queue` | execution worker / user stream bridge | engine/order state/risk | `ExecutionQueueConfig.event_queue_capacity` | bounded; surface counter and alert/degrade on full; execution authority must be reconciled | `market-core/engine/src/execution_queues.rs` currently returns failed event to caller and counts full events | `cargo test -p hft-engine --locked test_execution_event_queue_full_is_visible_to_stats` |
@@ -72,6 +72,9 @@ envelopes do not enter the execution worker queue.
 ## Operating Rules
 
 - Hot-path queues are bounded by default.
+- New unbounded channel usage must be classified in
+  `docs/reports/UNBOUNDED_CHANNEL_AUDIT.md`; run
+  `scripts/audit_unbounded_channels.sh` before merging queue changes.
 - Queue-full behavior must be explicit in code, docs, and tests.
 - Execution events are state authority; if they cannot be enqueued, the system
   must alert/degrade and reconcile rather than continue as if nothing happened.
@@ -84,7 +87,7 @@ envelopes do not enter the execution worker queue.
 
 - Add a Binance receiver -> bounded queue -> engine latency runner equivalent to
   the Bitget runner.
-- Convert production adapter `unbounded_channel` usage classified as
-  `must-fix` in the audit.
+- Convert the remaining production adapter `unbounded_channel` usage classified
+  as `must-fix` in the audit.
 - Add a real `risk_event_queue` with kill-switch priority.
 - Add central log/metrics queue policy and operator output.

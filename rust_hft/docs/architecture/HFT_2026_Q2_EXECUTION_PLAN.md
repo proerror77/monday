@@ -44,6 +44,9 @@ Already done:
 - `OrderIntentEnvelope` now adds lifecycle metadata around the stable
   `OrderIntent` contract, and the execution queue has a pre-execution gate for
   expiry, stale book source, and max local latency.
+- Bitget generic `MarketStream` and simulated execution event output are now
+  bounded; new unclassified unbounded channel usage is checked by
+  `scripts/audit_unbounded_channels.sh`.
 - Risk crates already contain default/enhanced/professional managers with
   position, notional, staleness, cooldown, and rate-style checks.
 
@@ -155,9 +158,11 @@ Tasks:
 - [x] Add tests for execution event queue full behavior and alert counters.
 - [x] Audit `unbounded_channel` usages and classify each as test/demo,
   control-plane acceptable, or must-fix.
-- [ ] Convert any hot-path or feedback-path unbounded channel found by the audit.
+- [ ] Convert remaining hot-path or feedback-path unbounded channel findings
+  from the audit.
 - [ ] Add a queue-summary output that surfaces capacity, utilization, full count,
   and dropped count per active queue.
+- [x] Add a guard script for new unclassified `unbounded_channel` usage.
 
 Acceptance:
 

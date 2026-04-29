@@ -132,6 +132,9 @@ jobs:
           cache-all-crates: true
           save-if: ${{ github.event_name != 'pull_request' }}
 
+      - name: Audit unbounded channels
+        run: scripts/audit_unbounded_channels.sh
+
       - name: Format hft-engine
         run: cargo fmt --check --package hft-engine
 
