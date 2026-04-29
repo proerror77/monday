@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let args = Args::from_env();
     println!(
-        "starting Bitget latency audit: url={} instType={} symbol={} depth_channel={} queue_capacity={} max_messages={} max_runtime_secs={} spin_polls={} busy_poll={} engine_core={}",
+        "starting Bitget latency audit: url={} instType={} symbol={} depth_channel={} queue_capacity={} max_messages={} max_runtime_secs={} spin_polls={} busy_poll={} receiver_core={} engine_core={}",
         args.ws_url,
         args.inst_type,
         args.symbol,
@@ -97,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         args.max_runtime_secs,
         args.spin_polls,
         args.busy_poll,
+        format_optional_core(args.receiver_core),
         format_optional_core(args.engine_core)
     );
 
@@ -116,6 +117,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let receiver_queue_depth = Arc::clone(&queue_depth);
     let receiver_stop = Arc::clone(&stop);
     let receiver_args = args.clone();
+    if let Some(core) = args.receiver_core {
+        match pin_current_thread_to_core(core) {
+            Ok(()) => println!("receiver thread pinned to core {core}"),
+            Err(err) => eprintln!("failed to pin receiver thread to core {core}: {err}"),
+        }
+    }
     if let Err(err) = run_receiver(
         receiver_args,
         tx,
@@ -349,6 +356,7 @@ struct Args {
     max_runtime_secs: u64,
     spin_polls: usize,
     busy_poll: bool,
+    receiver_core: Option<usize>,
     engine_core: Option<usize>,
 }
 
@@ -365,6 +373,7 @@ impl Args {
             max_runtime_secs: 30,
             spin_polls: 256,
             busy_poll: false,
+            receiver_core: None,
             engine_core: None,
         };
 
@@ -395,6 +404,13 @@ impl Args {
                         .expect("valid --spin-polls")
                 }
                 "--busy-poll" => parsed.busy_poll = true,
+                "--receiver-core" => {
+                    parsed.receiver_core = Some(
+                        take_value(&mut args, &flag)
+                            .parse()
+                            .expect("valid --receiver-core"),
+                    )
+                }
                 "--engine-core" => {
                     parsed.engine_core = Some(
                         take_value(&mut args, &flag)
@@ -423,7 +439,7 @@ fn print_help_and_exit() -> ! {
         "Usage: cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \\
   [--symbol BTCUSDT] [--inst-type SPOT] [--depth-channel books1] \\
   [--queue-capacity 1024] [--max-messages 500] [--max-runtime-secs 30] \\
-  [--spin-polls 256] [--busy-poll] [--engine-core 2]"
+  [--spin-polls 256] [--busy-poll] [--receiver-core 1] [--engine-core 2]"
     );
     std::process::exit(0);
 }

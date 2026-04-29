@@ -98,6 +98,7 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 60 \
+  --receiver-core 1 \
   --engine-core 2 \
   --busy-poll
 ```
@@ -115,7 +116,7 @@ Linux staging 標準命令：
 
 ```bash
 scripts/linux_latency_preflight.sh
-PROCESS_CORES=1,2 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
+PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
   scripts/run_bitget_latency_linux.sh
 ```
 

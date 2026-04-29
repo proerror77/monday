@@ -152,7 +152,7 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
 
 # Linux staging：先做只讀 preflight，再用 taskset + --engine-core 跑 dedicated-core audit
 scripts/linux_latency_preflight.sh
-PROCESS_CORES=1,2 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
+PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
   scripts/run_bitget_latency_linux.sh
 ```
 

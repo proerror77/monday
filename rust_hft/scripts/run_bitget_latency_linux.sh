@@ -22,6 +22,7 @@ QUEUE_CAPACITY="${QUEUE_CAPACITY:-1024}"
 MAX_MESSAGES="${MAX_MESSAGES:-5000}"
 MAX_RUNTIME_SECS="${MAX_RUNTIME_SECS:-300}"
 PROCESS_CORES="${PROCESS_CORES:-1,2}"
+RECEIVER_CORE="${RECEIVER_CORE:-1}"
 ENGINE_CORE="${ENGINE_CORE:-2}"
 SPIN_POLLS="${SPIN_POLLS:-256}"
 BUSY_POLL="${BUSY_POLL:-1}"
@@ -38,6 +39,7 @@ args=(
   --max-messages "$MAX_MESSAGES"
   --max-runtime-secs "$MAX_RUNTIME_SECS"
   --spin-polls "$SPIN_POLLS"
+  --receiver-core "$RECEIVER_CORE"
   --engine-core "$ENGINE_CORE"
 )
 
@@ -47,9 +49,14 @@ fi
 
 echo "Running Bitget latency audit"
 echo "  process cores: ${PROCESS_CORES}"
+echo "  receiver core: ${RECEIVER_CORE}"
 echo "  engine core:   ${ENGINE_CORE}"
 echo "  symbol:        ${SYMBOL}"
 echo "  depth channel: ${DEPTH_CHANNEL}"
 echo "  busy poll:     ${BUSY_POLL}"
+
+if [[ "$RECEIVER_CORE" == "$ENGINE_CORE" ]]; then
+  echo "WARN: RECEIVER_CORE and ENGINE_CORE are the same; p99/p999 may include self-inflicted contention" >&2
+fi
 
 exec taskset -c "$PROCESS_CORES" target/release/examples/latency_audit "${args[@]}"
