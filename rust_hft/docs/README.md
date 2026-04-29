@@ -140,26 +140,29 @@ cargo run -p hft-data-adapter-bitget --example live_p99 --release -- \
 cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --symbol BTCUSDT \
   --depth-channel books1 \
+  --queue-kind sync-channel \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 30
 
-# 低延遲模式：engine thread busy-poll raw queue，會占用一個核心
+# 低延遲模式：SPSC raw queue + engine thread busy-poll，會占用一個核心
 cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --symbol BTCUSDT \
   --depth-channel books1 \
+  --queue-kind spsc-spin \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 60 \
+  --idle-timeout-us 50 \
   --busy-poll
 
 # Linux staging：先做只讀 preflight，再用 taskset + --engine-core 跑 dedicated-core audit
 scripts/linux_latency_preflight.sh
-PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
+QUEUE_KIND=spsc-spin PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
   scripts/run_bitget_latency_linux.sh
 ```
 
-Linux runner 會把 `metadata.txt`、`stdout.log`、`summary.json` 寫到 `target/latency-audit/<run-id>/`，用來比較不同 region / host / core 配置的 p99/p999。
+Linux runner 會把 `metadata.txt`、`stdout.log`、`summary.json` 寫到 `target/latency-audit/<run-id>/`，用來比較不同 region / host / core / queue 配置的 p99/p999。`QUEUE_KIND=sync-channel` 保留 std bounded channel 基線，`QUEUE_KIND=spsc-spin` 用於量測 receiver -> engine 交接在預分配 SPSC ring 下的尾延遲。
 
 # 匯總多次 Linux staging run，按 engine_total p99 排序
 scripts/summarize_bitget_latency.py target/latency-audit

@@ -113,7 +113,8 @@ For the next Bitget latency audit:
   1. Keep OS/IRQ work away from the engine core.
   2. Run the process with taskset over receiver+engine cores.
   3. Pass --receiver-core and --engine-core so the two hot threads do not compete.
-  4. Use --busy-poll only on a dedicated core.
+  4. Use QUEUE_KIND=spsc-spin for the preallocated SPSC handoff comparison.
+  5. Use --busy-poll only on a dedicated core.
 EOF
 
 if [[ "${STRICT:-0}" == "1" ]]; then

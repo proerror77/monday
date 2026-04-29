@@ -67,12 +67,13 @@ cargo run -p hft-data-adapter-bitget --example live_p99 --release -- \
 
 ### Bitget latency audit with dedicated engine thread
 
-以下數據把 WebSocket receiver 和 engine consumer 拆開，中間使用 bounded raw queue。receiver 保留在 Tokio current-thread runtime，engine consumer 使用獨立 OS thread；`raw_queue_wait` 的口徑是 frame 入隊後到 engine 取出的等待時間。
+以下數據把 WebSocket receiver 和 engine consumer 拆開，中間使用 bounded raw queue。receiver 保留在 Tokio current-thread runtime，engine consumer 使用獨立 OS thread；`raw_queue_wait` 的口徑是 frame 入隊後到 engine 取出的等待時間。工具支持 `--queue-kind sync-channel|spsc-spin`：前者保留 std bounded channel 基線，後者使用預分配 SPSC ring，並直接保存 tungstenite `Utf8Bytes` 以避免 receiver 端 text frame 再拷貝。
 
 ```bash
 cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --symbol BTCUSDT \
   --depth-channel books1 \
+  --queue-kind sync-channel \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 60
@@ -95,9 +96,11 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
 cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --symbol BTCUSDT \
   --depth-channel books1 \
+  --queue-kind spsc-spin \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 60 \
+  --idle-timeout-us 50 \
   --receiver-core 1 \
   --engine-core 2 \
   --busy-poll
@@ -112,15 +115,25 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
 | `event_convert` | 3,208ns | 5,917ns | 7,500ns | 9,625ns | event conversion common path 降低 |
 | `engine_total` | 8,250ns | 14,916ns | 1,481,083ns | 8,987,000ns | p99/p999 需要 Linux CPU pinning / isolation 才能穩定 |
 
+2026-04-29 本機隊列 A/B 優化探針：
+
+| Run | Queue | Busy poll | `raw_queue_wait p99` | `engine_total p99` | 解讀 |
+|-----|-------|-----------|----------------------|--------------------|------|
+| `macos-sync2-20260429-125113-6f16c645` | `sync-channel` | false | 16,707,208ns | 16,743,042ns | std bounded channel 基線，macOS 調度尾延遲明顯 |
+| `macos-spsc2-20260429-125258-6f16c645` | `spsc-spin` | false | 1,752,167ns | 1,754,125ns | SPSC + producer `unpark` 明顯降低非 busy-poll 交接尾延遲 |
+| `macos-spsc-busy2-20260429-125341-6f16c645` | `spsc-spin` | true | 25,915,292ns | 25,936,333ns | common path 快，但 macOS 無 dedicated core 時 p99 仍會被本地調度污染 |
+
+以上 A/B 只證明本地工具邊界已可比較 queue kind 和 busy-poll 行為；正式 p99/p999 仍必須用 Linux staging runner。
+
 Linux staging 標準命令：
 
 ```bash
 scripts/linux_latency_preflight.sh
-PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
+QUEUE_KIND=spsc-spin PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
   scripts/run_bitget_latency_linux.sh
 ```
 
-輸出目錄：`target/latency-audit/<run-id>/`，包含 `metadata.txt`、`stdout.log`、`summary.json`。正式比較不同 Linux host 或 region 時，以 `summary.json` 為機器可讀結果，以 `metadata.txt` 保存環境和 core 配置。
+輸出目錄：`target/latency-audit/<run-id>/`，包含 `metadata.txt`、`stdout.log`、`summary.json`。正式比較不同 Linux host 或 region 時，以 `summary.json` 為機器可讀結果，以 `metadata.txt` 保存環境、core、queue kind、idle timeout 和 busy-poll 配置。
 
 多 run 匯總：
 

@@ -35,8 +35,9 @@ Already done:
 - Bitget parser and event-conversion hot path has Criterion benchmarks and live
   p99 probes.
 - Bitget `latency_audit` has bounded raw queue, dedicated engine OS thread,
-  `--receiver-core`, `--engine-core`, `--busy-poll`, `--json-out`, Linux runner,
-  preflight, and multi-run summary tooling.
+  `--queue-kind sync-channel|spsc-spin`, `--receiver-core`, `--engine-core`,
+  `--busy-poll`, `--idle-timeout-us`, `--json-out`, Linux runner, preflight,
+  and multi-run summary tooling.
 - Engine already has SPSC bounded execution queues for
   `OrderIntent -> ExecutionWorker` and `ExecutionEvent -> Engine`.
 - Runtime config already exposes execution queue capacities and worker batch
@@ -248,8 +249,9 @@ Tasks:
 
 - [x] Add Linux preflight.
 - [x] Add Bitget Linux runner with `taskset`, receiver core, engine core,
-  busy-poll, metadata, stdout, and JSON summary artifacts.
-- [x] Add summary script for multi-run comparison.
+  queue kind, busy-poll, metadata, stdout, and JSON summary artifacts.
+- [x] Add summary script for multi-run comparison, including queue kind and
+  idle timeout metadata.
 - [ ] Run Bitget 5-minute staging audit in at least one Linux region.
 - [ ] Run Bitget multi-run comparison for at least 3 runs on the same host.
 - [ ] Run Binance equivalent staging audit or add the missing parity runner.

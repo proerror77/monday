@@ -99,12 +99,13 @@ P2 系統層：
 cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --symbol BTCUSDT \
   --depth-channel books1 \
+  --queue-kind sync-channel \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 60
 ```
 
-結果：receiver 使用 Tokio current-thread runtime，engine consumer 使用獨立 OS thread；`raw_queue_wait` 只統計 frame 入隊後到 engine 取出的等待時間。
+結果：receiver 使用 Tokio current-thread runtime，engine consumer 使用獨立 OS thread；`raw_queue_wait` 只統計 frame 入隊後到 engine 取出的等待時間。`--queue-kind sync-channel` 是 std bounded channel 基線；`--queue-kind spsc-spin` 使用預分配 SPSC ring，並避免 receiver 端把 tungstenite text frame 再拷貝成 `String`。
 
 | Metric | p50 | p95 | p99 | p999 / max | Notes |
 |--------|-----|-----|-----|------------|-------|
@@ -121,9 +122,11 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
 cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --symbol BTCUSDT \
   --depth-channel books1 \
+  --queue-kind spsc-spin \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 60 \
+  --idle-timeout-us 50 \
   --receiver-core 1 \
   --engine-core 2 \
   --busy-poll
@@ -131,15 +134,25 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
 
 結果：`raw_queue_wait p50=500ns p95=8,959ns p99=1,473,000ns`，`engine_total p50=8,250ns p95=14,916ns p99=1,481,083ns`。busy-poll 已把 common path 壓到微秒級，但 macOS 仍會偶發 deschedule engine thread；要穩定 p99/p999，下一步需要 Linux dedicated core、CPU pinning/isolation、IRQ 隔離與 governor performance。
 
+最新本機 A/B 探針：
+
+| Run | Queue | Busy poll | `raw_queue_wait p99` | `engine_total p99` |
+|-----|-------|-----------|----------------------|--------------------|
+| `macos-sync2-20260429-125113-6f16c645` | `sync-channel` | false | 16,707,208ns | 16,743,042ns |
+| `macos-spsc2-20260429-125258-6f16c645` | `spsc-spin` | false | 1,752,167ns | 1,754,125ns |
+| `macos-spsc-busy2-20260429-125341-6f16c645` | `spsc-spin` | true | 25,915,292ns | 25,936,333ns |
+
+解讀：SPSC + producer `unpark` 已降低非 busy-poll 交接尾延遲；busy-poll 在 macOS 無 dedicated core 時仍可能被本地調度污染。這不是 Linux production p99 結論。
+
 Linux staging 驗證入口：
 
 ```bash
 scripts/linux_latency_preflight.sh
-PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
+QUEUE_KIND=spsc-spin PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
   scripts/run_bitget_latency_linux.sh
 ```
 
-每次 Linux run 會產生 `target/latency-audit/<run-id>/metadata.txt`、`stdout.log`、`summary.json`。比較 p99/p999 時必須同時保存 host、kernel、Rust、RUSTFLAGS、receiver/engine core 和 busy-poll 配置，避免把不同環境的數據混在一起。
+每次 Linux run 會產生 `target/latency-audit/<run-id>/metadata.txt`、`stdout.log`、`summary.json`。比較 p99/p999 時必須同時保存 host、kernel、Rust、RUSTFLAGS、receiver/engine core、queue kind、idle timeout 和 busy-poll 配置，避免把不同環境的數據混在一起。
 
 多 run 比較使用：
 
