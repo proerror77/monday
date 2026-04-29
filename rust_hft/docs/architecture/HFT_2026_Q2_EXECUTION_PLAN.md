@@ -44,8 +44,9 @@ Already done:
 - `OrderIntentEnvelope` now adds lifecycle metadata around the stable
   `OrderIntent` contract, and the execution queue has a pre-execution gate for
   expiry, stale book source, and max local latency.
-- Bitget generic `MarketStream` and simulated execution event output are now
-  bounded; new unclassified unbounded channel usage is checked by
+- Generic Binance stream, Bitget generic `MarketStream`, Bitget zero-copy
+  stream, and simulated execution event output are now bounded; new
+  unclassified unbounded channel usage is checked by
   `scripts/audit_unbounded_channels.sh`.
 - Risk crates already contain default/enhanced/professional managers with
   position, notional, staleness, cooldown, and rate-style checks.

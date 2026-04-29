@@ -21,6 +21,8 @@ pub use message_types::{BookTickerEvent, DepthSnapshot};
 pub use rest::BinanceRestClient;
 pub use websocket::BinanceWebSocket;
 
+const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 4096;
+
 pub mod capabilities {
     #[derive(Debug, Clone)]
     pub struct BinanceCapabilities {
@@ -87,6 +89,14 @@ impl BinanceMarketStream {
         self
     }
 
+    fn event_queue_capacity() -> usize {
+        std::env::var("BINANCE_EVENT_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|capacity| *capacity > 0)
+            .unwrap_or(DEFAULT_EVENT_QUEUE_CAPACITY)
+    }
+
     /// 獲取訂單簿快照（用於初始化）
     async fn get_initial_snapshots(&self, symbols: &[Symbol]) -> HftResult<Vec<MarketSnapshot>> {
         let mut snapshots = Vec::new();
@@ -107,6 +117,20 @@ impl BinanceMarketStream {
     }
 }
 
+fn try_send_stream_event(
+    tx: &mpsc::Sender<HftResult<MarketEvent>>,
+    event: HftResult<MarketEvent>,
+) -> bool {
+    match tx.try_send(event) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!("Binance event queue full, dropping stale stream event");
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
 #[async_trait]
 impl MarketStream for BinanceMarketStream {
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>> {
@@ -117,15 +141,21 @@ impl MarketStream for BinanceMarketStream {
         info!("訂閱 Binance 市場數據，品種: {:?}", symbols);
 
         // 創建事件通道
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(Self::event_queue_capacity());
 
         // 如果啟用了初始快照，先獲取快照
         if self.caps.snapshot_crc {
             match self.get_initial_snapshots(&symbols).await {
                 Ok(snapshots) => {
                     for snapshot in snapshots {
-                        if tx.send(Ok(MarketEvent::Snapshot(snapshot))).is_err() {
-                            return Err(HftError::new("事件通道發送失敗"));
+                        match tx.try_send(Ok(MarketEvent::Snapshot(snapshot))) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                return Err(HftError::new("Binance 初始快照事件通道已滿"));
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                return Err(HftError::new("Binance 事件通道已關閉"));
+                            }
                         }
                     }
                 }
@@ -159,13 +189,15 @@ impl MarketStream for BinanceMarketStream {
                                 Ok(Some(text)) => {
                                     match MessageConverter::parse_stream_message(&text) {
                                         Ok(Some(event)) => {
-                                            if tx.send(Ok(event)).is_err() {
+                                            if !try_send_stream_event(&tx, Ok(event)) {
                                                 return;
                                             }
                                         }
                                         Ok(None) => {}
                                         Err(e) => {
-                                            let _ = tx.send(Err(e));
+                                            if !try_send_stream_event(&tx, Err(e)) {
+                                                return;
+                                            }
                                         }
                                     }
                                 }
@@ -175,7 +207,9 @@ impl MarketStream for BinanceMarketStream {
                                 }
                                 Err(e) => {
                                     error!("Binance WS 錯誤: {}，準備重連", e);
-                                    let _ = tx.send(Err(e));
+                                    if !try_send_stream_event(&tx, Err(e)) {
+                                        return;
+                                    }
                                     break;
                                 }
                             }
@@ -185,10 +219,10 @@ impl MarketStream for BinanceMarketStream {
                         error!("Binance WS 連接失敗: {}", e);
                         attempts += 1;
                         if attempts > DEFAULT_MAX_ATTEMPTS {
-                            let _ = tx.send(Err(HftError::Network(format!(
-                                "WS 重連失敗次數過多: {}",
-                                e
-                            ))));
+                            let _ = try_send_stream_event(
+                                &tx,
+                                Err(HftError::Network(format!("WS 重連失敗次數過多: {}", e))),
+                            );
                             return;
                         }
                         let delay = calculate_exponential_backoff(attempts, DEFAULT_BASE_DELAY_MS);
@@ -200,7 +234,10 @@ impl MarketStream for BinanceMarketStream {
                 // 斷開後的退避重連
                 attempts += 1;
                 if attempts > DEFAULT_MAX_ATTEMPTS {
-                    let _ = tx.send(Err(HftError::Network("WS 重連失敗次數過多".to_string())));
+                    let _ = try_send_stream_event(
+                        &tx,
+                        Err(HftError::Network("WS 重連失敗次數過多".to_string())),
+                    );
                     return;
                 }
                 let delay = calculate_exponential_backoff(attempts, DEFAULT_BASE_DELAY_MS);

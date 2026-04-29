@@ -25,12 +25,14 @@ use hft_core::*;
 use integration::ws::{MessageHandler, ReconnectingWsClient, WsClientConfig};
 use ports::*;
 
+const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 4096;
+
 /// 零拷貝 Bitget 市場流
 ///
 /// 使用 tokio channel 傳遞事件，保持與 engine 層的解耦
 pub struct ZeroCopyBitgetStream {
     ws_client: Option<ReconnectingWsClient>,
-    event_sender: Option<mpsc::UnboundedSender<MarketEvent>>,
+    event_sender: Option<mpsc::Sender<MarketEvent>>,
     subscribed_symbols: Vec<Symbol>,
     /// 復用的 JSON 解析緩衝區
     parse_buffer: Vec<u8>,
@@ -66,6 +68,14 @@ impl ZeroCopyBitgetStream {
             max_frame_size: 256 * 1024,   // 256KB 幀上限
             heartbeat_text: Some("ping".to_string()),
         }
+    }
+
+    fn event_queue_capacity() -> usize {
+        std::env::var("BITGET_EVENT_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|capacity| *capacity > 0)
+            .unwrap_or(DEFAULT_EVENT_QUEUE_CAPACITY)
     }
 
     /// 零拷貝解析訂單簿數據
@@ -257,14 +267,14 @@ impl ZeroCopyBitgetStream {
 ///
 /// 不再直接依賴 EventIngester，通過 channel 解耦
 pub struct ZeroCopyMessageHandler {
-    event_sender: mpsc::UnboundedSender<MarketEvent>,
+    event_sender: mpsc::Sender<MarketEvent>,
     subscribed_symbols: Vec<Symbol>,
     /// 復用緩衝區
     buffer: Vec<u8>,
 }
 
 impl ZeroCopyMessageHandler {
-    pub fn new(sender: mpsc::UnboundedSender<MarketEvent>, symbols: Vec<Symbol>) -> Self {
+    pub fn new(sender: mpsc::Sender<MarketEvent>, symbols: Vec<Symbol>) -> Self {
         Self {
             event_sender: sender,
             subscribed_symbols: symbols,
@@ -274,8 +284,14 @@ impl ZeroCopyMessageHandler {
 
     /// 發送市場事件到 channel
     fn send_event(&self, event: MarketEvent) {
-        if let Err(e) = self.event_sender.send(event) {
-            warn!("事件發送失敗: {}", e);
+        match self.event_sender.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!("零拷貝 Bitget event queue full, dropping stale market event");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("零拷貝 Bitget event queue closed, dropping market event");
+            }
         }
     }
 }
@@ -514,7 +530,7 @@ impl MarketStream for ZeroCopyBitgetStream {
         info!("零拷貝 Bitget 流開始訂閱 {} 個符號", symbols.len());
 
         // 創建事件通道
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(Self::event_queue_capacity());
 
         // 創建 WebSocket 客戶端
         let ws_config = Self::create_ws_config();

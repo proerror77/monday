@@ -33,8 +33,8 @@ Classification:
 | `market-core/runtime/src/system_builder.rs` | stores execution-worker control senders | control-plane acceptable | Sender registry for worker lifecycle/control. Acceptable while it remains command-only. |
 | `market-core/runtime/src/system_builder/simulated_execution.rs` | simulated execution event stream | fixed in Q2 local slice | Converted to bounded `tokio::mpsc::channel` with `try_send`, full/closed errors, and a bounded-queue regression test. |
 | `data-pipelines/adapters/adapter-bitget/src/bitget_stream.rs` | adapter event sender and stream channel | fixed in Q2 local slice | Converted generic Bitget stream output to bounded `tokio::mpsc::channel` with `try_send` and `BITGET_EVENT_QUEUE_CAPACITY`. Dedicated `latency_audit` remains the p99 evidence path. |
-| `data-pipelines/adapters/adapter-bitget/src/zero_copy_stream.rs` | zero-copy adapter event sender and tests | must-fix before live MD path | Same market-data surface issue as `bitget_stream.rs`; keep test usage isolated or convert production path to bounded. |
-| `data-pipelines/adapters/adapter-binance/src/lib.rs` | adapter stream channel | must-fix before live MD path | Generic Binance adapter stream must not be the production low-latency path until bounded or isolated behind a latest-wins policy. |
+| `data-pipelines/adapters/adapter-bitget/src/zero_copy_stream.rs` | zero-copy adapter event sender and tests | fixed in Q2 local slice | Converted to bounded `tokio::mpsc::channel` with `try_send` and `BITGET_EVENT_QUEUE_CAPACITY`. |
+| `data-pipelines/adapters/adapter-binance/src/lib.rs` | adapter stream channel | fixed in Q2 local slice | Converted generic Binance stream output to bounded `tokio::mpsc::channel` with `try_send` and `BINANCE_EVENT_QUEUE_CAPACITY`; initial snapshots fail explicitly if the queue is full. |
 | `data-pipelines/adapters/adapter-bybit/src/lib.rs` | adapter stream channel | must-fix before live MD path | Same adapter output risk; classify before any live use. |
 | `data-pipelines/adapters/adapter-lighter/src/lib.rs` | adapter stream channel | must-fix before live MD path | Same adapter output risk; classify before any live use. |
 | `data-pipelines/adapters/adapter-asterdex/src/lib.rs` | adapter stream channel | must-fix before live MD path | Same adapter output risk; classify before any live use. |
@@ -54,13 +54,14 @@ streams:
   `ExecutionEvent`.
 - Simulated execution now uses bounded event output; paper/shadow code can no
   longer hide unbounded order-report buildup.
-- Binance fast lane has its own correctness/replay path and should get a Linux
-  latency runner before production p99/p999 claims.
+- Binance fast lane has its own correctness/replay path; generic Binance stream
+  output is now bounded, but the Binance Linux latency runner is still needed
+  before production p99/p999 claims.
 
 ## Required Q2 Fixes
 
-- Convert the generic Binance live adapter output used by any trading runtime
-  to bounded queues or an explicit latest-wins policy.
+- Convert the remaining non-Binance/non-Bitget adapter outputs used by any
+  trading runtime to bounded queues or an explicit latest-wins policy.
 - Keep `scripts/audit_unbounded_channels.sh` in CI so new unclassified
   `unbounded_channel` usage fails before merge.
 - Keep `ControlCommand` unbounded only while it remains low-rate control-plane
