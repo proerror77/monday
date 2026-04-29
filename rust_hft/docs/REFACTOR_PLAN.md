@@ -38,6 +38,22 @@ Binance raw market data
 
 舊里程碑 M2-M7 仍是長期平台治理方向，但需要等 Binance market-data lane 可測、可回放、可穩定運行後再恢復。
 
+## 2026-04-29 計畫補完：Q2 主線
+
+2026 Q2 的可執行主線以
+[`docs/architecture/HFT_2026_Q2_EXECUTION_PLAN.md`](architecture/HFT_2026_Q2_EXECUTION_PLAN.md)
+為準。該計畫把已完成的 market-data fast lane、Bitget/Linux staging
+工具，以及本季可在本機完成的隊列拓撲、Signal/OrderIntent 生命週期、
+OMS/risk/reconciliation 測試、paper/shadow evaluation、overload mode、
+exchange rules/rate limits/cost model 全部合併成季度里程碑。
+
+判斷口徑：
+
+- 本機負責結構正確性、測試、replay/paper/shadow、隊列與風控邊界。
+- Linux staging 負責 p99/p999 真實延遲證據。
+- small live、跨交易所實盤套利、FIX/SBE/order-entry、kernel bypass
+  延後到 Q2 驗收完成後。
+
 ---
 
 ## 核心原則

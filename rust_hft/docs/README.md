@@ -10,6 +10,7 @@
 - [**性能優化架構**](architecture/PERFORMANCE_ARCHITECTURE.md) - SIMD、CPU親和性、內存優化
 - [**Binance 低延遲 Market Data 藍圖**](architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md) - 行情接收、本地訂單簿、特徵與信號路線圖
 - [**Binance MD 執行計畫**](architecture/BINANCE_MD_REFACTOR_EXECUTION_PLAN.md) - fast-lane 實作、驗證命令、剩餘風險
+- [**HFT 2026 Q2 Execution Plan**](architecture/HFT_2026_Q2_EXECUTION_PLAN.md) - 本季可完成的隊列、信號生命週期、OMS、paper/shadow、Linux staging 計畫
 - [**HFT Production Readiness Checklist**](architecture/HFT_PRODUCTION_READINESS_CHECKLIST.md) - low latency、交易正確性、安全觀測三條主線的上線檢查表
 
 ### 📖 [用戶指南](guides/)

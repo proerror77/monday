@@ -2,6 +2,10 @@
 
 這份清單把系統從「低延遲行情處理」推進到「可上線交易內核」。目標不是每個局部都追絕對最快，而是讓路徑短、隊列可控、抖動可定位、過載可降級，並且永遠不要在狀態未知時交易。
 
+本季可執行範圍和里程碑以
+[`HFT_2026_Q2_EXECUTION_PLAN.md`](HFT_2026_Q2_EXECUTION_PLAN.md) 為準；
+本文保留為 production readiness checklist。
+
 ## 1. Low Latency Path
 
 範圍：`WebSocket -> raw queue -> parser -> order book -> feature -> signal`
