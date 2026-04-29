@@ -4,6 +4,8 @@
 
 本季可執行範圍和里程碑以
 [`HFT_2026_Q2_EXECUTION_PLAN.md`](HFT_2026_Q2_EXECUTION_PLAN.md) 為準；
+隊列 owner、容量與滿載行為以
+[`HFT_QUEUE_TOPOLOGY_CONTRACT.md`](HFT_QUEUE_TOPOLOGY_CONTRACT.md) 為準；
 本文保留為 production readiness checklist。
 
 ## 1. Low Latency Path
@@ -58,6 +60,10 @@ P2 多策略：
 - SelfTradePrevention 防止自成交。
 - RiskBudgetManager 分配 capital、risk、symbol、order-rate budget。
 - ShadowTradingEngine 支持 replay、paper、shadow live、small live、full live。
+
+當前本地契約：策略仍輸出穩定的 `OrderIntent`；live/paper/shadow 路徑在
+風控或執行前應包成 `OrderIntentEnvelope`，由 `created_ts`、`valid_until`、
+`source_book_seq`、`max_latency_us` 等欄位拒絕過期或過時意圖。
 
 ## 3. Safety & Observability Path
 

@@ -41,6 +41,9 @@ Already done:
   `OrderIntent -> ExecutionWorker` and `ExecutionEvent -> Engine`.
 - Runtime config already exposes execution queue capacities and worker batch
   settings.
+- `OrderIntentEnvelope` now adds lifecycle metadata around the stable
+  `OrderIntent` contract, and the execution queue has a pre-execution gate for
+  expiry, stale book source, and max local latency.
 - Risk crates already contain default/enhanced/professional managers with
   position, notional, staleness, cooldown, and rate-style checks.
 
@@ -50,9 +53,8 @@ Partially done:
   every producer/consumer pair.
 - Execution event queues are bounded, but full behavior under saturation is not
   yet a production contract.
-- `OrderIntent` carries symbol, side, quantity, type, price, TIF, strategy id,
-  and target venue, but not a generic lifecycle envelope such as `created_ts`,
-  `expire_ts`, `source_book_seq`, `max_latency`, or `max_slippage`.
+- Strategies still emit plain `OrderIntent`; generic live/paper paths must now
+  adopt `OrderIntentEnvelope` consistently before risk/execution.
 - Paper/replay exist, but paper fill modeling is not yet sufficient for queue
   position, cancel delay, and adverse-selection analysis.
 - Linux staging scripts exist, but real host/region results have not been
@@ -147,11 +149,11 @@ Queue policy:
 
 Tasks:
 
-- [ ] Add a queue topology contract document with owner, capacity, full behavior,
+- [x] Add a queue topology contract document with owner, capacity, full behavior,
   and test command for each queue.
-- [ ] Add tests for execution intent queue full behavior.
-- [ ] Add tests for execution event queue full behavior and alert counters.
-- [ ] Audit `unbounded_channel` usages and classify each as test/demo,
+- [x] Add tests for execution intent queue full behavior.
+- [x] Add tests for execution event queue full behavior and alert counters.
+- [x] Audit `unbounded_channel` usages and classify each as test/demo,
   control-plane acceptable, or must-fix.
 - [ ] Convert any hot-path or feedback-path unbounded channel found by the audit.
 - [ ] Add a queue-summary output that surfaces capacity, utilization, full count,
@@ -169,14 +171,14 @@ Status: Binance fast lane has expiring signal; generic order path is incomplete.
 
 Tasks:
 
-- [ ] Define a lifecycle wrapper for strategy output, preserving compatibility
+- [x] Define a lifecycle wrapper for strategy output, preserving compatibility
   with current `ports::OrderIntent`.
-- [ ] Add `created_ts`, `valid_until`, `source_book_seq`, `source_feature_ts`,
+- [x] Add `created_ts`, `valid_until`, `source_book_seq`, `source_feature_ts`,
   `max_latency_us`, `max_slippage_bps`, and `reduce_only` where appropriate.
-- [ ] Add a pre-risk expiry gate.
-- [ ] Add a pre-execution expiry gate.
-- [ ] Add tests proving expired intents never enter the execution queue.
-- [ ] Add tests proving stale book/source sequence invalidates a signal.
+- [x] Add a pre-risk expiry gate.
+- [x] Add a pre-execution expiry gate.
+- [x] Add tests proving expired intents never enter the execution queue.
+- [x] Add tests proving stale book/source sequence invalidates a signal.
 
 Acceptance:
 

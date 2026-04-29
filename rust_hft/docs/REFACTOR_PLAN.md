@@ -54,6 +54,12 @@ exchange rules/rate limits/cost model 全部合併成季度里程碑。
 - small live、跨交易所實盤套利、FIX/SBE/order-entry、kernel bypass
   延後到 Q2 驗收完成後。
 
+Milestone 1 的本地契約已補到：
+[`docs/architecture/HFT_QUEUE_TOPOLOGY_CONTRACT.md`](architecture/HFT_QUEUE_TOPOLOGY_CONTRACT.md)
+與 [`docs/reports/UNBOUNDED_CHANNEL_AUDIT.md`](reports/UNBOUNDED_CHANNEL_AUDIT.md)。
+generic `OrderIntent` 不破壞既有策略 trait，live/paper/shadow 邊界改用
+`OrderIntentEnvelope` 做 expiry、source book sequence 和 max-latency gate。
+
 ---
 
 ## 核心原則

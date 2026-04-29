@@ -11,6 +11,7 @@
 - [**Binance 低延遲 Market Data 藍圖**](architecture/BINANCE_LOW_LATENCY_MARKET_DATA_PLAN.md) - 行情接收、本地訂單簿、特徵與信號路線圖
 - [**Binance MD 執行計畫**](architecture/BINANCE_MD_REFACTOR_EXECUTION_PLAN.md) - fast-lane 實作、驗證命令、剩餘風險
 - [**HFT 2026 Q2 Execution Plan**](architecture/HFT_2026_Q2_EXECUTION_PLAN.md) - 本季可完成的隊列、信號生命週期、OMS、paper/shadow、Linux staging 計畫
+- [**HFT Queue Topology Contract**](architecture/HFT_QUEUE_TOPOLOGY_CONTRACT.md) - 本季隊列 owner、容量、滿載行為與驗證命令
 - [**HFT Production Readiness Checklist**](architecture/HFT_PRODUCTION_READINESS_CHECKLIST.md) - low latency、交易正確性、安全觀測三條主線的上線檢查表
 
 ### 📖 [用戶指南](guides/)
@@ -32,6 +33,7 @@
 
 ### 📊 [測試報告](reports/)
 - [**性能基準**](reports/PERFORMANCE_BENCHMARKS.md) - 延遲和吞吐量測試
+- [**Unbounded Channel Audit**](reports/UNBOUNDED_CHANNEL_AUDIT.md) - 生產路徑 `unbounded_channel` 分類與 Q2 收斂項
 - [**系統測試**](reports/SYSTEM_TEST_RESULTS.md) - 集成測試結果
 - [**風險優化**](reports/RISK_OPTIMIZATION.md) - 風控系統評估
 - [**壓力測試**](reports/STRESS_TEST_RESULTS.md) - 高負載測試報告

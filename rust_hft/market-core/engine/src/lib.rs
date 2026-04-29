@@ -35,7 +35,9 @@ use tracing::{debug, error, info, trace, warn};
 // 重新導出關鍵類型
 pub use adapter_bridge::{AdapterBridge, AdapterBridgeConfig};
 pub use dataflow::{BackpressurePolicy, BackpressureStatus, FlipPolicy};
-pub use execution_queues::{create_execution_queues, ExecutionQueueConfig, WorkerQueues};
+pub use execution_queues::{
+    create_execution_queues, ExecutionQueueConfig, LifecycleIntentSubmitError, WorkerQueues,
+};
 pub use execution_worker::{spawn_execution_worker, ExecutionWorker, ExecutionWorkerConfig};
 
 /// 交易狀態模式（由 Sentinel 控制）
@@ -604,6 +606,46 @@ impl Engine {
                         "執行隊列滿載，訂單意圖被拒絕: {} {}",
                         rejected_intent.symbol.as_str(),
                         rejected_intent.quantity.0
+                    );
+                    Err(HftError::Execution("執行隊列滿載".to_string()))
+                }
+            }
+        } else {
+            warn!("執行隊列未初始化，無法提交訂單意圖");
+            Err(HftError::Execution("執行隊列未初始化".to_string()))
+        }
+    }
+
+    /// 提交帶生命週期的訂單意圖到執行隊列。
+    ///
+    /// 用於 live/paper/shadow 路徑在進入 execution worker 前拒絕過期或過時意圖。
+    pub fn submit_order_intent_envelope(
+        &mut self,
+        envelope: ports::OrderIntentEnvelope,
+        now: hft_core::Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), HftError> {
+        if let Some(queues) = &mut self.execution_queues {
+            match queues.send_lifecycle_intent_with_book_seq(envelope, now, latest_book_seq) {
+                Ok(()) => {
+                    debug!("成功提交帶生命週期的訂單意圖到執行隊列");
+                    Ok(())
+                }
+                Err(execution_queues::LifecycleIntentSubmitError::LifecycleRejected {
+                    reason,
+                    ..
+                }) => {
+                    warn!("訂單意圖生命週期 gate 拒絕: {:?}", reason);
+                    Err(HftError::Execution(format!(
+                        "訂單意圖生命週期 gate 拒絕: {:?}",
+                        reason
+                    )))
+                }
+                Err(execution_queues::LifecycleIntentSubmitError::QueueFull { intent }) => {
+                    warn!(
+                        "執行隊列滿載，訂單意圖被拒絕: {} {}",
+                        intent.symbol.as_str(),
+                        intent.quantity.0
                     );
                     Err(HftError::Execution("執行隊列滿載".to_string()))
                 }

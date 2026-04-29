@@ -6,7 +6,8 @@
 //! - 双向队列确保任何网络 await 不持有引擎锁
 
 use crate::dataflow::ring_buffer::{spsc_ring_buffer, SpscConsumer, SpscProducer};
-use ports::{ExecutionEvent, OrderIntent};
+use hft_core::Timestamp;
+use ports::{ExecutionEvent, OrderIntent, OrderIntentEnvelope, OrderIntentRejectReason};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
@@ -63,6 +64,22 @@ pub struct QueueStats {
     pub events_received: u64,
     pub intent_queue_full_count: u64,
     pub event_queue_full_count: u64,
+    pub intent_lifecycle_rejected_count: u64,
+    pub intent_expired_count: u64,
+    pub intent_stale_count: u64,
+    pub intent_max_latency_count: u64,
+}
+
+/// 帶生命週期 envelope 的意圖提交失敗原因。
+#[derive(Debug, Clone)]
+pub enum LifecycleIntentSubmitError {
+    LifecycleRejected {
+        envelope: OrderIntentEnvelope,
+        reason: OrderIntentRejectReason,
+    },
+    QueueFull {
+        intent: OrderIntent,
+    },
 }
 
 /// 创建引擎和 Worker 队列对
@@ -104,6 +121,47 @@ impl EngineQueues {
                     intent.quantity.0
                 );
                 Err(intent)
+            }
+        }
+    }
+
+    /// 生命週期 gate 後再提交訂單意圖到執行 worker。
+    ///
+    /// 這是 pre-execution gate：過期、來源 book 已過時、或超過策略允許本地
+    /// 等待時間的 intent 不會進入執行隊列。
+    pub fn send_lifecycle_intent(
+        &mut self,
+        envelope: OrderIntentEnvelope,
+        now: Timestamp,
+    ) -> Result<(), LifecycleIntentSubmitError> {
+        self.send_lifecycle_intent_with_book_seq(envelope, now, None)
+    }
+
+    /// 帶最新 book sequence 的 pre-execution gate。
+    pub fn send_lifecycle_intent_with_book_seq(
+        &mut self,
+        envelope: OrderIntentEnvelope,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), LifecycleIntentSubmitError> {
+        match envelope.validate_pre_execution(now, latest_book_seq) {
+            Ok(()) => self
+                .send_intent(envelope.intent)
+                .map_err(|intent| LifecycleIntentSubmitError::QueueFull { intent }),
+            Err(reason) => {
+                self.stats.intent_lifecycle_rejected_count += 1;
+                match reason {
+                    OrderIntentRejectReason::Expired { .. } => {
+                        self.stats.intent_expired_count += 1;
+                    }
+                    OrderIntentRejectReason::SourceBookStale { .. } => {
+                        self.stats.intent_stale_count += 1;
+                    }
+                    OrderIntentRejectReason::MaxLatencyExceeded { .. } => {
+                        self.stats.intent_max_latency_count += 1;
+                    }
+                }
+                Err(LifecycleIntentSubmitError::LifecycleRejected { envelope, reason })
             }
         }
     }

@@ -197,6 +197,167 @@ pub struct OrderIntent {
     pub target_venue: Option<VenueId>,
 }
 
+/// OrderIntent 的生命週期元資料。
+///
+/// 策略仍可輸出穩定的 `OrderIntent`；live/paper/shadow 路徑在進入風控或
+/// 執行隊列前用這層 envelope 判斷過期、來源簿是否已被更新、以及本地等待
+/// 是否超過策略允許的最大延遲。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderIntentLifecycle {
+    pub created_ts: Timestamp,
+    pub valid_until: Timestamp,
+    pub source_book_seq: Option<u64>,
+    pub source_feature_ts: Option<Timestamp>,
+    pub max_latency_us: Option<u64>,
+    pub max_slippage_bps: Option<i32>,
+    #[serde(default)]
+    pub reduce_only: bool,
+}
+
+impl Default for OrderIntentLifecycle {
+    fn default() -> Self {
+        Self {
+            created_ts: 0,
+            valid_until: Timestamp::MAX,
+            source_book_seq: None,
+            source_feature_ts: None,
+            max_latency_us: None,
+            max_slippage_bps: None,
+            reduce_only: false,
+        }
+    }
+}
+
+impl OrderIntentLifecycle {
+    pub fn new(created_ts: Timestamp, valid_until: Timestamp) -> Self {
+        Self {
+            created_ts,
+            valid_until,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_expired_at(&self, now: Timestamp) -> bool {
+        now >= self.valid_until
+    }
+
+    pub fn is_stale_for_book_seq(&self, latest_book_seq: u64) -> bool {
+        self.source_book_seq
+            .is_some_and(|source_seq| latest_book_seq > source_seq)
+    }
+
+    pub fn latency_us_at(&self, now: Timestamp) -> u64 {
+        now.saturating_sub(self.created_ts)
+    }
+
+    pub fn validate_pre_risk(
+        &self,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), OrderIntentRejectReason> {
+        self.validate(now, latest_book_seq)
+    }
+
+    pub fn validate_pre_execution(
+        &self,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), OrderIntentRejectReason> {
+        self.validate(now, latest_book_seq)
+    }
+
+    fn validate(
+        &self,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), OrderIntentRejectReason> {
+        if self.is_expired_at(now) {
+            return Err(OrderIntentRejectReason::Expired {
+                now,
+                valid_until: self.valid_until,
+            });
+        }
+
+        if let (Some(source_book_seq), Some(latest_book_seq)) =
+            (self.source_book_seq, latest_book_seq)
+        {
+            if latest_book_seq > source_book_seq {
+                return Err(OrderIntentRejectReason::SourceBookStale {
+                    source_book_seq,
+                    latest_book_seq,
+                });
+            }
+        }
+
+        if let Some(max_latency_us) = self.max_latency_us {
+            let elapsed_us = self.latency_us_at(now);
+            if elapsed_us > max_latency_us {
+                return Err(OrderIntentRejectReason::MaxLatencyExceeded {
+                    now,
+                    created_ts: self.created_ts,
+                    elapsed_us,
+                    max_latency_us,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// 帶生命週期的下單意圖。這是策略輸出和風控/執行邊界之間的兼容 envelope，
+/// 不改動既有 Strategy trait。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderIntentEnvelope {
+    pub intent: OrderIntent,
+    pub lifecycle: OrderIntentLifecycle,
+}
+
+impl OrderIntentEnvelope {
+    pub fn new(intent: OrderIntent, lifecycle: OrderIntentLifecycle) -> Self {
+        Self { intent, lifecycle }
+    }
+
+    pub fn into_inner(self) -> OrderIntent {
+        self.intent
+    }
+
+    pub fn validate_pre_risk(
+        &self,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), OrderIntentRejectReason> {
+        self.lifecycle.validate_pre_risk(now, latest_book_seq)
+    }
+
+    pub fn validate_pre_execution(
+        &self,
+        now: Timestamp,
+        latest_book_seq: Option<u64>,
+    ) -> Result<(), OrderIntentRejectReason> {
+        self.lifecycle.validate_pre_execution(now, latest_book_seq)
+    }
+}
+
+/// OrderIntent envelope 被風控或執行前置 gate 拒絕的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderIntentRejectReason {
+    Expired {
+        now: Timestamp,
+        valid_until: Timestamp,
+    },
+    SourceBookStale {
+        source_book_seq: u64,
+        latest_book_seq: u64,
+    },
+    MaxLatencyExceeded {
+        now: Timestamp,
+        created_ts: Timestamp,
+        elapsed_us: u64,
+        max_latency_us: u64,
+    },
+}
+
 /// 執行事件 (下單後回報)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionEvent {
@@ -304,4 +465,65 @@ pub enum AlertSeverity {
     Info,
     Warning,
     Critical,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lifecycle(created_ts: Timestamp, valid_until: Timestamp) -> OrderIntentLifecycle {
+        OrderIntentLifecycle::new(created_ts, valid_until)
+    }
+
+    #[test]
+    fn lifecycle_rejects_expired_intent() {
+        let lifecycle = lifecycle(1_000, 1_100);
+
+        assert_eq!(
+            lifecycle.validate_pre_risk(1_100, None),
+            Err(OrderIntentRejectReason::Expired {
+                now: 1_100,
+                valid_until: 1_100,
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_rejects_stale_book_source() {
+        let mut lifecycle = lifecycle(1_000, 2_000);
+        lifecycle.source_book_seq = Some(42);
+
+        assert_eq!(
+            lifecycle.validate_pre_execution(1_100, Some(43)),
+            Err(OrderIntentRejectReason::SourceBookStale {
+                source_book_seq: 42,
+                latest_book_seq: 43,
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_rejects_max_latency_exceeded() {
+        let mut lifecycle = lifecycle(1_000, 2_000);
+        lifecycle.max_latency_us = Some(25);
+
+        assert_eq!(
+            lifecycle.validate_pre_execution(1_026, None),
+            Err(OrderIntentRejectReason::MaxLatencyExceeded {
+                now: 1_026,
+                created_ts: 1_000,
+                elapsed_us: 26,
+                max_latency_us: 25,
+            })
+        );
+    }
+
+    #[test]
+    fn lifecycle_accepts_current_intent() {
+        let mut lifecycle = lifecycle(1_000, 1_100);
+        lifecycle.source_book_seq = Some(42);
+        lifecycle.max_latency_us = Some(25);
+
+        assert_eq!(lifecycle.validate_pre_risk(1_025, Some(42)), Ok(()));
+    }
 }
