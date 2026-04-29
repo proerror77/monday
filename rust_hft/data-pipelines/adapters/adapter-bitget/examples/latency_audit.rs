@@ -4,17 +4,19 @@ use data_adapter_bitget::{
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError},
     Arc,
 };
+use std::thread;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_WS_URL: &str = "wss://ws.bitget.com/v2/ws/public";
 
 struct RawFrame {
     recv_at: Instant,
+    queued_at: Instant,
     text: String,
     inter_arrival_ns: Option<u64>,
     queue_depth_on_send: usize,
@@ -69,52 +71,85 @@ impl AuditStats {
             dropped,
             queue_capacity
         );
-        print_percentiles("audit ws_receive_gap", &mut self.ws_receive_gap_ns);
-        print_percentiles("audit raw_queue_depth", &mut self.raw_queue_depth);
-        print_percentiles("audit raw_queue_wait", &mut self.raw_queue_wait_ns);
-        print_percentiles("audit envelope_parse", &mut self.envelope_ns);
-        print_percentiles("audit event_convert", &mut self.event_ns);
-        print_percentiles("audit engine_total", &mut self.engine_total_ns);
+        print_percentiles("audit ws_receive_gap", "ns", &mut self.ws_receive_gap_ns);
+        print_percentiles("audit raw_queue_depth", "", &mut self.raw_queue_depth);
+        print_percentiles("audit raw_queue_wait", "ns", &mut self.raw_queue_wait_ns);
+        print_percentiles("audit envelope_parse", "ns", &mut self.envelope_ns);
+        print_percentiles("audit event_convert", "ns", &mut self.event_ns);
+        print_percentiles("audit engine_total", "ns", &mut self.engine_total_ns);
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = rustls_023::crypto::ring::default_provider().install_default();
 
     let args = Args::from_env();
     println!(
-        "starting Bitget latency audit: url={} instType={} symbol={} depth_channel={} queue_capacity={} max_messages={} max_runtime_secs={}",
+        "starting Bitget latency audit: url={} instType={} symbol={} depth_channel={} queue_capacity={} max_messages={} max_runtime_secs={} spin_polls={} busy_poll={}",
         args.ws_url,
         args.inst_type,
         args.symbol,
         args.depth_channel,
         args.queue_capacity,
         args.max_messages,
-        args.max_runtime_secs
+        args.max_runtime_secs,
+        args.spin_polls,
+        args.busy_poll
     );
 
     let dropped = Arc::new(AtomicU64::new(0));
-    let (tx, mut rx) = mpsc::channel::<RawFrame>(args.queue_capacity);
+    let queue_depth = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = sync_channel::<RawFrame>(args.queue_capacity);
+
+    let engine_args = args.clone();
+    let engine_queue_depth = Arc::clone(&queue_depth);
+    let engine_stop = Arc::clone(&stop);
+    let engine = thread::Builder::new()
+        .name("bitget-latency-audit-engine".to_string())
+        .spawn(move || run_engine(engine_args, rx, engine_queue_depth, engine_stop))?;
+
     let receiver_dropped = Arc::clone(&dropped);
+    let receiver_queue_depth = Arc::clone(&queue_depth);
+    let receiver_stop = Arc::clone(&stop);
     let receiver_args = args.clone();
+    if let Err(err) = run_receiver(
+        receiver_args,
+        tx,
+        receiver_dropped,
+        receiver_queue_depth,
+        receiver_stop,
+    )
+    .await
+    {
+        eprintln!("receiver stopped: {err}");
+    }
 
-    tokio::spawn(async move {
-        if let Err(err) = run_receiver(receiver_args, tx, receiver_dropped).await {
-            eprintln!("receiver stopped: {err}");
-        }
-    });
+    let mut stats = engine.join().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::Other, "latency audit engine panicked")
+    })?;
+    stop.store(true, Ordering::Relaxed);
+    stats.print(dropped.load(Ordering::Relaxed), args.queue_capacity);
+    Ok(())
+}
 
+fn run_engine(
+    args: Args,
+    rx: Receiver<RawFrame>,
+    queue_depth: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+) -> AuditStats {
     let started = Instant::now();
     let mut stats = AuditStats::default();
 
     while stats.engine_total_ns.len() < args.max_messages as usize
         && started.elapsed() < Duration::from_secs(args.max_runtime_secs)
     {
-        let frame = match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(_) => continue,
+        let frame = match recv_engine_frame(&rx, &queue_depth, args.spin_polls, args.busy_poll) {
+            EngineRecv::Frame(frame) => frame,
+            EngineRecv::Timeout => continue,
+            EngineRecv::Disconnected => break,
         };
 
         let dequeue_at = Instant::now();
@@ -149,7 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         stats.record(
             &frame,
-            nanos_between(frame.recv_at, dequeue_at),
+            nanos_between(frame.queued_at, dequeue_at),
             nanos_between(dequeue_at, envelope_done),
             nanos_between(envelope_done, event_done),
             nanos_between(frame.recv_at, event_done),
@@ -157,14 +192,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
-    stats.print(dropped.load(Ordering::Relaxed), args.queue_capacity);
-    Ok(())
+    stop.store(true, Ordering::Relaxed);
+    stats
+}
+
+enum EngineRecv {
+    Frame(RawFrame),
+    Timeout,
+    Disconnected,
+}
+
+fn recv_engine_frame(
+    rx: &Receiver<RawFrame>,
+    queue_depth: &AtomicUsize,
+    spin_polls: usize,
+    busy_poll: bool,
+) -> EngineRecv {
+    if busy_poll {
+        for _ in 0..1024 {
+            match rx.try_recv() {
+                Ok(frame) => {
+                    queue_depth.fetch_sub(1, Ordering::Relaxed);
+                    return EngineRecv::Frame(frame);
+                }
+                Err(TryRecvError::Empty) => std::hint::spin_loop(),
+                Err(TryRecvError::Disconnected) => return EngineRecv::Disconnected,
+            }
+        }
+        return EngineRecv::Timeout;
+    }
+
+    for _ in 0..spin_polls {
+        match rx.try_recv() {
+            Ok(frame) => {
+                queue_depth.fetch_sub(1, Ordering::Relaxed);
+                return EngineRecv::Frame(frame);
+            }
+            Err(TryRecvError::Empty) => std::hint::spin_loop(),
+            Err(TryRecvError::Disconnected) => return EngineRecv::Disconnected,
+        }
+    }
+
+    match rx.recv_timeout(Duration::from_millis(1)) {
+        Ok(frame) => {
+            queue_depth.fetch_sub(1, Ordering::Relaxed);
+            EngineRecv::Frame(frame)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => EngineRecv::Timeout,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => EngineRecv::Disconnected,
+    }
 }
 
 async fn run_receiver(
     args: Args,
-    tx: mpsc::Sender<RawFrame>,
+    tx: SyncSender<RawFrame>,
     dropped: Arc<AtomicU64>,
+    queue_depth: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let subscribe = json!({
         "op": "subscribe",
@@ -189,7 +273,7 @@ async fn run_receiver(
     let mut last_message_at: Option<Instant> = None;
     let mut last_ping_at = Instant::now();
 
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         if last_ping_at.elapsed() >= Duration::from_secs(25) {
             ws.send(Message::Text("ping".into())).await?;
             last_ping_at = Instant::now();
@@ -220,15 +304,25 @@ async fn run_receiver(
             continue;
         }
 
+        let queue_depth_on_send = queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         let frame = RawFrame {
             recv_at,
+            queued_at: Instant::now(),
             text,
             inter_arrival_ns,
-            queue_depth_on_send: tx.max_capacity().saturating_sub(tx.capacity()),
+            queue_depth_on_send,
         };
 
-        if tx.try_send(frame).is_err() {
-            dropped.fetch_add(1, Ordering::Relaxed);
+        match tx.try_send(frame) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                queue_depth.fetch_sub(1, Ordering::Relaxed);
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                queue_depth.fetch_sub(1, Ordering::Relaxed);
+                break;
+            }
         }
     }
 
@@ -244,6 +338,8 @@ struct Args {
     queue_capacity: usize,
     max_messages: u64,
     max_runtime_secs: u64,
+    spin_polls: usize,
+    busy_poll: bool,
 }
 
 impl Args {
@@ -257,6 +353,8 @@ impl Args {
             queue_capacity: 1024,
             max_messages: 500,
             max_runtime_secs: 30,
+            spin_polls: 256,
+            busy_poll: false,
         };
 
         while let Some(flag) = args.next() {
@@ -280,6 +378,12 @@ impl Args {
                         .parse()
                         .expect("valid --max-runtime-secs")
                 }
+                "--spin-polls" => {
+                    parsed.spin_polls = take_value(&mut args, &flag)
+                        .parse()
+                        .expect("valid --spin-polls")
+                }
+                "--busy-poll" => parsed.busy_poll = true,
                 "--help" | "-h" => {
                     print_help_and_exit();
                 }
@@ -300,7 +404,8 @@ fn print_help_and_exit() -> ! {
     println!(
         "Usage: cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \\
   [--symbol BTCUSDT] [--inst-type SPOT] [--depth-channel books1] \\
-  [--queue-capacity 1024] [--max-messages 500] [--max-runtime-secs 30]"
+  [--queue-capacity 1024] [--max-messages 500] [--max-runtime-secs 30] \\
+  [--spin-polls 256] [--busy-poll]"
     );
     std::process::exit(0);
 }
@@ -311,20 +416,26 @@ fn nanos_between(start: Instant, end: Instant) -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn print_percentiles(label: &str, samples: &mut [u64]) {
+fn print_percentiles(label: &str, unit: &str, samples: &mut [u64]) {
     if samples.is_empty() {
         println!("{label}: no samples");
         return;
     }
 
     samples.sort_unstable();
+    let suffix = unit;
     println!(
-        "{label}: p50={}ns p95={}ns p99={}ns p999={}ns max={}ns count={}",
+        "{label}: p50={}{} p95={}{} p99={}{} p999={}{} max={}{} count={}",
         percentile(samples, 0.50),
+        suffix,
         percentile(samples, 0.95),
+        suffix,
         percentile(samples, 0.99),
+        suffix,
         percentile(samples, 0.999),
+        suffix,
         samples[samples.len() - 1],
+        suffix,
         samples.len()
     );
 }

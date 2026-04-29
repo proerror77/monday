@@ -91,18 +91,32 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --depth-channel books1 \
   --queue-capacity 1024 \
   --max-messages 500 \
-  --max-runtime-secs 30
+  --max-runtime-secs 60
 ```
 
-結果：
+結果：receiver 使用 Tokio current-thread runtime，engine consumer 使用獨立 OS thread；`raw_queue_wait` 只統計 frame 入隊後到 engine 取出的等待時間。
 
 | Metric | p50 | p95 | p99 | p999 / max | Notes |
 |--------|-----|-----|-----|------------|-------|
-| `ws_receive_gap` | 8,923,042ns | 166,210,792ns | 381,230,416ns | 726,807,916ns | 真實消息到達間隔，不是本地處理延遲 |
-| `raw_queue_depth` | 0 | 3 | 6 | 8 | 1024 容量下無擁塞 |
-| `raw_queue_wait` | 13,708ns | 37,000ns | 557,125ns | 614,792ns | queue/scheduler tail 是當前主要尖刺 |
-| `envelope_parse` | 3,125ns | 7,792ns | 11,791ns | 26,625ns | parser 本身不是主瓶頸 |
-| `event_convert` | 4,584ns | 13,333ns | 32,291ns | 58,250ns | Decimal/event conversion 可接受 |
-| `engine_total` | 23,584ns | 53,625ns | 567,291ns | 627,125ns | 被 queue wait p99 主導 |
+| `ws_receive_gap` | 16,691,708ns | 397,709,708ns | 954,881,500ns | 2,028,413,834ns | 真實消息到達間隔，不是本地處理延遲 |
+| `raw_queue_depth` | 1 | 3 | 4 | 5 | 1024 容量下無擁塞 |
+| `raw_queue_wait` | 10,125ns | 29,750ns | 385,958ns | 881,416ns | queue/scheduler tail 仍是當前主要尖刺 |
+| `envelope_parse` | 3,625ns | 8,125ns | 15,208ns | 22,417ns | parser 本身不是主瓶頸 |
+| `event_convert` | 5,584ns | 12,209ns | 23,209ns | 75,750ns | Decimal/event conversion 可接受 |
+| `engine_total` | 21,667ns | 47,875ns | 518,709ns | 895,583ns | p99 仍由本機 thread scheduling 主導 |
 
-解讀：Bitget 本地 parser/convert 路徑的 p99 仍在數十微秒級，但 receiver -> engine 的 bounded queue wait 在這次測試中出現約 0.56ms p99 尖刺。下一步優先優化 receiver/engine 調度模型，而不是繼續微調 JSON parser。
+低延遲 busy-poll 模式：
+
+```bash
+cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
+  --symbol BTCUSDT \
+  --depth-channel books1 \
+  --queue-capacity 1024 \
+  --max-messages 500 \
+  --max-runtime-secs 60 \
+  --busy-poll
+```
+
+結果：`raw_queue_wait p50=500ns p95=8,959ns p99=1,473,000ns`，`engine_total p50=8,250ns p95=14,916ns p99=1,481,083ns`。busy-poll 已把 common path 壓到微秒級，但 macOS 仍會偶發 deschedule engine thread；要穩定 p99/p999，下一步需要 Linux dedicated core、CPU pinning/isolation、IRQ 隔離與 governor performance。
+
+解讀：Bitget 本地 parser/convert 路徑的 p99 仍在數十微秒級內；更大的問題是 receiver -> engine 調度尾延遲。下一步優先做 Linux pinned engine thread / CPU isolation / IRQ affinity 驗證，而不是繼續微調 JSON parser。

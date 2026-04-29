@@ -140,6 +140,15 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 30
+
+# 低延遲模式：engine thread busy-poll raw queue，會占用一個核心
+cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
+  --symbol BTCUSDT \
+  --depth-channel books1 \
+  --queue-capacity 1024 \
+  --max-messages 500 \
+  --max-runtime-secs 60 \
+  --busy-poll
 ```
 
 Bitget adapter 的行情接口按官方 v2 WebSocket 行為處理：公共端點使用 `wss://ws.bitget.com/v2/ws/public`，深度 channel 使用 `books/books1/books5/books15`，增量模式使用 `books`；心跳使用文本 `"ping"`/`"pong"`，不是只依賴 WebSocket ping frame。books/trade 熱路徑使用 borrowed typed JSON parser，非標準格式才回退 legacy `serde_json::Value` path。

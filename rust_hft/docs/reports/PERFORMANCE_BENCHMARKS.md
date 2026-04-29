@@ -65,9 +65,9 @@ cargo run -p hft-data-adapter-bitget --example live_p99 --release -- \
 | `total_local` | 5,917ns | 17,292ns | 35,542ns | 92,667ns | `receive -> envelope parse -> event conversion` |
 | `inter_arrival` | 3,488,167ns | 57,987,875ns | 141,756,833ns | 272,056,291ns | 真實消息到達間隔，不是本地處理延遲 |
 
-### Bitget latency audit with bounded queue
+### Bitget latency audit with dedicated engine thread
 
-以下數據把 WebSocket receiver 和 engine consumer 拆開，中間使用 bounded raw queue，命令：
+以下數據把 WebSocket receiver 和 engine consumer 拆開，中間使用 bounded raw queue。receiver 保留在 Tokio current-thread runtime，engine consumer 使用獨立 OS thread；`raw_queue_wait` 的口徑是 frame 入隊後到 engine 取出的等待時間。
 
 ```bash
 cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
@@ -75,19 +75,40 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --depth-channel books1 \
   --queue-capacity 1024 \
   --max-messages 500 \
-  --max-runtime-secs 30
+  --max-runtime-secs 60
 ```
 
-采樣結果：`samples=500 books=416 trades=84 ignored=2 dropped=0 queue_capacity=1024`
+采樣結果：`samples=500 books=432 trades=68 ignored=2 dropped=0 queue_capacity=1024`
 
 | Stage | p50 | p95 | p99 | p999 / max | 說明 |
 |-------|-----|-----|-----|------------|------|
-| `ws_receive_gap` | 8,923,042ns | 166,210,792ns | 381,230,416ns | 726,807,916ns | 真實消息到達間隔 |
-| `raw_queue_depth` | 0 | 3 | 6 | 8 | 1024 容量下無擁塞 |
-| `raw_queue_wait` | 13,708ns | 37,000ns | 557,125ns | 614,792ns | receiver -> engine 的等待時間 |
-| `envelope_parse` | 3,125ns | 7,792ns | 11,791ns | 26,625ns | parser 本身成本 |
-| `event_convert` | 4,584ns | 13,333ns | 32,291ns | 58,250ns | `MarketSnapshot` / `Trade` 轉換 |
-| `engine_total` | 23,584ns | 53,625ns | 567,291ns | 627,125ns | 被 queue wait p99 主導 |
+| `ws_receive_gap` | 16,691,708ns | 397,709,708ns | 954,881,500ns | 2,028,413,834ns | 真實消息到達間隔 |
+| `raw_queue_depth` | 1 | 3 | 4 | 5 | 1024 容量下無擁塞 |
+| `raw_queue_wait` | 10,125ns | 29,750ns | 385,958ns | 881,416ns | receiver -> engine 入隊後等待 |
+| `envelope_parse` | 3,625ns | 8,125ns | 15,208ns | 22,417ns | parser 本身成本 |
+| `event_convert` | 5,584ns | 12,209ns | 23,209ns | 75,750ns | `MarketSnapshot` / `Trade` 轉換 |
+| `engine_total` | 21,667ns | 47,875ns | 518,709ns | 895,583ns | p99 仍由本機 thread scheduling 尖刺主導 |
+
+低延遲 busy-poll 模式命令：
+
+```bash
+cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
+  --symbol BTCUSDT \
+  --depth-channel books1 \
+  --queue-capacity 1024 \
+  --max-messages 500 \
+  --max-runtime-secs 60 \
+  --busy-poll
+```
+
+采樣結果：`samples=422 books=369 trades=53 ignored=2 dropped=0 queue_capacity=1024`
+
+| Stage | p50 | p95 | p99 | p999 / max | 說明 |
+|-------|-----|-----|-----|------------|------|
+| `raw_queue_wait` | 500ns | 8,959ns | 1,473,000ns | 8,972,166ns | busy-poll 改善 common path，但 macOS 仍會偶發 deschedule engine thread |
+| `envelope_parse` | 2,334ns | 4,625ns | 6,792ns | 8,917ns | parser common path 降低 |
+| `event_convert` | 3,208ns | 5,917ns | 7,500ns | 9,625ns | event conversion common path 降低 |
+| `engine_total` | 8,250ns | 14,916ns | 1,481,083ns | 8,987,000ns | p99/p999 需要 Linux CPU pinning / isolation 才能穩定 |
 
 ### 核心組件延遲 (單次操作)
 
