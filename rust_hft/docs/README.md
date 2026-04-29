@@ -149,6 +149,11 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --max-messages 500 \
   --max-runtime-secs 60 \
   --busy-poll
+
+# Linux staging：先做只讀 preflight，再用 taskset + --engine-core 跑 dedicated-core audit
+scripts/linux_latency_preflight.sh
+PROCESS_CORES=1,2 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
+  scripts/run_bitget_latency_linux.sh
 ```
 
 Bitget adapter 的行情接口按官方 v2 WebSocket 行為處理：公共端點使用 `wss://ws.bitget.com/v2/ws/public`，深度 channel 使用 `books/books1/books5/books15`，增量模式使用 `books`；心跳使用文本 `"ping"`/`"pong"`，不是只依賴 WebSocket ping frame。books/trade 熱路徑使用 borrowed typed JSON parser，非標準格式才回退 legacy `serde_json::Value` path。

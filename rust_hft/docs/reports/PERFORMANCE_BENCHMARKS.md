@@ -98,6 +98,7 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 60 \
+  --engine-core 2 \
   --busy-poll
 ```
 
@@ -109,6 +110,14 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
 | `envelope_parse` | 2,334ns | 4,625ns | 6,792ns | 8,917ns | parser common path 降低 |
 | `event_convert` | 3,208ns | 5,917ns | 7,500ns | 9,625ns | event conversion common path 降低 |
 | `engine_total` | 8,250ns | 14,916ns | 1,481,083ns | 8,987,000ns | p99/p999 需要 Linux CPU pinning / isolation 才能穩定 |
+
+Linux staging 標準命令：
+
+```bash
+scripts/linux_latency_preflight.sh
+PROCESS_CORES=1,2 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
+  scripts/run_bitget_latency_linux.sh
+```
 
 ### 核心組件延遲 (單次操作)
 

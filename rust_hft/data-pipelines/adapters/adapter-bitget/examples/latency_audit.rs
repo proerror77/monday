@@ -3,6 +3,7 @@ use data_adapter_bitget::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use std::io;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -86,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let args = Args::from_env();
     println!(
-        "starting Bitget latency audit: url={} instType={} symbol={} depth_channel={} queue_capacity={} max_messages={} max_runtime_secs={} spin_polls={} busy_poll={}",
+        "starting Bitget latency audit: url={} instType={} symbol={} depth_channel={} queue_capacity={} max_messages={} max_runtime_secs={} spin_polls={} busy_poll={} engine_core={}",
         args.ws_url,
         args.inst_type,
         args.symbol,
@@ -95,7 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         args.max_messages,
         args.max_runtime_secs,
         args.spin_polls,
-        args.busy_poll
+        args.busy_poll,
+        format_optional_core(args.engine_core)
     );
 
     let dropped = Arc::new(AtomicU64::new(0));
@@ -140,6 +142,13 @@ fn run_engine(
     queue_depth: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
 ) -> AuditStats {
+    if let Some(core) = args.engine_core {
+        match pin_current_thread_to_core(core) {
+            Ok(()) => println!("engine thread pinned to core {core}"),
+            Err(err) => eprintln!("failed to pin engine thread to core {core}: {err}"),
+        }
+    }
+
     let started = Instant::now();
     let mut stats = AuditStats::default();
 
@@ -340,6 +349,7 @@ struct Args {
     max_runtime_secs: u64,
     spin_polls: usize,
     busy_poll: bool,
+    engine_core: Option<usize>,
 }
 
 impl Args {
@@ -355,6 +365,7 @@ impl Args {
             max_runtime_secs: 30,
             spin_polls: 256,
             busy_poll: false,
+            engine_core: None,
         };
 
         while let Some(flag) = args.next() {
@@ -384,6 +395,13 @@ impl Args {
                         .expect("valid --spin-polls")
                 }
                 "--busy-poll" => parsed.busy_poll = true,
+                "--engine-core" => {
+                    parsed.engine_core = Some(
+                        take_value(&mut args, &flag)
+                            .parse()
+                            .expect("valid --engine-core"),
+                    )
+                }
                 "--help" | "-h" => {
                     print_help_and_exit();
                 }
@@ -405,9 +423,56 @@ fn print_help_and_exit() -> ! {
         "Usage: cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \\
   [--symbol BTCUSDT] [--inst-type SPOT] [--depth-channel books1] \\
   [--queue-capacity 1024] [--max-messages 500] [--max-runtime-secs 30] \\
-  [--spin-polls 256] [--busy-poll]"
+  [--spin-polls 256] [--busy-poll] [--engine-core 2]"
     );
     std::process::exit(0);
+}
+
+fn format_optional_core(core: Option<usize>) -> String {
+    core.map_or_else(|| "none".to_string(), |value| value.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to_core(core: usize) -> io::Result<()> {
+    const CPU_SET_BITS: usize = 1024;
+    const USIZE_BITS: usize = usize::BITS as usize;
+    const CPU_SET_WORDS: usize = CPU_SET_BITS / USIZE_BITS;
+
+    if core >= CPU_SET_BITS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("core {core} exceeds CPU_SET_BITS={CPU_SET_BITS}"),
+        ));
+    }
+
+    #[repr(C)]
+    struct CpuSet {
+        bits: [usize; CPU_SET_WORDS],
+    }
+
+    extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const CpuSet) -> i32;
+    }
+
+    let mut set = CpuSet {
+        bits: [0; CPU_SET_WORDS],
+    };
+    set.bits[core / USIZE_BITS] |= 1usize << (core % USIZE_BITS);
+
+    let rc = unsafe { sched_setaffinity(0, std::mem::size_of::<CpuSet>(), &set) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread_to_core(_core: usize) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "--engine-core is only supported on Linux",
+    ))
 }
 
 fn nanos_between(start: Instant, end: Instant) -> u64 {

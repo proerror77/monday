@@ -114,9 +114,18 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
   --queue-capacity 1024 \
   --max-messages 500 \
   --max-runtime-secs 60 \
+  --engine-core 2 \
   --busy-poll
 ```
 
 結果：`raw_queue_wait p50=500ns p95=8,959ns p99=1,473,000ns`，`engine_total p50=8,250ns p95=14,916ns p99=1,481,083ns`。busy-poll 已把 common path 壓到微秒級，但 macOS 仍會偶發 deschedule engine thread；要穩定 p99/p999，下一步需要 Linux dedicated core、CPU pinning/isolation、IRQ 隔離與 governor performance。
 
-解讀：Bitget 本地 parser/convert 路徑的 p99 仍在數十微秒級內；更大的問題是 receiver -> engine 調度尾延遲。下一步優先做 Linux pinned engine thread / CPU isolation / IRQ affinity 驗證，而不是繼續微調 JSON parser。
+Linux staging 驗證入口：
+
+```bash
+scripts/linux_latency_preflight.sh
+PROCESS_CORES=1,2 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SECS=300 \
+  scripts/run_bitget_latency_linux.sh
+```
+
+解讀：Bitget 本地 parser/convert 路徑的 p99 仍在數十微秒級內；更大的問題是 receiver -> engine 調度尾延遲。下一步優先在 Linux staging 上跑 pinned engine thread / CPU isolation / IRQ affinity 驗證，而不是繼續微調 JSON parser。Mac 本機可以完成架構、測試和 replay，但不能作為最終 p99/p999 依據。
