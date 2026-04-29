@@ -3,7 +3,9 @@ use data_adapter_bitget::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use std::fs;
 use std::io;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -79,6 +81,36 @@ impl AuditStats {
         print_percentiles("audit event_convert", "ns", &mut self.event_ns);
         print_percentiles("audit engine_total", "ns", &mut self.engine_total_ns);
     }
+
+    fn summary_json(&self, args: &Args, dropped: u64) -> serde_json::Value {
+        json!({
+            "exchange": "bitget",
+            "endpoint": args.ws_url,
+            "inst_type": args.inst_type,
+            "symbol": args.symbol,
+            "depth_channel": args.depth_channel,
+            "queue_capacity": args.queue_capacity,
+            "max_messages": args.max_messages,
+            "max_runtime_secs": args.max_runtime_secs,
+            "spin_polls": args.spin_polls,
+            "busy_poll": args.busy_poll,
+            "receiver_core": args.receiver_core,
+            "engine_core": args.engine_core,
+            "samples": self.engine_total_ns.len(),
+            "books": self.books,
+            "trades": self.trades,
+            "ignored": self.ignored,
+            "dropped": dropped,
+            "metrics": {
+                "ws_receive_gap_ns": percentile_summary(self.ws_receive_gap_ns.clone()),
+                "raw_queue_depth": percentile_summary(self.raw_queue_depth.clone()),
+                "raw_queue_wait_ns": percentile_summary(self.raw_queue_wait_ns.clone()),
+                "envelope_parse_ns": percentile_summary(self.envelope_ns.clone()),
+                "event_convert_ns": percentile_summary(self.event_ns.clone()),
+                "engine_total_ns": percentile_summary(self.engine_total_ns.clone())
+            }
+        })
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -139,7 +171,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::io::Error::new(std::io::ErrorKind::Other, "latency audit engine panicked")
     })?;
     stop.store(true, Ordering::Relaxed);
-    stats.print(dropped.load(Ordering::Relaxed), args.queue_capacity);
+    let dropped_count = dropped.load(Ordering::Relaxed);
+    if let Some(path) = &args.json_out {
+        write_json_summary(path, &stats.summary_json(&args, dropped_count))?;
+    }
+    stats.print(dropped_count, args.queue_capacity);
     Ok(())
 }
 
@@ -358,6 +394,7 @@ struct Args {
     busy_poll: bool,
     receiver_core: Option<usize>,
     engine_core: Option<usize>,
+    json_out: Option<PathBuf>,
 }
 
 impl Args {
@@ -375,6 +412,7 @@ impl Args {
             busy_poll: false,
             receiver_core: None,
             engine_core: None,
+            json_out: None,
         };
 
         while let Some(flag) = args.next() {
@@ -418,6 +456,7 @@ impl Args {
                             .expect("valid --engine-core"),
                     )
                 }
+                "--json-out" => parsed.json_out = Some(PathBuf::from(take_value(&mut args, &flag))),
                 "--help" | "-h" => {
                     print_help_and_exit();
                 }
@@ -439,9 +478,22 @@ fn print_help_and_exit() -> ! {
         "Usage: cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \\
   [--symbol BTCUSDT] [--inst-type SPOT] [--depth-channel books1] \\
   [--queue-capacity 1024] [--max-messages 500] [--max-runtime-secs 30] \\
-  [--spin-polls 256] [--busy-poll] [--receiver-core 1] [--engine-core 2]"
+  [--spin-polls 256] [--busy-poll] [--receiver-core 1] [--engine-core 2] \\
+  [--json-out target/latency-audit/summary.json]"
     );
     std::process::exit(0);
+}
+
+fn write_json_summary(path: &PathBuf, summary: &serde_json::Value) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(summary).map_err(io::Error::other)?;
+    fs::write(path, bytes)?;
+    println!("wrote audit json summary to {}", path.display());
+    Ok(())
 }
 
 fn format_optional_core(core: Option<usize>) -> String {
@@ -519,6 +571,24 @@ fn print_percentiles(label: &str, unit: &str, samples: &mut [u64]) {
         suffix,
         samples.len()
     );
+}
+
+fn percentile_summary(mut samples: Vec<u64>) -> serde_json::Value {
+    if samples.is_empty() {
+        return json!({
+            "count": 0
+        });
+    }
+
+    samples.sort_unstable();
+    json!({
+        "p50": percentile(&samples, 0.50),
+        "p95": percentile(&samples, 0.95),
+        "p99": percentile(&samples, 0.99),
+        "p999": percentile(&samples, 0.999),
+        "max": samples[samples.len() - 1],
+        "count": samples.len()
+    })
 }
 
 fn percentile(samples: &[u64], q: f64) -> u64 {
