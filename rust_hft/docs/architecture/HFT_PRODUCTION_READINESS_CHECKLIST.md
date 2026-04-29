@@ -131,4 +131,10 @@ PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SE
 
 每次 Linux run 會產生 `target/latency-audit/<run-id>/metadata.txt`、`stdout.log`、`summary.json`。比較 p99/p999 時必須同時保存 host、kernel、Rust、RUSTFLAGS、receiver/engine core 和 busy-poll 配置，避免把不同環境的數據混在一起。
 
+多 run 比較使用：
+
+```bash
+scripts/summarize_bitget_latency.py target/latency-audit
+```
+
 解讀：Bitget 本地 parser/convert 路徑的 p99 仍在數十微秒級內；更大的問題是 receiver -> engine 調度尾延遲。下一步優先在 Linux staging 上跑 pinned engine thread / CPU isolation / IRQ affinity 驗證，而不是繼續微調 JSON parser。Mac 本機可以完成架構、測試和 replay，但不能作為最終 p99/p999 依據。

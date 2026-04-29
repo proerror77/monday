@@ -122,6 +122,13 @@ PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SE
 
 輸出目錄：`target/latency-audit/<run-id>/`，包含 `metadata.txt`、`stdout.log`、`summary.json`。正式比較不同 Linux host 或 region 時，以 `summary.json` 為機器可讀結果，以 `metadata.txt` 保存環境和 core 配置。
 
+多 run 匯總：
+
+```bash
+scripts/summarize_bitget_latency.py target/latency-audit
+scripts/summarize_bitget_latency.py --csv target/latency-audit > target/latency-audit/summary.csv
+```
+
 ### 核心組件延遲 (單次操作)
 
 | 組件 | 目標延遲 | 實際P50 | 實際P95 | 實際P99 | 狀態 |

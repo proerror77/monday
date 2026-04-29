@@ -158,6 +158,12 @@ PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGES=5000 MAX_RUNTIME_SE
 
 Linux runner 會把 `metadata.txt`、`stdout.log`、`summary.json` 寫到 `target/latency-audit/<run-id>/`，用來比較不同 region / host / core 配置的 p99/p999。
 
+# 匯總多次 Linux staging run，按 engine_total p99 排序
+scripts/summarize_bitget_latency.py target/latency-audit
+
+# 導出 CSV 方便保存到報告或表格
+scripts/summarize_bitget_latency.py --csv target/latency-audit > target/latency-audit/summary.csv
+
 Bitget adapter 的行情接口按官方 v2 WebSocket 行為處理：公共端點使用 `wss://ws.bitget.com/v2/ws/public`，深度 channel 使用 `books/books1/books5/books15`，增量模式使用 `books`；心跳使用文本 `"ping"`/`"pong"`，不是只依賴 WebSocket ping frame。books/trade 熱路徑使用 borrowed typed JSON parser，非標準格式才回退 legacy `serde_json::Value` path。
 
 ### 5. 開始交易
