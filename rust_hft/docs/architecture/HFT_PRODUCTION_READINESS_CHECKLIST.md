@@ -144,6 +144,15 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
 
 解讀：SPSC + producer `unpark` 已降低非 busy-poll 交接尾延遲；busy-poll 在 macOS 無 dedicated core 時仍可能被本地調度污染。這不是 Linux production p99 結論。
 
+新增診斷字段：
+
+- `raw_queue_depth.max`: queue 深度高水位。
+- `engine_wait.empty_polls`: engine 等待期間空輪詢次數。
+- `engine_wait.park_calls`: 非 busy-poll 模式下 park/wakeup 次數。
+- `engine_wait.recv_timeouts`: std `sync-channel` 等待超時次數。
+
+如果 queue depth max 很低但 `raw_queue_wait p99` 很高，優先按 OS 調度、CPU pinning、IRQ/NUMA、busy-poll dedicated core 方向排查，而不是先改 parser。
+
 Linux staging 驗證入口：
 
 ```bash

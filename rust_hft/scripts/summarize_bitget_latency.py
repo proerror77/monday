@@ -30,6 +30,10 @@ FIELDS = [
     "receiver_core",
     "engine_core",
     "busy_poll",
+    "raw_queue_depth_max",
+    "engine_wait_empty_polls",
+    "engine_park_calls",
+    "engine_recv_timeouts",
     "raw_queue_wait_p99_ns",
     "raw_queue_wait_p999_ns",
     "engine_total_p99_ns",
@@ -89,6 +93,7 @@ def load_row(path: Path) -> dict[str, Any]:
         summary = json.load(handle)
 
     metrics = summary.get("metrics", {})
+    engine_wait = summary.get("engine_wait", {})
     row = {
         "run_id": path.parent.name,
         "symbol": summary.get("symbol", ""),
@@ -99,6 +104,10 @@ def load_row(path: Path) -> dict[str, Any]:
         "receiver_core": none_to_empty(summary.get("receiver_core")),
         "engine_core": none_to_empty(summary.get("engine_core")),
         "busy_poll": summary.get("busy_poll", ""),
+        "raw_queue_depth_max": metric(metrics, "raw_queue_depth", "max"),
+        "engine_wait_empty_polls": int(engine_wait.get("empty_polls", 0) or 0),
+        "engine_park_calls": int(engine_wait.get("park_calls", 0) or 0),
+        "engine_recv_timeouts": int(engine_wait.get("recv_timeouts", 0) or 0),
         "raw_queue_wait_p99_ns": metric(metrics, "raw_queue_wait_ns", "p99"),
         "raw_queue_wait_p999_ns": metric(metrics, "raw_queue_wait_ns", "p999"),
         "engine_total_p99_ns": metric(metrics, "engine_total_ns", "p99"),
@@ -153,6 +162,9 @@ def write_markdown(rows: list[dict[str, Any]]) -> None:
         "receiver_core",
         "engine_core",
         "busy_poll",
+        "raw_queue_depth_max",
+        "engine_wait_empty_polls",
+        "engine_park_calls",
         "raw_queue_wait_p99_ns",
         "raw_queue_wait_p999_ns",
         "engine_total_p99_ns",

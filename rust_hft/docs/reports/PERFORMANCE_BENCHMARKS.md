@@ -125,6 +125,15 @@ cargo run -p hft-data-adapter-bitget --example latency_audit --release -- \
 
 以上 A/B 只證明本地工具邊界已可比較 queue kind 和 busy-poll 行為；正式 p99/p999 仍必須用 Linux staging runner。
 
+後續 audit summary 會額外輸出：
+
+- `raw_queue_depth.max`: 判斷是否真的有 queue backlog。
+- `engine_wait.empty_polls`: engine 等待期間空輪詢次數。
+- `engine_wait.park_calls`: 非 busy-poll 模式下 engine 進入 `park_timeout` 的次數。
+- `engine_wait.recv_timeouts`: std `sync-channel` 等待超時次數。
+
+這些字段用於區分 parser 慢、隊列擁塞和本地調度/喚醒尾延遲。2026-04-29 的 macOS 診斷樣本顯示 queue depth max 只有 11-19，但 p99 仍有 14ms-32ms，說明本機尾部主要來自調度/喚醒，不是隊列容量或 parser。
+
 Linux staging 標準命令：
 
 ```bash

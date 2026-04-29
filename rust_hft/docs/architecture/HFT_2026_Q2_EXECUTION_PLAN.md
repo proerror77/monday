@@ -252,6 +252,8 @@ Tasks:
   queue kind, busy-poll, metadata, stdout, and JSON summary artifacts.
 - [x] Add summary script for multi-run comparison, including queue kind and
   idle timeout metadata.
+- [x] Add queue-depth and engine-wait diagnostics so Linux p99 spikes can be
+  attributed to backlog, parser cost, or scheduler/wakeup behavior.
 - [ ] Run Bitget 5-minute staging audit in at least one Linux region.
 - [ ] Run Bitget multi-run comparison for at least 3 runs on the same host.
 - [ ] Run Binance equivalent staging audit or add the missing parity runner.

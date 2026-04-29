@@ -163,6 +163,7 @@ QUEUE_KIND=spsc-spin PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGE
 ```
 
 Linux runner 會把 `metadata.txt`、`stdout.log`、`summary.json` 寫到 `target/latency-audit/<run-id>/`，用來比較不同 region / host / core / queue 配置的 p99/p999。`QUEUE_KIND=sync-channel` 保留 std bounded channel 基線，`QUEUE_KIND=spsc-spin` 用於量測 receiver -> engine 交接在預分配 SPSC ring 下的尾延遲。
+`summary.json` 也包含 `engine_wait` counters 和 `raw_queue_depth.max`，用來判斷 p99 spike 是 queue backlog、engine park/wakeup、busy empty-poll，還是 parser/event conversion。
 
 # 匯總多次 Linux staging run，按 engine_total p99 排序
 scripts/summarize_bitget_latency.py target/latency-audit

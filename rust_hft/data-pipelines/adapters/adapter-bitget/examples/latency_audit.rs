@@ -259,9 +259,25 @@ struct AuditStats {
     envelope_ns: Vec<u64>,
     event_ns: Vec<u64>,
     engine_total_ns: Vec<u64>,
+    wait_stats: EngineWaitStats,
     books: u64,
     trades: u64,
     ignored: u64,
+}
+
+#[derive(Default)]
+struct EngineWaitStats {
+    spin_empty_polls: u64,
+    busy_empty_polls: u64,
+    park_calls: u64,
+    recv_timeouts: u64,
+    disconnects: u64,
+}
+
+impl EngineWaitStats {
+    fn empty_polls(&self) -> u64 {
+        self.spin_empty_polls.saturating_add(self.busy_empty_polls)
+    }
 }
 
 impl AuditStats {
@@ -292,13 +308,17 @@ impl AuditStats {
 
     fn print(&mut self, dropped: u64, queue_capacity: usize) {
         println!(
-            "audit stats: samples={} books={} trades={} ignored={} dropped={} queue_capacity={}",
+            "audit stats: samples={} books={} trades={} ignored={} dropped={} queue_capacity={} engine_empty_polls={} engine_park_calls={} engine_recv_timeouts={} engine_disconnects={}",
             self.engine_total_ns.len(),
             self.books,
             self.trades,
             self.ignored,
             dropped,
-            queue_capacity
+            queue_capacity,
+            self.wait_stats.empty_polls(),
+            self.wait_stats.park_calls,
+            self.wait_stats.recv_timeouts,
+            self.wait_stats.disconnects
         );
         print_percentiles("audit ws_receive_gap", "ns", &mut self.ws_receive_gap_ns);
         print_percentiles("audit raw_queue_depth", "", &mut self.raw_queue_depth);
@@ -329,6 +349,14 @@ impl AuditStats {
             "trades": self.trades,
             "ignored": self.ignored,
             "dropped": dropped,
+            "engine_wait": {
+                "spin_empty_polls": self.wait_stats.spin_empty_polls,
+                "busy_empty_polls": self.wait_stats.busy_empty_polls,
+                "empty_polls": self.wait_stats.empty_polls(),
+                "park_calls": self.wait_stats.park_calls,
+                "recv_timeouts": self.wait_stats.recv_timeouts,
+                "disconnects": self.wait_stats.disconnects
+            },
             "metrics": {
                 "ws_receive_gap_ns": percentile_summary(self.ws_receive_gap_ns.clone()),
                 "raw_queue_depth": percentile_summary(self.raw_queue_depth.clone()),
@@ -436,6 +464,7 @@ fn run_engine(
             args.idle_timeout_us,
             args.busy_poll,
             &stop,
+            &mut stats.wait_stats,
         ) {
             EngineRecv::Frame(frame) => frame,
             EngineRecv::Timeout => continue,
@@ -499,6 +528,7 @@ fn recv_engine_frame(
     idle_timeout_us: u64,
     busy_poll: bool,
     stop: &AtomicBool,
+    wait_stats: &mut EngineWaitStats,
 ) -> EngineRecv {
     if busy_poll {
         for _ in 0..4096 {
@@ -507,11 +537,18 @@ fn recv_engine_frame(
                     queue_depth.fetch_sub(1, Ordering::Relaxed);
                     return EngineRecv::Frame(frame);
                 }
-                Err(TryRecvError::Empty) => std::hint::spin_loop(),
-                Err(TryRecvError::Disconnected) => return EngineRecv::Disconnected,
+                Err(TryRecvError::Empty) => {
+                    wait_stats.busy_empty_polls = wait_stats.busy_empty_polls.saturating_add(1);
+                    std::hint::spin_loop();
+                }
+                Err(TryRecvError::Disconnected) => {
+                    wait_stats.disconnects = wait_stats.disconnects.saturating_add(1);
+                    return EngineRecv::Disconnected;
+                }
             }
         }
         if stop.load(Ordering::Relaxed) {
+            wait_stats.disconnects = wait_stats.disconnects.saturating_add(1);
             return EngineRecv::Disconnected;
         }
         return EngineRecv::Timeout;
@@ -523,8 +560,14 @@ fn recv_engine_frame(
                 queue_depth.fetch_sub(1, Ordering::Relaxed);
                 return EngineRecv::Frame(frame);
             }
-            Err(TryRecvError::Empty) => std::hint::spin_loop(),
-            Err(TryRecvError::Disconnected) => return EngineRecv::Disconnected,
+            Err(TryRecvError::Empty) => {
+                wait_stats.spin_empty_polls = wait_stats.spin_empty_polls.saturating_add(1);
+                std::hint::spin_loop();
+            }
+            Err(TryRecvError::Disconnected) => {
+                wait_stats.disconnects = wait_stats.disconnects.saturating_add(1);
+                return EngineRecv::Disconnected;
+            }
         }
     }
 
@@ -537,18 +580,25 @@ fn recv_engine_frame(
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if stop.load(Ordering::Relaxed) {
+                        wait_stats.disconnects = wait_stats.disconnects.saturating_add(1);
                         EngineRecv::Disconnected
                     } else {
+                        wait_stats.recv_timeouts = wait_stats.recv_timeouts.saturating_add(1);
                         EngineRecv::Timeout
                     }
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => EngineRecv::Disconnected,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    wait_stats.disconnects = wait_stats.disconnects.saturating_add(1);
+                    EngineRecv::Disconnected
+                }
             }
         }
         RawFrameReceiver::Spsc(_) => {
             if stop.load(Ordering::Relaxed) {
+                wait_stats.disconnects = wait_stats.disconnects.saturating_add(1);
                 EngineRecv::Disconnected
             } else {
+                wait_stats.park_calls = wait_stats.park_calls.saturating_add(1);
                 thread::park_timeout(Duration::from_micros(idle_timeout_us.max(1)));
                 EngineRecv::Timeout
             }
