@@ -116,6 +116,7 @@ impl SystemBuilder {
                     .unwrap_or_else(|| "wss://stream.binance.com:9443/ws".to_string()),
                 timeout_ms: 5000,
                 mode: exec_mode,
+                account_capability: hft_core::AccountCapability::default(),
             };
             let execution_client = binance_exec::BinanceExecutionClient::new(cfg);
             let account = venue

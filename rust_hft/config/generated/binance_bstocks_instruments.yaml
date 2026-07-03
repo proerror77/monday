@@ -1,0 +1,33 @@
+generated_at: "manual-seed"
+source: "https://api.binance.com/api/v3/exchangeInfo"
+instruments:
+  - symbol: TSLABUSDT
+    venue: BINANCE_TOKENIZED_SECURITIES
+    base: TSLAB
+    quote: USDT
+    asset_class: TokenizedSecurity
+    product_type: TokenizedSecuritySpot
+    regulatory_profile: AdgmTokenizedSecurity
+    underlying_symbol: TSLA
+    issuer: TSLAB
+    tick_size: "0.01"
+    lot_size: "0.000001"
+    min_qty: null
+    min_notional: null
+    status: TRADING
+    permissions: []
+  - symbol: NVDABUSDT
+    venue: BINANCE_TOKENIZED_SECURITIES
+    base: NVDAB
+    quote: USDT
+    asset_class: TokenizedSecurity
+    product_type: TokenizedSecuritySpot
+    regulatory_profile: AdgmTokenizedSecurity
+    underlying_symbol: NVDA
+    issuer: NVDAB
+    tick_size: "0.01"
+    lot_size: "0.000001"
+    min_qty: null
+    min_notional: null
+    status: TRADING
+    permissions: []

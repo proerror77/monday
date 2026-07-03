@@ -1,4 +1,4 @@
-use hft_core::{Symbol, VenueId};
+use hft_core::{AssetClass, ProductType, RegulatoryProfile, Symbol, VenueId};
 use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,16 @@ pub struct InstrumentMeta {
     pub venue: VenueId,
     pub base: String,
     pub quote: String,
+    #[serde(default)]
+    pub asset_class: AssetClass,
+    #[serde(default)]
+    pub product_type: ProductType,
+    #[serde(default)]
+    pub regulatory_profile: RegulatoryProfile,
+    #[serde(default)]
+    pub underlying_symbol: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
     pub tick_size: f64,
     pub lot_size: f64,
     #[serde(default)]
@@ -251,6 +261,11 @@ mod tests {
                 venue: VenueId::BINANCE,
                 base: "BTC".into(),
                 quote: "USDT".into(),
+                asset_class: AssetClass::Crypto,
+                product_type: ProductType::Spot,
+                regulatory_profile: RegulatoryProfile::None,
+                underlying_symbol: None,
+                issuer: None,
                 tick_size: 0.1,
                 lot_size: 0.001,
                 contract_multiplier: None,

@@ -449,6 +449,7 @@ impl ExecutionWorker {
                         time_in_force: _,
                         strategy_id,
                         target_venue: _,
+                        ..
                     } = intent;
 
                     let symbol_for_ack = symbol.clone();
@@ -948,6 +949,9 @@ mod tests {
     fn create_test_intent(symbol: &str) -> OrderIntent {
         OrderIntent {
             symbol: Symbol::new(symbol),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             order_type: OrderType::Market,
             quantity: Quantity::from_f64(1.0).unwrap(),

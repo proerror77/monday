@@ -10,7 +10,9 @@ use execution::{
 // Re-export ExecutionMode for backwards compatibility
 pub use execution::ExecutionMode;
 use futures::{stream, StreamExt};
-use hft_core::{HftResult, OrderId, Price, Quantity};
+use hft_core::{
+    AccountCapability, AssetClass, HftResult, OrderId, Price, ProductType, Quantity,
+};
 use integration::{
     http::{HttpClient, HttpClientConfig},
     signing::{BinanceCredentials, BinanceSigner},
@@ -28,6 +30,7 @@ pub struct BinanceExecutionConfig {
     pub ws_base_url: String,
     pub timeout_ms: u64,
     pub mode: ExecutionMode,
+    pub account_capability: AccountCapability,
 }
 
 pub struct BinanceExecutionClient {
@@ -38,6 +41,7 @@ pub struct BinanceExecutionClient {
     rest_base_url: String,
     ws_base_url: String,
     mode: ExecutionMode,
+    account_capability: AccountCapability,
     // order_id -> symbol 快取，撤單時需要
     order_symbol: HashMap<String, String>,
     // listenKey 維護
@@ -65,6 +69,7 @@ impl BinanceExecutionClient {
             rest_base_url: cfg.rest_base_url,
             ws_base_url: cfg.ws_base_url,
             mode: cfg.mode,
+            account_capability: cfg.account_capability,
             order_symbol: HashMap::new(),
             listen_key: None,
             resilient_executor: None,
@@ -152,11 +157,55 @@ impl BinanceExecutionClient {
             callback(alert);
         }
     }
+
+    fn validate_product_gate(&self, intent: &ports::OrderIntent) -> HftResult<()> {
+        match intent.product_type {
+            ProductType::Spot => {
+                if self.account_capability.can_trade_crypto_spot {
+                    Ok(())
+                } else {
+                    Err(hft_core::HftError::Execution(
+                        "Binance account is not enabled for crypto spot trading".to_string(),
+                    ))
+                }
+            }
+            ProductType::TokenizedSecuritySpot => {
+                let ctx = &intent.compliance_context;
+                if intent.asset_class != AssetClass::TokenizedSecurity {
+                    return Err(hft_core::HftError::Execution(
+                        "Binance tokenized security order must set asset_class=TokenizedSecurity"
+                            .to_string(),
+                    ));
+                }
+                if !ctx.allow_tokenized_securities || !ctx.eligibility_confirmed {
+                    return Err(hft_core::HftError::Execution(
+                        "Binance tokenized securities require explicit account eligibility and allow_tokenized_securities=true".to_string(),
+                    ));
+                }
+                if !self.account_capability.can_trade_tokenized_securities {
+                    return Err(hft_core::HftError::Execution(
+                        "Binance account is not enabled for tokenized securities".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+            ProductType::Futures | ProductType::Perp => Err(hft_core::HftError::Execution(
+                "Binance futures/perp orders must use a dedicated derivatives adapter, not /api/v3/order"
+                    .to_string(),
+            )),
+            ProductType::BrokerageEquity => Err(hft_core::HftError::Execution(
+                "Binance brokerage equities must use a dedicated equities adapter, not /api/v3/order"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 #[async_trait]
 impl ExecutionClient for BinanceExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
+        self.validate_product_gate(&intent)?;
+
         // Live 模式（需要 signer）
         if self.mode == ExecutionMode::Live && self.signer.is_some() {
             if self.http_client.is_none() {
@@ -782,6 +831,7 @@ mod tests {
             ws_base_url: "wss://stream.binance.com:9443/ws".to_string(),
             timeout_ms: 5000,
             mode,
+            account_capability: AccountCapability::default(),
         }
     }
 
@@ -837,6 +887,7 @@ mod tests {
             ws_base_url: "wss://stream.binance.com:9443/ws".to_string(),
             timeout_ms: 5000,
             mode: ExecutionMode::Paper,
+            account_capability: AccountCapability::default(),
         };
         let client = BinanceExecutionClient::new(config);
         // With credentials, signer should be Some
@@ -937,6 +988,9 @@ mod tests {
 
         let intent = OrderIntent {
             symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: Quantity::from_f64(0.001).unwrap(),
@@ -951,6 +1005,138 @@ mod tests {
 
         let order_id = result.unwrap();
         assert!(order_id.0.starts_with("BINANCE_PAPER_"));
+    }
+
+    #[tokio::test]
+    async fn tokenized_security_requires_explicit_eligibility() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let intent = OrderIntent {
+            symbol: Symbol::new("TSLABUSDT"),
+            asset_class: hft_core::AssetClass::TokenizedSecurity,
+            product_type: hft_core::ProductType::TokenizedSecuritySpot,
+            compliance_context: hft_core::ComplianceContext::default(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            price: Some(Price::from_f64(250.0).unwrap()),
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: Some(hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES),
+        };
+
+        let err = client.place_order(intent).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("explicit account eligibility"));
+    }
+
+    #[tokio::test]
+    async fn tokenized_security_requires_account_capability() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let intent = OrderIntent {
+            symbol: Symbol::new("TSLABUSDT"),
+            asset_class: hft_core::AssetClass::TokenizedSecurity,
+            product_type: hft_core::ProductType::TokenizedSecuritySpot,
+            compliance_context: hft_core::ComplianceContext {
+                eligibility_confirmed: true,
+                allow_tokenized_securities: true,
+                ..Default::default()
+            },
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            price: Some(Price::from_f64(250.0).unwrap()),
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: Some(hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES),
+        };
+
+        let err = client.place_order(intent).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("account is not enabled for tokenized securities"));
+    }
+
+    #[tokio::test]
+    async fn tokenized_security_allowed_when_order_and_account_are_enabled() {
+        let mut config = make_test_config(ExecutionMode::Paper);
+        config.account_capability.can_trade_tokenized_securities = true;
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let intent = OrderIntent {
+            symbol: Symbol::new("TSLABUSDT"),
+            asset_class: hft_core::AssetClass::TokenizedSecurity,
+            product_type: hft_core::ProductType::TokenizedSecuritySpot,
+            compliance_context: hft_core::ComplianceContext {
+                eligibility_confirmed: true,
+                allow_tokenized_securities: true,
+                ..Default::default()
+            },
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            price: Some(Price::from_f64(250.0).unwrap()),
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: Some(hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES),
+        };
+
+        assert!(client.place_order(intent).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn brokerage_equity_cannot_use_spot_order_api() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let intent = OrderIntent {
+            symbol: Symbol::new("AAPL"),
+            asset_class: hft_core::AssetClass::Equity,
+            product_type: hft_core::ProductType::BrokerageEquity,
+            compliance_context: hft_core::ComplianceContext::default(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            price: None,
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: Some(hft_core::VenueId::BINANCE_BROKERAGE_EQUITIES),
+        };
+
+        let err = client.place_order(intent).await.unwrap_err();
+        assert!(err.to_string().contains("dedicated equities adapter"));
+    }
+
+    #[tokio::test]
+    async fn derivatives_cannot_use_spot_order_api() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let mut client = BinanceExecutionClient::new(config);
+        client.connect().await.unwrap();
+
+        let intent = OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Perp,
+            compliance_context: hft_core::ComplianceContext::default(),
+            side: Side::Buy,
+            order_type: OrderType::Market,
+            quantity: Quantity::from_f64(0.001).unwrap(),
+            price: None,
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: Some(hft_core::VenueId::BINANCE_FUTURES),
+        };
+
+        let err = client.place_order(intent).await.unwrap_err();
+        assert!(err.to_string().contains("dedicated derivatives adapter"));
     }
 
     #[tokio::test]

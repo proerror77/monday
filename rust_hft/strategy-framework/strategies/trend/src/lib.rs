@@ -264,6 +264,9 @@ impl TrendStrategy {
                         ) {
                             orders.push(OrderIntent {
                                 symbol: self.symbol.clone(),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
                                 side: Side::Buy,
                                 quantity,
                                 order_type: OrderType::Limit,
@@ -290,6 +293,9 @@ impl TrendStrategy {
                         ) {
                             orders.push(OrderIntent {
                                 symbol: self.symbol.clone(),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
                                 side: Side::Sell,
                                 quantity,
                                 order_type: OrderType::Limit,

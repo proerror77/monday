@@ -50,6 +50,9 @@ impl Strategy for TestStrategy {
             self.executed = true;
             vec![OrderIntent {
                 symbol: self.symbol.clone(),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
                 side: Side::Buy,
                 quantity: Quantity::from_f64(0.1).unwrap(),
                 price: Some(Price::from_f64(50000.0).unwrap()),

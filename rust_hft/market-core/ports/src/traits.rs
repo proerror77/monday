@@ -172,6 +172,11 @@ pub trait Strategy: Send + Sync {
         VenueScope::Single
     }
 
+    /// 策略支援的資產類別。舊策略預設只支援 Crypto，避免誤吃證券型 token。
+    fn supported_asset_classes(&self) -> &'static [AssetClass] {
+        &[AssetClass::Crypto]
+    }
+
     /// 策略初始化
     fn initialize(&mut self) -> HftResult<()> {
         Ok(())

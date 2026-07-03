@@ -69,6 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let order_intents = vec![
         OrderIntent {
             symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001)?,
             order_type: OrderType::Limit,
@@ -78,6 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         OrderIntent {
             symbol: Symbol::new("ETHUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Sell,
             quantity: Quantity::from_f64(0.01)?,
             order_type: OrderType::Market,

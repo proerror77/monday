@@ -17,7 +17,8 @@ use shared_instrument::{InstrumentCatalog, InstrumentCatalogConfig, VenueMeta};
 use super::{
     CpuAffinityConfig, ExecutionQueueSettings, LobFlowGridParams, PortfolioSpec, RiskConfig,
     StrategyConfig, StrategyParams, StrategyRiskLimits, StrategyRiskOverride, StrategyType,
-    SystemConfig, SystemEngineConfig, VenueCapabilities, VenueConfig, VenueType,
+    SystemConfig, SystemEngineConfig, TokenizedSecuritiesRiskConfig, VenueCapabilities,
+    VenueConfig, VenueType,
 };
 
 use serde::{Deserialize, Serialize};
@@ -499,6 +500,15 @@ fn convert_risk_config(risk: shared::RiskConfig) -> RiskConfig {
         staleness_threshold_us: risk.staleness_threshold_us,
         enhanced,
         strategy_overrides: overrides,
+        tokenized_securities: TokenizedSecuritiesRiskConfig {
+            allow_trading: risk.tokenized_securities.allow_trading,
+            max_notional_per_symbol: risk.tokenized_securities.max_notional_per_symbol,
+            max_asset_class_notional: risk.tokenized_securities.max_asset_class_notional,
+            min_top_depth_usd: risk.tokenized_securities.min_top_depth_usd,
+            max_spread_bps: risk.tokenized_securities.max_spread_bps,
+            freeze_on_corporate_action: risk.tokenized_securities.freeze_on_corporate_action,
+            restricted_jurisdictions: risk.tokenized_securities.restricted_jurisdictions,
+        },
     }
 }
 

@@ -182,6 +182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let test_order = OrderIntent {
             symbol: Symbol::new("BTC-PERP"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001)?,
             price: Some(Price::from_f64(40000.0)?), // 遠離市價的限價單

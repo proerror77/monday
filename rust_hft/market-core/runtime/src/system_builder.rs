@@ -37,8 +37,8 @@ pub use config_types::{
     ClickHouseConfig, CpuAffinityConfig, EnhancedRiskSettings, ExecutionQueueSettings, InfraConfig,
     LobFlowGridParams, PortfolioSpec, RedisConfig, RiskConfig, StrategyConfig,
     StrategyEnhancedRiskOverride, StrategyParams, StrategyRiskLimits, StrategyRiskOverride,
-    StrategyType, SystemEngineConfig, TradingWindow, TradingWindowConfig, VenueCapabilities,
-    VenueConfig, VenueType,
+    StrategyType, SystemEngineConfig, TokenizedSecuritiesRiskConfig, TradingWindow,
+    TradingWindowConfig, VenueCapabilities, VenueConfig, VenueType,
 };
 
 #[cfg(feature = "redis")]
@@ -1376,6 +1376,7 @@ impl Default for SystemConfig {
                 staleness_threshold_us: 5000,
                 enhanced: None,
                 strategy_overrides: std::collections::HashMap::new(),
+                tokenized_securities: TokenizedSecuritiesRiskConfig::default(),
             },
             quotes_only: false,
             router: None,

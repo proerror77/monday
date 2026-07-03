@@ -185,6 +185,12 @@ pub enum OrderStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderIntent {
     pub symbol: Symbol,
+    #[serde(default)]
+    pub asset_class: AssetClass,
+    #[serde(default)]
+    pub product_type: ProductType,
+    #[serde(default)]
+    pub compliance_context: ComplianceContext,
     pub side: Side,
     pub quantity: Quantity,
     pub order_type: OrderType,
@@ -195,6 +201,40 @@ pub struct OrderIntent {
     /// None = 由 Router 決策，Some = 指定交易所
     #[serde(default)]
     pub target_venue: Option<VenueId>,
+}
+
+impl OrderIntent {
+    pub fn crypto_spot(
+        symbol: Symbol,
+        side: Side,
+        quantity: Quantity,
+        order_type: OrderType,
+        price: Option<Price>,
+        time_in_force: TimeInForce,
+        strategy_id: String,
+        target_venue: Option<VenueId>,
+    ) -> Self {
+        Self {
+            symbol,
+            asset_class: AssetClass::Crypto,
+            product_type: ProductType::Spot,
+            compliance_context: ComplianceContext::default(),
+            side,
+            quantity,
+            order_type,
+            price,
+            time_in_force,
+            strategy_id,
+            target_venue,
+        }
+    }
+
+    pub fn tokenized_security_spot(mut self, compliance_context: ComplianceContext) -> Self {
+        self.asset_class = AssetClass::TokenizedSecurity;
+        self.product_type = ProductType::TokenizedSecuritySpot;
+        self.compliance_context = compliance_context;
+        self
+    }
 }
 
 /// OrderIntent 的生命週期元資料。

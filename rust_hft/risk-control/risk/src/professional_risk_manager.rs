@@ -946,6 +946,9 @@ mod tests {
 
         let intent = OrderIntent {
             symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: Quantity(Decimal::from(10)),      // 10 units
@@ -984,6 +987,9 @@ mod tests {
 
         let intent = OrderIntent {
             symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             order_type: OrderType::Limit,
             quantity: Quantity(Decimal::from(1)),

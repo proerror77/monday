@@ -12,11 +12,16 @@ path = "src/bin/alpha.rs"
 name = "listing-monitor-spot"
 path = "src/bin/spot.rs"
 
+[[bin]]
+name = "binance-bstock-catalog-sync"
+path = "src/bin/bstock_catalog_sync.rs"
+
 [dependencies]
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

@@ -162,6 +162,10 @@ pub struct RiskConfig {
     /// Per-strategy risk overrides
     #[serde(default)]
     pub strategy_overrides: HashMap<String, StrategyRiskOverride>,
+
+    /// Tokenized securities are securities-like products, not ordinary crypto spot.
+    #[serde(default)]
+    pub tokenized_securities: TokenizedSecuritiesRiskConfig,
 }
 
 fn default_risk_type() -> String {
@@ -208,6 +212,38 @@ pub struct EnhancedRiskSettings {
     // System control
     pub aggressive_mode: bool,
     pub dry_run_mode: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenizedSecuritiesRiskConfig {
+    #[serde(default)]
+    pub allow_trading: bool,
+    #[serde(default)]
+    pub max_notional_per_symbol: Decimal,
+    #[serde(default)]
+    pub max_asset_class_notional: Decimal,
+    #[serde(default)]
+    pub min_top_depth_usd: Decimal,
+    #[serde(default)]
+    pub max_spread_bps: Decimal,
+    #[serde(default)]
+    pub freeze_on_corporate_action: bool,
+    #[serde(default)]
+    pub restricted_jurisdictions: Vec<String>,
+}
+
+impl Default for TokenizedSecuritiesRiskConfig {
+    fn default() -> Self {
+        Self {
+            allow_trading: false,
+            max_notional_per_symbol: Decimal::ZERO,
+            max_asset_class_notional: Decimal::ZERO,
+            min_top_depth_usd: Decimal::ZERO,
+            max_spread_bps: Decimal::ZERO,
+            freeze_on_corporate_action: true,
+            restricted_jurisdictions: vec!["US".to_string()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

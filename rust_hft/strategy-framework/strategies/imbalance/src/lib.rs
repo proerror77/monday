@@ -98,6 +98,9 @@ impl Strategy for ImbalanceStrategy {
                     // Buy when bid side is heavy
                     intents.push(OrderIntent {
                         symbol: sym.clone(),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
                         side: Side::Buy,
                         quantity: qty,
                         order_type: OrderType::Market,
@@ -115,6 +118,9 @@ impl Strategy for ImbalanceStrategy {
                 } else if obi < -self.params.obi_threshold {
                     intents.push(OrderIntent {
                         symbol: sym.clone(),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
                         side: Side::Sell,
                         quantity: qty,
                         order_type: OrderType::Market,

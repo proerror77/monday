@@ -25,6 +25,10 @@ impl VenueId {
     pub const LIGHTER: VenueId = VenueId(7);
     pub const BACKPACK: VenueId = VenueId(8);
     pub const GRVT: VenueId = VenueId(9);
+    pub const BINANCE_SPOT: VenueId = VenueId(101);
+    pub const BINANCE_TOKENIZED_SECURITIES: VenueId = VenueId(102);
+    pub const BINANCE_FUTURES: VenueId = VenueId(103);
+    pub const BINANCE_BROKERAGE_EQUITIES: VenueId = VenueId(104);
     pub const MOCK: VenueId = VenueId(99);
 
     pub fn as_str(&self) -> &'static str {
@@ -38,13 +42,17 @@ impl VenueId {
             Self::LIGHTER => "LIGHTER",
             Self::BACKPACK => "BACKPACK",
             Self::GRVT => "GRVT",
+            Self::BINANCE_SPOT => "BINANCE_SPOT",
+            Self::BINANCE_TOKENIZED_SECURITIES => "BINANCE_TOKENIZED_SECURITIES",
+            Self::BINANCE_FUTURES => "BINANCE_FUTURES",
+            Self::BINANCE_BROKERAGE_EQUITIES => "BINANCE_BROKERAGE_EQUITIES",
             Self::MOCK => "MOCK",
             _ => "UNKNOWN",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
-        match s {
+        match s.to_ascii_uppercase().as_str() {
             "BINANCE" => Some(Self::BINANCE),
             "BITGET" => Some(Self::BITGET),
             "BYBIT" => Some(Self::BYBIT),
@@ -54,6 +62,13 @@ impl VenueId {
             "LIGHTER" => Some(Self::LIGHTER),
             "BACKPACK" => Some(Self::BACKPACK),
             "GRVT" => Some(Self::GRVT),
+            "BINANCE_SPOT" | "BINANCE-SPOT" => Some(Self::BINANCE_SPOT),
+            "BINANCE_TOKENIZED_SECURITIES" | "BINANCE-TOKENIZED-SECURITIES"
+            | "BINANCE_BSTOCKS" => Some(Self::BINANCE_TOKENIZED_SECURITIES),
+            "BINANCE_FUTURES" | "BINANCE-FUTURES" => Some(Self::BINANCE_FUTURES),
+            "BINANCE_BROKERAGE_EQUITIES" | "BINANCE-BROKERAGE-EQUITIES" => {
+                Some(Self::BINANCE_BROKERAGE_EQUITIES)
+            }
             "MOCK" => Some(Self::MOCK),
             _ => None,
         }
@@ -73,6 +88,27 @@ pub struct AccountId(pub String);
 impl From<&str> for AccountId {
     fn from(s: &str) -> Self {
         AccountId(s.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AccountCapability {
+    pub can_trade_crypto_spot: bool,
+    pub can_trade_tokenized_securities: bool,
+    pub can_trade_brokerage_equities: bool,
+    pub jurisdiction: Option<String>,
+    pub kyc_level: Option<String>,
+}
+
+impl Default for AccountCapability {
+    fn default() -> Self {
+        Self {
+            can_trade_crypto_spot: true,
+            can_trade_tokenized_securities: false,
+            can_trade_brokerage_equities: false,
+            jurisdiction: None,
+            kyc_level: None,
+        }
     }
 }
 impl From<String> for AccountId {
@@ -258,6 +294,93 @@ pub struct VenueSymbol {
 impl VenueSymbol {
     pub fn new(venue: VenueId, symbol: Symbol) -> Self {
         Self { venue, symbol }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum AssetClass {
+    #[default]
+    Crypto,
+    TokenizedSecurity,
+    Equity,
+    Etf,
+    PreIpo,
+    Rwa,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ProductType {
+    #[default]
+    Spot,
+    Futures,
+    Perp,
+    TokenizedSecuritySpot,
+    BrokerageEquity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum RegulatoryProfile {
+    #[default]
+    None,
+    AdgmTokenizedSecurity,
+    RestrictedJurisdiction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct ComplianceContext {
+    #[serde(default)]
+    pub regulatory_profile: RegulatoryProfile,
+    #[serde(default)]
+    pub jurisdiction: Option<String>,
+    #[serde(default)]
+    pub eligibility_confirmed: bool,
+    #[serde(default)]
+    pub allow_tokenized_securities: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstrumentSpec {
+    pub symbol: Symbol,
+    pub venue: VenueId,
+    #[serde(default)]
+    pub asset_class: AssetClass,
+    #[serde(default)]
+    pub product_type: ProductType,
+    #[serde(default)]
+    pub regulatory_profile: RegulatoryProfile,
+    #[serde(default)]
+    pub underlying_symbol: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub quote_currency: Option<String>,
+}
+
+impl InstrumentSpec {
+    pub fn crypto_spot(symbol: Symbol, venue: VenueId) -> Self {
+        Self {
+            symbol,
+            venue,
+            asset_class: AssetClass::Crypto,
+            product_type: ProductType::Spot,
+            regulatory_profile: RegulatoryProfile::None,
+            underlying_symbol: None,
+            issuer: None,
+            quote_currency: None,
+        }
+    }
+
+    pub fn tokenized_security_spot(symbol: Symbol, venue: VenueId) -> Self {
+        Self {
+            symbol,
+            venue,
+            asset_class: AssetClass::TokenizedSecurity,
+            product_type: ProductType::TokenizedSecuritySpot,
+            regulatory_profile: RegulatoryProfile::AdgmTokenizedSecurity,
+            underlying_symbol: None,
+            issuer: None,
+            quote_currency: Some("USDT".to_string()),
+        }
     }
 }
 

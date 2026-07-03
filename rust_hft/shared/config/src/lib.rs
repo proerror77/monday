@@ -156,10 +156,34 @@ pub struct RiskConfig {
     pub enhanced: Option<serde_yaml::Value>,
     #[serde(default)]
     pub strategy_overrides: HashMap<String, serde_yaml::Value>,
+    #[serde(default)]
+    pub tokenized_securities: TokenizedSecuritiesRiskConfig,
 }
 
 fn default_risk_type() -> String {
     "Default".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenizedSecuritiesRiskConfig {
+    #[serde(default)]
+    pub allow_trading: bool,
+    #[serde(default)]
+    pub max_notional_per_symbol: Decimal,
+    #[serde(default)]
+    pub max_asset_class_notional: Decimal,
+    #[serde(default)]
+    pub min_top_depth_usd: Decimal,
+    #[serde(default)]
+    pub max_spread_bps: Decimal,
+    #[serde(default = "default_freeze_on_corporate_action")]
+    pub freeze_on_corporate_action: bool,
+    #[serde(default)]
+    pub restricted_jurisdictions: Vec<String>,
+}
+
+fn default_freeze_on_corporate_action() -> bool {
+    true
 }
 
 #[derive(Debug, Error)]

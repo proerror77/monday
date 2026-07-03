@@ -174,6 +174,9 @@ mod risk_manager_tests {
     fn create_test_intent(symbol: &str, side: Side, qty: f64, price: Option<f64>) -> OrderIntent {
         OrderIntent {
             symbol: Symbol::new(symbol),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side,
             quantity: Quantity::from_f64(qty).unwrap(),
             price: price.map(|p| Price::from_f64(p).unwrap()),
@@ -369,6 +372,9 @@ mod precision_tests {
     fn test_order_minimum_validation() {
         let intent = OrderIntent {
             symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001).unwrap(),
             price: Some(Price::from_f64(67000.0).unwrap()),
@@ -393,6 +399,9 @@ mod precision_tests {
     fn test_order_minimum_notional() {
         let intent = OrderIntent {
             symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.0001).unwrap(), // 0.0001 * 67000 = 6.7 notional
             price: Some(Price::from_f64(67000.0).unwrap()),
@@ -504,6 +513,9 @@ mod integration_tests {
         let intents = vec![
             OrderIntent {
                 symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
                 side: Side::Buy,
                 quantity: Quantity::from_f64(0.1).unwrap(),
                 price: Some(Price::from_f64(67000.0).unwrap()),
@@ -515,6 +527,9 @@ mod integration_tests {
             },
             OrderIntent {
                 symbol: Symbol::new("ETHUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
                 side: Side::Sell,
                 quantity: Quantity::from_f64(1.0).unwrap(),
                 price: Some(Price::from_f64(3500.0).unwrap()),

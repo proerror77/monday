@@ -277,6 +277,9 @@ impl ArbitrageStrategy {
         // 生成買入訂單 (在買入所)
         orders.push(OrderIntent {
             symbol: Symbol::from(format!("{}:{}", signal.buy_venue, self.symbol.as_str())),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             quantity: signal.quantity,
             order_type: OrderType::Market, // 使用市價單確保成交
@@ -289,6 +292,9 @@ impl ArbitrageStrategy {
         // 生成賣出訂單 (在賣出所)
         orders.push(OrderIntent {
             symbol: Symbol::from(format!("{}:{}", signal.sell_venue, self.symbol.as_str())),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Sell,
             quantity: signal.quantity,
             order_type: OrderType::Market, // 使用市價單確保成交

@@ -1,0 +1,45 @@
+schema_version: v2
+quotes_only: true
+engine:
+  queue_capacity: 16384
+  stale_us: 500000
+  top_n: 10
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  auto_cancel_exchange_only: false
+
+venues:
+  - name: binance-bstocks
+    venue_type: Binance
+    ws_public: "wss://stream.binance.com:9443/ws"
+    rest: "https://api.binance.com"
+    symbol_catalog:
+      - TSLABUSDT@BINANCE_TOKENIZED_SECURITIES
+      - NVDABUSDT@BINANCE_TOKENIZED_SECURITIES
+      - CRCLBUSDT@BINANCE_TOKENIZED_SECURITIES
+      - MUBUSDT@BINANCE_TOKENIZED_SECURITIES
+      - SNDKBUSDT@BINANCE_TOKENIZED_SECURITIES
+    capabilities:
+      supports_incremental_book: true
+      supports_private_ws: true
+      allows_post_only: true
+    simulate_execution: false
+
+strategies: []
+
+risk:
+  risk_type: Default
+  global_position_limit: 0.0
+  global_notional_limit: 0.0
+  max_daily_trades: 0
+  max_orders_per_second: 0
+  staleness_threshold_us: 5000
+  tokenized_securities:
+    allow_trading: false
+    max_notional_per_symbol: 0.0
+    max_asset_class_notional: 0.0
+    min_top_depth_usd: 0.0
+    max_spread_bps: 0.0
+    freeze_on_corporate_action: true
+    restricted_jurisdictions:
+      - US

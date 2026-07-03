@@ -24,6 +24,9 @@ impl Strategy for MockStrategy {
         // 模擬極簡策略邏輯：生成一筆 IOC 假單，貼近真實引擎的熱路徑
         vec![OrderIntent {
             symbol: Symbol::from("TEST:BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001).expect("valid quantity"),
             order_type: OrderType::Market,

@@ -241,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 staleness_threshold_us: 5000,
                 enhanced: None,
                 strategy_overrides: Default::default(),
+                tokenized_securities: Default::default(),
             };
 
             let cfg = SystemConfig {

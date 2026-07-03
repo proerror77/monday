@@ -153,6 +153,9 @@ impl SystemRuntime {
         use hft_core::{OrderType, Quantity, Side, Symbol, TimeInForce};
         let intent = ports::OrderIntent {
             symbol: Symbol::new(symbol),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
             side: Side::Buy,
             quantity: Quantity::from_f64(0.001)?,
             order_type: OrderType::Market,
