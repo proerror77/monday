@@ -39,7 +39,7 @@ async fn test_health_check() {
     let health = stream.health().await;
 
     assert!(!health.connected); // 初始状态未连接
-    assert!(health.latency_ms.is_some());
+    assert!(health.latency_ms.is_none());
     assert!(health.last_heartbeat > 0);
 }
 

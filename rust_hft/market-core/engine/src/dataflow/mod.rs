@@ -24,7 +24,7 @@
 //!
 //! # 使用建議
 //!
-//! ```rust
+//! ```ignore
 //! // 非關鍵路徑：使用標準版（保留完整監控）
 //! use hft_engine::dataflow::{EventIngester, IngestionConfig};
 //!

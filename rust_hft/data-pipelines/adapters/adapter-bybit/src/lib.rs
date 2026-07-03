@@ -355,10 +355,18 @@ impl MarketStream for BybitMarketStream {
 mod tests {
     use super::*;
     use ports::MarketStream;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     // Category tests
     #[test]
     fn test_category_default_is_spot() {
+        let _guard = env_guard();
         // Clear any env var that might affect the test
         std::env::remove_var("BYBIT_CATEGORY");
         let category = Category::from_env();
@@ -367,6 +375,7 @@ mod tests {
 
     #[test]
     fn test_category_linear_from_env() {
+        let _guard = env_guard();
         std::env::set_var("BYBIT_CATEGORY", "linear");
         let category = Category::from_env();
         assert_eq!(category, Category::Linear);
@@ -375,6 +384,7 @@ mod tests {
 
     #[test]
     fn test_category_usdt_maps_to_linear() {
+        let _guard = env_guard();
         std::env::set_var("BYBIT_CATEGORY", "usdt");
         let category = Category::from_env();
         assert_eq!(category, Category::Linear);
@@ -383,6 +393,7 @@ mod tests {
 
     #[test]
     fn test_category_perp_maps_to_linear() {
+        let _guard = env_guard();
         std::env::set_var("BYBIT_CATEGORY", "perp");
         let category = Category::from_env();
         assert_eq!(category, Category::Linear);
@@ -391,6 +402,7 @@ mod tests {
 
     #[test]
     fn test_category_unknown_defaults_to_spot() {
+        let _guard = env_guard();
         std::env::set_var("BYBIT_CATEGORY", "unknown_value");
         let category = Category::from_env();
         assert_eq!(category, Category::Spot);

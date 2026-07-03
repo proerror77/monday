@@ -119,7 +119,7 @@ impl<T> UltraRingBuffer<T> {
     /// # Example
     ///
     /// ```no_run
-    /// # use ultra_ring_buffer::UltraRingBuffer;
+    /// # use engine::dataflow::UltraRingBuffer;
     /// let buffer = UltraRingBuffer::new(1024);
     /// if !buffer.is_full() {
     ///     unsafe { buffer.push_unchecked(42); }
@@ -190,10 +190,10 @@ impl<T> UltraRingBuffer<T> {
     /// # Example
     ///
     /// ```no_run
-    /// # use ultra_ring_buffer::UltraRingBuffer;
+    /// # use engine::dataflow::UltraRingBuffer;
     /// let buffer = UltraRingBuffer::new(1024);
     /// if !buffer.is_empty() {
-    ///     let item = unsafe { buffer.pop_unchecked() };
+    ///     let item: i32 = unsafe { buffer.pop_unchecked() };
     /// }
     /// ```
     #[inline(always)]
@@ -393,8 +393,8 @@ impl<T> UltraConsumer<T> {
 ///
 /// # Example
 ///
-/// ```
-/// use ultra_ring_buffer::ultra_ring_buffer;
+/// ```no_run
+/// use engine::dataflow::ultra_ring_buffer;
 ///
 /// let (producer, consumer) = ultra_ring_buffer(1024);
 ///

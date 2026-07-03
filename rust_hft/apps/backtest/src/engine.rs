@@ -1049,3 +1049,87 @@ pub struct SummaryMetrics {
     pub max_drawdown: f64,
     pub max_position: f64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        BacktestConfig, DataConfig, ExecutionConfig, OutputConfig, RiskConfig, StrategyConfig,
+    };
+
+    fn test_config() -> BacktestConfig {
+        BacktestConfig {
+            data: DataConfig {
+                path: "unused.ndjson".to_string(),
+                format: "ndjson".to_string(),
+                tick_size: 0.01,
+                lot_size: 0.01,
+                max_depth_levels: 5,
+                start_ts: None,
+                end_ts: None,
+            },
+            strategy: StrategyConfig {
+                liquidity_window_secs: 1.0,
+                breakout_window_secs: 1.0,
+                price_delta_ticks: 1.0,
+                volume_factor: 1.0,
+                cvd_threshold: 0.0,
+                ofi_threshold: 0.0,
+                support_count: 1,
+                resistance_count: 1,
+                smoothing_alpha: 0.2,
+            },
+            execution: ExecutionConfig::default(),
+            risk: RiskConfig::default(),
+            output: OutputConfig::default(),
+        }
+    }
+
+    #[test]
+    fn backtest_replays_in_memory_l2_events() {
+        let mut engine = BacktestEngine::new(test_config());
+        let stream = vec![
+            Ok(EventEnvelope {
+                ts: 1_000_000,
+                payload: EventPayload::Snapshot {
+                    bids: vec![Level {
+                        price: 100.0,
+                        quantity: 5.0,
+                    }],
+                    asks: vec![Level {
+                        price: 100.2,
+                        quantity: 5.0,
+                    }],
+                },
+            }),
+            Ok(EventEnvelope {
+                ts: 1_100_000,
+                payload: EventPayload::L2Update {
+                    bids: vec![Level {
+                        price: 100.1,
+                        quantity: 4.0,
+                    }],
+                    asks: vec![Level {
+                        price: 100.2,
+                        quantity: 0.0,
+                    }],
+                },
+            }),
+            Ok(EventEnvelope {
+                ts: 1_200_000,
+                payload: EventPayload::Trade {
+                    side: TradeSide::Buy,
+                    price: 100.1,
+                    quantity: 1.0,
+                },
+            }),
+        ];
+
+        let result = engine
+            .run_with_stream(stream.into_iter())
+            .expect("in-memory replay should run");
+
+        assert_eq!(result.summary.trades, result.trades.len());
+        assert_eq!(engine.stats.last_trade_price, Some(100.1));
+    }
+}

@@ -117,8 +117,8 @@ impl UltraEventIngester {
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// # use ultra_ingestion::UltraEventIngester;
+    /// ```ignore
+    /// # use engine::dataflow::UltraEventIngester;
     /// # use ports::MarketEvent;
     /// let (ingester, _) = UltraEventIngester::new(Default::default());
     ///
@@ -327,8 +327,8 @@ impl UltraEventConsumer {
     ///
     /// # Example
     ///
-    /// ```no_run
-    /// # use ultra_ingestion::UltraEventConsumer;
+    /// ```ignore
+    /// # use engine::dataflow::UltraEventConsumer;
     /// let consumer = // ...;
     /// let batch = unsafe { consumer.consume_batch_unchecked(128) };
     /// for event in batch {

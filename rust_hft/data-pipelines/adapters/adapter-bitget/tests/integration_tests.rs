@@ -29,12 +29,19 @@ mod bitget_adapter_tests {
     use serde_json::json;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::OnceLock;
     use std::time::{Duration, Instant};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Mutex;
     use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
 
     type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    async fn bitget_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await
+    }
 
     // ============================================================================
     // Mock WebSocket Server Implementation
@@ -322,6 +329,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_orderbook_snapshot_parsing() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
 
         // 先排隊消息
@@ -376,6 +384,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_orderbook_incremental_updates() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
         mock_server.queue_orderbook_snapshot("BTCUSDT").await;
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -412,6 +421,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_trade_parsing() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
         mock_server
             .queue_trade("BTCUSDT", "buy", 67189.5, 0.025)
@@ -451,6 +461,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_multiple_trades_parsing() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
         let ws_url = mock_server.start().await?;
 
@@ -497,6 +508,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_ticker_parsing() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
         mock_server
             .queue_ticker("BTCUSDT", 67189.5, 67188.1, 67189.6)
@@ -524,6 +536,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_reconnection_mechanism() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
 
         // 計劃 2 秒後斷線
@@ -567,6 +580,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_heartbeat_mechanism() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
 
         // 設置短心跳間隔以加速測試
@@ -618,6 +632,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_data_integrity() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
 
         // 預先排隊大量消息
@@ -667,6 +682,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_latency_measurement() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
 
         // 預設一系列交易以測量延遲
@@ -725,6 +741,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_mixed_message_types() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
 
         // 預設混合消息類型
@@ -773,6 +790,7 @@ mod bitget_adapter_tests {
 
     #[tokio::test]
     async fn test_orderbook_price_validation() -> Result<()> {
+        let _guard = bitget_test_guard().await;
         let mut mock_server = MockWebSocketServer::new();
         mock_server.queue_orderbook_snapshot("BTCUSDT").await;
         let ws_url = mock_server.start().await?;
