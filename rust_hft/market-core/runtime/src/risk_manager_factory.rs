@@ -305,6 +305,7 @@ mod tests {
             staleness_threshold_us: 5000,
             enhanced: None,
             strategy_overrides: HashMap::new(),
+            tokenized_securities: Default::default(),
         };
 
         let _manager = RiskManagerFactory::create_risk_manager(&risk_config);
@@ -325,6 +326,7 @@ mod tests {
             staleness_threshold_us: 5000,
             enhanced: Some(enhanced_settings),
             strategy_overrides: HashMap::new(),
+            tokenized_securities: Default::default(),
         };
 
         let risk_manager = RiskManagerFactory::create_risk_manager(&risk_config);
@@ -344,6 +346,7 @@ mod tests {
             staleness_threshold_us: 5000,
             enhanced: None,
             strategy_overrides: HashMap::new(),
+            tokenized_securities: Default::default(),
         };
 
         let mut overrides = HashMap::new();

@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use futures::stream;
-use hft_core::{HftError, HftResult, Symbol, Timestamp};
+use hft_core::{HftError, HftResult, InstrumentSpec, ProductType, Symbol, Timestamp};
 use ports::events::MarketSnapshot;
 use ports::{BoxStream, ConnectionHealth, MarketEvent, MarketStream};
 use tokio::sync::mpsc;
@@ -255,6 +255,42 @@ impl MarketStream for BinanceMarketStream {
         Ok(Box::pin(stream))
     }
 
+    async fn subscribe_instruments(
+        &self,
+        instruments: Vec<InstrumentSpec>,
+    ) -> HftResult<BoxStream<MarketEvent>> {
+        if instruments.is_empty() {
+            return Err(HftError::new("商品列表不能為空"));
+        }
+
+        for instrument in &instruments {
+            match instrument.product_type {
+                ProductType::Spot | ProductType::TokenizedSecuritySpot => {}
+                ProductType::Futures | ProductType::Perp => {
+                    return Err(HftError::Network(format!(
+                        "Binance derivatives market data must use a derivatives adapter: {}",
+                        instrument.symbol
+                    )));
+                }
+                ProductType::BrokerageEquity => {
+                    return Err(HftError::Network(format!(
+                        "Binance brokerage equities market data must use an equities adapter: {}",
+                        instrument.symbol
+                    )));
+                }
+            }
+        }
+
+        info!("訂閱 Binance 商品市場數據: {:?}", instruments);
+        self.subscribe(
+            instruments
+                .into_iter()
+                .map(|instrument| instrument.symbol)
+                .collect(),
+        )
+        .await
+    }
+
     async fn health(&self) -> ConnectionHealth {
         ConnectionHealth {
             connected: self.is_connected,
@@ -373,6 +409,24 @@ mod tests {
         let result = stream.subscribe(vec![]).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_instruments_rejects_brokerage_equity_on_spot_adapter() {
+        let stream = BinanceMarketStream::new();
+        let instrument = InstrumentSpec {
+            symbol: Symbol::new("AAPL"),
+            venue: hft_core::VenueId::BINANCE_BROKERAGE_EQUITIES,
+            asset_class: hft_core::AssetClass::Equity,
+            product_type: ProductType::BrokerageEquity,
+            regulatory_profile: hft_core::RegulatoryProfile::RestrictedJurisdiction,
+            underlying_symbol: Some("AAPL".to_string()),
+            issuer: Some("AAPL".to_string()),
+            quote_currency: Some("USD".to_string()),
+        };
+
+        let result = stream.subscribe_instruments(vec![instrument]).await;
+        assert!(matches!(result, Err(err) if err.to_string().contains("equities adapter")));
     }
 
     #[test]

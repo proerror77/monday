@@ -253,7 +253,7 @@ pub struct SystemBuilder {
     strategies: Vec<Box<dyn Strategy>>,
     risk_managers: Vec<Box<dyn RiskManager>>,
     // 僅登記市場流規劃，實際橋接在 Runtime::start() 內進行
-    market_stream_plans: Vec<(VenueType, String, Vec<Symbol>)>,
+    market_stream_plans: Vec<(VenueType, String, Vec<InstrumentSpec>)>,
     // 分片配置
     shard_config: Option<ShardConfig>,
     // 🔥 Phase 1: 跟蹤執行客戶端對應的交易所
@@ -310,7 +310,25 @@ impl SystemBuilder {
         symbols: Vec<Symbol>,
     ) -> Self {
         info!("登記市場數據流規劃: {:?} {:?}", venue, symbols);
-        self.market_stream_plans.push((venue, venue_name, symbols));
+        let venue_id = venue_type_to_venue_id(&venue);
+        let instruments = symbols
+            .into_iter()
+            .map(|symbol| InstrumentSpec::crypto_spot(symbol, venue_id))
+            .collect();
+        self.market_stream_plans
+            .push((venue, venue_name, instruments));
+        self
+    }
+
+    pub fn register_market_instrument_plan(
+        mut self,
+        venue: VenueType,
+        venue_name: String,
+        instruments: Vec<InstrumentSpec>,
+    ) -> Self {
+        info!("登記市場商品流規劃: {:?} {:?}", venue, instruments);
+        self.market_stream_plans
+            .push((venue, venue_name, instruments));
         self
     }
 
@@ -652,6 +670,21 @@ impl SystemBuilder {
     }
 }
 
+fn venue_type_to_venue_id(venue_type: &VenueType) -> VenueId {
+    match venue_type {
+        VenueType::Binance => VenueId::BINANCE,
+        VenueType::Bitget => VenueId::BITGET,
+        VenueType::Bybit => VenueId::BYBIT,
+        VenueType::Okx => VenueId::OKX,
+        VenueType::Hyperliquid => VenueId::HYPERLIQUID,
+        VenueType::Grvt => VenueId::GRVT,
+        VenueType::Asterdex => VenueId::ASTERDEX,
+        VenueType::Lighter => VenueId::LIGHTER,
+        VenueType::Backpack => VenueId::BACKPACK,
+        VenueType::Mock => VenueId::MOCK,
+    }
+}
+
 /// 系統運行時
 pub struct SystemRuntime {
     pub engine: Arc<Mutex<Engine>>,
@@ -664,7 +697,7 @@ pub struct SystemRuntime {
     exec_control_txs:
         Vec<tokio::sync::mpsc::UnboundedSender<engine::execution_worker::ControlCommand>>,
     // 登記的市場流規劃
-    market_plans: Vec<(VenueType, String, Vec<Symbol>)>,
+    market_plans: Vec<(VenueType, String, Vec<InstrumentSpec>)>,
     // 🔥 Phase 1: 執行客戶端到交易所的映射
     execution_client_venues: Vec<VenueId>,
     // 🔥 Phase 1.x: 執行客戶端到帳戶的映射（可選）
@@ -699,7 +732,7 @@ impl SystemRuntime {
         bridge.set_engine_notify(engine_notify);
         // 橋接每個登記的市場數據流
         #[allow(unused_variables)]
-        for (venue_type, venue_name, symbols) in self.market_plans.clone() {
+        for (venue_type, venue_name, instruments) in self.market_plans.clone() {
             #[allow(unused_variables)]
             let venue_cfg = self
                 .config
@@ -707,6 +740,11 @@ impl SystemRuntime {
                 .iter()
                 .find(|v| v.name == venue_name)
                 .cloned();
+            #[allow(unused_variables)]
+            let symbols: Vec<Symbol> = instruments
+                .iter()
+                .map(|instrument| instrument.symbol.clone())
+                .collect();
             #[allow(unused_variables)]
             let plan_symbols = symbols.clone();
             match venue_type {
@@ -758,7 +796,7 @@ impl SystemRuntime {
                                 stream = stream.with_rest_base_url(rest_url.clone());
                             }
                         }
-                        let consumer = bridge.bridge_stream(stream, symbols).await?;
+                        let consumer = bridge.bridge_instrument_stream(stream, instruments).await?;
                         self.engine.lock().await.register_event_consumer(consumer);
                     }
                 }

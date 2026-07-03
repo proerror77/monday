@@ -5,7 +5,7 @@
 
 use crate::dataflow::{EventConsumer, EventIngester, IngestionConfig};
 use futures::StreamExt;
-use hft_core::{HftError, Symbol};
+use hft_core::{HftError, InstrumentSpec, Symbol};
 use ports::MarketStream;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -80,7 +80,50 @@ impl AdapterBridge {
                 message: format!("訂閱失敗: {}", e),
             })?;
 
-        // 在後台任務中運行攝取
+        self.spawn_ingestion_task(event_stream, ingester);
+        self.is_running = true;
+        Ok(consumer)
+    }
+
+    /// 橋接帶產品語義的 MarketStream 到 Engine。
+    pub async fn bridge_instrument_stream<S>(
+        &mut self,
+        stream: S,
+        instruments: Vec<InstrumentSpec>,
+    ) -> Result<EventConsumer, HftError>
+    where
+        S: MarketStream + Send + 'static,
+    {
+        let symbols: Vec<Symbol> = instruments
+            .iter()
+            .map(|instrument| instrument.symbol.clone())
+            .collect();
+        info!("橋接市場數據流，商品: {:?}", instruments);
+
+        let (mut ingester, consumer) = EventIngester::new(self.config.ingestion.clone());
+        if let Some(n) = &self.engine_notify {
+            ingester.set_engine_notify(n.clone());
+        }
+
+        let event_stream =
+            stream
+                .subscribe_instruments(instruments)
+                .await
+                .map_err(|e| HftError::Generic {
+                    message: format!("訂閱失敗: {}", e),
+                })?;
+
+        self.spawn_ingestion_task(event_stream, ingester);
+        info!("市場數據流橋接完成: {:?}", symbols);
+        self.is_running = true;
+        Ok(consumer)
+    }
+
+    fn spawn_ingestion_task(
+        &self,
+        event_stream: ports::BoxStream<ports::MarketEvent>,
+        mut ingester: EventIngester,
+    ) {
         let shutdown_listener = self.shutdown_notify.clone();
         tokio::spawn(async move {
             let mut event_stream = event_stream;
@@ -88,19 +131,16 @@ impl AdapterBridge {
 
             loop {
                 tokio::select! {
-                    // 監聽關閉信號
                     _ = shutdown_listener.notified() => {
                         info!("收到關閉信號，停止事件攝取");
                         break;
                     }
 
-                    // 處理事件流
                     event_result = event_stream.next() => {
                         match event_result {
                             Some(Ok(event)) => {
                                 events_processed += 1;
 
-                                // 🔥 降低日誌等級：事件級記錄改為 debug!（避免洪流）
                                 match &event {
                                     ports::MarketEvent::Bar(bar) => {
                                         trace!(
@@ -144,12 +184,10 @@ impl AdapterBridge {
 
                                 if let Err(e) = ingester.ingest(event) {
                                     tracing::error!("攝取事件失敗: {}", e);
-                                    // 繼續處理，不中斷流
                                 } else {
                                     trace!("事件成功攝取到 ring buffer");
                                 }
 
-                                // 統計輸出降為 debug 並降低頻率
                                 if events_processed.is_multiple_of(2000) {
                                     let metrics = ingester.metrics();
                                     debug!("攝取統計: 接收 {}, 丟棄 {}, 陳舊 {}, 最大利用率 {:.2}%",
@@ -161,7 +199,6 @@ impl AdapterBridge {
                             }
                             Some(Err(e)) => {
                                 warn!("事件流錯誤: {}", e);
-                                // 短暫延遲後繼續
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                             None => {
@@ -173,7 +210,6 @@ impl AdapterBridge {
                 }
             }
 
-            // 清理
             let final_metrics = ingester.metrics();
             info!(
                 "攝取器關閉，最終統計: 接收 {}, 丟棄 {}, 陳舊 {}",
@@ -182,9 +218,6 @@ impl AdapterBridge {
                 final_metrics.events_stale
             );
         });
-
-        self.is_running = true;
-        Ok(consumer)
     }
 
     /// 橋接多個 MarketStream 到 Engine

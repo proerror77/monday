@@ -1142,4 +1142,27 @@ risk:
         let result = load_config_from_str(system_yaml);
         assert!(result.is_err());
     }
+
+    #[test]
+    #[serial]
+    fn load_bstocks_quotes_only_config_preserves_tokenized_risk_boundary() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/dev/binance_bstocks_quotes_only.yaml"
+        );
+
+        let config = load_config_from_yaml(path).expect("load bstocks config");
+
+        assert!(config.quotes_only);
+        assert_eq!(config.venues.len(), 1);
+        let venue = &config.venues[0];
+        assert_eq!(venue.name, "binance-bstocks");
+        assert_eq!(venue.venue_type, VenueType::Binance);
+        assert!(venue
+            .symbol_catalog
+            .iter()
+            .all(|id| id.venue_id() == Some(VenueId::BINANCE_TOKENIZED_SECURITIES)));
+        assert!(!config.risk.tokenized_securities.allow_trading);
+        assert!(config.strategies.is_empty());
+    }
 }

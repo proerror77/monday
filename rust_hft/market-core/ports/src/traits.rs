@@ -25,6 +25,18 @@ pub trait MarketStream: Send + Sync {
     /// 訂閱指定品種，返回統一事件流
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>>;
 
+    /// 訂閱帶產品語義的品種。默認降級到 symbol-only，具體 adapter 可覆寫。
+    async fn subscribe_instruments(
+        &self,
+        instruments: Vec<InstrumentSpec>,
+    ) -> HftResult<BoxStream<MarketEvent>> {
+        let symbols = instruments
+            .into_iter()
+            .map(|instrument| instrument.symbol)
+            .collect();
+        self.subscribe(symbols).await
+    }
+
     /// 健康檢查
     async fn health(&self) -> ConnectionHealth;
 

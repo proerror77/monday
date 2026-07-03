@@ -113,6 +113,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "requires live Binance network"]
     async fn test_ping() {
         let client = BinanceRestClient::new();
         let result = client.ping().await;
@@ -120,6 +121,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires live Binance network"]
     async fn test_get_depth() {
         let client = BinanceRestClient::new();
         let symbol = Symbol::new("BTCUSDT");
