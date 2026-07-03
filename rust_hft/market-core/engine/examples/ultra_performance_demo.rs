@@ -145,20 +145,21 @@ fn demo_batch_operations() {
     let capacity = ingester.available_capacity();
     println!("Available capacity: {}", capacity);
 
+    let event_count = events.len();
     let start = Instant::now();
     unsafe {
-        ingester.ingest_batch_unchecked(&events);
+        ingester.ingest_batch_unchecked(events);
     }
     let batch_ingest_elapsed = start.elapsed();
 
     println!(
         "✅ Batch ingest {} events: {:?}",
-        events.len(),
+        event_count,
         batch_ingest_elapsed
     );
     println!(
         "   Average: {:.2}ns per event\n",
-        batch_ingest_elapsed.as_nanos() as f64 / events.len() as f64
+        batch_ingest_elapsed.as_nanos() as f64 / event_count as f64
     );
 
     // 測量批量消費

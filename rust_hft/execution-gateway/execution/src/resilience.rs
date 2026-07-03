@@ -569,7 +569,10 @@ mod tests {
         assert!(is_retryable(&HftError::Timeout("request timeout".into()), &config));
 
         assert!(!is_retryable(&HftError::InvalidOrder("bad order".into()), &config));
-        assert!(!is_retryable(&HftError::InsufficientFunds("no money".into()), &config));
+        assert!(!is_retryable(
+            &HftError::InsufficientBalance("no money".into()),
+            &config
+        ));
     }
 
     #[tokio::test]
