@@ -318,6 +318,76 @@ pub enum ProductType {
     BrokerageEquity,
 }
 
+impl ProductType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Spot => "SPOT",
+            Self::Futures => "FUTURES",
+            Self::Perp => "PERP",
+            Self::TokenizedSecuritySpot => "TOKENIZED_SECURITY_SPOT",
+            Self::BrokerageEquity => "BROKERAGE_EQUITY",
+        }
+    }
+}
+
+impl fmt::Display for ProductType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InstrumentKey {
+    pub venue: VenueId,
+    pub product_type: ProductType,
+    pub symbol: Symbol,
+}
+
+impl InstrumentKey {
+    pub fn new(venue: VenueId, product_type: ProductType, symbol: Symbol) -> Self {
+        Self {
+            venue,
+            product_type,
+            symbol,
+        }
+    }
+
+    pub fn from_spec(spec: &InstrumentSpec) -> Self {
+        Self::new(spec.venue, spec.product_type, spec.symbol.clone())
+    }
+
+    pub fn from_venue_symbol(vs: &VenueSymbol, product_type: ProductType) -> Self {
+        Self::new(vs.venue, product_type, vs.symbol.clone())
+    }
+
+    pub fn crypto_spot(symbol: Symbol, venue: VenueId) -> Self {
+        Self::new(venue, ProductType::Spot, symbol)
+    }
+
+    pub fn tokenized_security_spot(symbol: Symbol, venue: VenueId) -> Self {
+        Self::new(venue, ProductType::TokenizedSecuritySpot, symbol)
+    }
+
+    pub fn storage_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.venue.as_str(),
+            self.product_type.as_str(),
+            self.symbol.as_str()
+        )
+    }
+
+    pub fn legacy_venue_symbol_key(&self) -> String {
+        format!("{}:{}", self.venue.as_str(), self.symbol.as_str())
+    }
+}
+
+impl fmt::Display for InstrumentKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.storage_key())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum RegulatoryProfile {
     #[default]
@@ -381,6 +451,49 @@ impl InstrumentSpec {
             issuer: None,
             quote_currency: Some("USDT".to_string()),
         }
+    }
+
+    pub fn instrument_key(&self) -> InstrumentKey {
+        InstrumentKey::from_spec(self)
+    }
+}
+
+#[cfg(test)]
+mod instrument_key_tests {
+    use super::*;
+
+    #[test]
+    fn crypto_spot_storage_key_includes_product_type() {
+        let key = InstrumentKey::crypto_spot(Symbol::new("BTCUSDT"), VenueId::BINANCE);
+
+        assert_eq!(key.storage_key(), "BINANCE:SPOT:BTCUSDT");
+        assert_eq!(key.legacy_venue_symbol_key(), "BINANCE:BTCUSDT");
+    }
+
+    #[test]
+    fn tokenized_security_storage_key_is_distinct_from_crypto_spot() {
+        let key = InstrumentKey::tokenized_security_spot(
+            Symbol::new("TSLAUSDT"),
+            VenueId::BINANCE_TOKENIZED_SECURITIES,
+        );
+
+        assert_eq!(
+            key.storage_key(),
+            "BINANCE_TOKENIZED_SECURITIES:TOKENIZED_SECURITY_SPOT:TSLAUSDT"
+        );
+    }
+
+    #[test]
+    fn instrument_spec_exposes_canonical_key() {
+        let spec = InstrumentSpec::tokenized_security_spot(
+            Symbol::new("AAPLUSDT"),
+            VenueId::BINANCE_TOKENIZED_SECURITIES,
+        );
+
+        assert_eq!(
+            spec.instrument_key().storage_key(),
+            "BINANCE_TOKENIZED_SECURITIES:TOKENIZED_SECURITY_SPOT:AAPLUSDT"
+        );
     }
 }
 

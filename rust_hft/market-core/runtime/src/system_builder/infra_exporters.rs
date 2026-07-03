@@ -6,6 +6,7 @@
 mod redis_export {
     use super::*;
     use engine::aggregation::TopNSnapshot;
+    use hft_core::{InstrumentKey, ProductType};
     use tracing::info;
 
     /// 啟動 Redis 導出任務（從 system_builder.rs 拆分）
@@ -78,9 +79,15 @@ mod redis_export {
                 match client.get_async_connection().await {
                     Ok(mut conn) => {
                         for (vs, orderbook) in &market_view.orderbooks {
+                            let instrument_key =
+                                InstrumentKey::from_venue_symbol(vs, product_type_for_venue(vs.venue));
+                            let instrument_key_string = instrument_key.storage_key();
+                            let product_type = instrument_key.product_type.as_str();
                             let snapshot_data = serde_json::json!({
                                 "symbol": vs.symbol.as_str(),
                                 "venue": vs.venue.as_str(),
+                                "product_type": product_type,
+                                "instrument_key": instrument_key_string.as_str(),
                                 "mid_price": calculate_mid_price(orderbook),
                                 "spread": calculate_spread(orderbook),
                                 "timestamp": market_view.timestamp,
@@ -96,6 +103,8 @@ mod redis_export {
                                     &[
                                         ("symbol", vs.symbol.as_str()),
                                         ("venue", vs.venue.as_str()),
+                                        ("product_type", product_type),
+                                        ("instrument_key", instrument_key_string.as_str()),
                                         ("data", snapshot_data.to_string().as_str()),
                                     ],
                                 )
@@ -113,6 +122,14 @@ mod redis_export {
         Ok(())
     }
 
+    fn product_type_for_venue(venue: hft_core::VenueId) -> ProductType {
+        if venue == hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES {
+            ProductType::TokenizedSecuritySpot
+        } else {
+            ProductType::Spot
+        }
+    }
+
     impl SystemRuntime {
         #[cfg(feature = "redis")]
         pub async fn spawn_redis_exporter(
@@ -128,6 +145,7 @@ mod redis_export {
 mod clickhouse_export {
     use crate::system_builder::{ClickHouseConfig, SystemRuntime};
     use clickhouse::Client;
+    use hft_core::{InstrumentKey, ProductType};
     use tracing::info;
 
     // 市場狀態快照映射類型（用於 OFI 計算）
@@ -272,7 +290,9 @@ mod clickhouse_export {
                 let mut f_rows: Vec<FactorRow> = Vec::new();
                 // 計算市場因子
                 for (vs, ob) in &market_view.orderbooks {
-                    let key = vs.symbol.as_str().to_string();
+                    let instrument_key =
+                        InstrumentKey::from_venue_symbol(vs, product_type_for_venue(vs.venue));
+                    let key = instrument_key.storage_key();
                     let mut bid_px = 0.0;
                     let mut ask_px = 0.0;
                     let mut bid_qty = 0.0;
@@ -331,7 +351,7 @@ mod clickhouse_export {
                     );
                     f_rows.push(FactorRow {
                         timestamp: ts,
-                        symbol: key,
+                        symbol: vs.symbol.as_str().to_string(),
                         venue: vs.venue.as_str().into(),
                         obi_l1: obi1,
                         obi_l5: obi5,
@@ -438,6 +458,14 @@ mod clickhouse_export {
         });
         this.tasks.push(trade_handle);
         Ok(())
+    }
+
+    fn product_type_for_venue(venue: hft_core::VenueId) -> ProductType {
+        if venue == hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES {
+            ProductType::TokenizedSecuritySpot
+        } else {
+            ProductType::Spot
+        }
     }
 
     // 訂單歷史行結構

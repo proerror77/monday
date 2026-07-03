@@ -5,7 +5,7 @@
 //! 2. 提供標準化校驗功能
 //! 3. 支持運行時熱重載
 
-use hft_core::{HftError, HftResult, Price, Quantity, Symbol};
+use hft_core::{HftError, HftResult, InstrumentKey, Price, ProductType, Quantity, Symbol, VenueId};
 use ports::VenueSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,7 +64,8 @@ pub struct SpecDefaults {
 
 /// 交易所規格管理器
 pub struct VenueSpecManager {
-    specs: HashMap<String, VenueSpec>, // key: "{venue}:{symbol}"
+    specs: HashMap<String, VenueSpec>, // canonical key: "{venue}:{product_type}:{symbol}"
+    legacy_aliases: HashMap<String, String>,
     config_path: String,
 }
 
@@ -73,6 +74,7 @@ impl VenueSpecManager {
     pub fn new(config_path: String) -> Self {
         Self {
             specs: HashMap::new(),
+            legacy_aliases: HashMap::new(),
             config_path,
         }
     }
@@ -90,21 +92,20 @@ impl VenueSpecManager {
 
         // 清空現有規格
         self.specs.clear();
+        self.legacy_aliases.clear();
 
         // 處理每個交易所
         for (venue_name, venue_config) in &config.venues {
             // 處理現貨品種
             for (symbol, spec) in &venue_config.spot {
-                let key = format!("{}:{}", venue_name, symbol);
                 let venue_spec = self.convert_symbol_spec(venue_name, spec, &config.defaults)?;
-                self.specs.insert(key, venue_spec);
+                self.insert_spec(venue_name, ProductType::Spot, symbol, venue_spec);
             }
 
             // 處理期貨品種（如果有）
             for (symbol, spec) in &venue_config.futures {
-                let key = format!("{}:{}:FUTURES", venue_name, symbol);
                 let venue_spec = self.convert_symbol_spec(venue_name, spec, &config.defaults)?;
-                self.specs.insert(key, venue_spec);
+                self.insert_spec(venue_name, ProductType::Futures, symbol, venue_spec);
             }
         }
 
@@ -114,8 +115,33 @@ impl VenueSpecManager {
 
     /// 獲取指定品種的規格
     pub fn get_spec(&self, venue: &str, symbol: &Symbol) -> Option<&VenueSpec> {
-        let key = format!("{}:{}", venue, symbol.as_str());
-        self.specs.get(&key)
+        self.get_spec_for_product(venue, ProductType::Spot, symbol)
+            .or_else(|| self.get_by_key_or_alias(&legacy_spot_key(venue, symbol.as_str())))
+    }
+
+    /// 獲取指定產品型別的品種規格。
+    pub fn get_spec_for_product(
+        &self,
+        venue: &str,
+        product_type: ProductType,
+        symbol: &Symbol,
+    ) -> Option<&VenueSpec> {
+        let key = product_key(venue, product_type, symbol.as_str());
+        self.get_by_key_or_alias(&key).or_else(|| {
+            if product_type == ProductType::Spot {
+                self.get_by_key_or_alias(&legacy_spot_key(venue, symbol.as_str()))
+            } else if product_type == ProductType::Futures {
+                self.get_by_key_or_alias(&legacy_futures_key(venue, symbol.as_str()))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 獲取 canonical instrument key 的規格。
+    pub fn get_spec_by_key(&self, key: &InstrumentKey) -> Option<&VenueSpec> {
+        self.get_by_key_or_alias(&key.storage_key())
+            .or_else(|| self.get_spec_for_product(key.venue.as_str(), key.product_type, &key.symbol))
     }
 
     /// 獲取所有規格（用於風控系統）
@@ -239,11 +265,60 @@ impl VenueSpecManager {
         })
     }
 
+    fn insert_spec(
+        &mut self,
+        venue_name: &str,
+        product_type: ProductType,
+        symbol: &str,
+        venue_spec: VenueSpec,
+    ) {
+        let canonical_key = product_key(venue_name, product_type, symbol);
+        self.specs.insert(canonical_key.clone(), venue_spec);
+
+        // Keep legacy keys available for existing configs and callers during migration.
+        if product_type == ProductType::Spot {
+            self.legacy_aliases
+                .insert(legacy_spot_key(venue_name, symbol), canonical_key);
+        } else if product_type == ProductType::Futures {
+            self.legacy_aliases
+                .insert(legacy_futures_key(venue_name, symbol), canonical_key);
+        }
+    }
+
+    fn get_by_key_or_alias(&self, key: &str) -> Option<&VenueSpec> {
+        self.specs.get(key).or_else(|| {
+            self.legacy_aliases
+                .get(key)
+                .and_then(|canonical_key| self.specs.get(canonical_key))
+        })
+    }
+
     /// 重新加載配置（熱重載）
     pub async fn reload(&mut self) -> HftResult<()> {
         info!("熱重載交易所規格配置");
         self.load_config().await
     }
+}
+
+fn product_key(venue: &str, product_type: ProductType, symbol: &str) -> String {
+    if let Some(venue_id) = VenueId::from_str(venue) {
+        InstrumentKey::new(venue_id, product_type, Symbol::new(symbol)).storage_key()
+    } else {
+        format!(
+            "{}:{}:{}",
+            venue.to_ascii_uppercase(),
+            product_type.as_str(),
+            symbol
+        )
+    }
+}
+
+fn legacy_spot_key(venue: &str, symbol: &str) -> String {
+    format!("{}:{}", venue, symbol)
+}
+
+fn legacy_futures_key(venue: &str, symbol: &str) -> String {
+    format!("{}:{}:FUTURES", venue, symbol)
 }
 
 /// 創建默認的 VenueSpecManager
@@ -273,6 +348,9 @@ mod tests {
                 let spec = btc_spec.unwrap();
                 assert_eq!(spec.tick_size.0.to_string(), "0.1");
                 assert_eq!(spec.min_notional.to_string(), "5");
+
+                let key = InstrumentKey::crypto_spot(Symbol::new("BTCUSDT"), VenueId::BITGET);
+                assert!(manager.get_spec_by_key(&key).is_some());
             }
             Err(e) => {
                 // 測試環境可能沒有配置文件，不作為錯誤
@@ -287,5 +365,21 @@ mod tests {
         let _manager = VenueSpecManager::new("dummy".to_string());
         // 添加一個測試用的 spec
         // （實際實現中可以加一個 add_spec 方法）
+    }
+
+    #[test]
+    fn test_product_aware_keys() {
+        assert_eq!(
+            product_key("BINANCE", ProductType::Spot, "BTCUSDT"),
+            "BINANCE:SPOT:BTCUSDT"
+        );
+        assert_eq!(
+            product_key(
+                "BINANCE_TOKENIZED_SECURITIES",
+                ProductType::TokenizedSecuritySpot,
+                "TSLAUSDT"
+            ),
+            "BINANCE_TOKENIZED_SECURITIES:TOKENIZED_SECURITY_SPOT:TSLAUSDT"
+        );
     }
 }
