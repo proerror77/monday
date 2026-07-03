@@ -406,6 +406,19 @@ pub trait RiskManager: Send + Sync {
         let mut approved_intents = Vec::new();
 
         for intent in intents {
+            if matches!(intent.asset_class, AssetClass::TokenizedSecurity)
+                || matches!(intent.product_type, ProductType::TokenizedSecuritySpot)
+            {
+                let ctx = &intent.compliance_context;
+                if !ctx.allow_tokenized_securities || !ctx.eligibility_confirmed {
+                    eprintln!(
+                        "Warning: tokenized security intent rejected before risk review: {:?}",
+                        intent
+                    );
+                    continue;
+                }
+            }
+
             // 1. 優先使用 intent.target_venue
             let venue_spec = if let Some(target_venue) = intent.target_venue {
                 venue_specs.get(&target_venue)
