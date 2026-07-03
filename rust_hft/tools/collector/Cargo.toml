@@ -14,6 +14,7 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 
 # ClickHouse 客戶端
 clickhouse = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+duckdb = { version = "1.10504.0", optional = true, features = ["bundled"] }
 
 # JSON 處理
 serde = { version = "1", features = ["derive"] }
@@ -59,6 +60,7 @@ collector-bybit = []
 collector-hyperliquid = []
 collector-okx = []
 collector-asterdex = []
+duckdb = ["dep:duckdb"]
 
 [[bin]]
 name = "hft-collector"

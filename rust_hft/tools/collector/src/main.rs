@@ -485,6 +485,14 @@ struct Args {
     #[arg(long, default_value = "hft_db")]
     database: String,
 
+    /// DB backend: clickhouse | duckdb
+    #[arg(long, default_value = "clickhouse")]
+    db_backend: String,
+
+    /// DuckDB file path, used when --db-backend duckdb
+    #[arg(long, default_value = "data/hft.duckdb")]
+    duckdb_path: String,
+
     /// 批量大小
     #[arg(long, default_value = "1000")]
     batch_size: usize,
@@ -527,17 +535,27 @@ async fn main() -> Result<()> {
     let ch_user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
     let ch_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "".to_string());
 
-    db::init_db_config(db::DbConfig::clickhouse(
+    let db_config = db::DbConfig::from_backend(
+        &args.db_backend,
         args.ch_url.clone(),
+        args.duckdb_path.clone(),
         args.database.clone(),
         ch_user.clone(),
         ch_password.clone(),
         args.dry_run,
-    ));
+    )?;
+    let use_clickhouse_setup = db_config.is_clickhouse();
+    db::init_db_config(db_config.clone());
 
     // dry-run 模式提示
     if args.dry_run {
-        info!("🔬 Dry-run 模式：跳過 ClickHouse 連接");
+        info!("🔬 Dry-run 模式：跳過資料庫連接");
+    }
+    if !use_clickhouse_setup {
+        info!(
+            "使用 {} backend，跳過 ClickHouse DDL 初始化",
+            args.db_backend
+        );
     }
 
     // 為每個交易所啟動數據收集任務
@@ -557,6 +575,7 @@ async fn main() -> Result<()> {
         let batch_size = args.batch_size;
         let flush_ms = args.flush_ms;
         let dry_run = is_dry_run;
+        let use_clickhouse_setup = use_clickhouse_setup;
 
         let task = tokio::spawn(async move {
             if let Err(e) = run_exchange_collector(
@@ -571,6 +590,7 @@ async fn main() -> Result<()> {
                 batch_size,
                 flush_ms,
                 dry_run,
+                use_clickhouse_setup,
             )
             .await
             {
@@ -605,6 +625,7 @@ async fn run_exchange_collector(
     batch_size: usize,
     flush_ms: u64,
     dry_run: bool,
+    use_clickhouse_setup: bool,
 ) -> Result<()> {
     let symbols = filter_exchange_symbols(&exchange_name, symbols).await;
     if symbols.is_empty() {
@@ -626,7 +647,7 @@ async fn run_exchange_collector(
     );
 
     // 確保資料庫與表存在（IF NOT EXISTS，僅缺失時創建）
-    if !dry_run {
+    if !dry_run && use_clickhouse_setup {
         let mut client = Client::default().with_url(&ch_url);
         if !ch_password.is_empty() {
             client = client.with_user(&ch_user).with_password(&ch_password);

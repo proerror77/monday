@@ -1,4 +1,6 @@
 use anyhow::Result;
+#[cfg(feature = "duckdb")]
+use duckdb::{params, Connection};
 use once_cell::sync::{Lazy, OnceCell};
 use reqwest::Client;
 use std::collections::HashMap;
@@ -6,6 +8,8 @@ use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "duckdb")]
+use std::sync::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Duration;
 
@@ -19,6 +23,8 @@ static DB_CONFIG: OnceCell<DbConfig> = OnceCell::new();
 #[derive(Clone)]
 pub enum DbBackend {
     ClickHouse,
+    #[cfg(feature = "duckdb")]
+    DuckDb,
 }
 
 #[derive(Clone)]
@@ -49,6 +55,43 @@ impl DbConfig {
         }
     }
 
+    #[cfg(feature = "duckdb")]
+    pub fn duckdb(path: String, database: String, dry_run: bool) -> Self {
+        Self {
+            backend: DbBackend::DuckDb,
+            url: path,
+            database,
+            user: String::new(),
+            password: String::new(),
+            dry_run,
+        }
+    }
+
+    pub fn from_backend(
+        backend: &str,
+        ch_url: String,
+        _duckdb_path: String,
+        database: String,
+        user: String,
+        password: String,
+        dry_run: bool,
+    ) -> Result<Self> {
+        match backend.to_ascii_lowercase().as_str() {
+            "clickhouse" | "ch" => Ok(Self::clickhouse(ch_url, database, user, password, dry_run)),
+            #[cfg(feature = "duckdb")]
+            "duckdb" | "duck" => Ok(Self::duckdb(_duckdb_path, database, dry_run)),
+            #[cfg(not(feature = "duckdb"))]
+            "duckdb" | "duck" => anyhow::bail!(
+                "DuckDB backend requires building hft-collector with --features duckdb"
+            ),
+            other => anyhow::bail!("unsupported DB backend: {}", other),
+        }
+    }
+
+    pub fn is_clickhouse(&self) -> bool {
+        matches!(self.backend, DbBackend::ClickHouse)
+    }
+
     fn from_env(default_db: &str) -> Self {
         let url =
             std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
@@ -62,18 +105,25 @@ impl DbConfig {
                 .as_str(),
             "1" | "true" | "yes"
         );
-        let backend = match std::env::var("DB_BACKEND") {
-            Ok(v) if v.eq_ignore_ascii_case("clickhouse") => DbBackend::ClickHouse,
-            _ => DbBackend::ClickHouse,
-        };
-        Self {
-            backend,
+        Self::from_backend(
+            &std::env::var("DB_BACKEND").unwrap_or_else(|_| "clickhouse".to_string()),
             url,
+            std::env::var("DUCKDB_PATH").unwrap_or_else(|_| "data/hft.duckdb".to_string()),
             database,
             user,
             password,
             dry_run,
-        }
+        )
+        .unwrap_or_else(|err| {
+            tracing::warn!("DB_BACKEND invalid, falling back to ClickHouse: {}", err);
+            Self::clickhouse(
+                "http://localhost:8123".to_string(),
+                default_db.to_string(),
+                "default".to_string(),
+                String::new(),
+                dry_run,
+            )
+        })
     }
 }
 
@@ -126,9 +176,96 @@ pub async fn get_sink_async(default_db: &str) -> Result<Arc<DynSink>> {
 
     let sink: Arc<DynSink> = match config.backend {
         DbBackend::ClickHouse => Arc::new(ClickHouseHttpSink::from_config(&config, &db_name)),
+        #[cfg(feature = "duckdb")]
+        DbBackend::DuckDb => Arc::new(DuckDbSink::from_config(&config, &db_name)?),
     };
     cache.insert(db_name.clone(), sink.clone());
     Ok(sink)
+}
+
+#[cfg(feature = "duckdb")]
+pub struct DuckDbSink {
+    db: String,
+    conn: Mutex<Connection>,
+}
+
+#[cfg(feature = "duckdb")]
+impl DuckDbSink {
+    pub fn from_config(config: &DbConfig, database: &str) -> Result<Self> {
+        if let Some(parent) = std::path::Path::new(&config.url).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        Ok(Self {
+            db: database.to_string(),
+            conn: Mutex::new(Connection::open(&config.url)?),
+        })
+    }
+
+    fn safe_table_name(table: &str) -> String {
+        let mut out = String::with_capacity(table.len());
+        for ch in table.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                out.push(ch);
+            } else {
+                out.push('_');
+            }
+        }
+        if out.is_empty() || out.as_bytes()[0].is_ascii_digit() {
+            out.insert_str(0, "t_");
+        }
+        out
+    }
+}
+
+#[cfg(feature = "duckdb")]
+impl DbSink for DuckDbSink {
+    fn database(&self) -> &str {
+        &self.db
+    }
+
+    fn table_full_name(&self, table: &str) -> String {
+        Self::safe_table_name(table)
+    }
+
+    fn insert_json_rows<'a>(
+        &'a self,
+        table: &'a str,
+        rows: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
+        Box::pin(async move {
+            if rows.is_empty() {
+                return Ok(0);
+            }
+
+            let table = Self::safe_table_name(table);
+            let mut conn = self
+                .conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DuckDB connection lock poisoned"))?;
+            conn.execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS {} (ingested_at_ms BIGINT, payload TEXT)",
+                    table
+                ),
+                [],
+            )?;
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(&format!(
+                    "INSERT INTO {} (ingested_at_ms, payload) VALUES (?, ?)",
+                    table
+                ))?;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                for row in rows {
+                    stmt.execute(params![now_ms, row])?;
+                }
+            }
+            tx.commit()?;
+            Ok(rows.len())
+        })
+    }
 }
 
 /// ClickHouse HTTP JSONEachRow 後端
@@ -282,5 +419,39 @@ impl DbSink for NoopSink {
         rows: &'a [String],
     ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
         Box::pin(async move { Ok(rows.len()) })
+    }
+}
+
+#[cfg(all(test, feature = "duckdb"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn duckdb_sink_writes_json_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "hft_collector_test_{}_{}.duckdb",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let config = DbConfig::duckdb(path.to_string_lossy().to_string(), "hft_test".into(), false);
+        let sink = DuckDbSink::from_config(&config, "hft_test").expect("open duckdb");
+        let rows = vec![r#"{"symbol":"TSLABUSDT","price":396.24}"#.to_string()];
+
+        assert_eq!(
+            sink.insert_json_rows("binance_orderbook", &rows)
+                .await
+                .expect("insert"),
+            1
+        );
+
+        let count: i64 = sink
+            .conn
+            .lock()
+            .expect("lock")
+            .query_row("SELECT count(*) FROM binance_orderbook", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_file(path);
     }
 }
