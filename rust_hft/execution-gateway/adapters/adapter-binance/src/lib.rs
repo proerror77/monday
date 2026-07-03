@@ -207,6 +207,12 @@ impl ExecutionClient for BinanceExecutionClient {
         self.validate_product_gate(&intent)?;
 
         // Live 模式（需要 signer）
+        if self.mode == ExecutionMode::Live && self.signer.is_none() {
+            return Err(hft_core::HftError::Authentication(
+                "Binance live order requires API credentials".to_string(),
+            ));
+        }
+
         if self.mode == ExecutionMode::Live && self.signer.is_some() {
             if self.http_client.is_none() {
                 self.ensure_http()?;
@@ -1005,6 +1011,29 @@ mod tests {
 
         let order_id = result.unwrap();
         assert!(order_id.0.starts_with("BINANCE_PAPER_"));
+    }
+
+    #[tokio::test]
+    async fn live_mode_without_credentials_rejects_order_instead_of_paper_fallback() {
+        let config = make_test_config(ExecutionMode::Live);
+        let mut client = BinanceExecutionClient::new(config);
+
+        let intent = OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Quantity::from_f64(0.001).unwrap(),
+            price: Some(Price::from_f64(50000.0).unwrap()),
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: None,
+        };
+
+        let err = client.place_order(intent).await.unwrap_err();
+        assert!(err.to_string().contains("requires API credentials"));
     }
 
     #[tokio::test]
