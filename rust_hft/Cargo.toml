@@ -73,6 +73,7 @@ members = [
     "infra-services/testing",
 
     # Research Core
+    "research-core/factor-dsl",
     "research-core/manifest",
 
     # Applications

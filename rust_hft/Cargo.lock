@@ -2663,6 +2663,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-factor-dsl"
+version = "0.1.0"
+dependencies = [
+ "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hft-grpc-server"
 version = "0.1.0"
 dependencies = [
