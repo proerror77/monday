@@ -13,8 +13,8 @@ use hft_factor_eval::{
 };
 use hft_factor_store::{FactorQuery, FactorStore, FileFactorStore, InMemoryFactorStore};
 use hft_live_small_supervisor::{
-    rollback, supervise_rollout, LiveSmallAction, LiveSmallDecision, LiveSmallPolicyLimits,
-    LiveSmallRolloutRequest, RollbackTrigger,
+    rollback, runtime_command_from_decision, supervise_rollout, LiveSmallAction, LiveSmallDecision,
+    LiveSmallPolicyLimits, LiveSmallRolloutRequest, LiveSmallRuntimeCommand, RollbackTrigger,
 };
 use hft_loop_engine::{
     evaluate_loop_run, CandidateLoopEvidence, DoneCondition, LoopNextAction, LoopRun,
@@ -22,12 +22,16 @@ use hft_loop_engine::{
 };
 use hft_promotion_gate::{evaluate_promotion, PromotionGateInput, TargetStage};
 use hft_prototype_adapter::{
-    known_python_prototypes, PrototypeProposalAdapter, PrototypeRunRequest, StaticPrototypeAdapter,
+    known_python_prototypes, PrototypeBackendKind, PrototypeProposalAdapter, PrototypeRunRequest,
+    StaticPrototypeAdapter,
 };
 use hft_research_manifest::{ArtifactRef, LiveRolloutManifest, ManifestId, ManifestRef};
 use hft_research_memory::{
     learning_directive_from_memory, memory_from_live_small, memory_from_promotion_gate,
     HarnessChangeKind, HarnessChangeProposal, LearningDirective, ResearchMemoryEvent,
+};
+use hft_search_protocol::{
+    run_budgeted_lab_search, SearchBudget, SearchEngineKind, SearchRunRequest,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -63,12 +67,18 @@ enum Command {
     ExportAudit { output: PathBuf },
     /// Run the deterministic loop-engine progress check.
     LoopEngineDemo,
+    /// Run budgeted MCTS/RL/LLM proposal loops without real data.
+    EngineLoopDemo { output: PathBuf },
+    /// Emit a dry-run live-small runtime command.
+    LiveCommandDemo { output: PathBuf },
     /// Persist a generated factor candidate into a file-backed candidate pool.
     FactorPoolDemo { output: PathBuf },
     /// Persist a prototype-backed experiment run into a file-backed log.
     ExperimentLogDemo { output: PathBuf },
     /// Run all registered Python prototypes as lab-only proposal backends.
     PrototypeLabDemo { output: PathBuf },
+    /// Print Python prototype retirement status.
+    PythonRetirementDemo,
     /// Evaluate a replay CSV and persist the resulting candidate.
     ReplayEval {
         input: PathBuf,
@@ -409,6 +419,112 @@ fn prototype_lab_demo(output: &Path) -> Result<PrototypeLabDemoReport, Box<dyn s
         backends,
         stored_proposals: run.proposals.len(),
     })
+}
+
+#[derive(Debug, Serialize)]
+struct EngineLoopDemoReport {
+    output: String,
+    runs: usize,
+    stored_proposals: usize,
+}
+
+fn engine_loop_demo(output: &Path) -> Result<EngineLoopDemoReport, Box<dyn std::error::Error>> {
+    let now = chrono::Utc::now();
+    let ast = FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string()));
+    let engines = [
+        ("mcts-lab", SearchEngineKind::Mcts, 8, 0),
+        ("rl-lab", SearchEngineKind::ReinforcementLearning, 16, 0),
+        ("llm-lab", SearchEngineKind::LlmProposer, 0, 2_000),
+    ];
+    let mut proposals = Vec::new();
+    for (run_id, engine, max_expansions, max_tokens) in engines {
+        let report = run_budgeted_lab_search(
+            SearchRunRequest {
+                run_id: run_id.to_string(),
+                engine,
+                search_manifest_id: ManifestId::new("search-engine-loop-1")?,
+                budget: SearchBudget {
+                    max_candidates: 1,
+                    max_expansions,
+                    max_tokens,
+                    max_seconds: 5,
+                },
+            },
+            ast.clone(),
+            now,
+        )?;
+        proposals.extend(report.proposals);
+    }
+    let run = ExperimentRun {
+        experiment_id: "engine-loop-demo-1".to_string(),
+        search_manifest_id: ManifestId::new("search-engine-loop-1")?,
+        proposals,
+        started_at: now,
+        completed_at: Some(now),
+    };
+    let mut store = FileExperimentStore::new(output);
+    store.put_run(run)?;
+    let run = store.get_run("engine-loop-demo-1")?;
+
+    Ok(EngineLoopDemoReport {
+        output: store.path().display().to_string(),
+        runs: 3,
+        stored_proposals: run.proposals.len(),
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct LiveCommandDemoReport {
+    output: String,
+    command: LiveSmallRuntimeCommand,
+}
+
+fn live_command_demo(output: &Path) -> Result<LiveCommandDemoReport, Box<dyn std::error::Error>> {
+    let promotion = hft_promotion_gate::PromotionGateDecision {
+        passed: true,
+        failures: vec![],
+    };
+    let rollout_manifest = live_rollout_manifest()?;
+    let decision = live_small_decision(promotion)?;
+    let command =
+        runtime_command_from_decision("live-small-command-1", rollout_manifest, &decision)
+            .ok_or("live-small decision did not produce runtime command")?;
+    command.validate()?;
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let report = LiveCommandDemoReport {
+        output: output.display().to_string(),
+        command,
+    };
+    std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
+    register_artifact("live-small-command-1", output)?;
+    Ok(report)
+}
+
+#[derive(Debug, Serialize)]
+struct PythonRetirementRecord {
+    backend_id: String,
+    kind: PrototypeBackendKind,
+    source_path: String,
+    current_status: &'static str,
+    next_step: &'static str,
+}
+
+fn python_retirement_demo() -> Vec<PythonRetirementRecord> {
+    known_python_prototypes()
+        .into_iter()
+        .map(|backend| PythonRetirementRecord {
+            backend_id: backend.backend_id,
+            kind: backend.kind,
+            source_path: backend.source_path,
+            current_status: "wrapped_lab_only",
+            next_step: "add Rust parity fixture before replacing",
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -865,6 +981,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::LoopEngineDemo => {
             println!("{}", serde_json::to_string_pretty(&loop_engine_demo()?)?);
         }
+        Command::EngineLoopDemo { output } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&engine_loop_demo(&output)?)?
+            );
+        }
+        Command::LiveCommandDemo { output } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&live_command_demo(&output)?)?
+            );
+        }
         Command::FactorPoolDemo { output } => {
             println!(
                 "{}",
@@ -881,6 +1009,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&prototype_lab_demo(&output)?)?
+            );
+        }
+        Command::PythonRetirementDemo => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&python_retirement_demo())?
             );
         }
         Command::ReplayEval {

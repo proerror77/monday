@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use hft_factor_dsl::{FactorAst, FactorDslError};
-use hft_research_manifest::ManifestId;
+use hft_research_manifest::{ManifestError, ManifestId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -11,8 +11,16 @@ use thiserror::Error;
 pub enum SearchProtocolError {
     #[error("proposal id cannot be empty")]
     EmptyProposalId,
+    #[error("search run id cannot be empty")]
+    EmptyRunId,
     #[error("invalid factor AST: {0}")]
     InvalidFactorAst(#[from] FactorDslError),
+    #[error("invalid search manifest: {0}")]
+    InvalidSearchManifest(#[from] ManifestError),
+    #[error("search budget must request at least one candidate")]
+    InvalidCandidateBudget,
+    #[error("search budget must set at least one positive limit")]
+    EmptyBudgetLimit,
     #[error("MCTS proposals require an MCTS trace")]
     MissingMctsTrace,
     #[error("MCTS root node id cannot be empty")]
@@ -73,6 +81,112 @@ impl ProposalArtifact {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchBudget {
+    pub max_candidates: usize,
+    pub max_expansions: u64,
+    pub max_tokens: u64,
+    pub max_seconds: u64,
+}
+
+impl SearchBudget {
+    pub fn validate(&self) -> Result<(), SearchProtocolError> {
+        if self.max_candidates == 0 {
+            return Err(SearchProtocolError::InvalidCandidateBudget);
+        }
+        if self.max_expansions == 0 && self.max_tokens == 0 && self.max_seconds == 0 {
+            return Err(SearchProtocolError::EmptyBudgetLimit);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchRunRequest {
+    pub run_id: String,
+    pub engine: SearchEngineKind,
+    pub search_manifest_id: ManifestId,
+    pub budget: SearchBudget,
+}
+
+impl SearchRunRequest {
+    pub fn validate(&self) -> Result<(), SearchProtocolError> {
+        if self.run_id.trim().is_empty() {
+            return Err(SearchProtocolError::EmptyRunId);
+        }
+        self.search_manifest_id.validate()?;
+        self.budget.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchRunReport {
+    pub request: SearchRunRequest,
+    pub proposals: Vec<ProposalArtifact>,
+}
+
+pub fn run_budgeted_lab_search(
+    request: SearchRunRequest,
+    ast: FactorAst,
+    created_at: DateTime<Utc>,
+) -> Result<SearchRunReport, SearchProtocolError> {
+    request.validate()?;
+    ast.validate()?;
+    let proposal_count = request.budget.max_candidates.min(1);
+    let proposals = (0..proposal_count)
+        .map(|idx| {
+            let mcts_trace = (request.engine == SearchEngineKind::Mcts).then(|| MctsTrace {
+                root_node_id: "root".to_string(),
+                nodes: vec![
+                    MctsTraceNode {
+                        node_id: "root".to_string(),
+                        parent_node_id: None,
+                        visits: request.budget.max_expansions.max(1),
+                        total_reward: 0.0,
+                        best_reward: 0.0,
+                    },
+                    MctsTraceNode {
+                        node_id: "candidate-1".to_string(),
+                        parent_node_id: Some("root".to_string()),
+                        visits: 1,
+                        total_reward: 0.1,
+                        best_reward: 0.1,
+                    },
+                ],
+                backpropagation_truncated_count: 0,
+            });
+            let artifact = ProposalArtifact {
+                proposal_id: format!("{}-proposal-{}", request.run_id, idx + 1),
+                engine: request.engine.clone(),
+                search_manifest_id: request.search_manifest_id.clone(),
+                parent_factor_ids: vec![],
+                ast: ast.clone(),
+                mcts_trace,
+                parameters: BTreeMap::from([
+                    (
+                        "max_expansions".to_string(),
+                        request.budget.max_expansions.to_string(),
+                    ),
+                    (
+                        "max_tokens".to_string(),
+                        request.budget.max_tokens.to_string(),
+                    ),
+                    (
+                        "max_seconds".to_string(),
+                        request.budget.max_seconds.to_string(),
+                    ),
+                ]),
+                rationale: Some("budgeted lab search proposal".to_string()),
+                created_at,
+            };
+            artifact.validate()?;
+            Ok(artifact)
+        })
+        .collect::<Result<Vec<_>, SearchProtocolError>>()?;
+
+    Ok(SearchRunReport { request, proposals })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -226,7 +340,10 @@ mod tests {
 
     #[test]
     fn rejects_bad_proposal_mcts_trace() {
-        let artifact = proposal(field_ast(), Some(trace(vec![node("child", Some("missing"))])));
+        let artifact = proposal(
+            field_ast(),
+            Some(trace(vec![node("child", Some("missing"))])),
+        );
 
         assert_eq!(
             artifact.validate().unwrap_err(),
@@ -244,6 +361,44 @@ mod tests {
         assert_eq!(
             artifact.validate().unwrap_err(),
             SearchProtocolError::MissingMctsTrace
+        );
+    }
+
+    #[test]
+    fn budgeted_mcts_run_includes_trace() {
+        let report = run_budgeted_lab_search(
+            SearchRunRequest {
+                run_id: "mcts-run".to_string(),
+                engine: SearchEngineKind::Mcts,
+                search_manifest_id: ManifestId::new("search-1").unwrap(),
+                budget: SearchBudget {
+                    max_candidates: 1,
+                    max_expansions: 8,
+                    max_tokens: 0,
+                    max_seconds: 1,
+                },
+            },
+            field_ast(),
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert_eq!(report.proposals.len(), 1);
+        assert!(report.proposals[0].mcts_trace.is_some());
+    }
+
+    #[test]
+    fn rejects_empty_budget_limit() {
+        assert_eq!(
+            SearchBudget {
+                max_candidates: 1,
+                max_expansions: 0,
+                max_tokens: 0,
+                max_seconds: 0,
+            }
+            .validate()
+            .unwrap_err(),
+            SearchProtocolError::EmptyBudgetLimit
         );
     }
 

@@ -16,6 +16,10 @@ pub enum LiveSmallSupervisorError {
     InvalidRequestedRisk,
     #[error("configured risk cap must be finite and non-negative")]
     InvalidRiskCap,
+    #[error("runtime command id cannot be empty")]
+    EmptyCommandId,
+    #[error("runtime command boundary is dry-run only")]
+    RuntimeCommandMustBeDryRun,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +81,58 @@ pub struct LiveSmallDecision {
     pub action: LiveSmallAction,
     pub blockers: Vec<LiveSmallBlocker>,
     pub rollback_trigger: Option<RollbackTrigger>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeCommandKind {
+    StageLiveSmall,
+    RollbackLiveSmall,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveSmallRuntimeCommand {
+    pub command_id: String,
+    pub kind: RuntimeCommandKind,
+    pub rollout_manifest: LiveRolloutManifest,
+    pub dry_run: bool,
+    pub reason: String,
+}
+
+impl LiveSmallRuntimeCommand {
+    pub fn validate(&self) -> Result<(), LiveSmallSupervisorError> {
+        if self.command_id.trim().is_empty() {
+            return Err(LiveSmallSupervisorError::EmptyCommandId);
+        }
+        if !self.dry_run {
+            return Err(LiveSmallSupervisorError::RuntimeCommandMustBeDryRun);
+        }
+        self.rollout_manifest.validate()?;
+        Ok(())
+    }
+}
+
+pub fn runtime_command_from_decision(
+    command_id: impl Into<String>,
+    rollout_manifest: LiveRolloutManifest,
+    decision: &LiveSmallDecision,
+) -> Option<LiveSmallRuntimeCommand> {
+    match decision.action {
+        LiveSmallAction::AllowRollout => Some(LiveSmallRuntimeCommand {
+            command_id: command_id.into(),
+            kind: RuntimeCommandKind::StageLiveSmall,
+            rollout_manifest,
+            dry_run: true,
+            reason: "promotion and live-small limits passed".to_string(),
+        }),
+        LiveSmallAction::Rollback => Some(LiveSmallRuntimeCommand {
+            command_id: command_id.into(),
+            kind: RuntimeCommandKind::RollbackLiveSmall,
+            rollout_manifest,
+            dry_run: true,
+            reason: format!("rollback requested: {:?}", decision.rollback_trigger),
+        }),
+        LiveSmallAction::BlockRollout => None,
+    }
 }
 
 pub fn supervise_rollout(
@@ -197,6 +253,39 @@ mod tests {
         assert_eq!(
             rollback(RollbackTrigger::SentinelStopped),
             rollback(RollbackTrigger::SentinelStopped)
+        );
+    }
+
+    #[test]
+    fn runtime_command_is_dry_run_boundary() {
+        let decision = LiveSmallDecision {
+            action: LiveSmallAction::AllowRollout,
+            blockers: vec![],
+            rollback_trigger: None,
+        };
+        let command = runtime_command_from_decision("cmd-1", manifest(), &decision).unwrap();
+
+        assert_eq!(command.kind, RuntimeCommandKind::StageLiveSmall);
+        assert_eq!(command.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_non_dry_run_runtime_command() {
+        let mut command = runtime_command_from_decision(
+            "cmd-1",
+            manifest(),
+            &LiveSmallDecision {
+                action: LiveSmallAction::AllowRollout,
+                blockers: vec![],
+                rollback_trigger: None,
+            },
+        )
+        .unwrap();
+        command.dry_run = false;
+
+        assert_eq!(
+            command.validate().unwrap_err(),
+            LiveSmallSupervisorError::RuntimeCommandMustBeDryRun
         );
     }
 }
