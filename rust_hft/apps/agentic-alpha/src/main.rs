@@ -7,7 +7,10 @@ use hft_experiment_store::{
 };
 use hft_factor_bank::{FactorAsset, FactorLineage, FactorMetrics, FactorStatus, FactorType};
 use hft_factor_dsl::{FactorAst, FactorTerminal};
-use hft_factor_eval::{evaluate_factor, EvaluationInput, EvaluationThresholds};
+use hft_factor_eval::{
+    evaluate_factor, evaluate_replay_csv, EvaluationDecision, EvaluationInput,
+    EvaluationThresholds, ReplayCsvConfig,
+};
 use hft_factor_store::{FactorQuery, FactorStore, FileFactorStore, InMemoryFactorStore};
 use hft_live_small_supervisor::{
     rollback, supervise_rollout, LiveSmallAction, LiveSmallDecision, LiveSmallPolicyLimits,
@@ -62,6 +65,16 @@ enum Command {
     FactorPoolDemo { output: PathBuf },
     /// Persist a prototype-backed experiment run into a file-backed log.
     ExperimentLogDemo { output: PathBuf },
+    /// Evaluate a replay CSV and persist the resulting candidate.
+    ReplayEval {
+        input: PathBuf,
+        factor_pool: PathBuf,
+        report: PathBuf,
+        #[arg(long, default_value = "oi_delta_5m")]
+        signal_column: String,
+        #[arg(long, default_value = "forward_return")]
+        label_column: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -347,6 +360,115 @@ fn experiment_log_demo(
         experiment_id: run.experiment_id,
         stored_proposals: run.proposals.len(),
     })
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayEvalReport {
+    report: String,
+    factor_pool: String,
+    factor_id: String,
+    metrics: FactorMetrics,
+    evaluation: EvaluationDecision,
+    stored_factors: usize,
+}
+
+fn replay_eval(
+    input: &Path,
+    factor_pool: &Path,
+    report: &Path,
+    signal_column: &str,
+    label_column: &str,
+) -> Result<ReplayEvalReport, Box<dyn std::error::Error>> {
+    let csv = std::fs::read_to_string(input)?;
+    let evaluation = evaluate_replay_csv(
+        &csv,
+        &ReplayCsvConfig {
+            dataset_manifest: reference("data-replay-1", "data_manifest")?,
+            signal_column: signal_column.to_string(),
+            label_column: label_column.to_string(),
+            available_time_column: Some("available_time".to_string()),
+        },
+        &EvaluationThresholds {
+            min_sample_count: 4,
+            min_rank_ic: 0.03,
+            min_net_sharpe: 1.0,
+            max_drawdown: 0.05,
+            max_correlation: 0.8,
+        },
+        Some(0.2),
+    )?;
+    let now = chrono::Utc::now();
+    let factor_id = format!("replay-{signal_column}");
+    let asset = FactorAsset {
+        factor_id: factor_id.clone(),
+        factor_type: FactorType::Formula,
+        ast: FactorAst::Terminal(FactorTerminal::Field(signal_column.to_string())),
+        lineage: FactorLineage {
+            parent_factor_ids: vec![],
+            source_engine: "replay_eval".to_string(),
+            search_manifest_id: ManifestId::new("search-replay-1")?,
+        },
+        data_manifest: reference("data-replay-1", "data_manifest")?,
+        feature_manifest: reference("feature-replay-1", "feature_manifest")?,
+        label_manifest: reference("label-replay-1", "label_manifest")?,
+        evaluation_manifests: vec![reference("eval-replay-1", "evaluation_manifest")?],
+        metrics: evaluation.metrics.clone(),
+        correlation_cluster: None,
+        regime_metrics: BTreeMap::new(),
+        symbol_metrics: BTreeMap::new(),
+        promotion_status: if evaluation.decision.passed {
+            FactorStatus::FullBacktestPassed
+        } else {
+            FactorStatus::Generated
+        },
+        live_decay_state: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut factor_store = FileFactorStore::new(factor_pool);
+    factor_store.upsert_factor(asset)?;
+    let stored_factors = factor_store
+        .list_factors(FactorQuery {
+            status: None,
+            limit: 100,
+        })?
+        .len();
+
+    if let Some(parent) = report
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let output = ReplayEvalReport {
+        report: report.display().to_string(),
+        factor_pool: factor_store.path().display().to_string(),
+        factor_id,
+        metrics: evaluation.metrics,
+        evaluation: evaluation.decision,
+        stored_factors,
+    };
+    std::fs::write(report, serde_json::to_string_pretty(&output)?)?;
+    register_artifact("eval-replay-1", report)?;
+    Ok(output)
+}
+
+fn register_artifact(manifest_id: &str, artifact: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let index_root = artifact
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.join("artifact-index"))
+        .unwrap_or_else(|| PathBuf::from("artifact-index"));
+    let mut store = FileArtifactStore::new(index_root);
+    store.put_artifact(ArtifactRecord {
+        manifest_id: ManifestId::new(manifest_id)?,
+        artifact: ArtifactRef {
+            uri: artifact.to_string_lossy().to_string(),
+            content_type: "application/json".to_string(),
+            checksum: None,
+        },
+    })?;
+    Ok(())
 }
 
 fn live_rollout_manifest() -> Result<LiveRolloutManifest, Box<dyn std::error::Error>> {
@@ -671,6 +793,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&experiment_log_demo(&output)?)?
+            );
+        }
+        Command::ReplayEval {
+            input,
+            factor_pool,
+            report,
+            signal_column,
+            label_column,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&replay_eval(
+                    &input,
+                    &factor_pool,
+                    &report,
+                    &signal_column,
+                    &label_column,
+                )?)?
             );
         }
     }
