@@ -26,8 +26,8 @@ use hft_prototype_adapter::{
 };
 use hft_research_manifest::{ArtifactRef, LiveRolloutManifest, ManifestId, ManifestRef};
 use hft_research_memory::{
-    memory_from_live_small, memory_from_promotion_gate, HarnessChangeKind, HarnessChangeProposal,
-    ResearchMemoryEvent,
+    learning_directive_from_memory, memory_from_live_small, memory_from_promotion_gate,
+    HarnessChangeKind, HarnessChangeProposal, LearningDirective, ResearchMemoryEvent,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -53,6 +53,8 @@ enum Command {
     LiveSmallDemo,
     /// Convert failures into structured memory and harness-change proposal.
     MemoryDemo,
+    /// Persist a learned next-loop directive from research memory.
+    LearningDemo { output: PathBuf },
     /// Validate an allocator/risk policy proposal without mutating live weights.
     AllocatorDemo,
     /// Build a validated audit bundle for a local harness loop.
@@ -574,6 +576,33 @@ fn memory_demo() -> Result<MemoryDemoReport, Box<dyn std::error::Error>> {
 }
 
 #[derive(Debug, Serialize)]
+struct LearningDemoReport {
+    output: String,
+    directive: LearningDirective,
+}
+
+fn learning_demo(output: &Path) -> Result<LearningDemoReport, Box<dyn std::error::Error>> {
+    let events = memory_demo()?.events;
+    let directive = learning_directive_from_memory("learning-directive-1", &events)
+        .ok_or("memory demo did not produce learning events")?;
+    directive.validate()?;
+
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let report = LearningDemoReport {
+        output: output.display().to_string(),
+        directive,
+    };
+    std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
+    register_artifact("learning-directive-1", output)?;
+    Ok(report)
+}
+
+#[derive(Debug, Serialize)]
 struct AllocatorDemoReport {
     policy: AllocatorPolicyProposal,
     requested_factor_weight: f64,
@@ -770,6 +799,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::MemoryDemo => {
             println!("{}", serde_json::to_string_pretty(&memory_demo()?)?);
+        }
+        Command::LearningDemo { output } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&learning_demo(&output)?)?
+            );
         }
         Command::AllocatorDemo => {
             println!("{}", serde_json::to_string_pretty(&allocator_demo()?)?);

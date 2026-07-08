@@ -15,6 +15,8 @@ pub enum ResearchMemoryError {
     EmptyExplanation,
     #[error("harness change proposal id cannot be empty")]
     EmptyProposalId,
+    #[error("learning directive id cannot be empty")]
+    EmptyDirectiveId,
     #[error("harness changes cannot grant live trading authority")]
     LiveAuthorityChangeDenied,
 }
@@ -99,6 +101,88 @@ impl HarnessChangeProposal {
             return Err(ResearchMemoryError::LiveAuthorityChangeDenied);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LearningAction {
+    RequireAvailableTime,
+    IncreaseSampleFloor,
+    PenalizeCorrelationCluster,
+    RequireApprovalEvidence,
+    LowerLiveSmallRisk,
+    PreferLabOnlyPrototype,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearningDirective {
+    pub directive_id: String,
+    pub source_event_ids: Vec<String>,
+    pub actions: Vec<LearningAction>,
+    pub explanation: String,
+}
+
+impl LearningDirective {
+    pub fn validate(&self) -> Result<(), ResearchMemoryError> {
+        if self.directive_id.trim().is_empty() {
+            return Err(ResearchMemoryError::EmptyDirectiveId);
+        }
+        if self.explanation.trim().is_empty() {
+            return Err(ResearchMemoryError::EmptyExplanation);
+        }
+        Ok(())
+    }
+}
+
+pub fn learning_directive_from_memory(
+    directive_id: impl Into<String>,
+    events: &[ResearchMemoryEvent],
+) -> Option<LearningDirective> {
+    if events.is_empty() {
+        return None;
+    }
+    let mut actions = Vec::new();
+    for event in events {
+        match event.failure_kind {
+            FailureKind::DataUnavailable
+            | FailureKind::DataStale
+            | FailureKind::ManifestMissing => {
+                push_unique(&mut actions, LearningAction::RequireAvailableTime);
+            }
+            FailureKind::InsufficientSample | FailureKind::OverfitDetected => {
+                push_unique(&mut actions, LearningAction::IncreaseSampleFloor);
+            }
+            FailureKind::HighCorrelation => {
+                push_unique(&mut actions, LearningAction::PenalizeCorrelationCluster);
+            }
+            FailureKind::ApprovalRequired => {
+                push_unique(&mut actions, LearningAction::RequireApprovalEvidence);
+            }
+            FailureKind::RiskCapExceeded
+            | FailureKind::RuntimeRejected
+            | FailureKind::SentinelStopped => {
+                push_unique(&mut actions, LearningAction::LowerLiveSmallRisk);
+            }
+            FailureKind::SchemaMismatch
+            | FailureKind::LeakageDetected
+            | FailureKind::GateFailed
+            | FailureKind::RollbackFailed => {
+                push_unique(&mut actions, LearningAction::PreferLabOnlyPrototype);
+            }
+        }
+    }
+
+    Some(LearningDirective {
+        directive_id: directive_id.into(),
+        source_event_ids: events.iter().map(|event| event.event_id.clone()).collect(),
+        explanation: format!("learned from {} memory events", events.len()),
+        actions,
+    })
+}
+
+fn push_unique(actions: &mut Vec<LearningAction>, action: LearningAction) {
+    if !actions.contains(&action) {
+        actions.push(action);
     }
 }
 
@@ -197,5 +281,38 @@ mod tests {
             proposal.validate().unwrap_err(),
             ResearchMemoryError::LiveAuthorityChangeDenied
         );
+    }
+
+    #[test]
+    fn learning_directive_converts_failures_to_next_loop_actions() {
+        let events = vec![
+            ResearchMemoryEvent {
+                event_id: "event-1".to_string(),
+                source: MemorySource::Evaluation,
+                failure_kind: FailureKind::InsufficientSample,
+                related_manifest: None,
+                explanation: "sample too small".to_string(),
+                created_at: Utc::now(),
+            },
+            ResearchMemoryEvent {
+                event_id: "event-2".to_string(),
+                source: MemorySource::PromotionGate,
+                failure_kind: FailureKind::ApprovalRequired,
+                related_manifest: None,
+                explanation: "approval missing".to_string(),
+                created_at: Utc::now(),
+            },
+        ];
+
+        let directive = learning_directive_from_memory("learn-1", &events).unwrap();
+
+        assert_eq!(
+            directive.actions,
+            vec![
+                LearningAction::IncreaseSampleFloor,
+                LearningAction::RequireApprovalEvidence
+            ]
+        );
+        assert_eq!(directive.validate(), Ok(()));
     }
 }
