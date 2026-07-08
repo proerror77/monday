@@ -1,0 +1,20 @@
+[package]
+name = "hft-audit-trail"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+hft-allocator-policy = { path = "../allocator-policy" }
+hft-factor-eval = { path = "../factor-eval" }
+hft-live-small-supervisor = { path = "../live-small-supervisor" }
+hft-promotion-gate = { path = "../promotion-gate" }
+hft-research-memory = { path = "../research-memory" }
+hft-search-protocol = { path = "../search-protocol" }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true, features = ["serde"] }
+hft-factor-dsl = { path = "../factor-dsl" }
+hft-research-manifest = { path = "../manifest" }

@@ -2074,6 +2074,7 @@ dependencies = [
  "clap",
  "hft-allocator-policy",
  "hft-artifact-store",
+ "hft-audit-trail",
  "hft-experiment-store",
  "hft-factor-bank",
  "hft-factor-dsl",
@@ -2115,6 +2116,23 @@ name = "hft-artifact-store"
 version = "0.1.0"
 dependencies = [
  "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hft-audit-trail"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hft-allocator-policy",
+ "hft-factor-dsl",
+ "hft-factor-eval",
+ "hft-live-small-supervisor",
+ "hft-promotion-gate",
+ "hft-research-manifest",
+ "hft-research-memory",
+ "hft-search-protocol",
  "serde",
  "thiserror 2.0.18",
 ]

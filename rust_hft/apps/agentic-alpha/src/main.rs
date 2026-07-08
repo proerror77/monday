@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use hft_allocator_policy::{AllocatorPolicyProposal, FactorAllocation};
 use hft_artifact_store::{ArtifactRecord, ArtifactStore, InMemoryArtifactStore};
+use hft_audit_trail::HarnessAuditBundle;
 use hft_experiment_store::{ExperimentRun, ExperimentStore, InMemoryExperimentStore};
 use hft_factor_bank::{FactorAsset, FactorLineage, FactorMetrics, FactorStatus, FactorType};
 use hft_factor_dsl::{FactorAst, FactorTerminal};
@@ -44,6 +45,8 @@ enum Command {
     MemoryDemo,
     /// Validate an allocator/risk policy proposal without mutating live weights.
     AllocatorDemo,
+    /// Build a validated audit bundle for a local harness loop.
+    AuditDemo,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +120,7 @@ fn contract_bindings() -> Vec<&'static str> {
         std::any::type_name::<hft_prototype_adapter::PrototypeBackend>(),
         std::any::type_name::<hft_research_memory::ResearchMemoryEvent>(),
         std::any::type_name::<hft_allocator_policy::AllocatorPolicyProposal>(),
+        std::any::type_name::<hft_audit_trail::HarnessAuditBundle>(),
     ]
 }
 
@@ -357,6 +361,51 @@ fn allocator_demo() -> Result<AllocatorDemoReport, Box<dyn std::error::Error>> {
     })
 }
 
+fn audit_bundle() -> Result<HarnessAuditBundle, Box<dyn std::error::Error>> {
+    let now = chrono::Utc::now();
+    let ast = FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string()));
+    let search_manifest_id = ManifestId::new("search-demo-1")?;
+    let prototype = StaticPrototypeAdapter::new(known_python_prototypes().remove(0), ast)?;
+    let proposals = prototype.propose(
+        &PrototypeRunRequest {
+            search_manifest_id,
+            max_candidates: 1,
+        },
+        now,
+    )?;
+    let evaluation = evaluate_factor(
+        &EvaluationInput {
+            dataset_manifest: reference("data-demo-1", "data_manifest")?,
+            has_available_time: true,
+            sample_count: 100,
+            metrics: factor_metrics(),
+        },
+        &EvaluationThresholds {
+            min_sample_count: 50,
+            min_rank_ic: 0.03,
+            min_net_sharpe: 1.0,
+            max_drawdown: 0.05,
+            max_correlation: 0.8,
+        },
+        Some(0.2),
+    );
+    let promotion = hft_promotion_gate::PromotionGateDecision {
+        passed: true,
+        failures: vec![],
+    };
+    let bundle = HarnessAuditBundle {
+        bundle_id: "audit-demo-1".to_string(),
+        proposals,
+        evaluation,
+        promotion: promotion.clone(),
+        allocator_policy: allocator_policy()?,
+        live_small: live_small_decision(promotion)?,
+        memory_events: memory_demo()?.events,
+    };
+    bundle.validate()?;
+    Ok(bundle)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.command {
@@ -386,6 +435,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::AllocatorDemo => {
             println!("{}", serde_json::to_string_pretty(&allocator_demo()?)?);
+        }
+        Command::AuditDemo => {
+            println!("{}", serde_json::to_string_pretty(&audit_bundle()?)?);
         }
     }
     Ok(())
