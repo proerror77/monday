@@ -81,6 +81,7 @@ members = [
     "research-core/factor-eval",
     "research-core/manifest",
     "research-core/promotion-gate",
+    "research-core/prototype-adapter",
     "research-core/search-protocol",
 
     # Applications

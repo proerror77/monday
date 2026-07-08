@@ -6,8 +6,10 @@ use hft_factor_dsl::{FactorAst, FactorTerminal};
 use hft_factor_eval::{evaluate_factor, EvaluationInput, EvaluationThresholds};
 use hft_factor_store::{FactorQuery, FactorStore, InMemoryFactorStore};
 use hft_promotion_gate::{evaluate_promotion, PromotionGateInput, TargetStage};
+use hft_prototype_adapter::{
+    known_python_prototypes, PrototypeProposalAdapter, PrototypeRunRequest, StaticPrototypeAdapter,
+};
 use hft_research_manifest::{ArtifactRef, ManifestId, ManifestRef};
-use hft_search_protocol::{ProposalArtifact, SearchEngineKind};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -25,6 +27,8 @@ enum Command {
     Topology,
     /// Run a local in-memory research-to-promotion smoke loop.
     DemoLoop,
+    /// Print the Python prototypes currently wrapped by Rust contracts.
+    PrototypeBackends,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,6 +96,7 @@ fn contract_bindings() -> Vec<&'static str> {
         std::any::type_name::<hft_artifact_store::ArtifactRecord>(),
         std::any::type_name::<hft_experiment_store::ExperimentRun>(),
         std::any::type_name::<hft_promotion_gate::PromotionGateDecision>(),
+        std::any::type_name::<hft_prototype_adapter::PrototypeBackend>(),
     ]
 }
 
@@ -114,23 +119,20 @@ fn demo_loop() -> Result<DemoLoopReport, Box<dyn std::error::Error>> {
     let now = chrono::Utc::now();
     let ast = FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string()));
     let search_manifest_id = ManifestId::new("search-demo-1")?;
-    let proposal = ProposalArtifact {
-        proposal_id: "proposal-demo-1".to_string(),
-        engine: SearchEngineKind::ManualSeed,
-        search_manifest_id: search_manifest_id.clone(),
-        parent_factor_ids: vec![],
-        ast: ast.clone(),
-        mcts_trace: None,
-        parameters: BTreeMap::new(),
-        rationale: Some("manual seed for local harness smoke loop".to_string()),
-        created_at: now,
-    };
+    let prototype = StaticPrototypeAdapter::new(known_python_prototypes().remove(0), ast.clone())?;
+    let proposals = prototype.propose(
+        &PrototypeRunRequest {
+            search_manifest_id: search_manifest_id.clone(),
+            max_candidates: 1,
+        },
+        now,
+    )?;
 
     let mut experiment_store = InMemoryExperimentStore::default();
     experiment_store.put_run(ExperimentRun {
         experiment_id: "experiment-demo-1".to_string(),
         search_manifest_id,
-        proposals: vec![proposal],
+        proposals,
         started_at: now,
         completed_at: Some(now),
     })?;
@@ -230,6 +232,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::DemoLoop => {
             println!("{}", serde_json::to_string_pretty(&demo_loop()?)?);
+        }
+        Command::PrototypeBackends => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&known_python_prototypes())?
+            );
         }
     }
     Ok(())

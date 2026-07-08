@@ -14,6 +14,7 @@ hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-factor-eval = { path = "../../research-core/factor-eval" }
 hft-factor-store = { path = "../../infra-services/core/factor-store" }
 hft-promotion-gate = { path = "../../research-core/promotion-gate" }
+hft-prototype-adapter = { path = "../../research-core/prototype-adapter" }
 hft-research-manifest = { path = "../../research-core/manifest" }
 hft-search-protocol = { path = "../../research-core/search-protocol" }
 serde = { workspace = true, features = ["derive"] }

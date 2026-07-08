@@ -2079,6 +2079,7 @@ dependencies = [
  "hft-factor-eval",
  "hft-factor-store",
  "hft-promotion-gate",
+ "hft-prototype-adapter",
  "hft-research-manifest",
  "hft-search-protocol",
  "serde",
@@ -3022,6 +3023,18 @@ dependencies = [
  "hft-factor-bank",
  "hft-factor-dsl",
  "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hft-prototype-adapter"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hft-factor-dsl",
+ "hft-research-manifest",
+ "hft-search-protocol",
  "serde",
  "thiserror 2.0.18",
 ]
