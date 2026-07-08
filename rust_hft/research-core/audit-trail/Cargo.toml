@@ -12,6 +12,7 @@ hft-promotion-gate = { path = "../promotion-gate" }
 hft-research-memory = { path = "../research-memory" }
 hft-search-protocol = { path = "../search-protocol" }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

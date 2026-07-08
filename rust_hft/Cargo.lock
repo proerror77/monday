@@ -2134,6 +2134,7 @@ dependencies = [
  "hft-research-memory",
  "hft-search-protocol",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

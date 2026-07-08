@@ -63,6 +63,10 @@ impl HarnessAuditBundle {
     }
 }
 
+pub fn audit_bundle_json(bundle: &HarnessAuditBundle) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(bundle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +142,12 @@ mod tests {
             bundle.validate().unwrap_err(),
             AuditTrailError::EvaluationFailedForLiveRollout
         );
+    }
+
+    #[test]
+    fn serializes_bundle_json() {
+        let json = audit_bundle_json(&bundle()).unwrap();
+
+        assert!(json.contains("\"bundle_id\": \"audit-1\""));
     }
 }

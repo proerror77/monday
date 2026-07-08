@@ -22,6 +22,7 @@ use hft_research_memory::{
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "hft-agentic-alpha")]
@@ -47,6 +48,8 @@ enum Command {
     AllocatorDemo,
     /// Build a validated audit bundle for a local harness loop.
     AuditDemo,
+    /// Export a validated audit bundle to a JSON file.
+    ExportAudit { output: PathBuf },
 }
 
 #[derive(Debug, Serialize)]
@@ -406,6 +409,18 @@ fn audit_bundle() -> Result<HarnessAuditBundle, Box<dyn std::error::Error>> {
     Ok(bundle)
 }
 
+fn export_audit(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let bundle = audit_bundle()?;
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(output, hft_audit_trail::audit_bundle_json(&bundle)?)?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.command {
@@ -438,6 +453,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::AuditDemo => {
             println!("{}", serde_json::to_string_pretty(&audit_bundle()?)?);
+        }
+        Command::ExportAudit { output } => {
+            export_audit(&output)?;
+            println!("{}", output.display());
         }
     }
     Ok(())
