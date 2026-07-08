@@ -37,14 +37,14 @@ Agentic research stays outside hot runtime crates. LLM, RL, MCTS, GP, QD, Bayesi
 - `research-core/allocator-policy`: proposed allocation weights checked against hard caps.
 - `research-core/audit-trail`: validated harness audit bundles.
 - `infra-services/core/{artifact-store,experiment-store,factor-store}`: typed in-memory and file-backed stores.
-- `apps/agentic-alpha`: local CLI readback for topology, prototypes, replay evaluation, learning, audit, stores, and exchange/on-chain connectivity smoke.
+- `apps/agentic-alpha`: local CLI readback for topology, prototypes, replay evaluation, learning, audit, stores, connectivity smoke, and approval-gated Binance order binding.
 
 ## Not Implemented Yet
 
 - Real ClickHouse-backed research stores.
 - Real full-domain data wiring into manifests.
 - Production MCTS/RL/LLM engines with real model/tool execution.
-- Binding approved live-small runtime commands to credentialed production order adapters.
+- Binding approved live-small runtime commands to non-Binance production order adapters.
 - Full Python retirement.
 
 ## Validation Rule

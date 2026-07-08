@@ -65,6 +65,7 @@ cargo run -p hft-agentic-alpha -- replay-eval target/agentic-alpha/replay.csv ta
 cargo run -p hft-agentic-alpha -- learning-demo target/agentic-alpha/learning.json
 cargo run -p hft-agentic-alpha -- live-command-demo target/agentic-alpha/live-command.json
 cargo run -p hft-agentic-alpha -- live-command-demo target/agentic-alpha/armed-live-command.json --approval-ref approval-demo-1
+cargo run -p hft-agentic-alpha -- binance-order target/agentic-alpha/armed-live-command.json target/agentic-alpha/binance-order-paper.json --mode paper --symbol BTCUSDT --side buy --quantity 0.001 --price 1 --order-type limit
 cargo run -p hft-agentic-alpha -- connectivity-smoke target/agentic-alpha/connectivity-smoke.json --evm-rpc-url https://ethereum-rpc.publicnode.com
 cargo run -p hft-agentic-alpha -- python-retirement-demo
 cargo run -p hft-agentic-alpha -- export-audit target/agentic-alpha/audit-demo.json
@@ -75,5 +76,5 @@ cargo run -p hft-agentic-alpha -- export-audit target/agentic-alpha/audit-demo.j
 - Real ClickHouse-backed research stores.
 - Real full-domain data manifests.
 - Production MCTS/RL/LLM engines with real model/tool execution.
-- Binding approved live-small runtime commands to credentialed production order adapters.
+- Binding approved live-small runtime commands to non-Binance production order adapters.
 - Broad Python removal.

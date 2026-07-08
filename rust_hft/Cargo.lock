@@ -2075,13 +2075,17 @@ dependencies = [
  "hft-allocator-policy",
  "hft-artifact-store",
  "hft-audit-trail",
+ "hft-core",
+ "hft-execution-adapter-binance",
  "hft-experiment-store",
  "hft-factor-bank",
  "hft-factor-dsl",
  "hft-factor-eval",
  "hft-factor-store",
+ "hft-integration",
  "hft-live-small-supervisor",
  "hft-loop-engine",
+ "hft-ports",
  "hft-promotion-gate",
  "hft-prototype-adapter",
  "hft-research-manifest",
@@ -2090,6 +2094,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
