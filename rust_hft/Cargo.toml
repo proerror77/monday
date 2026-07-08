@@ -75,6 +75,7 @@ members = [
     # Research Core
     "research-core/factor-dsl",
     "research-core/manifest",
+    "research-core/search-protocol",
 
     # Applications
     "apps/live",
