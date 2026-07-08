@@ -74,6 +74,7 @@ members = [
 
     # Research Core
     "research-core/factor-dsl",
+    "research-core/factor-bank",
     "research-core/manifest",
     "research-core/search-protocol",
 

@@ -2663,6 +2663,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-factor-bank"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hft-factor-dsl",
+ "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hft-factor-dsl"
 version = "0.1.0"
 dependencies = [
