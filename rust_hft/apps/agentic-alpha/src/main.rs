@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use hft_allocator_policy::{AllocatorPolicyProposal, FactorAllocation};
-use hft_artifact_store::{ArtifactRecord, ArtifactStore, InMemoryArtifactStore};
+use hft_artifact_store::{ArtifactRecord, ArtifactStore, FileArtifactStore, InMemoryArtifactStore};
 use hft_audit_trail::HarnessAuditBundle;
 use hft_experiment_store::{ExperimentRun, ExperimentStore, InMemoryExperimentStore};
 use hft_factor_bank::{FactorAsset, FactorLineage, FactorMetrics, FactorStatus, FactorType};
@@ -409,16 +409,43 @@ fn audit_bundle() -> Result<HarnessAuditBundle, Box<dyn std::error::Error>> {
     Ok(bundle)
 }
 
-fn export_audit(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug, Serialize)]
+struct ExportAuditReport {
+    output: String,
+    artifact_index: String,
+    registered_artifacts: usize,
+}
+
+fn export_audit(output: &Path) -> Result<ExportAuditReport, Box<dyn std::error::Error>> {
     let bundle = audit_bundle()?;
-    if let Some(parent) = output
+    let parent = output
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(output, hft_audit_trail::audit_bundle_json(&bundle)?)?;
-    Ok(())
+
+    let manifest_id = ManifestId::new(bundle.bundle_id)?;
+    let index_root = parent
+        .map(|parent| parent.join("artifact-index"))
+        .unwrap_or_else(|| PathBuf::from("artifact-index"));
+    let mut artifact_store = FileArtifactStore::new(index_root);
+    artifact_store.put_artifact(ArtifactRecord {
+        manifest_id: manifest_id.clone(),
+        artifact: ArtifactRef {
+            uri: output.to_string_lossy().to_string(),
+            content_type: "application/json".to_string(),
+            checksum: None,
+        },
+    })?;
+    let registered_artifacts = artifact_store.get_artifacts(&manifest_id)?.len();
+
+    Ok(ExportAuditReport {
+        output: output.display().to_string(),
+        artifact_index: artifact_store.root().display().to_string(),
+        registered_artifacts,
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -455,8 +482,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&audit_bundle()?)?);
         }
         Command::ExportAudit { output } => {
-            export_audit(&output)?;
-            println!("{}", output.display());
+            println!("{}", serde_json::to_string_pretty(&export_audit(&output)?)?);
         }
     }
     Ok(())
