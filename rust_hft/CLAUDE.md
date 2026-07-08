@@ -1,429 +1,63 @@
-# HFT 系統狀態與設計總覽 (CLAUDE.md)
+# Agentic Alpha Harness Status
 
-**版本**: 7.0 (2025-12-16)
-**狀態**: 🟢 **Rust-Centric 閉環架構完成，LLM Ops Agent 已整合**
+**Status**: Rust-first agentic alpha harness skeleton is implemented. It is not a full autonomous live-trading system.
 
----
+## Current Direction
 
-## 1. Executive Summary
+The project direction is no longer a Python control-plane HFT system. The durable architecture is:
 
-系統已完成從「Python 多服務架構」到「Rust-Centric 閉環架構」的重構。
-
-**核心變更**:
-- ❌ 移除 `control_ws` (Python 控制工作區)
-- ✅ 新增 `Sentinel` (Rust 自動化風控哨兵)
-- ✅ 新增 `ModelManager` (Rust 模型熱加載)
-- ✅ 新增真實延遲統計 (p50/p95/p99)
-- ✅ 新增 PnL/DD 回撤追蹤整合 Sentinel
-- ✅ 新增 `HFT Ops Agent` (LLM 驅動的自動化運維代理)
-
-**新架構優勢**:
-- **微秒級響應**: Sentinel 完全在 Rust 內執行，無 Python/gRPC 延遲
-- **文件系統通訊**: 模型通過文件系統熱加載，取代複雜的 Redis Pub/Sub
-- **簡化部署**: 單一 Rust 二進制 + 定時訓練任務
-- **完整可觀測性**: 延遲分階段統計、回撤追蹤、uptime 監控
-- **智能運維**: LLM Agent 自動監控、異常處理、策略管理
-
----
-
-## 2. 系統架構
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Rust HFT 核心引擎                         │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────────┐  │
-│  │  數據接入 │→│  訂單簿   │→│  策略執行 │→│   執行網關   │  │
-│  │ (WS/REST)│  │ (Engine) │  │(Strategy)│  │(Execution) │  │
-│  └──────────┘  └──────────┘  └──────────┘  └─────────────┘  │
-│       ↓              ↓             ↓              ↓         │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │              Sentinel (自動化風控)                    │   │
-│  │  • 延遲監控 (latency_guard) - p50/p95/p99            │   │
-│  │  • 回撤監控 (dd_guard) - 實時 PnL/DD 追蹤            │   │
-│  │  • 自動 Degrade/Stop/EmergencyExit                   │   │
-│  └──────────────────────────────────────────────────────┘   │
-│       ↓                                                     │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │           ModelManager (模型熱加載)                   │   │
-│  │  • 監控 models/current/ 目錄                         │   │
-│  │  • 自動加載 .pt/.onnx 模型                           │   │
-│  │  • 版本管理和回滾                                    │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                              ↑
-                    (文件系統熱加載)
-                              ↑
-┌─────────────────────────────────────────────────────────────┐
-│                 ml_trainer (定時訓練)                        │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  ClickHouse → 特徵工程 → LSTM+Attention → 評估 → 部署  │   │
-│  │                                                      │   │
-│  │  部署條件: IC ≥ 0.03 ∧ IR ≥ 1.2 ∧ MaxDD ≤ 5%         │   │
-│  │  輸出: models/current/strategy_dl.pt                 │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                              ↑
-                     (每日批次查詢)
-                              ↑
-┌─────────────────────────────────────────────────────────────┐
-│                    ClickHouse (數據存儲)                     │
-│  • spot_books15: 訂單簿快照                                 │
-│  • spot_trades: 成交記錄                                    │
-│  • hft_features_*: 39維本地訂單簿特徵                       │
-└─────────────────────────────────────────────────────────────┘
+```text
+prototype engines / agents
+  -> proposal artifacts
+  -> replay/evaluation gates
+  -> Factor Bank
+  -> promotion gates
+  -> live-small supervision
+  -> audit artifacts
+  -> research memory / learning directives
 ```
 
----
+Agentic research stays outside hot runtime crates. LLM, RL, MCTS, GP, QD, Bayesian, and Python prototype outputs must enter through proposal artifacts and deterministic gates.
 
-## 3. 核心模組狀態
+## Implemented Harness Boundaries
 
-| 模組 | 路徑 | 狀態 | 說明 |
-|------|------|------|------|
-| **Sentinel** | `risk-control/risk/src/sentinel.rs` | ✅ 完成 | Rust 自動化風控，取代 Python control_ws |
-| **ModelManager** | `infra-services/core/model-manager/` | ✅ 完成 | 模型目錄監控、熱加載、版本管理 |
-| **Live App 整合** | `apps/live/src/helpers/` | ✅ 完成 | Sentinel + ModelManager 已整合 |
-| **延遲統計** | `market-core/engine/src/lib.rs` | ✅ 完成 | EngineLatencyStats (p50/p95/p99) |
-| **回撤追蹤** | `risk-control/portfolio-core/src/lib.rs` | ✅ 完成 | AccountView 整合 high_water_mark/drawdown |
-| **HFT Ops Agent** | `tools/hft-agent/` | ✅ 完成 | LLM 驅動的自動化運維代理 (Claude API) |
-| **ml_trainer** | `ml_trainer/` | ✅ 完成 | 精簡訓練腳本，支持 ClickHouse 和合成數據 |
-| **Docker 部署** | `deploy/docker-compose.yml` | ✅ 完成 | ClickHouse + 可選 Redis |
+- `research-core/manifest`: reproducible manifests.
+- `research-core/factor-dsl`: canonical factor AST.
+- `research-core/search-protocol`: proposal artifacts and MCTS trace validation.
+- `research-core/factor-bank`: auditable factor assets and MVP execution status rules.
+- `research-core/factor-eval`: deterministic metric gates plus local replay CSV evaluation.
+- `research-core/promotion-gate`: paper/shadow/live-small promotion checks.
+- `research-core/live-small-supervisor`: live-small rollout and rollback decisions.
+- `research-core/prototype-adapter`: lab-only wrappers for Python/RL/BBO/signal/exit prototypes.
+- `research-core/research-memory`: structured failures and learning directives.
+- `research-core/loop-engine`: turn/goal/time/event loop state and stop decisions.
+- `research-core/allocator-policy`: proposed allocation weights checked against hard caps.
+- `research-core/audit-trail`: validated harness audit bundles.
+- `infra-services/core/{artifact-store,experiment-store,factor-store}`: typed in-memory and file-backed stores.
+- `apps/agentic-alpha`: local CLI readback for topology, prototypes, replay evaluation, learning, audit, and stores.
 
----
+## Not Implemented Yet
 
-## 4. 最新實現功能
+- Real ClickHouse-backed research stores.
+- Real full-domain data wiring into manifests.
+- Production MCTS/RL/LLM engines.
+- Autonomous live-small runtime actuation.
+- Full Python retirement.
 
-### 4.1. 延遲統計 (EngineLatencyStats)
+## Validation Rule
 
-```rust
-pub struct EngineLatencyStats {
-    pub end_to_end_p50_us: u64,
-    pub end_to_end_p95_us: u64,
-    pub end_to_end_p99_us: u64,
-    pub ingestion_p99_us: u64,
-    pub aggregation_p99_us: u64,
-    pub strategy_p99_us: u64,
-    pub risk_p99_us: u64,
-    pub execution_p99_us: u64,
-    pub sample_count: u64,
-}
-```
-
-### 4.2. Sentinel 統計 (SentinelStats)
-
-```rust
-pub struct SentinelStats {
-    pub latency_p99_us: u64,
-    pub latency_p50_us: u64,
-    pub pnl: f64,
-    pub unrealized_pnl: f64,
-    pub drawdown_pct: f64,
-    pub max_drawdown_pct: f64,
-    pub high_water_mark: f64,
-}
-```
-
-### 4.3. 回撤追蹤 (AccountView)
-
-```rust
-pub struct AccountView {
-    pub cash_balance: Decimal,
-    pub positions: HashMap<Symbol, Position>,
-    pub unrealized_pnl: Decimal,
-    pub realized_pnl: Decimal,
-    pub high_water_mark: Decimal,      // 新增
-    pub drawdown_pct: f64,             // 新增
-    pub max_drawdown_pct: f64,         // 新增
-    pub session_start_us: u64,         // 新增
-}
-```
-
-### 4.4. HFT Ops Agent (LLM 驅動的運維代理)
-
-```rust
-pub struct HftOpsAgent {
-    config: AgentConfig,              // 配置
-    http_client: Client,              // Anthropic API 客戶端
-    grpc_client: Arc<Mutex<HftClient>>, // gRPC 控制客戶端
-    tools: Vec<Tool>,                 // 可用工具列表
-    system_prompt: String,            // 系統提示詞
-}
-```
-
-**可用工具 (Tools)**:
-| 工具 | 說明 |
-|------|------|
-| `get_system_status` | 獲取系統狀態 (延遲、訂單、連接) |
-| `get_portfolio_status` | 獲取組合狀態 (PnL、DD、持倉) |
-| `health_check` | 組件健康檢查 |
-| `pause_trading` | 暫停交易 |
-| `resume_trading` | 恢復交易 |
-| `enter_degrade_mode` | 進入降頻模式 |
-| `emergency_stop` | 緊急停止 + 可選平倉 |
-| `cancel_all_orders` | 取消所有訂單 |
-| `update_risk_config` | 更新風控參數 |
-| `load_model` | 加載新 ML 模型 |
-| `send_alert` | 發送告警通知 |
-| `log_decision` | 記錄決策日誌 |
-
-**決策規則**:
-- 延遲 p99 > 25ms → 進入 DEGRADE 模式
-- 延遲 p99 > 50ms → PAUSE 交易
-- 回撤 > 3% → 發送 WARNING 告警
-- 回撤 > 5% → 進入 DEGRADE 模式
-- 回撤 > 7% → EMERGENCY STOP + 平倉
-- WebSocket 重連 > 5 次 → 發送告警
-
----
-
-## 5. 閉環流程
-
-### 5.1. 訓練流程 (Cron Job)
+Do not compile the whole workspace for ordinary harness changes. Use focused lanes:
 
 ```bash
-# 每日凌晨 2:00 執行
-0 2 * * * cd /opt/hft && python ml_trainer/train.py >> /var/log/hft-trainer.log 2>&1
+cargo test -p hft-factor-eval --locked
+cargo test -p hft-prototype-adapter --locked
+cargo test -p hft-research-memory --locked
+cargo check -p hft-agentic-alpha -p hft-factorctl -p hft-harnessctl --locked
 ```
 
-1. 從 ClickHouse 加載 T-7 日數據
-2. 計算 39 維本地訂單簿特徵
-3. 訓練 LSTM+Attention 模型
-4. 評估 IC/IR/Sharpe/MaxDD
-5. 達標後部署到 `models/current/strategy_dl.pt`
-6. 更新 `models/metadata.json`
-
-### 5.2. 熱加載流程 (Real-time)
-
-1. `ModelWatcher` 監控 `models/current/` 目錄
-2. 檢測到新 `.pt` 或 `.onnx` 文件
-3. 驗證版本號
-4. 加載到 ONNX Runtime / tch-rs
-5. 原子切換模型引用
-
-### 5.3. 風控流程 (100ms 間隔)
-
-1. `Sentinel` 每 100ms 檢查系統狀態
-2. 從 Engine 獲取 `SentinelStats` (延遲 + PnL/DD)
-3. 根據閾值觸發動作:
-   - `Continue`: 正常運行
-   - `Warn`: 記錄警告
-   - `Degrade`: 降頻模式 (減少交易頻率)
-   - `Stop`: 停止交易
-   - `EmergencyExit`: 緊急平倉
-
----
-
-## 6. 配置參數
-
-### 6.1. Sentinel 配置
-
-```rust
-SentinelConfig {
-    // 延遲閾值 (microseconds)
-    latency_warn_us: 15_000,      // 15ms 警告
-    latency_degrade_us: 25_000,   // 25ms 降頻
-    latency_stop_us: 50_000,      // 50ms 停止
-
-    // 回撤閾值 (百分比)
-    drawdown_warn_pct: 2.0,       // 2% 警告
-    drawdown_degrade_pct: 3.0,    // 3% 降頻
-    drawdown_stop_pct: 5.0,       // 5% 停止
-    drawdown_emergency_pct: 7.0,  // 7% 緊急平倉
-
-    // 恢復條件
-    recovery_latency_below_us: 10_000,
-    recovery_cooldown_secs: 300,
-}
-```
-
-### 6.2. 模型部署條件
-
-```yaml
-deployment:
-  min_ic: 0.03        # 最小 Information Coefficient
-  min_ir: 1.2         # 最小 Information Ratio
-  max_drawdown: 0.05  # 最大回撤 5%
-```
-
-### 6.3. Live App 命令行參數
+For broader harness changes:
 
 ```bash
-cargo run -p hft-live -- \
-  --sentinel-enable=true \
-  --sentinel-interval-ms=100 \
-  --sentinel-latency-warn-us=15000 \
-  --sentinel-drawdown-stop-pct=5.0 \
-  --ml-enable=true \
-  --ml-model=models/current/strategy_dl.onnx
+cargo test -p hft-research-manifest -p hft-factor-dsl -p hft-search-protocol -p hft-factor-bank -p hft-promotion-gate -p hft-factor-eval -p hft-prototype-adapter -p hft-live-small-supervisor -p hft-loop-engine -p hft-research-memory -p hft-allocator-policy -p hft-audit-trail -p hft-artifact-store -p hft-experiment-store -p hft-factor-store --locked
+cargo check -p hft-agentic-alpha -p hft-factorctl -p hft-harnessctl --locked
 ```
-
----
-
-## 7. 目錄結構
-
-```
-monday/
-├── rust_hft/                          # Rust HFT 核心
-│   ├── apps/live/                     # 真盤應用
-│   │   └── src/helpers/
-│   │       ├── inference.rs           # ONNX 推理 + 熱加載
-│   │       ├── sentinel.rs            # Sentinel 整合
-│   │       └── metrics.rs             # Prometheus 指標
-│   ├── market-core/engine/
-│   │   └── src/lib.rs                 # EngineLatencyStats, SentinelStats
-│   ├── risk-control/
-│   │   ├── risk/src/sentinel.rs       # Sentinel 核心邏輯
-│   │   └── portfolio-core/src/lib.rs  # 回撤追蹤
-│   ├── infra-services/core/
-│   │   └── model-manager/             # 模型熱加載管理
-│   └── tools/hft-agent/               # LLM Ops Agent
-│       ├── src/
-│       │   ├── main.rs                # 入口點
-│       │   ├── lib.rs                 # 庫導出
-│       │   ├── agent.rs               # Agent 核心邏輯
-│       │   ├── config.rs              # 配置管理
-│       │   ├── grpc_client.rs         # gRPC 客戶端
-│       │   └── tools/mod.rs           # Tool 定義
-│       └── Cargo.toml
-│
-├── ml_trainer/                        # Python 訓練腳本
-│   ├── train.py                       # 主訓練腳本
-│   ├── config.yaml                    # 配置文件
-│   ├── test_e2e.py                    # 端到端測試
-│   └── requirements.txt               # 依賴
-│
-├── models/                            # 模型目錄
-│   ├── current/                       # 當前使用的模型
-│   │   └── strategy_dl.pt
-│   ├── archive/                       # 歷史版本
-│   └── metadata.json                  # 模型元數據
-│
-└── deploy/
-    └── docker-compose.yml             # 部署配置
-```
-
----
-
-## 8. 運維指南
-
-### 8.1. 啟動流程
-
-```bash
-# 1. 啟動基礎設施
-cd deploy && docker compose up -d clickhouse
-
-# 2. 編譯並啟動 Rust 核心
-cd rust_hft && cargo run -p hft-live --release
-
-# 3. 設置定時訓練
-crontab -e
-# 添加: 0 2 * * * cd /opt/hft && python ml_trainer/train.py
-```
-
-### 8.2. 手動訓練
-
-```bash
-cd ml_trainer
-source .venv/bin/activate
-python train.py --dry-run  # 測試模式
-python train.py            # 正式訓練
-```
-
-### 8.3. 模型回滾
-
-```bash
-# 查看歷史版本
-ls models/archive/
-
-# 手動回滾
-cp models/archive/strategy_dl_20251213_100000.pt models/current/strategy_dl.pt
-```
-
-### 8.4. HFT Ops Agent
-
-```bash
-# 設置 API Key
-export ANTHROPIC_API_KEY="sk-ant-..."
-
-# 啟動 Agent (需要先啟動 hft-live)
-cargo run -p hft-agent -- --config config/agent.toml
-
-# 測試模式 (不執行實際操作)
-cargo run -p hft-agent -- --dry-run
-
-# 單次監控 (執行一輪後退出)
-cargo run -p hft-agent -- --once
-
-# 自定義監控間隔
-cargo run -p hft-agent -- --interval 30
-```
-
-**配置文件**: `config/agent.toml`
-
-```toml
-[anthropic]
-model = "claude-sonnet-4-20250514"
-max_tokens = 4096
-
-[grpc]
-address = "http://127.0.0.1:50051"
-
-[agent]
-monitor_interval_secs = 60
-auto_handle_anomalies = true
-dry_run = false
-
-[agent.thresholds]
-latency_p99_us = 25000
-drawdown_warn_pct = 3.0
-drawdown_critical_pct = 5.0
-
-[alerts]
-enabled = true
-# webhook_url = "https://hooks.slack.com/..."
-```
-
----
-
-## 9. 測試狀態
-
-| 測試 | 狀態 | 說明 |
-|------|------|------|
-| Sentinel 單元測試 | ✅ 5/5 通過 | `cargo test -p hft-risk sentinel` |
-| ModelManager 單元測試 | ✅ 3/3 通過 | `cargo test -p hft-model-manager` |
-| HFT Ops Agent 測試 | ✅ 7/7 通過 | `cargo test -p hft-agent` |
-| ml_trainer dry-run | ✅ 通過 | 使用合成數據測試 |
-| E2E 測試 | ✅ 通過 | 訓練→部署→驗證完整流程 |
-| Release Build | ✅ 通過 | `cargo build -p hft-live --release` |
-| Clippy 檢查 | ✅ 0 警告 | `cargo clippy --workspace` |
-
----
-
-## 10. 代碼質量
-
-### 10.1. 已完成優化
-
-- ✅ 所有 clippy 警告已修復
-- ✅ unsafe 函數添加 Safety 文檔
-- ✅ 複雜類型使用 type alias 簡化
-- ✅ 適當使用 derive macros
-- ✅ WebSocket 常量集中管理
-
-### 10.2. 剩餘 TODO 項目
-
-| 類別 | 數量 | 說明 |
-|------|------|------|
-| Phase 2 功能 | 3 | secrets 後端 (Vault/AWS/Local) |
-| 測試框架 | 15 | adapter 和 e2e 測試存根 |
-| IPC 處理器 | 10 | 系統控制命令 (DefaultHandler) |
-| gRPC 服務 | 2 | 模型加載和風控更新 |
-
----
-
-## 11. 下一步計劃
-
-1. ~~**gRPC 模型加載**: 實現下載、驗證、加載完整流程~~ ✅ 已完成
-2. ~~**風控參數動態更新**: 添加 RiskManager trait 方法~~ ✅ 已完成
-3. ~~**HFT Ops Agent**: LLM 驅動的自動化運維~~ ✅ 已完成
-4. **測試覆蓋**: 完善 adapter 和 e2e 測試
-5. **ONNX 推理優化**: GPU 加速支持
-6. **生產部署**: K8s Helm Chart

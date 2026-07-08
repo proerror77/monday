@@ -793,17 +793,18 @@ Full workspace validation is reserved for:
 
 ### Phase 2: Wrap Existing Prototypes
 
-- Wrap existing LOB alpha search as a proposal backend.
-- Wrap OHLCV alpha generator as a proposal backend.
-- Wrap BBO as parameter optimizer backend.
-- Wrap RL stub as lab-only generator.
-- Store outputs as proposal artifacts and Factor Bank records.
+- Done locally: wrap existing LOB alpha search as a proposal backend.
+- Done locally: wrap OHLCV alpha generator as a proposal backend.
+- Done locally: wrap BBO as parameter optimizer backend.
+- Done locally: wrap RL stub as lab-only generator.
+- Done locally: wrap signal aggregator and smart exit manager as lab-only proposal backends.
+- Done locally: store prototype outputs as proposal artifacts in a file-backed experiment log.
 
 ### Phase 3: Evaluation and Manifested Replay
 
-- Add point-in-time evaluator flow.
+- Done locally: add replay CSV evaluator flow over manifested sample columns.
 - Add walk-forward and leakage gates.
-- Add replay fixture runner.
+- Done locally: add replay fixture runner through `hft-agentic-alpha replay-eval`.
 - Add factor and policy evaluation manifests.
 
 ### Phase 4: Trading Harness and Live-Small Gate
