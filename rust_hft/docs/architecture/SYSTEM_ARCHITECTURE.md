@@ -51,7 +51,7 @@ Current Python prototypes are wrapped as lab-only backends:
 
 They may generate proposal artifacts. They may not write directly to Factor Bank, mutate live weights, or trade.
 
-`python-retirement-demo` reports the current replacement queue. Each prototype stays `wrapped_lab_only` until a Rust parity fixture exists.
+`python-retirement-demo` reports the current replacement queue. The local harness no longer requires Python execution; existing Python files remain parity references until production engines replace them.
 
 ## Current Local Loop
 
@@ -64,6 +64,7 @@ cargo run -p hft-agentic-alpha -- prototype-lab-demo target/agentic-alpha/protot
 cargo run -p hft-agentic-alpha -- replay-eval target/agentic-alpha/replay.csv target/agentic-alpha/replay-factors.json target/agentic-alpha/replay-report.json
 cargo run -p hft-agentic-alpha -- learning-demo target/agentic-alpha/learning.json
 cargo run -p hft-agentic-alpha -- live-command-demo target/agentic-alpha/live-command.json
+cargo run -p hft-agentic-alpha -- live-command-demo target/agentic-alpha/armed-live-command.json --approval-ref approval-demo-1
 cargo run -p hft-agentic-alpha -- python-retirement-demo
 cargo run -p hft-agentic-alpha -- export-audit target/agentic-alpha/audit-demo.json
 ```
@@ -73,5 +74,5 @@ cargo run -p hft-agentic-alpha -- export-audit target/agentic-alpha/audit-demo.j
 - Real ClickHouse-backed research stores.
 - Real full-domain data manifests.
 - Production MCTS/RL/LLM engines with real model/tool execution.
-- Non-dry-run live runtime actuation.
+- Exchange adapter execution of approved live-small runtime commands.
 - Broad Python removal.

@@ -13,8 +13,9 @@ use hft_factor_eval::{
 };
 use hft_factor_store::{FactorQuery, FactorStore, FileFactorStore, InMemoryFactorStore};
 use hft_live_small_supervisor::{
-    rollback, runtime_command_from_decision, supervise_rollout, LiveSmallAction, LiveSmallDecision,
-    LiveSmallPolicyLimits, LiveSmallRolloutRequest, LiveSmallRuntimeCommand, RollbackTrigger,
+    arm_runtime_command, rollback, runtime_command_from_decision, supervise_rollout,
+    LiveSmallAction, LiveSmallDecision, LiveSmallPolicyLimits, LiveSmallRolloutRequest,
+    LiveSmallRuntimeCommand, RollbackTrigger,
 };
 use hft_loop_engine::{
     evaluate_loop_run, CandidateLoopEvidence, DoneCondition, LoopNextAction, LoopRun,
@@ -69,8 +70,12 @@ enum Command {
     LoopEngineDemo,
     /// Run budgeted MCTS/RL/LLM proposal loops without real data.
     EngineLoopDemo { output: PathBuf },
-    /// Emit a dry-run live-small runtime command.
-    LiveCommandDemo { output: PathBuf },
+    /// Emit a live-small runtime command. Non-dry-run requires --approval-ref.
+    LiveCommandDemo {
+        output: PathBuf,
+        #[arg(long)]
+        approval_ref: Option<String>,
+    },
     /// Persist a generated factor candidate into a file-backed candidate pool.
     FactorPoolDemo { output: PathBuf },
     /// Persist a prototype-backed experiment run into a file-backed log.
@@ -479,16 +484,25 @@ struct LiveCommandDemoReport {
     command: LiveSmallRuntimeCommand,
 }
 
-fn live_command_demo(output: &Path) -> Result<LiveCommandDemoReport, Box<dyn std::error::Error>> {
+fn live_command_demo(
+    output: &Path,
+    approval_ref: Option<&str>,
+) -> Result<LiveCommandDemoReport, Box<dyn std::error::Error>> {
     let promotion = hft_promotion_gate::PromotionGateDecision {
         passed: true,
         failures: vec![],
     };
     let rollout_manifest = live_rollout_manifest()?;
     let decision = live_small_decision(promotion)?;
-    let command =
+    let mut command =
         runtime_command_from_decision("live-small-command-1", rollout_manifest, &decision)
             .ok_or("live-small decision did not produce runtime command")?;
+    if let Some(approval_ref) = approval_ref {
+        command = arm_runtime_command(
+            command,
+            ManifestRef::new(ManifestId::new(approval_ref)?, "human_approval")?,
+        )?;
+    }
     command.validate()?;
     if let Some(parent) = output
         .parent()
@@ -511,6 +525,7 @@ struct PythonRetirementRecord {
     kind: PrototypeBackendKind,
     source_path: String,
     current_status: &'static str,
+    python_required_for_harness: bool,
     next_step: &'static str,
 }
 
@@ -521,8 +536,9 @@ fn python_retirement_demo() -> Vec<PythonRetirementRecord> {
             backend_id: backend.backend_id,
             kind: backend.kind,
             source_path: backend.source_path,
-            current_status: "wrapped_lab_only",
-            next_step: "add Rust parity fixture before replacing",
+            current_status: "replaced_by_rust_harness_contract",
+            python_required_for_harness: false,
+            next_step: "keep source as parity reference until production engine exists",
         })
         .collect()
 }
@@ -987,10 +1003,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::to_string_pretty(&engine_loop_demo(&output)?)?
             );
         }
-        Command::LiveCommandDemo { output } => {
+        Command::LiveCommandDemo {
+            output,
+            approval_ref,
+        } => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&live_command_demo(&output)?)?
+                serde_json::to_string_pretty(&live_command_demo(
+                    &output,
+                    approval_ref.as_deref()
+                )?)?
             );
         }
         Command::FactorPoolDemo { output } => {

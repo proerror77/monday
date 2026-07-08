@@ -32,7 +32,7 @@ Agentic research stays outside hot runtime crates. LLM, RL, MCTS, GP, QD, Bayesi
 - `research-core/research-memory`: structured failures and learning directives.
 - `research-core/loop-engine`: turn/goal/time/event loop state and stop decisions.
 - `research-core/search-protocol`: budgeted lab search runs for MCTS/RL/LLM proposal generation.
-- `research-core/live-small-supervisor`: dry-run runtime command boundary for live-small staging/rollback.
+- `research-core/live-small-supervisor`: dry-run and approval-gated non-dry-run runtime command boundary for live-small staging/rollback.
 - `research-core/allocator-policy`: proposed allocation weights checked against hard caps.
 - `research-core/audit-trail`: validated harness audit bundles.
 - `infra-services/core/{artifact-store,experiment-store,factor-store}`: typed in-memory and file-backed stores.
@@ -43,7 +43,7 @@ Agentic research stays outside hot runtime crates. LLM, RL, MCTS, GP, QD, Bayesi
 - Real ClickHouse-backed research stores.
 - Real full-domain data wiring into manifests.
 - Production MCTS/RL/LLM engines with real model/tool execution.
-- Non-dry-run live-small runtime actuation.
+- Exchange adapter execution of approved live-small runtime commands.
 - Full Python retirement.
 
 ## Validation Rule

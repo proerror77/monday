@@ -4,7 +4,7 @@
 //! policy limits into a rollout/rollback decision for the runtime boundary.
 
 use hft_promotion_gate::PromotionGateDecision;
-use hft_research_manifest::{LiveRolloutManifest, ManifestError};
+use hft_research_manifest::{LiveRolloutManifest, ManifestError, ManifestRef};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -18,8 +18,8 @@ pub enum LiveSmallSupervisorError {
     InvalidRiskCap,
     #[error("runtime command id cannot be empty")]
     EmptyCommandId,
-    #[error("runtime command boundary is dry-run only")]
-    RuntimeCommandMustBeDryRun,
+    #[error("non-dry-run runtime command requires approval manifest")]
+    RuntimeCommandRequiresApproval,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,6 +95,7 @@ pub struct LiveSmallRuntimeCommand {
     pub kind: RuntimeCommandKind,
     pub rollout_manifest: LiveRolloutManifest,
     pub dry_run: bool,
+    pub approval_ref: Option<ManifestRef>,
     pub reason: String,
 }
 
@@ -103,12 +104,26 @@ impl LiveSmallRuntimeCommand {
         if self.command_id.trim().is_empty() {
             return Err(LiveSmallSupervisorError::EmptyCommandId);
         }
-        if !self.dry_run {
-            return Err(LiveSmallSupervisorError::RuntimeCommandMustBeDryRun);
+        if !self.dry_run && self.approval_ref.is_none() {
+            return Err(LiveSmallSupervisorError::RuntimeCommandRequiresApproval);
         }
         self.rollout_manifest.validate()?;
+        if let Some(approval_ref) = &self.approval_ref {
+            approval_ref.validate()?;
+        }
         Ok(())
     }
+}
+
+pub fn arm_runtime_command(
+    mut command: LiveSmallRuntimeCommand,
+    approval_ref: ManifestRef,
+) -> Result<LiveSmallRuntimeCommand, LiveSmallSupervisorError> {
+    approval_ref.validate()?;
+    command.dry_run = false;
+    command.approval_ref = Some(approval_ref);
+    command.validate()?;
+    Ok(command)
 }
 
 pub fn runtime_command_from_decision(
@@ -122,6 +137,7 @@ pub fn runtime_command_from_decision(
             kind: RuntimeCommandKind::StageLiveSmall,
             rollout_manifest,
             dry_run: true,
+            approval_ref: None,
             reason: "promotion and live-small limits passed".to_string(),
         }),
         LiveSmallAction::Rollback => Some(LiveSmallRuntimeCommand {
@@ -129,6 +145,7 @@ pub fn runtime_command_from_decision(
             kind: RuntimeCommandKind::RollbackLiveSmall,
             rollout_manifest,
             dry_run: true,
+            approval_ref: None,
             reason: format!("rollback requested: {:?}", decision.rollback_trigger),
         }),
         LiveSmallAction::BlockRollout => None,
@@ -270,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_dry_run_runtime_command() {
+    fn rejects_non_dry_run_runtime_command_without_approval() {
         let mut command = runtime_command_from_decision(
             "cmd-1",
             manifest(),
@@ -285,7 +302,30 @@ mod tests {
 
         assert_eq!(
             command.validate().unwrap_err(),
-            LiveSmallSupervisorError::RuntimeCommandMustBeDryRun
+            LiveSmallSupervisorError::RuntimeCommandRequiresApproval
         );
+    }
+
+    #[test]
+    fn allows_non_dry_run_runtime_command_with_approval() {
+        let command = runtime_command_from_decision(
+            "cmd-1",
+            manifest(),
+            &LiveSmallDecision {
+                action: LiveSmallAction::AllowRollout,
+                blockers: vec![],
+                rollback_trigger: None,
+            },
+        )
+        .unwrap();
+
+        let command = arm_runtime_command(
+            command,
+            ManifestRef::new(ManifestId::new("approval-1").unwrap(), "human_approval").unwrap(),
+        )
+        .unwrap();
+
+        assert!(!command.dry_run);
+        assert!(command.approval_ref.is_some());
     }
 }
