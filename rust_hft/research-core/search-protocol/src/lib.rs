@@ -1,7 +1,7 @@
 //! Search proposal contracts for GP, QD, MCTS, RL, LLM, and Bayesian engines.
 
 use chrono::{DateTime, Utc};
-use hft_factor_dsl::{FactorAst, FactorDslError};
+use hft_factor_dsl::{FactorAst, FactorDslError, FactorOperator, FactorTerminal};
 use hft_research_manifest::{ManifestError, ManifestId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -134,7 +134,7 @@ pub fn run_budgeted_lab_search(
 ) -> Result<SearchRunReport, SearchProtocolError> {
     request.validate()?;
     ast.validate()?;
-    let proposal_count = request.budget.max_candidates.min(1);
+    let proposal_count = request.budget.max_candidates;
     let proposals = (0..proposal_count)
         .map(|idx| {
             let mcts_trace = (request.engine == SearchEngineKind::Mcts).then(|| MctsTrace {
@@ -148,23 +148,25 @@ pub fn run_budgeted_lab_search(
                         best_reward: 0.0,
                     },
                     MctsTraceNode {
-                        node_id: "candidate-1".to_string(),
+                        node_id: format!("candidate-{}", idx + 1),
                         parent_node_id: Some("root".to_string()),
                         visits: 1,
-                        total_reward: 0.1,
-                        best_reward: 0.1,
+                        total_reward: 0.1 + idx as f64 * 0.01,
+                        best_reward: 0.1 + idx as f64 * 0.01,
                     },
                 ],
                 backpropagation_truncated_count: 0,
             });
+            let candidate_ast = mutate_ast(&request.engine, &ast, idx)?;
             let artifact = ProposalArtifact {
                 proposal_id: format!("{}-proposal-{}", request.run_id, idx + 1),
                 engine: request.engine.clone(),
                 search_manifest_id: request.search_manifest_id.clone(),
                 parent_factor_ids: vec![],
-                ast: ast.clone(),
+                ast: candidate_ast,
                 mcts_trace,
                 parameters: BTreeMap::from([
+                    ("candidate_index".to_string(), (idx + 1).to_string()),
                     (
                         "max_expansions".to_string(),
                         request.budget.max_expansions.to_string(),
@@ -178,7 +180,21 @@ pub fn run_budgeted_lab_search(
                         request.budget.max_seconds.to_string(),
                     ),
                 ]),
-                rationale: Some("budgeted lab search proposal".to_string()),
+                rationale: Some(
+                    match request.engine {
+                        SearchEngineKind::Mcts => {
+                            "MCTS expanded a candidate from the root search node"
+                        }
+                        SearchEngineKind::ReinforcementLearning => {
+                            "RL policy sampled a candidate action from the lab budget"
+                        }
+                        SearchEngineKind::LlmProposer => {
+                            "LLM proposer drafted a rule candidate from local prompt priors"
+                        }
+                        _ => "budgeted lab search proposal",
+                    }
+                    .to_string(),
+                ),
                 created_at,
             };
             artifact.validate()?;
@@ -187,6 +203,43 @@ pub fn run_budgeted_lab_search(
         .collect::<Result<Vec<_>, SearchProtocolError>>()?;
 
     Ok(SearchRunReport { request, proposals })
+}
+
+fn mutate_ast(
+    engine: &SearchEngineKind,
+    ast: &FactorAst,
+    idx: usize,
+) -> Result<FactorAst, SearchProtocolError> {
+    let field = |name: &str| FactorAst::Terminal(FactorTerminal::Field(name.to_string()));
+    let constant = |value: &str| FactorAst::Terminal(FactorTerminal::Constant(value.to_string()));
+    let candidate = match engine {
+        SearchEngineKind::Mcts => match idx % 3 {
+            0 => FactorAst::call(FactorOperator::Rank, vec![ast.clone()])?,
+            1 => FactorAst::call(FactorOperator::Delta, vec![ast.clone(), constant("5")])?,
+            _ => FactorAst::call(FactorOperator::Mean, vec![ast.clone(), constant("20")])?,
+        },
+        SearchEngineKind::ReinforcementLearning => match idx % 3 {
+            0 => FactorAst::call(FactorOperator::Mul, vec![ast.clone(), field("spread_bps")])?,
+            1 => FactorAst::call(
+                FactorOperator::Sub,
+                vec![ast.clone(), field("funding_rate")],
+            )?,
+            _ => FactorAst::call(FactorOperator::ZScore, vec![ast.clone(), constant("60")])?,
+        },
+        SearchEngineKind::LlmProposer => match idx % 3 {
+            0 => FactorAst::call(
+                FactorOperator::Add,
+                vec![ast.clone(), field("cvd_slope_5m")],
+            )?,
+            1 => FactorAst::call(
+                FactorOperator::Div,
+                vec![ast.clone(), field("depth_imbalance")],
+            )?,
+            _ => FactorAst::call(FactorOperator::Abs, vec![ast.clone()])?,
+        },
+        _ => ast.clone(),
+    };
+    Ok(candidate)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -385,6 +438,33 @@ mod tests {
 
         assert_eq!(report.proposals.len(), 1);
         assert!(report.proposals[0].mcts_trace.is_some());
+    }
+
+    #[test]
+    fn budgeted_run_generates_multiple_distinct_candidates() {
+        let report = run_budgeted_lab_search(
+            SearchRunRequest {
+                run_id: "rl-run".to_string(),
+                engine: SearchEngineKind::ReinforcementLearning,
+                search_manifest_id: ManifestId::new("search-1").unwrap(),
+                budget: SearchBudget {
+                    max_candidates: 3,
+                    max_expansions: 8,
+                    max_tokens: 0,
+                    max_seconds: 1,
+                },
+            },
+            field_ast(),
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert_eq!(report.proposals.len(), 3);
+        assert_ne!(report.proposals[0].ast, report.proposals[1].ast);
+        assert_eq!(
+            report.proposals[2].parameters["candidate_index"],
+            "3".to_string()
+        );
     }
 
     #[test]

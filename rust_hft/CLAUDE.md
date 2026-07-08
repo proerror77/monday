@@ -31,13 +31,13 @@ Agentic research stays outside hot runtime crates. LLM, RL, MCTS, GP, QD, Bayesi
 - `research-core/prototype-adapter`: lab-only wrappers for Python/RL/BBO/signal/exit prototypes.
 - `research-core/research-memory`: structured failures and learning directives.
 - `research-core/loop-engine`: turn/goal/time/event loop state and stop decisions.
-- `research-core/search-protocol`: budgeted lab search runs for MCTS/RL/LLM proposal generation.
+- `research-core/search-protocol`: budgeted lab search runs for multi-candidate MCTS/RL/LLM proposal generation.
 - `research-core/live-small-supervisor`: dry-run and approval-gated non-dry-run runtime command boundary for live-small staging/rollback.
 - `research-core/live-small-supervisor`: runtime actuation result contracts for exchange/on-chain connectors.
 - `research-core/allocator-policy`: proposed allocation weights checked against hard caps.
 - `research-core/audit-trail`: validated harness audit bundles.
 - `infra-services/core/{artifact-store,experiment-store,factor-store}`: typed in-memory and file-backed stores.
-- `apps/agentic-alpha`: local CLI readback for topology, prototypes, replay evaluation, learning, audit, stores, connectivity smoke, approval-gated Binance order binding, and approval-gated EVM raw transaction binding.
+- `apps/agentic-alpha`: local CLI readback for topology, prototypes, replay evaluation, agent-loop learning, audit, stores, connectivity smoke, approval-gated Binance order binding, and approval-gated EVM raw transaction binding.
 
 ## Not Implemented Yet
 

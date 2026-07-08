@@ -10,7 +10,7 @@ use hft_experiment_store::{
 use hft_factor_bank::{FactorAsset, FactorLineage, FactorMetrics, FactorStatus, FactorType};
 use hft_factor_dsl::{FactorAst, FactorTerminal};
 use hft_factor_eval::{
-    evaluate_factor, evaluate_replay_csv, EvaluationDecision, EvaluationInput,
+    evaluate_factor, evaluate_replay_csv, EvaluationDecision, EvaluationFailure, EvaluationInput,
     EvaluationThresholds, ReplayCsvConfig,
 };
 use hft_factor_store::{FactorQuery, FactorStore, FileFactorStore, InMemoryFactorStore};
@@ -32,7 +32,8 @@ use hft_prototype_adapter::{
 use hft_research_manifest::{ArtifactRef, LiveRolloutManifest, ManifestId, ManifestRef};
 use hft_research_memory::{
     learning_directive_from_memory, memory_from_live_small, memory_from_promotion_gate,
-    HarnessChangeKind, HarnessChangeProposal, LearningDirective, ResearchMemoryEvent,
+    FailureKind, HarnessChangeKind, HarnessChangeProposal, LearningDirective, MemorySource,
+    ResearchMemoryEvent,
 };
 use hft_search_protocol::{
     run_budgeted_lab_search, SearchBudget, SearchEngineKind, SearchRunRequest,
@@ -75,6 +76,14 @@ enum Command {
     LoopEngineDemo,
     /// Run budgeted MCTS/RL/LLM proposal loops without real data.
     EngineLoopDemo { output: PathBuf },
+    /// Run candidate generation, failure explanation, and learning directive loop.
+    AgentLoopDemo {
+        output: PathBuf,
+        #[arg(long, default_value_t = 3)]
+        max_candidates_per_engine: usize,
+        #[arg(long, default_value_t = 0.0)]
+        max_live_risk_pct: f64,
+    },
     /// Emit a live-small runtime command. Non-dry-run requires --approval-ref.
     LiveCommandDemo {
         output: PathBuf,
@@ -496,6 +505,27 @@ struct EngineLoopDemoReport {
     stored_proposals: usize,
 }
 
+#[derive(Debug, Serialize)]
+struct AgentLoopCandidateReport {
+    proposal_id: String,
+    engine: SearchEngineKind,
+    formula: String,
+    evaluation: EvaluationDecision,
+    failure_explanation: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentLoopDemoReport {
+    output: String,
+    max_live_risk_pct: f64,
+    proposals: usize,
+    passed: usize,
+    failed: usize,
+    candidates: Vec<AgentLoopCandidateReport>,
+    memory_events: Vec<ResearchMemoryEvent>,
+    learning_directive: LearningDirective,
+}
+
 fn engine_loop_demo(output: &Path) -> Result<EngineLoopDemoReport, Box<dyn std::error::Error>> {
     let now = chrono::Utc::now();
     let ast = FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string()));
@@ -539,6 +569,154 @@ fn engine_loop_demo(output: &Path) -> Result<EngineLoopDemoReport, Box<dyn std::
         runs: 3,
         stored_proposals: run.proposals.len(),
     })
+}
+
+fn agent_loop_demo(
+    output: &Path,
+    max_candidates_per_engine: usize,
+    max_live_risk_pct: f64,
+) -> Result<AgentLoopDemoReport, Box<dyn std::error::Error>> {
+    if max_live_risk_pct < 0.0 || !max_live_risk_pct.is_finite() {
+        return Err("max live risk pct must be finite and non-negative".into());
+    }
+    let now = chrono::Utc::now();
+    let ast = FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string()));
+    let engines = [
+        ("mcts-agent-loop", SearchEngineKind::Mcts, 12, 0),
+        (
+            "rl-agent-loop",
+            SearchEngineKind::ReinforcementLearning,
+            24,
+            0,
+        ),
+        ("llm-agent-loop", SearchEngineKind::LlmProposer, 0, 4_000),
+    ];
+    let thresholds = EvaluationThresholds {
+        min_sample_count: 80,
+        min_rank_ic: 0.03,
+        min_net_sharpe: 1.0,
+        max_drawdown: 0.08,
+        max_correlation: 0.85,
+    };
+    let dataset_manifest = reference("agent-loop-dataset-1", "data_manifest")?;
+    let mut candidates = Vec::new();
+    let mut memory_events = Vec::new();
+
+    for (run_id, engine, max_expansions, max_tokens) in engines {
+        let report = run_budgeted_lab_search(
+            SearchRunRequest {
+                run_id: run_id.to_string(),
+                engine,
+                search_manifest_id: ManifestId::new("search-agent-loop-1")?,
+                budget: SearchBudget {
+                    max_candidates: max_candidates_per_engine,
+                    max_expansions,
+                    max_tokens,
+                    max_seconds: 10,
+                },
+            },
+            ast.clone(),
+            now,
+        )?;
+
+        for proposal in report.proposals {
+            let idx = candidates.len();
+            let metrics = candidate_metrics(idx);
+            let evaluation = evaluate_factor(
+                &EvaluationInput {
+                    dataset_manifest: dataset_manifest.clone(),
+                    has_available_time: true,
+                    sample_count: 64 + idx as u64 * 16,
+                    metrics,
+                },
+                &thresholds,
+                (idx % 5 == 4).then_some(0.92),
+            );
+            let failure_explanation = (!evaluation.passed).then(|| {
+                format!(
+                    "{} failed evaluation: {:?}",
+                    proposal.proposal_id, evaluation.failures
+                )
+            });
+            if let Some(explanation) = &failure_explanation {
+                let event = ResearchMemoryEvent {
+                    event_id: format!("agent-loop-memory-{}", memory_events.len() + 1),
+                    source: MemorySource::Evaluation,
+                    failure_kind: evaluation_failure_kind(&evaluation.failures),
+                    related_manifest: Some(dataset_manifest.clone()),
+                    explanation: explanation.clone(),
+                    created_at: now,
+                };
+                event.validate()?;
+                memory_events.push(event);
+            }
+            candidates.push(AgentLoopCandidateReport {
+                proposal_id: proposal.proposal_id,
+                engine: proposal.engine,
+                formula: proposal.ast.to_string(),
+                evaluation,
+                failure_explanation,
+            });
+        }
+    }
+
+    let learning_directive =
+        learning_directive_from_memory("agent-loop-learning-1", &memory_events).unwrap_or(
+            LearningDirective {
+                directive_id: "agent-loop-learning-1".to_string(),
+                source_event_ids: vec![],
+                actions: vec![],
+                explanation: "no failures; keep current search recipe".to_string(),
+            },
+        );
+    learning_directive.validate()?;
+
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let passed = candidates
+        .iter()
+        .filter(|candidate| candidate.evaluation.passed)
+        .count();
+    let report = AgentLoopDemoReport {
+        output: output.display().to_string(),
+        max_live_risk_pct,
+        proposals: candidates.len(),
+        passed,
+        failed: candidates.len() - passed,
+        candidates,
+        memory_events,
+        learning_directive,
+    };
+    std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
+    register_artifact("agent-loop-demo-1", output)?;
+    Ok(report)
+}
+
+fn candidate_metrics(idx: usize) -> FactorMetrics {
+    FactorMetrics {
+        rank_ic: Some(0.015 + idx as f64 * 0.004),
+        icir: Some(0.8 + idx as f64 * 0.1),
+        net_sharpe: Some(0.7 + idx as f64 * 0.12),
+        max_drawdown: Some(0.05 + (idx % 4) as f64 * 0.015),
+        turnover: Some(1.0 + idx as f64 * 0.1),
+        custom: BTreeMap::new(),
+    }
+}
+
+fn evaluation_failure_kind(failures: &[EvaluationFailure]) -> FailureKind {
+    if failures.contains(&EvaluationFailure::InsufficientSample) {
+        FailureKind::InsufficientSample
+    } else if failures.contains(&EvaluationFailure::CorrelationTooHigh) {
+        FailureKind::HighCorrelation
+    } else if failures.contains(&EvaluationFailure::MaxDrawdownAboveCeiling) {
+        FailureKind::RiskCapExceeded
+    } else {
+        FailureKind::GateFailed
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1427,6 +1605,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&engine_loop_demo(&output)?)?
+            );
+        }
+        Command::AgentLoopDemo {
+            output,
+            max_candidates_per_engine,
+            max_live_risk_pct,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&agent_loop_demo(
+                    &output,
+                    max_candidates_per_engine,
+                    max_live_risk_pct,
+                )?)?
             );
         }
         Command::LiveCommandDemo {
