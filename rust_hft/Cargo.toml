@@ -76,6 +76,7 @@ members = [
     "research-core/factor-dsl",
     "research-core/factor-bank",
     "research-core/manifest",
+    "research-core/promotion-gate",
     "research-core/search-protocol",
 
     # Applications

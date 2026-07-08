@@ -2938,6 +2938,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-promotion-gate"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hft-factor-bank",
+ "hft-factor-dsl",
+ "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hft-replay"
 version = "0.1.0"
 dependencies = [
