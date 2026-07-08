@@ -13,6 +13,7 @@ hft-factor-bank = { path = "../../research-core/factor-bank" }
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-factor-eval = { path = "../../research-core/factor-eval" }
 hft-factor-store = { path = "../../infra-services/core/factor-store" }
+hft-live-small-supervisor = { path = "../../research-core/live-small-supervisor" }
 hft-promotion-gate = { path = "../../research-core/promotion-gate" }
 hft-prototype-adapter = { path = "../../research-core/prototype-adapter" }
 hft-research-manifest = { path = "../../research-core/manifest" }

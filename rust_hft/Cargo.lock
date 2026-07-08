@@ -2078,6 +2078,7 @@ dependencies = [
  "hft-factor-dsl",
  "hft-factor-eval",
  "hft-factor-store",
+ "hft-live-small-supervisor",
  "hft-promotion-gate",
  "hft-prototype-adapter",
  "hft-research-manifest",
@@ -2948,6 +2949,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hft-live-small-supervisor"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hft-promotion-gate",
+ "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

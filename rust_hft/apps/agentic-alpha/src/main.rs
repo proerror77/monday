@@ -5,11 +5,15 @@ use hft_factor_bank::{FactorAsset, FactorLineage, FactorMetrics, FactorStatus, F
 use hft_factor_dsl::{FactorAst, FactorTerminal};
 use hft_factor_eval::{evaluate_factor, EvaluationInput, EvaluationThresholds};
 use hft_factor_store::{FactorQuery, FactorStore, InMemoryFactorStore};
+use hft_live_small_supervisor::{
+    rollback, supervise_rollout, LiveSmallAction, LiveSmallDecision, LiveSmallPolicyLimits,
+    LiveSmallRolloutRequest, RollbackTrigger,
+};
 use hft_promotion_gate::{evaluate_promotion, PromotionGateInput, TargetStage};
 use hft_prototype_adapter::{
     known_python_prototypes, PrototypeProposalAdapter, PrototypeRunRequest, StaticPrototypeAdapter,
 };
-use hft_research_manifest::{ArtifactRef, ManifestId, ManifestRef};
+use hft_research_manifest::{ArtifactRef, LiveRolloutManifest, ManifestId, ManifestRef};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -29,6 +33,8 @@ enum Command {
     DemoLoop,
     /// Print the Python prototypes currently wrapped by Rust contracts.
     PrototypeBackends,
+    /// Run live-small supervision readback without touching execution.
+    LiveSmallDemo,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +58,7 @@ struct DemoLoopReport {
     stored_factors: usize,
     evaluation_passed: bool,
     promotion_passed: bool,
+    live_small_action: LiveSmallAction,
 }
 
 fn topology() -> Vec<LoopSpec> {
@@ -95,6 +102,7 @@ fn contract_bindings() -> Vec<&'static str> {
         std::any::type_name::<hft_factor_store::FactorQuery>(),
         std::any::type_name::<hft_artifact_store::ArtifactRecord>(),
         std::any::type_name::<hft_experiment_store::ExperimentRun>(),
+        std::any::type_name::<hft_live_small_supervisor::LiveSmallDecision>(),
         std::any::type_name::<hft_promotion_gate::PromotionGateDecision>(),
         std::any::type_name::<hft_prototype_adapter::PrototypeBackend>(),
     ]
@@ -198,6 +206,7 @@ fn demo_loop() -> Result<DemoLoopReport, Box<dyn std::error::Error>> {
             first_same_class_approval_present: true,
         },
     );
+    let rollout = live_small_decision(promotion.clone())?;
 
     let mut artifact_store = InMemoryArtifactStore::default();
     artifact_store.put_artifact(ArtifactRecord {
@@ -215,6 +224,52 @@ fn demo_loop() -> Result<DemoLoopReport, Box<dyn std::error::Error>> {
         stored_factors,
         evaluation_passed: evaluation.passed,
         promotion_passed: promotion.passed,
+        live_small_action: rollout.action,
+    })
+}
+
+fn live_rollout_manifest() -> Result<LiveRolloutManifest, Box<dyn std::error::Error>> {
+    Ok(LiveRolloutManifest {
+        id: ManifestId::new("rollout-demo-1")?,
+        promotion_manifest: reference("promotion-demo-1", "promotion_manifest")?,
+        runtime_config_ref: "runtime-config-demo".to_string(),
+        risk_policy_ref: "risk-policy-demo".to_string(),
+        started_at: chrono::Utc::now(),
+        ended_at: None,
+        attribution: BTreeMap::new(),
+        rollback_result: None,
+    })
+}
+
+fn live_small_decision(
+    promotion_decision: hft_promotion_gate::PromotionGateDecision,
+) -> Result<LiveSmallDecision, Box<dyn std::error::Error>> {
+    Ok(supervise_rollout(&LiveSmallRolloutRequest {
+        rollout_manifest: live_rollout_manifest()?,
+        promotion_decision,
+        policy_limits: LiveSmallPolicyLimits {
+            max_factor_weight: 0.1,
+            max_symbol_exposure: 0.2,
+            max_account_drawdown: 0.03,
+        },
+        requested_factor_weight: 0.05,
+        requested_symbol_exposure: 0.1,
+    })?)
+}
+
+#[derive(Debug, Serialize)]
+struct LiveSmallDemoReport {
+    rollout: LiveSmallDecision,
+    rollback: LiveSmallDecision,
+}
+
+fn live_small_demo() -> Result<LiveSmallDemoReport, Box<dyn std::error::Error>> {
+    Ok(LiveSmallDemoReport {
+        rollout: live_small_decision(hft_promotion_gate::PromotionGateDecision {
+            passed: true,
+            failures: vec![],
+        })?,
+        rollback: rollback(RollbackTrigger::SentinelStopped),
     })
 }
 
@@ -238,6 +293,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{}",
                 serde_json::to_string_pretty(&known_python_prototypes())?
             );
+        }
+        Command::LiveSmallDemo => {
+            println!("{}", serde_json::to_string_pretty(&live_small_demo()?)?);
         }
     }
     Ok(())

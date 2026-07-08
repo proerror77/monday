@@ -79,6 +79,7 @@ members = [
     "research-core/factor-dsl",
     "research-core/factor-bank",
     "research-core/factor-eval",
+    "research-core/live-small-supervisor",
     "research-core/manifest",
     "research-core/promotion-gate",
     "research-core/prototype-adapter",
