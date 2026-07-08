@@ -2,7 +2,9 @@ use clap::{Parser, Subcommand};
 use hft_allocator_policy::{AllocatorPolicyProposal, FactorAllocation};
 use hft_artifact_store::{ArtifactRecord, ArtifactStore, FileArtifactStore, InMemoryArtifactStore};
 use hft_audit_trail::HarnessAuditBundle;
-use hft_experiment_store::{ExperimentRun, ExperimentStore, InMemoryExperimentStore};
+use hft_experiment_store::{
+    ExperimentRun, ExperimentStore, FileExperimentStore, InMemoryExperimentStore,
+};
 use hft_factor_bank::{FactorAsset, FactorLineage, FactorMetrics, FactorStatus, FactorType};
 use hft_factor_dsl::{FactorAst, FactorTerminal};
 use hft_factor_eval::{evaluate_factor, EvaluationInput, EvaluationThresholds};
@@ -58,6 +60,8 @@ enum Command {
     LoopEngineDemo,
     /// Persist a generated factor candidate into a file-backed candidate pool.
     FactorPoolDemo { output: PathBuf },
+    /// Persist a prototype-backed experiment run into a file-backed log.
+    ExperimentLogDemo { output: PathBuf },
 }
 
 #[derive(Debug, Serialize)]
@@ -301,6 +305,47 @@ fn factor_pool_demo(output: &Path) -> Result<FactorPoolDemoReport, Box<dyn std::
         output: store.path().display().to_string(),
         stored_factors,
         factor_id: asset.factor_id,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct ExperimentLogDemoReport {
+    output: String,
+    experiment_id: String,
+    stored_proposals: usize,
+}
+
+fn experiment_log_demo(
+    output: &Path,
+) -> Result<ExperimentLogDemoReport, Box<dyn std::error::Error>> {
+    let now = chrono::Utc::now();
+    let search_manifest_id = ManifestId::new("search-demo-1")?;
+    let prototype = StaticPrototypeAdapter::new(
+        known_python_prototypes().remove(0),
+        FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string())),
+    )?;
+    let proposals = prototype.propose(
+        &PrototypeRunRequest {
+            search_manifest_id: search_manifest_id.clone(),
+            max_candidates: 1,
+        },
+        now,
+    )?;
+    let run = ExperimentRun {
+        experiment_id: "experiment-demo-1".to_string(),
+        search_manifest_id,
+        proposals,
+        started_at: now,
+        completed_at: Some(now),
+    };
+    let mut store = FileExperimentStore::new(output);
+    store.put_run(run)?;
+    let run = store.get_run("experiment-demo-1")?;
+
+    Ok(ExperimentLogDemoReport {
+        output: store.path().display().to_string(),
+        experiment_id: run.experiment_id,
+        stored_proposals: run.proposals.len(),
     })
 }
 
@@ -620,6 +665,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&factor_pool_demo(&output)?)?
+            );
+        }
+        Command::ExperimentLogDemo { output } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&experiment_log_demo(&output)?)?
             );
         }
     }

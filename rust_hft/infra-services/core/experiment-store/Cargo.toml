@@ -9,4 +9,5 @@ chrono = { workspace = true, features = ["serde"] }
 hft-research-manifest = { path = "../../../research-core/manifest" }
 hft-search-protocol = { path = "../../../research-core/search-protocol" }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
