@@ -1,7 +1,7 @@
 //! Factor Bank contracts for auditable alpha assets.
 
 use chrono::{DateTime, Utc};
-use hft_factor_dsl::FactorAst;
+use hft_factor_dsl::{FactorAst, FactorDslError};
 use hft_research_manifest::{ManifestId, ManifestRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -11,6 +11,8 @@ use thiserror::Error;
 pub enum FactorBankError {
     #[error("factor id cannot be empty")]
     EmptyFactorId,
+    #[error("invalid factor AST: {0}")]
+    InvalidFactorAst(#[from] FactorDslError),
     #[error("live full candidate is bookkeeping only in MVP")]
     LiveFullCandidateNotExecutable,
 }
@@ -88,6 +90,7 @@ impl FactorAsset {
         if self.factor_id.trim().is_empty() {
             return Err(FactorBankError::EmptyFactorId);
         }
+        self.ast.validate()?;
         if self.promotion_status == FactorStatus::LiveFullCandidate {
             return Err(FactorBankError::LiveFullCandidateNotExecutable);
         }
@@ -152,5 +155,19 @@ mod tests {
             asset.validate().unwrap_err(),
             FactorBankError::LiveFullCandidateNotExecutable
         );
+    }
+
+    #[test]
+    fn rejects_bad_factor_ast() {
+        let mut asset = asset_with_status(FactorStatus::Generated);
+        asset.ast = FactorAst::Call {
+            operator: hft_factor_dsl::FactorOperator::Add,
+            args: vec![FactorAst::Terminal(FactorTerminal::Field("oi".to_string()))],
+        };
+
+        assert!(matches!(
+            asset.validate().unwrap_err(),
+            FactorBankError::InvalidFactorAst(_)
+        ));
     }
 }

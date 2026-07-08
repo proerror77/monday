@@ -19,14 +19,20 @@ pub struct ManifestId(String);
 impl ManifestId {
     pub fn new(value: impl Into<String>) -> Result<Self, ManifestError> {
         let value = value.into();
-        if value.trim().is_empty() {
-            return Err(ManifestError::EmptyId);
-        }
-        Ok(Self(value))
+        let id = Self(value);
+        id.validate()?;
+        Ok(id)
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.0.trim().is_empty() {
+            return Err(ManifestError::EmptyId);
+        }
+        Ok(())
     }
 }
 
@@ -39,10 +45,17 @@ pub struct ManifestRef {
 impl ManifestRef {
     pub fn new(id: ManifestId, kind: impl Into<String>) -> Result<Self, ManifestError> {
         let kind = kind.into();
-        if kind.trim().is_empty() {
+        let reference = Self { id, kind };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.id.validate()?;
+        if self.kind.trim().is_empty() {
             return Err(ManifestError::EmptyKind);
         }
-        Ok(Self { id, kind })
+        Ok(())
     }
 }
 
@@ -146,6 +159,62 @@ pub struct HarnessManifest {
     pub memory_snapshot_ref: Option<String>,
 }
 
+impl DataManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.id.validate()
+    }
+}
+
+impl FeatureManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.id.validate()?;
+        self.data_manifest.validate()
+    }
+}
+
+impl LabelManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.id.validate()?;
+        self.feature_manifest.validate()
+    }
+}
+
+impl SearchManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.id.validate()?;
+        self.parent_run_ids
+            .iter()
+            .try_for_each(ManifestId::validate)
+    }
+}
+
+impl EvaluationManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.id.validate()?;
+        self.search_manifest.validate()
+    }
+}
+
+impl PromotionManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.id.validate()?;
+        self.evaluation_manifest.validate()
+    }
+}
+
+impl LiveRolloutManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.id.validate()?;
+        self.promotion_manifest.validate()
+    }
+}
+
+impl HarnessManifest {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        self.id.validate()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +230,39 @@ mod tests {
         let reference = ManifestRef::new(id, "data_manifest").unwrap();
         assert_eq!(reference.kind, "data_manifest");
         assert_eq!(reference.id.as_str(), "data-20260708");
+    }
+
+    #[test]
+    fn validate_rejects_deserialized_empty_manifest_id() {
+        let id = ManifestId(" ".to_string());
+        assert_eq!(id.validate().unwrap_err(), ManifestError::EmptyId);
+    }
+
+    #[test]
+    fn validate_rejects_deserialized_empty_manifest_ref_kind() {
+        let reference = ManifestRef {
+            id: ManifestId::new("data-1").unwrap(),
+            kind: " ".to_string(),
+        };
+
+        assert_eq!(reference.validate().unwrap_err(), ManifestError::EmptyKind);
+    }
+
+    #[test]
+    fn validate_rejects_nested_manifest_ref() {
+        let manifest = FeatureManifest {
+            id: ManifestId::new("feature-1").unwrap(),
+            data_manifest: ManifestRef {
+                id: ManifestId::new("data-1").unwrap(),
+                kind: " ".to_string(),
+            },
+            feature_set_id: "features".to_string(),
+            operators: vec![],
+            windows: vec![],
+            normalization: "none".to_string(),
+            availability_policy: "close".to_string(),
+        };
+
+        assert_eq!(manifest.validate().unwrap_err(), ManifestError::EmptyKind);
     }
 }

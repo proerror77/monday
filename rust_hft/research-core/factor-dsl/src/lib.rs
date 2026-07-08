@@ -99,6 +99,24 @@ impl FactorAst {
         }
         Ok(Self::Call { operator, args })
     }
+
+    pub fn validate(&self) -> Result<(), FactorDslError> {
+        match self {
+            Self::Terminal(_) => Ok(()),
+            Self::Call { operator, args } => {
+                let expected = operator.arity();
+                let actual = args.len();
+                if expected != actual {
+                    return Err(FactorDslError::ArityMismatch {
+                        operator: operator.symbol().to_string(),
+                        expected,
+                        actual,
+                    });
+                }
+                args.iter().try_for_each(Self::validate)
+            }
+        }
+    }
 }
 
 impl fmt::Display for FactorAst {
@@ -140,6 +158,27 @@ mod tests {
         let err = FactorAst::call(FactorOperator::Add, vec![arg]).unwrap_err();
         assert_eq!(
             err,
+            FactorDslError::ArityMismatch {
+                operator: "+".to_string(),
+                expected: 2,
+                actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_deserialized_wrong_arity_recursively() {
+        let bad_child = FactorAst::Call {
+            operator: FactorOperator::Add,
+            args: vec![FactorAst::Terminal(FactorTerminal::Field("oi".to_string()))],
+        };
+        let ast = FactorAst::Call {
+            operator: FactorOperator::Abs,
+            args: vec![bad_child],
+        };
+
+        assert_eq!(
+            ast.validate().unwrap_err(),
             FactorDslError::ArityMismatch {
                 operator: "+".to_string(),
                 expected: 2,
