@@ -67,6 +67,8 @@ enum Command {
     FactorPoolDemo { output: PathBuf },
     /// Persist a prototype-backed experiment run into a file-backed log.
     ExperimentLogDemo { output: PathBuf },
+    /// Run all registered Python prototypes as lab-only proposal backends.
+    PrototypeLabDemo { output: PathBuf },
     /// Evaluate a replay CSV and persist the resulting candidate.
     ReplayEval {
         input: PathBuf,
@@ -360,6 +362,51 @@ fn experiment_log_demo(
     Ok(ExperimentLogDemoReport {
         output: store.path().display().to_string(),
         experiment_id: run.experiment_id,
+        stored_proposals: run.proposals.len(),
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct PrototypeLabDemoReport {
+    output: String,
+    experiment_id: String,
+    backends: usize,
+    stored_proposals: usize,
+}
+
+fn prototype_lab_demo(output: &Path) -> Result<PrototypeLabDemoReport, Box<dyn std::error::Error>> {
+    let now = chrono::Utc::now();
+    let search_manifest_id = ManifestId::new("search-prototype-lab-1")?;
+    let mut proposals = Vec::new();
+    for backend in known_python_prototypes() {
+        let adapter = StaticPrototypeAdapter::new(
+            backend,
+            FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string())),
+        )?;
+        proposals.extend(adapter.propose(
+            &PrototypeRunRequest {
+                search_manifest_id: search_manifest_id.clone(),
+                max_candidates: 1,
+            },
+            now,
+        )?);
+    }
+    let backends = proposals.len();
+    let run = ExperimentRun {
+        experiment_id: "prototype-lab-demo-1".to_string(),
+        search_manifest_id,
+        proposals,
+        started_at: now,
+        completed_at: Some(now),
+    };
+    let mut store = FileExperimentStore::new(output);
+    store.put_run(run)?;
+    let run = store.get_run("prototype-lab-demo-1")?;
+
+    Ok(PrototypeLabDemoReport {
+        output: store.path().display().to_string(),
+        experiment_id: run.experiment_id,
+        backends,
         stored_proposals: run.proposals.len(),
     })
 }
@@ -828,6 +875,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&experiment_log_demo(&output)?)?
+            );
+        }
+        Command::PrototypeLabDemo { output } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&prototype_lab_demo(&output)?)?
             );
         }
         Command::ReplayEval {

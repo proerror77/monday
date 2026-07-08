@@ -162,6 +162,20 @@ pub fn known_python_prototypes() -> Vec<PrototypeBackend> {
             engine: SearchEngineKind::ReinforcementLearning,
             rights: PrototypeRights::lab_only(),
         },
+        PrototypeBackend {
+            backend_id: "signal-aggregator".to_string(),
+            kind: PrototypeBackendKind::SignalAggregator,
+            source_path: "ml_workspace/algorithms/signal_aggregator.py".to_string(),
+            engine: SearchEngineKind::QualityDiversity,
+            rights: PrototypeRights::lab_only(),
+        },
+        PrototypeBackend {
+            backend_id: "smart-exit-manager".to_string(),
+            kind: PrototypeBackendKind::SmartExitManager,
+            source_path: "ml_workspace/algorithms/smart_exit_manager.py".to_string(),
+            engine: SearchEngineKind::ReinforcementLearning,
+            rights: PrototypeRights::lab_only(),
+        },
     ]
 }
 
@@ -205,5 +219,25 @@ mod tests {
             proposals[0].parameters["source_path"],
             "ml_workspace/lob_core/alpha_search.py"
         );
+    }
+
+    #[test]
+    fn known_python_prototypes_are_lab_only() {
+        let prototypes = known_python_prototypes();
+
+        assert!(prototypes
+            .iter()
+            .any(|backend| backend.kind == PrototypeBackendKind::RlLabGenerator));
+        assert!(prototypes
+            .iter()
+            .any(|backend| backend.kind == PrototypeBackendKind::SignalAggregator));
+        assert!(prototypes
+            .iter()
+            .any(|backend| backend.kind == PrototypeBackendKind::SmartExitManager));
+        assert!(prototypes.iter().all(|backend| {
+            backend.rights.may_generate_proposals
+                && !backend.rights.may_write_factor_bank
+                && !backend.rights.may_live_trade
+        }));
     }
 }
