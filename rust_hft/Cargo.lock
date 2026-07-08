@@ -2067,6 +2067,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-agentic-alpha"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hft-artifact-store",
+ "hft-experiment-store",
+ "hft-factor-eval",
+ "hft-factor-store",
+ "hft-promotion-gate",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hft-all-in-one"
 version = "0.1.0"
 dependencies = [
@@ -2075,6 +2089,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hft-artifact-store"
+version = "0.1.0"
+dependencies = [
+ "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2663,6 +2686,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-experiment-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hft-research-manifest",
+ "hft-search-protocol",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hft-factor-bank"
 version = "0.1.0"
 dependencies = [
@@ -2683,6 +2717,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-factor-eval"
+version = "0.1.0"
+dependencies = [
+ "hft-factor-bank",
+ "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hft-factor-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hft-factor-bank",
+ "hft-factor-dsl",
+ "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hft-factorctl"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hft-factor-bank",
+ "hft-factor-store",
+]
+
+[[package]]
 name = "hft-grpc-server"
 version = "0.1.0"
 dependencies = [
@@ -2700,6 +2765,13 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tracing",
+]
+
+[[package]]
+name = "hft-harnessctl"
+version = "0.1.0"
+dependencies = [
+ "clap",
 ]
 
 [[package]]

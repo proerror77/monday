@@ -1,0 +1,10 @@
+[package]
+name = "hft-artifact-store"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+hft-research-manifest = { path = "../../../research-core/manifest" }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }

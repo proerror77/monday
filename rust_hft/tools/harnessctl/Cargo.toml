@@ -1,0 +1,12 @@
+[package]
+name = "hft-harnessctl"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+
+[[bin]]
+name = "harnessctl"
+path = "src/main.rs"

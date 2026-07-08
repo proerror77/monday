@@ -1,0 +1,19 @@
+[package]
+name = "hft-agentic-alpha"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+hft-artifact-store = { path = "../../infra-services/core/artifact-store" }
+hft-experiment-store = { path = "../../infra-services/core/experiment-store" }
+hft-factor-eval = { path = "../../research-core/factor-eval" }
+hft-factor-store = { path = "../../infra-services/core/factor-store" }
+hft-promotion-gate = { path = "../../research-core/promotion-gate" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "hft-agentic-alpha"
+path = "src/main.rs"
