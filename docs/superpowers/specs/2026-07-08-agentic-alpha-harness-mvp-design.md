@@ -799,6 +799,7 @@ Full workspace validation is reserved for:
 - Done locally: wrap RL stub as lab-only generator.
 - Done locally: wrap signal aggregator and smart exit manager as lab-only proposal backends.
 - Done locally: store prototype outputs as proposal artifacts in a file-backed experiment log.
+- Done locally: expose Python retirement inventory with lab-only status and Rust parity next step.
 
 ### Phase 3: Evaluation and Manifested Replay
 
@@ -810,6 +811,7 @@ Full workspace validation is reserved for:
 ### Phase 4: Trading Harness and Live-Small Gate
 
 - Add allocator policy schema.
+- Done locally: add dry-run live-small runtime command boundary.
 - Add risk policy proposal schema.
 - Add promotion approval state.
 - Add live-small supervisor integration.

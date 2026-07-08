@@ -25,6 +25,7 @@ data / replay artifacts
 - `research-core/manifest`: reproducible data, feature, label, search, evaluation, promotion, live rollout, and harness manifests.
 - `research-core/factor-dsl`: canonical factor formula/program AST.
 - `research-core/search-protocol`: proposal artifacts and MCTS trace contracts.
+- `research-core/search-protocol`: budgeted MCTS/RL/LLM lab search runs.
 - `research-core/factor-bank`: factor assets, lineage, status, and MVP execution guardrails.
 - `research-core/factor-eval`: deterministic gates and local replay CSV metrics.
 - `research-core/promotion-gate`: paper, shadow, and live-small gates.
@@ -50,15 +51,20 @@ Current Python prototypes are wrapped as lab-only backends:
 
 They may generate proposal artifacts. They may not write directly to Factor Bank, mutate live weights, or trade.
 
+`python-retirement-demo` reports the current replacement queue. Each prototype stays `wrapped_lab_only` until a Rust parity fixture exists.
+
 ## Current Local Loop
 
 Implemented local commands:
 
 ```bash
 cargo run -p hft-agentic-alpha -- topology
+cargo run -p hft-agentic-alpha -- engine-loop-demo target/agentic-alpha/engine-loop.json
 cargo run -p hft-agentic-alpha -- prototype-lab-demo target/agentic-alpha/prototype-lab.json
 cargo run -p hft-agentic-alpha -- replay-eval target/agentic-alpha/replay.csv target/agentic-alpha/replay-factors.json target/agentic-alpha/replay-report.json
 cargo run -p hft-agentic-alpha -- learning-demo target/agentic-alpha/learning.json
+cargo run -p hft-agentic-alpha -- live-command-demo target/agentic-alpha/live-command.json
+cargo run -p hft-agentic-alpha -- python-retirement-demo
 cargo run -p hft-agentic-alpha -- export-audit target/agentic-alpha/audit-demo.json
 ```
 
@@ -66,6 +72,6 @@ cargo run -p hft-agentic-alpha -- export-audit target/agentic-alpha/audit-demo.j
 
 - Real ClickHouse-backed research stores.
 - Real full-domain data manifests.
-- Production MCTS/RL/LLM engines.
-- Direct live runtime actuation.
+- Production MCTS/RL/LLM engines with real model/tool execution.
+- Non-dry-run live runtime actuation.
 - Broad Python removal.
