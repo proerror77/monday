@@ -37,7 +37,7 @@ Agentic research stays outside hot runtime crates. LLM, RL, MCTS, GP, QD, Bayesi
 - `research-core/allocator-policy`: proposed allocation weights checked against hard caps.
 - `research-core/audit-trail`: validated harness audit bundles.
 - `infra-services/core/{artifact-store,experiment-store,factor-store}`: typed in-memory and file-backed stores.
-- `apps/agentic-alpha`: local CLI readback for topology, prototypes, replay evaluation, agent-loop learning, audit, stores, connectivity smoke, approval-gated Binance order binding, and approval-gated EVM raw transaction binding.
+- `apps/agentic-alpha`: local CLI readback for topology, prototypes, replay evaluation, DuckDB-backed agent-loop learning, audit, stores, connectivity smoke, approval-gated Binance order binding, and approval-gated EVM raw transaction binding.
 
 ## Not Implemented Yet
 

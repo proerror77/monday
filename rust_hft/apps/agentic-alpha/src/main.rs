@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use duckdb::{params, Connection};
 use execution_adapter_binance::{BinanceExecutionClient, BinanceExecutionConfig};
 use hft_allocator_policy::{AllocatorPolicyProposal, FactorAllocation};
 use hft_artifact_store::{ArtifactRecord, ArtifactStore, FileArtifactStore, InMemoryArtifactStore};
@@ -83,6 +84,19 @@ enum Command {
         max_candidates_per_engine: usize,
         #[arg(long, default_value_t = 0.0)]
         max_live_risk_pct: f64,
+    },
+    /// Run candidate generation and evaluation against a DuckDB replay table.
+    DuckdbAgentLoop {
+        duckdb_path: PathBuf,
+        output: PathBuf,
+        #[arg(long, default_value = "factor_replay")]
+        table: String,
+        #[arg(long, default_value_t = 3)]
+        max_candidates_per_engine: usize,
+        #[arg(long, default_value_t = 0.0)]
+        max_live_risk_pct: f64,
+        #[arg(long)]
+        bootstrap_fixture: bool,
     },
     /// Emit a live-small runtime command. Non-dry-run requires --approval-ref.
     LiveCommandDemo {
@@ -517,6 +531,8 @@ struct AgentLoopCandidateReport {
 #[derive(Debug, Serialize)]
 struct AgentLoopDemoReport {
     output: String,
+    data_source: Option<String>,
+    data_rows: Option<usize>,
     max_live_risk_pct: f64,
     proposals: usize,
     passed: usize,
@@ -524,6 +540,17 @@ struct AgentLoopDemoReport {
     candidates: Vec<AgentLoopCandidateReport>,
     memory_events: Vec<ResearchMemoryEvent>,
     learning_directive: LearningDirective,
+}
+
+#[derive(Debug, Clone)]
+struct ReplayDataRow {
+    oi_delta_5m: f64,
+    cvd_slope_5m: f64,
+    spread_bps: f64,
+    funding_rate: f64,
+    depth_imbalance: f64,
+    forward_return: f64,
+    available_time: bool,
 }
 
 fn engine_loop_demo(output: &Path) -> Result<EngineLoopDemoReport, Box<dyn std::error::Error>> {
@@ -569,6 +596,147 @@ fn engine_loop_demo(output: &Path) -> Result<EngineLoopDemoReport, Box<dyn std::
         runs: 3,
         stored_proposals: run.proposals.len(),
     })
+}
+
+fn duckdb_agent_loop(
+    duckdb_path: &Path,
+    output: &Path,
+    table: &str,
+    max_candidates_per_engine: usize,
+    max_live_risk_pct: f64,
+    bootstrap_fixture: bool,
+) -> Result<AgentLoopDemoReport, Box<dyn std::error::Error>> {
+    if !is_simple_identifier(table) {
+        return Err("DuckDB table must be a simple identifier".into());
+    }
+    let conn = Connection::open(duckdb_path)?;
+    if bootstrap_fixture {
+        bootstrap_duckdb_replay_fixture(&conn, table)?;
+    }
+    let rows = read_duckdb_replay_rows(&conn, table)?;
+    if rows.is_empty() {
+        return Err("DuckDB replay table has no rows".into());
+    }
+
+    let now = chrono::Utc::now();
+    let base_ast = FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string()));
+    let engines = [
+        ("mcts-duckdb-loop", SearchEngineKind::Mcts, 12, 0),
+        (
+            "rl-duckdb-loop",
+            SearchEngineKind::ReinforcementLearning,
+            24,
+            0,
+        ),
+        ("llm-duckdb-loop", SearchEngineKind::LlmProposer, 0, 4_000),
+    ];
+    let thresholds = EvaluationThresholds {
+        min_sample_count: 8,
+        min_rank_ic: 0.03,
+        min_net_sharpe: 0.5,
+        max_drawdown: 0.20,
+        max_correlation: 0.85,
+    };
+    let dataset_manifest = reference("duckdb-agent-loop-dataset-1", "data_manifest")?;
+    let mut candidates = Vec::new();
+    let mut memory_events = Vec::new();
+
+    for (run_id, engine, max_expansions, max_tokens) in engines {
+        let report = run_budgeted_lab_search(
+            SearchRunRequest {
+                run_id: run_id.to_string(),
+                engine,
+                search_manifest_id: ManifestId::new("search-duckdb-agent-loop-1")?,
+                budget: SearchBudget {
+                    max_candidates: max_candidates_per_engine,
+                    max_expansions,
+                    max_tokens,
+                    max_seconds: 10,
+                },
+            },
+            base_ast.clone(),
+            now,
+        )?;
+
+        for proposal in report.proposals {
+            let signals = eval_factor_ast_series(&proposal.ast, &rows)?;
+            let replay_csv = replay_rows_to_csv(&rows, &signals);
+            let eval_report = evaluate_replay_csv(
+                &replay_csv,
+                &ReplayCsvConfig {
+                    dataset_manifest: dataset_manifest.clone(),
+                    signal_column: "signal".to_string(),
+                    label_column: "forward_return".to_string(),
+                    available_time_column: Some("available_time".to_string()),
+                },
+                &thresholds,
+                None,
+            )?;
+            let evaluation = eval_report.decision;
+            let failure_explanation = (!evaluation.passed).then(|| {
+                format!(
+                    "{} failed DuckDB replay evaluation: {:?}",
+                    proposal.proposal_id, evaluation.failures
+                )
+            });
+            if let Some(explanation) = &failure_explanation {
+                let event = ResearchMemoryEvent {
+                    event_id: format!("duckdb-agent-loop-memory-{}", memory_events.len() + 1),
+                    source: MemorySource::Evaluation,
+                    failure_kind: evaluation_failure_kind(&evaluation.failures),
+                    related_manifest: Some(dataset_manifest.clone()),
+                    explanation: explanation.clone(),
+                    created_at: now,
+                };
+                event.validate()?;
+                memory_events.push(event);
+            }
+            candidates.push(AgentLoopCandidateReport {
+                proposal_id: proposal.proposal_id,
+                engine: proposal.engine,
+                formula: proposal.ast.to_string(),
+                evaluation,
+                failure_explanation,
+            });
+        }
+    }
+
+    let learning_directive =
+        learning_directive_from_memory("duckdb-agent-loop-learning-1", &memory_events).unwrap_or(
+            LearningDirective {
+                directive_id: "duckdb-agent-loop-learning-1".to_string(),
+                source_event_ids: vec![],
+                actions: vec![],
+                explanation: "no failures; keep current DuckDB search recipe".to_string(),
+            },
+        );
+    learning_directive.validate()?;
+
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let passed = candidates
+        .iter()
+        .filter(|candidate| candidate.evaluation.passed)
+        .count();
+    let report = AgentLoopDemoReport {
+        output: output.display().to_string(),
+        data_source: Some(format!("duckdb:{}", table)),
+        data_rows: Some(rows.len()),
+        max_live_risk_pct,
+        proposals: candidates.len(),
+        passed,
+        failed: candidates.len() - passed,
+        candidates,
+        memory_events,
+        learning_directive,
+    };
+    std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
+    register_artifact("duckdb-agent-loop-1", output)?;
+    Ok(report)
 }
 
 fn agent_loop_demo(
@@ -683,6 +851,8 @@ fn agent_loop_demo(
         .count();
     let report = AgentLoopDemoReport {
         output: output.display().to_string(),
+        data_source: None,
+        data_rows: None,
         max_live_risk_pct,
         proposals: candidates.len(),
         passed,
@@ -717,6 +887,234 @@ fn evaluation_failure_kind(failures: &[EvaluationFailure]) -> FailureKind {
     } else {
         FailureKind::GateFailed
     }
+}
+
+fn is_simple_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn bootstrap_duckdb_replay_fixture(
+    conn: &Connection,
+    table: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {table} (
+                ts TIMESTAMP,
+                symbol TEXT,
+                oi_delta_5m DOUBLE,
+                cvd_slope_5m DOUBLE,
+                spread_bps DOUBLE,
+                funding_rate DOUBLE,
+                depth_imbalance DOUBLE,
+                forward_return DOUBLE,
+                available_time BOOLEAN
+            )"
+        ),
+        [],
+    )?;
+    let count: i64 = conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })?;
+    if count > 0 {
+        return Ok(());
+    }
+    for idx in 0..24 {
+        let oi = idx as f64 * 0.08 - 0.6;
+        let cvd = (idx as f64 % 5.0) * 0.04 - 0.08;
+        let spread = 1.0 + (idx % 4) as f64 * 0.2;
+        let funding = if idx % 2 == 0 { 0.01 } else { -0.005 };
+        let depth = 0.2 + (idx % 6) as f64 * 0.05;
+        let forward = oi * 0.012 + cvd * 0.04 - spread * 0.001;
+        conn.execute(
+            &format!("INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+            params![
+                format!("2026-01-01 00:{idx:02}:00"),
+                "BTCUSDT",
+                oi,
+                cvd,
+                spread,
+                funding,
+                depth,
+                forward,
+                true
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn read_duckdb_replay_rows(
+    conn: &Connection,
+    table: &str,
+) -> Result<Vec<ReplayDataRow>, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT oi_delta_5m, cvd_slope_5m, spread_bps, funding_rate, depth_imbalance, forward_return, available_time
+         FROM {table}
+         ORDER BY ts"
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ReplayDataRow {
+            oi_delta_5m: row.get(0)?,
+            cvd_slope_5m: row.get(1)?,
+            spread_bps: row.get(2)?,
+            funding_rate: row.get(3)?,
+            depth_imbalance: row.get(4)?,
+            forward_return: row.get(5)?,
+            available_time: row.get(6)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+fn eval_factor_ast_series(
+    ast: &FactorAst,
+    rows: &[ReplayDataRow],
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    match ast {
+        FactorAst::Terminal(FactorTerminal::Field(name)) => rows
+            .iter()
+            .map(|row| field_value(row, name))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into),
+        FactorAst::Terminal(FactorTerminal::Constant(value)) => {
+            let value = value.parse::<f64>()?;
+            Ok(vec![value; rows.len()])
+        }
+        FactorAst::Call { operator, args } => {
+            let series = args
+                .iter()
+                .map(|arg| eval_factor_ast_series(arg, rows))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(match operator {
+                hft_factor_dsl::FactorOperator::Add => zip2(&series[0], &series[1], |a, b| a + b),
+                hft_factor_dsl::FactorOperator::Sub => zip2(&series[0], &series[1], |a, b| a - b),
+                hft_factor_dsl::FactorOperator::Mul => zip2(&series[0], &series[1], |a, b| a * b),
+                hft_factor_dsl::FactorOperator::Div => {
+                    zip2(
+                        &series[0],
+                        &series[1],
+                        |a, b| if b == 0.0 { 0.0 } else { a / b },
+                    )
+                }
+                hft_factor_dsl::FactorOperator::Abs => {
+                    series[0].iter().map(|value| value.abs()).collect()
+                }
+                hft_factor_dsl::FactorOperator::Rank => rank_series(&series[0]),
+                hft_factor_dsl::FactorOperator::Delta => lagged_delta(
+                    &series[0],
+                    series[1].first().copied().unwrap_or(1.0) as usize,
+                ),
+                hft_factor_dsl::FactorOperator::Mean => rolling_mean(
+                    &series[0],
+                    series[1].first().copied().unwrap_or(1.0) as usize,
+                ),
+                hft_factor_dsl::FactorOperator::ZScore => zscore(
+                    &series[0],
+                    series[1].first().copied().unwrap_or(1.0) as usize,
+                ),
+                _ => return Err("unsupported factor operator for DuckDB agent loop".into()),
+            })
+        }
+    }
+}
+
+fn field_value(row: &ReplayDataRow, name: &str) -> Result<f64, String> {
+    match name {
+        "oi_delta_5m" => Ok(row.oi_delta_5m),
+        "cvd_slope_5m" => Ok(row.cvd_slope_5m),
+        "spread_bps" => Ok(row.spread_bps),
+        "funding_rate" => Ok(row.funding_rate),
+        "depth_imbalance" => Ok(row.depth_imbalance),
+        "forward_return" => Ok(row.forward_return),
+        _ => Err(format!("unknown DuckDB replay field {name}")),
+    }
+}
+
+fn zip2(left: &[f64], right: &[f64], op: impl Fn(f64, f64) -> f64) -> Vec<f64> {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| op(*left, *right))
+        .collect()
+}
+
+fn rank_series(values: &[f64]) -> Vec<f64> {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    values
+        .iter()
+        .map(|value| {
+            sorted
+                .iter()
+                .position(|candidate| candidate == value)
+                .unwrap_or(0) as f64
+                / values.len().max(1) as f64
+        })
+        .collect()
+}
+
+fn lagged_delta(values: &[f64], window: usize) -> Vec<f64> {
+    let window = window.max(1);
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            if idx < window {
+                0.0
+            } else {
+                value - values[idx - window]
+            }
+        })
+        .collect()
+}
+
+fn rolling_mean(values: &[f64], window: usize) -> Vec<f64> {
+    let window = window.max(1);
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| {
+            let start = idx.saturating_sub(window - 1);
+            let slice = &values[start..=idx];
+            slice.iter().sum::<f64>() / slice.len() as f64
+        })
+        .collect()
+}
+
+fn zscore(values: &[f64], window: usize) -> Vec<f64> {
+    let mean = rolling_mean(values, window);
+    values
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| {
+            let start = idx.saturating_sub(window.max(1) - 1);
+            let slice = &values[start..=idx];
+            let variance = slice
+                .iter()
+                .map(|sample| (sample - mean[idx]).powi(2))
+                .sum::<f64>()
+                / slice.len() as f64;
+            let std = variance.sqrt();
+            if std == 0.0 {
+                0.0
+            } else {
+                (value - mean[idx]) / std
+            }
+        })
+        .collect()
+}
+
+fn replay_rows_to_csv(rows: &[ReplayDataRow], signals: &[f64]) -> String {
+    let mut csv = "signal,forward_return,available_time\n".to_string();
+    for (row, signal) in rows.iter().zip(signals) {
+        csv.push_str(&format!(
+            "{},{},{}\n",
+            signal, row.forward_return, row.available_time
+        ));
+    }
+    csv
 }
 
 #[derive(Debug, Serialize)]
@@ -1618,6 +2016,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &output,
                     max_candidates_per_engine,
                     max_live_risk_pct,
+                )?)?
+            );
+        }
+        Command::DuckdbAgentLoop {
+            duckdb_path,
+            output,
+            table,
+            max_candidates_per_engine,
+            max_live_risk_pct,
+            bootstrap_fixture,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&duckdb_agent_loop(
+                    &duckdb_path,
+                    &output,
+                    &table,
+                    max_candidates_per_engine,
+                    max_live_risk_pct,
+                    bootstrap_fixture,
                 )?)?
             );
         }

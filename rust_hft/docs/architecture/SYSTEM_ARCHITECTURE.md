@@ -61,6 +61,7 @@ Implemented local commands:
 cargo run -p hft-agentic-alpha -- topology
 cargo run -p hft-agentic-alpha -- engine-loop-demo target/agentic-alpha/engine-loop.json
 cargo run -p hft-agentic-alpha -- agent-loop-demo target/agentic-alpha/agent-loop.json --max-candidates-per-engine 3 --max-live-risk-pct 0
+cargo run -p hft-agentic-alpha -- duckdb-agent-loop target/agentic-alpha/duckdb-agent-loop.duckdb target/agentic-alpha/duckdb-agent-loop.json --bootstrap-fixture --max-candidates-per-engine 3 --max-live-risk-pct 0
 cargo run -p hft-agentic-alpha -- prototype-lab-demo target/agentic-alpha/prototype-lab.json
 cargo run -p hft-agentic-alpha -- replay-eval target/agentic-alpha/replay.csv target/agentic-alpha/replay-factors.json target/agentic-alpha/replay-report.json
 cargo run -p hft-agentic-alpha -- learning-demo target/agentic-alpha/learning.json

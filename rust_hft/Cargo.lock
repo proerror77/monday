@@ -2072,6 +2072,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "duckdb",
  "hft-allocator-policy",
  "hft-artifact-store",
  "hft-audit-trail",

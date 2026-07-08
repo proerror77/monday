@@ -8,6 +8,7 @@ publish = false
 execution_adapter_binance = { package = "hft-execution-adapter-binance", path = "../../execution-gateway/adapters/adapter-binance" }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
+duckdb = { version = "1.10504.0", features = ["bundled"] }
 hft-core = { package = "hft-core", path = "../../market-core/core" }
 hft-allocator-policy = { path = "../../research-core/allocator-policy" }
 hft-artifact-store = { path = "../../infra-services/core/artifact-store" }
