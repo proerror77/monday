@@ -72,6 +72,9 @@ members = [
     "infra-services/core/grpc-server",
     "infra-services/testing",
 
+    # Research Core
+    "research-core/manifest",
+
     # Applications
     "apps/live",
     "apps/all-in-one",
