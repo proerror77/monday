@@ -120,6 +120,25 @@ enum Command {
         #[arg(long, default_value = "BINANCE_API_SECRET")]
         api_secret_env: String,
     },
+    /// Bind an approved live-small command to an EVM raw transaction broadcast path.
+    EvmRawTx {
+        command: PathBuf,
+        output: PathBuf,
+        #[arg(long, value_enum, default_value_t = OrderRunMode::Paper)]
+        mode: OrderRunMode,
+        #[arg(long)]
+        confirm_live_tx: bool,
+        #[arg(long)]
+        rpc_url: String,
+        #[arg(long)]
+        expected_chain_id: String,
+        #[arg(long, default_value = "ethereum-mainnet")]
+        network: String,
+        #[arg(long)]
+        raw_tx: String,
+        #[arg(long, default_value_t = 8000)]
+        timeout_ms: u64,
+    },
     /// Persist a generated factor candidate into a file-backed candidate pool.
     FactorPoolDemo { output: PathBuf },
     /// Persist a prototype-backed experiment run into a file-backed log.
@@ -571,6 +590,18 @@ struct BinanceOrderReport {
     order_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct EvmRawTxReport {
+    output: String,
+    mode: OrderRunMode,
+    actuation: RuntimeActuationResult,
+    network: String,
+    chain_id: String,
+    raw_tx_prefix: String,
+    broadcasted: bool,
+    tx_hash: Option<String>,
+}
+
 fn live_command_demo(
     output: &Path,
     approval_ref: Option<&str>,
@@ -715,6 +746,89 @@ fn binance_order(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn evm_raw_tx(
+    command_path: &Path,
+    output: &Path,
+    mode: OrderRunMode,
+    confirm_live_tx: bool,
+    rpc_url: String,
+    expected_chain_id: String,
+    network: String,
+    raw_tx: String,
+    timeout_ms: u64,
+) -> Result<EvmRawTxReport, Box<dyn std::error::Error>> {
+    let command_file: LiveCommandFile =
+        serde_json::from_str(&std::fs::read_to_string(command_path)?)?;
+    if command_file.command.dry_run {
+        return Err("EVM raw transaction requires an armed live-small command".into());
+    }
+    if mode == OrderRunMode::Live && !confirm_live_tx {
+        return Err("live EVM transaction requires --confirm-live-tx".into());
+    }
+    if !is_hex_prefixed(&raw_tx) {
+        return Err("raw transaction must be 0x-prefixed hex".into());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()?;
+    let chain_id = evm_rpc_string(&client, &rpc_url, "eth_chainId", serde_json::json!([]))?;
+    if !chain_id.eq_ignore_ascii_case(&expected_chain_id) {
+        return Err(format!(
+            "EVM chain id mismatch: expected {}, got {}",
+            expected_chain_id, chain_id
+        )
+        .into());
+    }
+
+    let actuation = execute_runtime_command(
+        &command_file.command,
+        RuntimeConnectorKind::OnChain {
+            network: network.clone(),
+        },
+        match mode {
+            OrderRunMode::Paper => RuntimeActuationMode::Paper,
+            OrderRunMode::Live => RuntimeActuationMode::Live,
+        },
+    )?;
+
+    let tx_hash = if mode == OrderRunMode::Live {
+        Some(evm_rpc_string(
+            &client,
+            &rpc_url,
+            "eth_sendRawTransaction",
+            serde_json::json!([raw_tx]),
+        )?)
+    } else {
+        None
+    };
+
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let report = EvmRawTxReport {
+        output: output.display().to_string(),
+        mode,
+        actuation,
+        network,
+        chain_id,
+        raw_tx_prefix: raw_tx.chars().take(18).collect(),
+        broadcasted: tx_hash.is_some(),
+        tx_hash,
+    };
+    std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
+    register_artifact("evm-raw-tx-1", output)?;
+    Ok(report)
+}
+
+fn is_hex_prefixed(value: &str) -> bool {
+    value.len() > 2 && value.starts_with("0x") && value[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
 #[derive(Debug, Serialize)]
 struct EndpointSmoke {
     name: &'static str,
@@ -782,40 +896,15 @@ fn exchange_ping(client: &reqwest::blocking::Client, url: &str) -> EndpointSmoke
 }
 
 fn evm_chain_id(client: &reqwest::blocking::Client, url: &str) -> EndpointSmoke {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_chainId",
-        "params": []
-    });
-    match client.post(url).json(&body).send() {
-        Ok(response) => {
-            let status = response.status();
-            match response.json::<serde_json::Value>() {
-                Ok(value) => {
-                    let chain_id = value
-                        .get("result")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string);
-                    EndpointSmoke {
-                        name: "evm_rpc_chain_id",
-                        url: url.to_string(),
-                        ok: status.is_success() && chain_id.is_some(),
-                        http_status: Some(status.as_u16()),
-                        chain_id,
-                        error: value.get("error").map(ToString::to_string),
-                    }
-                }
-                Err(error) => EndpointSmoke {
-                    name: "evm_rpc_chain_id",
-                    url: url.to_string(),
-                    ok: false,
-                    http_status: Some(status.as_u16()),
-                    chain_id: None,
-                    error: Some(error.to_string()),
-                },
-            }
-        }
+    match evm_rpc_string(client, url, "eth_chainId", serde_json::json!([])) {
+        Ok(chain_id) => EndpointSmoke {
+            name: "evm_rpc_chain_id",
+            url: url.to_string(),
+            ok: true,
+            http_status: Some(200),
+            chain_id: Some(chain_id),
+            error: None,
+        },
         Err(error) => EndpointSmoke {
             name: "evm_rpc_chain_id",
             url: url.to_string(),
@@ -825,6 +914,35 @@ fn evm_chain_id(client: &reqwest::blocking::Client, url: &str) -> EndpointSmoke 
             error: Some(error.to_string()),
         },
     }
+}
+
+fn evm_rpc_string(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params
+    });
+
+    let response = client.post(url).json(&body).send()?;
+    let status = response.status();
+    let value = response.json::<serde_json::Value>()?;
+    if !status.is_success() {
+        return Err(format!("EVM RPC HTTP status {}: {}", status.as_u16(), value).into());
+    }
+    if let Some(error) = value.get("error") {
+        return Err(format!("EVM RPC error: {}", error).into());
+    }
+    value
+        .get("result")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "EVM RPC response missing string result".into())
 }
 
 #[derive(Debug, Serialize)]
@@ -1372,6 +1490,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ws_base_url,
                     api_key_env,
                     api_secret_env,
+                )?)?
+            );
+        }
+        Command::EvmRawTx {
+            command,
+            output,
+            mode,
+            confirm_live_tx,
+            rpc_url,
+            expected_chain_id,
+            network,
+            raw_tx,
+            timeout_ms,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&evm_raw_tx(
+                    &command,
+                    &output,
+                    mode,
+                    confirm_live_tx,
+                    rpc_url,
+                    expected_chain_id,
+                    network,
+                    raw_tx,
+                    timeout_ms,
                 )?)?
             );
         }
