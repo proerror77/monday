@@ -6,7 +6,7 @@ use hft_experiment_store::{ExperimentRun, ExperimentStore, InMemoryExperimentSto
 use hft_factor_bank::{FactorAsset, FactorLineage, FactorMetrics, FactorStatus, FactorType};
 use hft_factor_dsl::{FactorAst, FactorTerminal};
 use hft_factor_eval::{evaluate_factor, EvaluationInput, EvaluationThresholds};
-use hft_factor_store::{FactorQuery, FactorStore, InMemoryFactorStore};
+use hft_factor_store::{FactorQuery, FactorStore, FileFactorStore, InMemoryFactorStore};
 use hft_live_small_supervisor::{
     rollback, supervise_rollout, LiveSmallAction, LiveSmallDecision, LiveSmallPolicyLimits,
     LiveSmallRolloutRequest, RollbackTrigger,
@@ -56,6 +56,8 @@ enum Command {
     ExportAudit { output: PathBuf },
     /// Run the deterministic loop-engine progress check.
     LoopEngineDemo,
+    /// Persist a generated factor candidate into a file-backed candidate pool.
+    FactorPoolDemo { output: PathBuf },
 }
 
 #[derive(Debug, Serialize)]
@@ -252,6 +254,53 @@ fn demo_loop() -> Result<DemoLoopReport, Box<dyn std::error::Error>> {
         promotion_passed: promotion.passed,
         live_small_action: rollout.action,
         allocator_policy_id: allocator_policy()?.policy_id,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct FactorPoolDemoReport {
+    output: String,
+    stored_factors: usize,
+    factor_id: String,
+}
+
+fn factor_pool_demo(output: &Path) -> Result<FactorPoolDemoReport, Box<dyn std::error::Error>> {
+    let now = chrono::Utc::now();
+    let asset = FactorAsset {
+        factor_id: "factor-demo-1".to_string(),
+        factor_type: FactorType::Formula,
+        ast: FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string())),
+        lineage: FactorLineage {
+            parent_factor_ids: vec![],
+            source_engine: "llm_proposer".to_string(),
+            search_manifest_id: ManifestId::new("search-demo-1")?,
+        },
+        data_manifest: reference("data-demo-1", "data_manifest")?,
+        feature_manifest: reference("feature-demo-1", "feature_manifest")?,
+        label_manifest: reference("label-demo-1", "label_manifest")?,
+        evaluation_manifests: vec![reference("eval-demo-1", "evaluation_manifest")?],
+        metrics: factor_metrics(),
+        correlation_cluster: None,
+        regime_metrics: BTreeMap::new(),
+        symbol_metrics: BTreeMap::new(),
+        promotion_status: FactorStatus::LiveShadow,
+        live_decay_state: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut store = FileFactorStore::new(output);
+    store.upsert_factor(asset.clone())?;
+    let stored_factors = store
+        .list_factors(FactorQuery {
+            status: Some(FactorStatus::LiveShadow),
+            limit: 10,
+        })?
+        .len();
+
+    Ok(FactorPoolDemoReport {
+        output: store.path().display().to_string(),
+        stored_factors,
+        factor_id: asset.factor_id,
     })
 }
 
@@ -566,6 +615,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::LoopEngineDemo => {
             println!("{}", serde_json::to_string_pretty(&loop_engine_demo()?)?);
+        }
+        Command::FactorPoolDemo { output } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&factor_pool_demo(&output)?)?
+            );
         }
     }
     Ok(())
