@@ -2082,6 +2082,7 @@ dependencies = [
  "hft-promotion-gate",
  "hft-prototype-adapter",
  "hft-research-manifest",
+ "hft-research-memory",
  "hft-search-protocol",
  "serde",
  "serde_json",
@@ -3077,6 +3078,18 @@ name = "hft-research-manifest"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hft-research-memory"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hft-live-small-supervisor",
+ "hft-promotion-gate",
+ "hft-research-manifest",
  "serde",
  "thiserror 2.0.18",
 ]

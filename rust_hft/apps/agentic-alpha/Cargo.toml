@@ -17,6 +17,7 @@ hft-live-small-supervisor = { path = "../../research-core/live-small-supervisor"
 hft-promotion-gate = { path = "../../research-core/promotion-gate" }
 hft-prototype-adapter = { path = "../../research-core/prototype-adapter" }
 hft-research-manifest = { path = "../../research-core/manifest" }
+hft-research-memory = { path = "../../research-core/research-memory" }
 hft-search-protocol = { path = "../../research-core/search-protocol" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

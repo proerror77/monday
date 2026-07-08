@@ -83,6 +83,7 @@ members = [
     "research-core/manifest",
     "research-core/promotion-gate",
     "research-core/prototype-adapter",
+    "research-core/research-memory",
     "research-core/search-protocol",
 
     # Applications

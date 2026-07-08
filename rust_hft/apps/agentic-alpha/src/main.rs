@@ -14,6 +14,10 @@ use hft_prototype_adapter::{
     known_python_prototypes, PrototypeProposalAdapter, PrototypeRunRequest, StaticPrototypeAdapter,
 };
 use hft_research_manifest::{ArtifactRef, LiveRolloutManifest, ManifestId, ManifestRef};
+use hft_research_memory::{
+    memory_from_live_small, memory_from_promotion_gate, HarnessChangeKind, HarnessChangeProposal,
+    ResearchMemoryEvent,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -35,6 +39,8 @@ enum Command {
     PrototypeBackends,
     /// Run live-small supervision readback without touching execution.
     LiveSmallDemo,
+    /// Convert failures into structured memory and harness-change proposal.
+    MemoryDemo,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +111,7 @@ fn contract_bindings() -> Vec<&'static str> {
         std::any::type_name::<hft_live_small_supervisor::LiveSmallDecision>(),
         std::any::type_name::<hft_promotion_gate::PromotionGateDecision>(),
         std::any::type_name::<hft_prototype_adapter::PrototypeBackend>(),
+        std::any::type_name::<hft_research_memory::ResearchMemoryEvent>(),
     ]
 }
 
@@ -273,6 +280,47 @@ fn live_small_demo() -> Result<LiveSmallDemoReport, Box<dyn std::error::Error>> 
     })
 }
 
+#[derive(Debug, Serialize)]
+struct MemoryDemoReport {
+    events: Vec<ResearchMemoryEvent>,
+    harness_change: HarnessChangeProposal,
+}
+
+fn memory_demo() -> Result<MemoryDemoReport, Box<dyn std::error::Error>> {
+    let now = chrono::Utc::now();
+    let promotion_failure = hft_promotion_gate::PromotionGateDecision {
+        passed: false,
+        failures: vec![hft_promotion_gate::GateFailure::ApprovalRequired],
+    };
+    let rollback_decision = rollback(RollbackTrigger::SentinelStopped);
+    let mut events = Vec::new();
+    if let Some(event) =
+        memory_from_promotion_gate("memory-event-promotion-1", &promotion_failure, now)
+    {
+        event.validate()?;
+        events.push(event);
+    }
+    if let Some(event) = memory_from_live_small("memory-event-rollback-1", &rollback_decision, now)
+    {
+        event.validate()?;
+        events.push(event);
+    }
+
+    let harness_change = HarnessChangeProposal {
+        proposal_id: "harness-change-1".to_string(),
+        change_kind: HarnessChangeKind::EvaluatorRecipe,
+        source_event_ids: events.iter().map(|event| event.event_id.clone()).collect(),
+        description: "tighten approval evidence and rollback attribution checks".to_string(),
+        grants_live_trading_authority: false,
+    };
+    harness_change.validate()?;
+
+    Ok(MemoryDemoReport {
+        events,
+        harness_change,
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.command {
@@ -296,6 +344,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::LiveSmallDemo => {
             println!("{}", serde_json::to_string_pretty(&live_small_demo()?)?);
+        }
+        Command::MemoryDemo => {
+            println!("{}", serde_json::to_string_pretty(&memory_demo()?)?);
         }
     }
     Ok(())
