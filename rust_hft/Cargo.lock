@@ -2070,12 +2070,17 @@ dependencies = [
 name = "hft-agentic-alpha"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "hft-artifact-store",
  "hft-experiment-store",
+ "hft-factor-bank",
+ "hft-factor-dsl",
  "hft-factor-eval",
  "hft-factor-store",
  "hft-promotion-gate",
+ "hft-research-manifest",
+ "hft-search-protocol",
  "serde",
  "serde_json",
 ]
