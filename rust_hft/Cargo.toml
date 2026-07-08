@@ -82,6 +82,7 @@ members = [
     "research-core/factor-bank",
     "research-core/factor-eval",
     "research-core/live-small-supervisor",
+    "research-core/loop-engine",
     "research-core/manifest",
     "research-core/promotion-gate",
     "research-core/prototype-adapter",

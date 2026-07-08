@@ -11,6 +11,10 @@ use hft_live_small_supervisor::{
     rollback, supervise_rollout, LiveSmallAction, LiveSmallDecision, LiveSmallPolicyLimits,
     LiveSmallRolloutRequest, RollbackTrigger,
 };
+use hft_loop_engine::{
+    evaluate_loop_run, CandidateLoopEvidence, DoneCondition, LoopNextAction, LoopRun,
+    LoopStageKind, LoopStageRecord, LoopStageStatus, LoopTrigger,
+};
 use hft_promotion_gate::{evaluate_promotion, PromotionGateInput, TargetStage};
 use hft_prototype_adapter::{
     known_python_prototypes, PrototypeProposalAdapter, PrototypeRunRequest, StaticPrototypeAdapter,
@@ -50,6 +54,8 @@ enum Command {
     AuditDemo,
     /// Export a validated audit bundle to a JSON file.
     ExportAudit { output: PathBuf },
+    /// Run the deterministic loop-engine progress check.
+    LoopEngineDemo,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +130,7 @@ fn contract_bindings() -> Vec<&'static str> {
         std::any::type_name::<hft_research_memory::ResearchMemoryEvent>(),
         std::any::type_name::<hft_allocator_policy::AllocatorPolicyProposal>(),
         std::any::type_name::<hft_audit_trail::HarnessAuditBundle>(),
+        std::any::type_name::<hft_loop_engine::LoopRun>(),
     ]
 }
 
@@ -448,6 +455,79 @@ fn export_audit(output: &Path) -> Result<ExportAuditReport, Box<dyn std::error::
     })
 }
 
+#[derive(Debug, Serialize)]
+struct LoopEngineDemoReport {
+    run: LoopRun,
+    next_action: LoopNextAction,
+    evidence_valid: bool,
+}
+
+fn loop_engine_demo() -> Result<LoopEngineDemoReport, Box<dyn std::error::Error>> {
+    let promotion = hft_promotion_gate::PromotionGateDecision {
+        passed: true,
+        failures: vec![],
+    };
+    let evidence = CandidateLoopEvidence {
+        proposal: audit_bundle()?.proposals.remove(0),
+        evaluation: evaluate_factor(
+            &EvaluationInput {
+                dataset_manifest: reference("data-demo-1", "data_manifest")?,
+                has_available_time: true,
+                sample_count: 100,
+                metrics: factor_metrics(),
+            },
+            &EvaluationThresholds {
+                min_sample_count: 50,
+                min_rank_ic: 0.03,
+                min_net_sharpe: 1.0,
+                max_drawdown: 0.05,
+                max_correlation: 0.8,
+            },
+            Some(0.2),
+        ),
+        promotion: promotion.clone(),
+        live_small: Some(live_small_decision(promotion)?),
+    };
+    evidence.validate()?;
+    let run = LoopRun {
+        run_id: "loop-demo-1".to_string(),
+        trigger: LoopTrigger::GoalBased,
+        goal: "find one auditable live-small candidate without granting live authority".to_string(),
+        started_at: chrono::Utc::now(),
+        current_iteration: 1,
+        max_iterations: 3,
+        done_condition: DoneCondition::StagePassed(LoopStageKind::Audit),
+        stages: vec![
+            loop_stage(LoopStageKind::GatherContext, LoopStageStatus::Passed)?,
+            loop_stage(LoopStageKind::GenerateCandidates, LoopStageStatus::Passed)?,
+            loop_stage(LoopStageKind::EvaluateCandidates, LoopStageStatus::Passed)?,
+            loop_stage(LoopStageKind::PromoteCandidate, LoopStageStatus::Passed)?,
+            loop_stage(LoopStageKind::LiveSmallSupervision, LoopStageStatus::Passed)?,
+            loop_stage(LoopStageKind::CaptureMemory, LoopStageStatus::Passed)?,
+            loop_stage(LoopStageKind::Audit, LoopStageStatus::Passed)?,
+        ],
+    };
+    let next_action = evaluate_loop_run(&run)?;
+
+    Ok(LoopEngineDemoReport {
+        run,
+        next_action,
+        evidence_valid: true,
+    })
+}
+
+fn loop_stage(
+    kind: LoopStageKind,
+    status: LoopStageStatus,
+) -> Result<LoopStageRecord, Box<dyn std::error::Error>> {
+    Ok(LoopStageRecord {
+        kind,
+        status,
+        artifact_refs: vec![reference("audit-demo-1", "audit_bundle")?],
+        summary: "validated by local harness contracts".to_string(),
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.command {
@@ -483,6 +563,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::ExportAudit { output } => {
             println!("{}", serde_json::to_string_pretty(&export_audit(&output)?)?);
+        }
+        Command::LoopEngineDemo => {
+            println!("{}", serde_json::to_string_pretty(&loop_engine_demo()?)?);
         }
     }
     Ok(())
