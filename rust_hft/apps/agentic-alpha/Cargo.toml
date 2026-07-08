@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
+hft-allocator-policy = { path = "../../research-core/allocator-policy" }
 hft-artifact-store = { path = "../../infra-services/core/artifact-store" }
 hft-experiment-store = { path = "../../infra-services/core/experiment-store" }
 hft-factor-bank = { path = "../../research-core/factor-bank" }

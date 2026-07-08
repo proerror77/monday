@@ -2072,6 +2072,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "hft-allocator-policy",
  "hft-artifact-store",
  "hft-experiment-store",
  "hft-factor-bank",
@@ -2097,6 +2098,16 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hft-allocator-policy"
+version = "0.1.0"
+dependencies = [
+ "hft-live-small-supervisor",
+ "hft-research-manifest",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

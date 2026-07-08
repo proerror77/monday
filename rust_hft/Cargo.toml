@@ -76,6 +76,7 @@ members = [
     "infra-services/testing",
 
     # Research Core
+    "research-core/allocator-policy",
     "research-core/factor-dsl",
     "research-core/factor-bank",
     "research-core/factor-eval",

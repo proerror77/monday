@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use hft_allocator_policy::{AllocatorPolicyProposal, FactorAllocation};
 use hft_artifact_store::{ArtifactRecord, ArtifactStore, InMemoryArtifactStore};
 use hft_experiment_store::{ExperimentRun, ExperimentStore, InMemoryExperimentStore};
 use hft_factor_bank::{FactorAsset, FactorLineage, FactorMetrics, FactorStatus, FactorType};
@@ -41,6 +42,8 @@ enum Command {
     LiveSmallDemo,
     /// Convert failures into structured memory and harness-change proposal.
     MemoryDemo,
+    /// Validate an allocator/risk policy proposal without mutating live weights.
+    AllocatorDemo,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,6 +68,7 @@ struct DemoLoopReport {
     evaluation_passed: bool,
     promotion_passed: bool,
     live_small_action: LiveSmallAction,
+    allocator_policy_id: String,
 }
 
 fn topology() -> Vec<LoopSpec> {
@@ -112,6 +116,7 @@ fn contract_bindings() -> Vec<&'static str> {
         std::any::type_name::<hft_promotion_gate::PromotionGateDecision>(),
         std::any::type_name::<hft_prototype_adapter::PrototypeBackend>(),
         std::any::type_name::<hft_research_memory::ResearchMemoryEvent>(),
+        std::any::type_name::<hft_allocator_policy::AllocatorPolicyProposal>(),
     ]
 }
 
@@ -232,6 +237,7 @@ fn demo_loop() -> Result<DemoLoopReport, Box<dyn std::error::Error>> {
         evaluation_passed: evaluation.passed,
         promotion_passed: promotion.passed,
         live_small_action: rollout.action,
+        allocator_policy_id: allocator_policy()?.policy_id,
     })
 }
 
@@ -251,17 +257,33 @@ fn live_rollout_manifest() -> Result<LiveRolloutManifest, Box<dyn std::error::Er
 fn live_small_decision(
     promotion_decision: hft_promotion_gate::PromotionGateDecision,
 ) -> Result<LiveSmallDecision, Box<dyn std::error::Error>> {
+    let policy = allocator_policy()?;
     Ok(supervise_rollout(&LiveSmallRolloutRequest {
         rollout_manifest: live_rollout_manifest()?,
         promotion_decision,
-        policy_limits: LiveSmallPolicyLimits {
+        policy_limits: policy.live_small_limits.clone(),
+        requested_factor_weight: policy.requested_factor_weight(),
+        requested_symbol_exposure: policy.requested_symbol_exposure,
+    })?)
+}
+
+fn allocator_policy() -> Result<AllocatorPolicyProposal, Box<dyn std::error::Error>> {
+    let policy = AllocatorPolicyProposal {
+        policy_id: "alloc-policy-demo-1".to_string(),
+        source_manifest: reference("promotion-demo-1", "promotion_manifest")?,
+        allocations: vec![FactorAllocation {
+            factor_id: "factor-demo-1".to_string(),
+            weight: 0.05,
+        }],
+        requested_symbol_exposure: 0.1,
+        live_small_limits: LiveSmallPolicyLimits {
             max_factor_weight: 0.1,
             max_symbol_exposure: 0.2,
             max_account_drawdown: 0.03,
         },
-        requested_factor_weight: 0.05,
-        requested_symbol_exposure: 0.1,
-    })?)
+    };
+    policy.validate()?;
+    Ok(policy)
 }
 
 #[derive(Debug, Serialize)]
@@ -321,6 +343,20 @@ fn memory_demo() -> Result<MemoryDemoReport, Box<dyn std::error::Error>> {
     })
 }
 
+#[derive(Debug, Serialize)]
+struct AllocatorDemoReport {
+    policy: AllocatorPolicyProposal,
+    requested_factor_weight: f64,
+}
+
+fn allocator_demo() -> Result<AllocatorDemoReport, Box<dyn std::error::Error>> {
+    let policy = allocator_policy()?;
+    Ok(AllocatorDemoReport {
+        requested_factor_weight: policy.requested_factor_weight(),
+        policy,
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.command {
@@ -347,6 +383,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::MemoryDemo => {
             println!("{}", serde_json::to_string_pretty(&memory_demo()?)?);
+        }
+        Command::AllocatorDemo => {
+            println!("{}", serde_json::to_string_pretty(&allocator_demo()?)?);
         }
     }
     Ok(())
