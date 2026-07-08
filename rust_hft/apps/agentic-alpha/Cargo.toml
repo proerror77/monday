@@ -22,6 +22,7 @@ hft-prototype-adapter = { path = "../../research-core/prototype-adapter" }
 hft-research-manifest = { path = "../../research-core/manifest" }
 hft-research-memory = { path = "../../research-core/research-memory" }
 hft-search-protocol = { path = "../../research-core/search-protocol" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 

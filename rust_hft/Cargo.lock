@@ -2087,6 +2087,7 @@ dependencies = [
  "hft-research-manifest",
  "hft-research-memory",
  "hft-search-protocol",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
 ]

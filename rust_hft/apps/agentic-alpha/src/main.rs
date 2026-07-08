@@ -37,6 +37,7 @@ use hft_search_protocol::{
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "hft-agentic-alpha")]
@@ -75,6 +76,16 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         approval_ref: Option<String>,
+    },
+    /// Smoke-test real exchange REST and optional EVM JSON-RPC connectivity.
+    ConnectivitySmoke {
+        output: PathBuf,
+        #[arg(long, default_value = "https://api.binance.com/api/v3/ping")]
+        exchange_ping_url: String,
+        #[arg(long)]
+        evm_rpc_url: Option<String>,
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
     },
     /// Persist a generated factor candidate into a file-backed candidate pool.
     FactorPoolDemo { output: PathBuf },
@@ -517,6 +528,118 @@ fn live_command_demo(
     std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
     register_artifact("live-small-command-1", output)?;
     Ok(report)
+}
+
+#[derive(Debug, Serialize)]
+struct EndpointSmoke {
+    name: &'static str,
+    url: String,
+    ok: bool,
+    http_status: Option<u16>,
+    chain_id: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectivitySmokeReport {
+    output: String,
+    exchange: EndpointSmoke,
+    on_chain: Option<EndpointSmoke>,
+}
+
+fn connectivity_smoke(
+    output: &Path,
+    exchange_ping_url: &str,
+    evm_rpc_url: Option<&str>,
+    timeout_ms: u64,
+) -> Result<ConnectivitySmokeReport, Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()?;
+    let exchange = exchange_ping(&client, exchange_ping_url);
+    let on_chain = evm_rpc_url.map(|url| evm_chain_id(&client, url));
+
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let report = ConnectivitySmokeReport {
+        output: output.display().to_string(),
+        exchange,
+        on_chain,
+    };
+    std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
+    register_artifact("connectivity-smoke-1", output)?;
+    Ok(report)
+}
+
+fn exchange_ping(client: &reqwest::blocking::Client, url: &str) -> EndpointSmoke {
+    match client.get(url).send() {
+        Ok(response) => EndpointSmoke {
+            name: "exchange_rest_ping",
+            url: url.to_string(),
+            ok: response.status().is_success(),
+            http_status: Some(response.status().as_u16()),
+            chain_id: None,
+            error: None,
+        },
+        Err(error) => EndpointSmoke {
+            name: "exchange_rest_ping",
+            url: url.to_string(),
+            ok: false,
+            http_status: None,
+            chain_id: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn evm_chain_id(client: &reqwest::blocking::Client, url: &str) -> EndpointSmoke {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_chainId",
+        "params": []
+    });
+    match client.post(url).json(&body).send() {
+        Ok(response) => {
+            let status = response.status();
+            match response.json::<serde_json::Value>() {
+                Ok(value) => {
+                    let chain_id = value
+                        .get("result")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    EndpointSmoke {
+                        name: "evm_rpc_chain_id",
+                        url: url.to_string(),
+                        ok: status.is_success() && chain_id.is_some(),
+                        http_status: Some(status.as_u16()),
+                        chain_id,
+                        error: value.get("error").map(ToString::to_string),
+                    }
+                }
+                Err(error) => EndpointSmoke {
+                    name: "evm_rpc_chain_id",
+                    url: url.to_string(),
+                    ok: false,
+                    http_status: Some(status.as_u16()),
+                    chain_id: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        }
+        Err(error) => EndpointSmoke {
+            name: "evm_rpc_chain_id",
+            url: url.to_string(),
+            ok: false,
+            http_status: None,
+            chain_id: None,
+            error: Some(error.to_string()),
+        },
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1012,6 +1135,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::to_string_pretty(&live_command_demo(
                     &output,
                     approval_ref.as_deref()
+                )?)?
+            );
+        }
+        Command::ConnectivitySmoke {
+            output,
+            exchange_ping_url,
+            evm_rpc_url,
+            timeout_ms,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&connectivity_smoke(
+                    &output,
+                    &exchange_ping_url,
+                    evm_rpc_url.as_deref(),
+                    timeout_ms,
                 )?)?
             );
         }
