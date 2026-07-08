@@ -13,6 +13,8 @@ pub enum SearchProtocolError {
     EmptyProposalId,
     #[error("invalid factor AST: {0}")]
     InvalidFactorAst(#[from] FactorDslError),
+    #[error("MCTS proposals require an MCTS trace")]
+    MissingMctsTrace,
     #[error("MCTS root node id cannot be empty")]
     EmptyMctsRoot,
     #[error("MCTS node id cannot be empty")]
@@ -63,6 +65,9 @@ impl ProposalArtifact {
             return Err(SearchProtocolError::EmptyProposalId);
         }
         self.ast.validate()?;
+        if self.engine == SearchEngineKind::Mcts && self.mcts_trace.is_none() {
+            return Err(SearchProtocolError::MissingMctsTrace);
+        }
         if let Some(trace) = &self.mcts_trace {
             trace.validate()?;
         }
@@ -228,6 +233,17 @@ mod tests {
             SearchProtocolError::MissingMctsRoot {
                 node_id: "root".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn rejects_mcts_proposal_without_trace() {
+        let mut artifact = proposal(field_ast(), None);
+        artifact.engine = SearchEngineKind::Mcts;
+
+        assert_eq!(
+            artifact.validate().unwrap_err(),
+            SearchProtocolError::MissingMctsTrace
         );
     }
 

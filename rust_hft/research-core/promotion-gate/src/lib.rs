@@ -12,6 +12,7 @@ pub enum TargetStage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GateFailure {
+    InvalidAsset,
     MissingEvaluationManifest,
     MissingRankIc,
     MissingNetSharpe,
@@ -43,6 +44,10 @@ pub fn evaluate_promotion(
     input: &PromotionGateInput,
 ) -> PromotionGateDecision {
     let mut failures = Vec::new();
+
+    if asset.validate().is_err() {
+        failures.push(GateFailure::InvalidAsset);
+    }
 
     if asset.evaluation_manifests.is_empty() {
         failures.push(GateFailure::MissingEvaluationManifest);
@@ -160,5 +165,22 @@ mod tests {
         let decision = evaluate_promotion(&asset(FactorStatus::LiveShadow), &input);
         assert!(decision.passed);
         assert!(decision.failures.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_asset() {
+        let input = PromotionGateInput {
+            target_stage: TargetStage::LiveSmall,
+            min_rank_ic: 0.03,
+            min_net_sharpe: 1.0,
+            max_drawdown_ceiling: 0.05,
+            first_same_class_approval_present: true,
+        };
+        let mut asset = asset(FactorStatus::LiveShadow);
+        asset.factor_id = " ".to_string();
+
+        let decision = evaluate_promotion(&asset, &input);
+        assert!(!decision.passed);
+        assert!(decision.failures.contains(&GateFailure::InvalidAsset));
     }
 }

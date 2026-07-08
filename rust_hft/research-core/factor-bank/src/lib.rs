@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use hft_factor_dsl::{FactorAst, FactorDslError};
-use hft_research_manifest::{ManifestId, ManifestRef};
+use hft_research_manifest::{ManifestError, ManifestId, ManifestRef};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -13,6 +13,8 @@ pub enum FactorBankError {
     EmptyFactorId,
     #[error("invalid factor AST: {0}")]
     InvalidFactorAst(#[from] FactorDslError),
+    #[error("invalid manifest reference: {0}")]
+    InvalidManifest(#[from] ManifestError),
     #[error("live full candidate is bookkeeping only in MVP")]
     LiveFullCandidateNotExecutable,
 }
@@ -91,6 +93,13 @@ impl FactorAsset {
             return Err(FactorBankError::EmptyFactorId);
         }
         self.ast.validate()?;
+        self.lineage.search_manifest_id.validate()?;
+        self.data_manifest.validate()?;
+        self.feature_manifest.validate()?;
+        self.label_manifest.validate()?;
+        for manifest in &self.evaluation_manifests {
+            manifest.validate()?;
+        }
         if self.promotion_status == FactorStatus::LiveFullCandidate {
             return Err(FactorBankError::LiveFullCandidateNotExecutable);
         }
@@ -169,5 +178,16 @@ mod tests {
             asset.validate().unwrap_err(),
             FactorBankError::InvalidFactorAst(_)
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_manifest_refs() {
+        let mut asset = asset_with_status(FactorStatus::Generated);
+        asset.evaluation_manifests[0].kind = " ".to_string();
+
+        assert_eq!(
+            asset.validate().unwrap_err(),
+            FactorBankError::InvalidManifest(hft_research_manifest::ManifestError::EmptyKind)
+        );
     }
 }
