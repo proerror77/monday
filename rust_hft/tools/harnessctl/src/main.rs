@@ -20,7 +20,7 @@ fn main() {
         Command::ValidationLanes => {
             println!("contracts: cargo test -p <changed-research-crate> --locked");
             println!("stores: cargo test -p <changed-store-crate> --locked");
-            println!("orchestrator: cargo check -p hft-agentic-alpha --locked");
+            println!("orchestrator: cargo check -p alpha-harness --locked");
             println!("runtime: cargo check -p hft-live --locked");
         }
     }

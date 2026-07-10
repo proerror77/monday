@@ -76,17 +76,9 @@ members = [
     "infra-services/testing",
 
     # Research Core
-    "research-core/allocator-policy",
-    "research-core/audit-trail",
     "research-core/factor-dsl",
     "research-core/factor-bank",
-    "research-core/factor-eval",
-    "research-core/live-small-supervisor",
-    "research-core/loop-engine",
     "research-core/manifest",
-    "research-core/promotion-gate",
-    "research-core/prototype-adapter",
-    "research-core/research-memory",
     "research-core/search-protocol",
 
     # Agentic Alpha Harness
@@ -102,7 +94,6 @@ members = [
     "apps/paper",
     "apps/replay",
     "apps/backtest",
-    "apps/agentic-alpha",
 
     # Shared Catalogs
     "shared/instrument",
@@ -114,7 +105,6 @@ members = [
     "tools/infer-cli",
     "tools/hyperliquid-demo",
     "tools/ws_test",
-    "tools/hft-agent",
     "tools/factorctl",
     "tools/harnessctl",
     "tools/listing-monitor",

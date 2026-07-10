@@ -66,7 +66,7 @@ jobs:
             -p hft-live \
             -p hft-paper \
             -p hft-all-in-one \
-            -p hft-agentic-alpha \
+            -p alpha-harness \
             --all-targets \
             -W clippy::correctness \
             -W clippy::perf \
@@ -74,7 +74,7 @@ jobs:
         continue-on-error: true
 
       - name: Build focused packages
-        run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p hft-agentic-alpha --locked
+        run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p alpha-harness --locked
 
       - name: Package binaries (if present)
         if: github.event_name == 'push'
