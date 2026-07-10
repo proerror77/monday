@@ -1,7 +1,7 @@
 //! Transactional DuckDB source of truth for the Agentic Alpha control plane.
 
 use alpha_domain::{
-    CandidateArtifact, ResearchIteration, ResearchMission, SearchBudgetUsage,
+    CandidateArtifact, MissionStatus, ResearchIteration, ResearchMission, SearchBudgetUsage,
     SignedDeploymentEnvelope,
 };
 use chrono::{DateTime, Utc};
@@ -54,6 +54,22 @@ pub struct MissionLineage {
     pub mission: ResearchMission,
     pub iterations: Vec<ResearchIteration>,
     pub candidates: Vec<StoredCandidate>,
+    pub evaluations: Vec<StoredEvaluation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationRecord {
+    pub evaluation_id: String,
+    pub mission_id: String,
+    pub candidate_id: String,
+    pub payload: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredEvaluation {
+    pub record: EvaluationRecord,
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,10 +180,46 @@ impl AlphaStore {
         )
     }
 
+    pub fn transition_mission(
+        &mut self,
+        mission_id: &str,
+        next: MissionStatus,
+        at: DateTime<Utc>,
+    ) -> Result<ResearchMission, StoreError> {
+        let mut mission = self.get_mission(mission_id)?;
+        mission.transition_to(next, at).map_err(domain_error)?;
+        let (json, hash) = encoded(&mission)?;
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        transaction
+            .execute(
+                "UPDATE missions SET status = ?, payload_json = ?, content_hash = ?, updated_at = ?
+                 WHERE mission_id = ?",
+                params![
+                    enum_name(&mission.status)?,
+                    json,
+                    hash,
+                    mission.updated_at.to_rfc3339(),
+                    mission_id
+                ],
+            )
+            .map_err(database_error)?;
+        append_journal(
+            &transaction,
+            Some(mission_id),
+            "mission_transitioned",
+            mission_id,
+            &hash,
+            at,
+        )?;
+        transaction.commit().map_err(database_error)?;
+        Ok(mission)
+    }
+
     pub fn append_iteration(
         &mut self,
         iteration: &ResearchIteration,
         candidate: Option<(&str, &CandidateArtifact)>,
+        evaluation: Option<&EvaluationRecord>,
     ) -> Result<(), StoreError> {
         iteration.validate().map_err(domain_error)?;
         match (
@@ -179,6 +231,19 @@ impl AlphaStore {
             _ => {
                 return Err(StoreError::Domain(
                     "iteration candidate id does not match stored artifact".to_string(),
+                ))
+            }
+        }
+        match (&iteration.evaluation_artifact_id, evaluation) {
+            (Some(expected), Some(actual))
+                if expected == &actual.evaluation_id
+                    && actual.mission_id == iteration.mission_id
+                    && iteration.candidate_artifact_id.as_deref()
+                        == Some(actual.candidate_id.as_str()) => {}
+            (None, None) => {}
+            _ => {
+                return Err(StoreError::Domain(
+                    "iteration evaluation does not match stored evidence".to_string(),
                 ))
             }
         }
@@ -228,6 +293,29 @@ impl AlphaStore {
                         candidate_json,
                         candidate_hash,
                         iteration.created_at.to_rfc3339()
+                    ],
+                )
+                .map_err(database_error)?;
+        }
+        if let Some(evaluation) = evaluation {
+            require_text(&evaluation.evaluation_id)?;
+            let (evaluation_json, evaluation_hash) = encoded(evaluation)?;
+            ensure_absent(
+                &transaction,
+                "evaluation_artifacts",
+                "evaluation_id",
+                &evaluation.evaluation_id,
+            )?;
+            transaction
+                .execute(
+                    "INSERT INTO evaluation_artifacts VALUES (?, ?, ?, ?, ?, ?)",
+                    params![
+                        evaluation.evaluation_id,
+                        evaluation.mission_id,
+                        evaluation.candidate_id,
+                        evaluation_json,
+                        evaluation_hash,
+                        evaluation.created_at.to_rfc3339()
                     ],
                 )
                 .map_err(database_error)?;
@@ -348,10 +436,32 @@ impl AlphaStore {
                     .with_timezone(&Utc),
             });
         }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT payload_json, content_hash FROM evaluation_artifacts
+                 WHERE mission_id = ? ORDER BY created_at, evaluation_id",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(params![mission_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(database_error)?;
+        let mut evaluations = Vec::new();
+        for row in rows {
+            let (json, content_hash) = row.map_err(database_error)?;
+            verify_hash(&json, &content_hash)?;
+            evaluations.push(StoredEvaluation {
+                record: serde_json::from_str(&json).map_err(serialization_error)?,
+                content_hash,
+            });
+        }
         Ok(MissionLineage {
             mission,
             iterations,
             candidates,
+            evaluations,
         })
     }
 
@@ -742,10 +852,10 @@ mod tests {
         let iteration = iteration();
         let candidate = CandidateArtifact::Program(serde_json::json!({"op": "rank"}));
         store
-            .append_iteration(&iteration, Some(("candidate-1", &candidate)))
+            .append_iteration(&iteration, Some(("candidate-1", &candidate)), None)
             .unwrap();
         assert!(matches!(
-            store.append_iteration(&iteration, Some(("candidate-1", &candidate))),
+            store.append_iteration(&iteration, Some(("candidate-1", &candidate)), None),
             Err(StoreError::DuplicateRecord)
         ));
     }
@@ -768,7 +878,7 @@ mod tests {
             let mut store = AlphaStore::open(&path).unwrap();
             store.create_mission(&mission()).unwrap();
             store
-                .append_iteration(&iteration_without_candidate(), None)
+                .append_iteration(&iteration_without_candidate(), None, None)
                 .unwrap();
             store.save_checkpoint(&checkpoint).unwrap();
         }
@@ -783,7 +893,7 @@ mod tests {
         let iteration = iteration();
         let candidate = CandidateArtifact::Program(serde_json::json!({"op": "rank"}));
         store
-            .append_iteration(&iteration, Some(("candidate-1", &candidate)))
+            .append_iteration(&iteration, Some(("candidate-1", &candidate)), None)
             .unwrap();
         let lineage = store.mission_lineage("mission-1").unwrap();
         assert_eq!(lineage.iterations, vec![iteration]);

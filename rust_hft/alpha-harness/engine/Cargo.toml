@@ -1,0 +1,16 @@
+[package]
+name = "alpha-engine"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+alpha-domain = { path = "../domain" }
+alpha-store = { path = "../store" }
+chrono = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hft-research-manifest = { path = "../../research-core/manifest" }

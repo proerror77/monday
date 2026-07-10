@@ -75,6 +75,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-engine"
+version = "0.1.0"
+dependencies = [
+ "alpha-domain",
+ "alpha-store",
+ "chrono",
+ "hft-research-manifest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "alpha-store"
 version = "0.1.0"
 dependencies = [
