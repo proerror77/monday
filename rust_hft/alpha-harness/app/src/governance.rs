@@ -156,7 +156,9 @@ pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
     let key_array: [u8; 32] = key_bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("signing key must contain exactly 32 bytes"))?;
-    let signed = sign_envelope(envelope, args.key_id, &SigningKey::from_bytes(&key_array))?;
+    let signing_key = SigningKey::from_bytes(&key_array);
+    let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    let signed = sign_envelope(envelope, args.key_id, &signing_key)?;
     let mut store = AlphaStore::open(args.db)?;
     store.store_deployment(&signed, Utc::now())?;
     data_mission::write_json_atomic(&args.output, &signed)?;
@@ -164,5 +166,6 @@ pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
         "deployment_id": signed.envelope.deployment_id,
         "signed_envelope_path": args.output,
         "key_id": signed.key_id,
+        "verifying_key_hex": verifying_key_hex,
     }))
 }

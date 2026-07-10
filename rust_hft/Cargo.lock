@@ -3033,9 +3033,12 @@ dependencies = [
 name = "hft-live"
 version = "0.1.0"
 dependencies = [
+ "alpha-domain",
  "anyhow",
  "chrono",
  "clap",
+ "ed25519-dalek",
+ "hex",
  "hft-core",
  "hft-data",
  "hft-engine",
@@ -3050,7 +3053,10 @@ dependencies = [
  "prometheus",
  "rust_decimal",
  "serde",
+ "serde_json",
  "serde_yaml",
+ "sha2",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

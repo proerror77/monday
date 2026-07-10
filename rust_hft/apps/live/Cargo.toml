@@ -6,6 +6,7 @@ description = "真盤交易應用 - 開啟所有重特性的地方"
 
 [dependencies]
 # 核心依賴
+alpha-domain = { path = "../../alpha-harness/domain" }
 hft_core = { package = "hft-core", path = "../../market-core/core" }
 ports = { package = "hft-ports", path = "../../market-core/ports" }
 runtime = { package = "hft-runtime", path = "../../market-core/runtime" }
@@ -13,6 +14,9 @@ engine = { package = "hft-engine", path = "../../market-core/engine" }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
 rust_decimal = { version = "1.33", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
 
 # 注意：所有可選依賴現在通過 runtime 轉發，移除直接依賴
 
@@ -22,7 +26,9 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4.0", features = ["derive"] }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = "0.9"
+thiserror = { workspace = true }
 prometheus = { workspace = true, optional = true }
 infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics", features = ["http-server"], optional = true }
 ndarray = "0.15"
@@ -76,3 +82,7 @@ simd = ["runtime/json-simd"]
 
 # 完整特性集
 full = ["all-exchanges", "all-strategies", "full-infra", "simd", "mock"]
+
+[lib]
+name = "hft_live"
+path = "src/lib.rs"

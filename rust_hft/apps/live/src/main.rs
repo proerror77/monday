@@ -6,7 +6,12 @@
 
 mod helpers;
 
+use alpha_domain::SignedDeploymentEnvelope;
 use clap::Parser;
+use hft_live::deployment_envelope::{
+    decode_trusted_keys, ActivationRequest, DeploymentIntake, RuntimeAuditLog, RuntimeNonceLedger,
+    RuntimePolicyDocument, SystemConfigActivationAdapter,
+};
 use runtime::{
     ExecutionQueueSettings, RiskConfig as RtRiskConfig, StrategyConfig as RtStrategyConfig,
     StrategyParams as RtStrategyParams, StrategyRiskLimits as RtStrategyRiskLimits,
@@ -47,6 +52,30 @@ struct Args {
     /// 僅行情（不啟動執行端、不連私有WS、不下單）
     #[arg(long)]
     quotes_only: bool,
+
+    /// Print deterministic runtime/risk hashes and exit without starting the system.
+    #[arg(long)]
+    deployment_hashes_only: bool,
+
+    /// Signed deployment envelope produced by alpha-harness.
+    #[arg(long)]
+    deployment_envelope: Option<std::path::PathBuf>,
+
+    /// Runtime-owned deployment policy document.
+    #[arg(long, requires = "deployment_envelope")]
+    deployment_policy: Option<std::path::PathBuf>,
+
+    /// Runtime-owned JSON map of key id to Ed25519 public key hex.
+    #[arg(long, requires = "deployment_envelope")]
+    deployment_trusted_keys: Option<std::path::PathBuf>,
+
+    /// Runtime-owned durable nonce ledger.
+    #[arg(long, requires = "deployment_envelope")]
+    deployment_nonce_ledger: Option<std::path::PathBuf>,
+
+    /// Runtime-owned append-only deployment audit log.
+    #[arg(long, requires = "deployment_envelope")]
+    deployment_audit_log: Option<std::path::PathBuf>,
 
     /// Metrics HTTP 服務器端口（啟用 metrics feature 時生效）
     #[cfg(feature = "metrics")]
@@ -102,10 +131,10 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化日誌
-    tracing_subscriber::fmt().with_env_filter("info").init();
-
     let args = Args::parse();
+    if !args.deployment_hashes_only {
+        tracing_subscriber::fmt().with_env_filter("info").init();
+    }
 
     info!("啟動 HFT 真盤交易系統");
     info!("配置檔案: {}", args.config);
@@ -124,13 +153,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(builder) => {
             info!("成功載入配置檔案: {}", args.config);
             // 顯示關鍵引擎配置（包含 stale_us）便於核對
-            let cfg = builder.config().clone();
+            let mut cfg = builder.config().clone();
+            let (runtime_config_hash, risk_policy_hash) = deployment_hashes(&cfg)?;
+            if args.deployment_hashes_only {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "runtime_config_hash": runtime_config_hash,
+                        "risk_policy_hash": risk_policy_hash,
+                    }))?
+                );
+                return Ok(());
+            }
+            if let Some(request) =
+                apply_deployment_if_present(&args, &mut cfg, runtime_config_hash, risk_policy_hash)?
+            {
+                info!(
+                    deployment_id = request.deployment_id,
+                    mode = ?request.mode,
+                    "verified deployment applied to runtime startup config"
+                );
+            }
             info!(
                 queue_capacity = cfg.engine.queue_capacity,
                 stale_us = cfg.engine.stale_us,
                 top_n = cfg.engine.top_n,
                 "Engine 配置已載入"
             );
+            let builder = SystemBuilder::new(cfg);
             // 檢查分片配置並應用
             let builder_with_sharding = if let (Some(shard_index), Some(shard_count)) =
                 (args.shard_index, args.shard_count)
@@ -155,6 +205,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             builder_with_sharding.auto_register_adapters().build()
         }
         Err(e) => {
+            if args.deployment_hashes_only || args.deployment_envelope.is_some() {
+                return Err(anyhow::anyhow!(
+                    "deployment intake requires the configured runtime file: {e}"
+                )
+                .into());
+            }
             warn!("無法載入配置檔案: {}, 使用預設配置", e);
             // 構造一個合理的預設配置，確保行情與策略可運行
             // 注意：提高 stale_us 以避免本機/容器延遲造成事件被丟棄
@@ -342,6 +398,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     system.stop().await?;
 
     Ok(())
+}
+
+fn deployment_hashes(config: &SystemConfig) -> anyhow::Result<(String, String)> {
+    use sha2::{Digest, Sha256};
+
+    let runtime = serde_json::to_vec(&serde_json::to_value(config)?)?;
+    let risk = serde_json::to_vec(&serde_json::to_value(&config.risk)?)?;
+    Ok((
+        hex::encode(Sha256::digest(runtime)),
+        hex::encode(Sha256::digest(risk)),
+    ))
+}
+
+fn apply_deployment_if_present(
+    args: &Args,
+    config: &mut SystemConfig,
+    runtime_config_hash: String,
+    risk_policy_hash: String,
+) -> anyhow::Result<Option<ActivationRequest>> {
+    let Some(envelope_path) = args.deployment_envelope.as_ref() else {
+        return Ok(None);
+    };
+    let policy_path = required_path(&args.deployment_policy, "--deployment-policy")?;
+    let trusted_keys_path =
+        required_path(&args.deployment_trusted_keys, "--deployment-trusted-keys")?;
+    let nonce_path = required_path(&args.deployment_nonce_ledger, "--deployment-nonce-ledger")?;
+    let audit_path = required_path(&args.deployment_audit_log, "--deployment-audit-log")?;
+
+    let signed: SignedDeploymentEnvelope = read_json(envelope_path)?;
+    let policy_document: RuntimePolicyDocument = read_json(policy_path)?;
+    let trusted_keys = decode_trusted_keys(read_json(trusted_keys_path)?)?;
+    let policy = policy_document.bind(runtime_config_hash, risk_policy_hash);
+    let mut ledger = RuntimeNonceLedger::open(nonce_path)?;
+    let mut audit = RuntimeAuditLog::open(audit_path)?;
+    let mut adapter = SystemConfigActivationAdapter::new(config);
+    let request = DeploymentIntake::new(
+        &trusted_keys,
+        &policy,
+        policy_document.runtime_paused,
+        &mut ledger,
+        &mut audit,
+        &mut adapter,
+    )
+    .accept(&signed, chrono::Utc::now())?;
+    Ok(Some(request))
+}
+
+fn required_path<'a>(
+    path: &'a Option<std::path::PathBuf>,
+    flag: &str,
+) -> anyhow::Result<&'a std::path::Path> {
+    path.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("{flag} is required with --deployment-envelope"))
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> anyhow::Result<T> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("invalid JSON in {}: {error}", path.display()))
 }
 
 fn show_available_adapters() {
