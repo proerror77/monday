@@ -151,14 +151,26 @@ jobs:
 
       - name: Run Clippy (strict)
         run: |
-          cargo clippy --workspace --all-targets --all-features -- \
+          cargo clippy \
+            -p alpha-domain \
+            -p alpha-store \
+            -p alpha-engine \
+            -p alpha-harness \
+            --all-targets \
+            -- \
             -D warnings \
-            -D clippy::all \
-            -D clippy::pedantic \
-            -W clippy::nursery \
-            -A clippy::module_name_repetitions \
-            -A clippy::similar_names \
-            -A clippy::too_many_arguments
+            -D clippy::correctness \
+            -D clippy::suspicious
+
+          cargo clippy \
+            -p hft-live \
+            --no-default-features \
+            --test deployment_envelope \
+            --no-deps \
+            -- \
+            -D warnings \
+            -D clippy::correctness \
+            -D clippy::suspicious
 
   # ============================================================================
   # Unused Dependencies

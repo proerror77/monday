@@ -56,22 +56,34 @@ jobs:
           cache-all-crates: true
           save-if: ${{ github.event_name != 'pull_request' }}
 
-      - name: Format check (non-blocking)
-        run: cargo fmt --all -- --check
+      - name: Format Agentic Alpha packages (non-blocking)
+        run: |
+          cargo fmt --check --package alpha-domain
+          cargo fmt --check --package alpha-store
+          cargo fmt --check --package alpha-engine
+          cargo fmt --check --package alpha-harness
         continue-on-error: true
 
-      - name: Clippy focused packages (non-blocking)
+      - name: Clippy Agentic Alpha packages (non-blocking)
         run: |
           cargo clippy \
-            -p hft-live \
-            -p hft-paper \
-            -p hft-all-in-one \
+            -p alpha-domain \
+            -p alpha-store \
+            -p alpha-engine \
             -p alpha-harness \
             --all-targets \
-            -W clippy::correctness \
-            -W clippy::perf \
-            -W clippy::suspicious
+            -- \
+            -D warnings
         continue-on-error: true
+
+      - name: Test Agentic Alpha packages
+        run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness --locked
+
+      - name: Verify signed runtime handoff
+        run: cargo test -p hft-live --no-default-features --test deployment_envelope --locked
+
+      - name: Check governed data collector
+        run: cargo check -p hft-collector --locked
 
       - name: Build focused packages
         run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p alpha-harness --locked
@@ -148,64 +160,6 @@ jobs:
 
       - name: Test Binance MD fast lane
         run: cargo test -p hft-engine --locked binance_md
-
-  rust_extra_standalone:
-    name: Rust Standalone (test_bitget_standalone)
-    runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_INCREMENTAL: "0"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-    defaults:
-      run:
-        working-directory: test_bitget_standalone
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Record cache dimensions
-        id: cache-info
-        shell: bash
-        run: |
-          echo "rust=$(rustc -Vv | awk '/^release:/ {print $2}')" >> "$GITHUB_OUTPUT"
-          echo "sccache=$(${SCCACHE_PATH:-sccache} --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Rust (standalone)
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            test_bitget_standalone
-          key: bitget-standalone-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('test_bitget_standalone/Cargo.lock', 'test_bitget_standalone/Cargo.toml') }}
-          cache-all-crates: true
-          save-if: ${{ github.event_name != 'pull_request' }}
-
-      - name: Build (release)
-        run: cargo build --release
-
-      - name: Package standalone binaries (if present)
-        run: |
-          mkdir -p dist
-          for bin in test_bitget_standalone test_bitget_connection; do
-            if [ -f target/release/$bin ]; then
-              cp target/release/$bin dist/
-            fi
-          done
-          ls -la dist || true
-
-      - name: Upload standalone artifacts
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: rust-standalone-binaries-${{ github.sha }}
-          path: test_bitget_standalone/dist/*
-          if-no-files-found: ignore
 
   python_lint:
     name: Python Lint (ml_workspace)
