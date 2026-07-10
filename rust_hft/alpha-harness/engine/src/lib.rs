@@ -1,6 +1,8 @@
 //! Persistent, budgeted AutoResearch mission kernel.
 
+pub mod engines;
 pub mod evaluation;
+pub mod llm;
 
 use alpha_domain::{
     CandidateArtifact, EngineKind, IterationVerdict, MissionStatus, ResearchIteration,
@@ -42,6 +44,8 @@ pub trait ProposalEngine {
         context: &EngineContext<'_>,
         remaining: &RemainingBudget,
     ) -> Result<EngineProposal, String>;
+
+    fn observe(&mut self, _proposal: &EngineProposal, _evaluation: &CandidateEvaluation) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +190,7 @@ where
                     };
                     match evaluated {
                         Ok(result) => {
+                            self.proposal_engine.observe(&proposal, &result);
                             let evaluation_id = format!("{mission_id}-evaluation-{index}");
                             let evaluation = EvaluationRecord {
                                 evaluation_id: evaluation_id.clone(),
@@ -329,6 +334,10 @@ fn remaining_limit(limit: u64, used: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::{
+        BayesianOptimizerEngine, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
+        OfflineTrace,
+    };
     use crate::evaluation::{prepare_dataset, ResearchRow, WalkForwardConfig};
     use alpha_domain::{ResearchMission, SearchBudget, ValidatorMode};
     use chrono::Duration;
@@ -513,5 +522,65 @@ mod tests {
             .run("mission-1", &dataset(), RunControl::default())
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn real_engines_run_through_persistent_kernel() {
+        let fields = vec!["oi".to_string(), "imbalance".to_string()];
+        let gp_left =
+            run_single_engine(GeneticProgrammingEngine::new(9, fields.clone(), 4, 4).unwrap());
+        let gp_right = run_single_engine(GeneticProgrammingEngine::new(9, fields, 4, 4).unwrap());
+        assert_eq!(gp_left, gp_right);
+
+        let mcts_left = run_single_engine(MctsEngine::new(9, "oi", "imbalance", 1.4, 3).unwrap());
+        let mcts_right = run_single_engine(MctsEngine::new(9, "oi", "imbalance", 1.4, 3).unwrap());
+        assert_eq!(mcts_left, mcts_right);
+
+        assert!(!run_single_engine(
+            BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap()
+        )
+        .is_empty());
+
+        let traces = vec![
+            OfflineTrace {
+                state: "positive".to_string(),
+                action: "rank".to_string(),
+                reward: 1.0,
+                next_state: "positive".to_string(),
+                terminal: false,
+            },
+            OfflineTrace {
+                state: "positive".to_string(),
+                action: "mean".to_string(),
+                reward: -1.0,
+                next_state: "flat".to_string(),
+                terminal: true,
+            },
+            OfflineTrace {
+                state: "flat".to_string(),
+                action: "rank".to_string(),
+                reward: 0.2,
+                next_state: "positive".to_string(),
+                terminal: false,
+            },
+        ];
+        assert!(!run_single_engine(
+            OfflineRlEngine::train("oi", "policy-1", &traces, 3, 0.2, 0.9, 20).unwrap()
+        )
+        .is_empty());
+    }
+
+    fn run_single_engine<P: ProposalEngine>(engine: P) -> String {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let mut mission = mission();
+        mission.search_budget.max_candidates = 1;
+        store.create_mission(&mission).unwrap();
+        AutoResearchKernel::new(&mut store, engine, PassingEvaluator)
+            .run("mission-1", &dataset(), RunControl::default())
+            .unwrap();
+        match &store.mission_lineage("mission-1").unwrap().candidates[0].artifact {
+            CandidateArtifact::Formula(ast) => ast.to_string(),
+            other => panic!("expected formula candidate, got {other:?}"),
+        }
     }
 }

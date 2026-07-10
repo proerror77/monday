@@ -81,9 +81,13 @@ dependencies = [
  "alpha-domain",
  "alpha-store",
  "chrono",
+ "hex",
+ "hft-factor-dsl",
  "hft-research-manifest",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

@@ -8,8 +8,12 @@ publish = false
 alpha-domain = { path = "../domain" }
 alpha-store = { path = "../store" }
 chrono = { workspace = true, features = ["serde"] }
+hex = { workspace = true }
+hft-factor-dsl = { path = "../../research-core/factor-dsl" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
