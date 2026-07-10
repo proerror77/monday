@@ -511,6 +511,6 @@ Rejected alternatives:
 
 This written spec is approved for implementation.
 
-Implementation plan path: `.superpowers/sdd/task-1-brief.md`
+Implementation plan path: `docs/superpowers/plans/2026-07-10-agentic-trading-system-v2.md`
 
 No legacy deletion or production code migration starts outside that atomic implementation plan. Keep explicit prerequisites for every deletion and focused validation per phase.
