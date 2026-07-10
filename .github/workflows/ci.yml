@@ -60,16 +60,21 @@ jobs:
         run: cargo fmt --all -- --check
         continue-on-error: true
 
-      - name: Clippy (non-blocking)
+      - name: Clippy focused packages (non-blocking)
         run: |
-          cargo clippy --workspace --all-targets \
+          cargo clippy \
+            -p hft-live \
+            -p hft-paper \
+            -p hft-all-in-one \
+            -p hft-agentic-alpha \
+            --all-targets \
             -W clippy::correctness \
             -W clippy::perf \
             -W clippy::suspicious
         continue-on-error: true
 
-      - name: Build
-        run: cargo build --workspace --locked
+      - name: Build focused packages
+        run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p hft-agentic-alpha --locked
 
       - name: Package binaries (if present)
         if: github.event_name == 'push'

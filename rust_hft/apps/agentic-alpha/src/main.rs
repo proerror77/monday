@@ -1,10 +1,8 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use duckdb::{params, Connection};
-use execution_adapter_binance::{BinanceExecutionClient, BinanceExecutionConfig};
 use hft_allocator_policy::{AllocatorPolicyProposal, FactorAllocation};
 use hft_artifact_store::{ArtifactRecord, ArtifactStore, FileArtifactStore, InMemoryArtifactStore};
 use hft_audit_trail::HarnessAuditBundle;
-use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce, VenueId};
 use hft_experiment_store::{
     ExperimentRun, ExperimentStore, FileExperimentStore, InMemoryExperimentStore,
 };
@@ -16,10 +14,9 @@ use hft_factor_eval::{
 };
 use hft_factor_store::{FactorQuery, FactorStore, FileFactorStore, InMemoryFactorStore};
 use hft_live_small_supervisor::{
-    arm_runtime_command, execute_runtime_command, rollback, runtime_command_from_decision,
-    supervise_rollout, LiveSmallAction, LiveSmallDecision, LiveSmallPolicyLimits,
-    LiveSmallRolloutRequest, LiveSmallRuntimeCommand, RollbackTrigger, RuntimeActuationMode,
-    RuntimeActuationResult, RuntimeConnectorKind,
+    arm_runtime_command, rollback, runtime_command_from_decision, supervise_rollout,
+    LiveSmallAction, LiveSmallDecision, LiveSmallPolicyLimits, LiveSmallRolloutRequest,
+    LiveSmallRuntimeCommand, RollbackTrigger,
 };
 use hft_loop_engine::{
     evaluate_loop_run, CandidateLoopEvidence, DoneCondition, LoopNextAction, LoopRun,
@@ -39,8 +36,7 @@ use hft_research_memory::{
 use hft_search_protocol::{
     run_budgeted_lab_search, SearchBudget, SearchEngineKind, SearchRunRequest,
 };
-use ports::{ExecutionClient, OrderIntent};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -114,54 +110,6 @@ enum Command {
         #[arg(long)]
         evm_rpc_url: Option<String>,
         #[arg(long, default_value_t = 3000)]
-        timeout_ms: u64,
-    },
-    /// Bind an approved live-small command to the Binance ExecutionClient order path.
-    BinanceOrder {
-        command: PathBuf,
-        output: PathBuf,
-        #[arg(long, value_enum, default_value_t = OrderRunMode::Paper)]
-        mode: OrderRunMode,
-        #[arg(long)]
-        confirm_live_order: bool,
-        #[arg(long)]
-        symbol: String,
-        #[arg(long, value_enum)]
-        side: OrderSideArg,
-        #[arg(long)]
-        quantity: String,
-        #[arg(long)]
-        price: Option<String>,
-        #[arg(long, value_enum, default_value_t = OrderTypeArg::Limit)]
-        order_type: OrderTypeArg,
-        #[arg(long, value_enum, default_value_t = TimeInForceArg::Gtc)]
-        time_in_force: TimeInForceArg,
-        #[arg(long, default_value = "https://api.binance.com")]
-        rest_base_url: String,
-        #[arg(long, default_value = "wss://stream.binance.com:9443/ws")]
-        ws_base_url: String,
-        #[arg(long, default_value = "BINANCE_API_KEY")]
-        api_key_env: String,
-        #[arg(long, default_value = "BINANCE_API_SECRET")]
-        api_secret_env: String,
-    },
-    /// Bind an approved live-small command to an EVM raw transaction broadcast path.
-    EvmRawTx {
-        command: PathBuf,
-        output: PathBuf,
-        #[arg(long, value_enum, default_value_t = OrderRunMode::Paper)]
-        mode: OrderRunMode,
-        #[arg(long)]
-        confirm_live_tx: bool,
-        #[arg(long)]
-        rpc_url: String,
-        #[arg(long)]
-        expected_chain_id: String,
-        #[arg(long, default_value = "ethereum-mainnet")]
-        network: String,
-        #[arg(long)]
-        raw_tx: String,
-        #[arg(long, default_value_t = 8000)]
         timeout_ms: u64,
     },
     /// Persist a generated factor candidate into a file-backed candidate pool.
@@ -1247,61 +1195,6 @@ struct LiveCommandDemoReport {
     command: LiveSmallRuntimeCommand,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-enum OrderRunMode {
-    Paper,
-    Live,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-enum OrderSideArg {
-    Buy,
-    Sell,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-enum OrderTypeArg {
-    Limit,
-    Market,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
-enum TimeInForceArg {
-    Gtc,
-    Ioc,
-    Fok,
-}
-
-#[derive(Debug, Deserialize)]
-struct LiveCommandFile {
-    command: LiveSmallRuntimeCommand,
-}
-
-#[derive(Debug, Serialize)]
-struct BinanceOrderReport {
-    output: String,
-    mode: OrderRunMode,
-    actuation: RuntimeActuationResult,
-    symbol: String,
-    side: OrderSideArg,
-    quantity: String,
-    price: Option<String>,
-    order_type: OrderTypeArg,
-    order_id: String,
-}
-
-#[derive(Debug, Serialize)]
-struct EvmRawTxReport {
-    output: String,
-    mode: OrderRunMode,
-    actuation: RuntimeActuationResult,
-    network: String,
-    chain_id: String,
-    raw_tx_prefix: String,
-    broadcasted: bool,
-    tx_hash: Option<String>,
-}
-
 fn live_command_demo(
     output: &Path,
     approval_ref: Option<&str>,
@@ -1335,198 +1228,6 @@ fn live_command_demo(
     std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
     register_artifact("live-small-command-1", output)?;
     Ok(report)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn binance_order(
-    command_path: &Path,
-    output: &Path,
-    mode: OrderRunMode,
-    confirm_live_order: bool,
-    symbol: String,
-    side: OrderSideArg,
-    quantity: String,
-    price: Option<String>,
-    order_type: OrderTypeArg,
-    time_in_force: TimeInForceArg,
-    rest_base_url: String,
-    ws_base_url: String,
-    api_key_env: String,
-    api_secret_env: String,
-) -> Result<BinanceOrderReport, Box<dyn std::error::Error>> {
-    let command_file: LiveCommandFile =
-        serde_json::from_str(&std::fs::read_to_string(command_path)?)?;
-    if command_file.command.dry_run {
-        return Err("binance order requires an armed live-small command".into());
-    }
-    if mode == OrderRunMode::Live && !confirm_live_order {
-        return Err("live Binance order requires --confirm-live-order".into());
-    }
-    if order_type == OrderTypeArg::Limit && price.is_none() {
-        return Err("limit order requires --price".into());
-    }
-
-    let actuation = execute_runtime_command(
-        &command_file.command,
-        RuntimeConnectorKind::Exchange {
-            venue: "binance".to_string(),
-        },
-        match mode {
-            OrderRunMode::Paper => RuntimeActuationMode::Paper,
-            OrderRunMode::Live => RuntimeActuationMode::Live,
-        },
-    )?;
-
-    let (api_key, api_secret) = match mode {
-        OrderRunMode::Paper => (String::new(), String::new()),
-        OrderRunMode::Live => (
-            std::env::var(&api_key_env)
-                .map_err(|_| format!("missing live credential env {}", api_key_env))?,
-            std::env::var(&api_secret_env)
-                .map_err(|_| format!("missing live credential env {}", api_secret_env))?,
-        ),
-    };
-
-    let intent = OrderIntent::crypto_spot(
-        Symbol::new(&symbol),
-        match side {
-            OrderSideArg::Buy => Side::Buy,
-            OrderSideArg::Sell => Side::Sell,
-        },
-        Quantity::from_str(&quantity)?,
-        match order_type {
-            OrderTypeArg::Limit => OrderType::Limit,
-            OrderTypeArg::Market => OrderType::Market,
-        },
-        price.as_deref().map(Price::from_str).transpose()?,
-        match time_in_force {
-            TimeInForceArg::Gtc => TimeInForce::GTC,
-            TimeInForceArg::Ioc => TimeInForce::IOC,
-            TimeInForceArg::Fok => TimeInForce::FOK,
-        },
-        "agentic-alpha-live-small".to_string(),
-        Some(VenueId::BINANCE),
-    );
-
-    let mut client = BinanceExecutionClient::new(BinanceExecutionConfig {
-        credentials: integration::signing::BinanceCredentials::new(api_key, api_secret),
-        rest_base_url,
-        ws_base_url,
-        timeout_ms: 5000,
-        mode: match mode {
-            OrderRunMode::Paper => execution_adapter_binance::ExecutionMode::Paper,
-            OrderRunMode::Live => execution_adapter_binance::ExecutionMode::Live,
-        },
-        account_capability: hft_core::AccountCapability::default(),
-    });
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let order_id = runtime.block_on(client.place_order(intent))?;
-
-    if let Some(parent) = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let report = BinanceOrderReport {
-        output: output.display().to_string(),
-        mode,
-        actuation,
-        symbol,
-        side,
-        quantity,
-        price,
-        order_type,
-        order_id: order_id.0,
-    };
-    std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
-    register_artifact("binance-order-1", output)?;
-    Ok(report)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn evm_raw_tx(
-    command_path: &Path,
-    output: &Path,
-    mode: OrderRunMode,
-    confirm_live_tx: bool,
-    rpc_url: String,
-    expected_chain_id: String,
-    network: String,
-    raw_tx: String,
-    timeout_ms: u64,
-) -> Result<EvmRawTxReport, Box<dyn std::error::Error>> {
-    let command_file: LiveCommandFile =
-        serde_json::from_str(&std::fs::read_to_string(command_path)?)?;
-    if command_file.command.dry_run {
-        return Err("EVM raw transaction requires an armed live-small command".into());
-    }
-    if mode == OrderRunMode::Live && !confirm_live_tx {
-        return Err("live EVM transaction requires --confirm-live-tx".into());
-    }
-    if !is_hex_prefixed(&raw_tx) {
-        return Err("raw transaction must be 0x-prefixed hex".into());
-    }
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()?;
-    let chain_id = evm_rpc_string(&client, &rpc_url, "eth_chainId", serde_json::json!([]))?;
-    if !chain_id.eq_ignore_ascii_case(&expected_chain_id) {
-        return Err(format!(
-            "EVM chain id mismatch: expected {}, got {}",
-            expected_chain_id, chain_id
-        )
-        .into());
-    }
-
-    let actuation = execute_runtime_command(
-        &command_file.command,
-        RuntimeConnectorKind::OnChain {
-            network: network.clone(),
-        },
-        match mode {
-            OrderRunMode::Paper => RuntimeActuationMode::Paper,
-            OrderRunMode::Live => RuntimeActuationMode::Live,
-        },
-    )?;
-
-    let tx_hash = if mode == OrderRunMode::Live {
-        Some(evm_rpc_string(
-            &client,
-            &rpc_url,
-            "eth_sendRawTransaction",
-            serde_json::json!([raw_tx]),
-        )?)
-    } else {
-        None
-    };
-
-    if let Some(parent) = output
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let report = EvmRawTxReport {
-        output: output.display().to_string(),
-        mode,
-        actuation,
-        network,
-        chain_id,
-        raw_tx_prefix: raw_tx.chars().take(18).collect(),
-        broadcasted: tx_hash.is_some(),
-        tx_hash,
-    };
-    std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
-    register_artifact("evm-raw-tx-1", output)?;
-    Ok(report)
-}
-
-fn is_hex_prefixed(value: &str) -> bool {
-    value.len() > 2 && value.starts_with("0x") && value[2..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Serialize)]
@@ -2193,68 +1894,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?)?
             );
         }
-        Command::BinanceOrder {
-            command,
-            output,
-            mode,
-            confirm_live_order,
-            symbol,
-            side,
-            quantity,
-            price,
-            order_type,
-            time_in_force,
-            rest_base_url,
-            ws_base_url,
-            api_key_env,
-            api_secret_env,
-        } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&binance_order(
-                    &command,
-                    &output,
-                    mode,
-                    confirm_live_order,
-                    symbol,
-                    side,
-                    quantity,
-                    price,
-                    order_type,
-                    time_in_force,
-                    rest_base_url,
-                    ws_base_url,
-                    api_key_env,
-                    api_secret_env,
-                )?)?
-            );
-        }
-        Command::EvmRawTx {
-            command,
-            output,
-            mode,
-            confirm_live_tx,
-            rpc_url,
-            expected_chain_id,
-            network,
-            raw_tx,
-            timeout_ms,
-        } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&evm_raw_tx(
-                    &command,
-                    &output,
-                    mode,
-                    confirm_live_tx,
-                    rpc_url,
-                    expected_chain_id,
-                    network,
-                    raw_tx,
-                    timeout_ms,
-                )?)?
-            );
-        }
         Command::FactorPoolDemo { output } => {
             println!(
                 "{}",
@@ -2305,6 +1944,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn research_binary_has_no_live_actuation_surface() {
+        let source = include_str!("main.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        let forbidden = [
+            ["Binance", "Order"].concat(),
+            ["Evm", "RawTx"].concat(),
+            ["Execution", "Client"].concat(),
+            ["Order", "Intent"].concat(),
+        ];
+        for forbidden in forbidden {
+            assert!(
+                !source.contains(&forbidden),
+                "forbidden research authority: {forbidden}"
+            );
+        }
+    }
 
     #[test]
     fn chronological_holdout_split_is_non_overlapping() {

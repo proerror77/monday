@@ -1,17 +1,21 @@
-# HFT × Agno 24/7 AI Trading Platform
+# Agentic Trading System
 
-> **Rust HFT × Agno Framework** - Production-ready High-Frequency Trading System with Agent-driven MLOps
+This repository is being migrated from a legacy HFT + Agno prototype into a Rust-first Agentic Alpha research platform with a separately owned Rust execution runtime.
 
-基於PRD v2.0規範的三層架構：**L1 Rust執行引擎** + **L2 Ops監控Agent** + **L3 ML訓練Agent**
+| Capability | State | Current boundary |
+| --- | --- | --- |
+| Market data, risk, OMS, venue execution | `live-capable` | Rust runtime under `rust_hft/`; live use still requires operator configuration and controls |
+| DuckDB replay and chronological holdout baseline | `implemented` | `rust_hft/apps/agentic-alpha` |
+| MCTS, RL, and LLM-labelled proposal loops | `simulated` | Deterministic lab scaffolding; not evidence of real engine or model execution |
+| Persistent AutoResearch missions and signed deployment handoff | `deferred` | Approved design and implementation plan under `docs/superpowers/` |
 
-[![Architecture](https://img.shields.io/badge/Architecture-3%20Layer-blue)](./ARCHITECTURE_RESTRUCTURE_SUMMARY.md)
-[![Framework](https://img.shields.io/badge/Framework-Agno%20v2.0-green)](https://docs.agno.com)
-[![Performance](https://img.shields.io/badge/Latency-%3C25μs-red)](./docs/performance.md)
-[![Status](https://img.shields.io/badge/Status-Production%20Ready-success)](./deployment/)
+The research application must not submit orders, broadcast transactions, increase risk, or resume trading. Those capabilities belong only to `rust_hft/apps/live` and runtime-owned execution components.
+
+The material below is legacy documentation retained temporarily for migration reference. Its Agno topology, production-readiness claims, thresholds, and deployment commands are not the current system contract.
 
 ---
 
-## 🏗️ 系統架構
+## Legacy Architecture Reference
 
 ```mermaid
 graph TB
