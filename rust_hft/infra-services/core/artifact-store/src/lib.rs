@@ -194,7 +194,7 @@ mod tests {
         let record = ArtifactRecord {
             manifest_id: manifest_id.clone(),
             artifact: ArtifactRef {
-                uri: "target/agentic-alpha/audit-demo.json".to_string(),
+                uri: "target/alpha-harness/audit-demo.json".to_string(),
                 content_type: "application/json".to_string(),
                 checksum: None,
             },
