@@ -97,6 +97,8 @@ enum Command {
         max_live_risk_pct: f64,
         #[arg(long)]
         bootstrap_fixture: bool,
+        #[arg(long)]
+        factor_bank: Option<PathBuf>,
     },
     /// Emit a live-small runtime command. Non-dry-run requires --approval-ref.
     LiveCommandDemo {
@@ -525,6 +527,8 @@ struct AgentLoopCandidateReport {
     engine: SearchEngineKind,
     formula: String,
     evaluation: EvaluationDecision,
+    validation_evaluation: Option<EvaluationDecision>,
+    test_evaluation: Option<EvaluationDecision>,
     failure_explanation: Option<String>,
 }
 
@@ -533,6 +537,9 @@ struct AgentLoopDemoReport {
     output: String,
     data_source: Option<String>,
     data_rows: Option<usize>,
+    chronological_holdout: Option<ChronologicalHoldoutReport>,
+    factor_bank_path: Option<String>,
+    stored_factors: usize,
     max_live_risk_pct: f64,
     proposals: usize,
     passed: usize,
@@ -540,6 +547,13 @@ struct AgentLoopDemoReport {
     candidates: Vec<AgentLoopCandidateReport>,
     memory_events: Vec<ResearchMemoryEvent>,
     learning_directive: LearningDirective,
+}
+
+#[derive(Debug, Serialize)]
+struct ChronologicalHoldoutReport {
+    train_rows: usize,
+    validation_rows: usize,
+    test_rows: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -605,6 +619,7 @@ fn duckdb_agent_loop(
     max_candidates_per_engine: usize,
     max_live_risk_pct: f64,
     bootstrap_fixture: bool,
+    factor_bank: Option<&Path>,
 ) -> Result<AgentLoopDemoReport, Box<dyn std::error::Error>> {
     if !is_simple_identifier(table) {
         return Err("DuckDB table must be a simple identifier".into());
@@ -616,6 +631,22 @@ fn duckdb_agent_loop(
     let rows = read_duckdb_replay_rows(&conn, table)?;
     if rows.is_empty() {
         return Err("DuckDB replay table has no rows".into());
+    }
+    let thresholds = EvaluationThresholds {
+        min_sample_count: 8,
+        min_rank_ic: 0.03,
+        min_net_sharpe: 0.5,
+        max_drawdown: 0.20,
+        max_correlation: 0.85,
+    };
+    let min_holdout_rows = usize::try_from(thresholds.min_sample_count)
+        .map_err(|_| "evaluation threshold sample count does not fit usize")?;
+    let (train_rows, validation_rows, test_rows) = chronological_holdout_split(&rows);
+    if validation_rows.len() < min_holdout_rows || test_rows.len() < min_holdout_rows {
+        return Err(
+            "DuckDB replay table needs enough rows for chronological holdout validation and test windows"
+                .into(),
+        );
     }
 
     let now = chrono::Utc::now();
@@ -630,16 +661,11 @@ fn duckdb_agent_loop(
         ),
         ("llm-duckdb-loop", SearchEngineKind::LlmProposer, 0, 4_000),
     ];
-    let thresholds = EvaluationThresholds {
-        min_sample_count: 8,
-        min_rank_ic: 0.03,
-        min_net_sharpe: 0.5,
-        max_drawdown: 0.20,
-        max_correlation: 0.85,
-    };
     let dataset_manifest = reference("duckdb-agent-loop-dataset-1", "data_manifest")?;
     let mut candidates = Vec::new();
     let mut memory_events = Vec::new();
+    let mut factor_store = factor_bank.map(FileFactorStore::new);
+    let mut stored_factors = 0;
 
     for (run_id, engine, max_expansions, max_tokens) in engines {
         let report = run_budgeted_lab_search(
@@ -659,23 +685,29 @@ fn duckdb_agent_loop(
         )?;
 
         for proposal in report.proposals {
-            let signals = eval_factor_ast_series(&proposal.ast, &rows)?;
-            let replay_csv = replay_rows_to_csv(&rows, &signals);
-            let eval_report = evaluate_replay_csv(
-                &replay_csv,
-                &ReplayCsvConfig {
-                    dataset_manifest: dataset_manifest.clone(),
-                    signal_column: "signal".to_string(),
-                    label_column: "forward_return".to_string(),
-                    available_time_column: Some("available_time".to_string()),
-                },
+            let validation_report = evaluate_candidate_on_rows(
+                &proposal.ast,
+                validation_rows,
+                dataset_manifest.clone(),
                 &thresholds,
-                None,
             )?;
-            let evaluation = eval_report.decision;
+            let test_report = evaluate_candidate_on_rows(
+                &proposal.ast,
+                test_rows,
+                dataset_manifest.clone(),
+                &thresholds,
+            )?;
+            let evaluation = EvaluationDecision {
+                passed: validation_report.decision.passed && test_report.decision.passed,
+                failures: if validation_report.decision.passed {
+                    test_report.decision.failures.clone()
+                } else {
+                    validation_report.decision.failures.clone()
+                },
+            };
             let failure_explanation = (!evaluation.passed).then(|| {
                 format!(
-                    "{} failed DuckDB replay evaluation: {:?}",
+                    "{} failed DuckDB chronological holdout evaluation: {:?}",
                     proposal.proposal_id, evaluation.failures
                 )
             });
@@ -691,11 +723,23 @@ fn duckdb_agent_loop(
                 event.validate()?;
                 memory_events.push(event);
             }
+            if evaluation.passed {
+                if let Some(store) = factor_store.as_mut() {
+                    store.upsert_factor(factor_asset_from_proposal(
+                        &proposal,
+                        test_report.metrics.clone(),
+                        now,
+                    )?)?;
+                    stored_factors += 1;
+                }
+            }
             candidates.push(AgentLoopCandidateReport {
                 proposal_id: proposal.proposal_id,
                 engine: proposal.engine,
                 formula: proposal.ast.to_string(),
                 evaluation,
+                validation_evaluation: Some(validation_report.decision),
+                test_evaluation: Some(test_report.decision),
                 failure_explanation,
             });
         }
@@ -726,6 +770,13 @@ fn duckdb_agent_loop(
         output: output.display().to_string(),
         data_source: Some(format!("duckdb:{}", table)),
         data_rows: Some(rows.len()),
+        chronological_holdout: Some(ChronologicalHoldoutReport {
+            train_rows: train_rows.len(),
+            validation_rows: validation_rows.len(),
+            test_rows: test_rows.len(),
+        }),
+        factor_bank_path: factor_bank.map(|path| path.display().to_string()),
+        stored_factors,
         max_live_risk_pct,
         proposals: candidates.len(),
         passed,
@@ -823,6 +874,8 @@ fn agent_loop_demo(
                 engine: proposal.engine,
                 formula: proposal.ast.to_string(),
                 evaluation,
+                validation_evaluation: None,
+                test_evaluation: None,
                 failure_explanation,
             });
         }
@@ -853,6 +906,9 @@ fn agent_loop_demo(
         output: output.display().to_string(),
         data_source: None,
         data_rows: None,
+        chronological_holdout: None,
+        factor_bank_path: None,
+        stored_factors: 0,
         max_live_risk_pct,
         proposals: candidates.len(),
         passed,
@@ -887,6 +943,74 @@ fn evaluation_failure_kind(failures: &[EvaluationFailure]) -> FailureKind {
     } else {
         FailureKind::GateFailed
     }
+}
+
+fn chronological_holdout_split(
+    rows: &[ReplayDataRow],
+) -> (&[ReplayDataRow], &[ReplayDataRow], &[ReplayDataRow]) {
+    let len = rows.len();
+    let train_end = ((len * 60) / 100).max(1).min(len);
+    let validation_end = ((len * 80) / 100).max(train_end + 1).min(len);
+    (
+        &rows[..train_end],
+        &rows[train_end..validation_end],
+        &rows[validation_end..],
+    )
+}
+
+fn evaluate_candidate_on_rows(
+    ast: &FactorAst,
+    rows: &[ReplayDataRow],
+    dataset_manifest: ManifestRef,
+    thresholds: &EvaluationThresholds,
+) -> Result<hft_factor_eval::ReplayEvaluationReport, Box<dyn std::error::Error>> {
+    let signals = eval_factor_ast_series(ast, rows)?;
+    let replay_csv = replay_rows_to_csv(rows, &signals);
+    Ok(evaluate_replay_csv(
+        &replay_csv,
+        &ReplayCsvConfig {
+            dataset_manifest,
+            signal_column: "signal".to_string(),
+            label_column: "forward_return".to_string(),
+            available_time_column: Some("available_time".to_string()),
+        },
+        thresholds,
+        None,
+    )?)
+}
+
+fn factor_asset_from_proposal(
+    proposal: &hft_search_protocol::ProposalArtifact,
+    metrics: FactorMetrics,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<FactorAsset, Box<dyn std::error::Error>> {
+    let asset = FactorAsset {
+        factor_id: format!("duckdb-{}", proposal.proposal_id),
+        factor_type: FactorType::Formula,
+        ast: proposal.ast.clone(),
+        lineage: FactorLineage {
+            parent_factor_ids: proposal.parent_factor_ids.clone(),
+            source_engine: format!("{:?}", proposal.engine),
+            search_manifest_id: proposal.search_manifest_id.clone(),
+        },
+        data_manifest: reference("duckdb-agent-loop-dataset-1", "data_manifest")?,
+        feature_manifest: reference("duckdb-agent-loop-feature-1", "feature_manifest")?,
+        label_manifest: reference("duckdb-agent-loop-label-1", "label_manifest")?,
+        evaluation_manifests: vec![reference(
+            "duckdb-agent-loop-eval-1",
+            "evaluation_manifest",
+        )?],
+        metrics,
+        correlation_cluster: None,
+        regime_metrics: BTreeMap::new(),
+        symbol_metrics: BTreeMap::new(),
+        promotion_status: FactorStatus::FullBacktestPassed,
+        live_decay_state: None,
+        created_at: now,
+        updated_at: now,
+    };
+    asset.validate()?;
+    Ok(asset)
 }
 
 fn is_simple_identifier(value: &str) -> bool {
@@ -2026,6 +2150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_candidates_per_engine,
             max_live_risk_pct,
             bootstrap_fixture,
+            factor_bank,
         } => {
             println!(
                 "{}",
@@ -2036,6 +2161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     max_candidates_per_engine,
                     max_live_risk_pct,
                     bootstrap_fixture,
+                    factor_bank.as_deref(),
                 )?)?
             );
         }
@@ -2173,4 +2299,148 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn chronological_holdout_split_is_non_overlapping() {
+        let rows = replay_fixture_rows(10);
+        let (train, validation, test) = chronological_holdout_split(&rows);
+        assert_eq!((train.len(), validation.len(), test.len()), (6, 2, 2));
+        assert!(std::ptr::eq(train.last().unwrap(), &rows[5]));
+        assert!(std::ptr::eq(validation.first().unwrap(), &rows[6]));
+        assert!(std::ptr::eq(test.first().unwrap(), &rows[8]));
+    }
+
+    #[test]
+    fn duckdb_agent_loop_rejects_too_short_replay_data() {
+        let root = temp_test_dir("chronological-holdout-short");
+        let duckdb_path = root.join("replay.duckdb");
+        let output = root.join("report.json");
+        let conn = Connection::open(&duckdb_path).unwrap();
+        bootstrap_duckdb_replay_fixture_table(&conn, "factor_replay", &replay_fixture_rows(4))
+            .unwrap();
+
+        let error = duckdb_agent_loop(&duckdb_path, &output, "factor_replay", 1, 0.0, false, None)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "DuckDB replay table needs enough rows for chronological holdout validation and test windows"
+        );
+    }
+
+    #[test]
+    fn file_factor_store_round_trips_passed_factor_asset() {
+        let root = temp_test_dir("chronological-holdout-factor-store");
+        let path = root.join("factor-bank.json");
+        let mut store = FileFactorStore::new(&path);
+        let asset = replay_factor_asset("chronological-holdout-factor").unwrap();
+
+        store.upsert_factor(asset.clone()).unwrap();
+
+        assert_eq!(store.get_factor(&asset.factor_id).unwrap(), asset);
+    }
+
+    fn replay_fixture_rows(len: usize) -> Vec<ReplayDataRow> {
+        (0..len)
+            .map(|idx| ReplayDataRow {
+                oi_delta_5m: idx as f64 * 0.08 - 0.6,
+                cvd_slope_5m: (idx as f64 % 5.0) * 0.04 - 0.08,
+                spread_bps: 1.0 + (idx % 4) as f64 * 0.2,
+                funding_rate: if idx % 2 == 0 { 0.01 } else { -0.005 },
+                depth_imbalance: 0.2 + (idx % 6) as f64 * 0.05,
+                forward_return: (idx as f64 * 0.08 - 0.6) * 0.012
+                    + ((idx as f64 % 5.0) * 0.04 - 0.08) * 0.04
+                    - (1.0 + (idx % 4) as f64 * 0.2) * 0.001,
+                available_time: true,
+            })
+            .collect()
+    }
+
+    fn bootstrap_duckdb_replay_fixture_table(
+        conn: &Connection,
+        table: &str,
+        rows: &[ReplayDataRow],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        conn.execute(
+            &format!(
+                "CREATE TABLE {table} (
+                    ts TIMESTAMP,
+                    symbol TEXT,
+                    oi_delta_5m DOUBLE,
+                    cvd_slope_5m DOUBLE,
+                    spread_bps DOUBLE,
+                    funding_rate DOUBLE,
+                    depth_imbalance DOUBLE,
+                    forward_return DOUBLE,
+                    available_time BOOLEAN
+                )"
+            ),
+            [],
+        )?;
+        for (idx, row) in rows.iter().enumerate() {
+            conn.execute(
+                &format!("INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"),
+                params![
+                    format!("2026-01-01 00:{idx:02}:00"),
+                    "BTCUSDT",
+                    row.oi_delta_5m,
+                    row.cvd_slope_5m,
+                    row.spread_bps,
+                    row.funding_rate,
+                    row.depth_imbalance,
+                    row.forward_return,
+                    row.available_time
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn replay_factor_asset(factor_id: &str) -> Result<FactorAsset, Box<dyn std::error::Error>> {
+        let now = chrono::Utc::now();
+        let asset = FactorAsset {
+            factor_id: factor_id.to_string(),
+            factor_type: FactorType::Formula,
+            ast: FactorAst::Terminal(FactorTerminal::Field("oi_delta_5m".to_string())),
+            lineage: FactorLineage {
+                parent_factor_ids: vec![],
+                source_engine: "test".to_string(),
+                search_manifest_id: ManifestId::new("search-chronological-holdout-1")?,
+            },
+            data_manifest: reference("data-chronological-holdout-1", "data_manifest")?,
+            feature_manifest: reference("feature-chronological-holdout-1", "feature_manifest")?,
+            label_manifest: reference("label-chronological-holdout-1", "label_manifest")?,
+            evaluation_manifests: vec![reference(
+                "eval-chronological-holdout-1",
+                "evaluation_manifest",
+            )?],
+            metrics: factor_metrics(),
+            correlation_cluster: None,
+            regime_metrics: BTreeMap::new(),
+            symbol_metrics: BTreeMap::new(),
+            promotion_status: FactorStatus::FullBacktestPassed,
+            live_decay_state: None,
+            created_at: now,
+            updated_at: now,
+        };
+        asset.validate()?;
+        Ok(asset)
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
 }

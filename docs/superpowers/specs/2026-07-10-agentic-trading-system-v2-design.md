@@ -1,7 +1,7 @@
 # Agentic Trading System v2 Design
 
 Date: 2026-07-10
-Status: Draft for written-spec review
+Status: Approved for implementation
 
 ## 1. Decision
 
@@ -509,4 +509,8 @@ Rejected alternatives:
 
 ## 20. Implementation Gate
 
-No legacy deletion or production code migration starts until this written spec is reviewed. After approval, create a separate implementation plan with atomic commits, explicit prerequisites for every deletion, and focused validation per phase.
+This written spec is approved for implementation.
+
+Implementation plan path: `.superpowers/sdd/task-1-brief.md`
+
+No legacy deletion or production code migration starts outside that atomic implementation plan. Keep explicit prerequisites for every deletion and focused validation per phase.
