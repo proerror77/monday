@@ -91,6 +91,7 @@ members = [
 
     # Agentic Alpha Harness
     "alpha-harness/domain",
+    "alpha-harness/store",
 
     # Applications
     "apps/live",

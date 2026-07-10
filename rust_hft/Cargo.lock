@@ -75,6 +75,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-store"
+version = "0.1.0"
+dependencies = [
+ "alpha-domain",
+ "chrono",
+ "duckdb",
+ "hex",
+ "hft-research-manifest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
