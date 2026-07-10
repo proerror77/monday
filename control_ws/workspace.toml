@@ -1,4 +1,0 @@
-[workspace]
-name = "control_ws"
-description = "Agno control plane workspace for trading orchestration and ops."
-
