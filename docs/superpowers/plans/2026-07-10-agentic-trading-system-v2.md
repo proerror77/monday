@@ -65,15 +65,17 @@ git add rust_hft/apps/agentic-alpha/src/main.rs docs/superpowers/specs/2026-07-1
 git commit -m "test: freeze DuckDB agent loop baseline"
 ```
 
-### Task 2: Seal the Research/Execution Boundary
+### Task 2: Seal the Research/Execution Boundary and Correct Repository Truth
 
 **Files:**
 - Modify: `rust_hft/apps/agentic-alpha/src/main.rs`
 - Modify: `rust_hft/apps/agentic-alpha/Cargo.toml`
+- Modify: `README.md`
+- Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
 - Consumes: existing research demo commands.
-- Produces: a research binary with no execution adapter, `OrderIntent`, raw transaction broadcast, or live confirmation flag.
+- Produces: a research binary with no execution adapter, `OrderIntent`, raw transaction broadcast, or live confirmation flag; accurate top-level status; focused root CI for ordinary changes.
 
 - [ ] **Step 1: Add a source-boundary check**
 
@@ -99,12 +101,16 @@ Remove `execution_adapter_binance`, `hft-core`, `integration`, `ports`, and `tok
 
 - [ ] **Step 4: Verify and commit**
 
+Replace top-level production/completion claims with `implemented`, `simulated`, `deferred`, and `live-capable` labels. Change the ordinary root Rust CI job from `cargo build --workspace --locked` to package-scoped checks for the execution and alpha lanes; keep full graph validation only in release jobs.
+
 Run: `cargo test -p hft-agentic-alpha research_binary_has_no_live_actuation_surface --locked`
 
 Run: `cargo check -p hft-agentic-alpha --locked`
 
+Run: `rg -n 'cargo (build|check|test) --workspace' .github/workflows/ci.yml` (expected: no matches)
+
 ```bash
-git add rust_hft/apps/agentic-alpha
+git add rust_hft/apps/agentic-alpha README.md .github/workflows/ci.yml
 git commit -m "refactor: seal agent research execution boundary"
 ```
 
@@ -263,6 +269,7 @@ git commit -m "feat: add resumable autoresearch kernel"
 - Create: `rust_hft/alpha-harness/engine/src/engines/bayesian.rs`
 - Create: `rust_hft/alpha-harness/engine/src/engines/offline_rl.rs`
 - Create: `rust_hft/alpha-harness/engine/src/llm.rs`
+- Create: `rust_hft/alpha-harness/engine/tests/llm_live.rs`
 
 **Interfaces:**
 - Consumes: `ProposalEngine`, `EngineContext`, Factor AST grammar, persisted evaluation rewards and trace history.
@@ -288,6 +295,12 @@ For bounded numeric factor parameters, use a deterministic Gaussian-process surr
 
 Use an OpenAI-compatible HTTP endpoint configured by environment variables. Require JSON-schema output for `HypothesisArtifact` and `FailureExplanation`, record provider/model/prompt hashes/token usage, redact credentials, and return an explicit unavailable error instead of a synthetic response.
 
+Add an ignored, opt-in integration test that makes one real bounded call and writes the returned hypothesis artifact to a temporary file. It fails, rather than skips or fabricates output, when explicitly run without endpoint/model/key configuration.
+
+Run when credentials are available: `cargo test -p alpha-engine --test llm_live --locked -- --ignored`
+
+Expected: one valid `HypothesisArtifact` with non-empty provider/model/prompt hash and real token-usage metadata.
+
 - [ ] **Step 6: Implement offline RL gating**
 
 Implement a discrete offline Q-learning policy over persisted search actions and rewards. Refuse training below configurable minimum trace count, emit only lab proposals, and persist dataset/policy versions. Do not add online updates.
@@ -309,11 +322,15 @@ git commit -m "feat: add real alpha search engines"
 - Create: `rust_hft/alpha-harness/app/Cargo.toml`
 - Create: `rust_hft/alpha-harness/app/src/main.rs`
 - Create: `rust_hft/alpha-harness/app/src/data_mission.rs`
+- Create: `rust_hft/tools/collector/src/lib.rs`
+- Create: `rust_hft/tools/collector/src/source_catalog.rs`
+- Create: `rust_hft/tools/collector/tests/data_mission_smoke.rs`
 - Modify: `rust_hft/Cargo.toml`
-- Modify: `rust_hft/tools/collector/src/main.rs` only if a reusable catalog entry point is missing.
+- Modify: `rust_hft/tools/collector/src/main.rs`
+- Modify: `rust_hft/tools/collector/Cargo.toml`
 
 **Interfaces:**
-- Consumes: existing collector/data-pipeline connectors, `AlphaStore`, `AutoResearchKernel`, engine registry.
+- Consumes: existing collector/data-pipeline connectors through a reusable `hft_collector` library target, `AlphaStore`, `AutoResearchKernel`, engine registry.
 - Produces: `alpha-harness mission create|run|resume|status`, `data acquire`, `candidate list`, `evaluate`, `promote`, and `deployment sign` commands with no order command.
 
 - [ ] **Step 1: Add CLI and data-catalog tests**
@@ -322,11 +339,13 @@ Assert command parsing, no execution verbs, source capability discovery, explici
 
 - [ ] **Step 2: Register existing connector capabilities**
 
-Expose LOB, trade, BBO, OHLCV, funding, open-interest, and listing capabilities only when an existing connector actually implements them. A `DataAcquisitionMission` records source, symbols, requested interval, destination artifact, and quality requirements.
+Extract only source discovery and one-shot acquisition orchestration from the bin-only collector into `src/lib.rs`; keep CLI/bootstrap in `main.rs`. Expose LOB, trade, BBO, OHLCV, funding, open-interest, and listing capabilities only when an existing connector actually implements them. A `DataAcquisitionMission` records source, symbols, requested interval, destination artifact, and quality requirements.
 
 - [ ] **Step 3: Produce content-addressed dataset manifests**
 
 On successful acquisition, hash the artifact, record schema and point-in-time fields (`event_time`, `exchange_time`, `receive_time`, `available_time`, `ingestion_time`), and persist quality counts. Failed acquisition creates a failure artifact and never substitutes fixtures.
+
+Add an ignored opt-in public-connector smoke that acquires a bounded real sample through the extracted library and asserts a non-empty quality report plus a matching content-addressed dataset manifest.
 
 - [ ] **Step 4: Wire the app to mission execution**
 
@@ -338,8 +357,10 @@ Run: `cargo test -p alpha-harness --locked`
 
 Run: `cargo check -p hft-collector --locked`
 
+Run when network access is enabled: `cargo test -p hft-collector --test data_mission_smoke --features collector-binance --locked -- --ignored`
+
 ```bash
-git add rust_hft/Cargo.toml rust_hft/Cargo.lock rust_hft/alpha-harness/app rust_hft/tools/collector/src/main.rs
+git add rust_hft/Cargo.toml rust_hft/Cargo.lock rust_hft/alpha-harness/app rust_hft/tools/collector
 git commit -m "feat: add agent-driven alpha harness app"
 ```
 
@@ -352,7 +373,7 @@ git commit -m "feat: add agent-driven alpha harness app"
 - Modify: `rust_hft/alpha-harness/app/src/main.rs`
 
 **Interfaces:**
-- Consumes: `SignedDeploymentEnvelope`, runtime trusted keys, current account/venue/instrument state, DuckDB nonce ledger.
+- Consumes: `SignedDeploymentEnvelope`, runtime trusted keys, current account/venue/instrument state, and a runtime-owned durable nonce ledger.
 - Produces: verified paper/shadow/live-small deployment requests accepted only by `apps/live` before existing risk/OMS/execution paths.
 
 - [ ] **Step 1: Add runtime rejection tests**
@@ -361,17 +382,21 @@ Test forged payload, invalid signature, unknown key, expiry, early validity, wro
 
 - [ ] **Step 2: Add envelope intake**
 
-Add a cold-path CLI/file or control-service intake that verifies the envelope before translating it to existing runtime configuration. Verification cannot resume a paused runtime or increase caps without the required approval class.
+Add a cold-path CLI/file or control-service intake that verifies the envelope before translating it to existing runtime configuration. Implement `RuntimeNonceLedger` inside `apps/live`: append and `sync_data` each accepted nonce to a runtime-owned file before actuation, load prior nonces on startup, and reject duplicates across restart. Do not use or import the control-plane `AlphaStore`. Verification cannot resume a paused runtime or increase caps without the required approval class.
 
 - [ ] **Step 3: Recheck current state**
 
 After cryptographic verification, compare account, venue, instrument allowlist, notional, symbol exposure, order size, slippage, and runtime/risk hashes against current Rust state. Record accept/reject attribution before any model/policy activation.
+
+Add a positive integration test for a valid envelope that reaches existing `apps/live` paper and shadow activation adapters, records both accepted transitions, and never imports an execution adapter into `alpha-harness`.
 
 - [ ] **Step 4: Verify and commit**
 
 Run: `cargo test -p alpha-domain deployment_envelope --locked`
 
 Run: `cargo test -p hft-live deployment_envelope --locked`
+
+Run: `cargo test -p hft-live accepted_paper_shadow_handoff --locked`
 
 Run: `cargo check -p hft-live --locked`
 
@@ -421,6 +446,7 @@ git commit -m "feat: close bounded alpha learning loop"
 - Remove only after replacement checks pass: paths listed in design section 15.3.
 - Modify: `rust_hft/Cargo.toml`
 - Modify: root `README.md` and active architecture/status documents discovered by `rg`.
+- Modify: `.github/workflows/*.yml`
 - Create: `rust_hft/alpha-harness/README.md`
 
 **Interfaces:**
@@ -437,7 +463,7 @@ First remove `control_ws/`, legacy `deployment/`, `rust_hft/tools/hft-agent/`, d
 
 - [ ] **Step 3: Replace misleading documentation**
 
-Document only four capability states: `implemented`, `simulated`, `deferred`, `live-capable`. Describe DuckDB as control-plane truth, ClickHouse as analytics, Parquet/traces as data artifacts, and `apps/live` as execution owner.
+Finish the truth correction started in Task 2 across active architecture/status documents. Document only four capability states: `implemented`, `simulated`, `deferred`, `live-capable`. Describe DuckDB as control-plane truth, ClickHouse as analytics, Parquet/traces as data artifacts, and `apps/live` as execution owner. Consolidate active Rust CI at the repository root; remove nested workflow copies only after every retained job has a root equivalent. Ordinary CI uses package-scoped checks, while release workflows may validate the full workspace graph.
 
 - [ ] **Step 4: Run final focused and workspace-graph validation**
 
