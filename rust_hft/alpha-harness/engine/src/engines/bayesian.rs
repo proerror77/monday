@@ -1,5 +1,6 @@
 use crate::{
-    evaluation::EngineContext, CandidateEvaluation, EngineProposal, ProposalEngine, RemainingBudget,
+    evaluation::EngineContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
+    ProposalEngine, RemainingBudget,
 };
 use alpha_domain::{CandidateArtifact, EngineKind};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
@@ -41,9 +42,18 @@ impl BayesianOptimizerEngine {
             return Err("invalid Bayesian optimizer configuration".to_string());
         }
         let step = (max - min) / (points - 1) as f64;
+        let grid = (0..points)
+            .map(|index| (min + index as f64 * step).round() as u64)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|window| window.max(1) as f64)
+            .collect::<Vec<_>>();
+        if grid.len() < 3 {
+            return Err("Bayesian window grid has fewer than three unique points".to_string());
+        }
         Ok(Self {
             field,
-            grid: (0..points).map(|index| min + index as f64 * step).collect(),
+            grid,
             noise,
             length_scale,
             exploration,
@@ -176,6 +186,27 @@ impl ProposalEngine for BayesianOptimizerEngine {
         if let Some(point) = self.pending.remove(&proposal.candidate_id) {
             self.observations.push((point, evaluation.score));
         }
+    }
+
+    fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
+        for observation in observations {
+            let CandidateArtifact::Formula(FactorAst::Call {
+                operator: FactorOperator::Mean,
+                args,
+            }) = &observation.proposal.artifact
+            else {
+                return Err("Bayesian history contains an unexpected artifact".to_string());
+            };
+            let Some(FactorAst::Terminal(FactorTerminal::Constant(window))) = args.get(1) else {
+                return Err("Bayesian history has no window parameter".to_string());
+            };
+            let point = window
+                .parse::<f64>()
+                .map_err(|_| "Bayesian history window is invalid".to_string())?;
+            self.observations
+                .push((point, observation.evaluation.score));
+        }
+        Ok(())
     }
 }
 

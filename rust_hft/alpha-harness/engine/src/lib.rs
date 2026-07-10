@@ -8,7 +8,7 @@ pub mod llm;
 use alpha_domain::{
     CandidateArtifact, EngineKind, IterationVerdict, MissionStatus, ResearchIteration,
 };
-use alpha_store::{AlphaStore, EvaluationRecord, RunCheckpoint, StoreError};
+use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RunCheckpoint, StoreError};
 use chrono::Utc;
 use evaluation::{EngineContext, PreparedDataset};
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,12 @@ pub struct EngineProposal {
     pub elapsed_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoricalObservation {
+    pub proposal: EngineProposal,
+    pub evaluation: CandidateEvaluation,
+}
+
 pub trait ProposalEngine {
     fn kind(&self) -> EngineKind;
     fn propose(
@@ -47,6 +53,40 @@ pub trait ProposalEngine {
     ) -> Result<EngineProposal, String>;
 
     fn observe(&mut self, _proposal: &EngineProposal, _evaluation: &CandidateEvaluation) {}
+
+    fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
+        for observation in observations {
+            self.observe(&observation.proposal, &observation.evaluation);
+        }
+        Ok(())
+    }
+}
+
+impl<T> ProposalEngine for Box<T>
+where
+    T: ProposalEngine + ?Sized,
+{
+    fn kind(&self) -> EngineKind {
+        (**self).kind()
+    }
+
+    fn propose(
+        &mut self,
+        mission_id: &str,
+        iteration_index: usize,
+        context: &EngineContext<'_>,
+        remaining: &RemainingBudget,
+    ) -> Result<EngineProposal, String> {
+        (**self).propose(mission_id, iteration_index, context, remaining)
+    }
+
+    fn observe(&mut self, proposal: &EngineProposal, evaluation: &CandidateEvaluation) {
+        (**self).observe(proposal, evaluation);
+    }
+
+    fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
+        (**self).restore(observations)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +181,16 @@ where
             .iter()
             .filter(|iteration| iteration.verdict == IterationVerdict::Keep)
             .count();
+        let historical = historical_observations(&lineage, &self.proposal_engine.kind())?;
+        self.proposal_engine
+            .restore(&historical)
+            .map_err(EngineError::Proposal)?;
+        let mut seen_artifacts = lineage
+            .candidates
+            .iter()
+            .map(|candidate| serde_json::to_string(&candidate.artifact))
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()
+            .map_err(|error| EngineError::Evaluation(error.to_string()))?;
         let mut new_iterations = 0;
         let context = dataset.engine_context();
 
@@ -178,7 +228,12 @@ where
                     let within_budget = proposal.expansions <= remaining.expansions
                         && proposal.tokens <= remaining.tokens
                         && proposal.elapsed_ms <= remaining.milliseconds;
-                    let evaluated = if within_budget {
+                    let fingerprint = serde_json::to_string(&proposal.artifact)
+                        .map_err(|error| EngineError::Evaluation(error.to_string()))?;
+                    let is_novel = seen_artifacts.insert(fingerprint);
+                    let evaluated = if !is_novel {
+                        Err("proposal duplicated an existing candidate artifact".to_string())
+                    } else if within_budget {
                         self.evaluator
                             .evaluate(&proposal, &context)
                             .and_then(|result| {
@@ -227,24 +282,33 @@ where
                                 Some(evaluation),
                             )
                         }
-                        Err(error) => (
-                            ResearchIteration {
-                                iteration_id,
-                                mission_id: mission_id.to_string(),
-                                parent_candidate_ids: vec![],
-                                engine: self.proposal_engine.kind(),
-                                hypothesis: proposal.hypothesis.clone(),
-                                candidate_artifact_id: Some(proposal.candidate_id.clone()),
-                                evaluation_artifact_id: None,
-                                budget_usage: usage.clone(),
-                                verdict: IterationVerdict::Crash,
-                                failure_class: Some("evaluation_error".to_string()),
-                                failure_explanation: Some(error),
-                                created_at,
-                            },
-                            Some((proposal.candidate_id, proposal.artifact)),
-                            None,
-                        ),
+                        Err(error) => {
+                            let candidate_id = is_novel.then(|| proposal.candidate_id.clone());
+                            let candidate =
+                                is_novel.then_some((proposal.candidate_id, proposal.artifact));
+                            (
+                                ResearchIteration {
+                                    iteration_id,
+                                    mission_id: mission_id.to_string(),
+                                    parent_candidate_ids: vec![],
+                                    engine: self.proposal_engine.kind(),
+                                    hypothesis: proposal.hypothesis.clone(),
+                                    candidate_artifact_id: candidate_id,
+                                    evaluation_artifact_id: None,
+                                    budget_usage: usage.clone(),
+                                    verdict: IterationVerdict::Crash,
+                                    failure_class: Some(if is_novel {
+                                        "evaluation_error".to_string()
+                                    } else {
+                                        "duplicate_candidate".to_string()
+                                    }),
+                                    failure_explanation: Some(error),
+                                    created_at,
+                                },
+                                candidate,
+                                None,
+                            )
+                        }
                     }
                 }
                 Err(error) => {
@@ -300,6 +364,52 @@ where
             new_iterations,
         })
     }
+}
+
+fn historical_observations(
+    lineage: &MissionLineage,
+    engine_kind: &EngineKind,
+) -> Result<Vec<HistoricalObservation>, EngineError> {
+    let mut observations = Vec::new();
+    for iteration in lineage
+        .iterations
+        .iter()
+        .filter(|iteration| &iteration.engine == engine_kind)
+    {
+        let (Some(candidate_id), Some(evaluation_id)) = (
+            iteration.candidate_artifact_id.as_deref(),
+            iteration.evaluation_artifact_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let candidate = lineage
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == candidate_id)
+            .ok_or_else(|| {
+                EngineError::Evaluation("historical candidate is missing".to_string())
+            })?;
+        let evaluation = lineage
+            .evaluations
+            .iter()
+            .find(|evaluation| evaluation.record.evaluation_id == evaluation_id)
+            .ok_or_else(|| {
+                EngineError::Evaluation("historical evaluation is missing".to_string())
+            })?;
+        observations.push(HistoricalObservation {
+            proposal: EngineProposal {
+                candidate_id: candidate_id.to_string(),
+                hypothesis: iteration.hypothesis.clone(),
+                artifact: candidate.artifact.clone(),
+                expansions: 0,
+                tokens: 0,
+                elapsed_ms: 0,
+            },
+            evaluation: serde_json::from_value(evaluation.record.payload.clone())
+                .map_err(|error| EngineError::Evaluation(error.to_string()))?,
+        });
+    }
+    Ok(observations)
 }
 
 fn budget_exhausted(
@@ -372,7 +482,9 @@ mod tests {
             Ok(EngineProposal {
                 candidate_id: format!("{mission_id}-candidate-{iteration_index}"),
                 hypothesis: "signal predicts label".to_string(),
-                artifact: CandidateArtifact::Program(serde_json::json!({"op": "identity"})),
+                artifact: CandidateArtifact::Program(
+                    serde_json::json!({"op": "identity", "iteration": iteration_index}),
+                ),
                 expansions: 1,
                 tokens: 0,
                 elapsed_ms: 1,
@@ -505,6 +617,43 @@ mod tests {
             .iterations
             .iter()
             .all(|iteration| iteration.verdict == IterationVerdict::Crash));
+    }
+
+    #[test]
+    fn gp_resume_restores_history_and_keeps_candidate_artifacts_unique() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let mut mission = mission();
+        mission.search_budget.max_candidates = 4;
+        mission.search_budget.max_expansions = 50;
+        store.create_mission(&mission).unwrap();
+        {
+            let engine =
+                GeneticProgrammingEngine::new(7, vec!["signal".to_string()], 8, 5).unwrap();
+            AutoResearchKernel::new(&mut store, engine, PassingEvaluator)
+                .run(
+                    "mission-1",
+                    &dataset(),
+                    RunControl {
+                        max_new_iterations: Some(2),
+                    },
+                )
+                .unwrap();
+        }
+        {
+            let engine =
+                GeneticProgrammingEngine::new(7, vec!["signal".to_string()], 8, 5).unwrap();
+            AutoResearchKernel::new(&mut store, engine, PassingEvaluator)
+                .run("mission-1", &dataset(), RunControl::default())
+                .unwrap();
+        }
+        let lineage = store.mission_lineage("mission-1").unwrap();
+        let unique = lineage
+            .candidates
+            .iter()
+            .map(|candidate| serde_json::to_string(&candidate.artifact).unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(lineage.candidates.len(), 4);
+        assert_eq!(unique.len(), 4);
     }
 
     #[test]

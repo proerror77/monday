@@ -492,6 +492,14 @@ impl AlphaStore {
         )
     }
 
+    pub fn get_registry_revision(&self, revision_id: &str) -> Result<RegistryRevision, StoreError> {
+        read_json_row(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM registry_revisions WHERE revision_id = ?",
+            revision_id,
+        )
+    }
+
     pub fn append_memory(&mut self, record: &MemoryRecord) -> Result<(), StoreError> {
         require_text(&record.event_id)?;
         self.insert_json_record(

@@ -92,6 +92,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-harness"
+version = "0.1.0"
+dependencies = [
+ "alpha-domain",
+ "alpha-engine",
+ "alpha-store",
+ "anyhow",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "hft-collector",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "alpha-store"
 version = "0.1.0"
 dependencies = [

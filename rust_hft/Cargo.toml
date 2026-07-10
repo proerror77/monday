@@ -93,6 +93,7 @@ members = [
     "alpha-harness/domain",
     "alpha-harness/store",
     "alpha-harness/engine",
+    "alpha-harness/app",
 
     # Applications
     "apps/live",

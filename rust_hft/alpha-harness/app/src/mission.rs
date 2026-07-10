@@ -1,0 +1,124 @@
+use crate::{
+    cli::{print_json, EngineChoice, MissionStatusArgs, RunMissionArgs},
+    data_mission,
+};
+use alpha_domain::MissionStatus;
+use alpha_engine::{
+    engines::{
+        BayesianOptimizerEngine, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
+        OfflineTrace,
+    },
+    evaluation::{prepare_dataset, WalkForwardConfig},
+    formula_evaluator::{FormulaEvaluator, FormulaEvaluatorConfig},
+    llm::{LlmConfig, LlmProposalEngine, OpenAiCompatibleClient},
+    AutoResearchKernel, ProposalEngine, RunControl,
+};
+use alpha_store::{AlphaStore, StoreError};
+use anyhow::{bail, Context};
+
+pub fn run_mission(args: RunMissionArgs, resume: bool) -> anyhow::Result<()> {
+    let mut store = AlphaStore::open(&args.db)?;
+    let mission = store.get_mission(&args.mission_id)?;
+    match (resume, &mission.status) {
+        (false, MissionStatus::Pending | MissionStatus::Running) => {}
+        (true, MissionStatus::Paused | MissionStatus::Running) => {}
+        (false, _) => bail!("mission run requires a pending or running mission"),
+        (true, _) => bail!("mission resume requires a paused or running mission"),
+    }
+
+    let manifest = data_mission::read_manifest(&args.dataset.dataset_manifest)?;
+    if mission.dataset_manifest_id.as_str() != manifest.manifest_id {
+        bail!("mission dataset id does not match the supplied manifest");
+    }
+    let rows = data_mission::load_research_rows(
+        &manifest,
+        args.dataset.fee_bps,
+        args.dataset.funding_bps,
+        args.dataset.latency_bps,
+    )?;
+    let dataset = prepare_dataset(
+        rows,
+        &WalkForwardConfig {
+            initial_train_rows: args.dataset.initial_train_rows,
+            validation_rows: args.dataset.validation_rows,
+            fold_count: args.dataset.fold_count,
+            purge_rows: args.dataset.purge_rows,
+            embargo_rows: args.dataset.embargo_rows,
+            sealed_holdout_rows: args.dataset.sealed_holdout_rows,
+        },
+        format!("sealed:{}", manifest.manifest_id),
+    )?;
+    let proposal_engine = build_engine(&args)?;
+    let evaluator =
+        FormulaEvaluator::new(FormulaEvaluatorConfig::default()).map_err(anyhow::Error::msg)?;
+    let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
+    let outcome = kernel.run(
+        &args.mission_id,
+        &dataset,
+        RunControl {
+            max_new_iterations: args.max_new_iterations,
+        },
+    )?;
+    print_json(&serde_json::json!({
+        "mission_id": args.mission_id,
+        "status": outcome.status,
+        "total_iterations": outcome.total_iterations,
+        "new_iterations": outcome.new_iterations,
+        "engine": args.engine,
+        "dataset_manifest_id": manifest.manifest_id,
+    }))
+}
+
+pub fn mission_status(args: MissionStatusArgs) -> anyhow::Result<()> {
+    let store = AlphaStore::open(&args.db)?;
+    let lineage = store.mission_lineage(&args.mission_id)?;
+    let checkpoint = match store.get_checkpoint(&args.mission_id) {
+        Ok(checkpoint) => Some(checkpoint),
+        Err(StoreError::NotFound) => None,
+        Err(error) => return Err(error.into()),
+    };
+    print_json(&serde_json::json!({
+        "mission": lineage.mission,
+        "iteration_count": lineage.iterations.len(),
+        "candidate_count": lineage.candidates.len(),
+        "evaluation_count": lineage.evaluations.len(),
+        "checkpoint": checkpoint,
+    }))
+}
+
+fn build_engine(args: &RunMissionArgs) -> anyhow::Result<Box<dyn ProposalEngine>> {
+    let engine: Box<dyn ProposalEngine> = match args.engine {
+        EngineChoice::Gp => Box::new(
+            GeneticProgrammingEngine::new(args.seed, vec!["signal".to_string()], 32, 5)
+                .map_err(anyhow::Error::msg)?,
+        ),
+        EngineChoice::Mcts => Box::new(
+            MctsEngine::new(args.seed, "signal", "signal", 1.414, 5).map_err(anyhow::Error::msg)?,
+        ),
+        EngineChoice::Bayesian => Box::new(
+            BayesianOptimizerEngine::new("signal", 2.0, 60.0, 30, 1e-6, 10.0, 0.01)
+                .map_err(anyhow::Error::msg)?,
+        ),
+        EngineChoice::OfflineRl => {
+            let path = args
+                .offline_trace
+                .as_ref()
+                .context("--offline-trace is required for offline-rl")?;
+            let traces: Vec<OfflineTrace> =
+                serde_json::from_slice(&std::fs::read(path).with_context(|| {
+                    format!("failed to read offline trace {}", path.display())
+                })?)?;
+            Box::new(
+                OfflineRlEngine::train("signal", "offline-policy-v1", &traces, 3, 0.2, 0.9, 50)
+                    .map_err(anyhow::Error::msg)?,
+            )
+        }
+        EngineChoice::Llm => {
+            let client =
+                OpenAiCompatibleClient::new(LlmConfig::from_env().map_err(anyhow::Error::msg)?)
+                    .map_err(anyhow::Error::msg)?;
+            Box::new(LlmProposalEngine::new(client))
+        }
+    };
+    Ok(engine)
+}

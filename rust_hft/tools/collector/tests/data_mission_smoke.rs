@@ -1,20 +1,23 @@
-use hft_collector::{acquire_dataset, DataAcquisitionMission};
+use hft_collector::{acquire_dataset, DataAcquisitionMission, QualityRequirements};
 use sha2::{Digest, Sha256};
 
 #[tokio::test]
 #[ignore = "requires public Binance network access"]
 async fn real_binance_data_mission_produces_manifest_and_quality_report() {
     let artifact_dir = std::env::temp_dir().join("alpha-real-binance-data-mission");
-    let manifest = acquire_dataset(
-        &DataAcquisitionMission {
-            mission_id: "real-binance-smoke".to_string(),
-            source_id: "binance-public".to_string(),
-            symbol: "BTCUSDT".to_string(),
-            interval: "1m".to_string(),
-            limit: 5,
-        },
+    let manifest = acquire_dataset(&DataAcquisitionMission {
+        mission_id: "real-binance-smoke".to_string(),
+        source_id: "binance-public".to_string(),
+        symbol: "BTCUSDT".to_string(),
+        interval: "1m".to_string(),
+        limit: 5,
         artifact_dir,
-    )
+        quality_requirements: QualityRequirements {
+            max_parse_failures: 0,
+            max_non_monotonic_events: 0,
+            max_non_finite_values: 0,
+        },
+    })
     .await
     .unwrap();
     assert_eq!(manifest.quality.rows, 5);

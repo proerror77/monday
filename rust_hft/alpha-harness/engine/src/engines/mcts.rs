@@ -1,10 +1,11 @@
 use super::DeterministicRng;
 use crate::{
-    evaluation::EngineContext, CandidateEvaluation, EngineProposal, ProposalEngine, RemainingBudget,
+    evaluation::EngineContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
+    ProposalEngine, RemainingBudget,
 };
 use alpha_domain::{CandidateArtifact, EngineKind};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 struct Node {
     ast: FactorAst,
@@ -34,6 +35,7 @@ pub struct MctsEngine {
     secondary_field: String,
     nodes: Vec<Node>,
     candidates: BTreeMap<String, usize>,
+    seen: BTreeSet<String>,
 }
 
 impl MctsEngine {
@@ -68,6 +70,7 @@ impl MctsEngine {
                 best_reward: f64::NEG_INFINITY,
             }],
             candidates: BTreeMap::new(),
+            seen: BTreeSet::new(),
         })
     }
 
@@ -177,20 +180,26 @@ impl ProposalEngine for MctsEngine {
         if remaining.expansions == 0 {
             return Err("MCTS expansion budget is exhausted".to_string());
         }
-        let parent = self
-            .select_expandable(0)
-            .ok_or_else(|| "MCTS tree has no expandable node".to_string())?;
-        let node_id = self.expand(parent)?;
-        let candidate_id = format!("{mission_id}-mcts-{iteration_index}");
-        self.candidates.insert(candidate_id.clone(), node_id);
-        Ok(EngineProposal {
-            candidate_id,
-            hypothesis: "MCTS grammar expansion selected by UCT".to_string(),
-            artifact: CandidateArtifact::Formula(self.nodes[node_id].ast.clone()),
-            expansions: 1,
-            tokens: 0,
-            elapsed_ms: 0,
-        })
+        for attempt in 1..=remaining.expansions.min(256) {
+            let parent = self
+                .select_expandable(0)
+                .ok_or_else(|| "MCTS tree has no expandable node".to_string())?;
+            let node_id = self.expand(parent)?;
+            let formula = self.nodes[node_id].ast.to_string();
+            if self.seen.insert(formula) {
+                let candidate_id = format!("{mission_id}-mcts-{iteration_index}");
+                self.candidates.insert(candidate_id.clone(), node_id);
+                return Ok(EngineProposal {
+                    candidate_id,
+                    hypothesis: "MCTS grammar expansion selected by UCT".to_string(),
+                    artifact: CandidateArtifact::Formula(self.nodes[node_id].ast.clone()),
+                    expansions: attempt,
+                    tokens: 0,
+                    elapsed_ms: 0,
+                });
+            }
+        }
+        Err("MCTS could not produce a novel candidate within budget".to_string())
     }
 
     fn observe(&mut self, proposal: &EngineProposal, evaluation: &CandidateEvaluation) {
@@ -207,6 +216,20 @@ impl ProposalEngine for MctsEngine {
                 None => break,
             }
         }
+    }
+
+    fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
+        for observation in observations {
+            let CandidateArtifact::Formula(ast) = &observation.proposal.artifact else {
+                return Err("MCTS history contains a non-formula artifact".to_string());
+            };
+            self.seen.insert(ast.to_string());
+            let root = &mut self.nodes[0];
+            root.visits += 1;
+            root.total_reward += observation.evaluation.score;
+            root.best_reward = root.best_reward.max(observation.evaluation.score);
+        }
+        Ok(())
     }
 }
 

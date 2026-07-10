@@ -1,6 +1,7 @@
 use super::DeterministicRng;
 use crate::{
-    evaluation::EngineContext, CandidateEvaluation, EngineProposal, ProposalEngine, RemainingBudget,
+    evaluation::EngineContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
+    ProposalEngine, RemainingBudget,
 };
 use alpha_domain::{CandidateArtifact, EngineKind};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
@@ -132,6 +133,21 @@ impl ProposalEngine for GeneticProgrammingEngine {
         self.population
             .sort_by(|left, right| right.1.total_cmp(&left.1));
         self.population.truncate(self.population_limit);
+    }
+
+    fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
+        for observation in observations {
+            let CandidateArtifact::Formula(ast) = &observation.proposal.artifact else {
+                return Err("GP history contains a non-formula artifact".to_string());
+            };
+            self.seen.insert(ast.to_string());
+            self.population
+                .push((ast.clone(), observation.evaluation.score));
+        }
+        self.population
+            .sort_by(|left, right| right.1.total_cmp(&left.1));
+        self.population.truncate(self.population_limit);
+        Ok(())
     }
 }
 
