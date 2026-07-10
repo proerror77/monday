@@ -78,7 +78,6 @@ download_log.txt
 # Environment files
 .env
 .env.local
-agno_env/
 
 # Documentation builds
 docs/_build/

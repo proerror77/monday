@@ -1,67 +1,43 @@
-# Agentic Alpha Harness Status
+# Rust Workspace Instructions
+## Current System
 
-**Status**: Rust-first agentic alpha harness skeleton is implemented. It is not a full autonomous live-trading system.
+This workspace has two trust domains:
 
-## Current Direction
+- `alpha-harness/*` is the cold Agentic Alpha research/control plane.
+- `apps/live`, runtime, risk, OMS, and execution adapters own actuation.
 
-The project direction is no longer a Python control-plane HFT system. The durable architecture is:
+Never add execution-adapter dependencies or order commands to `alpha-harness`. LLM/RL/MCTS/GP outputs are candidate artifacts, not executable trading instructions.
 
-```text
-prototype engines / agents
-  -> proposal artifacts
-  -> replay/evaluation gates
-  -> Factor Bank
-  -> promotion gates
-  -> live-small supervision
-  -> audit artifacts
-  -> research memory / learning directives
-```
+## Durable Packages
 
-Agentic research stays outside hot runtime crates. LLM, RL, MCTS, GP, QD, Bayesian, and Python prototype outputs must enter through proposal artifacts and deterministic gates.
+- `alpha-domain`: mission, candidate, learning, and deployment contracts.
+- `alpha-store`: DuckDB control-plane source of truth.
+- `alpha-engine`: search, evaluation, failure critic, and learning loop.
+- `alpha-harness`: Agent-facing structured CLI.
+- `hft-live`: signed runtime handoff and execution runtime.
+- `hft-collector`: connector-owned data acquisition.
+- `hft-factor-dsl`, `hft-factor-bank`, `hft-research-manifest`, and `hft-search-protocol` remain shared contracts with active consumers.
 
-## Implemented Harness Boundaries
+## Validation Lanes
 
-- `research-core/manifest`: reproducible manifests.
-- `research-core/factor-dsl`: canonical factor AST.
-- `research-core/search-protocol`: proposal artifacts and MCTS trace validation.
-- `research-core/factor-bank`: auditable factor assets and MVP execution status rules.
-- `research-core/factor-eval`: deterministic metric gates plus local replay CSV evaluation.
-- `research-core/promotion-gate`: paper/shadow/live-small promotion checks.
-- `research-core/live-small-supervisor`: live-small rollout and rollback decisions.
-- `research-core/prototype-adapter`: lab-only wrappers for Python/RL/BBO/signal/exit prototypes.
-- `research-core/research-memory`: structured failures and learning directives.
-- `research-core/loop-engine`: turn/goal/time/event loop state and stop decisions.
-- `research-core/search-protocol`: budgeted lab search runs for multi-candidate MCTS/RL/LLM proposal generation.
-- `research-core/live-small-supervisor`: dry-run and approval-gated non-dry-run runtime command boundary for live-small staging/rollback.
-- `research-core/live-small-supervisor`: runtime actuation result contracts for exchange/on-chain connectors.
-- `research-core/allocator-policy`: proposed allocation weights checked against hard caps.
-- `research-core/audit-trail`: validated harness audit bundles.
-- `infra-services/core/{artifact-store,experiment-store,factor-store}`: typed in-memory and file-backed stores.
-- `apps/agentic-alpha`: local CLI readback for topology, prototypes, replay evaluation, DuckDB-backed agent-loop learning, audit, stores, connectivity smoke, approval-gated Binance order binding, and approval-gated EVM raw transaction binding.
-
-## Not Implemented Yet
-
-- Real ClickHouse-backed research stores.
-- Real full-domain data wiring into manifests.
-- Production MCTS/RL/LLM engines with real model/tool execution.
-- Binding approved live-small runtime commands to non-Binance production order adapters.
-- In-repo EVM wallet signing and contract ABI adapters.
-- Full Python retirement.
-
-## Validation Rule
-
-Do not compile the whole workspace for ordinary harness changes. Use focused lanes:
+Do not compile the full workspace for ordinary work.
 
 ```bash
-cargo test -p hft-factor-eval --locked
-cargo test -p hft-prototype-adapter --locked
-cargo test -p hft-research-memory --locked
-cargo check -p hft-agentic-alpha -p hft-factorctl -p hft-harnessctl --locked
+cargo test -p alpha-domain --locked
+cargo test -p alpha-store --locked
+cargo test -p alpha-engine --locked
+cargo test -p alpha-harness --locked
+cargo test -p hft-live --no-default-features --test deployment_envelope --locked
+cargo check -p hft-collector --locked
 ```
 
-For broader harness changes:
+Run `cargo metadata --locked --no-deps` after package additions or removals. Use release/full graph checks only in release work.
 
-```bash
-cargo test -p hft-research-manifest -p hft-factor-dsl -p hft-search-protocol -p hft-factor-bank -p hft-promotion-gate -p hft-factor-eval -p hft-prototype-adapter -p hft-live-small-supervisor -p hft-loop-engine -p hft-research-memory -p hft-allocator-policy -p hft-audit-trail -p hft-artifact-store -p hft-experiment-store -p hft-factor-store --locked
-cargo check -p hft-agentic-alpha -p hft-factorctl -p hft-harnessctl --locked
-```
+## Data Integrity
+
+- No silent real-to-fixture fallback.
+- Verify content hashes before reading datasets.
+- Preserve point-in-time availability and sealed holdout boundaries.
+- Keep iterations, feedback, approvals, policies, and deployment evidence append-only.
+- Never persist LLM API keys or private signing keys.
+- Live-small stays disabled until envelope limits are enforced in every order path.

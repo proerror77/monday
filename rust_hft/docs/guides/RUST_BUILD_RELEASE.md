@@ -59,7 +59,7 @@ CI cache key 至少要按下列維度隔離：
 
 不要讓不可信 PR 和受保護 release job 共用可寫快取。PR job 只 restore cache，不 save cache；release job 從源碼重建，並發布 checksum。
 
-這個 monorepo 的實際 GitHub workflow 在倉庫根目錄 `.github/workflows/`。`rust_hft/.github/workflows/` 內的文件只在 `rust_hft` 被拆成獨立倉庫時才會被 GitHub 直接觸發。
+這個 monorepo 的 GitHub workflow 只保留在倉庫根目錄 `.github/workflows/`，避免同一個 Rust graph 被多份配置重複編譯。
 
 ## Release Profile
 

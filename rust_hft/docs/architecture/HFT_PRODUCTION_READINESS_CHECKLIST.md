@@ -2,11 +2,12 @@
 
 這份清單把系統從「低延遲行情處理」推進到「可上線交易內核」。目標不是每個局部都追絕對最快，而是讓路徑短、隊列可控、抖動可定位、過載可降級，並且永遠不要在狀態未知時交易。
 
-本季可執行範圍和里程碑以
-[`HFT_2026_Q2_EXECUTION_PLAN.md`](HFT_2026_Q2_EXECUTION_PLAN.md) 為準；
+目前的研究/執行邊界以 [`../../ARCHITECTURE.md`](../../ARCHITECTURE.md) 為準；
 隊列 owner、容量與滿載行為以
 [`HFT_QUEUE_TOPOLOGY_CONTRACT.md`](HFT_QUEUE_TOPOLOGY_CONTRACT.md) 為準；
-本文保留為 production readiness checklist。
+本文只是一份 production readiness checklist，不代表所有條目已完成。尤其
+`live-small` 仍維持 fail-closed，直到每一條下單熱路徑都強制執行 envelope 的
+單筆數量與滑價上限。
 
 ## 1. Low Latency Path
 
