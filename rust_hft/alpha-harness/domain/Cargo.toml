@@ -1,0 +1,16 @@
+[package]
+name = "alpha-domain"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+chrono = { workspace = true, features = ["serde"] }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+hft-factor-dsl = { path = "../../research-core/factor-dsl" }
+hft-research-manifest = { path = "../../research-core/manifest" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }

@@ -89,6 +89,9 @@ members = [
     "research-core/research-memory",
     "research-core/search-protocol",
 
+    # Agentic Alpha Harness
+    "alpha-harness/domain",
+
     # Applications
     "apps/live",
     "apps/all-in-one",
@@ -144,6 +147,9 @@ metrics-exporter-prometheus = { workspace = true, optional = true }
 # 核心零依賴
 serde = { version = "1.0", features = ["derive", "rc"] }
 thiserror = "2.0"
+sha2 = "0.10"
+ed25519-dalek = "2"
+hex = "0.4"
 
 # 非同步 (只在需要的 crate 開)
 tokio = { version = "1.0", default-features = false }
