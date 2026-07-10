@@ -6,11 +6,13 @@
 
 mod helpers;
 
-use alpha_domain::SignedDeploymentEnvelope;
+use alpha_domain::{
+    AttributionMode, AttributionOutcome, RuntimeAttributionEvent, SignedDeploymentEnvelope,
+};
 use clap::Parser;
 use hft_live::deployment_envelope::{
-    decode_trusted_keys, ActivationRequest, DeploymentIntake, RuntimeAuditLog, RuntimeNonceLedger,
-    RuntimePolicyDocument, SystemConfigActivationAdapter,
+    decode_trusted_keys, ActivationRequest, DeploymentIntake, RuntimeAuditLog, RuntimeFeedbackLog,
+    RuntimeNonceLedger, RuntimePolicyDocument, SystemConfigActivationAdapter,
 };
 use runtime::{
     ExecutionQueueSettings, RiskConfig as RtRiskConfig, StrategyConfig as RtStrategyConfig,
@@ -76,6 +78,10 @@ struct Args {
     /// Runtime-owned append-only deployment audit log.
     #[arg(long, requires = "deployment_envelope")]
     deployment_audit_log: Option<std::path::PathBuf>,
+
+    /// Runtime-owned append-only paper/shadow/live attribution log.
+    #[arg(long, requires = "deployment_envelope")]
+    deployment_feedback_log: Option<std::path::PathBuf>,
 
     /// Metrics HTTP 服務器端口（啟用 metrics feature 時生效）
     #[cfg(feature = "metrics")]
@@ -425,6 +431,7 @@ fn apply_deployment_if_present(
         required_path(&args.deployment_trusted_keys, "--deployment-trusted-keys")?;
     let nonce_path = required_path(&args.deployment_nonce_ledger, "--deployment-nonce-ledger")?;
     let audit_path = required_path(&args.deployment_audit_log, "--deployment-audit-log")?;
+    let feedback_path = required_path(&args.deployment_feedback_log, "--deployment-feedback-log")?;
 
     let signed: SignedDeploymentEnvelope = read_json(envelope_path)?;
     let policy_document: RuntimePolicyDocument = read_json(policy_path)?;
@@ -433,6 +440,7 @@ fn apply_deployment_if_present(
     let mut ledger = RuntimeNonceLedger::open(nonce_path)?;
     let mut audit = RuntimeAuditLog::open(audit_path)?;
     let mut adapter = SystemConfigActivationAdapter::new(config);
+    let observed_at = chrono::Utc::now();
     let request = DeploymentIntake::new(
         &trusted_keys,
         &policy,
@@ -441,7 +449,22 @@ fn apply_deployment_if_present(
         &mut audit,
         &mut adapter,
     )
-    .accept(&signed, chrono::Utc::now())?;
+    .accept(&signed, observed_at)?;
+    RuntimeFeedbackLog::open(feedback_path)?.append(&RuntimeAttributionEvent {
+        event_id: format!("activation:{}", request.deployment_id),
+        deployment_id: request.deployment_id.clone(),
+        asset_revision_id: request.asset_revision_id.clone(),
+        mission_id: None,
+        mode: match request.mode {
+            hft_live::deployment_envelope::ActivationMode::Paper => AttributionMode::Paper,
+            hft_live::deployment_envelope::ActivationMode::Shadow => AttributionMode::Shadow,
+            hft_live::deployment_envelope::ActivationMode::LiveSmall => AttributionMode::LiveSmall,
+        },
+        outcome: AttributionOutcome::Activated,
+        metrics: std::collections::BTreeMap::new(),
+        reason: None,
+        observed_at,
+    })?;
     Ok(Some(request))
 }
 

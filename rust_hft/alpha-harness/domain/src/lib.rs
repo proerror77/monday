@@ -41,6 +41,10 @@ pub enum DomainError {
     RuntimeLimitExceeded,
     #[error("canonical deployment serialization failed")]
     CanonicalSerialization,
+    #[error("runtime attribution metrics must be finite")]
+    InvalidAttributionMetric,
+    #[error("search-policy validator scores must be finite")]
+    InvalidPolicyScore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +150,97 @@ pub enum EngineKind {
     LlmProposer,
     OfflineReinforcementLearning,
     ManualSeed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttributionMode {
+    Paper,
+    Shadow,
+    LiveSmall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttributionOutcome {
+    Activated,
+    Healthy,
+    Decayed,
+    RolledBack,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeAttributionEvent {
+    pub event_id: String,
+    pub deployment_id: String,
+    pub asset_revision_id: String,
+    pub mission_id: Option<String>,
+    pub mode: AttributionMode,
+    pub outcome: AttributionOutcome,
+    pub metrics: BTreeMap<String, f64>,
+    pub reason: Option<String>,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl RuntimeAttributionEvent {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text("attribution event_id", &self.event_id)?;
+        require_text("attribution deployment_id", &self.deployment_id)?;
+        require_text("attribution asset_revision_id", &self.asset_revision_id)?;
+        if self.metrics.values().any(|value| !value.is_finite()) {
+            return Err(DomainError::InvalidAttributionMetric);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LearningDirective {
+    pub directive_id: String,
+    pub mission_id: String,
+    pub failure_class: String,
+    pub evidence_iteration_ids: Vec<String>,
+    pub follow_up_mission_id: String,
+    pub search_policy_revision_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl LearningDirective {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text("directive_id", &self.directive_id)?;
+        require_text("directive mission_id", &self.mission_id)?;
+        require_text("failure_class", &self.failure_class)?;
+        require_text("follow_up_mission_id", &self.follow_up_mission_id)?;
+        require_text(
+            "directive search_policy_revision_id",
+            &self.search_policy_revision_id,
+        )?;
+        if self.evidence_iteration_ids.is_empty() {
+            return Err(DomainError::EmptyField("evidence_iteration_ids"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchPolicyRevision {
+    pub revision_id: String,
+    pub parent_revision_id: Option<String>,
+    pub policy: serde_json::Value,
+    pub evidence_event_ids: Vec<String>,
+    pub validator_score: f64,
+    pub adopted: bool,
+    pub rollback_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl SearchPolicyRevision {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text("search policy revision_id", &self.revision_id)?;
+        if !self.validator_score.is_finite() {
+            return Err(DomainError::InvalidPolicyScore);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

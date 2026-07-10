@@ -178,6 +178,17 @@ impl OpenAiCompatibleClient {
     }
 
     pub fn explain_failure(&self, prompt: &str) -> Result<FailureExplanation, String> {
+        self.explain_failure_bounded(prompt, self.config.max_tokens)
+    }
+
+    pub fn explain_failure_bounded(
+        &self,
+        prompt: &str,
+        max_tokens: u64,
+    ) -> Result<FailureExplanation, String> {
+        if max_tokens == 0 {
+            return Err("LLM token budget is exhausted".to_string());
+        }
         let (content, usage, prompt_hash) = self.request_json(
             prompt,
             "failure_explanation",
@@ -191,7 +202,7 @@ impl OpenAiCompatibleClient {
                     "next_experiment": {"type": "string"}
                 }
             }),
-            self.config.max_tokens,
+            max_tokens.min(self.config.max_tokens),
         )?;
         let raw: RawFailureExplanation = serde_json::from_str(&content)
             .map_err(|error| format!("LLM failure JSON is invalid: {error}"))?;
@@ -269,6 +280,27 @@ impl OpenAiCompatibleClient {
             },
             prompt_hash,
         ))
+    }
+}
+
+impl crate::learning::FailureCritic for OpenAiCompatibleClient {
+    fn explain(
+        &self,
+        context: &crate::learning::FailureContext,
+        max_tokens: u64,
+    ) -> Result<crate::learning::FailureCritique, String> {
+        let prompt = format!(
+            "Explain this bounded research failure and propose the next lab experiment. Do not propose orders, runtime risk changes, or live execution. Context: {}",
+            serde_json::to_string(context)
+                .map_err(|error| format!("failure context serialization failed: {error}"))?
+        );
+        let explanation = self.explain_failure_bounded(&prompt, max_tokens)?;
+        let tokens = explanation.token_usage.total_tokens;
+        Ok(crate::learning::FailureCritique {
+            payload: serde_json::to_value(explanation)
+                .map_err(|error| format!("failure explanation serialization failed: {error}"))?,
+            tokens,
+        })
     }
 }
 

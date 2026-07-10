@@ -1,5 +1,5 @@
 use crate::{
-    cli::{print_json, EngineChoice, MissionStatusArgs, RunMissionArgs},
+    cli::{print_json, EngineChoice, LearnMissionArgs, MissionStatusArgs, RunMissionArgs},
     data_mission,
 };
 use alpha_domain::MissionStatus;
@@ -10,6 +10,7 @@ use alpha_engine::{
     },
     evaluation::{prepare_dataset, WalkForwardConfig},
     formula_evaluator::{FormulaEvaluator, FormulaEvaluatorConfig},
+    learning::{close_learning_loop, FailureCritic, LearningConfig},
     llm::{LlmConfig, LlmProposalEngine, OpenAiCompatibleClient},
     AutoResearchKernel, ProposalEngine, RunControl,
 };
@@ -84,6 +85,29 @@ pub fn mission_status(args: MissionStatusArgs) -> anyhow::Result<()> {
         "evaluation_count": lineage.evaluations.len(),
         "checkpoint": checkpoint,
     }))
+}
+
+pub fn learn_mission(args: LearnMissionArgs) -> anyhow::Result<()> {
+    let mut store = AlphaStore::open(&args.db)?;
+    let critic = if args.llm_critic {
+        Some(
+            OpenAiCompatibleClient::new(LlmConfig::from_env().map_err(anyhow::Error::msg)?)
+                .map_err(anyhow::Error::msg)?,
+        )
+    } else {
+        None
+    };
+    let critic = critic.as_ref().map(|critic| critic as &dyn FailureCritic);
+    let outcome = close_learning_loop(
+        &mut store,
+        &args.mission_id,
+        &LearningConfig {
+            repeated_failure_threshold: args.repeated_failure_threshold,
+            max_critic_tokens: args.max_critic_tokens,
+        },
+        critic,
+    )?;
+    print_json(&outcome)
 }
 
 fn build_engine(args: &RunMissionArgs) -> anyhow::Result<Box<dyn ProposalEngine>> {

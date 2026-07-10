@@ -36,6 +36,18 @@ enum Command {
         #[command(subcommand)]
         command: DeploymentCommand,
     },
+    Feedback {
+        #[command(subcommand)]
+        command: FeedbackCommand,
+    },
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -44,6 +56,7 @@ enum MissionCommand {
     Run(RunMissionArgs),
     Resume(RunMissionArgs),
     Status(MissionStatusArgs),
+    Learn(LearnMissionArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -60,6 +73,22 @@ enum CandidateCommand {
 #[derive(Debug, Subcommand)]
 enum DeploymentCommand {
     Sign(SignDeploymentArgs),
+    ScopeHash(EnvelopeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum FeedbackCommand {
+    Ingest(JsonRecordArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    Propose(JsonRecordArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ApprovalCommand {
+    Record(JsonRecordArgs),
 }
 
 #[derive(Debug, Args)]
@@ -129,6 +158,28 @@ pub struct RunMissionArgs {
     pub dataset: DatasetArgs,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct LearnMissionArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub mission_id: String,
+    #[arg(long, default_value_t = 3)]
+    pub repeated_failure_threshold: usize,
+    #[arg(long, default_value_t = 500)]
+    pub max_critic_tokens: u64,
+    #[arg(long)]
+    pub llm_critic: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct JsonRecordArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub record: PathBuf,
+}
+
 #[derive(Debug, Args)]
 struct AcquireDataArgs {
     #[arg(long)]
@@ -193,6 +244,12 @@ pub struct SignDeploymentArgs {
     pub output: PathBuf,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct EnvelopeArgs {
+    #[arg(long)]
+    pub envelope: PathBuf,
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Mission { command } => match command {
@@ -208,6 +265,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             MissionCommand::Run(args) => mission::run_mission(args, false),
             MissionCommand::Resume(args) => mission::run_mission(args, true),
             MissionCommand::Status(args) => mission::mission_status(args),
+            MissionCommand::Learn(args) => mission::learn_mission(args),
         },
         Command::Data { command } => match command {
             DataCommand::Sources => print_json(&source_catalog()),
@@ -245,6 +303,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Promote(args) => governance::promote(args),
         Command::Deployment { command } => match command {
             DeploymentCommand::Sign(args) => governance::sign_deployment(args),
+            DeploymentCommand::ScopeHash(args) => governance::print_deployment_scope(args),
+        },
+        Command::Feedback { command } => match command {
+            FeedbackCommand::Ingest(args) => governance::ingest_feedback(args),
+        },
+        Command::Policy { command } => match command {
+            PolicyCommand::Propose(args) => governance::propose_policy(args),
+        },
+        Command::Approval { command } => match command {
+            ApprovalCommand::Record(args) => governance::record_approval(args),
         },
     }
 }

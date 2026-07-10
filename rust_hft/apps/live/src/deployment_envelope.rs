@@ -1,6 +1,6 @@
 use alpha_domain::{
-    verify_envelope, AllowedIntentType, ApprovalClass, DomainError, RuntimeEnvelopePolicy,
-    SignedDeploymentEnvelope, VerifiedDeploymentEnvelope,
+    verify_envelope, AllowedIntentType, ApprovalClass, DomainError, RuntimeAttributionEvent,
+    RuntimeEnvelopePolicy, SignedDeploymentEnvelope, VerifiedDeploymentEnvelope,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
@@ -249,6 +249,32 @@ pub struct RuntimeAuditEvent {
 
 pub struct RuntimeAuditLog {
     path: PathBuf,
+}
+
+pub struct RuntimeFeedbackLog {
+    path: PathBuf,
+}
+
+impl RuntimeFeedbackLog {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, IntakeError> {
+        let path = path.as_ref().to_path_buf();
+        ensure_parent(&path)?;
+        Ok(Self { path })
+    }
+
+    pub fn append(&mut self, event: &RuntimeAttributionEvent) -> Result<(), IntakeError> {
+        event.validate()?;
+        let mut bytes = serde_json::to_vec(event)
+            .map_err(|error| IntakeError::DurableState(error.to_string()))?;
+        bytes.push(b'\n');
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(durable_error)?;
+        file.write_all(&bytes).map_err(durable_error)?;
+        file.sync_data().map_err(durable_error)
+    }
 }
 
 impl RuntimeAuditLog {

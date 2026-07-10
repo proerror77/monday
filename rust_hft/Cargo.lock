@@ -117,6 +117,7 @@ dependencies = [
  "alpha-domain",
  "chrono",
  "duckdb",
+ "ed25519-dalek",
  "hex",
  "hft-research-manifest",
  "serde",

@@ -3,6 +3,7 @@
 pub mod engines;
 pub mod evaluation;
 pub mod formula_evaluator;
+pub mod learning;
 pub mod llm;
 
 use alpha_domain::{

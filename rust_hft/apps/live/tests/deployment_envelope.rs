@@ -278,3 +278,30 @@ fn nonce_replay_is_rejected_after_ledger_restart() {
     assert_eq!(adapter.requests.len(), 1);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn live_small_fails_closed_until_order_limits_are_in_the_hot_path() {
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let trusted = trusted(&key);
+    let directory = directory("live-small-disabled");
+    let signed = sign_envelope(
+        envelope(
+            now,
+            "live-small-1",
+            "nonce-live-small",
+            AllowedIntentType::StartLiveSmall,
+            ApprovalClass::HumanApprovedLiveSmall,
+        ),
+        "key-1",
+        &key,
+    )
+    .unwrap();
+    let mut config = configured_runtime();
+    let mut adapter = SystemConfigActivationAdapter::new(&mut config);
+    assert!(intake(&signed, &trusted, &policy(), now, &directory, &mut adapter,).is_err());
+    assert!(RuntimeNonceLedger::open(directory.join("nonces.jsonl"))
+        .unwrap()
+        .contains("nonce-live-small"));
+    std::fs::remove_dir_all(directory).unwrap();
+}

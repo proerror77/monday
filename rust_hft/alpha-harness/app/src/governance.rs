@@ -1,17 +1,24 @@
 use crate::{
-    cli::{print_json, EvaluateArgs, MissionStatusArgs, PromoteArgs, SignDeploymentArgs},
+    cli::{
+        print_json, EnvelopeArgs, EvaluateArgs, JsonRecordArgs, MissionStatusArgs, PromoteArgs,
+        SignDeploymentArgs,
+    },
     data_mission,
 };
-use alpha_domain::{sign_envelope, DeploymentEnvelope, IterationVerdict};
+use alpha_domain::{
+    sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope, IterationVerdict,
+    RuntimeAttributionEvent, SearchPolicyRevision,
+};
 use alpha_engine::{
     evaluation::{prepare_dataset, WalkForwardConfig},
     formula_evaluator::{FormulaEvaluator, FormulaEvaluatorConfig},
     CandidateEvaluation, EngineProposal,
 };
-use alpha_store::{AlphaStore, RegistryRevision, StoreError};
+use alpha_store::{AlphaStore, ApprovalRecord, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
+use sha2::{Digest, Sha256};
 
 pub fn candidate_list(args: MissionStatusArgs) -> anyhow::Result<()> {
     let store = AlphaStore::open(args.db)?;
@@ -150,6 +157,8 @@ pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
         &std::fs::read(&args.envelope)
             .with_context(|| format!("failed to read envelope {}", args.envelope.display()))?,
     )?;
+    let mut store = AlphaStore::open(args.db)?;
+    enforce_live_small_approval(&store, &envelope)?;
     let key_hex = std::fs::read_to_string(&args.signing_key)
         .with_context(|| format!("failed to read signing key {}", args.signing_key.display()))?;
     let key_bytes = hex::decode(key_hex.trim()).context("signing key must be hex encoded")?;
@@ -159,7 +168,6 @@ pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
     let signing_key = SigningKey::from_bytes(&key_array);
     let verifying_key_hex = hex::encode(signing_key.verifying_key().to_bytes());
     let signed = sign_envelope(envelope, args.key_id, &signing_key)?;
-    let mut store = AlphaStore::open(args.db)?;
     store.store_deployment(&signed, Utc::now())?;
     data_mission::write_json_atomic(&args.output, &signed)?;
     print_json(&serde_json::json!({
@@ -168,4 +176,140 @@ pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
         "key_id": signed.key_id,
         "verifying_key_hex": verifying_key_hex,
     }))
+}
+
+pub fn print_deployment_scope(args: EnvelopeArgs) -> anyhow::Result<()> {
+    let envelope: DeploymentEnvelope = read_record(&args.envelope)?;
+    print_json(&serde_json::json!({
+        "scope_hash": deployment_scope_hash(&envelope)?,
+        "asset_revision_id": envelope.asset_revision_id,
+    }))
+}
+
+pub fn ingest_feedback(args: JsonRecordArgs) -> anyhow::Result<()> {
+    let event: RuntimeAttributionEvent = read_record(&args.record)?;
+    let mut store = AlphaStore::open(args.db)?;
+    let inserted = store.ingest_runtime_attribution(event.clone())?;
+    let stored = store.get_runtime_attribution(&event.event_id)?;
+    print_json(&serde_json::json!({
+        "inserted": inserted,
+        "event": stored,
+    }))
+}
+
+pub fn propose_policy(args: JsonRecordArgs) -> anyhow::Result<()> {
+    let revision: SearchPolicyRevision = read_record(&args.record)?;
+    let mut store = AlphaStore::open(args.db)?;
+    print_json(&store.put_search_policy_revision(revision)?)
+}
+
+pub fn record_approval(args: JsonRecordArgs) -> anyhow::Result<()> {
+    let approval: ApprovalRecord = read_record(&args.record)?;
+    let mut store = AlphaStore::open(args.db)?;
+    store.record_approval(&approval)?;
+    print_json(&approval)
+}
+
+fn enforce_live_small_approval(
+    store: &AlphaStore,
+    envelope: &DeploymentEnvelope,
+) -> anyhow::Result<()> {
+    if !envelope
+        .allowed_intent_types
+        .contains(&AllowedIntentType::StartLiveSmall)
+    {
+        return Ok(());
+    }
+    if !matches!(
+        envelope.approval_class,
+        ApprovalClass::HumanApprovedLiveSmall | ApprovalClass::SameClassAutoLiveSmall
+    ) {
+        bail!("live-small deployment requires a live-small approval class");
+    }
+    let scope_hash = deployment_scope_hash(envelope)?;
+    let approved = envelope.approval_signatures.iter().any(|approval_id| {
+        store.get_approval(approval_id).is_ok_and(|approval| {
+            approval.approval_class == "human_live_small"
+                && approval
+                    .payload
+                    .get("scope_hash")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(scope_hash.as_str())
+                && (envelope.approval_class == ApprovalClass::SameClassAutoLiveSmall
+                    || approval.subject_id == envelope.asset_revision_id)
+        })
+    });
+    if !approved {
+        bail!("live-small deployment has no matching persisted human approval");
+    }
+    Ok(())
+}
+
+fn deployment_scope_hash(envelope: &DeploymentEnvelope) -> anyhow::Result<String> {
+    let mut instruments = envelope.instruments.clone();
+    instruments.sort();
+    let scope = serde_json::json!({
+        "venue": envelope.venue,
+        "instruments": instruments,
+        "intent": "live_small",
+    });
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&scope)?)))
+}
+
+fn read_record<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> anyhow::Result<T> {
+    serde_json::from_slice(
+        &std::fs::read(path)
+            .with_context(|| format!("failed to read record {}", path.display()))?,
+    )
+    .with_context(|| format!("record {} is invalid JSON", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn live_small_envelope() -> DeploymentEnvelope {
+        let now = Utc::now();
+        DeploymentEnvelope {
+            deployment_id: "deployment-live-small".to_string(),
+            asset_revision_id: "factor-1@2".to_string(),
+            promotion_manifest_hash: "promotion-hash".to_string(),
+            runtime_config_hash: "runtime-hash".to_string(),
+            risk_policy_hash: "risk-hash".to_string(),
+            account_id: "account-1".to_string(),
+            venue: "binance".to_string(),
+            instruments: vec!["BTCUSDT".to_string()],
+            allowed_intent_types: vec![AllowedIntentType::StartLiveSmall],
+            max_notional: 100.0,
+            max_symbol_exposure: 50.0,
+            max_order_size: 10.0,
+            max_slippage_bps: 2.0,
+            valid_from: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(5),
+            nonce: "nonce-live-small".to_string(),
+            approval_class: ApprovalClass::SameClassAutoLiveSmall,
+            approval_signatures: vec!["approval-1".to_string()],
+            payload_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn live_small_requires_a_persisted_human_approval_for_the_same_scope() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let envelope = live_small_envelope();
+        assert!(enforce_live_small_approval(&store, &envelope).is_err());
+        store
+            .record_approval(&ApprovalRecord {
+                approval_id: "approval-1".to_string(),
+                approval_class: "human_live_small".to_string(),
+                subject_id: "earlier-factor@1".to_string(),
+                payload: serde_json::json!({
+                    "scope_hash": deployment_scope_hash(&envelope).unwrap(),
+                }),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        assert!(enforce_live_small_approval(&store, &envelope).is_ok());
+    }
 }

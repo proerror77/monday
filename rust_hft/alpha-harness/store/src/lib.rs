@@ -1,8 +1,8 @@
 //! Transactional DuckDB source of truth for the Agentic Alpha control plane.
 
 use alpha_domain::{
-    CandidateArtifact, MissionStatus, ResearchIteration, ResearchMission, SearchBudgetUsage,
-    SignedDeploymentEnvelope,
+    CandidateArtifact, LearningDirective, MissionStatus, ResearchIteration, ResearchMission,
+    RuntimeAttributionEvent, SearchBudgetUsage, SearchPolicyRevision, SignedDeploymentEnvelope,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
@@ -500,6 +500,45 @@ impl AlphaStore {
         )
     }
 
+    pub fn put_search_policy_revision(
+        &mut self,
+        mut revision: SearchPolicyRevision,
+    ) -> Result<SearchPolicyRevision, StoreError> {
+        revision.validate().map_err(domain_error)?;
+        revision.adopted = match revision.parent_revision_id.as_deref() {
+            Some(parent_id) => {
+                let parent = self.get_search_policy_revision(parent_id)?;
+                parent.adopted && revision.validator_score > parent.validator_score
+            }
+            None => true,
+        };
+        if !revision.adopted && revision.rollback_reason.is_none() {
+            revision.rollback_reason = Some("validator did not beat parent revision".to_string());
+        }
+        self.put_registry_revision(&RegistryRevision {
+            revision_id: revision.revision_id.clone(),
+            registry_kind: "search_policy".to_string(),
+            asset_id: "alpha-search-policy".to_string(),
+            parent_revision_id: revision.parent_revision_id.clone(),
+            payload: serde_json::to_value(&revision).map_err(serialization_error)?,
+            created_at: revision.created_at,
+        })?;
+        Ok(revision)
+    }
+
+    pub fn get_search_policy_revision(
+        &self,
+        revision_id: &str,
+    ) -> Result<SearchPolicyRevision, StoreError> {
+        let revision = self.get_registry_revision(revision_id)?;
+        if revision.registry_kind != "search_policy" {
+            return Err(StoreError::Domain(
+                "registry revision is not a search policy".to_string(),
+            ));
+        }
+        serde_json::from_value(revision.payload).map_err(serialization_error)
+    }
+
     pub fn append_memory(&mut self, record: &MemoryRecord) -> Result<(), StoreError> {
         require_text(&record.event_id)?;
         self.insert_json_record(
@@ -525,6 +564,83 @@ impl AlphaStore {
                 Ok(())
             },
         )
+    }
+
+    pub fn get_memory(&self, event_id: &str) -> Result<MemoryRecord, StoreError> {
+        read_json_row(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM research_memory WHERE event_id = ?",
+            event_id,
+        )
+    }
+
+    pub fn append_memory_idempotent(&mut self, record: &MemoryRecord) -> Result<bool, StoreError> {
+        match self.get_memory(&record.event_id) {
+            Ok(existing) if existing == *record => Ok(false),
+            Ok(_) => Err(StoreError::DuplicateRecord),
+            Err(StoreError::NotFound) => {
+                self.append_memory(record)?;
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn append_learning_directive(
+        &mut self,
+        directive: &LearningDirective,
+    ) -> Result<bool, StoreError> {
+        directive.validate().map_err(domain_error)?;
+        self.append_memory_idempotent(&MemoryRecord {
+            event_id: directive.directive_id.clone(),
+            mission_id: Some(directive.mission_id.clone()),
+            payload: serde_json::json!({
+                "kind": "learning_directive",
+                "directive": directive,
+            }),
+            created_at: directive.created_at,
+        })
+    }
+
+    pub fn ingest_runtime_attribution(
+        &mut self,
+        mut event: RuntimeAttributionEvent,
+    ) -> Result<bool, StoreError> {
+        event.validate().map_err(domain_error)?;
+        let signed = self.get_deployment(&event.deployment_id)?;
+        if signed.envelope.asset_revision_id != event.asset_revision_id {
+            return Err(StoreError::Domain(
+                "attribution asset does not match deployment".to_string(),
+            ));
+        }
+        if event.mission_id.is_none() {
+            event.mission_id = self.mission_for_asset(&event.asset_revision_id)?;
+        }
+        let observed_at = event.observed_at;
+        self.append_memory_idempotent(&MemoryRecord {
+            event_id: event.event_id.clone(),
+            mission_id: event.mission_id.clone(),
+            payload: serde_json::json!({
+                "kind": "runtime_attribution",
+                "event": event,
+            }),
+            created_at: observed_at,
+        })
+    }
+
+    pub fn get_runtime_attribution(
+        &self,
+        event_id: &str,
+    ) -> Result<RuntimeAttributionEvent, StoreError> {
+        let memory = self.get_memory(event_id)?;
+        serde_json::from_value(
+            memory
+                .payload
+                .get("event")
+                .cloned()
+                .ok_or_else(|| StoreError::Domain("memory is not attribution".to_string()))?,
+        )
+        .map_err(serialization_error)
     }
 
     pub fn record_approval(&mut self, approval: &ApprovalRecord) -> Result<(), StoreError> {
@@ -553,6 +669,14 @@ impl AlphaStore {
         )
     }
 
+    pub fn get_approval(&self, approval_id: &str) -> Result<ApprovalRecord, StoreError> {
+        read_json_row(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM approvals WHERE approval_id = ?",
+            approval_id,
+        )
+    }
+
     pub fn store_deployment(
         &mut self,
         signed: &SignedDeploymentEnvelope,
@@ -575,6 +699,17 @@ impl AlphaStore {
         )
     }
 
+    pub fn get_deployment(
+        &self,
+        deployment_id: &str,
+    ) -> Result<SignedDeploymentEnvelope, StoreError> {
+        read_json_row(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM deployment_envelopes WHERE deployment_id = ?",
+            deployment_id,
+        )
+    }
+
     pub fn consume_nonce(&mut self, nonce: &str, at: DateTime<Utc>) -> Result<(), StoreError> {
         require_text(nonce)?;
         let transaction = self.connection.transaction().map_err(database_error)?;
@@ -592,6 +727,25 @@ impl AlphaStore {
 
     pub fn nonce_consumed(&self, nonce: &str) -> Result<bool, StoreError> {
         record_exists(&self.connection, "consumed_nonces", "nonce", nonce)
+    }
+
+    fn mission_for_asset(&self, asset_id: &str) -> Result<Option<String>, StoreError> {
+        let result = read_json_row::<RegistryRevision>(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM registry_revisions
+             WHERE asset_id = ? AND registry_kind = 'promotion'
+             ORDER BY created_at DESC LIMIT 1",
+            asset_id,
+        );
+        match result {
+            Ok(revision) => Ok(revision
+                .payload
+                .get("mission_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)),
+            Err(StoreError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn insert_json_record<T, F>(
@@ -764,7 +918,12 @@ fn serialization_error(error: serde_json::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alpha_domain::{EngineKind, IterationVerdict, MissionStatus, SearchBudget, ValidatorMode};
+    use alpha_domain::{
+        sign_envelope, AllowedIntentType, ApprovalClass, AttributionMode, AttributionOutcome,
+        DeploymentEnvelope, EngineKind, IterationVerdict, MissionStatus, RuntimeAttributionEvent,
+        SearchBudget, SearchPolicyRevision, ValidatorMode,
+    };
+    use ed25519_dalek::SigningKey;
     use hft_research_manifest::ManifestId;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -921,6 +1080,115 @@ mod tests {
             reopened.consume_nonce("nonce-1", Utc::now()),
             Err(StoreError::NonceReplay)
         ));
+    }
+
+    #[test]
+    fn runtime_attribution_is_idempotent_and_links_back_to_mission() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        store
+            .put_registry_revision(&RegistryRevision {
+                revision_id: "promotion-1".to_string(),
+                registry_kind: "promotion".to_string(),
+                asset_id: "candidate-1".to_string(),
+                parent_revision_id: None,
+                payload: serde_json::json!({"mission_id": "mission-1"}),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        let now = Utc::now();
+        let signed = sign_envelope(
+            DeploymentEnvelope {
+                deployment_id: "deployment-1".to_string(),
+                asset_revision_id: "candidate-1".to_string(),
+                promotion_manifest_hash: "promotion-hash".to_string(),
+                runtime_config_hash: "runtime-hash".to_string(),
+                risk_policy_hash: "risk-hash".to_string(),
+                account_id: "account-1".to_string(),
+                venue: "binance".to_string(),
+                instruments: vec!["BTCUSDT".to_string()],
+                allowed_intent_types: vec![AllowedIntentType::StartPaper],
+                max_notional: 100.0,
+                max_symbol_exposure: 50.0,
+                max_order_size: 10.0,
+                max_slippage_bps: 2.0,
+                valid_from: now - chrono::Duration::minutes(1),
+                expires_at: now + chrono::Duration::minutes(1),
+                nonce: "nonce-1".to_string(),
+                approval_class: ApprovalClass::Paper,
+                approval_signatures: vec!["approval-1".to_string()],
+                payload_hash: String::new(),
+            },
+            "key-1",
+            &SigningKey::from_bytes(&[7_u8; 32]),
+        )
+        .unwrap();
+        store.store_deployment(&signed, now).unwrap();
+        let event = RuntimeAttributionEvent {
+            event_id: "attribution-1".to_string(),
+            deployment_id: "deployment-1".to_string(),
+            asset_revision_id: "candidate-1".to_string(),
+            mission_id: None,
+            mode: AttributionMode::Paper,
+            outcome: AttributionOutcome::Healthy,
+            metrics: std::collections::BTreeMap::from([("pnl".to_string(), 1.0)]),
+            reason: None,
+            observed_at: now,
+        };
+        assert!(store.ingest_runtime_attribution(event.clone()).unwrap());
+        assert!(!store.ingest_runtime_attribution(event).unwrap());
+        assert_eq!(
+            store
+                .get_runtime_attribution("attribution-1")
+                .unwrap()
+                .mission_id
+                .as_deref(),
+            Some("mission-1")
+        );
+    }
+
+    #[test]
+    fn search_policy_adopts_only_a_strict_validator_improvement() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let base = store
+            .put_search_policy_revision(SearchPolicyRevision {
+                revision_id: "policy-1".to_string(),
+                parent_revision_id: None,
+                policy: serde_json::json!({"engine": "gp"}),
+                evidence_event_ids: vec![],
+                validator_score: 1.0,
+                adopted: false,
+                rollback_reason: None,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        assert!(base.adopted);
+        let worse = store
+            .put_search_policy_revision(SearchPolicyRevision {
+                revision_id: "policy-2".to_string(),
+                parent_revision_id: Some("policy-1".to_string()),
+                policy: serde_json::json!({"engine": "mcts"}),
+                evidence_event_ids: vec!["attribution-1".to_string()],
+                validator_score: 0.9,
+                adopted: true,
+                rollback_reason: None,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        assert!(!worse.adopted);
+        let better = store
+            .put_search_policy_revision(SearchPolicyRevision {
+                revision_id: "policy-3".to_string(),
+                parent_revision_id: Some("policy-1".to_string()),
+                policy: serde_json::json!({"engine": "mcts"}),
+                evidence_event_ids: vec!["attribution-1".to_string()],
+                validator_score: 1.1,
+                adopted: false,
+                rollback_reason: None,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        assert!(better.adopted);
     }
 
     fn temp_db(prefix: &str) -> PathBuf {
