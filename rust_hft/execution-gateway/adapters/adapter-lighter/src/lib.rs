@@ -404,6 +404,14 @@ impl LighterExecutionClient {
     }
 }
 
+fn lighter_mode_label(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Paper => "Paper",
+        ExecutionMode::Live => "Live",
+        ExecutionMode::Testnet => "Testnet",
+    }
+}
+
 #[async_trait]
 impl ExecutionClient for LighterExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
@@ -683,10 +691,13 @@ impl ExecutionClient for LighterExecutionClient {
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         match self.cfg.mode {
-            ExecutionMode::Paper | ExecutionMode::Testnet => Ok(Vec::new()),
-            ExecutionMode::Live => {
-                Err(HftError::Config("Lighter list_open_orders 尚未實作".into()))
-            }
+            ExecutionMode::Paper | ExecutionMode::Testnet => Err(HftError::Config(format!(
+                "Lighter list_open_orders 不支援 {} 模式",
+                lighter_mode_label(self.cfg.mode)
+            ))),
+            ExecutionMode::Live => Err(HftError::Config(
+                "Lighter list_open_orders 尚未實作且無法提供權威快照".into(),
+            )),
         }
     }
 
@@ -806,5 +817,40 @@ impl ExecutionClient for LighterExecutionClient {
             latency_ms: None,
             last_heartbeat: hft_core::now_micros(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config(mode: ExecutionMode) -> LighterExecutionConfig {
+        LighterExecutionConfig {
+            rest_base_url: "https://lighter.test".into(),
+            timeout_ms: 1000,
+            mode,
+            signer_lib_path: None,
+            api_key_private_key: None,
+            api_key_index: None,
+            account_index: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_open_orders_paper_mode_fails() {
+        let client = LighterExecutionClient::new(make_config(ExecutionMode::Paper)).unwrap();
+        let result = client.list_open_orders().await;
+
+        assert!(
+            matches!(result, Err(HftError::Config(message)) if message.contains("不支援 Paper"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_open_orders_live_mode_fails_explicitly() {
+        let client = LighterExecutionClient::new(make_config(ExecutionMode::Live)).unwrap();
+        let result = client.list_open_orders().await;
+
+        assert!(matches!(result, Err(HftError::Config(message)) if message.contains("尚未實作")));
     }
 }

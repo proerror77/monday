@@ -226,6 +226,59 @@ struct BitgetFillUpdate {
     fee_ccy: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BitgetRestResponse<T> {
+    code: String,
+    msg: String,
+    data: Option<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitgetRestOpenOrder {
+    #[serde(alias = "symbol", alias = "instId")]
+    symbol: Option<String>,
+    #[serde(alias = "orderId", alias = "ordId")]
+    order_id: String,
+    #[serde(alias = "clientOrderId", alias = "clOrdId")]
+    client_order_id: Option<String>,
+    side: Option<String>,
+    #[serde(alias = "orderType", alias = "ordType")]
+    order_type: Option<String>,
+    #[serde(alias = "price", alias = "px")]
+    price: Option<String>,
+    #[serde(alias = "quantity", alias = "sz")]
+    quantity: Option<String>,
+    #[serde(alias = "filledQuantity", alias = "fillSz")]
+    filled_quantity: Option<String>,
+    #[serde(alias = "status", alias = "state")]
+    status: Option<String>,
+    #[serde(alias = "createTime", alias = "cTime")]
+    c_time: Option<String>,
+    #[serde(alias = "updateTime", alias = "uTime")]
+    u_time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitgetSpotAssetInfo {
+    #[serde(alias = "coin", alias = "coinName")]
+    coin: String,
+    available: String,
+    #[serde(alias = "frozen", alias = "lock", alias = "locked")]
+    frozen: String,
+    #[serde(alias = "usdtValue")]
+    usdt_value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BitgetMixAccountInfo {
+    #[serde(alias = "marginCoin")]
+    margin_coin: String,
+    available: String,
+    #[serde(alias = "frozen", alias = "locked")]
+    frozen: String,
+    equity: String,
+}
+
 /// Bitget 執行客戶端
 pub struct BitgetExecutionClient {
     config: BitgetExecutionConfig,
@@ -251,6 +304,301 @@ pub struct BitgetExecutionClient {
     resilient_executor: Option<Arc<ResilientExecutor>>,
     // 告警回調
     alert_callback: Option<AlertCallback>,
+}
+
+fn bitget_mode_label(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Paper => "Paper",
+        ExecutionMode::Live => "Live",
+        ExecutionMode::Testnet => "Testnet",
+    }
+}
+
+fn parse_bitget_side(value: &str, source: &str) -> HftResult<Side> {
+    match value {
+        "buy" => Ok(Side::Buy),
+        "sell" => Ok(Side::Sell),
+        _ => Err(HftError::Parse(format!(
+            "Bitget {} 未知 side: {}",
+            source, value
+        ))),
+    }
+}
+
+fn parse_bitget_order_type(value: &str, source: &str) -> HftResult<OrderType> {
+    match value {
+        "market" => Ok(OrderType::Market),
+        "limit" => Ok(OrderType::Limit),
+        _ => Err(HftError::Parse(format!(
+            "Bitget {} 未知 orderType: {}",
+            source, value
+        ))),
+    }
+}
+
+fn parse_bitget_order_status(value: &str, source: &str) -> HftResult<ports::OrderStatus> {
+    match value {
+        "accepted" => Ok(ports::OrderStatus::Accepted),
+        "new" => Ok(ports::OrderStatus::New),
+        "partially_filled" => Ok(ports::OrderStatus::PartiallyFilled),
+        "filled" => Ok(ports::OrderStatus::Filled),
+        "cancelled" | "canceled" => Ok(ports::OrderStatus::Canceled),
+        "rejected" => Ok(ports::OrderStatus::Rejected),
+        _ => Err(HftError::Parse(format!(
+            "Bitget {} 未知 status: {}",
+            source, value
+        ))),
+    }
+}
+
+fn parse_bitget_quantity(
+    field: &str,
+    value: &str,
+    source: &str,
+    allow_zero: bool,
+) -> HftResult<Quantity> {
+    let decimal = value.parse::<Decimal>().map_err(|e| {
+        HftError::Parse(format!(
+            "Bitget {} {} 解析失敗: {} ({})",
+            source, field, value, e
+        ))
+    })?;
+    if decimal < Decimal::ZERO || (!allow_zero && decimal.is_zero()) {
+        return Err(HftError::Parse(format!(
+            "Bitget {} {} 非法數量: {}",
+            source, field, value
+        )));
+    }
+    Ok(Quantity(decimal))
+}
+
+fn parse_bitget_price(
+    value: Option<&str>,
+    order_type: OrderType,
+    source: &str,
+) -> HftResult<Option<Price>> {
+    match value {
+        Some("") | None if order_type == OrderType::Market => Ok(None),
+        Some("") | None => Err(HftError::Parse(format!(
+            "Bitget {} limit order 缺少 price",
+            source
+        ))),
+        Some(raw) => Price::from_str(raw).map(Some).map_err(|e| {
+            HftError::Parse(format!("Bitget {} price 解析失敗: {} ({})", source, raw, e))
+        }),
+    }
+}
+
+fn parse_bitget_timestamp(field: &str, value: Option<&str>, source: &str) -> HftResult<Timestamp> {
+    let raw = value.ok_or_else(|| HftError::Parse(format!("Bitget {} 缺少 {}", source, field)))?;
+    raw.parse::<u64>().map(|ts_ms| ts_ms * 1000).map_err(|e| {
+        HftError::Parse(format!(
+            "Bitget {} {} 解析失敗: {} ({})",
+            source, field, raw, e
+        ))
+    })
+}
+
+fn parse_bitget_decimal(field: &str, value: &str, source: &str) -> HftResult<Decimal> {
+    value.parse::<Decimal>().map_err(|e| {
+        HftError::Parse(format!(
+            "Bitget {} {} 解析失敗: {} ({})",
+            source, field, value, e
+        ))
+    })
+}
+
+fn parse_bitget_optional_decimal(
+    field: &str,
+    value: Option<&str>,
+    source: &str,
+) -> HftResult<Option<Decimal>> {
+    match value {
+        Some(raw) => parse_bitget_decimal(field, raw, source).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn bitget_numeric_cursor(order_id: &str, client_order_id: Option<&str>) -> Option<u64> {
+    order_id
+        .parse::<u64>()
+        .ok()
+        .or_else(|| client_order_id.and_then(|value| value.parse::<u64>().ok()))
+}
+
+fn parse_bitget_open_order(
+    item: BitgetRestOpenOrder,
+    source: &str,
+) -> HftResult<(OpenOrder, Option<u64>)> {
+    let symbol = item
+        .symbol
+        .ok_or_else(|| HftError::Parse(format!("Bitget {} 缺少 symbol", source)))?;
+    let side = parse_bitget_side(
+        item.side
+            .as_deref()
+            .ok_or_else(|| HftError::Parse(format!("Bitget {} 缺少 side", source)))?,
+        source,
+    )?;
+    let order_type = parse_bitget_order_type(
+        item.order_type
+            .as_deref()
+            .ok_or_else(|| HftError::Parse(format!("Bitget {} 缺少 orderType", source)))?,
+        source,
+    )?;
+    let qty = parse_bitget_quantity(
+        "quantity",
+        item.quantity
+            .as_deref()
+            .ok_or_else(|| HftError::Parse(format!("Bitget {} 缺少 quantity", source)))?,
+        source,
+        false,
+    )?;
+    let filled = parse_bitget_quantity(
+        "filledQuantity",
+        item.filled_quantity
+            .as_deref()
+            .ok_or_else(|| HftError::Parse(format!("Bitget {} 缺少 filledQuantity", source)))?,
+        source,
+        true,
+    )?;
+    if filled.0 > qty.0 {
+        return Err(HftError::Parse(format!(
+            "Bitget {} filledQuantity 大於 quantity: {} > {}",
+            source, filled, qty
+        )));
+    }
+    let status = parse_bitget_order_status(
+        item.status
+            .as_deref()
+            .ok_or_else(|| HftError::Parse(format!("Bitget {} 缺少 status", source)))?,
+        source,
+    )?;
+    let price = parse_bitget_price(item.price.as_deref(), order_type, source)?;
+    let created_at = parse_bitget_timestamp("createTime", item.c_time.as_deref(), source)?;
+    let updated_at = parse_bitget_timestamp("updateTime", item.u_time.as_deref(), source)?;
+    let cursor = bitget_numeric_cursor(&item.order_id, item.client_order_id.as_deref());
+
+    Ok((
+        OpenOrder {
+            order_id: OrderId(item.order_id),
+            symbol: hft_core::Symbol::from(symbol),
+            side,
+            order_type,
+            original_quantity: qty,
+            remaining_quantity: Quantity(qty.0 - filled.0),
+            filled_quantity: filled,
+            price,
+            status,
+            created_at,
+            updated_at,
+        },
+        cursor,
+    ))
+}
+
+fn parse_bitget_open_orders_page(
+    response: BitgetRestResponse<Vec<BitgetRestOpenOrder>>,
+    source: &str,
+    page_limit: usize,
+) -> HftResult<(Vec<OpenOrder>, Option<u64>)> {
+    if response.code != "00000" {
+        return Err(HftError::Exchange(format!(
+            "Bitget {} 查詢失敗: {} - {}",
+            source, response.code, response.msg
+        )));
+    }
+
+    let items = response
+        .data
+        .ok_or_else(|| HftError::Parse(format!("Bitget {} 回應缺少 data", source)))?;
+    let page_len = items.len();
+    let mut min_cursor: Option<u64> = None;
+    let mut orders = Vec::with_capacity(page_len);
+    for item in items {
+        let (order, cursor) = parse_bitget_open_order(item, source)?;
+        if let Some(id) = cursor {
+            min_cursor = Some(min_cursor.map(|current| current.min(id)).unwrap_or(id));
+        }
+        orders.push(order);
+    }
+
+    if page_len == page_limit && min_cursor.is_none() {
+        return Err(HftError::Parse(format!(
+            "Bitget {} 無法解析翻頁游標",
+            source
+        )));
+    }
+
+    Ok((orders, min_cursor))
+}
+
+fn parse_bitget_spot_balances(
+    response: BitgetRestResponse<Vec<BitgetSpotAssetInfo>>,
+) -> HftResult<Vec<AccountBalance>> {
+    if response.code != "00000" {
+        return Err(HftError::Exchange(format!(
+            "Bitget spot 餘額查詢失敗: {} - {}",
+            response.code, response.msg
+        )));
+    }
+
+    let assets = response
+        .data
+        .ok_or_else(|| HftError::Parse("Bitget spot 餘額回應缺少 data".to_string()))?;
+
+    assets
+        .into_iter()
+        .map(|asset| {
+            let available = parse_bitget_decimal("available", &asset.available, "spot balance")?;
+            let frozen = parse_bitget_decimal("frozen", &asset.frozen, "spot balance")?;
+            let usd_value = parse_bitget_optional_decimal(
+                "usdtValue",
+                asset.usdt_value.as_deref(),
+                "spot balance",
+            )?;
+            let total = available + frozen;
+
+            Ok(AccountBalance {
+                asset: asset.coin,
+                available,
+                frozen,
+                total,
+                usd_value,
+            })
+        })
+        .collect()
+}
+
+fn parse_bitget_mix_balances(
+    response: BitgetRestResponse<Vec<BitgetMixAccountInfo>>,
+) -> HftResult<Vec<AccountBalance>> {
+    if response.code != "00000" {
+        return Err(HftError::Exchange(format!(
+            "Bitget mix 餘額查詢失敗: {} - {}",
+            response.code, response.msg
+        )));
+    }
+
+    let accounts = response
+        .data
+        .ok_or_else(|| HftError::Parse("Bitget mix 餘額回應缺少 data".to_string()))?;
+
+    accounts
+        .into_iter()
+        .map(|account| {
+            let available = parse_bitget_decimal("available", &account.available, "mix balance")?;
+            let frozen = parse_bitget_decimal("frozen", &account.frozen, "mix balance")?;
+            let total = parse_bitget_decimal("equity", &account.equity, "mix balance")?;
+
+            Ok(AccountBalance {
+                asset: format!("MIX:{}", account.margin_coin),
+                available,
+                frozen,
+                total,
+                usd_value: Some(total),
+            })
+        })
+        .collect()
 }
 
 impl BitgetExecutionClient {
@@ -1127,12 +1475,12 @@ impl ExecutionClient for BitgetExecutionClient {
             client_order_id: None,
         };
 
-        let body = serde_json::to_string(&request)
-            .map_err(|e| HftError::Serialization(e.to_string()))?;
+        let body =
+            serde_json::to_string(&request).map_err(|e| HftError::Serialization(e.to_string()))?;
 
-        let headers = self
-            .signer
-            .generate_headers("POST", "/api/v2/spot/trade/cancel-order", &body, None);
+        let headers =
+            self.signer
+                .generate_headers("POST", "/api/v2/spot/trade/cancel-order", &body, None);
 
         let http_client = self.get_http_client()?.clone();
         let order_id_clone = order_id.clone();
@@ -1173,7 +1521,10 @@ impl ExecutionClient for BitgetExecutionClient {
 
                         Ok(())
                     } else {
-                        Err(BitgetExecutionClient::classify_error(&result.code, &result.msg))
+                        Err(BitgetExecutionClient::classify_error(
+                            &result.code,
+                            &result.msg,
+                        ))
                     }
                 }
             })
@@ -1243,12 +1594,12 @@ impl ExecutionClient for BitgetExecutionClient {
             price: new_price.map(|p| p.0.to_string()),
         };
 
-        let body = serde_json::to_string(&request)
-            .map_err(|e| HftError::Serialization(e.to_string()))?;
+        let body =
+            serde_json::to_string(&request).map_err(|e| HftError::Serialization(e.to_string()))?;
 
-        let headers = self
-            .signer
-            .generate_headers("POST", "/api/v2/spot/trade/modify-order", &body, None);
+        let headers =
+            self.signer
+                .generate_headers("POST", "/api/v2/spot/trade/modify-order", &body, None);
 
         let http_client = self.get_http_client()?.clone();
         let order_id_clone = order_id.clone();
@@ -1296,7 +1647,10 @@ impl ExecutionClient for BitgetExecutionClient {
 
                         Ok(())
                     } else {
-                        Err(BitgetExecutionClient::classify_error(&result.code, &result.msg))
+                        Err(BitgetExecutionClient::classify_error(
+                            &result.code,
+                            &result.msg,
+                        ))
                     }
                 }
             })
@@ -1374,13 +1728,9 @@ impl ExecutionClient for BitgetExecutionClient {
                     CircuitState::HalfOpen => return, // 半開狀態不發送告警
                 };
 
-                let alert = ExecutionAlert::new(
-                    alert_type,
-                    "bitget",
-                    "execution",
-                    &cb_alert.message,
-                )
-                .with_failure_count(cb_alert.failure_count);
+                let alert =
+                    ExecutionAlert::new(alert_type, "bitget", "execution", &cb_alert.message)
+                        .with_failure_count(cb_alert.failure_count);
 
                 alert_cb(alert);
             });
@@ -1426,22 +1776,21 @@ impl ExecutionClient for BitgetExecutionClient {
     }
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
-        // 模擬交易模式下返回空列表（沒有真實掛單）
-        if self.config.mode == ExecutionMode::Paper {
-            return Ok(Vec::new());
+        if self.config.mode != ExecutionMode::Live {
+            return Err(HftError::Config(format!(
+                "Bitget list_open_orders 不支援 {} 模式",
+                bitget_mode_label(self.config.mode)
+            )));
         }
-        // 真實交易模式：調用 Bitget V2 REST API 獲取未結訂單（SPOT）
-        // 端點: GET /api/v2/spot/trade/unfilled-orders
-        // 規則: v2 統一 symbol 命名，查詢參數支持 idLessThan + limit 翻頁；此處先抓取前 100 條
-        // 直接臨時構建 HTTP 客戶端（list 查詢不需要持久連線）
+
         let http_cfg = HttpClientConfig {
             base_url: self.config.rest_base_url.clone(),
             timeout_ms: self.config.timeout_ms,
             user_agent: "hft-bitget-exec/1.0".to_string(),
         };
         let http = HttpClient::new(http_cfg).map_err(|e| HftError::Network(e.to_string()))?;
+        const PAGE_LIMIT: usize = 100;
 
-        // 構建帶查詢的請求路徑（v2 建議用 idLessThan+limit 翻頁；此處只取前 100 條）
         let path = "/api/v2/spot/trade/unfilled-orders?limit=100";
         let headers = self.signer.generate_headers("GET", path, "", None);
 
@@ -1450,123 +1799,16 @@ impl ExecutionClient for BitgetExecutionClient {
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
 
-        #[derive(Debug, Deserialize)]
-        struct ApiResp<T> {
-            code: String,
-            msg: String,
-            data: Option<T>,
-        }
-
-        #[derive(Debug, Deserialize)]
-        struct RestOpenOrder {
-            // v2 統一字段（含常見別名方便兼容）
-            #[serde(alias = "symbol", alias = "instId")]
-            symbol: Option<String>,
-            #[serde(alias = "orderId", alias = "ordId")]
-            order_id: String,
-            #[serde(alias = "clientOrderId", alias = "clOrdId")]
-            client_order_id: Option<String>,
-            #[serde(alias = "side")]
-            side: Option<String>,
-            #[serde(alias = "orderType", alias = "ordType")]
-            order_type: Option<String>,
-            #[serde(alias = "price", alias = "px")]
-            price: Option<String>,
-            #[serde(alias = "quantity", alias = "sz")]
-            quantity: Option<String>,
-            #[serde(alias = "filledQuantity", alias = "fillSz")]
-            filled_quantity: Option<String>,
-            #[serde(alias = "status", alias = "state")]
-            status: Option<String>,
-            #[serde(alias = "createTime", alias = "cTime")]
-            c_time: Option<String>,
-            #[serde(alias = "updateTime", alias = "uTime")]
-            u_time: Option<String>,
-        }
-
-        let parsed: ApiResp<Vec<RestOpenOrder>> = HttpClient::parse_json(resp)
+        let parsed: BitgetRestResponse<Vec<BitgetRestOpenOrder>> = HttpClient::parse_json(resp)
             .await
             .map_err(|e| HftError::Serialization(e.to_string()))?;
+        let (mut out, mut spot_min_id) =
+            parse_bitget_open_orders_page(parsed, "spot open orders", PAGE_LIMIT)?;
 
-        if parsed.code != "00000" {
-            return Err(Self::classify_error(&parsed.code, &parsed.msg));
-        }
-
-        let mut out = Vec::new();
-        let mut spot_min_id: Option<u64> = None;
-        if let Some(items) = parsed.data {
-            for it in items {
-                let symbol = it.symbol.unwrap_or_else(|| "BTCUSDT".to_string());
-
-                // 轉換 side / type
-                let side = match it.side.as_deref() {
-                    Some("buy") => Side::Buy,
-                    Some("sell") => Side::Sell,
-                    _ => Side::Buy,
-                };
-                let order_type = match it.order_type.as_deref() {
-                    Some("market") => OrderType::Market,
-                    _ => OrderType::Limit,
-                };
-
-                // 轉數量/價格
-                let qty = Quantity::from_str(it.quantity.as_deref().unwrap_or("0"))
-                    .unwrap_or(Quantity::zero());
-                let filled = Quantity::from_str(it.filled_quantity.as_deref().unwrap_or("0"))
-                    .unwrap_or(Quantity::zero());
-                let remaining = Quantity(qty.0 - filled.0);
-                let price = match &it.price {
-                    Some(s) => Price::from_str(s).ok(),
-                    None => None,
-                };
-
-                // 狀態映射
-                let status = match it.status.as_deref() {
-                    Some("partially_filled") => ports::OrderStatus::PartiallyFilled,
-                    Some("filled") => ports::OrderStatus::Filled,
-                    Some("cancelled") | Some("canceled") => ports::OrderStatus::Canceled,
-                    Some("rejected") => ports::OrderStatus::Rejected,
-                    Some("accepted") | Some("new") => ports::OrderStatus::Accepted,
-                    _ => ports::OrderStatus::New,
-                };
-
-                // 時間戳（毫秒/微秒兼容，這裡一律按毫秒解析再轉微秒）
-                let parse_ts = |s: &Option<String>| -> Timestamp {
-                    s.as_ref()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(|ms| ms * 1000)
-                        .unwrap_or_else(Self::current_timestamp)
-                };
-                let created_at = parse_ts(&it.c_time);
-                let updated_at = parse_ts(&it.u_time);
-
-                // 計算最小游標 id（嘗試從 order_id 或 client_order_id 解析數值）
-                if let Ok(idv) = it.order_id.parse::<u64>() {
-                    spot_min_id = Some(spot_min_id.map(|m| m.min(idv)).unwrap_or(idv));
-                } else if let Some(cid) = &it.client_order_id {
-                    if let Ok(idv) = cid.parse::<u64>() {
-                        spot_min_id = Some(spot_min_id.map(|m| m.min(idv)).unwrap_or(idv));
-                    }
-                }
-
-                out.push(OpenOrder {
-                    order_id: OrderId(it.order_id),
-                    symbol: hft_core::Symbol::from(symbol),
-                    side,
-                    order_type,
-                    original_quantity: qty,
-                    remaining_quantity: remaining,
-                    filled_quantity: filled,
-                    price,
-                    status,
-                    created_at,
-                    updated_at,
-                });
+        while out.len() % PAGE_LIMIT == 0 && spot_min_id.is_some() {
+            if out.is_empty() {
+                break;
             }
-        }
-
-        // 追加 Spot 游標翻頁（最多 9 次）
-        for _ in 0..9 {
             let id = match spot_min_id {
                 Some(v) => v,
                 None => break,
@@ -1580,80 +1822,18 @@ impl ExecutionClient for BitgetExecutionClient {
                 .get(&next_path, Some(headers))
                 .await
                 .map_err(|e| HftError::Network(e.to_string()))?;
-            let parsed: ApiResp<Vec<RestOpenOrder>> = HttpClient::parse_json(resp)
+            let parsed: BitgetRestResponse<Vec<BitgetRestOpenOrder>> = HttpClient::parse_json(resp)
                 .await
                 .map_err(|e| HftError::Serialization(e.to_string()))?;
-            if parsed.code != "00000" {
-                break;
-            }
-            let batch = parsed.data.unwrap_or_default();
+            let (batch, next_cursor) =
+                parse_bitget_open_orders_page(parsed, "spot open orders page", PAGE_LIMIT)?;
             if batch.is_empty() {
                 break;
             }
-            for it in batch {
-                let symbol = it.symbol.clone().unwrap_or_else(|| "BTCUSDT".to_string());
-                let side = match it.side.as_deref() {
-                    Some("buy") => Side::Buy,
-                    Some("sell") => Side::Sell,
-                    _ => Side::Buy,
-                };
-                let order_type = match it.order_type.as_deref() {
-                    Some("market") => OrderType::Market,
-                    _ => OrderType::Limit,
-                };
-                let qty = Quantity::from_str(it.quantity.as_deref().unwrap_or("0"))
-                    .unwrap_or(Quantity::zero());
-                let filled = Quantity::from_str(it.filled_quantity.as_deref().unwrap_or("0"))
-                    .unwrap_or(Quantity::zero());
-                let remaining = Quantity(qty.0 - filled.0);
-                let price = match &it.price {
-                    Some(s) => Price::from_str(s).ok(),
-                    None => None,
-                };
-                let status = match it.status.as_deref() {
-                    Some("partially_filled") => ports::OrderStatus::PartiallyFilled,
-                    Some("filled") => ports::OrderStatus::Filled,
-                    Some("cancelled") | Some("canceled") => ports::OrderStatus::Canceled,
-                    Some("rejected") => ports::OrderStatus::Rejected,
-                    Some("accepted") | Some("new") => ports::OrderStatus::Accepted,
-                    _ => ports::OrderStatus::New,
-                };
-                let parse_ts = |s: &Option<String>| -> Timestamp {
-                    s.as_ref()
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(|ms| ms * 1000)
-                        .unwrap_or_else(Self::current_timestamp)
-                };
-                let created_at = parse_ts(&it.c_time);
-                let updated_at = parse_ts(&it.u_time);
-
-                if let Ok(idv) = it.order_id.parse::<u64>() {
-                    spot_min_id = Some(spot_min_id.map(|m| m.min(idv)).unwrap_or(idv));
-                } else if let Some(cid) = &it.client_order_id {
-                    if let Ok(idv) = cid.parse::<u64>() {
-                        spot_min_id = Some(spot_min_id.map(|m| m.min(idv)).unwrap_or(idv));
-                    }
-                }
-
-                out.push(OpenOrder {
-                    order_id: OrderId(it.order_id),
-                    symbol: hft_core::Symbol::from(symbol),
-                    side,
-                    order_type,
-                    original_quantity: qty,
-                    remaining_quantity: remaining,
-                    filled_quantity: filled,
-                    price,
-                    status,
-                    created_at,
-                    updated_at,
-                });
-            }
+            spot_min_id = next_cursor;
+            out.extend(batch);
         }
 
-        // 追加 Mix（合約）未結訂單（v2）
-        // 端點: GET /api/v2/mix/order/orders-pending
-        // 注意：若後端仍需 productType，則需根據具體合約類型傳遞；此處先按 v2 說明僅用 limit
         let mix_path = "/api/v2/mix/order/orders-pending?limit=100";
         let mix_headers = self.signer.generate_headers("GET", mix_path, "", None);
         let mix_resp = http
@@ -1661,201 +1841,46 @@ impl ExecutionClient for BitgetExecutionClient {
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
 
-        #[derive(Debug, Deserialize)]
-        struct MixApiResp<T> {
-            code: String,
-            msg: String,
-            data: Option<T>,
-        }
+        let mix_parsed: BitgetRestResponse<Vec<BitgetRestOpenOrder>> =
+            HttpClient::parse_json(mix_resp)
+                .await
+                .map_err(|e| HftError::Serialization(e.to_string()))?;
+        let (mix_orders, mut mix_min_id) =
+            parse_bitget_open_orders_page(mix_parsed, "mix open orders", PAGE_LIMIT)?;
+        let mut mix_count = mix_orders.len();
+        out.extend(mix_orders);
 
-        // 與現貨結構相似，沿用同一字段映射
-        #[derive(Debug, Deserialize)]
-        struct RestMixOpenOrder {
-            #[serde(alias = "symbol", alias = "instId")]
-            symbol: Option<String>,
-            #[serde(alias = "orderId", alias = "ordId")]
-            order_id: String,
-            #[serde(alias = "clientOrderId", alias = "clOrdId")]
-            client_order_id: Option<String>,
-            #[serde(alias = "side")]
-            side: Option<String>,
-            #[serde(alias = "orderType", alias = "ordType")]
-            order_type: Option<String>,
-            #[serde(alias = "price", alias = "px")]
-            price: Option<String>,
-            #[serde(alias = "quantity", alias = "sz")]
-            quantity: Option<String>,
-            #[serde(alias = "filledQuantity", alias = "fillSz")]
-            filled_quantity: Option<String>,
-            #[serde(alias = "status", alias = "state")]
-            status: Option<String>,
-            #[serde(alias = "createTime", alias = "cTime")]
-            c_time: Option<String>,
-            #[serde(alias = "updateTime", alias = "uTime")]
-            u_time: Option<String>,
-        }
-
-        let mix_parsed: MixApiResp<Vec<RestMixOpenOrder>> = HttpClient::parse_json(mix_resp)
-            .await
-            .map_err(|e| HftError::Serialization(e.to_string()))?;
-
-        if mix_parsed.code == "00000" {
-            let mut mix_min_id: Option<u64> = None;
-            if let Some(items) = mix_parsed.data {
-                for it in items {
-                    let symbol = it.symbol.unwrap_or_else(|| "BTCUSDT".to_string());
-                    let side = match it.side.as_deref() {
-                        Some("buy") => Side::Buy,
-                        Some("sell") => Side::Sell,
-                        _ => Side::Buy,
-                    };
-                    let order_type = match it.order_type.as_deref() {
-                        Some("market") => OrderType::Market,
-                        _ => OrderType::Limit,
-                    };
-                    let qty = Quantity::from_str(it.quantity.as_deref().unwrap_or("0"))
-                        .unwrap_or(Quantity::zero());
-                    let filled = Quantity::from_str(it.filled_quantity.as_deref().unwrap_or("0"))
-                        .unwrap_or(Quantity::zero());
-                    let remaining = Quantity(qty.0 - filled.0);
-                    let price = match &it.price {
-                        Some(s) => Price::from_str(s).ok(),
-                        None => None,
-                    };
-                    let status = match it.status.as_deref() {
-                        Some("partially_filled") => ports::OrderStatus::PartiallyFilled,
-                        Some("filled") => ports::OrderStatus::Filled,
-                        Some("cancelled") | Some("canceled") => ports::OrderStatus::Canceled,
-                        Some("rejected") => ports::OrderStatus::Rejected,
-                        Some("accepted") | Some("new") => ports::OrderStatus::Accepted,
-                        _ => ports::OrderStatus::New,
-                    };
-                    let parse_ts = |s: &Option<String>| -> Timestamp {
-                        s.as_ref()
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .map(|ms| ms * 1000)
-                            .unwrap_or_else(Self::current_timestamp)
-                    };
-                    let created_at = parse_ts(&it.c_time);
-                    let updated_at = parse_ts(&it.u_time);
-
-                    if let Ok(idv) = it.order_id.parse::<u64>() {
-                        mix_min_id = Some(mix_min_id.map(|m| m.min(idv)).unwrap_or(idv));
-                    } else if let Some(cid) = &it.client_order_id {
-                        if let Ok(idv) = cid.parse::<u64>() {
-                            mix_min_id = Some(mix_min_id.map(|m| m.min(idv)).unwrap_or(idv));
-                        }
-                    }
-
-                    out.push(OpenOrder {
-                        order_id: OrderId(it.order_id),
-                        symbol: hft_core::Symbol::from(symbol),
-                        side,
-                        order_type,
-                        original_quantity: qty,
-                        remaining_quantity: remaining,
-                        filled_quantity: filled,
-                        price,
-                        status,
-                        created_at,
-                        updated_at,
-                    });
-                }
+        while mix_count % PAGE_LIMIT == 0 && mix_min_id.is_some() {
+            if mix_count == 0 {
+                break;
             }
-            // 游標翻頁（最多 9 次）
-            for _ in 0..9 {
-                let id = match mix_min_id {
-                    Some(v) => v,
-                    None => break,
-                };
-                let mix_path = format!(
-                    "/api/v2/mix/order/orders-pending?limit=100&idLessThan={}",
-                    id
-                );
-                let mix_headers = self.signer.generate_headers("GET", &mix_path, "", None);
-                let mix_resp = http
-                    .get(&mix_path, Some(mix_headers))
-                    .await
-                    .map_err(|e| HftError::Network(e.to_string()))?;
-                let mix_parsed: MixApiResp<Vec<RestMixOpenOrder>> =
-                    HttpClient::parse_json(mix_resp)
-                        .await
-                        .map_err(|e| HftError::Serialization(e.to_string()))?;
-                if mix_parsed.code != "00000" {
-                    break;
-                }
-                let batch = mix_parsed.data.unwrap_or_default();
-                if batch.is_empty() {
-                    break;
-                }
-                for it in batch {
-                    let symbol = it.symbol.clone().unwrap_or_else(|| "BTCUSDT".to_string());
-                    let side = match it.side.as_deref() {
-                        Some("buy") => Side::Buy,
-                        Some("sell") => Side::Sell,
-                        _ => Side::Buy,
-                    };
-                    let order_type = match it.order_type.as_deref() {
-                        Some("market") => OrderType::Market,
-                        _ => OrderType::Limit,
-                    };
-                    let qty = Quantity::from_str(it.quantity.as_deref().unwrap_or("0"))
-                        .unwrap_or(Quantity::zero());
-                    let filled = Quantity::from_str(it.filled_quantity.as_deref().unwrap_or("0"))
-                        .unwrap_or(Quantity::zero());
-                    let remaining = Quantity(qty.0 - filled.0);
-                    let price = match &it.price {
-                        Some(s) => Price::from_str(s).ok(),
-                        None => None,
-                    };
-                    let status = match it.status.as_deref() {
-                        Some("partially_filled") => ports::OrderStatus::PartiallyFilled,
-                        Some("filled") => ports::OrderStatus::Filled,
-                        Some("cancelled") | Some("canceled") => ports::OrderStatus::Canceled,
-                        Some("rejected") => ports::OrderStatus::Rejected,
-                        Some("accepted") | Some("new") => ports::OrderStatus::Accepted,
-                        _ => ports::OrderStatus::New,
-                    };
-                    let parse_ts = |s: &Option<String>| -> Timestamp {
-                        s.as_ref()
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .map(|ms| ms * 1000)
-                            .unwrap_or_else(Self::current_timestamp)
-                    };
-                    let created_at = parse_ts(&it.c_time);
-                    let updated_at = parse_ts(&it.u_time);
-
-                    if let Ok(idv) = it.order_id.parse::<u64>() {
-                        mix_min_id = Some(mix_min_id.map(|m| m.min(idv)).unwrap_or(idv));
-                    } else if let Some(cid) = &it.client_order_id {
-                        if let Ok(idv) = cid.parse::<u64>() {
-                            mix_min_id = Some(mix_min_id.map(|m| m.min(idv)).unwrap_or(idv));
-                        }
-                    }
-
-                    out.push(OpenOrder {
-                        order_id: OrderId(it.order_id),
-                        symbol: hft_core::Symbol::from(symbol),
-                        side,
-                        order_type,
-                        original_quantity: qty,
-                        remaining_quantity: remaining,
-                        filled_quantity: filled,
-                        price,
-                        status,
-                        created_at,
-                        updated_at,
-                    });
-                }
-            }
-        } else {
-            warn!(
-                "Bitget mix 未結訂單查詢失敗: {} - {}",
-                mix_parsed.code, mix_parsed.msg
+            let id = match mix_min_id {
+                Some(v) => v,
+                None => break,
+            };
+            let mix_path = format!(
+                "/api/v2/mix/order/orders-pending?limit=100&idLessThan={}",
+                id
             );
+            let mix_headers = self.signer.generate_headers("GET", &mix_path, "", None);
+            let mix_resp = http
+                .get(&mix_path, Some(mix_headers))
+                .await
+                .map_err(|e| HftError::Network(e.to_string()))?;
+            let mix_parsed: BitgetRestResponse<Vec<BitgetRestOpenOrder>> =
+                HttpClient::parse_json(mix_resp)
+                    .await
+                    .map_err(|e| HftError::Serialization(e.to_string()))?;
+            let (batch, next_cursor) =
+                parse_bitget_open_orders_page(mix_parsed, "mix open orders page", PAGE_LIMIT)?;
+            if batch.is_empty() {
+                break;
+            }
+            mix_count = batch.len();
+            mix_min_id = next_cursor;
+            out.extend(batch);
         }
 
-        // 可選：基於環境變數過濾 symbol，便於測試
         if let Ok(filter_sym) = std::env::var("HFT_OPEN_ORDERS_SYMBOL") {
             out.retain(|o| o.symbol.as_str() == filter_sym);
         }
@@ -1864,20 +1889,13 @@ impl ExecutionClient for BitgetExecutionClient {
     }
 
     async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
-        // 模擬模式返回虛擬餘額
-        if self.config.mode == ExecutionMode::Paper {
-            return Ok(vec![
-                AccountBalance {
-                    asset: "USDT".to_string(),
-                    available: Decimal::from(10000),
-                    frozen: Decimal::ZERO,
-                    total: Decimal::from(10000),
-                    usd_value: Some(Decimal::from(10000)),
-                },
-            ]);
+        if self.config.mode != ExecutionMode::Live {
+            return Err(HftError::Config(format!(
+                "Bitget get_balance 不支援 {} 模式的權威快照",
+                bitget_mode_label(self.config.mode)
+            )));
         }
 
-        // 真實模式：調用 Bitget API
         let http_cfg = HttpClientConfig {
             base_url: self.config.rest_base_url.clone(),
             timeout_ms: self.config.timeout_ms,
@@ -1885,7 +1903,6 @@ impl ExecutionClient for BitgetExecutionClient {
         };
         let http = HttpClient::new(http_cfg).map_err(|e| HftError::Network(e.to_string()))?;
 
-        // 獲取 Spot 帳戶餘額
         let path = "/api/v2/spot/account/assets";
         let headers = self.signer.generate_headers("GET", path, "", None);
 
@@ -1894,116 +1911,21 @@ impl ExecutionClient for BitgetExecutionClient {
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
 
-        #[derive(Debug, Deserialize)]
-        struct ApiResp<T> {
-            code: String,
-            msg: String,
-            data: Option<T>,
-        }
-
-        #[derive(Debug, Deserialize)]
-        struct AssetInfo {
-            #[serde(alias = "coin", alias = "coinName")]
-            coin: String,
-            #[serde(alias = "available")]
-            available: String,
-            #[serde(alias = "frozen", alias = "lock")]
-            frozen: Option<String>,
-            #[serde(alias = "usdtValue")]
-            usdt_value: Option<String>,
-        }
-
-        let parsed: ApiResp<Vec<AssetInfo>> = HttpClient::parse_json(resp)
+        let parsed: BitgetRestResponse<Vec<BitgetSpotAssetInfo>> = HttpClient::parse_json(resp)
             .await
             .map_err(|e| HftError::Serialization(e.to_string()))?;
-
-        let mut balances = Vec::new();
-
-        if parsed.code == "00000" {
-            if let Some(assets) = parsed.data {
-                for asset in assets {
-                    let available = asset.available.parse::<Decimal>().unwrap_or(Decimal::ZERO);
-                    let frozen = asset
-                        .frozen
-                        .as_ref()
-                        .and_then(|s| s.parse::<Decimal>().ok())
-                        .unwrap_or(Decimal::ZERO);
-                    let total = available + frozen;
-                    let usd_value = asset
-                        .usdt_value
-                        .as_ref()
-                        .and_then(|s| s.parse::<Decimal>().ok());
-
-                    // 只保留有餘額的資產
-                    if total > Decimal::ZERO {
-                        balances.push(AccountBalance {
-                            asset: asset.coin,
-                            available,
-                            frozen,
-                            total,
-                            usd_value,
-                        });
-                    }
-                }
-            }
-        } else {
-            warn!(
-                "Bitget 餘額查詢失敗: {} - {}",
-                parsed.code, parsed.msg
-            );
-        }
-
-        // 可選：也獲取合約帳戶餘額
+        let mut balances = parse_bitget_spot_balances(parsed)?;
         let mix_path = "/api/v2/mix/account/accounts?productType=USDT-FUTURES";
         let mix_headers = self.signer.generate_headers("GET", mix_path, "", None);
-
-        if let Ok(mix_resp) = http.get(mix_path, Some(mix_headers)).await {
-            #[derive(Debug, Deserialize)]
-            struct MixAccountInfo {
-                #[serde(alias = "marginCoin")]
-                margin_coin: String,
-                #[serde(alias = "available")]
-                available: String,
-                #[serde(alias = "frozen", alias = "locked")]
-                frozen: Option<String>,
-                #[serde(alias = "equity")]
-                equity: Option<String>,
-            }
-
-            if let Ok(mix_parsed) =
-                HttpClient::parse_json::<ApiResp<Vec<MixAccountInfo>>>(mix_resp).await
-            {
-                if mix_parsed.code == "00000" {
-                    if let Some(accounts) = mix_parsed.data {
-                        for acc in accounts {
-                            let available =
-                                acc.available.parse::<Decimal>().unwrap_or(Decimal::ZERO);
-                            let frozen = acc
-                                .frozen
-                                .as_ref()
-                                .and_then(|s| s.parse::<Decimal>().ok())
-                                .unwrap_or(Decimal::ZERO);
-                            let total = acc
-                                .equity
-                                .as_ref()
-                                .and_then(|s| s.parse::<Decimal>().ok())
-                                .unwrap_or(available + frozen);
-
-                            if total > Decimal::ZERO {
-                                // 為合約帳戶添加前綴以區分
-                                balances.push(AccountBalance {
-                                    asset: format!("MIX:{}", acc.margin_coin),
-                                    available,
-                                    frozen,
-                                    total,
-                                    usd_value: Some(total), // 合約帳戶通常以 USDT 計價
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let mix_resp = http
+            .get(mix_path, Some(mix_headers))
+            .await
+            .map_err(|e| HftError::Network(e.to_string()))?;
+        let mix_parsed: BitgetRestResponse<Vec<BitgetMixAccountInfo>> =
+            HttpClient::parse_json(mix_resp)
+                .await
+                .map_err(|e| HftError::Serialization(e.to_string()))?;
+        balances.extend(parse_bitget_mix_balances(mix_parsed)?);
 
         info!("Bitget 餘額同步完成: {} 個資產", balances.len());
         Ok(balances)
@@ -2021,5 +1943,91 @@ impl ExecutionClient for BitgetExecutionClient {
             latency_ms,
             last_heartbeat: self.last_heartbeat,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_config(mode: ExecutionMode) -> BitgetExecutionConfig {
+        BitgetExecutionConfig {
+            credentials: BitgetCredentials::new("key".into(), "secret".into(), "pass".into()),
+            rest_base_url: "https://api.bitget.com".into(),
+            ws_private_url: "wss://ws.bitget.com/v2/ws/private".into(),
+            mode,
+            timeout_ms: 1000,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_open_orders_paper_mode_fails() {
+        let client = BitgetExecutionClient::new(make_config(ExecutionMode::Paper)).unwrap();
+        let result = client.list_open_orders().await;
+
+        assert!(
+            matches!(result, Err(HftError::Config(message)) if message.contains("不支援 Paper"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_balance_paper_mode_fails() {
+        let client = BitgetExecutionClient::new(make_config(ExecutionMode::Paper)).unwrap();
+        let result = client.get_balance().await;
+
+        assert!(matches!(result, Err(HftError::Config(message)) if message.contains("權威快照")));
+    }
+
+    #[test]
+    fn test_parse_bitget_open_orders_missing_data_fails() {
+        let response = BitgetRestResponse::<Vec<BitgetRestOpenOrder>> {
+            code: "00000".to_string(),
+            msg: "success".to_string(),
+            data: None,
+        };
+
+        let result = parse_bitget_open_orders_page(response, "spot open orders", 100);
+        assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("缺少 data")));
+    }
+
+    #[test]
+    fn test_parse_bitget_open_orders_unknown_side_fails() {
+        let response = BitgetRestResponse {
+            code: "00000".to_string(),
+            msg: "success".to_string(),
+            data: Some(vec![BitgetRestOpenOrder {
+                symbol: Some("BTCUSDT".to_string()),
+                order_id: "1".to_string(),
+                client_order_id: Some("2".to_string()),
+                side: Some("hold".to_string()),
+                order_type: Some("limit".to_string()),
+                price: Some("100".to_string()),
+                quantity: Some("1".to_string()),
+                filled_quantity: Some("0".to_string()),
+                status: Some("new".to_string()),
+                c_time: Some("1".to_string()),
+                u_time: Some("2".to_string()),
+            }]),
+        };
+
+        let result = parse_bitget_open_orders_page(response, "spot open orders", 100);
+        assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("未知 side")));
+    }
+
+    #[test]
+    fn test_parse_bitget_spot_balances_malformed_available_fails() {
+        let response = BitgetRestResponse {
+            code: "00000".to_string(),
+            msg: "success".to_string(),
+            data: Some(vec![BitgetSpotAssetInfo {
+                coin: "USDT".to_string(),
+                available: "oops".to_string(),
+                frozen: "1".to_string(),
+                usdt_value: Some("1".to_string()),
+            }]),
+        };
+
+        let result = parse_bitget_spot_balances(response);
+        assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("available")));
     }
 }

@@ -41,6 +41,34 @@ pub struct BybitExecutionClient {
     alert_callback: Option<AlertCallback>,
 }
 
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct BybitOpenOrdersItem {
+    orderId: String,
+    symbol: String,
+    side: String,
+    orderType: String,
+    qty: String,
+    cumExecQty: String,
+    price: String,
+    orderStatus: String,
+    createdTime: String,
+    updatedTime: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BybitOpenOrdersData {
+    list: Vec<BybitOpenOrdersItem>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct BybitOpenOrdersResponse {
+    retCode: i64,
+    retMsg: String,
+    data: Option<BybitOpenOrdersData>,
+}
+
 impl BybitExecutionClient {
     pub fn new(config: BybitExecutionConfig) -> Result<Self, HftError> {
         Ok(Self {
@@ -125,6 +153,126 @@ impl BybitExecutionClient {
             callback(alert);
         }
     }
+}
+
+fn bybit_mode_label(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Paper => "Paper",
+        ExecutionMode::Live => "Live",
+        ExecutionMode::Testnet => "Testnet",
+    }
+}
+
+fn parse_bybit_side(value: &str) -> HftResult<hft_core::Side> {
+    match value {
+        "Buy" | "BUY" | "buy" => Ok(hft_core::Side::Buy),
+        "Sell" | "SELL" | "sell" => Ok(hft_core::Side::Sell),
+        _ => Err(HftError::Parse(format!("Bybit 未知 side: {}", value))),
+    }
+}
+
+fn parse_bybit_order_type(value: &str) -> HftResult<hft_core::OrderType> {
+    match value {
+        "Market" | "MARKET" | "market" => Ok(hft_core::OrderType::Market),
+        "Limit" | "LIMIT" | "limit" => Ok(hft_core::OrderType::Limit),
+        _ => Err(HftError::Parse(format!("Bybit 未知 orderType: {}", value))),
+    }
+}
+
+fn parse_bybit_status(value: &str) -> HftResult<ports::OrderStatus> {
+    match value {
+        "New" | "Created" => Ok(ports::OrderStatus::New),
+        "PartiallyFilled" | "PartiallyFilledCanceled" => Ok(ports::OrderStatus::PartiallyFilled),
+        "Filled" => Ok(ports::OrderStatus::Filled),
+        "Cancelled" => Ok(ports::OrderStatus::Canceled),
+        "Rejected" => Ok(ports::OrderStatus::Rejected),
+        _ => Err(HftError::Parse(format!(
+            "Bybit 未知 orderStatus: {}",
+            value
+        ))),
+    }
+}
+
+fn parse_bybit_quantity(field: &str, value: &str, allow_zero: bool) -> HftResult<Quantity> {
+    let decimal = value
+        .parse::<rust_decimal::Decimal>()
+        .map_err(|e| HftError::Parse(format!("Bybit {} 解析失敗: {} ({})", field, value, e)))?;
+    if decimal < rust_decimal::Decimal::ZERO || (!allow_zero && decimal.is_zero()) {
+        return Err(HftError::Parse(format!(
+            "Bybit {} 非法數量: {}",
+            field, value
+        )));
+    }
+    Ok(Quantity(decimal))
+}
+
+fn parse_bybit_price(value: &str, order_type: hft_core::OrderType) -> HftResult<Option<Price>> {
+    if value.is_empty() {
+        return if order_type == hft_core::OrderType::Market {
+            Ok(None)
+        } else {
+            Err(HftError::Parse("Bybit limit order 缺少 price".to_string()))
+        };
+    }
+    Price::from_str(value)
+        .map(Some)
+        .map_err(|e| HftError::Parse(format!("Bybit price 解析失敗: {} ({})", value, e)))
+}
+
+fn parse_bybit_timestamp(field: &str, value: &str) -> HftResult<u64> {
+    value
+        .parse::<u64>()
+        .map(|ts_ms| ts_ms * 1000)
+        .map_err(|e| HftError::Parse(format!("Bybit {} 解析失敗: {} ({})", field, value, e)))
+}
+
+fn parse_bybit_open_orders_response(
+    response: BybitOpenOrdersResponse,
+) -> HftResult<Vec<OpenOrder>> {
+    if response.retCode != 0 {
+        return Err(HftError::Exchange(format!(
+            "Bybit 查詢未結失敗: {} {}",
+            response.retCode, response.retMsg
+        )));
+    }
+
+    let data = response
+        .data
+        .ok_or_else(|| HftError::Parse("Bybit 未結訂單回應缺少 data".to_string()))?;
+
+    data.list
+        .into_iter()
+        .map(|it| {
+            let side = parse_bybit_side(&it.side)?;
+            let order_type = parse_bybit_order_type(&it.orderType)?;
+            let qty = parse_bybit_quantity("qty", &it.qty, false)?;
+            let filled = parse_bybit_quantity("cumExecQty", &it.cumExecQty, true)?;
+            if filled.0 > qty.0 {
+                return Err(HftError::Parse(format!(
+                    "Bybit cumExecQty 大於 qty: {} > {}",
+                    filled, qty
+                )));
+            }
+            let price = parse_bybit_price(&it.price, order_type)?;
+            let status = parse_bybit_status(&it.orderStatus)?;
+            let created_at = parse_bybit_timestamp("createdTime", &it.createdTime)?;
+            let updated_at = parse_bybit_timestamp("updatedTime", &it.updatedTime)?;
+
+            Ok(OpenOrder {
+                order_id: OrderId(it.orderId),
+                symbol: hft_core::Symbol::from(it.symbol),
+                side,
+                order_type,
+                original_quantity: qty,
+                remaining_quantity: Quantity(qty.0 - filled.0),
+                filled_quantity: filled,
+                price,
+                status,
+                created_at,
+                updated_at,
+            })
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -477,13 +625,9 @@ impl ExecutionClient for BybitExecutionClient {
                     CircuitState::HalfOpen => return,
                 };
 
-                let alert = ExecutionAlert::new(
-                    alert_type,
-                    "bybit",
-                    "execution",
-                    &cb_alert.message,
-                )
-                .with_failure_count(cb_alert.failure_count);
+                let alert =
+                    ExecutionAlert::new(alert_type, "bybit", "execution", &cb_alert.message)
+                        .with_failure_count(cb_alert.failure_count);
 
                 alert_cb(alert);
             });
@@ -644,7 +788,10 @@ impl ExecutionClient for BybitExecutionClient {
             self.config.mode,
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
-            return Ok(Vec::new());
+            return Err(HftError::Config(format!(
+                "Bybit list_open_orders 不支援 {} 模式",
+                bybit_mode_label(self.config.mode)
+            )));
         }
         let http_local;
         let http: &HttpClient = if let Some(h) = &self.http {
@@ -669,84 +816,10 @@ impl ExecutionClient for BybitExecutionClient {
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
 
-        #[derive(serde::Deserialize)]
-        #[allow(non_snake_case)]
-        struct RespDataItem {
-            orderId: String,
-            symbol: String,
-            side: String,
-            orderType: String,
-            qty: String,
-            cumExecQty: String,
-            price: String,
-            orderStatus: String,
-            createdTime: String,
-            updatedTime: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct RespData {
-            list: Vec<RespDataItem>,
-        }
-        #[derive(serde::Deserialize)]
-        #[allow(non_snake_case)]
-        struct Resp {
-            retCode: i64,
-            retMsg: String,
-            data: Option<RespData>,
-        }
-
-        let r: Resp = integration::http::HttpClient::parse_json(resp)
+        let r: BybitOpenOrdersResponse = integration::http::HttpClient::parse_json(resp)
             .await
             .map_err(|e| HftError::Serialization(e.to_string()))?;
-        if r.retCode != 0 {
-            return Err(HftError::Exchange(format!(
-                "Bybit 查詢未結失敗: {} {}",
-                r.retCode, r.retMsg
-            )));
-        }
-
-        let mut out = Vec::new();
-        if let Some(d) = r.data {
-            for it in d.list {
-                let side = match it.side.as_str() {
-                    "Buy" | "BUY" | "buy" => hft_core::Side::Buy,
-                    _ => hft_core::Side::Sell,
-                };
-                let order_type = match it.orderType.as_str() {
-                    "Market" | "MARKET" | "market" => hft_core::OrderType::Market,
-                    _ => hft_core::OrderType::Limit,
-                };
-                let qty = Quantity::from_str(&it.qty).unwrap_or(Quantity::zero());
-                let filled = Quantity::from_str(&it.cumExecQty).unwrap_or(Quantity::zero());
-                let remaining = Quantity(qty.0 - filled.0);
-                let price = Price::from_str(&it.price).ok();
-                let status = match it.orderStatus.as_str() {
-                    "New" | "Created" => ports::OrderStatus::New,
-                    "PartiallyFilled" | "PartiallyFilledCanceled" => {
-                        ports::OrderStatus::PartiallyFilled
-                    }
-                    "Filled" => ports::OrderStatus::Filled,
-                    "Cancelled" | "Rejected" => ports::OrderStatus::Canceled,
-                    _ => ports::OrderStatus::Accepted,
-                };
-                let created_at = it.createdTime.parse::<u64>().unwrap_or(0) * 1000;
-                let updated_at = it.updatedTime.parse::<u64>().unwrap_or(0) * 1000;
-                out.push(OpenOrder {
-                    order_id: OrderId(it.orderId),
-                    symbol: hft_core::Symbol::from(it.symbol),
-                    side,
-                    order_type,
-                    original_quantity: qty,
-                    remaining_quantity: remaining,
-                    filled_quantity: filled,
-                    price,
-                    status,
-                    created_at,
-                    updated_at,
-                });
-            }
-        }
-        Ok(out)
+        parse_bybit_open_orders_response(r)
     }
 }
 
@@ -935,11 +1008,13 @@ mod tests {
         client.connect().await.unwrap();
 
         let order_id = OrderId("test_order_123".to_string());
-        let result = client.modify_order(
-            &order_id,
-            Some(Quantity::from_f64(0.002).unwrap()),
-            Some(Price::from_f64(51000.0).unwrap()),
-        ).await;
+        let result = client
+            .modify_order(
+                &order_id,
+                Some(Quantity::from_f64(0.002).unwrap()),
+                Some(Price::from_f64(51000.0).unwrap()),
+            )
+            .await;
         assert!(result.is_ok());
     }
 
@@ -1013,9 +1088,44 @@ mod tests {
         let config = make_test_config(ExecutionMode::Paper);
         let client = BybitExecutionClient::new(config).unwrap();
 
-        // Paper mode should return empty list without making API call
         let result = client.list_open_orders().await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert!(matches!(result, Err(HftError::Config(_))));
+    }
+
+    #[test]
+    fn test_parse_bybit_open_orders_missing_data_fails() {
+        let response = BybitOpenOrdersResponse {
+            retCode: 0,
+            retMsg: "OK".to_string(),
+            data: None,
+        };
+
+        let result = parse_bybit_open_orders_response(response);
+        assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("缺少 data")));
+    }
+
+    #[test]
+    fn test_parse_bybit_open_orders_unknown_side_fails() {
+        let response = BybitOpenOrdersResponse {
+            retCode: 0,
+            retMsg: "OK".to_string(),
+            data: Some(BybitOpenOrdersData {
+                list: vec![BybitOpenOrdersItem {
+                    orderId: "1".to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    side: "Hold".to_string(),
+                    orderType: "Limit".to_string(),
+                    qty: "1".to_string(),
+                    cumExecQty: "0".to_string(),
+                    price: "100".to_string(),
+                    orderStatus: "New".to_string(),
+                    createdTime: "1".to_string(),
+                    updatedTime: "2".to_string(),
+                }],
+            }),
+        };
+
+        let result = parse_bybit_open_orders_response(response);
+        assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("未知 side")));
     }
 }

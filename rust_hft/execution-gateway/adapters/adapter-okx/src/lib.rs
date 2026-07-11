@@ -53,6 +53,34 @@ pub struct OkxExecutionClient {
     alert_callback: Option<AlertCallback>,
 }
 
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct OkxOpenOrderItem {
+    #[serde(rename = "ordId")]
+    ord_id: String,
+    #[serde(rename = "instId")]
+    inst_id: String,
+    side: String,
+    #[serde(rename = "ordType")]
+    ord_type: String,
+    sz: String,
+    #[serde(rename = "fillSz")]
+    fill_sz: String,
+    px: Option<String>,
+    state: String,
+    #[serde(rename = "cTime")]
+    c_time: String,
+    #[serde(rename = "uTime")]
+    u_time: String,
+}
+
+#[derive(serde::Deserialize)]
+struct OkxOpenOrdersResponse {
+    code: String,
+    msg: String,
+    data: Option<Vec<OkxOpenOrderItem>>,
+}
+
 impl OkxExecutionClient {
     pub fn new(cfg: OkxExecutionConfig) -> Result<Self, HftError> {
         Ok(Self {
@@ -138,6 +166,121 @@ impl OkxExecutionClient {
             callback(alert);
         }
     }
+}
+
+fn okx_mode_label(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Paper => "Paper",
+        ExecutionMode::Live => "Live",
+        ExecutionMode::Testnet => "Testnet",
+    }
+}
+
+fn parse_okx_side(value: &str) -> HftResult<hft_core::Side> {
+    match value {
+        "buy" => Ok(hft_core::Side::Buy),
+        "sell" => Ok(hft_core::Side::Sell),
+        _ => Err(HftError::Parse(format!("OKX 未知 side: {}", value))),
+    }
+}
+
+fn parse_okx_order_type(value: &str) -> HftResult<hft_core::OrderType> {
+    match value {
+        "market" => Ok(hft_core::OrderType::Market),
+        "limit" => Ok(hft_core::OrderType::Limit),
+        _ => Err(HftError::Parse(format!("OKX 未知 ordType: {}", value))),
+    }
+}
+
+fn parse_okx_status(value: &str) -> HftResult<ports::OrderStatus> {
+    match value {
+        "live" | "new" => Ok(ports::OrderStatus::New),
+        "partially_filled" => Ok(ports::OrderStatus::PartiallyFilled),
+        "filled" => Ok(ports::OrderStatus::Filled),
+        "canceled" => Ok(ports::OrderStatus::Canceled),
+        "rejected" => Ok(ports::OrderStatus::Rejected),
+        _ => Err(HftError::Parse(format!("OKX 未知 state: {}", value))),
+    }
+}
+
+fn parse_okx_quantity(field: &str, value: &str, allow_zero: bool) -> HftResult<Quantity> {
+    let decimal = value
+        .parse::<rust_decimal::Decimal>()
+        .map_err(|e| HftError::Parse(format!("OKX {} 解析失敗: {} ({})", field, value, e)))?;
+    if decimal < rust_decimal::Decimal::ZERO || (!allow_zero && decimal.is_zero()) {
+        return Err(HftError::Parse(format!(
+            "OKX {} 非法數量: {}",
+            field, value
+        )));
+    }
+    Ok(Quantity(decimal))
+}
+
+fn parse_okx_price(
+    value: Option<&str>,
+    order_type: hft_core::OrderType,
+) -> HftResult<Option<Price>> {
+    match value {
+        Some("") | None if order_type == hft_core::OrderType::Market => Ok(None),
+        Some("") | None => Err(HftError::Parse("OKX limit order 缺少 px".to_string())),
+        Some(raw) => Price::from_str(raw)
+            .map(Some)
+            .map_err(|e| HftError::Parse(format!("OKX px 解析失敗: {} ({})", raw, e))),
+    }
+}
+
+fn parse_okx_timestamp(field: &str, value: &str) -> HftResult<u64> {
+    value
+        .parse::<u64>()
+        .map(|ts_ms| ts_ms * 1000)
+        .map_err(|e| HftError::Parse(format!("OKX {} 解析失敗: {} ({})", field, value, e)))
+}
+
+fn parse_okx_open_orders_response(response: OkxOpenOrdersResponse) -> HftResult<Vec<OpenOrder>> {
+    if response.code != "0" {
+        return Err(HftError::Exchange(format!(
+            "OKX 查詢未結失敗: {} {}",
+            response.code, response.msg
+        )));
+    }
+
+    let items = response
+        .data
+        .ok_or_else(|| HftError::Parse("OKX 未結訂單回應缺少 data".to_string()))?;
+
+    items
+        .into_iter()
+        .map(|it| {
+            let side = parse_okx_side(&it.side)?;
+            let order_type = parse_okx_order_type(&it.ord_type)?;
+            let qty = parse_okx_quantity("sz", &it.sz, false)?;
+            let filled = parse_okx_quantity("fillSz", &it.fill_sz, true)?;
+            if filled.0 > qty.0 {
+                return Err(HftError::Parse(format!(
+                    "OKX fillSz 大於 sz: {} > {}",
+                    filled, qty
+                )));
+            }
+            let price = parse_okx_price(it.px.as_deref(), order_type)?;
+            let status = parse_okx_status(&it.state)?;
+            let created_at = parse_okx_timestamp("cTime", &it.c_time)?;
+            let updated_at = parse_okx_timestamp("uTime", &it.u_time)?;
+
+            Ok(OpenOrder {
+                order_id: OrderId(it.ord_id),
+                symbol: hft_core::Symbol::from(it.inst_id),
+                side,
+                order_type,
+                original_quantity: qty,
+                remaining_quantity: Quantity(qty.0 - filled.0),
+                filled_quantity: filled,
+                price,
+                status,
+                created_at,
+                updated_at,
+            })
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -269,10 +412,11 @@ impl ExecutionClient for OkxExecutionClient {
             ord_id: order_id.0.clone(),
         };
 
-        let body = serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
-        let headers = self
-            .signer
-            .generate_headers("POST", "/api/v5/trade/cancel-order", &body, None);
+        let body =
+            serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
+        let headers =
+            self.signer
+                .generate_headers("POST", "/api/v5/trade/cancel-order", &body, None);
 
         let http_client = self.get_http()?.clone();
         let order_id_clone = order_id.clone();
@@ -309,7 +453,10 @@ impl ExecutionClient for OkxExecutionClient {
                         .map_err(|e| HftError::Serialization(e.to_string()))?;
 
                     if r.code != "0" {
-                        return Err(HftError::Exchange(format!("OKX 撤單失敗: {} {}", r.code, r.msg)));
+                        return Err(HftError::Exchange(format!(
+                            "OKX 撤單失敗: {} {}",
+                            r.code, r.msg
+                        )));
                     }
 
                     if let Some(ref tx) = tx {
@@ -387,10 +534,11 @@ impl ExecutionClient for OkxExecutionClient {
             new_px: new_price.map(|p| p.0.to_string()),
         };
 
-        let body = serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
-        let headers = self
-            .signer
-            .generate_headers("POST", "/api/v5/trade/amend-order", &body, None);
+        let body =
+            serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
+        let headers =
+            self.signer
+                .generate_headers("POST", "/api/v5/trade/amend-order", &body, None);
 
         let http_client = self.get_http()?.clone();
         let order_id_clone = order_id.clone();
@@ -429,7 +577,10 @@ impl ExecutionClient for OkxExecutionClient {
                         .map_err(|e| HftError::Serialization(e.to_string()))?;
 
                     if r.code != "0" {
-                        return Err(HftError::Exchange(format!("OKX 改單失敗: {} {}", r.code, r.msg)));
+                        return Err(HftError::Exchange(format!(
+                            "OKX 改單失敗: {} {}",
+                            r.code, r.msg
+                        )));
                     }
 
                     if let Some(ref tx) = tx {
@@ -504,13 +655,8 @@ impl ExecutionClient for OkxExecutionClient {
                     CircuitState::HalfOpen => return,
                 };
 
-                let alert = ExecutionAlert::new(
-                    alert_type,
-                    "okx",
-                    "execution",
-                    &cb_alert.message,
-                )
-                .with_failure_count(cb_alert.failure_count);
+                let alert = ExecutionAlert::new(alert_type, "okx", "execution", &cb_alert.message)
+                    .with_failure_count(cb_alert.failure_count);
 
                 alert_cb(alert);
             });
@@ -653,7 +799,10 @@ impl ExecutionClient for OkxExecutionClient {
     }
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         if self.cfg.mode != ExecutionMode::Live {
-            return Ok(Vec::new());
+            return Err(HftError::Config(format!(
+                "OKX list_open_orders 不支援 {} 模式",
+                okx_mode_label(self.cfg.mode)
+            )));
         }
         let http_local;
         let http: &HttpClient = if let Some(h) = &self.http {
@@ -676,82 +825,64 @@ impl ExecutionClient for OkxExecutionClient {
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
 
-        #[derive(serde::Deserialize)]
-        #[allow(dead_code)]
-        struct Item {
-            #[serde(rename = "ordId")]
-            ord_id: String,
-            #[serde(rename = "instId")]
-            inst_id: String,
-            side: String,
-            #[serde(rename = "ordType")]
-            ord_type: String,
-            sz: String,
-            #[serde(rename = "fillSz")]
-            fill_sz: String,
-            px: Option<String>,
-            state: String,
-            #[serde(rename = "cTime")]
-            c_time: String,
-            #[serde(rename = "uTime")]
-            u_time: String,
-        }
-        #[derive(serde::Deserialize)]
-        struct Resp {
-            code: String,
-            msg: String,
-            data: Option<Vec<Item>>,
-        }
-
-        let r: Resp = integration::http::HttpClient::parse_json(resp)
+        let r: OkxOpenOrdersResponse = integration::http::HttpClient::parse_json(resp)
             .await
             .map_err(|e| HftError::Serialization(e.to_string()))?;
-        if r.code != "0" {
-            return Err(HftError::Exchange(format!(
-                "OKX 查詢未結失敗: {} {}",
-                r.code, r.msg
-            )));
-        }
-        let mut out = Vec::new();
-        if let Some(items) = r.data {
-            for it in items {
-                let side = match it.side.as_str() {
-                    "buy" => hft_core::Side::Buy,
-                    _ => hft_core::Side::Sell,
-                };
-                let order_type = match it.ord_type.as_str() {
-                    "market" => hft_core::OrderType::Market,
-                    _ => hft_core::OrderType::Limit,
-                };
-                let qty = Quantity::from_str(&it.sz).unwrap_or(Quantity::zero());
-                let filled = Quantity::from_str(&it.fill_sz).unwrap_or(Quantity::zero());
-                let remaining = Quantity(qty.0 - filled.0);
-                let price = it.px.as_ref().and_then(|s| Price::from_str(s).ok());
-                let status = match it.state.as_str() {
-                    "live" | "new" => ports::OrderStatus::New,
-                    "partially_filled" => ports::OrderStatus::PartiallyFilled,
-                    "filled" => ports::OrderStatus::Filled,
-                    "canceled" => ports::OrderStatus::Canceled,
-                    "rejected" => ports::OrderStatus::Rejected,
-                    _ => ports::OrderStatus::Accepted,
-                };
-                let created_at = it.c_time.parse::<u64>().unwrap_or(0) * 1000;
-                let updated_at = it.u_time.parse::<u64>().unwrap_or(0) * 1000;
-                out.push(OpenOrder {
-                    order_id: OrderId(it.ord_id),
-                    symbol: hft_core::Symbol::from(it.inst_id),
-                    side,
-                    order_type,
-                    original_quantity: qty,
-                    remaining_quantity: remaining,
-                    filled_quantity: filled,
-                    price,
-                    status,
-                    created_at,
-                    updated_at,
-                });
-            }
-        }
-        Ok(out)
+        parse_okx_open_orders_response(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_list_open_orders_paper_mode_fails() {
+        let cfg = OkxExecutionConfig {
+            credentials: OkxCredentials::new("key".into(), "secret".into(), "pass".into()),
+            rest_base_url: "https://www.okx.com".into(),
+            ws_private_url: "wss://ws.okx.com:8443/ws/v5/private".into(),
+            timeout_ms: 1000,
+            mode: ExecutionMode::Paper,
+        };
+        let client = OkxExecutionClient::new(cfg).unwrap();
+
+        let result = client.list_open_orders().await;
+        assert!(matches!(result, Err(HftError::Config(_))));
+    }
+
+    #[test]
+    fn test_parse_okx_open_orders_missing_data_fails() {
+        let response = OkxOpenOrdersResponse {
+            code: "0".to_string(),
+            msg: String::new(),
+            data: None,
+        };
+
+        let result = parse_okx_open_orders_response(response);
+        assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("缺少 data")));
+    }
+
+    #[test]
+    fn test_parse_okx_open_orders_unknown_state_fails() {
+        let response = OkxOpenOrdersResponse {
+            code: "0".to_string(),
+            msg: String::new(),
+            data: Some(vec![OkxOpenOrderItem {
+                ord_id: "1".to_string(),
+                inst_id: "BTC-USDT".to_string(),
+                side: "buy".to_string(),
+                ord_type: "limit".to_string(),
+                sz: "1.0".to_string(),
+                fill_sz: "0.0".to_string(),
+                px: Some("100.0".to_string()),
+                state: "mystery".to_string(),
+                c_time: "1".to_string(),
+                u_time: "2".to_string(),
+            }]),
+        };
+
+        let result = parse_okx_open_orders_response(response);
+        assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("未知 state")));
     }
 }
