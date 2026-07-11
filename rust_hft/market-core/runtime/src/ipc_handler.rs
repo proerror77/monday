@@ -107,6 +107,7 @@ impl CommandHandler for SystemCommandHandler {
                 let engine_stats = engine_guard.get_statistics();
                 let latency_stats = engine_guard.get_latency_stats();
                 let risk_metrics = engine_guard.get_risk_metrics();
+                let engine_trading_mode = engine_guard.trading_mode();
                 drop(engine_guard);
 
                 // 從延遲統計提取關鍵健康指標（若可用）
@@ -143,23 +144,17 @@ impl CommandHandler for SystemCommandHandler {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    trading_mode: if !engine_stats.is_running {
-                        TradingMode::Paused
-                    } else if runtime.config.quotes_only {
-                        // 若 quotes_only = true，系統僅接收行情，不執行交易
-                        TradingMode::Replay
-                    } else if runtime
-                        .config
-                        .venues
-                        .iter()
-                        .any(|v| v.execution_mode.as_deref() == Some("Live"))
-                    {
-                        // 若任一交易所配置為 Live 模式
-                        TradingMode::Live
-                    } else {
-                        // 預設為 Paper 模式
-                        TradingMode::Paper
-                    },
+                    trading_mode: reported_trading_mode(
+                        engine_trading_mode,
+                        engine_stats.is_running,
+                        runtime.config.quotes_only,
+                        !runtime.config.strategies.is_empty(),
+                        runtime
+                            .config
+                            .venues
+                            .iter()
+                            .any(|venue| venue.execution_mode.as_deref() == Some("Live")),
+                    ),
                     active_strategies: engine_stats.strategies_count as u32,
                     connected_venues: engine_stats.consumers_count as u32, // Approximation
                     orders_today: engine_stats.orders_submitted as u64,
@@ -450,13 +445,16 @@ impl CommandHandler for SystemCommandHandler {
                 let runtime = self.runtime.lock().await;
 
                 match mode {
-                    TradingMode::Live | TradingMode::Paper => Response::Error {
+                    TradingMode::Live
+                    | TradingMode::Paper
+                    | TradingMode::Shadow
+                    | TradingMode::Degraded => Response::Error {
                         message:
                             "direct resume is disabled; deploy a signed envelope and restart"
                                 .to_string(),
                         code: Some(403),
                     },
-                    TradingMode::Replay => match runtime
+                    TradingMode::Replay | TradingMode::Emergency => match runtime
                         .execution_control_handle()
                         .emergency_stop(true)
                         .await
@@ -588,6 +586,65 @@ impl CommandHandler for SystemCommandHandler {
                 code: Some(403),
             },
         }
+    }
+}
+
+#[cfg(feature = "infra-ipc")]
+fn reported_trading_mode(
+    engine_mode: engine::TradingMode,
+    is_running: bool,
+    quotes_only: bool,
+    has_strategies: bool,
+    has_live_venue: bool,
+) -> TradingMode {
+    match engine_mode {
+        engine::TradingMode::Emergency => TradingMode::Emergency,
+        engine::TradingMode::Paused => TradingMode::Paused,
+        engine::TradingMode::Degraded => TradingMode::Degraded,
+        engine::TradingMode::Normal if !is_running => TradingMode::Paused,
+        engine::TradingMode::Normal if quotes_only && has_strategies => TradingMode::Shadow,
+        engine::TradingMode::Normal if quotes_only => TradingMode::Replay,
+        engine::TradingMode::Normal if has_live_venue => TradingMode::Live,
+        engine::TradingMode::Normal => TradingMode::Paper,
+    }
+}
+
+#[cfg(all(test, feature = "infra-ipc"))]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn ipc_status_preserves_engine_safety_modes() {
+        for (engine_mode, expected) in [
+            (engine::TradingMode::Degraded, TradingMode::Degraded),
+            (engine::TradingMode::Paused, TradingMode::Paused),
+            (engine::TradingMode::Emergency, TradingMode::Emergency),
+        ] {
+            assert_eq!(
+                reported_trading_mode(engine_mode, true, false, true, true),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn ipc_status_distinguishes_shadow_replay_paper_and_live() {
+        assert_eq!(
+            reported_trading_mode(engine::TradingMode::Normal, true, true, true, false),
+            TradingMode::Shadow
+        );
+        assert_eq!(
+            reported_trading_mode(engine::TradingMode::Normal, true, true, false, false),
+            TradingMode::Replay
+        );
+        assert_eq!(
+            reported_trading_mode(engine::TradingMode::Normal, true, false, true, false),
+            TradingMode::Paper
+        );
+        assert_eq!(
+            reported_trading_mode(engine::TradingMode::Normal, true, false, true, true),
+            TradingMode::Live
+        );
     }
 }
 

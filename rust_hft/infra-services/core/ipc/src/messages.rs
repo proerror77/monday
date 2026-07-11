@@ -172,7 +172,7 @@ pub struct CancelDetail {
 }
 
 /// Trading modes
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TradingMode {
     /// Live trading mode
     Live,
@@ -180,8 +180,14 @@ pub enum TradingMode {
     Paper,
     /// Replay mode for testing
     Replay,
+    /// Strategy evaluation with execution disabled
+    Shadow,
+    /// Trading is active with reduced frequency
+    Degraded,
     /// Paused (no new orders)
     Paused,
+    /// Emergency stop is active
+    Emergency,
 }
 
 /// Strategy-specific risk configuration
