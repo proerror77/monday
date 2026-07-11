@@ -1,10 +1,12 @@
 use alpha_domain::{
     verify_envelope, AllowedIntentType, ApprovalClass, DomainError, RuntimeAttributionEvent,
-    RuntimeEnvelopePolicy, SignedDeploymentEnvelope, VerifiedDeploymentEnvelope,
+    RuntimeEnvelopePolicy, SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
+    VerifiedDeploymentEnvelope,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
@@ -23,6 +25,10 @@ pub enum IntakeError {
     InvalidActivationIntent,
     #[error("deployment approval class does not authorize the requested activation")]
     ApprovalClassMismatch,
+    #[error("deployment must request exactly one supported strategy artifact activation")]
+    InvalidArtifactIntent,
+    #[error("deployment instruments must be unique")]
+    DuplicateInstrument,
     #[error("runtime nonce ledger already contains this nonce")]
     NonceReplay,
     #[error("runtime durable state failed: {0}")]
@@ -38,13 +44,23 @@ pub enum ActivationMode {
     LiveSmall,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivationArtifact {
+    Formula,
+    Onnx,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActivationRequest {
     pub deployment_id: String,
     pub asset_revision_id: String,
+    pub promotion_id: String,
+    pub bundle_id: String,
+    pub bundle_hash: String,
     pub account_id: String,
     pub venue: String,
     pub instruments: Vec<String>,
+    pub artifact: ActivationArtifact,
     pub mode: ActivationMode,
     pub max_notional: f64,
     pub max_symbol_exposure: f64,
@@ -115,13 +131,21 @@ pub fn decode_trusted_keys(
 
 pub struct SystemConfigActivationAdapter<'a> {
     config: &'a mut runtime::SystemConfig,
+    bundle: &'a StrategyBundle,
+    bundle_path: &'a Path,
     applied_modes: Vec<ActivationMode>,
 }
 
 impl<'a> SystemConfigActivationAdapter<'a> {
-    pub fn new(config: &'a mut runtime::SystemConfig) -> Self {
+    pub fn new(
+        config: &'a mut runtime::SystemConfig,
+        bundle: &'a StrategyBundle,
+        bundle_path: &'a Path,
+    ) -> Self {
         Self {
             config,
+            bundle,
+            bundle_path,
             applied_modes: Vec::new(),
         }
     }
@@ -133,25 +157,31 @@ impl<'a> SystemConfigActivationAdapter<'a> {
 
 impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
     fn activate(&mut self, request: &ActivationRequest) -> Result<(), String> {
-        let venue = self
-            .config
+        let mut proposed = self.config.clone();
+        let venue_matches = proposed
             .venues
-            .iter_mut()
-            .find(|venue| {
+            .iter()
+            .enumerate()
+            .filter(|(_, venue)| {
                 venue.name.eq_ignore_ascii_case(&request.venue)
                     && venue.account_id.as_deref().unwrap_or(&venue.name) == request.account_id
             })
-            .ok_or_else(|| {
-                "deployment account and venue are not present in runtime config".to_string()
-            })?;
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [venue_index] = venue_matches.as_slice() else {
+            return Err(
+                "deployment account and venue must identify exactly one runtime venue".to_string(),
+            );
+        };
+        validate_instrument_catalog(&proposed.venues[*venue_index], request)?;
         match request.mode {
             ActivationMode::Paper => {
-                venue.execution_mode = Some("Paper".to_string());
-                self.config.quotes_only = false;
+                proposed.venues[*venue_index].execution_mode = Some("Paper".to_string());
+                proposed.quotes_only = false;
             }
             ActivationMode::Shadow => {
-                venue.execution_mode = Some("Paper".to_string());
-                self.config.quotes_only = true;
+                proposed.venues[*venue_index].execution_mode = Some("Paper".to_string());
+                proposed.quotes_only = true;
             }
             ActivationMode::LiveSmall => {
                 return Err(
@@ -160,9 +190,209 @@ impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
                 )
             }
         }
+        apply_strategy_bundle(&mut proposed, request, self.bundle, self.bundle_path)?;
+        *self.config = proposed;
         self.applied_modes.push(request.mode);
         Ok(())
     }
+}
+
+fn validate_instrument_catalog(
+    venue: &runtime::VenueConfig,
+    request: &ActivationRequest,
+) -> Result<(), String> {
+    if venue.symbol_catalog.is_empty() {
+        return Err("deployment venue has no governed instrument catalog".to_string());
+    }
+    for instrument in &request.instruments {
+        let present = venue.symbol_catalog.iter().any(|entry| {
+            entry
+                .symbol()
+                .is_some_and(|symbol| symbol.as_str() == instrument)
+        });
+        if !present {
+            return Err(format!(
+                "deployment instrument {instrument} is absent from the venue catalog"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_strategy_bundle(
+    config: &mut runtime::SystemConfig,
+    request: &ActivationRequest,
+    bundle: &StrategyBundle,
+    bundle_path: &Path,
+) -> Result<(), String> {
+    bundle.validate().map_err(|error| error.to_string())?;
+    if bundle.bundle_id != request.bundle_id
+        || bundle.bundle_hash != request.bundle_hash
+        || bundle.candidate_id != request.asset_revision_id
+    {
+        return Err("strategy bundle does not match the deployment envelope".to_string());
+    }
+
+    let hard_notional = config.risk.global_notional_limit;
+    let requested_notional = positive_decimal("max_notional", request.max_notional)?;
+    let requested_symbol = positive_decimal("max_symbol_exposure", request.max_symbol_exposure)?;
+    let requested_order = positive_decimal("max_order_size", request.max_order_size)?;
+    if hard_notional <= rust_decimal::Decimal::ZERO {
+        return Err("runtime hard notional limit disables strategy activation".to_string());
+    }
+    let total_notional = hard_notional.min(requested_notional).min(requested_symbol);
+    let order_notional = total_notional.min(requested_order);
+    let symbols = request
+        .instruments
+        .iter()
+        .map(hft_core::Symbol::new)
+        .collect::<Vec<_>>();
+    let strategy_name = request.bundle_id.clone();
+    let risk_limits = runtime::StrategyRiskLimits {
+        max_notional: total_notional,
+        max_position: config.risk.global_position_limit,
+        daily_loss_limit: config.risk.max_daily_loss,
+        cooldown_ms: 100,
+    };
+
+    let (strategy, strategy_ids) = match (&request.artifact, &bundle.artifact) {
+        (ActivationArtifact::Formula, StrategyBundleArtifact::Formula { ast }) => {
+            let ids = symbols
+                .iter()
+                .map(|symbol| format!("{strategy_name}:{}", symbol.as_str()))
+                .collect();
+            (
+                runtime::StrategyConfig {
+                    name: strategy_name.clone(),
+                    strategy_type: runtime::StrategyType::Formula,
+                    symbols,
+                    params: runtime::StrategyParams::Formula {
+                        ast: ast.clone(),
+                        max_order_notional: order_notional,
+                        signal_threshold: 0.0,
+                    },
+                    risk_limits,
+                },
+                ids,
+            )
+        }
+        (ActivationArtifact::Onnx, StrategyBundleArtifact::Onnx { model }) => {
+            let (model_path, top_n, window_size, checksum) =
+                verify_onnx_artifact(model, bundle_path)?;
+            (
+                runtime::StrategyConfig {
+                    name: strategy_name.clone(),
+                    strategy_type: runtime::StrategyType::Onnx,
+                    symbols,
+                    params: runtime::StrategyParams::Onnx {
+                        model_path: model_path.to_string_lossy().into_owned(),
+                        model_version: bundle.bundle_hash.clone(),
+                        model_sha256: checksum,
+                        top_n,
+                        window_size,
+                        max_order_notional: order_notional,
+                        output_threshold: 0.0,
+                    },
+                    risk_limits,
+                },
+                vec![strategy_name.clone()],
+            )
+        }
+        _ => {
+            return Err("deployment artifact intent does not match the strategy bundle".to_string())
+        }
+    };
+
+    config.risk.global_notional_limit = total_notional;
+    config.venues.retain(|venue| {
+        venue.name.eq_ignore_ascii_case(&request.venue)
+            && venue.account_id.as_deref().unwrap_or(&venue.name) == request.account_id
+    });
+    config.risk.strategy_overrides.clear();
+    config.strategy_accounts.clear();
+    for strategy_id in strategy_ids {
+        config.risk.strategy_overrides.insert(
+            strategy_id.clone(),
+            runtime::StrategyRiskOverride {
+                max_position: Some(config.risk.global_position_limit),
+                max_notional: Some(order_notional),
+                max_orders_per_second: Some(config.risk.max_orders_per_second),
+                order_cooldown_ms: Some(100),
+                staleness_threshold_us: Some(config.risk.staleness_threshold_us),
+                max_daily_loss: Some(config.risk.max_daily_loss),
+                aggressive_mode: Some(false),
+                enhanced_overrides: None,
+            },
+        );
+        config
+            .strategy_accounts
+            .insert(strategy_id, request.account_id.clone());
+    }
+    config.strategies = vec![strategy];
+    Ok(())
+}
+
+fn positive_decimal(name: &str, value: f64) -> Result<rust_decimal::Decimal, String> {
+    let value = rust_decimal::Decimal::from_f64_retain(value)
+        .ok_or_else(|| format!("deployment {name} cannot be represented exactly enough"))?;
+    if value <= rust_decimal::Decimal::ZERO {
+        return Err(format!("deployment {name} must be positive"));
+    }
+    Ok(value)
+}
+
+fn verify_onnx_artifact(
+    model: &alpha_domain::OnnxModelCandidate,
+    bundle_path: &Path,
+) -> Result<(PathBuf, usize, usize, String), String> {
+    let input = match model.inputs.as_slice() {
+        [input] => input,
+        _ => return Err("ONNX runtime supports exactly one input tensor".to_string()),
+    };
+    let [Some(batch), Some(channels), Some(window_size), Some(top_n)] = input.dimensions.as_slice()
+    else {
+        return Err("ONNX input shape must be static [1, 4, L, K]".to_string());
+    };
+    if *batch != 1 || *channels != 4 || *window_size == 0 || *top_n == 0 {
+        return Err("ONNX input shape must be static [1, 4, L, K]".to_string());
+    }
+    if !matches!(
+        model.output.dimensions.as_slice(),
+        [Some(1)] | [Some(1), Some(1)]
+    ) {
+        return Err("ONNX output shape must be [1] or [1, 1]".to_string());
+    }
+
+    let uri = model.artifact.uri.as_str();
+    let path = if let Some(path) = uri.strip_prefix("file://") {
+        PathBuf::from(path)
+    } else if uri.contains("://") {
+        return Err("runtime accepts only local ONNX artifact paths".to_string());
+    } else {
+        bundle_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(uri)
+    };
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "failed to inspect ONNX artifact {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err("ONNX artifact must be a regular non-symlink file".to_string());
+    }
+    if metadata.len() != model.byte_len {
+        return Err("ONNX artifact byte length does not match the bundle".to_string());
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("failed to read ONNX artifact {}: {error}", path.display()))?;
+    let checksum = hex::encode(Sha256::digest(&bytes));
+    if model.artifact.checksum.as_deref() != Some(checksum.as_str()) {
+        return Err("ONNX artifact checksum does not match the bundle".to_string());
+    }
+    Ok((path, *top_n, *window_size, checksum))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +489,11 @@ impl RuntimeFeedbackLog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, IntakeError> {
         let path = path.as_ref().to_path_buf();
         ensure_parent(&path)?;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(durable_error)?;
         Ok(Self { path })
     }
 
@@ -369,7 +604,7 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
         if let Err(error) = self.adapter.activate(&request) {
             self.audit.append(&RuntimeAuditEvent {
                 deployment_id: request.deployment_id.clone(),
-                phase: "activation".to_string(),
+                phase: "configuration".to_string(),
                 result: "failed".to_string(),
                 reason: Some(error.clone()),
                 recorded_at: now,
@@ -378,8 +613,8 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
         }
         self.audit.append(&RuntimeAuditEvent {
             deployment_id: request.deployment_id.clone(),
-            phase: "activation".to_string(),
-            result: "activated".to_string(),
+            phase: "configuration".to_string(),
+            result: "prepared".to_string(),
             reason: None,
             recorded_at: now,
         })?;
@@ -408,6 +643,30 @@ fn activation_request(
     let [mode] = modes.as_slice() else {
         return Err(IntakeError::InvalidActivationIntent);
     };
+    let artifacts = verified
+        .0
+        .allowed_intent_types
+        .iter()
+        .filter_map(|intent| match intent {
+            AllowedIntentType::LoadFactor => Some(ActivationArtifact::Formula),
+            AllowedIntentType::LoadModel => Some(ActivationArtifact::Onnx),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [artifact] = artifacts.as_slice() else {
+        return Err(IntakeError::InvalidArtifactIntent);
+    };
+    if verified
+        .0
+        .allowed_intent_types
+        .contains(&AllowedIntentType::LoadAllocatorPolicy)
+    {
+        return Err(IntakeError::InvalidArtifactIntent);
+    }
+    if verified.0.instruments.iter().collect::<BTreeSet<_>>().len() != verified.0.instruments.len()
+    {
+        return Err(IntakeError::DuplicateInstrument);
+    }
     let approved = match mode {
         ActivationMode::Paper => matches!(
             verified.0.approval_class,
@@ -428,9 +687,13 @@ fn activation_request(
     Ok(ActivationRequest {
         deployment_id: verified.0.deployment_id.clone(),
         asset_revision_id: verified.0.asset_revision_id.clone(),
+        promotion_id: verified.0.promotion_id.clone(),
+        bundle_id: verified.0.bundle_id.clone(),
+        bundle_hash: verified.0.bundle_hash.clone(),
         account_id: verified.0.account_id.clone(),
         venue: verified.0.venue.clone(),
         instruments: verified.0.instruments.clone(),
+        artifact: *artifact,
         mode: *mode,
         max_notional: verified.0.max_notional,
         max_symbol_exposure: verified.0.max_symbol_exposure,

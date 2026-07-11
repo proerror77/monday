@@ -18,7 +18,6 @@ use engine::{
 use hft_core::HftError;
 use hft_core::*;
 use ports::*;
-use shared_config::{StrategyParams as SharedStrategyParams, StrategyType as SharedStrategyType};
 // use shared_instrument::InstrumentId; // 已移至 config_types
 use std::collections::HashMap;
 use tokio::sync::{Mutex, Notify};
@@ -541,6 +540,27 @@ impl SystemBuilder {
         }
 
         self
+    }
+
+    /// Register configured runtime components while treating every strategy build
+    /// failure and duplicate instance ID as a startup error.
+    pub fn auto_register_adapters_strict(mut self) -> HftResult<Self> {
+        info!("strictly auto-registering adapters and strategies");
+        self = self.register_market_streams_from_config();
+        let quotes_only = quotes_only_enabled(&self.config);
+        if quotes_only {
+            info!("quotes-only enabled; execution clients remain disabled");
+        } else {
+            self = self.register_execution_clients_from_config();
+            if self.execution_clients.len() != self.config.venues.len() {
+                return Err(HftError::Config(format!(
+                    "configured {} venues but registered {} execution clients",
+                    self.config.venues.len(),
+                    self.execution_clients.len()
+                )));
+            }
+        }
+        self.try_register_strategies_from_config()
     }
 
     /// 建構並啟動系統
@@ -1404,17 +1424,6 @@ fn deserialize_backpack_market_value(
             serde_yaml::from_value(YamlValue::Mapping(map)).ok()
         }
         other => serde_yaml::from_value(other).ok(),
-    }
-}
-
-fn to_shared_strategy_type(rt: &StrategyType) -> SharedStrategyType {
-    match rt {
-        StrategyType::Trend => SharedStrategyType::Trend,
-        StrategyType::Arbitrage => SharedStrategyType::Arbitrage,
-        StrategyType::MarketMaking => SharedStrategyType::MarketMaking,
-        StrategyType::Dl => SharedStrategyType::Dl,
-        StrategyType::Imbalance => SharedStrategyType::Imbalance,
-        StrategyType::LobFlowGrid => SharedStrategyType::LobFlowGrid,
     }
 }
 

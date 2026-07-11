@@ -31,15 +31,12 @@ serde_yaml = "0.9"
 thiserror = { workspace = true }
 prometheus = { workspace = true, optional = true }
 infra-metrics = { package = "hft-infra-metrics", path = "../../infra-services/core/metrics", features = ["http-server"], optional = true }
-ndarray = "0.15"
-hft-infer-onnx = { path = "../../strategy-framework/infer-onnx" }
-hft-model-manager = { path = "../../infra-services/core/model-manager" }
 risk = { package = "hft-risk", path = "../../risk-control/risk" }
 hft-grpc-server = { path = "../../infra-services/core/grpc-server", optional = true }
 anyhow = "1"
 
 [features]
-default = ["bitget", "trend-strategy", "metrics", "simd"]
+default = ["bitget", "formula-strategy", "metrics", "simd"]
 
 # 交易所適配器 (轉發到 runtime)
 bitget = ["runtime/bitget"]
@@ -55,12 +52,14 @@ all-exchanges = ["bitget", "binance", "bybit", "okx", "hyperliquid", "asterdex"]
 trend-strategy = ["runtime/strategy-trend"]
 arbitrage-strategy = ["runtime/strategy-arbitrage"]
 imbalance-strategy = ["runtime/strategy-imbalance"]
+formula-strategy = ["runtime/strategy-formula"]
 dl-strategy = ["runtime/strategy-dl"]
 lob-flow-grid-strategy = ["runtime/strategy-lob-flow-grid"]
 all-strategies = [
   "trend-strategy",
   "arbitrage-strategy",
   "imbalance-strategy",
+  "formula-strategy",
   "dl-strategy",
   "lob-flow-grid-strategy"
 ]

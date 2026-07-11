@@ -11,9 +11,13 @@ pub mod dl_strategy;
 pub mod feature_pipeline;
 pub mod inference_engine;
 pub mod model_loader;
+mod onnx_lob_strategy;
 
 pub use config::{DlStrategyConfig, FeatureConfig, InferenceConfig, ModelConfig};
 pub use dl_strategy::{DlStrategy, DlStrategyStats};
 pub use feature_pipeline::{FeatureExtractor, FeaturePipeline};
 pub use inference_engine::{InferenceEngine, InferenceResult};
 pub use model_loader::{ModelHandle, ModelLoader};
+pub use onnx_lob_strategy::{
+    OnnxLobStrategy, OnnxLobStrategyConfig, OnnxLobStrategyValidationError,
+};

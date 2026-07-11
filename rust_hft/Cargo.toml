@@ -42,6 +42,7 @@ members = [
     "strategy-framework/strategies/trend",
     "strategy-framework/strategies/arbitrage",
     "strategy-framework/strategies/imbalance",
+    "strategy-framework/strategies/formula",
     "strategy-framework/strategies/lob_flow_grid",
 
     # Risk Control

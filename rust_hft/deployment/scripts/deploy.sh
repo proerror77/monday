@@ -134,6 +134,7 @@ deploy_k8s() {
     kubectl apply -f "$K8S_DEPLOYMENT_ENVELOPE_FILE"
     kubectl apply -f "$K8S_DEPLOYMENT_AUTHORITY_FILE"
     require_configmap_key alpha-deployment-envelope envelope.json
+    require_configmap_key alpha-deployment-envelope bundle.json
     require_configmap_key runtime-deployment-authority policy.json
     require_configmap_key runtime-deployment-authority trusted-keys.json
 

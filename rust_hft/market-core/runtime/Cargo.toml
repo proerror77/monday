@@ -16,6 +16,7 @@ risk = { package = "hft-risk", path = "../../risk-control/risk" }
 snapshot = { package = "hft-snapshot", path = "../snapshot" }
 shared_config = { package = "hft-shared-config", path = "../../shared/config" }
 shared_instrument = { package = "hft-shared-instrument", path = "../../shared/instrument" }
+hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 # 🔥 P0: 依賴注入所需 - Runtime 需要創建 OMS 與 Portfolio 實例
 oms_core = { package = "hft-oms-core", path = "../../risk-control/oms-core" }
 portfolio_core = { package = "hft-portfolio-core", path = "../../risk-control/portfolio-core" }
@@ -47,6 +48,7 @@ strategy-trend = { package = "hft-strategy-trend", path = "../../strategy-framew
 strategy-arbitrage = { package = "hft-strategy-arbitrage", path = "../../strategy-framework/strategies/arbitrage", optional = true }
 strategy-dl = { package = "hft-strategy-dl", path = "../../strategy-framework/strategy-dl", optional = true }
 strategy-imbalance = { package = "hft-strategy-imbalance", path = "../../strategy-framework/strategies/imbalance", optional = true }
+strategy-formula = { package = "hft-strategy-formula", path = "../../strategy-framework/strategies/formula", optional = true }
 strategy-lob-flow-grid = { package = "hft-strategy-lob-flow-grid", path = "../../strategy-framework/strategies/lob_flow_grid", optional = true }
 
 # Infrastructure (optional)
@@ -124,6 +126,7 @@ strategy-trend = ["dep:strategy-trend"]
 strategy-arbitrage = ["dep:strategy-arbitrage"]
 strategy-dl = ["dep:strategy-dl"]
 strategy-imbalance = ["dep:strategy-imbalance"]
+strategy-formula = ["dep:strategy-formula"]
 strategy-lob-flow-grid = ["dep:strategy-lob-flow-grid"]
 
 # Infrastructure
@@ -144,5 +147,5 @@ asterdex = ["adapter-asterdex-data", "adapter-asterdex-execution"]
 lighter = ["adapter-lighter-data", "adapter-lighter-execution"]
 grvt = ["adapter-grvt-data", "adapter-grvt-execution"]
 mock = ["adapter-mock-data"]
-all-strategies = ["strategy-trend", "strategy-arbitrage", "strategy-imbalance", "strategy-dl", "strategy-lob-flow-grid"]
+all-strategies = ["strategy-trend", "strategy-arbitrage", "strategy-imbalance", "strategy-formula", "strategy-dl", "strategy-lob-flow-grid"]
 full = ["bitget", "binance", "bybit", "okx", "hyperliquid", "asterdex", "lighter", "backpack", "grvt", "all-strategies", "adapter-mock-data"]

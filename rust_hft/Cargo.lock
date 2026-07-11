@@ -2792,14 +2792,9 @@ name = "hft-grpc-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "hex",
  "hft-core",
  "hft-engine",
- "hft-model-manager",
- "hft-ports",
- "hft-risk",
  "prost 0.13.5",
- "reqwest",
  "sha2",
  "tokio",
  "tonic",
@@ -2970,13 +2965,10 @@ dependencies = [
  "hft-data",
  "hft-engine",
  "hft-grpc-server",
- "hft-infer-onnx",
  "hft-infra-metrics",
- "hft-model-manager",
  "hft-ports",
  "hft-risk",
  "hft-runtime",
- "ndarray 0.15.6",
  "prometheus",
  "rust_decimal",
  "serde",
@@ -3126,6 +3118,7 @@ dependencies = [
  "hft-execution-adapter-hyperliquid",
  "hft-execution-adapter-lighter",
  "hft-execution-adapter-okx",
+ "hft-factor-dsl",
  "hft-infra-clickhouse",
  "hft-infra-metrics",
  "hft-infra-redis",
@@ -3141,6 +3134,7 @@ dependencies = [
  "hft-snapshot",
  "hft-strategy-arbitrage",
  "hft-strategy-dl",
+ "hft-strategy-formula",
  "hft-strategy-imbalance",
  "hft-strategy-lob-flow-grid",
  "hft-strategy-trend",
@@ -3220,6 +3214,7 @@ name = "hft-strategy-dl"
 version = "0.1.0"
 dependencies = [
  "hft-core",
+ "hft-infer-onnx",
  "hft-ports",
  "ndarray 0.16.1",
  "rust_decimal",
@@ -3228,6 +3223,17 @@ dependencies = [
  "tch",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "hft-strategy-formula"
+version = "0.1.0"
+dependencies = [
+ "hft-core",
+ "hft-factor-dsl",
+ "hft-ports",
+ "rust_decimal",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

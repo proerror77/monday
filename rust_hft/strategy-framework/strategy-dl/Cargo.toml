@@ -6,6 +6,7 @@ description = "深度學習策略：TorchScript 模型集成與推理"
 
 [dependencies]
 hft-core = { package = "hft-core", path = "../../market-core/core" }
+hft-infer-onnx = { path = "../infer-onnx" }
 ports = { package = "hft-ports", path = "../../market-core/ports" }
 serde = { workspace = true }
 tracing = "0.1"

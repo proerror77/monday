@@ -85,11 +85,9 @@ impl AggregatedStats {
     }
 
     fn avg_latency(&self) -> u64 {
-        if self.successful_inferences == 0 {
-            0
-        } else {
-            self.total_latency_us / self.successful_inferences
-        }
+        self.total_latency_us
+            .checked_div(self.successful_inferences)
+            .unwrap_or(0)
     }
 
     fn build_stats(&self, state: InferenceEngineState) -> InferenceStats {

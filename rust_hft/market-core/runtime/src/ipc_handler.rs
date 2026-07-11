@@ -81,163 +81,28 @@ impl CommandHandler for SystemCommandHandler {
                 }
             }
 
-            Command::LoadModel {
-                model_path,
-                model_version,
-                sha256_hash: _sha256_hash,
-            } => {
-                info!(
-                    "IPC: Loading model {} version {}",
-                    model_path, model_version
-                );
+            Command::LoadModel { .. } => Response::Error {
+                message: "direct model loading is disabled; deploy a signed StrategyBundle"
+                    .to_string(),
+                code: Some(403),
+            },
 
-                #[cfg(feature = "strategy-dl")]
-                {
-                    use std::path::PathBuf;
-
-                    // 验证 SHA256（如果提供）
-                    if let Some(expected_hash) = &_sha256_hash {
-                        let path = PathBuf::from(&model_path);
-                        if path.exists() {
-                            // 计算文件哈希
-                            match Self::calculate_sha256(&path) {
-                                Ok(actual_hash) => {
-                                    if &actual_hash != expected_hash {
-                                        return Response::Error {
-                                            message: format!(
-                                                "SHA256 校验失败: 期望 {}, 实际 {}",
-                                                expected_hash, actual_hash
-                                            ),
-                                            code: Some(400),
-                                        };
-                                    }
-                                }
-                                Err(e) => {
-                                    return Response::Error {
-                                        message: format!("无法计算文件哈希: {}", e),
-                                        code: Some(500),
-                                    };
-                                }
-                            }
-                        } else {
-                            return Response::Error {
-                                message: format!("模型文件不存在: {}", model_path),
-                                code: Some(404),
-                            };
-                        }
-                    }
-
-                    // 查找 DL 策略实例并重载模型
-                    let mut runtime = self.runtime.lock().await;
-                    let mut engine = runtime.engine.lock().await;
-
-                    let mut loaded_count = 0;
-                    let strategy_ids = engine.strategy_instance_ids();
-
-                    for strategy_id in strategy_ids {
-                        // 通过策略 ID 获取策略实例的可变引用
-                        if let Some(strategy) = engine.get_strategy_mut_by_id(&strategy_id) {
-                            // 尝试将策略向下转型为 DlStrategy
-                            if let Some(dl_strategy) = strategy
-                                .as_any_mut()
-                                .downcast_mut::<hft_strategy_dl::DlStrategy>(
-                            ) {
-                                match dl_strategy
-                                    .load_model(PathBuf::from(&model_path), model_version.clone())
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        info!("策略 {} 成功加载模型: {}", strategy_id, model_path);
-                                        loaded_count += 1;
-                                    }
-                                    Err(e) => {
-                                        error!("策略 {} 模型加载失败: {}", strategy_id, e);
-                                        return Response::Error {
-                                            message: format!(
-                                                "策略 {} 模型加载失败: {}",
-                                                strategy_id, e
-                                            ),
-                                            code: Some(500),
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if loaded_count == 0 {
-                        Response::Error {
-                            message: "未找到 DL 策略实例".to_string(),
-                            code: Some(404),
-                        }
-                    } else {
-                        info!("成功为 {} 个 DL 策略加载模型", loaded_count);
-                        Response::Ok
-                    }
-                }
-
-                #[cfg(not(feature = "strategy-dl"))]
-                {
-                    Response::Error {
-                        message: "DL 策略功能未启用，请使用 --features strategy-dl 编译"
-                            .to_string(),
-                        code: Some(501),
-                    }
-                }
-            }
-
-            Command::UpdateRisk {
-                global_position_limit,
-                global_notional_limit,
-                max_daily_trades,
-                max_orders_per_second,
-                staleness_threshold_us,
-                strategy_overrides,
-            } => {
-                info!("IPC: Updating risk parameters");
-                let mut runtime = self.runtime.lock().await;
-                // 基於當前配置建立新的風控配置（僅覆蓋提供的欄位）
-                let mut new_risk = runtime.config.risk.clone();
-
-                if let Some(v) = global_position_limit {
-                    new_risk.global_position_limit = v;
-                }
-                if let Some(v) = global_notional_limit {
-                    new_risk.global_notional_limit = v;
-                }
-                if let Some(v) = max_daily_trades {
-                    new_risk.max_daily_trades = v;
-                }
-                if let Some(v) = max_orders_per_second {
-                    new_risk.max_orders_per_second = v;
-                }
-                if let Some(v) = staleness_threshold_us {
-                    new_risk.staleness_threshold_us = v;
-                }
-
-                // 轉換策略覆蓋（若有）
-                if !strategy_overrides.is_empty() {
-                    let mut merged = new_risk.strategy_overrides.clone();
-                    for (k, ov) in strategy_overrides.into_iter() {
-                        let converted = crate::ipc_handler::convert_strategy_override(ov);
-                        merged.insert(k, converted);
-                    }
-                    new_risk.strategy_overrides = merged;
-                }
-
-                // 應用更新
-                match runtime.update_risk_config(new_risk).await {
-                    Ok(_) => Response::Ok,
-                    Err(e) => Response::Error {
-                        message: format!("Failed to update risk: {}", e),
-                        code: Some(500),
-                    },
-                }
-            }
+            Command::UpdateRisk { .. } => Response::Error {
+                message: "direct risk mutation is disabled; deploy a signed envelope and restart"
+                    .to_string(),
+                code: Some(403),
+            },
 
             Command::GetStatus => {
                 let runtime = self.runtime.lock().await;
                 let account_view = runtime.get_account_view().await;
+                let model_version = runtime.config.strategies.iter().find_map(|strategy| {
+                    if let crate::StrategyParams::Onnx { model_version, .. } = &strategy.params {
+                        Some(model_version.clone())
+                    } else {
+                        None
+                    }
+                });
                 let engine_guard = runtime.engine.lock().await;
                 let engine_stats = engine_guard.get_statistics();
                 let latency_stats = engine_guard.get_latency_stats();
@@ -304,30 +169,7 @@ impl CommandHandler for SystemCommandHandler {
                         .as_ref()
                         .map(|metrics| metrics.max_drawdown)
                         .unwrap_or(rust_decimal::Decimal::ZERO),
-                    model_version: {
-                        // 从 DL 策略获取模型版本
-                        #[cfg(feature = "strategy-dl")]
-                        {
-                            let strategy_ids = engine_guard.strategy_instance_ids();
-                            let mut version = None;
-                            for strategy_id in strategy_ids {
-                                if let Some(strategy) =
-                                    engine_guard.get_strategy_by_id(&strategy_id)
-                                {
-                                    if let Some(dl_strategy) = strategy
-                                        .as_any()
-                                        .downcast_ref::<hft_strategy_dl::DlStrategy>(
-                                    ) {
-                                        version = dl_strategy.get_model_version();
-                                        break; // 使用第一个找到的 DL 策略的模型版本
-                                    }
-                                }
-                            }
-                            version
-                        }
-                        #[cfg(not(feature = "strategy-dl"))]
-                        None
-                    },
+                    model_version,
                     health: SystemHealth {
                         ingestion_lag_us: ingestion_us,
                         execution_lag_us: execution_us,
@@ -608,27 +450,12 @@ impl CommandHandler for SystemCommandHandler {
                 let runtime = self.runtime.lock().await;
 
                 match mode {
-                    TradingMode::Live | TradingMode::Paper => {
-                        let is_running = runtime.engine.lock().await.get_statistics().is_running;
-                        if !is_running {
-                            Response::Error {
-                                message: "engine is stopped; restart the supervised process"
-                                    .to_string(),
-                                code: Some(409),
-                            }
-                        } else {
-                            match runtime.execution_control_handle().resume_trading().await {
-                                Ok(()) => {
-                                    info!("交易模式已切换至 {:?}", mode);
-                                    Response::Ok
-                                }
-                                Err(error) => Response::Error {
-                                    message: error.to_string(),
-                                    code: Some(409),
-                                },
-                            }
-                        }
-                    }
+                    TradingMode::Live | TradingMode::Paper => Response::Error {
+                        message:
+                            "direct resume is disabled; deploy a signed envelope and restart"
+                                .to_string(),
+                        code: Some(403),
+                    },
                     TradingMode::Replay => match runtime
                         .execution_control_handle()
                         .emergency_stop(true)
@@ -671,6 +498,13 @@ impl CommandHandler for SystemCommandHandler {
                 enabled,
             } => {
                 info!("IPC: Setting strategy {} enabled={}", strategy_id, enabled);
+                if enabled {
+                    return Response::Error {
+                        message: "direct strategy enable is disabled; deploy a signed StrategyBundle and restart"
+                            .to_string(),
+                        code: Some(403),
+                    };
+                }
                 let runtime = self.runtime.lock().await;
 
                 // 通过引擎设置策略启用/禁用状态
@@ -742,92 +576,17 @@ impl CommandHandler for SystemCommandHandler {
                 }
             }
 
-            Command::SetSymbolLimits {
-                symbol,
-                max_position,
-                max_notional,
-            } => {
-                info!("IPC: Setting limits for symbol {}", symbol.as_str());
-                let mut runtime = self.runtime.lock().await;
+            Command::SetSymbolLimits { .. } => Response::Error {
+                message: "direct symbol-limit mutation is disabled; deploy a signed envelope and restart"
+                    .to_string(),
+                code: Some(403),
+            },
 
-                // 更新风控配置中的商品限制
-                // 这需要通过策略覆盖来实现，因为风控系统是以策略为维度的
-                // 我们需要为所有涉及该商品的策略应用限制
-
-                // 查找所有使用该商品的策略
-                let affected_strategies: Vec<String> = runtime
-                    .config
-                    .strategies
-                    .iter()
-                    .filter(|s| s.symbols.iter().any(|sym| sym.as_str() == symbol.as_str()))
-                    .map(|s| s.name.clone())
-                    .collect();
-
-                if affected_strategies.is_empty() {
-                    return Response::Error {
-                        message: format!("未找到使用商品 {} 的策略", symbol.as_str()),
-                        code: Some(404),
-                    };
-                }
-
-                // 更新每个受影响策略的风控覆盖
-                for strategy_name in &affected_strategies {
-                    let override_entry = runtime
-                        .config
-                        .risk
-                        .strategy_overrides
-                        .entry(strategy_name.clone())
-                        .or_insert_with(|| crate::StrategyRiskOverride {
-                            max_position: None,
-                            max_notional: None,
-                            max_orders_per_second: None,
-                            order_cooldown_ms: None,
-                            staleness_threshold_us: None,
-                            max_daily_loss: None,
-                            aggressive_mode: None,
-                            enhanced_overrides: None,
-                        });
-
-                    // 更新限制（仅覆盖提供的值）
-                    if let Some(pos_limit) = max_position {
-                        override_entry.max_position = Some(pos_limit);
-                    }
-                    if let Some(notional_limit) = max_notional {
-                        override_entry.max_notional = Some(notional_limit);
-                    }
-                }
-
-                // 重新创建风控管理器并应用到引擎
-                let new_manager = crate::RiskManagerFactory::create_strategy_aware_risk_manager(
-                    &runtime.config.risk,
-                );
-
-                let mut engine = runtime.engine.lock().await;
-                engine.register_risk_manager_boxed(new_manager);
-                drop(engine);
-
-                info!(
-                    "已为商品 {} 更新限制（影响策略: {:?}）",
-                    symbol.as_str(),
-                    affected_strategies
-                );
-                Response::Ok
-            }
-
-            Command::UpdateStrategyParams {
-                strategy_id,
-                params,
-            } => {
-                info!("IPC: Updating strategy params: {}", strategy_id);
-                let mut runtime = self.runtime.lock().await;
-                match runtime.update_strategy_params(&strategy_id, params).await {
-                    Ok(_) => Response::Ok,
-                    Err(e) => Response::Error {
-                        message: format!("Failed to update strategy params: {}", e),
-                        code: Some(500),
-                    },
-                }
-            }
+            Command::UpdateStrategyParams { .. } => Response::Error {
+                message: "direct strategy replacement is disabled; deploy a signed StrategyBundle and restart"
+                    .to_string(),
+                code: Some(403),
+            },
         }
     }
 }
@@ -868,31 +627,61 @@ mod tests {
         assert!(message.contains("1 of 2"));
         assert!(message.contains("failed: venue rejected cancellation"));
     }
+
+    #[tokio::test]
+    async fn ipc_denies_every_direct_risk_increasing_mutation() {
+        let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/dev/binance_quotes_only.yaml");
+        let runtime = crate::SystemBuilder::from_yaml(config_path.to_str().unwrap())
+            .unwrap()
+            .build();
+        let handler = SystemCommandHandler::new(Arc::new(Mutex::new(runtime)));
+        let commands = vec![
+            Command::LoadModel {
+                model_path: "/tmp/model.onnx".to_string(),
+                model_version: "v1".to_string(),
+                sha256_hash: None,
+            },
+            Command::UpdateRisk {
+                global_position_limit: None,
+                global_notional_limit: None,
+                max_daily_trades: None,
+                max_orders_per_second: None,
+                staleness_threshold_us: None,
+                strategy_overrides: HashMap::new(),
+            },
+            Command::SetTradingMode {
+                mode: TradingMode::Paper,
+            },
+            Command::SetStrategyEnabled {
+                strategy_id: "strategy-1".to_string(),
+                enabled: true,
+            },
+            Command::SetSymbolLimits {
+                symbol: hft_core::Symbol::new("BTCUSDT"),
+                max_position: None,
+                max_notional: None,
+            },
+            Command::UpdateStrategyParams {
+                strategy_id: "strategy-1".to_string(),
+                params: shared_config::StrategyParams::None,
+            },
+        ];
+
+        for command in commands {
+            assert!(matches!(
+                handler.handle_command(command).await,
+                Response::Error {
+                    code: Some(403),
+                    ..
+                }
+            ));
+        }
+    }
 }
 
 #[cfg(feature = "infra-ipc")]
 impl SystemCommandHandler {
-    /// 计算文件的 SHA256 哈希
-    #[cfg(feature = "strategy-dl")]
-    fn calculate_sha256(path: &std::path::Path) -> Result<String, std::io::Error> {
-        use sha2::{Digest, Sha256};
-        use std::io::Read;
-
-        let mut file = std::fs::File::open(path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 8192];
-
-        loop {
-            let count = file.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&buffer[..count]);
-        }
-
-        Ok(format!("{:x}", hasher.finalize()))
-    }
-
     /// Internal helper to cancel all orders
     async fn cancel_all_orders_internal(
         runtime: &SystemRuntime,
@@ -999,20 +788,6 @@ impl SystemCommandHandler {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(2_000)
-    }
-}
-
-#[cfg(feature = "infra-ipc")]
-fn convert_strategy_override(ov: infra_ipc::StrategyRiskConfig) -> crate::StrategyRiskOverride {
-    crate::StrategyRiskOverride {
-        max_position: ov.max_position,
-        max_notional: ov.max_notional,
-        max_orders_per_second: ov.max_orders_per_second,
-        order_cooldown_ms: None,
-        staleness_threshold_us: None,
-        max_daily_loss: None,
-        aggressive_mode: None,
-        enhanced_overrides: None,
     }
 }
 

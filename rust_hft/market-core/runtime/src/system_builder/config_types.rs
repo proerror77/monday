@@ -3,6 +3,7 @@
 
 use engine::dataflow::FlipPolicy;
 use hft_core::Symbol;
+use hft_factor_dsl::FactorAst;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -435,6 +436,8 @@ pub enum StrategyType {
     Arbitrage,
     MarketMaking,
     Dl,
+    Formula,
+    Onnx,
     Imbalance,
     LobFlowGrid,
 }
@@ -472,6 +475,20 @@ pub enum StrategyParams {
         timeout_ms: u64,
         max_error_rate: f64,
         degradation_mode: String,
+    },
+    Formula {
+        ast: FactorAst,
+        max_order_notional: Decimal,
+        signal_threshold: f64,
+    },
+    Onnx {
+        model_path: String,
+        model_version: String,
+        model_sha256: String,
+        top_n: usize,
+        window_size: usize,
+        max_order_notional: Decimal,
+        output_threshold: f64,
     },
     LobFlowGrid {
         #[serde(flatten)]

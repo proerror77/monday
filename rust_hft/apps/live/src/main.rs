@@ -8,20 +8,15 @@ mod helpers;
 
 use alpha_domain::{
     AttributionMode, AttributionOutcome, RuntimeAttributionEvent, SignedDeploymentEnvelope,
+    StrategyBundle,
 };
 use clap::Parser;
 use hft_live::deployment_envelope::{
     decode_trusted_keys, ActivationRequest, DeploymentIntake, RuntimeAuditLog, RuntimeFeedbackLog,
     RuntimeNonceLedger, RuntimePolicyDocument, SystemConfigActivationAdapter,
 };
-use runtime::{
-    ExecutionQueueSettings, RiskConfig as RtRiskConfig, StrategyConfig as RtStrategyConfig,
-    StrategyParams as RtStrategyParams, StrategyRiskLimits as RtStrategyRiskLimits,
-    StrategyType as RtStrategyType, SystemEngineConfig, VenueCapabilities,
-    VenueConfig as RtVenueConfig, VenueType,
-};
 use runtime::{ShardConfig, ShardStrategy, SystemBuilder, SystemConfig};
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -30,18 +25,6 @@ struct Args {
     /// Production starts from a v2 quotes-only configuration.
     #[arg(short, long, default_value = "config/prod/system.yaml")]
     config: String,
-
-    /// 是否為測試模式
-    #[arg(long)]
-    test_mode: bool,
-
-    /// 啟動後進行一次 dry-run 下單驗證（Paper 模式）
-    #[arg(long)]
-    dry_run_order: bool,
-
-    /// dry-run 下單的交易對
-    #[arg(long, default_value = "BTCUSDT")]
-    dry_run_symbol: String,
 
     /// 啟動後自動退出的毫秒數（用於CI/sandbox）
     #[arg(long)]
@@ -58,6 +41,10 @@ struct Args {
     /// Signed deployment envelope produced by alpha-harness.
     #[arg(long)]
     deployment_envelope: Option<std::path::PathBuf>,
+
+    /// Content-addressed StrategyBundle referenced by the deployment envelope.
+    #[arg(long, requires = "deployment_envelope")]
+    strategy_bundle: Option<std::path::PathBuf>,
 
     /// Runtime-owned deployment policy document.
     #[arg(long, requires = "deployment_envelope")]
@@ -95,22 +82,6 @@ struct Args {
     /// 靜態分片：使用自定義分片策略 (symbol-hash, venue-round-robin, hybrid)
     #[arg(long, default_value = "symbol-hash")]
     shard_strategy: String,
-
-    /// 啟用 ONNX 推理（model-only）
-    #[arg(long, default_value_t = false)]
-    ml_enable: bool,
-    /// ONNX 模型路徑
-    #[arg(long, default_value = "models/model.onnx")]
-    ml_model: String,
-    /// Top-K 檔數
-    #[arg(long, default_value_t = 20)]
-    ml_k: usize,
-    /// 序列長度 L
-    #[arg(long, default_value_t = 100)]
-    ml_l: usize,
-    /// 對齊步長（毫秒）
-    #[arg(long, default_value_t = 100)]
-    ml_step_ms: u64,
 
     /// 啟用 Sentinel 自動化風控
     #[arg(long, default_value_t = true)]
@@ -150,199 +121,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 展示可用的適配器
     show_available_adapters();
 
-    // 使用 SystemBuilder 從 YAML 配置建構系統
-    let mut system = match SystemBuilder::from_yaml(&args.config) {
-        Ok(builder) => {
-            info!("成功載入配置檔案: {}", args.config);
-            // 顯示關鍵引擎配置（包含 stale_us）便於核對
-            let mut cfg = builder.config().clone();
-            let (runtime_config_hash, risk_policy_hash) = deployment_hashes(&cfg)?;
-            if args.deployment_hashes_only {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "runtime_config_hash": runtime_config_hash,
-                        "risk_policy_hash": risk_policy_hash,
-                    }))?
-                );
-                return Ok(());
-            }
-            if let Some(request) =
-                apply_deployment_if_present(&args, &mut cfg, runtime_config_hash, risk_policy_hash)?
-            {
-                info!(
-                    deployment_id = request.deployment_id,
-                    mode = ?request.mode,
-                    "verified deployment applied to runtime startup config"
-                );
-            }
-            info!(
-                queue_capacity = cfg.engine.queue_capacity,
-                stale_us = cfg.engine.stale_us,
-                top_n = cfg.engine.top_n,
-                "Engine 配置已載入"
-            );
-            let builder = SystemBuilder::new(cfg);
-            // 檢查分片配置並應用
-            let builder_with_sharding = if let (Some(shard_index), Some(shard_count)) =
-                (args.shard_index, args.shard_count)
-            {
-                info!(
-                    "配置靜態分片: {}/{} (策略: {})",
-                    shard_index + 1,
-                    shard_count,
-                    args.shard_strategy
-                );
-                let strategy = ShardStrategy::from(args.shard_strategy.as_str());
-                let shard_config = ShardConfig::new(shard_index, shard_count, strategy);
-                builder.with_sharding(shard_config)
-            } else if args.shard_index.is_some() || args.shard_count.is_some() {
-                warn!("分片配置不完整，需要同時指定 --shard-index 和 --shard-count，忽略分片配置");
-                builder
-            } else {
-                info!("未配置分片，將處理所有符號");
-                builder
-            };
-
-            builder_with_sharding.auto_register_adapters().build()
-        }
-        Err(e) => {
-            if args.deployment_hashes_only || args.deployment_envelope.is_some() {
-                return Err(anyhow::anyhow!(
-                    "deployment intake requires the configured runtime file: {e}"
-                )
-                .into());
-            }
-            warn!("無法載入配置檔案: {}, 使用預設配置", e);
-            // 構造一個合理的預設配置，確保行情與策略可運行
-            // 注意：提高 stale_us 以避免本機/容器延遲造成事件被丟棄
-            let engine = SystemEngineConfig {
-                queue_capacity: 32768,
-                stale_us: 500_000,
-                top_n: 10,
-                flip_policy: engine::dataflow::FlipPolicy::OnTimer(100_000),
-                cpu_affinity: runtime::system_builder::CpuAffinityConfig::default(),
-                ack_timeout_ms: 3000,
-                reconcile_interval_ms: 5000,
-                balance_reconcile_tolerance_usd: rust_decimal::Decimal::ONE,
-                auto_cancel_exchange_only: false,
-                execution_queue: ExecutionQueueSettings::default(),
-            };
-            let venues = vec![
-                RtVenueConfig {
-                    name: "bitget".to_string(),
-                    account_id: Some("bitget_default".to_string()),
-                    venue_type: VenueType::Bitget,
-                    ws_public: Some("wss://ws.bitget.com/v2/ws/public".to_string()),
-                    ws_private: Some("wss://ws.bitget.com/v2/ws/private".to_string()),
-                    rest: Some("https://api.bitget.com".to_string()),
-                    api_key: std::env::var("BITGET_API_KEY").ok(),
-                    secret: std::env::var("BITGET_SECRET").ok(),
-                    passphrase: std::env::var("BITGET_PASSPHRASE").ok(),
-                    execution_mode: Some("Paper".to_string()),
-                    capabilities: VenueCapabilities::default(),
-                    inst_type: None,
-                    simulate_execution: false,
-                    symbol_catalog: Vec::new(),
-                    data_config: None,
-                    execution_config: None,
-                    secret_ref_api_key: None,
-                    secret_ref_secret: None,
-                    secret_ref_passphrase: None,
-                },
-                RtVenueConfig {
-                    name: "binance".to_string(),
-                    account_id: Some("binance_default".to_string()),
-                    venue_type: VenueType::Binance,
-                    ws_public: Some("wss://stream.binance.com:9443/ws".to_string()),
-                    ws_private: Some("wss://stream.binance.com:9443/ws".to_string()),
-                    rest: Some("https://api.binance.com".to_string()),
-                    api_key: std::env::var("BINANCE_API_KEY").ok(),
-                    secret: std::env::var("BINANCE_SECRET").ok(),
-                    passphrase: None,
-                    execution_mode: Some("Paper".to_string()),
-                    capabilities: VenueCapabilities::default(),
-                    inst_type: None,
-                    simulate_execution: false,
-                    symbol_catalog: Vec::new(),
-                    data_config: None,
-                    execution_config: None,
-                    secret_ref_api_key: None,
-                    secret_ref_secret: None,
-                    secret_ref_passphrase: None,
-                },
-            ];
-
-            let mk_imb = |sym: &str| RtStrategyConfig {
-                name: format!("imbalance_{}", sym),
-                strategy_type: RtStrategyType::Imbalance,
-                symbols: vec![hft_core::Symbol::new(sym)],
-                params: RtStrategyParams::Imbalance {
-                    obi_threshold: 0.2,
-                    lot: rust_decimal::Decimal::try_from(0.01).unwrap(),
-                    top_levels: 5,
-                },
-                risk_limits: RtStrategyRiskLimits {
-                    max_notional: rust_decimal::Decimal::from(15000),
-                    max_position: rust_decimal::Decimal::from(3),
-                    daily_loss_limit: rust_decimal::Decimal::from(800),
-                    cooldown_ms: 1000,
-                },
-            };
-
-            let strategies = vec![mk_imb("ETHUSDT"), mk_imb("SOLUSDT"), mk_imb("SUIUSDT")];
-            let risk = RtRiskConfig {
-                risk_type: "Default".to_string(),
-                global_position_limit: rust_decimal::Decimal::from(1_000_000),
-                global_notional_limit: rust_decimal::Decimal::from(10_000_000),
-                max_daily_trades: 10000,
-                max_orders_per_second: 100,
-                staleness_threshold_us: 5000,
-                max_daily_loss: rust_decimal::Decimal::from(10000),
-                max_drawdown_pct: 5.0,
-                enhanced: None,
-                strategy_overrides: Default::default(),
-                tokenized_securities: Default::default(),
-            };
-
-            let cfg = SystemConfig {
-                engine,
-                venues,
-                strategies,
-                risk,
-                quotes_only: false,
-                router: None,
-                infra: Some(runtime::system_builder::InfraConfig {
-                    redis: Some(runtime::system_builder::RedisConfig {
-                        url: "redis://127.0.0.1:6379".to_string(),
-                    }),
-                    clickhouse: Some(runtime::system_builder::ClickHouseConfig {
-                        url: "http://localhost:8123".to_string(),
-                        database: Some("hft".to_string()),
-                    }),
-                }),
-                strategy_accounts: std::collections::HashMap::new(),
-                accounts: Vec::new(),
-                portfolios: Vec::new(),
-            };
-
-            let builder = SystemBuilder::new(cfg).auto_register_adapters();
-            {
-                // 顯示最終使用的引擎配置
-                let cfg = builder.config().clone();
-                info!(
-                    queue_capacity = cfg.engine.queue_capacity,
-                    stale_us = cfg.engine.stale_us,
-                    top_n = cfg.engine.top_n,
-                    "Engine 配置(預設)"
-                );
-            }
-            builder.build()
-        }
+    let builder = SystemBuilder::from_yaml(&args.config)
+        .map_err(|error| anyhow::anyhow!("runtime configuration is required: {error}"))?;
+    info!("成功載入配置檔案: {}", args.config);
+    let mut cfg = builder.config().clone();
+    let (runtime_config_hash, risk_policy_hash) = deployment_hashes(&cfg)?;
+    if args.deployment_hashes_only {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "runtime_config_hash": runtime_config_hash,
+                "risk_policy_hash": risk_policy_hash,
+            }))?
+        );
+        return Ok(());
+    }
+    let activation =
+        apply_deployment_if_present(&args, &mut cfg, runtime_config_hash, risk_policy_hash)?;
+    if let Some(request) = &activation {
+        info!(
+            deployment_id = request.deployment_id,
+            mode = ?request.mode,
+            "verified deployment applied to runtime startup config"
+        );
+    }
+    validate_startup_authority(&cfg, activation.is_some())?;
+    info!(
+        queue_capacity = cfg.engine.queue_capacity,
+        stale_us = cfg.engine.stale_us,
+        top_n = cfg.engine.top_n,
+        "Engine 配置已載入"
+    );
+    let builder = SystemBuilder::new(cfg);
+    let builder = if let (Some(shard_index), Some(shard_count)) =
+        (args.shard_index, args.shard_count)
+    {
+        let strategy = ShardStrategy::from(args.shard_strategy.as_str());
+        builder.with_sharding(ShardConfig::new(shard_index, shard_count, strategy))
+    } else if args.shard_index.is_some() || args.shard_count.is_some() {
+        return Err(
+            anyhow::anyhow!("--shard-index and --shard-count must be supplied together").into(),
+        );
+    } else {
+        builder
     };
+    let mut system = builder.auto_register_adapters_strict()?.build();
 
     // 啟動系統
     system.start().await?;
+    if let Some(request) = &activation {
+        if let Err(error) = append_activation_feedback(&args, request) {
+            let _ = system.execution_control_handle().emergency_stop(true).await;
+            let _ = system.stop().await;
+            return Err(error.into());
+        }
+    }
 
     info!("系統正在運行...");
 
@@ -363,19 +196,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // 啟動推理 worker（可選）
-    let _inference_handle = if args.ml_enable {
-        Some(helpers::spawn_inference_worker(
-            system.engine.clone(),
-            args.ml_model.clone(),
-            args.ml_k,
-            args.ml_l,
-            args.ml_step_ms,
-        ))
-    } else {
-        None
-    };
-
     // 啟動 metrics HTTP 服務器（如果啟用 metrics feature）
     #[cfg(feature = "metrics")]
     let _metrics_handle = helpers::spawn_metrics_server(system.engine.clone(), args.metrics_port);
@@ -384,9 +204,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "grpc")]
     let _grpc_handle =
         helpers::spawn_grpc_server(system.execution_control_handle(), args.grpc_port);
-
-    // 可選：dry-run 下單驗證
-    helpers::run_dry_run_if_enabled(&system, args.dry_run_order, &args.dry_run_symbol).await;
 
     // 保持運行直到收到停止信號或到達自動退出時間
     if let Some(ms) = args.exit_after_ms {
@@ -417,6 +234,16 @@ fn deployment_hashes(config: &SystemConfig) -> anyhow::Result<(String, String)> 
     ))
 }
 
+fn validate_startup_authority(
+    config: &SystemConfig,
+    has_signed_activation: bool,
+) -> anyhow::Result<()> {
+    if !has_signed_activation && (!config.quotes_only || !config.strategies.is_empty()) {
+        anyhow::bail!("execution-capable hft-live startup requires a signed deployment envelope");
+    }
+    Ok(())
+}
+
 fn apply_deployment_if_present(
     args: &Args,
     config: &mut SystemConfig,
@@ -426,20 +253,22 @@ fn apply_deployment_if_present(
     let Some(envelope_path) = args.deployment_envelope.as_ref() else {
         return Ok(None);
     };
+    let bundle_path = required_path(&args.strategy_bundle, "--strategy-bundle")?;
     let policy_path = required_path(&args.deployment_policy, "--deployment-policy")?;
     let trusted_keys_path =
         required_path(&args.deployment_trusted_keys, "--deployment-trusted-keys")?;
     let nonce_path = required_path(&args.deployment_nonce_ledger, "--deployment-nonce-ledger")?;
     let audit_path = required_path(&args.deployment_audit_log, "--deployment-audit-log")?;
     let feedback_path = required_path(&args.deployment_feedback_log, "--deployment-feedback-log")?;
-
+    RuntimeFeedbackLog::open(feedback_path)?;
     let signed: SignedDeploymentEnvelope = read_json(envelope_path)?;
+    let bundle: StrategyBundle = read_json(bundle_path)?;
     let policy_document: RuntimePolicyDocument = read_json(policy_path)?;
     let trusted_keys = decode_trusted_keys(read_json(trusted_keys_path)?)?;
     let policy = policy_document.bind(runtime_config_hash, risk_policy_hash);
     let mut ledger = RuntimeNonceLedger::open(nonce_path)?;
     let mut audit = RuntimeAuditLog::open(audit_path)?;
-    let mut adapter = SystemConfigActivationAdapter::new(config);
+    let mut adapter = SystemConfigActivationAdapter::new(config, &bundle, bundle_path);
     let observed_at = chrono::Utc::now();
     let request = DeploymentIntake::new(
         &trusted_keys,
@@ -450,6 +279,12 @@ fn apply_deployment_if_present(
         &mut adapter,
     )
     .accept(&signed, observed_at)?;
+    Ok(Some(request))
+}
+
+fn append_activation_feedback(args: &Args, request: &ActivationRequest) -> anyhow::Result<()> {
+    let feedback_path = required_path(&args.deployment_feedback_log, "--deployment-feedback-log")?;
+    let observed_at = chrono::Utc::now();
     RuntimeFeedbackLog::open(feedback_path)?.append(&RuntimeAttributionEvent {
         event_id: format!("activation:{}", request.deployment_id),
         deployment_id: request.deployment_id.clone(),
@@ -465,7 +300,7 @@ fn apply_deployment_if_present(
         reason: None,
         observed_at,
     })?;
-    Ok(Some(request))
+    Ok(())
 }
 
 fn required_path<'a>(
@@ -518,3 +353,23 @@ fn show_available_adapters() {
 }
 
 // Legacy config structs removed - now using SystemBuilder from YAML directly
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_live_startup_is_limited_to_empty_quotes_only_config() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/prod/system.yaml");
+        let mut config = SystemBuilder::from_yaml(path.to_str().unwrap())
+            .unwrap()
+            .config()
+            .clone();
+        assert!(validate_startup_authority(&config, false).is_ok());
+
+        config.quotes_only = false;
+        assert!(validate_startup_authority(&config, false).is_err());
+        assert!(validate_startup_authority(&config, true).is_ok());
+    }
+}

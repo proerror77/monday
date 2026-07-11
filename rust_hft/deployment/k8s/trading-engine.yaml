@@ -72,6 +72,8 @@ spec:
         - /app/config/system.yaml
         - --deployment-envelope
         - /app/deployment/envelope.json
+        - --strategy-bundle
+        - /app/deployment/bundle.json
         - --deployment-policy
         - /app/deployment/policy.json
         - --deployment-trusted-keys
@@ -183,6 +185,8 @@ spec:
               items:
               - key: envelope.json
                 path: envelope.json
+              - key: bundle.json
+                path: bundle.json
           - configMap:
               name: runtime-deployment-authority
               items:

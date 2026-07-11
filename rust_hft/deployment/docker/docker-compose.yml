@@ -112,6 +112,8 @@ services:
       - /app/config/prod/system.yaml
       - --deployment-envelope
       - /app/deployment/envelope.json
+      - --strategy-bundle
+      - /app/deployment/bundle.json
       - --deployment-policy
       - /app/deployment/policy.json
       - --deployment-trusted-keys

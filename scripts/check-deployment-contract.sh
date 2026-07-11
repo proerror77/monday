@@ -47,6 +47,7 @@ require_text "$k8s" 'path: /readiness'
 reject_text "$k8s" 'path: /ready'
 for flag in \
   --deployment-envelope \
+  --strategy-bundle \
   --deployment-policy \
   --deployment-trusted-keys \
   --deployment-nonce-ledger \
@@ -56,6 +57,7 @@ for flag in \
 done
 for path in \
   /app/deployment/envelope.json \
+  /app/deployment/bundle.json \
   /app/deployment/policy.json \
   /app/deployment/trusted-keys.json \
   /app/state/nonces.jsonl \
@@ -76,6 +78,7 @@ require_text rust_hft/deployment/scripts/deploy.sh 'kubectl apply -f "$K8S_DIR/c
 require_text rust_hft/deployment/scripts/deploy.sh 'HFT_K8S_DEPLOYMENT_ENVELOPE_FILE'
 require_text rust_hft/deployment/scripts/deploy.sh 'HFT_K8S_DEPLOYMENT_AUTHORITY_FILE'
 require_text rust_hft/deployment/scripts/deploy.sh 'require_configmap_key alpha-deployment-envelope envelope.json'
+require_text rust_hft/deployment/scripts/deploy.sh 'require_configmap_key alpha-deployment-envelope bundle.json'
 require_text rust_hft/deployment/scripts/deploy.sh 'require_secret_key hft-secrets grpc-auth-token'
 reject_text rust_hft/deployment/scripts/deploy.sh 'envsubst < "$K8S_DIR/configmaps.yaml"'
 

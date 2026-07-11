@@ -119,20 +119,10 @@ impl HftControl for HftControlService {
 
     /// 恢復交易
     async fn resume_trading(&self, _request: Request<Empty>) -> Result<Response<Ack>, Status> {
-        info!("收到恢復交易請求");
-
-        self.execution_control
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("execution worker control is not configured"))?
-            .resume_trading()
-            .await
-            .map_err(|error| Status::failed_precondition(error.to_string()))?;
-
-        Ok(Response::new(Ack {
-            ok: true,
-            message: "交易已恢復".to_string(),
-            timestamp_us: Self::now_us(),
-        }))
+        warn!("rejected direct resume; runtime activation requires a signed deployment");
+        Err(Status::permission_denied(
+            "direct resume is disabled; deploy a signed envelope and restart",
+        ))
     }
 
     /// 進入降頻模式
@@ -319,39 +309,12 @@ impl HftControl for HftControlService {
     /// 更新風控參數
     async fn update_risk_config(
         &self,
-        request: Request<RiskConfigUpdate>,
+        _request: Request<RiskConfigUpdate>,
     ) -> Result<Response<Ack>, Status> {
-        let req = request.into_inner();
-        info!("收到風控參數更新請求: {:?}", req);
-
-        // 轉換 proto RiskConfigUpdate 到 ports RiskConfigUpdate
-        let update = ports::RiskConfigUpdate {
-            max_drawdown_pct: req.max_drawdown_pct,
-            max_position_usd: req.max_position_usd,
-            max_order_size_usd: req.max_order_size_usd,
-            latency_threshold_us: req.latency_threshold_us,
-            max_orders_per_second: req.max_orders_per_second,
-        };
-
-        let mut engine = self.engine.lock().await;
-        match engine.update_risk_config(update) {
-            Ok(()) => {
-                info!("風控參數更新成功");
-                Ok(Response::new(Ack {
-                    ok: true,
-                    message: "風控參數已更新".to_string(),
-                    timestamp_us: Self::now_us(),
-                }))
-            }
-            Err(e) => {
-                error!("風控參數更新失敗: {}", e);
-                Ok(Response::new(Ack {
-                    ok: false,
-                    message: format!("風控參數更新失敗: {}", e),
-                    timestamp_us: Self::now_us(),
-                }))
-            }
-        }
+        warn!("rejected direct risk mutation; runtime limits are deployment-bound");
+        Err(Status::permission_denied(
+            "direct risk mutation is disabled; deploy a signed envelope and restart",
+        ))
     }
 
     /// 取消所有訂單
@@ -508,6 +471,25 @@ mod tests {
 
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
         assert!(error.message().contains("StrategyBundle"));
+    }
+
+    #[tokio::test]
+    async fn direct_resume_and_risk_mutation_are_explicitly_disabled() {
+        let engine = Arc::new(Mutex::new(Engine::new(engine::EngineConfig::default())));
+        let control = ExecutionControlHandle::new(engine, None, false);
+        let service = HftControlService::with_execution_control(control);
+
+        let resume_error = service
+            .resume_trading(Request::new(Empty {}))
+            .await
+            .expect_err("direct resume must be denied");
+        assert_eq!(resume_error.code(), tonic::Code::PermissionDenied);
+
+        let risk_error = service
+            .update_risk_config(Request::new(RiskConfigUpdate::default()))
+            .await
+            .expect_err("direct risk mutation must be denied");
+        assert_eq!(risk_error.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]

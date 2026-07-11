@@ -1,0 +1,16 @@
+[package]
+name = "hft-strategy-formula"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Deterministic live strategy for canonical factor formulas"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+hft-factor-dsl = { path = "../../../research-core/factor-dsl" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+rust_decimal = { workspace = true }
+thiserror = { workspace = true }
+
+[lib]
+name = "strategy_formula"

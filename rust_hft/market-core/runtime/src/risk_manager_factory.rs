@@ -60,7 +60,7 @@ impl RiskManagerFactory {
             _ => {
                 // Default risk manager
                 let risk_config = RiskConfig {
-                    max_position_per_symbol: Quantity::from_f64(100.0).unwrap(),
+                    max_position_per_symbol: Quantity(system_risk_config.global_position_limit),
                     max_global_notional: system_risk_config.global_notional_limit,
                     max_orders_per_second: system_risk_config.max_orders_per_second,
                     order_cooldown_ms: 100,
