@@ -2,7 +2,7 @@
 # HFT 系統部署腳本
 # 用於構建和部署所有服務
 
-set -e
+set -euo pipefail
 
 # 顏色輸出
 RED='\033[0;31m'
@@ -16,6 +16,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DOCKER_DIR="$PROJECT_ROOT/deployment/docker"
 K8S_DIR="$PROJECT_ROOT/deployment/k8s"
 K8S_SECRETS_FILE="${HFT_K8S_SECRETS_FILE:-}"
+K8S_DEPLOYMENT_ENVELOPE_FILE="${HFT_K8S_DEPLOYMENT_ENVELOPE_FILE:-}"
+K8S_DEPLOYMENT_AUTHORITY_FILE="${HFT_K8S_DEPLOYMENT_AUTHORITY_FILE:-}"
 
 # 默認值
 REGISTRY="${ECR_REGISTRY:-localhost:5000}"
@@ -26,6 +28,24 @@ NAMESPACE="hft-trading"
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+require_external_manifest() {
+    local variable_name="$1"
+    local path="$2"
+    if [[ -z "$path" || ! -f "$path" ]]; then
+        log_error "$variable_name must point to an external Kubernetes manifest"
+        exit 1
+    fi
+}
+
+require_configmap_key() {
+    local name="$1"
+    local key="$2"
+    if [[ -z "$(kubectl -n "$NAMESPACE" get configmap "$name" -o "jsonpath={.data['$key']}" 2>/dev/null)" ]]; then
+        log_error "ConfigMap $name is missing required key $key"
+        exit 1
+    fi
+}
 
 # 函數: 構建 Docker 鏡像
 build_images() {
@@ -80,10 +100,9 @@ deploy_k8s() {
         exit 1
     fi
 
-    if [[ -z "$K8S_SECRETS_FILE" || ! -f "$K8S_SECRETS_FILE" ]]; then
-        log_error "HFT_K8S_SECRETS_FILE must point to an external Kubernetes Secret manifest"
-        exit 1
-    fi
+    require_external_manifest HFT_K8S_SECRETS_FILE "$K8S_SECRETS_FILE"
+    require_external_manifest HFT_K8S_DEPLOYMENT_ENVELOPE_FILE "$K8S_DEPLOYMENT_ENVELOPE_FILE"
+    require_external_manifest HFT_K8S_DEPLOYMENT_AUTHORITY_FILE "$K8S_DEPLOYMENT_AUTHORITY_FILE"
 
     # 替換環境變數
     export ECR_REGISTRY="$REGISTRY"
@@ -99,15 +118,22 @@ deploy_k8s() {
     log_info "創建 Secrets..."
     envsubst < "$K8S_SECRETS_FILE" | kubectl apply -f -
 
+    log_info "創建部署授權 ConfigMaps..."
+    kubectl apply -f "$K8S_DEPLOYMENT_ENVELOPE_FILE"
+    kubectl apply -f "$K8S_DEPLOYMENT_AUTHORITY_FILE"
+    require_configmap_key alpha-deployment-envelope envelope.json
+    require_configmap_key runtime-deployment-authority policy.json
+    require_configmap_key runtime-deployment-authority trusted-keys.json
+
     log_info "部署基礎設施..."
     envsubst '${AWS_ACCOUNT_ID}' < "$K8S_DIR/infrastructure.yaml" | kubectl apply -f -
 
     # 等待基礎設施就緒
     log_info "等待 Redis 就緒..."
-    kubectl -n $NAMESPACE rollout status statefulset/redis --timeout=120s
+    kubectl -n "$NAMESPACE" rollout status statefulset/redis --timeout=120s
 
     log_info "等待 ClickHouse 就緒..."
-    kubectl -n $NAMESPACE rollout status statefulset/clickhouse --timeout=180s
+    kubectl -n "$NAMESPACE" rollout status statefulset/clickhouse --timeout=180s
 
     log_info "部署 Sentinel..."
     envsubst '${ECR_REGISTRY} ${IMAGE_TAG}' < "$K8S_DIR/sentinel.yaml" | kubectl apply -f -
@@ -117,6 +143,7 @@ deploy_k8s() {
 
     log_info "部署 Trading Engine..."
     envsubst '${ECR_REGISTRY} ${IMAGE_TAG}' < "$K8S_DIR/trading-engine.yaml" | kubectl apply -f -
+    kubectl -n "$NAMESPACE" rollout status deployment/trading-engine --timeout=180s
 
     log_info "Kubernetes 部署完成!"
 }
@@ -153,15 +180,15 @@ status() {
 
     echo ""
     echo "=== Pods ==="
-    kubectl -n $NAMESPACE get pods -o wide 2>/dev/null || log_warn "無法獲取 Pods"
+    kubectl -n "$NAMESPACE" get pods -o wide 2>/dev/null || log_warn "無法獲取 Pods"
 
     echo ""
     echo "=== Services ==="
-    kubectl -n $NAMESPACE get svc 2>/dev/null || log_warn "無法獲取 Services"
+    kubectl -n "$NAMESPACE" get svc 2>/dev/null || log_warn "無法獲取 Services"
 
     echo ""
     echo "=== Deployments ==="
-    kubectl -n $NAMESPACE get deployments 2>/dev/null || log_warn "無法獲取 Deployments"
+    kubectl -n "$NAMESPACE" get deployments 2>/dev/null || log_warn "無法獲取 Deployments"
 }
 
 # 函數: 顯示日誌
@@ -170,7 +197,7 @@ logs() {
     log_info "顯示 $service 日誌..."
 
     if command -v kubectl &> /dev/null; then
-        kubectl -n $NAMESPACE logs -f -l app=$service --tail=100
+        kubectl -n "$NAMESPACE" logs -f -l "app=$service" --tail=100
     else
         docker logs -f "hft-$service" 2>/dev/null || log_error "容器不存在"
     fi
@@ -195,6 +222,9 @@ usage() {
     echo "環境變數:"
     echo "  ECR_REGISTRY  容器 Registry 地址 (默認: localhost:5000)"
     echo "  IMAGE_TAG     鏡像標籤 (默認: latest)"
+    echo "  HFT_K8S_SECRETS_FILE                外部 Secret manifest"
+    echo "  HFT_K8S_DEPLOYMENT_ENVELOPE_FILE    外部簽名 envelope ConfigMap manifest"
+    echo "  HFT_K8S_DEPLOYMENT_AUTHORITY_FILE   外部 policy/trusted-keys ConfigMap manifest"
     echo ""
     echo "範例:"
     echo "  $0 build"

@@ -528,11 +528,7 @@ impl SystemBuilder {
 
         self = self.register_market_streams_from_config();
         // Quotes-only 模式：YAML `quotes_only: true` 或環境變量 HFT_QUOTES_ONLY=1
-        let quotes_only_env = match std::env::var("HFT_QUOTES_ONLY") {
-            Ok(val) => matches!(val.as_str(), "1" | "true" | "TRUE"),
-            Err(_) => false,
-        };
-        let quotes_only = self.config.quotes_only || quotes_only_env;
+        let quotes_only = quotes_only_enabled(&self.config);
         if quotes_only {
             info!("已啟用 quotes-only（僅行情，不註冊執行客戶端）");
         } else {
@@ -699,6 +695,13 @@ pub struct SystemRuntime {
     portfolio_manager: Option<PortfolioManager>,
     // 🔥 修復資源洩漏：保存 AdapterBridge 以便優雅關閉
     adapter_bridge: Option<engine::AdapterBridge>,
+}
+
+fn quotes_only_enabled(config: &SystemConfig) -> bool {
+    let quotes_only_env = std::env::var("HFT_QUOTES_ONLY")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false);
+    config.quotes_only || quotes_only_env
 }
 
 impl SystemRuntime {
@@ -873,10 +876,7 @@ impl SystemRuntime {
         self.adapter_bridge = Some(bridge);
 
         // 2) (可選) 設置執行队列並啟動执行 worker
-        let quotes_only = match std::env::var("HFT_QUOTES_ONLY") {
-            Ok(val) => matches!(val.as_str(), "1" | "true" | "TRUE"),
-            Err(_) => false,
-        };
+        let quotes_only = quotes_only_enabled(&self.config);
 
         if quotes_only {
             info!("Quotes-only 模式：跳過執行隊列與 ExecutionWorker 啟動");
@@ -1830,5 +1830,19 @@ default_symbols:
 
         assert!(venue_ref_only.secret_ref_api_key.is_some());
         assert!(venue_ref_only.api_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn quotes_only_config_does_not_start_execution_workers() {
+        let config = SystemConfig {
+            quotes_only: true,
+            ..SystemConfig::default()
+        };
+        let mut runtime = SystemBuilder::new(config).build();
+
+        runtime.start().await.expect("quotes-only runtime starts");
+        assert!(runtime.execution_worker_tasks.is_empty());
+        assert!(runtime.exec_control_txs.is_empty());
+        runtime.stop().await.expect("quotes-only runtime stops");
     }
 }

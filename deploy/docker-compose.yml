@@ -151,7 +151,7 @@ services:
       CLICKHOUSE_URL: http://clickhouse:8123
       MODEL_DIR: /models
     ports:
-      - "9090:9090"
+      - "19090:9090"
     depends_on:
       clickhouse:
         condition: service_healthy

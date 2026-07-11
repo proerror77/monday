@@ -35,7 +35,9 @@ done
 
 require_text deploy/Dockerfile.hft 'curl'
 require_text deploy/Dockerfile.hft 'http://localhost:9090/readiness'
-require_text deploy/docker-compose.yml '9090:9090'
+require_text deploy/docker-compose.yml '19090:9090'
+require_text deploy/prometheus/prometheus.yml 'trader:9090'
+reject_text deploy/prometheus/prometheus.yml 'trader:8080'
 reject_text deploy/docker-compose.yml 'command: ["hft-live"'
 reject_text deploy/docker-compose.yml 'command: ["hft-paper"'
 
@@ -61,11 +63,38 @@ for path in \
   require_text "$k8s" "$path"
 done
 require_text "$k8s" 'claimName: runtime-state-pvc'
+require_text "$k8s" 'prometheus.io/port: "9090"'
+reject_text "$k8s" 'containerPort: 9091'
 require_text rust_hft/deployment/k8s/configmaps.yaml 'system.yaml: |'
 require_text rust_hft/deployment/k8s/configmaps.yaml 'quotes_only: true'
 require_text rust_hft/deployment/k8s/configmaps.yaml 'simulate_execution: true'
 reject_text "$k8s" 'BITGET_API_SECRET'
 require_text rust_hft/deployment/scripts/deploy.sh 'kubectl apply -f "$K8S_DIR/configmaps.yaml"'
+require_text rust_hft/deployment/scripts/deploy.sh 'HFT_K8S_DEPLOYMENT_ENVELOPE_FILE'
+require_text rust_hft/deployment/scripts/deploy.sh 'HFT_K8S_DEPLOYMENT_AUTHORITY_FILE'
+require_text rust_hft/deployment/scripts/deploy.sh 'require_configmap_key alpha-deployment-envelope envelope.json'
 reject_text rust_hft/deployment/scripts/deploy.sh 'envsubst < "$K8S_DIR/configmaps.yaml"'
+
+check_unique_host_ports() {
+  local compose_file="$1"
+  local duplicates
+  duplicates="$({
+    GRAFANA_ADMIN_PASSWORD=CHANGE_ME_CONTRACT_ONLY \
+      HFT_DEPLOYMENT_DIR=/tmp/hft-deployment \
+      HFT_RUNTIME_STATE_DIR=/tmp/hft-state \
+      docker compose -f "$compose_file" config --format json
+  } | jq -r '
+    [.services[].ports[]? | select(.published != null) |
+      ((.host_ip // "") + ":" + (.published | tostring))]
+    | group_by(.)[] | select(length > 1) | .[0]
+  ' )"
+  if [[ -n "$duplicates" ]]; then
+    printf 'duplicate published host ports in %s:\n%s\n' "$compose_file" "$duplicates" >&2
+    exit 1
+  fi
+}
+
+check_unique_host_ports deploy/docker-compose.yml
+check_unique_host_ports rust_hft/deployment/docker/docker-compose.yml
 
 printf 'deployment contract check passed\n'

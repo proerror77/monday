@@ -24,15 +24,9 @@ scrape_configs:
   # HFT Trader metrics
   - job_name: 'hft-trader'
     static_configs:
-      - targets: ['trader:8080']
+      - targets: ['trader:9090']
     metrics_path: /metrics
     scrape_interval: 1s  # 高頻採集
-
-  # HFT Collector metrics
-  - job_name: 'hft-collector'
-    static_configs:
-      - targets: ['collector:8080']
-    metrics_path: /metrics
 
   # ClickHouse metrics
   - job_name: 'clickhouse'

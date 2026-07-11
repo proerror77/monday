@@ -23,7 +23,7 @@ spec:
         tier: critical
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "9091"
+        prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
       # 優先級最高
@@ -82,14 +82,14 @@ spec:
         - /app/state/audit.jsonl
         - --deployment-feedback-log
         - /app/state/feedback.jsonl
+        - --metrics-port
+        - "9090"
 
         ports:
-        - name: metrics
-          containerPort: 9091
+        - name: http
+          containerPort: 9090
         - name: grpc
           containerPort: 9092
-        - name: health
-          containerPort: 9090
 
         # 環境變數
         env:
@@ -136,7 +136,7 @@ spec:
         livenessProbe:
           httpGet:
             path: /health
-            port: health
+            port: http
           initialDelaySeconds: 10
           periodSeconds: 10
           timeoutSeconds: 5
@@ -145,7 +145,7 @@ spec:
         readinessProbe:
           httpGet:
             path: /readiness
-            port: health
+            port: http
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 3
@@ -155,7 +155,7 @@ spec:
         startupProbe:
           httpGet:
             path: /health
-            port: health
+            port: http
           initialDelaySeconds: 5
           periodSeconds: 5
           failureThreshold: 30  # 最多 150 秒啟動時間
@@ -204,15 +204,12 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-  - name: metrics
-    port: 9091
-    targetPort: metrics
+  - name: http
+    port: 9090
+    targetPort: http
   - name: grpc
     port: 9092
     targetPort: grpc
-  - name: health
-    port: 9090
-    targetPort: health
   selector:
     app: trading-engine
 
