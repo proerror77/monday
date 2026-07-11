@@ -1021,7 +1021,7 @@ fn convert_strategy_override(ov: infra_ipc::StrategyRiskConfig) -> crate::Strate
 pub fn start_ipc_server(
     runtime: Arc<Mutex<SystemRuntime>>,
     socket_path: Option<String>,
-) -> tokio::task::JoinHandle<Result<(), infra_ipc::IPCError>> {
+) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
     let socket_path = socket_path.unwrap_or_else(|| infra_ipc::DEFAULT_SOCKET_PATH.to_string());
     let handler = SystemCommandHandler::new(runtime);
 
@@ -1044,7 +1044,7 @@ pub fn start_ipc_server(
             }
             Err(e) => {
                 error!("IPC server error: {}", e);
-                Err(e)
+                Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             }
         }
     })

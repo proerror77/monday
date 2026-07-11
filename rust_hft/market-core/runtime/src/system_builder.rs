@@ -685,7 +685,7 @@ pub struct SystemRuntime {
     // 执行 worker 任务
     execution_worker_tasks: Vec<tokio::task::JoinHandle<Result<(), HftError>>>,
     // IPC server is process-owned and requires explicit cancellation on shutdown.
-    ipc_task: Option<tokio::task::JoinHandle<()>>,
+    ipc_task: Option<tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
     // 執行控制通道（撤單等）
     exec_control_tx:
         Option<tokio::sync::mpsc::UnboundedSender<engine::execution_worker::ControlCommand>>,
@@ -1235,15 +1235,7 @@ impl SystemRuntime {
             // 使用 Arc::new(Mutex::new(self)) 來避免創建新實例
             // 但由於 self 的生命週期問題，我們需要重構為使用共享的 runtime_arc
             let runtime_arc = Arc::new(Mutex::new(self.clone_for_ipc()));
-
-            let ipc_handle = crate::ipc_handler::start_ipc_server(runtime_arc, None);
-            self.ipc_task = Some(tokio::spawn(async move {
-                match ipc_handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => tracing::error!(%error, "IPC server failed"),
-                    Err(error) => tracing::error!(%error, "IPC server task failed"),
-                }
-            }));
+            self.ipc_task = Some(crate::ipc_handler::start_ipc_server(runtime_arc, None));
             info!("IPC control server started");
         }
 
@@ -2132,6 +2124,9 @@ default_symbols:
         runtime.start().await.expect("quotes-only runtime starts");
         assert!(runtime.execution_worker_tasks.is_empty());
         assert!(runtime.exec_control_tx.is_none());
+        #[cfg(feature = "infra-ipc")]
+        assert!(runtime.ipc_task.is_some());
         runtime.stop().await.expect("quotes-only runtime stops");
+        assert!(runtime.ipc_task.is_none());
     }
 }
