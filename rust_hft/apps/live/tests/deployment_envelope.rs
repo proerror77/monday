@@ -42,8 +42,8 @@ fn policy() -> RuntimeEnvelopePolicy {
             AllowedIntentType::StartShadow,
             AllowedIntentType::StartLiveSmall,
         ],
-        runtime_config_hash: "runtime-hash".to_string(),
-        risk_policy_hash: "risk-hash".to_string(),
+        runtime_config_hash: "c".repeat(64),
+        risk_policy_hash: "d".repeat(64),
         max_notional: 1_000.0,
         max_symbol_exposure: 500.0,
         max_order_size: 100.0,
@@ -61,9 +61,12 @@ fn envelope(
     DeploymentEnvelope {
         deployment_id: id.to_string(),
         asset_revision_id: "factor-1@3".to_string(),
-        promotion_manifest_hash: "promotion-hash".to_string(),
-        runtime_config_hash: "runtime-hash".to_string(),
-        risk_policy_hash: "risk-hash".to_string(),
+        promotion_id: "promotion-1".to_string(),
+        promotion_manifest_hash: "a".repeat(64),
+        bundle_id: "bundle-1".to_string(),
+        bundle_hash: "b".repeat(64),
+        runtime_config_hash: "c".repeat(64),
+        risk_policy_hash: "d".repeat(64),
         account_id: "account-1".to_string(),
         venue: "binance".to_string(),
         instruments: vec!["BTCUSDT".to_string()],
@@ -243,8 +246,8 @@ fn runtime_rejects_forgery_time_binding_key_and_limit_failures() {
         match mutation {
             0 => changed.account_id = "wrong-account".to_string(),
             1 => changed.venue = "wrong-venue".to_string(),
-            2 => changed.runtime_config_hash = "wrong-runtime".to_string(),
-            3 => changed.risk_policy_hash = "wrong-risk".to_string(),
+            2 => changed.runtime_config_hash = "e".repeat(64),
+            3 => changed.risk_policy_hash = "f".repeat(64),
             _ => changed.max_order_size = policy().max_order_size + 1.0,
         }
         let signed = sign_envelope(changed, "key-1", &key).unwrap();

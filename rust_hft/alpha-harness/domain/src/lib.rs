@@ -19,6 +19,8 @@ pub enum DomainError {
     InvalidMissionTransition,
     #[error("deployment limits must be finite and non-negative")]
     InvalidDeploymentLimit,
+    #[error("deployment hashes must be lowercase SHA-256 values")]
+    InvalidDeploymentHash,
     #[error("deployment validity window is invalid")]
     InvalidValidityWindow,
     #[error("deployment envelope is not valid yet")]
@@ -45,6 +47,14 @@ pub enum DomainError {
     InvalidAttributionMetric,
     #[error("search-policy validator scores must be finite")]
     InvalidPolicyScore,
+    #[error("candidate artifact is research-only and cannot be promoted")]
+    ResearchOnlyArtifact,
+    #[error("strategy bundle is invalid")]
+    InvalidStrategyBundle,
+    #[error("strategy bundle hash does not match its canonical payload")]
+    StrategyBundleHashMismatch,
+    #[error("promotion record does not match its candidate, evidence, or bundle")]
+    PromotionBindingMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,13 +254,240 @@ impl SearchPolicyRevision {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TensorSpec {
+    pub name: String,
+    pub element_type: TensorElementType,
+    pub dimensions: Vec<Option<usize>>,
+}
+
+impl TensorSpec {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text("tensor name", &self.name)?;
+        if self.dimensions.is_empty() || self.dimensions.contains(&Some(0)) {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TensorElementType {
+    Float32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OnnxModelCandidate {
+    pub artifact: ArtifactRef,
+    pub byte_len: u64,
+    pub opset: u32,
+    pub inputs: Vec<TensorSpec>,
+    pub output: TensorSpec,
+}
+
+impl OnnxModelCandidate {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text("onnx artifact uri", &self.artifact.uri)?;
+        if self.artifact.content_type != "application/onnx"
+            || self.byte_len == 0
+            || self.opset == 0
+            || self.inputs.is_empty()
+        {
+            return Err(DomainError::InvalidStrategyBundle);
+        }
+        let checksum = self
+            .artifact
+            .checksum
+            .as_deref()
+            .ok_or(DomainError::InvalidStrategyBundle)?;
+        validate_sha256(checksum)?;
+        self.inputs.iter().try_for_each(TensorSpec::validate)?;
+        self.output.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CandidateArtifact {
     Formula(FactorAst),
+    OnnxModel(OnnxModelCandidate),
     Program(serde_json::Value),
     ModelConfig(serde_json::Value),
     ModelArtifact(ArtifactRef),
     Ensemble(serde_json::Value),
     AllocatorPolicy(serde_json::Value),
+}
+
+impl CandidateArtifact {
+    pub fn to_strategy_bundle_artifact(&self) -> Result<StrategyBundleArtifact, DomainError> {
+        match self {
+            Self::Formula(ast) => {
+                ast.validate()
+                    .map_err(|_| DomainError::InvalidStrategyBundle)?;
+                Ok(StrategyBundleArtifact::Formula { ast: ast.clone() })
+            }
+            Self::OnnxModel(model) => {
+                model.validate()?;
+                Ok(StrategyBundleArtifact::Onnx {
+                    model: model.clone(),
+                })
+            }
+            Self::Program(_)
+            | Self::ModelConfig(_)
+            | Self::ModelArtifact(_)
+            | Self::Ensemble(_)
+            | Self::AllocatorPolicy(_) => Err(DomainError::ResearchOnlyArtifact),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum StrategyBundleArtifact {
+    Formula { ast: FactorAst },
+    Onnx { model: OnnxModelCandidate },
+}
+
+impl StrategyBundleArtifact {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        match self {
+            Self::Formula { ast } => ast
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
+            Self::Onnx { model } => model.validate(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StrategyBundle {
+    pub bundle_id: String,
+    pub candidate_id: String,
+    pub candidate_content_hash: String,
+    pub dataset_manifest_id: ManifestId,
+    pub evaluator_version: String,
+    pub sealed_evaluation_hash: String,
+    pub artifact: StrategyBundleArtifact,
+    pub bundle_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl StrategyBundle {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        bundle_id: String,
+        candidate_id: String,
+        candidate_content_hash: String,
+        dataset_manifest_id: ManifestId,
+        evaluator_version: String,
+        sealed_evaluation_hash: String,
+        artifact: StrategyBundleArtifact,
+        created_at: DateTime<Utc>,
+    ) -> Result<Self, DomainError> {
+        let mut bundle = Self {
+            bundle_id,
+            candidate_id,
+            candidate_content_hash,
+            dataset_manifest_id,
+            evaluator_version,
+            sealed_evaluation_hash,
+            artifact,
+            bundle_hash: String::new(),
+            created_at,
+        };
+        bundle.validate_fields()?;
+        bundle.bundle_hash = bundle.calculated_hash()?;
+        Ok(bundle)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.validate_fields()?;
+        validate_sha256(&self.bundle_hash)?;
+        if self.bundle_hash != self.calculated_hash()? {
+            return Err(DomainError::StrategyBundleHashMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_fields(&self) -> Result<(), DomainError> {
+        require_text("bundle_id", &self.bundle_id)?;
+        require_text("bundle candidate_id", &self.candidate_id)?;
+        require_text("evaluator_version", &self.evaluator_version)?;
+        validate_sha256(&self.candidate_content_hash)?;
+        validate_sha256(&self.sealed_evaluation_hash)?;
+        self.dataset_manifest_id
+            .validate()
+            .map_err(|_| DomainError::InvalidStrategyBundle)?;
+        self.artifact.validate()
+    }
+
+    pub fn calculated_hash(&self) -> Result<String, DomainError> {
+        #[derive(Serialize)]
+        struct SignableBundle<'a> {
+            bundle_id: &'a str,
+            candidate_id: &'a str,
+            candidate_content_hash: &'a str,
+            dataset_manifest_id: &'a ManifestId,
+            evaluator_version: &'a str,
+            sealed_evaluation_hash: &'a str,
+            artifact: &'a StrategyBundleArtifact,
+            created_at: DateTime<Utc>,
+        }
+        canonical_json_hash(&SignableBundle {
+            bundle_id: &self.bundle_id,
+            candidate_id: &self.candidate_id,
+            candidate_content_hash: &self.candidate_content_hash,
+            dataset_manifest_id: &self.dataset_manifest_id,
+            evaluator_version: &self.evaluator_version,
+            sealed_evaluation_hash: &self.sealed_evaluation_hash,
+            artifact: &self.artifact,
+            created_at: self.created_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromotionRecord {
+    pub promotion_id: String,
+    pub mission_id: String,
+    pub candidate_id: String,
+    pub candidate_content_hash: String,
+    pub dataset_manifest_id: ManifestId,
+    pub evaluator_version: String,
+    pub sealed_evaluation_id: String,
+    pub sealed_evaluation_hash: String,
+    pub bundle_id: String,
+    pub bundle_hash: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl PromotionRecord {
+    pub fn validate(&self, bundle: &StrategyBundle) -> Result<(), DomainError> {
+        for (name, value) in [
+            ("promotion_id", self.promotion_id.as_str()),
+            ("promotion mission_id", self.mission_id.as_str()),
+            ("promotion candidate_id", self.candidate_id.as_str()),
+            ("sealed_evaluation_id", self.sealed_evaluation_id.as_str()),
+            ("promotion bundle_id", self.bundle_id.as_str()),
+            (
+                "promotion evaluator_version",
+                self.evaluator_version.as_str(),
+            ),
+        ] {
+            require_text(name, value)?;
+        }
+        validate_sha256(&self.candidate_content_hash)?;
+        validate_sha256(&self.sealed_evaluation_hash)?;
+        validate_sha256(&self.bundle_hash)?;
+        if self.candidate_id != bundle.candidate_id
+            || self.candidate_content_hash != bundle.candidate_content_hash
+            || self.dataset_manifest_id != bundle.dataset_manifest_id
+            || self.evaluator_version != bundle.evaluator_version
+            || self.sealed_evaluation_hash != bundle.sealed_evaluation_hash
+            || self.bundle_id != bundle.bundle_id
+            || self.bundle_hash != bundle.bundle_hash
+        {
+            return Err(DomainError::PromotionBindingMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,7 +551,10 @@ pub enum ApprovalClass {
 pub struct DeploymentEnvelope {
     pub deployment_id: String,
     pub asset_revision_id: String,
+    pub promotion_id: String,
     pub promotion_manifest_hash: String,
+    pub bundle_id: String,
+    pub bundle_hash: String,
     pub runtime_config_hash: String,
     pub risk_policy_hash: String,
     pub account_id: String,
@@ -338,10 +578,13 @@ impl DeploymentEnvelope {
         for (name, value) in [
             ("deployment_id", self.deployment_id.as_str()),
             ("asset_revision_id", self.asset_revision_id.as_str()),
+            ("promotion_id", self.promotion_id.as_str()),
             (
                 "promotion_manifest_hash",
                 self.promotion_manifest_hash.as_str(),
             ),
+            ("bundle_id", self.bundle_id.as_str()),
+            ("bundle_hash", self.bundle_hash.as_str()),
             ("runtime_config_hash", self.runtime_config_hash.as_str()),
             ("risk_policy_hash", self.risk_policy_hash.as_str()),
             ("account_id", self.account_id.as_str()),
@@ -349,6 +592,14 @@ impl DeploymentEnvelope {
             ("nonce", self.nonce.as_str()),
         ] {
             require_text(name, value)?;
+        }
+        for value in [
+            self.promotion_manifest_hash.as_str(),
+            self.bundle_hash.as_str(),
+            self.runtime_config_hash.as_str(),
+            self.risk_policy_hash.as_str(),
+        ] {
+            validate_deployment_hash(value)?;
         }
         if self.instruments.is_empty() || self.instruments.iter().any(|item| item.trim().is_empty())
         {
@@ -488,7 +739,10 @@ pub fn verify_envelope(
 struct SignableEnvelope<'a> {
     deployment_id: &'a str,
     asset_revision_id: &'a str,
+    promotion_id: &'a str,
     promotion_manifest_hash: &'a str,
+    bundle_id: &'a str,
+    bundle_hash: &'a str,
     runtime_config_hash: &'a str,
     risk_policy_hash: &'a str,
     account_id: &'a str,
@@ -510,7 +764,10 @@ fn canonical_payload(envelope: &DeploymentEnvelope) -> Result<Vec<u8>, DomainErr
     serde_json::to_vec(&SignableEnvelope {
         deployment_id: &envelope.deployment_id,
         asset_revision_id: &envelope.asset_revision_id,
+        promotion_id: &envelope.promotion_id,
         promotion_manifest_hash: &envelope.promotion_manifest_hash,
+        bundle_id: &envelope.bundle_id,
+        bundle_hash: &envelope.bundle_hash,
         runtime_config_hash: &envelope.runtime_config_hash,
         risk_policy_hash: &envelope.risk_policy_hash,
         account_id: &envelope.account_id,
@@ -530,6 +787,33 @@ fn canonical_payload(envelope: &DeploymentEnvelope) -> Result<Vec<u8>, DomainErr
     .map_err(|_| DomainError::CanonicalSerialization)
 }
 
+pub fn canonical_json_hash(value: &impl Serialize) -> Result<String, DomainError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| DomainError::CanonicalSerialization)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn validate_sha256(value: &str) -> Result<(), DomainError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(DomainError::InvalidStrategyBundle);
+    }
+    Ok(())
+}
+
+fn validate_deployment_hash(value: &str) -> Result<(), DomainError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(DomainError::InvalidDeploymentHash);
+    }
+    Ok(())
+}
+
 fn require_text(name: &'static str, value: &str) -> Result<(), DomainError> {
     if value.trim().is_empty() {
         return Err(DomainError::EmptyField(name));
@@ -542,6 +826,8 @@ fn validate_runtime_policy(policy: &RuntimeEnvelopePolicy) -> Result<(), DomainE
     require_text("runtime venue", &policy.venue)?;
     require_text("runtime_config_hash", &policy.runtime_config_hash)?;
     require_text("risk_policy_hash", &policy.risk_policy_hash)?;
+    validate_deployment_hash(&policy.runtime_config_hash)?;
+    validate_deployment_hash(&policy.risk_policy_hash)?;
     if policy.allowed_instruments.is_empty()
         || policy
             .allowed_instruments
@@ -574,9 +860,12 @@ mod tests {
         DeploymentEnvelope {
             deployment_id: "deployment-1".to_string(),
             asset_revision_id: "factor-1@3".to_string(),
-            promotion_manifest_hash: "promotion-hash".to_string(),
-            runtime_config_hash: "runtime-hash".to_string(),
-            risk_policy_hash: "risk-hash".to_string(),
+            promotion_id: "promotion-1".to_string(),
+            promotion_manifest_hash: "a".repeat(64),
+            bundle_id: "bundle-1".to_string(),
+            bundle_hash: "b".repeat(64),
+            runtime_config_hash: "c".repeat(64),
+            risk_policy_hash: "d".repeat(64),
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
             instruments: vec!["BTCUSDT".to_string()],
@@ -600,8 +889,8 @@ mod tests {
             venue: "binance".to_string(),
             allowed_instruments: vec!["BTCUSDT".to_string()],
             allowed_intent_types: vec![AllowedIntentType::StartPaper],
-            runtime_config_hash: "runtime-hash".to_string(),
-            risk_policy_hash: "risk-hash".to_string(),
+            runtime_config_hash: "c".repeat(64),
+            risk_policy_hash: "d".repeat(64),
             max_notional: 1_000.0,
             max_symbol_exposure: 500.0,
             max_order_size: 100.0,
@@ -663,6 +952,46 @@ mod tests {
         assert_eq!(
             mission.validate(),
             Err(DomainError::EmptyField("mission_id"))
+        );
+    }
+
+    #[test]
+    fn strategy_bundle_hash_detects_tampering() {
+        let mut bundle = StrategyBundle::new(
+            "bundle-1".to_string(),
+            "candidate-1".to_string(),
+            "a".repeat(64),
+            ManifestId::new("dataset-1").unwrap(),
+            "sealed-holdout-v1".to_string(),
+            "b".repeat(64),
+            StrategyBundleArtifact::Formula {
+                ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                    "signal".to_string(),
+                )),
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(bundle.validate().is_ok());
+
+        bundle.evaluator_version = "forged".to_string();
+        assert_eq!(
+            bundle.validate(),
+            Err(DomainError::StrategyBundleHashMismatch)
+        );
+    }
+
+    #[test]
+    fn opaque_candidate_artifacts_are_research_only() {
+        let artifact = CandidateArtifact::ModelArtifact(ArtifactRef {
+            uri: "artifact://model".to_string(),
+            content_type: "application/onnx".to_string(),
+            checksum: Some("a".repeat(64)),
+        });
+
+        assert_eq!(
+            artifact.to_strategy_bundle_artifact(),
+            Err(DomainError::ResearchOnlyArtifact)
         );
     }
 

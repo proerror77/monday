@@ -1,8 +1,9 @@
 //! Transactional DuckDB source of truth for the Agentic Alpha control plane.
 
 use alpha_domain::{
-    CandidateArtifact, LearningDirective, MissionStatus, ResearchIteration, ResearchMission,
-    RuntimeAttributionEvent, SearchBudgetUsage, SearchPolicyRevision, SignedDeploymentEnvelope,
+    canonical_json_hash, CandidateArtifact, DeploymentEnvelope, LearningDirective, MissionStatus,
+    PromotionRecord, ResearchIteration, ResearchMission, RuntimeAttributionEvent,
+    SearchBudgetUsage, SearchPolicyRevision, SignedDeploymentEnvelope, StrategyBundle,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const MIGRATION_001: &str = include_str!("../migrations/001_control_plane.sql");
+const MIGRATION_002: &str = include_str!("../migrations/002_promotion_bundles.sql");
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -96,7 +98,82 @@ pub struct ApprovalRecord {
     pub approval_class: String,
     pub subject_id: String,
     pub payload: serde_json::Value,
+    #[serde(default)]
+    pub signer_id: Option<String>,
+    #[serde(default)]
+    pub valid_from: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub revoked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub revoked_by: Option<String>,
+    #[serde(default)]
+    pub revocation_reason: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+impl ApprovalRecord {
+    pub fn validate(&self) -> Result<(), StoreError> {
+        require_text(&self.approval_id)?;
+        require_text(&self.approval_class)?;
+        require_text(&self.subject_id)?;
+        let signer = self
+            .signer_id
+            .as_deref()
+            .ok_or_else(|| StoreError::Domain("approval signer_id is required".to_string()))?;
+        require_text(signer)?;
+        let valid_from = self
+            .valid_from
+            .ok_or_else(|| StoreError::Domain("approval valid_from is required".to_string()))?;
+        let expires_at = self
+            .expires_at
+            .ok_or_else(|| StoreError::Domain("approval expires_at is required".to_string()))?;
+        if valid_from >= expires_at || self.created_at > valid_from {
+            return Err(StoreError::Domain(
+                "approval validity window is invalid".to_string(),
+            ));
+        }
+        match self.revoked_at {
+            Some(revoked_at)
+                if revoked_at < self.created_at
+                    || self
+                        .revoked_by
+                        .as_deref()
+                        .is_none_or(|value| value.trim().is_empty())
+                    || self
+                        .revocation_reason
+                        .as_deref()
+                        .is_none_or(|value| value.trim().is_empty()) =>
+            {
+                return Err(StoreError::Domain(
+                    "revoked approval requires a valid time, actor, and reason".to_string(),
+                ));
+            }
+            None if self.revoked_by.is_some() || self.revocation_reason.is_some() => {
+                return Err(StoreError::Domain(
+                    "approval revocation metadata is incomplete".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
+        self.signer_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && self.valid_from.is_some_and(|from| now >= from)
+            && self.expires_at.is_some_and(|until| now < until)
+            && self.revoked_at.is_none_or(|revoked_at| now < revoked_at)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredPromotion {
+    pub record: PromotionRecord,
+    pub content_hash: String,
 }
 
 pub struct AlphaStore {
@@ -140,6 +217,9 @@ impl AlphaStore {
     pub fn migrate(&mut self) -> Result<(), StoreError> {
         self.connection
             .execute_batch(MIGRATION_001)
+            .map_err(database_error)?;
+        self.connection
+            .execute_batch(MIGRATION_002)
             .map_err(database_error)
     }
 
@@ -500,6 +580,183 @@ impl AlphaStore {
         )
     }
 
+    pub fn promote_candidate(
+        &mut self,
+        bundle: &StrategyBundle,
+        promotion: &PromotionRecord,
+    ) -> Result<StoredPromotion, StoreError> {
+        bundle.validate().map_err(domain_error)?;
+        promotion.validate(bundle).map_err(domain_error)?;
+
+        let (candidate_mission_id, candidate_json, candidate_hash) = self
+            .connection
+            .query_row(
+                "SELECT mission_id, payload_json, content_hash FROM candidate_artifacts WHERE candidate_id = ?",
+                params![bundle.candidate_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .map_err(map_query_error)?;
+        verify_hash(&candidate_json, &candidate_hash)?;
+        let candidate_artifact: CandidateArtifact =
+            serde_json::from_str(&candidate_json).map_err(serialization_error)?;
+        let expected_bundle_artifact = candidate_artifact
+            .to_strategy_bundle_artifact()
+            .map_err(domain_error)?;
+        if candidate_mission_id != promotion.mission_id
+            || candidate_hash != bundle.candidate_content_hash
+            || expected_bundle_artifact != bundle.artifact
+        {
+            return Err(StoreError::Domain(
+                "promotion candidate binding does not match stored truth".to_string(),
+            ));
+        }
+        let mission = self.get_mission(&promotion.mission_id)?;
+        if mission.dataset_manifest_id != bundle.dataset_manifest_id {
+            return Err(StoreError::Domain(
+                "promotion dataset does not match mission".to_string(),
+            ));
+        }
+        let sealed = self.get_registry_revision(&promotion.sealed_evaluation_id)?;
+        let sealed_evaluation = sealed
+            .payload
+            .get("evaluation")
+            .ok_or_else(|| StoreError::Domain("sealed evaluation payload is incomplete".into()))?;
+        let stored_candidate_hash = sealed
+            .payload
+            .get("candidate_content_hash")
+            .and_then(serde_json::Value::as_str);
+        let stored_mission_id = sealed
+            .payload
+            .get("mission_id")
+            .and_then(serde_json::Value::as_str);
+        let stored_dataset = sealed
+            .payload
+            .get("dataset_manifest_id")
+            .and_then(serde_json::Value::as_str);
+        let stored_evaluator_version = sealed_evaluation
+            .get("evaluator_version")
+            .and_then(serde_json::Value::as_str);
+        let evaluation_hash = canonical_json_hash(sealed_evaluation).map_err(domain_error)?;
+        if sealed.registry_kind != "sealed_evaluation"
+            || sealed.asset_id != bundle.candidate_id
+            || stored_mission_id != Some(promotion.mission_id.as_str())
+            || stored_candidate_hash != Some(bundle.candidate_content_hash.as_str())
+            || stored_dataset != Some(bundle.dataset_manifest_id.as_str())
+            || stored_evaluator_version != Some(bundle.evaluator_version.as_str())
+            || evaluation_hash != bundle.sealed_evaluation_hash
+        {
+            return Err(StoreError::Domain(
+                "promotion evidence does not match sealed evaluation".to_string(),
+            ));
+        }
+
+        let (bundle_json, bundle_content_hash) = encoded(bundle)?;
+        let (promotion_json, promotion_content_hash) = encoded(promotion)?;
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        ensure_absent(
+            &transaction,
+            "strategy_bundles",
+            "bundle_id",
+            &bundle.bundle_id,
+        )?;
+        ensure_absent(
+            &transaction,
+            "promotions",
+            "promotion_id",
+            &promotion.promotion_id,
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO strategy_bundles VALUES (?, ?, ?, ?, ?)",
+                params![
+                    bundle.bundle_id,
+                    bundle.candidate_id,
+                    bundle_json,
+                    bundle_content_hash,
+                    bundle.created_at.to_rfc3339()
+                ],
+            )
+            .map_err(database_error)?;
+        transaction
+            .execute(
+                "INSERT INTO promotions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    promotion.promotion_id,
+                    promotion.mission_id,
+                    promotion.candidate_id,
+                    promotion.bundle_id,
+                    promotion_json,
+                    promotion_content_hash,
+                    promotion.created_at.to_rfc3339()
+                ],
+            )
+            .map_err(database_error)?;
+        append_journal(
+            &transaction,
+            Some(&promotion.mission_id),
+            "strategy_bundle_added",
+            &bundle.bundle_id,
+            &bundle.bundle_hash,
+            bundle.created_at,
+        )?;
+        append_journal(
+            &transaction,
+            Some(&promotion.mission_id),
+            "candidate_promoted",
+            &promotion.promotion_id,
+            &promotion_content_hash,
+            promotion.created_at,
+        )?;
+        transaction.commit().map_err(database_error)?;
+        Ok(StoredPromotion {
+            record: promotion.clone(),
+            content_hash: promotion_content_hash,
+        })
+    }
+
+    pub fn get_strategy_bundle(&self, bundle_id: &str) -> Result<StrategyBundle, StoreError> {
+        let bundle: StrategyBundle = read_json_row(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM strategy_bundles WHERE bundle_id = ?",
+            bundle_id,
+        )?;
+        bundle.validate().map_err(domain_error)?;
+        Ok(bundle)
+    }
+
+    pub fn get_promotion(&self, promotion_id: &str) -> Result<StoredPromotion, StoreError> {
+        let (record, content_hash): (PromotionRecord, String) = read_json_row_with_hash(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM promotions WHERE promotion_id = ?",
+            promotion_id,
+        )?;
+        let bundle = self.get_strategy_bundle(&record.bundle_id)?;
+        record.validate(&bundle).map_err(domain_error)?;
+        Ok(StoredPromotion {
+            record,
+            content_hash,
+        })
+    }
+
+    pub fn validate_deployment_binding(
+        &self,
+        envelope: &DeploymentEnvelope,
+    ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
+        let promotion = self.get_promotion(&envelope.promotion_id)?;
+        let bundle = self.get_strategy_bundle(&envelope.bundle_id)?;
+        if promotion.record.bundle_id != envelope.bundle_id
+            || promotion.record.bundle_hash != envelope.bundle_hash
+            || promotion.record.candidate_id != envelope.asset_revision_id
+            || promotion.content_hash != envelope.promotion_manifest_hash
+            || bundle.bundle_hash != envelope.bundle_hash
+        {
+            return Err(StoreError::Domain(
+                "deployment envelope does not match persisted promotion and bundle".to_string(),
+            ));
+        }
+        Ok((promotion, bundle))
+    }
+
     pub fn put_search_policy_revision(
         &mut self,
         mut revision: SearchPolicyRevision,
@@ -644,9 +901,7 @@ impl AlphaStore {
     }
 
     pub fn record_approval(&mut self, approval: &ApprovalRecord) -> Result<(), StoreError> {
-        require_text(&approval.approval_id)?;
-        require_text(&approval.approval_class)?;
-        require_text(&approval.subject_id)?;
+        approval.validate()?;
         self.insert_json_record(
             "approvals",
             &approval.approval_id,
@@ -654,14 +909,24 @@ impl AlphaStore {
             (None, "approval_recorded", approval.created_at),
             |transaction, json, hash| {
                 transaction.execute(
-                    "INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO approvals (
+                        approval_id, approval_class, subject_id, payload_json, content_hash,
+                        created_at, signer_id, valid_from, expires_at, revoked_at, revoked_by,
+                        revocation_reason
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         approval.approval_id,
                         approval.approval_class,
                         approval.subject_id,
                         json,
                         hash,
-                        approval.created_at.to_rfc3339()
+                        approval.created_at.to_rfc3339(),
+                        approval.signer_id,
+                        approval.valid_from.map(|value| value.to_rfc3339()),
+                        approval.expires_at.map(|value| value.to_rfc3339()),
+                        approval.revoked_at.map(|value| value.to_rfc3339()),
+                        approval.revoked_by,
+                        approval.revocation_reason,
                     ],
                 )?;
                 Ok(())
@@ -677,6 +942,45 @@ impl AlphaStore {
         )
     }
 
+    pub fn revoke_approval(
+        &mut self,
+        approval_id: &str,
+        revoked_by: &str,
+        reason: &str,
+        at: DateTime<Utc>,
+    ) -> Result<ApprovalRecord, StoreError> {
+        require_text(revoked_by)?;
+        require_text(reason)?;
+        let mut approval = self.get_approval(approval_id)?;
+        if approval.revoked_at.is_some() {
+            return Err(StoreError::Domain(
+                "approval is already revoked".to_string(),
+            ));
+        }
+        approval.revoked_at = Some(at);
+        approval.revoked_by = Some(revoked_by.to_string());
+        approval.revocation_reason = Some(reason.to_string());
+        approval.validate()?;
+        let (json, hash) = encoded(&approval)?;
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        transaction
+            .execute(
+                "UPDATE approvals SET payload_json = ?, content_hash = ?, revoked_at = ?, revoked_by = ?, revocation_reason = ? WHERE approval_id = ?",
+                params![json, hash, at.to_rfc3339(), revoked_by, reason, approval_id],
+            )
+            .map_err(database_error)?;
+        append_journal(
+            &transaction,
+            None,
+            "approval_revoked",
+            approval_id,
+            &hash,
+            at,
+        )?;
+        transaction.commit().map_err(database_error)?;
+        Ok(approval)
+    }
+
     pub fn store_deployment(
         &mut self,
         signed: &SignedDeploymentEnvelope,
@@ -684,6 +988,7 @@ impl AlphaStore {
     ) -> Result<(), StoreError> {
         let id = &signed.envelope.deployment_id;
         require_text(id)?;
+        self.validate_deployment_binding(&signed.envelope)?;
         self.insert_json_record(
             "deployment_envelopes",
             id,
@@ -730,6 +1035,17 @@ impl AlphaStore {
     }
 
     fn mission_for_asset(&self, asset_id: &str) -> Result<Option<String>, StoreError> {
+        let typed = read_json_row::<PromotionRecord>(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM promotions
+             WHERE candidate_id = ? ORDER BY created_at DESC LIMIT 1",
+            asset_id,
+        );
+        match typed {
+            Ok(promotion) => return Ok(Some(promotion.mission_id)),
+            Err(StoreError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
         let result = read_json_row::<RegistryRevision>(
             &self.connection,
             "SELECT payload_json, content_hash FROM registry_revisions
@@ -851,6 +1167,23 @@ fn read_json_row<T: DeserializeOwned>(
     serde_json::from_str(&json).map_err(serialization_error)
 }
 
+fn read_json_row_with_hash<T: DeserializeOwned>(
+    connection: &Connection,
+    sql: &str,
+    id: &str,
+) -> Result<(T, String), StoreError> {
+    let (json, hash) = connection
+        .query_row(sql, params![id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(map_query_error)?;
+    verify_hash(&json, &hash)?;
+    Ok((
+        serde_json::from_str(&json).map_err(serialization_error)?,
+        hash,
+    ))
+}
+
 fn read_json_rows<T: DeserializeOwned>(
     connection: &Connection,
     sql: &str,
@@ -919,11 +1252,13 @@ fn serialization_error(error: serde_json::Error) -> StoreError {
 mod tests {
     use super::*;
     use alpha_domain::{
-        sign_envelope, AllowedIntentType, ApprovalClass, AttributionMode, AttributionOutcome,
-        DeploymentEnvelope, EngineKind, IterationVerdict, MissionStatus, RuntimeAttributionEvent,
-        SearchBudget, SearchPolicyRevision, ValidatorMode,
+        canonical_json_hash, sign_envelope, AllowedIntentType, ApprovalClass, AttributionMode,
+        AttributionOutcome, DeploymentEnvelope, EngineKind, IterationVerdict, MissionStatus,
+        PromotionRecord, RuntimeAttributionEvent, SearchBudget, SearchPolicyRevision,
+        StrategyBundle, StrategyBundleArtifact, ValidatorMode,
     };
     use ed25519_dalek::SigningKey;
+    use hft_factor_dsl::{FactorAst, FactorTerminal};
     use hft_research_manifest::ManifestId;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -980,11 +1315,274 @@ mod tests {
         iteration
     }
 
+    fn persist_formula_promotion(
+        store: &mut AlphaStore,
+        now: DateTime<Utc>,
+    ) -> (StoredPromotion, StrategyBundle) {
+        let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
+            "signal".to_string(),
+        )));
+        store
+            .append_iteration(&iteration(), Some(("candidate-1", &candidate)), None)
+            .unwrap();
+        let candidate_hash = store.mission_lineage("mission-1").unwrap().candidates[0]
+            .content_hash
+            .clone();
+        let evaluation = serde_json::json!({
+            "passed": true,
+            "score": 1.0,
+            "failure_reasons": [],
+            "evaluator_version": "sealed-holdout-v1",
+        });
+        let sealed = RegistryRevision {
+            revision_id: "sealed-evaluation:candidate-1".to_string(),
+            registry_kind: "sealed_evaluation".to_string(),
+            asset_id: "candidate-1".to_string(),
+            parent_revision_id: None,
+            payload: serde_json::json!({
+                "mission_id": "mission-1",
+                "candidate_content_hash": candidate_hash,
+                "dataset_manifest_id": "dataset-1",
+                "evaluation": evaluation,
+            }),
+            created_at: now,
+        };
+        store.put_registry_revision(&sealed).unwrap();
+        let evaluation_hash = canonical_json_hash(&evaluation).unwrap();
+        let bundle = StrategyBundle::new(
+            "bundle:candidate-1".to_string(),
+            "candidate-1".to_string(),
+            candidate_hash.clone(),
+            ManifestId::new("dataset-1").unwrap(),
+            "sealed-holdout-v1".to_string(),
+            evaluation_hash.clone(),
+            StrategyBundleArtifact::Formula {
+                ast: FactorAst::Terminal(FactorTerminal::Field("signal".to_string())),
+            },
+            now,
+        )
+        .unwrap();
+        let promotion = PromotionRecord {
+            promotion_id: "promotion-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: "candidate-1".to_string(),
+            candidate_content_hash: candidate_hash,
+            dataset_manifest_id: ManifestId::new("dataset-1").unwrap(),
+            evaluator_version: "sealed-holdout-v1".to_string(),
+            sealed_evaluation_id: sealed.revision_id,
+            sealed_evaluation_hash: evaluation_hash,
+            bundle_id: bundle.bundle_id.clone(),
+            bundle_hash: bundle.bundle_hash.clone(),
+            created_at: now,
+        };
+        let stored = store.promote_candidate(&bundle, &promotion).unwrap();
+        (stored, bundle)
+    }
+
     #[test]
     fn migrations_are_idempotent() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.migrate().unwrap();
         store.migrate().unwrap();
+    }
+
+    #[test]
+    fn migration_002_preserves_legacy_approval_payloads() {
+        let path = temp_db("legacy-approval");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_001).unwrap();
+        let now = Utc::now();
+        let payload = serde_json::json!({
+            "approval_id": "legacy-approval",
+            "approval_class": "paper",
+            "subject_id": "promotion-1",
+            "payload": {},
+            "created_at": now,
+        });
+        let json = serde_json::to_string(&payload).unwrap();
+        let hash = hex::encode(Sha256::digest(json.as_bytes()));
+        connection
+            .execute(
+                "INSERT INTO approvals (approval_id, approval_class, subject_id, payload_json, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    "legacy-approval",
+                    "paper",
+                    "promotion-1",
+                    json,
+                    hash,
+                    now.to_rfc3339()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = AlphaStore::open(&path).unwrap();
+        let approval = store.get_approval("legacy-approval").unwrap();
+        assert_eq!(approval.signer_id, None);
+        assert!(!approval.is_active_at(now));
+    }
+
+    #[test]
+    fn typed_promotion_and_bundle_round_trip_atomically() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let (promotion, bundle) = persist_formula_promotion(&mut store, Utc::now());
+
+        assert_eq!(store.get_promotion("promotion-1").unwrap(), promotion);
+        assert_eq!(
+            store.get_strategy_bundle("bundle:candidate-1").unwrap(),
+            bundle
+        );
+    }
+
+    #[test]
+    fn deployment_store_rejects_arbitrary_bundle_binding() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let now = Utc::now();
+        let (promotion, bundle) = persist_formula_promotion(&mut store, now);
+        let signed = sign_envelope(
+            DeploymentEnvelope {
+                deployment_id: "deployment-bad-binding".to_string(),
+                asset_revision_id: "candidate-1".to_string(),
+                promotion_id: promotion.record.promotion_id,
+                promotion_manifest_hash: promotion.content_hash,
+                bundle_id: bundle.bundle_id,
+                bundle_hash: "f".repeat(64),
+                runtime_config_hash: "c".repeat(64),
+                risk_policy_hash: "d".repeat(64),
+                account_id: "account-1".to_string(),
+                venue: "binance".to_string(),
+                instruments: vec!["BTCUSDT".to_string()],
+                allowed_intent_types: vec![AllowedIntentType::StartPaper],
+                max_notional: 100.0,
+                max_symbol_exposure: 50.0,
+                max_order_size: 10.0,
+                max_slippage_bps: 2.0,
+                valid_from: now,
+                expires_at: now + chrono::Duration::minutes(1),
+                nonce: "nonce-bad-binding".to_string(),
+                approval_class: ApprovalClass::Paper,
+                approval_signatures: vec!["approval-1".to_string()],
+                payload_hash: String::new(),
+            },
+            "key-1",
+            &SigningKey::from_bytes(&[7_u8; 32]),
+        )
+        .unwrap();
+
+        assert!(store.store_deployment(&signed, now).is_err());
+    }
+
+    #[test]
+    fn promotion_rejects_candidate_hash_mismatch_without_partial_bundle() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
+            "signal".to_string(),
+        )));
+        store
+            .append_iteration(&iteration(), Some(("candidate-1", &candidate)), None)
+            .unwrap();
+        let now = Utc::now();
+        let evaluation = serde_json::json!({
+            "passed": true,
+            "score": 1.0,
+            "failure_reasons": [],
+            "evaluator_version": "sealed-holdout-v1",
+        });
+        store
+            .put_registry_revision(&RegistryRevision {
+                revision_id: "sealed-evaluation:candidate-1".to_string(),
+                registry_kind: "sealed_evaluation".to_string(),
+                asset_id: "candidate-1".to_string(),
+                parent_revision_id: None,
+                payload: serde_json::json!({
+                    "mission_id": "mission-1",
+                    "candidate_content_hash": "c".repeat(64),
+                    "dataset_manifest_id": "dataset-1",
+                    "evaluation": evaluation,
+                }),
+                created_at: now,
+            })
+            .unwrap();
+        let evaluation_hash = canonical_json_hash(&evaluation).unwrap();
+        let bundle = StrategyBundle::new(
+            "bundle:bad".to_string(),
+            "candidate-1".to_string(),
+            "c".repeat(64),
+            ManifestId::new("dataset-1").unwrap(),
+            "sealed-holdout-v1".to_string(),
+            evaluation_hash.clone(),
+            StrategyBundleArtifact::Formula {
+                ast: FactorAst::Terminal(FactorTerminal::Field("signal".to_string())),
+            },
+            now,
+        )
+        .unwrap();
+        let promotion = PromotionRecord {
+            promotion_id: "promotion-bad".to_string(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: "candidate-1".to_string(),
+            candidate_content_hash: "c".repeat(64),
+            dataset_manifest_id: ManifestId::new("dataset-1").unwrap(),
+            evaluator_version: "sealed-holdout-v1".to_string(),
+            sealed_evaluation_id: "sealed-evaluation:candidate-1".to_string(),
+            sealed_evaluation_hash: evaluation_hash,
+            bundle_id: bundle.bundle_id.clone(),
+            bundle_hash: bundle.bundle_hash.clone(),
+            created_at: now,
+        };
+
+        assert!(store.promote_candidate(&bundle, &promotion).is_err());
+        assert!(matches!(
+            store.get_strategy_bundle("bundle:bad"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn approvals_require_identity_window_and_honor_revocation() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        let approval = ApprovalRecord {
+            approval_id: "approval-1".to_string(),
+            approval_class: "paper".to_string(),
+            subject_id: "promotion-1".to_string(),
+            payload: serde_json::json!({"scope_hash": "scope"}),
+            signer_id: Some("reviewer-1".to_string()),
+            valid_from: Some(now),
+            expires_at: Some(now + chrono::Duration::minutes(10)),
+            revoked_at: None,
+            revoked_by: None,
+            revocation_reason: None,
+            created_at: now,
+        };
+        store.record_approval(&approval).unwrap();
+        assert!(store.get_approval("approval-1").unwrap().is_active_at(now));
+
+        store
+            .revoke_approval(
+                "approval-1",
+                "reviewer-2",
+                "withdrawn",
+                now + chrono::Duration::seconds(1),
+            )
+            .unwrap();
+        assert!(!store
+            .get_approval("approval-1")
+            .unwrap()
+            .is_active_at(now + chrono::Duration::seconds(1)));
+
+        let legacy: ApprovalRecord = serde_json::from_value(serde_json::json!({
+            "approval_id": "legacy",
+            "approval_class": "paper",
+            "subject_id": "promotion-1",
+            "payload": {},
+            "created_at": now,
+        }))
+        .unwrap();
+        assert!(!legacy.is_active_at(now));
     }
 
     #[test]
@@ -1086,24 +1684,18 @@ mod tests {
     fn runtime_attribution_is_idempotent_and_links_back_to_mission() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
-        store
-            .put_registry_revision(&RegistryRevision {
-                revision_id: "promotion-1".to_string(),
-                registry_kind: "promotion".to_string(),
-                asset_id: "candidate-1".to_string(),
-                parent_revision_id: None,
-                payload: serde_json::json!({"mission_id": "mission-1"}),
-                created_at: Utc::now(),
-            })
-            .unwrap();
         let now = Utc::now();
+        let (promotion, bundle) = persist_formula_promotion(&mut store, now);
         let signed = sign_envelope(
             DeploymentEnvelope {
                 deployment_id: "deployment-1".to_string(),
                 asset_revision_id: "candidate-1".to_string(),
-                promotion_manifest_hash: "promotion-hash".to_string(),
-                runtime_config_hash: "runtime-hash".to_string(),
-                risk_policy_hash: "risk-hash".to_string(),
+                promotion_id: "promotion-1".to_string(),
+                promotion_manifest_hash: promotion.content_hash,
+                bundle_id: bundle.bundle_id,
+                bundle_hash: bundle.bundle_hash,
+                runtime_config_hash: "c".repeat(64),
+                risk_policy_hash: "d".repeat(64),
                 account_id: "account-1".to_string(),
                 venue: "binance".to_string(),
                 instruments: vec!["BTCUSDT".to_string()],

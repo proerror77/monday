@@ -1,13 +1,13 @@
 use crate::{
     cli::{
         print_json, EnvelopeArgs, EvaluateArgs, JsonRecordArgs, MissionStatusArgs, PromoteArgs,
-        SignDeploymentArgs,
+        RevokeApprovalArgs, SignDeploymentArgs,
     },
     data_mission,
 };
 use alpha_domain::{
-    sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope, IterationVerdict,
-    RuntimeAttributionEvent, SearchPolicyRevision,
+    canonical_json_hash, sign_envelope, ApprovalClass, DeploymentEnvelope, IterationVerdict,
+    PromotionRecord, RuntimeAttributionEvent, SearchPolicyRevision, StrategyBundle,
 };
 use alpha_engine::{
     evaluation::{prepare_dataset, WalkForwardConfig},
@@ -16,7 +16,7 @@ use alpha_engine::{
 };
 use alpha_store::{AlphaStore, ApprovalRecord, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
@@ -127,29 +127,58 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         .iter()
         .find(|candidate| candidate.candidate_id == args.candidate_id)
         .context("candidate does not belong to mission")?;
+    if sealed.asset_id != candidate.candidate_id
+        || sealed
+            .payload
+            .get("candidate_content_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(candidate.content_hash.as_str())
+        || sealed
+            .payload
+            .get("dataset_manifest_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(lineage.mission.dataset_manifest_id.as_str())
+    {
+        bail!("sealed evaluation binding does not match candidate and mission");
+    }
     let promotion_id = args
         .promotion_id
         .unwrap_or_else(|| format!("promotion:{}", args.candidate_id));
-    match store.get_registry_revision(&promotion_id) {
+    match store.get_promotion(&promotion_id) {
         Ok(existing) => return print_json(&existing),
         Err(StoreError::NotFound) => {}
         Err(error) => return Err(error.into()),
     }
-    let revision = RegistryRevision {
-        revision_id: promotion_id,
-        registry_kind: "promotion".to_string(),
-        asset_id: args.candidate_id,
-        parent_revision_id: Some(sealed_id),
-        payload: serde_json::json!({
-            "mission_id": args.mission_id,
-            "candidate_content_hash": candidate.content_hash,
-            "sealed_evaluation": evaluation,
-            "capability": "research-only",
-        }),
-        created_at: Utc::now(),
+    let now = Utc::now();
+    let sealed_evaluation_hash = canonical_json_hash(&evaluation)?;
+    let bundle = StrategyBundle::new(
+        format!("bundle:{}", candidate.candidate_id),
+        candidate.candidate_id.clone(),
+        candidate.content_hash.clone(),
+        lineage.mission.dataset_manifest_id.clone(),
+        evaluation.evaluator_version.clone(),
+        sealed_evaluation_hash.clone(),
+        candidate.artifact.to_strategy_bundle_artifact()?,
+        now,
+    )?;
+    let promotion = PromotionRecord {
+        promotion_id,
+        mission_id: args.mission_id,
+        candidate_id: candidate.candidate_id.clone(),
+        candidate_content_hash: candidate.content_hash.clone(),
+        dataset_manifest_id: lineage.mission.dataset_manifest_id.clone(),
+        evaluator_version: evaluation.evaluator_version,
+        sealed_evaluation_id: sealed_id,
+        sealed_evaluation_hash,
+        bundle_id: bundle.bundle_id.clone(),
+        bundle_hash: bundle.bundle_hash.clone(),
+        created_at: now,
     };
-    store.put_registry_revision(&revision)?;
-    print_json(&revision)
+    let stored = store.promote_candidate(&bundle, &promotion)?;
+    print_json(&serde_json::json!({
+        "promotion": stored,
+        "bundle": bundle,
+    }))
 }
 
 pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
@@ -158,7 +187,8 @@ pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
             .with_context(|| format!("failed to read envelope {}", args.envelope.display()))?,
     )?;
     let mut store = AlphaStore::open(args.db)?;
-    enforce_live_small_approval(&store, &envelope)?;
+    store.validate_deployment_binding(&envelope)?;
+    enforce_deployment_approvals(&store, &envelope, Utc::now())?;
     let key_hex = std::fs::read_to_string(&args.signing_key)
         .with_context(|| format!("failed to read signing key {}", args.signing_key.display()))?;
     let key_bytes = hex::decode(key_hex.trim()).context("signing key must be hex encoded")?;
@@ -210,37 +240,51 @@ pub fn record_approval(args: JsonRecordArgs) -> anyhow::Result<()> {
     print_json(&approval)
 }
 
-fn enforce_live_small_approval(
+pub fn revoke_approval(args: RevokeApprovalArgs) -> anyhow::Result<()> {
+    let mut store = AlphaStore::open(args.db)?;
+    let approval = store.revoke_approval(
+        &args.approval_id,
+        &args.revoked_by,
+        &args.reason,
+        Utc::now(),
+    )?;
+    print_json(&approval)
+}
+
+fn enforce_deployment_approvals(
     store: &AlphaStore,
     envelope: &DeploymentEnvelope,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    if !envelope
-        .allowed_intent_types
-        .contains(&AllowedIntentType::StartLiveSmall)
-    {
-        return Ok(());
-    }
-    if !matches!(
-        envelope.approval_class,
-        ApprovalClass::HumanApprovedLiveSmall | ApprovalClass::SameClassAutoLiveSmall
-    ) {
-        bail!("live-small deployment requires a live-small approval class");
-    }
     let scope_hash = deployment_scope_hash(envelope)?;
-    let approved = envelope.approval_signatures.iter().any(|approval_id| {
-        store.get_approval(approval_id).is_ok_and(|approval| {
-            approval.approval_class == "human_live_small"
-                && approval
-                    .payload
-                    .get("scope_hash")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(scope_hash.as_str())
-                && (envelope.approval_class == ApprovalClass::SameClassAutoLiveSmall
-                    || approval.subject_id == envelope.asset_revision_id)
-        })
-    });
+    let mut approved = false;
+    for approval_id in &envelope.approval_signatures {
+        let approval = store
+            .get_approval(approval_id)
+            .with_context(|| format!("referenced approval {approval_id} is not persisted"))?;
+        if !approval.is_active_at(now) {
+            bail!("referenced approval {approval_id} is expired, revoked, or not yet valid");
+        }
+        let scope_matches = approval
+            .payload
+            .get("scope_hash")
+            .and_then(serde_json::Value::as_str)
+            == Some(scope_hash.as_str());
+        let class_matches = match envelope.approval_class {
+            ApprovalClass::Paper => approval.approval_class == "paper",
+            ApprovalClass::Shadow => approval.approval_class == "shadow",
+            ApprovalClass::HumanApprovedLiveSmall | ApprovalClass::SameClassAutoLiveSmall => {
+                approval.approval_class == "human_live_small"
+            }
+        };
+        let subject_matches = match envelope.approval_class {
+            ApprovalClass::SameClassAutoLiveSmall => true,
+            _ => approval.subject_id == envelope.promotion_id,
+        };
+        approved |= scope_matches && class_matches && subject_matches;
+    }
     if !approved {
-        bail!("live-small deployment has no matching persisted human approval");
+        bail!("deployment has no active approval matching class, subject, and scope");
     }
     Ok(())
 }
@@ -249,9 +293,14 @@ fn deployment_scope_hash(envelope: &DeploymentEnvelope) -> anyhow::Result<String
     let mut instruments = envelope.instruments.clone();
     instruments.sort();
     let scope = serde_json::json!({
+        "account_id": envelope.account_id,
         "venue": envelope.venue,
         "instruments": instruments,
-        "intent": "live_small",
+        "allowed_intent_types": envelope.allowed_intent_types,
+        "max_notional": envelope.max_notional,
+        "max_symbol_exposure": envelope.max_symbol_exposure,
+        "max_order_size": envelope.max_order_size,
+        "max_slippage_bps": envelope.max_slippage_bps,
     });
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&scope)?)))
 }
@@ -267,6 +316,7 @@ fn read_record<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alpha_domain::AllowedIntentType;
     use chrono::Duration;
 
     fn live_small_envelope() -> DeploymentEnvelope {
@@ -274,9 +324,12 @@ mod tests {
         DeploymentEnvelope {
             deployment_id: "deployment-live-small".to_string(),
             asset_revision_id: "factor-1@2".to_string(),
-            promotion_manifest_hash: "promotion-hash".to_string(),
-            runtime_config_hash: "runtime-hash".to_string(),
-            risk_policy_hash: "risk-hash".to_string(),
+            promotion_id: "promotion-1".to_string(),
+            promotion_manifest_hash: "a".repeat(64),
+            bundle_id: "bundle-1".to_string(),
+            bundle_hash: "b".repeat(64),
+            runtime_config_hash: "c".repeat(64),
+            risk_policy_hash: "d".repeat(64),
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
             instruments: vec!["BTCUSDT".to_string()],
@@ -298,7 +351,10 @@ mod tests {
     fn live_small_requires_a_persisted_human_approval_for_the_same_scope() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         let envelope = live_small_envelope();
-        assert!(enforce_live_small_approval(&store, &envelope).is_err());
+        let now = Utc::now();
+        assert!(
+            enforce_deployment_approvals(&store, &envelope, now + Duration::seconds(1)).is_err()
+        );
         store
             .record_approval(&ApprovalRecord {
                 approval_id: "approval-1".to_string(),
@@ -307,9 +363,27 @@ mod tests {
                 payload: serde_json::json!({
                     "scope_hash": deployment_scope_hash(&envelope).unwrap(),
                 }),
-                created_at: Utc::now(),
+                signer_id: Some("risk-officer-1".to_string()),
+                valid_from: Some(now),
+                expires_at: Some(now + Duration::minutes(10)),
+                revoked_at: None,
+                revoked_by: None,
+                revocation_reason: None,
+                created_at: now,
             })
             .unwrap();
-        assert!(enforce_live_small_approval(&store, &envelope).is_ok());
+        assert!(enforce_deployment_approvals(&store, &envelope, now).is_ok());
+
+        store
+            .revoke_approval(
+                "approval-1",
+                "risk-officer-2",
+                "risk posture changed",
+                now + Duration::seconds(1),
+            )
+            .unwrap();
+        assert!(
+            enforce_deployment_approvals(&store, &envelope, now + Duration::seconds(1)).is_err()
+        );
     }
 }

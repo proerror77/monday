@@ -89,6 +89,19 @@ enum PolicyCommand {
 #[derive(Debug, Subcommand)]
 enum ApprovalCommand {
     Record(JsonRecordArgs),
+    Revoke(RevokeApprovalArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RevokeApprovalArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub approval_id: String,
+    #[arg(long)]
+    pub revoked_by: String,
+    #[arg(long)]
+    pub reason: String,
 }
 
 #[derive(Debug, Args)]
@@ -313,6 +326,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Approval { command } => match command {
             ApprovalCommand::Record(args) => governance::record_approval(args),
+            ApprovalCommand::Revoke(args) => governance::revoke_approval(args),
         },
     }
 }

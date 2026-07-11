@@ -119,6 +119,7 @@ dependencies = [
  "duckdb",
  "ed25519-dalek",
  "hex",
+ "hft-factor-dsl",
  "hft-research-manifest",
  "serde",
  "serde_json",

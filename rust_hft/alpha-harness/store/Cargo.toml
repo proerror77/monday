@@ -17,3 +17,4 @@ thiserror = { workspace = true }
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
 hft-research-manifest = { path = "../../research-core/manifest" }
+hft-factor-dsl = { path = "../../research-core/factor-dsl" }
