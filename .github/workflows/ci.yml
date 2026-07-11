@@ -82,6 +82,8 @@ jobs:
         run: |
           cargo test -p hft-live --no-default-features --test deployment_envelope --locked
           cargo test -p hft-live --no-default-features --test deployment_artifacts --locked
+          cargo test -p hft-live --no-default-features --features formula-strategy,binance --test deployment_envelope --locked
+          cargo test -p hft-live --no-default-features --features formula-strategy,bitget --test deployment_artifacts --locked
 
       - name: Check JSON feature matrix
         run: |

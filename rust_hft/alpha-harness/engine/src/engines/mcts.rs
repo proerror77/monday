@@ -464,6 +464,17 @@ mod tests {
             score,
             failure_reasons: vec![],
             evaluator_version: "test".to_string(),
+            evaluator_config: serde_json::json!({"fixture": true}),
+            metrics: crate::EvaluationMetrics {
+                row_count: 1,
+                trade_count: 1,
+                mean_net_return: score,
+                cumulative_net_return: score,
+                max_drawdown: 0.0,
+                raw_score: score,
+                adjusted_score: score,
+                folds: vec![],
+            },
         }
     }
 
@@ -491,15 +502,7 @@ mod tests {
         engine
             .candidates
             .insert(proposal.candidate_id.clone(), child);
-        engine.observe(
-            &proposal,
-            &CandidateEvaluation {
-                passed: true,
-                score: 0.5,
-                failure_reasons: vec![],
-                evaluator_version: "test".to_string(),
-            },
-        );
+        engine.observe(&proposal, &evaluation(0.5));
         assert_eq!(engine.trace()[0].visits, 1);
         assert_eq!(engine.trace()[child].total_reward, 0.5);
     }

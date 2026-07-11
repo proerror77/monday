@@ -6,15 +6,16 @@ use crate::{
     data_mission,
 };
 use alpha_domain::{
-    canonical_json_hash, sign_envelope, ApprovalClass, DeploymentEnvelope, IterationVerdict,
-    PromotionRecord, RuntimeAttributionEvent, SearchPolicyRevision, StrategyBundle,
+    canonical_json_hash, sign_envelope, ApprovalClass, CandidateArtifact, DeploymentEnvelope,
+    IterationVerdict, PromotionRecord, RuntimeAttributionEvent, SearchPolicyRevision,
+    StrategyBundle, SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
     evaluation::{prepare_dataset, WalkForwardConfig},
-    formula_evaluator::{FormulaEvaluator, FormulaEvaluatorConfig},
+    formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
     CandidateEvaluation, EngineProposal,
 };
-use alpha_store::{AlphaStore, ApprovalRecord, RegistryRevision, StoreError};
+use alpha_store::{AlphaStore, ApprovalRecord, MissionLineage, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::SigningKey;
@@ -30,16 +31,88 @@ pub fn candidate_list(args: MissionStatusArgs) -> anyhow::Result<()> {
     }))
 }
 
+pub(crate) fn validated_walk_forward_candidates(
+    store: &AlphaStore,
+    mission_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let lineage = store.mission_lineage(mission_id)?;
+    validated_walk_forward_candidates_in_lineage(&lineage)
+}
+
+fn validated_walk_forward_candidates_in_lineage(
+    lineage: &MissionLineage,
+) -> anyhow::Result<Vec<String>> {
+    let expected_config = FormulaEvaluator::for_mission(&lineage.mission)
+        .map_err(anyhow::Error::msg)?
+        .config_evidence()
+        .map_err(anyhow::Error::msg)?;
+    let mut candidates = Vec::new();
+    for iteration in &lineage.iterations {
+        if iteration.verdict != IterationVerdict::Keep {
+            continue;
+        }
+        let (Some(candidate_id), Some(evaluation_id)) = (
+            iteration.candidate_artifact_id.as_deref(),
+            iteration.evaluation_artifact_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let Some(candidate) = lineage
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == candidate_id)
+        else {
+            continue;
+        };
+        if !matches!(candidate.artifact, CandidateArtifact::Formula(_)) {
+            continue;
+        }
+        let Some(stored) = lineage.evaluations.iter().find(|stored| {
+            stored.record.evaluation_id == evaluation_id
+                && stored.record.candidate_id == candidate_id
+        }) else {
+            continue;
+        };
+        if stored
+            .record
+            .payload
+            .get("evaluator_version")
+            .and_then(serde_json::Value::as_str)
+            != Some(WALK_FORWARD_EVALUATOR_VERSION)
+        {
+            continue;
+        }
+        let evaluation: CandidateEvaluation = serde_json::from_value(stored.record.payload.clone())
+            .with_context(|| format!("walk-forward evaluation {evaluation_id} is malformed"))?;
+        evaluation
+            .validate()
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("walk-forward evaluation {evaluation_id} is invalid"))?;
+        if evaluation.passed && evaluation.evaluator_config == expected_config {
+            candidates.push(candidate_id.to_string());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
 pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
     let mut store = AlphaStore::open(&args.db)?;
     let revision_id = format!("sealed-evaluation:{}", args.candidate_id);
-    match store.get_registry_revision(&revision_id) {
-        Ok(existing) => return print_json(&existing),
-        Err(StoreError::NotFound) => {}
+    let existing = match store.get_registry_revision(&revision_id) {
+        Ok(existing) => Some(existing),
+        Err(StoreError::NotFound) => None,
         Err(error) => return Err(error.into()),
-    }
+    };
 
     let lineage = store.mission_lineage(&args.mission_id)?;
+    if !validated_walk_forward_candidates_in_lineage(&lineage)?
+        .iter()
+        .any(|candidate_id| candidate_id == &args.candidate_id)
+    {
+        bail!("candidate lacks canonical v2 walk-forward evidence");
+    }
     let candidate = lineage
         .candidates
         .iter()
@@ -55,8 +128,53 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
     if iteration.verdict != IterationVerdict::Keep {
         bail!("only a candidate that passed walk-forward evaluation can access holdout");
     }
+    if iteration.engine == alpha_domain::EngineKind::OfflineReinforcementLearning {
+        bail!("offline RL candidates are lab search-policy output and cannot access holdout");
+    }
 
-    let manifest = data_mission::read_manifest(&args.dataset.dataset_manifest)?;
+    if let Some(existing) = existing {
+        let existing_evaluation: CandidateEvaluation = serde_json::from_value(
+            existing
+                .payload
+                .get("evaluation")
+                .cloned()
+                .context("existing sealed evaluation payload is incomplete")?,
+        )
+        .context("existing sealed evaluation is legacy or malformed")?;
+        existing_evaluation
+            .validate()
+            .map_err(anyhow::Error::new)
+            .context("existing sealed evaluation is invalid")?;
+        let expected_config = FormulaEvaluator::for_mission(&lineage.mission)
+            .map_err(anyhow::Error::msg)?
+            .config_evidence()
+            .map_err(anyhow::Error::msg)?;
+        if existing.registry_kind != "sealed_evaluation"
+            || existing.asset_id != candidate.candidate_id
+            || existing
+                .payload
+                .get("mission_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(args.mission_id.as_str())
+            || existing
+                .payload
+                .get("candidate_content_hash")
+                .and_then(serde_json::Value::as_str)
+                != Some(candidate.content_hash.as_str())
+            || existing
+                .payload
+                .get("dataset_manifest_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(lineage.mission.dataset_manifest_id.as_str())
+            || existing_evaluation.evaluator_version != SEALED_HOLDOUT_EVALUATOR_VERSION
+            || existing_evaluation.evaluator_config != expected_config
+        {
+            bail!("existing sealed evaluation is not canonical v2 evidence for this candidate");
+        }
+        return print_json(&existing);
+    }
+
+    let manifest = data_mission::read_registered_manifest(&store, &args.dataset.dataset_manifest)?;
     if lineage.mission.dataset_manifest_id.as_str() != manifest.manifest_id {
         bail!("mission dataset id does not match the supplied manifest");
     }
@@ -86,7 +204,7 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
         tokens: 0,
         elapsed_ms: 0,
     };
-    let evaluation = FormulaEvaluator::new(FormulaEvaluatorConfig::default())
+    let evaluation = FormulaEvaluator::for_mission(&lineage.mission)
         .map_err(anyhow::Error::msg)?
         .evaluate_sealed(&proposal, &dataset)
         .map_err(anyhow::Error::msg)?;
@@ -117,6 +235,7 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         .cloned()
         .context("sealed evaluation payload is incomplete")?;
     let evaluation: CandidateEvaluation = serde_json::from_value(sealed_evaluation.clone())?;
+    evaluation.validate().map_err(anyhow::Error::new)?;
     if !evaluation.passed {
         bail!("candidate failed sealed holdout and cannot be promoted");
     }
@@ -149,6 +268,16 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
     let now = Utc::now();
+    let evaluator_config_hash = canonical_json_hash(
+        sealed_evaluation
+            .get("evaluator_config")
+            .context("sealed evaluator config is missing")?,
+    )?;
+    let evaluation_metrics_hash = canonical_json_hash(
+        sealed_evaluation
+            .get("metrics")
+            .context("sealed evaluation metrics are missing")?,
+    )?;
     let sealed_evaluation_hash = canonical_json_hash(&sealed_evaluation)?;
     let bundle = StrategyBundle::new(
         format!("bundle:{}", candidate.candidate_id),
@@ -156,8 +285,10 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         candidate.content_hash.clone(),
         lineage.mission.dataset_manifest_id.clone(),
         evaluation.evaluator_version.clone(),
+        evaluator_config_hash.clone(),
+        evaluation_metrics_hash.clone(),
         sealed_evaluation_hash.clone(),
-        candidate.artifact.to_strategy_bundle_artifact()?,
+        candidate.artifact.to_governed_strategy_bundle_artifact()?,
         now,
     )?;
     let promotion = PromotionRecord {
@@ -167,6 +298,8 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         candidate_content_hash: candidate.content_hash.clone(),
         dataset_manifest_id: lineage.mission.dataset_manifest_id.clone(),
         evaluator_version: evaluation.evaluator_version,
+        evaluator_config_hash,
+        evaluation_metrics_hash,
         sealed_evaluation_id: sealed_id,
         sealed_evaluation_hash,
         bundle_id: bundle.bundle_id.clone(),

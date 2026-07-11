@@ -9,13 +9,20 @@ use alpha_engine::{
         OfflineTrace,
     },
     evaluation::{prepare_dataset, WalkForwardConfig},
-    formula_evaluator::{FormulaEvaluator, FormulaEvaluatorConfig},
+    formula_evaluator::FormulaEvaluator,
     learning::{close_learning_loop, FailureCritic, LearningConfig},
     llm::{LlmConfig, LlmProposalEngine, OpenAiCompatibleClient},
     AutoResearchKernel, ProposalEngine, RunControl,
 };
 use alpha_store::{AlphaStore, StoreError};
 use anyhow::{bail, Context};
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchEngineAuthority {
+    CandidateResearchOnly,
+    LabSearchPolicyOnly,
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MissionRunReport {
@@ -25,6 +32,7 @@ pub struct MissionRunReport {
     pub total_iterations: usize,
     pub new_iterations: usize,
     pub engine: EngineChoice,
+    pub engine_authority: ResearchEngineAuthority,
     pub dataset_manifest_id: String,
 }
 
@@ -42,7 +50,7 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
         (true, _) => bail!("mission resume requires a paused or running mission"),
     }
 
-    let manifest = data_mission::read_manifest(&args.dataset.dataset_manifest)?;
+    let manifest = data_mission::read_registered_manifest(&store, &args.dataset.dataset_manifest)?;
     if mission.dataset_manifest_id.as_str() != manifest.manifest_id {
         bail!("mission dataset id does not match the supplied manifest");
     }
@@ -65,8 +73,7 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
         format!("sealed:{}", manifest.manifest_id),
     )?;
     let proposal_engine = build_engine(args)?;
-    let evaluator =
-        FormulaEvaluator::new(FormulaEvaluatorConfig::default()).map_err(anyhow::Error::msg)?;
+    let evaluator = FormulaEvaluator::for_mission(&mission).map_err(anyhow::Error::msg)?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
     let outcome = kernel.run(
         &args.mission_id,
@@ -82,6 +89,10 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
         total_iterations: outcome.total_iterations,
         new_iterations: outcome.new_iterations,
         engine: args.engine,
+        engine_authority: match args.engine {
+            EngineChoice::OfflineRl => ResearchEngineAuthority::LabSearchPolicyOnly,
+            _ => ResearchEngineAuthority::CandidateResearchOnly,
+        },
         dataset_manifest_id: manifest.manifest_id,
     })
 }

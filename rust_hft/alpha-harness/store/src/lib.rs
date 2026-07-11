@@ -2,10 +2,11 @@
 
 use alpha_domain::{
     canonical_json_hash, AllowedIntentType, AttributionKind, AttributionMode, CandidateArtifact,
-    DeploymentEnvelope, EngineKind, LearningDirective, LiveSmallEligibilityEvidence, LoopRun,
-    MissionStatus, MissionTerminalReason, PromotionRecord, ResearchIteration, ResearchMission,
-    RuntimeAttributionEvent, SearchBudgetUsage, SearchPolicyRevision, SignedDeploymentEnvelope,
-    StrategyBundle, StrategyBundleArtifact, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    CandidateEvaluation, DeploymentEnvelope, EngineKind, FormulaEvaluatorConfig, LearningDirective,
+    LiveSmallEligibilityEvidence, LoopRun, MissionStatus, MissionTerminalReason, PromotionRecord,
+    ResearchIteration, ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
+    SearchPolicyRevision, SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
+    SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
@@ -824,19 +825,19 @@ impl AlphaStore {
         bundle.validate().map_err(domain_error)?;
         promotion.validate(bundle).map_err(domain_error)?;
 
-        let (candidate_mission_id, candidate_json, candidate_hash) = self
+        let (candidate_mission_id, candidate_iteration_id, candidate_json, candidate_hash) = self
             .connection
             .query_row(
-                "SELECT mission_id, payload_json, content_hash FROM candidate_artifacts WHERE candidate_id = ?",
+                "SELECT mission_id, iteration_id, payload_json, content_hash FROM candidate_artifacts WHERE candidate_id = ?",
                 params![bundle.candidate_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
             )
             .map_err(map_query_error)?;
         verify_hash(&candidate_json, &candidate_hash)?;
         let candidate_artifact: CandidateArtifact =
             serde_json::from_str(&candidate_json).map_err(serialization_error)?;
         let expected_bundle_artifact = candidate_artifact
-            .to_strategy_bundle_artifact()
+            .to_governed_strategy_bundle_artifact()
             .map_err(domain_error)?;
         if candidate_mission_id != promotion.mission_id
             || candidate_hash != bundle.candidate_content_hash
@@ -844,6 +845,20 @@ impl AlphaStore {
         {
             return Err(StoreError::Domain(
                 "promotion candidate binding does not match stored truth".to_string(),
+            ));
+        }
+        let candidate_iteration: ResearchIteration = read_json_row(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM iterations WHERE iteration_id = ?",
+            &candidate_iteration_id,
+        )?;
+        if candidate_iteration.mission_id != promotion.mission_id
+            || candidate_iteration.candidate_artifact_id.as_deref()
+                != Some(bundle.candidate_id.as_str())
+            || candidate_iteration.engine == EngineKind::OfflineReinforcementLearning
+        {
+            return Err(StoreError::Domain(
+                "candidate provenance is not eligible for promotion".to_string(),
             ));
         }
         let mission = self.get_mission(&promotion.mission_id)?;
@@ -857,6 +872,19 @@ impl AlphaStore {
             .payload
             .get("evaluation")
             .ok_or_else(|| StoreError::Domain("sealed evaluation payload is incomplete".into()))?;
+        let typed_evaluation: CandidateEvaluation =
+            serde_json::from_value(sealed_evaluation.clone()).map_err(serialization_error)?;
+        typed_evaluation.validate().map_err(domain_error)?;
+        let expected_evaluator_config =
+            FormulaEvaluatorConfig::for_mission(&mission).map_err(domain_error)?;
+        if !typed_evaluation.passed
+            || typed_evaluation.evaluator_version != SEALED_HOLDOUT_EVALUATOR_VERSION
+            || typed_evaluation.formula_config().map_err(domain_error)? != expected_evaluator_config
+        {
+            return Err(StoreError::Domain(
+                "sealed evaluation does not use the governed evaluator policy".to_string(),
+            ));
+        }
         let stored_candidate_hash = sealed
             .payload
             .get("candidate_content_hash")
@@ -872,6 +900,16 @@ impl AlphaStore {
         let stored_evaluator_version = sealed_evaluation
             .get("evaluator_version")
             .and_then(serde_json::Value::as_str);
+        let stored_evaluator_config = sealed_evaluation
+            .get("evaluator_config")
+            .ok_or_else(|| StoreError::Domain("sealed evaluator config is missing".into()))?;
+        let stored_evaluation_metrics = sealed_evaluation
+            .get("metrics")
+            .ok_or_else(|| StoreError::Domain("sealed evaluation metrics are missing".into()))?;
+        let evaluator_config_hash =
+            canonical_json_hash(stored_evaluator_config).map_err(domain_error)?;
+        let evaluation_metrics_hash =
+            canonical_json_hash(stored_evaluation_metrics).map_err(domain_error)?;
         let evaluation_hash = canonical_json_hash(sealed_evaluation).map_err(domain_error)?;
         if sealed.registry_kind != "sealed_evaluation"
             || sealed.asset_id != bundle.candidate_id
@@ -879,6 +917,8 @@ impl AlphaStore {
             || stored_candidate_hash != Some(bundle.candidate_content_hash.as_str())
             || stored_dataset != Some(bundle.dataset_manifest_id.as_str())
             || stored_evaluator_version != Some(bundle.evaluator_version.as_str())
+            || evaluator_config_hash != bundle.evaluator_config_hash
+            || evaluation_metrics_hash != bundle.evaluation_metrics_hash
             || evaluation_hash != bundle.sealed_evaluation_hash
         {
             return Err(StoreError::Domain(
@@ -1229,30 +1269,60 @@ impl AlphaStore {
                 .get("mission_id")
                 .and_then(serde_json::Value::as_str)
                 != Some(mission_id)
-                || revision
-                    .payload
-                    .get("evaluation")
-                    .and_then(|evaluation| evaluation.get("passed"))
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
+            {
+                continue;
+            }
+            let Some(evaluation_value) = revision.payload.get("evaluation") else {
+                continue;
+            };
+            if evaluation_value
+                .get("evaluator_version")
+                .and_then(serde_json::Value::as_str)
+                != Some(SEALED_HOLDOUT_EVALUATOR_VERSION)
+            {
+                continue;
+            }
+            let evaluation: CandidateEvaluation =
+                serde_json::from_value(evaluation_value.clone()).map_err(serialization_error)?;
+            evaluation.validate().map_err(domain_error)?;
+            if !evaluation.passed
+                || evaluation.formula_config().map_err(domain_error)?
+                    != FormulaEvaluatorConfig::for_mission(&mission).map_err(domain_error)?
             {
                 continue;
             }
             let candidate = self
                 .connection
                 .query_row(
-                    "SELECT payload_json, content_hash FROM candidate_artifacts
+                    "SELECT iteration_id, payload_json, content_hash FROM candidate_artifacts
                      WHERE candidate_id = ? AND mission_id = ?",
                     params![revision.asset_id, mission_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
                 )
                 .map_err(map_query_error);
-            let (candidate_json, candidate_hash) = match candidate {
+            let (candidate_iteration_id, candidate_json, candidate_hash) = match candidate {
                 Ok(candidate) => candidate,
                 Err(StoreError::NotFound) => continue,
                 Err(error) => return Err(error),
             };
             verify_hash(&candidate_json, &candidate_hash)?;
+            let candidate_iteration: ResearchIteration = read_json_row(
+                &self.connection,
+                "SELECT payload_json, content_hash FROM iterations WHERE iteration_id = ?",
+                &candidate_iteration_id,
+            )?;
+            if candidate_iteration.engine == EngineKind::OfflineReinforcementLearning
+                || candidate_iteration.candidate_artifact_id.as_deref()
+                    != Some(revision.asset_id.as_str())
+            {
+                continue;
+            }
             let candidate_hash_matches = revision
                 .payload
                 .get("candidate_content_hash")
@@ -1263,13 +1333,7 @@ impl AlphaStore {
                 .get("dataset_manifest_id")
                 .and_then(serde_json::Value::as_str)
                 == Some(mission.dataset_manifest_id.as_str());
-            let evaluator_version_matches = revision
-                .payload
-                .get("evaluation")
-                .and_then(|evaluation| evaluation.get("evaluator_version"))
-                .and_then(serde_json::Value::as_str)
-                == Some(SEALED_HOLDOUT_EVALUATOR_VERSION);
-            if candidate_hash_matches && dataset_matches && evaluator_version_matches {
+            if candidate_hash_matches && dataset_matches {
                 return Ok(Some(revision.asset_id));
             }
         }
@@ -2288,25 +2352,65 @@ mod tests {
         iteration
     }
 
+    fn sealed_evaluation() -> serde_json::Value {
+        let config = FormulaEvaluatorConfig::for_trials(3).unwrap();
+        let raw_score = 4.0;
+        let adjusted_score = config.adjusted_score(raw_score).unwrap();
+        serde_json::json!({
+            "passed": true,
+            "score": adjusted_score,
+            "failure_reasons": [],
+            "evaluator_version": SEALED_HOLDOUT_EVALUATOR_VERSION,
+            "evaluator_config": config,
+            "metrics": {
+                "row_count": 30,
+                "trade_count": 30,
+                "mean_net_return": 0.001,
+                "cumulative_net_return": 0.03,
+                "max_drawdown": 0.01,
+                "raw_score": raw_score,
+                "adjusted_score": adjusted_score,
+                "folds": [{
+                    "fold_index": 1,
+                    "row_count": 30,
+                    "trade_count": 30,
+                    "mean_net_return": 0.001,
+                    "cumulative_net_return": 0.03,
+                    "max_drawdown": 0.01,
+                    "raw_score": raw_score
+                }]
+            }
+        })
+    }
+
     fn persist_formula_promotion(
         store: &mut AlphaStore,
         now: DateTime<Utc>,
     ) -> (StoredPromotion, StrategyBundle) {
+        try_persist_formula_promotion(store, now, EngineKind::ManualSeed).unwrap()
+    }
+
+    fn try_persist_formula_promotion(
+        store: &mut AlphaStore,
+        now: DateTime<Utc>,
+        engine: EngineKind,
+    ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
             "signal".to_string(),
         )));
+        let mut candidate_iteration = iteration();
+        candidate_iteration.engine = engine;
         store
-            .append_iteration(&iteration(), Some(("candidate-1", &candidate)), None)
+            .append_iteration(
+                &candidate_iteration,
+                Some(("candidate-1", &candidate)),
+                None,
+            )
             .unwrap();
         let candidate_hash = store.mission_lineage("mission-1").unwrap().candidates[0]
             .content_hash
             .clone();
-        let evaluation = serde_json::json!({
-            "passed": true,
-            "score": 1.0,
-            "failure_reasons": [],
-            "evaluator_version": "sealed-holdout-v1",
-        });
+        let evaluation = sealed_evaluation();
         let sealed = RegistryRevision {
             revision_id: "sealed-evaluation:candidate-1".to_string(),
             registry_kind: "sealed_evaluation".to_string(),
@@ -2321,13 +2425,21 @@ mod tests {
             created_at: now,
         };
         store.put_registry_revision(&sealed).unwrap();
-        let evaluation_hash = canonical_json_hash(&evaluation).unwrap();
+        let persisted = store.get_registry_revision(&sealed.revision_id).unwrap();
+        let persisted_evaluation = persisted.payload.get("evaluation").unwrap();
+        let evaluator_config_hash =
+            canonical_json_hash(persisted_evaluation.get("evaluator_config").unwrap()).unwrap();
+        let evaluation_metrics_hash =
+            canonical_json_hash(persisted_evaluation.get("metrics").unwrap()).unwrap();
+        let evaluation_hash = canonical_json_hash(persisted_evaluation).unwrap();
         let bundle = StrategyBundle::new(
             "bundle:candidate-1".to_string(),
             "candidate-1".to_string(),
             candidate_hash.clone(),
             ManifestId::new("dataset-1").unwrap(),
-            "sealed-holdout-v1".to_string(),
+            SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            evaluator_config_hash.clone(),
+            evaluation_metrics_hash.clone(),
             evaluation_hash.clone(),
             StrategyBundleArtifact::Formula {
                 ast: FactorAst::Terminal(FactorTerminal::Field("signal".to_string())),
@@ -2341,15 +2453,17 @@ mod tests {
             candidate_id: "candidate-1".to_string(),
             candidate_content_hash: candidate_hash,
             dataset_manifest_id: ManifestId::new("dataset-1").unwrap(),
-            evaluator_version: "sealed-holdout-v1".to_string(),
+            evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            evaluator_config_hash,
+            evaluation_metrics_hash,
             sealed_evaluation_id: sealed.revision_id,
             sealed_evaluation_hash: evaluation_hash,
             bundle_id: bundle.bundle_id.clone(),
             bundle_hash: bundle.bundle_hash.clone(),
             created_at: now,
         };
-        let stored = store.promote_candidate(&bundle, &promotion).unwrap();
-        (stored, bundle)
+        let stored = store.promote_candidate(&bundle, &promotion)?;
+        Ok((stored, bundle))
     }
 
     #[test]
@@ -2458,6 +2572,63 @@ mod tests {
     }
 
     #[test]
+    fn promotion_recomputes_sealed_config_and_metrics_hashes() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let (stored, bundle) = persist_formula_promotion(&mut store, Utc::now());
+
+        for (suffix, forge_config) in [("config", true), ("metrics", false)] {
+            let mut forged_bundle = bundle.clone();
+            forged_bundle.bundle_id = format!("bundle:forged-{suffix}");
+            if forge_config {
+                forged_bundle.evaluator_config_hash = "f".repeat(64);
+            } else {
+                forged_bundle.evaluation_metrics_hash = "f".repeat(64);
+            }
+            forged_bundle.bundle_hash = forged_bundle.calculated_hash().unwrap();
+
+            let mut forged_promotion = stored.record.clone();
+            forged_promotion.promotion_id = format!("promotion-forged-{suffix}");
+            forged_promotion.bundle_id = forged_bundle.bundle_id.clone();
+            forged_promotion.bundle_hash = forged_bundle.bundle_hash.clone();
+            forged_promotion.evaluator_config_hash = forged_bundle.evaluator_config_hash.clone();
+            forged_promotion.evaluation_metrics_hash =
+                forged_bundle.evaluation_metrics_hash.clone();
+
+            assert!(store
+                .promote_candidate(&forged_bundle, &forged_promotion)
+                .is_err());
+            assert!(matches!(
+                store.get_strategy_bundle(&forged_bundle.bundle_id),
+                Err(StoreError::NotFound)
+            ));
+        }
+    }
+
+    #[test]
+    fn offline_rl_provenance_cannot_reach_sealed_or_promotion_authority() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+
+        assert!(try_persist_formula_promotion(
+            &mut store,
+            Utc::now(),
+            EngineKind::OfflineReinforcementLearning,
+        )
+        .is_err());
+        assert_eq!(
+            store
+                .sealed_passed_candidate_for_mission("mission-1")
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            store.get_strategy_bundle("bundle:candidate-1"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
     fn deployment_store_rejects_arbitrary_bundle_binding() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
@@ -2507,12 +2678,7 @@ mod tests {
             .append_iteration(&iteration(), Some(("candidate-1", &candidate)), None)
             .unwrap();
         let now = Utc::now();
-        let evaluation = serde_json::json!({
-            "passed": true,
-            "score": 1.0,
-            "failure_reasons": [],
-            "evaluator_version": "sealed-holdout-v1",
-        });
+        let evaluation = sealed_evaluation();
         store
             .put_registry_revision(&RegistryRevision {
                 revision_id: "sealed-evaluation:candidate-1".to_string(),
@@ -2528,13 +2694,19 @@ mod tests {
                 created_at: now,
             })
             .unwrap();
+        let evaluator_config_hash =
+            canonical_json_hash(evaluation.get("evaluator_config").unwrap()).unwrap();
+        let evaluation_metrics_hash =
+            canonical_json_hash(evaluation.get("metrics").unwrap()).unwrap();
         let evaluation_hash = canonical_json_hash(&evaluation).unwrap();
         let bundle = StrategyBundle::new(
             "bundle:bad".to_string(),
             "candidate-1".to_string(),
             "c".repeat(64),
             ManifestId::new("dataset-1").unwrap(),
-            "sealed-holdout-v1".to_string(),
+            SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            evaluator_config_hash.clone(),
+            evaluation_metrics_hash.clone(),
             evaluation_hash.clone(),
             StrategyBundleArtifact::Formula {
                 ast: FactorAst::Terminal(FactorTerminal::Field("signal".to_string())),
@@ -2548,7 +2720,9 @@ mod tests {
             candidate_id: "candidate-1".to_string(),
             candidate_content_hash: "c".repeat(64),
             dataset_manifest_id: ManifestId::new("dataset-1").unwrap(),
-            evaluator_version: "sealed-holdout-v1".to_string(),
+            evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            evaluator_config_hash,
+            evaluation_metrics_hash,
             sealed_evaluation_id: "sealed-evaluation:candidate-1".to_string(),
             sealed_evaluation_hash: evaluation_hash,
             bundle_id: bundle.bundle_id.clone(),

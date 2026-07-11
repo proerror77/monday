@@ -1,4 +1,4 @@
-use hft_collector::{acquire_dataset, DataAcquisitionMission, QualityRequirements};
+use hft_collector::{acquire_dataset, CandleInterval, DataAcquisitionMission, QualityRequirements};
 use sha2::{Digest, Sha256};
 
 #[tokio::test]
@@ -22,6 +22,12 @@ async fn real_binance_data_mission_produces_manifest_and_quality_report() {
     .unwrap();
     assert_eq!(manifest.quality.rows, 5);
     assert_eq!(manifest.quality.non_finite_values, 0);
+    assert_eq!(manifest.interval, CandleInterval::OneMinute);
+    assert_eq!(manifest.quality.duplicate_timestamps, 0);
+    assert_eq!(manifest.quality.interval_gaps, 0);
+    assert_eq!(manifest.quality.open_or_partial_candles, 0);
+    assert!(!manifest.quality.stale);
+    assert!(manifest.time_bounds.last_exchange_time < manifest.created_at);
     assert!(manifest.artifact_path.exists());
     assert!(manifest.manifest_id.ends_with(&manifest.artifact_sha256));
     let bytes = std::fs::read(&manifest.artifact_path).unwrap();

@@ -1,46 +1,40 @@
 use crate::{
     evaluation::{evaluate_sealed_holdout, EngineContext, PreparedDataset, ResearchRow},
-    CandidateEvaluation, CandidateEvaluator, EngineProposal,
+    CandidateEvaluation, CandidateEvaluator, EngineProposal, EvaluationMetrics,
+    FoldEvaluationMetrics,
 };
 use alpha_domain::{CandidateArtifact, SEALED_HOLDOUT_EVALUATOR_VERSION};
+pub use alpha_domain::{
+    FormulaEvaluatorConfig, MultipleTestingAdjustment, WALK_FORWARD_EVALUATOR_VERSION,
+};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
 
 const BPS: f64 = 10_000.0;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct FormulaEvaluatorConfig {
-    pub min_validation_rows: usize,
-    pub min_fold_mean_return: f64,
-    pub min_aggregate_score: f64,
-    pub max_abs_signal: f64,
-}
-
-impl Default for FormulaEvaluatorConfig {
-    fn default() -> Self {
-        Self {
-            min_validation_rows: 5,
-            min_fold_mean_return: 0.0,
-            min_aggregate_score: 0.0,
-            max_abs_signal: 1.0e12,
-        }
-    }
-}
 
 pub struct FormulaEvaluator {
     config: FormulaEvaluatorConfig,
 }
 
 impl FormulaEvaluator {
+    pub fn for_trials(multiple_testing_trials: usize) -> Result<Self, String> {
+        Self::new(
+            FormulaEvaluatorConfig::for_trials(multiple_testing_trials)
+                .map_err(|error| error.to_string())?,
+        )
+    }
+
+    pub fn for_mission(mission: &alpha_domain::ResearchMission) -> Result<Self, String> {
+        Self::new(FormulaEvaluatorConfig::for_mission(mission).map_err(|error| error.to_string())?)
+    }
+
     pub fn new(config: FormulaEvaluatorConfig) -> Result<Self, String> {
-        if config.min_validation_rows < 2
-            || !config.min_fold_mean_return.is_finite()
-            || !config.min_aggregate_score.is_finite()
-            || !config.max_abs_signal.is_finite()
-            || config.max_abs_signal <= 0.0
-        {
-            return Err("invalid formula evaluator configuration".to_string());
-        }
+        config.validate().map_err(|error| error.to_string())?;
         Ok(Self { config })
+    }
+
+    pub fn config_evidence(&self) -> Result<serde_json::Value, String> {
+        serde_json::to_value(&self.config)
+            .map_err(|error| format!("failed to serialize evaluator config: {error}"))
     }
 
     pub fn evaluate_sealed(
@@ -77,41 +71,94 @@ impl FormulaEvaluator {
             return Err("formula produced an invalid or unbounded signal".to_string());
         }
 
-        let mut scores = Vec::new();
+        let mut fold_metrics = Vec::new();
+        let mut all_returns = Vec::new();
         let mut failures = Vec::new();
         for (fold_index, range) in ranges.into_iter().enumerate() {
             if range.len() < self.config.min_validation_rows || range.end > rows.len() {
                 return Err("evaluation range is too short or out of bounds".to_string());
             }
-            let returns = net_returns(rows, signals, range.clone());
+            let (returns, trade_count) = net_returns(rows, signals, range.clone());
             let mean = mean(&returns);
-            let score = t_statistic(&returns, mean);
-            if mean < self.config.min_fold_mean_return {
+            let raw_score = t_statistic(&returns, mean);
+            let max_drawdown = max_drawdown(&returns);
+            if trade_count < self.config.min_trades {
                 failures.push(format!(
-                    "fold {} mean net return {:.8} is below {:.8}",
+                    "fold {} trades {} are below {}",
+                    fold_index + 1,
+                    trade_count,
+                    self.config.min_trades
+                ));
+            }
+            if mean <= self.config.min_fold_mean_return {
+                failures.push(format!(
+                    "fold {} does not establish positive net edge: mean {:.8} must exceed {:.8}",
                     fold_index + 1,
                     mean,
                     self.config.min_fold_mean_return
                 ));
             }
-            scores.push(score);
+            if max_drawdown > self.config.max_drawdown {
+                failures.push(format!(
+                    "fold {} drawdown {:.8} exceeds {:.8}",
+                    fold_index + 1,
+                    max_drawdown,
+                    self.config.max_drawdown
+                ));
+            }
+            fold_metrics.push(FoldEvaluationMetrics {
+                fold_index: fold_index + 1,
+                row_count: returns.len(),
+                trade_count,
+                mean_net_return: mean,
+                cumulative_net_return: returns.iter().sum(),
+                max_drawdown,
+                raw_score,
+            });
+            all_returns.extend(returns);
         }
-        if scores.is_empty() {
+        if fold_metrics.is_empty() {
             return Err("evaluation has no folds".to_string());
         }
-        let aggregate = mean(&scores);
-        if aggregate < self.config.min_aggregate_score {
+        let raw_score = mean(
+            &fold_metrics
+                .iter()
+                .map(|fold| fold.raw_score)
+                .collect::<Vec<_>>(),
+        );
+        let adjusted_score = self
+            .config
+            .adjusted_score(raw_score)
+            .map_err(|error| error.to_string())?;
+        if adjusted_score < self.config.min_aggregate_score {
             failures.push(format!(
-                "aggregate score {:.8} is below {:.8}",
-                aggregate, self.config.min_aggregate_score
+                "multiple-testing-adjusted score {:.8} is below {:.8}",
+                adjusted_score, self.config.min_aggregate_score
             ));
         }
-        Ok(CandidateEvaluation {
+        let metrics = EvaluationMetrics {
+            row_count: all_returns.len(),
+            trade_count: fold_metrics.iter().map(|fold| fold.trade_count).sum(),
+            mean_net_return: mean(&all_returns),
+            cumulative_net_return: all_returns.iter().sum(),
+            max_drawdown: fold_metrics
+                .iter()
+                .map(|fold| fold.max_drawdown)
+                .fold(0.0, f64::max),
+            raw_score,
+            adjusted_score,
+            folds: fold_metrics,
+        };
+        let evaluation = CandidateEvaluation {
             passed: failures.is_empty(),
-            score: aggregate,
+            score: adjusted_score,
             failure_reasons: failures,
             evaluator_version: evaluator_version.to_string(),
-        })
+            evaluator_config: self.config_evidence()?,
+            metrics,
+        };
+        evaluation.validate().map_err(|error| error.to_string())?;
+        Ok(evaluation)
     }
 }
 
@@ -127,7 +174,7 @@ impl CandidateEvaluator for FormulaEvaluator {
             context.rows(),
             &signals,
             context.folds().iter().map(|fold| fold.validation.clone()),
-            "purged-walk-forward-v1",
+            WALK_FORWARD_EVALUATOR_VERSION,
         )
     }
 }
@@ -309,16 +356,20 @@ fn expanding_rank(values: &[f64]) -> Result<Vec<f64>, String> {
         .collect())
 }
 
-fn net_returns(rows: &[ResearchRow], signals: &[f64], range: std::ops::Range<usize>) -> Vec<f64> {
-    let mut previous_position = if range.start == 0 {
-        0.0
-    } else {
-        signals[range.start - 1].signum()
-    };
-    range
+fn net_returns(
+    rows: &[ResearchRow],
+    signals: &[f64],
+    range: std::ops::Range<usize>,
+) -> (Vec<f64>, usize) {
+    let mut previous_position = 0.0;
+    let mut trade_count = 0;
+    let returns = range
         .map(|index| {
-            let position = signals[index].signum();
+            let position = signal_position(signals[index]);
             let turnover = (position - previous_position).abs();
+            if turnover > f64::EPSILON {
+                trade_count += 1;
+            }
             previous_position = position;
             let row = &rows[index];
             let transaction_cost =
@@ -326,7 +377,16 @@ fn net_returns(rows: &[ResearchRow], signals: &[f64], range: std::ops::Range<usi
             let funding_cost = row.funding_bps.max(0.0) * position.abs() / BPS;
             position * row.label - transaction_cost - funding_cost
         })
-        .collect()
+        .collect();
+    (returns, trade_count)
+}
+
+fn signal_position(signal: f64) -> f64 {
+    if signal.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        signal.signum()
+    }
 }
 
 fn mean(values: &[f64]) -> f64 {
@@ -345,10 +405,29 @@ fn standard_deviation(values: &[f64], average: f64) -> f64 {
 fn t_statistic(values: &[f64], average: f64) -> f64 {
     let deviation = standard_deviation(values, average);
     if deviation <= f64::EPSILON {
-        0.0
+        if average.abs() <= f64::EPSILON {
+            0.0
+        } else {
+            // Keep deterministic returns finite instead of persisting an infinite t-statistic.
+            average.signum() * (values.len() as f64).sqrt()
+        }
     } else {
         average / (deviation / (values.len() as f64).sqrt())
     }
+}
+
+fn max_drawdown(returns: &[f64]) -> f64 {
+    let mut equity = 1.0_f64;
+    let mut peak = 1.0_f64;
+    let mut maximum = 0.0_f64;
+    for value in returns {
+        equity += value;
+        peak = peak.max(equity);
+        if peak > f64::EPSILON {
+            maximum = maximum.max((peak - equity) / peak);
+        }
+    }
+    maximum
 }
 
 #[cfg(test)]
@@ -370,7 +449,7 @@ mod tests {
 
     fn rows(fee_bps: f64) -> Vec<ResearchRow> {
         let start = Utc::now();
-        (0..30)
+        (0..500)
             .map(|index| ResearchRow {
                 available_time: start + Duration::minutes(index as i64),
                 signal: if index % 2 == 0 { 1.0 } else { -1.0 },
@@ -386,12 +465,12 @@ mod tests {
         prepare_dataset(
             rows(fee_bps),
             &WalkForwardConfig {
-                initial_train_rows: 8,
-                validation_rows: 5,
-                fold_count: 2,
+                initial_train_rows: 200,
+                validation_rows: 64,
+                fold_count: 3,
                 purge_rows: 1,
                 embargo_rows: 1,
-                sealed_holdout_rows: 8,
+                sealed_holdout_rows: 64,
             },
             "sealed-1",
         )
@@ -430,6 +509,97 @@ mod tests {
             .unwrap();
         assert!(!result.passed);
         assert!(!result.failure_reasons.is_empty());
+    }
+
+    #[test]
+    fn derived_return_overflow_is_rejected_before_evidence_is_emitted() {
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
+            "signal".to_string(),
+        )));
+
+        assert!(evaluator
+            .evaluate(&proposal, &dataset(f64::MAX).engine_context())
+            .is_err());
+    }
+
+    #[test]
+    fn zero_signal_cannot_pass_without_trades_or_positive_edge() {
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let proposal = proposal(FactorAst::Terminal(FactorTerminal::Constant(
+            "0".to_string(),
+        )));
+        let result = evaluator.evaluate_sealed(&proposal, &dataset(0.0)).unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(result.metrics.trade_count, 0);
+        assert_eq!(result.metrics.mean_net_return, 0.0);
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.contains("trades")));
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.contains("positive net edge")));
+    }
+
+    #[test]
+    fn sealed_evidence_persists_metrics_config_and_multiple_testing_haircut() {
+        let config = FormulaEvaluatorConfig {
+            multiple_testing_trials: 100,
+            ..FormulaEvaluatorConfig::default()
+        };
+        let evaluator = FormulaEvaluator::new(config.clone()).unwrap();
+        let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
+            "signal".to_string(),
+        )));
+        let result = evaluator.evaluate_sealed(&proposal, &dataset(0.0)).unwrap();
+
+        result.validate().unwrap();
+        assert!(result.metrics.row_count >= config.min_validation_rows);
+        assert!(result.metrics.trade_count >= config.min_trades);
+        assert!(result.metrics.raw_score > result.metrics.adjusted_score);
+        assert_eq!(
+            result.evaluator_config["multiple_testing_trials"],
+            serde_json::json!(100)
+        );
+
+        let mut tampered = result;
+        tampered.evaluator_config = serde_json::Value::Null;
+        assert!(tampered.validate().is_err());
+    }
+
+    #[test]
+    fn drawdown_above_the_governed_bound_cannot_pass() {
+        let mut input = rows(0.0);
+        let holdout_loss = input.len() - 32;
+        input[holdout_loss].label = -0.5 * input[holdout_loss].signal.signum();
+        let dataset = prepare_dataset(
+            input,
+            &WalkForwardConfig {
+                initial_train_rows: 200,
+                validation_rows: 64,
+                fold_count: 3,
+                purge_rows: 1,
+                embargo_rows: 1,
+                sealed_holdout_rows: 64,
+            },
+            "sealed-drawdown",
+        )
+        .unwrap();
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
+            "signal".to_string(),
+        )));
+        let result = evaluator.evaluate_sealed(&proposal, &dataset).unwrap();
+
+        assert!(!result.passed);
+        assert!(result.metrics.max_drawdown > 0.2);
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.contains("drawdown")));
     }
 
     #[test]

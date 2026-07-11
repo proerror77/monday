@@ -10,6 +10,7 @@ use alpha_domain::{
     CandidateArtifact, EngineKind, IterationVerdict, MissionStatus, MissionTerminalReason,
     ResearchIteration, SearchBudgetLimit,
 };
+pub use alpha_domain::{CandidateEvaluation, EvaluationMetrics, FoldEvaluationMetrics};
 use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RunCheckpoint, StoreError};
 use chrono::Utc;
 use evaluation::{EngineContext, PreparedDataset};
@@ -150,14 +151,6 @@ pub struct RemainingBudget {
     pub expansions: u64,
     pub tokens: u64,
     pub milliseconds: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CandidateEvaluation {
-    pub passed: bool,
-    pub score: f64,
-    pub failure_reasons: Vec<String>,
-    pub evaluator_version: String,
 }
 
 pub trait CandidateEvaluator {
@@ -343,9 +336,8 @@ where
                         self.evaluator
                             .evaluate(&proposal, &context)
                             .and_then(|result| {
-                                result.score.is_finite().then_some(result).ok_or_else(|| {
-                                    "evaluator returned non-finite score".to_string()
-                                })
+                                result.validate().map_err(|error| error.to_string())?;
+                                Ok(result)
                             })
                     } else {
                         Err("proposal exceeded remaining search budget".to_string())
@@ -657,6 +649,25 @@ mod tests {
                 score: 1.0,
                 failure_reasons: vec![],
                 evaluator_version: "fixture-v1".to_string(),
+                evaluator_config: serde_json::json!({"fixture": true}),
+                metrics: EvaluationMetrics {
+                    row_count: context.rows().len(),
+                    trade_count: context.rows().len(),
+                    mean_net_return: 1.0,
+                    cumulative_net_return: context.rows().len() as f64,
+                    max_drawdown: 0.0,
+                    raw_score: 1.0,
+                    adjusted_score: 1.0,
+                    folds: vec![FoldEvaluationMetrics {
+                        fold_index: 1,
+                        row_count: context.rows().len(),
+                        trade_count: context.rows().len(),
+                        mean_net_return: 1.0,
+                        cumulative_net_return: context.rows().len() as f64,
+                        max_drawdown: 0.0,
+                        raw_score: 1.0,
+                    }],
+                },
             })
         }
     }

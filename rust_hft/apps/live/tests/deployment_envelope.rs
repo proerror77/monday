@@ -4,9 +4,14 @@ use alpha_domain::{
 };
 use chrono::{Duration, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+#[cfg(any(
+    not(feature = "formula-strategy"),
+    all(feature = "formula-strategy", feature = "binance")
+))]
+use hft_live::deployment_envelope::ActivationMode;
 use hft_live::deployment_envelope::{
-    ActivationMode, ActivationRequest, DeploymentIntake, DeploymentReservation,
-    RuntimeActivationAdapter, RuntimeAuditLog, RuntimeNonceLedger, SystemConfigActivationAdapter,
+    ActivationRequest, DeploymentIntake, DeploymentReservation, RuntimeActivationAdapter,
+    RuntimeAuditLog, RuntimeNonceLedger, SystemConfigActivationAdapter,
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -93,7 +98,9 @@ fn formula_bundle(now: chrono::DateTime<Utc>) -> StrategyBundle {
         "candidate_id": "candidate-1",
         "candidate_content_hash": "1".repeat(64),
         "dataset_manifest_id": "dataset-1",
-        "evaluator_version": "sealed-holdout-v1",
+        "evaluator_version": "sealed-holdout-v2",
+        "evaluator_config_hash": "3".repeat(64),
+        "evaluation_metrics_hash": "4".repeat(64),
         "sealed_evaluation_hash": "2".repeat(64),
         "artifact": {
             "Formula": {
@@ -120,7 +127,9 @@ fn onnx_bundle(
         "candidate_id": "candidate-onnx",
         "candidate_content_hash": "3".repeat(64),
         "dataset_manifest_id": "dataset-1",
-        "evaluator_version": "sealed-holdout-v1",
+        "evaluator_version": "onnx-fixture-v1",
+        "evaluator_config_hash": "5".repeat(64),
+        "evaluation_metrics_hash": "6".repeat(64),
         "sealed_evaluation_hash": "4".repeat(64),
         "artifact": {
             "Onnx": {
@@ -198,6 +207,7 @@ fn configured_runtime() -> runtime::SystemConfig {
 }
 
 #[test]
+#[cfg(all(feature = "formula-strategy", feature = "binance"))]
 fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
     let now = Utc::now();
     let key = SigningKey::from_bytes(&[7_u8; 32]);
@@ -279,6 +289,39 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
     assert!(audit.contains("\"result\":\"prepared\""));
     assert!(!audit.contains("\"result\":\"activated\""));
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(not(feature = "formula-strategy"))]
+fn featureless_runtime_rejects_formula_strategy_startup() {
+    let now = Utc::now();
+    let mut config = configured_runtime();
+    let bundle = formula_bundle(now);
+    let bundle_path = directory("featureless").join("bundle.json");
+    let request = ActivationRequest {
+        deployment_id: "deployment-featureless".to_string(),
+        asset_revision_id: bundle.candidate_id.clone(),
+        promotion_id: "promotion-1".to_string(),
+        bundle_id: bundle.bundle_id.clone(),
+        bundle_hash: bundle.bundle_hash.clone(),
+        account_id: "account-1".to_string(),
+        venue: "binance".to_string(),
+        instruments: vec!["BTCUSDT".to_string()],
+        artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
+        mode: ActivationMode::Paper,
+        max_notional: 1_000.0,
+        max_symbol_exposure: 500.0,
+        max_order_size: 100.0,
+        max_slippage_bps: 5.0,
+    };
+    SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
+        .activate(&request)
+        .unwrap();
+
+    assert!(runtime::SystemBuilder::new(config)
+        .auto_register_adapters_strict()
+        .is_err());
+    std::fs::remove_dir_all(bundle_path.parent().unwrap()).unwrap();
 }
 
 #[test]
@@ -543,7 +586,7 @@ fn onnx_handoff_rejects_bad_schema_and_checksum_before_runtime_build() {
     let mut config = configured_runtime();
     let bundle_path = directory.join("bundle-valid-metadata.json");
     let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
-    let (_, mut reservation) =
+    let (_, reservation) =
         prepare_intake(&signed, &trusted, &policy(), now, &directory, &mut adapter).unwrap();
     drop(adapter);
     assert!(matches!(
@@ -552,6 +595,7 @@ fn onnx_handoff_rejects_bad_schema_and_checksum_before_runtime_build() {
     ));
     #[cfg(feature = "dl-strategy")]
     {
+        let mut reservation = reservation;
         let error = runtime::SystemBuilder::new(config)
             .auto_register_adapters_strict()
             .err()

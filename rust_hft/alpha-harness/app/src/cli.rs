@@ -136,9 +136,9 @@ pub struct MissionStatusArgs {
 pub struct DatasetArgs {
     #[arg(long)]
     pub dataset_manifest: PathBuf,
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 200)]
     pub initial_train_rows: usize,
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 64)]
     pub validation_rows: usize,
     #[arg(long, default_value_t = 3)]
     pub fold_count: usize,
@@ -146,7 +146,7 @@ pub struct DatasetArgs {
     pub purge_rows: usize,
     #[arg(long, default_value_t = 1)]
     pub embargo_rows: usize,
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 64)]
     pub sealed_holdout_rows: usize,
     #[arg(long, default_value_t = 1.0)]
     pub fee_bps: f64,

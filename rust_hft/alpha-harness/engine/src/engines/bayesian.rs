@@ -416,6 +416,17 @@ mod tests {
             score,
             failure_reasons: vec![],
             evaluator_version: "test".to_string(),
+            evaluator_config: serde_json::json!({"fixture": true}),
+            metrics: crate::EvaluationMetrics {
+                row_count: 1,
+                trade_count: 1,
+                mean_net_return: score,
+                cumulative_net_return: score,
+                max_drawdown: 0.0,
+                raw_score: score,
+                adjusted_score: score,
+                folds: vec![],
+            },
         }
     }
 

@@ -45,12 +45,12 @@ The durable loop is:
 
 ## Strategy Bundle
 
-The first production-capable bundle supports only artifacts the runtime can execute deterministically:
+The runtime-loadable bundle schema supports artifacts the Rust runtime can execute deterministically:
 
 - `Formula`: validated Factor DSL plus live feature mapping, signal threshold, order size request, and strategy risk request.
 - `OnnxModel`: content-addressed model artifact plus existing deterministic DL strategy configuration.
 
-Other candidate variants remain research-only and cannot be signed. Model files are not embedded; the bundle includes path/URI, SHA-256, size, and schema/version metadata. Formula and model bundles share the same asset, evaluation, and risk bindings.
+The current governed evaluator and promotion producer is Formula-only. `OnnxModel` remains a research/runtime-compatibility artifact until a point-in-time ONNX evaluator and training lineage are implemented; it cannot be produced by the v2 promotion path. Other candidate variants remain research-only and cannot be signed. Model files are not embedded; the bundle schema includes path/URI, SHA-256, size, and schema/version metadata.
 
 ## Accounting And Execution Safety
 
@@ -85,7 +85,7 @@ Other candidate variants remain research-only and cannot be signed. Model files 
 6. Reconciliation errors halt live execution instead of returning success or empty state.
 7. A zero-signal or no-trade candidate fails evaluation.
 8. Promotion cannot sign an envelope that is not bound to its persisted candidate, evaluation, dataset, bundle, and approval.
-9. Paper/shadow activation loads the referenced formula or ONNX strategy before runtime build.
+9. Paper/shadow activation loads the referenced Formula v2 strategy before runtime build; ONNX runtime loading remains compatibility-tested but is not a governed promotion claim.
 10. Activation is reported only after runtime start succeeds.
 11. Fill/reject/cancel/PnL attribution is non-empty and tied to deployment and strategy bundle.
 12. Research mission completion uses explicit criteria and persists a completion reason; overall `LoopRun` completion uses a target stage.

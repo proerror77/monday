@@ -1,7 +1,10 @@
 use std::path::Path;
 
+#[cfg(all(feature = "formula-strategy", feature = "bitget"))]
 use alpha_domain::StrategyBundle;
+#[cfg(all(feature = "formula-strategy", feature = "bitget"))]
 use chrono::Utc;
+#[cfg(all(feature = "formula-strategy", feature = "bitget"))]
 use hft_live::deployment_envelope::{
     ActivationArtifact, ActivationMode, ActivationRequest, RuntimeActivationAdapter,
     SystemConfigActivationAdapter,
@@ -12,13 +15,16 @@ use serde::Deserialize;
 const K8S_CONFIG_MAPS: &str = include_str!("../../../deployment/k8s/configmaps.yaml");
 const PRODUCTION_CONFIG: &str = include_str!("../../../config/prod/system.yaml");
 
+#[cfg(all(feature = "formula-strategy", feature = "bitget"))]
 fn formula_bundle() -> StrategyBundle {
     let mut bundle: StrategyBundle = serde_json::from_value(serde_json::json!({
         "bundle_id": "bundle-1",
         "candidate_id": "candidate-1",
         "candidate_content_hash": "1".repeat(64),
         "dataset_manifest_id": "dataset-1",
-        "evaluator_version": "sealed-holdout-v1",
+        "evaluator_version": "sealed-holdout-v2",
+        "evaluator_config_hash": "3".repeat(64),
+        "evaluation_metrics_hash": "4".repeat(64),
         "sealed_evaluation_hash": "2".repeat(64),
         "artifact": {"Formula": {"ast": {"Terminal": {"Field": "book_imbalance"}}}},
         "bundle_hash": "",
@@ -45,6 +51,7 @@ fn production_config_is_parseable_and_fail_closed() {
 }
 
 #[test]
+#[cfg(all(feature = "formula-strategy", feature = "bitget"))]
 fn production_config_accepts_the_governed_paper_target() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/prod/system.yaml");
     let mut config = SystemBuilder::from_yaml(path.to_str().expect("utf-8 config path"))

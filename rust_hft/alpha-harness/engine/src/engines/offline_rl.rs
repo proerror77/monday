@@ -150,7 +150,7 @@ impl ProposalEngine for OfflineRlEngine {
         Ok(EngineProposal {
             candidate_id: format!("{mission_id}-offline-rl-{iteration_index}"),
             hypothesis: format!(
-                "offline Q-learning policy {} selected {} for {} state",
+                "lab-only offline Q-learning search policy {} selected {} for {} state; no allocator or runtime authority",
                 self.policy_version, action, state
             ),
             artifact: CandidateArtifact::Formula(self.ast_for_action(action)?),
@@ -200,5 +200,29 @@ mod tests {
     fn offline_q_learning_prefers_higher_reward_action() {
         let engine = OfflineRlEngine::train("oi", "policy-1", &traces(), 3, 0.2, 0.9, 20).unwrap();
         assert!(engine.q_value("positive", "rank") > engine.q_value("positive", "mean"));
+    }
+
+    #[test]
+    fn proposals_are_explicitly_labeled_lab_search_only() {
+        let mut engine =
+            OfflineRlEngine::train("signal", "policy-1", &traces(), 3, 0.2, 0.9, 20).unwrap();
+        let proposal = engine
+            .propose(
+                "mission",
+                0,
+                &super::super::test_dataset().engine_context(),
+                &RemainingBudget {
+                    candidates: 1,
+                    expansions: 0,
+                    tokens: 0,
+                    milliseconds: 0,
+                },
+            )
+            .unwrap();
+
+        assert!(proposal.hypothesis.contains("lab-only"));
+        assert!(proposal
+            .hypothesis
+            .contains("no allocator or runtime authority"));
     }
 }

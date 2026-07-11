@@ -22,7 +22,7 @@ cargo run -p alpha-harness -- data acquire \
   --artifact-dir var/datasets
 ```
 
-The command calls the registered public connector, writes a content-addressed JSONL trace and manifest, persists quality evidence, and writes a failure artifact on acquisition failure. It never substitutes fixtures.
+The command calls the registered public connector, writes a content-addressed JSONL trace and manifest, persists the full manifest as an immutable DuckDB registry revision, and writes a failure artifact on acquisition failure. Research commands reject a disk manifest that does not exactly match that revision. The acquisition path never substitutes fixtures.
 
 ## Research Mission
 
@@ -45,7 +45,7 @@ cargo run -p alpha-harness -- candidate list \
   --db var/alpha.duckdb --mission-id mission-1
 ```
 
-Supported engines are `gp`, `mcts`, `bayesian`, `offline-rl`, and `llm`. Offline RL requires an explicit trace file and minimum history. LLM requires:
+Supported engines are `gp`, `mcts`, `bayesian`, `offline-rl`, and `llm`. Offline RL requires an explicit trace file and minimum history; its output is lab search-policy evidence and cannot access sealed holdout or promotion authority. LLM requires:
 
 ```text
 ALPHA_LLM_ENDPOINT
@@ -71,7 +71,7 @@ cargo run -p alpha-harness -- mission learn \
   --repeated-failure-threshold 3
 ```
 
-Only a walk-forward Keep candidate can access the sealed holdout. Repeated failures generate one idempotent follow-up mission and learning directive. Add `--llm-critic` for a bounded real failure explanation.
+Only a canonical Formula v2 walk-forward Keep candidate can access the sealed holdout. The evaluator persists rows, trades, post-cost edge, drawdown, raw score, adjusted score, config, and version; config and metrics hashes are bound into promotion and bundle hashes. A mission may pre-register a larger multiple-testing family through `validator_spec.multiple_testing_trials`, but it cannot declare fewer trials than its candidate budget. Repeated failures generate one idempotent follow-up mission and learning directive. Add `--llm-critic` for a bounded real failure explanation.
 
 Runtime feedback and search policy revisions enter through typed JSON:
 
@@ -96,6 +96,8 @@ cargo run -p alpha-harness -- deployment sign \
 ```
 
 The signing key file contains exactly 32 bytes as hex and is never stored in DuckDB. Live-small signing requires a persisted `human_live_small` approval whose `scope_hash` matches venue, instruments, and live-small intent. The runtime still refuses live-small activation until universal per-order limits are implemented.
+
+The runtime bundle schema can validate Formula and ONNX artifacts, but the current governed evaluator/promotion producer emits Formula bundles only. ONNX candidates remain research-only until a point-in-time ONNX evaluator and training lineage are implemented; runtime ONNX compatibility tests are not evidence of governed ONNX promotion.
 
 For paper/shadow runtime intake, first obtain current hashes:
 

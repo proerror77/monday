@@ -11,7 +11,8 @@ use thiserror::Error;
 
 pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
-pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v1";
+pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v2";
+pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v2";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -67,6 +68,247 @@ pub enum DomainError {
     StrategyBundleHashMismatch,
     #[error("promotion record does not match its candidate, evidence, or bundle")]
     PromotionBindingMismatch,
+    #[error("evaluation evidence is inconsistent")]
+    InvalidEvaluationEvidence,
+    #[error("formula evaluator configuration is invalid")]
+    InvalidEvaluatorConfiguration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MultipleTestingAdjustment {
+    GaussianExpectedMaximum,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FormulaEvaluatorConfig {
+    pub min_validation_rows: usize,
+    pub min_trades: usize,
+    pub min_fold_mean_return: f64,
+    pub min_aggregate_score: f64,
+    pub max_drawdown: f64,
+    pub multiple_testing_trials: usize,
+    pub multiple_testing_adjustment: MultipleTestingAdjustment,
+    pub max_abs_signal: f64,
+}
+
+impl Default for FormulaEvaluatorConfig {
+    fn default() -> Self {
+        Self {
+            min_validation_rows: 30,
+            min_trades: 30,
+            min_fold_mean_return: 0.000_001,
+            min_aggregate_score: 2.0,
+            max_drawdown: 0.20,
+            multiple_testing_trials: 1,
+            multiple_testing_adjustment: MultipleTestingAdjustment::GaussianExpectedMaximum,
+            max_abs_signal: 1.0e12,
+        }
+    }
+}
+
+impl FormulaEvaluatorConfig {
+    pub fn for_trials(multiple_testing_trials: usize) -> Result<Self, DomainError> {
+        let config = Self {
+            multiple_testing_trials,
+            ..Self::default()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn for_mission(mission: &ResearchMission) -> Result<Self, DomainError> {
+        let multiple_testing_trials = match mission.validator_spec.get("multiple_testing_trials") {
+            Some(value) => usize::try_from(
+                value
+                    .as_u64()
+                    .ok_or(DomainError::InvalidEvaluatorConfiguration)?,
+            )
+            .map_err(|_| DomainError::InvalidEvaluatorConfiguration)?,
+            None => mission.search_budget.max_candidates,
+        };
+        if multiple_testing_trials < mission.search_budget.max_candidates {
+            return Err(DomainError::InvalidEvaluatorConfiguration);
+        }
+        Self::for_trials(multiple_testing_trials)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.min_validation_rows < 2
+            || self.min_trades == 0
+            || self.min_trades > self.min_validation_rows
+            || !self.min_fold_mean_return.is_finite()
+            || self.min_fold_mean_return <= 0.0
+            || !self.min_aggregate_score.is_finite()
+            || self.min_aggregate_score <= 0.0
+            || !self.max_drawdown.is_finite()
+            || !(0.0..=1.0).contains(&self.max_drawdown)
+            || self.max_drawdown <= 0.0
+            || self.multiple_testing_trials == 0
+            || !self.max_abs_signal.is_finite()
+            || self.max_abs_signal <= 0.0
+        {
+            return Err(DomainError::InvalidEvaluatorConfiguration);
+        }
+        Ok(())
+    }
+
+    pub fn adjusted_score(&self, raw_score: f64) -> Result<f64, DomainError> {
+        self.validate()?;
+        if !raw_score.is_finite() {
+            return Err(DomainError::InvalidEvaluationEvidence);
+        }
+        let penalty = match self.multiple_testing_adjustment {
+            MultipleTestingAdjustment::GaussianExpectedMaximum
+                if self.multiple_testing_trials <= 1 =>
+            {
+                0.0
+            }
+            MultipleTestingAdjustment::GaussianExpectedMaximum => {
+                (2.0 * (self.multiple_testing_trials as f64).ln()).sqrt()
+            }
+        };
+        Ok(raw_score - penalty)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoldEvaluationMetrics {
+    pub fold_index: usize,
+    pub row_count: usize,
+    pub trade_count: usize,
+    pub mean_net_return: f64,
+    pub cumulative_net_return: f64,
+    pub max_drawdown: f64,
+    pub raw_score: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvaluationMetrics {
+    pub row_count: usize,
+    pub trade_count: usize,
+    pub mean_net_return: f64,
+    pub cumulative_net_return: f64,
+    pub max_drawdown: f64,
+    pub raw_score: f64,
+    pub adjusted_score: f64,
+    pub folds: Vec<FoldEvaluationMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateEvaluation {
+    pub passed: bool,
+    pub score: f64,
+    pub failure_reasons: Vec<String>,
+    pub evaluator_version: String,
+    pub evaluator_config: serde_json::Value,
+    pub metrics: EvaluationMetrics,
+}
+
+impl CandidateEvaluation {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        let finite_metrics = [
+            self.metrics.mean_net_return,
+            self.metrics.cumulative_net_return,
+            self.metrics.max_drawdown,
+            self.metrics.raw_score,
+            self.metrics.adjusted_score,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+            && self.metrics.folds.iter().all(|fold| {
+                [
+                    fold.mean_net_return,
+                    fold.cumulative_net_return,
+                    fold.max_drawdown,
+                    fold.raw_score,
+                ]
+                .iter()
+                .all(|value| value.is_finite())
+                    && fold.fold_index > 0
+                    && fold.row_count > 0
+                    && fold.trade_count <= fold.row_count
+                    && fold.max_drawdown >= 0.0
+            });
+        let row_count: usize = self.metrics.folds.iter().map(|fold| fold.row_count).sum();
+        let trade_count: usize = self.metrics.folds.iter().map(|fold| fold.trade_count).sum();
+        let cumulative_net_return = self
+            .metrics
+            .folds
+            .iter()
+            .map(|fold| fold.cumulative_net_return)
+            .sum();
+        let weighted_mean = self
+            .metrics
+            .folds
+            .iter()
+            .map(|fold| fold.mean_net_return * fold.row_count as f64)
+            .sum::<f64>()
+            / row_count.max(1) as f64;
+        let maximum_drawdown = self
+            .metrics
+            .folds
+            .iter()
+            .map(|fold| fold.max_drawdown)
+            .fold(0.0_f64, f64::max);
+        let raw_score = self
+            .metrics
+            .folds
+            .iter()
+            .map(|fold| fold.raw_score)
+            .sum::<f64>()
+            / self.metrics.folds.len().max(1) as f64;
+        if self.evaluator_version.trim().is_empty()
+            || !self.evaluator_config.is_object()
+            || self.metrics.row_count == 0
+            || self.metrics.folds.is_empty()
+            || !self.score.is_finite()
+            || !finite_metrics
+            || self.metrics.max_drawdown < 0.0
+            || self.score.to_bits() != self.metrics.adjusted_score.to_bits()
+            || self.passed != self.failure_reasons.is_empty()
+            || row_count != self.metrics.row_count
+            || trade_count != self.metrics.trade_count
+            || !approximately_equal(cumulative_net_return, self.metrics.cumulative_net_return)
+            || !approximately_equal(weighted_mean, self.metrics.mean_net_return)
+            || !approximately_equal(maximum_drawdown, self.metrics.max_drawdown)
+            || !approximately_equal(raw_score, self.metrics.raw_score)
+        {
+            return Err(DomainError::InvalidEvaluationEvidence);
+        }
+        if matches!(
+            self.evaluator_version.as_str(),
+            WALK_FORWARD_EVALUATOR_VERSION | SEALED_HOLDOUT_EVALUATOR_VERSION
+        ) {
+            let config = self.formula_config()?;
+            let policy_passed = self.metrics.folds.iter().all(|fold| {
+                fold.row_count >= config.min_validation_rows
+                    && fold.trade_count >= config.min_trades
+                    && fold.mean_net_return > config.min_fold_mean_return
+                    && fold.max_drawdown <= config.max_drawdown
+            }) && self.metrics.adjusted_score >= config.min_aggregate_score;
+            if self.passed != policy_passed
+                || !approximately_equal(
+                    config.adjusted_score(self.metrics.raw_score)?,
+                    self.metrics.adjusted_score,
+                )
+            {
+                return Err(DomainError::InvalidEvaluationEvidence);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn formula_config(&self) -> Result<FormulaEvaluatorConfig, DomainError> {
+        let config: FormulaEvaluatorConfig = serde_json::from_value(self.evaluator_config.clone())
+            .map_err(|_| DomainError::InvalidEvaluatorConfiguration)?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+fn approximately_equal(left: f64, right: f64) -> bool {
+    let scale = left.abs().max(right.abs()).max(1.0);
+    (left - right).abs() <= f64::EPSILON * 16.0 * scale
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -706,20 +948,17 @@ pub enum CandidateArtifact {
 }
 
 impl CandidateArtifact {
-    pub fn to_strategy_bundle_artifact(&self) -> Result<StrategyBundleArtifact, DomainError> {
+    pub fn to_governed_strategy_bundle_artifact(
+        &self,
+    ) -> Result<StrategyBundleArtifact, DomainError> {
         match self {
             Self::Formula(ast) => {
                 ast.validate()
                     .map_err(|_| DomainError::InvalidStrategyBundle)?;
                 Ok(StrategyBundleArtifact::Formula { ast: ast.clone() })
             }
-            Self::OnnxModel(model) => {
-                model.validate()?;
-                Ok(StrategyBundleArtifact::Onnx {
-                    model: model.clone(),
-                })
-            }
-            Self::Program(_)
+            Self::OnnxModel(_)
+            | Self::Program(_)
             | Self::ModelConfig(_)
             | Self::ModelArtifact(_)
             | Self::Ensemble(_)
@@ -728,6 +967,7 @@ impl CandidateArtifact {
     }
 }
 
+/// Runtime-loadable artifact schema. Governed evaluator v2 currently produces Formula only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum StrategyBundleArtifact {
     Formula { ast: FactorAst },
@@ -752,6 +992,8 @@ pub struct StrategyBundle {
     pub candidate_content_hash: String,
     pub dataset_manifest_id: ManifestId,
     pub evaluator_version: String,
+    pub evaluator_config_hash: String,
+    pub evaluation_metrics_hash: String,
     pub sealed_evaluation_hash: String,
     pub artifact: StrategyBundleArtifact,
     pub bundle_hash: String,
@@ -766,6 +1008,8 @@ impl StrategyBundle {
         candidate_content_hash: String,
         dataset_manifest_id: ManifestId,
         evaluator_version: String,
+        evaluator_config_hash: String,
+        evaluation_metrics_hash: String,
         sealed_evaluation_hash: String,
         artifact: StrategyBundleArtifact,
         created_at: DateTime<Utc>,
@@ -776,6 +1020,8 @@ impl StrategyBundle {
             candidate_content_hash,
             dataset_manifest_id,
             evaluator_version,
+            evaluator_config_hash,
+            evaluation_metrics_hash,
             sealed_evaluation_hash,
             artifact,
             bundle_hash: String::new(),
@@ -800,6 +1046,8 @@ impl StrategyBundle {
         require_text("bundle candidate_id", &self.candidate_id)?;
         require_text("evaluator_version", &self.evaluator_version)?;
         validate_sha256(&self.candidate_content_hash)?;
+        validate_sha256(&self.evaluator_config_hash)?;
+        validate_sha256(&self.evaluation_metrics_hash)?;
         validate_sha256(&self.sealed_evaluation_hash)?;
         self.dataset_manifest_id
             .validate()
@@ -813,6 +1061,8 @@ impl StrategyBundle {
             candidate_content_hash: &'a str,
             dataset_manifest_id: &'a ManifestId,
             evaluator_version: &'a str,
+            evaluator_config_hash: &'a str,
+            evaluation_metrics_hash: &'a str,
             sealed_evaluation_hash: &'a str,
             artifact: &'a StrategyBundleArtifact,
         }
@@ -820,6 +1070,8 @@ impl StrategyBundle {
             candidate_content_hash: &self.candidate_content_hash,
             dataset_manifest_id: &self.dataset_manifest_id,
             evaluator_version: &self.evaluator_version,
+            evaluator_config_hash: &self.evaluator_config_hash,
+            evaluation_metrics_hash: &self.evaluation_metrics_hash,
             sealed_evaluation_hash: &self.sealed_evaluation_hash,
             artifact: &self.artifact,
         })
@@ -834,6 +1086,8 @@ pub struct PromotionRecord {
     pub candidate_content_hash: String,
     pub dataset_manifest_id: ManifestId,
     pub evaluator_version: String,
+    pub evaluator_config_hash: String,
+    pub evaluation_metrics_hash: String,
     pub sealed_evaluation_id: String,
     pub sealed_evaluation_hash: String,
     pub bundle_id: String,
@@ -857,12 +1111,16 @@ impl PromotionRecord {
             require_text(name, value)?;
         }
         validate_sha256(&self.candidate_content_hash)?;
+        validate_sha256(&self.evaluator_config_hash)?;
+        validate_sha256(&self.evaluation_metrics_hash)?;
         validate_sha256(&self.sealed_evaluation_hash)?;
         validate_sha256(&self.bundle_hash)?;
         if self.candidate_id != bundle.candidate_id
             || self.candidate_content_hash != bundle.candidate_content_hash
             || self.dataset_manifest_id != bundle.dataset_manifest_id
             || self.evaluator_version != bundle.evaluator_version
+            || self.evaluator_config_hash != bundle.evaluator_config_hash
+            || self.evaluation_metrics_hash != bundle.evaluation_metrics_hash
             || self.sealed_evaluation_hash != bundle.sealed_evaluation_hash
             || self.bundle_id != bundle.bundle_id
             || self.bundle_hash != bundle.bundle_hash
@@ -1498,13 +1756,73 @@ mod tests {
     }
 
     #[test]
+    fn evaluation_evidence_recomputes_policy_and_adjusted_score() {
+        let config = FormulaEvaluatorConfig::for_trials(10).unwrap();
+        let raw_score = 5.0;
+        let adjusted_score = config.adjusted_score(raw_score).unwrap();
+        let mut evaluation = CandidateEvaluation {
+            passed: true,
+            score: adjusted_score,
+            failure_reasons: vec![],
+            evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            evaluator_config: serde_json::to_value(&config).unwrap(),
+            metrics: EvaluationMetrics {
+                row_count: 30,
+                trade_count: 30,
+                mean_net_return: 0.001,
+                cumulative_net_return: 0.03,
+                max_drawdown: 0.01,
+                raw_score,
+                adjusted_score,
+                folds: vec![FoldEvaluationMetrics {
+                    fold_index: 1,
+                    row_count: 30,
+                    trade_count: 30,
+                    mean_net_return: 0.001,
+                    cumulative_net_return: 0.03,
+                    max_drawdown: 0.01,
+                    raw_score,
+                }],
+            },
+        };
+        assert!(evaluation.validate().is_ok());
+
+        evaluation.metrics.trade_count = 0;
+        evaluation.metrics.folds[0].trade_count = 0;
+        assert_eq!(
+            evaluation.validate(),
+            Err(DomainError::InvalidEvaluationEvidence)
+        );
+    }
+
+    #[test]
+    fn mission_can_preregister_a_larger_multiple_testing_family() {
+        let mut mission = mission(Utc::now());
+        mission.validator_spec = serde_json::json!({"multiple_testing_trials": 100});
+        assert_eq!(
+            FormulaEvaluatorConfig::for_mission(&mission)
+                .unwrap()
+                .multiple_testing_trials,
+            100
+        );
+
+        mission.validator_spec = serde_json::json!({"multiple_testing_trials": 1});
+        assert_eq!(
+            FormulaEvaluatorConfig::for_mission(&mission),
+            Err(DomainError::InvalidEvaluatorConfiguration)
+        );
+    }
+
+    #[test]
     fn strategy_bundle_hash_detects_tampering() {
         let mut bundle = StrategyBundle::new(
             "bundle-1".to_string(),
             "candidate-1".to_string(),
             "a".repeat(64),
             ManifestId::new("dataset-1").unwrap(),
-            "sealed-holdout-v1".to_string(),
+            SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            "c".repeat(64),
+            "d".repeat(64),
             "b".repeat(64),
             StrategyBundleArtifact::Formula {
                 ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
@@ -1533,7 +1851,9 @@ mod tests {
             "candidate-1".to_string(),
             "a".repeat(64),
             ManifestId::new("dataset-1").unwrap(),
-            "sealed-holdout-v1".to_string(),
+            SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            "c".repeat(64),
+            "d".repeat(64),
             "b".repeat(64),
             artifact.clone(),
             Utc::now(),
@@ -1544,7 +1864,9 @@ mod tests {
             "candidate-alias".to_string(),
             "a".repeat(64),
             ManifestId::new("dataset-1").unwrap(),
-            "sealed-holdout-v1".to_string(),
+            SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            "c".repeat(64),
+            "d".repeat(64),
             "b".repeat(64),
             artifact,
             first.created_at + chrono::Duration::seconds(1),
@@ -1618,7 +1940,30 @@ mod tests {
         });
 
         assert_eq!(
-            artifact.to_strategy_bundle_artifact(),
+            artifact.to_governed_strategy_bundle_artifact(),
+            Err(DomainError::ResearchOnlyArtifact)
+        );
+        let onnx = CandidateArtifact::OnnxModel(OnnxModelCandidate {
+            artifact: ArtifactRef {
+                uri: "model.onnx".to_string(),
+                content_type: "application/onnx".to_string(),
+                checksum: Some("a".repeat(64)),
+            },
+            byte_len: 1,
+            opset: 17,
+            inputs: vec![TensorSpec {
+                name: "input".to_string(),
+                element_type: TensorElementType::Float32,
+                dimensions: vec![Some(1), Some(1)],
+            }],
+            output: TensorSpec {
+                name: "output".to_string(),
+                element_type: TensorElementType::Float32,
+                dimensions: vec![Some(1), Some(1)],
+            },
+        });
+        assert_eq!(
+            onnx.to_governed_strategy_bundle_artifact(),
             Err(DomainError::ResearchOnlyArtifact)
         );
     }

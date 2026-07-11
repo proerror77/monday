@@ -3,7 +3,7 @@ use crate::{
         print_json, LearnMissionArgs, LoopRunArgs, LoopStatusArgs, LoopTargetChoice,
         RecoverLegacyCheckpointArgs,
     },
-    mission,
+    governance, mission,
 };
 use alpha_domain::{
     AttributionKind, AttributionMode, AttributionOutcome, LoopCompletionPolicy, LoopRun,
@@ -265,13 +265,25 @@ fn progress_completed_mission(
     if run.completion_policy.target_stage == LoopTargetStage::Researching {
         return Ok(CompletionProgress::ReachedTarget);
     }
+    let walk_forward_candidates = governance::validated_walk_forward_candidates(
+        &AlphaStore::open(&args.mission.db)?,
+        mission_id,
+    )?;
+    if walk_forward_candidates.is_empty() {
+        return Ok(CompletionProgress::AwaitingEvidence(
+            LoopTargetStage::WalkForwardKept,
+        ));
+    }
     append_stage_if_changed(
         args,
         run,
         mission_id,
         LoopStage::WalkForwardKept,
         LoopStageStatus::Completed,
-        research_reason,
+        format!(
+            "{research_reason}; canonical v2 walk-forward candidates: {}",
+            walk_forward_candidates.join(",")
+        ),
     )?;
 
     if run.completion_policy.target_stage == LoopTargetStage::WalkForwardKept {
@@ -286,6 +298,11 @@ fn progress_completed_mission(
                 LoopTargetStage::HoldoutPassed,
             ));
         };
+        if !walk_forward_candidates.contains(&candidate_id) {
+            return Ok(CompletionProgress::AwaitingEvidence(
+                LoopTargetStage::HoldoutPassed,
+            ));
+        }
         let events = if matches!(
             target_stage,
             LoopTargetStage::PaperHealthy
@@ -596,11 +613,19 @@ mod tests {
     use alpha_domain::{
         AllowedIntentType, ApprovalClass, CandidateArtifact, DeploymentEnvelope, EngineKind,
         IterationVerdict, LiveSmallEligibilityEvidence, MissionTerminalReason, ResearchIteration,
-        ResearchMission, SearchBudgetUsage,
+        ResearchMission, SearchBudgetUsage, SEALED_HOLDOUT_EVALUATOR_VERSION,
     };
-    use alpha_store::{ApprovalRecord, MemoryRecord, RegistryRevision};
+    use alpha_engine::{
+        evaluation::{prepare_dataset, WalkForwardConfig},
+        formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
+        CandidateEvaluation, CandidateEvaluator, EngineProposal, EvaluationMetrics,
+        FoldEvaluationMetrics,
+    };
+    use alpha_store::{ApprovalRecord, EvaluationRecord, MemoryRecord, RegistryRevision};
     use chrono::Duration;
-    use hft_collector::{DatasetManifest, OhlcvTraceRow, QualityReport};
+    use hft_collector::{
+        CandleInterval, DatasetManifest, DatasetTimeBounds, OhlcvTraceRow, QualityReport,
+    };
     use sha2::{Digest, Sha256};
     use std::{collections::BTreeMap, path::PathBuf};
 
@@ -619,26 +644,37 @@ mod tests {
             Utc::now().timestamp_nanos_opt().unwrap()
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        let start = Utc::now() - Duration::hours(2);
-        let rows = (0..80)
-            .map(|index| {
-                let close = 100.0 * 1.001_f64.powi(index);
-                OhlcvTraceRow {
-                    event_time: start + Duration::minutes(i64::from(index)),
-                    exchange_time: start + Duration::minutes(i64::from(index)),
-                    receive_time: start + Duration::minutes(i64::from(index)),
-                    available_time: start + Duration::minutes(i64::from(index)),
-                    ingestion_time: start + Duration::minutes(i64::from(index)),
+        let created_at = Utc::now();
+        let start = created_at - Duration::minutes(500);
+        let rows = (0..500)
+            .scan(100.0_f64, |close, index| {
+                let return_rate = match index % 4 {
+                    0 => 0.001,
+                    1 => 0.01,
+                    2 => -0.001,
+                    _ => -0.01,
+                };
+                *close *= 1.0 + return_rate;
+                let close = *close;
+                let event_time = start + Duration::minutes(i64::from(index));
+                let available_time = event_time + Duration::minutes(1);
+                Some(OhlcvTraceRow {
+                    event_time,
+                    exchange_time: available_time - Duration::milliseconds(1),
+                    receive_time: created_at,
+                    available_time,
+                    ingestion_time: created_at,
                     source: "binance-public".to_string(),
-                    schema_version: "binance-kline-v1".to_string(),
+                    schema_version: "binance-kline-v2".to_string(),
                     quality_flags: vec![],
                     symbol: "BTCUSDT".to_string(),
+                    interval: CandleInterval::OneMinute,
                     open: close * 0.9995,
                     high: close * 1.001,
                     low: close * 0.999,
                     close,
                     volume: 1.0,
-                }
+                })
             })
             .collect::<Vec<_>>();
         let mut bytes = Vec::new();
@@ -654,7 +690,19 @@ mod tests {
             mission_id: mission_id.to_string(),
             source_id: "binance-public".to_string(),
             symbol: "BTCUSDT".to_string(),
-            schema_version: "binance-kline-v1".to_string(),
+            schema_version: "binance-kline-v2".to_string(),
+            interval: CandleInterval::OneMinute,
+            time_bounds: DatasetTimeBounds {
+                first_event_time: rows.first().unwrap().event_time,
+                last_event_time: rows.last().unwrap().event_time,
+                last_exchange_time: rows.last().unwrap().exchange_time,
+                first_receive_time: rows.first().unwrap().receive_time,
+                last_receive_time: rows.last().unwrap().receive_time,
+                first_available_time: rows.first().unwrap().available_time,
+                last_available_time: rows.last().unwrap().available_time,
+                first_ingestion_time: rows.first().unwrap().ingestion_time,
+                last_ingestion_time: rows.last().unwrap().ingestion_time,
+            },
             artifact_path,
             artifact_sha256,
             quality: QualityReport {
@@ -662,8 +710,18 @@ mod tests {
                 parse_failures: 0,
                 non_monotonic_events: 0,
                 non_finite_values: 0,
+                duplicate_timestamps: 0,
+                interval_gaps: 0,
+                open_or_partial_candles: 0,
+                point_in_time_violations: 0,
+                invalid_ohlc_rows: 0,
+                non_positive_price_rows: 0,
+                negative_volume_rows: 0,
+                latest_candle_age_millis: 1,
+                max_staleness_millis: 120_000,
+                stale: false,
             },
-            created_at: start,
+            created_at,
         };
         let manifest_path = directory.join("manifest.json");
         data_mission::write_json_atomic(&manifest_path, &manifest).unwrap();
@@ -879,31 +937,85 @@ mod tests {
         }
     }
 
+    fn canonical_evaluation(version: &str, max_candidates: usize) -> CandidateEvaluation {
+        let evaluator = FormulaEvaluator::for_trials(max_candidates).unwrap();
+        CandidateEvaluation {
+            passed: true,
+            score: 2.0,
+            failure_reasons: vec![],
+            evaluator_version: version.to_string(),
+            evaluator_config: evaluator.config_evidence().unwrap(),
+            metrics: EvaluationMetrics {
+                row_count: 30,
+                trade_count: 30,
+                mean_net_return: 0.001,
+                cumulative_net_return: 0.03,
+                max_drawdown: 0.01,
+                raw_score: 2.0,
+                adjusted_score: 2.0,
+                folds: vec![FoldEvaluationMetrics {
+                    fold_index: 1,
+                    row_count: 30,
+                    trade_count: 30,
+                    mean_net_return: 0.001,
+                    cumulative_net_return: 0.03,
+                    max_drawdown: 0.01,
+                    raw_score: 2.0,
+                }],
+            },
+        }
+    }
+
     fn create_completed_mission(db: &PathBuf, mission_id: &str, candidate_id: &str) {
+        create_completed_mission_with_engine(db, mission_id, candidate_id, EngineKind::ManualSeed);
+    }
+
+    fn create_completed_mission_with_engine(
+        db: &PathBuf,
+        mission_id: &str,
+        candidate_id: &str,
+        engine: EngineKind,
+    ) {
         let now = Utc::now();
         let mut store = AlphaStore::open(db).unwrap();
-        store
-            .create_mission(&mission_fixture(now, mission_id))
-            .unwrap();
+        let mission = mission_fixture(now, mission_id);
+        store.create_mission(&mission).unwrap();
+        let evaluation_id = format!("evaluation-{mission_id}");
         let iteration = ResearchIteration {
             iteration_id: format!("iteration-{mission_id}"),
             mission_id: mission_id.to_string(),
             parent_candidate_ids: vec![],
-            engine: EngineKind::ManualSeed,
+            engine,
             hypothesis: "fixture candidate".to_string(),
             candidate_artifact_id: Some(candidate_id.to_string()),
-            evaluation_artifact_id: None,
+            evaluation_artifact_id: Some(evaluation_id.clone()),
             budget_usage: SearchBudgetUsage::default(),
             verdict: IterationVerdict::Keep,
             failure_class: None,
             failure_explanation: None,
             created_at: now,
         };
-        let candidate = CandidateArtifact::Program(serde_json::json!({
-            "candidate_id": candidate_id,
-        }));
+        let candidate: CandidateArtifact = serde_json::from_value(serde_json::json!({
+            "Formula": {"Terminal": {"Field": "signal"}}
+        }))
+        .unwrap();
+        let evaluation = canonical_evaluation(
+            WALK_FORWARD_EVALUATOR_VERSION,
+            mission.search_budget.max_candidates,
+        );
+        let evaluation = EvaluationRecord {
+            evaluation_id,
+            mission_id: mission_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            payload: serde_json::to_value(evaluation).unwrap(),
+            created_at: now,
+        };
         store
-            .append_iteration(&iteration, Some((candidate_id, &candidate)), None)
+            .append_iteration(
+                &iteration,
+                Some((candidate_id, &candidate)),
+                Some(&evaluation),
+            )
             .unwrap();
         store
             .transition_mission(mission_id, MissionStatus::Running, now)
@@ -937,10 +1049,10 @@ mod tests {
                     "mission_id": mission_id,
                     "candidate_content_hash": candidate_hash,
                     "dataset_manifest_id": "dataset-loop",
-                    "evaluation": {
-                        "passed": true,
-                        "evaluator_version": "sealed-holdout-v1"
-                    }
+                    "evaluation": canonical_evaluation(
+                        SEALED_HOLDOUT_EVALUATOR_VERSION,
+                        1,
+                    )
                 }),
                 created_at: Utc::now(),
             })
@@ -1089,6 +1201,163 @@ mod tests {
     }
 
     #[test]
+    fn manual_keep_without_v2_evaluation_cannot_reach_walk_forward_stage() {
+        let db = temp_db_path("alpha-loop-legacy-walk-forward");
+        let mission_id = "mission-loop";
+        let candidate_id = "candidate-legacy";
+        let now = Utc::now();
+        let mut store = AlphaStore::open(&db).unwrap();
+        store
+            .create_mission(&mission_fixture(now, mission_id))
+            .unwrap();
+        let candidate: CandidateArtifact = serde_json::from_value(serde_json::json!({
+            "Formula": {"Terminal": {"Field": "signal"}}
+        }))
+        .unwrap();
+        store
+            .append_iteration(
+                &ResearchIteration {
+                    iteration_id: "iteration-legacy".to_string(),
+                    mission_id: mission_id.to_string(),
+                    parent_candidate_ids: vec![],
+                    engine: EngineKind::ManualSeed,
+                    hypothesis: "legacy keep".to_string(),
+                    candidate_artifact_id: Some(candidate_id.to_string()),
+                    evaluation_artifact_id: None,
+                    budget_usage: SearchBudgetUsage::default(),
+                    verdict: IterationVerdict::Keep,
+                    failure_class: None,
+                    failure_explanation: None,
+                    created_at: now,
+                },
+                Some((candidate_id, &candidate)),
+                None,
+            )
+            .unwrap();
+        store
+            .transition_mission(mission_id, MissionStatus::Running, now)
+            .unwrap();
+        store
+            .finish_mission(
+                mission_id,
+                MissionTerminalReason::CompletionPolicySatisfied { kept_candidates: 1 },
+                now,
+            )
+            .unwrap();
+        drop(store);
+
+        run_loop(loop_args(
+            db.clone(),
+            mission_id,
+            LoopTargetChoice::WalkForwardKept,
+        ))
+        .unwrap();
+
+        let run = AlphaStore::open(&db)
+            .unwrap()
+            .get_loop_run("loop-mission-loop")
+            .unwrap();
+        assert_eq!(run.status, LoopRunStatus::Paused);
+        assert_eq!(
+            run.stop_reason,
+            Some(LoopStopReason::AwaitingEvidence {
+                mission_id: mission_id.to_string(),
+                stage: LoopTargetStage::WalkForwardKept,
+            })
+        );
+        assert_eq!(stage_names(&run), vec![LoopStage::Researching]);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
+    fn legacy_sealed_record_is_not_reported_as_an_idempotent_v2_evaluation() {
+        let db = temp_db_path("alpha-loop-legacy-sealed");
+        let mission_id = "mission-loop";
+        let candidate_id = "candidate-1";
+        create_completed_mission(&db, mission_id, candidate_id);
+        let mut store = AlphaStore::open(&db).unwrap();
+        let candidate_hash = store.mission_lineage(mission_id).unwrap().candidates[0]
+            .content_hash
+            .clone();
+        store
+            .put_registry_revision(&RegistryRevision {
+                revision_id: format!("sealed-evaluation:{candidate_id}"),
+                registry_kind: "sealed_evaluation".to_string(),
+                asset_id: candidate_id.to_string(),
+                parent_revision_id: None,
+                payload: serde_json::json!({
+                    "mission_id": mission_id,
+                    "candidate_content_hash": candidate_hash,
+                    "dataset_manifest_id": "dataset-loop",
+                    "evaluation": {
+                        "passed": true,
+                        "score": 1.0,
+                        "failure_reasons": [],
+                        "evaluator_version": "sealed-holdout-v1"
+                    }
+                }),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        drop(store);
+
+        let args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        let error = governance::evaluate(EvaluateArgs {
+            db: db.clone(),
+            mission_id: mission_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            dataset: args.mission.dataset,
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("legacy or malformed"));
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
+    fn offline_rl_candidate_remains_lab_only_with_sealed_evidence_present() {
+        let db = temp_db_path("alpha-loop-offline-rl-lab");
+        let mission_id = "mission-loop";
+        let candidate_id = "candidate-rl";
+        create_completed_mission_with_engine(
+            &db,
+            mission_id,
+            candidate_id,
+            EngineKind::OfflineReinforcementLearning,
+        );
+        add_sealed_holdout_pass(&db, mission_id, candidate_id);
+
+        let args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        let dataset = args.mission.dataset.clone();
+        run_loop(args).unwrap();
+        let run = AlphaStore::open(&db)
+            .unwrap()
+            .get_loop_run("loop-mission-loop")
+            .unwrap();
+        assert_eq!(run.status, LoopRunStatus::Paused);
+        assert_eq!(
+            run.stop_reason,
+            Some(LoopStopReason::AwaitingEvidence {
+                mission_id: mission_id.to_string(),
+                stage: LoopTargetStage::HoldoutPassed,
+            })
+        );
+        assert_eq!(
+            stage_names(&run),
+            vec![LoopStage::Researching, LoopStage::WalkForwardKept]
+        );
+
+        let error = governance::evaluate(EvaluateArgs {
+            db: db.clone(),
+            mission_id: mission_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            dataset,
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("lab search-policy output"));
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
     fn shadow_target_does_not_complete_at_paper_health() {
         let db = temp_db_path("alpha-loop-paper");
         create_completed_mission(&db, "mission-loop", "candidate-1");
@@ -1198,6 +1467,49 @@ mod tests {
             "Formula": {"Terminal": {"Field": "signal"}}
         }))
         .unwrap();
+        let dataset_args = DatasetArgs {
+            dataset_manifest: manifest_path.clone(),
+            initial_train_rows: 200,
+            validation_rows: 64,
+            fold_count: 3,
+            purge_rows: 1,
+            embargo_rows: 1,
+            sealed_holdout_rows: 64,
+            fee_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+        };
+        let research_rows = data_mission::load_research_rows(&manifest, 0.0, 0.0, 0.0).unwrap();
+        let prepared = prepare_dataset(
+            research_rows,
+            &WalkForwardConfig {
+                initial_train_rows: dataset_args.initial_train_rows,
+                validation_rows: dataset_args.validation_rows,
+                fold_count: dataset_args.fold_count,
+                purge_rows: dataset_args.purge_rows,
+                embargo_rows: dataset_args.embargo_rows,
+                sealed_holdout_rows: dataset_args.sealed_holdout_rows,
+            },
+            format!("sealed:{}", manifest.manifest_id),
+        )
+        .unwrap();
+        let walk_forward_evaluation =
+            FormulaEvaluator::for_trials(research_mission.search_budget.max_candidates)
+                .unwrap()
+                .evaluate(
+                    &EngineProposal {
+                        candidate_id: candidate_id.to_string(),
+                        hypothesis: "positive momentum persists".to_string(),
+                        artifact: candidate.clone(),
+                        expansions: 0,
+                        tokens: 0,
+                        elapsed_ms: 0,
+                    },
+                    &prepared.engine_context(),
+                )
+                .unwrap();
+        assert!(walk_forward_evaluation.passed);
+        let evaluation_id = "evaluation-e2e".to_string();
         let iteration = ResearchIteration {
             iteration_id: "iteration-e2e".to_string(),
             mission_id: mission_id.to_string(),
@@ -1205,18 +1517,39 @@ mod tests {
             engine: EngineKind::ManualSeed,
             hypothesis: "positive momentum persists".to_string(),
             candidate_artifact_id: Some(candidate_id.to_string()),
-            evaluation_artifact_id: None,
+            evaluation_artifact_id: Some(evaluation_id.clone()),
             budget_usage: SearchBudgetUsage::default(),
             verdict: IterationVerdict::Keep,
             failure_class: None,
             failure_explanation: None,
             created_at: now,
         };
+        let evaluation = EvaluationRecord {
+            evaluation_id,
+            mission_id: mission_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            payload: serde_json::to_value(walk_forward_evaluation).unwrap(),
+            created_at: now,
+        };
         {
             let mut store = AlphaStore::open(&db).unwrap();
+            store
+                .put_registry_revision(&RegistryRevision {
+                    revision_id: manifest.manifest_id.clone(),
+                    registry_kind: "dataset".to_string(),
+                    asset_id: manifest.symbol.clone(),
+                    parent_revision_id: None,
+                    payload: serde_json::to_value(&manifest).unwrap(),
+                    created_at: manifest.created_at,
+                })
+                .unwrap();
             store.create_mission(&research_mission).unwrap();
             store
-                .append_iteration(&iteration, Some((candidate_id, &candidate)), None)
+                .append_iteration(
+                    &iteration,
+                    Some((candidate_id, &candidate)),
+                    Some(&evaluation),
+                )
                 .unwrap();
             store
                 .transition_mission(mission_id, MissionStatus::Running, now)
@@ -1230,18 +1563,6 @@ mod tests {
                 .unwrap();
         }
 
-        let dataset_args = DatasetArgs {
-            dataset_manifest: manifest_path.clone(),
-            initial_train_rows: 20,
-            validation_rows: 5,
-            fold_count: 3,
-            purge_rows: 1,
-            embargo_rows: 1,
-            sealed_holdout_rows: 10,
-            fee_bps: 0.0,
-            funding_bps: 0.0,
-            latency_bps: 0.0,
-        };
         governance::evaluate(EvaluateArgs {
             db: db.clone(),
             mission_id: mission_id.to_string(),
@@ -1256,6 +1577,38 @@ mod tests {
             promotion_id: None,
         })
         .unwrap();
+        {
+            let store = AlphaStore::open(&db).unwrap();
+            let promotion = store
+                .get_promotion(&format!("promotion:{candidate_id}"))
+                .unwrap();
+            let bundle = store
+                .get_strategy_bundle(&promotion.record.bundle_id)
+                .unwrap();
+            let sealed = store
+                .get_registry_revision(&promotion.record.sealed_evaluation_id)
+                .unwrap();
+            let evaluation = sealed.payload.get("evaluation").unwrap();
+            let typed: CandidateEvaluation = serde_json::from_value(evaluation.clone()).unwrap();
+            typed.validate().unwrap();
+            assert_eq!(
+                bundle.evaluator_config_hash,
+                alpha_domain::canonical_json_hash(evaluation.get("evaluator_config").unwrap())
+                    .unwrap()
+            );
+            assert_eq!(
+                bundle.evaluation_metrics_hash,
+                alpha_domain::canonical_json_hash(evaluation.get("metrics").unwrap()).unwrap()
+            );
+            assert_eq!(
+                promotion.record.evaluator_config_hash,
+                bundle.evaluator_config_hash
+            );
+            assert_eq!(
+                promotion.record.evaluation_metrics_hash,
+                bundle.evaluation_metrics_hash
+            );
+        }
 
         let mut events = Vec::new();
         let bundle_id;

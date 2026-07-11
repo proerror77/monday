@@ -119,7 +119,7 @@ pub fn prepare_dataset(
     }
     if rows
         .windows(2)
-        .any(|window| window[0].available_time > window[1].available_time)
+        .any(|window| window[0].available_time >= window[1].available_time)
     {
         return Err(EvaluationError::NonMonotonicAvailability);
     }
@@ -219,6 +219,16 @@ mod tests {
     fn walk_forward_rejects_non_monotonic_availability() {
         let mut rows = rows(50);
         rows.swap(1, 2);
+        assert_eq!(
+            prepare_dataset(rows, &config(), "holdout-1").unwrap_err(),
+            EvaluationError::NonMonotonicAvailability
+        );
+    }
+
+    #[test]
+    fn walk_forward_rejects_duplicate_availability() {
+        let mut rows = rows(50);
+        rows[2].available_time = rows[1].available_time;
         assert_eq!(
             prepare_dataset(rows, &config(), "holdout-1").unwrap_err(),
             EvaluationError::NonMonotonicAvailability
