@@ -127,6 +127,7 @@ services:
     environment:
       RUST_LOG: info
       HFT_ENV: development
+      HFT_GRPC_AUTH_TOKEN: ${HFT_GRPC_AUTH_TOKEN:?set HFT_GRPC_AUTH_TOKEN}
       REDIS_URL: redis://redis:6379
       CLICKHOUSE_URL: http://clickhouse:8123
     depends_on:

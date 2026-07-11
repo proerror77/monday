@@ -107,6 +107,11 @@ spec:
             secretKeyRef:
               name: hft-secrets
               key: clickhouse-url
+        - name: HFT_GRPC_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hft-secrets
+              key: grpc-auth-token
         # 資源限制
         resources:
           requests:

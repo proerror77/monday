@@ -90,7 +90,7 @@ jobs:
           cargo test -p hft-data-adapter-binance --no-default-features --locked
           cargo test -p hft-data-adapter-binance --no-default-features --features json-simd --locked
           cargo test -p hft-infra-redis --features redis --locked
-          cargo check -p hft-live --features clickhouse,redis --locked
+          cargo check -p hft-live --features clickhouse,redis,grpc --locked
 
       - name: Check production deployment contract
         run: ../scripts/check-deployment-contract.sh

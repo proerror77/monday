@@ -48,6 +48,16 @@ require_configmap_key() {
     fi
 }
 
+require_secret_key() {
+    local name="$1"
+    local key="$2"
+    local escaped_key="${key//./\\.}"
+    if [[ -z "$(kubectl -n "$NAMESPACE" get secret "$name" -o "jsonpath={.data.$escaped_key}" 2>/dev/null)" ]]; then
+        log_error "Secret $name is missing required key $key"
+        exit 1
+    fi
+}
+
 # 函數: 構建 Docker 鏡像
 build_images() {
     log_info "構建 Docker 鏡像..."
@@ -118,6 +128,7 @@ deploy_k8s() {
 
     log_info "創建 Secrets..."
     envsubst < "$K8S_SECRETS_FILE" | kubectl apply -f -
+    require_secret_key hft-secrets grpc-auth-token
 
     log_info "創建部署授權 ConfigMaps..."
     kubectl apply -f "$K8S_DEPLOYMENT_ENVELOPE_FILE"

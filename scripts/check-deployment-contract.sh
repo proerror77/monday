@@ -29,6 +29,7 @@ for dockerfile in \
   require_text "$dockerfile" 'curl'
   require_text "$dockerfile" '/readiness'
   require_text "$dockerfile" 'ENTRYPOINT ["/usr/local/bin/hft-live"]'
+  require_text "$dockerfile" 'clickhouse,redis,grpc'
   reject_text "$dockerfile" 'hft-collector'
   reject_text "$dockerfile" '|| true'
 done
@@ -64,6 +65,8 @@ for path in \
 done
 require_text "$k8s" 'claimName: runtime-state-pvc'
 require_text "$k8s" 'prometheus.io/port: "9090"'
+require_text "$k8s" 'HFT_GRPC_AUTH_TOKEN'
+require_text "$k8s" 'key: grpc-auth-token'
 reject_text "$k8s" 'containerPort: 9091'
 require_text rust_hft/deployment/k8s/configmaps.yaml 'system.yaml: |'
 require_text rust_hft/deployment/k8s/configmaps.yaml 'quotes_only: true'
@@ -73,6 +76,7 @@ require_text rust_hft/deployment/scripts/deploy.sh 'kubectl apply -f "$K8S_DIR/c
 require_text rust_hft/deployment/scripts/deploy.sh 'HFT_K8S_DEPLOYMENT_ENVELOPE_FILE'
 require_text rust_hft/deployment/scripts/deploy.sh 'HFT_K8S_DEPLOYMENT_AUTHORITY_FILE'
 require_text rust_hft/deployment/scripts/deploy.sh 'require_configmap_key alpha-deployment-envelope envelope.json'
+require_text rust_hft/deployment/scripts/deploy.sh 'require_secret_key hft-secrets grpc-auth-token'
 reject_text rust_hft/deployment/scripts/deploy.sh 'envsubst < "$K8S_DIR/configmaps.yaml"'
 
 check_unique_host_ports() {
@@ -80,6 +84,7 @@ check_unique_host_ports() {
   local duplicates
   duplicates="$({
     GRAFANA_ADMIN_PASSWORD=CHANGE_ME_CONTRACT_ONLY \
+      HFT_GRPC_AUTH_TOKEN=CHANGE_ME_CONTRACT_ONLY_32_CHARS \
       HFT_DEPLOYMENT_DIR=/tmp/hft-deployment \
       HFT_RUNTIME_STATE_DIR=/tmp/hft-state \
       docker compose -f "$compose_file" config --format json

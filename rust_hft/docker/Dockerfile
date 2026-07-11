@@ -13,7 +13,7 @@ RUN cargo --config 'build.rustc-wrapper=""' build \
     --release \
     --locked \
     -p hft-live \
-    --features "clickhouse,redis"
+    --features "clickhouse,redis,grpc"
 
 FROM debian:bookworm-slim AS runtime
 
