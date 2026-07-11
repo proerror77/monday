@@ -9,7 +9,7 @@ serde = { workspace = true }
 tracing = { workspace = true }
 
 # ClickHouse feature dependencies
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"], optional = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json"], optional = true }
 tokio = { workspace = true, optional = true, features = ["sync", "rt"] }
 lz4 = { version = "1", optional = true }
 urlencoding = { version = "2", optional = true }

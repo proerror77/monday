@@ -4,7 +4,7 @@
 # ClickHouse Cloud 配置
 export CLICKHOUSE_URL="https://kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud:8443"
 export CLICKHOUSE_USER="default"
-export CLICKHOUSE_PASSWORD="s9wECb~NGZPOE"
+export CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}"
 
 echo "🚨 紧急启动本地数据收集器..."
 echo "📍 目标: ClickHouse Cloud"

@@ -78,6 +78,23 @@ download_log.txt
 # Environment files
 .env
 .env.local
+**/.env
+**/.env.local
+**/.env.*
+!**/.env.example
+!**/.env.sample
+!**/.env.*.example
+
+# Local credentials and key material
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.crt
+config/.env.shared
+config/.env.unified
+rust_hft/config/secrets.yaml
+rust_hft/clickhouse_credentials.txt
 
 # Documentation builds
 docs/_build/

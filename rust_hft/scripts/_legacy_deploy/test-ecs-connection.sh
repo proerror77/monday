@@ -4,7 +4,11 @@ echo "🔍 测试ECS连接状态"
 
 # 默认配置
 DEFAULT_IP="47.128.222.180"
-SSH_KEY="hft-admin-ssh-20250926144355.pem"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/hft-admin-ssh.pem}"
+CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud}"
+CLICKHOUSE_PORT="${CLICKHOUSE_PORT:-9440}"
+CLICKHOUSE_USER="${CLICKHOUSE_USER:-default}"
+CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
 
 # 允许用户指定IP
 ECS_IP="${1:-$DEFAULT_IP}"
@@ -46,7 +50,11 @@ if [[ -f "$SSH_KEY" ]]; then
         # 测试4: ClickHouse连接
         echo ""
         echo "4️⃣ 测试ClickHouse连接..."
-        ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@$ECS_IP" "clickhouse-client --host 'kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud' --port 9440 --secure --user default --password 's9wECb~NGZPOE' --database hft_db --query 'SELECT 1' 2>/dev/null && echo '✅ ClickHouse连接正常' || echo '❌ ClickHouse连接失败'"
+        if [[ -n "$CLICKHOUSE_PASSWORD" ]]; then
+            ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "root@$ECS_IP" "clickhouse-client --host '$CLICKHOUSE_HOST' --port '$CLICKHOUSE_PORT' --secure --user '$CLICKHOUSE_USER' --password '$CLICKHOUSE_PASSWORD' --database hft_db --query 'SELECT 1' 2>/dev/null && echo '✅ ClickHouse连接正常' || echo '❌ ClickHouse连接失败'"
+        else
+            echo "⚠️  跳过 ClickHouse 连接测试；请设置 CLICKHOUSE_PASSWORD"
+        fi
 
         echo ""
         echo "🎯 ECS实例可用！可以执行部署："

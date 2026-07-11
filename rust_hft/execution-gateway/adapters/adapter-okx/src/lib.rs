@@ -542,14 +542,14 @@ impl ExecutionClient for OkxExecutionClient {
                         });
                         let _ = ws
                             .send(tokio_tungstenite::tungstenite::Message::Text(
-                                login.to_string(),
+                                login.to_string().into(),
                             ))
                             .await;
                         // subscribe orders
                         let sub = serde_json::json!({"op":"subscribe","args":[{"channel":"orders","instType":"SPOT"}]});
                         let _ = ws
                             .send(tokio_tungstenite::tungstenite::Message::Text(
-                                sub.to_string(),
+                                sub.to_string().into(),
                             ))
                             .await;
                         while let Some(msg) = ws.next().await {

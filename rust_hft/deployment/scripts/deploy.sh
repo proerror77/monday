@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DOCKER_DIR="$PROJECT_ROOT/deployment/docker"
 K8S_DIR="$PROJECT_ROOT/deployment/k8s"
+K8S_SECRETS_FILE="${HFT_K8S_SECRETS_FILE:-}"
 
 # 默認值
 REGISTRY="${ECR_REGISTRY:-localhost:5000}"
@@ -79,6 +80,11 @@ deploy_k8s() {
         exit 1
     fi
 
+    if [[ -z "$K8S_SECRETS_FILE" || ! -f "$K8S_SECRETS_FILE" ]]; then
+        log_error "HFT_K8S_SECRETS_FILE must point to an external Kubernetes Secret manifest"
+        exit 1
+    fi
+
     # 替換環境變數
     export ECR_REGISTRY="$REGISTRY"
     export IMAGE_TAG="$IMAGE_TAG"
@@ -91,7 +97,7 @@ deploy_k8s() {
     envsubst < "$K8S_DIR/configmaps.yaml" | kubectl apply -f -
 
     log_info "創建 Secrets..."
-    envsubst < "$K8S_DIR/secrets.yaml" | kubectl apply -f -
+    envsubst < "$K8S_SECRETS_FILE" | kubectl apply -f -
 
     log_info "部署基礎設施..."
     envsubst < "$K8S_DIR/infrastructure.yaml" | kubectl apply -f -

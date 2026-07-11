@@ -9,12 +9,12 @@ set -euo pipefail
 # - ClickHouse Cloud URL/user/password
 #
 # Usage:
-#   ECS_IP=1.2.3.4 SSH_KEY=hft-collector-key.pem \
+#   ECS_IP=1.2.3.4 SSH_KEY=$HOME/.ssh/hft-collector-key.pem \
 #   CH_URL=https://...:8443 CH_USER=default CH_PASSWORD='***' CH_DB=hft_db \
 #   ./scripts/deploy-ecs-tools-collector.sh
 
 ECS_IP=${ECS_IP:-}
-SSH_KEY=${SSH_KEY:-hft-collector-key.pem}
+SSH_KEY=${SSH_KEY:-$HOME/.ssh/hft-collector-key.pem}
 CH_URL=${CH_URL:-"https://kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud:8443"}
 CH_USER=${CH_USER:-default}
 CH_PASSWORD=${CH_PASSWORD:-}

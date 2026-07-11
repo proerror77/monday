@@ -23,7 +23,7 @@ impl AsterdexWebSocket {
         let url = format!("{}/stream?streams={}", WS_BASE_URL, stream_param);
         let url = Url::parse(&url).map_err(|e| HftError::Parse(format!("URL 解析錯誤: {}", e)))?;
 
-        let (ws_stream, _resp) = connect_async(url)
+        let (ws_stream, _resp) = connect_async(url.as_str())
             .await
             .map_err(|e| HftError::Network(format!("Aster DEX WebSocket 連接失敗: {}", e)))?;
 

@@ -7,6 +7,7 @@
 REGISTRY ?= localhost:5000
 IMAGE_TAG ?= latest
 NAMESPACE := hft-trading
+HFT_K8S_SECRETS_FILE ?=
 
 # 顏色
 GREEN := \033[0;32m
@@ -29,6 +30,7 @@ help:
 	@echo "環境變數:"
 	@echo "  REGISTRY=$(REGISTRY)"
 	@echo "  IMAGE_TAG=$(IMAGE_TAG)"
+	@echo "  HFT_K8S_SECRETS_FILE=/absolute/path/to/secrets.yaml"
 
 # ============================================
 # Docker 操作
@@ -76,9 +78,10 @@ deploy:
 
 deploy-infra:
 	@echo "$(GREEN)[DEPLOY]$(NC) 部署基礎設施..."
+	@test -n "$(HFT_K8S_SECRETS_FILE)" && test -f "$(HFT_K8S_SECRETS_FILE)" || (echo "HFT_K8S_SECRETS_FILE must point to an external Secret manifest" >&2; exit 1)
 	@kubectl apply -f k8s/namespace.yaml
 	@kubectl apply -f k8s/configmaps.yaml
-	@kubectl apply -f k8s/secrets.yaml
+	@kubectl apply -f "$(HFT_K8S_SECRETS_FILE)"
 	@kubectl apply -f k8s/infrastructure.yaml
 
 deploy-services:

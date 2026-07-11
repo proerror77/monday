@@ -8,11 +8,10 @@ description = "低階網路：tokio-tungstenite + rustls、心跳/重連/簽名/
 tokio = { workspace = true, features = ["sync", "time", "net", "rt", "macros"] }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
-rustls = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 futures-util = "0.3"
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"

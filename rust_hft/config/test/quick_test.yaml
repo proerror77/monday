@@ -22,7 +22,7 @@ clickhouse:
     url: "http://localhost:8123"
     database: "hft_db"
     username: "hft_user"
-    password: "hft_password"
+    password: "${CLICKHOUSE_PASSWORD}"
   batch_settings:
     batch_size: 2000
     flush_interval_ms: 1000

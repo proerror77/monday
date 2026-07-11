@@ -15,9 +15,10 @@ LOG_FILE="$LOG_DIR/local-bitget-futures-$STAMP.log"
 
 # ClickHouse
 CH_URL="${CH_URL:-https://kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud:8443}"
-if [[ -f clickhouse_credentials.txt ]]; then
-  CH_USER=$(awk -F': ' '/Username/{print $2}' clickhouse_credentials.txt | head -1)
-  CH_PASS=$(awk -F': ' '/Password/{print $2}' clickhouse_credentials.txt | head -1)
+CLICKHOUSE_CREDENTIALS_FILE="${CLICKHOUSE_CREDENTIALS_FILE:-$HOME/.config/hft/clickhouse_credentials.txt}"
+if [[ -f "$CLICKHOUSE_CREDENTIALS_FILE" ]]; then
+  CH_USER=$(awk -F': ' '/Username/{print $2}' "$CLICKHOUSE_CREDENTIALS_FILE" | head -1)
+  CH_PASS=$(awk -F': ' '/Password/{print $2}' "$CLICKHOUSE_CREDENTIALS_FILE" | head -1)
 else
   CH_USER="${CLICKHOUSE_USER:-default}"
   CH_PASS="${CLICKHOUSE_PASSWORD:-}"

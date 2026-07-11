@@ -21,7 +21,7 @@ echo ""
 # ClickHouse配置
 CLICKHOUSE_URL="https://kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud:8443"
 CLICKHOUSE_USER="default"
-CLICKHOUSE_PASSWORD="s9wECb~NGZPOE"
+CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}"
 DATABASE="hft_db"
 
 # 检查必要文件

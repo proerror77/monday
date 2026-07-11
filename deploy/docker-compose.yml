@@ -78,7 +78,7 @@ services:
       - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: hft_grafana_2025
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
     depends_on:

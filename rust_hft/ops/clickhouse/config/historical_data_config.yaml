@@ -98,7 +98,7 @@ quick_test:
     url: "http://localhost:8123"
     database: "hft_db"
     username: "hft_user"
-    password: "hft_password"
+    password: "${CLICKHOUSE_PASSWORD}"
 
 # SOLUSDT 配置
 solusdt_weekly:
@@ -156,7 +156,7 @@ trade_data_test:
     url: "http://localhost:8123"
     database: "hft_db"
     username: "hft_user"
-    password: "hft_password"
+    password: "${CLICKHOUSE_PASSWORD}"
 
 # 訂單簿快照配置 - depth/SOLUSDT/1/20250703.zip
 depth_snapshot_test:
@@ -178,7 +178,7 @@ depth_snapshot_test:
     url: "http://localhost:8123"
     database: "hft_db"
     username: "hft_user"
-    password: "hft_password"
+    password: "${CLICKHOUSE_PASSWORD}"
 
 # 高性能配置
 high_performance:
@@ -218,7 +218,7 @@ solusdt_30days_depth:
     url: "http://localhost:8123"
     database: "hft_db"
     username: "hft_user"
-    password: "hft_password"
+    password: "${CLICKHOUSE_PASSWORD}"
 
 # SOLUSDT 30天成交數據配置
 solusdt_30days_trade:
@@ -240,7 +240,7 @@ solusdt_30days_trade:
     url: "http://localhost:8123"
     database: "hft_db"
     username: "hft_user"
-    password: "hft_password"
+    password: "${CLICKHOUSE_PASSWORD}"
 
 # SOLUSDT 可用成交數據配置 (只下載可用日期)
 solusdt_available_trade:
@@ -262,4 +262,4 @@ solusdt_available_trade:
     url: "http://localhost:8123"
     database: "hft_db"
     username: "hft_user"
-    password: "hft_password"
+    password: "${CLICKHOUSE_PASSWORD}"

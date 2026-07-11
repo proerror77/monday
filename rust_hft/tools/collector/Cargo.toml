@@ -9,8 +9,8 @@ description = "多交易所數據收集器：WebSocket → ClickHouse"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 
 # WebSocket + HTTP 客戶端（統一使用 rustls）
-tokio-tungstenite = { version = "0.20", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 
 # ClickHouse 客戶端
 clickhouse = { version = "0.12", default-features = false, features = ["rustls-tls"] }

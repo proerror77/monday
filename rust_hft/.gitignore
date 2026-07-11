@@ -1,1 +1,14 @@
 spec-kit/.codex/
+.env
+.env.local
+.env.*
+!.env.example
+!.env.sample
+!.env.*.example
+config/secrets.yaml
+clickhouse_credentials.txt
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt

@@ -1,0 +1,24 @@
+.git
+.github
+.worktrees
+**/target
+**/__pycache__
+**/.venv
+**/.pytest_cache
+
+# Local credentials and key material
+**/.env
+**/.env.local
+**/.env.*
+!**/.env.example
+!**/.env.sample
+!**/.env.*.example
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.crt
+config/.env.shared
+config/.env.unified
+rust_hft/config/secrets.yaml
+rust_hft/clickhouse_credentials.txt

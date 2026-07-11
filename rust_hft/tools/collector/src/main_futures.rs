@@ -291,7 +291,7 @@ async fn bitget_usdt_futures_stream(
 
     // 發送所有訂閱
     for msg in subscribe_msgs {
-        write.send(Message::Text(msg.to_string())).await?;
+        write.send(Message::Text(msg.to_string().into())).await?;
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
 

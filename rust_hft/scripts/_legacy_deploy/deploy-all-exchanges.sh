@@ -5,10 +5,10 @@ echo "🚀 HFT Collector - 部署所有交易所"
 
 # 配置参数
 ECS_IP="${ECS_IP:-8.216.64.241}"  # 更新为正确的IP
-SSH_KEY="hft-collector-key.pem"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/hft-collector-key.pem}"
 CLICKHOUSE_URL="https://kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud:8443"
 CLICKHOUSE_USER="default"
-CLICKHOUSE_PASSWORD="s9wECb~NGZPOE"
+CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}"
 DATABASE="hft_db"
 
 echo "📋 配置信息："

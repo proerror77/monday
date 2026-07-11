@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ECS_IP="${ECS_IP:-8.216.64.241}"
-SSH_KEY="hft-collector-key.pem"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/hft-collector-key.pem}"
 
 echo "🔍 HFT Collector 诊断工具"
 echo "="*80
@@ -69,12 +69,12 @@ import clickhouse_connect
 from datetime import datetime
 
 client = clickhouse_connect.get_client(
-    host='kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud',
-    port=8443,
-    database='hft_db',
-    secure=True,
-    username='default',
-    password='s9wECb~NGZPOE'
+    host='${CLICKHOUSE_HOST:-set CLICKHOUSE_HOST}',
+    port=${CLICKHOUSE_PORT:-8443},
+    database='${CLICKHOUSE_DB:-hft_db}',
+    secure=${CLICKHOUSE_SECURE:-True},
+    username='${CLICKHOUSE_USER:-set CLICKHOUSE_USER}',
+    password='${CLICKHOUSE_PASSWORD:-set CLICKHOUSE_PASSWORD}'
 )
 
 tables = {

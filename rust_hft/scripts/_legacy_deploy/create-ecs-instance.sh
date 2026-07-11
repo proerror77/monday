@@ -11,7 +11,7 @@ IMAGE_ID="ubuntu_22_04_x64_20G_alibase_20230907.vhd"  # Ubuntu 22.04镜像
 SECURITY_GROUP_NAME="hft-collector-sg"
 INSTANCE_NAME="hft-collector-spot"
 KEY_PAIR_NAME="hft-collector-key"
-KEY_FILE="hft-collector-key-new.pem"
+KEY_FILE="${KEY_FILE:-$HOME/.ssh/hft-collector-key-new.pem}"
 
 # 价格策略：抢占式实例
 SPOT_STRATEGY="SpotWithPriceLimit"      # 设置价格上限的抢占式实例

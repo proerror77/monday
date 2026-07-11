@@ -13,7 +13,7 @@ adapters-common = { package = "hft-data-adapters-common", path = "../../adapters
 
 # Async and networking
 tokio = { workspace = true, features = ["full"] }
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 
 # Serialization

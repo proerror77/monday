@@ -11,14 +11,16 @@ use exchanges::{
     create_exchange, parse_symbols_override, DepthMode, Exchange, ExchangeContext, MessageBuffers,
 };
 use futures::{SinkExt, StreamExt};
-use http::Request;
 use rand::Rng;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::interval;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{http::Request, Message},
+};
 use tracing::{error, info, warn};
 
 #[derive(Default, Clone, Debug)]
@@ -881,7 +883,7 @@ async fn run_exchange_session(
 
         for payload in plan.subscribe_messages {
             info!("[{}] 發送訂閱消息: {}", session_label, payload);
-            if let Err(e) = ws_sender.send(Message::Text(payload.clone())).await {
+            if let Err(e) = ws_sender.send(Message::Text(payload.clone().into())).await {
                 error!("[{}] 發送訂閱消息失敗: {:?}", session_label, e);
             }
         }
@@ -897,7 +899,10 @@ async fn run_exchange_session(
                         Ok(Message::Text(text)) => {
                             // Bitget JSON ping -> pong
                             if exchange_name == "bitget" && text.contains("\"op\":\"ping\"") {
-                                if let Err(e) = ws_sender.send(Message::Text("{\"op\":\"pong\"}".to_string())).await {
+                                if let Err(e) = ws_sender
+                                    .send(Message::Text("{\"op\":\"pong\"}".into()))
+                                    .await
+                                {
                                     warn!("[{}] 回應 Bitget pong 失敗: {:?}", session_label, e);
                                     break;
                                 }
@@ -989,7 +994,7 @@ async fn run_exchange_session(
                     }
                 }
                 _ = heartbeat_timer.tick() => {
-                    if let Err(e) = ws_sender.send(Message::Ping(vec![])).await {
+                    if let Err(e) = ws_sender.send(Message::Ping(Vec::new().into())).await {
                         error!(
                             "[{}] 心跳失敗: {:?}",
                             session_label, e

@@ -251,6 +251,6 @@ terraform apply
 # 4. 部署應用
 cd deployment/k8s
 kubectl apply -f namespace.yaml
-kubectl apply -f secrets.yaml
+kubectl apply -f /secure/external/path/secrets.yaml
 kubectl apply -f .
 ```

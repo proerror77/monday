@@ -11,9 +11,13 @@ fi
 
 # 設置變數
 ECS_HOST="47.128.222.180"  # 可能需要更新
-SSH_KEY="hft-admin-ssh-20250926144355.pem"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/hft-admin-ssh.pem}"
 BINARY_NAME="hft-collector"
 SERVICE_NAME="hft-collector"
+CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud}"
+CLICKHOUSE_PORT="${CLICKHOUSE_PORT:-9440}"
+CLICKHOUSE_USER="${CLICKHOUSE_USER:-default}"
+CLICKHOUSE_PASSWORD="${CLICKHOUSE_PASSWORD:-}"
 
 echo "📦 編譯修復版本..."
 pushd apps/collector >/dev/null
@@ -64,4 +68,8 @@ echo "   ssh -i $SSH_KEY root@$ECS_HOST 'journalctl -u $SERVICE_NAME -f'"
 
 # 檢查 ClickHouse 數據
 echo "🔍 檢查 ClickHouse 表..."
-run_remote "clickhouse-client --host 'kcveg5xfsi.ap-northeast-1.aws.clickhouse.cloud' --port 9440 --secure --user default --password 's9wECb~NGZPOE' --database hft_db --query 'SELECT count(*) as binance_orderbook_count FROM binance_orderbook' || echo '表檢查失敗'"
+if [[ -n "$CLICKHOUSE_PASSWORD" ]]; then
+    run_remote "clickhouse-client --host '$CLICKHOUSE_HOST' --port '$CLICKHOUSE_PORT' --secure --user '$CLICKHOUSE_USER' --password '$CLICKHOUSE_PASSWORD' --database hft_db --query 'SELECT count(*) as binance_orderbook_count FROM binance_orderbook' || echo '表檢查失敗'"
+else
+    echo "⚠️  跳過 ClickHouse 表檢查；請設置 CLICKHOUSE_PASSWORD"
+fi

@@ -528,14 +528,14 @@ impl ExecutionClient for BybitExecutionClient {
                     });
                     let _ = ws
                         .send(tokio_tungstenite::tungstenite::Message::Text(
-                            auth.to_string(),
+                            auth.to_string().into(),
                         ))
                         .await;
                     // 訂閱 order/execution
                     let sub = serde_json::json!({"op":"subscribe","args":["order.spot","execution.spot"]});
                     let _ = ws
                         .send(tokio_tungstenite::tungstenite::Message::Text(
-                            sub.to_string(),
+                            sub.to_string().into(),
                         ))
                         .await;
                     while let Some(msg) = ws.next().await {

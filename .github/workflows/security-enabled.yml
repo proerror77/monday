@@ -60,36 +60,29 @@ jobs:
           workspaces: rust_hft
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        run: cargo install --locked cargo-audit
 
       - name: Run security audit
-        run: cargo audit --json > audit-results.json
-        continue-on-error: true
-
-      - name: Check for critical vulnerabilities
         run: |
-          CRITICAL=$(jq -r '.vulnerabilities[] | select(.advisory.severity=="critical") | .id' audit-results.json | wc -l)
-          HIGH=$(jq -r '.vulnerabilities[] | select(.advisory.severity=="high") | .id' audit-results.json | wc -l)
-
-          echo "Critical: $CRITICAL, High: $HIGH"
-
-          if [ "$CRITICAL" -gt 0 ]; then
-            echo "::error::Found $CRITICAL critical vulnerabilities!"
-            jq -r '.vulnerabilities[] | select(.advisory.severity=="critical")' audit-results.json
-            exit 1
-          fi
-
-          if [ "$HIGH" -gt 0 ]; then
-            echo "::warning::Found $HIGH high severity vulnerabilities"
-            jq -r '.vulnerabilities[] | select(.advisory.severity=="high")' audit-results.json
-          fi
+          set -euo pipefail
+          cargo audit --json > audit-results.json
+          jq -e '.vulnerabilities.list? // [] | arrays' audit-results.json > /dev/null
 
       - name: Upload audit results
-        if: always()
+        if: always() && hashFiles('rust_hft/audit-results.json') != ''
         uses: actions/upload-artifact@v4
         with:
           name: cargo-audit-results
           path: rust_hft/audit-results.json
+
+  secret-presence:
+    name: Security - Repository Secret Presence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tracked secrets
+        run: bash ./scripts/check-tracked-secrets.sh
 
   # ============================================================================
   # License Compliance
@@ -313,6 +306,7 @@ jobs:
     needs:
       - sast-semgrep
       - cargo-audit
+      - secret-presence
       - license-check
       - clippy-strict
       - container-scan

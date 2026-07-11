@@ -15,8 +15,8 @@ futures = { workspace = true }
 async-trait = "0.1"
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+tokio-tungstenite = { workspace = true }
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde_json = "1.0"
 
 [features]

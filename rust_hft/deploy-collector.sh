@@ -9,6 +9,7 @@ SSH_KEY="${SSH_KEY:-$HOME/.ssh/hft-collector-key.pem}"
 BINARY_PATH="${BINARY_PATH:-./target/release/hft-collector}"
 WHITELIST_LOCAL="${WHITELIST_LOCAL:-config/symbol_whitelist.json}"
 CLICKHOUSE_URL="${CLICKHOUSE_URL:-https://n8xmym7qxq.ap-northeast-1.aws.clickhouse.cloud:8443}"
+CLICKHOUSE_CREDENTIALS_FILE="${CLICKHOUSE_CREDENTIALS_FILE:-$HOME/.config/hft/clickhouse_credentials.txt}"
 
 if [[ "$REMOTE_USER" == "root" ]]; then
   SUDO=""
@@ -18,13 +19,13 @@ else
   HOME_DIR="/home/$REMOTE_USER"
 fi
 
-# 讀取 ClickHouse 憑證（優先使用新憑證文件）
-if [ -f "$HOME/Downloads/clickhouse_credentials (1).txt" ]; then
-    CLICKHOUSE_PASSWORD=$(grep "Password:" "$HOME/Downloads/clickhouse_credentials (1).txt" | cut -d' ' -f2 | tr -d '\n\r')
-elif [ -f "clickhouse_credentials.txt" ]; then
-    CLICKHOUSE_PASSWORD=$(grep "Password:" clickhouse_credentials.txt | cut -d' ' -f2 | tr -d '\n\r')
-else
-    echo "❌ 找不到 ClickHouse 憑證文件"
+# 讀取 ClickHouse 憑證（優先使用環境變數，其次使用 repo 外的本機文件）
+if [[ -z "${CLICKHOUSE_PASSWORD:-}" && -f "$CLICKHOUSE_CREDENTIALS_FILE" ]]; then
+    CLICKHOUSE_PASSWORD=$(grep "Password:" "$CLICKHOUSE_CREDENTIALS_FILE" | cut -d' ' -f2 | tr -d '\n\r')
+fi
+
+if [[ -z "${CLICKHOUSE_PASSWORD:-}" ]]; then
+    echo "❌ 請設置 CLICKHOUSE_PASSWORD 或提供 CLICKHOUSE_CREDENTIALS_FILE"
     exit 1
 fi
 

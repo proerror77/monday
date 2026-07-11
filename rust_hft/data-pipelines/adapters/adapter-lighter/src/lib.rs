@@ -145,13 +145,13 @@ impl MarketStream for LighterMarketStream {
             // Proactively subscribe as soon as connected
             for (_sym, mid) in sym_to_mid.iter() {
                 let msg = serde_json::json!({"type": "subscribe", "channel": format!("order_book/{}", mid)});
-                let _ = ws.send(Message::Text(msg.to_string())).await;
+                let _ = ws.send(Message::Text(msg.to_string().into())).await;
             }
 
             while let Some(msg) = ws.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        let mut bytes = text.into_bytes();
+                        let mut bytes = text.as_bytes().to_vec();
                         let parsed: serde_json::Value = match parse_bytes(bytes.as_mut_slice()) {
                             Ok(v) => v,
                             Err(e) => {
@@ -165,7 +165,7 @@ impl MarketStream for LighterMarketStream {
                                 // subscribe again to be safe
                                 for (_sym, mid) in sym_to_mid.iter() {
                                     let msg = serde_json::json!({"type": "subscribe", "channel": format!("order_book/{}", mid)});
-                                    let _ = ws.send(Message::Text(msg.to_string())).await;
+                                    let _ = ws.send(Message::Text(msg.to_string().into())).await;
                                 }
                             }
                             t if t.starts_with("subscribed/") => {
