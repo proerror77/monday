@@ -105,11 +105,10 @@ impl Portfolio {
                         set.insert(fill_id.clone());
                     }
                     self.apply_fill(&symbol, side, *price, *quantity);
+                    // Fill price is the freshest executable fallback mark observed by this ledger.
+                    self.market_prices.insert(symbol.clone(), *price);
+                    self.recalculate_unrealized_pnl();
                 }
-                // Fill price is the freshest executable fallback mark observed by this ledger.
-                self.market_prices.insert(symbol.clone(), *price);
-                // 重新計算未實現盈虧
-                self.recalculate_unrealized_pnl();
             }
         }
         // 每次更新後發佈只讀快照
@@ -448,16 +447,27 @@ mod tests {
         fill(
             &mut portfolio,
             "B-1",
+            "newer-fill",
+            &symbol,
+            Side::Buy,
+            120,
+            1,
+        );
+        fill(
+            &mut portfolio,
+            "B-1",
             "same-fill",
             &symbol,
             Side::Buy,
-            100,
+            50,
             1,
         );
 
         let view = portfolio.reader().load();
-        assert_eq!(view.positions[&symbol].quantity.0, Decimal::ONE);
-        assert_eq!(view.cash_balance, Decimal::from(900));
+        assert_eq!(view.positions[&symbol].quantity.0, Decimal::from(2));
+        assert_eq!(view.cash_balance, Decimal::from(780));
+        assert_eq!(view.unrealized_pnl, Decimal::from(20));
+        assert_eq!(view.equity(), Decimal::from(1020));
     }
 
     #[test]

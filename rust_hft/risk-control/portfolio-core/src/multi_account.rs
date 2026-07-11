@@ -76,8 +76,8 @@ pub struct AggregatedPosition {
     pub symbol: Symbol,
     /// 淨持倉量（各所合計，可能對沖）
     pub net_quantity: Quantity,
-    /// 加權平均價
-    pub weighted_avg_price: Price,
+    /// Same-side weighted basis. `None` means long and short venue books are mixed.
+    pub weighted_avg_price: Option<Price>,
     /// 各所分佈
     pub per_venue: HashMap<AccountId, Position>,
     /// 總未實現盈虧
@@ -144,9 +144,7 @@ impl MultiAccountPortfolio {
 
     /// 添加/獲取帳戶
     pub fn get_or_create_account(&mut self, account_id: AccountId) -> &mut crate::Portfolio {
-        self.accounts
-            .entry(account_id)
-            .or_default()
+        self.accounts.entry(account_id).or_default()
     }
 
     /// 獲取帳戶（只讀）
@@ -162,7 +160,8 @@ impl MultiAccountPortfolio {
         symbol: Symbol,
         side: Side,
     ) {
-        self.order_to_account.insert(order_id.clone(), account_id.clone());
+        self.order_to_account
+            .insert(order_id.clone(), account_id.clone());
         let portfolio = self.get_or_create_account(account_id);
         portfolio.register_order(order_id, symbol, side);
     }
@@ -271,7 +270,7 @@ impl MultiAccountPortfolio {
                     .or_insert_with(|| AggregatedPosition {
                         symbol: symbol.clone(),
                         net_quantity: Quantity::zero(),
-                        weighted_avg_price: Price::zero(),
+                        weighted_avg_price: None,
                         per_venue: HashMap::new(),
                         total_unrealized_pnl: Decimal::ZERO,
                     });
@@ -279,7 +278,9 @@ impl MultiAccountPortfolio {
                 // 累加淨持倉
                 agg_pos.net_quantity = Quantity(agg_pos.net_quantity.0 + position.quantity.0);
                 agg_pos.total_unrealized_pnl += position.unrealized_pnl;
-                agg_pos.per_venue.insert(account_id.clone(), position.clone());
+                agg_pos
+                    .per_venue
+                    .insert(account_id.clone(), position.clone());
 
                 // 計算加權平均價（簡化：只累加，最後算）
                 // weighted_avg = sum(qty * price) / sum(qty)
@@ -290,16 +291,21 @@ impl MultiAccountPortfolio {
         for agg_pos in agg.aggregated_positions.values_mut() {
             let mut total_value = Decimal::ZERO;
             let mut total_qty = Decimal::ZERO;
+            let mut has_long = false;
+            let mut has_short = false;
 
             for pos in agg_pos.per_venue.values() {
-                if pos.quantity.0 > Decimal::ZERO {
-                    total_value += pos.quantity.0 * pos.avg_price.0;
-                    total_qty += pos.quantity.0;
+                if pos.quantity.0 != Decimal::ZERO {
+                    has_long |= pos.quantity.0 > Decimal::ZERO;
+                    has_short |= pos.quantity.0 < Decimal::ZERO;
+                    let absolute_quantity = pos.quantity.0.abs();
+                    total_value += absolute_quantity * pos.avg_price.0;
+                    total_qty += absolute_quantity;
                 }
             }
 
-            if total_qty > Decimal::ZERO {
-                agg_pos.weighted_avg_price = Price(total_value / total_qty);
+            if total_qty > Decimal::ZERO && !(has_long && has_short) {
+                agg_pos.weighted_avg_price = Some(Price(total_value / total_qty));
             }
         }
 
@@ -439,8 +445,18 @@ mod tests {
 
         // 註冊訂單
         let sym = Symbol::new("BTCUSDT");
-        multi.register_order(binance.clone(), OrderId("B-1".into()), sym.clone(), Side::Buy);
-        multi.register_order(bitget.clone(), OrderId("G-1".into()), sym.clone(), Side::Sell);
+        multi.register_order(
+            binance.clone(),
+            OrderId("B-1".into()),
+            sym.clone(),
+            Side::Buy,
+        );
+        multi.register_order(
+            bitget.clone(),
+            OrderId("G-1".into()),
+            sym.clone(),
+            Side::Sell,
+        );
 
         // 處理成交
         let fill_binance = ExecutionEvent::Fill {
@@ -464,6 +480,7 @@ mod tests {
         // 檢查聚合視圖
         let agg = multi.get_aggregated_view();
         assert_eq!(agg.accounts.len(), 2);
+        assert!(agg.aggregated_positions[&sym].weighted_avg_price.is_none());
 
         // 檢查 PnL 報告
         let report = multi.get_pnl_report();
@@ -480,8 +497,18 @@ mod tests {
         let sym = Symbol::new("ETHUSDT");
 
         // 兩所都買 ETH
-        multi.register_order(binance.clone(), OrderId("B-1".into()), sym.clone(), Side::Buy);
-        multi.register_order(bitget.clone(), OrderId("G-1".into()), sym.clone(), Side::Buy);
+        multi.register_order(
+            binance.clone(),
+            OrderId("B-1".into()),
+            sym.clone(),
+            Side::Buy,
+        );
+        multi.register_order(
+            bitget.clone(),
+            OrderId("G-1".into()),
+            sym.clone(),
+            Side::Buy,
+        );
 
         multi.on_execution_event(&ExecutionEvent::Fill {
             order_id: OrderId("B-1".into()),
@@ -508,7 +535,40 @@ mod tests {
 
         // 加權平均價 = (2*3000 + 3*3010) / 5 = 15030 / 5 = 3006
         let expected_avg = Decimal::from(15030) / Decimal::from(5);
-        assert_eq!(eth_pos.weighted_avg_price.0, expected_avg);
+        assert_eq!(eth_pos.weighted_avg_price.unwrap().0, expected_avg);
+    }
+
+    #[test]
+    fn all_short_positions_have_an_absolute_quantity_weighted_basis() {
+        let mut multi = MultiAccountPortfolio::new();
+        let binance = AccountId::new(VenueId::BINANCE);
+        let bitget = AccountId::new(VenueId::BITGET);
+        let symbol = Symbol::new("ETHUSDT");
+
+        multi.register_order(binance, OrderId("S-1".into()), symbol.clone(), Side::Sell);
+        multi.register_order(bitget, OrderId("S-2".into()), symbol.clone(), Side::Sell);
+        multi.on_execution_event(&ExecutionEvent::Fill {
+            order_id: OrderId("S-1".into()),
+            price: Price(Decimal::from(100)),
+            quantity: Quantity(Decimal::from(2)),
+            timestamp: 1,
+            fill_id: "f1".into(),
+        });
+        multi.on_execution_event(&ExecutionEvent::Fill {
+            order_id: OrderId("S-2".into()),
+            price: Price(Decimal::from(110)),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 2,
+            fill_id: "f2".into(),
+        });
+
+        let aggregate = multi.get_aggregated_view();
+        let position = &aggregate.aggregated_positions[&symbol];
+        assert_eq!(position.net_quantity.0, Decimal::from(-3));
+        assert_eq!(
+            position.weighted_avg_price.unwrap().0,
+            Decimal::from(310) / Decimal::from(3)
+        );
     }
 
     #[test]
