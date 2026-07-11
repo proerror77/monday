@@ -1,6 +1,6 @@
 # Research Core
 
-Rust-first contracts for the Agentic Alpha Harness.
+Rust-first shared contracts for the bounded Loop Engineer research plane.
 
 This tree owns durable schemas and deterministic gates for:
 
@@ -10,4 +10,4 @@ This tree owns durable schemas and deterministic gates for:
 - Factor Bank records
 - promotion gates
 
-It does not own hot-path execution, exchange adapters, order routing, or LLM orchestration.
+It does not own hot-path execution, exchange adapters, order routing, runtime authority, or LLM orchestration.

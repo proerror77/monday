@@ -1,10 +1,11 @@
 use alpha_domain::{
-    verify_envelope, AllowedIntentType, ApprovalClass, DomainError, RuntimeAttributionEvent,
-    RuntimeEnvelopePolicy, SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
-    VerifiedDeploymentEnvelope, MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS,
+    sign_runtime_attribution_event, verify_envelope, AllowedIntentType, ApprovalClass, DomainError,
+    RuntimeApprovalEvidence, RuntimeAttributionEvent, RuntimeEnvelopePolicy,
+    SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact, VerifiedDeploymentEnvelope,
+    MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS,
 };
 use chrono::{DateTime, Utc};
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -83,6 +84,8 @@ pub struct RuntimePolicyDocument {
     pub max_order_size: f64,
     pub max_slippage_bps: f64,
     #[serde(default)]
+    pub approvals: Vec<RuntimeApprovalEvidence>,
+    #[serde(default)]
     pub runtime_paused: bool,
 }
 
@@ -103,6 +106,7 @@ impl RuntimePolicyDocument {
             max_symbol_exposure: self.max_symbol_exposure,
             max_order_size: self.max_order_size,
             max_slippage_bps: self.max_slippage_bps,
+            approvals: self.approvals.clone(),
         }
     }
 }
@@ -181,7 +185,7 @@ impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
             }
             ActivationMode::Shadow => {
                 proposed.venues[*venue_index].execution_mode = Some("Paper".to_string());
-                proposed.quotes_only = true;
+                proposed.quotes_only = false;
             }
             ActivationMode::LiveSmall => {
                 return Err(
@@ -371,24 +375,43 @@ fn verify_onnx_artifact(
     }
 
     let uri = model.artifact.uri.as_str();
-    let path = if let Some(path) = uri.strip_prefix("file://") {
-        PathBuf::from(path)
-    } else if uri.contains("://") {
-        return Err("runtime accepts only local ONNX artifact paths".to_string());
-    } else {
-        bundle_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(uri)
-    };
-    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+    if uri.contains("://") {
+        return Err("ONNX artifact must use a bundle-relative path".to_string());
+    }
+    let relative_path = Path::new(uri);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err("ONNX artifact must stay inside the strategy bundle directory".to_string());
+    }
+    let bundle_directory =
+        std::fs::canonicalize(bundle_path.parent().unwrap_or_else(|| Path::new(".")))
+            .map_err(|error| format!("failed to resolve strategy bundle directory: {error}"))?;
+    let unresolved_path = bundle_directory.join(relative_path);
+    let metadata = std::fs::symlink_metadata(&unresolved_path).map_err(|error| {
         format!(
             "failed to inspect ONNX artifact {}: {error}",
-            path.display()
+            unresolved_path.display()
         )
     })?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err("ONNX artifact must be a regular non-symlink file".to_string());
+    }
+    let path = std::fs::canonicalize(&unresolved_path).map_err(|error| {
+        format!(
+            "failed to resolve ONNX artifact {}: {error}",
+            unresolved_path.display()
+        )
+    })?;
+    if !path.starts_with(&bundle_directory) {
+        return Err("ONNX artifact must stay inside the strategy bundle directory".to_string());
     }
     if metadata.len() > MAX_ONNX_ARTIFACT_BYTES {
         return Err("ONNX artifact exceeds the runtime byte limit".to_string());
@@ -494,23 +517,40 @@ pub struct RuntimeAuditLog {
 
 pub struct RuntimeFeedbackLog {
     path: PathBuf,
+    key_id: String,
+    signing_key: SigningKey,
 }
 
 impl RuntimeFeedbackLog {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, IntakeError> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        key_id: impl Into<String>,
+        signing_key: SigningKey,
+    ) -> Result<Self, IntakeError> {
         let path = path.as_ref().to_path_buf();
+        let key_id = key_id.into();
+        if key_id.trim().is_empty() {
+            return Err(IntakeError::DurableState(
+                "runtime feedback key id cannot be empty".to_string(),
+            ));
+        }
         ensure_parent(&path)?;
         OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(durable_error)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            key_id,
+            signing_key,
+        })
     }
 
     pub fn append(&mut self, event: &RuntimeAttributionEvent) -> Result<(), IntakeError> {
-        event.validate()?;
-        let mut bytes = serde_json::to_vec(event)
+        let signed =
+            sign_runtime_attribution_event(event.clone(), self.key_id.clone(), &self.signing_key)?;
+        let mut bytes = serde_json::to_vec(&signed)
             .map_err(|error| IntakeError::DurableState(error.to_string()))?;
         bytes.push(b'\n');
         let mut file = OpenOptions::new()

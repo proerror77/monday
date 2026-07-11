@@ -1,78 +1,112 @@
-# Rust Trading Architecture
-## Ownership Boundaries
+# Rust Loop Engineer Architecture
+
+## Trust Domains
 
 ```mermaid
 flowchart TB
     subgraph Research["Cold research and control plane"]
-        DM["Data Missions"]
-        AH["alpha-harness app"]
-        AE["alpha-engine"]
-        AS["alpha-store / DuckDB"]
-        DM --> AH --> AE --> AS
+        LR["LoopRun goal and stage ledger"]
+        DM["Governed Data Missions"]
+        AE["Search, evaluation, failure learning"]
+        AS["DuckDB lineage and policy memory"]
+        LR --> DM --> AE --> AS
+        AS --> AE
     end
 
-    subgraph Runtime["Rust runtime"]
+    subgraph Governance["Promotion and deployment authority"]
+        PR["Immutable promotion"]
+        SB["Content-addressed Formula bundle"]
+        DE["Signed DeploymentEnvelope"]
+        PR --> SB --> DE
+    end
+
+    subgraph Runtime["Deterministic Rust runtime"]
+        RV["hft-live verifier"]
         MD["Market data"]
-        ST["Strategies and model inference"]
-        RK["Risk and OMS"]
+        ST["Strategy"]
+        RK["Risk / OMS / reconciliation"]
         EX["Execution adapters"]
-        MD --> ST --> RK --> EX
+        RV --> MD --> ST --> RK --> EX
     end
 
-    AS -->|"signed DeploymentEnvelope only"| RV["hft-live verifier"]
-    RV --> Runtime
-    Runtime -->|"append-only attribution"| AS
+    AS --> PR
+    DE --> RV
+    Runtime -->|"append-only scoped attribution"| AS
 ```
 
-### Research Plane
+| Domain | Owns | Must not own |
+| --- | --- | --- |
+| Research | Goals, datasets, hypotheses, candidates, evaluation, failure evidence, learning directives | Credentials, orders, runtime resume, hard risk increases |
+| Governance | Promotion records, approvals, bundle/envelope binding and signing | Market connectivity or direct execution |
+| Runtime | Trusted keys, policy caps, nonce/audit state, account truth, risk, OMS, cancel, reconciliation, execution | LLM-driven decisions or unverified artifacts |
 
-- `alpha-harness/domain`: mission, candidate, learning, approval, and signed deployment contracts.
+## Durable Packages
+
+- `alpha-harness/domain`: mission, LoopRun, candidate, evaluation, learning, approval, bundle, and signed deployment contracts.
 - `alpha-harness/store`: DuckDB migrations and append-only control-plane repositories.
-- `alpha-harness/engine`: resumable AutoResearch kernel, search engines, causal evaluation, LLM client, and learning coordinator.
-- `alpha-harness/app`: structured CLI for data, missions, candidates, holdout evaluation, promotion, approvals, policies, feedback, and signing.
-- `tools/collector`: exchange connector ownership and governed public Data Missions.
-
-The research plane has no dependency on execution adapters and exposes no order or trade command.
-
-### Runtime Plane
-
-- `market-core`: event, engine, and runtime construction.
-- `data-pipelines`: venue market-data adapters and replay.
-- `strategy-framework`: deterministic strategies and ONNX inference.
-- `risk-control`: risk checks, OMS, portfolio state, and sentinel controls.
+- `alpha-harness/engine`: resumable search kernel, GP/MCTS/Bayesian engines, causal evaluator, bounded LLM client, offline-RL lab engine, and learning coordinator.
+- `alpha-harness/app`: structured CLI for data, loops, missions, evaluation, promotion, approvals, policies, feedback, and signing.
+- `tools/collector`: streaming connectors plus governed public Binance OHLCV acquisition.
+- `market-core` and `data-pipelines`: events, runtime construction, venue market data, and replay.
+- `strategy-framework`: deterministic Formula strategies and ONNX runtime compatibility.
+- `risk-control`: risk checks, OMS, portfolio accounting, reconciliation policy, and sentinel controls.
 - `execution-gateway`: venue-specific execution adapters.
-- `apps/live`: runtime startup, signed envelope intake, nonce ledger, audit, and feedback output.
+- `apps/live`: signed envelope intake, runtime startup, nonce ledger, audit, and attribution output.
 
-## Data and Time
+The research crates do not depend on execution adapters and expose no order, cancel, wallet, or transaction command.
 
-Every research event must preserve event, exchange, receive, available, and ingestion time. Labels are evaluated at their availability time. Dataset artifacts are content addressed and quality-gated; a failed real acquisition writes failure evidence and never falls back to synthetic data.
+## Bounded Loop
 
-## Evaluation and Promotion
+A `LoopRun` advances only through persisted evidence:
 
-1. Engines propose bounded typed artifacts.
-2. The factor DSL evaluator uses causal operators.
-3. Purged walk-forward folds include fees, funding, latency, and turnover.
-4. Resume replays historical observations and rejects duplicate artifacts.
-5. Only a walk-forward Keep candidate can access the sealed holdout.
-6. Promotion and deployment are separate records.
-7. Runtime rechecks the signed envelope against current policy.
-8. Paper/shadow results return as immutable attribution events.
+1. `Researching`
+2. `WalkForwardKept`
+3. `HoldoutPassed`
+4. `PaperHealthy`
+5. `ShadowHealthy`
+6. `LiveSmallEligible`
 
-No passing result or candidate count is fabricated. Budget exhaustion is a valid terminal mission result.
+The declared target stage, not candidate count, determines success. Awaiting evidence pauses the run; budget exhaustion, mission failure, and policy completion are distinct terminal reasons. Exact MCTS/Bayesian state, observations, iterations, and hashes are checkpointed so resume does not restart a different search.
+
+Repeated failures may create one idempotent follow-up mission. A learning directive can alter only a future lab search policy after deterministic validation. It cannot alter a runtime hard cap or authorize capital.
+
+This is a durable goal/evidence loop. Cron, Kubernetes Jobs, or event consumers may invoke it, but scheduling is not itself evidence and does not bypass any stage.
+
+## Data And Time
+
+Governed research rows preserve exchange event time, receive time, availability time, and ingestion time. Historical candle availability is strictly after candle close. Dataset artifacts are content-addressed and their exact manifest must match an immutable DuckDB registry revision before mission execution or sealed evaluation.
+
+The Binance OHLCV v2 acquisition path rejects open/partial candles, duplicates, gaps, stale windows, non-finite values, invalid OHLC relationships, non-positive prices, negative volume, time-bound violations, identity mismatch, row-count mismatch, and artifact hash mismatch. A failed real acquisition writes failure evidence and never falls back to synthetic data.
+
+Streaming connector availability is a runtime capability, not proof that the same source is supported by the governed research loader.
+
+## Evaluation And Promotion
+
+- Formula signals use causal operators and an explicit zero position for zero signal.
+- Purged walk-forward and sealed-holdout v2 evidence persists per-fold and aggregate rows, trades, post-cost return, drawdown, raw score, adjusted score, config, and failure reasons.
+- Mission policy pre-registers the multiple-testing family; the evaluator applies a Gaussian expected-maximum haircut without claiming full DSR or PBO.
+- Domain and store layers recompute evidence, evaluator config/metrics hashes, candidate binding, and bundle hash before promotion.
+- Only a canonical Formula v2 candidate can be promoted by the current producer.
+- Offline RL remains lab-only and is blocked from holdout and promotion.
+- ONNX remains runtime schema compatibility only until point-in-time training lineage and a governed model evaluator are implemented.
+
+No passing result, candidate count, or profitability claim is fabricated. DuckDB replay proves plumbing and lineage, not alpha.
 
 ## Deployment Safety
 
-The runtime owns trusted public keys, config/risk hashes, policy caps, nonce ledger, and audit log. The sequence is verification, pre-activation audit fsync, nonce fsync, runtime adapter, then activation attribution.
+The runtime verifies current config/risk hashes, account, venue, instruments, intent types, limits, validity window, envelope signature, runtime-owned approval evidence, and durable nonce before preparing activation. The order is pre-activation audit fsync, nonce reservation/fsync, runtime construction, then signed activation attribution.
 
-Paper forces venue `Paper`. Shadow forces `quotes_only`. Live-small currently fails closed because max order size and slippage are not yet enforced universally in every execution path.
+Paper forces paper execution. Shadow also uses simulated Paper execution, but emits Shadow-scoped attribution so fills and portfolio health are measurable without sending a real venue order. `LiveSmall` remains disabled even when eligibility evidence exists; a human approval cannot bypass missing real-venue acceptance tests.
+
+Runtime accounting uses exact decimals and covers long/short increases, partial closes, full closes, and position crossing. Unknown balance, position, open-order, sequence, or reconciliation state halts live execution. Emergency mode rejects new intents and cancels locally open orders; universal reduce-only flattening is not claimed.
 
 ## Storage
 
-- DuckDB: missions, lineage, registries, approvals, feedback, policy revisions, and memory.
+- DuckDB: goals, missions, lineage, registries, evaluations, approvals, feedback, policy revisions, and memory.
 - Trace/Parquet: raw and large derived research datasets.
-- ClickHouse: optional real-time analytics, not control-plane truth.
-- Runtime files: trusted keys, nonce ledger, audit, and feedback; these are not stored in AlphaStore.
+- ClickHouse: optional streaming analytics, not control-plane truth.
+- Runtime-owned files: deployment trusted keys, approval policy, feedback signing key, nonce ledger, audit log, and signed attribution feedback.
 
 ## Build Discipline
 
-Use focused package commands. The default workspace members remain execution-oriented; alpha harness crates are explicit workspace members but not default members.
+Use package-scoped development checks. The default workspace members remain execution-oriented; alpha crates are explicit members but are not default members. Run release feature graphs, production image builds, and Kubernetes validation only at release gates.

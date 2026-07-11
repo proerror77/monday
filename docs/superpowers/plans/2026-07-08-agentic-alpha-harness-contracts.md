@@ -1,5 +1,7 @@
 # Agentic Alpha Harness Contracts Implementation Plan
 
+> **Superseded:** retained for implementation history. Use the [2026-07-11 production-hardening plan](2026-07-11-loop-engineer-production-hardening.md) for current work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the first Rust-first contract layer for the Agentic Alpha Harness: manifests, factor DSL, search proposals, Factor Bank records, and promotion gate evaluation.

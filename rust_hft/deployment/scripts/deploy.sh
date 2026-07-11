@@ -129,6 +129,7 @@ deploy_k8s() {
     log_info "創建 Secrets..."
     envsubst < "$K8S_SECRETS_FILE" | kubectl apply -f -
     require_secret_key hft-secrets grpc-auth-token
+    require_secret_key hft-secrets feedback-signing-key-hex
 
     log_info "創建部署授權 ConfigMaps..."
     kubectl apply -f "$K8S_DEPLOYMENT_ENVELOPE_FILE"

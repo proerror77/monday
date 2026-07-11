@@ -1,7 +1,7 @@
 # Repository Instructions
 ## Architecture
 
-The current system is a Rust-first Agentic Alpha research/control plane plus a separately owned Rust trading runtime.
+The current system is a Rust-first bounded Loop Engineer research/control plane plus a separately owned deterministic Rust trading runtime.
 
 - Research: `rust_hft/alpha-harness/*`
 - Data acquisition: `rust_hft/tools/collector`
@@ -31,7 +31,7 @@ cargo test -p alpha-store --locked
 cargo test -p alpha-engine --locked
 cargo test -p alpha-harness --locked
 cargo test -p hft-live --no-default-features --test deployment_envelope --locked
-cargo check -p hft-collector --locked
+cargo clippy -p hft-collector --all-targets --features collector-binance --no-deps --locked -- -D warnings
 ```
 
 Do not compile the entire workspace for ordinary changes. Run `cargo metadata --locked --no-deps` after workspace graph changes.

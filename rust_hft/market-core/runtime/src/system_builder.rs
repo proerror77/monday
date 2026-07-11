@@ -325,7 +325,8 @@ impl SystemBuilder {
         self
     }
 
-    pub(crate) fn register_simulated_execution_client(mut self, venue: VenueId) -> Self {
+    /// Register the in-process paper execution adapter used by bounded Paper/Shadow runs.
+    pub fn register_simulated_execution_client(mut self, venue: VenueId) -> Self {
         let client = simulated_execution::SimulatedExecutionClient::new(venue);
         self = self.register_execution_client_with_venue(client, venue);
         self
@@ -560,6 +561,11 @@ impl SystemBuilder {
                 )));
             }
         }
+        self.try_register_strategies_from_config()
+    }
+
+    /// Register only governed strategy configurations, without opening market or venue adapters.
+    pub fn register_strategies_from_config_strict(self) -> HftResult<Self> {
         self.try_register_strategies_from_config()
     }
 
@@ -1652,8 +1658,10 @@ mod tests {
 
     #[test]
     fn only_real_live_execution_requires_authoritative_balance_reconciliation() {
-        let mut config = SystemConfig::default();
-        config.venues = vec![live_venue_config()];
+        let mut config = SystemConfig {
+            venues: vec![live_venue_config()],
+            ..Default::default()
+        };
         assert!(requires_authoritative_balance_reconciliation(&config));
 
         config.venues[0].simulate_execution = true;
@@ -1670,8 +1678,10 @@ mod tests {
 
     #[tokio::test]
     async fn live_runtime_reconciles_before_starting_engine_loop() {
-        let mut config = SystemConfig::default();
-        config.venues = vec![live_venue_config()];
+        let mut config = SystemConfig {
+            venues: vec![live_venue_config()],
+            ..Default::default()
+        };
         config.engine.reconcile_interval_ms = 0;
         let mut runtime = SystemBuilder::new(config)
             .register_execution_client_with_venue(

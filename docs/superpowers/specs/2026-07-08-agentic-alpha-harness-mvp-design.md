@@ -1,5 +1,7 @@
 # Agentic Alpha Harness MVP Design
 
+> **Superseded:** retained for design history. Use the [2026-07-11 Loop Engineer design](2026-07-11-loop-engineer-production-hardening-design.md) for current capability and safety boundaries.
+
 Date: 2026-07-08
 Status: Approved design draft
 

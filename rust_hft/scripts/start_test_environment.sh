@@ -195,7 +195,7 @@ show_service_status() {
     echo "  • ClickHouse TCP:   localhost:9000"
     echo "  • Redis:            localhost:6379"
     echo "  • Prometheus:       http://localhost:9090"
-    echo "  • Grafana:          http://localhost:3000 (admin/admin)"
+    echo "  • Grafana:          http://localhost:3000 (credentials from GRAFANA_ADMIN_PASSWORD)"
     echo ""
     
     echo "🗄️  数据库信息:"

@@ -1,4 +1,4 @@
-//! Trust-boundary contracts for Agentic Alpha research and runtime deployment.
+//! Trust-boundary contracts for bounded Loop Engineer research and runtime deployment.
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -6,7 +6,7 @@ use hft_factor_dsl::FactorAst;
 use hft_research_manifest::{ArtifactRef, ManifestId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -52,12 +52,22 @@ pub enum DomainError {
     RuntimeBindingMismatch,
     #[error("deployment exceeds a runtime hard limit")]
     RuntimeLimitExceeded,
+    #[error("deployment approval evidence does not match runtime-owned policy")]
+    ApprovalEvidenceMismatch,
     #[error("canonical deployment serialization failed")]
     CanonicalSerialization,
     #[error("runtime attribution metrics must be finite")]
     InvalidAttributionMetric,
     #[error("runtime attribution outcome does not match its event kind")]
     InvalidAttributionOutcome,
+    #[error("runtime attribution payload hash does not match")]
+    AttributionPayloadHashMismatch,
+    #[error("runtime attribution signing key is not trusted")]
+    UnknownAttributionSigningKey,
+    #[error("runtime attribution signature is invalid")]
+    InvalidAttributionSignature,
+    #[error("runtime attribution signature encoding is invalid")]
+    InvalidAttributionSignatureEncoding,
     #[error("search-policy validator scores must be finite")]
     InvalidPolicyScore,
     #[error("candidate artifact is research-only and cannot be promoted")]
@@ -823,6 +833,127 @@ impl RuntimeAttributionEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedRuntimeAttributionEvent {
+    pub event: RuntimeAttributionEvent,
+    pub key_id: String,
+    pub content_hash: String,
+    pub signature_hex: String,
+}
+
+pub fn sign_runtime_attribution_event(
+    event: RuntimeAttributionEvent,
+    key_id: impl Into<String>,
+    signing_key: &SigningKey,
+) -> Result<SignedRuntimeAttributionEvent, DomainError> {
+    event.validate()?;
+    let key_id = key_id.into();
+    require_text("runtime attribution key_id", &key_id)?;
+    let content_hash = canonical_json_hash(&event)?;
+    let signature = signing_key.sign(content_hash.as_bytes());
+    Ok(SignedRuntimeAttributionEvent {
+        event,
+        key_id,
+        content_hash,
+        signature_hex: hex::encode(signature.to_bytes()),
+    })
+}
+
+pub fn verify_runtime_attribution_event(
+    signed: &SignedRuntimeAttributionEvent,
+    trusted_keys: &BTreeMap<String, VerifyingKey>,
+) -> Result<RuntimeAttributionEvent, DomainError> {
+    signed.event.validate()?;
+    require_text("runtime attribution key_id", &signed.key_id)?;
+    let expected_hash = canonical_json_hash(&signed.event)?;
+    if expected_hash != signed.content_hash {
+        return Err(DomainError::AttributionPayloadHashMismatch);
+    }
+    let key = trusted_keys
+        .get(&signed.key_id)
+        .ok_or(DomainError::UnknownAttributionSigningKey)?;
+    let signature_bytes = hex::decode(&signed.signature_hex)
+        .map_err(|_| DomainError::InvalidAttributionSignatureEncoding)?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|_| DomainError::InvalidAttributionSignatureEncoding)?;
+    key.verify(signed.content_hash.as_bytes(), &signature)
+        .map_err(|_| DomainError::InvalidAttributionSignature)?;
+    Ok(signed.event.clone())
+}
+
+pub fn runtime_stage_is_healthy(
+    events: &[RuntimeAttributionEvent],
+    candidate_id: &str,
+    mode: AttributionMode,
+) -> bool {
+    #[derive(Default)]
+    struct DeploymentHealth {
+        activated: bool,
+        unhealthy: bool,
+        strategies: BTreeMap<String, StrategyHealth>,
+    }
+
+    #[derive(Default)]
+    struct StrategyHealth {
+        healthy_snapshot: bool,
+        fill: bool,
+    }
+
+    let mut by_deployment = BTreeMap::<String, DeploymentHealth>::new();
+    for event in events
+        .iter()
+        .filter(|event| event.asset_revision_id == candidate_id && event.mode == mode)
+    {
+        let health = by_deployment
+            .entry(event.deployment_id.clone())
+            .or_default();
+        if matches!(
+            event.outcome,
+            AttributionOutcome::Failed
+                | AttributionOutcome::Decayed
+                | AttributionOutcome::RolledBack
+        ) || event.kind == AttributionKind::StreamGap
+        {
+            health.unhealthy = true;
+            continue;
+        }
+        if event.kind == AttributionKind::Activation
+            && event.outcome == AttributionOutcome::Activated
+        {
+            health.activated = true;
+        }
+        if event.outcome == AttributionOutcome::Healthy
+            && event.kind == AttributionKind::PortfolioSnapshot
+        {
+            if let Some(strategy_id) = event.strategy_id.as_ref() {
+                health
+                    .strategies
+                    .entry(strategy_id.clone())
+                    .or_default()
+                    .healthy_snapshot = true;
+            }
+        }
+        if event.kind == AttributionKind::Fill {
+            if let Some(strategy_id) = event.strategy_id.as_ref() {
+                health
+                    .strategies
+                    .entry(strategy_id.clone())
+                    .or_default()
+                    .fill = true;
+            }
+        }
+    }
+
+    by_deployment.values().any(|health| {
+        !health.unhealthy
+            && health.activated
+            && health
+                .strategies
+                .values()
+                .any(|strategy| strategy.healthy_snapshot && strategy.fill)
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LearningDirective {
     pub directive_id: String,
     pub mission_id: String,
@@ -1189,6 +1320,43 @@ pub enum ApprovalClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeApprovalEvidence {
+    pub approval_id: String,
+    pub approval_class: ApprovalClass,
+    pub subject_id: String,
+    pub scope_hash: String,
+    pub signer_id: String,
+    pub valid_from: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl RuntimeApprovalEvidence {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text("runtime approval_id", &self.approval_id)?;
+        require_text("runtime approval subject_id", &self.subject_id)?;
+        require_text("runtime approval signer_id", &self.signer_id)?;
+        validate_deployment_hash(&self.scope_hash)?;
+        if self.approval_class == ApprovalClass::SameClassAutoLiveSmall
+            || self.valid_from >= self.expires_at
+            || self
+                .revoked_at
+                .is_some_and(|revoked_at| revoked_at < self.valid_from)
+        {
+            return Err(DomainError::ApprovalEvidenceMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
+        now >= self.valid_from
+            && now < self.expires_at
+            && self.revoked_at.is_none_or(|revoked_at| now < revoked_at)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveSmallEligibilityEvidence {
     pub candidate_id: String,
     pub bundle_id: String,
@@ -1324,6 +1492,7 @@ pub struct RuntimeEnvelopePolicy {
     pub max_symbol_exposure: f64,
     pub max_order_size: f64,
     pub max_slippage_bps: f64,
+    pub approvals: Vec<RuntimeApprovalEvidence>,
 }
 
 pub fn sign_envelope(
@@ -1400,7 +1569,34 @@ pub fn verify_envelope(
     {
         return Err(DomainError::RuntimeLimitExceeded);
     }
+    verify_runtime_approvals(&signed.envelope, policy, now)?;
     Ok(VerifiedDeploymentEnvelope(signed.envelope.clone()))
+}
+
+fn verify_runtime_approvals(
+    envelope: &DeploymentEnvelope,
+    policy: &RuntimeEnvelopePolicy,
+    now: DateTime<Utc>,
+) -> Result<(), DomainError> {
+    if envelope.approval_class == ApprovalClass::SameClassAutoLiveSmall {
+        return Err(DomainError::ApprovalEvidenceMismatch);
+    }
+    let scope_hash = deployment_scope_hash(envelope)?;
+    for approval_id in &envelope.approval_signatures {
+        let approval = policy
+            .approvals
+            .iter()
+            .find(|approval| approval.approval_id == *approval_id)
+            .ok_or(DomainError::ApprovalEvidenceMismatch)?;
+        if !approval.is_active_at(now)
+            || approval.approval_class != envelope.approval_class
+            || approval.subject_id != envelope.promotion_id
+            || approval.scope_hash != scope_hash
+        {
+            return Err(DomainError::ApprovalEvidenceMismatch);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1460,6 +1656,37 @@ pub fn canonical_json_hash(value: &impl Serialize) -> Result<String, DomainError
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+pub fn deployment_scope_hash(envelope: &DeploymentEnvelope) -> Result<String, DomainError> {
+    let mut instruments = envelope.instruments.clone();
+    instruments.sort();
+    instruments.dedup();
+    let mut allowed_intent_types = envelope.allowed_intent_types.clone();
+    allowed_intent_types.sort_by_key(intent_sort_key);
+    allowed_intent_types.dedup();
+    let scope = serde_json::json!({
+        "account_id": envelope.account_id,
+        "venue": envelope.venue,
+        "instruments": instruments,
+        "allowed_intent_types": allowed_intent_types,
+        "max_notional": envelope.max_notional,
+        "max_symbol_exposure": envelope.max_symbol_exposure,
+        "max_order_size": envelope.max_order_size,
+        "max_slippage_bps": envelope.max_slippage_bps,
+    });
+    canonical_json_hash(&scope)
+}
+
+fn intent_sort_key(intent: &AllowedIntentType) -> u8 {
+    match intent {
+        AllowedIntentType::LoadFactor => 0,
+        AllowedIntentType::LoadModel => 1,
+        AllowedIntentType::LoadAllocatorPolicy => 2,
+        AllowedIntentType::StartPaper => 3,
+        AllowedIntentType::StartShadow => 4,
+        AllowedIntentType::StartLiveSmall => 5,
+    }
+}
+
 fn validate_sha256(value: &str) -> Result<(), DomainError> {
     if value.len() != 64
         || !value
@@ -1504,6 +1731,13 @@ fn validate_runtime_policy(policy: &RuntimeEnvelopePolicy) -> Result<(), DomainE
         || policy.allowed_intent_types.is_empty()
     {
         return Err(DomainError::RuntimeBindingMismatch);
+    }
+    let mut approval_ids = BTreeSet::new();
+    for approval in &policy.approvals {
+        approval.validate()?;
+        if !approval_ids.insert(&approval.approval_id) {
+            return Err(DomainError::ApprovalEvidenceMismatch);
+        }
     }
     if [
         policy.max_notional,
@@ -1552,6 +1786,8 @@ mod tests {
     }
 
     fn policy() -> RuntimeEnvelopePolicy {
+        let now = Utc::now();
+        let approval_envelope = envelope(now);
         RuntimeEnvelopePolicy {
             account_id: "account-1".to_string(),
             venue: "binance".to_string(),
@@ -1563,6 +1799,16 @@ mod tests {
             max_symbol_exposure: 500.0,
             max_order_size: 100.0,
             max_slippage_bps: 5.0,
+            approvals: vec![RuntimeApprovalEvidence {
+                approval_id: "approval-1".to_string(),
+                approval_class: ApprovalClass::Paper,
+                subject_id: "promotion-1".to_string(),
+                scope_hash: deployment_scope_hash(&approval_envelope).unwrap(),
+                signer_id: "risk-officer-1".to_string(),
+                valid_from: now - Duration::hours(1),
+                expires_at: now + Duration::hours(1),
+                revoked_at: None,
+            }],
         }
     }
 
@@ -1743,6 +1989,99 @@ mod tests {
         assert!(event.validate().is_err());
         event.strategy_id = Some("strategy-1".to_string());
         assert!(event.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_attribution_requires_a_trusted_signature() {
+        let key = SigningKey::from_bytes(&[9_u8; 32]);
+        let event = RuntimeAttributionEvent {
+            event_id: "activation-1".to_string(),
+            deployment_id: "deployment-1".to_string(),
+            asset_revision_id: "candidate-1".to_string(),
+            mission_id: None,
+            mode: AttributionMode::Shadow,
+            outcome: AttributionOutcome::Activated,
+            kind: AttributionKind::Activation,
+            strategy_id: None,
+            order_id: None,
+            account_id: Some("account-1".to_string()),
+            venue: Some("binance".to_string()),
+            symbol: None,
+            metrics: BTreeMap::new(),
+            reason: None,
+            observed_at: Utc::now(),
+        };
+        let signed = sign_runtime_attribution_event(event.clone(), "feedback-1", &key).unwrap();
+        let trusted = BTreeMap::from([("feedback-1".to_string(), key.verifying_key())]);
+
+        assert_eq!(
+            verify_runtime_attribution_event(&signed, &trusted).unwrap(),
+            event
+        );
+        assert_eq!(
+            verify_runtime_attribution_event(&signed, &BTreeMap::new()).unwrap_err(),
+            DomainError::UnknownAttributionSigningKey
+        );
+
+        let mut tampered = signed;
+        tampered.event.asset_revision_id = "candidate-forged".to_string();
+        assert_eq!(
+            verify_runtime_attribution_event(&tampered, &trusted).unwrap_err(),
+            DomainError::AttributionPayloadHashMismatch
+        );
+    }
+
+    #[test]
+    fn runtime_health_requires_activation_fill_and_snapshot_from_one_strategy() {
+        let now = Utc::now();
+        let scoped = |id: &str,
+                      kind: AttributionKind,
+                      outcome: AttributionOutcome,
+                      strategy_id: Option<&str>| RuntimeAttributionEvent {
+            event_id: id.to_string(),
+            deployment_id: "deployment-1".to_string(),
+            asset_revision_id: "candidate-1".to_string(),
+            mission_id: None,
+            mode: AttributionMode::Shadow,
+            outcome,
+            kind,
+            strategy_id: strategy_id.map(str::to_string),
+            order_id: strategy_id.map(|_| "order-1".to_string()),
+            account_id: Some("account-1".to_string()),
+            venue: Some("binance".to_string()),
+            symbol: strategy_id.map(|_| "BTCUSDT".to_string()),
+            metrics: BTreeMap::new(),
+            reason: None,
+            observed_at: now,
+        };
+        let mut events = vec![scoped(
+            "activation",
+            AttributionKind::Activation,
+            AttributionOutcome::Activated,
+            None,
+        )];
+        assert!(!runtime_stage_is_healthy(
+            &events,
+            "candidate-1",
+            AttributionMode::Shadow
+        ));
+        events.push(scoped(
+            "fill",
+            AttributionKind::Fill,
+            AttributionOutcome::Healthy,
+            Some("strategy-1"),
+        ));
+        events.push(scoped(
+            "snapshot",
+            AttributionKind::PortfolioSnapshot,
+            AttributionOutcome::Healthy,
+            Some("strategy-1"),
+        ));
+        assert!(runtime_stage_is_healthy(
+            &events,
+            "candidate-1",
+            AttributionMode::Shadow
+        ));
     }
 
     #[test]
@@ -1974,6 +2313,45 @@ mod tests {
         let (signed, trusted) = signed(now);
         let verified = verify_envelope(&signed, &trusted, &policy(), now, |_| false).unwrap();
         assert_eq!(verified.0.deployment_id, "deployment-1");
+    }
+
+    #[test]
+    fn deployment_envelope_rejects_self_asserted_approval_ids() {
+        let now = Utc::now();
+        let key = SigningKey::from_bytes(&[7_u8; 32]);
+        let mut forged = envelope(now);
+        forged.approval_signatures = vec!["self-asserted".to_string()];
+        let signed = sign_envelope(forged, "key-1", &key).unwrap();
+        let trusted = BTreeMap::from([("key-1".to_string(), key.verifying_key())]);
+
+        assert_eq!(
+            verify_envelope(&signed, &trusted, &policy(), now, |_| false).unwrap_err(),
+            DomainError::ApprovalEvidenceMismatch
+        );
+    }
+
+    #[test]
+    fn deployment_envelope_rejects_wrong_or_inactive_runtime_approval_evidence() {
+        let now = Utc::now();
+        let (signed, trusted) = signed(now);
+
+        let mut wrong_class = policy();
+        wrong_class.approvals[0].approval_class = ApprovalClass::Shadow;
+        let mut wrong_subject = policy();
+        wrong_subject.approvals[0].subject_id = "promotion-2".to_string();
+        let mut wrong_scope = policy();
+        wrong_scope.approvals[0].scope_hash = "f".repeat(64);
+        let mut expired = policy();
+        expired.approvals[0].expires_at = now;
+        let mut revoked = policy();
+        revoked.approvals[0].revoked_at = Some(now);
+
+        for invalid_policy in [wrong_class, wrong_subject, wrong_scope, expired, revoked] {
+            assert_eq!(
+                verify_envelope(&signed, &trusted, &invalid_policy, now, |_| false).unwrap_err(),
+                DomainError::ApprovalEvidenceMismatch
+            );
+        }
     }
 
     #[test]

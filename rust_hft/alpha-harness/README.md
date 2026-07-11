@@ -1,11 +1,11 @@
 # Alpha Harness
-Rust CLI and libraries for governed Agentic Alpha research. It has no order or trade command and does not depend on execution adapters.
+Rust CLI and libraries for the governed, bounded Loop Engineer research plane. It has no order or trade command and does not depend on execution adapters.
 
 ## Packages
 
 - `alpha-domain`: typed missions, candidates, feedback, learning, approvals, and signed envelopes.
 - `alpha-store`: DuckDB source of truth with content hashes and append-only journals.
-- `alpha-engine`: GP, MCTS, Bayesian search, offline Q-learning, OpenAI-compatible proposals/critics, causal DSL evaluation, resume, and learning.
+- `alpha-engine`: GP, MCTS, Bayesian search, offline Q-learning, OpenAI-compatible proposals/critics, causal DSL evaluation, checkpointing, and learning.
 - `alpha-harness`: Agent-facing CLI.
 
 ## Data Mission
@@ -56,6 +56,27 @@ ALPHA_LLM_PROVIDER  # optional
 
 Credentials are process inputs and are never persisted.
 
+## Bounded LoopRun
+
+Run or resume a durable staged goal with the same command:
+
+```bash
+cargo run -p alpha-harness -- loop run \
+  --db var/alpha.duckdb \
+  --loop-run-id loop-btc-1 \
+  --mission-id mission-1 \
+  --engine mcts \
+  --dataset-manifest var/datasets/dataset-....manifest.json \
+  --target-stage shadow-healthy \
+  --max-research-missions 2
+
+cargo run -p alpha-harness -- loop status \
+  --db var/alpha.duckdb \
+  --loop-run-id loop-btc-1
+```
+
+The durable LoopRun accepts only `mcts` or `bayesian`, the two engines with versioned exact engine-state checkpoints. GP, offline RL, and LLM remain available through standalone `mission run` commands but cannot claim exact LoopRun resume. The LoopRun records ordered stages, completion policy, child missions, and an explicit stop reason. Missing evaluation, holdout, Paper, Shadow, or human evidence pauses the loop instead of fabricating progress. An external scheduler may invoke this command, but invocation does not bypass stage evidence.
+
 ## Evaluation and Learning
 
 ```bash
@@ -76,11 +97,14 @@ Only a canonical Formula v2 walk-forward Keep candidate can access the sealed ho
 Runtime feedback and search policy revisions enter through typed JSON:
 
 ```bash
-cargo run -p alpha-harness -- feedback ingest --db var/alpha.duckdb --record feedback.json
+cargo run -p alpha-harness -- feedback ingest \
+  --db var/alpha.duckdb \
+  --record signed-feedback.json \
+  --trusted-keys runtime-feedback-trusted-keys.json
 cargo run -p alpha-harness -- policy propose --db var/alpha.duckdb --record policy.json
 ```
 
-A child search policy is adopted only when its validator score strictly beats its adopted parent.
+Feedback records and JSONL logs must contain `SignedRuntimeAttributionEvent` wrappers. The CLI verifies every content hash, key id, and Ed25519 signature before opening DuckDB; raw or tampered runtime events fail closed. A child search policy is adopted only when its validator score strictly beats its adopted parent.
 
 ## Signed Handoff
 
@@ -95,7 +119,7 @@ cargo run -p alpha-harness -- deployment sign \
   --output signed-envelope.json
 ```
 
-The signing key file contains exactly 32 bytes as hex and is never stored in DuckDB. Live-small signing requires a persisted `human_live_small` approval whose `scope_hash` matches venue, instruments, and live-small intent. The runtime still refuses live-small activation until universal per-order limits are implemented.
+The deployment signing key file contains exactly 32 bytes as hex and is never stored in DuckDB or passed to the runtime. Live-small signing requires a persisted `human_live_small` approval whose `scope_hash` matches venue, instruments, and live-small intent. Runtime-owned `policy.json` must independently carry the referenced approval id, class, promotion subject, scope hash, signer, validity window, and revocation state; an envelope signer cannot self-assert an approval id. The runtime still refuses live-small activation until universal order/slippage enforcement and real-venue reconciliation/reduce-only acceptance tests pass.
 
 The runtime bundle schema can validate Formula and ONNX artifacts, but the current governed evaluator/promotion producer emits Formula bundles only. ONNX candidates remain research-only until a point-in-time ONNX evaluator and training lineage are implemented; runtime ONNX compatibility tests are not evidence of governed ONNX promotion.
 
@@ -107,4 +131,4 @@ cargo run -p hft-live --no-default-features -- \
   --deployment-hashes-only
 ```
 
-Then start `hft-live` with the signed envelope, runtime policy, trusted public keys, nonce ledger, audit log, and feedback log. Runtime verification occurs before startup configuration changes.
+Then start `hft-live` with the signed envelope, runtime policy, trusted deployment public keys, nonce ledger, audit log, feedback log, and a separate runtime feedback signing key. `policy.json` is runtime-owned and read-only; its `approvals` array is the independent approval authority. Formula and ONNX files must be relative to and contained by the bundle directory. Runtime verification occurs before startup configuration changes.

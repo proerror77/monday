@@ -108,19 +108,16 @@ cargo build --release --target x86_64-unknown-linux-musl -p hft-live
 
 ## 容器發布形態
 
-用 multi-stage build，runtime image 只保留運行所需內容。需要出站 HTTPS 的二進制，不要盲目用 `scratch`；用 distroless/static，或把 CA certificates 複製進最終 image。
+Canonical production image: `deployment/docker/Dockerfile.trading`. It builds `hft-live` with `--release --locked` and the `clickhouse,redis,grpc` graph, installs `protobuf-compiler` for the gRPC build, and uses BuildKit registry/target caches. The compiled binary is copied out of the cache mount before the runtime stage.
 
-```dockerfile
-FROM rust:1.91 AS builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release -p hft-live
-
-FROM gcr.io/distroless/cc-debian12
-COPY --from=builder /app/target/release/hft-live /usr/local/bin/hft-live
-USER 10001
-ENTRYPOINT ["/usr/local/bin/hft-live"]
+```bash
+docker build \
+  -t hft-trading:<immutable-tag> \
+  -f deployment/docker/Dockerfile.trading \
+  .
 ```
+
+The Debian runtime layer contains CA certificates, `curl` for `/readiness`, and required shared libraries. It runs as the unprivileged `hft` user, exposes only `9090` and `9092`, and starts `hft-live` directly. The image does not contain `hft-collector`, source credentials, signing private keys, or an LLM runtime.
 
 ## Release Workflow
 
@@ -134,3 +131,22 @@ ENTRYPOINT ["/usr/local/bin/hft-live"]
 - `hft-collector`
 
 每個平台產出一個 `tar.gz` 和一個 `.sha256`。發布 job 使用 `--locked`，所以 `Cargo.lock` 必須納入版本控制；這是 release 可復現的基本邊界。
+
+## Production Gate
+
+Release packaging is not deployment approval. Before a Paper/Shadow deployment, run from the repository root:
+
+```bash
+bash scripts/check-tracked-secrets.sh
+bash scripts/check-deployment-contract.sh
+kubectl apply --dry-run=client -f rust_hft/deployment/k8s/
+```
+
+Then verify the built image metadata and CLI:
+
+```bash
+docker image inspect hft-trading:<immutable-tag>
+docker run --rm hft-trading:<immutable-tag> --help
+```
+
+Real venue credentials, reconciliation/exit tests, shadow soak, and a scoped human approval remain external gates. A release tag never enables live-small by itself.

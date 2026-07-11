@@ -1,14 +1,15 @@
 use crate::{
     cli::{
-        print_json, EnvelopeArgs, EvaluateArgs, JsonLogArgs, JsonRecordArgs, MissionStatusArgs,
-        PromoteArgs, RevokeApprovalArgs, SignDeploymentArgs,
+        print_json, EnvelopeArgs, EvaluateArgs, FeedbackLogArgs, FeedbackRecordArgs,
+        JsonRecordArgs, MissionStatusArgs, PromoteArgs, RevokeApprovalArgs, SignDeploymentArgs,
     },
     data_mission,
 };
 use alpha_domain::{
-    canonical_json_hash, sign_envelope, ApprovalClass, CandidateArtifact, DeploymentEnvelope,
-    IterationVerdict, PromotionRecord, RuntimeAttributionEvent, SearchPolicyRevision,
-    StrategyBundle, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    canonical_json_hash, deployment_scope_hash, sign_envelope, verify_runtime_attribution_event,
+    ApprovalClass, CandidateArtifact, DeploymentEnvelope, IterationVerdict, PromotionRecord,
+    RuntimeAttributionEvent, SearchPolicyRevision, SignedRuntimeAttributionEvent, StrategyBundle,
+    SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
     evaluation::{prepare_dataset, WalkForwardConfig},
@@ -18,8 +19,8 @@ use alpha_engine::{
 use alpha_store::{AlphaStore, ApprovalRecord, MissionLineage, RegistryRevision, StoreError};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
-use ed25519_dalek::SigningKey;
-use sha2::{Digest, Sha256};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use std::collections::BTreeMap;
 
 pub fn candidate_list(args: MissionStatusArgs) -> anyhow::Result<()> {
     let store = AlphaStore::open(args.db)?;
@@ -262,12 +263,15 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
     let promotion_id = args
         .promotion_id
         .unwrap_or_else(|| format!("promotion:{}", args.candidate_id));
-    match store.get_promotion(&promotion_id) {
-        Ok(existing) => return print_json(&existing),
-        Err(StoreError::NotFound) => {}
+    let existing = match store.get_promotion(&promotion_id) {
+        Ok(existing) => Some(existing),
+        Err(StoreError::NotFound) => None,
         Err(error) => return Err(error.into()),
-    }
-    let now = Utc::now();
+    };
+    let now = existing
+        .as_ref()
+        .map(|existing| existing.record.created_at)
+        .unwrap_or_else(Utc::now);
     let evaluator_config_hash = canonical_json_hash(
         sealed_evaluation
             .get("evaluator_config")
@@ -306,11 +310,34 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         bundle_hash: bundle.bundle_hash.clone(),
         created_at: now,
     };
+    if let Some(existing) = existing {
+        let stored_bundle = store.get_strategy_bundle(&existing.record.bundle_id)?;
+        ensure_exact_promotion_replay(&existing.record, &stored_bundle, &promotion, &bundle)?;
+        return print_json(&serde_json::json!({
+            "promotion": existing,
+            "bundle": stored_bundle,
+        }));
+    }
     let stored = store.promote_candidate(&bundle, &promotion)?;
     print_json(&serde_json::json!({
         "promotion": stored,
         "bundle": bundle,
     }))
+}
+
+fn ensure_exact_promotion_replay(
+    existing: &PromotionRecord,
+    existing_bundle: &StrategyBundle,
+    requested: &PromotionRecord,
+    requested_bundle: &StrategyBundle,
+) -> anyhow::Result<()> {
+    if existing != requested || existing_bundle != requested_bundle {
+        bail!(
+            "promotion_id {} is already bound to a different mission, candidate, evaluation, or bundle",
+            requested.promotion_id
+        );
+    }
+    Ok(())
 }
 
 pub fn sign_deployment(args: SignDeploymentArgs) -> anyhow::Result<()> {
@@ -348,8 +375,11 @@ pub fn print_deployment_scope(args: EnvelopeArgs) -> anyhow::Result<()> {
     }))
 }
 
-pub fn ingest_feedback(args: JsonRecordArgs) -> anyhow::Result<()> {
-    let event: RuntimeAttributionEvent = read_record(&args.record)?;
+pub fn ingest_feedback(args: FeedbackRecordArgs) -> anyhow::Result<()> {
+    let signed: SignedRuntimeAttributionEvent = read_record(&args.record)?;
+    let trusted_keys = read_trusted_attribution_keys(&args.trusted_keys)?;
+    let event = verify_runtime_attribution_event(&signed, &trusted_keys)
+        .context("runtime feedback signature verification failed")?;
     let mut store = AlphaStore::open(args.db)?;
     let inserted = store.ingest_runtime_attribution(event.clone())?;
     let stored = store.get_runtime_attribution(&event.event_id)?;
@@ -359,10 +389,11 @@ pub fn ingest_feedback(args: JsonRecordArgs) -> anyhow::Result<()> {
     }))
 }
 
-pub fn ingest_feedback_log(args: JsonLogArgs) -> anyhow::Result<()> {
+pub fn ingest_feedback_log(args: FeedbackLogArgs) -> anyhow::Result<()> {
     let contents = std::fs::read_to_string(&args.log)
         .with_context(|| format!("failed to read feedback log {}", args.log.display()))?;
-    let events = parse_runtime_attribution_log(&contents)?;
+    let trusted_keys = read_trusted_attribution_keys(&args.trusted_keys)?;
+    let events = parse_runtime_attribution_log(&contents, &trusted_keys)?;
     let records = events.len();
     let mut store = AlphaStore::open(args.db)?;
     let inserted = store.ingest_runtime_attributions(events)?;
@@ -373,17 +404,19 @@ pub fn ingest_feedback_log(args: JsonLogArgs) -> anyhow::Result<()> {
     }))
 }
 
-fn parse_runtime_attribution_log(contents: &str) -> anyhow::Result<Vec<RuntimeAttributionEvent>> {
+fn parse_runtime_attribution_log(
+    contents: &str,
+    trusted_keys: &BTreeMap<String, VerifyingKey>,
+) -> anyhow::Result<Vec<RuntimeAttributionEvent>> {
     let mut events = Vec::new();
     for (index, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let event: RuntimeAttributionEvent = serde_json::from_str(line)
+        let signed: SignedRuntimeAttributionEvent = serde_json::from_str(line)
             .with_context(|| format!("feedback log line {} is invalid JSON", index + 1))?;
-        event
-            .validate()
-            .with_context(|| format!("feedback log line {} is invalid", index + 1))?;
+        let event = verify_runtime_attribution_event(&signed, trusted_keys)
+            .with_context(|| format!("feedback log line {} failed verification", index + 1))?;
         events.push(event);
     }
     if events.is_empty() {
@@ -453,37 +486,6 @@ fn enforce_deployment_approvals(
     Ok(())
 }
 
-pub(crate) fn deployment_scope_hash(envelope: &DeploymentEnvelope) -> anyhow::Result<String> {
-    let mut instruments = envelope.instruments.clone();
-    instruments.sort();
-    instruments.dedup();
-    let mut allowed_intent_types = envelope.allowed_intent_types.clone();
-    allowed_intent_types.sort_by_key(intent_sort_key);
-    allowed_intent_types.dedup();
-    let scope = serde_json::json!({
-        "account_id": envelope.account_id,
-        "venue": envelope.venue,
-        "instruments": instruments,
-        "allowed_intent_types": allowed_intent_types,
-        "max_notional": envelope.max_notional,
-        "max_symbol_exposure": envelope.max_symbol_exposure,
-        "max_order_size": envelope.max_order_size,
-        "max_slippage_bps": envelope.max_slippage_bps,
-    });
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&scope)?)))
-}
-
-fn intent_sort_key(intent: &alpha_domain::AllowedIntentType) -> u8 {
-    match intent {
-        alpha_domain::AllowedIntentType::LoadFactor => 0,
-        alpha_domain::AllowedIntentType::LoadModel => 1,
-        alpha_domain::AllowedIntentType::LoadAllocatorPolicy => 2,
-        alpha_domain::AllowedIntentType::StartPaper => 3,
-        alpha_domain::AllowedIntentType::StartShadow => 4,
-        alpha_domain::AllowedIntentType::StartLiveSmall => 5,
-    }
-}
-
 fn read_record<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> anyhow::Result<T> {
     serde_json::from_slice(
         &std::fs::read(path)
@@ -492,10 +494,29 @@ fn read_record<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> anyhow
     .with_context(|| format!("record {} is invalid JSON", path.display()))
 }
 
+fn read_trusted_attribution_keys(
+    path: &std::path::Path,
+) -> anyhow::Result<BTreeMap<String, VerifyingKey>> {
+    let encoded: BTreeMap<String, String> = read_record(path)?;
+    encoded
+        .into_iter()
+        .map(|(key_id, value)| {
+            let bytes = hex::decode(value)
+                .with_context(|| format!("runtime feedback key {key_id} is not hex"))?;
+            let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+                anyhow::anyhow!("runtime feedback key {key_id} must contain exactly 32 bytes")
+            })?;
+            let key = VerifyingKey::from_bytes(&bytes)
+                .with_context(|| format!("runtime feedback key {key_id} is invalid"))?;
+            Ok((key_id, key))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alpha_domain::AllowedIntentType;
+    use alpha_domain::{sign_runtime_attribution_event, AllowedIntentType};
     use chrono::Duration;
 
     fn live_small_envelope() -> DeploymentEnvelope {
@@ -524,6 +545,70 @@ mod tests {
             approval_signatures: vec!["approval-1".to_string()],
             payload_hash: String::new(),
         }
+    }
+
+    fn promotion_fixture() -> (PromotionRecord, StrategyBundle) {
+        let now = Utc::now();
+        let mut bundle: StrategyBundle = serde_json::from_value(serde_json::json!({
+            "bundle_id": "bundle-1",
+            "candidate_id": "candidate-1",
+            "candidate_content_hash": "1".repeat(64),
+            "dataset_manifest_id": "dataset-1",
+            "evaluator_version": "sealed-holdout-v2",
+            "evaluator_config_hash": "2".repeat(64),
+            "evaluation_metrics_hash": "3".repeat(64),
+            "sealed_evaluation_hash": "4".repeat(64),
+            "artifact": {
+                "Formula": {"ast": {"Terminal": {"Field": "signal"}}}
+            },
+            "bundle_hash": "",
+            "created_at": now,
+        }))
+        .unwrap();
+        bundle.bundle_hash = bundle.calculated_hash().unwrap();
+        let promotion = PromotionRecord {
+            promotion_id: "promotion-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: bundle.candidate_id.clone(),
+            candidate_content_hash: bundle.candidate_content_hash.clone(),
+            dataset_manifest_id: bundle.dataset_manifest_id.clone(),
+            evaluator_version: bundle.evaluator_version.clone(),
+            evaluator_config_hash: bundle.evaluator_config_hash.clone(),
+            evaluation_metrics_hash: bundle.evaluation_metrics_hash.clone(),
+            sealed_evaluation_id: "sealed-evaluation:candidate-1".to_string(),
+            sealed_evaluation_hash: bundle.sealed_evaluation_hash.clone(),
+            bundle_id: bundle.bundle_id.clone(),
+            bundle_hash: bundle.bundle_hash.clone(),
+            created_at: now,
+        };
+        (promotion, bundle)
+    }
+
+    #[test]
+    fn promotion_idempotency_requires_an_exact_replay_binding() {
+        let (promotion, bundle) = promotion_fixture();
+        ensure_exact_promotion_replay(&promotion, &bundle, &promotion, &bundle).unwrap();
+
+        let mut different_mission = promotion.clone();
+        different_mission.mission_id = "mission-2".to_string();
+        assert!(
+            ensure_exact_promotion_replay(&promotion, &bundle, &different_mission, &bundle)
+                .is_err()
+        );
+
+        let mut different_candidate = promotion.clone();
+        different_candidate.candidate_id = "candidate-2".to_string();
+        assert!(
+            ensure_exact_promotion_replay(&promotion, &bundle, &different_candidate, &bundle)
+                .is_err()
+        );
+
+        let mut different_bundle = bundle.clone();
+        different_bundle.bundle_hash = "f".repeat(64);
+        assert!(
+            ensure_exact_promotion_replay(&promotion, &bundle, &promotion, &different_bundle)
+                .is_err()
+        );
     }
 
     #[test]
@@ -616,6 +701,8 @@ mod tests {
 
     #[test]
     fn feedback_log_parser_validates_every_line_before_ingestion() {
+        let key = SigningKey::from_bytes(&[9_u8; 32]);
+        let trusted = BTreeMap::from([("feedback-1".to_string(), key.verifying_key())]);
         let event = RuntimeAttributionEvent {
             event_id: "activation-1".to_string(),
             deployment_id: "deployment-1".to_string(),
@@ -633,11 +720,33 @@ mod tests {
             reason: None,
             observed_at: Utc::now(),
         };
-        let valid = serde_json::to_string(&event).unwrap();
-        assert_eq!(parse_runtime_attribution_log(&valid).unwrap(), vec![event]);
-        assert!(parse_runtime_attribution_log(&format!("{valid}\n{{bad"))
-            .unwrap_err()
-            .to_string()
-            .contains("line 2"));
+        let signed = sign_runtime_attribution_event(event.clone(), "feedback-1", &key).unwrap();
+        let valid = serde_json::to_string(&signed).unwrap();
+        assert_eq!(
+            parse_runtime_attribution_log(&valid, &trusted).unwrap(),
+            vec![event.clone()]
+        );
+        assert!(
+            parse_runtime_attribution_log(&format!("{valid}\n{{bad"), &trusted)
+                .unwrap_err()
+                .to_string()
+                .contains("line 2")
+        );
+        assert!(
+            parse_runtime_attribution_log(&serde_json::to_string(&event).unwrap(), &trusted)
+                .unwrap_err()
+                .to_string()
+                .contains("line 1")
+        );
+
+        let mut tampered = signed;
+        tampered.event.asset_revision_id = "candidate-forged".to_string();
+        assert!(parse_runtime_attribution_log(
+            &serde_json::to_string(&tampered).unwrap(),
+            &trusted
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("failed verification"));
     }
 }

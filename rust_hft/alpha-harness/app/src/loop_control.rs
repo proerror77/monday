@@ -1,20 +1,27 @@
 use crate::{
     cli::{
-        print_json, LearnMissionArgs, LoopRunArgs, LoopStatusArgs, LoopTargetChoice,
+        print_json, EngineChoice, LearnMissionArgs, LoopRunArgs, LoopStatusArgs, LoopTargetChoice,
         RecoverLegacyCheckpointArgs,
     },
     governance, mission,
 };
 use alpha_domain::{
-    AttributionKind, AttributionMode, AttributionOutcome, LoopCompletionPolicy, LoopRun,
-    LoopRunStatus, LoopStage, LoopStageRecord, LoopStageStatus, LoopStopReason, LoopTargetStage,
-    MissionStatus, RuntimeAttributionEvent,
+    runtime_stage_is_healthy, AttributionMode, LoopCompletionPolicy, LoopRun, LoopRunStatus,
+    LoopStage, LoopStageRecord, LoopStageStatus, LoopStopReason, LoopTargetStage, MissionStatus,
 };
 use alpha_store::{AlphaStore, StoreError};
 use anyhow::{bail, Context};
 use chrono::Utc;
 
 pub fn run_loop(args: LoopRunArgs) -> anyhow::Result<()> {
+    if !matches!(
+        args.mission.engine,
+        EngineChoice::Mcts | EngineChoice::Bayesian
+    ) {
+        bail!(
+            "durable LoopRun supports only mcts or bayesian exact-resume engines; run gp, offline-rl, or llm as standalone lab missions"
+        );
+    }
     if args.max_research_missions == 0 {
         bail!("max_research_missions must be positive");
     }
@@ -522,79 +529,6 @@ fn mission_reason_text(mission: &alpha_domain::ResearchMission) -> anyhow::Resul
         .unwrap_or_else(|| format!("{:?}", mission.status)))
 }
 
-fn runtime_stage_is_healthy(
-    events: &[RuntimeAttributionEvent],
-    candidate_id: &str,
-    mode: AttributionMode,
-) -> bool {
-    #[derive(Default)]
-    struct DeploymentHealth {
-        activated: bool,
-        unhealthy: bool,
-        strategies: std::collections::BTreeMap<String, StrategyHealth>,
-    }
-
-    #[derive(Default)]
-    struct StrategyHealth {
-        healthy_snapshot: bool,
-        fill: bool,
-    }
-
-    let mut by_deployment = std::collections::BTreeMap::<String, DeploymentHealth>::new();
-    for event in events
-        .iter()
-        .filter(|event| event.asset_revision_id == candidate_id && event.mode == mode)
-    {
-        let health = by_deployment
-            .entry(event.deployment_id.clone())
-            .or_default();
-        if matches!(
-            event.outcome,
-            AttributionOutcome::Failed
-                | AttributionOutcome::Decayed
-                | AttributionOutcome::RolledBack
-        ) || event.kind == AttributionKind::StreamGap
-        {
-            health.unhealthy = true;
-            continue;
-        }
-        if event.kind == AttributionKind::Activation
-            && event.outcome == AttributionOutcome::Activated
-        {
-            health.activated = true;
-        }
-        if event.outcome == AttributionOutcome::Healthy
-            && event.kind == AttributionKind::PortfolioSnapshot
-        {
-            if let Some(strategy_id) = event.strategy_id.as_ref() {
-                health
-                    .strategies
-                    .entry(strategy_id.clone())
-                    .or_default()
-                    .healthy_snapshot = true;
-            }
-        }
-        if event.kind == AttributionKind::Fill {
-            if let Some(strategy_id) = event.strategy_id.as_ref() {
-                health
-                    .strategies
-                    .entry(strategy_id.clone())
-                    .or_default()
-                    .fill = true;
-            }
-        }
-    }
-
-    by_deployment.values().any(|health| {
-        !health.unhealthy
-            && health.activated
-            && health
-                .strategies
-                .values()
-                .any(|strategy| strategy.healthy_snapshot && strategy.fill)
-    })
-}
-
 enum CompletionProgress {
     ReachedTarget,
     AwaitingEvidence(LoopTargetStage),
@@ -605,15 +539,17 @@ mod tests {
     use super::*;
     use crate::{
         cli::{
-            DatasetArgs, EngineChoice, EvaluateArgs, JsonLogArgs, PromoteArgs, RunMissionArgs,
+            DatasetArgs, EngineChoice, EvaluateArgs, FeedbackLogArgs, PromoteArgs, RunMissionArgs,
             SignDeploymentArgs,
         },
         data_mission, governance,
     };
     use alpha_domain::{
-        AllowedIntentType, ApprovalClass, CandidateArtifact, DeploymentEnvelope, EngineKind,
+        deployment_scope_hash, sign_runtime_attribution_event, AllowedIntentType, ApprovalClass,
+        AttributionKind, AttributionOutcome, CandidateArtifact, DeploymentEnvelope, EngineKind,
         IterationVerdict, LiveSmallEligibilityEvidence, MissionTerminalReason, ResearchIteration,
-        ResearchMission, SearchBudgetUsage, SEALED_HOLDOUT_EVALUATOR_VERSION,
+        ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
+        SEALED_HOLDOUT_EVALUATOR_VERSION,
     };
     use alpha_engine::{
         evaluation::{prepare_dataset, WalkForwardConfig},
@@ -785,7 +721,7 @@ mod tests {
                 approval_class: suffix.to_string(),
                 subject_id: promotion.record.promotion_id,
                 payload: serde_json::json!({
-                    "scope_hash": governance::deployment_scope_hash(&envelope).unwrap(),
+                    "scope_hash": deployment_scope_hash(&envelope).unwrap(),
                 }),
                 signer_id: Some(format!("risk-officer-{suffix}")),
                 valid_from: Some(now - Duration::minutes(1)),
@@ -1146,6 +1082,22 @@ mod tests {
             .iter()
             .map(|record| record.stage.clone())
             .collect()
+    }
+
+    #[test]
+    fn durable_loop_rejects_engines_without_exact_checkpoint_semantics() {
+        for engine in [EngineChoice::Gp, EngineChoice::OfflineRl, EngineChoice::Llm] {
+            let db = temp_db_path("alpha-loop-unsupported-engine");
+            let mut args = loop_args(db.clone(), "mission-loop", LoopTargetChoice::Researching);
+            args.mission.engine = engine;
+
+            let error = run_loop(args).unwrap_err().to_string();
+            assert!(error.contains("supports only mcts or bayesian"));
+            assert!(
+                !db.exists(),
+                "validation must happen before durable state is opened"
+            );
+        }
     }
 
     #[test]
@@ -1577,6 +1529,13 @@ mod tests {
             promotion_id: None,
         })
         .unwrap();
+        governance::promote(PromoteArgs {
+            db: db.clone(),
+            mission_id: mission_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            promotion_id: None,
+        })
+        .expect("an exact promotion replay must be idempotent");
         {
             let store = AlphaStore::open(&db).unwrap();
             let promotion = store
@@ -1646,15 +1605,30 @@ mod tests {
             ));
         }
         let feedback_path = directory.join("runtime-feedback.jsonl");
+        let trusted_keys_path = directory.join("runtime-feedback-trusted-keys.json");
+        let feedback_key = ed25519_dalek::SigningKey::from_bytes(&[11_u8; 32]);
         let mut feedback = Vec::new();
         for event in &events {
-            serde_json::to_writer(&mut feedback, event).unwrap();
+            let signed =
+                sign_runtime_attribution_event(event.clone(), "runtime-feedback-1", &feedback_key)
+                    .unwrap();
+            serde_json::to_writer(&mut feedback, &signed).unwrap();
             feedback.push(b'\n');
         }
         std::fs::write(&feedback_path, feedback).unwrap();
-        governance::ingest_feedback_log(JsonLogArgs {
+        std::fs::write(
+            &trusted_keys_path,
+            serde_json::to_vec(&BTreeMap::from([(
+                "runtime-feedback-1".to_string(),
+                hex::encode(feedback_key.verifying_key().to_bytes()),
+            )]))
+            .unwrap(),
+        )
+        .unwrap();
+        governance::ingest_feedback_log(FeedbackLogArgs {
             db: db.clone(),
             log: feedback_path,
+            trusted_keys: trusted_keys_path,
         })
         .unwrap();
 

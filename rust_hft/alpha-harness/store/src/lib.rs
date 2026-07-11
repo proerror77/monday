@@ -1,4 +1,4 @@
-//! Transactional DuckDB source of truth for the Agentic Alpha control plane.
+//! Transactional DuckDB source of truth for the bounded Loop Engineer control plane.
 
 use alpha_domain::{
     canonical_json_hash, AllowedIntentType, AttributionKind, AttributionMode, CandidateArtifact,

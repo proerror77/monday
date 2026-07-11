@@ -106,6 +106,7 @@ services:
       - ${HFT_MODEL_DIR:-../../models}:/app/models:ro
       - ${HFT_DEPLOYMENT_DIR:?set HFT_DEPLOYMENT_DIR}:/app/deployment:ro
       - ${HFT_RUNTIME_STATE_DIR:?set HFT_RUNTIME_STATE_DIR}:/app/state
+      - ${HFT_RUNTIME_SECRET_DIR:-../../runtime/secrets}:/run/secrets/hft:ro
       - trading-logs:/app/logs
     command:
       - --config
@@ -124,6 +125,10 @@ services:
       - /app/state/audit.jsonl
       - --deployment-feedback-log
       - /app/state/feedback.jsonl
+      - --deployment-feedback-signing-key
+      - /run/secrets/hft/feedback-signing-key.hex
+      - --deployment-feedback-key-id
+      - ${HFT_FEEDBACK_KEY_ID:-runtime-feedback-1}
       - --metrics-port
       - "9090"
     environment:

@@ -60,6 +60,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD if [ "$HFT_TARGET" = "live" ]; then curl --fail --silent http://localhost:9090/readiness; else exit 0; fi
 
 # 默認暴露端口
-EXPOSE 9090 9091 9092
+EXPOSE 9090 9092
 
 ENTRYPOINT ["/app/hft"]

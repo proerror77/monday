@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[command(
     name = "alpha-harness",
     version,
-    about = "Agentic alpha research control plane"
+    about = "Bounded Loop Engineer alpha research control plane"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -89,8 +89,8 @@ enum DeploymentCommand {
 
 #[derive(Debug, Subcommand)]
 enum FeedbackCommand {
-    Ingest(JsonRecordArgs),
-    IngestLog(JsonLogArgs),
+    Ingest(FeedbackRecordArgs),
+    IngestLog(FeedbackLogArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -252,11 +252,25 @@ pub struct JsonRecordArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct JsonLogArgs {
+pub struct FeedbackRecordArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub record: PathBuf,
+    /// Runtime feedback key id to Ed25519 public key hex JSON map.
+    #[arg(long)]
+    pub trusted_keys: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct FeedbackLogArgs {
     #[arg(long)]
     pub db: PathBuf,
     #[arg(long)]
     pub log: PathBuf,
+    /// Runtime feedback key id to Ed25519 public key hex JSON map.
+    #[arg(long)]
+    pub trusted_keys: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -503,6 +517,32 @@ mod tests {
             "loop-1",
             "--target-stage",
             "live-small-eligible",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn feedback_ingestion_requires_runtime_trusted_keys() {
+        let base = [
+            "alpha-harness",
+            "feedback",
+            "ingest",
+            "--db",
+            "alpha.duckdb",
+            "--record",
+            "feedback.json",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "feedback",
+            "ingest",
+            "--db",
+            "alpha.duckdb",
+            "--record",
+            "feedback.json",
+            "--trusted-keys",
+            "runtime-feedback-trusted-keys.json",
         ])
         .is_ok());
     }

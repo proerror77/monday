@@ -332,7 +332,7 @@ show_final_results() {
     
     echo -e "${WHITE}🔗 服务访问:${NC}"
     echo "  • ClickHouse: http://localhost:8123"
-    echo "  • Grafana: http://localhost:3000 (admin/admin)"
+    echo "  • Grafana: http://localhost:3000 (credentials from GRAFANA_ADMIN_PASSWORD)"
     echo "  • Prometheus: http://localhost:9090"
     echo ""
     

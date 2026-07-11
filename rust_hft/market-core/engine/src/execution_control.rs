@@ -534,8 +534,10 @@ mod tests {
 
     fn engine_with_equity(equity: Decimal) -> Arc<Mutex<Engine>> {
         let engine = Engine::new(EngineConfig::default());
-        let mut account = ports::AccountView::default();
-        account.cash_balance = equity;
+        let account = ports::AccountView {
+            cash_balance: equity,
+            ..Default::default()
+        };
         engine.account_snapshots.store(Arc::new(account));
         Arc::new(Mutex::new(engine))
     }

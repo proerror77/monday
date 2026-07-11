@@ -84,6 +84,10 @@ spec:
         - /app/state/audit.jsonl
         - --deployment-feedback-log
         - /app/state/feedback.jsonl
+        - --deployment-feedback-signing-key
+        - /app/secrets/feedback-signing-key.hex
+        - --deployment-feedback-key-id
+        - runtime-feedback-1
         - --metrics-port
         - "9090"
 
@@ -138,6 +142,9 @@ spec:
           readOnly: true
         - name: runtime-state
           mountPath: /app/state
+        - name: runtime-secrets
+          mountPath: /app/secrets
+          readOnly: true
 
         # 健康檢查
         livenessProbe:
@@ -197,6 +204,13 @@ spec:
       - name: runtime-state
         persistentVolumeClaim:
           claimName: runtime-state-pvc
+      - name: runtime-secrets
+        secret:
+          secretName: hft-secrets
+          defaultMode: 0440
+          items:
+          - key: feedback-signing-key-hex
+            path: feedback-signing-key.hex
 
       # 優雅關閉
       terminationGracePeriodSeconds: 60

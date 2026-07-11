@@ -27,20 +27,34 @@ for dockerfile in \
   require_text "$dockerfile" '-p hft-live'
   require_text "$dockerfile" 'target/release/hft-live'
   require_text "$dockerfile" 'curl'
+  require_text "$dockerfile" 'protobuf-compiler'
+  require_text "$dockerfile" '--mount=type=cache,target=/usr/local/cargo/registry'
   require_text "$dockerfile" '/readiness'
   require_text "$dockerfile" 'ENTRYPOINT ["/usr/local/bin/hft-live"]'
+  require_text "$dockerfile" 'EXPOSE 9090 9092'
+  require_text "$dockerfile" 'USER hft'
   require_text "$dockerfile" 'clickhouse,redis,grpc'
   reject_text "$dockerfile" 'hft-collector'
+  reject_text "$dockerfile" 'EXPOSE 9090 9091 9092'
   reject_text "$dockerfile" '|| true'
 done
 
 require_text deploy/Dockerfile.hft 'curl'
 require_text deploy/Dockerfile.hft 'http://localhost:9090/readiness'
+require_text deploy/Dockerfile.hft 'EXPOSE 9090 9092'
+require_text deploy/Dockerfile.hft 'USER hft'
+reject_text deploy/Dockerfile.hft 'EXPOSE 9090 9091 9092'
 require_text deploy/docker-compose.yml '19090:9090'
 require_text deploy/prometheus/prometheus.yml 'trader:9090'
 reject_text deploy/prometheus/prometheus.yml 'trader:8080'
 reject_text deploy/docker-compose.yml 'command: ["hft-live"'
 reject_text deploy/docker-compose.yml 'command: ["hft-paper"'
+for compose_file in deploy/docker-compose.yml rust_hft/deployment/docker/docker-compose.yml; do
+  require_text "$compose_file" '--strategy-bundle'
+  require_text "$compose_file" '--deployment-feedback-signing-key'
+  require_text "$compose_file" '--deployment-feedback-key-id'
+  require_text "$compose_file" '/run/secrets/hft/feedback-signing-key.hex'
+done
 
 k8s=rust_hft/deployment/k8s/trading-engine.yaml
 require_text "$k8s" 'path: /readiness'
@@ -52,7 +66,9 @@ for flag in \
   --deployment-trusted-keys \
   --deployment-nonce-ledger \
   --deployment-audit-log \
-  --deployment-feedback-log; do
+  --deployment-feedback-log \
+  --deployment-feedback-signing-key \
+  --deployment-feedback-key-id; do
   require_text "$k8s" "$flag"
 done
 for path in \
@@ -62,13 +78,15 @@ for path in \
   /app/deployment/trusted-keys.json \
   /app/state/nonces.jsonl \
   /app/state/audit.jsonl \
-  /app/state/feedback.jsonl; do
+  /app/state/feedback.jsonl \
+  /app/secrets/feedback-signing-key.hex; do
   require_text "$k8s" "$path"
 done
 require_text "$k8s" 'claimName: runtime-state-pvc'
 require_text "$k8s" 'prometheus.io/port: "9090"'
 require_text "$k8s" 'HFT_GRPC_AUTH_TOKEN'
 require_text "$k8s" 'key: grpc-auth-token'
+require_text "$k8s" 'key: feedback-signing-key-hex'
 reject_text "$k8s" 'containerPort: 9091'
 require_text rust_hft/deployment/k8s/configmaps.yaml 'system.yaml: |'
 require_text rust_hft/deployment/k8s/configmaps.yaml 'quotes_only: true'
@@ -80,6 +98,7 @@ require_text rust_hft/deployment/scripts/deploy.sh 'HFT_K8S_DEPLOYMENT_AUTHORITY
 require_text rust_hft/deployment/scripts/deploy.sh 'require_configmap_key alpha-deployment-envelope envelope.json'
 require_text rust_hft/deployment/scripts/deploy.sh 'require_configmap_key alpha-deployment-envelope bundle.json'
 require_text rust_hft/deployment/scripts/deploy.sh 'require_secret_key hft-secrets grpc-auth-token'
+require_text rust_hft/deployment/scripts/deploy.sh 'require_secret_key hft-secrets feedback-signing-key-hex'
 reject_text rust_hft/deployment/scripts/deploy.sh 'envsubst < "$K8S_DIR/configmaps.yaml"'
 
 check_unique_host_ports() {

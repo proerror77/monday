@@ -56,27 +56,29 @@ jobs:
           cache-all-crates: true
           save-if: ${{ github.event_name != 'pull_request' }}
 
-      - name: Format Agentic Alpha packages
+      - name: Format Loop Engineer packages
         run: |
           cargo fmt --check --package alpha-domain
           cargo fmt --check --package alpha-store
           cargo fmt --check --package alpha-engine
           cargo fmt --check --package alpha-harness
+          cargo fmt --check --package hft-harnessctl
 
-      - name: Clippy Agentic Alpha packages
+      - name: Clippy Loop Engineer packages
         run: |
           cargo clippy \
             -p alpha-domain \
             -p alpha-store \
             -p alpha-engine \
             -p alpha-harness \
+            -p hft-harnessctl \
             --all-targets \
             --locked \
             -- \
             -D warnings
 
-      - name: Test Agentic Alpha packages
-        run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness --locked
+      - name: Test Loop Engineer packages
+        run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness -p hft-harnessctl --locked
 
       - name: Verify signed runtime handoff
         run: |
@@ -97,11 +99,14 @@ jobs:
       - name: Check production deployment contract
         run: ../scripts/check-deployment-contract.sh
 
-      - name: Check governed data collector
-        run: cargo check -p hft-collector --locked
+      - name: Verify governed data collector
+        run: |
+          cargo check -p hft-collector --locked
+          cargo clippy -p hft-collector --all-targets --features collector-binance --no-deps --locked -- -D warnings
+          cargo test -p hft-collector --features collector-binance --locked
 
       - name: Build focused packages
-        run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p alpha-harness --locked
+        run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p alpha-harness -p hft-harnessctl --locked
 
       - name: Package binaries (if present)
         if: github.event_name == 'push'
@@ -121,6 +126,36 @@ jobs:
           name: rust-dev-binaries-${{ github.sha }}
           path: rust_hft/dist/*
           if-no-files-found: ignore
+
+  deployment_artifacts:
+    name: Production Image And Kubernetes Contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build production trading image
+        uses: docker/build-push-action@v7
+        with:
+          context: rust_hft
+          file: rust_hft/deployment/docker/Dockerfile.trading
+          push: false
+          tags: hft-trading:${{ github.sha }}
+          cache-from: type=gha,scope=hft-trading-image
+          cache-to: type=gha,mode=max,scope=hft-trading-image
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.35.3
+
+      - name: Validate Kubernetes manifests without a cluster
+        run: kubectl apply --dry-run=client -f rust_hft/deployment/k8s/
 
   rust_hft_engine_fast_lane:
     name: Rust HFT Engine Fast Lane

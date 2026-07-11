@@ -1,28 +1,24 @@
-# Control Plane Contracts
+# Control-Plane Contract Index
 
-- Redis channels
-  - `ops.alert`: { event, severity, scope, payload, timestamp, version }
-  - `kill-switch`: { event: "emergency_stop", reason, scope, timestamp, version }
-  - `ml.deploy`: { event: "model_ready", symbol, model_path, metrics, timestamp, version }
-  - `ml.reject`: { event: "model_reject", symbol, reason, metrics, timestamp, version }
-  - `model.status`: { event: "model_status", symbol, status, model_path, metrics, timestamp, version }
-  - `system.metrics`: { event: "metrics", scope, values, window, timestamp, version }
+This file is an index, not an independent protocol definition. Rust types and validators are the source of truth.
 
-- gRPC endpoints (per protos/hft_control.proto)
-  - StartTrading/StopTrading/EmergencyStop
-  - LoadModel/UnloadModel/GetModelStatus
-  - GetSystemStatus/SubscribeAlerts/TriggerAlert/GetMetrics
+## Research Contracts
 
-- Versioning
-  - All events must include `version` for forward/backward compatibility.
+- `rust_hft/alpha-harness/domain`: `ResearchMission`, `LoopRun`, `CandidateArtifact`, evaluation evidence, approvals, promotion records, strategy bundles, deployment envelopes, and runtime attribution.
+- `rust_hft/alpha-harness/store`: immutable revisions, append-only iterations, authenticated checkpoints, approvals, policy memory, and deployment evidence.
+- `rust_hft/tools/collector`: governed dataset manifests, source capabilities, time bounds, and quality reports.
 
-- Rollout statuses (model.status)
-  - `canary`: model loaded for canary stage
-  - `promoted`: canary passed health window and promoted
-  - `rolled_back`: canary failed or critical alert; rolled back
-  - `failed`: load failed or control-plane error
+## Runtime Boundary
 
-- Health window
-  - Duration: `rollout_policy.health_timeout_seconds` (config/control_plane.yaml)
-  - Critical ops alerts during window trigger rollback
-  - If no critical alerts, promotion occurs automatically at window end
+The only research-to-runtime activation path is a signed `DeploymentEnvelope` bound to a persisted promotion and exact `StrategyBundle`. Runtime code revalidates hashes, policy scope, account, venue, instruments, limits, validity, signature, nonce, and runtime-owned approval evidence. Runtime feedback is separately signed and must be verified before research ingestion.
+
+The research plane does not call `StartTrading`, `LoadModel`, order, cancel, wallet, or transaction endpoints. Runtime pause, resume, artifact load, strategy replacement, and risk increase remain runtime/governance operations and cannot be inferred from an LLM message or Redis event.
+
+Paper and simulated-execution Shadow Formula activation are implemented. Live-small activation is disabled. ONNX remains runtime compatibility only, accepts only contained bundle-relative files, and has no governed v2 promotion producer.
+
+## Source References
+
+- [Canonical architecture](../rust_hft/ARCHITECTURE.md)
+- [Alpha Harness CLI](../rust_hft/alpha-harness/README.md)
+- [Runtime event contracts](../rust_hft/docs/contracts.md)
+- [Approved production-hardening design](superpowers/specs/2026-07-11-loop-engineer-production-hardening-design.md)

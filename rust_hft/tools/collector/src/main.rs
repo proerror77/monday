@@ -577,8 +577,6 @@ async fn main() -> Result<()> {
         let batch_size = args.batch_size;
         let flush_ms = args.flush_ms;
         let dry_run = is_dry_run;
-        let use_clickhouse_setup = use_clickhouse_setup;
-
         let task = tokio::spawn(async move {
             if let Err(e) = run_exchange_collector(
                 exchange_name.clone(),

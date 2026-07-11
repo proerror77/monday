@@ -1,18 +1,18 @@
 use alpha_domain::{
-    sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope, RuntimeEnvelopePolicy,
-    StrategyBundle,
+    deployment_scope_hash, sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope,
+    RuntimeApprovalEvidence, RuntimeEnvelopePolicy, StrategyBundle,
 };
 use chrono::{Duration, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-#[cfg(any(
-    not(feature = "formula-strategy"),
-    all(feature = "formula-strategy", feature = "binance")
-))]
 use hft_live::deployment_envelope::ActivationMode;
+#[cfg(feature = "formula-strategy")]
+use hft_live::deployment_envelope::RuntimeFeedbackLog;
 use hft_live::deployment_envelope::{
     ActivationRequest, DeploymentIntake, DeploymentReservation, RuntimeActivationAdapter,
     RuntimeAuditLog, RuntimeNonceLedger, SystemConfigActivationAdapter,
 };
+#[cfg(feature = "formula-strategy")]
+use hft_live::runtime_attribution::RuntimeAttributionObserver;
 use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Default)]
@@ -37,7 +37,7 @@ fn directory(name: &str) -> PathBuf {
     path
 }
 
-fn policy() -> RuntimeEnvelopePolicy {
+fn policy(envelope: &DeploymentEnvelope) -> RuntimeEnvelopePolicy {
     RuntimeEnvelopePolicy {
         account_id: "account-1".to_string(),
         venue: "binance".to_string(),
@@ -55,6 +55,16 @@ fn policy() -> RuntimeEnvelopePolicy {
         max_symbol_exposure: 500.0,
         max_order_size: 100.0,
         max_slippage_bps: 5.0,
+        approvals: vec![RuntimeApprovalEvidence {
+            approval_id: envelope.approval_signatures[0].clone(),
+            approval_class: envelope.approval_class.clone(),
+            subject_id: envelope.promotion_id.clone(),
+            scope_hash: deployment_scope_hash(envelope).unwrap(),
+            signer_id: "risk-officer-1".to_string(),
+            valid_from: envelope.valid_from,
+            expires_at: envelope.expires_at,
+            revoked_at: None,
+        }],
     }
 }
 
@@ -243,15 +253,29 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
     )
     .unwrap();
     assert_eq!(
-        intake(&paper, &trusted, &policy(), now, &directory, &mut adapter)
-            .unwrap()
-            .mode,
+        intake(
+            &paper,
+            &trusted,
+            &policy(&paper.envelope),
+            now,
+            &directory,
+            &mut adapter,
+        )
+        .unwrap()
+        .mode,
         ActivationMode::Paper
     );
     assert_eq!(
-        intake(&shadow, &trusted, &policy(), now, &directory, &mut adapter,)
-            .unwrap()
-            .mode,
+        intake(
+            &shadow,
+            &trusted,
+            &policy(&shadow.envelope),
+            now,
+            &directory,
+            &mut adapter,
+        )
+        .unwrap()
+        .mode,
         ActivationMode::Shadow
     );
     assert_eq!(
@@ -259,7 +283,7 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
         &[ActivationMode::Paper, ActivationMode::Shadow]
     );
     drop(adapter);
-    assert!(config.quotes_only);
+    assert!(!config.quotes_only);
     assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Paper"));
     assert_eq!(config.strategies.len(), 1);
     assert_eq!(config.strategies[0].name, bundle.bundle_id);
@@ -288,6 +312,175 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
     assert!(audit.contains("\"phase\":\"configuration\""));
     assert!(audit.contains("\"result\":\"prepared\""));
     assert!(!audit.contains("\"result\":\"activated\""));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+#[cfg(feature = "formula-strategy")]
+async fn shadow_activation_waits_for_market_then_produces_loop_consumable_evidence() {
+    use alpha_domain::{
+        runtime_stage_is_healthy, verify_runtime_attribution_event, AttributionKind,
+        AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
+        SignedRuntimeAttributionEvent,
+    };
+    use engine::dataflow::{EventIngester, IngestionConfig};
+    use hft_core::{Symbol, VenueId};
+    use ports::{BookLevel, MarketEvent, MarketSnapshot};
+    use std::collections::BTreeMap;
+    use tokio::sync::oneshot;
+
+    let now = Utc::now();
+    let envelope_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let signed = sign_envelope(
+        envelope(
+            now,
+            "shadow-runtime-1",
+            "nonce-shadow-runtime-1",
+            AllowedIntentType::StartShadow,
+            ApprovalClass::Shadow,
+        ),
+        "key-1",
+        &envelope_key,
+    )
+    .unwrap();
+    let directory = directory("shadow-runtime-evidence");
+    let bundle = formula_bundle(now);
+    let bundle_path = directory.join("bundle.json");
+    let mut config = configured_runtime();
+    let request = {
+        let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+        intake(
+            &signed,
+            &trusted(&envelope_key),
+            &policy(&signed.envelope),
+            now,
+            &directory,
+            &mut adapter,
+        )
+        .unwrap()
+    };
+    assert_eq!(request.mode, ActivationMode::Shadow);
+    assert!(!config.quotes_only);
+    assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Paper"));
+
+    let (mut ingester, consumer) = EventIngester::new(IngestionConfig {
+        stale_threshold_us: u64::MAX,
+        ..IngestionConfig::default()
+    });
+    let mut system = runtime::SystemBuilder::new(config)
+        .register_event_consumer(consumer)
+        .register_simulated_execution_client(VenueId::BINANCE)
+        .register_strategies_from_config_strict()
+        .unwrap()
+        .build();
+    let (execution_receiver, market_reader, notify) = {
+        let engine = system.engine.lock().await;
+        (
+            engine.subscribe_execution_events(),
+            engine.market_reader(),
+            engine.get_wakeup_notify(),
+        )
+    };
+    ingester.set_engine_notify(notify);
+
+    let feedback_key = SigningKey::from_bytes(&[13_u8; 32]);
+    let feedback_path = directory.join("runtime-feedback.jsonl");
+    let mut feedback_log =
+        RuntimeFeedbackLog::open(&feedback_path, "runtime-feedback-1", feedback_key.clone())
+            .unwrap();
+    feedback_log
+        .append(&RuntimeAttributionEvent {
+            event_id: format!("activation:{}", request.deployment_id),
+            deployment_id: request.deployment_id.clone(),
+            asset_revision_id: request.asset_revision_id.clone(),
+            mission_id: None,
+            mode: AttributionMode::Shadow,
+            outcome: AttributionOutcome::Activated,
+            kind: AttributionKind::Activation,
+            strategy_id: None,
+            order_id: None,
+            account_id: Some(request.account_id.clone()),
+            venue: Some(request.venue.clone()),
+            symbol: None,
+            metrics: BTreeMap::new(),
+            reason: None,
+            observed_at: now,
+        })
+        .unwrap();
+    let observer = RuntimeAttributionObserver::new(
+        execution_receiver,
+        market_reader,
+        request.clone(),
+        feedback_log,
+        u64::MAX,
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let observer_handle = tokio::spawn(observer.run(shutdown_rx));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let startup_events = std::fs::read_to_string(&feedback_path).unwrap();
+    assert!(!startup_events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<SignedRuntimeAttributionEvent>(line).ok())
+        .any(|signed| signed.event.kind == AttributionKind::PortfolioSnapshot));
+
+    system.start().await.unwrap();
+    ingester
+        .ingest(MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: hft_core::now_micros(),
+            bids: vec![BookLevel::new_unchecked(99.0, 3.0)],
+            asks: vec![BookLevel::new_unchecked(101.0, 1.0)],
+            sequence: 1,
+            source_venue: Some(VenueId::BINANCE),
+        }))
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let has_fill = std::fs::read_to_string(&feedback_path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<SignedRuntimeAttributionEvent>(line).ok())
+            .any(|signed| signed.event.kind == AttributionKind::Fill);
+        if has_fill {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shadow paper execution did not emit a fill"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    shutdown_tx.send(()).unwrap();
+    observer_handle.await.unwrap().unwrap();
+    system.stop().await.unwrap();
+
+    let trusted_feedback = BTreeMap::from([(
+        "runtime-feedback-1".to_string(),
+        feedback_key.verifying_key(),
+    )]);
+    let events = std::fs::read_to_string(&feedback_path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let signed: SignedRuntimeAttributionEvent = serde_json::from_str(line).unwrap();
+            verify_runtime_attribution_event(&signed, &trusted_feedback).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == AttributionKind::Fill));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == AttributionKind::PortfolioSnapshot));
+    assert!(runtime_stage_is_healthy(
+        &events,
+        &request.asset_revision_id,
+        AttributionMode::Shadow,
+    ));
+
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -338,10 +531,19 @@ fn runtime_rejects_forgery_time_binding_key_and_limit_failures() {
         ApprovalClass::Paper,
     );
     let mut adapter = RecordingAdapter::default();
+    let runtime_policy = policy(&base);
 
     let mut forged = sign_envelope(base.clone(), "key-1", &key).unwrap();
     forged.envelope.max_notional += 1.0;
-    assert!(intake(&forged, &trusted, &policy(), now, &directory, &mut adapter).is_err());
+    assert!(intake(
+        &forged,
+        &trusted,
+        &runtime_policy,
+        now,
+        &directory,
+        &mut adapter
+    )
+    .is_err());
 
     let mut invalid_signature = sign_envelope(base.clone(), "key-1", &key).unwrap();
     let replacement = if invalid_signature.signature_hex.starts_with('0') {
@@ -355,7 +557,7 @@ fn runtime_rejects_forgery_time_binding_key_and_limit_failures() {
     assert!(intake(
         &invalid_signature,
         &trusted,
-        &policy(),
+        &runtime_policy,
         now,
         &directory,
         &mut adapter
@@ -366,7 +568,7 @@ fn runtime_rejects_forgery_time_binding_key_and_limit_failures() {
     assert!(intake(
         &signed,
         &BTreeMap::new(),
-        &policy(),
+        &runtime_policy,
         now,
         &directory,
         &mut adapter
@@ -377,13 +579,29 @@ fn runtime_rejects_forgery_time_binding_key_and_limit_failures() {
     expired.valid_from = now - Duration::minutes(2);
     expired.expires_at = now - Duration::minutes(1);
     let signed = sign_envelope(expired, "key-1", &key).unwrap();
-    assert!(intake(&signed, &trusted, &policy(), now, &directory, &mut adapter).is_err());
+    assert!(intake(
+        &signed,
+        &trusted,
+        &runtime_policy,
+        now,
+        &directory,
+        &mut adapter
+    )
+    .is_err());
 
     let mut early = base.clone();
     early.valid_from = now + Duration::minutes(1);
     early.expires_at = now + Duration::minutes(2);
     let signed = sign_envelope(early, "key-1", &key).unwrap();
-    assert!(intake(&signed, &trusted, &policy(), now, &directory, &mut adapter).is_err());
+    assert!(intake(
+        &signed,
+        &trusted,
+        &runtime_policy,
+        now,
+        &directory,
+        &mut adapter
+    )
+    .is_err());
 
     for mutation in 0..5 {
         let mut changed = base.clone();
@@ -393,12 +611,66 @@ fn runtime_rejects_forgery_time_binding_key_and_limit_failures() {
             1 => changed.venue = "wrong-venue".to_string(),
             2 => changed.runtime_config_hash = "e".repeat(64),
             3 => changed.risk_policy_hash = "f".repeat(64),
-            _ => changed.max_order_size = policy().max_order_size + 1.0,
+            _ => changed.max_order_size = runtime_policy.max_order_size + 1.0,
         }
         let signed = sign_envelope(changed, "key-1", &key).unwrap();
-        assert!(intake(&signed, &trusted, &policy(), now, &directory, &mut adapter).is_err());
+        assert!(intake(
+            &signed,
+            &trusted,
+            &runtime_policy,
+            now,
+            &directory,
+            &mut adapter
+        )
+        .is_err());
     }
     assert!(adapter.requests.is_empty());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn runtime_rejects_a_valid_envelope_without_exact_operator_approval_evidence() {
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let signed = sign_envelope(
+        envelope(
+            now,
+            "approval-rejection",
+            "nonce-approval-rejection",
+            AllowedIntentType::StartShadow,
+            ApprovalClass::Shadow,
+        ),
+        "key-1",
+        &key,
+    )
+    .unwrap();
+    let trusted = trusted(&key);
+    let directory = directory("approval-rejection");
+
+    for mutation in 0..5 {
+        let mut runtime_policy = policy(&signed.envelope);
+        match mutation {
+            0 => runtime_policy.approvals.clear(),
+            1 => runtime_policy.approvals[0].approval_class = ApprovalClass::Paper,
+            2 => runtime_policy.approvals[0].subject_id = "promotion-forged".to_string(),
+            3 => runtime_policy.approvals[0].scope_hash = "f".repeat(64),
+            _ => runtime_policy.approvals[0].revoked_at = Some(now),
+        }
+        let mut adapter = RecordingAdapter::default();
+        let error = intake(
+            &signed,
+            &trusted,
+            &runtime_policy,
+            now,
+            &directory,
+            &mut adapter,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("approval evidence"));
+        assert!(adapter.requests.is_empty());
+    }
+
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -421,8 +693,25 @@ fn nonce_replay_is_rejected_after_ledger_restart() {
     )
     .unwrap();
     let mut adapter = RecordingAdapter::default();
-    intake(&signed, &trusted, &policy(), now, &directory, &mut adapter).unwrap();
-    assert!(intake(&signed, &trusted, &policy(), now, &directory, &mut adapter).is_err());
+    let runtime_policy = policy(&signed.envelope);
+    intake(
+        &signed,
+        &trusted,
+        &runtime_policy,
+        now,
+        &directory,
+        &mut adapter,
+    )
+    .unwrap();
+    assert!(intake(
+        &signed,
+        &trusted,
+        &runtime_policy,
+        now,
+        &directory,
+        &mut adapter
+    )
+    .is_err());
     assert_eq!(adapter.requests.len(), 1);
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -449,7 +738,7 @@ fn concurrent_startups_serialize_nonce_reservation_and_recheck_the_ledger() {
     let (_, mut first_reservation) = prepare_intake(
         &signed,
         &trusted,
-        &policy(),
+        &policy(&signed.envelope),
         now,
         &directory,
         &mut first_adapter,
@@ -467,7 +756,7 @@ fn concurrent_startups_serialize_nonce_reservation_and_recheck_the_ledger() {
         let result = prepare_intake(
             &second_signed,
             &second_trusted,
-            &policy(),
+            &policy(&second_signed.envelope),
             now,
             &second_directory,
             &mut adapter,
@@ -510,7 +799,15 @@ fn live_small_fails_closed_until_order_limits_are_in_the_hot_path() {
     let bundle = formula_bundle(now);
     let bundle_path = directory.join("bundle.json");
     let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
-    assert!(intake(&signed, &trusted, &policy(), now, &directory, &mut adapter,).is_err());
+    assert!(intake(
+        &signed,
+        &trusted,
+        &policy(&signed.envelope),
+        now,
+        &directory,
+        &mut adapter,
+    )
+    .is_err());
     assert!(!RuntimeNonceLedger::open(directory.join("nonces.jsonl"))
         .unwrap()
         .contains("nonce-live-small"));
@@ -533,13 +830,7 @@ fn onnx_handoff_rejects_bad_schema_and_checksum_before_runtime_build() {
         ("checksum", "f".repeat(64), 4),
         ("schema", hex::encode(Sha256::digest(bytes)), 3),
     ] {
-        let bundle = onnx_bundle(
-            now,
-            model_path.to_str().unwrap(),
-            bytes.len() as u64,
-            &checksum,
-            channels,
-        );
+        let bundle = onnx_bundle(now, "model.onnx", bytes.len() as u64, &checksum, channels);
         let mut unsigned = envelope(
             now,
             &format!("onnx-{suffix}"),
@@ -557,19 +848,21 @@ fn onnx_handoff_rejects_bad_schema_and_checksum_before_runtime_build() {
         let bundle_path = directory.join(format!("bundle-{suffix}.json"));
         let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
 
-        assert!(intake(&signed, &trusted, &policy(), now, &directory, &mut adapter,).is_err());
+        assert!(intake(
+            &signed,
+            &trusted,
+            &policy(&signed.envelope),
+            now,
+            &directory,
+            &mut adapter,
+        )
+        .is_err());
         drop(adapter);
         assert!(config.strategies.is_empty());
     }
 
     let checksum = hex::encode(Sha256::digest(bytes));
-    let bundle = onnx_bundle(
-        now,
-        model_path.to_str().unwrap(),
-        bytes.len() as u64,
-        &checksum,
-        4,
-    );
+    let bundle = onnx_bundle(now, "model.onnx", bytes.len() as u64, &checksum, 4);
     let mut unsigned = envelope(
         now,
         "onnx-malformed",
@@ -586,8 +879,15 @@ fn onnx_handoff_rejects_bad_schema_and_checksum_before_runtime_build() {
     let mut config = configured_runtime();
     let bundle_path = directory.join("bundle-valid-metadata.json");
     let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
-    let (_, reservation) =
-        prepare_intake(&signed, &trusted, &policy(), now, &directory, &mut adapter).unwrap();
+    let (_, reservation) = prepare_intake(
+        &signed,
+        &trusted,
+        &policy(&signed.envelope),
+        now,
+        &directory,
+        &mut adapter,
+    )
+    .unwrap();
     drop(adapter);
     assert!(matches!(
         config.strategies[0].strategy_type,
@@ -613,6 +913,68 @@ fn onnx_handoff_rejects_bad_schema_and_checksum_before_runtime_build() {
     }
     #[cfg(not(feature = "dl-strategy"))]
     drop(reservation);
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn onnx_handoff_rejects_absolute_file_and_parent_paths() {
+    use sha2::{Digest, Sha256};
+
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let trusted = trusted(&key);
+    let directory = directory("onnx-containment");
+    let bundle_directory = directory.join("bundle");
+    std::fs::create_dir_all(&bundle_directory).unwrap();
+    let outside_path = directory.join("outside.onnx");
+    let bytes = b"outside bundle";
+    std::fs::write(&outside_path, bytes).unwrap();
+    let checksum = hex::encode(Sha256::digest(bytes));
+
+    for (suffix, uri) in [
+        ("parent", "../outside.onnx".to_string()),
+        ("absolute", outside_path.to_string_lossy().into_owned()),
+        (
+            "file-uri",
+            format!("file://{}", outside_path.to_string_lossy()),
+        ),
+    ] {
+        let bundle = onnx_bundle(now, &uri, bytes.len() as u64, &checksum, 4);
+        let mut unsigned = envelope(
+            now,
+            &format!("onnx-containment-{suffix}"),
+            &format!("nonce-onnx-containment-{suffix}"),
+            AllowedIntentType::StartPaper,
+            ApprovalClass::Paper,
+        );
+        unsigned.asset_revision_id = bundle.candidate_id.clone();
+        unsigned.bundle_id = bundle.bundle_id.clone();
+        unsigned.bundle_hash = bundle.bundle_hash.clone();
+        unsigned.allowed_intent_types =
+            vec![AllowedIntentType::LoadModel, AllowedIntentType::StartPaper];
+        let signed = sign_envelope(unsigned, "key-1", &key).unwrap();
+        let mut config = configured_runtime();
+        let bundle_path = bundle_directory.join(format!("bundle-{suffix}.json"));
+        let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
+
+        let error = intake(
+            &signed,
+            &trusted,
+            &policy(&signed.envelope),
+            now,
+            &directory,
+            &mut adapter,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("bundle-relative") || error.contains("bundle directory"),
+            "unexpected containment error: {error}"
+        );
+        drop(adapter);
+        assert!(config.strategies.is_empty());
+    }
 
     std::fs::remove_dir_all(directory).unwrap();
 }

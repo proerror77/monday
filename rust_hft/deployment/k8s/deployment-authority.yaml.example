@@ -1,0 +1,36 @@
+# Copy outside the repository and replace every placeholder. The runtime policy
+# is operator-owned authority; do not source it from the research output bundle.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: runtime-deployment-authority
+  namespace: hft-trading
+data:
+  policy.json: |
+    {
+      "account_id": "REPLACE_ACCOUNT_ID",
+      "venue": "bitget",
+      "allowed_instruments": ["BTCUSDT"],
+      "allowed_intent_types": ["LoadFactor", "StartPaper", "StartShadow"],
+      "max_notional": 1000.0,
+      "max_symbol_exposure": 500.0,
+      "max_order_size": 100.0,
+      "max_slippage_bps": 5.0,
+      "approvals": [
+        {
+          "approval_id": "REPLACE_APPROVAL_ID",
+          "approval_class": "Shadow",
+          "subject_id": "REPLACE_PROMOTION_ID",
+          "scope_hash": "REPLACE_WITH_DEPLOYMENT_SCOPE_HASH",
+          "signer_id": "REPLACE_RISK_APPROVER_ID",
+          "valid_from": "2026-07-11T00:00:00Z",
+          "expires_at": "2026-07-12T00:00:00Z",
+          "revoked_at": null
+        }
+      ],
+      "runtime_paused": false
+    }
+  trusted-keys.json: |
+    {
+      "research-signer-1": "REPLACE_WITH_64_HEX_ED25519_PUBLIC_KEY"
+    }

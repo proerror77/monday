@@ -1,6 +1,8 @@
-ML Workspace
+# Legacy Python ML Workspace
 
-Unified, config-driven ML workspace for market microstructure research and training.
+Config-driven Python prototypes for market microstructure research and training. This workspace is retained for experiments and Rust-parity migration; it is not the governed Loop Engineer control plane and has no deployment or execution authority.
+
+Outputs from this workspace cannot enter promotion directly. A model or feature must first gain point-in-time lineage, deterministic evaluation, a typed Rust bundle contract, and runtime compatibility evidence.
 
 Key Directories
 
@@ -14,7 +16,7 @@ Key Directories
 - demos/: self-contained demos
 - models/, workspace/, logs/, results/: artifacts (gitignored)
 
-CLI Quickstart
+## Prototype CLI
 
 - QA checks: `python cli.py qa run --config configs/qa.yaml`
 - Build multi-symbol dataset: `python cli.py dataset build --config configs/features_build.yaml`
@@ -23,12 +25,15 @@ CLI Quickstart
 - Unsupervised TCN-GRU: `python cli.py unsup train --symbol WLFIUSDT --start 2025-09-01T00:00:00Z --end 2025-09-08T00:00:00Z --seq_len 60 --epochs 10`
  - Backtest (DL): `python cli.py backtest dl --model ./models/dl_model_xxx.pt --symbol WLFIUSDT --start 2025-09-03T00:00:00Z --end 2025-09-05T23:59:59Z --horizon 5 --trades_output results/trades.json --plot_output results/equity.png --summary_output results/summary.json`
 
-Conventions
+## Conventions
 
 - Prefer YAML configs over long CLI flags.
 - Never commit credentials. Use `.env` locally and environment variables in CI. See `.env.example`.
 - Artifacts are ignored via `.gitignore`.
-Caching
+- Do not add order, wallet, runtime resume, signing, or hard-risk mutation paths here.
+- Use `rust_hft/alpha-harness` for governed goals, evaluation, lineage, promotion, and feedback.
+
+## Caching
 
 - Set `FEATURE_CACHE_ENABLE=true` to enable local Parquet caching (default).
 - `FEATURE_CACHE_DIR=./cache/features` controls where files are stored.

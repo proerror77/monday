@@ -82,14 +82,16 @@ impl LatencyMonitor {
         }
 
         // 保存樣本（僅保留最近 window_size 筆）
-        let mut samples = self.samples.lock();
-        let dq = samples
-            .entry(stage)
-            .or_insert_with(|| VecDeque::with_capacity(self.config.window_size));
-        if dq.len() >= self.config.window_size {
-            dq.pop_front();
+        {
+            let mut samples = self.samples.lock();
+            let dq = samples
+                .entry(stage)
+                .or_insert_with(|| VecDeque::with_capacity(self.config.window_size));
+            if dq.len() >= self.config.window_size {
+                dq.pop_front();
+            }
+            dq.push_back(latency_micros);
         }
-        dq.push_back(latency_micros);
 
         // 檢查是否需要生成報告
         self.maybe_generate_report();
@@ -239,6 +241,30 @@ pub enum LatencyHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn periodic_reporting_does_not_deadlock_recording() {
+        let monitor = Arc::new(LatencyMonitor::new(LatencyMonitorConfig {
+            report_interval_ms: 0,
+            ..Default::default()
+        }));
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let worker_monitor = Arc::clone(&monitor);
+
+        std::thread::spawn(move || {
+            worker_monitor.record_latency(LatencyStage::Ingestion, 500);
+            completed_tx.send(()).unwrap();
+        });
+
+        assert!(
+            completed_rx
+                .recv_timeout(Duration::from_millis(500))
+                .is_ok(),
+            "periodic latency reporting deadlocked record_latency"
+        );
+    }
 
     #[test]
     fn test_latency_monitor_basic() {

@@ -1,60 +1,93 @@
-# Agentic Trading System
-Rust-first alpha research and execution platform. The research control plane discovers and evaluates candidate factors; the Rust runtime alone owns market connectivity, risk, OMS, and execution.
+# Rust Loop Engineer Trading System
+
+Rust-first, bounded alpha discovery and paper/shadow execution platform. The research plane may acquire governed data, propose and evaluate candidates, learn from failures, and prepare signed deployments. Deterministic Rust runtime code alone owns market connectivity, risk, OMS, reconciliation, cancellation, and execution.
+
+## Production Boundary
+
+This repository is locally production-gated for governed research plus signed **Paper** and **Shadow** activation. It is not approved for real-money autonomous trading. `LiveSmall` runtime activation remains fail-closed until real-venue reconciliation, reduce-only exit, order-size, and slippage acceptance tests are complete.
+
+## Loop Engineer Contract
+
+The implemented loop is goal-based and evidence-driven:
+
+1. A `LoopRun` declares a target stage, bounded mission budget, and explicit completion policy.
+2. Durable `LoopRun` execution uses MCTS or Bayesian engines with exact engine-state checkpoints. GP, offline RL, and LLM remain explicit standalone Lab missions.
+3. The versioned evaluator applies point-in-time data, purged walk-forward folds, costs, drawdown limits, minimum evidence, and a pre-registered multiple-testing haircut.
+4. Failures remain queryable and may create one bounded follow-up mission with a validator-gated learning directive.
+5. Promotion binds candidate, dataset, evaluator config/metrics, sealed result, approval, and bundle hashes.
+6. `hft-live` verifies the signed envelope and loads that exact bundle for Paper or Shadow.
+7. Runtime attribution is signed by a runtime-only key, verified before ingestion, appended to the same lineage, and may influence only a future lab search policy.
+
+The repository provides the durable goal loop and CLI. Time-based or event-based invocation is an external scheduler responsibility. LLMs never receive order, credential, wallet, risk-increase, resume, or artifact-loading authority.
 
 ## Capability Truth
 
-| Capability | State | Owner |
+| Capability | State | Boundary |
 | --- | --- | --- |
-| Public Binance OHLCV Data Missions with content-addressed traces | `implemented` | `hft-collector` + `alpha-harness` |
-| DuckDB missions, lineage, checkpoints, approvals, memory, and policy revisions | `implemented` | `alpha-store` |
-| GP, MCTS, Bayesian search, offline Q-learning, and factor DSL evaluation | `implemented` | `alpha-engine` |
-| OpenAI-compatible hypothesis and failure critic | `implemented` | `alpha-engine`; live calls require `ALPHA_LLM_*` |
-| Purged walk-forward, trading costs, and one-time sealed holdout | `implemented` | `alpha-engine` |
-| Signed paper/shadow deployment handoff and durable nonce replay protection | `implemented` | `alpha-domain` + `hft-live` |
-| Runtime attribution, follow-up missions, and validator-gated search policy learning | `implemented` | `hft-live` + `alpha-store` + `alpha-engine` |
-| Live-small activation from an Agent envelope | `deferred` | Fails closed until universal order-size and slippage gates consume envelope limits |
-| Full Python prototype replacement | `deferred` | Python remains only where Rust parity is not proven |
-| Real alpha profitability | `not claimed` | Requires statistically valid data and evaluation evidence |
+| Binance closed-candle OHLCV v2 Data Missions | `governed` | Content-addressed trace, immutable DuckDB registry, point-in-time and quality checks |
+| Tick/LOB and multi-venue streaming connectors | `runtime-only` | Connector availability is not a governed research-dataset claim |
+| Formula search with GP, MCTS, and Bayesian optimization | `governed` | Eligible for evaluator v2 and Formula-only promotion |
+| Offline Q-learning | `lab-only` | Search-policy experiment; blocked from holdout, promotion, allocation, and runtime authority |
+| OpenAI-compatible hypothesis/failure critic | `lab-only` | Optional `ALPHA_LLM_*` calls; outputs remain evidence/proposals |
+| Purged walk-forward and one-time sealed holdout v2 | `governed` | Typed metrics/config hashes are recomputed before promotion |
+| ONNX loading | `runtime-compatibility` | No governed ONNX producer until point-in-time training lineage and model evaluation exist |
+| Signed Formula Paper/Shadow handoff | `implemented` | Ed25519 verification, runtime-owned approval evidence, policy binding, durable nonce and audit records |
+| Runtime attribution and follow-up learning | `implemented` | Signed deployment/strategy-scoped events; validator-gated lab policy adoption |
+| Live-small runtime activation | `disabled` | Human eligibility evidence does not bypass the runtime fail-closed gate |
+| Python ML workspace | `legacy-prototype` | Not production control-plane or execution authority; migrate only with Rust parity evidence |
+| Real alpha profitability | `not claimed` | Requires real point-in-time data, valid evaluation, and venue soak evidence |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    S["Data Mission"] --> C["Rust connectors"]
-    C --> A["Content-addressed traces"]
-    A --> H["Alpha Harness"]
-    H --> E["GP / MCTS / Bayesian / RL / LLM"]
-    E --> V["Purged walk-forward"]
-    V --> D["DuckDB lineage and memory"]
-    D --> P["Promotion + signed envelope"]
-    P --> R["Rust live runtime verifier"]
+    G["Bounded LoopRun goal"] --> D["Governed Data Mission"]
+    D --> C["Content-addressed dataset"]
+    C --> S["MCTS / Bayesian LoopRun"]
+    C --> Q["Standalone GP / RL / LLM Lab missions"]
+    S --> E["Evaluator v2"]
+    E -->|"fail + evidence"| L["Learning directive / follow-up mission"]
+    L --> S
+    E -->|"walk-forward + sealed pass"| P["Promotion + Formula bundle"]
+    P --> H["Signed deployment envelope"]
+    H --> R["Rust runtime verifier"]
     R --> X["Paper / Shadow"]
-    X --> F["Attribution feedback"]
-    F --> D
+    X --> A["Scoped runtime attribution"]
+    A --> L
 ```
 
-The research plane cannot submit orders or broadcast transactions. It emits signed, bounded deployment envelopes. `apps/live` verifies current config, risk hashes, account, venue, instruments, limits, approval class, validity, signature, and nonce before changing startup configuration.
+The research plane exposes no order or trade command and has no execution-adapter dependency. Runtime hard limits always clamp proposed limits; unknown account or reconciliation state halts live execution.
 
 ## Focused Validation
 
-Run package-scoped checks from `rust_hft/`:
+Run from `rust_hft/` unless noted:
 
 ```bash
-cargo test -p alpha-domain --locked
-cargo test -p alpha-store --locked
-cargo test -p alpha-engine --locked
-cargo test -p alpha-harness --locked
-cargo test -p hft-live --no-default-features --test deployment_envelope --locked
-cargo check -p hft-collector -p hft-live --locked
+cargo test --locked -p hft-collector -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness
+cargo clippy --locked -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness --all-targets --no-deps -- -D warnings
+cargo clippy --locked -p hft-collector --all-targets --features collector-binance --no-deps -- -D warnings
+cargo test --locked -p hft-live --features dl-strategy
+cargo test --locked -p hft-live --no-default-features --features formula-strategy,binance --test deployment_envelope
+cargo test --locked -p hft-live --no-default-features --features formula-strategy,bitget --test deployment_artifacts
+cargo audit --no-fetch
 ```
 
-Do not use full-workspace compilation for ordinary changes. Run `cargo metadata --locked --no-deps` after changing workspace members.
+From the repository root:
+
+```bash
+bash scripts/check-tracked-secrets.sh
+bash scripts/check-deployment-contract.sh
+```
+
+Ordinary changes should use package-scoped checks. Run a release graph, container build, and Kubernetes dry-run once at a production gate, not after every edit.
 
 ## Entry Points
 
-- Research CLI: [rust_hft/alpha-harness/README.md](rust_hft/alpha-harness/README.md)
-- Runtime architecture: [rust_hft/ARCHITECTURE.md](rust_hft/ARCHITECTURE.md)
-- Approved design: [docs/superpowers/specs/2026-07-10-agentic-trading-system-v2-design.md](docs/superpowers/specs/2026-07-10-agentic-trading-system-v2-design.md)
-- Implementation plan: [docs/superpowers/plans/2026-07-10-agentic-trading-system-v2.md](docs/superpowers/plans/2026-07-10-agentic-trading-system-v2.md)
+- [Canonical architecture](rust_hft/ARCHITECTURE.md)
+- [Alpha Harness CLI](rust_hft/alpha-harness/README.md)
+- [Production deployment](rust_hft/deployment/PRODUCTION_DEPLOYMENT.md)
+- [Current approved design](docs/superpowers/specs/2026-07-11-loop-engineer-production-hardening-design.md)
+- [Current implementation plan](docs/superpowers/plans/2026-07-11-loop-engineer-production-hardening.md)
+- [Design document status](docs/superpowers/README.md)
 
-Raw market data remains in trace/Parquet artifacts or analytics stores. DuckDB is the local research control-plane source of truth; it is not the hot market-data database.
+DuckDB is the local research control-plane source of truth. Raw and large derived market data belongs in content-addressed trace/Parquet artifacts; ClickHouse is optional analytics storage, not control-plane authority.

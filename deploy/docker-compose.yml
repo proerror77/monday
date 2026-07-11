@@ -131,6 +131,8 @@ services:
       - /config/prod/system.yaml
       - --deployment-envelope
       - /deployment/envelope.json
+      - --strategy-bundle
+      - /deployment/bundle.json
       - --deployment-policy
       - /deployment/policy.json
       - --deployment-trusted-keys
@@ -141,11 +143,16 @@ services:
       - /state/audit.jsonl
       - --deployment-feedback-log
       - /state/feedback.jsonl
+      - --deployment-feedback-signing-key
+      - /run/secrets/hft/feedback-signing-key.hex
+      - --deployment-feedback-key-id
+      - ${HFT_FEEDBACK_KEY_ID:-runtime-feedback-1}
     volumes:
       - ../rust_hft/config:/config:ro
       - ../models:/models:ro
       - ${HFT_DEPLOYMENT_DIR:-../runtime/deployment}:/deployment:ro
       - ${HFT_RUNTIME_STATE_DIR:-../runtime/state}:/state
+      - ${HFT_RUNTIME_SECRET_DIR:-../runtime/secrets}:/run/secrets/hft:ro
     environment:
       RUST_LOG: info
       CLICKHOUSE_URL: http://clickhouse:8123

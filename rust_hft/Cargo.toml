@@ -82,7 +82,7 @@ members = [
     "research-core/manifest",
     "research-core/search-protocol",
 
-    # Agentic Alpha Harness
+    # Bounded Loop Engineer research plane
     "alpha-harness/domain",
     "alpha-harness/store",
     "alpha-harness/engine",

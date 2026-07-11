@@ -1,5 +1,7 @@
 # Agentic Trading System v2 Design
 
+> **Superseded:** retained for design history. Use the [2026-07-11 Loop Engineer design](2026-07-11-loop-engineer-production-hardening-design.md) for current capability and safety boundaries.
+
 Date: 2026-07-10
 Status: Approved for implementation
 
@@ -243,7 +245,7 @@ The kernel adopts validator-gated automated research:
 6. Every result is persisted before the next iteration.
 7. Improvement means validator evidence, not an Agent statement.
 8. Crashes and negative results remain research memory.
-9. Checkpoints allow pause and resume without regenerating completed work.
+9. Durable MCTS and Bayesian checkpoints allow exact pause/resume without regenerating completed work; GP and LLM history replay is not represented as exact engine-state resume.
 10. Completion requires a passing artifact or explicit budget exhaustion.
 
 The program database stores kept and discarded candidates, novelty descriptors, lineage, and scores. Parent selection may use quality-diversity or a bandit scheduler, but selection logic is versioned and reproducible.
@@ -428,7 +430,7 @@ Keep selected real GP, factor generation, Bayesian, RL, deep-model training, and
 
 ### Phase 4: AutoResearch vertical slice
 
-- Add mission creation, checkpoint/resume, budget accounting, validator artifacts, and keep/discard/crash history.
+- Add mission creation, engine-scoped checkpoint/resume, budget accounting, validator artifacts, and keep/discard/crash history.
 - Run real GP and LLM hypothesis/critic candidates against deterministic fixtures.
 
 ### Phase 5: Real search and evaluation
@@ -483,7 +485,7 @@ Full workspace validation is reserved for dependency-graph changes, release cand
 The rewrite is complete only when all of the following are true:
 
 1. No LLM-enabled binary can directly place an order, resume trading, increase risk, or load a model without a validated deployment workflow.
-2. One persisted mission can pause and resume without repeating completed iterations.
+2. One persisted MCTS or Bayesian LoopRun can pause and resume from versioned engine state without repeating completed iterations.
 3. One Agent-created data mission produces a quality report and content-addressed dataset manifest through existing Rust connectors.
 4. One real LLM call produces a hypothesis artifact through bounded research tools.
 5. Real GP, MCTS, and Bayesian engines produce reproducible candidate lineage and budget evidence.

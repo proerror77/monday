@@ -1,5 +1,7 @@
 # Agentic Alpha Harness Full Architecture Plan
 
+> **Superseded:** retained for implementation history. Use the [2026-07-11 production-hardening plan](2026-07-11-loop-engineer-production-hardening.md) for current work.
+
 Date: 2026-07-08
 Status: Active implementation plan
 

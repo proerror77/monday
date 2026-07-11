@@ -2,7 +2,7 @@
 name = "hft-live"
 version = "0.1.0"
 edition = "2021"
-description = "真盤交易應用 - 開啟所有重特性的地方"
+description = "Deterministic Rust trading runtime with signed Paper and Shadow activation"
 
 [dependencies]
 # 核心依賴

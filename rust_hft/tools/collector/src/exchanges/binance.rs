@@ -82,8 +82,7 @@ impl Exchange for BinanceExchange {
             _ => 20,
         };
 
-        let mut streams: Vec<String> = Vec::new();
-        streams.reserve(symbols.len() * 4 + 1);
+        let mut streams: Vec<String> = Vec::with_capacity(symbols.len() * 4 + 1);
         for symbol in symbols {
             let lower_symbol = symbol.to_lowercase();
             if include_trades {
@@ -331,7 +330,7 @@ impl Exchange for BinanceExchange {
                             let ts = Utc
                                 .timestamp_millis_opt(event_time)
                                 .single()
-                                .unwrap_or_else(|| Utc::now());
+                                .unwrap_or_else(Utc::now);
                             let parse = |k: &str| {
                                 it.get(k)
                                     .and_then(|x| x.as_str())
@@ -495,7 +494,7 @@ impl Exchange for BinanceExchange {
                     }
                 };
                 let snap = serde_json::json!({
-                    "ts": (ex_ms as u64) * 1000u64,
+                    "ts": ex_ms * 1000u64,
                     "symbol": symbol,
                     "venue": "binance",
                     "last_id": last_id,
@@ -619,7 +618,7 @@ impl Exchange for BinanceExchange {
                         }
                     };
                     let snap = serde_json::json!({
-                        "ts": (ex_ms as u64) * 1000u64, // 微秒
+                        "ts": ex_ms * 1000u64, // 微秒
                         "symbol": depth_update.symbol,
                         "venue": "binance",
                         "last_id": last_id,

@@ -5,7 +5,6 @@
 //! - cargo run --features="full"  # 開啟所有特性
 
 mod helpers;
-mod runtime_attribution;
 
 use alpha_domain::{
     AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
@@ -17,8 +16,8 @@ use hft_live::deployment_envelope::{
     RuntimeAuditLog, RuntimeFeedbackLog, RuntimeNonceLedger, RuntimePolicyDocument,
     SystemConfigActivationAdapter,
 };
+use hft_live::runtime_attribution::RuntimeAttributionObserver;
 use runtime::{ShardConfig, ShardStrategy, SystemBuilder, SystemConfig};
-use runtime_attribution::RuntimeAttributionObserver;
 use tracing::info;
 
 #[derive(Parser)]
@@ -68,6 +67,14 @@ struct Args {
     /// Runtime-owned append-only paper/shadow/live attribution log.
     #[arg(long, requires = "deployment_envelope")]
     deployment_feedback_log: Option<std::path::PathBuf>,
+
+    /// Runtime-owned Ed25519 private key used only to sign attribution records.
+    #[arg(long, requires = "deployment_envelope")]
+    deployment_feedback_signing_key: Option<std::path::PathBuf>,
+
+    /// Public identifier for the runtime attribution signing key.
+    #[arg(long, requires = "deployment_envelope")]
+    deployment_feedback_key_id: Option<String>,
 
     /// Metrics HTTP 服務器端口（啟用 metrics feature 時生效）
     #[cfg(feature = "metrics")]
@@ -187,9 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut system = builder.build();
     let attribution_observer = if let Some(deployment) = activation.as_ref() {
-        let feedback_path =
-            required_path(&args.deployment_feedback_log, "--deployment-feedback-log")?;
-        let feedback_log = RuntimeFeedbackLog::open(feedback_path)?;
+        let feedback_log = open_feedback_log(&args)?;
         let (receiver, market_reader) = {
             let engine = system.engine.lock().await;
             (engine.subscribe_execution_events(), engine.market_reader())
@@ -375,8 +380,7 @@ fn apply_deployment_if_present(
         required_path(&args.deployment_trusted_keys, "--deployment-trusted-keys")?;
     let nonce_path = required_path(&args.deployment_nonce_ledger, "--deployment-nonce-ledger")?;
     let audit_path = required_path(&args.deployment_audit_log, "--deployment-audit-log")?;
-    let feedback_path = required_path(&args.deployment_feedback_log, "--deployment-feedback-log")?;
-    RuntimeFeedbackLog::open(feedback_path)?;
+    open_feedback_log(args)?;
     let signed: SignedDeploymentEnvelope = read_json(envelope_path)?;
     let bundle: StrategyBundle = read_json(bundle_path)?;
     let policy_document: RuntimePolicyDocument = read_json(policy_path)?;
@@ -402,9 +406,8 @@ fn apply_deployment_if_present(
 }
 
 fn append_activation_feedback(args: &Args, request: &ActivationRequest) -> anyhow::Result<()> {
-    let feedback_path = required_path(&args.deployment_feedback_log, "--deployment-feedback-log")?;
     let observed_at = chrono::Utc::now();
-    RuntimeFeedbackLog::open(feedback_path)?.append(&RuntimeAttributionEvent {
+    open_feedback_log(args)?.append(&RuntimeAttributionEvent {
         event_id: format!("activation:{}", request.deployment_id),
         deployment_id: request.deployment_id.clone(),
         asset_revision_id: request.asset_revision_id.clone(),
@@ -426,6 +429,38 @@ fn append_activation_feedback(args: &Args, request: &ActivationRequest) -> anyho
         observed_at,
     })?;
     Ok(())
+}
+
+fn open_feedback_log(args: &Args) -> anyhow::Result<RuntimeFeedbackLog> {
+    let feedback_path = required_path(&args.deployment_feedback_log, "--deployment-feedback-log")?;
+    let signing_key_path = required_path(
+        &args.deployment_feedback_signing_key,
+        "--deployment-feedback-signing-key",
+    )?;
+    let key_id = args
+        .deployment_feedback_key_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("--deployment-feedback-key-id is required with --deployment-envelope")
+        })?;
+    let encoded = std::fs::read_to_string(signing_key_path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to read feedback signing key {}: {error}",
+            signing_key_path.display()
+        )
+    })?;
+    let key_bytes = hex::decode(encoded.trim())
+        .map_err(|_| anyhow::anyhow!("feedback signing key must be hex encoded"))?;
+    let key_bytes: [u8; 32] = key_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("feedback signing key must contain exactly 32 bytes"))?;
+    RuntimeFeedbackLog::open(
+        feedback_path,
+        key_id,
+        ed25519_dalek::SigningKey::from_bytes(&key_bytes),
+    )
+    .map_err(Into::into)
 }
 
 fn required_path<'a>(

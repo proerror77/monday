@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::deployment_envelope::{
+    ActivationArtifact, ActivationMode, ActivationRequest, RuntimeFeedbackLog,
+};
 use alpha_domain::{AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent};
 use chrono::{DateTime, Utc};
 use engine::aggregation::MarketView;
 use hft_core::{Side, Symbol, VenueId, VenueSymbol};
-use hft_live::deployment_envelope::{
-    ActivationArtifact, ActivationMode, ActivationRequest, RuntimeFeedbackLog,
-};
 use ports::ExecutionEvent;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -19,7 +19,7 @@ const PORTFOLIO_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 const COVERAGE_COMPLETE: f64 = 1.0;
 const COVERAGE_MISSING: f64 = 0.0;
 
-pub(crate) struct RuntimeAttributionObserver {
+pub struct RuntimeAttributionObserver {
     receiver: broadcast::Receiver<ExecutionEvent>,
     market_reader: Arc<dyn SnapshotReader<MarketView>>,
     activation: ActivationRequest,
@@ -48,6 +48,7 @@ struct AttributionState {
     orders: HashMap<String, OrderMetadata>,
     targets: BTreeMap<String, StrategyTarget>,
     ledgers: BTreeMap<String, StrategyLedger>,
+    valuation_started: bool,
     permanently_invalid: Option<String>,
 }
 
@@ -77,7 +78,7 @@ struct StrategySnapshotMetrics {
 }
 
 impl RuntimeAttributionObserver {
-    pub(crate) fn new(
+    pub fn new(
         receiver: broadcast::Receiver<ExecutionEvent>,
         market_reader: Arc<dyn SnapshotReader<MarketView>>,
         activation: ActivationRequest,
@@ -93,7 +94,7 @@ impl RuntimeAttributionObserver {
         }
     }
 
-    pub(crate) async fn run(mut self, mut shutdown: oneshot::Receiver<()>) -> anyhow::Result<()> {
+    pub async fn run(mut self, mut shutdown: oneshot::Receiver<()>) -> anyhow::Result<()> {
         let mut state = AttributionState::new(&self.activation)?;
         let mut snapshots = tokio::time::interval(PORTFOLIO_SNAPSHOT_INTERVAL);
         snapshots.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -189,6 +190,7 @@ impl AttributionState {
             orders: HashMap::new(),
             targets,
             ledgers,
+            valuation_started: false,
             permanently_invalid: None,
         })
     }
@@ -461,7 +463,28 @@ fn portfolio_attribution(
     let venue = VenueId::from_str(&activation.venue)
         .ok_or_else(|| anyhow::anyhow!("unsupported activation venue {}", activation.venue))?;
     let invalid_reason = state.permanently_invalid.clone();
-    let market_stale = market.is_stale(stale_us);
+    let observed_at_us = u64::try_from(observed_at.timestamp_micros()).unwrap_or_default();
+    let mut missing_marks = Vec::new();
+    let mut stale_marks = Vec::new();
+    for symbol in &activation.instruments {
+        let key = VenueSymbol::new(venue, Symbol::new(symbol.as_str()));
+        match market.get_orderbook(&key) {
+            Some(orderbook) if orderbook.get_mid_price().is_none() => {
+                missing_marks.push(symbol.clone());
+            }
+            Some(orderbook) if observed_at_us.saturating_sub(orderbook.timestamp) > stale_us => {
+                stale_marks.push(symbol.clone());
+            }
+            Some(_) => {}
+            None => missing_marks.push(symbol.clone()),
+        }
+    }
+    if invalid_reason.is_none() && !state.valuation_started {
+        if !stale_marks.is_empty() || !missing_marks.is_empty() {
+            return Ok(Vec::new());
+        }
+        state.valuation_started = true;
+    }
     let strategy_ids = state.targets.keys().cloned().collect::<Vec<_>>();
     let mut events = Vec::with_capacity(strategy_ids.len());
 
@@ -479,15 +502,28 @@ fn portfolio_attribution(
                 reason.clone(),
                 false,
             )?
-        } else if market_stale {
+        } else if !stale_marks.is_empty() {
             invalid_portfolio_attribution(
                 activation,
                 &target,
                 observed_at,
                 AttributionOutcome::Decayed,
                 format!(
-                    "market view is stale beyond {}us; gross/session metrics withheld",
-                    stale_us
+                    "stale mid price beyond {}us for activation instruments {}; gross/session metrics withheld",
+                    stale_us,
+                    stale_marks.join(",")
+                ),
+                false,
+            )?
+        } else if !missing_marks.is_empty() {
+            invalid_portfolio_attribution(
+                activation,
+                &target,
+                observed_at,
+                AttributionOutcome::Decayed,
+                format!(
+                    "missing mid price for activation instruments {}; gross/session metrics withheld",
+                    missing_marks.join(",")
                 ),
                 false,
             )?
@@ -882,9 +918,9 @@ fn execution_time(timestamp: u64) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deployment_envelope::ActivationArtifact;
     use engine::aggregation::TopNSnapshot;
     use hft_core::{OrderId, Price, Quantity, Side, Symbol, VenueId};
-    use hft_live::deployment_envelope::ActivationArtifact;
     use ports::{BookLevel, MarketSnapshot};
     use snapshot::SnapshotContainer;
 
@@ -950,16 +986,28 @@ mod tests {
 
     fn market_with_mid(quotes: &[(&str, f64)]) -> MarketView {
         let timestamp = Utc::now().timestamp_micros().max(0) as u64;
+        let timed_quotes = quotes
+            .iter()
+            .map(|(symbol, mid)| (*symbol, *mid, timestamp))
+            .collect::<Vec<_>>();
+        market_with_timed_mids(&timed_quotes)
+    }
+
+    fn market_with_timed_mids(quotes: &[(&str, f64, u64)]) -> MarketView {
         let mut market = MarketView {
             orderbooks: Default::default(),
             arbitrage_opportunities: Vec::new(),
-            timestamp,
+            timestamp: quotes
+                .iter()
+                .map(|(_, _, timestamp)| *timestamp)
+                .max()
+                .unwrap_or_default(),
             version: 1,
         };
-        for (symbol, mid) in quotes {
+        for (symbol, mid, timestamp) in quotes {
             let snapshot = MarketSnapshot {
                 symbol: Symbol::new(*symbol),
-                timestamp,
+                timestamp: *timestamp,
                 bids: vec![BookLevel::new(mid - 1.0, 1.0).unwrap()],
                 asks: vec![BookLevel::new(mid + 1.0, 1.0).unwrap()],
                 sequence: 1,
@@ -1469,9 +1517,73 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_snapshot_waits_for_initial_mark_coverage() {
+        let activation = activation();
+        let mut state = AttributionState::new(&activation).unwrap();
+
+        let events = snapshot_events(&activation, &mut state, &market_with_mid(&[]));
+        assert!(events.is_empty());
+
+        let events = snapshot_events(
+            &activation,
+            &mut state,
+            &market_with_mid(&[("BTCUSDT", 100.0)]),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, AttributionOutcome::Healthy);
+    }
+
+    #[test]
+    fn multi_instrument_portfolio_requires_each_mark_to_be_fresh() {
+        let activation = formula_activation(&["BTCUSDT", "ETHUSDT"]);
+        let mut state = AttributionState::new(&activation).unwrap();
+        let observed_at = Utc::now();
+        let now_us = observed_at.timestamp_micros().max(0) as u64;
+        let stale_us = 1_000;
+
+        let one_stale = market_with_timed_mids(&[
+            ("BTCUSDT", 100.0, now_us),
+            ("ETHUSDT", 50.0, now_us - stale_us - 1),
+        ]);
+        let events =
+            portfolio_attribution(&activation, &mut state, &one_stale, observed_at, stale_us)
+                .unwrap();
+        assert!(events.is_empty());
+
+        let complete =
+            market_with_timed_mids(&[("BTCUSDT", 100.0, now_us), ("ETHUSDT", 50.0, now_us)]);
+        let events =
+            portfolio_attribution(&activation, &mut state, &complete, observed_at, stale_us)
+                .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.outcome == AttributionOutcome::Healthy));
+
+        let events =
+            portfolio_attribution(&activation, &mut state, &one_stale, observed_at, stale_us)
+                .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event.outcome == AttributionOutcome::Decayed));
+        assert!(events.iter().all(|event| event
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("ETHUSDT"))));
+    }
+
+    #[test]
     fn portfolio_snapshot_decays_when_mark_is_missing() {
         let activation = activation();
         let mut state = AttributionState::new(&activation).unwrap();
+
+        let initial = snapshot_events(
+            &activation,
+            &mut state,
+            &market_with_mid(&[("BTCUSDT", 100.0)]),
+        );
+        assert_eq!(initial[0].outcome, AttributionOutcome::Healthy);
 
         execution_attribution(&activation, &mut state, &order_new("buy-1")).unwrap();
         execution_attribution(
@@ -1565,7 +1677,9 @@ mod tests {
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        let feedback_log = RuntimeFeedbackLog::open(&path).unwrap();
+        let feedback_key = ed25519_dalek::SigningKey::from_bytes(&[13_u8; 32]);
+        let feedback_log =
+            RuntimeFeedbackLog::open(&path, "runtime-feedback-1", feedback_key.clone()).unwrap();
         let observer = RuntimeAttributionObserver::new(
             execution_tx.subscribe(),
             market.reader(),
@@ -1589,10 +1703,18 @@ mod tests {
         shutdown_tx.send(()).unwrap();
         handle.await.unwrap().unwrap();
 
+        let trusted = BTreeMap::from([(
+            "runtime-feedback-1".to_string(),
+            feedback_key.verifying_key(),
+        )]);
         let events: Vec<RuntimeAttributionEvent> = std::fs::read_to_string(&path)
             .unwrap()
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .map(|line| {
+                let signed: alpha_domain::SignedRuntimeAttributionEvent =
+                    serde_json::from_str(line).unwrap();
+                alpha_domain::verify_runtime_attribution_event(&signed, &trusted).unwrap()
+            })
             .collect();
         assert!(events
             .iter()

@@ -11,13 +11,13 @@ LLM, GP, MCTS, Bayesian optimization, ML training, and offline RL remain outside
 The durable loop is:
 
 1. `LoopRun` defines the overall goal, completion policy, current stage, terminal reason, and child research missions. `ResearchMission::Completed` means only that its research-local criteria passed.
-2. A proposal engine emits a typed `CandidateArtifact` and evidence of budget use.
+2. Durable `LoopRun` execution accepts only MCTS or Bayesian proposal engines because they persist exact versioned engine state; each emits a typed `CandidateArtifact` plus budget evidence. GP, offline RL, and LLM remain standalone Lab missions.
 3. A deterministic evaluator returns a versioned report with trade count, net return, uncertainty, drawdown, and failure reasons.
 4. The kernel checkpoints every iteration, including versioned engine-specific search state, and stops only on research completion, pause, failure, or budget exhaustion.
 5. Repeated failures create immutable learning directives and bounded follow-up missions.
 6. Promotion binds the candidate, dataset manifest, evaluator version, sealed result, and approval state into one content-addressed `StrategyBundle`.
 7. `hft-live` verifies and loads that exact bundle before runtime construction. Paper and shadow may activate automatically; live-small remains disabled.
-8. Execution events and portfolio snapshots produce append-only attribution tied to deployment, bundle, strategy, mission, and asset revision.
+8. Execution events and portfolio snapshots produce per-record signed append-only attribution tied to deployment, bundle, strategy, mission, and asset revision. Research ingestion verifies the runtime feedback key before accepting evidence.
 9. Attribution may change future lab search policy only after deterministic validation. The adopted child policy is pinned by the next mission. It never changes runtime hard caps.
 
 `LoopRun` advances through explicit stage records: `researching`, `walkforward_kept`, `holdout_passed`, `paper_healthy`, `shadow_healthy`, and `live_small_eligible`. A run completes only when its declared target stage is reached; candidate count or budget exhaustion is never a success heuristic.
@@ -38,7 +38,7 @@ The durable loop is:
 
 ### Runtime plane
 
-- Owns trusted keys, nonce ledger, account state, risk caps, OMS, execution, reconciliation, emergency cancellation, and attribution.
+- Owns trusted keys, an independent approval policy, the feedback signing key, nonce ledger, account state, risk caps, OMS, execution, reconciliation, emergency cancellation, and attribution.
 - Calculates `effective_limit = min(agent_request, strategy_cap, account_cap, venue_cap, global_hard_cap)`.
 - Fails closed on unknown balances, positions, open orders, unsupported reconciliation, stale data, or invalid deployment state.
 - Keeps pause, degrade, and emergency-stop controls directly available. Resume, model load, strategy replacement, and risk increases require the same validated deployment/approval path.
@@ -50,13 +50,14 @@ The runtime-loadable bundle schema supports artifacts the Rust runtime can execu
 - `Formula`: validated Factor DSL plus live feature mapping, signal threshold, order size request, and strategy risk request.
 - `OnnxModel`: content-addressed model artifact plus existing deterministic DL strategy configuration.
 
-The current governed evaluator and promotion producer is Formula-only. `OnnxModel` remains a research/runtime-compatibility artifact until a point-in-time ONNX evaluator and training lineage are implemented; it cannot be produced by the v2 promotion path. Other candidate variants remain research-only and cannot be signed. Model files are not embedded; the bundle schema includes path/URI, SHA-256, size, and schema/version metadata.
+The current governed evaluator and promotion producer is Formula-only. `OnnxModel` remains a research/runtime-compatibility artifact until a point-in-time ONNX evaluator and training lineage are implemented; it cannot be produced by the v2 promotion path. Other candidate variants remain research-only and cannot be signed. Model files are not embedded; the bundle schema includes a bundle-relative contained path, SHA-256, size, and schema/version metadata. Absolute, URI, parent-traversal, and symlink escape paths fail closed.
 
 ## Accounting And Execution Safety
 
 - Portfolio accounting handles opening, increasing, reducing, closing, and crossing long/short positions using exact decimals.
 - Realized PnL is recorded only for the closed quantity. Unrealized PnL uses signed quantity and current mark.
 - Drawdown is based on account equity and an initialized equity high-water mark.
+- Portfolio health evidence starts only after every activation instrument has a present, venue-matched, non-stale mark. After startup, one missing or stale instrument decays the deployment rather than allowing another instrument's fresh timestamp to mask it.
 - Emergency mode pauses new intents and sends cancellation commands for every locally open order. Automatic flattening is not claimed until reduce-only semantics exist for every enabled venue.
 - Reconciliation detects exchange-only, local-only, status/quantity mismatches, balance failures, and client errors. Unknown state halts live execution.
 
@@ -84,10 +85,10 @@ The current governed evaluator and promotion producer is Formula-only. `OnnxMode
 5. Emergency action sends cancellation commands and rejects subsequent intents.
 6. Reconciliation errors halt live execution instead of returning success or empty state.
 7. A zero-signal or no-trade candidate fails evaluation.
-8. Promotion cannot sign an envelope that is not bound to its persisted candidate, evaluation, dataset, bundle, and approval.
+8. Promotion cannot sign an envelope that is not bound to its persisted candidate, evaluation, dataset, bundle, and approval; runtime independently resolves the approval id to exact class, subject, scope, signer, and active window.
 9. Paper/shadow activation loads the referenced Formula v2 strategy before runtime build; ONNX runtime loading remains compatibility-tested but is not a governed promotion claim.
 10. Activation is reported only after runtime start succeeds.
-11. Fill/reject/cancel/PnL attribution is non-empty and tied to deployment and strategy bundle.
+11. Fill/reject/cancel/PnL attribution is non-empty, signed by a runtime-only key, verified before ingestion, and tied to deployment and strategy bundle.
 12. Research mission completion uses explicit criteria and persists a completion reason; overall `LoopRun` completion uses a target stage.
 13. MCTS/Bayesian checkpoint-resume restores versioned search state rather than only usage counters.
 14. Learning directives retain source evidence, pin an adopted child policy into the next mission, and cannot mutate runtime limits.
@@ -97,4 +98,4 @@ The current governed evaluator and promotion producer is Formula-only. `OnnxMode
 
 ## Loop Engineer Verdict
 
-The architecture becomes a bounded Loop Engineer after criteria 7-15 pass: it then pursues explicit staged goals, evaluates its own evidence, retains failures, resumes exact search state, and changes future research behavior. It is not a self-authorizing trader. Capital authority, hard limits, emergency control, and artifact loading remain deterministic Rust responsibilities.
+The architecture becomes a bounded Loop Engineer after criteria 7-15 pass: it then pursues explicit staged goals, evaluates its own evidence, retains failures, resumes exact MCTS/Bayesian search state, and changes future research behavior. It is not a self-authorizing trader. Capital authority, hard limits, emergency control, and artifact loading remain deterministic Rust responsibilities.

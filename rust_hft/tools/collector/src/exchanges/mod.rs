@@ -43,26 +43,12 @@ impl DepthMode {
         }
     }
 
-    #[cfg_attr(
-        not(any(
-            feature = "collector-binance",
-            feature = "collector-binance-futures",
-            feature = "collector-okx"
-        )),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(feature = "collector-binance-futures"), allow(dead_code))]
     pub fn include_limited(self) -> bool {
         matches!(self, DepthMode::Limited | DepthMode::Both)
     }
 
-    #[cfg_attr(
-        not(any(
-            feature = "collector-binance",
-            feature = "collector-binance-futures",
-            feature = "collector-okx"
-        )),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(feature = "collector-binance-futures"), allow(dead_code))]
     pub fn include_incremental(self) -> bool {
         matches!(self, DepthMode::Incremental | DepthMode::Both)
     }
@@ -70,14 +56,7 @@ impl DepthMode {
 
 #[derive(Clone, Debug)]
 pub struct ExchangeContext {
-    #[cfg_attr(
-        not(any(
-            feature = "collector-binance",
-            feature = "collector-binance-futures",
-            feature = "collector-okx"
-        )),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(feature = "collector-binance-futures"), allow(dead_code))]
     pub depth_mode: DepthMode,
     #[cfg_attr(
         not(any(

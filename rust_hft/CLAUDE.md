@@ -3,7 +3,7 @@
 
 This workspace has two trust domains:
 
-- `alpha-harness/*` is the cold Agentic Alpha research/control plane.
+- `alpha-harness/*` is the cold bounded Loop Engineer research/control plane.
 - `apps/live`, runtime, risk, OMS, and execution adapters own actuation.
 
 Never add execution-adapter dependencies or order commands to `alpha-harness`. LLM/RL/MCTS/GP outputs are candidate artifacts, not executable trading instructions.
@@ -28,7 +28,7 @@ cargo test -p alpha-store --locked
 cargo test -p alpha-engine --locked
 cargo test -p alpha-harness --locked
 cargo test -p hft-live --no-default-features --test deployment_envelope --locked
-cargo check -p hft-collector --locked
+cargo clippy -p hft-collector --all-targets --features collector-binance --no-deps --locked -- -D warnings
 ```
 
 Run `cargo metadata --locked --no-deps` after package additions or removals. Use release/full graph checks only in release work.

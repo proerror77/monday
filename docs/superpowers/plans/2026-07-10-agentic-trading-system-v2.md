@@ -1,5 +1,7 @@
 # Agentic Trading System v2 Implementation Plan
 
+> **Superseded:** retained for implementation history. Use the [2026-07-11 production-hardening plan](2026-07-11-loop-engineer-production-hardening.md) for current work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the demo research/control plane with a persistent Rust-first AutoResearch harness while keeping all order execution inside the existing Rust live runtime.
