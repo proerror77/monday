@@ -1,6 +1,7 @@
 mod cli;
 mod data_mission;
 mod governance;
+mod loop_control;
 mod mission;
 
 use clap::Parser;

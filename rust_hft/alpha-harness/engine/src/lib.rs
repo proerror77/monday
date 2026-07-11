@@ -7,7 +7,8 @@ pub mod learning;
 pub mod llm;
 
 use alpha_domain::{
-    CandidateArtifact, EngineKind, IterationVerdict, MissionStatus, ResearchIteration,
+    CandidateArtifact, EngineKind, IterationVerdict, MissionStatus, MissionTerminalReason,
+    ResearchIteration, SearchBudgetLimit,
 };
 use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RunCheckpoint, StoreError};
 use chrono::Utc;
@@ -25,6 +26,8 @@ pub enum EngineError {
     Proposal(String),
     #[error("candidate evaluator failed: {0}")]
     Evaluation(String),
+    #[error("engine checkpoint failed: {0}")]
+    Checkpoint(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,6 +46,13 @@ pub struct HistoricalObservation {
     pub evaluation: CandidateEvaluation,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProposalEngineCheckpoint {
+    pub kind: EngineKind,
+    pub version: u32,
+    pub state: serde_json::Value,
+}
+
 pub trait ProposalEngine {
     fn kind(&self) -> EngineKind;
     fn propose(
@@ -55,11 +65,39 @@ pub trait ProposalEngine {
 
     fn observe(&mut self, _proposal: &EngineProposal, _evaluation: &CandidateEvaluation) {}
 
+    fn abandon(&mut self, _proposal: &EngineProposal) {}
+
     fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
         for observation in observations {
             self.observe(&observation.proposal, &observation.evaluation);
         }
         Ok(())
+    }
+
+    fn checkpoint(&self) -> Result<ProposalEngineCheckpoint, String> {
+        Ok(ProposalEngineCheckpoint {
+            kind: self.kind(),
+            version: 1,
+            state: serde_json::json!({"mode": "history_replay"}),
+        })
+    }
+
+    fn restore_checkpoint(
+        &mut self,
+        checkpoint: &ProposalEngineCheckpoint,
+        observations: &[HistoricalObservation],
+    ) -> Result<(), String> {
+        if checkpoint.kind != self.kind()
+            || checkpoint.version != 1
+            || checkpoint
+                .state
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                != Some("history_replay")
+        {
+            return Err("proposal engine checkpoint kind, version, or mode mismatch".to_string());
+        }
+        self.restore(observations)
     }
 }
 
@@ -85,8 +123,24 @@ where
         (**self).observe(proposal, evaluation);
     }
 
+    fn abandon(&mut self, proposal: &EngineProposal) {
+        (**self).abandon(proposal);
+    }
+
     fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
         (**self).restore(observations)
+    }
+
+    fn checkpoint(&self) -> Result<ProposalEngineCheckpoint, String> {
+        (**self).checkpoint()
+    }
+
+    fn restore_checkpoint(
+        &mut self,
+        checkpoint: &ProposalEngineCheckpoint,
+        observations: &[HistoricalObservation],
+    ) -> Result<(), String> {
+        (**self).restore_checkpoint(checkpoint, observations)
     }
 }
 
@@ -122,6 +176,7 @@ pub struct RunControl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
     pub status: MissionStatus,
+    pub terminal_reason: Option<MissionTerminalReason>,
     pub total_iterations: usize,
     pub new_iterations: usize,
 }
@@ -154,28 +209,43 @@ where
         let now = Utc::now();
         let mission = self.store.get_mission(mission_id)?;
         match mission.status {
-            MissionStatus::Pending | MissionStatus::Paused => {
-                self.store
-                    .transition_mission(mission_id, MissionStatus::Running, now)?;
-            }
-            MissionStatus::Running => {}
+            MissionStatus::Pending | MissionStatus::Paused | MissionStatus::Running => {}
             MissionStatus::Completed | MissionStatus::BudgetExhausted | MissionStatus::Failed => {
                 return Err(EngineError::TerminalMission)
             }
         }
 
         let lineage = self.store.mission_lineage(mission_id)?;
-        let mut usage = lineage
+        let checkpoint = match self.store.get_checkpoint(mission_id) {
+            Ok(checkpoint) => Some(checkpoint),
+            Err(StoreError::NotFound) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let expected_last_iteration = lineage
             .iterations
             .last()
-            .map(|iteration| iteration.budget_usage.clone())
-            .or_else(|| {
-                self.store
-                    .get_checkpoint(mission_id)
-                    .ok()
-                    .map(|value| value.budget_usage)
-            })
+            .map(|iteration| iteration.iteration_id.as_str());
+        if checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.last_iteration_id.as_deref() != expected_last_iteration
+        }) || (checkpoint.is_none() && expected_last_iteration.is_some())
+        {
+            return Err(EngineError::Checkpoint(
+                "checkpoint lineage does not match the persisted iterations".to_string(),
+            ));
+        }
+        let mut usage = checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.budget_usage.clone())
             .unwrap_or_default();
+        if lineage
+            .iterations
+            .last()
+            .is_some_and(|iteration| iteration.budget_usage != usage)
+        {
+            return Err(EngineError::Checkpoint(
+                "checkpoint budget does not match the last iteration".to_string(),
+            ));
+        }
         let mut total_iterations = lineage.iterations.len();
         let mut kept = lineage
             .iterations
@@ -183,9 +253,29 @@ where
             .filter(|iteration| iteration.verdict == IterationVerdict::Keep)
             .count();
         let historical = historical_observations(&lineage, &self.proposal_engine.kind())?;
-        self.proposal_engine
-            .restore(&historical)
-            .map_err(EngineError::Proposal)?;
+        if let Some(checkpoint) = &checkpoint {
+            self.proposal_engine
+                .restore_checkpoint(
+                    &ProposalEngineCheckpoint {
+                        kind: checkpoint.engine_kind.clone(),
+                        version: checkpoint.engine_version,
+                        state: checkpoint.engine_state.clone(),
+                    },
+                    &historical,
+                )
+                .map_err(EngineError::Checkpoint)?;
+        } else {
+            self.proposal_engine
+                .restore(&historical)
+                .map_err(EngineError::Proposal)?;
+        }
+        if matches!(
+            mission.status,
+            MissionStatus::Pending | MissionStatus::Paused
+        ) {
+            self.store
+                .transition_mission(mission_id, MissionStatus::Running, now)?;
+        }
         let mut seen_artifacts = lineage
             .candidates
             .iter()
@@ -194,6 +284,20 @@ where
             .map_err(|error| EngineError::Evaluation(error.to_string()))?;
         let mut new_iterations = 0;
         let context = dataset.engine_context();
+
+        if kept >= mission.completion_policy.min_kept_candidates {
+            let reason = MissionTerminalReason::CompletionPolicySatisfied {
+                kept_candidates: kept,
+            };
+            self.store
+                .finish_mission(mission_id, reason.clone(), Utc::now())?;
+            return Ok(RunOutcome {
+                status: MissionStatus::Completed,
+                terminal_reason: Some(reason),
+                total_iterations,
+                new_iterations,
+            });
+        }
 
         while !budget_exhausted(&mission.search_budget, &usage) {
             if control
@@ -204,6 +308,7 @@ where
                     .transition_mission(mission_id, MissionStatus::Paused, Utc::now())?;
                 return Ok(RunOutcome {
                     status: MissionStatus::Paused,
+                    terminal_reason: None,
                     total_iterations,
                     new_iterations,
                 });
@@ -284,6 +389,7 @@ where
                             )
                         }
                         Err(error) => {
+                            self.proposal_engine.abandon(&proposal);
                             let candidate_id = is_novel.then(|| proposal.candidate_id.clone());
                             let candidate =
                                 is_novel.then_some((proposal.candidate_id, proposal.artifact));
@@ -335,32 +441,57 @@ where
                 }
             };
 
-            self.store.append_iteration(
+            let engine_checkpoint = self
+                .proposal_engine
+                .checkpoint()
+                .map_err(EngineError::Checkpoint)?;
+            if engine_checkpoint.kind != iteration.engine || engine_checkpoint.version == 0 {
+                return Err(EngineError::Checkpoint(
+                    "proposal engine returned an invalid checkpoint envelope".to_string(),
+                ));
+            }
+            let checkpoint = RunCheckpoint {
+                mission_id: mission_id.to_string(),
+                last_iteration_id: Some(iteration.iteration_id.clone()),
+                budget_usage: usage.clone(),
+                engine_kind: engine_checkpoint.kind,
+                engine_version: engine_checkpoint.version,
+                engine_state: engine_checkpoint.state,
+                updated_at: created_at,
+            };
+            self.store.append_iteration_with_checkpoint(
                 &iteration,
                 candidate
                     .as_ref()
                     .map(|(candidate_id, artifact)| (candidate_id.as_str(), artifact)),
                 evaluation.as_ref(),
+                &checkpoint,
             )?;
-            self.store.save_checkpoint(&RunCheckpoint {
-                mission_id: mission_id.to_string(),
-                last_iteration_id: Some(iteration.iteration_id.clone()),
-                budget_usage: usage.clone(),
-                updated_at: created_at,
-            })?;
             total_iterations += 1;
             new_iterations += 1;
+            if kept >= mission.completion_policy.min_kept_candidates {
+                let reason = MissionTerminalReason::CompletionPolicySatisfied {
+                    kept_candidates: kept,
+                };
+                self.store
+                    .finish_mission(mission_id, reason.clone(), Utc::now())?;
+                return Ok(RunOutcome {
+                    status: MissionStatus::Completed,
+                    terminal_reason: Some(reason),
+                    total_iterations,
+                    new_iterations,
+                });
+            }
         }
 
-        let status = if kept > 0 {
-            MissionStatus::Completed
-        } else {
-            MissionStatus::BudgetExhausted
+        let reason = MissionTerminalReason::SearchBudgetExhausted {
+            exhausted_limits: exhausted_budget_limits(&mission.search_budget, &usage),
         };
         self.store
-            .transition_mission(mission_id, status.clone(), Utc::now())?;
+            .finish_mission(mission_id, reason.clone(), Utc::now())?;
         Ok(RunOutcome {
-            status,
+            status: MissionStatus::BudgetExhausted,
+            terminal_reason: Some(reason),
             total_iterations,
             new_iterations,
         })
@@ -423,6 +554,26 @@ fn budget_exhausted(
         || (budget.max_seconds > 0 && usage.elapsed_ms >= budget.max_seconds.saturating_mul(1_000))
 }
 
+fn exhausted_budget_limits(
+    budget: &alpha_domain::SearchBudget,
+    usage: &alpha_domain::SearchBudgetUsage,
+) -> Vec<SearchBudgetLimit> {
+    let mut limits = Vec::new();
+    if usage.candidates >= budget.max_candidates {
+        limits.push(SearchBudgetLimit::Candidates);
+    }
+    if budget.max_expansions > 0 && usage.expansions >= budget.max_expansions {
+        limits.push(SearchBudgetLimit::Expansions);
+    }
+    if budget.max_tokens > 0 && usage.tokens >= budget.max_tokens {
+        limits.push(SearchBudgetLimit::Tokens);
+    }
+    if budget.max_seconds > 0 && usage.elapsed_ms >= budget.max_seconds.saturating_mul(1_000) {
+        limits.push(SearchBudgetLimit::Time);
+    }
+    limits
+}
+
 fn remaining_budget(
     budget: &alpha_domain::SearchBudget,
     usage: &alpha_domain::SearchBudgetUsage,
@@ -451,7 +602,7 @@ mod tests {
         OfflineTrace,
     };
     use crate::evaluation::{prepare_dataset, ResearchRow, WalkForwardConfig};
-    use alpha_domain::{ResearchMission, SearchBudget, ValidatorMode};
+    use alpha_domain::{MissionCompletionPolicy, ResearchMission, SearchBudget, ValidatorMode};
     use chrono::Duration;
     use hft_research_manifest::ManifestId;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -527,9 +678,13 @@ mod tests {
                 max_tokens: 0,
                 max_seconds: 30,
             },
+            completion_policy: MissionCompletionPolicy {
+                min_kept_candidates: 3,
+            },
             prompt_snapshot_id: None,
             search_policy_snapshot_id: "policy-1".to_string(),
             status: MissionStatus::Pending,
+            terminal_reason: None,
             created_at: now,
             updated_at: now,
         }
@@ -602,6 +757,71 @@ mod tests {
     }
 
     #[test]
+    fn completion_policy_stops_search_before_budget_exhaustion() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let mut mission = mission();
+        mission.completion_policy.min_kept_candidates = 1;
+        store.create_mission(&mission).unwrap();
+        let outcome = AutoResearchKernel::new(
+            &mut store,
+            CountingEngine {
+                calls: calls.clone(),
+                crash: false,
+            },
+            PassingEvaluator,
+        )
+        .run("mission-1", &dataset(), RunControl::default())
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.status, MissionStatus::Completed);
+        assert_eq!(
+            outcome.terminal_reason,
+            Some(MissionTerminalReason::CompletionPolicySatisfied { kept_candidates: 1 })
+        );
+        assert_eq!(
+            store.get_mission("mission-1").unwrap().terminal_reason,
+            outcome.terminal_reason
+        );
+    }
+
+    #[test]
+    fn resume_rejects_engine_kind_change_before_mission_state_transition() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        AutoResearchKernel::new(
+            &mut store,
+            CountingEngine {
+                calls: Arc::new(AtomicUsize::new(0)),
+                crash: false,
+            },
+            PassingEvaluator,
+        )
+        .run(
+            "mission-1",
+            &dataset(),
+            RunControl {
+                max_new_iterations: Some(1),
+            },
+        )
+        .unwrap();
+
+        let error = AutoResearchKernel::new(
+            &mut store,
+            GeneticProgrammingEngine::new(7, vec!["signal".to_string()], 4, 3).unwrap(),
+            PassingEvaluator,
+        )
+        .run("mission-1", &dataset(), RunControl::default())
+        .unwrap_err();
+        assert!(matches!(error, EngineError::Checkpoint(_)));
+        assert_eq!(
+            store.get_mission("mission-1").unwrap().status,
+            MissionStatus::Paused
+        );
+    }
+
+    #[test]
     fn proposal_crashes_remain_queryable() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut store = AlphaStore::open_in_memory().unwrap();
@@ -626,6 +846,7 @@ mod tests {
         let mut mission = mission();
         mission.search_budget.max_candidates = 4;
         mission.search_budget.max_expansions = 50;
+        mission.completion_policy.min_kept_candidates = 4;
         store.create_mission(&mission).unwrap();
         {
             let engine =
@@ -719,6 +940,49 @@ mod tests {
             OfflineRlEngine::train("oi", "policy-1", &traces, 3, 0.2, 0.9, 20).unwrap()
         )
         .is_empty());
+    }
+
+    #[test]
+    fn mcts_kernel_resume_matches_uninterrupted_run() {
+        fn candidates(split_after: Option<usize>) -> Vec<String> {
+            let mut store = AlphaStore::open_in_memory().unwrap();
+            let mut mission = mission();
+            mission.search_budget.max_candidates = 4;
+            mission.search_budget.max_expansions = 100;
+            mission.completion_policy.min_kept_candidates = 4;
+            store.create_mission(&mission).unwrap();
+            if let Some(limit) = split_after {
+                AutoResearchKernel::new(
+                    &mut store,
+                    MctsEngine::new(9, "signal", "signal", 1.4, 4).unwrap(),
+                    PassingEvaluator,
+                )
+                .run(
+                    "mission-1",
+                    &dataset(),
+                    RunControl {
+                        max_new_iterations: Some(limit),
+                    },
+                )
+                .unwrap();
+            }
+            AutoResearchKernel::new(
+                &mut store,
+                MctsEngine::new(9, "signal", "signal", 1.4, 4).unwrap(),
+                PassingEvaluator,
+            )
+            .run("mission-1", &dataset(), RunControl::default())
+            .unwrap();
+            store
+                .mission_lineage("mission-1")
+                .unwrap()
+                .candidates
+                .into_iter()
+                .map(|candidate| serde_json::to_string(&candidate.artifact).unwrap())
+                .collect()
+        }
+
+        assert_eq!(candidates(Some(2)), candidates(None));
     }
 
     fn run_single_engine<P: ProposalEngine>(engine: P) -> String {

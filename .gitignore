@@ -91,6 +91,7 @@ download_log.txt
 **/*.p12
 **/*.pfx
 **/*.crt
+**/*.integrity-key
 config/.env.shared
 config/.env.unified
 rust_hft/config/secrets.yaml

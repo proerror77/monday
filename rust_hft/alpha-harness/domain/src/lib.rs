@@ -11,6 +11,7 @@ use thiserror::Error;
 
 pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
+pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v1";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -20,6 +21,12 @@ pub enum DomainError {
     InvalidSearchBudget,
     #[error("invalid mission status transition")]
     InvalidMissionTransition,
+    #[error("mission completion policy is invalid")]
+    InvalidMissionCompletionPolicy,
+    #[error("mission terminal reason does not match its status or policy")]
+    InvalidMissionTerminalReason,
+    #[error("loop run is invalid")]
+    InvalidLoopRun,
     #[error("deployment limits must be finite and non-negative")]
     InvalidDeploymentLimit,
     #[error("deployment hashes must be lowercase SHA-256 values")]
@@ -48,6 +55,8 @@ pub enum DomainError {
     CanonicalSerialization,
     #[error("runtime attribution metrics must be finite")]
     InvalidAttributionMetric,
+    #[error("runtime attribution outcome does not match its event kind")]
+    InvalidAttributionOutcome,
     #[error("search-policy validator scores must be finite")]
     InvalidPolicyScore,
     #[error("candidate artifact is research-only and cannot be promoted")]
@@ -83,10 +92,60 @@ impl MissionStatus {
             (Self::Pending, Self::Running)
                 | (Self::Running, Self::Paused)
                 | (Self::Paused, Self::Running)
-                | (Self::Running, Self::Completed)
-                | (Self::Running, Self::BudgetExhausted)
-                | (Self::Running, Self::Failed)
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionCompletionPolicy {
+    pub min_kept_candidates: usize,
+}
+
+impl Default for MissionCompletionPolicy {
+    fn default() -> Self {
+        Self {
+            min_kept_candidates: 1,
+        }
+    }
+}
+
+impl MissionCompletionPolicy {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.min_kept_candidates == 0 {
+            return Err(DomainError::InvalidMissionCompletionPolicy);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchBudgetLimit {
+    Candidates,
+    Expansions,
+    Tokens,
+    Time,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MissionTerminalReason {
+    CompletionPolicySatisfied {
+        kept_candidates: usize,
+    },
+    SearchBudgetExhausted {
+        exhausted_limits: Vec<SearchBudgetLimit>,
+    },
+    Failed {
+        code: String,
+    },
+}
+
+impl MissionTerminalReason {
+    pub fn status(&self) -> MissionStatus {
+        match self {
+            Self::CompletionPolicySatisfied { .. } => MissionStatus::Completed,
+            Self::SearchBudgetExhausted { .. } => MissionStatus::BudgetExhausted,
+            Self::Failed { .. } => MissionStatus::Failed,
+        }
     }
 }
 
@@ -120,9 +179,13 @@ pub struct ResearchMission {
     pub validation_mode: ValidatorMode,
     pub validator_spec: serde_json::Value,
     pub search_budget: SearchBudget,
+    #[serde(default)]
+    pub completion_policy: MissionCompletionPolicy,
     pub prompt_snapshot_id: Option<String>,
     pub search_policy_snapshot_id: String,
     pub status: MissionStatus,
+    #[serde(default)]
+    pub terminal_reason: Option<MissionTerminalReason>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -138,7 +201,9 @@ impl ResearchMission {
         {
             return Err(DomainError::EmptyField("mutable_scope"));
         }
-        self.search_budget.validate()
+        self.search_budget.validate()?;
+        self.completion_policy.validate()?;
+        self.validate_terminal_state()
     }
 
     pub fn transition_to(
@@ -152,6 +217,244 @@ impl ResearchMission {
         self.status = next;
         self.updated_at = at;
         Ok(())
+    }
+
+    pub fn finish(
+        &mut self,
+        reason: MissionTerminalReason,
+        at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        if self.status != MissionStatus::Running {
+            return Err(DomainError::InvalidMissionTransition);
+        }
+        validate_mission_terminal_reason(&self.completion_policy, &reason)?;
+        self.status = reason.status();
+        self.terminal_reason = Some(reason);
+        self.updated_at = at;
+        Ok(())
+    }
+
+    fn validate_terminal_state(&self) -> Result<(), DomainError> {
+        match (&self.status, &self.terminal_reason) {
+            (MissionStatus::Pending | MissionStatus::Running | MissionStatus::Paused, None) => {
+                Ok(())
+            }
+            (status, Some(reason)) if *status == reason.status() => {
+                validate_mission_terminal_reason(&self.completion_policy, reason)
+            }
+            _ => Err(DomainError::InvalidMissionTerminalReason),
+        }
+    }
+}
+
+fn validate_mission_terminal_reason(
+    policy: &MissionCompletionPolicy,
+    reason: &MissionTerminalReason,
+) -> Result<(), DomainError> {
+    match reason {
+        MissionTerminalReason::CompletionPolicySatisfied { kept_candidates }
+            if *kept_candidates >= policy.min_kept_candidates =>
+        {
+            Ok(())
+        }
+        MissionTerminalReason::SearchBudgetExhausted { exhausted_limits }
+            if !exhausted_limits.is_empty() =>
+        {
+            Ok(())
+        }
+        MissionTerminalReason::Failed { code } if !code.trim().is_empty() => Ok(()),
+        _ => Err(DomainError::InvalidMissionTerminalReason),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoopTargetStage {
+    Researching,
+    WalkForwardKept,
+    HoldoutPassed,
+    PaperHealthy,
+    ShadowHealthy,
+    LiveSmallEligible,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopCompletionPolicy {
+    pub target_stage: LoopTargetStage,
+    pub max_research_missions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoopRunStatus {
+    Pending,
+    Running,
+    Paused,
+    Completed,
+    BudgetExhausted,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoopStage {
+    Researching,
+    WalkForwardKept,
+    HoldoutPassed,
+    PaperHealthy,
+    ShadowHealthy,
+    LiveSmallEligible,
+    Learning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoopStageStatus {
+    Completed,
+    Paused,
+    BudgetExhausted,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopStageRecord {
+    pub record_id: String,
+    pub mission_id: String,
+    pub stage: LoopStage,
+    pub status: LoopStageStatus,
+    pub reason: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LoopStopReason {
+    TargetStageReached {
+        mission_id: String,
+        stage: LoopTargetStage,
+    },
+    AwaitingEvidence {
+        mission_id: String,
+        stage: LoopTargetStage,
+    },
+    MissionPaused {
+        mission_id: String,
+    },
+    ResearchBudgetExhausted {
+        mission_id: String,
+    },
+    MissionFailed {
+        mission_id: String,
+        code: String,
+    },
+    MissionLimitReached {
+        attempted: usize,
+    },
+}
+
+impl LoopStopReason {
+    pub fn status(&self) -> LoopRunStatus {
+        match self {
+            Self::TargetStageReached { .. } => LoopRunStatus::Completed,
+            Self::AwaitingEvidence { .. } | Self::MissionPaused { .. } => LoopRunStatus::Paused,
+            Self::ResearchBudgetExhausted { .. } | Self::MissionLimitReached { .. } => {
+                LoopRunStatus::BudgetExhausted
+            }
+            Self::MissionFailed { .. } => LoopRunStatus::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopRun {
+    pub loop_run_id: String,
+    pub root_mission_id: String,
+    pub completion_policy: LoopCompletionPolicy,
+    pub child_mission_ids: Vec<String>,
+    pub stage_records: Vec<LoopStageRecord>,
+    pub status: LoopRunStatus,
+    pub stop_reason: Option<LoopStopReason>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl LoopRun {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text("loop_run_id", &self.loop_run_id)?;
+        require_text("loop root_mission_id", &self.root_mission_id)?;
+        if self.completion_policy.max_research_missions == 0
+            || self
+                .child_mission_ids
+                .iter()
+                .any(|mission_id| mission_id.trim().is_empty())
+            || self
+                .child_mission_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.child_mission_ids.len()
+        {
+            return Err(DomainError::InvalidLoopRun);
+        }
+        let mut record_ids = std::collections::BTreeSet::new();
+        for record in &self.stage_records {
+            if record.record_id.trim().is_empty()
+                || record.mission_id.trim().is_empty()
+                || record.reason.trim().is_empty()
+                || !record_ids.insert(&record.record_id)
+                || (record.mission_id != self.root_mission_id
+                    && !self.child_mission_ids.contains(&record.mission_id))
+            {
+                return Err(DomainError::InvalidLoopRun);
+            }
+        }
+        match (&self.status, &self.stop_reason) {
+            (LoopRunStatus::Pending | LoopRunStatus::Running, None) => Ok(()),
+            (status, Some(reason)) if *status == reason.status() => Ok(()),
+            _ => Err(DomainError::InvalidLoopRun),
+        }
+    }
+
+    pub fn start(&mut self, at: DateTime<Utc>) -> Result<(), DomainError> {
+        if !matches!(self.status, LoopRunStatus::Pending | LoopRunStatus::Paused) {
+            return Err(DomainError::InvalidLoopRun);
+        }
+        self.status = LoopRunStatus::Running;
+        self.stop_reason = None;
+        self.updated_at = at;
+        self.validate()
+    }
+
+    pub fn add_child_mission(&mut self, mission_id: String) -> Result<(), DomainError> {
+        require_text("loop child mission_id", &mission_id)?;
+        if mission_id == self.root_mission_id {
+            return Err(DomainError::InvalidLoopRun);
+        }
+        if !self.child_mission_ids.contains(&mission_id) {
+            self.child_mission_ids.push(mission_id);
+            if let Err(error) = self.validate() {
+                self.child_mission_ids.pop();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn append_stage(&mut self, record: LoopStageRecord) -> Result<(), DomainError> {
+        if self.status != LoopRunStatus::Running {
+            return Err(DomainError::InvalidLoopRun);
+        }
+        self.stage_records.push(record);
+        if let Err(error) = self.validate() {
+            self.stage_records.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn stop(&mut self, reason: LoopStopReason, at: DateTime<Utc>) -> Result<(), DomainError> {
+        if self.status != LoopRunStatus::Running {
+            return Err(DomainError::InvalidLoopRun);
+        }
+        self.status = reason.status();
+        self.stop_reason = Some(reason);
+        self.updated_at = at;
+        self.validate()
     }
 }
 
@@ -181,6 +484,17 @@ pub enum AttributionOutcome {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AttributionKind {
+    #[default]
+    Activation,
+    Fill,
+    Reject,
+    Cancel,
+    PortfolioSnapshot,
+    StreamGap,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeAttributionEvent {
     pub event_id: String,
@@ -189,6 +503,18 @@ pub struct RuntimeAttributionEvent {
     pub mission_id: Option<String>,
     pub mode: AttributionMode,
     pub outcome: AttributionOutcome,
+    #[serde(default)]
+    pub kind: AttributionKind,
+    #[serde(default)]
+    pub strategy_id: Option<String>,
+    #[serde(default)]
+    pub order_id: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub venue: Option<String>,
+    #[serde(default)]
+    pub symbol: Option<String>,
     pub metrics: BTreeMap<String, f64>,
     pub reason: Option<String>,
     pub observed_at: DateTime<Utc>,
@@ -202,7 +528,55 @@ impl RuntimeAttributionEvent {
         if self.metrics.values().any(|value| !value.is_finite()) {
             return Err(DomainError::InvalidAttributionMetric);
         }
-        Ok(())
+        for value in [
+            self.strategy_id.as_deref(),
+            self.order_id.as_deref(),
+            self.account_id.as_deref(),
+            self.venue.as_deref(),
+            self.symbol.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.trim().is_empty() {
+                return Err(DomainError::EmptyField("attribution scope"));
+            }
+        }
+        match self.kind {
+            AttributionKind::Fill | AttributionKind::Reject | AttributionKind::Cancel
+                if self.strategy_id.is_none()
+                    || self.order_id.is_none()
+                    || self.account_id.is_none()
+                    || self.venue.is_none()
+                    || self.symbol.is_none() =>
+            {
+                return Err(DomainError::EmptyField("attribution order scope"));
+            }
+            AttributionKind::PortfolioSnapshot
+                if self.strategy_id.is_none()
+                    || self.account_id.is_none()
+                    || self.venue.is_none() =>
+            {
+                return Err(DomainError::EmptyField("attribution portfolio scope"));
+            }
+            AttributionKind::StreamGap if self.reason.as_deref().is_none_or(str::is_empty) => {
+                return Err(DomainError::EmptyField("attribution stream gap reason"));
+            }
+            _ => {}
+        }
+        match (&self.kind, &self.outcome) {
+            (AttributionKind::Fill | AttributionKind::Cancel, AttributionOutcome::Healthy)
+            | (AttributionKind::Reject | AttributionKind::StreamGap, AttributionOutcome::Failed)
+            | (
+                AttributionKind::PortfolioSnapshot,
+                AttributionOutcome::Healthy
+                | AttributionOutcome::Decayed
+                | AttributionOutcome::RolledBack
+                | AttributionOutcome::Failed,
+            )
+            | (AttributionKind::Activation, _) => Ok(()),
+            _ => Err(DomainError::InvalidAttributionOutcome),
+        }
     }
 }
 
@@ -212,6 +586,8 @@ pub struct LearningDirective {
     pub mission_id: String,
     pub failure_class: String,
     pub evidence_iteration_ids: Vec<String>,
+    #[serde(default)]
+    pub runtime_evidence_event_ids: Vec<String>,
     pub follow_up_mission_id: String,
     pub search_policy_revision_id: String,
     pub created_at: DateTime<Utc>,
@@ -227,8 +603,8 @@ impl LearningDirective {
             "directive search_policy_revision_id",
             &self.search_policy_revision_id,
         )?;
-        if self.evidence_iteration_ids.is_empty() {
-            return Err(DomainError::EmptyField("evidence_iteration_ids"));
+        if self.evidence_iteration_ids.is_empty() && self.runtime_evidence_event_ids.is_empty() {
+            return Err(DomainError::EmptyField("directive evidence"));
         }
         Ok(())
     }
@@ -552,6 +928,30 @@ pub enum ApprovalClass {
     Shadow,
     HumanApprovedLiveSmall,
     SameClassAutoLiveSmall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveSmallEligibilityEvidence {
+    pub candidate_id: String,
+    pub bundle_id: String,
+    pub reconciliation_evidence_sha256: String,
+    pub reduce_only_exit_evidence_sha256: String,
+    pub shadow_soak_evidence_sha256: String,
+}
+
+impl LiveSmallEligibilityEvidence {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text("eligibility candidate_id", &self.candidate_id)?;
+        require_text("eligibility bundle_id", &self.bundle_id)?;
+        for hash in [
+            &self.reconciliation_evidence_sha256,
+            &self.reduce_only_exit_evidence_sha256,
+            &self.shadow_soak_evidence_sha256,
+        ] {
+            validate_sha256(hash)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -931,9 +1331,11 @@ mod tests {
                 max_tokens: 0,
                 max_seconds: 30,
             },
+            completion_policy: MissionCompletionPolicy::default(),
             prompt_snapshot_id: None,
             search_policy_snapshot_id: "policy-1".to_string(),
             status: MissionStatus::Pending,
+            terminal_reason: None,
             created_at: now,
             updated_at: now,
         }
@@ -953,6 +1355,136 @@ mod tests {
     #[test]
     fn mission_rejects_invalid_terminal_transition() {
         assert!(!MissionStatus::Completed.can_transition_to(&MissionStatus::Running));
+    }
+
+    #[test]
+    fn mission_finishes_only_with_a_policy_bound_reason() {
+        let now = Utc::now();
+        let mut mission = mission(now);
+        mission.transition_to(MissionStatus::Running, now).unwrap();
+        assert_eq!(
+            mission.finish(
+                MissionTerminalReason::CompletionPolicySatisfied { kept_candidates: 0 },
+                now,
+            ),
+            Err(DomainError::InvalidMissionTerminalReason)
+        );
+        mission
+            .finish(
+                MissionTerminalReason::CompletionPolicySatisfied { kept_candidates: 1 },
+                now,
+            )
+            .unwrap();
+        assert_eq!(mission.status, MissionStatus::Completed);
+        assert!(mission.validate().is_ok());
+    }
+
+    #[test]
+    fn loop_run_persists_stage_history_and_explicit_stop_reason() {
+        let now = Utc::now();
+        let mut run = LoopRun {
+            loop_run_id: "loop-1".to_string(),
+            root_mission_id: "mission-1".to_string(),
+            completion_policy: LoopCompletionPolicy {
+                target_stage: LoopTargetStage::ShadowHealthy,
+                max_research_missions: 2,
+            },
+            child_mission_ids: vec![],
+            stage_records: vec![],
+            status: LoopRunStatus::Pending,
+            stop_reason: None,
+            created_at: now,
+            updated_at: now,
+        };
+        run.start(now).unwrap();
+        run.append_stage(LoopStageRecord {
+            record_id: "loop-1:mission-1:researching".to_string(),
+            mission_id: "mission-1".to_string(),
+            stage: LoopStage::Researching,
+            status: LoopStageStatus::Completed,
+            reason: "completion policy satisfied".to_string(),
+            recorded_at: now,
+        })
+        .unwrap();
+        run.stop(
+            LoopStopReason::TargetStageReached {
+                mission_id: "mission-1".to_string(),
+                stage: LoopTargetStage::Researching,
+            },
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(run.status, LoopRunStatus::Completed);
+        assert_eq!(run.stage_records.len(), 1);
+        assert!(run.validate().is_ok());
+    }
+
+    #[test]
+    fn awaiting_evidence_pauses_loop_runs() {
+        assert_eq!(
+            LoopStopReason::AwaitingEvidence {
+                mission_id: "mission-1".to_string(),
+                stage: LoopTargetStage::PaperHealthy,
+            }
+            .status(),
+            LoopRunStatus::Paused
+        );
+    }
+
+    #[test]
+    fn order_attribution_requires_complete_strategy_scope() {
+        let now = Utc::now();
+        let mut event = RuntimeAttributionEvent {
+            event_id: "fill-1".to_string(),
+            deployment_id: "deployment-1".to_string(),
+            asset_revision_id: "candidate-1".to_string(),
+            mission_id: None,
+            mode: AttributionMode::Paper,
+            outcome: AttributionOutcome::Healthy,
+            kind: AttributionKind::Fill,
+            strategy_id: None,
+            order_id: Some("order-1".to_string()),
+            account_id: Some("account-1".to_string()),
+            venue: Some("binance".to_string()),
+            symbol: Some("BTCUSDT".to_string()),
+            metrics: BTreeMap::new(),
+            reason: None,
+            observed_at: now,
+        };
+        assert!(event.validate().is_err());
+        event.strategy_id = Some("strategy-1".to_string());
+        assert!(event.validate().is_ok());
+        event.outcome = AttributionOutcome::Activated;
+        assert_eq!(
+            event.validate(),
+            Err(DomainError::InvalidAttributionOutcome)
+        );
+    }
+
+    #[test]
+    fn portfolio_snapshot_requires_strategy_account_and_venue() {
+        let now = Utc::now();
+        let mut event = RuntimeAttributionEvent {
+            event_id: "snapshot-1".to_string(),
+            deployment_id: "deployment-1".to_string(),
+            asset_revision_id: "candidate-1".to_string(),
+            mission_id: None,
+            mode: AttributionMode::Paper,
+            outcome: AttributionOutcome::Healthy,
+            kind: AttributionKind::PortfolioSnapshot,
+            strategy_id: None,
+            order_id: None,
+            account_id: Some("account-1".to_string()),
+            venue: Some("binance".to_string()),
+            symbol: None,
+            metrics: BTreeMap::new(),
+            reason: None,
+            observed_at: now,
+        };
+        assert!(event.validate().is_err());
+        event.strategy_id = Some("strategy-1".to_string());
+        assert!(event.validate().is_ok());
     }
 
     #[test]

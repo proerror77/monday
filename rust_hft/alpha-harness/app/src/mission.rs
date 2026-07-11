@@ -17,7 +17,22 @@ use alpha_engine::{
 use alpha_store::{AlphaStore, StoreError};
 use anyhow::{bail, Context};
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MissionRunReport {
+    pub mission_id: String,
+    pub status: MissionStatus,
+    pub terminal_reason: Option<alpha_domain::MissionTerminalReason>,
+    pub total_iterations: usize,
+    pub new_iterations: usize,
+    pub engine: EngineChoice,
+    pub dataset_manifest_id: String,
+}
+
 pub fn run_mission(args: RunMissionArgs, resume: bool) -> anyhow::Result<()> {
+    print_json(&execute_mission(&args, resume)?)
+}
+
+pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<MissionRunReport> {
     let mut store = AlphaStore::open(&args.db)?;
     let mission = store.get_mission(&args.mission_id)?;
     match (resume, &mission.status) {
@@ -49,7 +64,7 @@ pub fn run_mission(args: RunMissionArgs, resume: bool) -> anyhow::Result<()> {
         },
         format!("sealed:{}", manifest.manifest_id),
     )?;
-    let proposal_engine = build_engine(&args)?;
+    let proposal_engine = build_engine(args)?;
     let evaluator =
         FormulaEvaluator::new(FormulaEvaluatorConfig::default()).map_err(anyhow::Error::msg)?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
@@ -60,14 +75,15 @@ pub fn run_mission(args: RunMissionArgs, resume: bool) -> anyhow::Result<()> {
             max_new_iterations: args.max_new_iterations,
         },
     )?;
-    print_json(&serde_json::json!({
-        "mission_id": args.mission_id,
-        "status": outcome.status,
-        "total_iterations": outcome.total_iterations,
-        "new_iterations": outcome.new_iterations,
-        "engine": args.engine,
-        "dataset_manifest_id": manifest.manifest_id,
-    }))
+    Ok(MissionRunReport {
+        mission_id: args.mission_id.clone(),
+        status: outcome.status,
+        terminal_reason: outcome.terminal_reason,
+        total_iterations: outcome.total_iterations,
+        new_iterations: outcome.new_iterations,
+        engine: args.engine,
+        dataset_manifest_id: manifest.manifest_id,
+    })
 }
 
 pub fn mission_status(args: MissionStatusArgs) -> anyhow::Result<()> {
@@ -88,6 +104,12 @@ pub fn mission_status(args: MissionStatusArgs) -> anyhow::Result<()> {
 }
 
 pub fn learn_mission(args: LearnMissionArgs) -> anyhow::Result<()> {
+    print_json(&execute_learning(&args)?)
+}
+
+pub fn execute_learning(
+    args: &LearnMissionArgs,
+) -> anyhow::Result<alpha_engine::learning::LearningOutcome> {
     let mut store = AlphaStore::open(&args.db)?;
     let critic = if args.llm_critic {
         Some(
@@ -98,7 +120,7 @@ pub fn learn_mission(args: LearnMissionArgs) -> anyhow::Result<()> {
         None
     };
     let critic = critic.as_ref().map(|critic| critic as &dyn FailureCritic);
-    let outcome = close_learning_loop(
+    Ok(close_learning_loop(
         &mut store,
         &args.mission_id,
         &LearningConfig {
@@ -106,8 +128,7 @@ pub fn learn_mission(args: LearnMissionArgs) -> anyhow::Result<()> {
             max_critic_tokens: args.max_critic_tokens,
         },
         critic,
-    )?;
-    print_json(&outcome)
+    )?)
 }
 
 fn build_engine(args: &RunMissionArgs) -> anyhow::Result<Box<dyn ProposalEngine>> {

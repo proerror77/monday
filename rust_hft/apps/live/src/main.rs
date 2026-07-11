@@ -5,10 +5,11 @@
 //! - cargo run --features="full"  # 開啟所有特性
 
 mod helpers;
+mod runtime_attribution;
 
 use alpha_domain::{
-    AttributionMode, AttributionOutcome, RuntimeAttributionEvent, SignedDeploymentEnvelope,
-    StrategyBundle,
+    AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent,
+    SignedDeploymentEnvelope, StrategyBundle,
 };
 use clap::Parser;
 use hft_live::deployment_envelope::{
@@ -17,6 +18,7 @@ use hft_live::deployment_envelope::{
     SystemConfigActivationAdapter,
 };
 use runtime::{ShardConfig, ShardStrategy, SystemBuilder, SystemConfig};
+use runtime_attribution::RuntimeAttributionObserver;
 use tracing::info;
 
 #[derive(Parser)]
@@ -153,6 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         top_n = cfg.engine.top_n,
         "Engine 配置已載入"
     );
+    let market_stale_us = cfg.engine.stale_us;
     let builder = SystemBuilder::new(cfg);
     let builder = if let (Some(shard_index), Some(shard_count)) =
         (args.shard_index, args.shard_count)
@@ -183,6 +186,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .commit_configuration(chrono::Utc::now())?;
     }
     let mut system = builder.build();
+    let attribution_observer = if let Some(deployment) = activation.as_ref() {
+        let feedback_path =
+            required_path(&args.deployment_feedback_log, "--deployment-feedback-log")?;
+        let feedback_log = RuntimeFeedbackLog::open(feedback_path)?;
+        let (receiver, market_reader) = {
+            let engine = system.engine.lock().await;
+            (engine.subscribe_execution_events(), engine.market_reader())
+        };
+        Some(RuntimeAttributionObserver::new(
+            receiver,
+            market_reader,
+            deployment.request.clone(),
+            feedback_log,
+            market_stale_us,
+        ))
+    } else {
+        None
+    };
 
     // 啟動系統
     if let Err(error) = system.start().await {
@@ -210,6 +231,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(error.into());
         }
     }
+    let (attribution_shutdown, mut attribution_handle) =
+        if let Some(observer) = attribution_observer {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            (
+                Some(shutdown_tx),
+                Some(tokio::spawn(observer.run(shutdown_rx))),
+            )
+        } else {
+            (None, None)
+        };
 
     info!("系統正在運行...");
 
@@ -239,20 +270,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _grpc_handle =
         helpers::spawn_grpc_server(system.execution_control_handle(), args.grpc_port);
 
-    // 保持運行直到收到停止信號或到達自動退出時間
-    if let Some(ms) = args.exit_after_ms {
+    // 保持運行直到收到停止信號、到達自動退出時間或歸因 observer 退出。
+    let shutdown_signal = async {
+        if let Some(ms) = args.exit_after_ms {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => signal,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => Ok(()),
+            }
+        } else {
+            tokio::signal::ctrl_c().await
+        }
+    };
+    tokio::pin!(shutdown_signal);
+    let attribution_result = if let Some(handle) = attribution_handle.as_mut() {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {},
+            result = handle => Some(result),
+            signal = &mut shutdown_signal => {
+                signal?;
+                None
+            }
         }
     } else {
-        tokio::signal::ctrl_c().await?;
-    }
-
+        shutdown_signal.await?;
+        None
+    };
     info!("收到停止信號，正在關閉系統...");
 
-    // 優雅停止系統
-    system.stop().await?;
+    // Keep attribution alive while the runtime cancels and reconciles outstanding orders.
+    let stop_result = system.stop().await;
+
+    let attribution_result = if attribution_result.is_some() {
+        attribution_result.map(|result| (false, result))
+    } else if let Some(handle) = attribution_handle.take() {
+        if let Some(shutdown) = attribution_shutdown {
+            let _ = shutdown.send(());
+        }
+        Some((true, handle.await))
+    } else {
+        None
+    };
+
+    stop_result?;
+
+    if let Some((expected_shutdown, result)) = attribution_result {
+        match (expected_shutdown, result) {
+            (true, Ok(Ok(()))) => {}
+            (false, Ok(Ok(()))) => {
+                return Err(
+                    anyhow::anyhow!("runtime attribution observer exited unexpectedly").into(),
+                )
+            }
+            (_, Ok(Err(error))) => {
+                return Err(anyhow::anyhow!("runtime attribution observer failed: {error}").into())
+            }
+            (_, Err(error)) => {
+                return Err(
+                    anyhow::anyhow!("runtime attribution observer task failed: {error}").into(),
+                )
+            }
+        }
+    }
 
     Ok(())
 }
@@ -338,6 +415,12 @@ fn append_activation_feedback(args: &Args, request: &ActivationRequest) -> anyho
             hft_live::deployment_envelope::ActivationMode::LiveSmall => AttributionMode::LiveSmall,
         },
         outcome: AttributionOutcome::Activated,
+        kind: AttributionKind::Activation,
+        strategy_id: None,
+        order_id: None,
+        account_id: Some(request.account_id.clone()),
+        venue: Some(request.venue.clone()),
+        symbol: None,
         metrics: std::collections::BTreeMap::new(),
         reason: None,
         observed_at,

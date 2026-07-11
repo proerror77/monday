@@ -1,7 +1,7 @@
 use crate::{
     cli::{
-        print_json, EnvelopeArgs, EvaluateArgs, JsonRecordArgs, MissionStatusArgs, PromoteArgs,
-        RevokeApprovalArgs, SignDeploymentArgs,
+        print_json, EnvelopeArgs, EvaluateArgs, JsonLogArgs, JsonRecordArgs, MissionStatusArgs,
+        PromoteArgs, RevokeApprovalArgs, SignDeploymentArgs,
     },
     data_mission,
 };
@@ -111,13 +111,12 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
     let mut store = AlphaStore::open(&args.db)?;
     let sealed_id = format!("sealed-evaluation:{}", args.candidate_id);
     let sealed = store.get_registry_revision(&sealed_id)?;
-    let evaluation: CandidateEvaluation = serde_json::from_value(
-        sealed
-            .payload
-            .get("evaluation")
-            .cloned()
-            .context("sealed evaluation payload is incomplete")?,
-    )?;
+    let sealed_evaluation = sealed
+        .payload
+        .get("evaluation")
+        .cloned()
+        .context("sealed evaluation payload is incomplete")?;
+    let evaluation: CandidateEvaluation = serde_json::from_value(sealed_evaluation.clone())?;
     if !evaluation.passed {
         bail!("candidate failed sealed holdout and cannot be promoted");
     }
@@ -150,7 +149,7 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
     let now = Utc::now();
-    let sealed_evaluation_hash = canonical_json_hash(&evaluation)?;
+    let sealed_evaluation_hash = canonical_json_hash(&sealed_evaluation)?;
     let bundle = StrategyBundle::new(
         format!("bundle:{}", candidate.candidate_id),
         candidate.candidate_id.clone(),
@@ -227,6 +226,39 @@ pub fn ingest_feedback(args: JsonRecordArgs) -> anyhow::Result<()> {
     }))
 }
 
+pub fn ingest_feedback_log(args: JsonLogArgs) -> anyhow::Result<()> {
+    let contents = std::fs::read_to_string(&args.log)
+        .with_context(|| format!("failed to read feedback log {}", args.log.display()))?;
+    let events = parse_runtime_attribution_log(&contents)?;
+    let records = events.len();
+    let mut store = AlphaStore::open(args.db)?;
+    let inserted = store.ingest_runtime_attributions(events)?;
+    print_json(&serde_json::json!({
+        "records": records,
+        "inserted": inserted,
+        "duplicates": records - inserted,
+    }))
+}
+
+fn parse_runtime_attribution_log(contents: &str) -> anyhow::Result<Vec<RuntimeAttributionEvent>> {
+    let mut events = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: RuntimeAttributionEvent = serde_json::from_str(line)
+            .with_context(|| format!("feedback log line {} is invalid JSON", index + 1))?;
+        event
+            .validate()
+            .with_context(|| format!("feedback log line {} is invalid", index + 1))?;
+        events.push(event);
+    }
+    if events.is_empty() {
+        bail!("feedback log contains no attribution events");
+    }
+    Ok(events)
+}
+
 pub fn propose_policy(args: JsonRecordArgs) -> anyhow::Result<()> {
     let revision: SearchPolicyRevision = read_record(&args.record)?;
     let mut store = AlphaStore::open(args.db)?;
@@ -256,6 +288,9 @@ fn enforce_deployment_approvals(
     envelope: &DeploymentEnvelope,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
+    if envelope.approval_class == ApprovalClass::SameClassAutoLiveSmall {
+        bail!("same-class automatic live-small approval is disabled");
+    }
     let scope_hash = deployment_scope_hash(envelope)?;
     let mut approved = false;
     for approval_id in &envelope.approval_signatures {
@@ -273,14 +308,10 @@ fn enforce_deployment_approvals(
         let class_matches = match envelope.approval_class {
             ApprovalClass::Paper => approval.approval_class == "paper",
             ApprovalClass::Shadow => approval.approval_class == "shadow",
-            ApprovalClass::HumanApprovedLiveSmall | ApprovalClass::SameClassAutoLiveSmall => {
-                approval.approval_class == "human_live_small"
-            }
+            ApprovalClass::HumanApprovedLiveSmall => approval.approval_class == "human_live_small",
+            ApprovalClass::SameClassAutoLiveSmall => false,
         };
-        let subject_matches = match envelope.approval_class {
-            ApprovalClass::SameClassAutoLiveSmall => true,
-            _ => approval.subject_id == envelope.promotion_id,
-        };
+        let subject_matches = approval.subject_id == envelope.promotion_id;
         approved |= scope_matches && class_matches && subject_matches;
     }
     if !approved {
@@ -289,7 +320,7 @@ fn enforce_deployment_approvals(
     Ok(())
 }
 
-fn deployment_scope_hash(envelope: &DeploymentEnvelope) -> anyhow::Result<String> {
+pub(crate) fn deployment_scope_hash(envelope: &DeploymentEnvelope) -> anyhow::Result<String> {
     let mut instruments = envelope.instruments.clone();
     instruments.sort();
     instruments.dedup();
@@ -356,7 +387,7 @@ mod tests {
             valid_from: now - Duration::minutes(1),
             expires_at: now + Duration::minutes(5),
             nonce: "nonce-live-small".to_string(),
-            approval_class: ApprovalClass::SameClassAutoLiveSmall,
+            approval_class: ApprovalClass::HumanApprovedLiveSmall,
             approval_signatures: vec!["approval-1".to_string()],
             payload_hash: String::new(),
         }
@@ -365,8 +396,11 @@ mod tests {
     #[test]
     fn live_small_requires_a_persisted_human_approval_for_the_same_scope() {
         let mut store = AlphaStore::open_in_memory().unwrap();
-        let envelope = live_small_envelope();
+        let mut envelope = live_small_envelope();
         let now = Utc::now();
+        let mut automatic = envelope.clone();
+        automatic.approval_class = ApprovalClass::SameClassAutoLiveSmall;
+        assert!(enforce_deployment_approvals(&store, &automatic, now).is_err());
         assert!(
             enforce_deployment_approvals(&store, &envelope, now + Duration::seconds(1)).is_err()
         );
@@ -387,11 +421,30 @@ mod tests {
                 created_at: now,
             })
             .unwrap();
+        assert!(enforce_deployment_approvals(&store, &envelope, now).is_err());
+        store
+            .record_approval(&ApprovalRecord {
+                approval_id: "approval-2".to_string(),
+                approval_class: "human_live_small".to_string(),
+                subject_id: envelope.promotion_id.clone(),
+                payload: serde_json::json!({
+                    "scope_hash": deployment_scope_hash(&envelope).unwrap(),
+                }),
+                signer_id: Some("risk-officer-2".to_string()),
+                valid_from: Some(now),
+                expires_at: Some(now + Duration::minutes(10)),
+                revoked_at: None,
+                revoked_by: None,
+                revocation_reason: None,
+                created_at: now,
+            })
+            .unwrap();
+        envelope.approval_signatures = vec!["approval-2".to_string()];
         assert!(enforce_deployment_approvals(&store, &envelope, now).is_ok());
 
         store
             .revoke_approval(
-                "approval-1",
+                "approval-2",
                 "risk-officer-2",
                 "risk posture changed",
                 now + Duration::seconds(1),
@@ -426,5 +479,32 @@ mod tests {
             deployment_scope_hash(&first).unwrap(),
             deployment_scope_hash(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn feedback_log_parser_validates_every_line_before_ingestion() {
+        let event = RuntimeAttributionEvent {
+            event_id: "activation-1".to_string(),
+            deployment_id: "deployment-1".to_string(),
+            asset_revision_id: "candidate-1".to_string(),
+            mission_id: None,
+            mode: alpha_domain::AttributionMode::Paper,
+            outcome: alpha_domain::AttributionOutcome::Activated,
+            kind: alpha_domain::AttributionKind::Activation,
+            strategy_id: None,
+            order_id: None,
+            account_id: None,
+            venue: None,
+            symbol: None,
+            metrics: std::collections::BTreeMap::new(),
+            reason: None,
+            observed_at: Utc::now(),
+        };
+        let valid = serde_json::to_string(&event).unwrap();
+        assert_eq!(parse_runtime_attribution_log(&valid).unwrap(), vec![event]);
+        assert!(parse_runtime_attribution_log(&format!("{valid}\n{{bad"))
+            .unwrap_err()
+            .to_string()
+            .contains("line 2"));
     }
 }

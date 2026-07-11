@@ -1,10 +1,31 @@
 use crate::{
     evaluation::EngineContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
-    ProposalEngine, RemainingBudget,
+    ProposalEngine, ProposalEngineCheckpoint, RemainingBudget,
 };
 use alpha_domain::{CandidateArtifact, EngineKind};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+const BAYESIAN_CHECKPOINT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BayesianConfigV1 {
+    field: String,
+    grid: Vec<f64>,
+    noise: f64,
+    length_scale: f64,
+    exploration: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BayesianCheckpointV1 {
+    config: BayesianConfigV1,
+    observations: Vec<(f64, f64)>,
+    pending: BTreeMap<String, f64>,
+}
 
 pub struct BayesianOptimizerEngine {
     field: String,
@@ -60,6 +81,16 @@ impl BayesianOptimizerEngine {
             observations: vec![],
             pending: BTreeMap::new(),
         })
+    }
+
+    fn config(&self) -> BayesianConfigV1 {
+        BayesianConfigV1 {
+            field: self.field.clone(),
+            grid: self.grid.clone(),
+            noise: self.noise,
+            length_scale: self.length_scale,
+            exploration: self.exploration,
+        }
     }
 
     fn choose_point(&self) -> Result<f64, String> {
@@ -184,8 +215,14 @@ impl ProposalEngine for BayesianOptimizerEngine {
 
     fn observe(&mut self, proposal: &EngineProposal, evaluation: &CandidateEvaluation) {
         if let Some(point) = self.pending.remove(&proposal.candidate_id) {
-            self.observations.push((point, evaluation.score));
+            if evaluation.score.is_finite() {
+                self.observations.push((point, evaluation.score));
+            }
         }
+    }
+
+    fn abandon(&mut self, proposal: &EngineProposal) {
+        self.pending.remove(&proposal.candidate_id);
     }
 
     fn restore(&mut self, observations: &[HistoricalObservation]) -> Result<(), String> {
@@ -203,8 +240,97 @@ impl ProposalEngine for BayesianOptimizerEngine {
             let point = window
                 .parse::<f64>()
                 .map_err(|_| "Bayesian history window is invalid".to_string())?;
+            if !observation.evaluation.score.is_finite() {
+                return Err("Bayesian history contains a non-finite score".to_string());
+            }
             self.observations
                 .push((point, observation.evaluation.score));
+        }
+        Ok(())
+    }
+
+    fn checkpoint(&self) -> Result<ProposalEngineCheckpoint, String> {
+        let state = BayesianCheckpointV1 {
+            config: self.config(),
+            observations: self.observations.clone(),
+            pending: self.pending.clone(),
+        };
+        state.validate()?;
+        Ok(ProposalEngineCheckpoint {
+            kind: EngineKind::BayesianOptimizer,
+            version: BAYESIAN_CHECKPOINT_VERSION,
+            state: serde_json::to_value(state)
+                .map_err(|error| format!("failed to encode Bayesian checkpoint: {error}"))?,
+        })
+    }
+
+    fn restore_checkpoint(
+        &mut self,
+        checkpoint: &ProposalEngineCheckpoint,
+        _observations: &[HistoricalObservation],
+    ) -> Result<(), String> {
+        if checkpoint.kind != EngineKind::BayesianOptimizer
+            || checkpoint.version != BAYESIAN_CHECKPOINT_VERSION
+        {
+            return Err("Bayesian checkpoint kind or version mismatch".to_string());
+        }
+        let state: BayesianCheckpointV1 = serde_json::from_value(checkpoint.state.clone())
+            .map_err(|error| format!("invalid Bayesian checkpoint state: {error}"))?;
+        state.validate()?;
+        if state.config != self.config() {
+            return Err("Bayesian checkpoint configuration mismatch".to_string());
+        }
+
+        let BayesianCheckpointV1 {
+            config,
+            observations,
+            pending,
+        } = state;
+        self.field = config.field;
+        self.grid = config.grid;
+        self.noise = config.noise;
+        self.length_scale = config.length_scale;
+        self.exploration = config.exploration;
+        self.observations = observations;
+        self.pending = pending;
+        Ok(())
+    }
+}
+
+impl BayesianCheckpointV1 {
+    fn validate(&self) -> Result<(), String> {
+        if self.config.field.trim().is_empty()
+            || self.config.grid.len() < 3
+            || self
+                .config
+                .grid
+                .iter()
+                .any(|point| !point.is_finite() || *point <= 0.0)
+            || !self.config.noise.is_finite()
+            || self.config.noise <= 0.0
+            || !self.config.length_scale.is_finite()
+            || self.config.length_scale <= 0.0
+            || !self.config.exploration.is_finite()
+            || self.config.exploration < 0.0
+        {
+            return Err("invalid Bayesian checkpoint configuration".to_string());
+        }
+
+        let grid = self
+            .config
+            .grid
+            .iter()
+            .map(|point| point.to_bits())
+            .collect::<BTreeSet<_>>();
+        for (point, score) in &self.observations {
+            if !point.is_finite() || !score.is_finite() || !grid.contains(&point.to_bits()) {
+                return Err("invalid Bayesian checkpoint observations".to_string());
+            }
+        }
+        for (candidate_id, point) in &self.pending {
+            if candidate_id.is_empty() || !point.is_finite() || !grid.contains(&point.to_bits()) {
+                return Err("invalid Bayesian checkpoint pending candidates".to_string());
+            }
         }
         Ok(())
     }
@@ -275,6 +401,37 @@ fn erf(value: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn budget() -> RemainingBudget {
+        RemainingBudget {
+            candidates: 16,
+            expansions: 16,
+            tokens: 0,
+            milliseconds: 0,
+        }
+    }
+
+    fn evaluation(score: f64) -> CandidateEvaluation {
+        CandidateEvaluation {
+            passed: true,
+            score,
+            failure_reasons: vec![],
+            evaluator_version: "test".to_string(),
+        }
+    }
+
+    fn advance(
+        engine: &mut BayesianOptimizerEngine,
+        iteration: usize,
+        score: f64,
+    ) -> EngineProposal {
+        let dataset = super::super::test_dataset();
+        let proposal = engine
+            .propose("mission", iteration, &dataset.engine_context(), &budget())
+            .unwrap();
+        engine.observe(&proposal, &evaluation(score));
+        proposal
+    }
+
     #[test]
     fn gaussian_process_acquisition_is_finite() {
         let mut engine =
@@ -283,5 +440,99 @@ mod tests {
         let point = engine.choose_point().unwrap();
         assert!(point.is_finite());
         assert!(![5.0, 60.0, 30.0].contains(&point));
+    }
+
+    #[test]
+    fn checkpoint_round_trip_restores_complete_search_state() {
+        let mut engine =
+            BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap();
+        advance(&mut engine, 0, 0.2);
+        advance(&mut engine, 1, 0.8);
+        let dataset = super::super::test_dataset();
+        let pending = engine
+            .propose("mission", 2, &dataset.engine_context(), &budget())
+            .unwrap();
+        let checkpoint = engine.checkpoint().unwrap();
+
+        let mut restored =
+            BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap();
+        restored.restore_checkpoint(&checkpoint, &[]).unwrap();
+
+        assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+        assert_eq!(restored.field, engine.field);
+        assert_eq!(restored.grid, engine.grid);
+        assert_eq!(restored.noise, engine.noise);
+        assert_eq!(restored.length_scale, engine.length_scale);
+        assert_eq!(restored.exploration, engine.exploration);
+        assert_eq!(restored.observations, engine.observations);
+        assert_eq!(restored.pending, engine.pending);
+        assert!(restored.pending.contains_key(&pending.candidate_id));
+    }
+
+    #[test]
+    fn restored_search_continues_like_uninterrupted_search() {
+        let mut uninterrupted =
+            BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap();
+        for (iteration, score) in [0.2, 0.8, 0.4, 0.6].into_iter().enumerate() {
+            advance(&mut uninterrupted, iteration, score);
+        }
+        let checkpoint = uninterrupted.checkpoint().unwrap();
+        let mut restored =
+            BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap();
+        restored.restore_checkpoint(&checkpoint, &[]).unwrap();
+        let dataset = super::super::test_dataset();
+
+        let expected = uninterrupted
+            .propose("mission", 4, &dataset.engine_context(), &budget())
+            .unwrap();
+        let actual = restored
+            .propose("mission", 4, &dataset.engine_context(), &budget())
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            restored.checkpoint().unwrap(),
+            uninterrupted.checkpoint().unwrap()
+        );
+    }
+
+    #[test]
+    fn restore_checkpoint_fails_closed_on_config_or_state_mismatch() {
+        let engine = BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap();
+        let checkpoint = engine.checkpoint().unwrap();
+        let mut wrong_kind = checkpoint.clone();
+        wrong_kind.kind = EngineKind::Mcts;
+        let mut restored =
+            BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap();
+        assert!(restored.restore_checkpoint(&wrong_kind, &[]).is_err());
+
+        let mut wrong_version = checkpoint.clone();
+        wrong_version.version += 1;
+        assert!(restored.restore_checkpoint(&wrong_version, &[]).is_err());
+
+        let mut different_config =
+            BayesianOptimizerEngine::new("price", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap();
+        assert!(different_config
+            .restore_checkpoint(&checkpoint, &[])
+            .is_err());
+
+        let mut malformed = checkpoint;
+        malformed.state = serde_json::json!({"unexpected": true});
+        assert!(restored.restore_checkpoint(&malformed, &[]).is_err());
+    }
+
+    #[test]
+    fn abandon_removes_pending_candidate() {
+        let mut engine =
+            BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap();
+        let dataset = super::super::test_dataset();
+        let proposal = engine
+            .propose("mission", 0, &dataset.engine_context(), &budget())
+            .unwrap();
+        assert!(engine.pending.contains_key(&proposal.candidate_id));
+
+        engine.abandon(&proposal);
+
+        assert!(!engine.pending.contains_key(&proposal.candidate_id));
     }
 }

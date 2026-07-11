@@ -11,6 +11,7 @@ hft_core = { package = "hft-core", path = "../../market-core/core" }
 ports = { package = "hft-ports", path = "../../market-core/ports" }
 runtime = { package = "hft-runtime", path = "../../market-core/runtime" }
 engine = { package = "hft-engine", path = "../../market-core/engine" }
+snapshot = { package = "hft-snapshot", path = "../../market-core/snapshot" }
 data = { package = "hft-data", path = "../../data-pipelines/core" }
 rust_decimal = { version = "1.33", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }

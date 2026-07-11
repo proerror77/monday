@@ -2,7 +2,7 @@ use crate::{
     evaluation::{evaluate_sealed_holdout, EngineContext, PreparedDataset, ResearchRow},
     CandidateEvaluation, CandidateEvaluator, EngineProposal,
 };
-use alpha_domain::CandidateArtifact;
+use alpha_domain::{CandidateArtifact, SEALED_HOLDOUT_EVALUATOR_VERSION};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
 
 const BPS: f64 = 10_000.0;
@@ -55,7 +55,7 @@ impl FormulaEvaluator {
                 rows,
                 &signals,
                 std::iter::once(0..rows.len()),
-                "sealed-holdout-v1",
+                SEALED_HOLDOUT_EVALUATOR_VERSION,
             )
         })
     }

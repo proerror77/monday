@@ -8,7 +8,9 @@ publish = false
 alpha-domain = { path = "../domain" }
 chrono = { workspace = true, features = ["serde"] }
 duckdb = { version = "1.10504.0", features = ["bundled"] }
+getrandom = "0.3"
 hex = { workspace = true }
+hmac = "0.12"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

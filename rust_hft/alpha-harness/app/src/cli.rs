@@ -1,4 +1,4 @@
-use crate::{data_mission, governance, mission};
+use crate::{data_mission, governance, loop_control, mission};
 use alpha_store::AlphaStore;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -21,6 +21,10 @@ enum Command {
     Mission {
         #[command(subcommand)]
         command: MissionCommand,
+    },
+    Loop {
+        #[command(subcommand)]
+        command: LoopCommand,
     },
     Data {
         #[command(subcommand)]
@@ -57,6 +61,13 @@ enum MissionCommand {
     Resume(RunMissionArgs),
     Status(MissionStatusArgs),
     Learn(LearnMissionArgs),
+    RecoverLegacyCheckpoint(RecoverLegacyCheckpointArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum LoopCommand {
+    Run(Box<LoopRunArgs>),
+    Status(LoopStatusArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -79,6 +90,7 @@ enum DeploymentCommand {
 #[derive(Debug, Subcommand)]
 enum FeedbackCommand {
     Ingest(JsonRecordArgs),
+    IngestLog(JsonLogArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -153,6 +165,16 @@ pub enum EngineChoice {
     Llm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LoopTargetChoice {
+    Researching,
+    WalkForwardKept,
+    HoldoutPassed,
+    PaperHealthy,
+    ShadowHealthy,
+    LiveSmallEligible,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct RunMissionArgs {
     #[arg(long)]
@@ -186,11 +208,55 @@ pub struct LearnMissionArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct RecoverLegacyCheckpointArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub mission_id: String,
+    #[arg(long)]
+    pub replacement_mission_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LoopRunArgs {
+    #[command(flatten)]
+    pub mission: RunMissionArgs,
+    #[arg(long)]
+    pub loop_run_id: String,
+    #[arg(long, value_enum, default_value = "walk-forward-kept")]
+    pub target_stage: LoopTargetChoice,
+    #[arg(long, default_value_t = 3)]
+    pub max_research_missions: usize,
+    #[arg(long, default_value_t = 3)]
+    pub repeated_failure_threshold: usize,
+    #[arg(long, default_value_t = 500)]
+    pub max_critic_tokens: u64,
+    #[arg(long)]
+    pub llm_critic: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct LoopStatusArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub loop_run_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct JsonRecordArgs {
     #[arg(long)]
     pub db: PathBuf,
     #[arg(long)]
     pub record: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct JsonLogArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub log: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -279,6 +345,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             MissionCommand::Resume(args) => mission::run_mission(args, true),
             MissionCommand::Status(args) => mission::mission_status(args),
             MissionCommand::Learn(args) => mission::learn_mission(args),
+            MissionCommand::RecoverLegacyCheckpoint(args) => {
+                loop_control::recover_legacy_checkpoint(args)
+            }
+        },
+        Command::Loop { command } => match command {
+            LoopCommand::Run(args) => loop_control::run_loop(*args),
+            LoopCommand::Status(args) => loop_control::loop_status(args),
         },
         Command::Data { command } => match command {
             DataCommand::Sources => print_json(&source_catalog()),
@@ -320,6 +393,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Feedback { command } => match command {
             FeedbackCommand::Ingest(args) => governance::ingest_feedback(args),
+            FeedbackCommand::IngestLog(args) => governance::ingest_feedback_log(args),
         },
         Command::Policy { command } => match command {
             PolicyCommand::Propose(args) => governance::propose_policy(args),
@@ -367,11 +441,69 @@ mod tests {
             "artifacts",
         ])
         .is_ok());
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "mission",
+            "recover-legacy-checkpoint",
+            "--db",
+            "alpha.duckdb",
+            "--mission-id",
+            "mission-1",
+            "--replacement-mission-id",
+            "mission-1-recovered",
+        ])
+        .is_ok());
     }
 
     #[test]
     fn exposes_no_order_or_trade_command() {
         assert!(Cli::try_parse_from(["alpha-harness", "order"]).is_err());
         assert!(Cli::try_parse_from(["alpha-harness", "trade"]).is_err());
+    }
+
+    #[test]
+    fn parses_bounded_loop_run_without_execution_authority() {
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "loop",
+            "run",
+            "--db",
+            "alpha.duckdb",
+            "--mission-id",
+            "mission-1",
+            "--engine",
+            "mcts",
+            "--dataset-manifest",
+            "dataset.json",
+            "--loop-run-id",
+            "loop-1",
+            "--target-stage",
+            "shadow-healthy",
+            "--max-research-missions",
+            "2",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn parses_staged_loop_targets() {
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "loop",
+            "run",
+            "--db",
+            "alpha.duckdb",
+            "--mission-id",
+            "mission-1",
+            "--engine",
+            "mcts",
+            "--dataset-manifest",
+            "dataset.json",
+            "--loop-run-id",
+            "loop-1",
+            "--target-stage",
+            "live-small-eligible",
+        ])
+        .is_ok());
     }
 }

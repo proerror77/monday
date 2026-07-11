@@ -739,7 +739,7 @@ fn activation_request(
         ),
         ActivationMode::LiveSmall => matches!(
             verified.0.approval_class,
-            ApprovalClass::HumanApprovedLiveSmall | ApprovalClass::SameClassAutoLiveSmall
+            ApprovalClass::HumanApprovedLiveSmall
         ),
     };
     if !approved {
@@ -790,4 +790,48 @@ fn ensure_parent(path: &Path) -> Result<(), IntakeError> {
 
 fn durable_error(error: std::io::Error) -> IntakeError {
     IntakeError::DurableState(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alpha_domain::DeploymentEnvelope;
+    use chrono::Duration;
+
+    #[test]
+    fn same_class_auto_live_small_is_not_runtime_authority() {
+        let now = Utc::now();
+        let verified = VerifiedDeploymentEnvelope(DeploymentEnvelope {
+            deployment_id: "deployment-auto-live".to_string(),
+            asset_revision_id: "candidate-1".to_string(),
+            promotion_id: "promotion-1".to_string(),
+            promotion_manifest_hash: "a".repeat(64),
+            bundle_id: "bundle-1".to_string(),
+            bundle_hash: "b".repeat(64),
+            runtime_config_hash: "c".repeat(64),
+            risk_policy_hash: "d".repeat(64),
+            account_id: "account-1".to_string(),
+            venue: "binance".to_string(),
+            instruments: vec!["BTCUSDT".to_string()],
+            allowed_intent_types: vec![
+                AllowedIntentType::LoadFactor,
+                AllowedIntentType::StartLiveSmall,
+            ],
+            max_notional: 100.0,
+            max_symbol_exposure: 50.0,
+            max_order_size: 10.0,
+            max_slippage_bps: 2.0,
+            valid_from: now - Duration::minutes(1),
+            expires_at: now + Duration::minutes(10),
+            nonce: "nonce-auto-live".to_string(),
+            approval_class: ApprovalClass::SameClassAutoLiveSmall,
+            approval_signatures: vec!["approval-1".to_string()],
+            payload_hash: "e".repeat(64),
+        });
+
+        assert!(matches!(
+            activation_request(&verified, false),
+            Err(IntakeError::ApprovalClassMismatch)
+        ));
+    }
 }
