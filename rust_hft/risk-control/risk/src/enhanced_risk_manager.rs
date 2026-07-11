@@ -189,7 +189,7 @@ impl EnhancedRiskManager {
         }
 
         // 檢查觸發條件
-        let current_balance = account.cash_balance + account.unrealized_pnl;
+        let current_balance = account.equity();
 
         let daily_loss = self.stats.starting_balance - current_balance;
         let drawdown_pct = if self.stats.peak_balance > Decimal::ZERO {

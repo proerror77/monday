@@ -54,6 +54,8 @@ data:
       max_daily_trades: 2000
       max_orders_per_second: 50
       staleness_threshold_us: 300000
+      max_daily_loss: 1000
+      max_drawdown_pct: 5.0
 
 ---
 apiVersion: v1

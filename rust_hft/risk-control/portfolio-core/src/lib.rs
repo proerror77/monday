@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hft_core::{OrderId, Price, Quantity, Side, Symbol};
 use ports::{AccountView, ExecutionEvent, Position};
 use snapshot::SnapshotContainer;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Portfolio state that can be persisted
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +62,16 @@ impl Portfolio {
         Self::default()
     }
 
+    pub fn with_cash_balance(cash_balance: Decimal) -> Self {
+        let mut portfolio = Self::default();
+        portfolio.view.cash_balance = cash_balance;
+        if cash_balance > Decimal::ZERO {
+            portfolio.view.high_water_mark = cash_balance;
+        }
+        portfolio.snapshot.store(Arc::new(portfolio.view.clone()));
+        portfolio
+    }
+
     /// 註冊下單元資訊（供 fill 時查找 symbol/side）
     pub fn register_order(&mut self, order_id: hft_core::OrderId, symbol: Symbol, side: Side) {
         self.order_meta.insert(order_id, (symbol, side));
@@ -77,6 +87,14 @@ impl Portfolio {
             ..
         } = event
         {
+            if quantity.0 <= Decimal::ZERO {
+                warn!(
+                    order_id = %order_id.0,
+                    quantity = %quantity.0,
+                    "ignoring fill with non-positive quantity"
+                );
+                return;
+            }
             if let Some((symbol, side)) = self.order_meta.get(order_id).cloned() {
                 // De-duplication: skip duplicated fill_id for this order
                 let set = self.processed_fill_ids.entry(order_id.clone()).or_default();
@@ -140,16 +158,16 @@ impl Portfolio {
 
     /// 更新回撤統計 (高水位、當前回撤、最大回撤)
     fn update_drawdown_stats(&mut self) {
-        let total_pnl = self.view.total_pnl();
+        let equity = self.view.equity();
 
         // 更新高水位標記
-        if total_pnl > self.view.high_water_mark {
-            self.view.high_water_mark = total_pnl;
+        if equity > self.view.high_water_mark {
+            self.view.high_water_mark = equity;
         }
 
         // 計算當前回撤百分比
         if self.view.high_water_mark > Decimal::ZERO {
-            let drawdown = self.view.high_water_mark - total_pnl;
+            let drawdown = self.view.high_water_mark - equity;
             // 避免除以零，計算回撤百分比
             let dd_pct = (drawdown / self.view.high_water_mark * Decimal::from(100))
                 .to_string()
@@ -178,31 +196,38 @@ impl Portfolio {
                 unrealized_pnl: Decimal::ZERO,
             });
 
-        match side {
-            Side::Buy => {
-                // 新均價 = (舊倉*舊均價 + 新買*成交價) / 新總倉
-                let old_qty = pos.quantity.0;
-                let new_qty = Quantity(old_qty + qty.0);
-                let new_avg = if new_qty.0 > rust_decimal::Decimal::ZERO {
-                    Price((pos.avg_price.0 * old_qty + price.0 * qty.0) / new_qty.0)
-                } else {
-                    price
-                };
-                pos.quantity = new_qty;
-                pos.avg_price = new_avg;
-                // 現金減少
-                self.view.cash_balance -= price.0 * qty.0;
-            }
-            Side::Sell => {
-                // 實現損益 = (賣價 - 均價) * 賣出數量
-                let realized = (price.0 - pos.avg_price.0) * qty.0;
-                self.view.realized_pnl += realized;
-                // 減倉
-                pos.quantity = Quantity(pos.quantity.0 - qty.0);
-                // 現金增加
-                self.view.cash_balance += price.0 * qty.0;
+        let old_qty = pos.quantity.0;
+        let delta = match side {
+            Side::Buy => qty.0,
+            Side::Sell => -qty.0,
+        };
+        let new_qty = old_qty + delta;
+        let increases_same_side = old_qty == Decimal::ZERO
+            || (old_qty > Decimal::ZERO && delta > Decimal::ZERO)
+            || (old_qty < Decimal::ZERO && delta < Decimal::ZERO);
+
+        if increases_same_side {
+            let gross_quantity = old_qty.abs() + delta.abs();
+            pos.avg_price =
+                Price((pos.avg_price.0 * old_qty.abs() + price.0 * delta.abs()) / gross_quantity);
+        } else {
+            let closed_quantity = old_qty.abs().min(delta.abs());
+            let direction = if old_qty > Decimal::ZERO {
+                Decimal::ONE
+            } else {
+                -Decimal::ONE
+            };
+            self.view.realized_pnl += (price.0 - pos.avg_price.0) * closed_quantity * direction;
+
+            if new_qty == Decimal::ZERO {
+                pos.avg_price = Price::zero();
+            } else if (new_qty > Decimal::ZERO) != (old_qty > Decimal::ZERO) {
+                pos.avg_price = price;
             }
         }
+
+        pos.quantity = Quantity(new_qty);
+        self.view.cash_balance -= price.0 * delta;
     }
 
     /// Export portfolio state for persistence
@@ -238,7 +263,7 @@ impl Portfolio {
         // Log summary
         info!(
             "Portfolio state imported - Total value: {}, Realized PnL: {}, Unrealized PnL: {}",
-            self.view.cash_balance + self.view.unrealized_pnl,
+            self.view.equity(),
             self.view.realized_pnl,
             self.view.unrealized_pnl
         );
@@ -295,23 +320,162 @@ mod tests {
     use super::*;
     use hft_core::{OrderId, Price, Quantity};
 
-    #[test]
-    fn test_portfolio_fill_updates() {
-        let mut pf = Portfolio::new();
-        let oid = OrderId("O-1".into());
-        let sym = Symbol::new("BTCUSDT");
-        pf.register_order(oid.clone(), sym.clone(), Side::Buy);
-
-        let ev = ExecutionEvent::Fill {
-            order_id: oid,
-            price: Price::from_f64(100.0).unwrap(),
-            quantity: Quantity::from_f64(1.0).unwrap(),
+    fn fill(
+        portfolio: &mut Portfolio,
+        order: &str,
+        fill_id: &str,
+        symbol: &Symbol,
+        side: Side,
+        price: i64,
+        quantity: i64,
+    ) {
+        let order_id = OrderId(order.into());
+        portfolio.register_order(order_id.clone(), symbol.clone(), side);
+        portfolio.on_execution_event(&ExecutionEvent::Fill {
+            order_id,
+            price: Price(Decimal::from(price)),
+            quantity: Quantity(Decimal::from(quantity)),
             timestamp: 0,
-            fill_id: "f1".into(),
-        };
-        pf.on_execution_event(&ev);
+            fill_id: fill_id.into(),
+        });
+    }
 
-        let view = pf.reader().load();
-        assert!(view.positions.contains_key(&sym));
+    fn mark(portfolio: &mut Portfolio, symbol: &Symbol, price: i64) {
+        portfolio.update_market_prices(&HashMap::from([(
+            symbol.clone(),
+            Price(Decimal::from(price)),
+        )]));
+    }
+
+    #[test]
+    fn long_open_increase_reduce_and_close_preserve_accounting_identity() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(1000));
+        let symbol = Symbol::new("BTCUSDT");
+
+        fill(&mut portfolio, "B-1", "f1", &symbol, Side::Buy, 100, 2);
+        fill(&mut portfolio, "B-2", "f2", &symbol, Side::Buy, 130, 1);
+
+        let view = portfolio.reader().load();
+        let position = view.positions.get(&symbol).unwrap();
+        assert_eq!(position.quantity.0, Decimal::from(3));
+        assert_eq!(position.avg_price.0, Decimal::from(110));
+        assert_eq!(view.cash_balance, Decimal::from(670));
+        assert_eq!(view.realized_pnl, Decimal::ZERO);
+
+        fill(&mut portfolio, "S-1", "f3", &symbol, Side::Sell, 140, 1);
+        let view = portfolio.reader().load();
+        let position = view.positions.get(&symbol).unwrap();
+        assert_eq!(position.quantity.0, Decimal::from(2));
+        assert_eq!(position.avg_price.0, Decimal::from(110));
+        assert_eq!(view.realized_pnl, Decimal::from(30));
+
+        fill(&mut portfolio, "S-2", "f4", &symbol, Side::Sell, 90, 2);
+        mark(&mut portfolio, &symbol, 90);
+        let view = portfolio.reader().load();
+        let position = view.positions.get(&symbol).unwrap();
+        assert_eq!(position.quantity.0, Decimal::ZERO);
+        assert_eq!(position.avg_price.0, Decimal::ZERO);
+        assert_eq!(view.realized_pnl, Decimal::from(-10));
+        assert_eq!(view.cash_balance, Decimal::from(990));
+        assert_eq!(view.equity(), Decimal::from(990));
+    }
+
+    #[test]
+    fn short_open_increase_reduce_and_cross_to_long_are_signed_correctly() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(1000));
+        let symbol = Symbol::new("ETHUSDT");
+
+        fill(&mut portfolio, "S-1", "f1", &symbol, Side::Sell, 100, 1);
+        fill(&mut portfolio, "S-2", "f2", &symbol, Side::Sell, 120, 1);
+        let view = portfolio.reader().load();
+        let position = view.positions.get(&symbol).unwrap();
+        assert_eq!(position.quantity.0, Decimal::from(-2));
+        assert_eq!(position.avg_price.0, Decimal::from(110));
+        assert_eq!(view.realized_pnl, Decimal::ZERO);
+        assert_eq!(view.cash_balance, Decimal::from(1220));
+
+        fill(&mut portfolio, "B-1", "f3", &symbol, Side::Buy, 90, 1);
+        let view = portfolio.reader().load();
+        let position = view.positions.get(&symbol).unwrap();
+        assert_eq!(position.quantity.0, Decimal::from(-1));
+        assert_eq!(position.avg_price.0, Decimal::from(110));
+        assert_eq!(view.realized_pnl, Decimal::from(20));
+
+        fill(&mut portfolio, "B-2", "f4", &symbol, Side::Buy, 100, 2);
+        mark(&mut portfolio, &symbol, 100);
+        let view = portfolio.reader().load();
+        let position = view.positions.get(&symbol).unwrap();
+        assert_eq!(position.quantity.0, Decimal::ONE);
+        assert_eq!(position.avg_price.0, Decimal::from(100));
+        assert_eq!(view.realized_pnl, Decimal::from(30));
+        assert_eq!(view.cash_balance, Decimal::from(930));
+        assert_eq!(view.equity(), Decimal::from(1030));
+    }
+
+    #[test]
+    fn long_cross_to_short_sets_residual_basis_to_fill_price() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(1000));
+        let symbol = Symbol::new("SOLUSDT");
+
+        fill(&mut portfolio, "B-1", "f1", &symbol, Side::Buy, 100, 1);
+        fill(&mut portfolio, "S-1", "f2", &symbol, Side::Sell, 110, 2);
+        mark(&mut portfolio, &symbol, 110);
+
+        let view = portfolio.reader().load();
+        let position = view.positions.get(&symbol).unwrap();
+        assert_eq!(position.quantity.0, Decimal::from(-1));
+        assert_eq!(position.avg_price.0, Decimal::from(110));
+        assert_eq!(view.realized_pnl, Decimal::from(10));
+        assert_eq!(view.equity(), Decimal::from(1010));
+    }
+
+    #[test]
+    fn duplicate_fill_is_idempotent() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(1000));
+        let symbol = Symbol::new("BTCUSDT");
+
+        fill(
+            &mut portfolio,
+            "B-1",
+            "same-fill",
+            &symbol,
+            Side::Buy,
+            100,
+            1,
+        );
+        fill(
+            &mut portfolio,
+            "B-1",
+            "same-fill",
+            &symbol,
+            Side::Buy,
+            100,
+            1,
+        );
+
+        let view = portfolio.reader().load();
+        assert_eq!(view.positions[&symbol].quantity.0, Decimal::ONE);
+        assert_eq!(view.cash_balance, Decimal::from(900));
+    }
+
+    #[test]
+    fn marks_drive_equity_drawdown_from_initialized_capital() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(1000));
+        let symbol = Symbol::new("BTCUSDT");
+        fill(&mut portfolio, "B-1", "f1", &symbol, Side::Buy, 100, 1);
+
+        mark(&mut portfolio, &symbol, 90);
+        let losing = portfolio.reader().load();
+        assert_eq!(losing.equity(), Decimal::from(990));
+        assert_eq!(losing.high_water_mark, Decimal::from(1000));
+        assert!((losing.drawdown_pct - 1.0).abs() < f64::EPSILON);
+        assert!((losing.max_drawdown_pct - 1.0).abs() < f64::EPSILON);
+
+        mark(&mut portfolio, &symbol, 110);
+        let recovered = portfolio.reader().load();
+        assert_eq!(recovered.equity(), Decimal::from(1010));
+        assert_eq!(recovered.high_water_mark, Decimal::from(1010));
+        assert_eq!(recovered.drawdown_pct, 0.0);
+        assert!((recovered.max_drawdown_pct - 1.0).abs() < f64::EPSILON);
     }
 }

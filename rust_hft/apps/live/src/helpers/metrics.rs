@@ -86,7 +86,7 @@ async fn generate_basic_metrics(engine_arc: Arc<Mutex<Engine>>) -> String {
     }
 
     let total_pnl = account_view.realized_pnl + account_view.unrealized_pnl;
-    let equity = account_view.cash_balance + total_pnl;
+    let equity = account_view.equity();
 
     let custom = format!(
         r#"# HELP hft_system_uptime_seconds HFT system uptime in seconds
@@ -113,7 +113,7 @@ hft_account_realized_pnl {}
 # TYPE hft_account_total_pnl gauge
 hft_account_total_pnl {}
 
-# HELP hft_account_equity Account equity (cash + total_pnl)
+# HELP hft_account_equity Account equity (cash + marked positions)
 # TYPE hft_account_equity gauge
 hft_account_equity {}
 

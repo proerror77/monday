@@ -114,9 +114,9 @@ pub struct AccountView {
     pub positions: std::collections::HashMap<Symbol, Position>,
     pub unrealized_pnl: rust_decimal::Decimal,
     pub realized_pnl: rust_decimal::Decimal,
-    /// 高水位標記 (總 PnL 歷史最高值)
+    /// 高水位標記 (帳戶權益歷史最高值)
     pub high_water_mark: rust_decimal::Decimal,
-    /// 當前回撤百分比 ((high_water_mark - current_pnl) / high_water_mark * 100)
+    /// 當前回撤百分比 ((high_water_mark - equity) / high_water_mark * 100)
     pub drawdown_pct: f64,
     /// 歷史最大回撤百分比
     pub max_drawdown_pct: f64,
@@ -143,6 +143,19 @@ impl AccountView {
     /// 總 PnL (已實現 + 未實現)
     pub fn total_pnl(&self) -> rust_decimal::Decimal {
         self.realized_pnl + self.unrealized_pnl
+    }
+
+    /// 帳戶權益 = 現金 + 持倉成本價值 + 未實現盈虧。
+    /// 已實現盈虧已反映在現金中，不應重覆相加。
+    pub fn equity(&self) -> rust_decimal::Decimal {
+        self.cash_balance
+            + self
+                .positions
+                .values()
+                .map(|position| {
+                    position.avg_price.0 * position.quantity.0 + position.unrealized_pnl
+                })
+                .sum::<rust_decimal::Decimal>()
     }
 }
 

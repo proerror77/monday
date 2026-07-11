@@ -58,7 +58,7 @@ pub struct AggregatedAccountView {
     pub total_unrealized_pnl: Decimal,
     /// 總已實現盈虧
     pub total_realized_pnl: Decimal,
-    /// 總資產價值 (現金 + 未實現)
+    /// 總資產價值 (各帳戶權益合計)
     pub total_equity: Decimal,
     /// 聚合持倉（相同 symbol 合併）
     pub aggregated_positions: HashMap<Symbol, AggregatedPosition>,
@@ -261,6 +261,7 @@ impl MultiAccountPortfolio {
             agg.total_cash_balance += view.cash_balance;
             agg.total_unrealized_pnl += view.unrealized_pnl;
             agg.total_realized_pnl += view.realized_pnl;
+            agg.total_equity += view.equity();
 
             // 聚合持倉
             for (symbol, position) in &view.positions {
@@ -301,9 +302,6 @@ impl MultiAccountPortfolio {
                 agg_pos.weighted_avg_price = Price(total_value / total_qty);
             }
         }
-
-        // 計算總資產
-        agg.total_equity = agg.total_cash_balance + agg.total_unrealized_pnl;
 
         // 更新最高水位線和回撤
         if agg.total_equity > self.high_water_mark {
@@ -375,7 +373,7 @@ impl MultiAccountPortfolio {
                     unrealized_pnl: view.unrealized_pnl,
                     realized_pnl: view.realized_pnl,
                     total_pnl: view.unrealized_pnl + view.realized_pnl,
-                    equity: view.cash_balance + view.unrealized_pnl,
+                    equity: view.equity(),
                     position_count: view.positions.len(),
                 },
             );
@@ -511,5 +509,38 @@ mod tests {
         // 加權平均價 = (2*3000 + 3*3010) / 5 = 15030 / 5 = 3006
         let expected_avg = Decimal::from(15030) / Decimal::from(5);
         assert_eq!(eth_pos.weighted_avg_price.0, expected_avg);
+    }
+
+    #[test]
+    fn aggregate_equity_includes_marked_position_value() {
+        let mut multi = MultiAccountPortfolio::new();
+        let account_id = AccountId::new(VenueId::BINANCE);
+        let symbol = Symbol::new("BTCUSDT");
+        let account = multi.get_or_create_account(account_id.clone());
+        let mut state = account.export_state();
+        state.account_view.cash_balance = Decimal::from(1000);
+        account.import_state(state);
+
+        multi.register_order(
+            account_id.clone(),
+            OrderId("B-1".into()),
+            symbol.clone(),
+            Side::Buy,
+        );
+        multi.on_execution_event(&ExecutionEvent::Fill {
+            order_id: OrderId("B-1".into()),
+            price: Price(Decimal::from(100)),
+            quantity: Quantity(Decimal::ONE),
+            timestamp: 1,
+            fill_id: "f1".into(),
+        });
+
+        let aggregate = multi.get_aggregated_view();
+        assert_eq!(aggregate.total_cash_balance, Decimal::from(900));
+        assert_eq!(aggregate.total_equity, Decimal::from(1000));
+        assert_eq!(
+            multi.get_pnl_report().per_account[&account_id].equity,
+            Decimal::from(1000)
+        );
     }
 }

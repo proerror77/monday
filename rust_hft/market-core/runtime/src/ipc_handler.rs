@@ -375,7 +375,7 @@ impl CommandHandler for SystemCommandHandler {
 
                 let account = AccountInfo {
                     cash_balance: account_view.cash_balance,
-                    total_value: account_view.cash_balance + account_view.unrealized_pnl,
+                    total_value: account_view.equity(),
                     realized_pnl: account_view.realized_pnl,
                     unrealized_pnl: account_view.unrealized_pnl,
                     max_drawdown: risk_metrics

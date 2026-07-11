@@ -44,4 +44,6 @@ risk:
     );
     assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Paper"));
     assert_eq!(config.risk.risk_type, "Default");
+    assert_eq!(config.risk.max_daily_loss, Decimal::from(10000));
+    assert_eq!(config.risk.max_drawdown_pct, 5.0);
 }

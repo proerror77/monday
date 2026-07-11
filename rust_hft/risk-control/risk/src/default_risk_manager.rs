@@ -31,6 +31,8 @@ pub struct RiskConfig {
     pub staleness_threshold_us: u64,
     /// 最大日内亏损限额
     pub max_daily_loss: rust_decimal::Decimal,
+    /// 最大權益回撤百分比
+    pub max_drawdown_pct: f64,
     /// 是否启用激进模式（跳过某些检查）
     pub aggressive_mode: bool,
 }
@@ -44,6 +46,7 @@ impl Default for RiskConfig {
             order_cooldown_ms: 100,
             staleness_threshold_us: 5000,
             max_daily_loss: rust_decimal::Decimal::from(10000),
+            max_drawdown_pct: 5.0,
             aggressive_mode: false,
         }
     }
@@ -66,7 +69,8 @@ struct SymbolRiskState {
 pub struct DefaultRiskManager {
     config: RiskConfig,
     symbol_states: HashMap<Symbol, SymbolRiskState>,
-    daily_pnl: rust_decimal::Decimal,
+    last_account: Option<AccountView>,
+    last_account_update_us: u64,
     total_orders_today: u64,
     total_rejected_today: u64,
 }
@@ -76,7 +80,8 @@ impl DefaultRiskManager {
         Self {
             config,
             symbol_states: HashMap::new(),
-            daily_pnl: rust_decimal::Decimal::ZERO,
+            last_account: None,
+            last_account_update_us: 0,
             total_orders_today: 0,
             total_rejected_today: 0,
         }
@@ -88,6 +93,13 @@ impl DefaultRiskManager {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
+    }
+
+    fn current_time_us() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64
     }
 
     /// 检查下单频率
@@ -173,12 +185,32 @@ impl DefaultRiskManager {
 
     /// 检查日内亏损
     fn check_daily_loss(&self, account: &AccountView) -> Result<(), String> {
+        if self.config.max_daily_loss < Decimal::ZERO {
+            return Err("最大日内亏损配置不能为负数".to_string());
+        }
         let total_pnl = account.realized_pnl + account.unrealized_pnl;
 
-        if total_pnl < -self.config.max_daily_loss {
+        if total_pnl <= -self.config.max_daily_loss {
             return Err(format!(
-                "超过日内最大亏损: {:.2} < -{:.2}",
+                "超过日内最大亏损: {:.2} <= -{:.2}",
                 total_pnl, self.config.max_daily_loss
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn check_drawdown(&self, account: &AccountView) -> Result<(), String> {
+        if !self.config.max_drawdown_pct.is_finite()
+            || !(0.0..=100.0).contains(&self.config.max_drawdown_pct)
+        {
+            return Err("最大回撤配置必须在 0 到 100 之间".to_string());
+        }
+        if !account.drawdown_pct.is_finite() || account.drawdown_pct >= self.config.max_drawdown_pct
+        {
+            return Err(format!(
+                "超过最大回撤: {:.4}% >= {:.4}%",
+                account.drawdown_pct, self.config.max_drawdown_pct
             ));
         }
 
@@ -203,24 +235,11 @@ impl RiskManager for DefaultRiskManager {
         account: &AccountView,
         venue: &VenueSpec,
     ) -> Vec<OrderIntent> {
+        self.last_account = Some(account.clone());
+        self.last_account_update_us = Self::current_time_us();
         let mut approved_intents = Vec::new();
 
         for mut intent in intents {
-            // 激进模式下跳过某些检查
-            if self.config.aggressive_mode {
-                // 即使激进模式也要做精度标准化
-                if let Some(price) = intent.price {
-                    intent.price =
-                        Some(PrecisionNormalizer::normalize_price(price, venue.tick_size));
-                }
-                intent.quantity =
-                    PrecisionNormalizer::normalize_quantity(intent.quantity, venue.lot_size);
-
-                self.update_state(&intent.symbol);
-                approved_intents.push(intent);
-                continue;
-            }
-
             // 第一步：精度标准化
             if let Some(price) = intent.price {
                 intent.price = Some(PrecisionNormalizer::normalize_price(price, venue.tick_size));
@@ -236,11 +255,17 @@ impl RiskManager for DefaultRiskManager {
             );
 
             // 第三步：风控检查
+            let rate_check = if self.config.aggressive_mode {
+                Ok(())
+            } else {
+                self.check_rate_limit(&intent.symbol)
+            };
             let checks = vec![
                 venue_check,
-                self.check_rate_limit(&intent.symbol),
+                rate_check,
                 self.check_position_limits(&intent, account),
                 self.check_daily_loss(account),
+                self.check_drawdown(account),
             ];
 
             // 收集所有错误
@@ -296,15 +321,9 @@ impl RiskManager for DefaultRiskManager {
         approved_intents
     }
 
-    fn on_execution_event(&mut self, event: &ExecutionEvent) {
-        // 更新日内盈亏（简化版，实际应考虑方向与均价）
-        if let ExecutionEvent::Fill {
-            price, quantity, ..
-        } = event
-        {
-            let notional = price.0 * quantity.0;
-            self.daily_pnl += notional;
-        }
+    fn on_execution_event(&mut self, _event: &ExecutionEvent) {
+        // PnL belongs to the portfolio ledger. A fill has no direction/cost basis here,
+        // so fabricating account metrics from notional would be unsafe.
     }
 
     fn emergency_stop(&mut self) -> Result<(), HftError> {
@@ -327,7 +346,29 @@ impl RiskManager for DefaultRiskManager {
             "total_rejected_today".to_string(),
             Decimal::from(self.total_rejected_today),
         );
-        metrics.insert("daily_pnl".to_string(), self.daily_pnl);
+        metrics.insert(
+            "account_metrics_available".to_string(),
+            if self.last_account.is_some() {
+                Decimal::ONE
+            } else {
+                Decimal::ZERO
+            },
+        );
+
+        if let Some(account) = &self.last_account {
+            metrics.insert("realized_pnl".to_string(), account.realized_pnl);
+            metrics.insert("unrealized_pnl".to_string(), account.unrealized_pnl);
+            metrics.insert("total_pnl".to_string(), account.total_pnl());
+            metrics.insert("equity".to_string(), account.equity());
+            metrics.insert(
+                "drawdown_pct".to_string(),
+                Decimal::from_f64_retain(account.drawdown_pct).unwrap_or(Decimal::ZERO),
+            );
+            metrics.insert(
+                "max_drawdown_pct".to_string(),
+                Decimal::from_f64_retain(account.max_drawdown_pct).unwrap_or(Decimal::ZERO),
+            );
+        }
 
         if self.total_orders_today > 0 {
             metrics.insert(
@@ -353,34 +394,74 @@ impl RiskManager for DefaultRiskManager {
     }
 
     fn should_halt_trading(&self, account: &AccountView) -> bool {
-        // 如果日内亏损超过限额，应该停止交易
-        let total_pnl = account.realized_pnl + account.unrealized_pnl;
-        total_pnl < -self.config.max_daily_loss
+        self.check_daily_loss(account).is_err() || self.check_drawdown(account).is_err()
     }
 
     fn risk_metrics(&self) -> RiskMetrics {
+        let (max_drawdown, current_drawdown) = self
+            .last_account
+            .as_ref()
+            .map(|account| {
+                (
+                    Decimal::from_f64_retain(account.max_drawdown_pct).unwrap_or(Decimal::ZERO),
+                    Decimal::from_f64_retain(account.drawdown_pct).unwrap_or(Decimal::ZERO),
+                )
+            })
+            .unwrap_or((Decimal::ZERO, Decimal::ZERO));
+
         RiskMetrics {
-            max_drawdown: self.daily_pnl.min(Decimal::ZERO).abs(),
-            current_drawdown: Decimal::ZERO,
+            max_drawdown,
+            current_drawdown,
             var_1d: Decimal::ZERO,
             leverage: Decimal::ZERO,
             concentration_risk: Decimal::ZERO,
             order_rate: Decimal::ZERO,
-            last_update: 0,
+            last_update: self.last_account_update_us,
         }
     }
 
     fn update_config(&mut self, update: RiskConfigUpdate) -> Result<(), HftError> {
         if let Some(max_drawdown_pct) = update.max_drawdown_pct {
-            // 将百分比转换为绝对值（假设初始资金为 max_daily_loss 的 20 倍）
-            let implied_capital = self.config.max_daily_loss * Decimal::from(20);
-            self.config.max_daily_loss =
-                implied_capital * Decimal::from_f64_retain(max_drawdown_pct / 100.0)
-                    .unwrap_or(Decimal::ZERO);
-            info!(
-                "风控配置更新: max_daily_loss = {}",
-                self.config.max_daily_loss
-            );
+            if !max_drawdown_pct.is_finite() || !(0.0..=100.0).contains(&max_drawdown_pct) {
+                return Err(HftError::Config(
+                    "max_drawdown_pct 必须在 0 到 100 之间".to_string(),
+                ));
+            }
+        }
+
+        if let Some(max_position_usd) = update.max_position_usd {
+            if !max_position_usd.is_finite() || max_position_usd < 0.0 {
+                return Err(HftError::Config(
+                    "max_position_usd 必须是非负有限值".to_string(),
+                ));
+            }
+        }
+
+        if update.max_order_size_usd.is_some() {
+            return Err(HftError::Config(
+                "DefaultRiskManager 不支持 max_order_size_usd".to_string(),
+            ));
+        }
+
+        if let Some(max_orders_per_second) = update.max_orders_per_second {
+            if max_orders_per_second < 0 {
+                return Err(HftError::Config(
+                    "max_orders_per_second 不能为负数".to_string(),
+                ));
+            }
+        }
+
+        if let Some(latency_threshold_us) = update.latency_threshold_us {
+            if latency_threshold_us < 0 {
+                return Err(HftError::Config(
+                    "latency_threshold_us 不能为负数".to_string(),
+                ));
+            }
+        }
+
+        if let Some(max_drawdown_pct) = update.max_drawdown_pct {
+            self.config.max_drawdown_pct = max_drawdown_pct;
+            info!("风控配置更新: max_drawdown_pct = {}", max_drawdown_pct);
         }
 
         if let Some(max_position_usd) = update.max_position_usd {
@@ -413,12 +494,7 @@ impl RiskManager for DefaultRiskManager {
 
     fn get_config_snapshot(&self) -> RiskConfigSnapshot {
         RiskConfigSnapshot {
-            max_drawdown_pct: (self.config.max_daily_loss
-                / (self.config.max_daily_loss * Decimal::from(20))
-                * Decimal::from(100))
-            .to_string()
-            .parse()
-            .unwrap_or(5.0),
+            max_drawdown_pct: self.config.max_drawdown_pct,
             max_position_usd: self
                 .config
                 .max_global_notional
@@ -742,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fill_event_updates_daily_pnl() {
+    fn fill_event_does_not_fabricate_pnl() {
         let config = RiskConfig::default();
         let mut mgr = DefaultRiskManager::new(config);
 
@@ -756,8 +832,24 @@ mod tests {
 
         mgr.on_execution_event(&fill_event);
 
-        // daily_pnl should be updated
-        assert!(mgr.daily_pnl > Decimal::ZERO);
+        let metrics = mgr.get_risk_metrics();
+        assert_eq!(metrics["account_metrics_available"], Decimal::ZERO);
+        assert!(!metrics.contains_key("daily_pnl"));
+    }
+
+    #[test]
+    fn review_captures_real_account_metrics() {
+        let mut mgr = DefaultRiskManager::new(RiskConfig::default());
+        let account = create_test_account();
+
+        mgr.review(Vec::new(), &account, &VenueSpec::default());
+
+        let metrics = mgr.get_risk_metrics();
+        assert_eq!(metrics["account_metrics_available"], Decimal::ONE);
+        assert_eq!(metrics["realized_pnl"], Decimal::from(500));
+        assert_eq!(metrics["unrealized_pnl"], Decimal::from(100));
+        assert_eq!(metrics["total_pnl"], Decimal::from(600));
+        assert_eq!(metrics["equity"], account.equity());
     }
 
     #[test]
@@ -779,19 +871,27 @@ mod tests {
     fn test_should_halt_trading() {
         let config = RiskConfig {
             max_daily_loss: Decimal::from(1000),
+            max_drawdown_pct: 5.0,
             ..Default::default()
         };
         let mgr = DefaultRiskManager::new(config);
 
         // Account with acceptable loss
-        let mut account = AccountView::default();
-        account.realized_pnl = Decimal::from(-500);
-        account.unrealized_pnl = Decimal::from(-400);
+        let mut account = AccountView {
+            realized_pnl: Decimal::from(-500),
+            unrealized_pnl: Decimal::from(-400),
+            ..Default::default()
+        };
         assert!(!mgr.should_halt_trading(&account));
 
         // Account with excessive loss
         account.realized_pnl = Decimal::from(-600);
         account.unrealized_pnl = Decimal::from(-500);
+        assert!(mgr.should_halt_trading(&account));
+
+        account.realized_pnl = Decimal::ZERO;
+        account.unrealized_pnl = Decimal::ZERO;
+        account.drawdown_pct = 5.1;
         assert!(mgr.should_halt_trading(&account));
     }
 
@@ -886,12 +986,12 @@ mod tests {
     #[test]
     fn test_update_config_max_drawdown() {
         let config = RiskConfig {
-            max_daily_loss: Decimal::from(10000), // 10K
+            max_daily_loss: Decimal::from(10000),
+            max_drawdown_pct: 5.0,
             ..Default::default()
         };
         let mut mgr = DefaultRiskManager::new(config);
 
-        // Update drawdown to 10% (implied capital is 20x max_daily_loss = 200K, so 10% = 20K)
         let update = RiskConfigUpdate {
             max_drawdown_pct: Some(10.0),
             ..Default::default()
@@ -899,12 +999,8 @@ mod tests {
 
         let result = mgr.update_config(update);
         assert!(result.is_ok());
-        // New max_daily_loss should be 10% of 200K = 20K
-        // Use approximate comparison due to floating point precision
-        let expected = Decimal::from(20000);
-        let diff = (mgr.config.max_daily_loss - expected).abs();
-        assert!(diff < Decimal::from_str_exact("0.01").unwrap(),
-            "max_daily_loss {} should be approximately {}", mgr.config.max_daily_loss, expected);
+        assert_eq!(mgr.config.max_drawdown_pct, 10.0);
+        assert_eq!(mgr.config.max_daily_loss, Decimal::from(10000));
     }
 
     #[test]
@@ -929,6 +1025,33 @@ mod tests {
     }
 
     #[test]
+    fn invalid_config_update_is_atomic() {
+        let mut mgr = DefaultRiskManager::new(RiskConfig::default());
+        let before = mgr.get_config_snapshot();
+        let update = RiskConfigUpdate {
+            max_drawdown_pct: Some(10.0),
+            max_position_usd: Some(-1.0),
+            ..Default::default()
+        };
+
+        assert!(mgr.update_config(update).is_err());
+        let after = mgr.get_config_snapshot();
+        assert_eq!(after.max_drawdown_pct, before.max_drawdown_pct);
+        assert_eq!(after.max_position_usd, before.max_position_usd);
+    }
+
+    #[test]
+    fn unsupported_order_size_update_fails_explicitly() {
+        let mut mgr = DefaultRiskManager::new(RiskConfig::default());
+        let update = RiskConfigUpdate {
+            max_order_size_usd: Some(1000.0),
+            ..Default::default()
+        };
+
+        assert!(mgr.update_config(update).is_err());
+    }
+
+    #[test]
     fn test_get_config_snapshot() {
         let config = RiskConfig {
             max_position_per_symbol: Quantity::from_f64(50.0).unwrap(),
@@ -936,6 +1059,7 @@ mod tests {
             max_orders_per_second: 25,
             staleness_threshold_us: 8000,
             max_daily_loss: Decimal::from(5000),
+            max_drawdown_pct: 7.5,
             ..Default::default()
         };
         let mgr = DefaultRiskManager::new(config);
@@ -947,6 +1071,7 @@ mod tests {
         assert_eq!(snapshot.latency_threshold_us, 8000);
         // max_order_size_usd comes from max_position_per_symbol
         assert_eq!(snapshot.max_order_size_usd, 50.0);
+        assert_eq!(snapshot.max_drawdown_pct, 7.5);
     }
 
     #[test]

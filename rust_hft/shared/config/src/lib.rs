@@ -142,7 +142,7 @@ pub struct StrategyRiskLimits {
     pub cooldown_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
     #[serde(default = "default_risk_type")]
     pub risk_type: String,
@@ -156,6 +156,10 @@ pub struct RiskConfig {
     pub max_orders_per_second: u32,
     #[serde(default)]
     pub staleness_threshold_us: u64,
+    #[serde(default = "default_max_daily_loss")]
+    pub max_daily_loss: Decimal,
+    #[serde(default = "default_max_drawdown_pct")]
+    pub max_drawdown_pct: f64,
     #[serde(default)]
     pub enhanced: Option<serde_yaml::Value>,
     #[serde(default)]
@@ -164,8 +168,34 @@ pub struct RiskConfig {
     pub tokenized_securities: TokenizedSecuritiesRiskConfig,
 }
 
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            risk_type: default_risk_type(),
+            global_position_limit: Decimal::ZERO,
+            global_notional_limit: Decimal::ZERO,
+            max_daily_trades: 0,
+            max_orders_per_second: 0,
+            staleness_threshold_us: 0,
+            max_daily_loss: default_max_daily_loss(),
+            max_drawdown_pct: default_max_drawdown_pct(),
+            enhanced: None,
+            strategy_overrides: HashMap::new(),
+            tokenized_securities: TokenizedSecuritiesRiskConfig::default(),
+        }
+    }
+}
+
 fn default_risk_type() -> String {
     "Default".to_string()
+}
+
+fn default_max_daily_loss() -> Decimal {
+    Decimal::from(10000)
+}
+
+fn default_max_drawdown_pct() -> f64 {
+    5.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

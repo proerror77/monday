@@ -65,7 +65,8 @@ impl RiskManagerFactory {
                     max_orders_per_second: system_risk_config.max_orders_per_second,
                     order_cooldown_ms: 100,
                     staleness_threshold_us: system_risk_config.staleness_threshold_us,
-                    max_daily_loss: rust_decimal::Decimal::from(10000),
+                    max_daily_loss: system_risk_config.max_daily_loss,
+                    max_drawdown_pct: system_risk_config.max_drawdown_pct,
                     aggressive_mode: false,
                 };
 
@@ -303,15 +304,21 @@ mod tests {
             max_daily_trades: 100,
             max_orders_per_second: 10,
             staleness_threshold_us: 5000,
+            max_daily_loss: Decimal::from(1234),
+            max_drawdown_pct: 3.5,
             enhanced: None,
             strategy_overrides: HashMap::new(),
             tokenized_securities: Default::default(),
         };
 
-        let _manager = RiskManagerFactory::create_risk_manager(&risk_config);
+        let manager = RiskManagerFactory::create_risk_manager(&risk_config);
 
         // 產生 Default 風控，且保持風控類型不被意外修改
         assert_eq!(risk_config.risk_type, "Default");
+        assert_eq!(manager.get_config_snapshot().max_drawdown_pct, 3.5);
+        let mut losing_account = ports::AccountView::default();
+        losing_account.realized_pnl = Decimal::from(-1234);
+        assert!(manager.should_halt_trading(&losing_account));
     }
 
     #[test]
@@ -324,6 +331,8 @@ mod tests {
             max_daily_trades: 100,
             max_orders_per_second: 10,
             staleness_threshold_us: 5000,
+            max_daily_loss: Decimal::from(10000),
+            max_drawdown_pct: 5.0,
             enhanced: Some(enhanced_settings),
             strategy_overrides: HashMap::new(),
             tokenized_securities: Default::default(),
@@ -344,6 +353,8 @@ mod tests {
             max_daily_trades: 100,
             max_orders_per_second: 10,
             staleness_threshold_us: 5000,
+            max_daily_loss: Decimal::from(10000),
+            max_drawdown_pct: 5.0,
             enhanced: None,
             strategy_overrides: HashMap::new(),
             tokenized_securities: Default::default(),

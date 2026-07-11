@@ -297,6 +297,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_daily_trades: 10000,
                 max_orders_per_second: 100,
                 staleness_threshold_us: 5000,
+                max_daily_loss: rust_decimal::Decimal::from(10000),
+                max_drawdown_pct: 5.0,
                 enhanced: None,
                 strategy_overrides: Default::default(),
                 tokenized_securities: Default::default(),

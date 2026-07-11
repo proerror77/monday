@@ -500,6 +500,8 @@ fn convert_risk_config(risk: shared::RiskConfig) -> RiskConfig {
         max_daily_trades: risk.max_daily_trades,
         max_orders_per_second: risk.max_orders_per_second,
         staleness_threshold_us: risk.staleness_threshold_us,
+        max_daily_loss: risk.max_daily_loss,
+        max_drawdown_pct: risk.max_drawdown_pct,
         enhanced,
         strategy_overrides: overrides,
         tokenized_securities: TokenizedSecuritiesRiskConfig {

@@ -404,7 +404,12 @@ impl HftControl for HftControlService {
         let unrealized: f64 = state.account_view.unrealized_pnl.to_string().parse().unwrap_or(0.0);
         let realized: f64 = state.account_view.realized_pnl.to_string().parse().unwrap_or(0.0);
         let high_water: f64 = state.account_view.high_water_mark.to_string().parse().unwrap_or(0.0);
-        let total_equity = cash + unrealized;
+        let total_equity = state
+            .account_view
+            .equity()
+            .to_string()
+            .parse()
+            .unwrap_or(0.0);
 
         Ok(Response::new(PortfolioStatus {
             cash_balance: cash,
