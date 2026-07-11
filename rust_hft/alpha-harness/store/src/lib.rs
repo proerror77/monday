@@ -1423,6 +1423,55 @@ mod tests {
     }
 
     #[test]
+    fn migration_002_preserves_legacy_deployment_readback() {
+        let path = temp_db("legacy-deployment");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_001).unwrap();
+        let now = Utc::now();
+        let payload = serde_json::json!({
+            "envelope": {
+                "deployment_id": "legacy-deployment",
+                "asset_revision_id": "candidate-legacy",
+                "promotion_manifest_hash": "a".repeat(64),
+                "runtime_config_hash": "b".repeat(64),
+                "risk_policy_hash": "c".repeat(64),
+                "account_id": "account-1",
+                "venue": "binance",
+                "instruments": ["BTCUSDT"],
+                "allowed_intent_types": ["StartPaper"],
+                "max_notional": 100.0,
+                "max_symbol_exposure": 50.0,
+                "max_order_size": 10.0,
+                "max_slippage_bps": 2.0,
+                "valid_from": now,
+                "expires_at": now + chrono::Duration::minutes(5),
+                "nonce": "legacy-nonce",
+                "approval_class": "Paper",
+                "approval_signatures": ["legacy-approval"],
+                "payload_hash": "legacy-payload-hash"
+            },
+            "key_id": "legacy-key",
+            "signature_hex": "legacy-signature"
+        });
+        let json = serde_json::to_string(&payload).unwrap();
+        let hash = hex::encode(Sha256::digest(json.as_bytes()));
+        connection
+            .execute(
+                "INSERT INTO deployment_envelopes VALUES (?, ?, ?, ?)",
+                params!["legacy-deployment", json, hash, now.to_rfc3339()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = AlphaStore::open(&path).unwrap();
+        let signed = store.get_deployment("legacy-deployment").unwrap();
+        assert!(signed.envelope.promotion_id.is_empty());
+        assert!(signed.envelope.bundle_id.is_empty());
+        assert!(signed.envelope.bundle_hash.is_empty());
+        assert!(signed.envelope.validate().is_err());
+    }
+
+    #[test]
     fn typed_promotion_and_bundle_round_trip_atomically() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();

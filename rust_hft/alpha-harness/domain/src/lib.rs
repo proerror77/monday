@@ -421,24 +421,18 @@ impl StrategyBundle {
     pub fn calculated_hash(&self) -> Result<String, DomainError> {
         #[derive(Serialize)]
         struct SignableBundle<'a> {
-            bundle_id: &'a str,
-            candidate_id: &'a str,
             candidate_content_hash: &'a str,
             dataset_manifest_id: &'a ManifestId,
             evaluator_version: &'a str,
             sealed_evaluation_hash: &'a str,
             artifact: &'a StrategyBundleArtifact,
-            created_at: DateTime<Utc>,
         }
         canonical_json_hash(&SignableBundle {
-            bundle_id: &self.bundle_id,
-            candidate_id: &self.candidate_id,
             candidate_content_hash: &self.candidate_content_hash,
             dataset_manifest_id: &self.dataset_manifest_id,
             evaluator_version: &self.evaluator_version,
             sealed_evaluation_hash: &self.sealed_evaluation_hash,
             artifact: &self.artifact,
-            created_at: self.created_at,
         })
     }
 }
@@ -551,9 +545,12 @@ pub enum ApprovalClass {
 pub struct DeploymentEnvelope {
     pub deployment_id: String,
     pub asset_revision_id: String,
+    #[serde(default)]
     pub promotion_id: String,
     pub promotion_manifest_hash: String,
+    #[serde(default)]
     pub bundle_id: String,
+    #[serde(default)]
     pub bundle_hash: String,
     pub runtime_config_hash: String,
     pub risk_policy_hash: String,
@@ -978,6 +975,56 @@ mod tests {
         assert_eq!(
             bundle.validate(),
             Err(DomainError::StrategyBundleHashMismatch)
+        );
+    }
+
+    #[test]
+    fn strategy_bundle_hash_is_stable_across_storage_metadata() {
+        let artifact = StrategyBundleArtifact::Formula {
+            ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field("signal".to_string())),
+        };
+        let first = StrategyBundle::new(
+            "bundle-1".to_string(),
+            "candidate-1".to_string(),
+            "a".repeat(64),
+            ManifestId::new("dataset-1").unwrap(),
+            "sealed-holdout-v1".to_string(),
+            "b".repeat(64),
+            artifact.clone(),
+            Utc::now(),
+        )
+        .unwrap();
+        let second = StrategyBundle::new(
+            "bundle-2".to_string(),
+            "candidate-alias".to_string(),
+            "a".repeat(64),
+            ManifestId::new("dataset-1").unwrap(),
+            "sealed-holdout-v1".to_string(),
+            "b".repeat(64),
+            artifact,
+            first.created_at + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        assert_eq!(first.bundle_hash, second.bundle_hash);
+    }
+
+    #[test]
+    fn legacy_deployment_envelope_deserializes_but_cannot_be_activated() {
+        let now = Utc::now();
+        let mut value = serde_json::to_value(envelope(now)).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("promotion_id");
+        object.remove("bundle_id");
+        object.remove("bundle_hash");
+
+        let legacy: DeploymentEnvelope = serde_json::from_value(value).unwrap();
+        assert!(legacy.promotion_id.is_empty());
+        assert!(legacy.bundle_id.is_empty());
+        assert!(legacy.bundle_hash.is_empty());
+        assert_eq!(
+            legacy.validate(),
+            Err(DomainError::EmptyField("promotion_id"))
         );
     }
 

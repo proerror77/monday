@@ -292,17 +292,32 @@ fn enforce_deployment_approvals(
 fn deployment_scope_hash(envelope: &DeploymentEnvelope) -> anyhow::Result<String> {
     let mut instruments = envelope.instruments.clone();
     instruments.sort();
+    instruments.dedup();
+    let mut allowed_intent_types = envelope.allowed_intent_types.clone();
+    allowed_intent_types.sort_by_key(intent_sort_key);
+    allowed_intent_types.dedup();
     let scope = serde_json::json!({
         "account_id": envelope.account_id,
         "venue": envelope.venue,
         "instruments": instruments,
-        "allowed_intent_types": envelope.allowed_intent_types,
+        "allowed_intent_types": allowed_intent_types,
         "max_notional": envelope.max_notional,
         "max_symbol_exposure": envelope.max_symbol_exposure,
         "max_order_size": envelope.max_order_size,
         "max_slippage_bps": envelope.max_slippage_bps,
     });
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&scope)?)))
+}
+
+fn intent_sort_key(intent: &alpha_domain::AllowedIntentType) -> u8 {
+    match intent {
+        alpha_domain::AllowedIntentType::LoadFactor => 0,
+        alpha_domain::AllowedIntentType::LoadModel => 1,
+        alpha_domain::AllowedIntentType::LoadAllocatorPolicy => 2,
+        alpha_domain::AllowedIntentType::StartPaper => 3,
+        alpha_domain::AllowedIntentType::StartShadow => 4,
+        alpha_domain::AllowedIntentType::StartLiveSmall => 5,
+    }
 }
 
 fn read_record<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> anyhow::Result<T> {
@@ -384,6 +399,32 @@ mod tests {
             .unwrap();
         assert!(
             enforce_deployment_approvals(&store, &envelope, now + Duration::seconds(1)).is_err()
+        );
+    }
+
+    #[test]
+    fn deployment_scope_hash_normalizes_instrument_and_intent_sets() {
+        let mut first = live_small_envelope();
+        first.instruments = vec!["ETHUSDT".to_string(), "BTCUSDT".to_string()];
+        first.allowed_intent_types = vec![
+            AllowedIntentType::StartLiveSmall,
+            AllowedIntentType::LoadFactor,
+        ];
+        let mut second = first.clone();
+        second.instruments = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "BTCUSDT".to_string(),
+        ];
+        second.allowed_intent_types = vec![
+            AllowedIntentType::LoadFactor,
+            AllowedIntentType::StartLiveSmall,
+            AllowedIntentType::LoadFactor,
+        ];
+
+        assert_eq!(
+            deployment_scope_hash(&first).unwrap(),
+            deployment_scope_hash(&second).unwrap()
         );
     }
 }
