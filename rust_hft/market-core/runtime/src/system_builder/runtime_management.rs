@@ -11,6 +11,15 @@ use hft_core::{HftError, Symbol};
 use std::sync::Arc;
 
 impl SystemRuntime {
+    pub fn execution_control_handle(&self) -> engine::ExecutionControlHandle {
+        let execution_enabled = self.exec_control_tx.is_some();
+        engine::ExecutionControlHandle::new(
+            self.engine.clone(),
+            self.exec_control_tx.clone(),
+            execution_enabled,
+        )
+    }
+
     /// 為 IPC 創建共享實例，避免雙實例問題
     /// 共享引擎和配置，但使用獨立的任務列表
     #[allow(dead_code)] // Used when infra-ipc feature is enabled
@@ -20,7 +29,7 @@ impl SystemRuntime {
             config: self.config.clone(),
             tasks: vec![],                  // IPC 專用空任務列表
             execution_worker_tasks: vec![], // IPC 專用空任務列表
-            exec_control_txs: vec![],
+            exec_control_tx: self.exec_control_tx.clone(),
             market_plans: self.market_plans.clone(),
             execution_client_venues: self.execution_client_venues.clone(),
             execution_client_accounts: self.execution_client_accounts.clone(),
@@ -109,7 +118,7 @@ impl SystemRuntime {
         self.engine.lock().await.get_account_view()
     }
 
-    /// 取消指定策略的所有未結訂單（非阻塞）
+    /// Cancel a strategy's OMS-open orders and wait for worker dispatch results.
     pub async fn cancel_orders_for_strategy(&self, strategy_id: &str) -> usize {
         let pairs = {
             let eng = self.engine.lock().await;
@@ -118,12 +127,14 @@ impl SystemRuntime {
         if pairs.is_empty() {
             return 0;
         }
-        for tx in &self.exec_control_txs {
-            let _ = tx.send(engine::execution_worker::ControlCommand::CancelOrders(
-                pairs.clone(),
-            ));
+        let handle = self.execution_control_handle();
+        match handle.cancel_orders_for_strategy(strategy_id).await {
+            Ok(report) => report.submitted.len(),
+            Err(error) => {
+                tracing::error!(%error, strategy_id, "failed to dispatch strategy cancellation");
+                0
+            }
         }
-        pairs.len()
     }
 
     /// 熱更新風控配置：替換風控管理器並應用新的策略覆蓋

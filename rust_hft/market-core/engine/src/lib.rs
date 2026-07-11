@@ -8,6 +8,7 @@ pub mod adapter_bridge;
 pub mod aggregation;
 pub mod binance_md;
 pub mod dataflow;
+pub mod execution_control;
 pub mod execution_queues;
 pub mod execution_worker;
 pub mod latency_monitor;
@@ -35,6 +36,7 @@ use tracing::{debug, error, info, trace, warn};
 // 重新導出關鍵類型
 pub use adapter_bridge::{AdapterBridge, AdapterBridgeConfig};
 pub use dataflow::{BackpressurePolicy, BackpressureStatus, FlipPolicy};
+pub use execution_control::{ExecutionControlHandle, RuntimeReconciliationReport};
 pub use execution_queues::{
     create_execution_queues, ExecutionQueueConfig, LifecycleIntentSubmitError, WorkerQueues,
 };
@@ -330,6 +332,23 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Compare the OMS source of truth with an authoritative exchange snapshot.
+    pub fn reconcile_open_orders(
+        &self,
+        exchange_orders: &[ports::OpenOrder],
+    ) -> ports::OrderReconciliationReport {
+        self.order_manager
+            .as_ref()
+            .map(|manager| manager.reconcile_with_exchange(exchange_orders))
+            .unwrap_or_else(|| ports::OrderReconciliationReport {
+                exchange_only: exchange_orders
+                    .iter()
+                    .map(|order| order.order_id.clone())
+                    .collect(),
+                ..Default::default()
+            })
+    }
+
     /// 取得指定策略的未結訂單 (order_id, symbol) 配對，供外部控制/撤單使用
     pub fn open_order_pairs_by_strategy(
         &self,
@@ -595,6 +614,7 @@ impl Engine {
 
     /// 提交訂單意圖到執行隊列（用於 dry-run 測試）
     pub fn submit_order_intent(&mut self, intent: ports::OrderIntent) -> Result<(), HftError> {
+        self.ensure_accepting_new_intents()?;
         if let Some(queues) = &mut self.execution_queues {
             match queues.send_intent(intent) {
                 Ok(()) => {
@@ -625,6 +645,7 @@ impl Engine {
         now: hft_core::Timestamp,
         latest_book_seq: Option<u64>,
     ) -> Result<(), HftError> {
+        self.ensure_accepting_new_intents()?;
         if let Some(queues) = &mut self.execution_queues {
             match queues.send_lifecycle_intent_with_book_seq(envelope, now, latest_book_seq) {
                 Ok(()) => {
@@ -1256,6 +1277,20 @@ impl Engine {
                 }
             }
 
+            if matches!(
+                self.stats.trading_mode,
+                TradingMode::Paused | TradingMode::Emergency
+            ) {
+                if !intents_to_send.is_empty() {
+                    warn!(
+                        mode = ?self.stats.trading_mode,
+                        blocked = intents_to_send.len(),
+                        "交易模式禁止提交新策略意圖"
+                    );
+                }
+                intents_to_send.clear();
+            }
+
             // 發送通過風控的意圖到执行队列
             let execution_start = now_micros();
             if let Some(queues) = &mut self.execution_queues {
@@ -1366,6 +1401,16 @@ impl Engine {
         self.stats.trading_mode
     }
 
+    fn ensure_accepting_new_intents(&self) -> Result<(), HftError> {
+        match self.stats.trading_mode {
+            TradingMode::Normal | TradingMode::Degraded => Ok(()),
+            TradingMode::Paused | TradingMode::Emergency => Err(HftError::Risk(format!(
+                "trading mode {:?} rejects new order intents",
+                self.stats.trading_mode
+            ))),
+        }
+    }
+
     /// 設置交易模式（由 Sentinel 調用）
     pub fn set_trading_mode(&mut self, mode: TradingMode) {
         if self.stats.trading_mode != mode {
@@ -1397,12 +1442,22 @@ impl Engine {
         error!("Sentinel: 緊急平倉觸發！");
         self.stats.trading_mode = TradingMode::Emergency;
 
-        // 收集所有策略的未結訂單用於平倉
-        let mut all_open_orders = Vec::new();
-        for strategy_id in &self.strategy_instance_ids {
-            let orders = self.open_order_pairs_by_strategy(strategy_id);
-            all_open_orders.extend(orders);
-        }
+        // Export every OMS-open order, including manually submitted or restored
+        // orders that are not attached to a currently registered strategy.
+        let all_open_orders = self
+            .export_oms_state()
+            .into_iter()
+            .filter_map(|(order_id, record)| {
+                matches!(
+                    record.status,
+                    ports::OrderStatus::New
+                        | ports::OrderStatus::Acknowledged
+                        | ports::OrderStatus::Accepted
+                        | ports::OrderStatus::PartiallyFilled
+                )
+                .then_some((order_id, record.symbol))
+            })
+            .collect::<Vec<_>>();
 
         info!("緊急平倉: 發現 {} 個待取消訂單", all_open_orders.len());
         all_open_orders
@@ -1684,7 +1739,9 @@ mod tests {
     #![allow(unused_imports)]
     use super::*;
     use hft_core::{Price, Quantity, Symbol, VenueId};
-    use ports::{AggregatedBar, MarketEvent};
+    use ports::{
+        AggregatedBar, MarketEvent, OrderIntent, OrderIntentEnvelope, OrderIntentLifecycle,
+    };
 
     struct SingleVenueStub {
         id: String,
@@ -1762,6 +1819,22 @@ mod tests {
         }
     }
 
+    fn test_intent() -> OrderIntent {
+        OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
+            side: hft_core::Side::Buy,
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            order_type: hft_core::OrderType::Limit,
+            price: Some(Price::from_f64(100.0).unwrap()),
+            time_in_force: hft_core::TimeInForce::GTC,
+            strategy_id: "test".to_string(),
+            target_venue: Some(VenueId::MOCK),
+        }
+    }
+
     #[test]
     fn test_engine_creation() {
         let config = EngineConfig::default();
@@ -1810,5 +1883,33 @@ mod tests {
         let got = calls.lock().unwrap().clone();
         assert!(got.contains(&"cross1".to_string()));
         assert!(!got.contains(&"single1".to_string()));
+    }
+
+    #[test]
+    fn paused_and_emergency_modes_reject_direct_intents() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let (engine_queues, _worker_queues) =
+            create_execution_queues(ExecutionQueueConfig::default());
+        engine.set_execution_queues(engine_queues);
+
+        engine.pause_trading();
+        assert!(matches!(
+            engine.submit_order_intent(test_intent()),
+            Err(HftError::Risk(_))
+        ));
+        assert!(matches!(
+            engine.submit_order_intent_envelope(
+                OrderIntentEnvelope::new(test_intent(), OrderIntentLifecycle::new(1, 2)),
+                1,
+                None
+            ),
+            Err(HftError::Risk(_))
+        ));
+
+        engine.emergency_exit();
+        assert!(matches!(
+            engine.submit_order_intent(test_intent()),
+            Err(HftError::Risk(_))
+        ));
     }
 }

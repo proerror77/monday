@@ -355,7 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             drawdown_stop_pct: args.sentinel_drawdown_stop_pct,
         };
         Some(helpers::spawn_sentinel_worker(
-            system.engine.clone(),
+            system.execution_control_handle(),
             sentinel_config,
         ))
     } else {
@@ -381,7 +381,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 啟動 gRPC 控制服務（如果啟用 grpc feature）
     #[cfg(feature = "grpc")]
-    let _grpc_handle = helpers::spawn_grpc_server(system.engine.clone(), args.grpc_port);
+    let _grpc_handle =
+        helpers::spawn_grpc_server(system.execution_control_handle(), args.grpc_port);
 
     // 可選：dry-run 下單驗證
     helpers::run_dry_run_if_enabled(&system, args.dry_run_order, &args.dry_run_symbol).await;

@@ -105,13 +105,12 @@ impl AdapterBridge {
             ingester.set_engine_notify(n.clone());
         }
 
-        let event_stream =
-            stream
-                .subscribe_instruments(instruments)
-                .await
-                .map_err(|e| HftError::Generic {
-                    message: format!("訂閱失敗: {}", e),
-                })?;
+        let event_stream = stream
+            .subscribe_instruments(instruments)
+            .await
+            .map_err(|e| HftError::Generic {
+                message: format!("訂閱失敗: {}", e),
+            })?;
 
         self.spawn_ingestion_task(event_stream, ingester);
         info!("市場數據流橋接完成: {:?}", symbols);
@@ -295,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn test_adapter_bridge_creation() {
         let config = AdapterBridgeConfig::default();
-        let mut bridge = AdapterBridge::new(config);
+        let bridge = AdapterBridge::new(config);
         assert!(!bridge.is_running());
     }
 }

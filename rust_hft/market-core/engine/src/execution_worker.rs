@@ -9,14 +9,17 @@
 use crate::execution_queues::WorkerQueues;
 use crate::latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use futures::{FutureExt, StreamExt};
-use hft_core::{now_micros, HftError, LatencyStage, OrderId, Price, Quantity};
+use hft_core::{now_micros, AccountId, HftError, LatencyStage, OrderId, Price, Quantity};
 use hft_core::{Symbol, VenueId};
-use ports::{BoxStream, ExecutionClient, ExecutionEvent, ExecutionRouter, OrderIntent};
+use ports::{
+    AccountBalance, BoxStream, ExecutionClient, ExecutionEvent, ExecutionRouter, OpenOrder,
+    OrderIntent,
+};
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::yield_now;
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -126,6 +129,11 @@ pub struct ExecutionWorker {
     last_reconcile: Instant,
     /// 策略到客戶端索引的映射（同交易所多帳戶路由）
     strategy_to_client: Option<rustc_hash::FxHashMap<String, usize>>,
+    /// 帳戶到客戶端索引的映射（恢復訂單與控制面路由）
+    account_to_client: FxHashMap<AccountId, usize>,
+    /// Emergency is sticky for the worker lifetime; restart is required to re-arm execution.
+    accepting_intents: bool,
+    emergency_latched: bool,
 }
 
 impl ExecutionWorker {
@@ -197,6 +205,9 @@ impl ExecutionWorker {
             pending_acks: FxHashMap::default(),
             last_reconcile: Instant::now(),
             strategy_to_client: None,
+            account_to_client: FxHashMap::default(),
+            accepting_intents: true,
+            emergency_latched: false,
         }
     }
 
@@ -226,6 +237,9 @@ impl ExecutionWorker {
             pending_acks: FxHashMap::default(),
             last_reconcile: Instant::now(),
             strategy_to_client: None,
+            account_to_client: FxHashMap::default(),
+            accepting_intents: true,
+            emergency_latched: false,
         }
     }
 
@@ -394,6 +408,13 @@ impl ExecutionWorker {
         }
 
         for intent in intents {
+            while let Ok(command) = self.control_rx.try_recv() {
+                self.handle_control_command(command).await;
+            }
+            if !self.accepting_intents {
+                self.reject_for_disabled_intake(&intent);
+                continue;
+            }
             let execution_start = now_micros();
 
             // 🔥 Phase 1.1: 选择执行客户端 - 現在可能失敗
@@ -503,6 +524,22 @@ impl ExecutionWorker {
         }
     }
 
+    fn reject_for_disabled_intake(&mut self, intent: &OrderIntent) {
+        let reject_event = ExecutionEvent::OrderReject {
+            order_id: OrderId(format!(
+                "emergency_blocked_{}",
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            )),
+            reason: format!(
+                "execution intake disabled by emergency control for {}",
+                intent.symbol.as_str()
+            ),
+            timestamp: now_micros(),
+        };
+        let _ = self.queues.send_event_force(reject_event);
+        self.stats.orders_failed += 1;
+    }
+
     /// 下单并重试
     async fn place_order_with_retry(
         &mut self,
@@ -554,12 +591,16 @@ impl ExecutionWorker {
             while batch_count < self.config.batch_size {
                 match stream.next().now_or_never() {
                     Some(Some(Ok(event))) => {
-                        // 更新 pending_acks
+                        // Keep routing metadata only while an order may still be open.
                         match &event {
-                            ExecutionEvent::OrderAck { order_id, .. }
-                            | ExecutionEvent::OrderCanceled { order_id, .. }
-                            | ExecutionEvent::OrderReject { order_id, .. } => {
+                            ExecutionEvent::OrderAck { order_id, .. } => {
                                 self.pending_acks.remove(order_id);
+                            }
+                            ExecutionEvent::OrderCanceled { order_id, .. }
+                            | ExecutionEvent::OrderReject { order_id, .. }
+                            | ExecutionEvent::OrderCompleted { order_id, .. } => {
+                                self.pending_acks.remove(order_id);
+                                self.order_to_client.remove(order_id);
                             }
                             _ => {}
                         }
@@ -712,31 +753,33 @@ impl ExecutionWorker {
     /// 處理控制指令（取消訂單等）
     async fn handle_control_command(&mut self, cmd: ControlCommand) {
         match cmd {
-            ControlCommand::CancelOrders(pairs) => {
-                info!("控制指令: 取消 {} 個訂單", pairs.len());
-                for (order_id, symbol) in pairs {
-                    // 優先使用下單時記錄的客戶端映射
-                    let client_idx = if let Some(idx) = self.order_to_client.get(&order_id).copied()
-                    {
-                        idx
-                    } else {
-                        // 回退：按照符號一致性哈希選擇客戶端
-                        self.select_client_by_symbol(&symbol)
-                    };
-                    if let Some(client) = self.execution_clients.get_mut(client_idx) {
-                        match client.cancel_order(&order_id).await {
-                            Ok(()) => {
-                                debug!("取消訂單成功: {} (client={})", order_id.0, client_idx);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "取消訂單失敗: {} - {} (client={})",
-                                    order_id.0, e, client_idx
-                                );
-                            }
-                        }
-                    }
-                }
+            ControlCommand::CancelOrders { targets, reply } => {
+                let report = self.dispatch_cancellations(targets).await;
+                let _ = reply.send(report);
+            }
+            ControlCommand::EnterEmergency { targets, reply } => {
+                self.accepting_intents = false;
+                self.emergency_latched = true;
+                warn!("execution worker intake disabled by emergency control");
+                let targets = self.include_worker_tracked_orders(targets);
+                let report = self.dispatch_cancellations(targets).await;
+                let _ = reply.send(report);
+            }
+            ControlCommand::Reconcile {
+                include_balances,
+                reply,
+            } => {
+                let snapshot = self.collect_reconcile_snapshot(include_balances).await;
+                let _ = reply.send(snapshot);
+            }
+            ControlCommand::SetIntake { enabled, reply } => {
+                let result = if enabled && self.emergency_latched {
+                    Err("execution intake is emergency-latched; restart required".to_string())
+                } else {
+                    self.accepting_intents = enabled;
+                    Ok(())
+                };
+                let _ = reply.send(result);
             }
             ControlCommand::ReplaceOrder {
                 order_id,
@@ -770,6 +813,98 @@ impl ExecutionWorker {
         }
     }
 
+    fn include_worker_tracked_orders(&self, mut targets: Vec<CancelTarget>) -> Vec<CancelTarget> {
+        let mut known = targets
+            .iter()
+            .map(|target| target.order_id.clone())
+            .collect::<HashSet<_>>();
+        for (order_id, client_idx) in &self.order_to_client {
+            if !known.insert(order_id.clone()) {
+                continue;
+            }
+            let symbol = self
+                .pending_acks
+                .get(order_id)
+                .map(|(symbol, _)| symbol.clone())
+                .unwrap_or_else(|| Symbol::new("UNKNOWN"));
+            targets.push(CancelTarget {
+                order_id: order_id.clone(),
+                symbol,
+                venue: self.venue_for_client(*client_idx),
+                account_id: None,
+            });
+        }
+        targets
+    }
+
+    async fn dispatch_cancellations(&mut self, targets: Vec<CancelTarget>) -> CancelDispatchReport {
+        let mut report = CancelDispatchReport {
+            requested: targets.len(),
+            ..Default::default()
+        };
+        info!("控制指令: 取消 {} 個訂單", report.requested);
+
+        for target in targets {
+            let client_idx = match self.select_client_for_cancel(&target) {
+                Ok(client_idx) => client_idx,
+                Err(reason) => {
+                    report.failures.push(CancelFailure {
+                        order_id: target.order_id,
+                        reason,
+                    });
+                    continue;
+                }
+            };
+            let Some(client) = self.execution_clients.get_mut(client_idx) else {
+                report.failures.push(CancelFailure {
+                    order_id: target.order_id,
+                    reason: format!("execution client index {client_idx} is unavailable"),
+                });
+                continue;
+            };
+
+            match client.cancel_order(&target.order_id).await {
+                Ok(()) => {
+                    debug!(
+                        "取消訂單已提交: {} (client={})",
+                        target.order_id.0, client_idx
+                    );
+                    report.submitted.push(target.order_id);
+                }
+                Err(error) => report.failures.push(CancelFailure {
+                    order_id: target.order_id,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        report
+    }
+
+    fn select_client_for_cancel(&self, target: &CancelTarget) -> Result<usize, String> {
+        if let Some(client_idx) = self.order_to_client.get(&target.order_id).copied() {
+            return Ok(client_idx);
+        }
+        if let Some(account_id) = &target.account_id {
+            if let Some(client_idx) = self.account_to_client.get(account_id).copied() {
+                return Ok(client_idx);
+            }
+        }
+        if let Some(venue) = target.venue {
+            if let Some(client_idx) = self.venue_to_client.get(&venue).copied() {
+                return Ok(client_idx);
+            }
+        }
+        if self.execution_clients.len() == 1 {
+            return Ok(0);
+        }
+        Err(format!(
+            "cannot route cancellation for {} across {} execution clients",
+            target.order_id.0,
+            self.execution_clients.len()
+        ))
+    }
+
     fn select_client_by_symbol(&self, symbol: &Symbol) -> usize {
         if self.execution_clients.is_empty() {
             return 0;
@@ -791,11 +926,79 @@ impl ExecutionWorker {
     }
 }
 
-/// 執行控制指令
 #[derive(Debug, Clone)]
+pub struct CancelTarget {
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub venue: Option<VenueId>,
+    pub account_id: Option<AccountId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CancelFailure {
+    pub order_id: OrderId,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CancelDispatchReport {
+    pub requested: usize,
+    pub submitted: Vec<OrderId>,
+    pub failures: Vec<CancelFailure>,
+}
+
+impl CancelDispatchReport {
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty() && self.submitted.len() == self.requested
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientReconcileSnapshot {
+    pub client_index: usize,
+    pub venue: Option<VenueId>,
+    pub account_id: Option<AccountId>,
+    pub open_orders: Result<Vec<OpenOrder>, HftError>,
+    pub balances: Option<Result<Vec<AccountBalance>, HftError>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkerReconcileSnapshot {
+    pub clients: Vec<ClientReconcileSnapshot>,
+}
+
+impl WorkerReconcileSnapshot {
+    pub fn is_complete(&self) -> bool {
+        !self.clients.is_empty()
+            && self.clients.iter().all(|client| {
+                client.open_orders.is_ok()
+                    && client
+                        .balances
+                        .as_ref()
+                        .is_none_or(|balances| balances.is_ok())
+            })
+    }
+}
+
+/// 執行控制指令
+#[derive(Debug)]
 pub enum ControlCommand {
-    /// 取消指定訂單：以 (order_id, symbol) 傳遞
-    CancelOrders(Vec<(hft_core::OrderId, Symbol)>),
+    CancelOrders {
+        targets: Vec<CancelTarget>,
+        reply: oneshot::Sender<CancelDispatchReport>,
+    },
+    EnterEmergency {
+        targets: Vec<CancelTarget>,
+        reply: oneshot::Sender<CancelDispatchReport>,
+    },
+    Reconcile {
+        include_balances: bool,
+        reply: oneshot::Sender<WorkerReconcileSnapshot>,
+    },
+    SetIntake {
+        enabled: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     /// 替換/修改訂單（優先嘗試 modify，失敗時由上層決策是否 Cancel/Replace）
     ReplaceOrder {
         order_id: hft_core::OrderId,
@@ -811,6 +1014,7 @@ pub fn spawn_execution_worker_with_control(
     queues: WorkerQueues,
     execution_clients: Vec<Box<dyn ExecutionClient>>,
     strategy_to_client: Option<std::collections::HashMap<String, usize>>,
+    account_to_client: Option<std::collections::HashMap<AccountId, usize>>,
 ) -> (
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
@@ -819,6 +1023,9 @@ pub fn spawn_execution_worker_with_control(
     let mut worker = ExecutionWorker::new(config.clone(), queues, execution_clients, rx);
     if let Some(map) = strategy_to_client {
         worker.strategy_to_client = Some(map.into_iter().collect());
+    }
+    if let Some(map) = account_to_client {
+        worker.account_to_client = map.into_iter().collect();
     }
     let handle = tokio::spawn(async move {
         info!("执行 Worker {} 任务启动", config.name);
@@ -835,6 +1042,7 @@ pub fn spawn_execution_worker_with_control_and_router(
     router: Box<dyn ExecutionRouter>,
     venue_to_client: HashMap<VenueId, usize>,
     strategy_to_client: Option<std::collections::HashMap<String, usize>>,
+    account_to_client: Option<std::collections::HashMap<AccountId, usize>>,
 ) -> (
     tokio::task::JoinHandle<Result<(), HftError>>,
     mpsc::UnboundedSender<ControlCommand>,
@@ -851,6 +1059,9 @@ pub fn spawn_execution_worker_with_control_and_router(
     if let Some(map) = strategy_to_client {
         worker.strategy_to_client = Some(map.into_iter().collect());
     }
+    if let Some(map) = account_to_client {
+        worker.account_to_client = map.into_iter().collect();
+    }
     let handle = tokio::spawn(async move {
         info!("执行 Worker {} 任务启动 (带路由器)", config.name);
         worker.run().await
@@ -864,86 +1075,135 @@ pub fn spawn_execution_worker(
     queues: WorkerQueues,
     execution_clients: Vec<Box<dyn ExecutionClient>>,
 ) -> tokio::task::JoinHandle<Result<(), HftError>> {
-    let (h, _tx) = spawn_execution_worker_with_control(config, queues, execution_clients, None);
+    let (h, _tx) =
+        spawn_execution_worker_with_control(config, queues, execution_clients, None, None);
     h
 }
 
 impl ExecutionWorker {
-    /// 對帳：列舉各交換端未結訂單，記錄交換端獨有訂單，必要時嘗試撤銷
+    /// Periodic worker-side capability check. OMS comparison is performed by
+    /// `ExecutionControlHandle`, which owns access to the engine's local truth.
     async fn reconcile_open_orders(&mut self) -> bool {
-        use ports::OpenOrder;
-        let mut exchange_only: Vec<(OrderId, Symbol, usize)> = Vec::new();
-        let mut total_open = 0usize;
-        for (idx, client) in self.execution_clients.iter().enumerate() {
-            match client.list_open_orders().await {
-                Ok(list) => {
-                    #[cfg(feature = "metrics")]
-                    {
-                        #[cfg(feature = "metrics")]
-                        infra_metrics::MetricsRegistry::global().inc_reconcile_runs();
-                    }
-                    total_open += list.len();
-                    for OpenOrder {
-                        order_id, symbol, ..
-                    } in list
-                    {
-                        if !self.order_to_client.contains_key(&order_id) {
-                            exchange_only.push((order_id, symbol, idx));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("對帳：獲取客戶端 {} 未結訂單失敗: {}", idx, e);
-                    #[cfg(feature = "metrics")]
-                    {
-                        #[cfg(feature = "metrics")]
-                        infra_metrics::MetricsRegistry::global().inc_reconcile_errors();
-                    }
-                }
-            }
+        let snapshot = self.collect_reconcile_snapshot(false).await;
+        let complete = snapshot.is_complete();
+        if !complete {
+            warn!("對帳快照不完整；系統不得將未知狀態視為無未結訂單");
         }
+        if self.config.auto_cancel_exchange_only {
+            debug!("exchange-only auto-cancel requires a runtime OMS comparison");
+        }
+        complete
+    }
 
-        if !exchange_only.is_empty() {
-            warn!(
-                "對帳：發現 {} 筆交換端存在但本地未追蹤的訂單（總未結={}）",
-                exchange_only.len(),
-                total_open
-            );
+    async fn collect_reconcile_snapshot(
+        &mut self,
+        include_balances: bool,
+    ) -> WorkerReconcileSnapshot {
+        let mut clients = Vec::with_capacity(self.execution_clients.len());
+        for (idx, client) in self.execution_clients.iter_mut().enumerate() {
+            let open_orders = client.list_open_orders().await;
             #[cfg(feature = "metrics")]
             {
-                #[cfg(feature = "metrics")]
-                infra_metrics::MetricsRegistry::global()
-                    .add_reconcile_exchange_only_found(exchange_only.len() as u64);
-            }
-            if self.config.auto_cancel_exchange_only {
-                for (order_id, _symbol, idx) in &exchange_only {
-                    if let Some(client) = self.execution_clients.get_mut(*idx) {
-                        let oid = order_id.clone();
-                        if let Err(e) = client.cancel_order(&oid).await {
-                            tracing::warn!("對帳自動撤單失敗: {} - {}", oid.0, e);
-                        } else {
-                            tracing::info!("對帳自動撤單已發送: {}", oid.0);
-                        }
-                        #[cfg(feature = "metrics")]
-                        {
-                            #[cfg(feature = "metrics")]
-                            infra_metrics::MetricsRegistry::global().add_reconcile_cancel_sent(1);
-                        }
-                    }
+                infra_metrics::MetricsRegistry::global().inc_reconcile_runs();
+                if open_orders.is_err() {
+                    infra_metrics::MetricsRegistry::global().inc_reconcile_errors();
                 }
             }
-        } else {
-            debug!("對帳：未發現交換端獨有訂單（總未結={}）", total_open);
+
+            let balances = if include_balances {
+                Some(client.get_balance().await)
+            } else {
+                None
+            };
+            clients.push(ClientReconcileSnapshot {
+                client_index: idx,
+                venue: self
+                    .venue_to_client
+                    .iter()
+                    .find_map(|(venue, client_idx)| (*client_idx == idx).then_some(*venue)),
+                account_id: self
+                    .account_to_client
+                    .iter()
+                    .find_map(|(account_id, client_idx)| {
+                        (*client_idx == idx).then_some(account_id.clone())
+                    }),
+                open_orders,
+                balances,
+            });
         }
-        true
+
+        WorkerReconcileSnapshot { clients }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
-    use ports::OrderIntent;
+    use ports::{ConnectionHealth, HftResult, OrderIntent};
     use std::collections::HashSet;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct MockExecutionState {
+        placed: Vec<Symbol>,
+        canceled: Vec<OrderId>,
+    }
+
+    struct MockExecutionClient {
+        state: Arc<StdMutex<MockExecutionState>>,
+        list_error: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionClient for MockExecutionClient {
+        async fn place_order(&mut self, intent: OrderIntent) -> HftResult<OrderId> {
+            self.state.lock().unwrap().placed.push(intent.symbol);
+            Ok(OrderId("placed".to_string()))
+        }
+
+        async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
+            self.state.lock().unwrap().canceled.push(order_id.clone());
+            Ok(())
+        }
+
+        async fn modify_order(
+            &mut self,
+            _order_id: &OrderId,
+            _new_quantity: Option<Quantity>,
+            _new_price: Option<Price>,
+        ) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
+            if self.list_error {
+                Err(HftError::Network("open-order snapshot failed".to_string()))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn connect(&mut self) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn health(&self) -> ConnectionHealth {
+            ConnectionHealth {
+                connected: true,
+                latency_ms: None,
+                last_heartbeat: now_micros(),
+            }
+        }
+    }
 
     #[allow(dead_code)]
     fn create_test_intent(symbol: &str) -> OrderIntent {
@@ -1057,5 +1317,79 @@ mod tests {
 
         // 列印分佈以供調試
         println!("哈希分佈: {:?}", distribution);
+    }
+
+    #[tokio::test]
+    async fn emergency_disables_intake_before_cancel_dispatch() {
+        let state = Arc::new(StdMutex::new(MockExecutionState::default()));
+        let client = MockExecutionClient {
+            state: state.clone(),
+            list_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        engine_queues
+            .send_intent(create_test_intent("ETHUSDT"))
+            .expect("queue intent");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let order_id = OrderId("open-order".to_string());
+        worker.order_to_client.insert(order_id.clone(), 0);
+        let (reply, report) = oneshot::channel();
+
+        worker
+            .handle_control_command(ControlCommand::EnterEmergency {
+                targets: Vec::new(),
+                reply,
+            })
+            .await;
+        let report = report.await.expect("emergency report");
+        assert!(report.is_complete());
+
+        let (resume_reply, resume_result) = oneshot::channel();
+        worker
+            .handle_control_command(ControlCommand::SetIntake {
+                enabled: true,
+                reply: resume_reply,
+            })
+            .await;
+        assert!(resume_result.await.expect("resume result").is_err());
+
+        let queued = worker.queues.receive_intents();
+        worker.process_order_intents(queued).await;
+        let state = state.lock().unwrap();
+        assert_eq!(state.canceled, vec![order_id]);
+        assert!(state.placed.is_empty());
+        assert_eq!(worker.stats.orders_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_snapshot_is_incomplete_on_client_error() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            list_error: true,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+
+        let snapshot = worker.collect_reconcile_snapshot(false).await;
+        assert_eq!(snapshot.clients.len(), 1);
+        assert!(snapshot.clients[0].open_orders.is_err());
+        assert!(!snapshot.is_complete());
     }
 }

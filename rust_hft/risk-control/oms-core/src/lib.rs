@@ -433,7 +433,16 @@ impl OmsCore {
                 report.local_only.push(LocalOnlyOrder {
                     order_id: order_id.clone(),
                     symbol: record.symbol.clone(),
-                    status: record.status,
+                    status: match record.status {
+                        OrderStatus::New => ports::OrderStatus::New,
+                        OrderStatus::Acknowledged => ports::OrderStatus::Acknowledged,
+                        OrderStatus::PartiallyFilled => ports::OrderStatus::PartiallyFilled,
+                        OrderStatus::Filled => ports::OrderStatus::Filled,
+                        OrderStatus::Canceled => ports::OrderStatus::Canceled,
+                        OrderStatus::Rejected => ports::OrderStatus::Rejected,
+                        OrderStatus::Expired => ports::OrderStatus::Expired,
+                        OrderStatus::Replaced => ports::OrderStatus::Replaced,
+                    },
                 });
             }
         }
@@ -442,47 +451,9 @@ impl OmsCore {
     }
 }
 
-/// 對帳報告
-#[derive(Debug, Clone, Default)]
-pub struct ReconciliationReport {
-    /// 訂單在交易所存在但本地未追蹤
-    pub exchange_only: Vec<OrderId>,
-    /// 訂單在本地存在但交易所沒有
-    pub local_only: Vec<LocalOnlyOrder>,
-    /// 訂單存在但成交量不一致
-    pub qty_mismatch: Vec<QuantityMismatch>,
-}
-
-impl ReconciliationReport {
-    /// 是否有差異需要處理
-    pub fn has_discrepancies(&self) -> bool {
-        !self.exchange_only.is_empty()
-            || !self.local_only.is_empty()
-            || !self.qty_mismatch.is_empty()
-    }
-
-    /// 總差異數量
-    pub fn total_discrepancies(&self) -> usize {
-        self.exchange_only.len() + self.local_only.len() + self.qty_mismatch.len()
-    }
-}
-
-/// 本地獨有訂單
-#[derive(Debug, Clone)]
-pub struct LocalOnlyOrder {
-    pub order_id: OrderId,
-    pub symbol: Symbol,
-    pub status: OrderStatus,
-}
-
-/// 成交量不一致
-#[derive(Debug, Clone)]
-pub struct QuantityMismatch {
-    pub order_id: OrderId,
-    pub symbol: Symbol,
-    pub exchange_filled: Quantity,
-    pub local_filled: Quantity,
-}
+pub type ReconciliationReport = ports::OrderReconciliationReport;
+pub type LocalOnlyOrder = ports::LocalOnlyOrder;
+pub type QuantityMismatch = ports::QuantityMismatch;
 
 // 實現 OrderManager trait
 impl ports::OrderManager for OmsCore {
@@ -596,6 +567,13 @@ impl ports::OrderManager for OmsCore {
 
     fn open_order_pairs_by_strategy(&self, strategy_id: &str) -> Vec<(OrderId, Symbol)> {
         self.open_order_pairs_by_strategy(strategy_id)
+    }
+
+    fn reconcile_with_exchange(
+        &self,
+        exchange_orders: &[ports::OpenOrder],
+    ) -> ports::OrderReconciliationReport {
+        self.reconcile_with_exchange(exchange_orders)
     }
 }
 

@@ -316,8 +316,10 @@ mod tests {
         // 產生 Default 風控，且保持風控類型不被意外修改
         assert_eq!(risk_config.risk_type, "Default");
         assert_eq!(manager.get_config_snapshot().max_drawdown_pct, 3.5);
-        let mut losing_account = ports::AccountView::default();
-        losing_account.realized_pnl = Decimal::from(-1234);
+        let losing_account = ports::AccountView {
+            realized_pnl: Decimal::from(-1234),
+            ..Default::default()
+        };
         assert!(manager.should_halt_trading(&losing_account));
     }
 

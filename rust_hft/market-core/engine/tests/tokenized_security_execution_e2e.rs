@@ -10,9 +10,7 @@ use hft_core::{
     AssetClass, ComplianceContext, HftResult, OrderId, OrderType, Price, ProductType, Quantity,
     RegulatoryProfile, Side, Symbol, TimeInForce,
 };
-use ports::{
-    BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntent,
-};
+use ports::{BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntent};
 use tokio::sync::Mutex;
 
 #[derive(Default)]
@@ -105,9 +103,11 @@ async fn tokenized_security_order_reaches_paper_execution_events() {
     });
     let seen = Arc::new(Mutex::new(Vec::new()));
     let client = RecordingExecutionClient { seen: seen.clone() };
-    let mut worker_config = ExecutionWorkerConfig::default();
-    worker_config.ack_timeout_ms = 0;
-    worker_config.reconcile_interval_ms = 0;
+    let worker_config = ExecutionWorkerConfig {
+        ack_timeout_ms: 0,
+        reconcile_interval_ms: 0,
+        ..Default::default()
+    };
 
     let handle = spawn_execution_worker(worker_config, worker_queues, vec![Box::new(client)]);
     engine_queues

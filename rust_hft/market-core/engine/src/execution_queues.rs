@@ -74,7 +74,7 @@ pub struct QueueStats {
 #[derive(Debug, Clone)]
 pub enum LifecycleIntentSubmitError {
     LifecycleRejected {
-        envelope: OrderIntentEnvelope,
+        envelope: Box<OrderIntentEnvelope>,
         reason: OrderIntentRejectReason,
     },
     QueueFull {
@@ -161,7 +161,10 @@ impl EngineQueues {
                         self.stats.intent_max_latency_count += 1;
                     }
                 }
-                Err(LifecycleIntentSubmitError::LifecycleRejected { envelope, reason })
+                Err(LifecycleIntentSubmitError::LifecycleRejected {
+                    envelope: Box::new(envelope),
+                    reason,
+                })
             }
         }
     }

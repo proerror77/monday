@@ -2,12 +2,10 @@
 //!
 //! 定期檢查系統狀態，根據延遲和回撤自動調整交易行為
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use engine::Engine;
+use engine::ExecutionControlHandle;
 use risk::{Sentinel, SentinelAction, SentinelConfig, SentinelState, SystemStats};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -51,7 +49,7 @@ impl From<SentinelWorkerConfig> for SentinelConfig {
 
 /// 啟動 Sentinel 監控 Worker
 pub fn spawn_sentinel_worker(
-    engine_arc: Arc<Mutex<Engine>>,
+    control: ExecutionControlHandle,
     config: SentinelWorkerConfig,
 ) -> JoinHandle<()> {
     info!(
@@ -63,16 +61,17 @@ pub fn spawn_sentinel_worker(
     let sentinel_config: SentinelConfig = config.into();
 
     tokio::spawn(async move {
-        run_sentinel_loop(engine_arc, sentinel_config, check_interval).await;
+        run_sentinel_loop(control, sentinel_config, check_interval).await;
     })
 }
 
 /// Sentinel 主循環
 async fn run_sentinel_loop(
-    engine_arc: Arc<Mutex<Engine>>,
+    control: ExecutionControlHandle,
     config: SentinelConfig,
     check_interval_ms: u64,
 ) {
+    let engine_arc = control.engine();
     let mut sentinel = Sentinel::new(config);
     let mut interval = tokio::time::interval(Duration::from_millis(check_interval_ms));
 
@@ -90,7 +89,8 @@ async fn run_sentinel_loop(
             let sentinel_stats = engine.get_sentinel_stats();
 
             // 估算活躍訂單數：提交 - 完成 - 取消 - 拒絕
-            let active_orders = engine_stats.orders_submitted
+            let active_orders = engine_stats
+                .orders_submitted
                 .saturating_sub(engine_stats.orders_filled)
                 .saturating_sub(engine_stats.orders_canceled)
                 .saturating_sub(engine_stats.orders_rejected);
@@ -161,26 +161,27 @@ async fn run_sentinel_loop(
                     "停止交易: latency_p99={}us, drawdown={:.2}%",
                     stats.latency_p99_us, stats.drawdown_pct
                 );
-                let mut engine = engine_arc.lock().await;
-                engine.pause_trading();
+                if let Err(error) = control.pause_trading().await {
+                    error!(%error, "Sentinel failed to disable execution intake");
+                }
             }
             SentinelAction::EmergencyExit => {
-                // 緊急平倉
-                error!(
-                    "緊急平倉觸發: drawdown={:.2}%",
-                    stats.drawdown_pct
-                );
-                let mut engine = engine_arc.lock().await;
-                let orders_to_cancel = engine.emergency_exit();
-                if !orders_to_cancel.is_empty() {
-                    error!(
-                        "緊急平倉: 需要取消 {} 個訂單",
-                        orders_to_cancel.len()
-                    );
-                    for (order_id, symbol) in &orders_to_cancel {
-                        error!("  待取消訂單: {:?} @ {}", order_id, symbol);
+                error!("緊急平倉觸發: drawdown={:.2}%", stats.drawdown_pct);
+                match control.emergency_stop(true).await {
+                    Ok(report) if report.is_complete() => {
+                        error!(submitted = report.submitted.len(), "緊急撤單已提交")
                     }
-                    // 訂單取消由 ExecutionWorker 處理，這裡只記錄
+                    Ok(report) => {
+                        error!(
+                            requested = report.requested,
+                            submitted = report.submitted.len(),
+                            failures = report.failures.len(),
+                            "緊急撤單未完整提交"
+                        )
+                    }
+                    Err(error) => {
+                        error!(%error, "緊急控制失敗；系統保持 Emergency 模式")
+                    }
                 }
             }
         }

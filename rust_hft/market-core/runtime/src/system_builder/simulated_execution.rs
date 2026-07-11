@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -8,7 +9,8 @@ use chrono::Utc;
 use futures::StreamExt;
 use hft_core::{HftError, OrderId, Price, Quantity, Timestamp, VenueId};
 use ports::{
-    BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, HftResult, OpenOrder, OrderIntent,
+    BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, HftResult, OpenOrder,
+    OrderIntent, OrderStatus,
 };
 use tokio::{
     sync::mpsc::{channel, error::TrySendError, Receiver, Sender},
@@ -29,6 +31,7 @@ pub struct SimulatedExecutionClient {
     id_counter: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
     dropped_events: Arc<AtomicU64>,
+    open_orders: Arc<Mutex<HashMap<OrderId, OpenOrder>>>,
     fill_delay_ms: u64,
 }
 
@@ -49,6 +52,7 @@ impl SimulatedExecutionClient {
             id_counter: Arc::new(AtomicU64::new(1)),
             connected: Arc::new(AtomicBool::new(false)),
             dropped_events: Arc::new(AtomicU64::new(0)),
+            open_orders: Arc::new(Mutex::new(HashMap::new())),
             fill_delay_ms: DEFAULT_FILL_DELAY_MS,
         }
     }
@@ -116,17 +120,38 @@ impl ExecutionClient for SimulatedExecutionClient {
             timestamp: now,
         })?;
 
+        self.open_orders.lock().await.insert(
+            order_id.clone(),
+            OpenOrder {
+                order_id: order_id.clone(),
+                symbol: intent.symbol.clone(),
+                side: intent.side,
+                order_type: intent.order_type,
+                original_quantity: intent.quantity,
+                remaining_quantity: intent.quantity,
+                filled_quantity: Quantity::from_f64(0.0).expect("valid zero quantity"),
+                price: intent.price,
+                status: OrderStatus::Accepted,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+
         let sender = self.events_tx.clone();
         let dropped_events = Arc::clone(&self.dropped_events);
-        let qty = intent.quantity;
-        let price = intent
-            .price
-            .unwrap_or_else(|| Price::from_f64(0.0).expect("valid price"));
+        let open_orders = Arc::clone(&self.open_orders);
         let delay = Duration::from_millis(self.fill_delay_ms);
         let order_id_in_flight = order_id.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
+            let Some(open_order) = open_orders.lock().await.remove(&order_id_in_flight) else {
+                return;
+            };
+            let qty = open_order.remaining_quantity;
+            let price = open_order
+                .price
+                .unwrap_or_else(|| Price::from_f64(0.0).expect("valid price"));
             let ts = Utc::now().timestamp_micros() as u64;
             let fill_id = format!("sim_fill_{}", ts);
             if let Err(e) = Self::try_send_event(
@@ -170,6 +195,9 @@ impl ExecutionClient for SimulatedExecutionClient {
     }
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
+        if self.open_orders.lock().await.remove(order_id).is_none() {
+            return Err(HftError::OrderNotFound(order_id.0.clone()));
+        }
         self.send_event(ExecutionEvent::OrderCanceled {
             order_id: order_id.clone(),
             timestamp: Self::current_timestamp(),
@@ -183,6 +211,19 @@ impl ExecutionClient for SimulatedExecutionClient {
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
     ) -> HftResult<()> {
+        let mut open_orders = self.open_orders.lock().await;
+        let open_order = open_orders
+            .get_mut(order_id)
+            .ok_or_else(|| HftError::OrderNotFound(order_id.0.clone()))?;
+        if let Some(quantity) = new_quantity {
+            open_order.original_quantity = quantity;
+            open_order.remaining_quantity = quantity;
+        }
+        if let Some(price) = new_price {
+            open_order.price = Some(price);
+        }
+        open_order.updated_at = Self::current_timestamp();
+        drop(open_orders);
         self.send_event(ExecutionEvent::OrderModified {
             order_id: order_id.clone(),
             new_quantity,
@@ -202,7 +243,7 @@ impl ExecutionClient for SimulatedExecutionClient {
     }
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
-        Ok(Vec::new())
+        Ok(self.open_orders.lock().await.values().cloned().collect())
     }
 
     async fn connect(&mut self) -> HftResult<()> {
@@ -253,5 +294,26 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(client.dropped_events(), 1);
+    }
+
+    #[tokio::test]
+    async fn simulated_open_orders_are_authoritative_and_cancelable() {
+        let mut client = SimulatedExecutionClient::new(VenueId::MOCK);
+        client.fill_delay_ms = 5_000;
+
+        let order_id = client
+            .place_order(test_intent())
+            .await
+            .expect("place order");
+        let open_orders = client.list_open_orders().await.expect("open orders");
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].order_id, order_id);
+
+        client.cancel_order(&order_id).await.expect("cancel order");
+        assert!(client
+            .list_open_orders()
+            .await
+            .expect("open orders after cancel")
+            .is_empty());
     }
 }

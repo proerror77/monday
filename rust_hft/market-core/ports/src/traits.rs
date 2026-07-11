@@ -82,8 +82,9 @@ pub trait ExecutionClient: Send + Sync {
 
     /// 獲取帳戶餘額 (用於餘額同步)
     async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
-        // 默認實現：返回空列表（向後兼容）
-        Ok(Vec::new())
+        Err(HftError::Config(
+            "execution client does not support authoritative balance snapshots".to_string(),
+        ))
     }
 
     /// 連線管理
@@ -577,6 +578,41 @@ pub struct OrderRecord {
     pub strategy_id: Option<String>,
 }
 
+/// Local OMS versus authoritative exchange open-order reconciliation.
+#[derive(Debug, Clone, Default)]
+pub struct OrderReconciliationReport {
+    pub exchange_only: Vec<OrderId>,
+    pub local_only: Vec<LocalOnlyOrder>,
+    pub qty_mismatch: Vec<QuantityMismatch>,
+}
+
+impl OrderReconciliationReport {
+    pub fn has_discrepancies(&self) -> bool {
+        !self.exchange_only.is_empty()
+            || !self.local_only.is_empty()
+            || !self.qty_mismatch.is_empty()
+    }
+
+    pub fn total_discrepancies(&self) -> usize {
+        self.exchange_only.len() + self.local_only.len() + self.qty_mismatch.len()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalOnlyOrder {
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub status: OrderStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuantityMismatch {
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub exchange_filled: Quantity,
+    pub local_filled: Quantity,
+}
+
 /// 訂單管理器 trait - 提供訂單生命週期管理能力
 pub trait OrderManager: Send + Sync {
     /// 註冊新訂單
@@ -593,6 +629,9 @@ pub trait OrderManager: Send + Sync {
 
     /// 取得指定策略的未結訂單
     fn open_order_pairs_by_strategy(&self, strategy_id: &str) -> Vec<(OrderId, Symbol)>;
+
+    /// Compare OMS truth with an authoritative exchange snapshot.
+    fn reconcile_with_exchange(&self, exchange_orders: &[OpenOrder]) -> OrderReconciliationReport;
 }
 
 /// Portfolio 狀態（供持久化使用）

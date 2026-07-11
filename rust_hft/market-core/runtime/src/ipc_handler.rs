@@ -13,13 +13,12 @@ use infra_ipc::{
 use async_trait::async_trait;
 
 #[cfg(feature = "infra-ipc")]
-use sysinfo::{CpuExt, System, SystemExt};
+use sysinfo::System;
 
 use crate::SystemRuntime;
 #[cfg(feature = "infra-ipc")]
 use hft_core::{OrderId, Symbol};
 #[cfg(feature = "infra-ipc")]
-use shared_config::StrategyParams as SharedStrategyParams;
 #[cfg(feature = "infra-ipc")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "infra-ipc")]
@@ -47,46 +46,38 @@ impl SystemCommandHandler {
 impl CommandHandler for SystemCommandHandler {
     async fn handle_command(&self, command: Command) -> Response {
         match command {
-            Command::Start => {
-                info!("IPC: Starting trading system");
-                let mut runtime = self.runtime.lock().await;
-                match runtime.start().await {
-                    Ok(_) => Response::Ok,
-                    Err(e) => Response::Error {
-                        message: format!("Failed to start system: {}", e),
-                        code: Some(500),
-                    },
-                }
-            }
+            Command::Start => Response::Error {
+                message: "runtime lifecycle is process-owned; restart the supervised process"
+                    .to_string(),
+                code: Some(409),
+            },
 
-            Command::Stop => {
-                info!("IPC: Stopping trading system");
-                let mut runtime = self.runtime.lock().await;
-                match runtime.stop().await {
-                    Ok(_) => Response::Ok,
-                    Err(e) => Response::Error {
-                        message: format!("Failed to stop system: {}", e),
-                        code: Some(500),
-                    },
-                }
-            }
+            Command::Stop => Response::Error {
+                message: "use EmergencyStop for trading safety or stop the supervised process"
+                    .to_string(),
+                code: Some(409),
+            },
 
             Command::EmergencyStop => {
                 warn!("IPC: Emergency stop requested");
-                let mut runtime = self.runtime.lock().await;
-
-                // First cancel all orders
-                match Self::cancel_all_orders_internal(&runtime).await {
-                    Ok(_) => info!("All orders cancelled as part of emergency stop"),
-                    Err(e) => error!("Failed to cancel orders during emergency stop: {}", e),
-                }
-
-                // Then stop the system
-                match runtime.stop().await {
-                    Ok(_) => Response::Ok,
-                    Err(e) => Response::Error {
-                        message: format!("Emergency stop failed: {}", e),
-                        code: Some(500),
+                let runtime = self.runtime.lock().await;
+                match runtime
+                    .execution_control_handle()
+                    .emergency_stop(true)
+                    .await
+                {
+                    Ok(report) if report.is_complete() => Response::Ok,
+                    Ok(report) => Response::Error {
+                        message: format!(
+                            "Emergency cancellation incomplete: {} of {} submitted",
+                            report.submitted.len(),
+                            report.requested
+                        ),
+                        code: Some(503),
+                    },
+                    Err(error) => Response::Error {
+                        message: format!("Emergency stop failed: {error}"),
+                        code: Some(503),
                     },
                 }
             }
@@ -94,7 +85,7 @@ impl CommandHandler for SystemCommandHandler {
             Command::LoadModel {
                 model_path,
                 model_version,
-                sha256_hash,
+                sha256_hash: _sha256_hash,
             } => {
                 info!(
                     "IPC: Loading model {} version {}",
@@ -106,7 +97,7 @@ impl CommandHandler for SystemCommandHandler {
                     use std::path::PathBuf;
 
                     // 验证 SHA256（如果提供）
-                    if let Some(expected_hash) = &sha256_hash {
+                    if let Some(expected_hash) = &_sha256_hash {
                         let path = PathBuf::from(&model_path);
                         if path.exists() {
                             // 计算文件哈希
@@ -312,7 +303,7 @@ impl CommandHandler for SystemCommandHandler {
                     current_pnl: account_view.realized_pnl + account_view.unrealized_pnl,
                     max_drawdown: risk_metrics
                         .as_ref()
-                        .and_then(|m| rust_decimal::Decimal::from_f64_retain(m.max_drawdown))
+                        .map(|metrics| metrics.max_drawdown)
                         .unwrap_or(rust_decimal::Decimal::ZERO),
                     model_version: {
                         // 从 DL 策略获取模型版本
@@ -366,9 +357,10 @@ impl CommandHandler for SystemCommandHandler {
                     .filter(|rec| {
                         matches!(
                             rec.status,
-                            oms_core::OrderStatus::New
-                                | oms_core::OrderStatus::Acknowledged
-                                | oms_core::OrderStatus::PartiallyFilled
+                            ports::OrderStatus::New
+                                | ports::OrderStatus::Acknowledged
+                                | ports::OrderStatus::Accepted
+                                | ports::OrderStatus::PartiallyFilled
                         )
                     })
                     .count() as u32;
@@ -380,7 +372,7 @@ impl CommandHandler for SystemCommandHandler {
                     unrealized_pnl: account_view.unrealized_pnl,
                     max_drawdown: risk_metrics
                         .as_ref()
-                        .and_then(|m| rust_decimal::Decimal::from_f64_retain(m.max_drawdown))
+                        .map(|metrics| metrics.max_drawdown)
                         .unwrap_or(rust_decimal::Decimal::ZERO),
                     open_positions: account_view.positions.len() as u32,
                     open_orders: open_orders_count,
@@ -398,10 +390,10 @@ impl CommandHandler for SystemCommandHandler {
                     .iter()
                     .map(|(symbol, pos)| {
                         Position {
-                            symbol: Symbol::from(symbol.clone()),
-                            quantity: pos.quantity,
-                            average_price: pos.average_price,
-                            market_value: pos.market_value,
+                            symbol: symbol.clone(),
+                            quantity: pos.quantity.0,
+                            average_price: pos.avg_price.0,
+                            market_value: pos.avg_price.0 * pos.quantity.0 + pos.unrealized_pnl,
                             unrealized_pnl: pos.unrealized_pnl,
                             realized_pnl: rust_decimal::Decimal::ZERO, // TODO: 逐部位已实现损益追踪需要扩展 ports::Position 结构
                             // 当前系统仅在 AccountView 层面追踪总已实现损益
@@ -428,25 +420,26 @@ impl CommandHandler for SystemCommandHandler {
                     // 僅返回未完成/未取消/未拒絕的訂單
                     if matches!(
                         rec.status,
-                        oms_core::OrderStatus::New
-                            | oms_core::OrderStatus::Acknowledged
-                            | oms_core::OrderStatus::PartiallyFilled
+                        ports::OrderStatus::New
+                            | ports::OrderStatus::Acknowledged
+                            | ports::OrderStatus::Accepted
+                            | ports::OrderStatus::PartiallyFilled
                     ) {
                         // 狀態映射
                         let status = match rec.status {
-                            oms_core::OrderStatus::New | oms_core::OrderStatus::Acknowledged => {
+                            ports::OrderStatus::New
+                            | ports::OrderStatus::Acknowledged
+                            | ports::OrderStatus::Accepted => {
                                 infra_ipc::messages::OrderStatus::Pending
                             }
-                            oms_core::OrderStatus::PartiallyFilled => {
+                            ports::OrderStatus::PartiallyFilled => {
                                 infra_ipc::messages::OrderStatus::PartiallyFilled
                             }
-                            oms_core::OrderStatus::Filled => {
-                                infra_ipc::messages::OrderStatus::Filled
-                            }
-                            oms_core::OrderStatus::Canceled => {
+                            ports::OrderStatus::Filled => infra_ipc::messages::OrderStatus::Filled,
+                            ports::OrderStatus::Canceled => {
                                 infra_ipc::messages::OrderStatus::Cancelled
                             }
-                            oms_core::OrderStatus::Rejected => {
+                            ports::OrderStatus::Rejected => {
                                 infra_ipc::messages::OrderStatus::Rejected
                             }
                             _ => infra_ipc::messages::OrderStatus::Pending,
@@ -496,9 +489,10 @@ impl CommandHandler for SystemCommandHandler {
                     for (order_id, rec) in state.into_iter() {
                         if matches!(
                             rec.status,
-                            oms_core::OrderStatus::New
-                                | oms_core::OrderStatus::Acknowledged
-                                | oms_core::OrderStatus::PartiallyFilled
+                            ports::OrderStatus::New
+                                | ports::OrderStatus::Acknowledged
+                                | ports::OrderStatus::Accepted
+                                | ports::OrderStatus::PartiallyFilled
                         ) {
                             pairs.push((order_id, rec.symbol));
                         }
@@ -506,8 +500,12 @@ impl CommandHandler for SystemCommandHandler {
                     pairs
                 };
 
-                // 下發取消
-                let _ = Self::cancel_all_orders_internal(&runtime).await;
+                if let Err(error) = Self::cancel_all_orders_internal(&runtime).await {
+                    return Response::Error {
+                        message: format!("Failed to dispatch cancellation: {error}"),
+                        code: Some(503),
+                    };
+                }
                 // 追蹤回覆
                 let stats =
                     Self::await_cancel_stats(&runtime, &pairs, Self::cancel_timeout_ms()).await;
@@ -523,24 +521,29 @@ impl CommandHandler for SystemCommandHandler {
                     let state = eng.export_oms_state();
                     let mut pairs = Vec::new();
                     for (order_id, rec) in state.into_iter() {
-                        if rec.symbol.as_str() == symbol.as_str() {
-                            if matches!(
+                        if rec.symbol.as_str() == symbol.as_str()
+                            && matches!(
                                 rec.status,
-                                oms_core::OrderStatus::New
-                                    | oms_core::OrderStatus::Acknowledged
-                                    | oms_core::OrderStatus::PartiallyFilled
-                            ) {
-                                pairs.push((order_id, rec.symbol));
-                            }
+                                ports::OrderStatus::New
+                                    | ports::OrderStatus::Acknowledged
+                                    | ports::OrderStatus::Accepted
+                                    | ports::OrderStatus::PartiallyFilled
+                            )
+                        {
+                            pairs.push((order_id, rec.symbol));
                         }
                     }
                     pairs
                 };
-                // 發送控制
-                for tx in &runtime.exec_control_txs {
-                    let _ = tx.send(engine::execution_worker::ControlCommand::CancelOrders(
-                        pairs.clone(),
-                    ));
+                if let Err(error) = runtime
+                    .execution_control_handle()
+                    .cancel_orders_filtered(Some(symbol.clone()), None)
+                    .await
+                {
+                    return Response::Error {
+                        message: format!("Failed to dispatch cancellation: {error}"),
+                        code: Some(503),
+                    };
                 }
                 // 追蹤回覆
                 let stats =
@@ -556,11 +559,15 @@ impl CommandHandler for SystemCommandHandler {
                     let eng = runtime.engine.lock().await;
                     eng.open_order_pairs_by_strategy(&strategy_id)
                 };
-                // 發送控制
-                for tx in &runtime.exec_control_txs {
-                    let _ = tx.send(engine::execution_worker::ControlCommand::CancelOrders(
-                        pairs.clone(),
-                    ));
+                if let Err(error) = runtime
+                    .execution_control_handle()
+                    .cancel_orders_for_strategy(&strategy_id)
+                    .await
+                {
+                    return Response::Error {
+                        message: format!("Failed to dispatch cancellation: {error}"),
+                        code: Some(503),
+                    };
                 }
                 // 等待撤單統計
                 let stats =
@@ -576,73 +583,78 @@ impl CommandHandler for SystemCommandHandler {
                 );
                 let runtime = self.runtime.lock().await;
                 let pair = (OrderId(order_id), symbol);
-                for tx in &runtime.exec_control_txs {
-                    let _ = tx.send(engine::execution_worker::ControlCommand::CancelOrders(
-                        vec![pair.clone()],
-                    ));
+                if let Err(error) = runtime
+                    .execution_control_handle()
+                    .cancel_order(pair.0.clone(), pair.1.clone())
+                    .await
+                {
+                    return Response::Error {
+                        message: format!("Failed to dispatch cancellation: {error}"),
+                        code: Some(503),
+                    };
                 }
                 let stats =
-                    Self::await_cancel_stats(&runtime, &vec![pair], Self::cancel_timeout_ms())
-                        .await;
+                    Self::await_cancel_stats(&runtime, &[pair], Self::cancel_timeout_ms()).await;
                 Response::Data(infra_ipc::messages::ResponseData::CancelResult(stats))
             }
 
             Command::SetTradingMode { mode } => {
                 info!("IPC: Setting trading mode to {:?}", mode);
-                let mut runtime = self.runtime.lock().await;
+                let runtime = self.runtime.lock().await;
 
-                // 更新配置中的 quotes_only 标志
                 match mode {
                     TradingMode::Live | TradingMode::Paper => {
-                        runtime.config.quotes_only = false;
-                        // 确保引擎处于运行状态
-                        let mut engine = runtime.engine.lock().await;
-                        if !engine.get_statistics().is_running {
-                            // 如果引擎已停止，需要重新启动
-                            drop(engine);
-                            match runtime.start().await {
-                                Ok(_) => {
+                        let is_running = runtime.engine.lock().await.get_statistics().is_running;
+                        if !is_running {
+                            Response::Error {
+                                message: "engine is stopped; restart the supervised process"
+                                    .to_string(),
+                                code: Some(409),
+                            }
+                        } else {
+                            match runtime.execution_control_handle().resume_trading().await {
+                                Ok(()) => {
                                     info!("交易模式已切换至 {:?}", mode);
                                     Response::Ok
                                 }
-                                Err(e) => Response::Error {
-                                    message: format!("启动交易引擎失败: {}", e),
-                                    code: Some(500),
+                                Err(error) => Response::Error {
+                                    message: error.to_string(),
+                                    code: Some(409),
                                 },
                             }
-                        } else {
-                            drop(engine);
-                            info!("交易模式已切换至 {:?}", mode);
+                        }
+                    }
+                    TradingMode::Replay => match runtime
+                        .execution_control_handle()
+                        .emergency_stop(true)
+                        .await
+                    {
+                        Ok(report) if report.is_complete() => {
+                            info!("已进入安全 Replay 边界；重启后方可恢复执行");
                             Response::Ok
                         }
-                    }
-                    TradingMode::Replay => {
-                        // Replay 模式：仅接收行情，不执行交易
-                        runtime.config.quotes_only = true;
-
-                        // 取消所有未结订单
-                        match Self::cancel_all_orders_internal(&runtime).await {
-                            Ok(_) => {
-                                info!("已取消所有订单，切换至 Replay 模式");
-                                Response::Ok
-                            }
-                            Err(e) => Response::Error {
-                                message: format!("取消订单失败: {}", e),
-                                code: Some(500),
-                            },
-                        }
-                    }
+                        Ok(report) => Response::Error {
+                            message: format!(
+                                "Replay cancellation incomplete: {} of {} submitted",
+                                report.submitted.len(),
+                                report.requested
+                            ),
+                            code: Some(503),
+                        },
+                        Err(error) => Response::Error {
+                            message: error.to_string(),
+                            code: Some(503),
+                        },
+                    },
                     TradingMode::Paused => {
-                        // 暂停模式：停止引擎
-                        runtime.config.quotes_only = true;
-                        match runtime.stop().await {
-                            Ok(_) => {
+                        match runtime.execution_control_handle().pause_trading().await {
+                            Ok(()) => {
                                 info!("系统已暂停");
                                 Response::Ok
                             }
-                            Err(e) => Response::Error {
-                                message: format!("暂停系统失败: {}", e),
-                                code: Some(500),
+                            Err(error) => Response::Error {
+                                message: error.to_string(),
+                                code: Some(503),
                             },
                         }
                     }
@@ -800,35 +812,17 @@ impl SystemCommandHandler {
     }
 
     /// Internal helper to cancel all orders
-    async fn cancel_all_orders_internal(
-        runtime: &SystemRuntime,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // 1) 從引擎導出 OMS 狀態，收集未結訂單（New/Ack/PartiallyFilled）
-        use oms_core::OrderStatus as OmsStatus;
-        let (pairs, txs) = {
-            let eng = runtime.engine.lock().await;
-            let state = eng.export_oms_state();
-            let mut pairs = Vec::new();
-            for (order_id, rec) in state.into_iter() {
-                if matches!(
-                    rec.status,
-                    OmsStatus::New | OmsStatus::Acknowledged | OmsStatus::PartiallyFilled
-                ) {
-                    pairs.push((order_id, rec.symbol));
-                }
-            }
-            (pairs, runtime.exec_control_txs.clone())
-        };
-
-        if pairs.is_empty() {
-            return Ok(());
-        }
-
-        // 2) 通知執行 worker 撤單
-        for tx in txs {
-            let _ = tx.send(engine::execution_worker::ControlCommand::CancelOrders(
-                pairs.clone(),
-            ));
+    async fn cancel_all_orders_internal(runtime: &SystemRuntime) -> Result<(), hft_core::HftError> {
+        let report = runtime
+            .execution_control_handle()
+            .cancel_all_orders()
+            .await?;
+        if !report.is_complete() {
+            return Err(hft_core::HftError::Execution(format!(
+                "cancellation dispatch incomplete: {} of {} submitted",
+                report.submitted.len(),
+                report.requested
+            )));
         }
         Ok(())
     }
@@ -865,13 +859,11 @@ impl SystemCommandHandler {
         while Instant::now() < deadline && !pending.is_empty() {
             // 等待下一個事件（最長 200ms）
             match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-                Ok(Ok(ev)) => {
-                    if let ports::ExecutionEvent::OrderCanceled { order_id, .. } = ev {
-                        if pending.remove(&order_id) {
-                            if let Some(entry) = details.get_mut(&order_id) {
-                                *entry = (true, None);
-                            }
-                        }
+                Ok(Ok(ports::ExecutionEvent::OrderCanceled { order_id, .. }))
+                    if pending.remove(&order_id) =>
+                {
+                    if let Some(entry) = details.get_mut(&order_id) {
+                        *entry = (true, None);
                     }
                 }
                 _ => {
@@ -888,7 +880,7 @@ impl SystemCommandHandler {
             };
             for oid in pending.clone() {
                 if let Some(rec) = state.get(&oid) {
-                    if matches!(rec.status, oms_core::OrderStatus::Canceled) {
+                    if matches!(rec.status, ports::OrderStatus::Canceled) {
                         pending.remove(&oid);
                         if let Some(entry) = details.get_mut(&oid) {
                             *entry = (true, None);
@@ -899,7 +891,7 @@ impl SystemCommandHandler {
         }
 
         // 標記超時者原因
-        for (oid, entry) in details.iter_mut() {
+        for (_oid, entry) in details.iter_mut() {
             if !entry.0 {
                 entry.1 = Some("timeout".to_string());
             }
@@ -932,7 +924,7 @@ impl SystemCommandHandler {
 }
 
 #[cfg(feature = "infra-ipc")]
-fn convert_strategy_override(ov: hft_ipc::StrategyRiskConfig) -> crate::StrategyRiskOverride {
+fn convert_strategy_override(ov: infra_ipc::StrategyRiskConfig) -> crate::StrategyRiskOverride {
     crate::StrategyRiskOverride {
         max_position: ov.max_position,
         max_notional: ov.max_notional,

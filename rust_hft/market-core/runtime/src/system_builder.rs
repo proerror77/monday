@@ -428,28 +428,27 @@ impl SystemBuilder {
         // 解析 api_key 參考
         if let Some(ref secret_ref) = venue.secret_ref_api_key {
             match manager.get_secret(secret_ref).await {
-                Ok(secret_value) => {
-                    match secret_value.to_string_safe() {
-                        Ok(api_key) => {
-                            venue.api_key = Some(api_key);
-                            venue.secret_ref_api_key = None;
-                            info!("已解析 {} 的 api_key 參考", venue_name);
-                        }
-                        Err(e) => {
-                            error!("無法將 {} 的 api_key 秘密轉換為字符串: {}", venue_name, e);
-                            return Err(format!(
-                                "憑證 {} 無效 UTF-8: {}",
-                                secret_ref, e
-                            ).into());
-                        }
+                Ok(secret_value) => match secret_value.to_string_safe() {
+                    Ok(api_key) => {
+                        venue.api_key = Some(api_key);
+                        venue.secret_ref_api_key = None;
+                        info!("已解析 {} 的 api_key 參考", venue_name);
                     }
-                }
+                    Err(e) => {
+                        error!("無法將 {} 的 api_key 秘密轉換為字符串: {}", venue_name, e);
+                        return Err(format!("憑證 {} 無效 UTF-8: {}", secret_ref, e).into());
+                    }
+                },
                 Err(e) => {
-                    error!("無法解析 {} 的 api_key 參考 {}: {}", venue_name, secret_ref, e);
+                    error!(
+                        "無法解析 {} 的 api_key 參考 {}: {}",
+                        venue_name, secret_ref, e
+                    );
                     return Err(format!(
                         "無法從 SecretsManager 解析 {} 的 api_key: {}",
                         venue_name, e
-                    ).into());
+                    )
+                    .into());
                 }
             }
         }
@@ -457,28 +456,27 @@ impl SystemBuilder {
         // 解析 secret 參考
         if let Some(ref secret_ref) = venue.secret_ref_secret {
             match manager.get_secret(secret_ref).await {
-                Ok(secret_value) => {
-                    match secret_value.to_string_safe() {
-                        Ok(secret) => {
-                            venue.secret = Some(secret);
-                            venue.secret_ref_secret = None;
-                            info!("已解析 {} 的 secret 參考", venue_name);
-                        }
-                        Err(e) => {
-                            error!("無法將 {} 的 secret 秘密轉換為字符串: {}", venue_name, e);
-                            return Err(format!(
-                                "憑證 {} 無效 UTF-8: {}",
-                                secret_ref, e
-                            ).into());
-                        }
+                Ok(secret_value) => match secret_value.to_string_safe() {
+                    Ok(secret) => {
+                        venue.secret = Some(secret);
+                        venue.secret_ref_secret = None;
+                        info!("已解析 {} 的 secret 參考", venue_name);
                     }
-                }
+                    Err(e) => {
+                        error!("無法將 {} 的 secret 秘密轉換為字符串: {}", venue_name, e);
+                        return Err(format!("憑證 {} 無效 UTF-8: {}", secret_ref, e).into());
+                    }
+                },
                 Err(e) => {
-                    error!("無法解析 {} 的 secret 參考 {}: {}", venue_name, secret_ref, e);
+                    error!(
+                        "無法解析 {} 的 secret 參考 {}: {}",
+                        venue_name, secret_ref, e
+                    );
                     return Err(format!(
                         "無法從 SecretsManager 解析 {} 的 secret: {}",
                         venue_name, e
-                    ).into());
+                    )
+                    .into());
                 }
             }
         }
@@ -486,28 +484,30 @@ impl SystemBuilder {
         // 解析 passphrase 參考
         if let Some(ref secret_ref) = venue.secret_ref_passphrase {
             match manager.get_secret(secret_ref).await {
-                Ok(secret_value) => {
-                    match secret_value.to_string_safe() {
-                        Ok(passphrase) => {
-                            venue.passphrase = Some(passphrase);
-                            venue.secret_ref_passphrase = None;
-                            info!("已解析 {} 的 passphrase 參考", venue_name);
-                        }
-                        Err(e) => {
-                            error!("無法將 {} 的 passphrase 秘密轉換為字符串: {}", venue_name, e);
-                            return Err(format!(
-                                "憑證 {} 無效 UTF-8: {}",
-                                secret_ref, e
-                            ).into());
-                        }
+                Ok(secret_value) => match secret_value.to_string_safe() {
+                    Ok(passphrase) => {
+                        venue.passphrase = Some(passphrase);
+                        venue.secret_ref_passphrase = None;
+                        info!("已解析 {} 的 passphrase 參考", venue_name);
                     }
-                }
+                    Err(e) => {
+                        error!(
+                            "無法將 {} 的 passphrase 秘密轉換為字符串: {}",
+                            venue_name, e
+                        );
+                        return Err(format!("憑證 {} 無效 UTF-8: {}", secret_ref, e).into());
+                    }
+                },
                 Err(e) => {
-                    error!("無法解析 {} 的 passphrase 參考 {}: {}", venue_name, secret_ref, e);
+                    error!(
+                        "無法解析 {} 的 passphrase 參考 {}: {}",
+                        venue_name, secret_ref, e
+                    );
                     return Err(format!(
                         "無法從 SecretsManager 解析 {} 的 passphrase: {}",
                         venue_name, e
-                    ).into());
+                    )
+                    .into());
                 }
             }
         }
@@ -650,7 +650,7 @@ impl SystemBuilder {
             config: self.config,
             tasks: Vec::new(),
             execution_worker_tasks: Vec::new(),
-            exec_control_txs: Vec::new(),
+            exec_control_tx: None,
             market_plans: self.market_stream_plans,
             execution_client_venues: self.execution_client_venues,
             execution_client_accounts: self.execution_client_accounts,
@@ -684,8 +684,8 @@ pub struct SystemRuntime {
     // 执行 worker 任务
     execution_worker_tasks: Vec<tokio::task::JoinHandle<Result<(), HftError>>>,
     // 執行控制通道（撤單等）
-    exec_control_txs:
-        Vec<tokio::sync::mpsc::UnboundedSender<engine::execution_worker::ControlCommand>>,
+    exec_control_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<engine::execution_worker::ControlCommand>>,
     // 登記的市場流規劃
     market_plans: Vec<(VenueType, String, Vec<InstrumentSpec>)>,
     // 🔥 Phase 1: 執行客戶端到交易所的映射
@@ -907,13 +907,20 @@ impl SystemRuntime {
                 batch_size: queue_settings.worker_batch_size,
                 idle_sleep_ms: queue_settings.worker_idle_sleep_ms,
                 ack_timeout_ms: self.config.engine.ack_timeout_ms,
-                reconcile_interval_ms: self.config.engine.reconcile_interval_ms,
+                // Runtime owns OMS-aware reconciliation; the worker only supplies snapshots.
+                reconcile_interval_ms: 0,
                 auto_cancel_exchange_only: self.config.engine.auto_cancel_exchange_only,
                 ..Default::default()
             };
 
             // Capture client count before move
             let client_count = execution_clients.len();
+            let account_to_client = self
+                .execution_client_accounts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, account)| account.clone().map(|account| (account, index)))
+                .collect::<std::collections::HashMap<_, _>>();
 
             let (worker_handle, control_tx) = if let Some(router_config) = &self.config.router {
                 // 有路由器配置，創建路由器並使用帶路由器的 worker
@@ -985,6 +992,7 @@ impl SystemRuntime {
                     router,
                     venue_to_client,
                     strategy_to_client,
+                    Some(account_to_client.clone()),
                 )
             } else {
                 // 沒有路由器配置，使用預設邏輯
@@ -1016,10 +1024,11 @@ impl SystemRuntime {
                     worker_queues,
                     execution_clients,
                     strategy_to_client,
+                    Some(account_to_client),
                 )
             };
             self.execution_worker_tasks.push(worker_handle);
-            self.exec_control_txs.push(control_tx);
+            self.exec_control_tx = Some(control_tx);
             info!("已启动执行 worker (客户端数量: {})", client_count);
         }
 
@@ -1035,6 +1044,58 @@ impl SystemRuntime {
         let affinity_core = self.config.engine.cpu_affinity.engine_core;
         let engine_handle = spawn_engine_loop(engine_arc, notify, affinity_core);
         self.tasks.push(engine_handle);
+
+        if self.config.engine.reconcile_interval_ms > 0 && self.exec_control_tx.is_some() {
+            let interval_ms = self.config.engine.reconcile_interval_ms;
+            let control = self.execution_control_handle();
+            self.tasks.push(tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let engine = control.engine();
+                    if !engine.lock().await.get_statistics().is_running {
+                        break;
+                    }
+                    match control.reconcile(false).await {
+                        Ok(report) if report.healthy => {
+                            tracing::debug!("runtime order reconciliation healthy");
+                        }
+                        Ok(report) => {
+                            tracing::error!(
+                                complete = report.complete,
+                                exchange_only = report.order_report.exchange_only.len(),
+                                local_only = report.order_report.local_only.len(),
+                                quantity_mismatch = report.order_report.qty_mismatch.len(),
+                                "runtime order reconciliation unhealthy; pausing new intents"
+                            );
+                            let mode = engine.lock().await.trading_mode();
+                            if matches!(
+                                mode,
+                                engine::TradingMode::Normal | engine::TradingMode::Degraded
+                            ) {
+                                if let Err(error) = control.pause_trading().await {
+                                    tracing::error!(%error, "failed to disable execution intake");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "runtime reconciliation failed; pausing new intents");
+                            let mode = engine.lock().await.trading_mode();
+                            if matches!(
+                                mode,
+                                engine::TradingMode::Normal | engine::TradingMode::Degraded
+                            ) {
+                                if let Err(error) = control.pause_trading().await {
+                                    tracing::error!(%error, "failed to disable execution intake");
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+        }
 
         // 4) 狀態欄：每秒輸出一次系統狀態摘要（現金/持倉/PNL/事件統計）
         {
@@ -1124,7 +1185,13 @@ impl SystemRuntime {
             let runtime_arc = Arc::new(Mutex::new(self.clone_for_ipc()));
 
             let ipc_handle = crate::ipc_handler::start_ipc_server(runtime_arc, None);
-            self.tasks.push(ipc_handle);
+            self.tasks.push(tokio::spawn(async move {
+                match ipc_handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::error!(%error, "IPC server failed"),
+                    Err(error) => tracing::error!(%error, "IPC server task failed"),
+                }
+            }));
             info!("IPC control server started");
         }
 
@@ -1493,8 +1560,8 @@ default_symbols:
                 ws_public: Some("wss://ws.bitget.com".to_string()),
                 ws_private: None,
                 rest: Some("https://api.bitget.com".to_string()),
-                api_key: None, // Will be populated by resolution
-                secret: None, // Will be populated by resolution
+                api_key: None,    // Will be populated by resolution
+                secret: None,     // Will be populated by resolution
                 passphrase: None, // Will be populated by resolution
                 execution_mode: Some("Paper".to_string()),
                 capabilities: VenueCapabilities::default(),
@@ -1521,21 +1588,26 @@ default_symbols:
         let builder = SystemBuilder::new(config);
 
         // Execute credential resolution
-        let builder = builder.resolve_credentials_async().await
+        let builder = builder
+            .resolve_credentials_async()
+            .await
             .expect("Credential resolution should succeed");
 
         // Verify: Check that plaintext fields are populated
         let bitget_venue = &builder.config.venues[0];
         assert_eq!(
-            bitget_venue.api_key, Some("test_api_key_12345".to_string()),
+            bitget_venue.api_key,
+            Some("test_api_key_12345".to_string()),
             "api_key should be resolved from environment"
         );
         assert_eq!(
-            bitget_venue.secret, Some("test_secret_98765".to_string()),
+            bitget_venue.secret,
+            Some("test_secret_98765".to_string()),
             "secret should be resolved from environment"
         );
         assert_eq!(
-            bitget_venue.passphrase, Some("test_pass_abcde".to_string()),
+            bitget_venue.passphrase,
+            Some("test_pass_abcde".to_string()),
             "passphrase should be resolved from environment"
         );
 
@@ -1603,7 +1675,9 @@ default_symbols:
         let original_secret = builder.config.venues[0].secret.clone();
 
         // Execute credential resolution
-        let builder = builder.resolve_credentials_async().await
+        let builder = builder
+            .resolve_credentials_async()
+            .await
             .expect("Credential resolution should succeed");
 
         // Verify: Plaintext credentials should remain unchanged
@@ -1633,7 +1707,7 @@ default_symbols:
                 ws_private: None,
                 rest: Some("https://www.okex.com".to_string()),
                 api_key: Some("plaintext_api_key".to_string()), // Plaintext
-                secret: None, // Will be resolved
+                secret: None,                                   // Will be resolved
                 passphrase: Some("plaintext_passphrase".to_string()), // Plaintext
                 execution_mode: Some("Paper".to_string()),
                 capabilities: VenueCapabilities::default(),
@@ -1658,25 +1732,33 @@ default_symbols:
 
         let builder = SystemBuilder::new(config);
 
-        let builder = builder.resolve_credentials_async().await
+        let builder = builder
+            .resolve_credentials_async()
+            .await
             .expect("Credential resolution should succeed");
 
         let okx_venue = &builder.config.venues[0];
 
         // Verify: Only the referenced field was updated
         assert_eq!(
-            okx_venue.api_key, Some("plaintext_api_key".to_string()),
+            okx_venue.api_key,
+            Some("plaintext_api_key".to_string()),
             "api_key should remain unchanged (no reference)"
         );
         assert_eq!(
-            okx_venue.secret, Some("resolved_secret_value".to_string()),
+            okx_venue.secret,
+            Some("resolved_secret_value".to_string()),
             "secret should be resolved from reference"
         );
         assert_eq!(
-            okx_venue.passphrase, Some("plaintext_passphrase".to_string()),
+            okx_venue.passphrase,
+            Some("plaintext_passphrase".to_string()),
             "passphrase should remain unchanged (no reference)"
         );
-        assert!(okx_venue.secret_ref_secret.is_none(), "secret reference should be cleared");
+        assert!(
+            okx_venue.secret_ref_secret.is_none(),
+            "secret reference should be cleared"
+        );
 
         // Cleanup
         std::env::remove_var("HFT_SECRET_OKX_SECRET");
@@ -1723,7 +1805,10 @@ default_symbols:
 
         // Execute: Should fail gracefully
         let result = builder.resolve_credentials_async().await;
-        assert!(result.is_err(), "Resolution should fail for missing credential reference");
+        assert!(
+            result.is_err(),
+            "Resolution should fail for missing credential reference"
+        );
     }
 
     #[cfg(not(feature = "infra-secrets"))]
@@ -1766,7 +1851,9 @@ default_symbols:
         let builder = SystemBuilder::new(config);
 
         // Execute: Should succeed (no-op) even with unresolved references
-        let builder = builder.resolve_credentials_async().await
+        let builder = builder
+            .resolve_credentials_async()
+            .await
             .expect("Resolution should be no-op when feature disabled");
 
         // Verify: References should remain unchanged (not resolved, not cleared)
@@ -1805,7 +1892,7 @@ default_symbols:
         // When both plaintext and reference exist, reference should be used
         assert!(venue.secret_ref_api_key.is_some());
         assert!(venue.api_key.is_some()); // Both exist
-        // In actual resolution, reference would take precedence and plaintext would be overwritten
+                                          // In actual resolution, reference would take precedence and plaintext would be overwritten
 
         // When only reference exists, that's the source of truth
         let venue_ref_only = VenueConfig {
@@ -1844,7 +1931,7 @@ default_symbols:
 
         runtime.start().await.expect("quotes-only runtime starts");
         assert!(runtime.execution_worker_tasks.is_empty());
-        assert!(runtime.exec_control_txs.is_empty());
+        assert!(runtime.exec_control_tx.is_none());
         runtime.stop().await.expect("quotes-only runtime stops");
     }
 }
