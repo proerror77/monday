@@ -41,7 +41,8 @@ require_external_manifest() {
 require_configmap_key() {
     local name="$1"
     local key="$2"
-    if [[ -z "$(kubectl -n "$NAMESPACE" get configmap "$name" -o "jsonpath={.data['$key']}" 2>/dev/null)" ]]; then
+    local escaped_key="${key//./\\.}"
+    if [[ -z "$(kubectl -n "$NAMESPACE" get configmap "$name" -o "jsonpath={.data.$escaped_key}" 2>/dev/null)" ]]; then
         log_error "ConfigMap $name is missing required key $key"
         exit 1
     fi
