@@ -12,8 +12,9 @@ use alpha_domain::{
 };
 use clap::Parser;
 use hft_live::deployment_envelope::{
-    decode_trusted_keys, ActivationRequest, DeploymentIntake, RuntimeAuditLog, RuntimeFeedbackLog,
-    RuntimeNonceLedger, RuntimePolicyDocument, SystemConfigActivationAdapter,
+    decode_trusted_keys, ActivationRequest, DeploymentIntake, DeploymentReservation,
+    RuntimeAuditLog, RuntimeFeedbackLog, RuntimeNonceLedger, RuntimePolicyDocument,
+    SystemConfigActivationAdapter,
 };
 use runtime::{ShardConfig, ShardStrategy, SystemBuilder, SystemConfig};
 use tracing::info;
@@ -136,12 +137,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return Ok(());
     }
-    let activation =
+    let mut activation =
         apply_deployment_if_present(&args, &mut cfg, runtime_config_hash, risk_policy_hash)?;
-    if let Some(request) = &activation {
+    if let Some(deployment) = &activation {
         info!(
-            deployment_id = request.deployment_id,
-            mode = ?request.mode,
+            deployment_id = deployment.request.deployment_id,
+            mode = ?deployment.request.mode,
             "verified deployment applied to runtime startup config"
         );
     }
@@ -165,12 +166,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         builder
     };
-    let mut system = builder.auto_register_adapters_strict()?.build();
+    let builder = match builder.auto_register_adapters_strict() {
+        Ok(builder) => builder,
+        Err(error) => {
+            if let Some(deployment) = activation.as_mut() {
+                deployment
+                    .reservation
+                    .record_startup_failed(chrono::Utc::now(), error.to_string())?;
+            }
+            return Err(error.into());
+        }
+    };
+    if let Some(deployment) = activation.as_mut() {
+        deployment
+            .reservation
+            .commit_configuration(chrono::Utc::now())?;
+    }
+    let mut system = builder.build();
 
     // 啟動系統
-    system.start().await?;
-    if let Some(request) = &activation {
-        if let Err(error) = append_activation_feedback(&args, request) {
+    if let Err(error) = system.start().await {
+        if let Some(deployment) = activation.as_mut() {
+            deployment
+                .reservation
+                .record_startup_failed(chrono::Utc::now(), error.to_string())?;
+        }
+        let _ = system.stop().await;
+        return Err(error);
+    }
+    if let Some(deployment) = activation.as_mut() {
+        if let Err(error) = append_activation_feedback(&args, &deployment.request) {
+            let _ = deployment.reservation.record_startup_failed(
+                chrono::Utc::now(),
+                format!("activation feedback failed: {error}"),
+            );
+            let _ = system.execution_control_handle().emergency_stop(true).await;
+            let _ = system.stop().await;
+            return Err(error.into());
+        }
+        if let Err(error) = deployment.reservation.record_activated(chrono::Utc::now()) {
             let _ = system.execution_control_handle().emergency_stop(true).await;
             let _ = system.stop().await;
             return Err(error.into());
@@ -244,12 +278,17 @@ fn validate_startup_authority(
     Ok(())
 }
 
+struct PreparedDeployment {
+    request: ActivationRequest,
+    reservation: DeploymentReservation,
+}
+
 fn apply_deployment_if_present(
     args: &Args,
     config: &mut SystemConfig,
     runtime_config_hash: String,
     risk_policy_hash: String,
-) -> anyhow::Result<Option<ActivationRequest>> {
+) -> anyhow::Result<Option<PreparedDeployment>> {
     let Some(envelope_path) = args.deployment_envelope.as_ref() else {
         return Ok(None);
     };
@@ -266,20 +305,23 @@ fn apply_deployment_if_present(
     let policy_document: RuntimePolicyDocument = read_json(policy_path)?;
     let trusted_keys = decode_trusted_keys(read_json(trusted_keys_path)?)?;
     let policy = policy_document.bind(runtime_config_hash, risk_policy_hash);
-    let mut ledger = RuntimeNonceLedger::open(nonce_path)?;
-    let mut audit = RuntimeAuditLog::open(audit_path)?;
+    let ledger = RuntimeNonceLedger::open(nonce_path)?;
+    let audit = RuntimeAuditLog::open(audit_path)?;
     let mut adapter = SystemConfigActivationAdapter::new(config, &bundle, bundle_path);
     let observed_at = chrono::Utc::now();
-    let request = DeploymentIntake::new(
+    let (request, reservation) = DeploymentIntake::new(
         &trusted_keys,
         &policy,
         policy_document.runtime_paused,
-        &mut ledger,
-        &mut audit,
+        ledger,
+        audit,
         &mut adapter,
     )
-    .accept(&signed, observed_at)?;
-    Ok(Some(request))
+    .prepare(&signed, observed_at)?;
+    Ok(Some(PreparedDeployment {
+        request,
+        reservation,
+    }))
 }
 
 fn append_activation_feedback(args: &Args, request: &ActivationRequest) -> anyhow::Result<()> {

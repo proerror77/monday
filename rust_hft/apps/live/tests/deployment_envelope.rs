@@ -5,8 +5,8 @@ use alpha_domain::{
 use chrono::{Duration, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hft_live::deployment_envelope::{
-    ActivationMode, ActivationRequest, DeploymentIntake, RuntimeActivationAdapter, RuntimeAuditLog,
-    RuntimeNonceLedger, SystemConfigActivationAdapter,
+    ActivationMode, ActivationRequest, DeploymentIntake, DeploymentReservation,
+    RuntimeActivationAdapter, RuntimeAuditLog, RuntimeNonceLedger, SystemConfigActivationAdapter,
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -165,9 +165,23 @@ fn intake<A: RuntimeActivationAdapter>(
     directory: &std::path::Path,
     adapter: &mut A,
 ) -> Result<ActivationRequest, hft_live::deployment_envelope::IntakeError> {
-    let mut ledger = RuntimeNonceLedger::open(directory.join("nonces.jsonl")).unwrap();
-    let mut audit = RuntimeAuditLog::open(directory.join("audit.jsonl")).unwrap();
-    DeploymentIntake::new(keys, policy, false, &mut ledger, &mut audit, adapter).accept(signed, now)
+    let (request, mut reservation) = prepare_intake(signed, keys, policy, now, directory, adapter)?;
+    reservation.commit_configuration(now)?;
+    Ok(request)
+}
+
+fn prepare_intake<A: RuntimeActivationAdapter>(
+    signed: &alpha_domain::SignedDeploymentEnvelope,
+    keys: &BTreeMap<String, VerifyingKey>,
+    policy: &RuntimeEnvelopePolicy,
+    now: chrono::DateTime<Utc>,
+    directory: &std::path::Path,
+    adapter: &mut A,
+) -> Result<(ActivationRequest, DeploymentReservation), hft_live::deployment_envelope::IntakeError>
+{
+    let ledger = RuntimeNonceLedger::open(directory.join("nonces.jsonl")).unwrap();
+    let audit = RuntimeAuditLog::open(directory.join("audit.jsonl")).unwrap();
+    DeploymentIntake::new(keys, policy, false, ledger, audit, adapter).prepare(signed, now)
 }
 
 fn configured_runtime() -> runtime::SystemConfig {
@@ -371,6 +385,67 @@ fn nonce_replay_is_rejected_after_ledger_restart() {
 }
 
 #[test]
+fn concurrent_startups_serialize_nonce_reservation_and_recheck_the_ledger() {
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let trusted = trusted(&key);
+    let directory = directory("nonce-concurrent");
+    let signed = sign_envelope(
+        envelope(
+            now,
+            "paper-concurrent",
+            "nonce-concurrent",
+            AllowedIntentType::StartPaper,
+            ApprovalClass::Paper,
+        ),
+        "key-1",
+        &key,
+    )
+    .unwrap();
+    let mut first_adapter = RecordingAdapter::default();
+    let (_, mut first_reservation) = prepare_intake(
+        &signed,
+        &trusted,
+        &policy(),
+        now,
+        &directory,
+        &mut first_adapter,
+    )
+    .unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let second_directory = directory.clone();
+    let second_signed = signed.clone();
+    let second_trusted = trusted.clone();
+    let handle = std::thread::spawn(move || {
+        let mut adapter = RecordingAdapter::default();
+        started_tx.send(()).unwrap();
+        let result = prepare_intake(
+            &second_signed,
+            &second_trusted,
+            &policy(),
+            now,
+            &second_directory,
+            &mut adapter,
+        );
+        result_tx.send(result.is_err()).unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert!(result_rx
+        .recv_timeout(std::time::Duration::from_millis(50))
+        .is_err());
+
+    first_reservation.commit_configuration(now).unwrap();
+    drop(first_reservation);
+    assert!(result_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap());
+    handle.join().unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn live_small_fails_closed_until_order_limits_are_in_the_hot_path() {
     let now = Utc::now();
     let key = SigningKey::from_bytes(&[7_u8; 32]);
@@ -393,7 +468,7 @@ fn live_small_fails_closed_until_order_limits_are_in_the_hot_path() {
     let bundle_path = directory.join("bundle.json");
     let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
     assert!(intake(&signed, &trusted, &policy(), now, &directory, &mut adapter,).is_err());
-    assert!(RuntimeNonceLedger::open(directory.join("nonces.jsonl"))
+    assert!(!RuntimeNonceLedger::open(directory.join("nonces.jsonl"))
         .unwrap()
         .contains("nonce-live-small"));
     std::fs::remove_dir_all(directory).unwrap();
@@ -468,16 +543,32 @@ fn onnx_handoff_rejects_bad_schema_and_checksum_before_runtime_build() {
     let mut config = configured_runtime();
     let bundle_path = directory.join("bundle-valid-metadata.json");
     let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
-    intake(&signed, &trusted, &policy(), now, &directory, &mut adapter).unwrap();
+    let (_, mut reservation) =
+        prepare_intake(&signed, &trusted, &policy(), now, &directory, &mut adapter).unwrap();
     drop(adapter);
     assert!(matches!(
         config.strategies[0].strategy_type,
         runtime::StrategyType::Onnx
     ));
     #[cfg(feature = "dl-strategy")]
-    assert!(runtime::SystemBuilder::new(config)
-        .auto_register_adapters_strict()
-        .is_err());
+    {
+        let error = runtime::SystemBuilder::new(config)
+            .auto_register_adapters_strict()
+            .err()
+            .unwrap();
+        reservation
+            .record_startup_failed(now, error.to_string())
+            .unwrap();
+        drop(reservation);
+        assert!(!RuntimeNonceLedger::open(directory.join("nonces.jsonl"))
+            .unwrap()
+            .contains("nonce-onnx-malformed"));
+        let audit = std::fs::read_to_string(directory.join("audit.jsonl")).unwrap();
+        assert!(audit.contains("\"phase\":\"startup\""));
+        assert!(!audit.contains("\"result\":\"prepared\""));
+    }
+    #[cfg(not(feature = "dl-strategy"))]
+    drop(reservation);
 
     std::fs::remove_dir_all(directory).unwrap();
 }

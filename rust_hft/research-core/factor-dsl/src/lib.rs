@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use thiserror::Error;
 
+pub const MAX_FACTOR_AST_DEPTH: usize = 64;
+pub const MAX_FACTOR_AST_NODES: usize = 10_000;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FactorDslError {
     #[error("operator arity mismatch for {operator}: expected {expected}, got {actual}")]
@@ -13,6 +16,10 @@ pub enum FactorDslError {
         expected: usize,
         actual: usize,
     },
+    #[error("factor AST exceeds the maximum depth of {max_depth}")]
+    AstTooDeep { max_depth: usize },
+    #[error("factor AST exceeds the maximum size of {max_nodes} nodes")]
+    AstTooLarge { max_nodes: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,9 +108,21 @@ impl FactorAst {
     }
 
     pub fn validate(&self) -> Result<(), FactorDslError> {
-        match self {
-            Self::Terminal(_) => Ok(()),
-            Self::Call { operator, args } => {
+        let mut stack = vec![(self, 1_usize)];
+        let mut nodes = 0_usize;
+        while let Some((node, depth)) = stack.pop() {
+            if depth > MAX_FACTOR_AST_DEPTH {
+                return Err(FactorDslError::AstTooDeep {
+                    max_depth: MAX_FACTOR_AST_DEPTH,
+                });
+            }
+            nodes = nodes.saturating_add(1);
+            if nodes > MAX_FACTOR_AST_NODES {
+                return Err(FactorDslError::AstTooLarge {
+                    max_nodes: MAX_FACTOR_AST_NODES,
+                });
+            }
+            if let Self::Call { operator, args } = node {
                 let expected = operator.arity();
                 let actual = args.len();
                 if expected != actual {
@@ -113,9 +132,10 @@ impl FactorAst {
                         actual,
                     });
                 }
-                args.iter().try_for_each(Self::validate)
+                stack.extend(args.iter().map(|arg| (arg, depth + 1)));
             }
         }
+        Ok(())
     }
 }
 
@@ -183,6 +203,44 @@ mod tests {
                 operator: "+".to_string(),
                 expected: 2,
                 actual: 1
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_excessive_depth_without_recursive_validation() {
+        let mut ast = FactorAst::Terminal(FactorTerminal::Field("oi".to_string()));
+        for _ in 0..MAX_FACTOR_AST_DEPTH {
+            ast = FactorAst::Call {
+                operator: FactorOperator::Abs,
+                args: vec![ast],
+            };
+        }
+
+        assert_eq!(
+            ast.validate().unwrap_err(),
+            FactorDslError::AstTooDeep {
+                max_depth: MAX_FACTOR_AST_DEPTH
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_excessive_node_count() {
+        fn tree(depth: usize) -> FactorAst {
+            if depth == 0 {
+                return FactorAst::Terminal(FactorTerminal::Field("oi".to_string()));
+            }
+            FactorAst::Call {
+                operator: FactorOperator::Add,
+                args: vec![tree(depth - 1), tree(depth - 1)],
+            }
+        }
+
+        assert_eq!(
+            tree(14).validate().unwrap_err(),
+            FactorDslError::AstTooLarge {
+                max_nodes: MAX_FACTOR_AST_NODES
             }
         );
     }

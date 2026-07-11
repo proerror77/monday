@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
     #[error("{0} cannot be empty")]
@@ -266,6 +269,15 @@ impl TensorSpec {
         if self.dimensions.is_empty() || self.dimensions.contains(&Some(0)) {
             return Err(DomainError::InvalidStrategyBundle);
         }
+        let mut known_elements = 1_usize;
+        for dimension in self.dimensions.iter().flatten() {
+            known_elements = known_elements
+                .checked_mul(*dimension)
+                .ok_or(DomainError::InvalidStrategyBundle)?;
+            if known_elements > MAX_ONNX_TENSOR_ELEMENTS {
+                return Err(DomainError::InvalidStrategyBundle);
+            }
+        }
         Ok(())
     }
 }
@@ -289,6 +301,7 @@ impl OnnxModelCandidate {
         require_text("onnx artifact uri", &self.artifact.uri)?;
         if self.artifact.content_type != "application/onnx"
             || self.byte_len == 0
+            || self.byte_len > MAX_ONNX_ARTIFACT_BYTES
             || self.opset == 0
             || self.inputs.is_empty()
         {
@@ -1007,6 +1020,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(first.bundle_hash, second.bundle_hash);
+    }
+
+    #[test]
+    fn onnx_candidate_rejects_oversized_artifacts_and_tensors() {
+        let candidate = |byte_len, dimensions| OnnxModelCandidate {
+            artifact: ArtifactRef {
+                uri: "model.onnx".to_string(),
+                content_type: "application/onnx".to_string(),
+                checksum: Some("a".repeat(64)),
+            },
+            byte_len,
+            opset: 17,
+            inputs: vec![TensorSpec {
+                name: "lob".to_string(),
+                element_type: TensorElementType::Float32,
+                dimensions,
+            }],
+            output: TensorSpec {
+                name: "signal".to_string(),
+                element_type: TensorElementType::Float32,
+                dimensions: vec![Some(1)],
+            },
+        };
+
+        assert_eq!(
+            candidate(
+                MAX_ONNX_ARTIFACT_BYTES + 1,
+                vec![Some(1), Some(4), Some(2), Some(2)]
+            )
+            .validate(),
+            Err(DomainError::InvalidStrategyBundle)
+        );
+        assert_eq!(
+            candidate(1, vec![Some(1), Some(4), Some(MAX_ONNX_TENSOR_ELEMENTS)]).validate(),
+            Err(DomainError::InvalidStrategyBundle)
+        );
     }
 
     #[test]

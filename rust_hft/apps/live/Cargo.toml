@@ -17,6 +17,7 @@ chrono = { version = "0.4", features = ["serde"] }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+fs4 = { workspace = true }
 
 # 注意：所有可選依賴現在通過 runtime 轉發，移除直接依賴
 

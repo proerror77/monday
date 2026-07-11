@@ -22,6 +22,10 @@ rust_decimal = { workspace = true }
 # 配置與序列化  
 serde_yaml = "0.9"
 
+[dev-dependencies]
+hex = { workspace = true }
+sha2 = { workspace = true }
+
 [features]
 default = []
 # TorchScript 模型支持

@@ -1,7 +1,7 @@
 use alpha_domain::{
     verify_envelope, AllowedIntentType, ApprovalClass, DomainError, RuntimeAttributionEvent,
     RuntimeEnvelopePolicy, SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
-    VerifiedDeploymentEnvelope,
+    VerifiedDeploymentEnvelope, MAX_ONNX_ARTIFACT_BYTES, MAX_ONNX_TENSOR_ELEMENTS,
 };
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 use thiserror::Error;
@@ -356,6 +356,13 @@ fn verify_onnx_artifact(
     if *batch != 1 || *channels != 4 || *window_size == 0 || *top_n == 0 {
         return Err("ONNX input shape must be static [1, 4, L, K]".to_string());
     }
+    let input_elements = window_size
+        .checked_mul(*top_n)
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| "ONNX input shape exceeds runtime limits".to_string())?;
+    if input_elements > MAX_ONNX_TENSOR_ELEMENTS {
+        return Err("ONNX input shape exceeds runtime limits".to_string());
+    }
     if !matches!(
         model.output.dimensions.as_slice(),
         [Some(1)] | [Some(1), Some(1)]
@@ -383,6 +390,9 @@ fn verify_onnx_artifact(
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err("ONNX artifact must be a regular non-symlink file".to_string());
     }
+    if metadata.len() > MAX_ONNX_ARTIFACT_BYTES {
+        return Err("ONNX artifact exceeds the runtime byte limit".to_string());
+    }
     if metadata.len() != model.byte_len {
         return Err("ONNX artifact byte length does not match the bundle".to_string());
     }
@@ -403,7 +413,7 @@ struct NonceRecord {
 }
 
 pub struct RuntimeNonceLedger {
-    path: PathBuf,
+    file: File,
     consumed: BTreeSet<String>,
 }
 
@@ -411,28 +421,34 @@ impl RuntimeNonceLedger {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, IntakeError> {
         let path = path.as_ref().to_path_buf();
         ensure_parent(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(durable_error)?;
+        fs4::FileExt::lock(&file).map_err(durable_error)?;
+        file.seek(SeekFrom::Start(0)).map_err(durable_error)?;
         let mut consumed = BTreeSet::new();
-        if path.exists() {
-            let file = File::open(&path).map_err(durable_error)?;
-            for (line_number, line) in BufReader::new(file).lines().enumerate() {
-                let line = line.map_err(durable_error)?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let record: NonceRecord = serde_json::from_str(&line).map_err(|error| {
-                    IntakeError::DurableState(format!(
-                        "nonce ledger line {} is invalid: {error}",
-                        line_number + 1
-                    ))
-                })?;
-                if !consumed.insert(record.nonce) {
-                    return Err(IntakeError::DurableState(
-                        "nonce ledger contains a duplicate record".to_string(),
-                    ));
-                }
+        for (line_number, line) in BufReader::new(&mut file).lines().enumerate() {
+            let line = line.map_err(durable_error)?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: NonceRecord = serde_json::from_str(&line).map_err(|error| {
+                IntakeError::DurableState(format!(
+                    "nonce ledger line {} is invalid: {error}",
+                    line_number + 1
+                ))
+            })?;
+            if !consumed.insert(record.nonce) {
+                return Err(IntakeError::DurableState(
+                    "nonce ledger contains a duplicate record".to_string(),
+                ));
             }
         }
-        Ok(Self { path, consumed })
+        file.seek(SeekFrom::End(0)).map_err(durable_error)?;
+        Ok(Self { file, consumed })
     }
 
     pub fn contains(&self, nonce: &str) -> bool {
@@ -456,13 +472,8 @@ impl RuntimeNonceLedger {
         let mut bytes = serde_json::to_vec(&record)
             .map_err(|error| IntakeError::DurableState(error.to_string()))?;
         bytes.push(b'\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(durable_error)?;
-        file.write_all(&bytes).map_err(durable_error)?;
-        file.sync_data().map_err(durable_error)?;
+        self.file.write_all(&bytes).map_err(durable_error)?;
+        self.file.sync_data().map_err(durable_error)?;
         self.consumed.insert(nonce.to_string());
         Ok(())
     }
@@ -537,9 +548,62 @@ pub struct DeploymentIntake<'a, A> {
     trusted_keys: &'a BTreeMap<String, VerifyingKey>,
     policy: &'a RuntimeEnvelopePolicy,
     runtime_paused: bool,
-    ledger: &'a mut RuntimeNonceLedger,
-    audit: &'a mut RuntimeAuditLog,
+    ledger: RuntimeNonceLedger,
+    audit: RuntimeAuditLog,
     adapter: &'a mut A,
+}
+
+pub struct DeploymentReservation {
+    nonce: String,
+    deployment_id: String,
+    ledger: Option<RuntimeNonceLedger>,
+    audit: RuntimeAuditLog,
+}
+
+impl DeploymentReservation {
+    pub fn commit_configuration(&mut self, at: DateTime<Utc>) -> Result<(), IntakeError> {
+        let ledger = self.ledger.as_mut().ok_or_else(|| {
+            IntakeError::DurableState("deployment reservation was already committed".to_string())
+        })?;
+        ledger.consume(&self.nonce, &self.deployment_id, at)?;
+        self.ledger.take();
+        self.audit.append(&RuntimeAuditEvent {
+            deployment_id: self.deployment_id.clone(),
+            phase: "configuration".to_string(),
+            result: "prepared".to_string(),
+            reason: None,
+            recorded_at: at,
+        })
+    }
+
+    pub fn record_startup_failed(
+        &mut self,
+        at: DateTime<Utc>,
+        reason: impl Into<String>,
+    ) -> Result<(), IntakeError> {
+        self.audit.append(&RuntimeAuditEvent {
+            deployment_id: self.deployment_id.clone(),
+            phase: "startup".to_string(),
+            result: "failed".to_string(),
+            reason: Some(reason.into()),
+            recorded_at: at,
+        })
+    }
+
+    pub fn record_activated(&mut self, at: DateTime<Utc>) -> Result<(), IntakeError> {
+        if self.ledger.is_some() {
+            return Err(IntakeError::DurableState(
+                "deployment cannot activate before configuration is committed".to_string(),
+            ));
+        }
+        self.audit.append(&RuntimeAuditEvent {
+            deployment_id: self.deployment_id.clone(),
+            phase: "runtime".to_string(),
+            result: "activated".to_string(),
+            reason: None,
+            recorded_at: at,
+        })
+    }
 }
 
 impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
@@ -547,8 +611,8 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
         trusted_keys: &'a BTreeMap<String, VerifyingKey>,
         policy: &'a RuntimeEnvelopePolicy,
         runtime_paused: bool,
-        ledger: &'a mut RuntimeNonceLedger,
-        audit: &'a mut RuntimeAuditLog,
+        ledger: RuntimeNonceLedger,
+        audit: RuntimeAuditLog,
         adapter: &'a mut A,
     ) -> Self {
         Self {
@@ -561,18 +625,18 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
         }
     }
 
-    pub fn accept(
-        &mut self,
+    pub fn prepare(
+        mut self,
         signed: &SignedDeploymentEnvelope,
         now: DateTime<Utc>,
-    ) -> Result<ActivationRequest, IntakeError> {
+    ) -> Result<(ActivationRequest, DeploymentReservation), IntakeError> {
         let verified = match verify_envelope(signed, self.trusted_keys, self.policy, now, |nonce| {
             self.ledger.contains(nonce)
         }) {
             Ok(verified) => verified,
             Err(error) => {
                 append_rejection(
-                    self.audit,
+                    &mut self.audit,
                     &signed.envelope.deployment_id,
                     now,
                     &error.to_string(),
@@ -584,7 +648,7 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
             Ok(request) => request,
             Err(error) => {
                 append_rejection(
-                    self.audit,
+                    &mut self.audit,
                     &signed.envelope.deployment_id,
                     now,
                     &error.to_string(),
@@ -595,12 +659,10 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
         self.audit.append(&RuntimeAuditEvent {
             deployment_id: request.deployment_id.clone(),
             phase: "pre_activation".to_string(),
-            result: "accepted".to_string(),
+            result: "verified".to_string(),
             reason: None,
             recorded_at: now,
         })?;
-        self.ledger
-            .consume(&signed.envelope.nonce, &signed.envelope.deployment_id, now)?;
         if let Err(error) = self.adapter.activate(&request) {
             self.audit.append(&RuntimeAuditEvent {
                 deployment_id: request.deployment_id.clone(),
@@ -611,14 +673,13 @@ impl<'a, A: RuntimeActivationAdapter> DeploymentIntake<'a, A> {
             })?;
             return Err(IntakeError::Activation(error));
         }
-        self.audit.append(&RuntimeAuditEvent {
-            deployment_id: request.deployment_id.clone(),
-            phase: "configuration".to_string(),
-            result: "prepared".to_string(),
-            reason: None,
-            recorded_at: now,
-        })?;
-        Ok(request)
+        let reservation = DeploymentReservation {
+            nonce: signed.envelope.nonce.clone(),
+            deployment_id: signed.envelope.deployment_id.clone(),
+            ledger: Some(self.ledger),
+            audit: self.audit,
+        };
+        Ok((request, reservation))
     }
 }
 

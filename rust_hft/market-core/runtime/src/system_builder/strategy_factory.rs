@@ -290,7 +290,7 @@ fn create_onnx_strategy(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn Strat
         let StrategyParams::Onnx {
             model_path,
             model_version,
-            model_sha256: _,
+            model_sha256,
             top_n,
             window_size,
             max_order_notional,
@@ -308,6 +308,7 @@ fn create_onnx_strategy(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn Strat
             symbols: _config.symbols.clone(),
             model_path: std::path::PathBuf::from(model_path),
             model_version: model_version.clone(),
+            model_sha256: model_sha256.clone(),
             top_n: *top_n,
             window_size: *window_size,
             max_order_notional: *max_order_notional,

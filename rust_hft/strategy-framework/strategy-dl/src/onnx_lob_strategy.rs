@@ -1,5 +1,5 @@
 use hft_core::{HftError, HftResult, OrderType, Price, Quantity, Side, Symbol, TimeInForce};
-use hft_infer_onnx::OnnxPredictor;
+use hft_infer_onnx::{OnnxPredictor, MAX_ONNX_INPUT_ELEMENTS};
 use ports::{
     AccountView, BookLevel, ExecutionEvent, MarketEvent, MarketSnapshot, OrderIntent, Strategy,
 };
@@ -16,6 +16,7 @@ pub struct OnnxLobStrategyConfig {
     pub symbols: Vec<Symbol>,
     pub model_path: PathBuf,
     pub model_version: String,
+    pub model_sha256: String,
     pub top_n: usize,
     pub window_size: usize,
     pub max_order_notional: Decimal,
@@ -29,6 +30,8 @@ pub enum OnnxLobStrategyValidationError {
     DuplicateSymbol(String),
     ZeroTopN,
     ZeroWindowSize,
+    InputTooLarge,
+    InvalidModelSha256,
     NonPositiveMaxOrderNotional,
     InvalidOutputThreshold,
 }
@@ -41,6 +44,13 @@ impl fmt::Display for OnnxLobStrategyValidationError {
             Self::DuplicateSymbol(symbol) => write!(f, "duplicate symbol: {symbol}"),
             Self::ZeroTopN => write!(f, "top_n must be greater than zero"),
             Self::ZeroWindowSize => write!(f, "window_size must be greater than zero"),
+            Self::InputTooLarge => write!(
+                f,
+                "ONNX input exceeds the {MAX_ONNX_INPUT_ELEMENTS} element limit"
+            ),
+            Self::InvalidModelSha256 => {
+                write!(f, "model_sha256 must be a lowercase SHA-256 value")
+            }
             Self::NonPositiveMaxOrderNotional => {
                 write!(f, "max_order_notional must be positive")
             }
@@ -76,6 +86,22 @@ impl OnnxLobStrategyConfig {
         }
         if self.window_size == 0 {
             return Err(OnnxLobStrategyValidationError::ZeroWindowSize);
+        }
+        let input_elements = self
+            .top_n
+            .checked_mul(self.window_size)
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or(OnnxLobStrategyValidationError::InputTooLarge)?;
+        if input_elements > MAX_ONNX_INPUT_ELEMENTS {
+            return Err(OnnxLobStrategyValidationError::InputTooLarge);
+        }
+        if self.model_sha256.len() != 64
+            || !self
+                .model_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(OnnxLobStrategyValidationError::InvalidModelSha256);
         }
         if self.max_order_notional <= Decimal::ZERO {
             return Err(OnnxLobStrategyValidationError::NonPositiveMaxOrderNotional);
@@ -274,12 +300,12 @@ impl OnnxLobStrategy {
         config
             .validate()
             .map_err(|error| HftError::Config(error.to_string()))?;
-        let model_path = config
-            .model_path
-            .to_str()
-            .ok_or_else(|| HftError::Config("model_path must be valid UTF-8".to_string()))?;
-        let predictor = OnnxPredictor::load(model_path, (1, 4, config.window_size, config.top_n))
-            .map_err(|error| {
+        let predictor = OnnxPredictor::load_verified(
+            &config.model_path,
+            &config.model_sha256,
+            (1, 4, config.window_size, config.top_n),
+        )
+        .map_err(|error| {
             HftError::Config(format!(
                 "failed to load ONNX model {} ({}): {error}",
                 config.model_path.display(),
@@ -492,6 +518,7 @@ mod tests {
     use hft_core::{AssetClass, ProductType, Symbol, VenueId};
     use ports::{BookLevel, MarketSnapshot};
     use rust_decimal::Decimal;
+    use sha2::Digest as _;
     use std::path::PathBuf;
 
     fn config() -> OnnxLobStrategyConfig {
@@ -500,6 +527,7 @@ mod tests {
             symbols: vec![Symbol::new("BTCUSDT")],
             model_path: PathBuf::from("model.onnx"),
             model_version: "sha256:test".to_string(),
+            model_sha256: "a".repeat(64),
             top_n: 2,
             window_size: 2,
             max_order_notional: Decimal::from(1_000),
@@ -561,6 +589,20 @@ mod tests {
         assert_eq!(
             cfg.validate(),
             Err(OnnxLobStrategyValidationError::ZeroWindowSize)
+        );
+
+        cfg = config();
+        cfg.model_sha256 = "ABC".to_string();
+        assert_eq!(
+            cfg.validate(),
+            Err(OnnxLobStrategyValidationError::InvalidModelSha256)
+        );
+
+        cfg = config();
+        cfg.top_n = MAX_ONNX_INPUT_ELEMENTS;
+        assert_eq!(
+            cfg.validate(),
+            Err(OnnxLobStrategyValidationError::InputTooLarge)
         );
 
         for notional in [Decimal::ZERO, -Decimal::ONE] {
@@ -700,6 +742,7 @@ mod tests {
         std::fs::write(&path, b"not an onnx model").unwrap();
         let mut cfg = config();
         cfg.model_path = path.clone();
+        cfg.model_sha256 = hex::encode(sha2::Sha256::digest(b"not an onnx model"));
 
         let result = OnnxLobStrategy::new(cfg);
         let _ = std::fs::remove_file(path);
