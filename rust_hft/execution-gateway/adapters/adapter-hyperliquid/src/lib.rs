@@ -1027,39 +1027,24 @@ impl HyperliquidExecutionClient {
             .map_err(|e| HftError::Network(format!("读取未结订单响应失败: {}", e)))?;
 
         debug!("Hyperliquid 未结订单响应: {}", response_text);
-
-        // 解析响应
-        let parsed: Result<Value, _> = parse_json(&response_text);
-        match parsed {
-            Ok(data) => {
-                // 尝试解析为订单数组
-                if let Ok(hl_orders) = parse_value::<Vec<HyperliquidOpenOrder>>(data) {
-                    let mut open_orders = Vec::new();
-
-                    for hl_order in hl_orders {
-                        if let Some(our_order) = self.convert_hyperliquid_order(hl_order) {
-                            open_orders.push(our_order);
-                        }
-                    }
-
-                    info!("查询到 {} 个未结订单", open_orders.len());
-                    Ok(open_orders)
-                } else {
-                    debug!("未结订单响应格式不匹配，可能为空或错误格式");
-                    Ok(Vec::new())
-                }
-            }
-            Err(e) => {
-                warn!("解析未结订单响应失败: {} | 响应: {}", e, response_text);
-                Ok(Vec::new()) // 解析失败时返回空列表而不是错误
-            }
-        }
+        let open_orders = self.parse_open_orders_response(&response_text)?;
+        info!("查询到 {} 个未结订单", open_orders.len());
+        Ok(open_orders)
     }
 
     // 将 Hyperliquid 订单转换为系统统一格式
-    fn convert_hyperliquid_order(&self, hl_order: HyperliquidOpenOrder) -> Option<OpenOrder> {
+    fn convert_hyperliquid_order(&self, hl_order: HyperliquidOpenOrder) -> HftResult<OpenOrder> {
         // 查找内部订单 ID
-        let our_order_id = self.reverse_order_map.get(&hl_order.oid)?;
+        let our_order_id = self
+            .reverse_order_map
+            .get(&hl_order.oid)
+            .cloned()
+            .ok_or_else(|| {
+                HftError::Execution(format!(
+                    "未找到 Hyperliquid 订单映射: oid={}",
+                    hl_order.oid
+                ))
+            })?;
 
         // 构建符号
         let symbol = Symbol::from(format!("{}-PERP", hl_order.coin));
@@ -1067,23 +1052,19 @@ impl HyperliquidExecutionClient {
         // 解析价格和数量
         let price = hl_order
             .limit_px
-            .parse::<f64>()
-            .ok()
-            .and_then(|p| rust_decimal::Decimal::try_from(p).ok())
-            .map(Price)?;
+            .parse::<Decimal>()
+            .map(Price)
+            .map_err(|e| HftError::Serialization(format!("无效限价 {}: {}", hl_order.limit_px, e)))?;
         let original_quantity = hl_order
             .sz
-            .parse::<f64>()
-            .ok()
-            .and_then(|q| rust_decimal::Decimal::try_from(q).ok())
-            .map(Quantity)?;
+            .parse::<Decimal>()
+            .map(Quantity)
+            .map_err(|e| HftError::Serialization(format!("无效数量 {}: {}", hl_order.sz, e)))?;
         let filled_quantity = hl_order
             .filled
-            .parse::<f64>()
-            .ok()
-            .and_then(|q| rust_decimal::Decimal::try_from(q).ok())
+            .parse::<Decimal>()
             .map(Quantity)
-            .unwrap_or_else(|| Quantity(rust_decimal::Decimal::ZERO));
+            .map_err(|e| HftError::Serialization(format!("无效已成交数量 {}: {}", hl_order.filled, e)))?;
 
         // 计算剩余数量
         let remaining_quantity = Quantity(original_quantity.0 - filled_quantity.0);
@@ -1092,7 +1073,12 @@ impl HyperliquidExecutionClient {
         let side = match hl_order.side.as_str() {
             "B" => Side::Buy,
             "A" => Side::Sell,
-            _ => return None,
+            other => {
+                return Err(HftError::Serialization(format!(
+                    "未知订单方向: {}",
+                    other
+                )))
+            }
         };
 
         // 解析订单类型
@@ -1107,8 +1093,8 @@ impl HyperliquidExecutionClient {
             OrderStatus::PartiallyFilled // 部分成交
         };
 
-        Some(OpenOrder {
-            order_id: our_order_id.clone(),
+        Ok(OpenOrder {
+            order_id: our_order_id,
             symbol,
             side,
             order_type,
@@ -1120,6 +1106,24 @@ impl HyperliquidExecutionClient {
             created_at: hl_order.timestamp * 1000, // 转换为微秒
             updated_at: now_micros(),
         })
+    }
+
+    fn parse_open_orders_response(&self, response_text: &str) -> HftResult<Vec<OpenOrder>> {
+        let data: Value = parse_json(response_text).map_err(|e| {
+            warn!("解析未结订单响应失败: {} | 响应: {}", e, response_text);
+            e
+        })?;
+        let hl_orders: Vec<HyperliquidOpenOrder> = parse_value(data).map_err(|e| {
+            HftError::Serialization(format!(
+                "未结订单响应 schema 不匹配: {} | 响应: {}",
+                e, response_text
+            ))
+        })?;
+
+        hl_orders
+            .into_iter()
+            .map(|hl_order| self.convert_hyperliquid_order(hl_order))
+            .collect()
     }
 }
 
@@ -1204,10 +1208,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         match self.cfg.mode {
-            ExecutionMode::Paper | ExecutionMode::Testnet => {
-                // Paper 模式直接返回空列表（模拟所有订单都已成交）
-                Ok(Vec::new())
-            }
+            ExecutionMode::Paper | ExecutionMode::Testnet => Err(HftError::Execution(
+                "Hyperliquid list_open_orders is only supported in Live mode".to_string(),
+            )),
             ExecutionMode::Live => self.list_open_orders_live().await,
         }
     }

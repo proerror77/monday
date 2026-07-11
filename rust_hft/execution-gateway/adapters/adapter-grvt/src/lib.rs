@@ -160,6 +160,20 @@ impl GrvtExecutionClient {
         hm.insert("X-Grvt-Account-Id", acc_val);
         Ok(hm)
     }
+
+    fn parse_open_orders_response(response_text: &str) -> HftResult<Vec<OpenOrder>> {
+        match parse_json::<Value>(response_text)? {
+            Value::Array(items) if items.is_empty() => Ok(Vec::new()),
+            Value::Array(_) => Err(HftError::Execution(
+                "GRVT open_orders returned orders but adapter schema mapping is not implemented"
+                    .to_string(),
+            )),
+            other => Err(HftError::Execution(format!(
+                "GRVT open_orders returned unsupported schema: {}",
+                other
+            ))),
+        }
+    }
 }
 
 fn extract_cookie_and_account_id(headers: &HeaderMap) -> HftResult<(String, String)> {
@@ -246,9 +260,7 @@ impl ExecutionClient for GrvtExecutionClient {
             .text()
             .await
             .map_err(|e| HftError::Network(e.to_string()))?;
-        // 由於回應 schema 未提供，暫時不嘗試映射，返回空集合，避免 schema 演進破壞
-        let _raw: Value = parse_json(&txt).unwrap_or(Value::Null);
-        Ok(Vec::new())
+        Self::parse_open_orders_response(&txt)
     }
 
     async fn connect(&mut self) -> HftResult<()> {
@@ -265,5 +277,22 @@ impl ExecutionClient for GrvtExecutionClient {
             latency_ms: None,
             last_heartbeat: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_open_orders_response_accepts_authoritative_empty_array() {
+        let orders = GrvtExecutionClient::parse_open_orders_response("[]").unwrap();
+        assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn parse_open_orders_response_rejects_unmapped_schema() {
+        let err = GrvtExecutionClient::parse_open_orders_response(r#"{"items":[]}"#).unwrap_err();
+        assert!(err.to_string().contains("unsupported schema"));
     }
 }

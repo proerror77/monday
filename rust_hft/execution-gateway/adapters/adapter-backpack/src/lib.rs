@@ -657,9 +657,15 @@ impl ExecutionClient for BackpackExecutionClient {
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         let credentials = match (&self.credentials, &self.cfg.mode) {
             (Some(creds), ExecutionMode::Live) => creds,
-            (_, ExecutionMode::Paper) | (_, ExecutionMode::Testnet) | (None, _) => {
-                warn!("Backpack list_open_orders called without live credentials");
-                return Ok(Vec::new());
+            (_, ExecutionMode::Paper) | (_, ExecutionMode::Testnet) => {
+                return Err(HftError::Execution(
+                    "Backpack list_open_orders is only supported in Live mode".into(),
+                ));
+            }
+            (None, ExecutionMode::Live) => {
+                return Err(HftError::Authentication(
+                    "Backpack live list_open_orders requires API credentials".into(),
+                ));
             }
         };
 
@@ -764,6 +770,18 @@ impl ExecutionClient for BackpackExecutionClient {
 mod tests {
     use super::*;
 
+    fn test_config(mode: ExecutionMode) -> BackpackExecutionConfig {
+        BackpackExecutionConfig {
+            rest_base_url: "https://api.backpack.exchange".into(),
+            ws_public_url: "wss://ws.backpack.exchange".into(),
+            api_key: String::new(),
+            secret_key: String::new(),
+            timeout_ms: 5_000,
+            mode,
+            window_ms: None,
+        }
+    }
+
     #[test]
     fn signing_string_matches_example() {
         let secret = vec![1u8; 32];
@@ -774,5 +792,13 @@ mod tests {
         params.insert("symbol".to_string(), "BTC_USDT".to_string());
         let signature = creds.sign("orderCancel", &params, 1_614_550_000_000, 5_000);
         assert!(!signature.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_open_orders_requires_live_mode() {
+        let client = BackpackExecutionClient::new(test_config(ExecutionMode::Paper)).unwrap();
+
+        let err = client.list_open_orders().await.unwrap_err();
+        assert!(err.to_string().contains("only supported in Live mode"));
     }
 }

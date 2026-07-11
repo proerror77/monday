@@ -55,9 +55,10 @@ mod tests {
             .await;
         assert!(modify_result.is_ok());
 
-        // 测试查询未结订单 (Paper 模式应该返回空列表)
-        let open_orders = client.list_open_orders().await.unwrap();
-        assert_eq!(open_orders.len(), 0);
+        let open_orders_err = client.list_open_orders().await.unwrap_err();
+        assert!(open_orders_err
+            .to_string()
+            .contains("only supported in Live mode"));
 
         // 测试断开连接
         assert!(client.disconnect().await.is_ok());
@@ -106,9 +107,8 @@ mod tests {
         let mut paper_client = HyperliquidExecutionClient::new(paper_config);
         assert!(paper_client.connect().await.is_ok());
 
-        // Paper 模式应该总是返回空列表
-        let paper_orders = paper_client.list_open_orders().await.unwrap();
-        assert_eq!(paper_orders.len(), 0);
+        let paper_err = paper_client.list_open_orders().await.unwrap_err();
+        assert!(paper_err.to_string().contains("only supported in Live mode"));
 
         // 测试 Live 模式（无私钥，应该返回错误）
         let live_config = HyperliquidExecutionConfig {
@@ -123,6 +123,38 @@ mod tests {
         assert!(live_orders_result.is_err());
 
         assert!(paper_client.disconnect().await.is_ok());
+    }
+
+    #[test]
+    fn parse_open_orders_response_accepts_authoritative_empty_array() {
+        let client = HyperliquidExecutionClient::new(HyperliquidExecutionConfig::default());
+
+        let orders = client.parse_open_orders_response("[]").unwrap();
+        assert!(orders.is_empty());
+    }
+
+    #[test]
+    fn parse_open_orders_response_rejects_unmapped_orders() {
+        let client = HyperliquidExecutionClient::new(HyperliquidExecutionConfig::default());
+
+        let err = client
+            .parse_open_orders_response(
+                r#"[{"coin":"BTC","side":"B","limitPx":"100.5","sz":"1.0","filled":"0.25","oid":42,"timestamp":123,"tif":"Gtc","reduceOnly":false}]"#,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("订单映射"));
+    }
+
+    #[test]
+    fn parse_open_orders_response_rejects_schema_mismatch() {
+        let client = HyperliquidExecutionClient::new(HyperliquidExecutionConfig::default());
+
+        let err = client
+            .parse_open_orders_response(r#"{"status":"ok"}"#)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("schema"));
     }
 
     #[test]

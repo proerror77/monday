@@ -646,14 +646,16 @@ impl ExecutionClient for AsterdexExecutionClient {
     }
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
-        // 若無憑證，無法調用 Aster DEX 簽名端點
-        let signer = match &self.signer {
-            Some(s) => s,
-            None => {
-                tracing::warn!("Aster DEX list_open_orders: 未提供 API 憑證，返回空列表");
-                return Ok(Vec::new());
-            }
-        };
+        if self.mode != ExecutionMode::Live {
+            return Err(hft_core::HftError::Execution(
+                "AsterDEX list_open_orders is only supported in Live mode".to_string(),
+            ));
+        }
+        let signer = self.signer.as_ref().ok_or_else(|| {
+            hft_core::HftError::Authentication(
+                "AsterDEX live list_open_orders requires API credentials".to_string(),
+            )
+        })?;
 
         // 確保存在 HTTP 客戶端，然後以借用方式使用
         // 注意：此方法簽名為 &self，因此不要移動所有權
@@ -753,5 +755,41 @@ impl ExecutionClient for AsterdexExecutionClient {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use integration::signing::AsterdexCredentials;
+    use ports::ExecutionClient;
+
+    fn make_test_config(mode: ExecutionMode) -> AsterdexExecutionConfig {
+        AsterdexExecutionConfig {
+            credentials: AsterdexCredentials {
+                api_key: String::new(),
+                secret_key: String::new(),
+            },
+            rest_base_url: "https://fapi.asterdex.com".to_string(),
+            ws_base_url: "wss://fstream.asterdex.com/ws".to_string(),
+            timeout_ms: 5_000,
+            mode,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_open_orders_requires_live_mode() {
+        let client = AsterdexExecutionClient::new(make_test_config(ExecutionMode::Paper));
+
+        let err = client.list_open_orders().await.unwrap_err();
+        assert!(err.to_string().contains("only supported in Live mode"));
+    }
+
+    #[tokio::test]
+    async fn list_open_orders_requires_live_credentials() {
+        let client = AsterdexExecutionClient::new(make_test_config(ExecutionMode::Live));
+
+        let err = client.list_open_orders().await.unwrap_err();
+        assert!(err.to_string().contains("requires API credentials"));
     }
 }

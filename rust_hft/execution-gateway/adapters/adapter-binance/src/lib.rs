@@ -709,14 +709,16 @@ impl ExecutionClient for BinanceExecutionClient {
     }
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
-        // 若無憑證，無法調用 Binance 簽名端點
-        let signer = match &self.signer {
-            Some(s) => s,
-            None => {
-                tracing::warn!("Binance list_open_orders: 未提供 API 憑證，返回空列表");
-                return Ok(Vec::new());
-            }
-        };
+        if self.mode != ExecutionMode::Live {
+            return Err(hft_core::HftError::Execution(
+                "Binance list_open_orders is only supported in Live mode".to_string(),
+            ));
+        }
+        let signer = self.signer.as_ref().ok_or_else(|| {
+            hft_core::HftError::Authentication(
+                "Binance live list_open_orders requires API credentials".to_string(),
+            )
+        })?;
 
         // 確保存在 HTTP 客戶端，然後以借用方式使用
         // 注意：此方法簽名為 &self，因此不要移動所有權
@@ -1033,6 +1035,24 @@ mod tests {
         };
 
         let err = client.place_order(intent).await.unwrap_err();
+        assert!(err.to_string().contains("requires API credentials"));
+    }
+
+    #[tokio::test]
+    async fn list_open_orders_requires_live_mode() {
+        let config = make_test_config(ExecutionMode::Paper);
+        let client = BinanceExecutionClient::new(config);
+
+        let err = client.list_open_orders().await.unwrap_err();
+        assert!(err.to_string().contains("only supported in Live mode"));
+    }
+
+    #[tokio::test]
+    async fn list_open_orders_requires_live_credentials() {
+        let config = make_test_config(ExecutionMode::Live);
+        let client = BinanceExecutionClient::new(config);
+
+        let err = client.list_open_orders().await.unwrap_err();
         assert!(err.to_string().contains("requires API credentials"));
     }
 
