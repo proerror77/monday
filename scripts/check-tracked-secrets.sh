@@ -51,7 +51,11 @@ tracked = subprocess.run(
 skip_prefixes = ("docs/", "rust_hft/docs/", "rust_hft/tests/", "rust_hft/specs/")
 skip_suffixes = (".example", ".sample", ".md", ".rs")
 patterns = [
-    re.compile(r"^\s*(CLICKHOUSE_PASSWORD|POSTGRES_PASSWORD|GRAFANA_ADMIN_PASSWORD|BITGET_API_SECRET|BINANCE_API_SECRET|BYBIT_API_SECRET|HYPERLIQUID_PRIVATE_KEY)\s*=\s*(.+?)\s*$"),
+    re.compile(
+        r"^\s*(?:export\s+)?(?:Environment=)?[\"']?"
+        r"([A-Za-z0-9_]*(?:SECRET|PASSWORD|PASSWD|PASSPHRASE|PRIVATE_KEY|API_KEY|ACCESS_KEY|SIGNING_KEY|PAGERDUTY_KEY|WEBHOOK(?:_URL)?|TOKEN|CREDENTIAL)[A-Za-z0-9_]*)"
+        r"\s*=\s*(.+?)[\"']?\s*$",
+    ),
     re.compile(r"^\s*(api_secret|passphrase|secret_key|private_key|password)\s*:\s*(.+?)\s*$"),
     re.compile(r"^\s*([A-Za-z0-9_-]*(?:api-key|api-secret|passphrase|password|private-key|webhook-url|pagerduty-key))\s*:\s*(.+?)\s*$", re.IGNORECASE),
     re.compile(r"^\s*Password:\s*(.+?)\s*$"),
@@ -60,13 +64,26 @@ allowed_prefixes = ("${", "$", "<", "CHANGE_ME", "YOUR_", "your_", "example_", "
 allowed_exact = {"", "\"\"", "''", "null", "None"}
 private_key_header = re.compile(r"^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----$")
 
+for sample in (
+    "Environment=CLICKHOUSE_PASSWORD=CHANGE_ME_LITERAL",
+    'Environment="PAGERDUTY_KEY=CHANGE_ME_LITERAL"',
+    "ALERT_WEBHOOK_URL=CHANGE_ME_LITERAL",
+    "BITGET_SECRET_KEY=CHANGE_ME_LITERAL",
+):
+    if not patterns[0].match(sample):
+        print(f"secret scanner self-check failed for {sample.split('=', 1)[0]}", file=sys.stderr)
+        sys.exit(1)
+
 violations = []
 for rel in tracked:
     if rel.startswith(skip_prefixes) or rel.endswith(skip_suffixes):
         continue
     if not rel.endswith((".sh", ".txt", ".yaml", ".yml", ".env", ".shared", ".unified")):
         continue
-    text = (root / rel).read_text(errors="ignore").splitlines()
+    path = root / rel
+    if not path.is_file():
+        continue
+    text = path.read_text(errors="ignore").splitlines()
     for lineno, line in enumerate(text, 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):

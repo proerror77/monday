@@ -328,8 +328,8 @@ jobs:
           echo "" >> security-summary.md
 
           if [ -f cargo-audit-results/audit-results.json ]; then
-            CRITICAL=$(jq -r '.vulnerabilities[] | select(.advisory.severity=="critical") | .id' cargo-audit-results/audit-results.json 2>/dev/null | wc -l)
-            HIGH=$(jq -r '.vulnerabilities[] | select(.advisory.severity=="high") | .id' cargo-audit-results/audit-results.json 2>/dev/null | wc -l)
+            CRITICAL=$(jq -r '.vulnerabilities.list[]? | select(.advisory.severity=="critical") | .advisory.id' cargo-audit-results/audit-results.json 2>/dev/null | wc -l)
+            HIGH=$(jq -r '.vulnerabilities.list[]? | select(.advisory.severity=="high") | .advisory.id' cargo-audit-results/audit-results.json 2>/dev/null | wc -l)
             echo "- **Cargo Audit**: Critical=$CRITICAL, High=$HIGH" >> security-summary.md
           fi
 
