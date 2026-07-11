@@ -56,15 +56,14 @@ jobs:
           cache-all-crates: true
           save-if: ${{ github.event_name != 'pull_request' }}
 
-      - name: Format Agentic Alpha packages (non-blocking)
+      - name: Format Agentic Alpha packages
         run: |
           cargo fmt --check --package alpha-domain
           cargo fmt --check --package alpha-store
           cargo fmt --check --package alpha-engine
           cargo fmt --check --package alpha-harness
-        continue-on-error: true
 
-      - name: Clippy Agentic Alpha packages (non-blocking)
+      - name: Clippy Agentic Alpha packages
         run: |
           cargo clippy \
             -p alpha-domain \
@@ -72,15 +71,29 @@ jobs:
             -p alpha-engine \
             -p alpha-harness \
             --all-targets \
+            --locked \
             -- \
             -D warnings
-        continue-on-error: true
 
       - name: Test Agentic Alpha packages
         run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness --locked
 
       - name: Verify signed runtime handoff
-        run: cargo test -p hft-live --no-default-features --test deployment_envelope --locked
+        run: |
+          cargo test -p hft-live --no-default-features --test deployment_envelope --locked
+          cargo test -p hft-live --no-default-features --test deployment_artifacts --locked
+
+      - name: Check JSON feature matrix
+        run: |
+          cargo test -p hft-integration --no-default-features --locked
+          cargo test -p hft-integration --no-default-features --features json-simd --locked
+          cargo test -p hft-data-adapter-binance --no-default-features --locked
+          cargo test -p hft-data-adapter-binance --no-default-features --features json-simd --locked
+          cargo test -p hft-infra-redis --features redis --locked
+          cargo check -p hft-live --features clickhouse,redis --locked
+
+      - name: Check production deployment contract
+        run: ../scripts/check-deployment-contract.sh
 
       - name: Check governed data collector
         run: cargo check -p hft-collector --locked

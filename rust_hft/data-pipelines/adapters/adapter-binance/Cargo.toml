@@ -30,7 +30,7 @@ async-trait = "0.1"
 
 [features]
 default = []
-json-simd = ["dep:simd-json", "integration/json-simd"]
+json-simd = ["dep:simd-json", "integration/json-simd", "adapters-common/json-simd"]
 
 [lib]
 name = "data_adapter_binance"

@@ -11,7 +11,9 @@ engine:
 
 venues:
   - name: binance
+    account_id: binance_paper
     venue_type: BINANCE
+    execution_mode: Paper
     symbol_catalog: [ "BTCUSDT@BINANCE" ]
 
 strategies:
@@ -36,5 +38,10 @@ risk:
     assert_eq!(config.engine.top_n, 10);
     assert_eq!(config.strategies.len(), 1);
     assert_eq!(config.venues.len(), 1);
+    assert_eq!(
+        config.venues[0].account_id.as_deref(),
+        Some("binance_paper")
+    );
+    assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Paper"));
     assert_eq!(config.risk.risk_type, "Default");
 }

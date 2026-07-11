@@ -4,7 +4,7 @@
 
 #[cfg(feature = "redis")]
 mod redis_export {
-    use super::*;
+    use crate::system_builder::{RedisConfig, SystemRuntime};
     use engine::aggregation::TopNSnapshot;
     use hft_core::{InstrumentKey, ProductType};
     use tracing::info;
@@ -12,7 +12,7 @@ mod redis_export {
     /// 啟動 Redis 導出任務（從 system_builder.rs 拆分）
     pub async fn spawn_redis_exporter(
         this: &mut SystemRuntime,
-        redis_config: super::RedisConfig,
+        redis_config: RedisConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // 計算中間價格
         fn calculate_mid_price(orderbook: &TopNSnapshot) -> Option<f64> {
@@ -41,7 +41,7 @@ mod redis_export {
 
         // 測試連接
         let client = Client::open(redis_config.url.as_str())?;
-        let mut conn = client.get_async_connection().await?;
+        let mut conn = client.get_multiplexed_async_connection().await?;
         let _: String = redis::cmd("PING").query_async(&mut conn).await?;
         info!("Redis 連接測試成功");
 
@@ -76,7 +76,7 @@ mod redis_export {
                 };
 
                 // 連接 Redis 並導出數據
-                match client.get_async_connection().await {
+                match client.get_multiplexed_async_connection().await {
                     Ok(mut conn) => {
                         for (vs, orderbook) in &market_view.orderbooks {
                             let instrument_key =
@@ -131,10 +131,9 @@ mod redis_export {
     }
 
     impl SystemRuntime {
-        #[cfg(feature = "redis")]
         pub async fn spawn_redis_exporter(
             &mut self,
-            redis_config: super::RedisConfig,
+            redis_config: RedisConfig,
         ) -> Result<(), Box<dyn std::error::Error>> {
             spawn_redis_exporter(self, redis_config).await
         }

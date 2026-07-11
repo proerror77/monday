@@ -26,6 +26,8 @@
 use std::error::Error as StdError;
 use std::fmt;
 
+use serde::de::DeserializeOwned;
+
 // ============================================================================
 // 類型定義：根據 feature flag 選擇 JSON 值類型
 // ============================================================================
@@ -126,6 +128,18 @@ pub fn parse_json_from_bytes(bytes: bytes::Bytes) -> Result<Value, JsonError> {
     parse_json_bytes(&mut buf)
 }
 
+/// Deserialize the feature-selected owned value without crossing JSON value types.
+#[cfg(not(feature = "json-simd"))]
+pub fn from_value<T: DeserializeOwned>(value: Value) -> Result<T, JsonError> {
+    serde_json::from_value(value).map_err(Into::into)
+}
+
+/// Deserialize the feature-selected owned value without crossing JSON value types.
+#[cfg(feature = "json-simd")]
+pub fn from_value<T: DeserializeOwned>(value: Value) -> Result<T, JsonError> {
+    simd_json::serde::from_owned_value(value).map_err(Into::into)
+}
+
 // ============================================================================
 // 測試
 // ============================================================================
@@ -133,6 +147,15 @@ pub fn parse_json_from_bytes(bytes: bytes::Bytes) -> Result<Value, JsonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    #[cfg(feature = "json-simd")]
+    use simd_json::prelude::ValueAsScalar;
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Quote {
+        symbol: String,
+        price: f64,
+    }
 
     #[test]
     fn test_parse_json_str() {
@@ -147,7 +170,6 @@ mod tests {
 
         #[cfg(feature = "json-simd")]
         {
-            use simd_json::ValueAccess;
             assert_eq!(value["price"].as_f64(), Some(50000.0));
             assert_eq!(value["symbol"].as_str(), Some("BTCUSDT"));
         }
@@ -167,7 +189,6 @@ mod tests {
 
         #[cfg(feature = "json-simd")]
         {
-            use simd_json::ValueAccess;
             assert_eq!(value["price"].as_f64(), Some(50000.0));
             assert_eq!(value["symbol"].as_str(), Some("BTCUSDT"));
         }
@@ -178,5 +199,19 @@ mod tests {
         let invalid = r#"{"price": 50000.0"#; // 缺少結束括號
         let result = parse_json_str(invalid);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_feature_selected_value() {
+        let value = parse_json_str(r#"{"symbol":"BTCUSDT","price":50000.0}"#).unwrap();
+        let quote: Quote = from_value(value).unwrap();
+
+        assert_eq!(
+            quote,
+            Quote {
+                symbol: "BTCUSDT".to_string(),
+                price: 50000.0,
+            }
+        );
     }
 }

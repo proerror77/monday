@@ -18,6 +18,8 @@ jobs:
             context: .
           - dockerfile: rust_hft/docker/Dockerfile
             context: rust_hft
+          - dockerfile: rust_hft/deployment/docker/Dockerfile.trading
+            context: rust_hft
           - dockerfile: deployment/docker/Dockerfile.ops_workspace
             context: .
     steps:
@@ -41,4 +43,3 @@ jobs:
           sbom: false
           build-args: |
             PYTHON_VERSION=3.11
-

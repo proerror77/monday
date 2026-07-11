@@ -91,16 +91,16 @@ deploy_k8s() {
 
     # 部署順序很重要
     log_info "創建 Namespace..."
-    envsubst < "$K8S_DIR/namespace.yaml" | kubectl apply -f -
+    kubectl apply -f "$K8S_DIR/namespace.yaml"
 
     log_info "創建 ConfigMaps..."
-    envsubst < "$K8S_DIR/configmaps.yaml" | kubectl apply -f -
+    kubectl apply -f "$K8S_DIR/configmaps.yaml"
 
     log_info "創建 Secrets..."
     envsubst < "$K8S_SECRETS_FILE" | kubectl apply -f -
 
     log_info "部署基礎設施..."
-    envsubst < "$K8S_DIR/infrastructure.yaml" | kubectl apply -f -
+    envsubst '${AWS_ACCOUNT_ID}' < "$K8S_DIR/infrastructure.yaml" | kubectl apply -f -
 
     # 等待基礎設施就緒
     log_info "等待 Redis 就緒..."
@@ -110,13 +110,13 @@ deploy_k8s() {
     kubectl -n $NAMESPACE rollout status statefulset/clickhouse --timeout=180s
 
     log_info "部署 Sentinel..."
-    envsubst < "$K8S_DIR/sentinel.yaml" | kubectl apply -f -
+    envsubst '${ECR_REGISTRY} ${IMAGE_TAG}' < "$K8S_DIR/sentinel.yaml" | kubectl apply -f -
 
     log_info "部署 Market Data 服務..."
-    envsubst < "$K8S_DIR/market-data.yaml" | kubectl apply -f -
+    envsubst '${ECR_REGISTRY} ${IMAGE_TAG}' < "$K8S_DIR/market-data.yaml" | kubectl apply -f -
 
     log_info "部署 Trading Engine..."
-    envsubst < "$K8S_DIR/trading-engine.yaml" | kubectl apply -f -
+    envsubst '${ECR_REGISTRY} ${IMAGE_TAG}' < "$K8S_DIR/trading-engine.yaml" | kubectl apply -f -
 
     log_info "Kubernetes 部署完成!"
 }
@@ -130,7 +130,7 @@ dev_up() {
     log_info "  Redis: localhost:6379"
     log_info "  ClickHouse: localhost:8123"
     log_info "  Prometheus: localhost:9090"
-    log_info "  Grafana: localhost:3000 (admin/admin)"
+    log_info "  Grafana: localhost:3000 (credentials from GRAFANA_ADMIN_PASSWORD)"
 }
 
 # 函數: 停止本地開發環境

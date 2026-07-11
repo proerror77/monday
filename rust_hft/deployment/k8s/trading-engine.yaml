@@ -67,6 +67,22 @@ spec:
         image: ${ECR_REGISTRY}/hft-trading:${IMAGE_TAG}
         imagePullPolicy: Always
 
+        args:
+        - --config
+        - /app/config/system.yaml
+        - --deployment-envelope
+        - /app/deployment/envelope.json
+        - --deployment-policy
+        - /app/deployment/policy.json
+        - --deployment-trusted-keys
+        - /app/deployment/trusted-keys.json
+        - --deployment-nonce-ledger
+        - /app/state/nonces.jsonl
+        - --deployment-audit-log
+        - /app/state/audit.jsonl
+        - --deployment-feedback-log
+        - /app/state/feedback.jsonl
+
         ports:
         - name: metrics
           containerPort: 9091
@@ -91,22 +107,6 @@ spec:
             secretKeyRef:
               name: hft-secrets
               key: clickhouse-url
-        - name: BITGET_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: exchange-secrets
-              key: bitget-api-key
-        - name: BITGET_API_SECRET
-          valueFrom:
-            secretKeyRef:
-              name: exchange-secrets
-              key: bitget-api-secret
-        - name: BITGET_PASSPHRASE
-          valueFrom:
-            secretKeyRef:
-              name: exchange-secrets
-              key: bitget-passphrase
-
         # 資源限制
         resources:
           requests:
@@ -126,6 +126,11 @@ spec:
           readOnly: true
         - name: logs
           mountPath: /app/logs
+        - name: deployment-authority
+          mountPath: /app/deployment
+          readOnly: true
+        - name: runtime-state
+          mountPath: /app/state
 
         # 健康檢查
         livenessProbe:
@@ -139,7 +144,7 @@ spec:
 
         readinessProbe:
           httpGet:
-            path: /ready
+            path: /readiness
             port: health
           initialDelaySeconds: 5
           periodSeconds: 5
@@ -165,6 +170,24 @@ spec:
       - name: logs
         emptyDir:
           sizeLimit: 1Gi
+      - name: deployment-authority
+        projected:
+          sources:
+          - configMap:
+              name: alpha-deployment-envelope
+              items:
+              - key: envelope.json
+                path: envelope.json
+          - configMap:
+              name: runtime-deployment-authority
+              items:
+              - key: policy.json
+                path: policy.json
+              - key: trusted-keys.json
+                path: trusted-keys.json
+      - name: runtime-state
+        persistentVolumeClaim:
+          claimName: runtime-state-pvc
 
       # 優雅關閉
       terminationGracePeriodSeconds: 60
@@ -205,6 +228,19 @@ spec:
   selector:
     matchLabels:
       app: trading-engine
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: runtime-state-pvc
+  namespace: hft-trading
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
 
 ---
 # HorizontalPodAutoscaler (可選，通常不用於核心交易)

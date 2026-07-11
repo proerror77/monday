@@ -41,12 +41,6 @@ pub use config_types::{
     TradingWindowConfig, VenueCapabilities, VenueConfig, VenueType,
 };
 
-#[cfg(feature = "redis")]
-use serde_json;
-
-#[cfg(feature = "redis")]
-use engine::aggregation;
-
 // ClickHouse 行結構已移至 system_builder::infra_exporters（feature = "clickhouse"）
 
 /// 系統配置

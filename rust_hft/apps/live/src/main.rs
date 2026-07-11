@@ -27,12 +27,8 @@ use tracing::{info, warn};
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// 配置檔案路徑
-    /// 預設切換為多交易所只行情配置（Binance/Bitget/Aster），便於快速 e2e 驗證
-    #[arg(
-        short,
-        long,
-        default_value = "config/prod/system_accounts_multi_quotes_only.yaml"
-    )]
+    /// Production starts from a v2 quotes-only configuration.
+    #[arg(short, long, default_value = "config/prod/system.yaml")]
     config: String,
 
     /// 是否為測試模式

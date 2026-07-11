@@ -15,34 +15,45 @@ data:
   bybit-symbols: "BTCUSDT,ETHUSDT,SOLUSDT"
   hyperliquid-symbols: "BTC,ETH,SOL"
 
-  # 交易引擎配置
-  trading.yaml: |
+  # Runtime starts fail-closed in quotes-only mode. A signed deployment bundle
+  # may transition it to paper or shadow after all authority checks pass.
+  system.yaml: |
+    schema_version: v2
+    quotes_only: true
+
     engine:
-      mode: production
-      log_level: info
+      queue_capacity: 16384
+      stale_us: 500000
+      top_n: 10
+      ack_timeout_ms: 3000
+      reconcile_interval_ms: 5000
+      auto_cancel_exchange_only: false
 
-    market_data:
-      buffer_size: 10000
-      snapshot_interval_ms: 100
+    venues:
+      - name: bitget
+        account_id: bitget_main
+        venue_type: BITGET
+        ws_public: "wss://ws.bitget.com/v2/ws/public"
+        rest: "https://api.bitget.com"
+        execution_mode: "Paper"
+        symbol_catalog:
+          - BTCUSDT@BITGET
+          - ETHUSDT@BITGET
+        capabilities:
+          supports_incremental_book: true
+          supports_private_ws: true
+          allows_post_only: true
+        simulate_execution: true
 
-    execution:
-      max_orders_per_second: 100
-      order_timeout_ms: 5000
-      retry_attempts: 3
-
-    strategy:
-      enabled: true
-      model_path: /app/models/latest.pt
+    strategies: []
 
     risk:
-      enabled: true
-      max_position_usd: 100000
-      max_order_size_usd: 10000
-
-    metrics:
-      enabled: true
-      port: 9091
-      path: /metrics
+      risk_type: Default
+      global_position_limit: 100
+      global_notional_limit: 50000
+      max_daily_trades: 2000
+      max_orders_per_second: 50
+      staleness_threshold_us: 300000
 
 ---
 apiVersion: v1

@@ -383,8 +383,7 @@ impl RedisPubSub {
 
     /// 啟動訂閱者背景任務
     pub async fn start_subscriber(self: Arc<Self>) -> Result<tokio::task::JoinHandle<()>, PubSubError> {
-        let conn = self.client.get_async_connection().await?;
-        let pubsub_conn = conn.into_pubsub();
+        let pubsub_conn = self.client.get_async_pubsub().await?;
 
         let alert_tx = self.alert_tx.clone();
         let deploy_tx = self.deploy_tx.clone();

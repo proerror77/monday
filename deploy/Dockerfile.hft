@@ -4,7 +4,7 @@
 # ============================================
 # Stage 1: Builder
 # ============================================
-FROM rust:1.75-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 
 WORKDIR /app
 
@@ -25,17 +25,19 @@ ARG TARGET=live
 # 構建指定的目標
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --bin hft-${TARGET} && \
+    cargo --config 'build.rustc-wrapper=""' build --release --locked --bin hft-${TARGET} && \
     cp /app/target/release/hft-${TARGET} /app/hft-binary
 
 # ============================================
 # Stage 2: Runtime
 # ============================================
 FROM debian:bookworm-slim AS runtime
+ARG TARGET=live
 
 # 安裝運行時依賴
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    curl \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -51,12 +53,13 @@ COPY --from=builder /app/hft-binary /app/hft
 RUN mkdir -p /config /models && chown -R hft:hft /app /config /models
 
 USER hft
+ENV HFT_TARGET=${TARGET}
 
 # 健康檢查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD if [ "$HFT_TARGET" = "live" ]; then curl --fail --silent http://localhost:9090/readiness; else exit 0; fi
 
 # 默認暴露端口
-EXPOSE 8080
+EXPOSE 9090 9091 9092
 
 ENTRYPOINT ["/app/hft"]

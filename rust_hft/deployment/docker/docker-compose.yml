@@ -1,8 +1,6 @@
 # HFT 系統 Docker Compose 配置
 # 用於本地開發和測試
 
-version: '3.8'
-
 services:
   # ============================================
   # 基礎設施層
@@ -101,21 +99,35 @@ services:
       dockerfile: deployment/docker/Dockerfile.trading
     container_name: hft-trading
     ports:
+      - "9090:9090"  # Health/readiness
       - "9091:9091"  # Metrics
       - "9092:9092"  # gRPC
     volumes:
-      - ./config:/app/config:ro
-      - ./models:/app/models:ro
+      - ../../config:/app/config:ro
+      - ${HFT_MODEL_DIR:-../../models}:/app/models:ro
+      - ${HFT_DEPLOYMENT_DIR:?set HFT_DEPLOYMENT_DIR}:/app/deployment:ro
+      - ${HFT_RUNTIME_STATE_DIR:?set HFT_RUNTIME_STATE_DIR}:/app/state
       - trading-logs:/app/logs
+    command:
+      - --config
+      - /app/config/prod/system.yaml
+      - --deployment-envelope
+      - /app/deployment/envelope.json
+      - --deployment-policy
+      - /app/deployment/policy.json
+      - --deployment-trusted-keys
+      - /app/deployment/trusted-keys.json
+      - --deployment-nonce-ledger
+      - /app/state/nonces.jsonl
+      - --deployment-audit-log
+      - /app/state/audit.jsonl
+      - --deployment-feedback-log
+      - /app/state/feedback.jsonl
     environment:
       RUST_LOG: info
       HFT_ENV: development
       REDIS_URL: redis://redis:6379
       CLICKHOUSE_URL: http://clickhouse:8123
-      # 交易所 API (使用 .env 文件)
-      BITGET_API_KEY: ${BITGET_API_KEY}
-      BITGET_API_SECRET: ${BITGET_API_SECRET}
-      BITGET_PASSPHRASE: ${BITGET_PASSPHRASE}
     depends_on:
       redis:
         condition: service_healthy

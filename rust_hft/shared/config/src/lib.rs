@@ -48,6 +48,8 @@ fn default_reconcile_interval_ms() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VenueConfig {
     pub name: String,
+    #[serde(default)]
+    pub account_id: Option<String>,
     #[serde(
         deserialize_with = "venue_id_deserialize",
         serialize_with = "venue_id_serialize"
@@ -61,6 +63,8 @@ pub struct VenueConfig {
     pub inst_type: Option<String>,
     #[serde(default)]
     pub simulate_execution: bool,
+    #[serde(default)]
+    pub execution_mode: Option<String>,
     #[serde(default)]
     pub data_config: Option<YamlValue>,
     #[serde(default)]

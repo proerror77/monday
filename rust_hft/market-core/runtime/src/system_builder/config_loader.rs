@@ -204,11 +204,13 @@ fn convert_venue_config(
 ) -> VenueConfig {
     let shared::VenueConfig {
         name,
+        account_id,
         venue_type,
         mut symbol_catalog,
         capabilities: cfg_caps,
         inst_type,
         simulate_execution,
+        execution_mode,
         data_config,
         execution_config,
     } = cfg;
@@ -297,7 +299,7 @@ fn convert_venue_config(
 
     VenueConfig {
         name,
-        account_id: None,
+        account_id,
         venue_type: map_venue_type(venue_type),
         ws_public: venue_meta
             .as_ref()
@@ -314,7 +316,7 @@ fn convert_venue_config(
         secret_ref_api_key: None,
         secret_ref_secret: None,
         secret_ref_passphrase: None,
-        execution_mode: None,
+        execution_mode,
         capabilities: combined_caps,
         inst_type,
         simulate_execution,

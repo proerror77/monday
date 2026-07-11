@@ -1,8 +1,6 @@
 # HFT System Docker Compose
 # 精簡部署配置 - ClickHouse + 可選 Redis
 
-version: '3.8'
-
 services:
   # ============================================
   # 數據存儲 (唯一)
@@ -97,7 +95,15 @@ services:
       args:
         - TARGET=collector
     container_name: hft-collector
-    command: ["hft-collector", "--config", "/config/collector.yaml"]
+    command:
+      - --exchanges
+      - bitget,binance
+      - --symbols
+      - BTCUSDT,ETHUSDT
+      - --ch-url
+      - http://clickhouse:8123
+      - --database
+      - hft
     volumes:
       - ../rust_hft/config:/config:ro
       - ../models:/models:ro
@@ -120,16 +126,32 @@ services:
       args:
         - TARGET=live
     container_name: hft-trader
-    command: ["hft-live", "--config", "/config/prod/system.yaml"]
+    command:
+      - --config
+      - /config/prod/system.yaml
+      - --deployment-envelope
+      - /deployment/envelope.json
+      - --deployment-policy
+      - /deployment/policy.json
+      - --deployment-trusted-keys
+      - /deployment/trusted-keys.json
+      - --deployment-nonce-ledger
+      - /state/nonces.jsonl
+      - --deployment-audit-log
+      - /state/audit.jsonl
+      - --deployment-feedback-log
+      - /state/feedback.jsonl
     volumes:
       - ../rust_hft/config:/config:ro
       - ../models:/models:ro
+      - ${HFT_DEPLOYMENT_DIR:-../runtime/deployment}:/deployment:ro
+      - ${HFT_RUNTIME_STATE_DIR:-../runtime/state}:/state
     environment:
       RUST_LOG: info
       CLICKHOUSE_URL: http://clickhouse:8123
       MODEL_DIR: /models
     ports:
-      - "8080:8080"
+      - "9090:9090"
     depends_on:
       - clickhouse
       - collector
@@ -146,7 +168,7 @@ services:
       args:
         - TARGET=paper
     container_name: hft-paper
-    command: ["hft-paper", "--config", "/config/dev/paper.yaml"]
+    command: ["--config", "/config/dev/system.yaml"]
     volumes:
       - ../rust_hft/config:/config:ro
       - ../models:/models:ro

@@ -26,7 +26,8 @@ impl MessageConverter {
     /// 從 Value 反序列化為目標類型
     #[inline]
     fn parse_value<T: DeserializeOwned>(value: Value) -> HftResult<T> {
-        adapters_common::parse_owned_value(value).map_err(Into::into)
+        integration::json::from_value(value)
+            .map_err(|error| HftError::Serialization(error.to_string()))
     }
 
     /// 轉換深度快照
@@ -338,5 +339,22 @@ mod tests {
         assert_eq!(trade_event.trade_id, "12345");
         // ms → μs 轉換
         assert_eq!(trade_event.timestamp, 123456789 * 1000);
+    }
+
+    #[test]
+    fn test_parse_wrapped_stream_message() {
+        let message = r#"{
+            "stream":"btcusdt@trade",
+            "data":{
+                "e":"trade","E":123456789,"s":"BTCUSDT","t":12345,
+                "p":"45000.00","q":"0.1","b":111,"a":222,
+                "T":123456789,"m":false,"M":false
+            }
+        }"#;
+
+        let event = MessageConverter::parse_stream_message(message)
+            .unwrap()
+            .expect("trade event");
+        assert!(matches!(event, MarketEvent::Trade(_)));
     }
 }
