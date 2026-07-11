@@ -30,12 +30,8 @@ pub struct HftControlService {
 
 impl HftControlService {
     /// 創建新的控制服務
-    pub fn new(engine: Arc<Mutex<Engine>>) -> Self {
-        Self {
-            engine,
-            execution_control: None,
-            model_manager: None,
-        }
+    pub fn new(execution_control: ExecutionControlHandle) -> Self {
+        Self::with_execution_control(execution_control)
     }
 
     pub fn with_execution_control(execution_control: ExecutionControlHandle) -> Self {
@@ -48,12 +44,12 @@ impl HftControlService {
 
     /// 創建帶模型管理器的控制服務
     pub fn with_model_manager(
-        engine: Arc<Mutex<Engine>>,
+        execution_control: ExecutionControlHandle,
         model_manager: Arc<Mutex<ModelManager>>,
     ) -> Self {
         Self {
-            engine,
-            execution_control: None,
+            engine: execution_control.engine(),
+            execution_control: Some(execution_control),
             model_manager: Some(model_manager),
         }
     }
@@ -595,15 +591,20 @@ impl HftControl for HftControlService {
         let engine = self.engine.lock().await;
         let stats = engine.get_statistics();
 
-        let healthy = stats.is_running;
+        let mode = engine.trading_mode();
+        let healthy = stats.is_running
+            && matches!(
+                mode,
+                engine::TradingMode::Normal | engine::TradingMode::Degraded
+            );
         let status = if healthy { "healthy" } else { "unhealthy" };
 
         let mut components = std::collections::HashMap::new();
         components.insert(
             "engine".to_string(),
             ComponentHealth {
-                healthy: stats.is_running,
-                message: format!("cycles: {}", stats.cycle_count),
+                healthy,
+                message: format!("mode: {:?}, cycles: {}", mode, stats.cycle_count),
                 last_check_us: Self::now_us(),
             },
         );
@@ -637,11 +638,11 @@ pub async fn start_grpc_server(
 
 /// 啟動帶模型管理器的 gRPC 服務器
 pub async fn start_grpc_server_with_model_manager(
-    engine: Arc<Mutex<Engine>>,
+    execution_control: ExecutionControlHandle,
     model_manager: Arc<Mutex<ModelManager>>,
     addr: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
-    let service = HftControlService::with_model_manager(engine, model_manager);
+    let service = HftControlService::with_model_manager(execution_control, model_manager);
     let auth_token = grpc_auth_token()?;
     let service = HftControlServer::with_interceptor(service, grpc_auth_interceptor(auth_token));
 
@@ -671,14 +672,16 @@ pub fn spawn_grpc_server(
 
 /// 在後台啟動帶模型管理器的 gRPC 服務器
 pub fn spawn_grpc_server_with_model_manager(
-    engine: Arc<Mutex<Engine>>,
+    execution_control: ExecutionControlHandle,
     model_manager: Arc<Mutex<ModelManager>>,
     port: u16,
 ) -> tokio::task::JoinHandle<()> {
     let addr = format!("0.0.0.0:{}", port).parse().unwrap();
 
     tokio::spawn(async move {
-        if let Err(e) = start_grpc_server_with_model_manager(engine, model_manager, addr).await {
+        if let Err(e) =
+            start_grpc_server_with_model_manager(execution_control, model_manager, addr).await
+        {
             error!("gRPC 服務器錯誤: {}", e);
         }
     })
@@ -790,5 +793,23 @@ mod tests {
             engine::TradingMode::Emergency
         );
         worker.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn paused_engine_is_not_reported_as_healthy() {
+        let mut engine = Engine::new(engine::EngineConfig::default());
+        engine.pause_trading();
+        let control = ExecutionControlHandle::new(Arc::new(Mutex::new(engine)), None, false);
+        let service = HftControlService::new(control);
+
+        let response = service
+            .health_check(Request::new(Empty {}))
+            .await
+            .expect("health response")
+            .into_inner();
+
+        assert!(!response.healthy);
+        assert_eq!(response.status, "unhealthy");
+        assert!(response.components["engine"].message.contains("Paused"));
     }
 }

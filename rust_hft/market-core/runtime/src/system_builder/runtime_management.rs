@@ -18,6 +18,7 @@ impl SystemRuntime {
             self.exec_control_tx.clone(),
             execution_enabled,
         )
+        .with_balance_tolerance_usd(self.config.engine.balance_reconcile_tolerance_usd)
     }
 
     /// 為 IPC 創建共享實例，避免雙實例問題
@@ -29,6 +30,7 @@ impl SystemRuntime {
             config: self.config.clone(),
             tasks: vec![],                  // IPC 專用空任務列表
             execution_worker_tasks: vec![], // IPC 專用空任務列表
+            ipc_task: None,
             exec_control_tx: self.exec_control_tx.clone(),
             market_plans: self.market_plans.clone(),
             execution_client_venues: self.execution_client_venues.clone(),
@@ -118,23 +120,14 @@ impl SystemRuntime {
         self.engine.lock().await.get_account_view()
     }
 
-    /// Cancel a strategy's OMS-open orders and wait for worker dispatch results.
-    pub async fn cancel_orders_for_strategy(&self, strategy_id: &str) -> usize {
-        let pairs = {
-            let eng = self.engine.lock().await;
-            eng.open_order_pairs_by_strategy(strategy_id)
-        };
-        if pairs.is_empty() {
-            return 0;
-        }
-        let handle = self.execution_control_handle();
-        match handle.cancel_orders_for_strategy(strategy_id).await {
-            Ok(report) => report.submitted.len(),
-            Err(error) => {
-                tracing::error!(%error, strategy_id, "failed to dispatch strategy cancellation");
-                0
-            }
-        }
+    /// Cancel every OMS-open or worker-tracked order owned by a strategy.
+    pub async fn cancel_orders_for_strategy(
+        &self,
+        strategy_id: &str,
+    ) -> Result<engine::execution_worker::CancelDispatchReport, HftError> {
+        self.execution_control_handle()
+            .cancel_orders_for_strategy(strategy_id)
+            .await
     }
 
     /// 熱更新風控配置：替換風控管理器並應用新的策略覆蓋

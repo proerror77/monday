@@ -104,6 +104,14 @@ pub struct ExecutionWorkerStats {
     pub recent_execution_latency_micros: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+struct TrackedOrder {
+    symbol: Symbol,
+    strategy_id: String,
+    venue: Option<VenueId>,
+    account_id: Option<AccountId>,
+}
+
 /// 执行 Worker - 在独立 Tokio 任务中运行
 pub struct ExecutionWorker {
     config: ExecutionWorkerConfig,
@@ -113,6 +121,7 @@ pub struct ExecutionWorker {
     stats: ExecutionWorkerStats,
     /// 订单 ID 到客户端索引的映射
     order_to_client: FxHashMap<OrderId, usize>,
+    tracked_orders: FxHashMap<OrderId, TrackedOrder>,
     /// 轮询计数器（用于 RoundRobin 策略）
     round_robin_counter: AtomicUsize,
     /// 延遲監控器 - 追蹤 Worker 執行延遲
@@ -197,6 +206,7 @@ impl ExecutionWorker {
             execution_streams: Vec::new(),
             stats: ExecutionWorkerStats::default(),
             order_to_client: FxHashMap::default(),
+            tracked_orders: FxHashMap::default(),
             round_robin_counter: AtomicUsize::new(0),
             latency_monitor,
             control_rx,
@@ -229,6 +239,7 @@ impl ExecutionWorker {
             execution_streams: Vec::new(),
             stats: ExecutionWorkerStats::default(),
             order_to_client: FxHashMap::default(),
+            tracked_orders: FxHashMap::default(),
             round_robin_counter: AtomicUsize::new(0),
             latency_monitor,
             control_rx,
@@ -459,7 +470,24 @@ impl ExecutionWorker {
 
                     // 向引擎派發 OrderNew 以註冊訂單（便於 Portfolio/OMS 正確處理 Fill）
                     // 推斷對應的 venue（根據 venue_to_client 反查）
-                    let venue_for_client = self.venue_for_client(client_idx);
+                    let venue_for_client = intent
+                        .target_venue
+                        .or_else(|| self.venue_for_client(client_idx));
+                    let account_id =
+                        self.account_to_client
+                            .iter()
+                            .find_map(|(account_id, index)| {
+                                (*index == client_idx).then_some(account_id.clone())
+                            });
+                    self.tracked_orders.insert(
+                        order_id.clone(),
+                        TrackedOrder {
+                            symbol: intent.symbol.clone(),
+                            strategy_id: intent.strategy_id.clone(),
+                            venue: venue_for_client,
+                            account_id,
+                        },
+                    );
 
                     let OrderIntent {
                         symbol,
@@ -601,6 +629,7 @@ impl ExecutionWorker {
                             | ExecutionEvent::OrderCompleted { order_id, .. } => {
                                 self.pending_acks.remove(order_id);
                                 self.order_to_client.remove(order_id);
+                                self.tracked_orders.remove(order_id);
                             }
                             _ => {}
                         }
@@ -753,7 +782,12 @@ impl ExecutionWorker {
     /// 處理控制指令（取消訂單等）
     async fn handle_control_command(&mut self, cmd: ControlCommand) {
         match cmd {
-            ControlCommand::CancelOrders { targets, reply } => {
+            ControlCommand::CancelOrders {
+                targets,
+                scope,
+                reply,
+            } => {
+                let targets = self.include_worker_tracked_orders(targets, &scope);
                 let report = self.dispatch_cancellations(targets).await;
                 let _ = reply.send(report);
             }
@@ -761,7 +795,7 @@ impl ExecutionWorker {
                 self.accepting_intents = false;
                 self.emergency_latched = true;
                 warn!("execution worker intake disabled by emergency control");
-                let targets = self.include_worker_tracked_orders(targets);
+                let targets = self.include_worker_tracked_orders(targets, &CancelScope::All);
                 let report = self.dispatch_cancellations(targets).await;
                 let _ = reply.send(report);
             }
@@ -813,25 +847,27 @@ impl ExecutionWorker {
         }
     }
 
-    fn include_worker_tracked_orders(&self, mut targets: Vec<CancelTarget>) -> Vec<CancelTarget> {
+    fn include_worker_tracked_orders(
+        &self,
+        mut targets: Vec<CancelTarget>,
+        scope: &CancelScope,
+    ) -> Vec<CancelTarget> {
         let mut known = targets
             .iter()
             .map(|target| target.order_id.clone())
             .collect::<HashSet<_>>();
-        for (order_id, client_idx) in &self.order_to_client {
+        for (order_id, metadata) in &self.tracked_orders {
+            if !scope.matches(metadata) {
+                continue;
+            }
             if !known.insert(order_id.clone()) {
                 continue;
             }
-            let symbol = self
-                .pending_acks
-                .get(order_id)
-                .map(|(symbol, _)| symbol.clone())
-                .unwrap_or_else(|| Symbol::new("UNKNOWN"));
             targets.push(CancelTarget {
                 order_id: order_id.clone(),
-                symbol,
-                venue: self.venue_for_client(*client_idx),
-                account_id: None,
+                symbol: metadata.symbol.clone(),
+                venue: metadata.venue,
+                account_id: metadata.account_id.clone(),
             });
         }
         targets
@@ -927,6 +963,31 @@ impl ExecutionWorker {
 }
 
 #[derive(Debug, Clone)]
+pub enum CancelScope {
+    Explicit,
+    All,
+    Filter {
+        symbol: Option<Symbol>,
+        venue: Option<VenueId>,
+    },
+    Strategy(String),
+}
+
+impl CancelScope {
+    fn matches(&self, order: &TrackedOrder) -> bool {
+        match self {
+            Self::Explicit => false,
+            Self::All => true,
+            Self::Filter { symbol, venue } => {
+                symbol.as_ref().is_none_or(|value| &order.symbol == value)
+                    && venue.is_none_or(|value| order.venue == Some(value))
+            }
+            Self::Strategy(strategy_id) => order.strategy_id == *strategy_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CancelTarget {
     pub order_id: OrderId,
     pub symbol: Symbol,
@@ -985,6 +1046,7 @@ impl WorkerReconcileSnapshot {
 pub enum ControlCommand {
     CancelOrders {
         targets: Vec<CancelTarget>,
+        scope: CancelScope,
         reply: oneshot::Sender<CancelDispatchReport>,
     },
     EnterEmergency {
@@ -1013,6 +1075,7 @@ pub fn spawn_execution_worker_with_control(
     config: ExecutionWorkerConfig,
     queues: WorkerQueues,
     execution_clients: Vec<Box<dyn ExecutionClient>>,
+    venue_to_client: HashMap<VenueId, usize>,
     strategy_to_client: Option<std::collections::HashMap<String, usize>>,
     account_to_client: Option<std::collections::HashMap<AccountId, usize>>,
 ) -> (
@@ -1021,6 +1084,7 @@ pub fn spawn_execution_worker_with_control(
 ) {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut worker = ExecutionWorker::new(config.clone(), queues, execution_clients, rx);
+    worker.venue_to_client = venue_to_client;
     if let Some(map) = strategy_to_client {
         worker.strategy_to_client = Some(map.into_iter().collect());
     }
@@ -1075,8 +1139,14 @@ pub fn spawn_execution_worker(
     queues: WorkerQueues,
     execution_clients: Vec<Box<dyn ExecutionClient>>,
 ) -> tokio::task::JoinHandle<Result<(), HftError>> {
-    let (h, _tx) =
-        spawn_execution_worker_with_control(config, queues, execution_clients, None, None);
+    let (h, _tx) = spawn_execution_worker_with_control(
+        config,
+        queues,
+        execution_clients,
+        HashMap::new(),
+        None,
+        None,
+    );
     h
 }
 
@@ -1343,6 +1413,15 @@ mod tests {
         );
         let order_id = OrderId("open-order".to_string());
         worker.order_to_client.insert(order_id.clone(), 0);
+        worker.tracked_orders.insert(
+            order_id.clone(),
+            TrackedOrder {
+                symbol: Symbol::new("ETHUSDT"),
+                strategy_id: "test_strategy".to_string(),
+                venue: Some(VenueId::MOCK),
+                account_id: None,
+            },
+        );
         let (reply, report) = oneshot::channel();
 
         worker
@@ -1369,6 +1448,62 @@ mod tests {
         assert_eq!(state.canceled, vec![order_id]);
         assert!(state.placed.is_empty());
         assert_eq!(worker.stats.orders_failed, 1);
+    }
+
+    #[test]
+    fn regular_cancel_scopes_include_only_matching_worker_tracked_orders() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            list_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker.tracked_orders.insert(
+            OrderId("alpha-btc".to_string()),
+            TrackedOrder {
+                symbol: Symbol::new("BTCUSDT"),
+                strategy_id: "alpha".to_string(),
+                venue: Some(VenueId::MOCK),
+                account_id: None,
+            },
+        );
+        worker.tracked_orders.insert(
+            OrderId("beta-eth".to_string()),
+            TrackedOrder {
+                symbol: Symbol::new("ETHUSDT"),
+                strategy_id: "beta".to_string(),
+                venue: Some(VenueId::MOCK),
+                account_id: None,
+            },
+        );
+
+        let all = worker.include_worker_tracked_orders(Vec::new(), &CancelScope::All);
+        assert_eq!(all.len(), 2);
+
+        let alpha = worker
+            .include_worker_tracked_orders(Vec::new(), &CancelScope::Strategy("alpha".to_string()));
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(alpha[0].order_id, OrderId("alpha-btc".to_string()));
+
+        let eth = worker.include_worker_tracked_orders(
+            Vec::new(),
+            &CancelScope::Filter {
+                symbol: Some(Symbol::new("ETHUSDT")),
+                venue: Some(VenueId::MOCK),
+            },
+        );
+        assert_eq!(eth.len(), 1);
+        assert_eq!(eth[0].order_id, OrderId("beta-eth".to_string()));
+
+        let explicit = worker.include_worker_tracked_orders(Vec::new(), &CancelScope::Explicit);
+        assert!(explicit.is_empty());
     }
 
     #[tokio::test]

@@ -47,6 +47,9 @@ pub struct SystemEngineConfig {
     /// Reconciliation interval (ms)
     #[serde(default = "default_reconcile_interval_ms")]
     pub reconcile_interval_ms: u64,
+    /// Maximum absolute USD difference accepted between exchange and local equity.
+    #[serde(default = "default_balance_reconcile_tolerance_usd")]
+    pub balance_reconcile_tolerance_usd: Decimal,
     /// Auto-cancel exchange-only orders discovered in reconciliation
     #[serde(default)]
     pub auto_cancel_exchange_only: bool,
@@ -73,6 +76,10 @@ fn default_ack_timeout_ms() -> u64 {
 
 fn default_reconcile_interval_ms() -> u64 {
     5000
+}
+
+fn default_balance_reconcile_tolerance_usd() -> Decimal {
+    Decimal::ONE
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

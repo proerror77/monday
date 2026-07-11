@@ -650,6 +650,7 @@ impl SystemBuilder {
             config: self.config,
             tasks: Vec::new(),
             execution_worker_tasks: Vec::new(),
+            ipc_task: None,
             exec_control_tx: None,
             market_plans: self.market_stream_plans,
             execution_client_venues: self.execution_client_venues,
@@ -683,6 +684,8 @@ pub struct SystemRuntime {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     // 执行 worker 任务
     execution_worker_tasks: Vec<tokio::task::JoinHandle<Result<(), HftError>>>,
+    // IPC server is process-owned and requires explicit cancellation on shutdown.
+    ipc_task: Option<tokio::task::JoinHandle<()>>,
     // 執行控制通道（撤單等）
     exec_control_tx:
         Option<tokio::sync::mpsc::UnboundedSender<engine::execution_worker::ControlCommand>>,
@@ -704,10 +707,23 @@ fn quotes_only_enabled(config: &SystemConfig) -> bool {
     config.quotes_only || quotes_only_env
 }
 
+fn requires_authoritative_balance_reconciliation(config: &SystemConfig) -> bool {
+    !quotes_only_enabled(config)
+        && config.venues.iter().any(|venue| {
+            !venue.simulate_execution
+                && venue
+                    .execution_mode
+                    .as_deref()
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("live"))
+        })
+}
+
 impl SystemRuntime {
     /// 啟動系統
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("啟動系統運行時...");
+        let require_authoritative_balances =
+            requires_authoritative_balance_reconciliation(&self.config);
 
         // 1) 橋接市場流（依登記規劃）
         let bridge_cfg = engine::AdapterBridgeConfig {
@@ -921,45 +937,40 @@ impl SystemRuntime {
                 .enumerate()
                 .filter_map(|(index, account)| account.clone().map(|account| (account, index)))
                 .collect::<std::collections::HashMap<_, _>>();
+            let mut venue_to_client = self
+                .execution_client_venues
+                .iter()
+                .enumerate()
+                .map(|(client_idx, venue_id)| (*venue_id, client_idx))
+                .collect::<std::collections::HashMap<_, _>>();
+            if venue_to_client.is_empty() {
+                for (index, venue_config) in self.config.venues.iter().enumerate() {
+                    if let Some(venue_id) = hft_core::VenueId::from_str(&venue_config.name) {
+                        if index < execution_clients.len() {
+                            venue_to_client.insert(venue_id, index);
+                        }
+                    }
+                }
+            }
+            for (venue_id, client_idx) in &venue_to_client {
+                if *client_idx >= execution_clients.len() {
+                    warn!(
+                        "無效的客戶端索引: venue={:?}, client_idx={}, 總客戶端數={}",
+                        venue_id,
+                        client_idx,
+                        execution_clients.len()
+                    );
+                }
+            }
 
             let (worker_handle, control_tx) = if let Some(router_config) = &self.config.router {
                 // 有路由器配置，創建路由器並使用帶路由器的 worker
                 let router = router_config.clone().build();
 
-                // 🔥 Phase 1: 構建真實的 venue_to_client 映射 - 基於實際註冊的執行客戶端
-                let mut venue_to_client = std::collections::HashMap::new();
-                for (client_idx, venue_id) in self.execution_client_venues.iter().enumerate() {
-                    venue_to_client.insert(*venue_id, client_idx);
-                }
-
-                // 如果沒有註冊任何帶 venue 的客戶端，回退到配置順序
-                if venue_to_client.is_empty() {
-                    warn!("沒有找到帶 venue 信息的執行客戶端，回退到配置順序映射");
-                    for (idx, venue_config) in self.config.venues.iter().enumerate() {
-                        if let Some(venue_id) =
-                            hft_core::VenueId::from_str(&venue_config.name.to_uppercase())
-                        {
-                            venue_to_client.insert(venue_id, idx);
-                        }
-                    }
-                }
-
-                // 驗證 venue_to_client 映射的有效性
-                for (venue_id, client_idx) in &venue_to_client {
-                    if *client_idx >= execution_clients.len() {
-                        warn!(
-                            "無效的客戶端索引: venue={:?}, client_idx={}, 總客戶端數={}",
-                            venue_id,
-                            client_idx,
-                            execution_clients.len()
-                        );
-                    }
-                }
-
                 info!(
                     "使用路由器: {:?}, venue映射: {:?}, 執行客戶端總數: {}",
                     router.name(),
-                    venue_to_client,
+                    venue_to_client.clone(),
                     execution_clients.len()
                 );
                 // 構建策略→客戶端映射（根據 strategy_accounts 與註冊的帳戶）
@@ -1023,6 +1034,7 @@ impl SystemRuntime {
                     worker_config,
                     worker_queues,
                     execution_clients,
+                    venue_to_client,
                     strategy_to_client,
                     Some(account_to_client),
                 )
@@ -1030,6 +1042,37 @@ impl SystemRuntime {
             self.execution_worker_tasks.push(worker_handle);
             self.exec_control_tx = Some(control_tx);
             info!("已启动执行 worker (客户端数量: {})", client_count);
+        }
+
+        if require_authoritative_balances {
+            let control = self.execution_control_handle();
+            let startup_reconciliation = async {
+                control.pause_trading().await?;
+                let report = control.reconcile(true).await?;
+                if !report.healthy {
+                    return Err(HftError::Execution(format!(
+                        "initial live reconciliation failed: complete={}, exchange_only={}, local_only={}, quantity_mismatch={}, balance_complete={}, balance_difference_usd={:?}",
+                        report.complete,
+                        report.order_report.exchange_only.len(),
+                        report.order_report.local_only.len(),
+                        report.order_report.qty_mismatch.len(),
+                        report
+                            .balance_report
+                            .as_ref()
+                            .is_some_and(|balances| balances.complete),
+                        report
+                            .balance_report
+                            .as_ref()
+                            .and_then(|balances| balances.difference_usd),
+                    )));
+                }
+                control.resume_trading().await
+            }
+            .await;
+            if let Err(error) = startup_reconciliation {
+                self.abort_execution_workers().await;
+                return Err(Box::new(error));
+            }
         }
 
         // 3) 啟動引擎主循環（後台，事件驅動）
@@ -1047,6 +1090,7 @@ impl SystemRuntime {
 
         if self.config.engine.reconcile_interval_ms > 0 && self.exec_control_tx.is_some() {
             let interval_ms = self.config.engine.reconcile_interval_ms;
+            let include_balances = require_authoritative_balances;
             let control = self.execution_control_handle();
             self.tasks.push(tokio::spawn(async move {
                 let mut interval =
@@ -1058,7 +1102,7 @@ impl SystemRuntime {
                     if !engine.lock().await.get_statistics().is_running {
                         break;
                     }
-                    match control.reconcile(false).await {
+                    match control.reconcile(include_balances).await {
                         Ok(report) if report.healthy => {
                             tracing::debug!("runtime order reconciliation healthy");
                         }
@@ -1068,6 +1112,14 @@ impl SystemRuntime {
                                 exchange_only = report.order_report.exchange_only.len(),
                                 local_only = report.order_report.local_only.len(),
                                 quantity_mismatch = report.order_report.qty_mismatch.len(),
+                                balance_complete = report
+                                    .balance_report
+                                    .as_ref()
+                                    .is_none_or(|balances| balances.complete),
+                                balance_difference_usd = ?report
+                                    .balance_report
+                                    .as_ref()
+                                    .and_then(|balances| balances.difference_usd),
                                 "runtime order reconciliation unhealthy; pausing new intents"
                             );
                             let mode = engine.lock().await.trading_mode();
@@ -1185,7 +1237,7 @@ impl SystemRuntime {
             let runtime_arc = Arc::new(Mutex::new(self.clone_for_ipc()));
 
             let ipc_handle = crate::ipc_handler::start_ipc_server(runtime_arc, None);
-            self.tasks.push(tokio::spawn(async move {
+            self.ipc_task = Some(tokio::spawn(async move {
                 match ipc_handle.await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => tracing::error!(%error, "IPC server failed"),
@@ -1210,16 +1262,25 @@ impl SystemRuntime {
 
         // 停止引擎
         self.engine.lock().await.stop();
+        if let Some(ipc_task) = self.ipc_task.take() {
+            ipc_task.abort();
+            let _ = ipc_task.await;
+        }
         // 等待背景任務退出
         for t in self.tasks.drain(..) {
             let _ = t.await;
         }
-        // 中止執行 worker 任務，避免阻塞退出
-        for w in self.execution_worker_tasks.drain(..) {
-            w.abort();
-        }
+        self.abort_execution_workers().await;
         info!("系統運行時已停止");
         Ok(())
+    }
+
+    async fn abort_execution_workers(&mut self) {
+        self.exec_control_tx.take();
+        for worker in self.execution_worker_tasks.drain(..) {
+            worker.abort();
+            let _ = worker.await;
+        }
     }
 
     pub fn portfolio_manager(&self) -> Option<&PortfolioManager> {
@@ -1461,6 +1522,7 @@ impl Default for SystemConfig {
                 cpu_affinity: CpuAffinityConfig::default(),
                 ack_timeout_ms: 3000,
                 reconcile_interval_ms: 5000,
+                balance_reconcile_tolerance_usd: rust_decimal::Decimal::ONE,
                 auto_cancel_exchange_only: false,
                 execution_queue: ExecutionQueueSettings::default(),
             },
@@ -1492,9 +1554,147 @@ impl Default for SystemConfig {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
+    use async_trait::async_trait;
+    use futures::stream;
+    use ports::{AccountBalance, BoxStream, ConnectionHealth, ExecutionEvent, OpenOrder};
+    use rust_decimal::Decimal;
     use shared_instrument::InstrumentId;
 
     use super::*;
+
+    struct AuthoritativeBalanceClient {
+        equity_usd: Decimal,
+    }
+
+    #[async_trait]
+    impl ExecutionClient for AuthoritativeBalanceClient {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> HftResult<hft_core::OrderId> {
+            Err(HftError::Execution(
+                "test client does not place orders".to_string(),
+            ))
+        }
+
+        async fn cancel_order(&mut self, _order_id: &hft_core::OrderId) -> HftResult<()> {
+            Err(HftError::Execution("test client has no orders".to_string()))
+        }
+
+        async fn modify_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> HftResult<()> {
+            Err(HftError::Execution("test client has no orders".to_string()))
+        }
+
+        async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
+            Ok(Box::pin(stream::pending()))
+        }
+
+        async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
+            Ok(vec![AccountBalance {
+                asset: "USDT".to_string(),
+                available: self.equity_usd,
+                frozen: Decimal::ZERO,
+                total: self.equity_usd,
+                usd_value: Some(self.equity_usd),
+            }])
+        }
+
+        async fn connect(&mut self) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn health(&self) -> ConnectionHealth {
+            ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
+        }
+    }
+
+    fn live_venue_config() -> VenueConfig {
+        VenueConfig {
+            name: "binance".to_string(),
+            account_id: None,
+            venue_type: VenueType::Binance,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+            execution_mode: Some("Live".to_string()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: false,
+            symbol_catalog: Vec::new(),
+            data_config: None,
+            execution_config: None,
+        }
+    }
+
+    #[test]
+    fn only_real_live_execution_requires_authoritative_balance_reconciliation() {
+        let mut config = SystemConfig::default();
+        config.venues = vec![live_venue_config()];
+        assert!(requires_authoritative_balance_reconciliation(&config));
+
+        config.venues[0].simulate_execution = true;
+        assert!(!requires_authoritative_balance_reconciliation(&config));
+
+        config.venues[0].simulate_execution = false;
+        config.venues[0].execution_mode = Some("Paper".to_string());
+        assert!(!requires_authoritative_balance_reconciliation(&config));
+
+        config.venues[0].execution_mode = Some("Live".to_string());
+        config.quotes_only = true;
+        assert!(!requires_authoritative_balance_reconciliation(&config));
+    }
+
+    #[tokio::test]
+    async fn live_runtime_reconciles_before_starting_engine_loop() {
+        let mut config = SystemConfig::default();
+        config.venues = vec![live_venue_config()];
+        config.engine.reconcile_interval_ms = 0;
+        let mut runtime = SystemBuilder::new(config)
+            .register_execution_client_with_venue(
+                AuthoritativeBalanceClient {
+                    equity_usd: Decimal::from(100),
+                },
+                VenueId::MOCK,
+            )
+            .build();
+
+        let error = runtime
+            .start()
+            .await
+            .expect_err("mismatched live equity must block startup");
+
+        assert!(error
+            .to_string()
+            .contains("initial live reconciliation failed"));
+        assert_eq!(
+            runtime.engine.lock().await.trading_mode(),
+            engine::TradingMode::Paused
+        );
+        assert!(runtime.execution_worker_tasks.is_empty());
+    }
 
     #[cfg(feature = "adapter-backpack-data")]
     #[test]

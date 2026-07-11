@@ -7,6 +7,7 @@ engine:
   top_n: 10
   ack_timeout_ms: 3000
   reconcile_interval_ms: 5000
+  balance_reconcile_tolerance_usd: 1
   auto_cancel_exchange_only: false
 
 # 說明：為了驗證多交易所行情接入，這裡顯式配置 symbol_catalog
@@ -66,4 +67,3 @@ risk:
 
 # 目前暫無策略，可保留為空映射；未來增加策略後，請綁定至對應 account_id
 strategy_accounts: {}
-

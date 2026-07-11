@@ -1,9 +1,10 @@
 use crate::execution_worker::{
-    CancelDispatchReport, CancelTarget, ControlCommand, WorkerReconcileSnapshot,
+    CancelDispatchReport, CancelScope, CancelTarget, ControlCommand, WorkerReconcileSnapshot,
 };
 use crate::Engine;
 use hft_core::{HftError, HftResult, OrderId, Symbol, VenueId};
 use ports::{OrderReconciliationReport, OrderRecord, OrderStatus};
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -12,6 +13,19 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 pub struct RuntimeReconciliationReport {
     pub worker_snapshot: WorkerReconcileSnapshot,
     pub order_report: OrderReconciliationReport,
+    pub balance_report: Option<BalanceReconciliationReport>,
+    pub complete: bool,
+    pub healthy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BalanceReconciliationReport {
+    pub local_equity_usd: Decimal,
+    pub exchange_equity_usd: Option<Decimal>,
+    pub difference_usd: Option<Decimal>,
+    pub tolerance_usd: Decimal,
+    pub missing_valuations: Vec<String>,
+    pub client_errors: Vec<String>,
     pub complete: bool,
     pub healthy: bool,
 }
@@ -26,6 +40,7 @@ pub struct ExecutionControlHandle {
     worker_tx: Option<mpsc::UnboundedSender<ControlCommand>>,
     execution_enabled: bool,
     response_timeout: Duration,
+    balance_tolerance_usd: Decimal,
 }
 
 impl ExecutionControlHandle {
@@ -39,7 +54,17 @@ impl ExecutionControlHandle {
             worker_tx,
             execution_enabled,
             response_timeout: Duration::from_secs(5),
+            balance_tolerance_usd: Decimal::ONE,
         }
+    }
+
+    pub fn with_balance_tolerance_usd(mut self, tolerance_usd: Decimal) -> Self {
+        self.balance_tolerance_usd = if tolerance_usd < Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            tolerance_usd
+        };
+        self
     }
 
     pub fn engine(&self) -> Arc<Mutex<Engine>> {
@@ -55,11 +80,20 @@ impl ExecutionControlHandle {
     }
 
     pub async fn resume_trading(&self) -> HftResult<()> {
+        if self.engine.lock().await.trading_mode() == crate::TradingMode::Emergency {
+            return Err(HftError::Risk(
+                "Emergency mode is sticky; restart is required".to_string(),
+            ));
+        }
         if self.execution_enabled {
             self.set_intake(true).await?;
         }
         let mut engine = self.engine.lock().await;
         if engine.trading_mode() == crate::TradingMode::Emergency {
+            drop(engine);
+            if self.execution_enabled {
+                self.set_intake(false).await?;
+            }
             return Err(HftError::Risk(
                 "Emergency mode is sticky; restart is required".to_string(),
             ));
@@ -84,7 +118,8 @@ impl ExecutionControlHandle {
             return Ok(CancelDispatchReport::default());
         }
 
-        self.dispatch_cancellations(targets, true).await
+        self.dispatch_cancellations(targets, true, CancelScope::All)
+            .await
     }
 
     pub async fn cancel_all_orders(&self) -> HftResult<CancelDispatchReport> {
@@ -92,7 +127,8 @@ impl ExecutionControlHandle {
             let engine = self.engine.lock().await;
             collect_open_targets(&engine, None, None, None)
         };
-        self.dispatch_cancellations(targets, false).await
+        self.dispatch_cancellations(targets, false, CancelScope::All)
+            .await
     }
 
     pub async fn cancel_orders_filtered(
@@ -116,7 +152,8 @@ impl ExecutionControlHandle {
             }
             collect_open_targets(&engine, symbol.as_ref(), venue, None)
         };
-        self.dispatch_cancellations(targets, false).await
+        self.dispatch_cancellations(targets, false, CancelScope::Filter { symbol, venue })
+            .await
     }
 
     pub async fn cancel_orders_for_strategy(
@@ -127,7 +164,12 @@ impl ExecutionControlHandle {
             let engine = self.engine.lock().await;
             collect_open_targets(&engine, None, None, Some(strategy_id))
         };
-        self.dispatch_cancellations(targets, false).await
+        self.dispatch_cancellations(
+            targets,
+            false,
+            CancelScope::Strategy(strategy_id.to_string()),
+        )
+        .await
     }
 
     pub async fn cancel_order(
@@ -148,7 +190,8 @@ impl ExecutionControlHandle {
                 |record| cancel_target(&engine, record),
             )
         };
-        self.dispatch_cancellations(vec![target], false).await
+        self.dispatch_cancellations(vec![target], false, CancelScope::Explicit)
+            .await
     }
 
     pub async fn reconcile(
@@ -175,12 +218,30 @@ impl ExecutionControlHandle {
             let engine = self.engine.lock().await;
             engine.reconcile_open_orders(&exchange_orders)
         };
-        let complete = worker_snapshot.is_complete();
-        let healthy = complete && !order_report.has_discrepancies();
+        let balance_report = if include_balances {
+            let local_equity = self.engine.lock().await.get_account_view().equity();
+            Some(reconcile_balances(
+                &worker_snapshot,
+                local_equity,
+                self.balance_tolerance_usd,
+            ))
+        } else {
+            None
+        };
+        let complete = worker_snapshot.is_complete()
+            && balance_report
+                .as_ref()
+                .is_none_or(|balances| balances.complete);
+        let healthy = complete
+            && !order_report.has_discrepancies()
+            && balance_report
+                .as_ref()
+                .is_none_or(|balances| balances.healthy);
 
         Ok(RuntimeReconciliationReport {
             worker_snapshot,
             order_report,
+            balance_report,
             complete,
             healthy,
         })
@@ -190,11 +251,9 @@ impl ExecutionControlHandle {
         &self,
         targets: Vec<CancelTarget>,
         emergency: bool,
+        scope: CancelScope,
     ) -> HftResult<CancelDispatchReport> {
-        if targets.is_empty() && !emergency {
-            return Ok(CancelDispatchReport::default());
-        }
-        if targets.is_empty() && emergency && !self.execution_enabled {
+        if targets.is_empty() && !self.execution_enabled {
             return Ok(CancelDispatchReport::default());
         }
 
@@ -208,6 +267,7 @@ impl ExecutionControlHandle {
         } else {
             ControlCommand::CancelOrders {
                 targets,
+                scope,
                 reply: reply_tx,
             }
         };
@@ -246,6 +306,71 @@ impl ExecutionControlHandle {
             .await
             .map_err(|_| HftError::Timeout(format!("{operation} control reply timed out")))?
             .map_err(|_| HftError::Execution(format!("{operation} control reply dropped")))
+    }
+}
+
+fn reconcile_balances(
+    snapshot: &WorkerReconcileSnapshot,
+    local_equity_usd: Decimal,
+    tolerance_usd: Decimal,
+) -> BalanceReconciliationReport {
+    let mut exchange_equity_usd = Decimal::ZERO;
+    let mut missing_valuations = Vec::new();
+    let mut client_errors = Vec::new();
+
+    if snapshot.clients.is_empty() {
+        client_errors.push("no execution clients returned balance snapshots".to_string());
+    }
+
+    for client in &snapshot.clients {
+        match &client.balances {
+            None => client_errors.push(format!(
+                "client={} did not return a balance snapshot",
+                client.client_index
+            )),
+            Some(Err(error)) => client_errors.push(format!(
+                "client={} balance snapshot failed: {}",
+                client.client_index, error
+            )),
+            Some(Ok(balances)) => {
+                for balance in balances {
+                    if let Some(value) = balance.usd_value {
+                        exchange_equity_usd += value;
+                    } else if balance.total != Decimal::ZERO
+                        || balance.available != Decimal::ZERO
+                        || balance.frozen != Decimal::ZERO
+                    {
+                        missing_valuations.push(format!(
+                            "client={} asset={}",
+                            client.client_index, balance.asset
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let complete = client_errors.is_empty() && missing_valuations.is_empty();
+    let difference_usd = complete.then(|| decimal_abs(local_equity_usd - exchange_equity_usd));
+    let healthy = difference_usd.is_some_and(|difference| difference <= tolerance_usd);
+
+    BalanceReconciliationReport {
+        local_equity_usd,
+        exchange_equity_usd: complete.then_some(exchange_equity_usd),
+        difference_usd,
+        tolerance_usd,
+        missing_valuations,
+        client_errors,
+        complete,
+        healthy,
+    }
+}
+
+fn decimal_abs(value: Decimal) -> Decimal {
+    if value < Decimal::ZERO {
+        -value
+    } else {
+        value
     }
 }
 
@@ -292,7 +417,8 @@ mod tests {
     use super::*;
     use crate::{EngineConfig, TradingMode};
     use hft_core::{Price, Quantity, Side};
-    use ports::{ExecutionEvent, OrderManager, OrderUpdate, RegisterOrderParams};
+    use ports::{AccountBalance, ExecutionEvent, OrderManager, OrderUpdate, RegisterOrderParams};
+    use rust_decimal::Decimal;
     use std::collections::HashMap;
 
     struct ReconcileOrderManager {
@@ -404,5 +530,136 @@ mod tests {
         assert!(!report.healthy);
         assert_eq!(report.order_report.local_only.len(), 1);
         worker.await.expect("worker task");
+    }
+
+    fn engine_with_equity(equity: Decimal) -> Arc<Mutex<Engine>> {
+        let engine = Engine::new(EngineConfig::default());
+        let mut account = ports::AccountView::default();
+        account.cash_balance = equity;
+        engine.account_snapshots.store(Arc::new(account));
+        Arc::new(Mutex::new(engine))
+    }
+
+    fn balance(asset: &str, total: Decimal, usd_value: Option<Decimal>) -> AccountBalance {
+        AccountBalance {
+            asset: asset.to_string(),
+            available: total,
+            frozen: Decimal::ZERO,
+            total,
+            usd_value,
+        }
+    }
+
+    async fn reconcile_with_balances(
+        engine: Arc<Mutex<Engine>>,
+        balances: Result<Vec<AccountBalance>, HftError>,
+    ) -> RuntimeReconciliationReport {
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine, Some(worker_tx), true)
+            .with_balance_tolerance_usd(Decimal::ONE);
+        let worker = tokio::spawn(async move {
+            match worker_rx.recv().await.expect("control command") {
+                ControlCommand::Reconcile {
+                    include_balances,
+                    reply,
+                } => {
+                    assert!(include_balances);
+                    reply
+                        .send(WorkerReconcileSnapshot {
+                            clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                                client_index: 0,
+                                venue: Some(VenueId::MOCK),
+                                account_id: None,
+                                open_orders: Ok(Vec::new()),
+                                balances: Some(balances),
+                            }],
+                        })
+                        .expect("send reconciliation");
+                }
+                _ => panic!("unexpected control command"),
+            }
+        });
+        let report = control.reconcile(true).await.expect("reconcile");
+        worker.await.expect("worker task");
+        report
+    }
+
+    #[tokio::test]
+    async fn balance_reconciliation_accepts_authoritative_equity_within_tolerance() {
+        let report = reconcile_with_balances(
+            engine_with_equity(Decimal::from(100)),
+            Ok(vec![balance(
+                "USDT",
+                Decimal::from(100),
+                Some(Decimal::from(100)),
+            )]),
+        )
+        .await;
+
+        assert!(report.complete);
+        assert!(report.healthy);
+        let balances = report.balance_report.expect("balance report");
+        assert!(balances.complete);
+        assert!(balances.healthy);
+        assert_eq!(balances.difference_usd, Some(Decimal::ZERO));
+    }
+
+    #[tokio::test]
+    async fn balance_reconciliation_rejects_equity_mismatch() {
+        let report = reconcile_with_balances(
+            engine_with_equity(Decimal::from(100)),
+            Ok(vec![balance(
+                "USDT",
+                Decimal::from(80),
+                Some(Decimal::from(80)),
+            )]),
+        )
+        .await;
+
+        assert!(report.complete);
+        assert!(!report.healthy);
+        assert_eq!(
+            report
+                .balance_report
+                .expect("balance report")
+                .difference_usd,
+            Some(Decimal::from(20))
+        );
+    }
+
+    #[tokio::test]
+    async fn balance_reconciliation_is_incomplete_without_nonzero_asset_valuation() {
+        let report = reconcile_with_balances(
+            engine_with_equity(Decimal::from(100)),
+            Ok(vec![balance("BTC", Decimal::ONE, None)]),
+        )
+        .await;
+
+        assert!(!report.complete);
+        assert!(!report.healthy);
+        let balances = report.balance_report.expect("balance report");
+        assert!(!balances.complete);
+        assert_eq!(balances.missing_valuations, vec!["client=0 asset=BTC"]);
+    }
+
+    #[tokio::test]
+    async fn emergency_resume_does_not_reenable_worker_intake() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.emergency_exit();
+        let engine = Arc::new(Mutex::new(engine));
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine, Some(worker_tx), true);
+
+        let error = control
+            .resume_trading()
+            .await
+            .expect_err("sticky emergency");
+        assert!(error.to_string().contains("sticky"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), worker_rx.recv())
+                .await
+                .is_err(),
+            "resume must not send an intake-enable command while emergency-latched"
+        );
     }
 }

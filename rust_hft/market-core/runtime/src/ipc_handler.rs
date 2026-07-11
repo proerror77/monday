@@ -17,8 +17,7 @@ use sysinfo::System;
 
 use crate::SystemRuntime;
 #[cfg(feature = "infra-ipc")]
-use hft_core::{OrderId, Symbol};
-#[cfg(feature = "infra-ipc")]
+use hft_core::OrderId;
 #[cfg(feature = "infra-ipc")]
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "infra-ipc")]
@@ -481,97 +480,88 @@ impl CommandHandler for SystemCommandHandler {
             Command::CancelAllOrders => {
                 info!("IPC: Cancelling all orders");
                 let runtime = self.runtime.lock().await;
-                // 收集目標
-                let pairs = {
-                    let eng = runtime.engine.lock().await;
-                    let state = eng.export_oms_state();
-                    let mut pairs = Vec::new();
-                    for (order_id, rec) in state.into_iter() {
-                        if matches!(
-                            rec.status,
-                            ports::OrderStatus::New
-                                | ports::OrderStatus::Acknowledged
-                                | ports::OrderStatus::Accepted
-                                | ports::OrderStatus::PartiallyFilled
-                        ) {
-                            pairs.push((order_id, rec.symbol));
-                        }
+                let cancel_events = runtime.engine.lock().await.subscribe_execution_events();
+                let report = match Self::cancel_all_orders_internal(&runtime).await {
+                    Ok(report) => report,
+                    Err(error) => {
+                        return Response::Error {
+                            message: format!("Failed to dispatch cancellation: {error}"),
+                            code: Some(503),
+                        };
                     }
-                    pairs
                 };
-
-                if let Err(error) = Self::cancel_all_orders_internal(&runtime).await {
-                    return Response::Error {
-                        message: format!("Failed to dispatch cancellation: {error}"),
-                        code: Some(503),
-                    };
-                }
                 // 追蹤回覆
-                let stats =
-                    Self::await_cancel_stats(&runtime, &pairs, Self::cancel_timeout_ms()).await;
+                let stats = Self::await_cancel_stats(
+                    &runtime,
+                    &report.submitted,
+                    Self::cancel_timeout_ms(),
+                    cancel_events,
+                )
+                .await;
                 Response::Data(infra_ipc::messages::ResponseData::CancelResult(stats))
             }
 
             Command::CancelOrdersForSymbol { symbol } => {
                 info!("IPC: Cancelling orders for symbol {}", symbol.as_str());
                 let runtime = self.runtime.lock().await;
-                // 導出未結訂單（該 symbol）
-                let pairs = {
-                    let eng = runtime.engine.lock().await;
-                    let state = eng.export_oms_state();
-                    let mut pairs = Vec::new();
-                    for (order_id, rec) in state.into_iter() {
-                        if rec.symbol.as_str() == symbol.as_str()
-                            && matches!(
-                                rec.status,
-                                ports::OrderStatus::New
-                                    | ports::OrderStatus::Acknowledged
-                                    | ports::OrderStatus::Accepted
-                                    | ports::OrderStatus::PartiallyFilled
-                            )
-                        {
-                            pairs.push((order_id, rec.symbol));
-                        }
-                    }
-                    pairs
-                };
-                if let Err(error) = runtime
+                let cancel_events = runtime.engine.lock().await.subscribe_execution_events();
+                let report = match runtime
                     .execution_control_handle()
                     .cancel_orders_filtered(Some(symbol.clone()), None)
                     .await
                 {
-                    return Response::Error {
-                        message: format!("Failed to dispatch cancellation: {error}"),
-                        code: Some(503),
-                    };
-                }
+                    Ok(report) if report.is_complete() => report,
+                    Ok(report) => {
+                        return Response::Error {
+                            message: incomplete_cancel_message(&report),
+                            code: Some(503),
+                        };
+                    }
+                    Err(error) => {
+                        return Response::Error {
+                            message: format!("Failed to dispatch cancellation: {error}"),
+                            code: Some(503),
+                        };
+                    }
+                };
                 // 追蹤回覆
-                let stats =
-                    Self::await_cancel_stats(&runtime, &pairs, Self::cancel_timeout_ms()).await;
+                let stats = Self::await_cancel_stats(
+                    &runtime,
+                    &report.submitted,
+                    Self::cancel_timeout_ms(),
+                    cancel_events,
+                )
+                .await;
                 Response::Data(infra_ipc::messages::ResponseData::CancelResult(stats))
             }
 
             Command::CancelOrdersForStrategy { strategy_id } => {
                 info!("IPC: Cancelling orders for strategy {}", strategy_id);
                 let runtime = self.runtime.lock().await;
-                // 收集該策略未結訂單 (order_id, symbol)
-                let pairs = {
-                    let eng = runtime.engine.lock().await;
-                    eng.open_order_pairs_by_strategy(&strategy_id)
+                let cancel_events = runtime.engine.lock().await.subscribe_execution_events();
+                let report = match runtime.cancel_orders_for_strategy(&strategy_id).await {
+                    Ok(report) if report.is_complete() => report,
+                    Ok(report) => {
+                        return Response::Error {
+                            message: incomplete_cancel_message(&report),
+                            code: Some(503),
+                        };
+                    }
+                    Err(error) => {
+                        return Response::Error {
+                            message: format!("Failed to dispatch cancellation: {error}"),
+                            code: Some(503),
+                        };
+                    }
                 };
-                if let Err(error) = runtime
-                    .execution_control_handle()
-                    .cancel_orders_for_strategy(&strategy_id)
-                    .await
-                {
-                    return Response::Error {
-                        message: format!("Failed to dispatch cancellation: {error}"),
-                        code: Some(503),
-                    };
-                }
                 // 等待撤單統計
-                let stats =
-                    Self::await_cancel_stats(&runtime, &pairs, Self::cancel_timeout_ms()).await;
+                let stats = Self::await_cancel_stats(
+                    &runtime,
+                    &report.submitted,
+                    Self::cancel_timeout_ms(),
+                    cancel_events,
+                )
+                .await;
                 Response::Data(infra_ipc::messages::ResponseData::CancelResult(stats))
             }
 
@@ -582,19 +572,34 @@ impl CommandHandler for SystemCommandHandler {
                     symbol.as_str()
                 );
                 let runtime = self.runtime.lock().await;
-                let pair = (OrderId(order_id), symbol);
-                if let Err(error) = runtime
+                let cancel_events = runtime.engine.lock().await.subscribe_execution_events();
+                let target_id = OrderId(order_id);
+                let report = match runtime
                     .execution_control_handle()
-                    .cancel_order(pair.0.clone(), pair.1.clone())
+                    .cancel_order(target_id, symbol)
                     .await
                 {
-                    return Response::Error {
-                        message: format!("Failed to dispatch cancellation: {error}"),
-                        code: Some(503),
-                    };
-                }
-                let stats =
-                    Self::await_cancel_stats(&runtime, &[pair], Self::cancel_timeout_ms()).await;
+                    Ok(report) if report.is_complete() => report,
+                    Ok(report) => {
+                        return Response::Error {
+                            message: incomplete_cancel_message(&report),
+                            code: Some(503),
+                        };
+                    }
+                    Err(error) => {
+                        return Response::Error {
+                            message: format!("Failed to dispatch cancellation: {error}"),
+                            code: Some(503),
+                        };
+                    }
+                };
+                let stats = Self::await_cancel_stats(
+                    &runtime,
+                    &report.submitted,
+                    Self::cancel_timeout_ms(),
+                    cancel_events,
+                )
+                .await;
                 Response::Data(infra_ipc::messages::ResponseData::CancelResult(stats))
             }
 
@@ -681,11 +686,50 @@ impl CommandHandler for SystemCommandHandler {
                         // 如果禁用策略，取消该策略的所有未结订单
                         if !enabled {
                             drop(engine);
-                            let cancelled_count =
-                                runtime.cancel_orders_for_strategy(&strategy_id).await;
+                            let cancel_events =
+                                runtime.engine.lock().await.subscribe_execution_events();
+                            let report = match runtime
+                                .cancel_orders_for_strategy(&strategy_id)
+                                .await
+                            {
+                                Ok(report) if report.is_complete() => report,
+                                Ok(report) => {
+                                    return Response::Error {
+                                        message: format!(
+                                            "strategy disabled but cancellation failed: {}",
+                                            incomplete_cancel_message(&report)
+                                        ),
+                                        code: Some(503),
+                                    };
+                                }
+                                Err(error) => {
+                                    return Response::Error {
+                                        message: format!(
+                                            "strategy disabled but cancellation dispatch failed: {error}"
+                                        ),
+                                        code: Some(503),
+                                    };
+                                }
+                            };
+                            let stats = Self::await_cancel_stats(
+                                &runtime,
+                                &report.submitted,
+                                Self::cancel_timeout_ms(),
+                                cancel_events,
+                            )
+                            .await;
+                            if stats.failed > 0 {
+                                return Response::Error {
+                                    message: format!(
+                                        "strategy disabled but {} of {} cancellations were not confirmed",
+                                        stats.failed, stats.requested
+                                    ),
+                                    code: Some(503),
+                                };
+                            }
                             info!(
                                 "已取消策略 {} 的 {} 个未结订单",
-                                strategy_id, cancelled_count
+                                strategy_id, stats.succeeded
                             );
                         }
 
@@ -789,6 +833,44 @@ impl CommandHandler for SystemCommandHandler {
 }
 
 #[cfg(feature = "infra-ipc")]
+fn incomplete_cancel_message(report: &engine::execution_worker::CancelDispatchReport) -> String {
+    let reasons = report
+        .failures
+        .iter()
+        .map(|failure| format!("{}: {}", failure.order_id.0, failure.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "cancellation dispatch incomplete: {} of {} submitted{}{}",
+        report.submitted.len(),
+        report.requested,
+        if reasons.is_empty() { "" } else { "; " },
+        reasons
+    )
+}
+
+#[cfg(all(test, feature = "infra-ipc"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_cancel_message_preserves_dispatch_failure_evidence() {
+        let report = engine::execution_worker::CancelDispatchReport {
+            requested: 2,
+            submitted: vec![OrderId("submitted".to_string())],
+            failures: vec![engine::execution_worker::CancelFailure {
+                order_id: OrderId("failed".to_string()),
+                reason: "venue rejected cancellation".to_string(),
+            }],
+        };
+
+        let message = incomplete_cancel_message(&report);
+        assert!(message.contains("1 of 2"));
+        assert!(message.contains("failed: venue rejected cancellation"));
+    }
+}
+
+#[cfg(feature = "infra-ipc")]
 impl SystemCommandHandler {
     /// 计算文件的 SHA256 哈希
     #[cfg(feature = "strategy-dl")]
@@ -812,7 +894,9 @@ impl SystemCommandHandler {
     }
 
     /// Internal helper to cancel all orders
-    async fn cancel_all_orders_internal(runtime: &SystemRuntime) -> Result<(), hft_core::HftError> {
+    async fn cancel_all_orders_internal(
+        runtime: &SystemRuntime,
+    ) -> Result<engine::execution_worker::CancelDispatchReport, hft_core::HftError> {
         let report = runtime
             .execution_control_handle()
             .cancel_all_orders()
@@ -824,14 +908,15 @@ impl SystemCommandHandler {
                 report.requested
             )));
         }
-        Ok(())
+        Ok(report)
     }
 
     /// 追蹤撤單回覆：輪詢 OMS 狀態，直到所有訂單為 Canceled 或超時
     async fn await_cancel_stats(
         runtime: &SystemRuntime,
-        targets: &[(OrderId, Symbol)],
+        targets: &[OrderId],
         timeout_ms: u64,
+        mut rx: tokio::sync::broadcast::Receiver<ports::ExecutionEvent>,
     ) -> infra_ipc::messages::CancelStats {
         let requested = targets.len() as u32;
         if requested == 0 {
@@ -843,17 +928,11 @@ impl SystemCommandHandler {
             };
         }
 
-        let mut pending: HashSet<OrderId> = targets.iter().map(|(id, _)| id.clone()).collect();
+        let mut pending: HashSet<OrderId> = targets.iter().cloned().collect();
         let mut details: HashMap<OrderId, (bool, Option<String>)> = targets
             .iter()
-            .map(|(id, _)| (id.clone(), (false, None)))
+            .map(|id| (id.clone(), (false, None)))
             .collect();
-
-        // 事件驅動：訂閱執行事件流
-        let mut rx = {
-            let eng = runtime.engine.lock().await;
-            eng.subscribe_execution_events()
-        };
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         while Instant::now() < deadline && !pending.is_empty() {

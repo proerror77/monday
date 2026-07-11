@@ -10,6 +10,7 @@ engine:
   flip_policy: { OnTimer: 100000 }
   ack_timeout_ms: 3000
   reconcile_interval_ms: 5000
+  balance_reconcile_tolerance_usd: 1
   auto_cancel_exchange_only: false
 
 accounts:
@@ -57,4 +58,3 @@ router: null
 infra: null
 
 strategy_accounts: {}
-

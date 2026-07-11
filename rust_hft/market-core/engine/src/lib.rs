@@ -1421,6 +1421,10 @@ impl Engine {
 
     /// 暫停交易（不生成新訂單）
     pub fn pause_trading(&mut self) {
+        if self.stats.trading_mode == TradingMode::Emergency {
+            warn!("Sentinel: 緊急模式已鎖定，忽略降級為暫停的請求");
+            return;
+        }
         warn!("Sentinel: 暫停交易");
         self.stats.trading_mode = TradingMode::Paused;
     }
@@ -1911,5 +1915,15 @@ mod tests {
             engine.submit_order_intent(test_intent()),
             Err(HftError::Risk(_))
         ));
+    }
+
+    #[test]
+    fn emergency_mode_cannot_be_downgraded_to_pause() {
+        let mut engine = Engine::new(EngineConfig::default());
+        engine.emergency_exit();
+
+        engine.pause_trading();
+
+        assert_eq!(engine.trading_mode(), TradingMode::Emergency);
     }
 }

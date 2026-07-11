@@ -73,6 +73,8 @@ pub(crate) fn load_config_from_str(
     // Legacy path first for backwards compatibility
     if let Ok(mut config) = serde_yaml::from_str::<SystemConfig>(&expanded_content) {
         normalize_accounts(&mut config);
+        validate_runtime_config(&config)
+            .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
         return Ok(config);
     }
 
@@ -88,6 +90,8 @@ pub(crate) fn load_config_from_str(
             let mut cfg = convert_shared_config(shared_cfg)
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
             cfg.quotes_only = quotes_only_flag;
+            validate_runtime_config(&cfg)
+                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
             return Ok(cfg);
         }
     }
@@ -109,7 +113,21 @@ fn legacy_load_with_templates(content: &str) -> Result<SystemConfig, Box<dyn std
     }
     let mut config: SystemConfig = serde_yaml::from_value(root)?;
     normalize_accounts(&mut config);
+    validate_runtime_config(&config)
+        .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
     Ok(config)
+}
+
+fn validate_runtime_config(config: &SystemConfig) -> Result<(), LoaderError> {
+    let mut errors = Vec::new();
+    if config.engine.balance_reconcile_tolerance_usd < Decimal::ZERO {
+        errors.push("engine.balance_reconcile_tolerance_usd must be non-negative".to_string());
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LoaderError::Validation(errors))
+    }
 }
 
 fn convert_shared_config(shared_cfg: SharedSystemConfig) -> Result<SystemConfig, LoaderError> {
@@ -121,6 +139,7 @@ fn convert_shared_config(shared_cfg: SharedSystemConfig) -> Result<SystemConfig,
         cpu_affinity: CpuAffinityConfig::default(),
         ack_timeout_ms: shared_cfg.engine.ack_timeout_ms,
         reconcile_interval_ms: shared_cfg.engine.reconcile_interval_ms,
+        balance_reconcile_tolerance_usd: shared_cfg.engine.balance_reconcile_tolerance_usd,
         auto_cancel_exchange_only: shared_cfg.engine.auto_cancel_exchange_only,
         execution_queue: ExecutionQueueSettings::default(),
     };
@@ -1168,5 +1187,17 @@ risk:
             .all(|id| id.venue_id() == Some(VenueId::BINANCE_TOKENIZED_SECURITIES)));
         assert!(!config.risk.tokenized_securities.allow_trading);
         assert!(config.strategies.is_empty());
+    }
+
+    #[test]
+    fn negative_balance_reconciliation_tolerance_is_rejected() {
+        let mut config = SystemConfig::default();
+        config.engine.balance_reconcile_tolerance_usd = Decimal::NEGATIVE_ONE;
+        let yaml = serde_yaml::to_string(&config).expect("serialize config");
+
+        let error = load_config_from_str(&yaml).expect_err("negative tolerance");
+        assert!(error
+            .to_string()
+            .contains("balance_reconcile_tolerance_usd"));
     }
 }

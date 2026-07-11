@@ -6,6 +6,7 @@ engine:
   top_n: 10
   ack_timeout_ms: 2000
   reconcile_interval_ms: 2000
+  balance_reconcile_tolerance_usd: 1
   auto_cancel_exchange_only: false
 
 venues:
@@ -60,4 +61,3 @@ risk:
 strategy_accounts:
   sA: mock_a
   sB: mock_b
-

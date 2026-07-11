@@ -224,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cpu_affinity: runtime::system_builder::CpuAffinityConfig::default(),
                 ack_timeout_ms: 3000,
                 reconcile_interval_ms: 5000,
+                balance_reconcile_tolerance_usd: rust_decimal::Decimal::ONE,
                 auto_cancel_exchange_only: false,
                 execution_queue: ExecutionQueueSettings::default(),
             };
