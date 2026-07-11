@@ -2586,6 +2586,7 @@ dependencies = [
  "hft-integration",
  "hft-ports",
  "reqwest",
+ "rust_decimal",
  "serde",
  "serde_json",
  "tokio",

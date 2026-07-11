@@ -10,14 +10,13 @@ use execution::{
 // Re-export ExecutionMode for backwards compatibility
 pub use execution::ExecutionMode;
 use futures::{stream, StreamExt};
-use hft_core::{
-    AccountCapability, AssetClass, HftResult, OrderId, Price, ProductType, Quantity,
-};
+use hft_core::{AccountCapability, AssetClass, HftResult, OrderId, Price, ProductType, Quantity};
 use integration::{
     http::{HttpClient, HttpClientConfig},
     signing::{BinanceCredentials, BinanceSigner},
 };
 use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -50,6 +49,130 @@ pub struct BinanceExecutionClient {
     resilient_executor: Option<Arc<ResilientExecutor>>,
     // 告警回調
     alert_callback: Option<AlertCallback>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[allow(dead_code)]
+struct BinanceOrder {
+    symbol: String,
+    #[serde(rename = "orderId")]
+    order_id: u64,
+    #[serde(rename = "clientOrderId")]
+    client_order_id: String,
+    price: String,
+    #[serde(rename = "origQty")]
+    orig_qty: String,
+    #[serde(rename = "executedQty")]
+    executed_qty: String,
+    status: String,
+    time: u64,
+    #[serde(rename = "updateTime")]
+    update_time: u64,
+    side: String,
+    r#type: String,
+}
+
+fn parse_binance_open_order(order: BinanceOrder) -> HftResult<OpenOrder> {
+    if order.order_id == 0 || order.symbol.is_empty() || order.client_order_id.is_empty() {
+        return Err(hft_core::HftError::Parse(
+            "Binance open order is missing an identifier or symbol".to_string(),
+        ));
+    }
+
+    let side = match order.side.as_str() {
+        "BUY" => hft_core::Side::Buy,
+        "SELL" => hft_core::Side::Sell,
+        value => {
+            return Err(hft_core::HftError::Parse(format!(
+                "Binance open order {} has unknown side {value}",
+                order.order_id
+            )))
+        }
+    };
+    let order_type = match order.r#type.as_str() {
+        "MARKET" => hft_core::OrderType::Market,
+        "LIMIT" => hft_core::OrderType::Limit,
+        value => {
+            return Err(hft_core::HftError::Parse(format!(
+                "Binance open order {} has unsupported order type {value}",
+                order.order_id
+            )))
+        }
+    };
+    let original = order.orig_qty.parse::<Decimal>().map_err(|error| {
+        hft_core::HftError::Parse(format!(
+            "Binance open order {} has invalid origQty: {error}",
+            order.order_id
+        ))
+    })?;
+    let filled = order.executed_qty.parse::<Decimal>().map_err(|error| {
+        hft_core::HftError::Parse(format!(
+            "Binance open order {} has invalid executedQty: {error}",
+            order.order_id
+        ))
+    })?;
+    if original <= Decimal::ZERO || filled < Decimal::ZERO || filled > original {
+        return Err(hft_core::HftError::Parse(format!(
+            "Binance open order {} has inconsistent quantities",
+            order.order_id
+        )));
+    }
+
+    let price = match order_type {
+        hft_core::OrderType::Market => None,
+        hft_core::OrderType::Limit => Some(Price::from_str(&order.price).map_err(|error| {
+            hft_core::HftError::Parse(format!(
+                "Binance open order {} has invalid price: {error}",
+                order.order_id
+            ))
+        })?),
+    };
+    let status = match order.status.as_str() {
+        "NEW" => ports::OrderStatus::New,
+        "PARTIALLY_FILLED" => ports::OrderStatus::PartiallyFilled,
+        "FILLED" => ports::OrderStatus::Filled,
+        "CANCELED" => ports::OrderStatus::Canceled,
+        "REJECTED" => ports::OrderStatus::Rejected,
+        "EXPIRED" => ports::OrderStatus::Expired,
+        value => {
+            return Err(hft_core::HftError::Parse(format!(
+                "Binance open order {} has unknown status {value}",
+                order.order_id
+            )))
+        }
+    };
+    let created_at = order.time.checked_mul(1_000).ok_or_else(|| {
+        hft_core::HftError::Parse(format!(
+            "Binance open order {} creation timestamp overflow",
+            order.order_id
+        ))
+    })?;
+    let updated_at = order.update_time.checked_mul(1_000).ok_or_else(|| {
+        hft_core::HftError::Parse(format!(
+            "Binance open order {} update timestamp overflow",
+            order.order_id
+        ))
+    })?;
+    if created_at == 0 || updated_at < created_at {
+        return Err(hft_core::HftError::Parse(format!(
+            "Binance open order {} has invalid timestamps",
+            order.order_id
+        )));
+    }
+
+    Ok(OpenOrder {
+        order_id: hft_core::OrderId(order.order_id.to_string()),
+        symbol: hft_core::Symbol::from(order.symbol),
+        side,
+        order_type,
+        original_quantity: Quantity(original),
+        remaining_quantity: Quantity(original - filled),
+        filled_quantity: Quantity(filled),
+        price,
+        status,
+        created_at,
+        updated_at,
+    })
 }
 
 impl BinanceExecutionClient {
@@ -132,9 +255,11 @@ impl BinanceExecutionClient {
     /// 獲取 Signer 引用
     #[inline]
     fn get_signer(&self) -> HftResult<&BinanceSigner> {
-        self.signer
-            .as_ref()
-            .ok_or_else(|| hft_core::HftError::Execution("Signer not initialized - missing credentials".to_string()))
+        self.signer.as_ref().ok_or_else(|| {
+            hft_core::HftError::Execution(
+                "Signer not initialized - missing credentials".to_string(),
+            )
+        })
     }
 
     /// 執行帶韌性保護的操作
@@ -510,13 +635,9 @@ impl ExecutionClient for BinanceExecutionClient {
                     CircuitState::HalfOpen => return,
                 };
 
-                let alert = ExecutionAlert::new(
-                    alert_type,
-                    "binance",
-                    "execution",
-                    &cb_alert.message,
-                )
-                .with_failure_count(cb_alert.failure_count);
+                let alert =
+                    ExecutionAlert::new(alert_type, "binance", "execution", &cb_alert.message)
+                        .with_failure_count(cb_alert.failure_count);
 
                 alert_cb(alert);
             });
@@ -750,72 +871,14 @@ impl ExecutionClient for BinanceExecutionClient {
             .await
             .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
 
-        // 響應為陣列
-        #[derive(Debug, serde::Deserialize)]
-        #[allow(dead_code)]
-        struct BinanceOrder {
-            symbol: String,
-            #[serde(rename = "orderId")]
-            order_id: u64,
-            #[serde(rename = "clientOrderId")]
-            client_order_id: String,
-            price: String,
-            #[serde(rename = "origQty")]
-            orig_qty: String,
-            #[serde(rename = "executedQty")]
-            executed_qty: String,
-            status: String,
-            time: u64,
-            #[serde(rename = "updateTime")]
-            update_time: u64,
-            side: String,
-            r#type: String,
-        }
-
         let items: Vec<BinanceOrder> = HttpClient::parse_json(resp)
             .await
             .map_err(|e| hft_core::HftError::Serialization(e.to_string()))?;
 
         // 映射到統一 OpenOrder
         let mut out = Vec::new();
-        for it in items {
-            let side = match it.side.as_str() {
-                "BUY" | "Buy" | "buy" => hft_core::Side::Buy,
-                _ => hft_core::Side::Sell,
-            };
-            let order_type = match it.r#type.as_str() {
-                "MARKET" | "Market" | "market" => hft_core::OrderType::Market,
-                _ => hft_core::OrderType::Limit,
-            };
-            let qty =
-                hft_core::Quantity::from_str(&it.orig_qty).unwrap_or(hft_core::Quantity::zero());
-            let filled = hft_core::Quantity::from_str(&it.executed_qty)
-                .unwrap_or(hft_core::Quantity::zero());
-            let remaining = hft_core::Quantity(qty.0 - filled.0);
-            let price = hft_core::Price::from_str(&it.price).ok();
-            let status = match it.status.as_str() {
-                "NEW" => ports::OrderStatus::New,
-                "PARTIALLY_FILLED" => ports::OrderStatus::PartiallyFilled,
-                "FILLED" => ports::OrderStatus::Filled,
-                "CANCELED" => ports::OrderStatus::Canceled,
-                "REJECTED" => ports::OrderStatus::Rejected,
-                "EXPIRED" => ports::OrderStatus::Expired,
-                _ => ports::OrderStatus::Accepted,
-            };
-
-            out.push(OpenOrder {
-                order_id: hft_core::OrderId(it.order_id.to_string()),
-                symbol: hft_core::Symbol::from(it.symbol),
-                side,
-                order_type,
-                original_quantity: qty,
-                remaining_quantity: remaining,
-                filled_quantity: filled,
-                price,
-                status,
-                created_at: it.time * 1000,        // ms -> μs
-                updated_at: it.update_time * 1000, // ms -> μs
-            });
+        for item in items {
+            out.push(parse_binance_open_order(item)?);
         }
 
         Ok(out)
@@ -929,10 +992,9 @@ mod tests {
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = Arc::clone(&called);
 
-        let client = BinanceExecutionClient::new(config)
-            .with_alert_callback(move |_alert| {
-                called_clone.store(true, Ordering::SeqCst);
-            });
+        let client = BinanceExecutionClient::new(config).with_alert_callback(move |_alert| {
+            called_clone.store(true, Ordering::SeqCst);
+        });
 
         // Alert callback should be set
         assert!(client.alert_callback.is_some());
@@ -1056,6 +1118,61 @@ mod tests {
         assert!(err.to_string().contains("requires API credentials"));
     }
 
+    #[test]
+    fn open_order_parser_rejects_unknown_side_and_invalid_quantities() {
+        let mut order = BinanceOrder {
+            symbol: "BTCUSDT".to_string(),
+            order_id: 42,
+            client_order_id: "client-42".to_string(),
+            price: "50000".to_string(),
+            orig_qty: "1".to_string(),
+            executed_qty: "0".to_string(),
+            status: "NEW".to_string(),
+            time: 1,
+            update_time: 2,
+            side: "UNKNOWN".to_string(),
+            r#type: "LIMIT".to_string(),
+        };
+        assert!(parse_binance_open_order(order.clone()).is_err());
+
+        order.side = "BUY".to_string();
+        order.executed_qty = "2".to_string();
+        assert!(parse_binance_open_order(order).is_err());
+    }
+
+    #[test]
+    fn open_order_parser_rejects_unknown_status_and_order_type() {
+        let mut order = BinanceOrder {
+            symbol: "BTCUSDT".to_string(),
+            order_id: 42,
+            client_order_id: "client-42".to_string(),
+            price: "50000".to_string(),
+            orig_qty: "1".to_string(),
+            executed_qty: "0".to_string(),
+            status: "MYSTERY".to_string(),
+            time: 1,
+            update_time: 2,
+            side: "BUY".to_string(),
+            r#type: "LIMIT".to_string(),
+        };
+        assert!(parse_binance_open_order(order.clone()).is_err());
+
+        order.status = "NEW".to_string();
+        order.r#type = "STOP_LOSS_LIMIT".to_string();
+        assert!(parse_binance_open_order(order).is_err());
+    }
+
+    #[test]
+    fn open_order_deserialization_rejects_missing_required_fields() {
+        let value = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "orderId": 42,
+            "clientOrderId": "client-42"
+        });
+
+        assert!(serde_json::from_value::<BinanceOrder>(value).is_err());
+    }
+
     #[tokio::test]
     async fn tokenized_security_requires_explicit_eligibility() {
         let config = make_test_config(ExecutionMode::Paper);
@@ -1077,9 +1194,7 @@ mod tests {
         };
 
         let err = client.place_order(intent).await.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("explicit account eligibility"));
+        assert!(err.to_string().contains("explicit account eligibility"));
     }
 
     #[tokio::test]
@@ -1206,11 +1321,13 @@ mod tests {
         client.connect().await.unwrap();
 
         let order_id = OrderId("test_order_123".to_string());
-        let result = client.modify_order(
-            &order_id,
-            Some(Quantity::from_f64(0.002).unwrap()),
-            Some(Price::from_f64(51000.0).unwrap()),
-        ).await;
+        let result = client
+            .modify_order(
+                &order_id,
+                Some(Quantity::from_f64(0.002).unwrap()),
+                Some(Price::from_f64(51000.0).unwrap()),
+            )
+            .await;
         assert!(result.is_ok());
     }
 

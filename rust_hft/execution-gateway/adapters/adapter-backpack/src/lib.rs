@@ -511,96 +511,126 @@ impl BackpackExecutionClient {
 
         result
     }
-
-    fn parse_decimal(value: Option<&String>) -> Option<Decimal> {
-        value.and_then(|v| v.parse::<Decimal>().ok())
-    }
-
-    fn parse_price(value: Option<&String>) -> Option<Price> {
-        Self::parse_decimal(value).map(Price)
-    }
-
-    fn map_status(status: Option<&String>) -> OrderStatus {
-        match status.map(|s| s.as_str()) {
-            Some("New") => OrderStatus::New,
-            Some("PartiallyFilled") => OrderStatus::PartiallyFilled,
-            Some("Filled") => OrderStatus::Filled,
-            Some("Cancelled") => OrderStatus::Canceled,
-            Some("Expired") => OrderStatus::Expired,
-            Some("TriggerFailed") => OrderStatus::Rejected,
-            _ => OrderStatus::New,
-        }
-    }
-
-    fn map_order_type(order_type: Option<&String>) -> OrderType {
-        match order_type.map(|s| s.as_str()) {
-            Some("Market") => OrderType::Market,
-            Some("Limit") => OrderType::Limit,
-            _ => OrderType::Limit,
-        }
-    }
-
-    fn map_side(side: Option<&String>) -> Side {
-        match side.map(|s| s.as_str()) {
-            Some("Bid") => Side::Buy,
-            Some("Ask") => Side::Sell,
-            _ => Side::Buy,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OrderRecord {
-    #[serde(default)]
     id: String,
-    #[serde(default)]
     symbol: String,
-    #[serde(default)]
-    side: Option<String>,
-    #[serde(default)]
-    order_type: Option<String>,
-    #[serde(default)]
-    quantity: Option<String>,
-    #[serde(default)]
-    executed_quantity: Option<String>,
+    side: String,
+    order_type: String,
+    quantity: String,
+    executed_quantity: String,
     #[serde(default)]
     price: Option<String>,
-    #[serde(default)]
-    created_at: Option<u64>,
-    #[serde(default)]
-    updated_at: Option<u64>,
-    #[serde(default)]
-    status: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+    status: String,
 }
 
 impl OrderRecord {
-    fn into_open_order(self) -> Option<OpenOrder> {
-        let original_dec =
-            BackpackExecutionClient::parse_decimal(self.quantity.as_ref()).unwrap_or(Decimal::ZERO);
-        let filled_dec = BackpackExecutionClient::parse_decimal(self.executed_quantity.as_ref())
-            .unwrap_or(Decimal::ZERO);
-        let remaining_dec = (original_dec - filled_dec).max(Decimal::ZERO);
+    fn into_open_order(self) -> HftResult<OpenOrder> {
+        if self.id.is_empty() || self.symbol.is_empty() {
+            return Err(HftError::Parse(
+                "Backpack open order is missing an identifier or symbol".to_string(),
+            ));
+        }
+        let original_dec = self.quantity.parse::<Decimal>().map_err(|error| {
+            HftError::Parse(format!(
+                "Backpack open order {} has invalid quantity: {error}",
+                self.id
+            ))
+        })?;
+        let filled_dec = self.executed_quantity.parse::<Decimal>().map_err(|error| {
+            HftError::Parse(format!(
+                "Backpack open order {} has invalid executedQuantity: {error}",
+                self.id
+            ))
+        })?;
+        if original_dec <= Decimal::ZERO || filled_dec < Decimal::ZERO || filled_dec > original_dec
+        {
+            return Err(HftError::Parse(format!(
+                "Backpack open order {} has inconsistent quantities",
+                self.id
+            )));
+        }
 
-        let original_qty = Quantity(original_dec);
-        let filled_qty = Quantity(filled_dec);
-        let remaining_qty = Quantity(remaining_dec);
-        let price = BackpackExecutionClient::parse_price(self.price.as_ref());
-        let status = BackpackExecutionClient::map_status(self.status.as_ref());
-        let order_type = BackpackExecutionClient::map_order_type(self.order_type.as_ref());
-        let side = BackpackExecutionClient::map_side(self.side.as_ref());
+        let side = match self.side.as_str() {
+            "Bid" => Side::Buy,
+            "Ask" => Side::Sell,
+            value => {
+                return Err(HftError::Parse(format!(
+                    "Backpack open order {} has unknown side {value}",
+                    self.id
+                )))
+            }
+        };
+        let order_type = match self.order_type.as_str() {
+            "Market" => OrderType::Market,
+            "Limit" => OrderType::Limit,
+            value => {
+                return Err(HftError::Parse(format!(
+                    "Backpack open order {} has unsupported order type {value}",
+                    self.id
+                )))
+            }
+        };
+        let status = match self.status.as_str() {
+            "New" => OrderStatus::New,
+            "PartiallyFilled" => OrderStatus::PartiallyFilled,
+            "Filled" => OrderStatus::Filled,
+            "Cancelled" => OrderStatus::Canceled,
+            "Expired" => OrderStatus::Expired,
+            "TriggerFailed" => OrderStatus::Rejected,
+            value => {
+                return Err(HftError::Parse(format!(
+                    "Backpack open order {} has unknown status {value}",
+                    self.id
+                )))
+            }
+        };
+        let price = match order_type {
+            OrderType::Market => None,
+            OrderType::Limit => {
+                let raw = self.price.as_deref().ok_or_else(|| {
+                    HftError::Parse(format!("Backpack limit order {} is missing price", self.id))
+                })?;
+                Some(Price::from_str(raw).map_err(|error| {
+                    HftError::Parse(format!(
+                        "Backpack open order {} has invalid price: {error}",
+                        self.id
+                    ))
+                })?)
+            }
+        };
+        let created_at = self.created_at.checked_mul(1_000).ok_or_else(|| {
+            HftError::Parse(format!(
+                "Backpack open order {} creation timestamp overflow",
+                self.id
+            ))
+        })?;
+        let updated_at = self.updated_at.checked_mul(1_000).ok_or_else(|| {
+            HftError::Parse(format!(
+                "Backpack open order {} update timestamp overflow",
+                self.id
+            ))
+        })?;
+        if created_at == 0 || updated_at < created_at {
+            return Err(HftError::Parse(format!(
+                "Backpack open order {} has invalid timestamps",
+                self.id
+            )));
+        }
 
-        let created_at = self.created_at.unwrap_or(0) * 1000;
-        let updated_at = self.updated_at.unwrap_or(self.created_at.unwrap_or(0)) * 1000;
-
-        Some(OpenOrder {
+        Ok(OpenOrder {
             order_id: OrderId(self.id),
             symbol: Symbol::from(self.symbol),
             side,
             order_type,
-            original_quantity: original_qty,
-            remaining_quantity: remaining_qty,
-            filled_quantity: filled_qty,
+            original_quantity: Quantity(original_dec),
+            remaining_quantity: Quantity(original_dec - filled_dec),
+            filled_quantity: Quantity(filled_dec),
             price,
             status,
             created_at,
@@ -705,9 +735,7 @@ impl ExecutionClient for BackpackExecutionClient {
 
         let mut open_orders = Vec::new();
         for record in orders {
-            if let Some(order) = record.into_open_order() {
-                open_orders.push(order);
-            }
+            open_orders.push(record.into_open_order()?);
         }
 
         Ok(open_orders)
@@ -800,5 +828,54 @@ mod tests {
 
         let err = client.list_open_orders().await.unwrap_err();
         assert!(err.to_string().contains("only supported in Live mode"));
+    }
+
+    fn valid_order_record() -> OrderRecord {
+        OrderRecord {
+            id: "42".to_string(),
+            symbol: "BTC_USDT".to_string(),
+            side: "Bid".to_string(),
+            order_type: "Limit".to_string(),
+            quantity: "1".to_string(),
+            executed_quantity: "0".to_string(),
+            price: Some("50000".to_string()),
+            created_at: 1,
+            updated_at: 2,
+            status: "New".to_string(),
+        }
+    }
+
+    #[test]
+    fn open_order_parser_rejects_missing_or_unknown_required_values() {
+        let mut record = valid_order_record();
+        record.side = "Unknown".to_string();
+        assert!(record.into_open_order().is_err());
+
+        let mut record = valid_order_record();
+        record.status = "Unknown".to_string();
+        assert!(record.into_open_order().is_err());
+
+        let mut record = valid_order_record();
+        record.price = None;
+        assert!(record.into_open_order().is_err());
+    }
+
+    #[test]
+    fn open_order_parser_rejects_filled_quantity_above_original() {
+        let mut record = valid_order_record();
+        record.executed_quantity = "2".to_string();
+
+        assert!(record.into_open_order().is_err());
+    }
+
+    #[test]
+    fn open_order_deserialization_rejects_missing_required_fields() {
+        let value = serde_json::json!({
+            "id": "42",
+            "symbol": "BTC_USDT",
+            "side": "Bid"
+        });
+
+        assert!(serde_json::from_value::<OrderRecord>(value).is_err());
     }
 }
