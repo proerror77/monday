@@ -16,12 +16,23 @@ jobs:
         include:
           - dockerfile: deployment/docker/Dockerfile.ml_workspace
             context: .
+            build_args: PYTHON_VERSION=3.11
           - dockerfile: rust_hft/docker/Dockerfile
             context: rust_hft
           - dockerfile: rust_hft/deployment/docker/Dockerfile.trading
             context: rust_hft
           - dockerfile: deployment/docker/Dockerfile.ops_workspace
             context: .
+            build_args: PYTHON_VERSION=3.11
+          - dockerfile: deploy/Dockerfile.hft
+            context: .
+            build_args: TARGET=live
+          - dockerfile: deploy/Dockerfile.hft
+            context: .
+            build_args: TARGET=collector
+          - dockerfile: deploy/Dockerfile.hft
+            context: .
+            build_args: TARGET=paper
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,5 +52,4 @@ jobs:
           load: false
           provenance: false
           sbom: false
-          build-args: |
-            PYTHON_VERSION=3.11
+          build-args: ${{ matrix.build_args }}

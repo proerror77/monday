@@ -153,8 +153,8 @@ services:
     ports:
       - "9090:9090"
     depends_on:
-      - clickhouse
-      - collector
+      clickhouse:
+        condition: service_healthy
     restart: unless-stopped
 
   # ============================================
