@@ -134,15 +134,7 @@ async fn run_sentinel_loop(
 
         // 根據動作執行操作
         match action {
-            SentinelAction::Continue => {
-                // 正常繼續，檢查是否需要恢復
-                let mut engine = engine_arc.lock().await;
-                if engine.trading_mode() == engine::TradingMode::Degraded {
-                    // 如果之前是降頻模式，現在恢復正常
-                    engine.resume_trading();
-                    info!("從降頻模式恢復正常交易");
-                }
-            }
+            SentinelAction::Continue => {}
             SentinelAction::Warn => {
                 // 警告已在 Sentinel 內部記錄
             }
