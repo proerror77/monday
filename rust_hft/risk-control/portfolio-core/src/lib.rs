@@ -106,10 +106,8 @@ impl Portfolio {
                     }
                     self.apply_fill(&symbol, side, *price, *quantity);
                 }
-                // 更新該品種的市場價格為成交價（如果沒有更好的市場價格）
-                if !self.market_prices.contains_key(&symbol) {
-                    self.market_prices.insert(symbol.clone(), *price);
-                }
+                // Fill price is the freshest executable fallback mark observed by this ledger.
+                self.market_prices.insert(symbol.clone(), *price);
                 // 重新計算未實現盈虧
                 self.recalculate_unrealized_pnl();
             }
@@ -228,6 +226,9 @@ impl Portfolio {
 
         pos.quantity = Quantity(new_qty);
         self.view.cash_balance -= price.0 * delta;
+        if new_qty == Decimal::ZERO {
+            self.view.positions.remove(symbol);
+        }
     }
 
     /// Export portfolio state for persistence
@@ -361,6 +362,8 @@ mod tests {
         assert_eq!(position.avg_price.0, Decimal::from(110));
         assert_eq!(view.cash_balance, Decimal::from(670));
         assert_eq!(view.realized_pnl, Decimal::ZERO);
+        assert_eq!(view.unrealized_pnl, Decimal::from(60));
+        assert_eq!(view.equity(), Decimal::from(1060));
 
         fill(&mut portfolio, "S-1", "f3", &symbol, Side::Sell, 140, 1);
         let view = portfolio.reader().load();
@@ -372,9 +375,8 @@ mod tests {
         fill(&mut portfolio, "S-2", "f4", &symbol, Side::Sell, 90, 2);
         mark(&mut portfolio, &symbol, 90);
         let view = portfolio.reader().load();
-        let position = view.positions.get(&symbol).unwrap();
-        assert_eq!(position.quantity.0, Decimal::ZERO);
-        assert_eq!(position.avg_price.0, Decimal::ZERO);
+        assert!(!view.positions.contains_key(&symbol));
+        assert!(view.positions.is_empty());
         assert_eq!(view.realized_pnl, Decimal::from(-10));
         assert_eq!(view.cash_balance, Decimal::from(990));
         assert_eq!(view.equity(), Decimal::from(990));

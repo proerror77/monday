@@ -521,7 +521,7 @@ pub struct RiskConfigUpdate {
 pub struct RiskConfigSnapshot {
     pub max_drawdown_pct: f64,
     pub max_position_usd: f64,
-    pub max_order_size_usd: f64,
+    pub max_order_size_usd: Option<f64>,
     pub latency_threshold_us: i64,
     pub max_orders_per_second: i32,
 }

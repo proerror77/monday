@@ -529,12 +529,13 @@ impl RiskManager for SimplifiedProfessionalRiskManager {
                 .to_string()
                 .parse()
                 .unwrap_or(0.0),
-            max_order_size_usd: self
-                .config
-                .max_order_notional
-                .to_string()
-                .parse()
-                .unwrap_or(0.0),
+            max_order_size_usd: Some(
+                self.config
+                    .max_order_notional
+                    .to_string()
+                    .parse()
+                    .unwrap_or(0.0),
+            ),
             latency_threshold_us: 0, // 此實現不使用延遲閾值
             max_orders_per_second: self.config.max_orders_per_second as i32,
         }
@@ -774,7 +775,7 @@ mod tests {
 
         let snapshot = risk_manager.get_config_snapshot();
 
-        assert_eq!(snapshot.max_order_size_usd, 50000.0);
+        assert_eq!(snapshot.max_order_size_usd, Some(50000.0));
         assert_eq!(snapshot.max_position_usd, 1000000.0);
         assert_eq!(snapshot.max_orders_per_second, 100);
         assert_eq!(snapshot.max_drawdown_pct, 5.0);
@@ -802,7 +803,7 @@ mod tests {
 
         assert_eq!(snapshot.max_drawdown_pct, 8.0);
         assert_eq!(snapshot.max_position_usd, 800000.0);
-        assert_eq!(snapshot.max_order_size_usd, 80000.0);
+        assert_eq!(snapshot.max_order_size_usd, Some(80000.0));
         assert_eq!(snapshot.max_orders_per_second, 80);
     }
 

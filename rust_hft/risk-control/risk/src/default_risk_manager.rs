@@ -162,22 +162,44 @@ impl DefaultRiskManager {
             ));
         }
 
-        // 检查全局名义价值
-        if let Some(price) = &intent.price {
-            let notional = price.0 * intent.quantity.0;
-            let total_notional = account
-                .positions
-                .values()
-                .map(|p| p.avg_price.0 * p.quantity.0.abs())
-                .sum::<rust_decimal::Decimal>()
-                + notional;
+        // Orders that strictly reduce signed exposure must remain available even
+        // when another position has already pushed the account over its cap.
+        if new_position.0.abs() < current_position.0.abs() {
+            return Ok(());
+        }
 
-            if total_notional > self.config.max_global_notional {
-                return Err(format!(
-                    "超过全局名义价值限额: {:.2} > {:.2}",
-                    total_notional, self.config.max_global_notional
-                ));
-            }
+        let reference_price = intent
+            .price
+            .map(|price| price.0)
+            .or_else(|| {
+                account.positions.get(&intent.symbol).and_then(|position| {
+                    if position.quantity.0 == Decimal::ZERO {
+                        None
+                    } else {
+                        Some(
+                            position.avg_price.0
+                                + position.unrealized_pnl / position.quantity.0,
+                        )
+                    }
+                })
+            })
+            .ok_or_else(|| "无法计算无价格新敞口的全局名义价值".to_string())?;
+        let other_notional = account
+            .positions
+            .iter()
+            .filter(|(symbol, _)| *symbol != &intent.symbol)
+            .map(|(_, position)| {
+                (position.avg_price.0 * position.quantity.0 + position.unrealized_pnl).abs()
+            })
+            .sum::<Decimal>();
+        let projected_notional =
+            other_notional + reference_price.abs() * new_position.0.abs();
+
+        if projected_notional > self.config.max_global_notional {
+            return Err(format!(
+                "超过全局名义价值限额: {:.2} > {:.2}",
+                projected_notional, self.config.max_global_notional
+            ));
         }
 
         Ok(())
@@ -501,13 +523,7 @@ impl RiskManager for DefaultRiskManager {
                 .to_string()
                 .parse()
                 .unwrap_or(0.0),
-            max_order_size_usd: self
-                .config
-                .max_position_per_symbol
-                .0
-                .to_string()
-                .parse()
-                .unwrap_or(0.0),
+            max_order_size_usd: None,
             latency_threshold_us: self.config.staleness_threshold_us as i64,
             max_orders_per_second: self.config.max_orders_per_second as i32,
         }
@@ -721,6 +737,39 @@ mod tests {
         let result = mgr.check_position_limits(&intent, &account);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("全局名义价值限额"));
+    }
+
+    #[test]
+    fn reduce_and_close_orders_bypass_an_already_breached_global_cap() {
+        let config = RiskConfig {
+            max_position_per_symbol: Quantity::from_f64(100.0).unwrap(),
+            max_global_notional: Decimal::from(1000),
+            ..Default::default()
+        };
+        let mgr = DefaultRiskManager::new(config);
+        let symbol = Symbol::new("BTCUSDT");
+        let mut account = AccountView::default();
+        account.positions.insert(
+            symbol.clone(),
+            Position {
+                symbol: symbol.clone(),
+                quantity: Quantity::from_f64(11.0).unwrap(),
+                avg_price: Price::from_f64(100.0).unwrap(),
+                unrealized_pnl: Decimal::ZERO,
+            },
+        );
+
+        let reduce = create_test_intent("BTCUSDT", Side::Sell, 1.0, Some(100.0));
+        let close = create_test_intent("BTCUSDT", Side::Sell, 11.0, Some(100.0));
+        let increase = create_test_intent("BTCUSDT", Side::Buy, 1.0, Some(100.0));
+        assert!(mgr.check_position_limits(&reduce, &account).is_ok());
+        assert!(mgr.check_position_limits(&close, &account).is_ok());
+        assert!(mgr.check_position_limits(&increase, &account).is_err());
+
+        account.positions.get_mut(&symbol).unwrap().quantity =
+            Quantity::from_f64(-11.0).unwrap();
+        let cover = create_test_intent("BTCUSDT", Side::Buy, 1.0, Some(100.0));
+        assert!(mgr.check_position_limits(&cover, &account).is_ok());
     }
 
     #[test]
@@ -1069,8 +1118,7 @@ mod tests {
         assert_eq!(snapshot.max_position_usd, 1000000.0);
         assert_eq!(snapshot.max_orders_per_second, 25);
         assert_eq!(snapshot.latency_threshold_us, 8000);
-        // max_order_size_usd comes from max_position_per_symbol
-        assert_eq!(snapshot.max_order_size_usd, 50.0);
+        assert_eq!(snapshot.max_order_size_usd, None);
         assert_eq!(snapshot.max_drawdown_pct, 7.5);
     }
 

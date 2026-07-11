@@ -741,12 +741,13 @@ impl RiskManager for EnhancedRiskManager {
                 .to_string()
                 .parse()
                 .unwrap_or(0.0),
-            max_order_size_usd: self
-                .config
-                .max_order_notional
-                .to_string()
-                .parse()
-                .unwrap_or(0.0),
+            max_order_size_usd: Some(
+                self.config
+                    .max_order_notional
+                    .to_string()
+                    .parse()
+                    .unwrap_or(0.0),
+            ),
             latency_threshold_us: self.config.market_data_staleness_us as i64,
             max_orders_per_second: self.config.max_orders_per_second as i32,
         }
@@ -960,7 +961,7 @@ mod tests {
 
         let snapshot = risk_manager.get_config_snapshot();
 
-        assert_eq!(snapshot.max_order_size_usd, 50_000.0);
+        assert_eq!(snapshot.max_order_size_usd, Some(50_000.0));
         assert_eq!(snapshot.max_position_usd, 500_000.0);
         assert_eq!(snapshot.max_orders_per_second, 50);
         assert_eq!(snapshot.latency_threshold_us, 8_000);
@@ -988,7 +989,7 @@ mod tests {
 
         assert_eq!(snapshot.max_drawdown_pct, 6.0);
         assert_eq!(snapshot.max_position_usd, 600_000.0);
-        assert_eq!(snapshot.max_order_size_usd, 60_000.0);
+        assert_eq!(snapshot.max_order_size_usd, Some(60_000.0));
         assert_eq!(snapshot.latency_threshold_us, 12_000);
         assert_eq!(snapshot.max_orders_per_second, 60);
     }
