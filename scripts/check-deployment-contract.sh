@@ -6,7 +6,7 @@ cd "$(git rev-parse --show-toplevel)"
 require_text() {
   local file="$1"
   local text="$2"
-  if ! rg --fixed-strings --quiet -- "$text" "$file"; then
+  if ! grep -Fq -- "$text" "$file"; then
     printf 'deployment contract missing in %s: %s\n' "$file" "$text" >&2
     exit 1
   fi
@@ -15,7 +15,7 @@ require_text() {
 reject_text() {
   local file="$1"
   local text="$2"
-  if rg --fixed-strings --quiet -- "$text" "$file"; then
+  if grep -Fq -- "$text" "$file"; then
     printf 'deployment contract forbids in %s: %s\n' "$file" "$text" >&2
     exit 1
   fi
