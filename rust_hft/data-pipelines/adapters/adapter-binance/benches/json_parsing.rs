@@ -11,7 +11,7 @@
 //! cargo bench --bench json_parsing --features json-simd
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use data_adapter_binance::MessageConverter;
 
 /// 真實的 Binance 深度更新消息樣本
@@ -78,6 +78,8 @@ const KLINE_EVENT_JSON: &str = r#"{
     }
 }"#;
 
+const BOOK_TICKER_COMBINED_JSON: &[u8] = br#"{"stream":"btcusdt@bookTicker","data":{"u":400900217,"s":"BTCUSDT","b":"67188.10","B":"31.21000000","a":"67188.20","A":"40.66000000"}}"#;
+
 /// 基準測試：解析深度更新消息
 fn bench_parse_depth_update(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse_depth_update");
@@ -135,9 +137,27 @@ fn bench_parse_mixed_batch(c: &mut Criterion) {
         b.iter(|| {
             for msg in &messages {
                 let result = MessageConverter::parse_stream_message(black_box(msg));
-                black_box(result);
+                let _ = black_box(result);
             }
         })
+    });
+
+    group.finish();
+}
+
+fn bench_parse_realtime_book_ticker(c: &mut Criterion) {
+    let mut group = c.benchmark_group("parse_realtime_book_ticker");
+    group.throughput(Throughput::Bytes(BOOK_TICKER_COMBINED_JSON.len() as u64));
+
+    group.bench_function("mutable_combined_frame", |b| {
+        b.iter_batched_ref(
+            || BOOK_TICKER_COMBINED_JSON.to_vec(),
+            |frame| {
+                let result = MessageConverter::parse_stream_message_bytes(black_box(frame));
+                let _ = black_box(result);
+            },
+            BatchSize::SmallInput,
+        )
     });
 
     group.finish();
@@ -148,6 +168,7 @@ criterion_group!(
     bench_parse_depth_update,
     bench_parse_trade_event,
     bench_parse_kline_event,
-    bench_parse_mixed_batch
+    bench_parse_mixed_batch,
+    bench_parse_realtime_book_ticker
 );
 criterion_main!(benches);

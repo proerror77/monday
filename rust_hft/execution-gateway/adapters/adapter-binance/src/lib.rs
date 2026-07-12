@@ -15,12 +15,12 @@ use integration::{
     http::{HttpClient, HttpClientConfig},
     signing::{BinanceCredentials, BinanceSigner},
 };
-use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
+use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct BinanceExecutionConfig {
@@ -49,6 +49,29 @@ pub struct BinanceExecutionClient {
     resilient_executor: Option<Arc<ResilientExecutor>>,
     // 告警回調
     alert_callback: Option<AlertCallback>,
+    next_client_order_id: Option<String>,
+}
+
+fn uses_exchange_api(mode: ExecutionMode) -> bool {
+    matches!(mode, ExecutionMode::Live | ExecutionMode::Testnet)
+}
+
+fn classify_binance_http_error(
+    status: reqwest::StatusCode,
+    retry_after: Option<&str>,
+    body: &str,
+) -> hft_core::HftError {
+    let retry = retry_after
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("; retry-after={value}s"))
+        .unwrap_or_default();
+    let detail = format!("Binance HTTP {status}{retry}: {body}");
+    match status.as_u16() {
+        418 | 429 => hft_core::HftError::RateLimit(detail),
+        401 | 403 => hft_core::HftError::Authentication(detail),
+        400..=499 => hft_core::HftError::Exchange(detail),
+        _ => hft_core::HftError::Network(detail),
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -197,6 +220,7 @@ impl BinanceExecutionClient {
             listen_key: None,
             resilient_executor: None,
             alert_callback: None,
+            next_client_order_id: None,
         }
     }
 
@@ -329,16 +353,34 @@ impl BinanceExecutionClient {
 #[async_trait]
 impl ExecutionClient for BinanceExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
+        let client_order_id = self.next_client_order_id.take().unwrap_or_else(|| {
+            if matches!(self.mode, ExecutionMode::Paper) {
+                format!("BINANCE_PAPER_{:x}", hft_core::now_micros())
+            } else {
+                format!("BINANCE_{:x}", hft_core::now_micros())
+            }
+        });
+        if client_order_id.is_empty()
+            || client_order_id.len() > 36
+            || !client_order_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/".contains(&byte))
+        {
+            return Err(hft_core::HftError::InvalidOrder(
+                "Binance client order id must be 1-36 ASCII characters [A-Za-z0-9-_.:/]"
+                    .to_string(),
+            ));
+        }
         self.validate_product_gate(&intent)?;
 
-        // Live 模式（需要 signer）
-        if self.mode == ExecutionMode::Live && self.signer.is_none() {
+        // Live/Testnet 模式都必須有 signer，不能靜默退回 Paper。
+        if uses_exchange_api(self.mode) && self.signer.is_none() {
             return Err(hft_core::HftError::Authentication(
-                "Binance live order requires API credentials".to_string(),
+                "Binance live/testnet order requires API credentials".to_string(),
             ));
         }
 
-        if self.mode == ExecutionMode::Live && self.signer.is_some() {
+        if uses_exchange_api(self.mode) && self.signer.is_some() {
             if self.http_client.is_none() {
                 self.ensure_http()?;
             }
@@ -365,6 +407,7 @@ impl ExecutionClient for BinanceExecutionClient {
                 params.insert("price".to_string(), p.0.to_string());
             }
             params.insert("quantity".to_string(), intent.quantity.0.to_string());
+            params.insert("newClientOrderId".to_string(), client_order_id.clone());
             // 僅限限價單需要 TIF
             if matches!(intent.order_type, hft_core::OrderType::Limit) {
                 let tif = match intent.time_in_force {
@@ -384,6 +427,21 @@ impl ExecutionClient for BinanceExecutionClient {
                 .await
                 .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
 
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let body = resp.text().await.unwrap_or_default();
+                return Err(classify_binance_http_error(
+                    status,
+                    retry_after.as_deref(),
+                    &body,
+                ));
+            }
+
             #[derive(Debug, serde::Deserialize)]
             #[allow(dead_code)]
             struct PlaceResp {
@@ -397,7 +455,17 @@ impl ExecutionClient for BinanceExecutionClient {
             }
             let pr: PlaceResp = integration::http::HttpClient::parse_json(resp)
                 .await
-                .map_err(|e| hft_core::HftError::Serialization(e.to_string()))?;
+                .map_err(|e| {
+                    hft_core::HftError::Execution(format!(
+                        "Binance accepted an order request but its response could not be decoded: {e}"
+                    ))
+                })?;
+            if pr.client_order_id != client_order_id {
+                return Err(hft_core::HftError::Execution(format!(
+                    "Binance returned mismatched client order id: expected {}, got {}",
+                    client_order_id, pr.client_order_id
+                )));
+            }
 
             let oid = OrderId(pr.order_id.to_string());
             self.order_symbol.insert(oid.0.clone(), pr.symbol);
@@ -411,7 +479,7 @@ impl ExecutionClient for BinanceExecutionClient {
         }
 
         // Paper: 立即回傳訂單ID並廣播 ACK/Fill
-        let order_id = OrderId(format!("BINANCE_PAPER_{}", hft_core::now_micros()));
+        let order_id = OrderId(client_order_id);
         info!(
             "Binance 模擬下單: {} {} {} @ {:?}",
             intent.symbol.as_str(),
@@ -451,8 +519,13 @@ impl ExecutionClient for BinanceExecutionClient {
         Ok(order_id)
     }
 
+    async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
+        self.next_client_order_id = Some(envelope.client_order_id.clone());
+        self.place_order(envelope.intent.clone()).await
+    }
+
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
-        if self.mode == ExecutionMode::Live && self.signer.is_some() {
+        if uses_exchange_api(self.mode) && self.signer.is_some() {
             if self.http_client.is_none() {
                 self.ensure_http()?;
             }
@@ -533,7 +606,7 @@ impl ExecutionClient for BinanceExecutionClient {
         new_quantity: Option<Quantity>,
         new_price: Option<Price>,
     ) -> HftResult<()> {
-        if self.mode == ExecutionMode::Live {
+        if uses_exchange_api(self.mode) {
             // Binance 原生修改有限制，這裡採用 Cancel + New 的簡化策略
             if new_quantity.is_none() && new_price.is_none() {
                 return Ok(());
@@ -595,10 +668,9 @@ impl ExecutionClient for BinanceExecutionClient {
                 tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| async move {
                     match result {
                         Ok(event) => Some(Ok(event)),
-                        Err(e) => {
-                            error!("Binance 執行事件流錯誤: {}", e);
-                            None
-                        }
+                        Err(e) => Some(Err(hft_core::HftError::Execution(format!(
+                            "Binance private execution stream lagged: {e}"
+                        )))),
                     }
                 });
             Ok(Box::pin(stream))
@@ -653,8 +725,8 @@ impl ExecutionClient for BinanceExecutionClient {
 
         info!("[Binance] 執行客戶端連接成功");
 
-        // 啟動私有 WS（Live）
-        if self.mode == ExecutionMode::Live {
+        // 啟動私有 WS（Live/Testnet）
+        if uses_exchange_api(self.mode) {
             // 1) 創建 listenKey
             let http = self.get_http()?;
             let headers = self.get_signer()?.generate_headers();
@@ -688,6 +760,10 @@ impl ExecutionClient for BinanceExecutionClient {
                 match tokio_tungstenite::connect_async(&url).await {
                     Ok((mut ws, _)) => {
                         info!("Binance 私有 WS 已連線");
+                        let _ = ws_tx.send(ExecutionEvent::ConnectionStatus {
+                            connected: true,
+                            timestamp: hft_core::now_micros(),
+                        });
                         while let Some(msg) = ws.next().await {
                             match msg {
                                 Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) => {
@@ -706,7 +782,7 @@ impl ExecutionClient for BinanceExecutionClient {
                                             let ts = v
                                                 .get("E")
                                                 .and_then(|x| x.as_u64())
-                                                .unwrap_or(hft_core::now_micros());
+                                                .unwrap_or_else(|| hft_core::now_micros() / 1000);
                                             let ts_us = ts * 1000; // ms -> μs
                                             match status {
                                                 "NEW" => {
@@ -775,6 +851,10 @@ impl ExecutionClient for BinanceExecutionClient {
                     }
                     Err(e) => warn!("Binance 私有 WS 連接失敗: {}", e),
                 }
+                let _ = ws_tx.send(ExecutionEvent::ConnectionStatus {
+                    connected: false,
+                    timestamp: hft_core::now_micros(),
+                });
             });
 
             // 3) KeepAlive listenKey（每 30 分鐘）
@@ -830,14 +910,14 @@ impl ExecutionClient for BinanceExecutionClient {
     }
 
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
-        if self.mode != ExecutionMode::Live {
+        if !uses_exchange_api(self.mode) {
             return Err(hft_core::HftError::Execution(
-                "Binance list_open_orders is only supported in Live mode".to_string(),
+                "Binance list_open_orders is only supported in Live or Testnet mode".to_string(),
             ));
         }
         let signer = self.signer.as_ref().ok_or_else(|| {
             hft_core::HftError::Authentication(
-                "Binance live list_open_orders requires API credentials".to_string(),
+                "Binance live/testnet list_open_orders requires API credentials".to_string(),
             )
         })?;
 
@@ -904,6 +984,23 @@ mod tests {
             mode,
             account_capability: AccountCapability::default(),
         }
+    }
+
+    #[test]
+    fn http_rate_limits_are_known_rejections_with_retry_after() {
+        let error = classify_binance_http_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            Some("7"),
+            r#"{"code":-1003,"msg":"Too many requests"}"#,
+        );
+
+        assert!(
+            matches!(error, hft_core::HftError::RateLimit(message) if message.contains("retry-after=7s"))
+        );
+        assert!(matches!(
+            classify_binance_http_error(reqwest::StatusCode::IM_A_TEAPOT, None, "IP banned"),
+            hft_core::HftError::RateLimit(_)
+        ));
     }
 
     #[test]
@@ -1101,12 +1198,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn testnet_without_credentials_rejects_order_instead_of_paper_fallback() {
+        let config = make_test_config(ExecutionMode::Testnet);
+        let mut client = BinanceExecutionClient::new(config);
+        let intent = OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            quantity: Quantity::from_f64(0.001).unwrap(),
+            price: Some(Price::from_f64(50000.0).unwrap()),
+            time_in_force: TimeInForce::GTC,
+            strategy_id: "test_strategy".to_string(),
+            target_venue: None,
+        };
+
+        let err = client.place_order(intent).await.unwrap_err();
+        assert!(err.to_string().contains("requires API credentials"));
+    }
+
+    #[tokio::test]
     async fn list_open_orders_requires_live_mode() {
         let config = make_test_config(ExecutionMode::Paper);
         let client = BinanceExecutionClient::new(config);
 
         let err = client.list_open_orders().await.unwrap_err();
-        assert!(err.to_string().contains("only supported in Live mode"));
+        assert!(err
+            .to_string()
+            .contains("only supported in Live or Testnet mode"));
     }
 
     #[tokio::test]

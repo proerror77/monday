@@ -14,7 +14,7 @@ pub struct SpscRingBuffer<T> {
 
 impl<T> SpscRingBuffer<T> {
     pub fn new(capacity: usize) -> Self {
-        let actual_capacity = capacity.next_power_of_two();
+        let actual_capacity = capacity.max(2).next_power_of_two();
         let mut buffer = Vec::with_capacity(actual_capacity);
         for _ in 0..actual_capacity {
             buffer.push(UnsafeCell::new(None));
@@ -37,9 +37,6 @@ impl<T> SpscRingBuffer<T> {
             let slot = &mut *self.buffer.get_unchecked(head).get();
             *slot = Some(item);
         }
-        // Memory fence to ensure data write completes before head update is visible
-        // Critical for ARM/weak memory models to prevent consumer seeing stale data
-        std::sync::atomic::fence(Ordering::Release);
         self.head.store(next_head, Ordering::Release);
         Ok(())
     }
@@ -97,6 +94,7 @@ impl<T> SpscProducer<T> {
         self.ring_buffer.utilization()
     }
 }
+#[cfg(loom)]
 impl<T> Clone for SpscProducer<T> {
     fn clone(&self) -> Self {
         Self {
@@ -107,6 +105,14 @@ impl<T> Clone for SpscProducer<T> {
 
 pub struct SpscConsumer<T> {
     ring_buffer: Arc<SpscRingBuffer<T>>,
+}
+#[cfg(loom)]
+impl<T> Clone for SpscConsumer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ring_buffer: Arc::clone(&self.ring_buffer),
+        }
+    }
 }
 impl<T> SpscConsumer<T> {
     pub fn recv(&self) -> Option<T> {

@@ -8,8 +8,13 @@ use crate::feature_pipeline::FeaturePipeline;
 use crate::inference_engine::{InferenceEngine, InferenceEngineState, InferenceResult};
 use crate::model_loader::ModelLoader;
 
-use hft_core::{HftError, HftResult, OrderType, Quantity, Side, Symbol, TimeInForce, Timestamp};
-use ports::{AccountView, ExecutionEvent, MarketEvent, MarketSnapshot, OrderIntent, Strategy};
+use hft_core::{
+    HftError, HftResult, OrderType, Quantity, Side, Symbol, TimeInForce, Timestamp, VenueId,
+};
+use ports::{
+    AccountView, ExecutionEvent, L2BookView, MarketEvent, MarketSnapshot, OrderIntent, Strategy,
+    StrategyContext,
+};
 use std::collections::HashMap;
 use tracing::{error, info, warn};
 
@@ -29,6 +34,7 @@ struct BookContext {
     best_bid: f64,
     best_ask: f64,
     mid_price: f64,
+    venue: VenueId,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +127,28 @@ impl DlStrategy {
                 if let Some(ctx) = context {
                     let state = self.state_for_symbol_mut(&snapshot.symbol);
                     state.context = Some(ctx);
+                }
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    fn handle_book(
+        &mut self,
+        book: L2BookView<'_>,
+        account: &AccountView,
+    ) -> HftResult<Vec<OrderIntent>> {
+        let symbol_key = book.symbol.as_str().to_string();
+        let context = Self::build_book_context(book);
+        let maybe_features = self.feature_pipeline.process_book(&symbol_key, book)?;
+
+        match maybe_features {
+            Some(features) => {
+                self.maybe_run_inference(symbol_key, book.symbol, context, features, account)
+            }
+            None => {
+                if let Some(ctx) = context {
+                    self.state_for_symbol_mut(book.symbol).context = Some(ctx);
                 }
                 Ok(Vec::new())
             }
@@ -242,13 +270,14 @@ impl DlStrategy {
             price: None,
             time_in_force: TimeInForce::IOC,
             strategy_id: strategy_name.to_string(),
-            target_venue: None,
+            target_venue: Some(context.venue),
         };
 
         Ok(vec![intent])
     }
 
     fn build_context(snapshot: &MarketSnapshot) -> Option<BookContext> {
+        let venue = snapshot.source_venue?;
         let best_bid = snapshot
             .bids
             .first()
@@ -263,6 +292,21 @@ impl DlStrategy {
             best_bid,
             best_ask,
             mid_price,
+            venue,
+        })
+    }
+
+    fn build_book_context(book: L2BookView<'_>) -> Option<BookContext> {
+        let best_bid = book.bid_prices.first()?.to_f64();
+        let best_ask = book.ask_prices.first()?.to_f64();
+        if best_bid <= 0.0 || best_ask <= best_bid {
+            return None;
+        }
+        Some(BookContext {
+            best_bid,
+            best_ask,
+            mid_price: (best_bid + best_ask) * 0.5,
+            venue: book.venue,
         })
     }
 }
@@ -278,6 +322,37 @@ impl Strategy for DlStrategy {
                 }
             },
             _ => Vec::new(),
+        }
+    }
+
+    fn on_market_event_with_context(
+        &mut self,
+        event: &MarketEvent,
+        context: &StrategyContext<'_>,
+    ) -> Vec<OrderIntent> {
+        let symbol = match event {
+            MarketEvent::Snapshot(snapshot) => &snapshot.symbol,
+            MarketEvent::Update(update) => &update.symbol,
+            MarketEvent::Quote(quote) => &quote.symbol,
+            _ => return Vec::new(),
+        };
+        if !self
+            .config
+            .symbols
+            .iter()
+            .any(|configured| configured == symbol)
+        {
+            return Vec::new();
+        }
+        let Some(book) = context.book.filter(|book| book.symbol == symbol) else {
+            return Vec::new();
+        };
+        match self.handle_book(book, context.account) {
+            Ok(orders) => orders,
+            Err(error) => {
+                error!(symbol = %symbol.as_str(), %error, "failed to process canonical L2 book");
+                Vec::new()
+            }
         }
     }
 

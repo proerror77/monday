@@ -14,6 +14,7 @@ adapters-common = { package = "hft-data-adapters-common", path = "../../adapters
 # Async and networking
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
+async-stream = "0.3"
 bytes = "1.5"
 
 # Serialization

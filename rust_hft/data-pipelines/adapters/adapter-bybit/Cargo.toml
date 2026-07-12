@@ -17,6 +17,7 @@ adapters-common = { package = "hft-data-adapters-common", path = "../../adapters
 tokio = { workspace = true, features = ["full"] }
 futures = { workspace = true }
 async-stream = "0.3"
+bytes = "1.5"
 
 # Serialization
 serde = { workspace = true }
@@ -32,4 +33,4 @@ async-trait = "0.1"
 
 [features]
 default = []
-json-simd = ["dep:simd-json"]
+json-simd = ["dep:simd-json", "integration/json-simd", "adapters-common/json-simd"]

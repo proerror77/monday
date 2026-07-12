@@ -1,6 +1,6 @@
-use hft_core::{OrderType, Quantity, Side, Symbol, TimeInForce};
-use ports::{AccountView, MarketEvent, OrderIntent, Strategy, VenueScope};
-use tracing::info;
+use hft_core::{FixedQuantity, OrderType, Quantity, Side, Symbol, TimeInForce, VenueId};
+use ports::{AccountView, MarketEvent, OrderIntent, Strategy, StrategyContext, VenueScope};
+use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub struct ImbalanceParams {
@@ -23,6 +23,14 @@ pub struct ImbalanceStrategy {
     symbol: Symbol,
     params: ImbalanceParams,
     name: String,
+    signal_state: SignalState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalState {
+    Neutral,
+    Buy,
+    Sell,
 }
 
 impl ImbalanceStrategy {
@@ -42,19 +50,80 @@ impl ImbalanceStrategy {
             name: strategy_name,
             symbol,
             params: params.unwrap_or_default(),
+            signal_state: SignalState::Neutral,
         }
     }
 
-    fn calc_obi(&self, bids: &[(f64, f64)], asks: &[(f64, f64)]) -> f64 {
-        let n = self.params.top_levels;
-        let bid_sum: f64 = bids.iter().take(n).map(|(_, q)| *q).sum();
-        let ask_sum: f64 = asks.iter().take(n).map(|(_, q)| *q).sum();
+    #[inline]
+    fn calc_obi_from_sums(bid_sum: f64, ask_sum: f64) -> f64 {
         let total = bid_sum + ask_sum;
         if total > 0.0 {
             (bid_sum - ask_sum) / total
         } else {
             0.0
         }
+    }
+
+    #[inline]
+    fn calc_fixed_obi(&self, bids: &[FixedQuantity], asks: &[FixedQuantity]) -> f64 {
+        let levels = self.params.top_levels;
+        let bid_sum: i128 = bids
+            .iter()
+            .take(levels)
+            .map(|quantity| i128::from(quantity.raw()))
+            .sum();
+        let ask_sum: i128 = asks
+            .iter()
+            .take(levels)
+            .map(|quantity| i128::from(quantity.raw()))
+            .sum();
+        Self::calc_obi_from_sums(bid_sum as f64, ask_sum as f64)
+    }
+
+    fn intent_for_obi(&mut self, obi: f64, venue: Option<VenueId>) -> Vec<OrderIntent> {
+        let next_state = if obi > self.params.obi_threshold {
+            SignalState::Buy
+        } else if obi < -self.params.obi_threshold {
+            SignalState::Sell
+        } else {
+            self.signal_state = SignalState::Neutral;
+            return Vec::new();
+        };
+        if next_state == self.signal_state {
+            return Vec::new();
+        }
+        let side = match next_state {
+            SignalState::Buy => Side::Buy,
+            SignalState::Sell => Side::Sell,
+            SignalState::Neutral => unreachable!(),
+        };
+        let Ok(quantity) = Quantity::from_f64(self.params.lot) else {
+            return Vec::new();
+        };
+
+        debug!(
+            strategy = %self.name,
+            symbol = %self.symbol.as_str(),
+            obi,
+            threshold = self.params.obi_threshold,
+            ?side,
+            ?venue,
+            "LOB imbalance signal"
+        );
+        self.signal_state = next_state;
+        vec![OrderIntent {
+            symbol: self.symbol.clone(),
+            asset_class: hft_core::AssetClass::Crypto,
+            product_type: hft_core::ProductType::Spot,
+            compliance_context: hft_core::ComplianceContext::default(),
+            side,
+            quantity,
+            order_type: OrderType::Market,
+            price: None,
+            time_in_force: TimeInForce::IOC,
+            strategy_id: self.name.clone(),
+            target_venue: venue,
+        }]
     }
 }
 
@@ -66,80 +135,51 @@ impl Strategy for ImbalanceStrategy {
         VenueScope::Single
     }
     fn on_market_event(&mut self, event: &MarketEvent, _account: &AccountView) -> Vec<OrderIntent> {
-        let mut intents = Vec::new();
-        let sym = &self.symbol;
         match event {
-            MarketEvent::Snapshot(s) if &s.symbol == sym => {
-                // Convert BookLevels -> (price, qty)
-                let bids: Vec<(f64, f64)> = s
+            MarketEvent::Snapshot(snapshot) if snapshot.symbol == self.symbol => {
+                let bid_sum = snapshot
                     .bids
                     .iter()
-                    .map(|l| {
-                        (
-                            l.price.to_f64().unwrap_or(0.0),
-                            l.quantity.to_f64().unwrap_or(0.0),
-                        )
-                    })
-                    .collect();
-                let asks: Vec<(f64, f64)> = s
+                    .take(self.params.top_levels)
+                    .filter_map(|level| level.quantity.to_f64())
+                    .sum();
+                let ask_sum = snapshot
                     .asks
                     .iter()
-                    .map(|l| {
-                        (
-                            l.price.to_f64().unwrap_or(0.0),
-                            l.quantity.to_f64().unwrap_or(0.0),
-                        )
-                    })
-                    .collect();
-                let obi = self.calc_obi(&bids, &asks);
-                let qty = Quantity::from_f64(self.params.lot)
-                    .unwrap_or_else(|_| Quantity::from_f64(0.01).unwrap());
-                if obi > self.params.obi_threshold {
-                    // Buy when bid side is heavy
-                    intents.push(OrderIntent {
-                        symbol: sym.clone(),
-            asset_class: hft_core::AssetClass::Crypto,
-            product_type: hft_core::ProductType::Spot,
-            compliance_context: hft_core::ComplianceContext::default(),
-                        side: Side::Buy,
-                        quantity: qty,
-                        order_type: OrderType::Market,
-                        price: None,
-                        time_in_force: TimeInForce::IOC,
-                        strategy_id: self.name.clone(),
-                        target_venue: s.source_venue, // 單場策略：綁定來源場館
-                    });
-                    info!(
-                        "OBI {:.3} > {:.3}, BUY {}",
-                        obi,
-                        self.params.obi_threshold,
-                        sym.as_str()
-                    );
-                } else if obi < -self.params.obi_threshold {
-                    intents.push(OrderIntent {
-                        symbol: sym.clone(),
-            asset_class: hft_core::AssetClass::Crypto,
-            product_type: hft_core::ProductType::Spot,
-            compliance_context: hft_core::ComplianceContext::default(),
-                        side: Side::Sell,
-                        quantity: qty,
-                        order_type: OrderType::Market,
-                        price: None,
-                        time_in_force: TimeInForce::IOC,
-                        strategy_id: self.name.clone(),
-                        target_venue: s.source_venue,
-                    });
-                    info!(
-                        "OBI {:.3} < -{:.3}, SELL {}",
-                        obi,
-                        self.params.obi_threshold,
-                        sym.as_str()
-                    );
-                }
+                    .take(self.params.top_levels)
+                    .filter_map(|level| level.quantity.to_f64())
+                    .sum();
+                self.intent_for_obi(
+                    Self::calc_obi_from_sums(bid_sum, ask_sum),
+                    snapshot.source_venue,
+                )
             }
-            _ => {}
+            _ => Vec::new(),
         }
-        intents
+    }
+
+    fn on_market_event_with_context(
+        &mut self,
+        event: &MarketEvent,
+        context: &StrategyContext<'_>,
+    ) -> Vec<OrderIntent> {
+        let is_matching_book_event = match event {
+            MarketEvent::Snapshot(snapshot) => snapshot.symbol == self.symbol,
+            MarketEvent::Update(update) => update.symbol == self.symbol,
+            MarketEvent::Quote(quote) => quote.symbol == self.symbol,
+            _ => false,
+        };
+        if !is_matching_book_event {
+            return Vec::new();
+        }
+        let Some(book) = context.book.filter(|book| book.symbol == &self.symbol) else {
+            return Vec::new();
+        };
+
+        self.intent_for_obi(
+            self.calc_fixed_obi(book.bid_quantities, book.ask_quantities),
+            Some(book.venue),
+        )
     }
 
     fn on_execution_event(
@@ -160,4 +200,64 @@ pub fn create_imbalance_strategy(
     params: Option<ImbalanceParams>,
 ) -> ImbalanceStrategy {
     ImbalanceStrategy::new(symbol, params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hft_core::{Price, VenueId};
+    use ports::{BookLevel, MarketSnapshot};
+
+    fn snapshot(bid_quantity: f64, ask_quantity: f64) -> MarketEvent {
+        MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 1,
+            bids: vec![BookLevel {
+                price: Price::from_f64(100.0).unwrap(),
+                quantity: Quantity::from_f64(bid_quantity).unwrap(),
+            }],
+            asks: vec![BookLevel {
+                price: Price::from_f64(101.0).unwrap(),
+                quantity: Quantity::from_f64(ask_quantity).unwrap(),
+            }],
+            sequence: 1,
+            source_venue: Some(VenueId::BINANCE),
+        })
+    }
+
+    #[test]
+    fn persistent_imbalance_emits_only_on_signal_transition() {
+        let mut strategy = ImbalanceStrategy::new(
+            Symbol::new("BTCUSDT"),
+            Some(ImbalanceParams {
+                obi_threshold: 0.2,
+                lot: 0.01,
+                top_levels: 1,
+            }),
+        );
+        let account = AccountView::default();
+
+        assert_eq!(
+            strategy
+                .on_market_event(&snapshot(3.0, 1.0), &account)
+                .len(),
+            1
+        );
+        assert!(strategy
+            .on_market_event(&snapshot(4.0, 1.0), &account)
+            .is_empty());
+        assert!(strategy
+            .on_market_event(&snapshot(1.0, 1.0), &account)
+            .is_empty());
+        assert_eq!(
+            strategy
+                .on_market_event(&snapshot(3.0, 1.0), &account)
+                .len(),
+            1
+        );
+        assert_eq!(
+            strategy.on_market_event(&snapshot(1.0, 3.0), &account)[0].side,
+            Side::Sell
+        );
+    }
 }

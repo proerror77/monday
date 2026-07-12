@@ -57,6 +57,8 @@ fn bench_boxed_strategy_dispatch(c: &mut Criterion) {
 
     let market_event = MarketEvent::Disconnect {
         reason: "benchmark".to_string(),
+        source_venue: None,
+        symbol: None,
     };
     let account = AccountView::default();
 

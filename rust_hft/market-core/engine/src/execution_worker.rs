@@ -8,19 +8,19 @@
 
 use crate::execution_queues::WorkerQueues;
 use crate::latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
+use futures::stream::SelectAll;
 use futures::{FutureExt, StreamExt};
 use hft_core::{now_micros, AccountId, HftError, LatencyStage, OrderId, Price, Quantity};
 use hft_core::{Symbol, VenueId};
 use ports::{
     AccountBalance, BoxStream, ExecutionClient, ExecutionEvent, ExecutionRouter, OpenOrder,
-    OrderIntent,
+    OrderIntent, OrderIntentEnvelope,
 };
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::yield_now;
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -43,10 +43,6 @@ pub struct ExecutionWorkerConfig {
     pub batch_size: usize,
     /// 空闲时的睡眠时间 (ms)
     pub idle_sleep_ms: u64,
-    /// 最大重试次数
-    pub max_retries: u32,
-    /// 重试延迟 (ms)
-    pub retry_delay_ms: u64,
     /// 客户端选择策略
     pub client_selection: ClientSelectionStrategy,
     /// 延遲監控配置
@@ -65,8 +61,6 @@ impl Default for ExecutionWorkerConfig {
             name: "execution_worker".to_string(),
             batch_size: 16,
             idle_sleep_ms: 1, // 1ms 空闲睡眠
-            max_retries: 3,
-            retry_delay_ms: 100,
             client_selection: ClientSelectionStrategy::default(),
             latency_monitor: LatencyMonitorConfig::default(),
             ack_timeout_ms: 3000,
@@ -83,7 +77,6 @@ impl ExecutionWorkerConfig {
             batch_size: 64,
             idle_sleep_ms: 0,
             ack_timeout_ms: 2000,
-            retry_delay_ms: 50,
             ..Default::default()
         }
     }
@@ -97,9 +90,6 @@ pub struct ExecutionWorkerStats {
     pub orders_failed: u64,
     pub events_sent: u64,
     pub queue_full_events: u64,
-    pub retries_count: u64,
-    /// 執行階段延遲統計（微秒）
-    pub execution_latency_micros: Vec<u64>,
     /// 最近的執行延遲（用於實時監控）
     pub recent_execution_latency_micros: Option<u64>,
 }
@@ -117,7 +107,7 @@ pub struct ExecutionWorker {
     config: ExecutionWorkerConfig,
     queues: WorkerQueues,
     execution_clients: Vec<Box<dyn ExecutionClient>>,
-    execution_streams: Vec<BoxStream<ExecutionEvent>>,
+    execution_streams: SelectAll<BoxStream<ExecutionEvent>>,
     stats: ExecutionWorkerStats,
     /// 订单 ID 到客户端索引的映射
     order_to_client: FxHashMap<OrderId, usize>,
@@ -143,6 +133,8 @@ pub struct ExecutionWorker {
     /// Emergency is sticky for the worker lifetime; restart is required to re-arm execution.
     accepting_intents: bool,
     emergency_latched: bool,
+    intents_buf: Vec<OrderIntentEnvelope>,
+    execution_events_buf: Vec<ExecutionEvent>,
 }
 
 impl ExecutionWorker {
@@ -198,12 +190,13 @@ impl ExecutionWorker {
         control_rx: mpsc::UnboundedReceiver<ControlCommand>,
     ) -> Self {
         let latency_monitor = Arc::new(LatencyMonitor::new(config.latency_monitor.clone()));
+        let batch_size = config.batch_size;
 
         Self {
             config,
             queues,
             execution_clients,
-            execution_streams: Vec::new(),
+            execution_streams: SelectAll::new(),
             stats: ExecutionWorkerStats::default(),
             order_to_client: FxHashMap::default(),
             tracked_orders: FxHashMap::default(),
@@ -218,6 +211,8 @@ impl ExecutionWorker {
             account_to_client: FxHashMap::default(),
             accepting_intents: true,
             emergency_latched: false,
+            intents_buf: Vec::with_capacity(batch_size),
+            execution_events_buf: Vec::with_capacity(batch_size),
         }
     }
 
@@ -231,12 +226,13 @@ impl ExecutionWorker {
         venue_to_client: HashMap<VenueId, usize>,
     ) -> Self {
         let latency_monitor = Arc::new(LatencyMonitor::new(config.latency_monitor.clone()));
+        let batch_size = config.batch_size;
 
         Self {
             config,
             queues,
             execution_clients,
-            execution_streams: Vec::new(),
+            execution_streams: SelectAll::new(),
             stats: ExecutionWorkerStats::default(),
             order_to_client: FxHashMap::default(),
             tracked_orders: FxHashMap::default(),
@@ -251,6 +247,8 @@ impl ExecutionWorker {
             account_to_client: FxHashMap::default(),
             accepting_intents: true,
             emergency_latched: false,
+            intents_buf: Vec::with_capacity(batch_size),
+            execution_events_buf: Vec::with_capacity(batch_size),
         }
     }
 
@@ -282,11 +280,15 @@ impl ExecutionWorker {
             }
 
             // 1. 处理意图队列中的新订单
-            let intents = self.queues.receive_intents();
+            let mut intents = std::mem::take(&mut self.intents_buf);
+            intents.clear();
+            self.queues.receive_envelopes_into(&mut intents);
             if !intents.is_empty() {
-                self.process_order_intents(intents).await;
+                self.process_order_intents(&mut intents).await;
                 had_activity = true;
             }
+            intents.clear();
+            self.intents_buf = intents;
 
             // 2. 处理执行回报流
             let events_received = self.poll_execution_events().await;
@@ -326,21 +328,31 @@ impl ExecutionWorker {
 
             // 4. 空闲控制
             if !had_activity {
-                let idle_duration = tick_start.duration_since(last_activity);
-                if self.config.idle_sleep_ms == 0 {
-                    // 忙等模式下交出調度權，避免 100% CPU
-                    yield_now().await;
-                } else if idle_duration.as_millis() > 1000 {
-                    // 长时间空闲，增加睡眠时间
-                    sleep(Duration::from_millis(self.config.idle_sleep_ms * 2)).await;
-                } else {
-                    // 正常空闲
-                    sleep(Duration::from_millis(self.config.idle_sleep_ms)).await;
+                let intent_notify = self.queues.intent_notify();
+                let has_execution_stream = !self.execution_streams.is_empty();
+                let maintenance_wait = Duration::from_millis(self.config.idle_sleep_ms.max(10));
+                tokio::select! {
+                    biased;
+                    command = self.control_rx.recv() => {
+                        if let Some(command) = command {
+                            self.handle_control_command(command).await;
+                            last_activity = Instant::now();
+                        }
+                    }
+                    _ = intent_notify.notified() => {
+                        last_activity = Instant::now();
+                    }
+                    item = self.execution_streams.next(), if has_execution_stream => {
+                        self.handle_execution_stream_item(item).await;
+                        last_activity = Instant::now();
+                    }
+                    _ = sleep(maintenance_wait) => {}
                 }
             }
 
             // 5. 周期性状态日志
-            if tick_start.duration_since(last_activity).as_secs() > 30 {
+            if last_activity.elapsed().as_secs() > 30 {
+                self.latency_monitor.report_if_due();
                 info!(
                     "Worker {} 状态: 意图处理 {}, 订单下达 {}, 事件发送 {}",
                     self.config.name,
@@ -397,79 +409,76 @@ impl ExecutionWorker {
         Ok(())
     }
 
-    /// 处理订单意图批次
-    async fn process_order_intents(&mut self, intents: Vec<OrderIntent>) {
+    /// Process lifecycle-qualified intents. A placement is submitted once; ambiguous failures latch
+    /// intake until reconciliation/restart instead of risking a duplicate live order.
+    async fn process_order_intents(&mut self, intents: &mut Vec<OrderIntentEnvelope>) {
         self.stats.intents_processed += intents.len() as u64;
 
         if self.execution_clients.is_empty() {
-            // 没有执行客户端，直接发送失败事件
-            for _intent in intents {
+            for envelope in intents.drain(..) {
                 let reject_event = ExecutionEvent::OrderReject {
-                    order_id: OrderId(format!(
-                        "no_client_{}",
-                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-                    )),
+                    order_id: OrderId(envelope.client_order_id),
                     reason: "没有可用的执行客户端".to_string(),
-                    timestamp: chrono::Utc::now().timestamp_micros() as u64,
+                    timestamp: now_micros(),
                 };
-                let _ = self.queues.send_event_force(reject_event);
+                self.queues.send_event_reliable(reject_event).await;
                 self.stats.orders_failed += 1;
             }
             return;
         }
 
-        for intent in intents {
+        for envelope in intents.drain(..) {
             while let Ok(command) = self.control_rx.try_recv() {
                 self.handle_control_command(command).await;
             }
+            if let Err(reason) = envelope.validate_pre_execution(now_micros(), None) {
+                let reject_event = ExecutionEvent::OrderReject {
+                    order_id: OrderId(envelope.client_order_id.clone()),
+                    reason: format!("execution lifecycle gate rejected intent: {reason:?}"),
+                    timestamp: now_micros(),
+                };
+                self.queues.send_event_reliable(reject_event).await;
+                self.stats.orders_failed += 1;
+                continue;
+            }
+            let intent = &envelope.intent;
             if !self.accepting_intents {
-                self.reject_for_disabled_intake(&intent);
+                self.reject_for_disabled_intake(&envelope).await;
                 continue;
             }
             let execution_start = now_micros();
 
-            // 🔥 Phase 1.1: 选择执行客户端 - 現在可能失敗
-            let client_idx = match self.select_execution_client(&intent) {
+            let client_idx = match self.select_execution_client(intent) {
                 Ok(idx) => idx,
                 Err(reason) => {
-                    // 客戶端選擇失敗，發送拒絕事件
                     warn!("客戶端選擇失敗: {}", reason);
                     let reject_event = ExecutionEvent::OrderReject {
-                        order_id: OrderId(format!(
-                            "route_failed_{}",
-                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-                        )),
+                        order_id: OrderId(envelope.client_order_id.clone()),
                         reason: format!("路由失敗: {}", reason),
-                        timestamp: chrono::Utc::now().timestamp_micros() as u64,
+                        timestamp: now_micros(),
                     };
-
-                    if let Err(failed_event) = self.queues.send_event(reject_event) {
-                        // 队列满载，使用 force_send
-                        self.queues.send_event_force(failed_event);
-                    }
+                    self.queues.send_event_reliable(reject_event).await;
                     self.stats.orders_failed += 1;
-                    continue; // 跳過這個意圖，繼續處理下一個
+                    continue;
                 }
             };
 
-            match self.place_order_with_retry(client_idx, &intent).await {
+            match self.execution_clients[client_idx]
+                .place_order_envelope(&envelope)
+                .await
+            {
                 Ok(order_id) => {
-                    // 記錄執行延遲到統一監控器和本地統計
                     let execution_latency = now_micros().saturating_sub(execution_start);
                     self.latency_monitor
                         .record_latency(LatencyStage::Submission, execution_latency);
-                    self.stats.execution_latency_micros.push(execution_latency);
                     self.stats.recent_execution_latency_micros = Some(execution_latency);
                     #[cfg(feature = "metrics")]
                     infra_metrics::MetricsRegistry::global()
                         .record_submission_latency(execution_latency as f64);
 
                     self.stats.orders_placed += 1;
-                    // 记录订单到客户端映射，用于回报路由
                     self.order_to_client.insert(order_id.clone(), client_idx);
 
-                    // 向引擎派發 OrderNew 以註冊訂單（便於 Portfolio/OMS 正確處理 Fill）
-                    // 推斷對應的 venue（根據 venue_to_client 反查）
                     let venue_for_client = intent
                         .target_venue
                         .or_else(|| self.venue_for_client(client_idx));
@@ -499,7 +508,7 @@ impl ExecutionWorker {
                         strategy_id,
                         target_venue: _,
                         ..
-                    } = intent;
+                    } = envelope.intent;
 
                     let symbol_for_ack = symbol.clone();
 
@@ -513,10 +522,7 @@ impl ExecutionWorker {
                         venue: venue_for_client,
                         strategy_id,
                     };
-                    if let Err(failed_event) = self.queues.send_event(new_event) {
-                        // 队列满载，使用強制发送
-                        self.queues.send_event_force(failed_event);
-                    }
+                    self.queues.send_event_reliable(new_event).await;
 
                     debug!("訂單執行成功，延遲: {}μs", execution_latency);
 
@@ -525,148 +531,167 @@ impl ExecutionWorker {
                         .insert(order_id.clone(), (symbol_for_ack, Instant::now()));
                 }
                 Err(e) => {
-                    // 記錄執行失敗延遲
                     let execution_latency = now_micros().saturating_sub(execution_start);
-                    self.stats.execution_latency_micros.push(execution_latency);
                     self.stats.recent_execution_latency_micros = Some(execution_latency);
 
                     self.stats.orders_failed += 1;
-                    warn!("下单失败: {}", e);
-
-                    // 发送失败事件到引擎
-                    let reject_event = ExecutionEvent::OrderReject {
-                        order_id: OrderId(format!(
-                            "failed_{}",
-                            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-                        )),
-                        reason: format!("Worker 下单失败: {}", e),
-                        timestamp: chrono::Utc::now().timestamp_micros() as u64,
-                    };
-
-                    if let Err(failed_event) = self.queues.send_event(reject_event) {
-                        // 队列满载，使用 force_send
-                        self.queues.send_event_force(failed_event);
+                    let outcome_unknown = Self::submission_outcome_may_be_unknown(&e);
+                    if outcome_unknown {
+                        self.accepting_intents = false;
+                        self.emergency_latched = true;
                     }
+                    warn!(
+                        client_order_id = %envelope.client_order_id,
+                        outcome_unknown,
+                        "下单失败: {}",
+                        e
+                    );
+                    let reject_event = ExecutionEvent::OrderReject {
+                        order_id: OrderId(envelope.client_order_id.clone()),
+                        reason: if outcome_unknown {
+                            format!(
+                                "submission outcome unknown; execution intake latched; reconcile client order id {}: {}",
+                                envelope.client_order_id, e
+                            )
+                        } else {
+                            format!("Worker 下单失败: {}", e)
+                        },
+                        timestamp: now_micros(),
+                    };
+                    self.queues.send_event_reliable(reject_event).await;
                 }
             }
         }
     }
 
-    fn reject_for_disabled_intake(&mut self, intent: &OrderIntent) {
+    async fn reject_for_disabled_intake(&mut self, envelope: &OrderIntentEnvelope) {
         let reject_event = ExecutionEvent::OrderReject {
-            order_id: OrderId(format!(
-                "emergency_blocked_{}",
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-            )),
+            order_id: OrderId(envelope.client_order_id.clone()),
             reason: format!(
                 "execution intake disabled by emergency control for {}",
-                intent.symbol.as_str()
+                envelope.intent.symbol.as_str()
             ),
             timestamp: now_micros(),
         };
-        let _ = self.queues.send_event_force(reject_event);
+        self.queues.send_event_reliable(reject_event).await;
         self.stats.orders_failed += 1;
     }
 
-    /// 下单并重试
-    async fn place_order_with_retry(
-        &mut self,
-        client_idx: usize,
-        intent: &OrderIntent,
-    ) -> Result<OrderId, HftError> {
-        let mut last_error = HftError::Generic {
-            message: "未知错误".to_string(),
-        };
-
-        for attempt in 0..=self.config.max_retries {
-            match self.execution_clients[client_idx]
-                .place_order(intent.clone())
-                .await
-            {
-                Ok(order_id) => {
-                    if attempt > 0 {
-                        self.stats.retries_count += attempt as u64;
-                        info!("下单重试 {} 次后成功: {}", attempt, order_id.0);
-                    }
-                    return Ok(order_id);
-                }
-                Err(e) => {
-                    last_error = e;
-                    if attempt < self.config.max_retries {
-                        warn!(
-                            "下单失败，尝试重试 {}/{}: {}",
-                            attempt + 1,
-                            self.config.max_retries,
-                            last_error
-                        );
-                        sleep(Duration::from_millis(self.config.retry_delay_ms)).await;
-                    }
-                }
-            }
-        }
-
-        Err(last_error)
+    fn submission_outcome_may_be_unknown(error: &HftError) -> bool {
+        !matches!(
+            error,
+            HftError::InvalidOrder(_)
+                | HftError::InsufficientBalance(_)
+                | HftError::Risk(_)
+                | HftError::Config(_)
+                | HftError::Authentication(_)
+                | HftError::RateLimit(_)
+                | HftError::Exchange(_)
+                | HftError::OrderNotFound(_)
+                | HftError::Parse(_)
+                | HftError::Serialization(_)
+        )
     }
 
     /// 轮询执行回报流
     async fn poll_execution_events(&mut self) -> u32 {
         let mut events_count = 0;
+        let mut execution_events = std::mem::take(&mut self.execution_events_buf);
+        execution_events.clear();
+        let mut stream_failed = false;
 
-        for stream in &mut self.execution_streams {
-            let mut batch_count = 0;
-
-            // 批量处理回报，避免单个流阻塞
-            while batch_count < self.config.batch_size {
-                match stream.next().now_or_never() {
-                    Some(Some(Ok(event))) => {
-                        // Keep routing metadata only while an order may still be open.
-                        match &event {
-                            ExecutionEvent::OrderAck { order_id, .. } => {
-                                self.pending_acks.remove(order_id);
-                            }
-                            ExecutionEvent::OrderCanceled { order_id, .. }
-                            | ExecutionEvent::OrderReject { order_id, .. }
-                            | ExecutionEvent::OrderCompleted { order_id, .. } => {
-                                self.pending_acks.remove(order_id);
-                                self.order_to_client.remove(order_id);
-                                self.tracked_orders.remove(order_id);
-                            }
-                            _ => {}
-                        }
-                        // 发送回报到引擎
-                        match self.queues.send_event(event) {
-                            Ok(()) => {
-                                self.stats.events_sent += 1;
-                                events_count += 1;
-                                batch_count += 1;
-                            }
-                            Err(failed_event) => {
-                                // 队列满载，尝试 force_send
-                                if self.queues.send_event_force(failed_event) {
-                                    self.stats.events_sent += 1;
-                                    events_count += 1;
-                                } else {
-                                    self.stats.queue_full_events += 1;
-                                    warn!("回报队列满载，事件丢失");
-                                }
-                                batch_count += 1;
-                            }
-                        }
-                    }
-                    Some(Some(Err(e))) => {
-                        warn!("执行回报流错误: {}", e);
-                        break;
-                    }
-                    Some(None) => {
-                        debug!("执行回报流结束");
-                        break;
-                    }
-                    None => break, // 没有可用事件
+        while execution_events.len() < self.config.batch_size {
+            match self.execution_streams.next().now_or_never() {
+                Some(Some(Ok(event))) => execution_events.push(event),
+                Some(Some(Err(e))) => {
+                    warn!("执行回报流错误: {}", e);
+                    stream_failed = true;
+                    break;
                 }
+                Some(None) => {
+                    if !self.execution_streams.is_empty() {
+                        continue;
+                    }
+                    debug!("所有执行回报流已结束");
+                    stream_failed = true;
+                    break;
+                }
+                None => break,
             }
         }
 
+        if stream_failed {
+            self.accepting_intents = false;
+            self.emergency_latched = true;
+            execution_events.push(ExecutionEvent::ConnectionStatus {
+                connected: false,
+                timestamp: now_micros(),
+            });
+        }
+
+        for event in execution_events.drain(..) {
+            self.update_execution_tracking(&event);
+            self.queues.send_event_reliable(event).await;
+            self.stats.events_sent += 1;
+            events_count += 1;
+        }
+        self.execution_events_buf = execution_events;
+
         events_count
+    }
+
+    async fn handle_execution_stream_item(
+        &mut self,
+        item: Option<Result<ExecutionEvent, HftError>>,
+    ) {
+        match item {
+            Some(Ok(event)) => {
+                self.update_execution_tracking(&event);
+                self.queues.send_event_reliable(event).await;
+                self.stats.events_sent += 1;
+            }
+            Some(Err(error)) => {
+                warn!("执行回报流错误: {}", error);
+                self.latch_on_execution_stream_failure().await;
+            }
+            None => {
+                warn!("所有执行回报流已结束");
+                self.latch_on_execution_stream_failure().await;
+            }
+        }
+    }
+
+    fn update_execution_tracking(&mut self, event: &ExecutionEvent) {
+        match event {
+            ExecutionEvent::ConnectionStatus {
+                connected: false, ..
+            } => {
+                self.accepting_intents = false;
+                self.emergency_latched = true;
+            }
+            ExecutionEvent::OrderAck { order_id, .. } => {
+                self.pending_acks.remove(order_id);
+            }
+            ExecutionEvent::OrderCanceled { order_id, .. }
+            | ExecutionEvent::OrderReject { order_id, .. }
+            | ExecutionEvent::OrderCompleted { order_id, .. } => {
+                self.pending_acks.remove(order_id);
+                self.order_to_client.remove(order_id);
+                self.tracked_orders.remove(order_id);
+            }
+            _ => {}
+        }
+    }
+
+    async fn latch_on_execution_stream_failure(&mut self) {
+        self.accepting_intents = false;
+        self.emergency_latched = true;
+        self.queues
+            .send_event_reliable(ExecutionEvent::ConnectionStatus {
+                connected: false,
+                timestamp: now_micros(),
+            })
+            .await;
     }
 
     /// 选择执行客户端（Phase 1 重構：支持路由器或舊邏輯 + 強制目標場約束）
@@ -1214,6 +1239,22 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
 
+    #[test]
+    fn explicit_exchange_rejections_are_known_but_transport_failures_are_ambiguous() {
+        assert!(!ExecutionWorker::submission_outcome_may_be_unknown(
+            &HftError::RateLimit("429".to_string())
+        ));
+        assert!(!ExecutionWorker::submission_outcome_may_be_unknown(
+            &HftError::Exchange("invalid quantity".to_string())
+        ));
+        assert!(ExecutionWorker::submission_outcome_may_be_unknown(
+            &HftError::Network("connection reset".to_string())
+        ));
+        assert!(ExecutionWorker::submission_outcome_may_be_unknown(
+            &HftError::Execution("accepted response was malformed".to_string())
+        ));
+    }
+
     #[derive(Default)]
     struct MockExecutionState {
         placed: Vec<Symbol>,
@@ -1403,10 +1444,7 @@ mod tests {
             .expect("queue intent");
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let mut worker = ExecutionWorker::new(
-            ExecutionWorkerConfig {
-                max_retries: 0,
-                ..Default::default()
-            },
+            ExecutionWorkerConfig::default(),
             worker_queues,
             vec![Box::new(client)],
             control_rx,
@@ -1442,8 +1480,8 @@ mod tests {
             .await;
         assert!(resume_result.await.expect("resume result").is_err());
 
-        let queued = worker.queues.receive_intents();
-        worker.process_order_intents(queued).await;
+        let mut queued = worker.queues.receive_envelopes();
+        worker.process_order_intents(&mut queued).await;
         let state = state.lock().unwrap();
         assert_eq!(state.canceled, vec![order_id]);
         assert!(state.placed.is_empty());

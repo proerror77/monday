@@ -1,6 +1,6 @@
 # Unbounded Channel Audit
 
-Date: 2026-04-29
+Date: 2026-07-13
 Scope: `market-core`, `risk-control`, `strategy-framework`, `apps`, `data-pipelines`
 
 Command:
@@ -30,12 +30,13 @@ Classification:
 | File | Usage | Classification | Rationale / next action |
 | --- | --- | --- | --- |
 | `market-core/engine/src/execution_worker.rs` | `UnboundedReceiver<ControlCommand>` and `unbounded_channel()` for worker control handles | control-plane acceptable | Low-rate worker control path, not order intent or execution feedback. Keep separate from hot path; do not carry market data or reports here. |
+| `market-core/engine/src/execution_control.rs` | sends emergency, pause, resume, cancel, and reconciliation commands to execution workers | control-plane acceptable | Human/ops lifecycle commands only. Market data, order intents, acks, fills, and private reports use separate bounded queues. |
 | `market-core/runtime/src/system_builder.rs` | stores execution-worker control senders | control-plane acceptable | Sender registry for worker lifecycle/control. Acceptable while it remains command-only. |
 | `market-core/runtime/src/system_builder/simulated_execution.rs` | simulated execution event stream | fixed in Q2 local slice | Converted to bounded `tokio::mpsc::channel` with `try_send`, full/closed errors, and a bounded-queue regression test. |
 | `data-pipelines/adapters/adapter-bitget/src/bitget_stream.rs` | adapter event sender and stream channel | fixed in Q2 local slice | Converted generic Bitget stream output to bounded `tokio::mpsc::channel` with `try_send` and `BITGET_EVENT_QUEUE_CAPACITY`. Dedicated `latency_audit` remains the p99 evidence path. |
 | `data-pipelines/adapters/adapter-bitget/src/zero_copy_stream.rs` | zero-copy adapter event sender and tests | fixed in Q2 local slice | Converted to bounded `tokio::mpsc::channel` with `try_send` and `BITGET_EVENT_QUEUE_CAPACITY`. |
-| `data-pipelines/adapters/adapter-binance/src/lib.rs` | adapter stream channel | fixed in Q2 local slice | Converted generic Binance stream output to bounded `tokio::mpsc::channel` with `try_send` and `BINANCE_EVENT_QUEUE_CAPACITY`; initial snapshots fail explicitly if the queue is full. |
-| `data-pipelines/adapters/adapter-bybit/src/lib.rs` | adapter stream channel | must-fix before live MD path | Same adapter output risk; classify before any live use. |
+| `data-pipelines/adapters/adapter-binance/src/lib.rs` | adapter stream channel | fixed | Bounded `tokio::mpsc::channel`; snapshot and delta delivery await capacity so sequence-bearing L2 updates are not silently dropped. |
+| `data-pipelines/adapters/adapter-bybit/src/lib.rs` | adapter stream channel | fixed | Bounded `tokio::mpsc::channel`; snapshot and delta delivery await capacity so sequence-bearing L2 updates are not silently dropped. |
 | `data-pipelines/adapters/adapter-lighter/src/lib.rs` | adapter stream channel | must-fix before live MD path | Same adapter output risk; classify before any live use. |
 | `data-pipelines/adapters/adapter-asterdex/src/lib.rs` | adapter stream channel | must-fix before live MD path | Same adapter output risk; classify before any live use. |
 | `data-pipelines/adapters/adapter-grvt/src/lib.rs` | adapter stream channel wrapped as stream | must-fix before live MD path | Same adapter output risk; bounded stream conversion needed before production use. |
@@ -50,7 +51,9 @@ streams:
 - Bitget generic `MarketStream` now uses bounded output as well; full queues
   drop stale market events with a warning instead of growing memory without
   bound.
-- Engine execution queues use bounded SPSC queues for `OrderIntent` and
+- Binance and Bybit generic market streams use bounded channels with lossless
+  backpressure for sequence-bearing L2 events.
+- Engine execution queues use bounded SPSC queues for `OrderIntentEnvelope` and
   `ExecutionEvent`.
 - Simulated execution now uses bounded event output; paper/shadow code can no
   longer hide unbounded order-report buildup.

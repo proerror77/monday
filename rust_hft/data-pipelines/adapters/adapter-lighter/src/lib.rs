@@ -225,6 +225,7 @@ impl MarketStream for LighterMarketStream {
                                             timestamp: now,
                                             bids,
                                             asks,
+                                            first_sequence: None,
                                             sequence: 0,
                                             is_snapshot: false,
                                             source_venue: Some(VenueId::LIGHTER),
@@ -244,6 +245,8 @@ impl MarketStream for LighterMarketStream {
                     Ok(Message::Close(_)) => {
                         let _ = tx.send(Ok(MarketEvent::Disconnect {
                             reason: "WS closed".to_string(),
+                            source_venue: Some(VenueId::LIGHTER),
+                            symbol: None,
                         }));
                         break;
                     }

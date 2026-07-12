@@ -210,11 +210,13 @@ pub struct EventIngester {
     last_flip_time: u64,
     /// 引擎喚醒通知器（可選）：成功入隊時喚醒引擎
     engine_notify: Option<Arc<Notify>>,
+    queue_space_notify: Arc<Notify>,
 }
 
 impl EventIngester {
     pub fn new(config: IngestionConfig) -> (Self, EventConsumer) {
         let (producer, consumer) = spsc_ring_buffer(config.queue_capacity);
+        let queue_space_notify = Arc::new(Notify::new());
 
         let ingester = Self {
             producer,
@@ -222,9 +224,10 @@ impl EventIngester {
             metrics: IngestionMetrics::default(),
             last_flip_time: current_timestamp_us(),
             engine_notify: None,
+            queue_space_notify: Arc::clone(&queue_space_notify),
         };
 
-        let event_consumer = EventConsumer::new(consumer, config);
+        let event_consumer = EventConsumer::new(consumer, config, queue_space_notify);
 
         (ingester, event_consumer)
     }
@@ -391,11 +394,53 @@ impl EventIngester {
         }
     }
 
+    /// Lossless production ingestion. Queue pressure is propagated to the adapter task instead of
+    /// dropping a sequence-bearing book delta.
+    pub async fn ingest_lossless(&mut self, event: MarketEvent) -> Result<(), HftError> {
+        self.metrics.events_received += 1;
+        let received_at = current_timestamp_us();
+        let event_ts = self.extract_timestamp(&event);
+        if let Some(timestamp) = event_ts {
+            let delay = received_at.saturating_sub(timestamp);
+            self.metrics.record_latency(delay);
+            if delay > self.config.stale_threshold_us {
+                self.metrics.events_stale += 1;
+            }
+        }
+
+        // Exchange time remains in MarketEvent. Runtime latency and order validity start at the
+        // local adapter boundary so batched public feeds are not mistaken for local queue delay.
+        let mut tracker = LatencyTracker::from_time(received_at);
+        tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+        tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
+        tracker.record_stage(LatencyStage::Ingestion);
+        let mut tracked_event = TrackedMarketEvent { event, tracker };
+
+        loop {
+            match self.producer.send(tracked_event) {
+                Ok(()) => {
+                    let utilization = self.producer.utilization();
+                    self.metrics.ring_utilization_max =
+                        self.metrics.ring_utilization_max.max(utilization);
+                    if let Some(notify) = &self.engine_notify {
+                        notify.notify_one();
+                    }
+                    return Ok(());
+                }
+                Err(rejected) => {
+                    tracked_event = rejected;
+                    self.queue_space_notify.notified().await;
+                }
+            }
+        }
+    }
+
     /// 提取事件時間戳
     fn extract_timestamp(&self, event: &MarketEvent) -> Option<u64> {
         match event {
             MarketEvent::Snapshot(s) => Some(s.timestamp),
             MarketEvent::Update(u) => Some(u.timestamp),
+            MarketEvent::Quote(q) => Some(q.timestamp),
             MarketEvent::Trade(t) => Some(t.timestamp),
             MarketEvent::Bar(b) => Some(b.close_time),
             MarketEvent::Arbitrage(a) => Some(a.timestamp),
@@ -453,6 +498,7 @@ pub struct EventConsumer {
     flip_metrics: FlipMetrics,
     /// 引擎唤醒通知器（可选）
     engine_notify: Option<Arc<Notify>>,
+    queue_space_notify: Arc<Notify>,
 }
 
 #[derive(Debug)]
@@ -471,13 +517,18 @@ pub struct FlipMetrics {
 }
 
 impl EventConsumer {
-    fn new(consumer: SpscConsumer<TrackedMarketEvent>, config: IngestionConfig) -> Self {
+    fn new(
+        consumer: SpscConsumer<TrackedMarketEvent>,
+        config: IngestionConfig,
+        queue_space_notify: Arc<Notify>,
+    ) -> Self {
         Self {
             consumer,
             config,
             symbol_state: FxHashMap::default(),
             flip_metrics: FlipMetrics::default(),
             engine_notify: None,
+            queue_space_notify,
         }
     }
 
@@ -527,6 +578,7 @@ impl EventConsumer {
 
         // 如果处理了事件，唤醒引擎进行下一轮处理
         if events_processed > 0 {
+            self.queue_space_notify.notify_one();
             if let Some(notify) = &self.engine_notify {
                 notify.notify_one();
             }
@@ -540,6 +592,7 @@ impl EventConsumer {
         let (symbol, sequence) = match event {
             MarketEvent::Snapshot(s) => (s.symbol.clone(), s.sequence),
             MarketEvent::Update(u) => (u.symbol.clone(), u.sequence),
+            MarketEvent::Quote(q) => (q.symbol.clone(), q.sequence),
             MarketEvent::Trade(t) => (t.symbol.clone(), 0), // Trade 無序號
             MarketEvent::Bar(b) => (b.symbol.clone(), 0),
             MarketEvent::Arbitrage(a) => (a.symbol.clone(), 0),
@@ -664,5 +717,86 @@ mod tests {
             .ingest(MarketEvent::Snapshot(stale_snapshot))
             .is_ok());
         assert_eq!(ingester.metrics().events_stale, 1);
+    }
+
+    #[tokio::test]
+    async fn lossless_ingestion_waits_for_consumer_capacity() {
+        let config = IngestionConfig {
+            queue_capacity: 4,
+            stale_threshold_us: u64::MAX,
+            ..Default::default()
+        };
+        let (mut ingester, mut consumer) = EventIngester::new(config);
+        let event = |sequence| {
+            MarketEvent::Snapshot(MarketSnapshot {
+                symbol: Symbol::new("BTCUSDT"),
+                timestamp: current_timestamp_us(),
+                bids: vec![],
+                asks: vec![],
+                sequence,
+                source_venue: None,
+            })
+        };
+        for sequence in 1..=3 {
+            ingester.ingest_lossless(event(sequence)).await.unwrap();
+        }
+
+        let sender = tokio::spawn(async move {
+            ingester.ingest_lossless(event(4)).await.unwrap();
+            ingester
+        });
+        tokio::task::yield_now().await;
+        assert!(!sender.is_finished());
+
+        let mut received = Vec::new();
+        consumer.consume_events(|tracked| {
+            received.push(tracked.event);
+            false
+        });
+        let _ingester = tokio::time::timeout(std::time::Duration::from_secs(1), sender)
+            .await
+            .expect("producer wakes after consumer drain")
+            .expect("producer task succeeds");
+        consumer.consume_events(|tracked| {
+            received.push(tracked.event);
+            false
+        });
+        let sequences: Vec<u64> = received
+            .into_iter()
+            .filter_map(|event| match event {
+                MarketEvent::Snapshot(snapshot) => Some(snapshot.sequence),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sequences, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn lossless_live_ingestion_preserves_exchange_time_but_tracks_local_receive_time() {
+        let (mut ingester, mut consumer) = EventIngester::new(IngestionConfig::default());
+        let received_after = current_timestamp_us();
+        ingester
+            .ingest_lossless(MarketEvent::Snapshot(MarketSnapshot {
+                symbol: Symbol::new("BTCUSDT"),
+                timestamp: 1,
+                bids: vec![],
+                asks: vec![],
+                sequence: 1,
+                source_venue: None,
+            }))
+            .await
+            .unwrap();
+
+        let mut received = Vec::new();
+        consumer.consume_events(|tracked| {
+            received.push(tracked);
+            false
+        });
+        assert_eq!(received.len(), 1);
+        assert!(received[0].tracker.origin_time >= received_after);
+        let MarketEvent::Snapshot(snapshot) = &received[0].event else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(snapshot.timestamp, 1);
     }
 }

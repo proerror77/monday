@@ -326,7 +326,10 @@ impl MarketStream for GrvtMarketStream {
                     "id": req_id,
                 });
                 req_id += 1;
-                if let Err(e) = socket.send(Message::Text(subscribe.to_string().into())).await {
+                if let Err(e) = socket
+                    .send(Message::Text(subscribe.to_string().into()))
+                    .await
+                {
                     let _ = tx.send(Err(HftError::Network(format!("GRVT WS 訂閱失敗: {}", e))));
                     return;
                 }
@@ -490,6 +493,7 @@ impl MarketStream for GrvtMarketStream {
                                 timestamp: ts,
                                 bids,
                                 asks,
+                                first_sequence: None,
                                 sequence,
                                 is_snapshot: false,
                                 source_venue: Some(VenueId::GRVT),
@@ -571,6 +575,7 @@ impl MarketStream for GrvtMarketStream {
                                 timestamp: ts,
                                 bids,
                                 asks,
+                                first_sequence: None,
                                 sequence,
                                 is_snapshot: false,
                                 source_venue: Some(VenueId::GRVT),
@@ -598,6 +603,8 @@ impl MarketStream for GrvtMarketStream {
                     Ok(Message::Close(_)) => {
                         let _ = tx.send(Ok(MarketEvent::Disconnect {
                             reason: "WS closed".into(),
+                            source_venue: Some(VenueId::GRVT),
+                            symbol: None,
                         }));
                         break;
                     }

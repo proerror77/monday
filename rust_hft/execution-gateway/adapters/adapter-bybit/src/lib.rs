@@ -15,7 +15,7 @@ use integration::{
     http::{HttpClient, HttpClientConfig},
     signing::{BybitCredentials, BybitSigner},
 };
-use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder};
+use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -39,6 +39,7 @@ pub struct BybitExecutionClient {
     resilient_executor: Option<Arc<ResilientExecutor>>,
     // 告警回調
     alert_callback: Option<AlertCallback>,
+    next_client_order_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -66,7 +67,30 @@ struct BybitOpenOrdersData {
 struct BybitOpenOrdersResponse {
     retCode: i64,
     retMsg: String,
-    data: Option<BybitOpenOrdersData>,
+    result: Option<BybitOpenOrdersData>,
+}
+
+fn classify_bybit_response_error(operation: &str, code: i64, message: &str) -> HftError {
+    let detail = format!("Bybit {operation} failed: {code} {message}");
+    match code {
+        10006 | 10429 | 20003 => HftError::RateLimit(detail),
+        10003 | 10004 | 10005 | 10007 => HftError::Authentication(detail),
+        _ => HftError::Exchange(detail),
+    }
+}
+
+fn classify_bybit_http_error(status: reqwest::StatusCode, body: &str) -> HftError {
+    let detail = format!("Bybit HTTP {status}: {body}");
+    let normalized = body.to_ascii_lowercase();
+    match status.as_u16() {
+        429 => HftError::RateLimit(detail),
+        403 if normalized.contains("too frequent") || normalized.contains("rate") => {
+            HftError::RateLimit(detail)
+        }
+        401 | 403 => HftError::Authentication(detail),
+        400..=499 => HftError::Exchange(detail),
+        _ => HftError::Network(detail),
+    }
 }
 
 impl BybitExecutionClient {
@@ -79,6 +103,7 @@ impl BybitExecutionClient {
             connected: false,
             resilient_executor: None,
             alert_callback: None,
+            next_client_order_id: None,
         })
     }
 
@@ -230,15 +255,16 @@ fn parse_bybit_open_orders_response(
     response: BybitOpenOrdersResponse,
 ) -> HftResult<Vec<OpenOrder>> {
     if response.retCode != 0 {
-        return Err(HftError::Exchange(format!(
-            "Bybit 查詢未結失敗: {} {}",
-            response.retCode, response.retMsg
-        )));
+        return Err(classify_bybit_response_error(
+            "open-orders query",
+            response.retCode,
+            &response.retMsg,
+        ));
     }
 
     let data = response
-        .data
-        .ok_or_else(|| HftError::Parse("Bybit 未結訂單回應缺少 data".to_string()))?;
+        .result
+        .ok_or_else(|| HftError::Parse("Bybit 未結訂單回應缺少 result".to_string()))?;
 
     data.list
         .into_iter()
@@ -275,9 +301,182 @@ fn parse_bybit_open_orders_response(
         .collect()
 }
 
+fn has_private_credentials(credentials: &BybitCredentials) -> bool {
+    !credentials.api_key.trim().is_empty()
+        && !credentials.secret_key.trim().is_empty()
+        && !credentials.api_key.contains("${")
+        && !credentials.secret_key.contains("${")
+}
+
+fn bybit_private_ws_auth_payload(
+    credentials: &BybitCredentials,
+    expires: u64,
+) -> serde_json::Value {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(credentials.secret_key.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(format!("GET/realtime{expires}").as_bytes());
+    let signature = hex::encode(mac.finalize().into_bytes());
+
+    serde_json::json!({
+        "op": "auth",
+        "args": [credentials.api_key, expires, signature],
+    })
+}
+
+async fn await_private_ws_control<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+    expected_op: &str,
+) -> HftResult<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = ws
+                .next()
+                .await
+                .ok_or_else(|| HftError::Network("Bybit private WS closed".to_string()))?
+                .map_err(|error| HftError::Network(error.to_string()))?;
+
+            match message {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    let value: serde_json::Value = serde_json::from_str(&text)
+                        .map_err(|error| HftError::Serialization(error.to_string()))?;
+                    if value.get("op").and_then(|value| value.as_str()) == Some(expected_op) {
+                        return Ok(value);
+                    }
+                }
+                tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                    ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                        .await
+                        .map_err(|error| HftError::Network(error.to_string()))?;
+                }
+                tokio_tungstenite::tungstenite::Message::Close(_) => {
+                    return Err(HftError::Network("Bybit private WS closed".to_string()));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| HftError::Network(format!("Bybit private WS {expected_op} timed out")))??;
+
+    if response.get("success").and_then(|value| value.as_bool()) == Some(true) {
+        Ok(())
+    } else {
+        Err(HftError::Authentication(format!(
+            "Bybit private WS {expected_op} rejected: {}",
+            response
+                .get("ret_msg")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown response")
+        )))
+    }
+}
+
+fn publish_private_ws_event(tx: &broadcast::Sender<ExecutionEvent>, value: &serde_json::Value) {
+    let topic = value
+        .get("topic")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or("");
+    let Some(entries) = value.get("data").and_then(|entry| entry.as_array()) else {
+        return;
+    };
+
+    for entry in entries {
+        let order_id = entry
+            .get("orderId")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(|value| OrderId(value.to_string()));
+        let Some(order_id) = order_id else {
+            continue;
+        };
+
+        if topic.starts_with("order") {
+            let timestamp = entry
+                .get("updatedTime")
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| hft_core::now_micros() / 1000)
+                * 1000;
+            match entry
+                .get("orderStatus")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+            {
+                "New" | "Created" => {
+                    let _ = tx.send(ExecutionEvent::OrderAck {
+                        order_id,
+                        timestamp,
+                    });
+                }
+                "Cancelled" | "Rejected" => {
+                    let _ = tx.send(ExecutionEvent::OrderCanceled {
+                        order_id,
+                        timestamp,
+                    });
+                }
+                _ => {}
+            }
+        } else if topic.starts_with("execution") {
+            let price = entry
+                .get("execPrice")
+                .and_then(|value| value.as_str())
+                .and_then(|value| Price::from_str(value).ok());
+            let quantity = entry
+                .get("execQty")
+                .and_then(|value| value.as_str())
+                .and_then(|value| Quantity::from_str(value).ok());
+            let timestamp = entry
+                .get("execTime")
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| hft_core::now_micros() / 1000)
+                * 1000;
+            if let (Some(price), Some(quantity)) = (price, quantity) {
+                let fill_id = entry
+                    .get("execId")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| format!("BYBIT-{timestamp}"));
+                let _ = tx.send(ExecutionEvent::Fill {
+                    order_id,
+                    price,
+                    quantity,
+                    timestamp,
+                    fill_id,
+                });
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl ExecutionClient for BybitExecutionClient {
     async fn place_order(&mut self, intent: ports::OrderIntent) -> HftResult<OrderId> {
+        let client_order_id = self.next_client_order_id.take().unwrap_or_else(|| {
+            if matches!(self.config.mode, ExecutionMode::Paper) {
+                format!("BYBIT_PAPER_{:x}", hft_core::now_micros())
+            } else {
+                format!("BYBIT_{:x}", hft_core::now_micros())
+            }
+        });
+        if client_order_id.is_empty()
+            || client_order_id.len() > 36
+            || !client_order_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(HftError::InvalidOrder(
+                "Bybit orderLinkId must be 1-36 ASCII characters [A-Za-z0-9-_]".to_string(),
+            ));
+        }
         if matches!(
             self.config.mode,
             ExecutionMode::Live | ExecutionMode::Testnet
@@ -294,6 +493,7 @@ impl ExecutionClient for BybitExecutionClient {
                 qty: String,
                 price: Option<String>,
                 time_in_force: &'a str,
+                order_link_id: &'a str,
             }
             let side = match intent.side {
                 hft_core::Side::Buy => "Buy",
@@ -316,6 +516,7 @@ impl ExecutionClient for BybitExecutionClient {
                 qty: intent.quantity.0.to_string(),
                 price: intent.price.map(|p| p.0.to_string()),
                 time_in_force: tif,
+                order_link_id: &client_order_id,
             };
             let body =
                 serde_json::to_string(&req).map_err(|e| HftError::Serialization(e.to_string()))?;
@@ -331,28 +532,52 @@ impl ExecutionClient for BybitExecutionClient {
                 )
                 .await
                 .map_err(|e| HftError::Network(e.to_string()))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(classify_bybit_http_error(status, &body));
+            }
             #[derive(serde::Deserialize)]
             #[allow(non_snake_case)]
             struct Resp {
                 retCode: i64,
                 retMsg: String,
                 #[serde(default)]
-                data: serde_json::Value,
+                result: serde_json::Value,
             }
-            let r: Resp = HttpClient::parse_json(resp)
-                .await
-                .map_err(|e| HftError::Serialization(e.to_string()))?;
+            let r: Resp = HttpClient::parse_json(resp).await.map_err(|e| {
+                HftError::Execution(format!(
+                    "Bybit accepted an order request but its response could not be decoded: {e}"
+                ))
+            })?;
             if r.retCode != 0 {
-                return Err(HftError::Exchange(format!(
-                    "Bybit 下單失敗: {} {}",
-                    r.retCode, r.retMsg
+                return Err(classify_bybit_response_error(
+                    "order create",
+                    r.retCode,
+                    &r.retMsg,
+                ));
+            }
+            let returned_link_id = r
+                .result
+                .get("orderLinkId")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if returned_link_id != client_order_id {
+                return Err(HftError::Execution(format!(
+                    "Bybit returned mismatched orderLinkId: expected {}, got {}",
+                    client_order_id, returned_link_id
                 )));
             }
             let ord_id = r
-                .data
+                .result
                 .get("orderId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    HftError::Execution(
+                        "Bybit accepted an order request but returned no orderId".to_string(),
+                    )
+                })?
                 .to_string();
             if let Some(ref tx) = self.event_tx {
                 let _ = tx.send(ExecutionEvent::OrderAck {
@@ -363,7 +588,7 @@ impl ExecutionClient for BybitExecutionClient {
             return Ok(OrderId(ord_id));
         }
         // Paper
-        let oid = OrderId(format!("BYBIT_PAPER_{}", hft_core::now_micros()));
+        let oid = OrderId(client_order_id);
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderAck {
                 order_id: oid.clone(),
@@ -380,6 +605,11 @@ impl ExecutionClient for BybitExecutionClient {
             }
         }
         Ok(oid)
+    }
+
+    async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
+        self.next_client_order_id = Some(envelope.client_order_id.clone());
+        self.place_order(envelope.intent.clone()).await
     }
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
@@ -590,8 +820,11 @@ impl ExecutionClient for BybitExecutionClient {
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
         if let Some(ref tx) = self.event_tx {
             let rx = tx.subscribe();
-            let s = tokio_stream::wrappers::BroadcastStream::new(rx)
-                .filter_map(|e| async move { e.ok().map(Ok) });
+            let s = tokio_stream::wrappers::BroadcastStream::new(rx).map(|result| {
+                result.map_err(|error| {
+                    HftError::Execution(format!("Bybit private execution stream lagged: {error}"))
+                })
+            });
             return Ok(Box::pin(s));
         }
         Ok(Box::pin(futures::stream::empty()))
@@ -635,138 +868,87 @@ impl ExecutionClient for BybitExecutionClient {
 
         self.resilient_executor = Some(Arc::new(executor));
 
-        let (tx, _) = broadcast::channel(1000);
-        self.event_tx = Some(tx.clone());
-        self.connected = true;
         self.ensure_http()?;
 
-        info!("[Bybit] 執行客戶端連接成功");
+        let (tx, _) = broadcast::channel(1000);
 
         if matches!(
             self.config.mode,
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
-            // 私有 WS：簡化處理，僅嘗試 auth + 訂閱 order/execution
-            let ws_url = self.config.ws_private_url.clone();
-            let api_key = self.config.credentials.api_key.clone();
-            let secret = self.config.credentials.secret_key.clone();
+            if !has_private_credentials(&self.config.credentials) {
+                return Err(HftError::Authentication(
+                    "Bybit live/testnet connection requires API credentials".to_string(),
+                ));
+            }
+
+            let (mut ws, _) = tokio_tungstenite::connect_async(&self.config.ws_private_url)
+                .await
+                .map_err(|error| HftError::Network(error.to_string()))?;
+            let expires = BybitSigner::current_timestamp().saturating_add(1_000);
+            let auth = bybit_private_ws_auth_payload(&self.config.credentials, expires);
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                auth.to_string().into(),
+            ))
+            .await
+            .map_err(|error| HftError::Network(error.to_string()))?;
+            await_private_ws_control(&mut ws, "auth").await?;
+
+            let subscription = serde_json::json!({
+                "op": "subscribe",
+                "args": ["order", "execution"],
+            });
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                subscription.to_string().into(),
+            ))
+            .await
+            .map_err(|error| HftError::Network(error.to_string()))?;
+            await_private_ws_control(&mut ws, "subscribe").await?;
+
+            let event_tx = tx.clone();
             tokio::spawn(async move {
-                if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&ws_url).await {
-                    // WS 認證：Bybit v5: op=auth
-                    // 簽名: hex(HMAC_SHA256(secret, timestamp + apiKey + recvWindow))
-                    let ts = integration::signing::BybitSigner::current_timestamp().to_string();
-                    let recv_window = "5000";
-                    let msg = format!("{}{}{}", ts, api_key, recv_window);
-                    let sign = {
-                        use hmac::{Hmac, Mac};
-                        use sha2::Sha256;
-                        type HmacSha256 = Hmac<Sha256>;
-                        let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-                            .expect("HMAC accepts any key length");
-                        mac.update(msg.as_bytes());
-                        hex::encode(mac.finalize().into_bytes())
-                    };
-                    let auth = serde_json::json!({
-                        "op": "auth",
-                        "args": [api_key, ts, recv_window, sign]
-                    });
-                    let _ = ws
-                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                            auth.to_string().into(),
-                        ))
-                        .await;
-                    // 訂閱 order/execution
-                    let sub = serde_json::json!({"op":"subscribe","args":["order.spot","execution.spot"]});
-                    let _ = ws
-                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                            sub.to_string().into(),
-                        ))
-                        .await;
-                    while let Some(msg) = ws.next().await {
-                        if let Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) = msg {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                let topic = v.get("topic").and_then(|x| x.as_str()).unwrap_or("");
-                                if topic.starts_with("order") {
-                                    if let Some(d) = v
-                                        .get("data")
-                                        .and_then(|d| d.as_array())
-                                        .and_then(|arr| arr.first())
-                                    {
-                                        let status = d
-                                            .get("orderStatus")
-                                            .and_then(|x| x.as_str())
-                                            .unwrap_or("");
-                                        let oid = d
-                                            .get("orderId")
-                                            .and_then(|x| x.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let ts = d
-                                            .get("updatedTime")
-                                            .and_then(|x| x.as_str())
-                                            .and_then(|s| s.parse::<u64>().ok())
-                                            .unwrap_or(hft_core::now_micros())
-                                            * 1000;
-                                        match status {
-                                            "New" | "Created" => {
-                                                let _ = tx.send(ExecutionEvent::OrderAck {
-                                                    order_id: OrderId(oid.clone()),
-                                                    timestamp: ts,
-                                                });
-                                            }
-                                            "Cancelled" | "Rejected" => {
-                                                let _ = tx.send(ExecutionEvent::OrderCanceled {
-                                                    order_id: OrderId(oid.clone()),
-                                                    timestamp: ts,
-                                                });
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                } else if topic.starts_with("execution") {
-                                    if let Some(d) = v
-                                        .get("data")
-                                        .and_then(|d| d.as_array())
-                                        .and_then(|arr| arr.first())
-                                    {
-                                        let oid = d
-                                            .get("orderId")
-                                            .and_then(|x| x.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let px = d
-                                            .get("execPrice")
-                                            .and_then(|x| x.as_str())
-                                            .and_then(|s| Price::from_str(s).ok());
-                                        let qty = d
-                                            .get("execQty")
-                                            .and_then(|x| x.as_str())
-                                            .and_then(|s| Quantity::from_str(s).ok());
-                                        let ts = d
-                                            .get("execTime")
-                                            .and_then(|x| x.as_str())
-                                            .and_then(|s| s.parse::<u64>().ok())
-                                            .unwrap_or(hft_core::now_micros())
-                                            * 1000;
-                                        if let (Some(p), Some(q)) = (px, qty) {
-                                            let _ = tx.send(ExecutionEvent::Fill {
-                                                order_id: OrderId(oid),
-                                                price: p,
-                                                quantity: q,
-                                                timestamp: ts,
-                                                fill_id: format!("BYBIT-{}", ts),
-                                            });
-                                        }
-                                    }
-                                }
+                let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
+                heartbeat.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = heartbeat.tick() => {
+                            if ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                                serde_json::json!({"op": "ping"}).to_string().into(),
+                            )).await.is_err() {
+                                warn!("Bybit private WS heartbeat failed");
+                                break;
                             }
                         }
+                        message = ws.next() => match message {
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    publish_private_ws_event(&event_tx, &value);
+                                }
+                            }
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
+                                if ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
+                            Some(Err(error)) => {
+                                warn!(error = %error, "Bybit private WS read failed");
+                                break;
+                            }
+                            _ => {}
+                        }
                     }
-                } else {
-                    warn!("Bybit 私有 WS 連線失敗");
                 }
+                let _ = event_tx.send(ExecutionEvent::ConnectionStatus {
+                    connected: false,
+                    timestamp: hft_core::now_micros(),
+                });
             });
         }
+
+        self.event_tx = Some(tx);
+        self.connected = true;
+        info!("[Bybit] 執行客戶端連接成功");
         Ok(())
     }
 
@@ -844,6 +1026,22 @@ mod tests {
     }
 
     #[test]
+    fn exchange_rate_limits_are_classified_without_retrying_order_submission() {
+        assert!(matches!(
+            classify_bybit_response_error("order create", 10006, "Too many visits"),
+            HftError::RateLimit(_)
+        ));
+        assert!(matches!(
+            classify_bybit_http_error(reqwest::StatusCode::FORBIDDEN, "access too frequent"),
+            HftError::RateLimit(_)
+        ));
+        assert!(matches!(
+            classify_bybit_response_error("order create", 110007, "insufficient balance"),
+            HftError::Exchange(_)
+        ));
+    }
+
+    #[test]
     fn test_config_creation() {
         let config = make_test_config(ExecutionMode::Paper);
         assert_eq!(config.rest_base_url, "https://api.bybit.com");
@@ -865,6 +1063,24 @@ mod tests {
         let config = make_test_config(ExecutionMode::Paper);
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("BybitExecutionConfig"));
+    }
+
+    #[test]
+    fn private_ws_auth_uses_bybit_v5_get_realtime_signature() {
+        let credentials = BybitCredentials {
+            api_key: "test_key".to_string(),
+            secret_key: "test_secret".to_string(),
+        };
+
+        let payload = bybit_private_ws_auth_payload(&credentials, 123_456);
+
+        assert_eq!(payload["op"], "auth");
+        assert_eq!(payload["args"][0], "test_key");
+        assert_eq!(payload["args"][1], 123_456);
+        assert_eq!(
+            payload["args"][2],
+            "c78e068710f8dfc40c7c66173ff9bbce29560787724e255b5cdd76b81f05ede9"
+        );
     }
 
     #[test]
@@ -934,6 +1150,21 @@ mod tests {
         assert!(client.connected);
         assert!(client.event_tx.is_some());
         assert!(client.resilient_executor.is_some());
+    }
+
+    #[tokio::test]
+    async fn live_connect_without_credentials_is_rejected_before_network_io() {
+        let mut config = make_test_config(ExecutionMode::Testnet);
+        config.credentials = BybitCredentials {
+            api_key: String::new(),
+            secret_key: String::new(),
+        };
+        let mut client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client.connect().await.unwrap_err();
+
+        assert!(error.to_string().contains("requires API credentials"));
+        assert!(!client.connected);
     }
 
     #[tokio::test]
@@ -1097,11 +1328,21 @@ mod tests {
         let response = BybitOpenOrdersResponse {
             retCode: 0,
             retMsg: "OK".to_string(),
-            data: None,
+            result: None,
         };
 
         let result = parse_bybit_open_orders_response(response);
-        assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("缺少 data")));
+        assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("缺少 result")));
+    }
+
+    #[test]
+    fn open_orders_parser_accepts_v5_result_envelope() {
+        let response: BybitOpenOrdersResponse =
+            serde_json::from_str(r#"{"retCode":0,"retMsg":"OK","result":{"list":[]}}"#).unwrap();
+
+        assert!(parse_bybit_open_orders_response(response)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1109,7 +1350,7 @@ mod tests {
         let response = BybitOpenOrdersResponse {
             retCode: 0,
             retMsg: "OK".to_string(),
-            data: Some(BybitOpenOrdersData {
+            result: Some(BybitOpenOrdersData {
                 list: vec![BybitOpenOrdersItem {
                     orderId: "1".to_string(),
                     symbol: "BTCUSDT".to_string(),

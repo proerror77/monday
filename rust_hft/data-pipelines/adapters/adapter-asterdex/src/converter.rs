@@ -27,6 +27,7 @@ impl MessageConverter {
             timestamp: update.event_time.saturating_mul(1000),
             bids,
             asks,
+            first_sequence: Some(update.first_update_id),
             sequence: update.final_update_id,
             is_snapshot: false,
         })

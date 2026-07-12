@@ -101,6 +101,8 @@ impl MarketStream for ClickhouseReplayStream {
                 Err(e) => {
                     let _ = tx.send(MarketEvent::Disconnect {
                         reason: format!("CH snapshot query failed: {}", e),
+                        source_venue: Some(hft_core::VenueId::MOCK),
+                        symbol: Some(Symbol::from(symbol.clone())),
                     });
                     return;
                 }
@@ -144,6 +146,8 @@ impl MarketStream for ClickhouseReplayStream {
             } else {
                 let _ = tx.send(MarketEvent::Disconnect {
                     reason: "No starting snapshot".to_string(),
+                    source_venue: Some(hft_core::VenueId::MOCK),
+                    symbol: Some(Symbol::from(symbol.clone())),
                 });
             }
 
@@ -176,6 +180,8 @@ impl MarketStream for ClickhouseReplayStream {
                 Err(e) => {
                     let _ = tx.send(MarketEvent::Disconnect {
                         reason: format!("CH query failed: {}", e),
+                        source_venue: Some(hft_core::VenueId::MOCK),
+                        symbol: Some(Symbol::from(symbol.clone())),
                     });
                     return;
                 }
@@ -233,6 +239,8 @@ impl MarketStream for ClickhouseReplayStream {
             }
             let _ = tx.send(MarketEvent::Disconnect {
                 reason: "replay_finish".to_string(),
+                source_venue: Some(hft_core::VenueId::MOCK),
+                symbol: Some(Symbol::from(symbol.clone())),
             });
         });
 
