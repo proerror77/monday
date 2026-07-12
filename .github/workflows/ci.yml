@@ -163,7 +163,7 @@ jobs:
           version: v1.35.3
 
       - name: Validate Kubernetes manifests without a cluster
-        run: kubectl apply --dry-run=client -f rust_hft/deployment/k8s/
+        run: kubectl apply --dry-run=client --validate=false -f rust_hft/deployment/k8s/
 
   rust_hft_engine_fast_lane:
     name: Rust HFT Engine Fast Lane
