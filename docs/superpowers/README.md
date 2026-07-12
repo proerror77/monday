@@ -5,7 +5,7 @@
 - [Loop Engineer production-hardening design](specs/2026-07-11-loop-engineer-production-hardening-design.md)
 - [Loop Engineer production-hardening plan](plans/2026-07-11-loop-engineer-production-hardening.md)
 
-These documents define the bounded goal/evidence loop, Formula-only governed promotion, lab-only RL/LLM boundaries, signed Paper/Shadow handoff, and disabled live-small activation.
+These documents define the bounded goal/evidence loop, governed Formula/ONNX promotion, lab-only RL/LLM authority, signed Paper/Shadow handoff, and disabled live-small activation.
 
 ## Superseded Documents
 

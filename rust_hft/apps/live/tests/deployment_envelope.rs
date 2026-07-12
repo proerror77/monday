@@ -151,6 +151,7 @@ fn onnx_bundle(
                     },
                     "byte_len": byte_len,
                     "opset": 17,
+                    "preprocessing_version": "lob-relative-price-log-size-v1",
                     "inputs": [{
                         "name": "lob",
                         "element_type": "Float32",

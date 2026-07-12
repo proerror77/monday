@@ -121,7 +121,7 @@ cargo run -p alpha-harness -- deployment sign \
 
 The deployment signing key file contains exactly 32 bytes as hex and is never stored in DuckDB or passed to the runtime. Live-small signing requires a persisted `human_live_small` approval whose `scope_hash` matches venue, instruments, and live-small intent. Runtime-owned `policy.json` must independently carry the referenced approval id, class, promotion subject, scope hash, signer, validity window, and revocation state; an envelope signer cannot self-assert an approval id. The runtime still refuses live-small activation until universal order/slippage enforcement and real-venue reconciliation/reduce-only acceptance tests pass.
 
-The runtime bundle schema can validate Formula and ONNX artifacts, but the current governed evaluator/promotion producer emits Formula bundles only. ONNX candidates remain research-only until a point-in-time ONNX evaluator and training lineage are implemented; runtime ONNX compatibility tests are not evidence of governed ONNX promotion.
+ONNX candidates enter through `candidate register-onnx`. The command verifies a bundle-relative model, checksum, byte length, static LOB tensor schema, preprocessing version, registered PIT feature matrix, and Rust walk-forward results before persisting one immutable candidate iteration. Sealed evaluation reruns the same model through Rust. ONNX promotion requires `--bundle-out` and `--model-root`; it materializes the exact verified model beside the content-addressed bundle. Python may train/export the model, but cannot create promotion evidence or load it into the runtime directly.
 
 For paper/shadow runtime intake, first obtain current hashes:
 

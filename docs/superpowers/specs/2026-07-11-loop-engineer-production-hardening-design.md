@@ -50,7 +50,7 @@ The runtime-loadable bundle schema supports artifacts the Rust runtime can execu
 - `Formula`: validated Factor DSL plus live feature mapping, signal threshold, order size request, and strategy risk request.
 - `OnnxModel`: content-addressed model artifact plus existing deterministic DL strategy configuration.
 
-The current governed evaluator and promotion producer is Formula-only. `OnnxModel` remains a research/runtime-compatibility artifact until a point-in-time ONNX evaluator and training lineage are implemented; it cannot be produced by the v2 promotion path. Other candidate variants remain research-only and cannot be signed. Model files are not embedded; the bundle schema includes a bundle-relative contained path, SHA-256, size, and schema/version metadata. Absolute, URI, parent-traversal, and symlink escape paths fail closed.
+The governed producer supports Formula candidates and externally trained ONNX candidates. ONNX registration requires an immutable PIT feature matrix, a pinned LOB preprocessing version, a static `[1, 4, window, levels]` input, a single signal output, and Rust-owned walk-forward and sealed-holdout inference. Promotion materializes the verified model beside the bundle at its contained relative path. Other candidate variants remain research-only and cannot be signed. Absolute, URI, parent-traversal, checksum, size, and symlink escape failures fail closed.
 
 ## Accounting And Execution Safety
 
@@ -86,7 +86,7 @@ The current governed evaluator and promotion producer is Formula-only. `OnnxMode
 6. Reconciliation errors halt live execution instead of returning success or empty state.
 7. A zero-signal or no-trade candidate fails evaluation.
 8. Promotion cannot sign an envelope that is not bound to its persisted candidate, evaluation, dataset, bundle, and approval; runtime independently resolves the approval id to exact class, subject, scope, signer, and active window.
-9. Paper/shadow activation loads the referenced Formula v2 strategy before runtime build; ONNX runtime loading remains compatibility-tested but is not a governed promotion claim.
+9. Paper/shadow activation loads the referenced Formula or governed ONNX strategy before runtime build; the exact candidate, evaluator evidence, bundle, model digest, and preprocessing version remain content-bound.
 10. Activation is reported only after runtime start succeeds.
 11. Fill/reject/cancel/PnL attribution is non-empty, signed by a runtime-only key, verified before ingestion, and tied to deployment and strategy bundle.
 12. Research mission completion uses explicit criteria and persists a completion reason; overall `LoopRun` completion uses a target stage.

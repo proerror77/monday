@@ -80,6 +80,7 @@ enum DataCommand {
 #[derive(Debug, Subcommand)]
 enum CandidateCommand {
     List(MissionStatusArgs),
+    RegisterOnnx(RegisterOnnxArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -324,6 +325,26 @@ pub struct EvaluateArgs {
     pub mission_id: String,
     #[arg(long)]
     pub candidate_id: String,
+    #[arg(long)]
+    pub model_root: Option<PathBuf>,
+    #[command(flatten)]
+    pub dataset: DatasetArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RegisterOnnxArgs {
+    #[arg(long)]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub mission_id: String,
+    #[arg(long)]
+    pub candidate_id: String,
+    #[arg(long)]
+    pub hypothesis: String,
+    #[arg(long)]
+    pub model: PathBuf,
+    #[arg(long)]
+    pub model_root: PathBuf,
     #[command(flatten)]
     pub dataset: DatasetArgs,
 }
@@ -338,6 +359,10 @@ pub struct PromoteArgs {
     pub candidate_id: String,
     #[arg(long)]
     pub promotion_id: Option<String>,
+    #[arg(long)]
+    pub bundle_out: Option<PathBuf>,
+    #[arg(long)]
+    pub model_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -429,6 +454,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Candidate { command } => match command {
             CandidateCommand::List(args) => governance::candidate_list(args),
+            CandidateCommand::RegisterOnnx(args) => governance::register_onnx_candidate(args),
         },
         Command::Evaluate(args) => governance::evaluate(args),
         Command::Promote(args) => governance::promote(args),

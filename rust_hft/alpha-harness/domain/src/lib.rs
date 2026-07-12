@@ -13,6 +13,9 @@ pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
 pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v2";
 pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v2";
+pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v1";
+pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v1";
+pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -287,7 +290,10 @@ impl CandidateEvaluation {
         }
         if matches!(
             self.evaluator_version.as_str(),
-            WALK_FORWARD_EVALUATOR_VERSION | SEALED_HOLDOUT_EVALUATOR_VERSION
+            WALK_FORWARD_EVALUATOR_VERSION
+                | SEALED_HOLDOUT_EVALUATOR_VERSION
+                | ONNX_WALK_FORWARD_EVALUATOR_VERSION
+                | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
         ) {
             let config = self.formula_config()?;
             let policy_passed = self.metrics.folds.iter().all(|fold| {
@@ -1041,6 +1047,7 @@ pub struct OnnxModelCandidate {
     pub artifact: ArtifactRef,
     pub byte_len: u64,
     pub opset: u32,
+    pub preprocessing_version: String,
     pub inputs: Vec<TensorSpec>,
     pub output: TensorSpec,
 }
@@ -1052,6 +1059,7 @@ impl OnnxModelCandidate {
             || self.byte_len == 0
             || self.byte_len > MAX_ONNX_ARTIFACT_BYTES
             || self.opset == 0
+            || self.preprocessing_version != LOB_ONNX_PREPROCESSING_VERSION
             || self.inputs.is_empty()
         {
             return Err(DomainError::InvalidStrategyBundle);
@@ -1088,8 +1096,13 @@ impl CandidateArtifact {
                     .map_err(|_| DomainError::InvalidStrategyBundle)?;
                 Ok(StrategyBundleArtifact::Formula { ast: ast.clone() })
             }
-            Self::OnnxModel(_)
-            | Self::Program(_)
+            Self::OnnxModel(model) => {
+                model.validate()?;
+                Ok(StrategyBundleArtifact::Onnx {
+                    model: model.clone(),
+                })
+            }
+            Self::Program(_)
             | Self::ModelConfig(_)
             | Self::ModelArtifact(_)
             | Self::Ensemble(_)
@@ -2225,6 +2238,7 @@ mod tests {
             },
             byte_len,
             opset: 17,
+            preprocessing_version: LOB_ONNX_PREPROCESSING_VERSION.to_string(),
             inputs: vec![TensorSpec {
                 name: "lob".to_string(),
                 element_type: TensorElementType::Float32,
@@ -2290,6 +2304,7 @@ mod tests {
             },
             byte_len: 1,
             opset: 17,
+            preprocessing_version: LOB_ONNX_PREPROCESSING_VERSION.to_string(),
             inputs: vec![TensorSpec {
                 name: "input".to_string(),
                 element_type: TensorElementType::Float32,
@@ -2301,10 +2316,10 @@ mod tests {
                 dimensions: vec![Some(1), Some(1)],
             },
         });
-        assert_eq!(
+        assert!(matches!(
             onnx.to_governed_strategy_bundle_artifact(),
-            Err(DomainError::ResearchOnlyArtifact)
-        );
+            Ok(StrategyBundleArtifact::Onnx { .. })
+        ));
     }
 
     #[test]

@@ -37,6 +37,25 @@ impl FormulaEvaluator {
             .map_err(|error| format!("failed to serialize evaluator config: {error}"))
     }
 
+    pub fn evaluate_onnx_signals(
+        &self,
+        rows: &[ResearchRow],
+        signals: &[f64],
+        ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+        sealed: bool,
+    ) -> Result<CandidateEvaluation, String> {
+        self.evaluate_ranges(
+            rows,
+            signals,
+            ranges,
+            if sealed {
+                alpha_domain::ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+            } else {
+                alpha_domain::ONNX_WALK_FORWARD_EVALUATOR_VERSION
+            },
+        )
+    }
+
     pub fn evaluate_sealed(
         &self,
         proposal: &EngineProposal,

@@ -97,6 +97,7 @@ version = "0.1.0"
 dependencies = [
  "alpha-domain",
  "alpha-engine",
+ "alpha-onnx-evaluator",
  "alpha-store",
  "anyhow",
  "chrono",
@@ -108,6 +109,17 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+]
+
+[[package]]
+name = "alpha-onnx-evaluator"
+version = "0.1.0"
+dependencies = [
+ "alpha-domain",
+ "alpha-engine",
+ "chrono",
+ "hft-infer-onnx",
+ "hft-research-manifest",
 ]
 
 [[package]]

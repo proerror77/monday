@@ -1,26 +1,36 @@
 use crate::{
     cli::{
         print_json, EnvelopeArgs, EvaluateArgs, FeedbackLogArgs, FeedbackRecordArgs,
-        JsonRecordArgs, MissionStatusArgs, PromoteArgs, RevokeApprovalArgs, SignDeploymentArgs,
+        JsonRecordArgs, MissionStatusArgs, PromoteArgs, RegisterOnnxArgs, RevokeApprovalArgs,
+        SignDeploymentArgs,
     },
     data_mission,
 };
 use alpha_domain::{
     canonical_json_hash, deployment_scope_hash, sign_envelope, verify_runtime_attribution_event,
-    ApprovalClass, CandidateArtifact, DeploymentEnvelope, IterationVerdict, PromotionRecord,
-    RuntimeAttributionEvent, SearchPolicyRevision, SignedRuntimeAttributionEvent, StrategyBundle,
-    SEALED_HOLDOUT_EVALUATOR_VERSION,
+    ApprovalClass, CandidateArtifact, DeploymentEnvelope, EngineKind, IterationVerdict,
+    MissionStatus, MissionTerminalReason, OnnxModelCandidate, PromotionRecord, ResearchIteration,
+    RuntimeAttributionEvent, SearchBudgetLimit, SearchBudgetUsage, SearchPolicyRevision,
+    SignedRuntimeAttributionEvent, StrategyBundle, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
+    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
     evaluation::{prepare_dataset, WalkForwardConfig},
     formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
     CandidateEvaluation, EngineProposal,
 };
-use alpha_store::{AlphaStore, ApprovalRecord, MissionLineage, RegistryRevision, StoreError};
+use alpha_onnx_evaluator::OnnxEvaluator;
+use alpha_store::{
+    AlphaStore, ApprovalRecord, EvaluationRecord, MissionLineage, RegistryRevision, StoreError,
+};
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 pub fn candidate_list(args: MissionStatusArgs) -> anyhow::Result<()> {
     let store = AlphaStore::open(args.db)?;
@@ -74,13 +84,34 @@ fn validated_walk_forward_candidates_in_lineage(
         }) else {
             continue;
         };
-        if stored
+        let evaluator_version = stored
             .record
             .payload
             .get("evaluator_version")
-            .and_then(serde_json::Value::as_str)
-            != Some(WALK_FORWARD_EVALUATOR_VERSION)
-        {
+            .and_then(serde_json::Value::as_str);
+        if !matches!(
+            evaluator_version,
+            Some(WALK_FORWARD_EVALUATOR_VERSION | ONNX_WALK_FORWARD_EVALUATOR_VERSION)
+        ) {
+            continue;
+        }
+        let Some(candidate) = lineage
+            .candidates
+            .iter()
+            .find(|candidate| candidate.candidate_id == candidate_id)
+        else {
+            continue;
+        };
+        if !matches!(
+            (&candidate.artifact, evaluator_version),
+            (
+                CandidateArtifact::Formula(_),
+                Some(WALK_FORWARD_EVALUATOR_VERSION)
+            ) | (
+                CandidateArtifact::OnnxModel(_),
+                Some(ONNX_WALK_FORWARD_EVALUATOR_VERSION)
+            )
+        ) {
             continue;
         }
         let evaluation: CandidateEvaluation = serde_json::from_value(stored.record.payload.clone())
@@ -96,6 +127,99 @@ fn validated_walk_forward_candidates_in_lineage(
     candidates.sort();
     candidates.dedup();
     Ok(candidates)
+}
+
+pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
+    let mut store = AlphaStore::open(&args.db)?;
+    let mission = store.get_mission(&args.mission_id)?;
+    let lineage = store.mission_lineage(&args.mission_id)?;
+    if mission.status != MissionStatus::Pending
+        || mission.completion_policy.min_kept_candidates != 1
+        || !lineage.iterations.is_empty()
+    {
+        bail!("ONNX registration requires an empty pending one-candidate mission");
+    }
+    let model: OnnxModelCandidate = serde_json::from_slice(
+        &std::fs::read(&args.model)
+            .with_context(|| format!("failed to read ONNX candidate {}", args.model.display()))?,
+    )?;
+    model.validate().map_err(anyhow::Error::new)?;
+    let model_path = verified_model_path(&model, &args.model_root)?;
+    let manifest =
+        data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
+    if mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
+        bail!("mission dataset id does not match the supplied manifest");
+    }
+    let dataset = prepare_dataset(
+        manifest.load_rows(
+            args.dataset.fee_bps,
+            args.dataset.funding_bps,
+            args.dataset.latency_bps,
+        )?,
+        &WalkForwardConfig {
+            initial_train_rows: args.dataset.initial_train_rows,
+            validation_rows: args.dataset.validation_rows,
+            fold_count: args.dataset.fold_count,
+            purge_rows: args.dataset.purge_rows,
+            embargo_rows: args.dataset.embargo_rows,
+            sealed_holdout_rows: args.dataset.sealed_holdout_rows,
+        },
+        format!("sealed:{}", manifest.manifest_id()),
+    )?;
+    let evaluation = OnnxEvaluator::for_mission(&mission)
+        .map_err(anyhow::Error::msg)?
+        .evaluate(&model, &model_path, &dataset.engine_context())
+        .map_err(anyhow::Error::msg)?;
+    let now = Utc::now();
+    let evaluation_id = format!("{}-onnx-evaluation-1", args.mission_id);
+    let iteration = ResearchIteration {
+        iteration_id: format!("{}-onnx-iteration-1", args.mission_id),
+        mission_id: args.mission_id.clone(),
+        parent_candidate_ids: vec![],
+        engine: EngineKind::ManualSeed,
+        hypothesis: args.hypothesis,
+        candidate_artifact_id: Some(args.candidate_id.clone()),
+        evaluation_artifact_id: Some(evaluation_id.clone()),
+        budget_usage: SearchBudgetUsage {
+            candidates: 1,
+            ..SearchBudgetUsage::default()
+        },
+        verdict: if evaluation.passed {
+            IterationVerdict::Keep
+        } else {
+            IterationVerdict::Discard
+        },
+        failure_class: None,
+        failure_explanation: (!evaluation.passed).then(|| evaluation.failure_reasons.join("; ")),
+        created_at: now,
+    };
+    let candidate = CandidateArtifact::OnnxModel(model);
+    let record = EvaluationRecord {
+        evaluation_id,
+        mission_id: args.mission_id.clone(),
+        candidate_id: args.candidate_id.clone(),
+        payload: serde_json::to_value(&evaluation)?,
+        created_at: now,
+    };
+    store.transition_mission(&args.mission_id, MissionStatus::Running, now)?;
+    store.append_iteration(
+        &iteration,
+        Some((&args.candidate_id, &candidate)),
+        Some(&record),
+    )?;
+    let reason = if evaluation.passed {
+        MissionTerminalReason::CompletionPolicySatisfied { kept_candidates: 1 }
+    } else {
+        MissionTerminalReason::SearchBudgetExhausted {
+            exhausted_limits: vec![SearchBudgetLimit::Candidates],
+        }
+    };
+    store.finish_mission(&args.mission_id, reason, Utc::now())?;
+    print_json(&serde_json::json!({
+        "candidate_id": args.candidate_id,
+        "evaluation": evaluation,
+        "model_path": model_path,
+    }))
 }
 
 pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
@@ -132,6 +256,12 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
     if iteration.engine == alpha_domain::EngineKind::OfflineReinforcementLearning {
         bail!("offline RL candidates are lab search-policy output and cannot access holdout");
     }
+    let is_onnx = matches!(candidate.artifact, CandidateArtifact::OnnxModel(_));
+    let expected_sealed_version = if is_onnx {
+        ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+    } else {
+        SEALED_HOLDOUT_EVALUATOR_VERSION
+    };
 
     if let Some(existing) = existing {
         let existing_evaluation: CandidateEvaluation = serde_json::from_value(
@@ -167,7 +297,7 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
                 .get("dataset_manifest_id")
                 .and_then(serde_json::Value::as_str)
                 != Some(lineage.mission.dataset_manifest_id.as_str())
-            || existing_evaluation.evaluator_version != SEALED_HOLDOUT_EVALUATOR_VERSION
+            || existing_evaluation.evaluator_version != expected_sealed_version
             || existing_evaluation.evaluator_config != expected_config
         {
             bail!("existing sealed evaluation is not canonical v2 evidence for this candidate");
@@ -205,10 +335,24 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
         tokens: 0,
         elapsed_ms: 0,
     };
-    let evaluation = FormulaEvaluator::for_mission(&lineage.mission)
-        .map_err(anyhow::Error::msg)?
-        .evaluate_sealed(&proposal, &dataset)
-        .map_err(anyhow::Error::msg)?;
+    let evaluation = match &candidate.artifact {
+        CandidateArtifact::Formula(_) => FormulaEvaluator::for_mission(&lineage.mission)
+            .map_err(anyhow::Error::msg)?
+            .evaluate_sealed(&proposal, &dataset)
+            .map_err(anyhow::Error::msg)?,
+        CandidateArtifact::OnnxModel(model) => {
+            let root = args
+                .model_root
+                .as_deref()
+                .context("--model-root is required for ONNX sealed evaluation")?;
+            let model_path = verified_model_path(model, root)?;
+            OnnxEvaluator::for_mission(&lineage.mission)
+                .map_err(anyhow::Error::msg)?
+                .evaluate_sealed(model, &model_path, &dataset)
+                .map_err(anyhow::Error::msg)?
+        }
+        _ => bail!("candidate artifact has no governed sealed evaluator"),
+    };
     let revision = RegistryRevision {
         revision_id,
         registry_kind: "sealed_evaluation".to_string(),
@@ -226,7 +370,45 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
     print_json(&revision)
 }
 
+fn verified_model_path(model: &OnnxModelCandidate, root: &Path) -> anyhow::Result<PathBuf> {
+    let uri = model.artifact.uri.as_str();
+    let relative = Path::new(uri);
+    if uri.contains("://")
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!("ONNX artifact path must remain inside the model root");
+    }
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve model root {}", root.display()))?;
+    let path = canonical_root
+        .join(relative)
+        .canonicalize()
+        .with_context(|| format!("failed to resolve ONNX artifact {}", relative.display()))?;
+    if !path.starts_with(&canonical_root) || !path.is_file() {
+        bail!("ONNX artifact escapes the model root or is not a regular file");
+    }
+    let bytes = std::fs::read(&path)?;
+    let checksum = hex::encode(Sha256::digest(&bytes));
+    if bytes.len() as u64 != model.byte_len
+        || model.artifact.checksum.as_deref() != Some(checksum.as_str())
+    {
+        bail!("ONNX artifact size or checksum does not match candidate metadata");
+    }
+    Ok(path)
+}
+
 pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
+    let bundle_out = args.bundle_out.clone();
+    let model_root = args.model_root.clone();
     let mut store = AlphaStore::open(&args.db)?;
     let sealed_id = format!("sealed-evaluation:{}", args.candidate_id);
     let sealed = store.get_registry_revision(&sealed_id)?;
@@ -310,6 +492,7 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         bundle_hash: bundle.bundle_hash.clone(),
         created_at: now,
     };
+    materialize_bundle(&bundle, bundle_out.as_deref(), model_root.as_deref())?;
     if let Some(existing) = existing {
         let stored_bundle = store.get_strategy_bundle(&existing.record.bundle_id)?;
         ensure_exact_promotion_replay(&existing.record, &stored_bundle, &promotion, &bundle)?;
@@ -323,6 +506,58 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         "promotion": stored,
         "bundle": bundle,
     }))
+}
+
+fn materialize_bundle(
+    bundle: &StrategyBundle,
+    bundle_out: Option<&Path>,
+    model_root: Option<&Path>,
+) -> anyhow::Result<()> {
+    let Some(bundle_out) = bundle_out else {
+        if matches!(
+            &bundle.artifact,
+            alpha_domain::StrategyBundleArtifact::Onnx { .. }
+        ) {
+            bail!("ONNX promotion requires --bundle-out and --model-root");
+        }
+        return Ok(());
+    };
+    let bundle_dir = bundle_out
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(bundle_dir)?;
+    let canonical_bundle_dir = bundle_dir.canonicalize()?;
+    if let alpha_domain::StrategyBundleArtifact::Onnx { model } = &bundle.artifact {
+        let source = verified_model_path(
+            model,
+            model_root.context("ONNX promotion requires --model-root")?,
+        )?;
+        let relative = Path::new(&model.artifact.uri);
+        let target = canonical_bundle_dir.join(relative);
+        let target_parent = target
+            .parent()
+            .context("ONNX bundle target has no parent directory")?;
+        std::fs::create_dir_all(target_parent)?;
+        let canonical_target_parent = target_parent.canonicalize()?;
+        if !canonical_target_parent.starts_with(&canonical_bundle_dir) {
+            bail!("ONNX bundle target escapes the bundle directory");
+        }
+        if target.exists() {
+            let bytes = std::fs::read(&target)?;
+            let checksum = hex::encode(Sha256::digest(&bytes));
+            if bytes.len() as u64 != model.byte_len
+                || model.artifact.checksum.as_deref() != Some(checksum.as_str())
+            {
+                bail!("existing ONNX bundle artifact has different content");
+            }
+        } else if source != target {
+            let temporary = target.with_extension("onnx.tmp");
+            std::fs::copy(&source, &temporary)?;
+            std::fs::rename(temporary, &target)?;
+        }
+    }
+    data_mission::write_json_atomic(bundle_out, bundle)
 }
 
 fn ensure_exact_promotion_replay(

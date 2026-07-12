@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 alpha-domain = { path = "../domain" }
 alpha-engine = { path = "../engine" }
+alpha-onnx-evaluator = { path = "../onnx-evaluator" }
 alpha-store = { path = "../store" }
 anyhow = "1"
 chrono = { workspace = true, features = ["serde"] }

@@ -1259,6 +1259,7 @@ mod tests {
             db: db.clone(),
             mission_id: mission_id.to_string(),
             candidate_id: candidate_id.to_string(),
+            model_root: None,
             dataset: args.mission.dataset,
         })
         .unwrap_err();
@@ -1303,6 +1304,7 @@ mod tests {
             db: db.clone(),
             mission_id: mission_id.to_string(),
             candidate_id: candidate_id.to_string(),
+            model_root: None,
             dataset,
         })
         .unwrap_err();
@@ -1520,6 +1522,7 @@ mod tests {
             db: db.clone(),
             mission_id: mission_id.to_string(),
             candidate_id: candidate_id.to_string(),
+            model_root: None,
             dataset: dataset_args.clone(),
         })
         .unwrap();
@@ -1528,6 +1531,8 @@ mod tests {
             mission_id: mission_id.to_string(),
             candidate_id: candidate_id.to_string(),
             promotion_id: None,
+            bundle_out: None,
+            model_root: None,
         })
         .unwrap();
         governance::promote(PromoteArgs {
@@ -1535,6 +1540,8 @@ mod tests {
             mission_id: mission_id.to_string(),
             candidate_id: candidate_id.to_string(),
             promotion_id: None,
+            bundle_out: None,
+            model_root: None,
         })
         .expect("an exact promotion replay must be idempotent");
         {

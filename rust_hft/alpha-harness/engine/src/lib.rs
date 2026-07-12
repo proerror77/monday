@@ -3,21 +3,29 @@
 pub mod engines;
 pub mod evaluation;
 pub mod formula_evaluator;
+#[cfg(feature = "kernel")]
 pub mod learning;
 pub mod llm;
 
+use alpha_domain::{CandidateArtifact, EngineKind};
+#[cfg(feature = "kernel")]
 use alpha_domain::{
-    CandidateArtifact, EngineKind, IterationVerdict, MissionStatus, MissionTerminalReason,
-    ResearchIteration, SearchBudgetLimit,
+    IterationVerdict, MissionStatus, MissionTerminalReason, ResearchIteration, SearchBudgetLimit,
 };
 pub use alpha_domain::{CandidateEvaluation, EvaluationMetrics, FoldEvaluationMetrics};
+#[cfg(feature = "kernel")]
 use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RunCheckpoint, StoreError};
+#[cfg(feature = "kernel")]
 use chrono::Utc;
-use evaluation::{EngineContext, PreparedDataset};
+use evaluation::EngineContext;
+#[cfg(feature = "kernel")]
+use evaluation::PreparedDataset;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "kernel")]
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[cfg(feature = "kernel")]
 pub enum EngineError {
     #[error("control-plane store failed: {0}")]
     Store(#[from] StoreError),
@@ -162,11 +170,13 @@ pub trait CandidateEvaluator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg(feature = "kernel")]
 pub struct RunControl {
     pub max_new_iterations: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "kernel")]
 pub struct RunOutcome {
     pub status: MissionStatus,
     pub terminal_reason: Option<MissionTerminalReason>,
@@ -174,12 +184,14 @@ pub struct RunOutcome {
     pub new_iterations: usize,
 }
 
+#[cfg(feature = "kernel")]
 pub struct AutoResearchKernel<'a, P, E> {
     store: &'a mut AlphaStore,
     proposal_engine: P,
     evaluator: E,
 }
 
+#[cfg(feature = "kernel")]
 impl<'a, P, E> AutoResearchKernel<'a, P, E>
 where
     P: ProposalEngine,
@@ -490,6 +502,7 @@ where
     }
 }
 
+#[cfg(feature = "kernel")]
 fn historical_observations(
     lineage: &MissionLineage,
     engine_kind: &EngineKind,
@@ -536,6 +549,7 @@ fn historical_observations(
     Ok(observations)
 }
 
+#[cfg(feature = "kernel")]
 fn budget_exhausted(
     budget: &alpha_domain::SearchBudget,
     usage: &alpha_domain::SearchBudgetUsage,
@@ -546,6 +560,7 @@ fn budget_exhausted(
         || (budget.max_seconds > 0 && usage.elapsed_ms >= budget.max_seconds.saturating_mul(1_000))
 }
 
+#[cfg(feature = "kernel")]
 fn exhausted_budget_limits(
     budget: &alpha_domain::SearchBudget,
     usage: &alpha_domain::SearchBudgetUsage,
@@ -566,6 +581,7 @@ fn exhausted_budget_limits(
     limits
 }
 
+#[cfg(feature = "kernel")]
 fn remaining_budget(
     budget: &alpha_domain::SearchBudget,
     usage: &alpha_domain::SearchBudgetUsage,
@@ -578,6 +594,7 @@ fn remaining_budget(
     }
 }
 
+#[cfg(feature = "kernel")]
 fn remaining_limit(limit: u64, used: u64) -> u64 {
     if limit == 0 {
         u64::MAX
@@ -586,7 +603,7 @@ fn remaining_limit(limit: u64, used: u64) -> u64 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "kernel"))]
 mod tests {
     use super::*;
     use crate::engines::{

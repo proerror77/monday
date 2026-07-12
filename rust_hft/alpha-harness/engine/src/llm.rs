@@ -284,6 +284,7 @@ impl OpenAiCompatibleClient {
     }
 }
 
+#[cfg(feature = "kernel")]
 impl crate::learning::FailureCritic for OpenAiCompatibleClient {
     fn explain(
         &self,

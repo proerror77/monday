@@ -1,0 +1,14 @@
+[package]
+name = "alpha-onnx-evaluator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+alpha-domain = { path = "../domain" }
+alpha-engine = { path = "../engine", default-features = false }
+hft-infer-onnx = { path = "../../strategy-framework/infer-onnx" }
+
+[dev-dependencies]
+chrono = { workspace = true }
+hft-research-manifest = { path = "../../research-core/manifest" }

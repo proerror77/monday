@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = ["kernel"]
+kernel = ["dep:alpha-store"]
+
 [dependencies]
 alpha-domain = { path = "../domain" }
-alpha-store = { path = "../store" }
+alpha-store = { path = "../store", optional = true }
 chrono = { workspace = true, features = ["serde"] }
 hex = { workspace = true }
 hft-factor-dsl = { path = "../../research-core/factor-dsl" }

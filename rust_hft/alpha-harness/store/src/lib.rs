@@ -6,7 +6,7 @@ use alpha_domain::{
     LiveSmallEligibilityEvidence, LoopRun, MissionStatus, MissionTerminalReason, PromotionRecord,
     ResearchIteration, ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
     SearchPolicyRevision, SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
-    SEALED_HOLDOUT_EVALUATOR_VERSION,
+    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
@@ -877,8 +877,17 @@ impl AlphaStore {
         typed_evaluation.validate().map_err(domain_error)?;
         let expected_evaluator_config =
             FormulaEvaluatorConfig::for_mission(&mission).map_err(domain_error)?;
+        let evaluator_matches_artifact = match &candidate_artifact {
+            CandidateArtifact::Formula(_) => {
+                typed_evaluation.evaluator_version == SEALED_HOLDOUT_EVALUATOR_VERSION
+            }
+            CandidateArtifact::OnnxModel(_) => {
+                typed_evaluation.evaluator_version == ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+            }
+            _ => false,
+        };
         if !typed_evaluation.passed
-            || typed_evaluation.evaluator_version != SEALED_HOLDOUT_EVALUATOR_VERSION
+            || !evaluator_matches_artifact
             || typed_evaluation.formula_config().map_err(domain_error)? != expected_evaluator_config
         {
             return Err(StoreError::Domain(
@@ -1275,11 +1284,13 @@ impl AlphaStore {
             let Some(evaluation_value) = revision.payload.get("evaluation") else {
                 continue;
             };
-            if evaluation_value
+            let evaluator_version = evaluation_value
                 .get("evaluator_version")
-                .and_then(serde_json::Value::as_str)
-                != Some(SEALED_HOLDOUT_EVALUATOR_VERSION)
-            {
+                .and_then(serde_json::Value::as_str);
+            if !matches!(
+                evaluator_version,
+                Some(SEALED_HOLDOUT_EVALUATOR_VERSION | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION)
+            ) {
                 continue;
             }
             let evaluation: CandidateEvaluation =
@@ -1312,6 +1323,18 @@ impl AlphaStore {
                 Err(error) => return Err(error),
             };
             verify_hash(&candidate_json, &candidate_hash)?;
+            let candidate_artifact: CandidateArtifact =
+                serde_json::from_str(&candidate_json).map_err(serialization_error)?;
+            let evaluator_matches_artifact = matches!(
+                (&candidate_artifact, evaluator_version),
+                (
+                    CandidateArtifact::Formula(_),
+                    Some(SEALED_HOLDOUT_EVALUATOR_VERSION)
+                ) | (
+                    CandidateArtifact::OnnxModel(_),
+                    Some(ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION)
+                )
+            );
             let candidate_iteration: ResearchIteration = read_json_row(
                 &self.connection,
                 "SELECT payload_json, content_hash FROM iterations WHERE iteration_id = ?",
@@ -1333,7 +1356,7 @@ impl AlphaStore {
                 .get("dataset_manifest_id")
                 .and_then(serde_json::Value::as_str)
                 == Some(mission.dataset_manifest_id.as_str());
-            if candidate_hash_matches && dataset_matches {
+            if candidate_hash_matches && dataset_matches && evaluator_matches_artifact {
                 return Ok(Some(revision.asset_id));
             }
         }
