@@ -48,6 +48,8 @@ flowchart TB
 - `alpha-harness/app`: structured CLI for data, loops, missions, evaluation, promotion, approvals, policies, feedback, and signing.
 - `tools/collector`: streaming connectors plus governed public Binance OHLCV acquisition.
 - `market-core` and `data-pipelines`: events, runtime construction, venue market data, and replay.
+  The live quote/depth/recovery contract is defined in
+  [`docs/architecture/MARKET_DATA_HOT_PATH.md`](docs/architecture/MARKET_DATA_HOT_PATH.md).
 - `strategy-framework`: deterministic Formula strategies and ONNX runtime compatibility.
 - `risk-control`: risk checks, OMS, portfolio accounting, reconciliation policy, and sentinel controls.
 - `execution-gateway`: venue-specific execution adapters.

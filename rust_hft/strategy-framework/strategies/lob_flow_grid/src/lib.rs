@@ -3,7 +3,10 @@ use std::collections::VecDeque;
 use hft_core::{
     HftResult, OrderType, Price, Quantity, Side, Symbol, TimeInForce, Timestamp, VenueId,
 };
-use ports::{AccountView, ExecutionEvent, MarketEvent, OrderIntent, Strategy, VenueScope};
+use ports::{
+    AccountView, ExecutionEvent, L2BookView, MarketEvent, OrderIntent, Strategy, StrategyContext,
+    VenueScope,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -260,7 +263,46 @@ impl LobFlowGridStrategy {
         self.update_ofi(prev_top, timestamp);
     }
 
+    fn handle_book_view(&mut self, book: L2BookView<'_>) {
+        if book.bid_prices.is_empty() || book.ask_prices.is_empty() {
+            return;
+        }
+
+        let levels = self.config.top_levels;
+        let prev_top = self.state.current_top();
+        self.state.bids.clear();
+        self.state.asks.clear();
+        if self.state.bids.capacity() < levels {
+            self.state.bids.reserve(levels);
+        }
+        if self.state.asks.capacity() < levels {
+            self.state.asks.reserve(levels);
+        }
+        self.state.bids.extend(
+            book.bid_prices
+                .iter()
+                .zip(book.bid_quantities)
+                .take(levels)
+                .map(|(price, quantity)| (price.to_f64(), quantity.to_f64())),
+        );
+        self.state.asks.extend(
+            book.ask_prices
+                .iter()
+                .zip(book.ask_quantities)
+                .take(levels)
+                .map(|(price, quantity)| (price.to_f64(), quantity.to_f64())),
+        );
+        self.state.last_top = self.state.current_top().or(prev_top);
+        self.update_mid_state(book.timestamp);
+        self.update_ofi(prev_top, book.timestamp);
+    }
+
     fn handle_bar(&mut self, bar: &ports::AggregatedBar) {
+        // A bar may seed a non-LOB research run, but it must never replace a synchronized
+        // exchange book in production.
+        if !self.state.bids.is_empty() && !self.state.asks.is_empty() {
+            return;
+        }
         let close = match bar.close.to_f64() {
             Some(v) if v.is_finite() && v > 0.0 => v,
             _ => return,
@@ -289,38 +331,16 @@ impl LobFlowGridStrategy {
         asks: &[ports::BookLevel],
         timestamp: Timestamp,
     ) {
-        // 增量更新：若提供資料則覆蓋相關檔位
+        // Raw compatibility path. Production receives the canonical book through
+        // `StrategyContext`; direct callers still apply deltas by price, not array index.
         if self.state.bids.is_empty() || self.state.asks.is_empty() {
-            // 若尚未有快照，直接當快照處理
-            self.handle_snapshot(bids, asks, timestamp);
             return;
         }
 
-        let mut bids_vec = self.state.bids.clone();
-        for (idx, level) in bids.iter().enumerate() {
-            if idx >= self.config.top_levels {
-                break;
-            }
-            if let (Some(price), Some(qty)) = (level.price.to_f64(), level.quantity.to_f64()) {
-                if idx < bids_vec.len() {
-                    bids_vec[idx] = (price, qty);
-                }
-            }
-        }
-        let mut asks_vec = self.state.asks.clone();
-        for (idx, level) in asks.iter().enumerate() {
-            if idx >= self.config.top_levels {
-                break;
-            }
-            if let (Some(price), Some(qty)) = (level.price.to_f64(), level.quantity.to_f64()) {
-                if idx < asks_vec.len() {
-                    asks_vec[idx] = (price, qty);
-                }
-            }
-        }
-
         let prev_top = self.state.current_top();
-        self.state.update_depth(bids_vec, asks_vec);
+        apply_price_deltas(&mut self.state.bids, bids, self.config.top_levels, true);
+        apply_price_deltas(&mut self.state.asks, asks, self.config.top_levels, false);
+        self.state.last_top = self.state.current_top().or(prev_top);
         self.update_mid_state(timestamp);
         self.update_ofi(prev_top, timestamp);
     }
@@ -642,9 +662,9 @@ impl LobFlowGridStrategy {
                         {
                             orders.push(OrderIntent {
                                 symbol: self.symbol.clone(),
-            asset_class: hft_core::AssetClass::Crypto,
-            product_type: hft_core::ProductType::Spot,
-            compliance_context: hft_core::ComplianceContext::default(),
+                                asset_class: hft_core::AssetClass::Crypto,
+                                product_type: hft_core::ProductType::Spot,
+                                compliance_context: hft_core::ComplianceContext::default(),
                                 side: Side::Buy,
                                 quantity: quantity_decimal,
                                 order_type: OrderType::Limit,
@@ -676,9 +696,9 @@ impl LobFlowGridStrategy {
                         {
                             orders.push(OrderIntent {
                                 symbol: self.symbol.clone(),
-            asset_class: hft_core::AssetClass::Crypto,
-            product_type: hft_core::ProductType::Spot,
-            compliance_context: hft_core::ComplianceContext::default(),
+                                asset_class: hft_core::AssetClass::Crypto,
+                                product_type: hft_core::ProductType::Spot,
+                                compliance_context: hft_core::ComplianceContext::default(),
                                 side: Side::Sell,
                                 quantity: quantity_decimal,
                                 order_type: OrderType::Limit,
@@ -785,6 +805,46 @@ impl Strategy for LobFlowGridStrategy {
         }
     }
 
+    fn on_market_event_with_context(
+        &mut self,
+        event: &MarketEvent,
+        context: &StrategyContext<'_>,
+    ) -> Vec<OrderIntent> {
+        match event {
+            MarketEvent::Snapshot(snapshot) if snapshot.symbol == self.symbol => {
+                let Some(book) = context
+                    .book
+                    .filter(|book| book.symbol == &self.symbol && book.venue == self.config.venue)
+                else {
+                    return Vec::new();
+                };
+                self.handle_book_view(book);
+                self.orders_if_refresh_due(book.timestamp, context.account)
+            }
+            MarketEvent::Update(update) if update.symbol == self.symbol => {
+                let Some(book) = context
+                    .book
+                    .filter(|book| book.symbol == &self.symbol && book.venue == self.config.venue)
+                else {
+                    return Vec::new();
+                };
+                self.handle_book_view(book);
+                self.orders_if_refresh_due(book.timestamp, context.account)
+            }
+            MarketEvent::Quote(quote) if quote.symbol == self.symbol => {
+                let Some(book) = context
+                    .book
+                    .filter(|book| book.symbol == &self.symbol && book.venue == self.config.venue)
+                else {
+                    return Vec::new();
+                };
+                self.handle_book_view(book);
+                self.orders_if_refresh_due(book.timestamp, context.account)
+            }
+            _ => self.on_market_event(event, context.account),
+        }
+    }
+
     fn on_execution_event(
         &mut self,
         _event: &ExecutionEvent,
@@ -809,6 +869,25 @@ impl Strategy for LobFlowGridStrategy {
         let sym = &self.symbol.as_str();
         info!(symbol = %sym, "initializing LOB Flow Grid strategy");
         Ok(())
+    }
+}
+
+impl LobFlowGridStrategy {
+    fn orders_if_refresh_due(
+        &mut self,
+        timestamp: Timestamp,
+        account: &AccountView,
+    ) -> Vec<OrderIntent> {
+        if !self.refresh_due(timestamp) {
+            return Vec::new();
+        }
+        let Some(signals) = self.compute_signals(timestamp) else {
+            return Vec::new();
+        };
+        let spacing = self.compute_spacing_bps(&signals);
+        let orders = self.generate_orders(signals, account, spacing);
+        self.state.reset_refresh(timestamp);
+        orders
     }
 }
 
@@ -843,6 +922,38 @@ fn convert_levels(levels: &[ports::BookLevel], top_levels: usize) -> Vec<(f64, f
     out
 }
 
+fn apply_price_deltas(
+    book: &mut Vec<(f64, f64)>,
+    deltas: &[ports::BookLevel],
+    top_levels: usize,
+    descending: bool,
+) {
+    for level in deltas {
+        let (Some(price), Some(quantity)) = (level.price.to_f64(), level.quantity.to_f64()) else {
+            continue;
+        };
+        let existing = book
+            .iter()
+            .position(|(candidate, _)| candidate.total_cmp(&price).is_eq());
+        match (existing, quantity > 0.0) {
+            (Some(index), true) => book[index].1 = quantity,
+            (Some(index), false) => {
+                book.remove(index);
+            }
+            (None, true) => book.push((price, quantity)),
+            (None, false) => {}
+        }
+    }
+    book.sort_unstable_by(|left, right| {
+        if descending {
+            right.0.total_cmp(&left.0)
+        } else {
+            left.0.total_cmp(&right.0)
+        }
+    });
+    book.truncate(top_levels);
+}
+
 fn round_down_to_tick(price: f64, tick: f64) -> f64 {
     if tick <= 0.0 {
         return price;
@@ -860,7 +971,8 @@ fn round_up_to_tick(price: f64, tick: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ports::{BookLevel, MarketSnapshot};
+    use hft_core::{FixedPrice, FixedQuantity};
+    use ports::{BookLevel, L2BookView, MarketSnapshot, StrategyContext};
 
     fn create_level(price: f64, qty: f64) -> BookLevel {
         BookLevel {
@@ -902,5 +1014,92 @@ mod tests {
         let signals = strategy.compute_signals(1).unwrap();
         assert!(signals.mid > 0.0);
         assert!(signals.best_ask > signals.best_bid);
+    }
+
+    #[test]
+    fn delta_updates_price_levels_and_removes_zero_quantity() {
+        let symbol = Symbol::new("BTCUSDT");
+        let mut config = LobFlowGridConfig::default();
+        config.top_levels = 3;
+        let mut strategy = LobFlowGridStrategy::new(symbol, config);
+        strategy.handle_snapshot(
+            &[create_level(100.0, 2.0), create_level(99.0, 1.0)],
+            &[create_level(101.0, 2.0), create_level(102.0, 1.0)],
+            1,
+        );
+
+        strategy.handle_update(
+            &[create_level(100.0, 0.0), create_level(99.5, 3.0)],
+            &[create_level(101.0, 0.0), create_level(100.5, 4.0)],
+            2,
+        );
+
+        assert_eq!(strategy.state.bids, vec![(99.5, 3.0), (99.0, 1.0)]);
+        assert_eq!(strategy.state.asks, vec![(100.5, 4.0), (102.0, 1.0)]);
+    }
+
+    #[test]
+    fn production_context_consumes_canonical_rebuilt_book() {
+        let symbol = Symbol::new("BTCUSDT");
+        let mut config = LobFlowGridConfig::default();
+        config.venue = VenueId::BINANCE;
+        config.top_levels = 2;
+        let mut strategy = LobFlowGridStrategy::new(symbol.clone(), config);
+        let bid_prices = [FixedPrice::from_f64(100.5), FixedPrice::from_f64(100.0)];
+        let bid_quantities = [FixedQuantity::from_f64(5.0), FixedQuantity::from_f64(2.0)];
+        let ask_prices = [FixedPrice::from_f64(100.75), FixedPrice::from_f64(101.0)];
+        let ask_quantities = [FixedQuantity::from_f64(4.0), FixedQuantity::from_f64(3.0)];
+        let account = AccountView::default();
+        let context = StrategyContext {
+            account: &account,
+            book: Some(L2BookView {
+                symbol: &symbol,
+                venue: VenueId::BINANCE,
+                timestamp: 2,
+                sequence: 11,
+                bid_prices: &bid_prices,
+                bid_quantities: &bid_quantities,
+                ask_prices: &ask_prices,
+                ask_quantities: &ask_quantities,
+            }),
+        };
+        let event = MarketEvent::Update(ports::BookUpdate {
+            symbol: symbol.clone(),
+            timestamp: 2,
+            bids: vec![create_level(100.5, 5.0)],
+            asks: Vec::new(),
+            first_sequence: Some(11),
+            sequence: 11,
+            is_snapshot: false,
+            source_venue: Some(VenueId::BINANCE),
+        });
+
+        let _ = strategy.on_market_event_with_context(&event, &context);
+
+        assert_eq!(strategy.state.bids, vec![(100.5, 5.0), (100.0, 2.0)]);
+        assert_eq!(strategy.state.asks, vec![(100.75, 4.0), (101.0, 3.0)]);
+    }
+
+    #[test]
+    fn bar_does_not_replace_an_initialized_exchange_book() {
+        let symbol = Symbol::new("BTCUSDT");
+        let mut strategy = LobFlowGridStrategy::new(symbol.clone(), LobFlowGridConfig::default());
+        strategy.handle_snapshot(&[create_level(100.0, 2.0)], &[create_level(101.0, 2.0)], 1);
+        strategy.handle_bar(&ports::AggregatedBar {
+            symbol,
+            interval_ms: 60_000,
+            open_time: 1,
+            close_time: 2,
+            open: Price::from_f64(200.0).unwrap(),
+            high: Price::from_f64(201.0).unwrap(),
+            low: Price::from_f64(199.0).unwrap(),
+            close: Price::from_f64(200.0).unwrap(),
+            volume: Quantity::from_f64(1.0).unwrap(),
+            trade_count: 1,
+            source_venue: Some(VenueId::ASTERDEX),
+        });
+
+        assert_eq!(strategy.state.bids, vec![(100.0, 2.0)]);
+        assert_eq!(strategy.state.asks, vec![(101.0, 2.0)]);
     }
 }

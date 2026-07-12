@@ -100,6 +100,7 @@ impl SystemBuilder {
             use adapter_binance_execution as binance_exec;
             let exec_mode = match venue.execution_mode.as_deref().unwrap_or("Paper") {
                 "Live" => binance_exec::ExecutionMode::Live,
+                "Testnet" => binance_exec::ExecutionMode::Testnet,
                 _ => binance_exec::ExecutionMode::Paper,
             };
             let cfg = binance_exec::BinanceExecutionConfig {

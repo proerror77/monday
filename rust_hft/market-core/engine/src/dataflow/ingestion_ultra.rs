@@ -148,6 +148,7 @@ impl UltraEventIngester {
         let event_ts = match &event {
             MarketEvent::Snapshot(s) => s.timestamp,
             MarketEvent::Update(u) => u.timestamp,
+            MarketEvent::Quote(q) => q.timestamp,
             MarketEvent::Trade(t) => t.timestamp,
             MarketEvent::Bar(b) => b.close_time,
             MarketEvent::Arbitrage(a) => a.timestamp,
@@ -201,6 +202,7 @@ impl UltraEventIngester {
             let event_ts = match &event {
                 MarketEvent::Snapshot(s) => s.timestamp,
                 MarketEvent::Update(u) => u.timestamp,
+                MarketEvent::Quote(q) => q.timestamp,
                 MarketEvent::Trade(t) => t.timestamp,
                 MarketEvent::Bar(b) => b.close_time,
                 MarketEvent::Arbitrage(a) => a.timestamp,
@@ -252,6 +254,7 @@ impl UltraEventIngester {
         let event_ts = match &event {
             MarketEvent::Snapshot(s) => s.timestamp,
             MarketEvent::Update(u) => u.timestamp,
+            MarketEvent::Quote(q) => q.timestamp,
             MarketEvent::Trade(t) => t.timestamp,
             MarketEvent::Bar(b) => b.close_time,
             MarketEvent::Arbitrage(a) => a.timestamp,

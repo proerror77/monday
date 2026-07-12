@@ -53,6 +53,11 @@ pub trait ExecutionClient: Send + Sync {
     /// 下單 (live/mock 實現不同)
     async fn place_order(&mut self, intent: OrderIntent) -> HftResult<OrderId>;
 
+    /// Idempotent live-order boundary. Adapters should forward `client_order_id` to the venue.
+    async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
+        self.place_order(envelope.intent.clone()).await
+    }
+
     /// 帶 VenueSpec 校驗的下單
     async fn place_order_with_spec(
         &mut self,
@@ -176,9 +181,44 @@ pub enum VenueScope {
     Cross,
 }
 
+/// Read-only, sequence-validated L2 book exposed to strategies on the hot path.
+///
+/// The engine owns and rebuilds this view from snapshots and price-keyed deltas.
+/// Strategies must not maintain a second interpretation of exchange delta semantics.
+#[derive(Debug, Clone, Copy)]
+pub struct L2BookView<'a> {
+    pub symbol: &'a Symbol,
+    pub venue: VenueId,
+    pub timestamp: Timestamp,
+    pub sequence: u64,
+    pub bid_prices: &'a [FixedPrice],
+    pub bid_quantities: &'a [FixedQuantity],
+    pub ask_prices: &'a [FixedPrice],
+    pub ask_quantities: &'a [FixedQuantity],
+}
+
+/// Stable strategy input. `book` is present when the event identifies a venue and symbol
+/// whose canonical L2 state is currently synchronized.
+#[derive(Debug, Clone, Copy)]
+pub struct StrategyContext<'a> {
+    pub account: &'a AccountView,
+    pub book: Option<L2BookView<'a>>,
+}
+
 pub trait Strategy: Send + Sync {
     /// 處理市場事件，返回交易意圖
     fn on_market_event(&mut self, event: &MarketEvent, account: &AccountView) -> Vec<OrderIntent>;
+
+    /// Process an event with the engine's latest canonical L2 state.
+    ///
+    /// Existing non-LOB strategies remain source-compatible through this default implementation.
+    fn on_market_event_with_context(
+        &mut self,
+        event: &MarketEvent,
+        context: &StrategyContext<'_>,
+    ) -> Vec<OrderIntent> {
+        self.on_market_event(event, context.account)
+    }
 
     /// 處理執行事件 (成交回報等)
     fn on_execution_event(

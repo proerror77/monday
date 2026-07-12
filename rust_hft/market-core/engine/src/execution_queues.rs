@@ -36,23 +36,27 @@ impl Default for ExecutionQueueConfig {
 /// 引擎端的队列接口
 pub struct EngineQueues {
     /// 发送订单意图给执行 worker
-    intent_producer: SpscProducer<OrderIntent>,
+    intent_producer: SpscProducer<OrderIntentEnvelope>,
     /// 接收执行回报从执行 worker
     event_consumer: SpscConsumer<ExecutionEvent>,
     config: ExecutionQueueConfig,
     stats: QueueStats,
+    intent_notify: Arc<Notify>,
+    event_space_notify: Arc<Notify>,
 }
 
 /// 执行 Worker 端的队列接口
 pub struct WorkerQueues {
     /// 接收订单意图从引擎
-    intent_consumer: SpscConsumer<OrderIntent>,
+    intent_consumer: SpscConsumer<OrderIntentEnvelope>,
     /// 发送执行回报给引擎
     event_producer: SpscProducer<ExecutionEvent>,
     config: ExecutionQueueConfig,
     stats: QueueStats,
     /// 引擎唤醒通知器
     engine_notify: Option<Arc<Notify>>,
+    intent_notify: Arc<Notify>,
+    event_space_notify: Arc<Notify>,
 }
 
 /// 队列统计
@@ -78,7 +82,7 @@ pub enum LifecycleIntentSubmitError {
         reason: OrderIntentRejectReason,
     },
     QueueFull {
-        intent: OrderIntent,
+        envelope: Box<OrderIntentEnvelope>,
     },
 }
 
@@ -86,12 +90,16 @@ pub enum LifecycleIntentSubmitError {
 pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, WorkerQueues) {
     let (intent_producer, intent_consumer) = spsc_ring_buffer(config.intent_queue_capacity);
     let (event_producer, event_consumer) = spsc_ring_buffer(config.event_queue_capacity);
+    let intent_notify = Arc::new(Notify::new());
+    let event_space_notify = Arc::new(Notify::new());
 
     let engine_queues = EngineQueues {
         intent_producer,
         event_consumer,
         config: config.clone(),
         stats: QueueStats::default(),
+        intent_notify: Arc::clone(&intent_notify),
+        event_space_notify: Arc::clone(&event_space_notify),
     };
 
     let worker_queues = WorkerQueues {
@@ -100,6 +108,8 @@ pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, W
         config,
         stats: QueueStats::default(),
         engine_notify: None,
+        intent_notify,
+        event_space_notify,
     };
 
     (engine_queues, worker_queues)
@@ -108,19 +118,35 @@ pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, W
 impl EngineQueues {
     /// 发送订单意图到执行 worker (非阻塞)
     pub fn send_intent(&mut self, intent: OrderIntent) -> Result<(), OrderIntent> {
-        match self.intent_producer.send(intent) {
+        let now = hft_core::now_micros();
+        let envelope = OrderIntentEnvelope::new(
+            intent,
+            ports::OrderIntentLifecycle::new(now, Timestamp::MAX),
+        );
+        self.send_envelope(envelope)
+            .map_err(OrderIntentEnvelope::into_inner)
+    }
+
+    /// Send a fully qualified intent without stripping lifecycle or idempotency metadata.
+    #[allow(clippy::result_large_err)] // Returning ownership avoids a heap allocation on the hot path.
+    pub fn send_envelope(
+        &mut self,
+        envelope: OrderIntentEnvelope,
+    ) -> Result<(), OrderIntentEnvelope> {
+        match self.intent_producer.send(envelope) {
             Ok(()) => {
                 self.stats.intents_sent += 1;
+                self.intent_notify.notify_one();
                 Ok(())
             }
-            Err(intent) => {
+            Err(envelope) => {
                 self.stats.intent_queue_full_count += 1;
                 warn!(
                     "意图队列满载，丢弃订单: {} {}",
-                    intent.symbol.as_str(),
-                    intent.quantity.0
+                    envelope.intent.symbol.as_str(),
+                    envelope.intent.quantity.0
                 );
-                Err(intent)
+                Err(envelope)
             }
         }
     }
@@ -145,9 +171,11 @@ impl EngineQueues {
         latest_book_seq: Option<u64>,
     ) -> Result<(), LifecycleIntentSubmitError> {
         match envelope.validate_pre_execution(now, latest_book_seq) {
-            Ok(()) => self
-                .send_intent(envelope.intent)
-                .map_err(|intent| LifecycleIntentSubmitError::QueueFull { intent }),
+            Ok(()) => self.send_envelope(envelope).map_err(|envelope| {
+                LifecycleIntentSubmitError::QueueFull {
+                    envelope: Box::new(envelope),
+                }
+            }),
             Err(reason) => {
                 self.stats.intent_lifecycle_rejected_count += 1;
                 match reason {
@@ -184,7 +212,8 @@ impl EngineQueues {
             }
         }
 
-        if !buffer.is_empty() {
+        if count > 0 {
+            self.event_space_notify.notify_one();
             debug!("引擎接收到 {} 个执行回报", buffer.len());
         }
     }
@@ -221,15 +250,20 @@ impl WorkerQueues {
         self.engine_notify = Some(notify);
     }
 
-    /// 接收订单意图 (非阻塞批量)
-    pub fn receive_intents(&mut self) -> Vec<OrderIntent> {
-        let mut intents = Vec::new();
+    /// Receive lifecycle-qualified order intents (non-blocking batch).
+    pub fn receive_envelopes(&mut self) -> Vec<OrderIntentEnvelope> {
+        let mut envelopes = Vec::with_capacity(self.config.batch_size);
+        self.receive_envelopes_into(&mut envelopes);
+        envelopes
+    }
+
+    pub fn receive_envelopes_into(&mut self, envelopes: &mut Vec<OrderIntentEnvelope>) {
         let mut count = 0;
 
         while count < self.config.batch_size {
             match self.intent_consumer.recv() {
-                Some(intent) => {
-                    intents.push(intent);
+                Some(envelope) => {
+                    envelopes.push(envelope);
                     self.stats.intents_received += 1;
                     count += 1;
                 }
@@ -237,11 +271,21 @@ impl WorkerQueues {
             }
         }
 
-        if !intents.is_empty() {
-            debug!("执行 Worker 接收到 {} 个订单意图", intents.len());
+        if count > 0 {
+            debug!("执行 Worker 接收到 {} 个订单意图", count);
         }
+    }
 
-        intents
+    /// Compatibility helper for tests and non-live callers.
+    pub fn receive_intents(&mut self) -> Vec<OrderIntent> {
+        self.receive_envelopes()
+            .into_iter()
+            .map(OrderIntentEnvelope::into_inner)
+            .collect()
+    }
+
+    pub fn intent_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.intent_notify)
     }
 
     /// 发送执行回报到引擎 (非阻塞)
@@ -257,31 +301,23 @@ impl WorkerQueues {
             }
             Err(event) => {
                 self.stats.event_queue_full_count += 1;
-                warn!("回报队列满载，丢弃事件: {:?}", event);
+                warn!("回报队列满载，等待引擎释放空间: {:?}", event);
                 Err(event)
             }
         }
     }
 
-    /// 尝试发送执行回报；满载时丢弃（DropNew）
-    pub fn send_event_force(&mut self, event: ExecutionEvent) -> bool {
-        match self.send_event(event) {
-            Ok(()) => true,
-            Err(_) => false,
-        }
-    }
-
-    /// 批量发送执行回报
-    pub fn send_events_batch(&mut self, events: Vec<ExecutionEvent>) -> Vec<ExecutionEvent> {
-        let mut failed = Vec::new();
-
-        for event in events {
-            if let Err(failed_event) = self.send_event(event) {
-                failed.push(failed_event);
+    /// Execution reports are lossless: backpressure waits for the engine to drain the SPSC ring.
+    pub async fn send_event_reliable(&mut self, mut event: ExecutionEvent) {
+        loop {
+            match self.send_event(event) {
+                Ok(()) => return,
+                Err(rejected) => {
+                    event = rejected;
+                    self.event_space_notify.notified().await;
+                }
             }
         }
-
-        failed
     }
 
     /// 检查是否有待处理的意图

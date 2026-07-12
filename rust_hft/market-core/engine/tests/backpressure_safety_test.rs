@@ -272,3 +272,69 @@ fn test_execution_event_queue_full_is_visible_to_stats() {
     assert_eq!(worker_queues.stats().events_sent, 3);
     assert_eq!(worker_queues.stats().event_queue_full_count, 1);
 }
+
+#[tokio::test]
+async fn execution_report_waits_for_capacity_instead_of_being_dropped() {
+    let config = ExecutionQueueConfig {
+        intent_queue_capacity: 4,
+        event_queue_capacity: 4,
+        batch_size: 8,
+    };
+    let (mut engine_queues, mut worker_queues) = create_execution_queues(config);
+    for timestamp in 1..=3 {
+        worker_queues
+            .send_event(ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp,
+            })
+            .expect("queue has capacity");
+    }
+
+    let sender = tokio::spawn(async move {
+        worker_queues
+            .send_event_reliable(ExecutionEvent::ConnectionStatus {
+                connected: false,
+                timestamp: 4,
+            })
+            .await;
+        worker_queues
+    });
+    tokio::task::yield_now().await;
+    assert!(!sender.is_finished(), "sender must apply backpressure");
+
+    let mut first_batch = Vec::new();
+    engine_queues.receive_events_into(&mut first_batch);
+    assert_eq!(first_batch.len(), 3);
+
+    let worker_queues = tokio::time::timeout(std::time::Duration::from_secs(1), sender)
+        .await
+        .expect("sender wakes when capacity is available")
+        .expect("sender task succeeds");
+    let mut second_batch = Vec::new();
+    engine_queues.receive_events_into(&mut second_batch);
+    assert!(matches!(
+        second_batch.as_slice(),
+        [ExecutionEvent::ConnectionStatus {
+            connected: false,
+            timestamp: 4
+        }]
+    ));
+    assert_eq!(worker_queues.stats().events_sent, 4);
+}
+
+#[tokio::test]
+async fn intent_submission_wakes_worker_without_polling_delay() {
+    let (mut engine_queues, worker_queues) =
+        create_execution_queues(ExecutionQueueConfig::default());
+    let notify = worker_queues.intent_notify();
+    let waiter = tokio::spawn(async move { notify.notified().await });
+    tokio::task::yield_now().await;
+
+    engine_queues
+        .send_intent(test_intent())
+        .expect("intent accepted");
+    tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+        .await
+        .expect("worker notified immediately")
+        .expect("waiter succeeds");
+}

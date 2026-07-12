@@ -3,6 +3,9 @@
 use hft_core::latency::LatencyTracker;
 use hft_core::*;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CLIENT_ORDER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// 訂單簿檔位
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,9 +51,28 @@ pub struct BookUpdate {
     pub timestamp: Timestamp,
     pub bids: Vec<BookLevel>, // 變更的檔位
     pub asks: Vec<BookLevel>,
+    /// First sequence covered by this delta. Feeds that expose only a monotonic update ID leave
+    /// this unset; the engine then rejects stale IDs but does not invent a contiguity guarantee.
+    #[serde(default)]
+    pub first_sequence: Option<u64>,
     pub sequence: u64,
     pub is_snapshot: bool, // true=快照，false=增量
     /// 來源交易所（Phase 1 重構：顯式 venue 語義）
+    #[serde(default)]
+    pub source_venue: Option<VenueId>,
+}
+
+/// Sequence-tagged best bid/ask update.
+///
+/// This is intentionally separate from `BookUpdate`: a BBO feed does not describe which
+/// deeper levels were removed, so treating it as an L2 delta would corrupt the local book.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopOfBook {
+    pub symbol: Symbol,
+    pub timestamp: Timestamp,
+    pub sequence: u64,
+    pub bid: BookLevel,
+    pub ask: BookLevel,
     #[serde(default)]
     pub source_venue: Option<VenueId>,
 }
@@ -92,10 +114,17 @@ pub struct AggregatedBar {
 pub enum MarketEvent {
     Snapshot(MarketSnapshot),
     Update(BookUpdate),
+    Quote(TopOfBook),
     Trade(Trade),
     Bar(AggregatedBar),
     Arbitrage(ArbitrageOpportunity),
-    Disconnect { reason: String },
+    Disconnect {
+        reason: String,
+        #[serde(default)]
+        source_venue: Option<VenueId>,
+        #[serde(default)]
+        symbol: Option<Symbol>,
+    },
 }
 
 /// 帶延遲追蹤的市場事件 - 用於端到端延遲測量
@@ -134,10 +163,11 @@ impl TrackedMarketEvent {
         match &self.event {
             MarketEvent::Snapshot(s) => Some(&s.symbol),
             MarketEvent::Update(u) => Some(&u.symbol),
+            MarketEvent::Quote(q) => Some(&q.symbol),
             MarketEvent::Trade(t) => Some(&t.symbol),
             MarketEvent::Bar(b) => Some(&b.symbol),
             MarketEvent::Arbitrage(arb) => Some(&arb.symbol),
-            MarketEvent::Disconnect { .. } => None,
+            MarketEvent::Disconnect { symbol, .. } => symbol.as_ref(),
         }
     }
 }
@@ -204,6 +234,7 @@ pub struct OrderIntent {
 }
 
 impl OrderIntent {
+    #[allow(clippy::too_many_arguments)]
     pub fn crypto_spot(
         symbol: Symbol,
         side: Side,
@@ -351,11 +382,25 @@ impl OrderIntentLifecycle {
 pub struct OrderIntentEnvelope {
     pub intent: OrderIntent,
     pub lifecycle: OrderIntentLifecycle,
+    /// Stable idempotency key generated once before the intent enters execution.
+    #[serde(default)]
+    pub client_order_id: String,
 }
 
 impl OrderIntentEnvelope {
     pub fn new(intent: OrderIntent, lifecycle: OrderIntentLifecycle) -> Self {
-        Self { intent, lifecycle }
+        let sequence = CLIENT_ORDER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let client_order_id = format!("h{:x}{:x}", lifecycle.created_ts, sequence);
+        Self {
+            intent,
+            lifecycle,
+            client_order_id,
+        }
+    }
+
+    pub fn with_client_order_id(mut self, client_order_id: impl Into<String>) -> Self {
+        self.client_order_id = client_order_id.into();
+        self
     }
 
     pub fn into_inner(self) -> OrderIntent {

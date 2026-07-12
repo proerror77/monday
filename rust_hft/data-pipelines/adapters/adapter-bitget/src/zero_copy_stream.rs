@@ -170,8 +170,8 @@ impl ZeroCopyBitgetStream {
         }
 
         // 按價格排序
-        bids.sort_by(|a, b| b.price.cmp(&a.price)); // 降序
-        asks.sort_by(|a, b| a.price.cmp(&b.price)); // 升序
+        bids.sort_by_key(|level| std::cmp::Reverse(level.price)); // 降序
+        asks.sort_by_key(|level| level.price); // 升序
 
         Ok(MarketSnapshot {
             symbol: symbol.clone(),
@@ -483,6 +483,8 @@ impl MessageHandler for ZeroCopyMessageHandler {
 
         let disconnect_event = MarketEvent::Disconnect {
             reason: "Connection lost".to_string(),
+            source_venue: Some(hft_core::VenueId::BITGET),
+            symbol: None,
         };
 
         self.send_event(disconnect_event);

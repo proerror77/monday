@@ -13,11 +13,12 @@ pub mod execution_queues;
 pub mod execution_worker;
 pub mod latency_monitor;
 
-use aggregation::{AggregationEngine, MarketView};
+use aggregation::{AggregationEngine, MarketView, TopNSnapshot};
 use dataflow::{EventConsumer, IngestionConfig};
 use execution_queues::EngineQueues;
 use hft_core::{
-    now_micros, HftError, HftResult, LatencyStage, LatencyTracker, OrderType, Side, Symbol, VenueId,
+    now_micros, HftError, HftResult, LatencyStage, LatencyTracker, OrderType, Side, Symbol,
+    Timestamp, VenueId,
 };
 use latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use ports::Trade as MarketTrade;
@@ -90,7 +91,16 @@ pub struct EngineConfig {
     pub ingestion: IngestionConfig,
     pub max_events_per_cycle: u32,
     pub aggregation_symbols: Vec<Symbol>,
+    pub top_n: usize,
     pub latency_monitor: LatencyMonitorConfig,
+}
+
+struct PendingMarketEvent {
+    event: ports::MarketEvent,
+    /// Local adapter-boundary timestamp used for latency and order lifecycle validation.
+    received_at: Timestamp,
+    /// Canonical L2 immediately after this event was applied, before any later batched delta.
+    book: Option<(VenueId, Arc<TopNSnapshot>)>,
 }
 
 impl Default for EngineConfig {
@@ -99,6 +109,7 @@ impl Default for EngineConfig {
             ingestion: IngestionConfig::default(),
             max_events_per_cycle: 100,
             aggregation_symbols: vec![],
+            top_n: 10,
             latency_monitor: LatencyMonitorConfig::default(),
         }
     }
@@ -136,7 +147,9 @@ pub struct Engine {
     /// 運行統計
     stats: EngineStats,
     /// 暫存的市場事件（從聚合引擎產生）
-    pending_market_events: Vec<ports::MarketEvent>,
+    pending_market_events: Vec<PendingMarketEvent>,
+    /// Reused output buffer for one aggregation input event.
+    aggregation_events_buf: Vec<ports::MarketEvent>,
     /// 復用的策略意圖工作緩衝，減少熱路徑 Vec 分配
     intents_work_buf: Vec<ports::OrderIntent>,
     /// 復用的執行事件緩衝，避免每 tick 分配
@@ -177,6 +190,10 @@ impl Engine {
         let initial_account_view = AccountView::default();
 
         let latency_monitor = LatencyMonitor::new(config.latency_monitor.clone());
+        let aggregation_engine = AggregationEngine::with_config(
+            config.top_n.max(1),
+            config.ingestion.stale_threshold_us,
+        );
         let (exec_event_tx, _rx) = broadcast::channel(1024);
         let (market_trade_tx, _rx_trade) = broadcast::channel(4096);
         let (market_event_tx, _rx_mev) = broadcast::channel(4096);
@@ -189,7 +206,7 @@ impl Engine {
         Self {
             config,
             event_consumers: Vec::new(),
-            aggregation_engine: AggregationEngine::new(),
+            aggregation_engine,
             market_snapshots: SnapshotContainer::new(initial_market_view),
             account_snapshots: SnapshotContainer::new(initial_account_view),
             strategies: Vec::new(),
@@ -216,6 +233,7 @@ impl Engine {
                 start_time_us: now_micros(),
             },
             pending_market_events: Vec::new(),
+            aggregation_events_buf: Vec::with_capacity(4),
             intents_work_buf: Vec::new(),
             execution_events_buf: Vec::new(),
             wakeup_notify: Arc::new(Notify::new()),
@@ -277,6 +295,7 @@ impl Engine {
                 let event_venue = match event {
                     ports::MarketEvent::Snapshot(snapshot) => snapshot.source_venue,
                     ports::MarketEvent::Update(update) => update.source_venue,
+                    ports::MarketEvent::Quote(quote) => quote.source_venue,
                     ports::MarketEvent::Trade(trade) => trade.source_venue,
                     ports::MarketEvent::Bar(bar) => bar.source_venue,
                     _ => None,
@@ -662,11 +681,11 @@ impl Engine {
                         reason
                     )))
                 }
-                Err(execution_queues::LifecycleIntentSubmitError::QueueFull { intent }) => {
+                Err(execution_queues::LifecycleIntentSubmitError::QueueFull { envelope }) => {
                     warn!(
                         "執行隊列滿載，訂單意圖被拒絕: {} {}",
-                        intent.symbol.as_str(),
-                        intent.quantity.0
+                        envelope.intent.symbol.as_str(),
+                        envelope.intent.quantity.0
                     );
                     Err(HftError::Execution("執行隊列滿載".to_string()))
                 }
@@ -706,6 +725,7 @@ impl Engine {
                 // 記錄聚合階段開始（零拷貝：直接使用隊列彈出的事件所有權）
                 let mut tracked_event = event;
                 tracked_event.record_stage(hft_core::latency::LatencyStage::Aggregation);
+                let received_at = tracked_event.tracker.origin_time;
 
                 // 更新市場事件時間戳供端到端延遲計算
                 self.recent_market_event_timestamp = Some(tracked_event.tracker.origin_time);
@@ -715,6 +735,7 @@ impl Engine {
                     ports::MarketEvent::Bar(bar) => ("bar", bar.symbol.as_str()),
                     ports::MarketEvent::Trade(trade) => ("trade", trade.symbol.as_str()),
                     ports::MarketEvent::Snapshot(snap) => ("snapshot", snap.symbol.as_str()),
+                    ports::MarketEvent::Quote(quote) => ("quote", quote.symbol.as_str()),
                     _ => ("other", ""),
                 };
 
@@ -746,16 +767,33 @@ impl Engine {
 
                 // 處理事件 -> 聚合引擎
                 let aggregation_start = now_micros();
-                let before_len = self.pending_market_events.len();
+                let mut aggregation_events = std::mem::take(&mut self.aggregation_events_buf);
+                aggregation_events.clear();
                 match self
                     .aggregation_engine
-                    .handle_event_into(tracked_event.event, &mut self.pending_market_events)
+                    .handle_event_into(tracked_event.event, &mut aggregation_events)
                 {
                     Ok(()) => {
-                        let event_count = self.pending_market_events.len() - before_len;
+                        let event_count = aggregation_events.len();
                         if event_count > 0 {
                             debug!("聚合引擎生成 {} 個事件", event_count);
                         }
+
+                        for event in aggregation_events.drain(..) {
+                            let book = Self::event_venue_symbol(&event).and_then(|key| {
+                                self.aggregation_engine
+                                    .orderbooks
+                                    .get(&key)
+                                    .cloned()
+                                    .map(|snapshot| (key.venue, snapshot))
+                            });
+                            self.pending_market_events.push(PendingMarketEvent {
+                                event,
+                                received_at,
+                                book,
+                            });
+                        }
+                        self.aggregation_events_buf = aggregation_events;
 
                         // 記錄聚合階段延遲到統一監控器
                         let aggregation_latency = now_micros().saturating_sub(aggregation_start);
@@ -767,10 +805,11 @@ impl Engine {
                         infra_metrics::MetricsRegistry::global()
                             .record_aggregation_latency(aggregation_latency as f64);
 
-                        // 如果有新事件產生，觸發快照發佈
-                        !self.pending_market_events.is_empty()
+                        // 如果此輸入有新事件產生，觸發快照發佈
+                        event_count > 0
                     }
                     Err(e) => {
+                        self.aggregation_events_buf = aggregation_events;
                         warn!("聚合引擎處理事件失敗: {}", e);
                         false
                     }
@@ -818,7 +857,7 @@ impl Engine {
         }
 
         // 階段 4: 策略決策 (基於最新快照)
-        if result.snapshot_published {
+        if !self.pending_market_events.is_empty() {
             // Note: run_strategies simplified to sync for tick() compatibility
             self.run_strategies_sync(&mut result)?;
         }
@@ -852,6 +891,7 @@ impl Engine {
         // 定期同步延遲統計到 Prometheus（每 100 個 tick 或有活動時）
         if self.stats.cycle_count.is_multiple_of(100) || total_events > 0 || exec_processed > 0 {
             self.sync_latency_metrics_to_prometheus();
+            self.latency_monitor.report_if_due();
         }
 
         Ok(result)
@@ -1090,21 +1130,19 @@ impl Engine {
         // 處理所有待處理的市場事件（包括真實的 Bar 事件）
         let events_to_process = std::mem::take(&mut self.pending_market_events);
 
-        for event in &events_to_process {
-            // 創建延遲追蹤器用於此市場事件的處理
-            let event_timestamp = self.extract_event_timestamp(event);
-            let mut event_tracker = if let Some(ts) = event_timestamp {
-                self.recent_market_event_timestamp = Some(ts);
-                LatencyTracker::from_time(ts)
-            } else {
-                LatencyTracker::new()
-            };
+        for pending in &events_to_process {
+            let event = &pending.event;
+            let exchange_timestamp = self.extract_event_timestamp(event);
+            let received_at = pending.received_at;
+            self.recent_market_event_timestamp = Some(received_at);
+            let mut event_tracker = LatencyTracker::from_time(received_at);
 
             // 日誌降噪：逐事件改為 debug 級別
             let (event_kind, symbol) = match event {
                 ports::MarketEvent::Bar(bar) => ("bar", bar.symbol.as_str()),
                 ports::MarketEvent::Trade(trade) => ("trade", trade.symbol.as_str()),
                 ports::MarketEvent::Snapshot(snap) => ("snapshot", snap.symbol.as_str()),
+                ports::MarketEvent::Quote(quote) => ("quote", quote.symbol.as_str()),
                 _ => ("other", ""),
             };
 
@@ -1120,6 +1158,24 @@ impl Engine {
 
             // 收集所有策略的意圖，並自動填充 strategy_id
             let strategy_start = now_micros();
+
+            let l2_book = pending
+                .book
+                .as_ref()
+                .map(|(venue, book)| ports::L2BookView {
+                    symbol: &book.symbol,
+                    venue: *venue,
+                    timestamp: book.timestamp,
+                    sequence: book.sequence,
+                    bid_prices: &book.bid_prices,
+                    bid_quantities: &book.bid_quantities,
+                    ask_prices: &book.ask_prices,
+                    ask_quantities: &book.ask_quantities,
+                });
+            let strategy_context = ports::StrategyContext {
+                account: &account_view,
+                book: l2_book,
+            };
 
             // 使用策略實例 ID（而不是類型名稱）進行事件過濾
             // strategy_instance_ids 與 strategies Vec 順序對應
@@ -1144,6 +1200,7 @@ impl Engine {
                     let event_venue = match event {
                         ports::MarketEvent::Snapshot(snapshot) => snapshot.source_venue,
                         ports::MarketEvent::Update(update) => update.source_venue,
+                        ports::MarketEvent::Quote(quote) => quote.source_venue,
                         ports::MarketEvent::Trade(trade) => trade.source_venue,
                         ports::MarketEvent::Bar(bar) => bar.source_venue,
                         _ => None,
@@ -1167,6 +1224,9 @@ impl Engine {
                         ports::MarketEvent::Snapshot(snap) => {
                             ("snapshot", snap.symbol.as_str(), snap.source_venue)
                         }
+                        ports::MarketEvent::Quote(quote) => {
+                            ("quote", quote.symbol.as_str(), quote.source_venue)
+                        }
                         _ => ("other", "", None),
                     };
                     debug!(
@@ -1179,7 +1239,7 @@ impl Engine {
                     continue;
                 }
 
-                let mut intents = strategy.on_market_event(event, &account_view);
+                let mut intents = strategy.on_market_event_with_context(event, &strategy_context);
 
                 // 自動填充 strategy_id（如果是空字串）：使用策略實例 ID 而非索引
                 for intent in &mut intents {
@@ -1206,6 +1266,25 @@ impl Engine {
             #[cfg(feature = "metrics")]
             infra_metrics::MetricsRegistry::global()
                 .record_strategy_latency(strategy_latency as f64);
+
+            // Risk must see an executable reference price for every market intent. Use the
+            // event-sequenced book first; fail closed if no valid quote can be resolved.
+            if intents_work_buf.iter().any(|intent| {
+                matches!(intent.order_type, OrderType::Market) && intent.price.is_none()
+            }) {
+                let latest_market_view = self.get_market_view();
+                let before_pricing = intents_work_buf.len();
+                intents_work_buf.retain_mut(|intent| {
+                    Self::enrich_market_intent_price(intent, l2_book, &latest_market_view)
+                });
+                let rejected = before_pricing.saturating_sub(intents_work_buf.len());
+                if rejected > 0 {
+                    warn!(
+                        rejected,
+                        "market intents rejected because no executable quote was available"
+                    );
+                }
+            }
 
             // 通過風控審核（如果有配置風控管理器）
             let _risk_start = now_micros();
@@ -1239,44 +1318,6 @@ impl Engine {
                     intents_to_send.len()
                 );
             }
-            if !intents_to_send.is_empty() {
-                let market_view = self.get_market_view();
-                for intent in &mut intents_to_send {
-                    if matches!(intent.order_type, OrderType::Market) && intent.price.is_none() {
-                        // 優先使用目標場館的最佳價，否則回退為任一場所
-                        let preferred = if let Some(venue) = intent.target_venue {
-                            let key = hft_core::VenueSymbol::new(venue, intent.symbol.clone());
-                            match intent.side {
-                                Side::Buy => {
-                                    market_view.get_best_ask_for_venue(&key).map(|(p, _)| p)
-                                }
-                                Side::Sell => {
-                                    market_view.get_best_bid_for_venue(&key).map(|(p, _)| p)
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        let best_any = match intent.side {
-                            Side::Buy => {
-                                market_view.get_best_ask_any(&intent.symbol).map(|(p, _)| p)
-                            }
-                            Side::Sell => {
-                                market_view.get_best_bid_any(&intent.symbol).map(|(p, _)| p)
-                            }
-                        };
-
-                        if let Some(px) = preferred
-                            .or(best_any)
-                            .or_else(|| market_view.get_mid_price_any(&intent.symbol))
-                        {
-                            intent.price = Some(px);
-                        }
-                    }
-                }
-            }
-
             if matches!(
                 self.stats.trading_mode,
                 TradingMode::Paused | TradingMode::Emergency
@@ -1296,7 +1337,30 @@ impl Engine {
             if let Some(queues) = &mut self.execution_queues {
                 let mut dropped = 0usize;
                 for intent in intents_to_send.drain(..) {
-                    if queues.send_intent(intent).is_err() {
+                    let created_ts = received_at;
+                    let max_latency_us = self.config.ingestion.stale_threshold_us.max(1);
+                    let mut lifecycle = ports::OrderIntentLifecycle::new(
+                        created_ts,
+                        created_ts.saturating_add(max_latency_us),
+                    );
+                    lifecycle.max_latency_us = Some(max_latency_us);
+                    lifecycle.source_feature_ts = exchange_timestamp;
+                    lifecycle.source_book_seq = l2_book.map(|book| book.sequence).or(match event {
+                        ports::MarketEvent::Snapshot(snapshot) => Some(snapshot.sequence),
+                        ports::MarketEvent::Update(update) => Some(update.sequence),
+                        ports::MarketEvent::Quote(quote) => Some(quote.sequence),
+                        _ => None,
+                    });
+                    let latest_book_seq = lifecycle.source_book_seq;
+                    let envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
+                    if queues
+                        .send_lifecycle_intent_with_book_seq(
+                            envelope,
+                            now_micros(),
+                            latest_book_seq,
+                        )
+                        .is_err()
+                    {
                         dropped += 1;
                     }
                 }
@@ -1322,12 +1386,10 @@ impl Engine {
                 .record_latency(LatencyStage::Execution, execution_latency);
 
             // 如果有起始時間戳，計算端到端延遲
-            if let Some(origin_ts) = event_timestamp {
-                let end_to_end_latency = now_micros().saturating_sub(origin_ts);
-                event_tracker.record_stage(LatencyStage::EndToEnd);
-                self.latency_monitor
-                    .record_latency(LatencyStage::EndToEnd, end_to_end_latency);
-            }
+            let end_to_end_latency = now_micros().saturating_sub(received_at);
+            event_tracker.record_stage(LatencyStage::EndToEnd);
+            self.latency_monitor
+                .record_latency(LatencyStage::EndToEnd, end_to_end_latency);
 
             // 記錄執行延遲到 Prometheus
             #[cfg(feature = "metrics")]
@@ -1504,6 +1566,76 @@ impl Engine {
         }
     }
 
+    fn event_venue_symbol(event: &ports::MarketEvent) -> Option<hft_core::VenueSymbol> {
+        match event {
+            ports::MarketEvent::Snapshot(snapshot) => snapshot
+                .source_venue
+                .map(|venue| hft_core::VenueSymbol::new(venue, snapshot.symbol.clone())),
+            ports::MarketEvent::Update(update) => update
+                .source_venue
+                .map(|venue| hft_core::VenueSymbol::new(venue, update.symbol.clone())),
+            ports::MarketEvent::Quote(quote) => quote
+                .source_venue
+                .map(|venue| hft_core::VenueSymbol::new(venue, quote.symbol.clone())),
+            ports::MarketEvent::Trade(trade) => trade
+                .source_venue
+                .map(|venue| hft_core::VenueSymbol::new(venue, trade.symbol.clone())),
+            ports::MarketEvent::Bar(bar) => bar
+                .source_venue
+                .map(|venue| hft_core::VenueSymbol::new(venue, bar.symbol.clone())),
+            ports::MarketEvent::Arbitrage(_) | ports::MarketEvent::Disconnect { .. } => None,
+        }
+    }
+
+    fn enrich_market_intent_price(
+        intent: &mut ports::OrderIntent,
+        event_book: Option<ports::L2BookView<'_>>,
+        latest_market_view: &MarketView,
+    ) -> bool {
+        if !matches!(intent.order_type, OrderType::Market) || intent.price.is_some() {
+            return true;
+        }
+
+        let sequenced_price = event_book.and_then(|book| {
+            if book.symbol != &intent.symbol
+                || intent.target_venue.is_some_and(|venue| venue != book.venue)
+            {
+                return None;
+            }
+            match intent.side {
+                Side::Buy => book.ask_prices.first().copied().map(hft_core::Price::from),
+                Side::Sell => book.bid_prices.first().copied().map(hft_core::Price::from),
+            }
+        });
+        let venue_price = intent.target_venue.and_then(|venue| {
+            let key = hft_core::VenueSymbol::new(venue, intent.symbol.clone());
+            match intent.side {
+                Side::Buy => latest_market_view
+                    .get_best_ask_for_venue(&key)
+                    .map(|(price, _)| price),
+                Side::Sell => latest_market_view
+                    .get_best_bid_for_venue(&key)
+                    .map(|(price, _)| price),
+            }
+        });
+        let unbound_price = if intent.target_venue.is_none() {
+            match intent.side {
+                Side::Buy => latest_market_view
+                    .get_best_ask_any(&intent.symbol)
+                    .map(|(price, _)| price),
+                Side::Sell => latest_market_view
+                    .get_best_bid_any(&intent.symbol)
+                    .map(|(price, _)| price),
+            }
+            .or_else(|| latest_market_view.get_mid_price_any(&intent.symbol))
+        } else {
+            None
+        };
+
+        intent.price = sequenced_price.or(venue_price).or(unbound_price);
+        intent.price.is_some()
+    }
+
     /// 從市場事件中提取時間戳
     fn extract_event_timestamp(&self, event: &ports::MarketEvent) -> Option<u64> {
         match event {
@@ -1511,6 +1643,7 @@ impl Engine {
             ports::MarketEvent::Trade(trade) => Some(trade.timestamp),
             ports::MarketEvent::Snapshot(snapshot) => Some(snapshot.timestamp),
             ports::MarketEvent::Update(update) => Some(update.timestamp),
+            ports::MarketEvent::Quote(quote) => Some(quote.timestamp),
             _ => None,
         }
     }

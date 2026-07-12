@@ -5,7 +5,11 @@ use ports::*;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+const INLINE_BOOK_LEVELS: usize = 16;
 
 /// TopN 深度快照 - 使用 SoA (Structure of Arrays) 提升性能
 /// 内部使用定点存储，边缘转换 Decimal
@@ -16,10 +20,11 @@ pub struct TopNSnapshot {
     pub sequence: u64,
 
     // SoA 定点存储: 提升 SIMD/缓存性能，避免 Decimal 开销
-    pub bid_prices: Vec<FixedPrice>,
-    pub bid_quantities: Vec<FixedQuantity>,
-    pub ask_prices: Vec<FixedPrice>,
-    pub ask_quantities: Vec<FixedQuantity>,
+    pub bid_prices: SmallVec<[FixedPrice; INLINE_BOOK_LEVELS]>,
+    pub bid_quantities: SmallVec<[FixedQuantity; INLINE_BOOK_LEVELS]>,
+    pub ask_prices: SmallVec<[FixedPrice; INLINE_BOOK_LEVELS]>,
+    pub ask_quantities: SmallVec<[FixedQuantity; INLINE_BOOK_LEVELS]>,
+    top_n: usize,
 }
 
 impl TopNSnapshot {
@@ -28,10 +33,11 @@ impl TopNSnapshot {
             symbol,
             timestamp: 0,
             sequence: 0,
-            bid_prices: Vec::with_capacity(top_n),
-            bid_quantities: Vec::with_capacity(top_n),
-            ask_prices: Vec::with_capacity(top_n),
-            ask_quantities: Vec::with_capacity(top_n),
+            bid_prices: SmallVec::with_capacity(top_n),
+            bid_quantities: SmallVec::with_capacity(top_n),
+            ask_prices: SmallVec::with_capacity(top_n),
+            ask_quantities: SmallVec::with_capacity(top_n),
+            top_n,
         }
     }
 
@@ -46,15 +52,83 @@ impl TopNSnapshot {
         self.ask_quantities.clear();
 
         // 填充 bids (已按價格降序排列) - 边界转换 Decimal -> FixedPoint
-        for level in &snapshot.bids {
+        for level in snapshot.bids.iter().take(self.top_n) {
             self.bid_prices.push(level.price.into());
             self.bid_quantities.push(level.quantity.into());
         }
 
         // 填充 asks (已按價格升序排列) - 边界转换 Decimal -> FixedPoint
-        for level in &snapshot.asks {
+        for level in snapshot.asks.iter().take(self.top_n) {
             self.ask_prices.push(level.price.into());
             self.ask_quantities.push(level.quantity.into());
+        }
+    }
+
+    pub fn apply_update(&mut self, update: &BookUpdate) {
+        self.timestamp = update.timestamp;
+        self.sequence = update.sequence;
+        for level in &update.bids {
+            Self::apply_level(
+                &mut self.bid_prices,
+                &mut self.bid_quantities,
+                level,
+                self.top_n,
+                true,
+            );
+        }
+        for level in &update.asks {
+            Self::apply_level(
+                &mut self.ask_prices,
+                &mut self.ask_quantities,
+                level,
+                self.top_n,
+                false,
+            );
+        }
+    }
+
+    #[inline]
+    fn apply_level(
+        prices: &mut SmallVec<[FixedPrice; INLINE_BOOK_LEVELS]>,
+        quantities: &mut SmallVec<[FixedQuantity; INLINE_BOOK_LEVELS]>,
+        level: &BookLevel,
+        top_n: usize,
+        descending: bool,
+    ) {
+        let price = FixedPrice::from(level.price);
+        let quantity = FixedQuantity::from(level.quantity);
+        if let Some(index) = prices.iter().position(|candidate| *candidate == price) {
+            if quantity <= FixedQuantity::ZERO {
+                prices.remove(index);
+                quantities.remove(index);
+            } else {
+                quantities[index] = quantity;
+            }
+            return;
+        }
+
+        if quantity <= FixedQuantity::ZERO {
+            return;
+        }
+
+        let index = prices
+            .iter()
+            .position(|candidate| {
+                if descending {
+                    *candidate < price
+                } else {
+                    *candidate > price
+                }
+            })
+            .unwrap_or(prices.len());
+        if index >= top_n {
+            return;
+        }
+        prices.insert(index, price);
+        quantities.insert(index, quantity);
+        if prices.len() > top_n {
+            prices.truncate(top_n);
+            quantities.truncate(top_n);
         }
     }
 
@@ -100,6 +174,118 @@ impl TopNSnapshot {
         }
 
         Some(FixedPrice::spread_bps(best_bid, best_ask))
+    }
+}
+
+/// Mutable full-depth reconstruction state. Readers never observe this structure directly;
+/// each accepted update publishes a compact immutable `TopNSnapshot`.
+#[derive(Debug)]
+struct CanonicalDepthBook {
+    symbol: Symbol,
+    timestamp: Timestamp,
+    sequence: u64,
+    bids: BTreeMap<FixedPrice, FixedQuantity>,
+    asks: BTreeMap<FixedPrice, FixedQuantity>,
+}
+
+impl CanonicalDepthBook {
+    fn from_snapshot(snapshot: &MarketSnapshot) -> Self {
+        let mut book = Self {
+            symbol: snapshot.symbol.clone(),
+            timestamp: snapshot.timestamp,
+            sequence: snapshot.sequence,
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+        };
+        for level in &snapshot.bids {
+            Self::apply_level(&mut book.bids, level);
+        }
+        for level in &snapshot.asks {
+            Self::apply_level(&mut book.asks, level);
+        }
+        book
+    }
+
+    fn apply_update(&mut self, update: &BookUpdate) {
+        self.timestamp = update.timestamp;
+        self.sequence = update.sequence;
+        for level in &update.bids {
+            Self::apply_level(&mut self.bids, level);
+        }
+        for level in &update.asks {
+            Self::apply_level(&mut self.asks, level);
+        }
+    }
+
+    #[inline]
+    fn apply_level(side: &mut BTreeMap<FixedPrice, FixedQuantity>, level: &BookLevel) {
+        let price = FixedPrice::from(level.price);
+        let quantity = FixedQuantity::from(level.quantity);
+        if quantity <= FixedQuantity::ZERO {
+            side.remove(&price);
+        } else {
+            side.insert(price, quantity);
+        }
+    }
+
+    fn top_n(&self, levels: usize) -> TopNSnapshot {
+        let mut snapshot = TopNSnapshot::new(self.symbol.clone(), levels);
+        snapshot.timestamp = self.timestamp;
+        snapshot.sequence = self.sequence;
+        for (&price, &quantity) in self.bids.iter().rev().take(levels) {
+            snapshot.bid_prices.push(price);
+            snapshot.bid_quantities.push(quantity);
+        }
+        for (&price, &quantity) in self.asks.iter().take(levels) {
+            snapshot.ask_prices.push(price);
+            snapshot.ask_quantities.push(quantity);
+        }
+        snapshot
+    }
+
+    /// Publish a real-time BBO over a slower depth image without mutating reconstructed L2.
+    /// Levels that contradict the newer BBO are filtered until the depth stream catches up.
+    fn top_n_with_quote(&self, levels: usize, quote: &TopOfBook) -> TopNSnapshot {
+        let mut snapshot = TopNSnapshot::new(self.symbol.clone(), levels);
+        snapshot.timestamp = quote.timestamp;
+        snapshot.sequence = quote.sequence;
+
+        let bid_price = FixedPrice::from(quote.bid.price);
+        let bid_quantity = FixedQuantity::from(quote.bid.quantity);
+        let ask_price = FixedPrice::from(quote.ask.price);
+        let ask_quantity = FixedQuantity::from(quote.ask.quantity);
+
+        if levels > 0 && bid_quantity > FixedQuantity::ZERO {
+            snapshot.bid_prices.push(bid_price);
+            snapshot.bid_quantities.push(bid_quantity);
+        }
+        for (&price, &quantity) in self.bids.iter().rev() {
+            if snapshot.bid_prices.len() >= levels {
+                break;
+            }
+            if price >= bid_price {
+                continue;
+            }
+            snapshot.bid_prices.push(price);
+            snapshot.bid_quantities.push(quantity);
+        }
+
+        if levels > 0 && ask_quantity > FixedQuantity::ZERO {
+            snapshot.ask_prices.push(ask_price);
+            snapshot.ask_quantities.push(ask_quantity);
+        }
+        for (&price, &quantity) in &self.asks {
+            if snapshot.ask_prices.len() >= levels {
+                break;
+            }
+            if price <= ask_price {
+                continue;
+            }
+            snapshot.ask_prices.push(price);
+            snapshot.ask_quantities.push(quantity);
+        }
+
+        snapshot
     }
 }
 
@@ -343,6 +529,10 @@ impl CrossExchangeJoiner {
 /// 聚合引擎 - 統一管理所有聚合功能
 pub struct AggregationEngine {
     pub top_n: usize,
+    /// Full sequence-validated books used to reconstruct published Top-N after level deletion.
+    canonical_books: FxHashMap<VenueSymbol, CanonicalDepthBook>,
+    /// Faster BBO feed overlaid on the latest depth image. It never mutates canonical L2.
+    quote_overlays: FxHashMap<VenueSymbol, TopOfBook>,
     /// 不可变共享订单簿（per-venue）：只在有变更时替换 Arc
     pub orderbooks: FxHashMap<VenueSymbol, Arc<TopNSnapshot>>,
     pub bar_builders: FxHashMap<(Symbol, u64), BarBuilder>,
@@ -364,6 +554,8 @@ impl AggregationEngine {
     pub fn new() -> Self {
         Self {
             top_n: 10, // 預設 Top-10
+            canonical_books: FxHashMap::with_capacity_and_hasher(64, Default::default()),
+            quote_overlays: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             orderbooks: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             bar_builders: FxHashMap::with_capacity_and_hasher(128, Default::default()),
             joiners: FxHashMap::with_capacity_and_hasher(32, Default::default()),
@@ -376,6 +568,8 @@ impl AggregationEngine {
     pub fn with_config(top_n: usize, stale_threshold_us: u64) -> Self {
         Self {
             top_n,
+            canonical_books: FxHashMap::with_capacity_and_hasher(64, Default::default()),
+            quote_overlays: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             orderbooks: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             bar_builders: FxHashMap::with_capacity_and_hasher(128, Default::default()),
             joiners: FxHashMap::with_capacity_and_hasher(32, Default::default()),
@@ -399,27 +593,26 @@ impl AggregationEngine {
                 let symbol = snapshot.symbol.clone();
                 let source_venue = snapshot.source_venue;
 
-                // 创建新的快照（不可变），替换旧的 Arc
-                let mut new_topn = if let Some(venue) = source_venue {
-                    if let Some(existing) = self
-                        .orderbooks
-                        .get(&VenueSymbol::new(venue, symbol.clone()))
-                    {
-                        // 复用现有容量，避免频繁分配
-                        (**existing).clone()
-                    } else {
-                        TopNSnapshot::new(symbol.clone(), self.top_n)
-                    }
-                } else {
-                    TopNSnapshot::new(symbol.clone(), self.top_n)
-                };
-
-                new_topn.update_from_snapshot(&snapshot);
-
                 // 替换为新的 Arc（需要 source_venue 才能寫入 per-venue 訂單簿）
                 if let Some(venue) = source_venue {
                     let key = VenueSymbol::new(venue, symbol.clone());
-                    self.orderbooks.insert(key, Arc::new(new_topn));
+                    let canonical = CanonicalDepthBook::from_snapshot(&snapshot);
+                    let quote = self.quote_overlays.get(&key).cloned();
+                    let top_n = quote.as_ref().map_or_else(
+                        || canonical.top_n(self.top_n),
+                        |quote| {
+                            if quote.sequence > canonical.sequence {
+                                canonical.top_n_with_quote(self.top_n, quote)
+                            } else {
+                                canonical.top_n(self.top_n)
+                            }
+                        },
+                    );
+                    if quote.is_some_and(|quote| quote.sequence <= canonical.sequence) {
+                        self.quote_overlays.remove(&key);
+                    }
+                    self.canonical_books.insert(key.clone(), canonical);
+                    self.orderbooks.insert(key, Arc::new(top_n));
                 }
 
                 // 标记该 symbol 已变更
@@ -451,6 +644,176 @@ impl AggregationEngine {
                 }
             }
 
+            MarketEvent::Update(update) => {
+                let symbol = update.symbol.clone();
+                let Some(venue) = update.source_venue else {
+                    output_events.push(MarketEvent::Disconnect {
+                        reason: format!("book update for {} has no source venue", symbol.as_str()),
+                        source_venue: None,
+                        symbol: Some(symbol.clone()),
+                    });
+                    return;
+                };
+                let key = VenueSymbol::new(venue, symbol.clone());
+
+                if update.is_snapshot {
+                    let snapshot = MarketSnapshot {
+                        symbol,
+                        timestamp: update.timestamp,
+                        bids: update.bids,
+                        asks: update.asks,
+                        sequence: update.sequence,
+                        source_venue: Some(venue),
+                    };
+                    self.process_market_event_into(MarketEvent::Snapshot(snapshot), output_events);
+                    return;
+                }
+
+                let Some(existing) = self.canonical_books.get(&key) else {
+                    output_events.push(MarketEvent::Disconnect {
+                        reason: format!(
+                            "delta arrived before snapshot for {}:{}",
+                            venue,
+                            symbol.as_str()
+                        ),
+                        source_venue: Some(venue),
+                        symbol: Some(symbol.clone()),
+                    });
+                    return;
+                };
+
+                let expected = existing.sequence.saturating_add(1);
+                if update.sequence < expected {
+                    return;
+                }
+                if update
+                    .first_sequence
+                    .is_some_and(|first_sequence| first_sequence > expected)
+                {
+                    self.canonical_books.remove(&key);
+                    self.quote_overlays.remove(&key);
+                    self.orderbooks.remove(&key);
+                    if let Some(joiner) = self.joiners.get_mut(&symbol) {
+                        joiner.exchanges.remove(&venue);
+                    }
+                    self.changed_symbols.insert(symbol.clone());
+                    output_events.push(MarketEvent::Disconnect {
+                        reason: format!(
+                            "book sequence gap for {}:{} expected {}, received {:?}-{}",
+                            venue,
+                            symbol.as_str(),
+                            expected,
+                            update.first_sequence,
+                            update.sequence
+                        ),
+                        source_venue: Some(venue),
+                        symbol: Some(symbol.clone()),
+                    });
+                    return;
+                }
+
+                let quote = self.quote_overlays.get(&key).cloned();
+                let next = {
+                    let canonical = self
+                        .canonical_books
+                        .get_mut(&key)
+                        .expect("canonical book was checked above");
+                    canonical.apply_update(&update);
+                    quote.as_ref().map_or_else(
+                        || canonical.top_n(self.top_n),
+                        |quote| {
+                            if quote.sequence > canonical.sequence {
+                                canonical.top_n_with_quote(self.top_n, quote)
+                            } else {
+                                canonical.top_n(self.top_n)
+                            }
+                        },
+                    )
+                };
+                if quote.is_some_and(|quote| quote.sequence <= update.sequence) {
+                    self.quote_overlays.remove(&key);
+                }
+                self.orderbooks.insert(key, Arc::new(next.clone()));
+                self.changed_symbols.insert(symbol.clone());
+
+                let joiner = self
+                    .joiners
+                    .entry(symbol.clone())
+                    .or_insert_with(|| CrossExchangeJoiner::new(symbol));
+                joiner.update_exchange(venue, next);
+                let arbitrage_opportunity =
+                    joiner.check_arbitrage_opportunity_fast(FixedBps::from_f64(5.0));
+                output_events.push(MarketEvent::Update(update));
+                if let Some(opportunity) = arbitrage_opportunity {
+                    output_events.push(MarketEvent::Arbitrage(opportunity));
+                }
+            }
+
+            MarketEvent::Quote(quote) => {
+                let symbol = quote.symbol.clone();
+                let Some(venue) = quote.source_venue else {
+                    output_events.push(MarketEvent::Disconnect {
+                        reason: format!("BBO update for {} has no source venue", symbol.as_str()),
+                        source_venue: None,
+                        symbol: Some(symbol),
+                    });
+                    return;
+                };
+                let key = VenueSymbol::new(venue, symbol.clone());
+
+                if quote.bid.quantity <= Quantity::zero()
+                    || quote.ask.quantity <= Quantity::zero()
+                    || quote.bid.price >= quote.ask.price
+                {
+                    self.canonical_books.remove(&key);
+                    self.quote_overlays.remove(&key);
+                    self.orderbooks.remove(&key);
+                    if let Some(joiner) = self.joiners.get_mut(&symbol) {
+                        joiner.exchanges.remove(&venue);
+                    }
+                    self.changed_symbols.insert(symbol.clone());
+                    output_events.push(MarketEvent::Disconnect {
+                        reason: format!("invalid BBO update for {}:{}", venue, symbol.as_str()),
+                        source_venue: Some(venue),
+                        symbol: Some(symbol),
+                    });
+                    return;
+                }
+
+                if self
+                    .quote_overlays
+                    .get(&key)
+                    .is_some_and(|existing| existing.sequence >= quote.sequence)
+                    || self
+                        .canonical_books
+                        .get(&key)
+                        .is_some_and(|book| book.sequence > quote.sequence)
+                {
+                    return;
+                }
+
+                self.quote_overlays.insert(key.clone(), quote.clone());
+                let Some(canonical) = self.canonical_books.get(&key) else {
+                    output_events.push(MarketEvent::Quote(quote));
+                    return;
+                };
+                let next = canonical.top_n_with_quote(self.top_n, &quote);
+                self.orderbooks.insert(key, Arc::new(next.clone()));
+                self.changed_symbols.insert(symbol.clone());
+
+                let joiner = self
+                    .joiners
+                    .entry(symbol.clone())
+                    .or_insert_with(|| CrossExchangeJoiner::new(symbol));
+                joiner.update_exchange(venue, next);
+                let arbitrage_opportunity =
+                    joiner.check_arbitrage_opportunity_fast(FixedBps::from_f64(5.0));
+                output_events.push(MarketEvent::Quote(quote));
+                if let Some(opportunity) = arbitrage_opportunity {
+                    output_events.push(MarketEvent::Arbitrage(opportunity));
+                }
+            }
+
             MarketEvent::Trade(trade) => {
                 // 更新 K線
                 for interval_ms in [60000, 300000, 900000] {
@@ -477,6 +840,43 @@ impl AggregationEngine {
                         );
                     }
                 }
+                output_events.push(MarketEvent::Trade(trade));
+            }
+
+            MarketEvent::Disconnect {
+                reason,
+                source_venue,
+                symbol,
+            } => {
+                let invalidated: Vec<VenueSymbol> = self
+                    .orderbooks
+                    .keys()
+                    .filter(|key| {
+                        source_venue.is_none_or(|venue| key.venue == venue)
+                            && symbol.as_ref().is_none_or(|value| &key.symbol == value)
+                    })
+                    .cloned()
+                    .collect();
+                for key in invalidated {
+                    self.canonical_books.remove(&key);
+                    self.quote_overlays.remove(&key);
+                    self.orderbooks.remove(&key);
+                    if let Some(joiner) = self.joiners.get_mut(&key.symbol) {
+                        joiner.exchanges.remove(&key.venue);
+                    }
+                    self.changed_symbols.insert(key.symbol);
+                }
+                self.joiners
+                    .retain(|_, joiner| !joiner.exchanges.is_empty());
+                self.quote_overlays.retain(|key, _| {
+                    !(source_venue.is_none_or(|venue| key.venue == venue)
+                        && symbol.as_ref().is_none_or(|value| &key.symbol == value))
+                });
+                output_events.push(MarketEvent::Disconnect {
+                    reason,
+                    source_venue,
+                    symbol,
+                });
             }
 
             _ => {
@@ -498,8 +898,14 @@ impl AggregationEngine {
 
     pub fn cleanup_stale_data(&mut self, current_time: Timestamp) {
         // 清理過期的訂單簿
+        self.canonical_books.retain(|_, book| {
+            current_time.saturating_sub(book.timestamp) < self.stale_threshold_us
+        });
         self.orderbooks.retain(|_, snapshot| {
             current_time.saturating_sub(snapshot.timestamp) < self.stale_threshold_us
+        });
+        self.quote_overlays.retain(|_, quote| {
+            current_time.saturating_sub(quote.timestamp) < self.stale_threshold_us
         });
 
         // 清理過期的 K線建構器

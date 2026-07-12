@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tr.timestamp
                         );
                     }
-                    ports::MarketEvent::Disconnect { reason } => {
+                    ports::MarketEvent::Disconnect { reason, .. } => {
                         eprintln!("DISCONNECT: {}", reason);
                         break;
                     }

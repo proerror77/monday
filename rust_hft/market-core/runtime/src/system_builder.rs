@@ -582,7 +582,8 @@ impl SystemBuilder {
                 backpressure_policy: engine::dataflow::BackpressurePolicy::DropNew, // 默认丢弃新事件，保持稳定性
             },
             max_events_per_cycle: 100,
-            aggregation_symbols: vec![], // top_n 暫時不用，留待聚合層實現
+            aggregation_symbols: vec![],
+            top_n: self.config.engine.top_n,
             latency_monitor: engine::latency_monitor::LatencyMonitorConfig::default(),
         };
 
@@ -822,7 +823,7 @@ impl SystemRuntime {
                     {
                         let caps = venue_cfg
                             .as_ref()
-                            .map(|cfg| parse_binance_capabilities(cfg))
+                            .map(parse_binance_capabilities)
                             .unwrap_or_else(|| {
                                 adapter_binance_data::capabilities::BinanceCapabilities::default()
                             });
@@ -841,7 +842,18 @@ impl SystemRuntime {
                     }
                 }
                 VenueType::Bybit => {
-                    warn!("Bybit 適配器為占位符實現，跳過註冊");
+                    #[cfg(feature = "adapter-bybit-data")]
+                    {
+                        let mut stream = adapter_bybit_data::BybitMarketStream::new();
+                        if let Some(cfg) = &venue_cfg {
+                            if let Some(ws_url) = &cfg.ws_public {
+                                stream = stream.with_ws_url(ws_url.clone());
+                            }
+                        }
+                        let consumer = bridge.bridge_stream(stream, symbols).await?;
+                        self.engine.lock().await.register_event_consumer(consumer);
+                        info!("Bybit 行情已橋接至引擎");
+                    }
                 }
                 VenueType::Grvt => {
                     #[cfg(feature = "adapter-grvt-data")]
@@ -1488,10 +1500,14 @@ async fn engine_event_loop(engine_arc: Arc<Mutex<Engine>>, notify: Arc<Notify>) 
             }
         };
 
-        let prev_stats = guard.get_statistics();
         let tick_result = guard.tick();
         let new_stats = guard.get_statistics();
-        let had_activity = new_stats.cycle_count > prev_stats.cycle_count;
+        let had_activity = tick_result.as_ref().is_ok_and(|result| {
+            result.events_total > 0
+                || result.execution_events_processed > 0
+                || result.orders_generated > 0
+                || result.snapshot_published
+        });
         let running = new_stats.is_running;
         drop(guard);
 

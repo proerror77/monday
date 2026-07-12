@@ -2304,6 +2304,7 @@ dependencies = [
 name = "hft-data-adapter-binance"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "bytes",
  "chrono",
@@ -2353,6 +2354,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "bytes",
  "chrono",
  "futures",
  "hft-core",
@@ -2529,6 +2531,7 @@ dependencies = [
  "hft-ports",
  "hft-snapshot",
  "hft-strategy-arbitrage",
+ "hft-strategy-imbalance",
  "hft-strategy-trend",
  "loom",
  "num-traits",
@@ -2538,6 +2541,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "smallvec",
  "tokio",
  "tracing",
 ]
@@ -6152,6 +6156,9 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "socket2"

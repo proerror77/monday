@@ -144,57 +144,59 @@ impl WsClient {
     pub async fn receive_message(
         &mut self,
     ) -> Result<Option<(String, WsFrameMetrics)>, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(conn) = &mut self.connection {
-            if let Some(msg) = conn.next().await {
-                match msg? {
-                    Message::Text(text) => {
-                        if self.cfg.heartbeat_text.is_some() && text == "pong" {
+        loop {
+            if let Some(conn) = &mut self.connection {
+                if let Some(msg) = conn.next().await {
+                    match msg? {
+                        Message::Text(text) => {
+                            if self.cfg.heartbeat_text.is_some() && text == "pong" {
+                                self.metrics.last_heartbeat = Some(Instant::now());
+                                continue;
+                            }
+                            self.metrics.messages_received += 1;
+                            trace!("接收到消息: {}", text);
+                            let metrics = WsFrameMetrics::record_receive();
+                            return Ok(Some((text.to_string(), metrics)));
+                        }
+                        Message::Ping(payload) => {
+                            // 自動回應 Ping
+                            conn.send(Message::Pong(payload)).await?;
                             self.metrics.last_heartbeat = Some(Instant::now());
+                            continue;
+                        }
+                        Message::Pong(_) => {
+                            self.metrics.last_heartbeat = Some(Instant::now());
+                            continue;
+                        }
+                        Message::Close(_) => {
+                            warn!("WebSocket 連接被遠程關閉");
+                            self.connection = None;
                             return Ok(None);
                         }
-                        self.metrics.messages_received += 1;
-                        trace!("接收到消息: {}", text);
-                        let metrics = WsFrameMetrics::record_receive();
-                        Ok(Some((text.to_string(), metrics)))
-                    }
-                    Message::Ping(payload) => {
-                        // 自動回應 Ping
-                        conn.send(Message::Pong(payload)).await?;
-                        self.metrics.last_heartbeat = Some(Instant::now());
-                        Ok(None)
-                    }
-                    Message::Pong(_) => {
-                        self.metrics.last_heartbeat = Some(Instant::now());
-                        Ok(None)
-                    }
-                    Message::Close(_) => {
-                        warn!("WebSocket 連接被遠程關閉");
-                        self.connection = None;
-                        Ok(None)
-                    }
-                    Message::Binary(data) => {
-                        // 對於二進制數據，轉換為 UTF-8
-                        match String::from_utf8(data.to_vec()) {
-                            Ok(text) => {
-                                self.metrics.messages_received += 1;
-                                let metrics = WsFrameMetrics::record_receive();
-                                Ok(Some((text, metrics)))
-                            }
-                            Err(_) => {
-                                warn!("收到無法解析的二進制數據");
-                                Ok(None)
+                        Message::Binary(data) => {
+                            // 對於二進制數據，轉換為 UTF-8
+                            match String::from_utf8(data.to_vec()) {
+                                Ok(text) => {
+                                    self.metrics.messages_received += 1;
+                                    let metrics = WsFrameMetrics::record_receive();
+                                    return Ok(Some((text, metrics)));
+                                }
+                                Err(_) => {
+                                    warn!("收到無法解析的二進制數據");
+                                    continue;
+                                }
                             }
                         }
+                        Message::Frame(_) => continue,
                     }
-                    Message::Frame(_) => Ok(None),
+                } else {
+                    // 連接已斷開
+                    self.connection = None;
+                    return Ok(None);
                 }
             } else {
-                // 連接已斷開
-                self.connection = None;
-                Ok(None)
+                return Err("WebSocket 未連接".into());
             }
-        } else {
-            Err("WebSocket 未連接".into())
         }
     }
 
@@ -210,51 +212,53 @@ impl WsClient {
     pub async fn receive_message_bytes(
         &mut self,
     ) -> Result<Option<(Bytes, WsFrameMetrics)>, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(conn) = &mut self.connection {
-            if let Some(msg) = conn.next().await {
-                match msg? {
-                    Message::Text(text) => {
-                        if self.cfg.heartbeat_text.is_some() && text == "pong" {
+        loop {
+            if let Some(conn) = &mut self.connection {
+                if let Some(msg) = conn.next().await {
+                    match msg? {
+                        Message::Text(text) => {
+                            if self.cfg.heartbeat_text.is_some() && text == "pong" {
+                                self.metrics.last_heartbeat = Some(Instant::now());
+                                continue;
+                            }
+                            self.metrics.messages_received += 1;
+                            trace!("接收到文本消息 (零拷貝)");
+                            let metrics = WsFrameMetrics::record_receive();
+                            // Utf8Bytes and Bytes share the same backing storage in tungstenite.
+                            return Ok(Some((Bytes::from(text), metrics)));
+                        }
+                        Message::Binary(data) => {
+                            self.metrics.messages_received += 1;
+                            trace!("接收到二進制消息 (零拷貝)");
+                            let metrics = WsFrameMetrics::record_receive();
+                            // 直接包裝為 Bytes（零拷貝）
+                            return Ok(Some((data, metrics)));
+                        }
+                        Message::Ping(payload) => {
+                            // 自動回應 Ping
+                            conn.send(Message::Pong(payload)).await?;
                             self.metrics.last_heartbeat = Some(Instant::now());
+                            continue;
+                        }
+                        Message::Pong(_) => {
+                            self.metrics.last_heartbeat = Some(Instant::now());
+                            continue;
+                        }
+                        Message::Close(_) => {
+                            warn!("WebSocket 連接被遠程關閉");
+                            self.connection = None;
                             return Ok(None);
                         }
-                        self.metrics.messages_received += 1;
-                        trace!("接收到文本消息 (零拷貝)");
-                        let metrics = WsFrameMetrics::record_receive();
-                        // 將 String 轉為 Bytes（一次性分配，無需二次拷貝）
-                        Ok(Some((Bytes::from(text.to_string()), metrics)))
+                        Message::Frame(_) => continue,
                     }
-                    Message::Binary(data) => {
-                        self.metrics.messages_received += 1;
-                        trace!("接收到二進制消息 (零拷貝)");
-                        let metrics = WsFrameMetrics::record_receive();
-                        // 直接包裝為 Bytes（零拷貝）
-                        Ok(Some((data, metrics)))
-                    }
-                    Message::Ping(payload) => {
-                        // 自動回應 Ping
-                        conn.send(Message::Pong(payload)).await?;
-                        self.metrics.last_heartbeat = Some(Instant::now());
-                        Ok(None)
-                    }
-                    Message::Pong(_) => {
-                        self.metrics.last_heartbeat = Some(Instant::now());
-                        Ok(None)
-                    }
-                    Message::Close(_) => {
-                        warn!("WebSocket 連接被遠程關閉");
-                        self.connection = None;
-                        Ok(None)
-                    }
-                    Message::Frame(_) => Ok(None),
+                } else {
+                    // 連接已斷開
+                    self.connection = None;
+                    return Ok(None);
                 }
             } else {
-                // 連接已斷開
-                self.connection = None;
-                Ok(None)
+                return Err("WebSocket 未連接".into());
             }
-        } else {
-            Err("WebSocket 未連接".into())
         }
     }
 
@@ -487,5 +491,45 @@ impl ReconnectingWsClient {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    #[tokio::test]
+    async fn protocol_ping_is_consumed_internally_not_reported_as_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Ping(b"heartbeat".to_vec().into()))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text("market-data".into()))
+                .await
+                .unwrap();
+        });
+
+        let mut client = WsClient::new(WsClientConfig {
+            url: format!("ws://{address}"),
+            ..Default::default()
+        });
+        client.connect().await.unwrap();
+        let (payload, _) =
+            tokio::time::timeout(Duration::from_secs(2), client.receive_message_bytes())
+                .await
+                .expect("client receive timeout")
+                .expect("client receive error")
+                .expect("connection closed after protocol ping");
+
+        assert_eq!(payload.as_ref(), b"market-data");
+        server.await.unwrap();
     }
 }

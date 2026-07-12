@@ -658,6 +658,8 @@ impl MarketStream for BitgetMarketStream {
                 if tx
                     .try_send(MarketEvent::Disconnect {
                         reason: format!("WebSocket error: {}", e),
+                        source_venue: Some(hft_core::VenueId::BITGET),
+                        symbol: None,
                     })
                     .is_err()
                 {
@@ -847,6 +849,8 @@ impl MessageHandler for BitgetMessageHandler {
         self.subscription_sent = false; // 重置訂閱狀態，重連後需要重新訂閱
         self.try_send_event(MarketEvent::Disconnect {
             reason: "Connection lost".to_string(),
+            source_venue: Some(hft_core::VenueId::BITGET),
+            symbol: None,
         });
         Ok(())
     }

@@ -1,7 +1,8 @@
 use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
 use hft_factor_dsl::{FactorAst, FactorDslError, FactorOperator, FactorTerminal};
 use ports::{
-    AccountView, AggregatedBar, ExecutionEvent, MarketEvent, MarketSnapshot, OrderIntent, Strategy,
+    AccountView, AggregatedBar, ExecutionEvent, L2BookView, MarketEvent, MarketSnapshot,
+    OrderIntent, Strategy, StrategyContext,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -93,6 +94,57 @@ impl FormulaStrategy {
             _ => None,
         }
     }
+
+    fn emit_signal(
+        &mut self,
+        signal: f64,
+        target_venue: hft_core::VenueId,
+        executable_price: impl FnOnce(Side) -> Option<Decimal>,
+    ) -> Vec<OrderIntent> {
+        let next_state = if signal > self.config.signal_threshold {
+            SignalState::Buy
+        } else if signal < -self.config.signal_threshold {
+            SignalState::Sell
+        } else {
+            SignalState::Neutral
+        };
+        if next_state == SignalState::Neutral {
+            self.signal_state = SignalState::Neutral;
+            return Vec::new();
+        }
+        if next_state == self.signal_state {
+            return Vec::new();
+        }
+        let side = match next_state {
+            SignalState::Buy => Side::Buy,
+            SignalState::Sell => Side::Sell,
+            SignalState::Neutral => unreachable!(),
+        };
+        let Some(limit_price) = executable_price(side).filter(|price| *price > Decimal::ZERO)
+        else {
+            return Vec::new();
+        };
+        let Some(quantity) = self
+            .config
+            .max_order_notional
+            .checked_div(limit_price)
+            .filter(|quantity| *quantity > Decimal::ZERO)
+        else {
+            return Vec::new();
+        };
+
+        self.signal_state = next_state;
+        vec![OrderIntent::crypto_spot(
+            self.config.symbol.clone(),
+            side,
+            Quantity(quantity),
+            OrderType::Limit,
+            Some(Price(limit_price)),
+            TimeInForce::IOC,
+            self.config.name.clone(),
+            Some(target_venue),
+        )]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,50 +165,48 @@ impl Strategy for FormulaStrategy {
         let Some((signal, source_venue)) = self.evaluate_event(event) else {
             return Vec::new();
         };
-        let next_state = if signal > self.config.signal_threshold {
-            SignalState::Buy
-        } else if signal < -self.config.signal_threshold {
-            SignalState::Sell
-        } else {
-            SignalState::Neutral
-        };
-        if next_state == SignalState::Neutral {
-            self.signal_state = SignalState::Neutral;
-            return Vec::new();
-        }
-        if next_state == self.signal_state {
-            return Vec::new();
-        }
         let Some(target_venue) = source_venue else {
             return Vec::new();
         };
-        let side = match next_state {
-            SignalState::Buy => Side::Buy,
-            SignalState::Sell => Side::Sell,
-            SignalState::Neutral => unreachable!(),
+        self.emit_signal(signal, target_venue, |side| executable_price(event, side))
+    }
+
+    fn on_market_event_with_context(
+        &mut self,
+        event: &MarketEvent,
+        context: &StrategyContext<'_>,
+    ) -> Vec<OrderIntent> {
+        if self.domain != EventDomain::Snapshot {
+            return self.on_market_event(event, context.account);
+        }
+        let event_symbol = match event {
+            MarketEvent::Snapshot(snapshot) => &snapshot.symbol,
+            MarketEvent::Update(update) => &update.symbol,
+            MarketEvent::Quote(quote) => &quote.symbol,
+            _ => return Vec::new(),
         };
-        let Some(limit_price) = executable_price(event, side) else {
+        if event_symbol != &self.config.symbol {
             return Vec::new();
-        };
-        let Some(quantity) = self
-            .config
-            .max_order_notional
-            .checked_div(limit_price)
-            .filter(|quantity| *quantity > Decimal::ZERO)
+        }
+        let Some(book) = context
+            .book
+            .filter(|book| book.symbol == &self.config.symbol)
         else {
             return Vec::new();
         };
-        self.signal_state = next_state;
-        vec![OrderIntent::crypto_spot(
-            self.config.symbol.clone(),
-            side,
-            Quantity(quantity),
-            OrderType::Limit,
-            Some(Price(limit_price)),
-            TimeInForce::IOC,
-            self.config.name.clone(),
-            Some(target_venue),
-        )]
+        let Some(signal) = evaluate_book_formula(&self.config.ast, book) else {
+            return Vec::new();
+        };
+        let (Some(best_bid), Some(best_ask)) = (book.bid_prices.first(), book.ask_prices.first())
+        else {
+            return Vec::new();
+        };
+        let best_bid = Price::from(*best_bid).0;
+        let best_ask = Price::from(*best_ask).0;
+        self.emit_signal(signal, book.venue, |side| match side {
+            Side::Buy => Some(best_ask),
+            Side::Sell => Some(best_bid),
+        })
     }
 
     fn on_execution_event(
@@ -322,6 +372,38 @@ fn snapshot_value(snapshot: &MarketSnapshot, field: &str) -> Option<f64> {
     }
 }
 
+fn evaluate_book_formula(ast: &FactorAst, book: L2BookView<'_>) -> Option<f64> {
+    let best_bid = book.bid_prices.first()?.to_f64();
+    let best_ask = book.ask_prices.first()?.to_f64();
+    let bid_size = book.bid_quantities.first()?.to_f64();
+    let ask_size = book.ask_quantities.first()?.to_f64();
+    if best_bid <= 0.0
+        || best_ask <= best_bid
+        || bid_size <= 0.0
+        || ask_size <= 0.0
+        || ![best_bid, best_ask, bid_size, ask_size]
+            .into_iter()
+            .all(f64::is_finite)
+    {
+        return None;
+    }
+    let mid_price = (best_bid + best_ask) * 0.5;
+    let spread = best_ask - best_bid;
+    evaluate_ast(ast, &|field| match field {
+        "best_bid" => Some(best_bid),
+        "best_ask" => Some(best_ask),
+        "mid_price" => finite(mid_price),
+        "spread" => finite(spread),
+        "spread_bps" if mid_price != 0.0 => finite(spread / mid_price * 10_000.0),
+        "bid_size" => Some(bid_size),
+        "ask_size" => Some(ask_size),
+        "book_imbalance" if bid_size + ask_size != 0.0 => {
+            finite((bid_size - ask_size) / (bid_size + ask_size))
+        }
+        _ => None,
+    })
+}
+
 fn bar_value(bar: &AggregatedBar, field: &str) -> Option<f64> {
     match field {
         "open" => decimal_to_f64(bar.open.0),
@@ -353,9 +435,10 @@ fn finite(value: f64) -> Option<f64> {
 mod tests {
     use super::*;
     use hft_core::{
-        AssetClass, OrderType, Price, ProductType, Quantity, Side, TimeInForce, VenueId,
+        AssetClass, FixedPrice, FixedQuantity, OrderType, Price, ProductType, Quantity, Side,
+        TimeInForce, VenueId,
     };
-    use ports::{AggregatedBar, BookLevel, MarketSnapshot};
+    use ports::{AggregatedBar, BookLevel, L2BookView, MarketSnapshot, StrategyContext};
 
     fn config(ast: FactorAst) -> FormulaStrategyConfig {
         FormulaStrategyConfig {
@@ -723,5 +806,50 @@ mod tests {
         };
         crossed.bids[0].price = Price(Decimal::from(102));
         assert!(intents(&mut strategy, &MarketEvent::Snapshot(crossed)).is_empty());
+    }
+
+    #[test]
+    fn canonical_lob_delta_evaluates_snapshot_domain_formula() {
+        let mut strategy =
+            FormulaStrategy::new(config(field("book_imbalance"))).expect("valid strategy");
+        let symbol = Symbol::from("BTCUSDT");
+        let bid_prices = [FixedPrice::from_f64(99.0)];
+        let bid_quantities = [FixedQuantity::from_f64(3.0)];
+        let ask_prices = [FixedPrice::from_f64(101.0)];
+        let ask_quantities = [FixedQuantity::from_f64(1.0)];
+        let account = AccountView::default();
+        let context = StrategyContext {
+            account: &account,
+            book: Some(L2BookView {
+                symbol: &symbol,
+                venue: VenueId::BITGET,
+                timestamp: 2,
+                sequence: 2,
+                bid_prices: &bid_prices,
+                bid_quantities: &bid_quantities,
+                ask_prices: &ask_prices,
+                ask_quantities: &ask_quantities,
+            }),
+        };
+        let event = MarketEvent::Update(ports::BookUpdate {
+            symbol: symbol.clone(),
+            timestamp: 2,
+            bids: vec![BookLevel {
+                price: Price(Decimal::from(99)),
+                quantity: Quantity(Decimal::from(3)),
+            }],
+            asks: Vec::new(),
+            first_sequence: Some(2),
+            sequence: 2,
+            is_snapshot: false,
+            source_venue: Some(VenueId::BITGET),
+        });
+
+        let orders = strategy.on_market_event_with_context(&event, &context);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, Side::Buy);
+        assert_eq!(orders[0].price, Some(Price(Decimal::from(101))));
+        assert_eq!(orders[0].target_venue, Some(VenueId::BITGET));
     }
 }

@@ -181,7 +181,7 @@ impl AdapterBridge {
                                     }
                                 }
 
-                                if let Err(e) = ingester.ingest(event) {
+                                if let Err(e) = ingester.ingest_lossless(event).await {
                                     tracing::error!("攝取事件失敗: {}", e);
                                 } else {
                                     trace!("事件成功攝取到 ring buffer");
