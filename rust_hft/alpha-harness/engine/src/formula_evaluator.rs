@@ -194,9 +194,15 @@ fn evaluate_ast(ast: &FactorAst, rows: &[ResearchRow]) -> Result<Vec<f64>, Strin
         FactorAst::Terminal(FactorTerminal::Field(field)) if field == "signal" => {
             Ok(rows.iter().map(|row| row.signal).collect())
         }
-        FactorAst::Terminal(FactorTerminal::Field(field)) => {
-            Err(format!("formula field is not registered: {field}"))
-        }
+        FactorAst::Terminal(FactorTerminal::Field(field)) => rows
+            .iter()
+            .map(|row| {
+                row.features
+                    .get(field)
+                    .copied()
+                    .ok_or_else(|| format!("formula field is not registered: {field}"))
+            })
+            .collect(),
         FactorAst::Terminal(FactorTerminal::Constant(value)) => {
             let value = value
                 .parse::<f64>()
@@ -453,6 +459,7 @@ mod tests {
             .map(|index| ResearchRow {
                 available_time: start + Duration::minutes(index as i64),
                 signal: if index % 2 == 0 { 1.0 } else { -1.0 },
+                features: std::collections::BTreeMap::new(),
                 label: if index % 2 == 0 { 0.01 } else { -0.01 },
                 fee_bps,
                 funding_bps: 0.0,
@@ -493,6 +500,38 @@ mod tests {
         assert!(
             evaluator
                 .evaluate_sealed(&proposal, &dataset)
+                .unwrap()
+                .passed
+        );
+    }
+
+    #[test]
+    fn registered_point_in_time_feature_can_drive_a_formula() {
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
+            "lob_imbalance".to_string(),
+        )));
+        let mut rows = rows(0.0);
+        for row in &mut rows {
+            row.features.insert("lob_imbalance".to_string(), row.signal);
+        }
+        let dataset = prepare_dataset(
+            rows,
+            &WalkForwardConfig {
+                initial_train_rows: 200,
+                validation_rows: 64,
+                fold_count: 3,
+                purge_rows: 1,
+                embargo_rows: 1,
+                sealed_holdout_rows: 64,
+            },
+            "sealed-1",
+        )
+        .unwrap();
+
+        assert!(
+            evaluator
+                .evaluate(&proposal, &dataset.engine_context())
                 .unwrap()
                 .passed
         );

@@ -74,6 +74,7 @@ enum LoopCommand {
 enum DataCommand {
     Sources,
     Acquire(AcquireDataArgs),
+    ImportFeatures(ImportFeatureDataArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -185,6 +186,8 @@ pub struct RunMissionArgs {
     pub engine: EngineChoice,
     #[arg(long, default_value_t = 7)]
     pub seed: u64,
+    #[arg(long, value_delimiter = ',', default_value = "signal")]
+    pub feature_fields: Vec<String>,
     #[arg(long)]
     pub offline_trace: Option<PathBuf>,
     #[arg(long)]
@@ -299,6 +302,20 @@ struct AcquireDataArgs {
     max_non_finite_values: usize,
 }
 
+#[derive(Debug, Args)]
+struct ImportFeatureDataArgs {
+    #[arg(long)]
+    db: PathBuf,
+    #[arg(long)]
+    mission_id: String,
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    artifact_dir: PathBuf,
+    #[arg(long)]
+    manifest_out: PathBuf,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct EvaluateArgs {
     #[arg(long)]
@@ -393,6 +410,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 print_json(&serde_json::json!({
                     "manifest": manifest,
                     "manifest_path": output,
+                }))
+            }
+            DataCommand::ImportFeatures(args) => {
+                let mut store = AlphaStore::open(&args.db)?;
+                let manifest = data_mission::import_and_register_features(
+                    &mut store,
+                    &args.mission_id,
+                    &args.input,
+                    &args.artifact_dir,
+                )?;
+                data_mission::write_json_atomic(&args.manifest_out, &manifest)?;
+                print_json(&serde_json::json!({
+                    "manifest": manifest,
+                    "manifest_path": args.manifest_out,
                 }))
             }
         },

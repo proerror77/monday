@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::ops::Range;
+use std::{collections::BTreeMap, ops::Range};
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -15,12 +15,16 @@ pub enum EvaluationError {
     NonMonotonicAvailability,
     #[error("dataset contains a non-finite numeric value")]
     NonFiniteValue,
+    #[error("dataset feature schema is empty, inconsistent, or contains an invalid field")]
+    InvalidFeatureSchema,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResearchRow {
     pub available_time: DateTime<Utc>,
     pub signal: f64,
+    #[serde(default)]
+    pub features: BTreeMap<String, f64>,
     pub label: f64,
     pub fee_bps: f64,
     pub funding_bps: f64,
@@ -74,6 +78,7 @@ impl<'a> EngineContext<'a> {
 #[derive(Debug)]
 pub struct PreparedDataset {
     rows: Vec<ResearchRow>,
+    feature_names: Vec<String>,
     plan: WalkForwardPlan,
     sealed_holdout_id: String,
 }
@@ -89,6 +94,10 @@ impl PreparedDataset {
 
     pub fn plan(&self) -> &WalkForwardPlan {
         &self.plan
+    }
+
+    pub fn feature_names(&self) -> &[String] {
+        &self.feature_names
     }
 }
 
@@ -114,9 +123,25 @@ pub fn prepare_dataset(
         ]
         .iter()
         .any(|value| !value.is_finite())
+            || row.features.values().any(|value| !value.is_finite())
     }) {
         return Err(EvaluationError::NonFiniteValue);
     }
+    let feature_names = rows
+        .first()
+        .map(|row| row.features.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if feature_names
+        .iter()
+        .any(|name| name.trim().is_empty() || name == "signal")
+        || rows
+            .iter()
+            .any(|row| row.features.keys().cloned().collect::<Vec<_>>() != feature_names)
+    {
+        return Err(EvaluationError::InvalidFeatureSchema);
+    }
+    let mut registered_features = vec!["signal".to_string()];
+    registered_features.extend(feature_names);
     if rows
         .windows(2)
         .any(|window| window[0].available_time >= window[1].available_time)
@@ -151,6 +176,7 @@ pub fn prepare_dataset(
     }
     Ok(PreparedDataset {
         rows,
+        feature_names: registered_features,
         plan: WalkForwardPlan {
             folds,
             sealed_holdout: holdout_start..holdout_start + config.sealed_holdout_rows,
@@ -177,6 +203,7 @@ mod tests {
             .map(|index| ResearchRow {
                 available_time: start + Duration::seconds(index as i64),
                 signal: index as f64,
+                features: BTreeMap::new(),
                 label: index as f64 * 0.01,
                 fee_bps: 1.0,
                 funding_bps: 0.1,
@@ -232,6 +259,17 @@ mod tests {
         assert_eq!(
             prepare_dataset(rows, &config(), "holdout-1").unwrap_err(),
             EvaluationError::NonMonotonicAvailability
+        );
+    }
+
+    #[test]
+    fn walk_forward_rejects_feature_schema_drift() {
+        let mut rows = rows(50);
+        rows[0].features.insert("lob_imbalance".to_string(), 0.1);
+
+        assert_eq!(
+            prepare_dataset(rows, &config(), "holdout-1").unwrap_err(),
+            EvaluationError::InvalidFeatureSchema
         );
     }
 }

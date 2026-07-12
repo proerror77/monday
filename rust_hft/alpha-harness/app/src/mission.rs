@@ -50,12 +50,12 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
         (true, _) => bail!("mission resume requires a paused or running mission"),
     }
 
-    let manifest = data_mission::read_registered_manifest(&store, &args.dataset.dataset_manifest)?;
-    if mission.dataset_manifest_id.as_str() != manifest.manifest_id {
+    let manifest =
+        data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
+    if mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
         bail!("mission dataset id does not match the supplied manifest");
     }
-    let rows = data_mission::load_research_rows(
-        &manifest,
+    let rows = manifest.load_rows(
         args.dataset.fee_bps,
         args.dataset.funding_bps,
         args.dataset.latency_bps,
@@ -70,9 +70,9 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
             embargo_rows: args.dataset.embargo_rows,
             sealed_holdout_rows: args.dataset.sealed_holdout_rows,
         },
-        format!("sealed:{}", manifest.manifest_id),
+        format!("sealed:{}", manifest.manifest_id()),
     )?;
-    let proposal_engine = build_engine(args)?;
+    let proposal_engine = build_engine(args, &dataset)?;
     let evaluator = FormulaEvaluator::for_mission(&mission).map_err(anyhow::Error::msg)?;
     let mut kernel = AutoResearchKernel::new(&mut store, proposal_engine, evaluator);
     let outcome = kernel.run(
@@ -93,7 +93,7 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
             EngineChoice::OfflineRl => ResearchEngineAuthority::LabSearchPolicyOnly,
             _ => ResearchEngineAuthority::CandidateResearchOnly,
         },
-        dataset_manifest_id: manifest.manifest_id,
+        dataset_manifest_id: manifest.manifest_id().to_string(),
     })
 }
 
@@ -142,17 +142,40 @@ pub fn execute_learning(
     )?)
 }
 
-fn build_engine(args: &RunMissionArgs) -> anyhow::Result<Box<dyn ProposalEngine>> {
+fn build_engine(
+    args: &RunMissionArgs,
+    dataset: &alpha_engine::evaluation::PreparedDataset,
+) -> anyhow::Result<Box<dyn ProposalEngine>> {
+    let fields = args
+        .feature_fields
+        .iter()
+        .map(|field| field.trim().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    if fields.is_empty()
+        || fields.contains("")
+        || fields
+            .iter()
+            .any(|field| !dataset.feature_names().contains(field))
+    {
+        bail!(
+            "feature fields must be non-empty and registered by the prepared dataset: {:?}",
+            dataset.feature_names()
+        );
+    }
+    let fields = fields.into_iter().collect::<Vec<_>>();
+    let primary = fields[0].clone();
+    let secondary = fields.get(1).cloned().unwrap_or_else(|| primary.clone());
     let engine: Box<dyn ProposalEngine> = match args.engine {
         EngineChoice::Gp => Box::new(
-            GeneticProgrammingEngine::new(args.seed, vec!["signal".to_string()], 32, 5)
+            GeneticProgrammingEngine::new(args.seed, fields.clone(), 32, 5)
                 .map_err(anyhow::Error::msg)?,
         ),
         EngineChoice::Mcts => Box::new(
-            MctsEngine::new(args.seed, "signal", "signal", 1.414, 5).map_err(anyhow::Error::msg)?,
+            MctsEngine::new(args.seed, primary.clone(), secondary, 1.414, 5)
+                .map_err(anyhow::Error::msg)?,
         ),
         EngineChoice::Bayesian => Box::new(
-            BayesianOptimizerEngine::new("signal", 2.0, 60.0, 30, 1e-6, 10.0, 0.01)
+            BayesianOptimizerEngine::new(primary.clone(), 2.0, 60.0, 30, 1e-6, 10.0, 0.01)
                 .map_err(anyhow::Error::msg)?,
         ),
         EngineChoice::OfflineRl => {
@@ -165,7 +188,7 @@ fn build_engine(args: &RunMissionArgs) -> anyhow::Result<Box<dyn ProposalEngine>
                     format!("failed to read offline trace {}", path.display())
                 })?)?;
             Box::new(
-                OfflineRlEngine::train("signal", "offline-policy-v1", &traces, 3, 0.2, 0.9, 50)
+                OfflineRlEngine::train(primary, "offline-policy-v1", &traces, 3, 0.2, 0.9, 50)
                     .map_err(anyhow::Error::msg)?,
             )
         }
@@ -173,7 +196,7 @@ fn build_engine(args: &RunMissionArgs) -> anyhow::Result<Box<dyn ProposalEngine>
             let client =
                 OpenAiCompatibleClient::new(LlmConfig::from_env().map_err(anyhow::Error::msg)?)
                     .map_err(anyhow::Error::msg)?;
-            Box::new(LlmProposalEngine::new(client))
+            Box::new(LlmProposalEngine::new(client, fields).map_err(anyhow::Error::msg)?)
         }
     };
     Ok(engine)

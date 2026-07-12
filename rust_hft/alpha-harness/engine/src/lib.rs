@@ -707,6 +707,7 @@ mod tests {
             .map(|index| ResearchRow {
                 available_time: start + Duration::seconds(index),
                 signal: index as f64,
+                features: std::collections::BTreeMap::new(),
                 label: index as f64 * 0.01,
                 fee_bps: 1.0,
                 funding_bps: 0.1,

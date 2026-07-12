@@ -3,6 +3,7 @@ use alpha_domain::{CandidateArtifact, EngineKind};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 pub struct LlmConfig {
@@ -306,11 +307,19 @@ impl crate::learning::FailureCritic for OpenAiCompatibleClient {
 
 pub struct LlmProposalEngine {
     client: OpenAiCompatibleClient,
+    allowed_fields: BTreeSet<String>,
 }
 
 impl LlmProposalEngine {
-    pub fn new(client: OpenAiCompatibleClient) -> Self {
-        Self { client }
+    pub fn new(client: OpenAiCompatibleClient, fields: Vec<String>) -> Result<Self, String> {
+        let allowed_fields = fields.into_iter().collect::<BTreeSet<_>>();
+        if allowed_fields.is_empty() || allowed_fields.iter().any(|field| field.trim().is_empty()) {
+            return Err("LLM proposer requires registered feature fields".to_string());
+        }
+        Ok(Self {
+            client,
+            allowed_fields,
+        })
     }
 }
 
@@ -330,14 +339,21 @@ impl ProposalEngine for LlmProposalEngine {
             return Err("LLM token budget is exhausted".to_string());
         }
         let prompt = format!(
-            "Mission: {mission_id}. Available research rows: {}. Walk-forward folds: {}. Sealed holdout id: {}. Propose one testable factor hypothesis using only a registered field and the allowed operator grammar.",
+            "Mission: {mission_id}. Available research rows: {}. Walk-forward folds: {}. Sealed holdout id: {}. Registered feature fields: {:?}. Propose one testable factor hypothesis using only one registered field and the allowed operator grammar.",
             context.rows().len(),
             context.folds().len(),
             context.sealed_holdout_id(),
+            self.allowed_fields,
         );
         let artifact = self
             .client
             .generate_hypothesis_bounded(&prompt, remaining.tokens)?;
+        if !self.allowed_fields.contains(&artifact.field) {
+            return Err(format!(
+                "LLM proposed unregistered feature field: {}",
+                artifact.field
+            ));
+        }
         if artifact.token_usage.total_tokens > remaining.tokens {
             return Err("LLM response exceeded remaining token budget".to_string());
         }

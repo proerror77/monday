@@ -849,6 +849,7 @@ mod tests {
                 mission_id: mission_id.to_string(),
                 engine: EngineChoice::Mcts,
                 seed: 7,
+                feature_fields: vec!["signal".to_string()],
                 offline_trace: None,
                 max_new_iterations: None,
                 dataset: DatasetArgs {

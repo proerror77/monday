@@ -41,6 +41,7 @@ fn test_dataset() -> crate::evaluation::PreparedDataset {
         .map(|index| ResearchRow {
             available_time: start + Duration::seconds(index),
             signal: index as f64,
+            features: std::collections::BTreeMap::new(),
             label: index as f64,
             fee_bps: 0.0,
             funding_bps: 0.0,

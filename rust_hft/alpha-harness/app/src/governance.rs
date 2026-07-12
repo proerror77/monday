@@ -175,12 +175,12 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
         return print_json(&existing);
     }
 
-    let manifest = data_mission::read_registered_manifest(&store, &args.dataset.dataset_manifest)?;
-    if lineage.mission.dataset_manifest_id.as_str() != manifest.manifest_id {
+    let manifest =
+        data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
+    if lineage.mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
         bail!("mission dataset id does not match the supplied manifest");
     }
-    let rows = data_mission::load_research_rows(
-        &manifest,
+    let rows = manifest.load_rows(
         args.dataset.fee_bps,
         args.dataset.funding_bps,
         args.dataset.latency_bps,
@@ -195,7 +195,7 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
             embargo_rows: args.dataset.embargo_rows,
             sealed_holdout_rows: args.dataset.sealed_holdout_rows,
         },
-        format!("sealed:{}", manifest.manifest_id),
+        format!("sealed:{}", manifest.manifest_id()),
     )?;
     let proposal = EngineProposal {
         candidate_id: candidate.candidate_id.clone(),
@@ -217,7 +217,7 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
         payload: serde_json::json!({
             "mission_id": args.mission_id,
             "candidate_content_hash": candidate.content_hash,
-            "dataset_manifest_id": manifest.manifest_id,
+            "dataset_manifest_id": manifest.manifest_id(),
             "evaluation": evaluation,
         }),
         created_at: Utc::now(),

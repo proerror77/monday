@@ -1,7 +1,10 @@
 use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
-use hft_collector::{acquire_dataset, DataAcquisitionMission, DatasetManifest, OhlcvTraceRow};
+use hft_collector::{
+    acquire_dataset, import_feature_dataset, read_feature_rows, DataAcquisitionMission,
+    DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
+};
 use sha2::{Digest, Sha256};
 use std::{io::BufRead, path::Path};
 
@@ -21,12 +24,63 @@ pub async fn acquire_and_register(
     Ok(manifest)
 }
 
+pub fn import_and_register_features(
+    store: &mut AlphaStore,
+    mission_id: &str,
+    input: &Path,
+    artifact_dir: &Path,
+) -> anyhow::Result<FeatureDatasetManifest> {
+    let manifest =
+        import_feature_dataset(mission_id, input, artifact_dir).map_err(anyhow::Error::msg)?;
+    store.put_registry_revision(&RegistryRevision {
+        revision_id: manifest.manifest_id.clone(),
+        registry_kind: "dataset".to_string(),
+        asset_id: manifest.symbol.clone(),
+        parent_revision_id: None,
+        payload: serde_json::to_value(&manifest)?,
+        created_at: manifest.created_at,
+    })?;
+    Ok(manifest)
+}
+
+pub enum RegisteredResearchDataset {
+    Ohlcv(DatasetManifest),
+    FeatureMatrix(FeatureDatasetManifest),
+}
+
+impl RegisteredResearchDataset {
+    pub fn manifest_id(&self) -> &str {
+        match self {
+            Self::Ohlcv(manifest) => &manifest.manifest_id,
+            Self::FeatureMatrix(manifest) => &manifest.manifest_id,
+        }
+    }
+
+    pub fn load_rows(
+        &self,
+        fee_bps: f64,
+        funding_bps: f64,
+        latency_bps: f64,
+    ) -> anyhow::Result<Vec<ResearchRow>> {
+        match self {
+            Self::Ohlcv(manifest) => {
+                load_research_rows(manifest, fee_bps, funding_bps, latency_bps)
+            }
+            Self::FeatureMatrix(manifest) => {
+                load_feature_research_rows(manifest, fee_bps, funding_bps, latency_bps)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn read_manifest(path: &Path) -> anyhow::Result<DatasetManifest> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read dataset manifest {}", path.display()))?;
     serde_json::from_slice(&bytes).context("dataset manifest is invalid JSON")
 }
 
+#[cfg(test)]
 pub fn read_registered_manifest(
     store: &AlphaStore,
     path: &Path,
@@ -43,6 +97,48 @@ pub fn read_registered_manifest(
         bail!("dataset manifest does not match its registered immutable revision");
     }
     Ok(manifest)
+}
+
+pub fn read_registered_research_dataset(
+    store: &AlphaStore,
+    path: &Path,
+) -> anyhow::Result<RegisteredResearchDataset> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read dataset manifest {}", path.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).context("dataset manifest is invalid JSON")?;
+    let dataset = if value
+        .get("dataset_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("point_in_time_feature_matrix")
+    {
+        RegisteredResearchDataset::FeatureMatrix(serde_json::from_value(value.clone())?)
+    } else {
+        RegisteredResearchDataset::Ohlcv(serde_json::from_value(value.clone())?)
+    };
+    let (manifest_id, symbol, created_at) = match &dataset {
+        RegisteredResearchDataset::Ohlcv(manifest) => (
+            manifest.manifest_id.as_str(),
+            manifest.symbol.as_str(),
+            manifest.created_at,
+        ),
+        RegisteredResearchDataset::FeatureMatrix(manifest) => (
+            manifest.manifest_id.as_str(),
+            manifest.symbol.as_str(),
+            manifest.created_at,
+        ),
+    };
+    let registered = store
+        .get_registry_revision(manifest_id)
+        .context("dataset manifest is not registered in the control-plane store")?;
+    if registered.registry_kind != "dataset"
+        || registered.asset_id != symbol
+        || registered.created_at != created_at
+        || registered.payload != value
+    {
+        bail!("dataset manifest does not match its registered immutable revision");
+    }
+    Ok(dataset)
 }
 
 pub fn load_research_rows(
@@ -107,6 +203,7 @@ pub fn load_research_rows(
             // The forward label is only observable when the next bar is available.
             available_time: trace[index + 1].available_time,
             signal,
+            features: std::collections::BTreeMap::from([("return_1".to_string(), signal)]),
             label,
             fee_bps,
             funding_bps,
@@ -114,6 +211,36 @@ pub fn load_research_rows(
         });
     }
     Ok(rows)
+}
+
+fn load_feature_research_rows(
+    manifest: &FeatureDatasetManifest,
+    fee_bps: f64,
+    funding_bps: f64,
+    latency_bps: f64,
+) -> anyhow::Result<Vec<ResearchRow>> {
+    if [fee_bps, funding_bps, latency_bps]
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        bail!("research costs must be finite and non-negative");
+    }
+    read_feature_rows(manifest)
+        .map_err(anyhow::Error::msg)?
+        .into_iter()
+        .map(|row| {
+            Ok(ResearchRow {
+                // Training labels cannot enter the research row before their availability time.
+                available_time: row.label_available_time,
+                signal: 0.0,
+                features: row.features,
+                label: row.label,
+                fee_bps,
+                funding_bps,
+                latency_bps,
+            })
+        })
+        .collect()
 }
 
 pub fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
@@ -142,9 +269,69 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Duration, Utc};
     use hft_collector::{CandleInterval, DatasetTimeBounds, QualityReport};
+    use hft_collector::{DataModality, PointInTimeFeatureRow};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn registered_multimodal_feature_matrix_loads_without_losing_pit_availability() {
+        let directory = std::env::temp_dir().join(format!(
+            "alpha-feature-data-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let input = directory.join("input.jsonl");
+        let ingestion = Utc::now() - Duration::seconds(1);
+        let rows = (0..4)
+            .map(|index| {
+                let event_time = ingestion - Duration::minutes(10 - index);
+                PointInTimeFeatureRow {
+                    event_time,
+                    feature_available_time: event_time + Duration::seconds(1),
+                    label_available_time: event_time + Duration::minutes(1),
+                    ingestion_time: ingestion,
+                    symbol: "BTCUSDT".to_string(),
+                    source_revisions: BTreeMap::from([
+                        ("binance-lob".to_string(), "depth-v1".to_string()),
+                        ("ethereum".to_string(), "transfer-v1".to_string()),
+                    ]),
+                    modalities: BTreeSet::from([DataModality::Lob, DataModality::OnChain]),
+                    features: BTreeMap::from([
+                        ("lob_imbalance".to_string(), index as f64),
+                        ("onchain_flow".to_string(), index as f64 * 2.0),
+                    ]),
+                    label: index as f64 * 0.001,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        for row in &rows {
+            serde_json::to_writer(&mut bytes, row).unwrap();
+            bytes.push(b'\n');
+        }
+        std::fs::write(&input, bytes).unwrap();
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let manifest = import_and_register_features(
+            &mut store,
+            "data-feature-1",
+            &input,
+            &directory.join("artifacts"),
+        )
+        .unwrap();
+        let manifest_path = directory.join("manifest.json");
+        write_json_atomic(&manifest_path, &manifest).unwrap();
+
+        let registered = read_registered_research_dataset(&store, &manifest_path).unwrap();
+        let loaded = registered.load_rows(1.0, 0.0, 0.5).unwrap();
+
+        assert_eq!(loaded[0].available_time, rows[0].label_available_time);
+        assert_eq!(loaded[0].features["lob_imbalance"], 0.0);
+        assert_eq!(loaded[0].features["onchain_flow"], 0.0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn trace_fixture() -> (std::path::PathBuf, DatasetManifest, Vec<OhlcvTraceRow>) {
         let directory = std::env::temp_dir().join(format!(
