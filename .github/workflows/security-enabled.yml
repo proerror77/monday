@@ -77,6 +77,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cargo-audit-results
+          path: cargo-audit-results
           path: rust_hft/audit-results.json
 
   secret-presence:
@@ -123,6 +124,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: license-report
+          path: license-report
           path: rust_hft/licenses.json
 
   # ============================================================================
@@ -311,6 +313,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sbom
+          path: sbom
           path: sbom.json
 
   # ============================================================================
@@ -329,8 +332,20 @@ jobs:
       - secret-detection
     if: always()
     steps:
-      - name: Download all artifacts
+      - name: Download cargo audit results
         uses: actions/download-artifact@v4
+        with:
+          name: cargo-audit-results
+
+      - name: Download license report
+        uses: actions/download-artifact@v4
+        with:
+          name: license-report
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
 
       - name: Generate summary
         run: |
