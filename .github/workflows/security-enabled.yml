@@ -152,6 +152,7 @@ jobs:
             -p alpha-domain \
             -p alpha-store \
             -p alpha-engine \
+            -p alpha-onnx-evaluator \
             -p alpha-harness \
             -p hft-harnessctl \
             --all-targets \

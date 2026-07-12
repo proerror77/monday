@@ -61,6 +61,7 @@ jobs:
           cargo fmt --check --package alpha-domain
           cargo fmt --check --package alpha-store
           cargo fmt --check --package alpha-engine
+          cargo fmt --check --package alpha-onnx-evaluator
           cargo fmt --check --package alpha-harness
           cargo fmt --check --package hft-harnessctl
 
@@ -70,6 +71,7 @@ jobs:
             -p alpha-domain \
             -p alpha-store \
             -p alpha-engine \
+            -p alpha-onnx-evaluator \
             -p alpha-harness \
             -p hft-harnessctl \
             --all-targets \
@@ -78,7 +80,7 @@ jobs:
             -D warnings
 
       - name: Test Loop Engineer packages
-        run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness -p hft-harnessctl --locked
+        run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-onnx-evaluator -p alpha-harness -p hft-harnessctl --locked
 
       - name: Verify signed runtime handoff
         run: |
@@ -95,6 +97,12 @@ jobs:
           cargo test -p hft-data-adapter-binance --no-default-features --features json-simd --locked
           cargo test -p hft-infra-redis --features redis --locked
           cargo check -p hft-live --features clickhouse,redis,grpc --locked
+
+      - name: Verify Ondo Perps feature boundary
+        run: |
+          cargo test -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --locked
+          cargo clippy -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --all-targets --no-deps --locked -- -D warnings
+          cargo check -p hft-live --features ondo-perps --locked
 
       - name: Check production deployment contract
         run: ../scripts/check-deployment-contract.sh
