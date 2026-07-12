@@ -698,6 +698,7 @@ fn venue_type_to_venue_id(venue_type: &VenueType) -> VenueId {
         VenueType::Asterdex => VenueId::ASTERDEX,
         VenueType::Lighter => VenueId::LIGHTER,
         VenueType::Backpack => VenueId::BACKPACK,
+        VenueType::OndoPerps => VenueId::ONDO_PERPS,
         VenueType::Mock => VenueId::MOCK,
     }
 }
@@ -870,6 +871,20 @@ impl SystemRuntime {
                         let consumer = bridge.bridge_stream(stream, symbols).await?;
                         self.engine.lock().await.register_event_consumer(consumer);
                         info!("Hyperliquid 行情已橋接至引擎");
+                    }
+                }
+                VenueType::OndoPerps => {
+                    #[cfg(feature = "adapter-ondo-perps-data")]
+                    {
+                        let mut stream = adapter_ondo_perps_data::OndoPerpsMarketStream::new();
+                        if let Some(cfg) = &venue_cfg {
+                            if let Some(ws_url) = &cfg.ws_public {
+                                stream = stream.with_ws_url(ws_url.clone());
+                            }
+                        }
+                        let consumer = bridge.bridge_instrument_stream(stream, instruments).await?;
+                        self.engine.lock().await.register_event_consumer(consumer);
+                        info!("Ondo Perps 行情已橋接至引擎");
                     }
                 }
                 VenueType::Backpack => {

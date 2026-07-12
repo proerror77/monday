@@ -1,0 +1,21 @@
+[package]
+name = "hft-data-adapter-ondo-perps"
+version = "0.1.0"
+edition = "2021"
+description = "Ondo Perps public market data adapter"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+
+async-trait = "0.1"
+chrono = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+
+[lib]
+name = "adapter_ondo_perps_data"

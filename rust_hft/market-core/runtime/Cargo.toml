@@ -30,6 +30,7 @@ adapter-mock-data = { package = "hft-data-adapter-mock", path = "../../data-pipe
 adapter-asterdex-data = { package = "hft-data-adapter-asterdex", path = "../../data-pipelines/adapters/adapter-asterdex", optional = true }
 adapter-lighter-data = { package = "hft-data-adapter-lighter", path = "../../data-pipelines/adapters/adapter-lighter", optional = true }
 adapter-grvt-data = { package = "hft-data-adapter-grvt", path = "../../data-pipelines/adapters/adapter-grvt", optional = true }
+adapter-ondo-perps-data = { package = "hft-data-adapter-ondo-perps", path = "../../data-pipelines/adapters/adapter-ondo-perps", optional = true }
 
 # Execution adapters (optional)
 adapter-bitget-execution = { package = "hft-execution-adapter-bitget", path = "../../execution-gateway/adapters/adapter-bitget", optional = true }
@@ -42,6 +43,7 @@ adapter-hyperliquid-execution = { package = "hft-execution-adapter-hyperliquid",
 adapter-asterdex-execution = { package = "hft-execution-adapter-asterdex", path = "../../execution-gateway/adapters/adapter-asterdex", optional = true }
 adapter-lighter-execution = { package = "hft-execution-adapter-lighter", path = "../../execution-gateway/adapters/adapter-lighter", optional = true }
 adapter-grvt-execution = { package = "hft-execution-adapter-grvt", path = "../../execution-gateway/adapters/adapter-grvt", optional = true }
+adapter-ondo-perps-execution = { package = "hft-execution-adapter-ondo-perps", path = "../../execution-gateway/adapters/adapter-ondo-perps", optional = true }
 
 # Strategy libraries (optional)
 strategy-trend = { package = "hft-strategy-trend", path = "../../strategy-framework/strategies/trend", optional = true }
@@ -108,6 +110,7 @@ adapter-mock-data = ["dep:adapter-mock-data"]
 adapter-asterdex-data = ["dep:adapter-asterdex-data"]
 adapter-lighter-data = ["dep:adapter-lighter-data"]
 adapter-grvt-data = ["dep:adapter-grvt-data"]
+adapter-ondo-perps-data = ["dep:adapter-ondo-perps-data"]
 
 # Execution adapters
 adapter-bitget-execution = ["dep:adapter-bitget-execution"]
@@ -120,6 +123,7 @@ adapter-hyperliquid-execution = ["dep:adapter-hyperliquid-execution"]
 adapter-asterdex-execution = ["dep:adapter-asterdex-execution"]
 adapter-lighter-execution = ["dep:adapter-lighter-execution"]
 adapter-grvt-execution = ["dep:adapter-grvt-execution"]
+adapter-ondo-perps-execution = ["dep:adapter-ondo-perps-execution"]
 
 # Strategies
 strategy-trend = ["dep:strategy-trend"]
@@ -146,6 +150,7 @@ hyperliquid = ["adapter-hyperliquid-data", "adapter-hyperliquid-execution"]
 asterdex = ["adapter-asterdex-data", "adapter-asterdex-execution"]
 lighter = ["adapter-lighter-data", "adapter-lighter-execution"]
 grvt = ["adapter-grvt-data", "adapter-grvt-execution"]
+ondo-perps = ["adapter-ondo-perps-data", "adapter-ondo-perps-execution"]
 mock = ["adapter-mock-data"]
 all-strategies = ["strategy-trend", "strategy-arbitrage", "strategy-imbalance", "strategy-formula", "strategy-dl", "strategy-lob-flow-grid"]
-full = ["bitget", "binance", "bybit", "okx", "hyperliquid", "asterdex", "lighter", "backpack", "grvt", "all-strategies", "adapter-mock-data"]
+full = ["bitget", "binance", "bybit", "okx", "hyperliquid", "asterdex", "lighter", "backpack", "grvt", "ondo-perps", "all-strategies", "adapter-mock-data"]

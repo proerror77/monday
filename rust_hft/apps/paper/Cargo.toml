@@ -22,6 +22,7 @@ mock = ["runtime/adapter-mock-data"]
 bitget = ["runtime/adapter-bitget-data"]
 binance = ["runtime/adapter-binance-data"]
 bybit = ["runtime/adapter-bybit-data"]
+ondo-perps = ["runtime/adapter-ondo-perps-data"]
 
 # 基礎設施（轉發至 runtime 並啟用 HTTP 暴露）
 metrics = [

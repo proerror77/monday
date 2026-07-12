@@ -25,6 +25,7 @@ impl VenueId {
     pub const LIGHTER: VenueId = VenueId(7);
     pub const BACKPACK: VenueId = VenueId(8);
     pub const GRVT: VenueId = VenueId(9);
+    pub const ONDO_PERPS: VenueId = VenueId(10);
     pub const BINANCE_SPOT: VenueId = VenueId(101);
     pub const BINANCE_TOKENIZED_SECURITIES: VenueId = VenueId(102);
     pub const BINANCE_FUTURES: VenueId = VenueId(103);
@@ -42,6 +43,7 @@ impl VenueId {
             Self::LIGHTER => "LIGHTER",
             Self::BACKPACK => "BACKPACK",
             Self::GRVT => "GRVT",
+            Self::ONDO_PERPS => "ONDO_PERPS",
             Self::BINANCE_SPOT => "BINANCE_SPOT",
             Self::BINANCE_TOKENIZED_SECURITIES => "BINANCE_TOKENIZED_SECURITIES",
             Self::BINANCE_FUTURES => "BINANCE_FUTURES",
@@ -62,9 +64,11 @@ impl VenueId {
             "LIGHTER" => Some(Self::LIGHTER),
             "BACKPACK" => Some(Self::BACKPACK),
             "GRVT" => Some(Self::GRVT),
+            "ONDO_PERPS" | "ONDO-PERPS" => Some(Self::ONDO_PERPS),
             "BINANCE_SPOT" | "BINANCE-SPOT" => Some(Self::BINANCE_SPOT),
-            "BINANCE_TOKENIZED_SECURITIES" | "BINANCE-TOKENIZED-SECURITIES"
-            | "BINANCE_BSTOCKS" => Some(Self::BINANCE_TOKENIZED_SECURITIES),
+            "BINANCE_TOKENIZED_SECURITIES" | "BINANCE-TOKENIZED-SECURITIES" | "BINANCE_BSTOCKS" => {
+                Some(Self::BINANCE_TOKENIZED_SECURITIES)
+            }
             "BINANCE_FUTURES" | "BINANCE-FUTURES" => Some(Self::BINANCE_FUTURES),
             "BINANCE_BROKERAGE_EQUITIES" | "BINANCE-BROKERAGE-EQUITIES" => {
                 Some(Self::BINANCE_BROKERAGE_EQUITIES)
@@ -440,6 +444,19 @@ impl InstrumentSpec {
         }
     }
 
+    pub fn ondo_perp(symbol: Symbol) -> Self {
+        Self {
+            symbol,
+            venue: VenueId::ONDO_PERPS,
+            asset_class: AssetClass::TokenizedSecurity,
+            product_type: ProductType::Perp,
+            regulatory_profile: RegulatoryProfile::RestrictedJurisdiction,
+            underlying_symbol: None,
+            issuer: Some("Ondo".to_string()),
+            quote_currency: Some("USD".to_string()),
+        }
+    }
+
     pub fn tokenized_security_spot(symbol: Symbol, venue: VenueId) -> Self {
         Self {
             symbol,
@@ -494,6 +511,21 @@ mod instrument_key_tests {
             spec.instrument_key().storage_key(),
             "BINANCE_TOKENIZED_SECURITIES:TOKENIZED_SECURITY_SPOT:AAPLUSDT"
         );
+    }
+
+    #[test]
+    fn ondo_perp_uses_existing_perp_product_boundary() {
+        let spec = InstrumentSpec::ondo_perp(Symbol::new("TSLA"));
+
+        assert_eq!(VenueId::from_str("ondo-perps"), Some(VenueId::ONDO_PERPS));
+        assert_eq!(spec.venue, VenueId::ONDO_PERPS);
+        assert_eq!(spec.asset_class, AssetClass::TokenizedSecurity);
+        assert_eq!(spec.product_type, ProductType::Perp);
+        assert_eq!(
+            spec.regulatory_profile,
+            RegulatoryProfile::RestrictedJurisdiction
+        );
+        assert_eq!(spec.instrument_key().storage_key(), "ONDO_PERPS:PERP:TSLA");
     }
 }
 

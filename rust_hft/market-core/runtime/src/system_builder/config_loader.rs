@@ -545,6 +545,7 @@ fn map_venue_type(venue_id: VenueId) -> VenueType {
         VenueId::GRVT => VenueType::Grvt,
         VenueId::ASTERDEX => VenueType::Asterdex,
         VenueId::BACKPACK => VenueType::Backpack,
+        VenueId::ONDO_PERPS => VenueType::OndoPerps,
         VenueId::MOCK => VenueType::Mock,
         _ => VenueType::Mock,
     }
@@ -1187,6 +1188,23 @@ risk:
             .all(|id| id.venue_id() == Some(VenueId::BINANCE_TOKENIZED_SECURITIES)));
         assert!(!config.risk.tokenized_securities.allow_trading);
         assert!(config.strategies.is_empty());
+    }
+
+    #[test]
+    fn load_ondo_perps_quotes_only_config_preserves_restricted_risk_boundary() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/dev/ondo_perps_quotes_only.yaml"
+        );
+        let config = load_config_from_yaml(path).expect("load Ondo Perps config");
+
+        assert!(config.quotes_only);
+        assert_eq!(config.venues[0].venue_type, VenueType::OndoPerps);
+        assert!(config.venues[0]
+            .symbol_catalog
+            .iter()
+            .all(|id| id.venue_id() == Some(VenueId::ONDO_PERPS)));
+        assert!(!config.risk.tokenized_securities.allow_trading);
     }
 
     #[test]

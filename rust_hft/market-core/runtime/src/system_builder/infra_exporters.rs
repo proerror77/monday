@@ -123,10 +123,10 @@ mod redis_export {
     }
 
     fn product_type_for_venue(venue: hft_core::VenueId) -> ProductType {
-        if venue == hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES {
-            ProductType::TokenizedSecuritySpot
-        } else {
-            ProductType::Spot
+        match venue {
+            hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES => ProductType::TokenizedSecuritySpot,
+            hft_core::VenueId::ONDO_PERPS => ProductType::Perp,
+            _ => ProductType::Spot,
         }
     }
 
@@ -460,10 +460,10 @@ mod clickhouse_export {
     }
 
     fn product_type_for_venue(venue: hft_core::VenueId) -> ProductType {
-        if venue == hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES {
-            ProductType::TokenizedSecuritySpot
-        } else {
-            ProductType::Spot
+        match venue {
+            hft_core::VenueId::BINANCE_TOKENIZED_SECURITIES => ProductType::TokenizedSecuritySpot,
+            hft_core::VenueId::ONDO_PERPS => ProductType::Perp,
+            _ => ProductType::Spot,
         }
     }
 

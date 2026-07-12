@@ -483,6 +483,8 @@ fn show_available_adapters() {
 
     #[cfg(feature = "bitget")]
     info!("  ✓ Bitget 交易所");
+    #[cfg(feature = "ondo-perps")]
+    info!("  ✓ Ondo Perps 行情與執行適配器");
 
     #[cfg(feature = "binance")]
     info!("  ✓ Binance 交易所");

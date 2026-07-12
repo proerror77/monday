@@ -20,9 +20,10 @@ binance = ["runtime/binance"]
 bybit = ["runtime/bybit"]
 okx = ["runtime/okx"]
 hyperliquid = ["runtime/hyperliquid"]
+ondo-perps = ["runtime/ondo-perps"]
 asterdex = ["runtime/asterdex"]
 mock = ["runtime/mock"]
-all-exchanges = ["bitget", "binance", "bybit", "okx", "hyperliquid", "asterdex", "mock"]
+all-exchanges = ["bitget", "binance", "bybit", "okx", "hyperliquid", "ondo-perps", "asterdex", "mock"]
 
 # 策略 (轉發到 runtime)
 trend-strategy = ["runtime/strategy-trend"]

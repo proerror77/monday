@@ -2435,6 +2435,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-data-adapter-ondo-perps"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "hft-core",
+ "hft-ports",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+]
+
+[[package]]
 name = "hft-data-adapter-replay"
 version = "0.1.0"
 dependencies = [
@@ -2743,6 +2759,26 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tracing",
+]
+
+[[package]]
+name = "hft-execution-adapter-ondo-perps"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "hex",
+ "hft-core",
+ "hft-ports",
+ "hmac",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -3128,6 +3164,7 @@ dependencies = [
  "hft-data-adapter-hyperliquid",
  "hft-data-adapter-lighter",
  "hft-data-adapter-mock",
+ "hft-data-adapter-ondo-perps",
  "hft-engine",
  "hft-execution-adapter-asterdex",
  "hft-execution-adapter-backpack",
@@ -3138,6 +3175,7 @@ dependencies = [
  "hft-execution-adapter-hyperliquid",
  "hft-execution-adapter-lighter",
  "hft-execution-adapter-okx",
+ "hft-execution-adapter-ondo-perps",
  "hft-factor-dsl",
  "hft-infra-clickhouse",
  "hft-infra-metrics",

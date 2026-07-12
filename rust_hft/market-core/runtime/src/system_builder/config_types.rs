@@ -406,6 +406,7 @@ pub enum VenueType {
     Asterdex,
     Lighter,
     Backpack,
+    OndoPerps,
     Mock,
 }
 

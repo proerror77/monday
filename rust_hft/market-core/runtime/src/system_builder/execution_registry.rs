@@ -22,6 +22,7 @@ impl SystemBuilder {
             VenueType::Asterdex => self.register_asterdex_adapters(venue),
             VenueType::Lighter => self.register_lighter_adapters(venue),
             VenueType::Backpack => self.register_backpack_adapters(venue),
+            VenueType::OndoPerps => self.register_ondo_perps_adapters(venue),
             VenueType::Mock => {
                 if venue.simulate_execution {
                     info!("Mock: 使用模擬執行客戶端 (SimulatedExecutionClient)");
@@ -249,6 +250,47 @@ impl SystemBuilder {
     #[cfg(not(feature = "adapter-grvt-data"))]
     pub(crate) fn register_grvt_adapters(self, _venue: &VenueConfig) -> Self {
         warn!("GRVT 適配器未啟用 (缺少 feature flag)");
+        self
+    }
+
+    #[cfg(feature = "adapter-ondo-perps-data")]
+    pub(crate) fn register_ondo_perps_adapters(mut self, venue: &VenueConfig) -> Self {
+        info!("註冊 Ondo Perps 適配器");
+        #[cfg(feature = "adapter-ondo-perps-execution")]
+        {
+            use adapter_ondo_perps_execution::{
+                OndoPerpsExecutionClient, OndoPerpsExecutionConfig,
+            };
+            let cfg = OndoPerpsExecutionConfig {
+                rest_base_url: venue
+                    .rest
+                    .clone()
+                    .unwrap_or_else(|| "https://api.ondoperps.xyz".to_string()),
+                key_id: venue.api_key.clone().unwrap_or_default(),
+                api_secret: venue.secret.clone().unwrap_or_default(),
+                timeout_ms: 5_000,
+            };
+            match OndoPerpsExecutionClient::new(cfg) {
+                Ok(client) => {
+                    let account = venue
+                        .account_id
+                        .as_ref()
+                        .map(|id| hft_core::AccountId(id.clone()));
+                    self = self.register_execution_client_with_key(
+                        client,
+                        hft_core::VenueId::ONDO_PERPS,
+                        account,
+                    );
+                }
+                Err(error) => warn!("Ondo Perps 執行未註冊: {}", error),
+            }
+        }
+        self
+    }
+
+    #[cfg(not(feature = "adapter-ondo-perps-data"))]
+    pub(crate) fn register_ondo_perps_adapters(self, _venue: &VenueConfig) -> Self {
+        warn!("Ondo Perps 適配器未啟用 (缺少 feature flag)");
         self
     }
 

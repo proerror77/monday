@@ -1,0 +1,24 @@
+[package]
+name = "hft-execution-adapter-ondo-perps"
+version = "0.1.0"
+edition = "2021"
+description = "Ondo Perps REST execution adapter"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+async-trait = "0.1"
+chrono = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+hmac = "0.12"
+reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+
+[lib]
+name = "adapter_ondo_perps_execution"
