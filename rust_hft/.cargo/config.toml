@@ -5,8 +5,3 @@
 jobs = 8
 # CI lanes that install sccache opt in through RUSTC_WRAPPER. Keeping the
 # wrapper out of project config lets metadata and security tools run anywhere.
-
-# Linux 使用 clang 驅動 mold，避免直接調用 ld 時找不到 mold。
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
