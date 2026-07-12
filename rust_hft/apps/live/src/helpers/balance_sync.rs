@@ -90,10 +90,7 @@ async fn run_balance_sync_loop<E: ExecutionClient + 'static>(
             .unwrap_or(Decimal::ZERO);
 
         // 計算總 USD 價值
-        let total_usd_value: Decimal = balances
-            .iter()
-            .filter_map(|b| b.usd_value)
-            .sum();
+        let total_usd_value: Decimal = balances.iter().filter_map(|b| b.usd_value).sum();
 
         info!(
             "餘額同步完成: {} {} 可用, 總價值 {} USD, {} 種資產",
@@ -118,8 +115,7 @@ async fn run_balance_sync_loop<E: ExecutionClient + 'static>(
 
             // 如果差異超過 1 USD 或 1%，則更新
             let should_update = diff > Decimal::ONE
-                || (current_balance > Decimal::ZERO
-                    && diff / current_balance > Decimal::new(1, 2));
+                || (current_balance > Decimal::ZERO && diff / current_balance > Decimal::new(1, 2));
 
             if should_update {
                 info!(

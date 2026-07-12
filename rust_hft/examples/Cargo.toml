@@ -24,11 +24,6 @@ path = "03_execution/main.rs"
 required-features = ["legacy-sdk"]
 
 [[bin]]
-name = "03_execution_legacy"
-path = "_archive/legacy_oms.rs"
-required-features = ["legacy-oms"]
-
-[[bin]]
 name = "04_risk"
 path = "04_risk/main.rs"
 required-features = ["legacy-sdk"]
@@ -70,6 +65,5 @@ serde_yaml = "0.9"
 
 [features]
 default = []
-legacy-oms = []
 legacy-sdk = []
 binance = ["data_adapter_binance"]

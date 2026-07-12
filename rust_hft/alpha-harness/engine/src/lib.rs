@@ -8,11 +8,11 @@ pub mod learning;
 pub mod llm;
 
 use alpha_domain::{CandidateArtifact, EngineKind};
+pub use alpha_domain::{CandidateEvaluation, EvaluationMetrics, FoldEvaluationMetrics};
 #[cfg(feature = "kernel")]
 use alpha_domain::{
     IterationVerdict, MissionStatus, MissionTerminalReason, ResearchIteration, SearchBudgetLimit,
 };
-pub use alpha_domain::{CandidateEvaluation, EvaluationMetrics, FoldEvaluationMetrics};
 #[cfg(feature = "kernel")]
 use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RunCheckpoint, StoreError};
 #[cfg(feature = "kernel")]

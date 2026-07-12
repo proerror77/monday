@@ -154,8 +154,7 @@ fn demo_batch_operations() {
 
     println!(
         "✅ Batch ingest {} events: {:?}",
-        event_count,
-        batch_ingest_elapsed
+        event_count, batch_ingest_elapsed
     );
     println!(
         "   Average: {:.2}ns per event\n",

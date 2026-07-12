@@ -10,9 +10,9 @@ use ports::{
 fn test_intent() -> OrderIntent {
     OrderIntent {
         symbol: Symbol::new("BTCUSDT"),
-            asset_class: hft_core::AssetClass::Crypto,
-            product_type: hft_core::ProductType::Spot,
-            compliance_context: hft_core::ComplianceContext::default(),
+        asset_class: hft_core::AssetClass::Crypto,
+        product_type: hft_core::ProductType::Spot,
+        compliance_context: hft_core::ComplianceContext::default(),
         side: Side::Buy,
         quantity: Quantity::from_f64(1.0).expect("valid quantity"),
         order_type: OrderType::Market,

@@ -9,10 +9,13 @@ FROM rust:1.91-bookworm AS builder
 WORKDIR /app
 
 # 安裝依賴
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
     cmake \
     libssl-dev \
+    mold \
     pkg-config \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # 複製 workspace 配置
@@ -25,17 +28,16 @@ ARG TARGET=live
 # 構建指定的目標
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo --config 'build.rustc-wrapper=""' build --release --locked --bin hft-${TARGET} && \
+    cargo --config 'build.rustc-wrapper=""' build --release --locked -p hft-${TARGET} && \
     cp /app/target/release/hft-${TARGET} /app/hft-binary
 
 # ============================================
 # Stage 2: Runtime
 # ============================================
 FROM debian:bookworm-slim AS runtime
-ARG TARGET=live
 
 # 安裝運行時依賴
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     libssl3 \
@@ -53,6 +55,7 @@ COPY --from=builder /app/hft-binary /app/hft
 RUN mkdir -p /config /models && chown -R hft:hft /app /config /models
 
 USER hft
+ARG TARGET=live
 ENV HFT_TARGET=${TARGET}
 
 # 健康檢查
