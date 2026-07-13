@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -35,6 +36,7 @@ SYMBOLS = tuple(
     if item.strip()
 )
 SECURITY_TOKEN_SYMBOLS: tuple[str, ...] = ()
+EXCLUDED_SYMBOLS: tuple[str, ...] = ()
 MODE = os.getenv("DEPTH_MODE", "diff").strip().lower()
 SEGMENT_SECONDS = max(60, int(os.getenv("SEGMENT_SECONDS", "3600")))
 SPOOL_DIR = Path(os.getenv("SPOOL_DIR", "/data/monday/spool/binance-lob"))
@@ -53,7 +55,7 @@ SNAPSHOT_REQUESTS_PER_SECOND = float(
     os.getenv("SNAPSHOT_REQUESTS_PER_SECOND", "15")
 )
 WS_SHARD_SIZE = int(os.getenv("WS_SHARD_SIZE", "100"))
-SYNC_TIMEOUT_SECONDS = int(os.getenv("SYNC_TIMEOUT_SECONDS", "20"))
+SYNC_TIMEOUT_SECONDS = int(os.getenv("SYNC_TIMEOUT_SECONDS", "120"))
 STALL_TIMEOUT_SECONDS = int(os.getenv("STALL_TIMEOUT_SECONDS", "60"))
 MAX_BUFFERED_DIFFS = int(os.getenv("MAX_BUFFERED_DIFFS", "250000"))
 STARTUP_DELAY_SECONDS = int(os.getenv("STARTUP_DELAY_SECONDS", "0"))
@@ -62,9 +64,17 @@ SNAPSHOT_RETRY_ATTEMPTS = max(
 )
 MAX_PENDING_DIFFS_TOTAL = int(os.getenv("MAX_PENDING_DIFFS_TOTAL", "250000"))
 MIN_FREE_GB = int(os.getenv("MIN_FREE_GB", "20"))
-DISK_RETRY_SECONDS = int(os.getenv("DISK_RETRY_SECONDS", "300"))
 ZSTD_TIMEOUT_SECONDS = int(os.getenv("ZSTD_TIMEOUT_SECONDS", "300"))
 OSS_COPY_TIMEOUT_SECONDS = int(os.getenv("OSS_COPY_TIMEOUT_SECONDS", "300"))
+PROCESS_WATCHDOG_SECONDS = int(os.getenv("PROCESS_WATCHDOG_SECONDS", "180"))
+TASK_CANCEL_TIMEOUT_SECONDS = int(os.getenv("TASK_CANCEL_TIMEOUT_SECONDS", "5"))
+LAST_DATA_AT = time.monotonic()
+PROCESS_WATCHDOG_ARMED = False
+UPLOAD_STATUS: dict[str, str | None] = {
+    "last_success_at": None,
+    "last_error_at": None,
+    "last_error": None,
+}
 
 
 class SequenceGap(RuntimeError):
@@ -81,7 +91,14 @@ class SequenceGap(RuntimeError):
         )
 
 
-class DiskSpaceLow(RuntimeError):
+class SnapshotUnavailable(RuntimeError):
+    def __init__(self, symbol: str, status: int) -> None:
+        self.symbol = symbol.upper()
+        self.status = status
+        super().__init__(f"snapshot unavailable symbol={self.symbol} status={status}")
+
+
+class TaskCancellationStuck(RuntimeError):
     pass
 
 
@@ -302,11 +319,24 @@ def finalize_segment(
         return None
 
     output = path.with_suffix("").with_suffix(".jsonl.zst")
+    temporary_output = output.with_suffix(output.suffix + ".tmp")
     subprocess.run(
-        ["zstd", "-q", "-T1", "-3", "--rm", str(path), "-o", str(output)],
+        [
+            "zstd",
+            "-q",
+            "-f",
+            "-T1",
+            "-3",
+            str(path),
+            "-o",
+            str(temporary_output),
+        ],
         check=True,
         timeout=ZSTD_TIMEOUT_SECONDS,
     )
+    with temporary_output.open("rb") as compressed:
+        os.fsync(compressed.fileno())
+    temporary_output.replace(output)
     date, hour = segment_partition(start_ns)
     metadata = {
         "schema": schema,
@@ -317,7 +347,10 @@ def finalize_segment(
         "mode": MODE,
         "symbols": list(SYMBOLS),
         "security_token_symbols": list(SECURITY_TOKEN_SYMBOLS),
+        "excluded_symbols": list(EXCLUDED_SYMBOLS),
         "snapshot_limit": SNAPSHOT_LIMIT,
+        "replay_scope": "captured_snapshot_seed_plus_sequence_checked_diffs",
+        "venue_depth_complete": False,
         "events": sum(counts.values()),
         "event_types": dict(sorted(counts.items())),
         "has_replay_safe_checkpoint": replay_safe and counts["checkpoint"] > 0,
@@ -333,6 +366,7 @@ def finalize_segment(
     temporary = manifest.with_suffix(manifest.suffix + ".tmp")
     temporary.write_text(json.dumps(metadata, sort_keys=True) + "\n")
     temporary.replace(manifest)
+    path.unlink()
     return manifest
 
 
@@ -376,6 +410,7 @@ def upload(manifest: Path) -> None:
     data.unlink()
     manifest.unlink()
     success.unlink()
+    UPLOAD_STATUS["last_success_at"] = datetime.now(timezone.utc).isoformat()
     LOG.info(
         "uploaded segment events=%s types=%s key=%s/%s",
         metadata["events"],
@@ -386,11 +421,22 @@ def upload(manifest: Path) -> None:
 
 
 def upload_pending() -> None:
+    had_error = False
     for manifest in sorted(SPOOL_DIR.rglob("*.manifest.json")):
         try:
             upload(manifest)
-        except Exception:
+        except Exception as error:
+            had_error = True
+            UPLOAD_STATUS["last_error_at"] = datetime.now(timezone.utc).isoformat()
+            UPLOAD_STATUS["last_error"] = str(error)[:500]
             LOG.exception("pending upload failed: %s", manifest)
+    if not had_error:
+        UPLOAD_STATUS["last_error_at"] = None
+        UPLOAD_STATUS["last_error"] = None
+
+
+def pending_upload_count() -> int:
+    return sum(1 for _ in SPOOL_DIR.rglob("*.manifest.json"))
 
 
 def recover_parts() -> None:
@@ -398,21 +444,58 @@ def recover_parts() -> None:
         counts = Counter()
         start_ns = end_ns = path.stat().st_mtime_ns
         schema = "binance.lob_tape.v2"
-        with path.open("rb") as source:
-            for index, line in enumerate(source):
+        valid_lines = 0
+        corrupted = False
+        path.with_suffix(path.suffix + ".recovering").unlink(missing_ok=True)
+        with path.open("rb+") as source:
+            while True:
+                line_start = source.tell()
+                line = source.readline()
+                if not line:
+                    break
                 try:
                     event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise ValueError("archive event must be a JSON object")
                     received = int(event["received_at_ns"])
                     event_type = event.get("type")
                     if event_type is None:
                         event_type = "diff"
                         schema = "binance.raw_diff_tape.v1"
                     counts[event_type] += 1
-                    if index == 0:
+                    if valid_lines == 0:
                         start_ns = received
                     end_ns = received
-                except (ValueError, KeyError, json.JSONDecodeError):
-                    counts["invalid"] += 1
+                    valid_lines += 1
+                except (
+                    AttributeError,
+                    TypeError,
+                    ValueError,
+                    KeyError,
+                    json.JSONDecodeError,
+                ):
+                    if source.read(1):
+                        quarantine = path.with_suffix(path.suffix + ".corrupt")
+                        source.close()
+                        path.replace(quarantine)
+                        LOG.error(
+                            "recovery quarantined JSONL with an invalid middle "
+                            "record: %s",
+                            quarantine,
+                        )
+                        corrupted = True
+                    else:
+                        source.seek(line_start)
+                        source.truncate()
+                        source.flush()
+                        os.fsync(source.fileno())
+                        LOG.warning(
+                            "recovery dropped 1 invalid trailing JSONL line: %s",
+                            path,
+                        )
+                    break
+        if corrupted:
+            continue
         finalize_segment(
             path,
             counts,
@@ -487,6 +570,13 @@ def fetch_snapshot_sync(symbol: str) -> dict:
                 snapshot = json.load(response)
             break
         except HTTPError as error:
+            if error.code == 400:
+                try:
+                    payload = json.load(error)
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                if payload.get("code") == -1121:
+                    raise SnapshotUnavailable(symbol, error.code) from error
             retryable = error.code == 429 or 500 <= error.code < 600
             if not retryable or attempt + 1 == SNAPSHOT_RETRY_ATTEMPTS:
                 raise
@@ -515,6 +605,7 @@ def fetch_snapshot_sync(symbol: str) -> dict:
 
 
 async def receive_url(url: str, queue: asyncio.Queue, stop: asyncio.Event) -> None:
+    global LAST_DATA_AT
     async with connect(
         url, open_timeout=20, ping_interval=20, max_size=8 * 1024 * 1024
     ) as websocket:
@@ -528,20 +619,43 @@ async def receive_url(url: str, queue: asyncio.Queue, stop: asyncio.Event) -> No
                     f"no depth frames for {STALL_TIMEOUT_SECONDS}s on websocket shard"
                 )
             if isinstance(message, str):
+                LAST_DATA_AT = time.monotonic()
                 await queue.put(("diff", time.time_ns(), json.loads(message)))
 
 
-async def produce_snapshots(queue: asyncio.Queue) -> None:
-    interval = 1 / SNAPSHOT_REQUESTS_PER_SECOND
+async def produce_snapshots(
+    queue: asyncio.Queue,
+    limiter: "SnapshotRateLimiter | None" = None,
+) -> None:
+    limiter = limiter or SnapshotRateLimiter(SNAPSHOT_REQUESTS_PER_SECOND)
     for symbol in SYMBOLS:
-        started = time.monotonic()
-        snapshot = await asyncio.to_thread(fetch_snapshot_sync, symbol)
+        snapshot = await limiter.fetch(symbol)
         await queue.put(("snapshot", snapshot["received_at_ns"], snapshot))
-        await asyncio.sleep(max(0, interval - (time.monotonic() - started)))
 
 
-async def produce_snapshot(symbol: str, queue: asyncio.Queue) -> None:
-    snapshot = await asyncio.to_thread(fetch_snapshot_sync, symbol)
+class SnapshotRateLimiter:
+    def __init__(self, requests_per_second: float) -> None:
+        self.interval = 1 / requests_per_second
+        self.next_started_at = 0.0
+        self.lock = asyncio.Lock()
+
+    async def fetch(self, symbol: str) -> dict:
+        async with self.lock:
+            now = time.monotonic()
+            delay = max(0.0, self.next_started_at - now)
+            if delay:
+                await asyncio.sleep(delay)
+            self.next_started_at = time.monotonic() + self.interval
+        return await asyncio.to_thread(fetch_snapshot_sync, symbol)
+
+
+async def produce_snapshot(
+    symbol: str,
+    queue: asyncio.Queue,
+    limiter: SnapshotRateLimiter | None = None,
+) -> None:
+    limiter = limiter or SnapshotRateLimiter(SNAPSHOT_REQUESTS_PER_SECOND)
+    snapshot = await limiter.fetch(symbol)
     await queue.put(("snapshot", snapshot["received_at_ns"], snapshot))
 
 
@@ -557,6 +671,43 @@ def is_stalled(last_frame_at: float, now: float) -> bool:
     return now - last_frame_at > STALL_TIMEOUT_SECONDS
 
 
+def process_watchdog_expired(last_data_at: float, now: float) -> bool:
+    return now - last_data_at > PROCESS_WATCHDOG_SECONDS
+
+
+def run_process_watchdog() -> None:
+    interval = max(1.0, min(10.0, PROCESS_WATCHDOG_SECONDS / 4))
+    while True:
+        time.sleep(interval)
+        if not PROCESS_WATCHDOG_ARMED:
+            continue
+        now = time.monotonic()
+        if process_watchdog_expired(LAST_DATA_AT, now):
+            LOG.critical(
+                "process watchdog exiting after %.1fs without market data",
+                now - LAST_DATA_AT,
+            )
+            os._exit(75)
+
+
+async def cancel_tasks_bounded(tasks: tuple[asyncio.Task, ...]) -> None:
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    _, pending = await asyncio.wait(
+        tasks, timeout=TASK_CANCEL_TIMEOUT_SECONDS
+    )
+    if pending:
+        LOG.error(
+            "task cancellation timed out pending=%s",
+            len(pending),
+        )
+        raise TaskCancellationStuck(
+            f"task cancellation timed out pending={len(pending)}"
+        )
+
+
 def bridge_timed_out(
     previously_synced: bool, sync_deadline: float | None, now: float
 ) -> bool:
@@ -567,18 +718,45 @@ def bridge_timed_out(
     )
 
 
-def ensure_disk_headroom() -> None:
-    free = shutil.disk_usage(SPOOL_DIR).free
-    minimum = MIN_FREE_GB * 1024**3
-    if free < minimum:
-        raise DiskSpaceLow(
-            f"spool free space below {MIN_FREE_GB}GiB: {free / 1024**3:.1f}GiB"
+def begin_resync(now: float) -> tuple[bool, float]:
+    return False, now + SYNC_TIMEOUT_SECONDS
+
+
+def exclude_unavailable_symbols(
+    excluded_symbols: tuple[str, ...],
+    symbols: tuple[str, ...],
+    security_tokens: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    excluded = {symbol.lower() for symbol in excluded_symbols}
+    return (
+        tuple(item for item in symbols if item not in excluded),
+        tuple(item for item in security_tokens if item not in excluded),
+    )
+
+
+def disk_headroom() -> tuple[float, bool]:
+    free_gb = shutil.disk_usage(SPOOL_DIR).free / 1024**3
+    return round(free_gb, 1), free_gb < MIN_FREE_GB
+
+
+def warn_if_disk_low() -> tuple[float, bool]:
+    free_gb, warning = disk_headroom()
+    if warning:
+        LOG.warning(
+            "spool free space below %sGiB: %.1fGiB; continuing collection; "
+            "successfully uploaded segments are removed locally, but pending "
+            "segments are retained to prevent data loss",
+            MIN_FREE_GB,
+            free_gb,
         )
+    return free_gb, warning
 
 
 def write_health(
     states: dict[str, OrderBookState], session_id: str, status: str, gaps: int
 ) -> None:
+    disk_free_gb, disk_warning = disk_headroom()
+    pending_segments = pending_upload_count()
     health = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
@@ -586,8 +764,17 @@ def write_health(
         "dataset": DATASET,
         "symbol_count": len(states),
         "security_token_count": len(SECURITY_TOKEN_SYMBOLS),
+        "excluded_symbols": list(EXCLUDED_SYMBOLS),
         "session_id": session_id,
         "sequence_gaps": gaps,
+        "disk_free_gb": disk_free_gb,
+        "disk_warning": disk_warning,
+        "disk_warning_threshold_gb": MIN_FREE_GB,
+        "pending_upload_segments": pending_segments,
+        "upload_warning": UPLOAD_STATUS["last_error_at"] is not None,
+        "last_upload_success_at": UPLOAD_STATUS["last_success_at"],
+        "last_upload_error_at": UPLOAD_STATUS["last_error_at"],
+        "last_upload_error": UPLOAD_STATUS["last_error"],
         "symbols": {
             symbol: {
                 "synced": state.synced,
@@ -610,41 +797,48 @@ class ArchiveRuntime:
         self.segment = Segment()
         self.total_gaps = 0
         self.last_upload_retry = 0.0
-        self.upload_task: asyncio.Task | None = None
+        self.upload_thread: threading.Thread | None = None
 
     def write_checkpoints(
         self, states: dict[str, OrderBookState], session_id: str, reason: str
     ) -> None:
         if not self.segment.replay_safe:
             return
+        if not states or any(not state.synced for state in states.values()):
+            self.segment.mark_replay_unsafe()
+            return
         for state in states.values():
-            if state.synced:
-                self.segment.write(
-                    "checkpoint",
-                    {
-                        "reason": reason,
-                        "replay_safe": True,
-                        **state.checkpoint(session_id),
-                    },
-                )
+            self.segment.write(
+                "checkpoint",
+                {
+                    "reason": reason,
+                    "replay_safe": True,
+                    **state.checkpoint(session_id),
+                },
+            )
 
     async def retry_uploads_if_due(self, force: bool = False) -> None:
-        if self.upload_task is not None and self.upload_task.done():
-            await self.upload_task
-            self.upload_task = None
+        if self.upload_thread is not None and not self.upload_thread.is_alive():
+            self.upload_thread = None
         now = time.monotonic()
         if not force and now - self.last_upload_retry < 300:
             return
-        if self.upload_task is not None:
+        if self.upload_thread is not None:
             return
         self.last_upload_retry = now
-        self.upload_task = asyncio.create_task(asyncio.to_thread(upload_pending))
+        self.upload_thread = threading.Thread(
+            target=upload_pending,
+            name=f"binance-oss-upload-{MARKET}",
+            daemon=True,
+        )
+        self.upload_thread.start()
 
     async def finish_uploads(self) -> None:
-        if self.upload_task is not None:
-            await self.upload_task
-            self.upload_task = None
-        await asyncio.to_thread(upload_pending)
+        if self.upload_thread is not None and self.upload_thread.is_alive():
+            LOG.warning(
+                "shutdown leaving OSS upload in progress; local segment remains "
+                "retryable if the process is terminated"
+            )
 
     async def rotate(
         self,
@@ -701,9 +895,10 @@ async def run_session(
     receivers = [
         asyncio.create_task(receive_url(url, queue, stop)) for url in stream_urls()
     ]
-    snapshotter = asyncio.create_task(produce_snapshots(queue))
+    snapshot_limiter = SnapshotRateLimiter(SNAPSHOT_REQUESTS_PER_SECOND)
+    snapshotter = asyncio.create_task(produce_snapshots(queue, snapshot_limiter))
     tasks = [*receivers, snapshotter]
-    resync_tasks: set[asyncio.Task] = set()
+    resync_tasks: dict[str, asyncio.Task] = {}
     LOG.info(
         "connected market=%s symbols=%s websocket_shards=%s session=%s",
         MARKET,
@@ -749,7 +944,7 @@ async def run_session(
                     await runtime.rotate(states, session_id, "scheduled")
                 now = time.monotonic()
                 if now - last_disk_check >= 60:
-                    ensure_disk_headroom()
+                    warn_if_disk_low()
                     last_disk_check = now
                 await runtime.retry_uploads_if_due()
                 continue
@@ -788,13 +983,15 @@ async def run_session(
                     )
                 runtime.total_gaps += 1
                 states[gap.symbol].invalidate_for_resync()
+                previously_synced, sync_deadline = begin_resync(time.monotonic())
                 write_health(states, session_id, "resyncing", runtime.total_gaps)
                 await runtime.rotate(states, session_id, "sequence_gap")
-                resync_tasks.add(
-                    asyncio.create_task(
-                        produce_snapshot(gap.symbol.lower(), queue)
+                if gap.symbol not in resync_tasks or resync_tasks[gap.symbol].done():
+                    resync_tasks[gap.symbol] = asyncio.create_task(
+                        produce_snapshot(
+                            gap.symbol.lower(), queue, snapshot_limiter
+                        )
                     )
-                )
                 continue
 
             if snapshotter.done():
@@ -818,22 +1015,20 @@ async def run_session(
                 for receiver in receivers:
                     if receiver.done():
                         await receiver
-                for task in tuple(resync_tasks):
+                for symbol, task in tuple(resync_tasks.items()):
                     if task.done():
                         await task
-                        resync_tasks.remove(task)
+                        del resync_tasks[symbol]
                 last_task_check = now
             if now - last_disk_check >= 60:
-                ensure_disk_headroom()
+                warn_if_disk_low()
                 last_disk_check = now
             await runtime.retry_uploads_if_due()
     except BaseException as error:
         failure = error
         raise
     finally:
-        for task in [*tasks, *resync_tasks]:
-            task.cancel()
-        await asyncio.gather(*tasks, *resync_tasks, return_exceptions=True)
+        await cancel_tasks_bounded(tuple([*tasks, *resync_tasks.values()]))
         archive_only = isinstance(failure, SequenceGap)
         drain_gap: SequenceGap | None = None
         while not queue.empty():
@@ -877,9 +1072,12 @@ async def run_session(
 
 
 async def collect(stop: asyncio.Event) -> None:
+    global SYMBOLS, SECURITY_TOKEN_SYMBOLS, EXCLUDED_SYMBOLS
+    global LAST_DATA_AT, PROCESS_WATCHDOG_ARMED
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
     recover_parts()
-    upload_pending()
+    LAST_DATA_AT = time.monotonic()
+    PROCESS_WATCHDOG_ARMED = True
     runtime = ArchiveRuntime()
     backoff = 1
     initial_budget = PendingBudget(MAX_PENDING_DIFFS_TOTAL)
@@ -908,11 +1106,36 @@ async def collect(stop: asyncio.Event) -> None:
                 await runtime.rotate(states, session_id, "sequence_gap")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
-            except DiskSpaceLow:
-                write_health(states, session_id, "disk_low", runtime.total_gaps)
-                LOG.exception("disk watermark reached; pausing collection")
-                await runtime.rotate(states, session_id, "disk_low")
-                await asyncio.sleep(DISK_RETRY_SECONDS)
+            except SnapshotUnavailable as error:
+                write_health(
+                    states, session_id, "catalog_refresh", runtime.total_gaps
+                )
+                LOG.exception(
+                    "snapshot rejected; refreshing catalog and excluding %s",
+                    error.symbol,
+                )
+                await runtime.rotate(states, session_id, "snapshot_unavailable")
+                if SYMBOLS_SETTING.upper() == "ALL":
+                    discovered, security_tokens = await asyncio.to_thread(
+                        discover_symbols_sync
+                    )
+                    EXCLUDED_SYMBOLS = tuple(
+                        sorted({*EXCLUDED_SYMBOLS, error.symbol.lower()})
+                    )
+                    SYMBOLS, SECURITY_TOKEN_SYMBOLS = exclude_unavailable_symbols(
+                        EXCLUDED_SYMBOLS, discovered, security_tokens
+                    )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+            except TaskCancellationStuck:
+                write_health(
+                    states, session_id, "fatal_task_stall", runtime.total_gaps
+                )
+                LOG.critical(
+                    "receiver cancellation stuck; exiting for systemd restart",
+                    exc_info=True,
+                )
+                raise
             except Exception:
                 write_health(states, session_id, "reconnecting", runtime.total_gaps)
                 LOG.exception("websocket session failed; reconnecting in %ss", backoff)
@@ -946,6 +1169,10 @@ def self_test() -> None:
         assert manifest is not None
         metadata = json.loads(manifest.read_text())
         assert metadata["schema"] == "binance.lob_tape.v2"
+        assert metadata["replay_scope"] == (
+            "captured_snapshot_seed_plus_sequence_checked_diffs"
+        )
+        assert metadata["venue_depth_complete"] is False
         assert metadata["event_types"] == {"checkpoint": 1, "snapshot": 1}
         assert metadata["sha256"] == sha256(manifest.with_name(metadata["file"]))
     print("self-test: ok")
@@ -980,6 +1207,11 @@ def main() -> None:
     if STARTUP_DELAY_SECONDS:
         LOG.info("startup delay=%ss", STARTUP_DELAY_SECONDS)
         time.sleep(STARTUP_DELAY_SECONDS)
+    threading.Thread(
+        target=run_process_watchdog,
+        name=f"binance-data-watchdog-{MARKET}",
+        daemon=True,
+    ).start()
     loop.run_until_complete(collect(stop))
 
 

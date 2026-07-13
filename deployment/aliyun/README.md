@@ -12,11 +12,23 @@ Each service opens bounded WebSocket shards, records every diff, fetches a REST
 Top-100 snapshot, validates sequence continuity, writes replay checkpoints, compresses
 hourly segments, and uploads `.jsonl.zst`, `manifest.json`, and `_SUCCESS` to OSS.
 `health.json` under `/data/monday/spool/binance-lob/<market>/` reports freshness,
-symbol coverage, bridge state, and gap count. A silent WebSocket shard fails after
-`STALL_TIMEOUT_SECONDS`; systemd then restarts the service.
-The shared pending-diff budget and 20GiB free-space watermark fail closed before
-an initialization burst or OSS outage can exhaust the 2C8G host. Services restart
+symbol coverage, bridge state, gap count, free disk space, and whether the 20GiB
+warning threshold is active. It also reports pending upload count, last upload
+success/error, and an upload warning so OSS failures cannot look fully healthy.
+A silent WebSocket shard fails after
+`STALL_TIMEOUT_SECONDS`. Receiver cleanup is bounded to five seconds so a stuck
+WebSocket close handshake cannot block reconnection. A separate process watchdog
+exits after 180 seconds without any market-data frame, allowing systemd to recover
+even if the asyncio loop deadlocks. Low disk space emits a warning but does not
+pause collection. Successfully uploaded segments are deleted
+from the local spool immediately. Pending segments are retained when OSS upload
+fails so the collector never creates a silent data hole merely to reclaim space.
+The shared pending-diff budget still bounds initialization bursts. Services restart
 every six hours to refresh the active-symbol catalog.
+
+The snapshot bridge timeout is 120 seconds after the last initial snapshot request
+finishes. This gives the full-market queue time to apply the tail of Spot and USD-M
+snapshots without turning normal initialization backlog into a reconnect loop.
 
 Current coverage:
 
@@ -38,10 +50,14 @@ files locally and uses DuckDB for filtering, joins, feature datasets, run lineag
 and result metadata. The Rust `apps/replay` / `apps/backtest` path owns order-book
 replay, fees, latency, slippage, fills, and capacity simulation.
 
-This is a top-100 LOB replay contract, not a complete full-depth book. It is
-appropriate for Top-20/Top-50 imbalance and flow research. A strategy requiring
-deeper market-impact modeling must collect deeper snapshots in a separately
-benchmarked dataset.
+This is a deterministic replay contract for the state captured from a Top-100
+snapshot seed plus sequence-checked diffs; it is not a complete venue-depth
+contract. Deep unchanged levels can move into the visible range after enough
+near-book deletions without appearing in a diff, so manifests explicitly set
+`venue_depth_complete=false`. Top-20/Top-50 imbalance research must validate the
+acceptable snapshot age and churn window for each experiment. Strategies that
+require guaranteed depth completeness or market-impact modeling need a separately
+benchmarked deeper or periodically refreshed snapshot dataset.
 
 ClickHouse is optional for always-on shared analytics, dashboards, and derived
 realtime features. It is not required for the first backtest pipeline and should
