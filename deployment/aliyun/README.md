@@ -13,7 +13,9 @@ Top-100 snapshot, validates sequence continuity, writes replay checkpoints, comp
 hourly segments, and uploads `.jsonl.zst`, `manifest.json`, and `_SUCCESS` to OSS.
 `health.json` under `/data/monday/spool/binance-lob/<market>/` reports freshness,
 symbol coverage, bridge state, gap count, free disk space, and whether the 20GiB
-warning threshold is active. A silent WebSocket shard fails after
+warning threshold is active. It also reports pending upload count, last upload
+success/error, and an upload warning so OSS failures cannot look fully healthy.
+A silent WebSocket shard fails after
 `STALL_TIMEOUT_SECONDS`; systemd then restarts the service. Low disk space emits a
 warning but does not pause collection. Successfully uploaded segments are deleted
 from the local spool immediately. Pending segments are retained when OSS upload

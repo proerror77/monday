@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -64,6 +65,11 @@ MAX_PENDING_DIFFS_TOTAL = int(os.getenv("MAX_PENDING_DIFFS_TOTAL", "250000"))
 MIN_FREE_GB = int(os.getenv("MIN_FREE_GB", "20"))
 ZSTD_TIMEOUT_SECONDS = int(os.getenv("ZSTD_TIMEOUT_SECONDS", "300"))
 OSS_COPY_TIMEOUT_SECONDS = int(os.getenv("OSS_COPY_TIMEOUT_SECONDS", "300"))
+UPLOAD_STATUS: dict[str, str | None] = {
+    "last_success_at": None,
+    "last_error_at": None,
+    "last_error": None,
+}
 
 
 class SequenceGap(RuntimeError):
@@ -297,11 +303,24 @@ def finalize_segment(
         return None
 
     output = path.with_suffix("").with_suffix(".jsonl.zst")
+    temporary_output = output.with_suffix(output.suffix + ".tmp")
     subprocess.run(
-        ["zstd", "-q", "-T1", "-3", "--rm", str(path), "-o", str(output)],
+        [
+            "zstd",
+            "-q",
+            "-f",
+            "-T1",
+            "-3",
+            str(path),
+            "-o",
+            str(temporary_output),
+        ],
         check=True,
         timeout=ZSTD_TIMEOUT_SECONDS,
     )
+    with temporary_output.open("rb") as compressed:
+        os.fsync(compressed.fileno())
+    temporary_output.replace(output)
     date, hour = segment_partition(start_ns)
     metadata = {
         "schema": schema,
@@ -328,6 +347,7 @@ def finalize_segment(
     temporary = manifest.with_suffix(manifest.suffix + ".tmp")
     temporary.write_text(json.dumps(metadata, sort_keys=True) + "\n")
     temporary.replace(manifest)
+    path.unlink()
     return manifest
 
 
@@ -371,6 +391,7 @@ def upload(manifest: Path) -> None:
     data.unlink()
     manifest.unlink()
     success.unlink()
+    UPLOAD_STATUS["last_success_at"] = datetime.now(timezone.utc).isoformat()
     LOG.info(
         "uploaded segment events=%s types=%s key=%s/%s",
         metadata["events"],
@@ -381,11 +402,22 @@ def upload(manifest: Path) -> None:
 
 
 def upload_pending() -> None:
+    had_error = False
     for manifest in sorted(SPOOL_DIR.rglob("*.manifest.json")):
         try:
             upload(manifest)
-        except Exception:
+        except Exception as error:
+            had_error = True
+            UPLOAD_STATUS["last_error_at"] = datetime.now(timezone.utc).isoformat()
+            UPLOAD_STATUS["last_error"] = str(error)[:500]
             LOG.exception("pending upload failed: %s", manifest)
+    if not had_error:
+        UPLOAD_STATUS["last_error_at"] = None
+        UPLOAD_STATUS["last_error"] = None
+
+
+def pending_upload_count() -> int:
+    return sum(1 for _ in SPOOL_DIR.rglob("*.manifest.json"))
 
 
 def recover_parts() -> None:
@@ -393,8 +425,11 @@ def recover_parts() -> None:
         counts = Counter()
         start_ns = end_ns = path.stat().st_mtime_ns
         schema = "binance.lob_tape.v2"
-        with path.open("rb") as source:
-            for index, line in enumerate(source):
+        dropped = 0
+        valid_lines = 0
+        recovering = path.with_suffix(path.suffix + ".recovering")
+        with path.open("rb") as source, recovering.open("wb") as target:
+            for line in source:
                 try:
                     event = json.loads(line)
                     received = int(event["received_at_ns"])
@@ -403,11 +438,20 @@ def recover_parts() -> None:
                         event_type = "diff"
                         schema = "binance.raw_diff_tape.v1"
                     counts[event_type] += 1
-                    if index == 0:
+                    if valid_lines == 0:
                         start_ns = received
                     end_ns = received
+                    target.write(line if line.endswith(b"\n") else line + b"\n")
+                    valid_lines += 1
                 except (ValueError, KeyError, json.JSONDecodeError):
-                    counts["invalid"] += 1
+                    dropped += 1
+            target.flush()
+            os.fsync(target.fileno())
+        recovering.replace(path)
+        if dropped:
+            LOG.warning(
+                "recovery dropped %s invalid JSONL line(s): %s", dropped, path
+            )
         finalize_segment(
             path,
             counts,
@@ -562,6 +606,10 @@ def bridge_timed_out(
     )
 
 
+def begin_resync(now: float) -> tuple[bool, float]:
+    return False, now + SYNC_TIMEOUT_SECONDS
+
+
 def disk_headroom() -> tuple[float, bool]:
     free_gb = shutil.disk_usage(SPOOL_DIR).free / 1024**3
     return round(free_gb, 1), free_gb < MIN_FREE_GB
@@ -584,6 +632,7 @@ def write_health(
     states: dict[str, OrderBookState], session_id: str, status: str, gaps: int
 ) -> None:
     disk_free_gb, disk_warning = disk_headroom()
+    pending_segments = pending_upload_count()
     health = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
@@ -596,6 +645,11 @@ def write_health(
         "disk_free_gb": disk_free_gb,
         "disk_warning": disk_warning,
         "disk_warning_threshold_gb": MIN_FREE_GB,
+        "pending_upload_segments": pending_segments,
+        "upload_warning": UPLOAD_STATUS["last_error_at"] is not None,
+        "last_upload_success_at": UPLOAD_STATUS["last_success_at"],
+        "last_upload_error_at": UPLOAD_STATUS["last_error_at"],
+        "last_upload_error": UPLOAD_STATUS["last_error"],
         "symbols": {
             symbol: {
                 "synced": state.synced,
@@ -618,41 +672,48 @@ class ArchiveRuntime:
         self.segment = Segment()
         self.total_gaps = 0
         self.last_upload_retry = 0.0
-        self.upload_task: asyncio.Task | None = None
+        self.upload_thread: threading.Thread | None = None
 
     def write_checkpoints(
         self, states: dict[str, OrderBookState], session_id: str, reason: str
     ) -> None:
         if not self.segment.replay_safe:
             return
+        if not states or any(not state.synced for state in states.values()):
+            self.segment.mark_replay_unsafe()
+            return
         for state in states.values():
-            if state.synced:
-                self.segment.write(
-                    "checkpoint",
-                    {
-                        "reason": reason,
-                        "replay_safe": True,
-                        **state.checkpoint(session_id),
-                    },
-                )
+            self.segment.write(
+                "checkpoint",
+                {
+                    "reason": reason,
+                    "replay_safe": True,
+                    **state.checkpoint(session_id),
+                },
+            )
 
     async def retry_uploads_if_due(self, force: bool = False) -> None:
-        if self.upload_task is not None and self.upload_task.done():
-            await self.upload_task
-            self.upload_task = None
+        if self.upload_thread is not None and not self.upload_thread.is_alive():
+            self.upload_thread = None
         now = time.monotonic()
         if not force and now - self.last_upload_retry < 300:
             return
-        if self.upload_task is not None:
+        if self.upload_thread is not None:
             return
         self.last_upload_retry = now
-        self.upload_task = asyncio.create_task(asyncio.to_thread(upload_pending))
+        self.upload_thread = threading.Thread(
+            target=upload_pending,
+            name=f"binance-oss-upload-{MARKET}",
+            daemon=True,
+        )
+        self.upload_thread.start()
 
     async def finish_uploads(self) -> None:
-        if self.upload_task is not None:
-            await self.upload_task
-            self.upload_task = None
-        await asyncio.to_thread(upload_pending)
+        if self.upload_thread is not None and self.upload_thread.is_alive():
+            LOG.warning(
+                "shutdown leaving OSS upload in progress; local segment remains "
+                "retryable if the process is terminated"
+            )
 
     async def rotate(
         self,
@@ -796,6 +857,7 @@ async def run_session(
                     )
                 runtime.total_gaps += 1
                 states[gap.symbol].invalidate_for_resync()
+                previously_synced, sync_deadline = begin_resync(time.monotonic())
                 write_health(states, session_id, "resyncing", runtime.total_gaps)
                 await runtime.rotate(states, session_id, "sequence_gap")
                 resync_tasks.add(
@@ -887,7 +949,6 @@ async def run_session(
 async def collect(stop: asyncio.Event) -> None:
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
     recover_parts()
-    upload_pending()
     runtime = ArchiveRuntime()
     backoff = 1
     initial_budget = PendingBudget(MAX_PENDING_DIFFS_TOTAL)

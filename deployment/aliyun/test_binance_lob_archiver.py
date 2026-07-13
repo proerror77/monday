@@ -165,6 +165,62 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.segment.counts["checkpoint"], 0)
         runtime.segment.close()
 
+    async def test_finalize_keeps_source_until_manifest_is_committed(self):
+        path = ARCHIVER.SPOOL_DIR / "part-1.jsonl.part"
+        path.write_text('{"received_at_ns":1,"type":"diff"}\n')
+        output = path.with_suffix("").with_suffix(".jsonl.zst")
+        temporary_output = output.with_suffix(output.suffix + ".tmp")
+
+        def compress(*args, **kwargs):
+            self.assertTrue(path.exists())
+            temporary_output.write_bytes(b"compressed")
+
+        with patch.object(ARCHIVER.subprocess, "run", side_effect=compress):
+            manifest = ARCHIVER.finalize_segment(
+                path,
+                ARCHIVER.Counter({"diff": 1}),
+                1,
+                1,
+            )
+
+        self.assertIsNotNone(manifest)
+        self.assertFalse(path.exists())
+        self.assertTrue(manifest.exists())
+
+    async def test_recovery_drops_truncated_json_lines_before_compression(self):
+        path = ARCHIVER.SPOOL_DIR / "part-1.jsonl.part"
+        valid = b'{"received_at_ns":1,"type":"diff"}\n'
+        path.write_bytes(valid + b'{"received_at_ns":')
+
+        with (
+            patch.object(ARCHIVER, "finalize_segment") as finalize,
+            self.assertLogs("binance-lob-archiver", level="WARNING") as logs,
+        ):
+            ARCHIVER.recover_parts()
+
+        self.assertEqual(path.read_bytes(), valid)
+        counts = finalize.call_args.args[1]
+        self.assertEqual(counts, ARCHIVER.Counter({"diff": 1}))
+        self.assertIn("dropped 1 invalid", logs.output[0])
+
+    async def test_partial_market_state_cannot_emit_replay_safe_checkpoint(self):
+        runtime = ARCHIVER.ArchiveRuntime()
+        synced = ARCHIVER.OrderBookState("BTCUSDT")
+        synced.install_snapshot(
+            {"lastUpdateId": 10, "bids": [["9", "1"]], "asks": [["11", "1"]]}
+        )
+        unsynced = ARCHIVER.OrderBookState("ETHUSDT")
+
+        runtime.write_checkpoints(
+            {"BTCUSDT": synced, "ETHUSDT": unsynced},
+            "session-1",
+            "scheduled",
+        )
+
+        self.assertFalse(runtime.segment.replay_safe)
+        self.assertEqual(runtime.segment.counts["checkpoint"], 0)
+        runtime.segment.close()
+
     async def test_gap_is_recorded_before_trailing_archive_only_diffs(self):
         runtime = ARCHIVER.ArchiveRuntime()
         state = ARCHIVER.OrderBookState("ETHUSDT")
@@ -192,11 +248,49 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(ARCHIVER, "upload_pending") as pending:
             await runtime.retry_uploads_if_due(force=True)
-            assert runtime.upload_task is not None
-            await runtime.upload_task
+            assert runtime.upload_thread is not None
+            runtime.upload_thread.join(timeout=1)
 
         pending.assert_called_once_with()
         runtime.segment.close()
+
+    async def test_upload_failure_is_exposed_to_health_checks(self):
+        manifest = ARCHIVER.SPOOL_DIR / "failed.manifest.json"
+        manifest.write_text("{}")
+        with (
+            patch.object(ARCHIVER, "upload", side_effect=RuntimeError("oss down")),
+            self.assertLogs("binance-lob-archiver", level="ERROR"),
+        ):
+            ARCHIVER.upload_pending()
+
+        self.assertIsNotNone(ARCHIVER.UPLOAD_STATUS["last_error_at"])
+        self.assertEqual(ARCHIVER.UPLOAD_STATUS["last_error"], "oss down")
+
+    async def test_collection_does_not_block_startup_on_pending_uploads(self):
+        stop = ARCHIVER.asyncio.Event()
+
+        class Runtime:
+            total_gaps = 0
+
+            async def rotate(self, *args, **kwargs):
+                return None
+
+            async def finish_uploads(self):
+                return None
+
+        async def run_session(*args):
+            stop.set()
+
+        with (
+            patch.object(ARCHIVER, "recover_parts"),
+            patch.object(ARCHIVER, "upload_pending") as upload_pending,
+            patch.object(ARCHIVER, "ArchiveRuntime", return_value=Runtime()),
+            patch.object(ARCHIVER, "run_session", side_effect=run_session),
+            patch.object(ARCHIVER, "SYMBOLS", ("btcusdt",)),
+        ):
+            await ARCHIVER.collect(stop)
+
+        upload_pending.assert_not_called()
 
     async def test_stall_watchdog_trips_only_after_timeout(self):
         with patch.object(ARCHIVER, "STALL_TIMEOUT_SECONDS", 60):
@@ -206,6 +300,9 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_resync_does_not_reuse_expired_initial_deadline(self):
         self.assertTrue(ARCHIVER.bridge_timed_out(False, 100, 101))
         self.assertFalse(ARCHIVER.bridge_timed_out(True, 100, 101))
+        synced, deadline = ARCHIVER.begin_resync(200)
+        self.assertFalse(synced)
+        self.assertEqual(deadline, 200 + ARCHIVER.SYNC_TIMEOUT_SECONDS)
 
     async def test_disk_watermark_warns_without_stopping_collection(self):
         with (
@@ -225,10 +322,22 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_health_reports_disk_warning(self):
         state = ARCHIVER.OrderBookState("BTCUSDT")
-        with patch.object(
-            ARCHIVER,
-            "disk_headroom",
-            return_value=(19.0, True),
+        with (
+            patch.object(
+                ARCHIVER,
+                "disk_headroom",
+                return_value=(19.0, True),
+            ),
+            patch.object(ARCHIVER, "pending_upload_count", return_value=3),
+            patch.dict(
+                ARCHIVER.UPLOAD_STATUS,
+                {
+                    "last_success_at": "2026-07-13T12:00:00+00:00",
+                    "last_error_at": "2026-07-13T12:01:00+00:00",
+                    "last_error": "oss down",
+                },
+                clear=True,
+            ),
         ):
             ARCHIVER.write_health(
                 {"BTCUSDT": state}, "session-1", "synced", 0
@@ -240,6 +349,9 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health["disk_free_gb"], 19.0)
         self.assertTrue(health["disk_warning"])
         self.assertEqual(health["disk_warning_threshold_gb"], 20)
+        self.assertEqual(health["pending_upload_segments"], 3)
+        self.assertTrue(health["upload_warning"])
+        self.assertEqual(health["last_upload_error"], "oss down")
 
     async def test_streams_are_split_into_bounded_websocket_shards(self):
         with (
