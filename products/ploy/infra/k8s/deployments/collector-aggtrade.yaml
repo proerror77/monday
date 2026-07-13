@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: binance-aggtrade-collector
+  namespace: ploy
+  labels:
+    app: binance-aggtrade-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: binance-aggtrade-collector
+  template:
+    metadata:
+      labels:
+        app: binance-aggtrade-collector
+    spec:
+      containers:
+      - name: collector
+        image: registry-vpc.ap-northeast-1.aliyuncs.com/ploy/ploy-collector:latest
+        command: ["python", "binance_aggtrade_collector.py"]
+        envFrom:
+        - secretRef:
+            name: ploy-secrets
+        - configMapRef:
+            name: ploy-config
+        env:
+        - name: PLOY_DATABASE__URL
+          valueFrom:
+            secretKeyRef:
+              name: ploy-secrets
+              key: DATABASE_URL
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      nodeSelector:
+        node-pool: trading

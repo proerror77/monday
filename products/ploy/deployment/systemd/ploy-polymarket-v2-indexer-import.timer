@@ -1,0 +1,11 @@
+[Unit]
+Description=Import Polymarket V2 indexer events into Ploy periodically
+
+[Timer]
+OnBootSec=15m
+OnUnitActiveSec=10m
+Persistent=true
+Unit=ploy-polymarket-v2-indexer-import.service
+
+[Install]
+WantedBy=timers.target

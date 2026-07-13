@@ -1,0 +1,29 @@
+[Unit]
+Description=Binance LOB Collector
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ploy
+Environment=BINANCE_LOB_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT
+Environment=BINANCE_LOB_LEVELS=20
+Environment=BINANCE_LOB_COMMIT_BATCH_SIZE=25
+Environment=PLOY_DATABASE__URL=postgresql://postgres:postgres@localhost:5432/ploy
+ExecStartPre=/bin/sleep 17
+ExecStart=/opt/ploy/bin/ploy-runner collect-binance-lob \
+    --symbols ${BINANCE_LOB_SYMBOLS} \
+    --depth ${BINANCE_LOB_LEVELS} \
+    --batch-size ${BINANCE_LOB_COMMIT_BATCH_SIZE}
+Restart=always
+RestartSec=17
+StandardOutput=journal
+StandardError=journal
+
+MemoryHigh=384M
+MemoryMax=768M
+CPUQuota=70%
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

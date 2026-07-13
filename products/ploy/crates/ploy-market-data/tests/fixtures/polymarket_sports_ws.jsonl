@@ -1,0 +1,4 @@
+{"gameId":19439,"leagueAbbreviation":"nfl","slug":"nfl-lac-buf-2025-01-26","homeTeam":"LAC","awayTeam":"BUF","status":"Scheduled","score":"0-0","period":"1Q","elapsed":"0:00","live":false,"ended":false}
+{"gameId":19439,"leagueAbbreviation":"nfl","slug":"nfl-lac-buf-2025-01-26","homeTeam":"LAC","awayTeam":"BUF","status":"InProgress","score":"3-16","period":"Q4","elapsed":"5:18","live":true,"ended":false,"turn":"lac"}
+{"gameId":845321,"leagueAbbreviation":"soccer","slug":"soccer-ars-che-2025-01-26","homeTeam":"ARS","awayTeam":"CHE","status":"Break","score":"1-0","period":"HT","live":true,"ended":false}
+{"gameId":1317359,"leagueAbbreviation":"cs2","slug":"cs2-arcred-the-glecs-2025-07-20","homeTeam":"ARCRED","awayTeam":"The glecs","status":"finished","score":"000-000|2-0|Bo3","period":"2/3","live":false,"ended":true,"finished_timestamp":"2025-07-20T18:30:00.000Z"}

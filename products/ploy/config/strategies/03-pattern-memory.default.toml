@@ -1,0 +1,65 @@
+# Pattern Memory Strategy Default Configuration
+#
+# Objective B (Polymarket 5m):
+#   Estimate P(price_at_resolution > price_to_beat) from Binance kline pattern similarity.
+#
+# Notes:
+# - Uses Binance kline WS (5m + 15m) close events.
+# - Trades only when 5m signal agrees with 15m filter.
+
+[strategy]
+name = "pattern_memory"
+enabled = true
+
+# Polymarket series IDs for 5m UP/DOWN crypto markets.
+#
+# Known (as of 2026-02-17):
+# - BTC 5m: 10684
+# - ETH 5m: 10683
+# - SOL 5m: 10686
+# - XRP 5m: 10685
+[[markets]]
+symbol = "BTCUSDT"
+series_id = "10684"
+
+[[markets]]
+symbol = "ETHUSDT"
+series_id = "10683"
+
+[[markets]]
+symbol = "SOLUSDT"
+series_id = "10686"
+
+[[markets]]
+symbol = "XRPUSDT"
+series_id = "10685"
+
+[pattern]
+# Pearson correlation threshold for considering a historical pattern a "match".
+corr_threshold = 0.70
+
+# Beta prior (Bayesian smoothing).
+alpha = 1.0
+beta = 1.0
+
+# Minimum evidence to act.
+min_matches = 3
+min_n_eff = 2.0
+min_confidence = 0.60
+
+[filter_15m]
+enabled = true
+min_confidence = 0.55
+min_n_eff = 1.0
+
+[timing]
+# On Binance 5m close, we want the next Polymarket 5m event (about 300s remaining).
+target_remaining_secs = 300
+tolerance_secs = 45
+min_remaining_secs = 60
+
+[trade]
+shares = 100
+max_entry_price = 0.55
+min_net_ev = 0.0
+cooldown_secs = 30

@@ -1,0 +1,130 @@
+{
+  "broadcast": {
+    "drop_avg_per_interval": 27.58114131182795,
+    "drop_total": 2565.0461419999992,
+    "lag_avg_per_interval": 367.74853613978485,
+    "lag_total": 34200.61386099999
+  },
+  "duration_secs_observed": 86448.76693725586,
+  "duration_secs_observed_wall": 30.01693296432495,
+  "duration_secs_requested": 86400,
+  "error_count": 0,
+  "generated_at": "2026-03-03T04:05:26Z",
+  "interval_secs": 900,
+  "metrics_url": "http://127.0.0.1:19090/metrics",
+  "run_id": "phase0-seed-20260303",
+  "sample_count": 94,
+  "source_rates": {
+    "binance_kline": {
+      "avg_rps": 2.2747980752776993,
+      "max_rps": 2.408279265555579,
+      "min_rps": 2.2677545155555707,
+      "p50_rps": 2.353883437777792,
+      "p95_rps": 2.385975555333309,
+      "samples": 93.0,
+      "total_messages": 196653.48863900005
+    },
+    "binance_spot": {
+      "avg_rps": 41.5397939424096,
+      "max_rps": 43.977305602222266,
+      "min_rps": 41.41158599888802,
+      "p50_rps": 42.98370208777694,
+      "p95_rps": 43.570231933555256,
+      "samples": 93.0,
+      "total_messages": 3591063.9651490003
+    },
+    "chainlink_rtds": {
+      "avg_rps": 4.549596808228168,
+      "max_rps": 4.816562042222358,
+      "min_rps": 4.535568694444502,
+      "p50_rps": 4.7077352900001115,
+      "p95_rps": 4.771986205777774,
+      "samples": 93.0,
+      "total_messages": 393307.03413300007
+    },
+    "polymarket_ws": {
+      "avg_rps": 14.143312384830313,
+      "max_rps": 14.973258209999962,
+      "min_rps": 14.099768142222116,
+      "p50_rps": 14.634916230000348,
+      "p95_rps": 14.834646224666592,
+      "samples": 93.0,
+      "total_messages": 1222671.916077
+    }
+  },
+  "symbol_rates": {
+    "binance_kline|BTCUSDT": {
+      "avg_rps": 1.186850778929767,
+      "max_rps": 1.2562408444444493,
+      "min_rps": 1.1831378177777514,
+      "p50_rps": 1.2281433100000463,
+      "p95_rps": 1.2448405157777662,
+      "samples": 93.0,
+      "total_messages": 102601.78637700001
+    },
+    "binance_kline|ETHUSDT": {
+      "avg_rps": 1.087946660942686,
+      "max_rps": 1.1516355133333451,
+      "min_rps": 1.084558105555544,
+      "p50_rps": 1.1257904811110995,
+      "p95_rps": 1.1411111906666644,
+      "samples": 93.0,
+      "total_messages": 94051.647332
+    },
+    "binance_spot|BTCUSDT": {
+      "avg_rps": 23.73701900986464,
+      "max_rps": 25.12941284222218,
+      "min_rps": 23.663159178888634,
+      "p50_rps": 24.562719726667016,
+      "p95_rps": 24.896971434889153,
+      "samples": 93.0,
+      "total_messages": 2052036.0241689999
+    },
+    "binance_spot|ETHUSDT": {
+      "avg_rps": 17.80276468632594,
+      "max_rps": 18.84714202888879,
+      "min_rps": 17.747355652222307,
+      "p50_rps": 18.42197113111098,
+      "p95_rps": 18.672747802888868,
+      "samples": 93.0,
+      "total_messages": 1539027.055207
+    },
+    "chainlink_rtds|BTCUSDT": {
+      "avg_rps": 2.3737020344308193,
+      "max_rps": 2.512950440000018,
+      "min_rps": 2.366330566666697,
+      "p50_rps": 2.456270141111066,
+      "p95_rps": 2.4897033686667243,
+      "samples": 93.0,
+      "total_messages": 205203.613953
+    },
+    "chainlink_rtds|ETHUSDT": {
+      "avg_rps": 2.175893549037253,
+      "max_rps": 2.3035362244444615,
+      "min_rps": 2.169136352222219,
+      "p50_rps": 2.2515759277777074,
+      "p95_rps": 2.282228088000039,
+      "samples": 93.0,
+      "total_messages": 188103.31430099998
+    },
+    "polymarket_ws|0xpm-btc": {
+      "avg_rps": 7.417819393715871,
+      "max_rps": 7.852993012222255,
+      "min_rps": 7.394805907777821,
+      "p50_rps": 7.675827025555384,
+      "p95_rps": 7.7803241726667105,
+      "samples": 93.0,
+      "total_messages": 641261.3399499999
+    },
+    "polymarket_ws|0xpm-eth": {
+      "avg_rps": 6.725489637648449,
+      "max_rps": 7.12004699666648,
+      "min_rps": 6.704629211111201,
+      "p50_rps": 6.959416503333487,
+      "p95_rps": 7.054165771110966,
+      "samples": 93.0,
+      "total_messages": 581410.2862240002
+    }
+  },
+  "time_scale": 2880.0
+}

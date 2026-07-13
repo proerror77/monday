@@ -1,0 +1,6 @@
+self-hosted-runner:
+  labels:
+    - ploy-ci-1
+    - tango-1-1
+
+config-variables: null

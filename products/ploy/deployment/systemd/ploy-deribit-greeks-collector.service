@@ -1,0 +1,27 @@
+[Unit]
+Description=Ploy Deribit ATM Greeks Collector
+After=postgresql.service network-online.target ploy-deribit-iv-collector.service
+Wants=network-online.target ploy-deribit-iv-collector.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ploy
+Environment=DERIBIT_GREEKS_CURRENCIES=BTC,ETH,SOL
+Environment=DERIBIT_GREEKS_POLL_SECS=30
+Environment=PLOY_DATABASE__URL=postgresql://postgres:postgres@localhost:5432/ploy
+ExecStartPre=/bin/sleep 29
+ExecStart=/opt/ploy/bin/ploy-runner collect-deribit-greeks \
+    --currencies ${DERIBIT_GREEKS_CURRENCIES} \
+    --poll-secs ${DERIBIT_GREEKS_POLL_SECS}
+Restart=always
+RestartSec=29
+StandardOutput=journal
+StandardError=journal
+
+MemoryHigh=256M
+MemoryMax=512M
+CPUQuota=25%
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

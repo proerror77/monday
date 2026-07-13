@@ -1,0 +1,95 @@
+{
+  "generated_at": "2026-03-03T04:05:26Z",
+  "interval_secs": 900,
+  "rollback_rule": {
+    "drop_pct": 0.05,
+    "sustain_secs": 60
+  },
+  "run_id": "phase0-seed-20260303",
+  "series": {
+    "source_messages": [
+      {
+        "baseline_rps": 2.353883437777792,
+        "key": "binance_kline",
+        "min_allowed_rps": 2.2361892658889024,
+        "source": "binance_kline"
+      },
+      {
+        "baseline_rps": 42.98370208777694,
+        "key": "binance_spot",
+        "min_allowed_rps": 40.83451698338809,
+        "source": "binance_spot"
+      },
+      {
+        "baseline_rps": 4.7077352900001115,
+        "key": "chainlink_rtds",
+        "min_allowed_rps": 4.472348525500106,
+        "source": "chainlink_rtds"
+      },
+      {
+        "baseline_rps": 14.634916230000348,
+        "key": "polymarket_ws",
+        "min_allowed_rps": 13.90317041850033,
+        "source": "polymarket_ws"
+      }
+    ],
+    "symbol_updates": [
+      {
+        "baseline_rps": 1.2281433100000463,
+        "key": "binance_kline|BTCUSDT",
+        "min_allowed_rps": 1.166736144500044,
+        "source": "binance_kline",
+        "symbol": "BTCUSDT"
+      },
+      {
+        "baseline_rps": 1.1257904811110995,
+        "key": "binance_kline|ETHUSDT",
+        "min_allowed_rps": 1.0695009570555445,
+        "source": "binance_kline",
+        "symbol": "ETHUSDT"
+      },
+      {
+        "baseline_rps": 24.562719726667016,
+        "key": "binance_spot|BTCUSDT",
+        "min_allowed_rps": 23.334583740333663,
+        "source": "binance_spot",
+        "symbol": "BTCUSDT"
+      },
+      {
+        "baseline_rps": 18.42197113111098,
+        "key": "binance_spot|ETHUSDT",
+        "min_allowed_rps": 17.50087257455543,
+        "source": "binance_spot",
+        "symbol": "ETHUSDT"
+      },
+      {
+        "baseline_rps": 2.456270141111066,
+        "key": "chainlink_rtds|BTCUSDT",
+        "min_allowed_rps": 2.3334566340555125,
+        "source": "chainlink_rtds",
+        "symbol": "BTCUSDT"
+      },
+      {
+        "baseline_rps": 2.2515759277777074,
+        "key": "chainlink_rtds|ETHUSDT",
+        "min_allowed_rps": 2.138997131388822,
+        "source": "chainlink_rtds",
+        "symbol": "ETHUSDT"
+      },
+      {
+        "baseline_rps": 7.675827025555384,
+        "key": "polymarket_ws|0xpm-btc",
+        "min_allowed_rps": 7.2920356742776145,
+        "source": "polymarket_ws",
+        "symbol": "0xpm-btc"
+      },
+      {
+        "baseline_rps": 6.959416503333487,
+        "key": "polymarket_ws|0xpm-eth",
+        "min_allowed_rps": 6.611445678166812,
+        "source": "polymarket_ws",
+        "symbol": "0xpm-eth"
+      }
+    ]
+  }
+}

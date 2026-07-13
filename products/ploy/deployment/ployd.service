@@ -1,0 +1,32 @@
+[Unit]
+Description=Ploy Platform Daemon
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ploy
+Group=ploy
+WorkingDirectory=/opt/ploy
+EnvironmentFile=-/opt/ploy/.env
+ExecStart=/opt/ploy/bin/ployd
+Restart=always
+RestartSec=5
+MemoryHigh=1280M
+MemoryMax=1536M
+OOMPolicy=kill
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/ploy/run /opt/ploy/data /opt/ploy/logs
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ployd
+
+[Install]
+WantedBy=multi-user.target

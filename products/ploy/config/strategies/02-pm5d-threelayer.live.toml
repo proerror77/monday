@@ -1,0 +1,72 @@
+# Three-layer settlement-probability live config
+#
+# Model and execution semantics mirror
+# 02-pm5d-threelayer.settlement-probability-btc-eth-dryrun.toml. Only runtime
+# recording fields are removed and live risk is reduced to the bounded policy.
+
+[runtime]
+strategy_variant = "three_layer"
+mode = "live"
+market_data_source = "dual"
+
+[strategy]
+symbols = ["BTCUSDT", "ETHUSDT"]
+
+vol_floor = 0.001
+min_probability = 0.51
+min_z_score = 0.20
+
+min_entry_price = 0.10
+max_entry_price = 0.95
+no_trade_zone_min = 0.45
+no_trade_zone_max = 0.55
+
+min_edge = 0.0
+
+min_time_remaining_secs = 30
+max_time_remaining_secs = 180
+cooldown_secs = 30
+
+stake_usd = 5.0
+max_positions = 1
+max_daily_trades = 10
+allowed_window_secs = [300]
+
+three_layer_strategy_profile = "settlement_probability"
+three_layer_autofactor_runtime_score = "autofactor_formula:mut_auto_settlement_model_full_depth_settlement_edge_x_capacity_spread_adjusted"
+three_layer_min_entry_score = 0.10
+three_layer_min_direction_prob = 0.56
+three_layer_min_distance_over_sigma = 0.30
+three_layer_min_confirmation_score = 0.0
+three_layer_require_confirmation = false
+three_layer_min_drift_confirmation = 0.0
+three_layer_min_edge = 0.02
+three_layer_min_reward_risk = 0.0
+three_layer_alpha_contrarian = false
+three_layer_cex_contrarian = false
+three_layer_probability_shrink = 1.0
+three_layer_probability_haircut = 0.0
+three_layer_take_profit_ask = 0.99
+three_layer_stop_distance_pct = 0.030
+three_layer_max_pm_lag_secs = 15
+
+[execution]
+use_spread = true
+spread_pct = 0.08
+enable_partial_fills = false
+min_fill_pct = 0.5
+enable_market_impact = true
+impact_coefficient = 0.1
+default_depth_shares = 500
+require_lob_liquidity = true
+visible_depth_haircut = 0.5
+max_sweep_levels = 3
+max_sweep_price_delta = 0.003
+
+[reference_data]
+capture_sports_state = false
+
+[backtest_data]
+include_reference_prices = false
+include_sports_state = false
+require_official_settlement = true

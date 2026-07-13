@@ -1,0 +1,131 @@
+name: Dry-Run Candidate Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref"
+        required: true
+        default: "main"
+      report_url:
+        description: "Dry-run report API URL"
+        required: true
+        default: "http://8.221.143.151/api/reports/dry-run"
+      deployment_id:
+        description: "Deployment id to evaluate"
+        required: true
+        default: "pm5d.threelayer.settlement-probability-btc-eth.dryrun"
+      mode:
+        description: "Gate mode: clean-baseline or candidate-quality"
+        required: true
+        default: "clean-baseline"
+      min_closed_trades:
+        description: "Candidate-quality minimum closed trades"
+        required: true
+        default: "50"
+      min_realized_pnl:
+        description: "Candidate-quality minimum realized PnL"
+        required: true
+        default: "0"
+      min_profit_factor:
+        description: "Candidate-quality minimum profit factor"
+        required: true
+        default: "1.1"
+      max_drawdown_floor:
+        description: "Candidate-quality max drawdown floor"
+        required: true
+        default: "-50"
+      min_buy_fill_rate_pct:
+        description: "Candidate-quality minimum buy fill rate pct"
+        required: true
+        default: "95"
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Evaluate dry-run evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Validate inputs
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+        run: |
+          set -euo pipefail
+          case "${MODE}" in
+            clean-baseline|candidate-quality) ;;
+            *) echo "unsupported mode: ${MODE}" >&2; exit 2 ;;
+          esac
+
+      - name: Run dry-run candidate gate
+        env:
+          REPORT_URL: ${{ github.event.inputs.report_url }}
+          DEPLOYMENT_ID: ${{ github.event.inputs.deployment_id }}
+          MODE: ${{ github.event.inputs.mode }}
+          MIN_CLOSED_TRADES: ${{ github.event.inputs.min_closed_trades }}
+          MIN_REALIZED_PNL: ${{ github.event.inputs.min_realized_pnl }}
+          MIN_PROFIT_FACTOR: ${{ github.event.inputs.min_profit_factor }}
+          MAX_DRAWDOWN_FLOOR: ${{ github.event.inputs.max_drawdown_floor }}
+          MIN_BUY_FILL_RATE_PCT: ${{ github.event.inputs.min_buy_fill_rate_pct }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/dryrun-candidate-gate
+          curl -fsS --max-time 10 "${REPORT_URL}" > artifacts/dryrun-candidate-gate/dryrun-report.json
+          set +e
+          python3 scripts/check_dryrun_candidate_gate.py \
+            --dryrun-json artifacts/dryrun-candidate-gate/dryrun-report.json \
+            --deployment-id "${DEPLOYMENT_ID}" \
+            --mode "${MODE}" \
+            --min-closed-trades "${MIN_CLOSED_TRADES}" \
+            --min-realized-pnl "${MIN_REALIZED_PNL}" \
+            --min-profit-factor "${MIN_PROFIT_FACTOR}" \
+            --max-drawdown-floor "${MAX_DRAWDOWN_FLOOR}" \
+            --min-buy-fill-rate-pct "${MIN_BUY_FILL_RATE_PCT}" \
+            > artifacts/dryrun-candidate-gate/gate-result.json
+          status="$?"
+          set -e
+          cat artifacts/dryrun-candidate-gate/gate-result.json
+          exit "${status}"
+
+      - name: Publish summary
+        if: always()
+        run: |
+          set -euo pipefail
+          result="artifacts/dryrun-candidate-gate/gate-result.json"
+          if [ ! -f "${result}" ]; then
+            echo "No gate result artifact found." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("artifacts/dryrun-candidate-gate/gate-result.json").read_text())
+          print("## Dry-Run Candidate Gate")
+          print("")
+          print(f"- Status: `{payload.get('status')}`")
+          print(f"- Mode: `{payload.get('mode')}`")
+          print(f"- Deployment: `{payload.get('deployment_id')}`")
+          if payload.get("reason"):
+              print(f"- Reason: `{payload.get('reason')}`")
+          if payload.get("residual_counts"):
+              print(f"- Residual counts: `{json.dumps(payload['residual_counts'], sort_keys=True)}`")
+          if payload.get("failures"):
+              print(f"- Failures: `{json.dumps(payload['failures'], sort_keys=True)}`")
+          PY
+
+      - name: Upload gate artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dryrun-candidate-gate-${{ github.run_id }}
+          path: artifacts/dryrun-candidate-gate/
+          retention-days: 30

@@ -1,0 +1,40 @@
+[account]
+id = "default"
+
+[market]
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+rest_url = "https://clob.polymarket.com"
+market_slug = "btc-price-series-15m"
+
+[strategy]
+shares = 20
+window_min = 2
+move_pct = 0.15
+sum_target = 1.0
+fee_buffer = 0.005
+slippage_buffer = 0.02
+profit_buffer = 0.01
+
+[execution]
+order_timeout_ms = 5000
+max_retries = 3
+max_spread_bps = 500
+poll_interval_ms = 500
+
+[risk]
+max_single_exposure_usd = 100
+min_remaining_seconds = 30
+max_consecutive_failures = 3
+daily_loss_limit_usd = 500
+leg2_force_close_seconds = 20
+
+[database]
+url = "postgres://localhost/ploy"
+max_connections = 5
+
+[dry_run]
+enabled = true
+
+[logging]
+level = "info"
+json = false

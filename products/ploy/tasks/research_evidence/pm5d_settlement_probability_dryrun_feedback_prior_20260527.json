@@ -1,0 +1,75 @@
+{
+  "schema_version": "research_manager_typed_prior.v1",
+  "source": "dry_run_runtime_feedback",
+  "evidence_stage": "dry_run_candidate",
+  "theme": "revise_prior",
+  "actions": [
+    "rerun_alpha_search_with_bounded_mutations"
+  ],
+  "blocker_actions": [
+    {
+      "blocker_family": "strategy_economics",
+      "action": "mutate_or_reject_negative_runtime_edge",
+      "reason": "Post-reset settlement-probability dry-run is execution-healthy but loses money after fees and settlement accounting."
+    }
+  ],
+  "constraints": [
+    "do not promote the current runtime score without a new runtime_market_update_replay artifact",
+    "penalize losing runtime-observed factor families and require positive executable PnL before handoff",
+    "treat symbol/side bucket splits as diagnostic until they survive walk-forward and runtime replay",
+    "preserve one-event-one-decision accounting and full-depth executable entry pricing"
+  ],
+  "runtime_avoid_factors": [
+    {
+      "base_factor": "mut_auto_settlement_model_full_depth_settlement_edge_x_capacity_spread_adjusted",
+      "factor_family": "auto_settlement_model_full_depth_settlement_edge",
+      "runtime_score": "autofactor_formula:mut_auto_settlement_model_full_depth_settlement_edge_x_capacity_spread_adjusted",
+      "reason": "negative_dry_run_runtime_edge",
+      "metrics": {
+        "closed_trades": 137,
+        "realized_pnl": -207.4342,
+        "profit_factor": 0.781,
+        "sharpe": -1.0667,
+        "avg_trade": -1.5141,
+        "max_drawdown": -220.2696,
+        "buy_fill_rate_pct": 99.31,
+        "rejected_buy_orders": 0,
+        "post_reset_closed_trades": 74,
+        "post_reset_net_pnl": -74.5452,
+        "post_reset_profit_factor": 0.8498,
+        "worst_symbol_side_bucket": "BTCUSDT UP",
+        "worst_symbol_side_bucket_net_pnl": -105.6478,
+        "worst_symbol_side_bucket_profit_factor": 0.5316,
+        "second_worst_symbol_side_bucket": "ETHUSDT DOWN",
+        "second_worst_symbol_side_bucket_net_pnl": -28.4443,
+        "second_worst_symbol_side_bucket_profit_factor": 0.3699
+      }
+    }
+  ],
+  "mutations": [
+    {
+      "base_factor": "auto_settlement_model_full_depth_settlement_edge",
+      "mutation_type": "add_feature_gate",
+      "name": "llm_model_full_depth_edge_near_strike_gate_after_negative_dryrun",
+      "feature": "near_strike_score"
+    },
+    {
+      "base_factor": "auto_settlement_model_full_depth_settlement_edge",
+      "mutation_type": "add_feature_gate",
+      "name": "llm_model_full_depth_edge_full_depth_gate_after_negative_dryrun",
+      "feature": "full_depth_entry_fillable_gate"
+    },
+    {
+      "base_factor": "auto_settlement_model_full_depth_settlement_edge",
+      "mutation_type": "add_spread_penalty",
+      "name": "llm_model_full_depth_edge_spread_penalty_after_negative_dryrun",
+      "feature": "side_spread",
+      "constant": 0.02
+    },
+    {
+      "base_factor": "auto_settlement_conservative_settlement_edge",
+      "mutation_type": "invert_or_contrarian",
+      "name": "llm_conservative_settlement_edge_contrarian_after_negative_dryrun"
+    }
+  ]
+}

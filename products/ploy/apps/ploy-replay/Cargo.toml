@@ -1,0 +1,12 @@
+[package]
+name = "ploy-replay"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lean replay-only Ploy strategy runner"
+
+[dependencies]
+ploy-runner-host = { path = "../../crates/ploy-runner-host", default-features = false, features = ["lean-replay"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

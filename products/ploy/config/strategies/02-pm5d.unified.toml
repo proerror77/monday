@@ -1,0 +1,61 @@
+# Unified pm_5m_directional config for StrategyRuntime
+# Same file drives backtest, dry-run, and live — change [runtime].mode only
+#
+# 5-gate pipeline: price validity → quote availability → price filter → probability → edge
+# Params from TPE optimization (2026-04-05, real data): Sharpe 240, 121 trades/day
+
+[runtime]
+mode = "dryrun"
+from = "2026-04-04T00:00:00Z"
+to   = "2026-04-10T00:00:00Z"
+throttle_hz = 1
+# max_updates = 500000
+
+[strategy]
+symbols = ["ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+
+vol_floor = 0.001
+min_probability = 0.5253
+min_z_score = 0.35      # deprecated
+
+min_entry_price = 0.15
+max_entry_price = 0.55   # was 0.85 — exclude low-ROI high-price zone (36% vs 119% ROI)
+no_trade_zone_min = 0.45
+no_trade_zone_max = 0.55
+
+min_edge = 0.0367
+
+# Enter 60-240s before expiry
+# - min 60s: enough time for price to move, avoid last-minute noise
+# - max 240s: enter within the last 4 minutes (signal is fresh)
+min_time_remaining_secs = 90   # was 60 — later entry = higher signal reliability
+max_time_remaining_secs = 180  # was 240 — 1-2min window shows best ROI
+cooldown_secs = 71
+
+stake_usd = 15.0
+max_positions = 1000
+max_daily_trades = 1000
+allowed_window_secs = [300, 900]
+
+[execution]
+# Execution simulation (backtest + dry-run modes)
+# CLOB small orders: no synthetic spread, no market impact
+use_spread = false
+spread_pct = 0.02
+enable_partial_fills = false
+min_fill_pct = 0.5
+enable_market_impact = false
+impact_coefficient = 0.1
+default_depth_shares = 500
+
+[reference_data]
+# Optional non-crypto RTDS capture list for live/dry-run sessions.
+# pyth_symbols = ["AAPL", "XAUUSD"]
+capture_sports_state = false
+
+[backtest_data]
+# Historical DB loader stays crypto-only by default.
+include_reference_prices = false
+include_sports_state = false
+# When empty, reference-price backtests fall back to [reference_data].pyth_symbols.
+# reference_symbols = ["AAPL", "XAUUSD"]

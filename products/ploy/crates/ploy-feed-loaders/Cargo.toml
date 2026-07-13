@@ -1,0 +1,19 @@
+[package]
+name = "ploy-feed-loaders"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Database-backed market-update loaders for Ploy"
+
+[dependencies]
+chrono.workspace = true
+ploy-market-contracts.workspace = true
+rust_decimal.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "chrono", "rust_decimal", "json"] }
+tracing.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true

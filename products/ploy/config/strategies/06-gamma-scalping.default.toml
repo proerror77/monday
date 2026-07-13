@@ -1,0 +1,47 @@
+# Gamma Scalping (PM 5m) — implemented as staggered two-leg complete-set arbitrage.
+#
+# Why: Polymarket binaries typically have `UP_ask + DOWN_ask > 1` due to spread.
+# Buying UP+DOWN simultaneously as taker is negative EV. The workable "gamma scalping"
+# behavior is to leg in: buy Leg1 first, then buy Leg2 after price movement so the
+# combined cost can be < $1, then merge for $1.
+
+[strategy]
+name = "gamma_scalping"
+enabled = true
+
+[entry]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+# shares_per_trade is ignored when fixed_amount_usd is set in [risk]
+max_concurrent = 5
+direction_threshold = 0.03
+max_initial_sum = 1.10
+min_profit_target = 0.005
+min_ask_price = 0.05
+min_entry_sum = 0.70
+
+[timing]
+max_wait_secs = 180
+max_wait_pct = 0.40
+min_time_remaining = 60
+cooldown_secs = 5
+min_leg2_delay_secs = 3
+max_trades_per_event = 2
+
+[risk]
+# Fixed USD amount per Leg1 (min 5 shares may raise actual notional)
+fixed_amount_usd = 1.0
+min_balance_usd = 5.0
+
+# Risk knobs
+max_leg1_loss = 0.0
+force_complete_threshold = 1.00
+
+[model]
+mu = 0.0
+vol_lookback_secs = 300
+vol_floor = 0.005
+
+[filter]
+# PM 5m only
+allowed_windows = [300]
+window_tolerance = 30

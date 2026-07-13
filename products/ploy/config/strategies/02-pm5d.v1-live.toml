@@ -1,0 +1,46 @@
+[runtime]
+mode = "live"
+strategy_variant = "v1"
+throttle_hz = 1
+
+[strategy]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+vol_floor = 0.001
+min_probability = 0.55
+min_z_score = 0.35
+min_entry_price = 0.15
+max_entry_price = 0.85
+no_trade_zone_min = 0.45
+no_trade_zone_max = 0.55
+min_edge = 0.02
+min_deviation_pct = 0.005
+min_reversal_consistency = 0.55
+take_profit_price_delta = 0.10
+stop_loss_price_delta = 0.05
+max_hold_secs = 120
+reversal_bonus_cap = 0.20
+use_multiscale_volatility = false
+use_price_structure_adjustment = false
+min_time_remaining_secs = 60
+max_time_remaining_secs = 240
+cooldown_secs = 60
+stake_usd = 15.0
+max_positions = 1000
+max_daily_trades = 1000
+allowed_window_secs = [300, 900]
+
+[execution]
+use_spread = false
+spread_pct = 0.02
+enable_partial_fills = false
+min_fill_pct = 0.5
+enable_market_impact = false
+impact_coefficient = 0.1
+default_depth_shares = 500
+
+[reference_data]
+capture_sports_state = false
+
+[backtest_data]
+include_reference_prices = false
+include_sports_state = false

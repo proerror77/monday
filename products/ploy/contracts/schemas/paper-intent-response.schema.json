@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PaperIntentResponse",
+  "type": "object",
+  "required": [
+    "deployment_id",
+    "intent_id",
+    "order_id",
+    "state"
+  ],
+  "properties": {
+    "deployment_id": {
+      "type": "string"
+    },
+    "intent_id": {
+      "type": "string"
+    },
+    "last_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "order_id": {
+      "type": "string"
+    },
+    "rejection_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state": {
+      "type": "string"
+    },
+    "venue_order_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

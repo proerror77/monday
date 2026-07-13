@@ -1,0 +1,27 @@
+[Unit]
+Description=Binance AggTrade Collector
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ploy
+Environment=BINANCE_AGGTRADE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT
+Environment=BINANCE_AGGTRADE_COMMIT_BATCH_SIZE=50
+Environment=PLOY_DATABASE__URL=postgresql://postgres:postgres@localhost:5432/ploy
+ExecStartPre=/bin/sleep 11
+ExecStart=/opt/ploy/bin/ploy-runner collect-binance-aggtrade \
+    --symbols ${BINANCE_AGGTRADE_SYMBOLS} \
+    --batch-size ${BINANCE_AGGTRADE_COMMIT_BATCH_SIZE}
+Restart=always
+RestartSec=11
+StandardOutput=journal
+StandardError=journal
+
+MemoryHigh=256M
+MemoryMax=512M
+CPUQuota=35%
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

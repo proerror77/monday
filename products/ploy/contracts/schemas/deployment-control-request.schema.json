@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DeploymentControlRequest",
+  "type": "object",
+  "properties": {
+    "deployment_state": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DeploymentState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "desired_state": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DesiredState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "DeploymentState": {
+      "type": "string",
+      "enum": [
+        "enabled",
+        "draining",
+        "disabled",
+        "archived"
+      ]
+    },
+    "DesiredState": {
+      "type": "string",
+      "enum": [
+        "running",
+        "paused",
+        "stopped"
+      ]
+    }
+  }
+}

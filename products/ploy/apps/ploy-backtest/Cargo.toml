@@ -1,0 +1,12 @@
+[package]
+name = "ploy-backtest"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lean database-backed Ploy strategy backtest runner"
+
+[dependencies]
+ploy-runner-host = { path = "../../crates/ploy-runner-host", default-features = false, features = ["lean-backtest"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

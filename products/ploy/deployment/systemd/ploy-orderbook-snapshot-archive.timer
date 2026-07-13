@@ -1,0 +1,11 @@
+[Unit]
+Description=Archive completed CLOB orderbook snapshot hours to Parquet
+
+[Timer]
+OnBootSec=20m
+OnCalendar=*:15:00
+Persistent=true
+Unit=ploy-orderbook-snapshot-archive.service
+
+[Install]
+WantedBy=timers.target

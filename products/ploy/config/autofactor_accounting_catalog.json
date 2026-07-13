@@ -1,0 +1,104 @@
+{
+  "schema_version": "autofactor_accounting_catalog.v1",
+  "targets": {
+    "reprice_pnl_5s": {
+      "horizon": "5s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "quote_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": false
+    },
+    "full_depth_reprice_pnl_5s": {
+      "horizon": "5s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "full_depth_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": true
+    },
+    "reprice_pnl_10s": {
+      "horizon": "10s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "quote_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": false
+    },
+    "full_depth_reprice_pnl_10s": {
+      "horizon": "10s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "full_depth_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": true
+    },
+    "reprice_pnl_30s": {
+      "horizon": "30s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "quote_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": false
+    },
+    "full_depth_reprice_pnl_30s": {
+      "horizon": "30s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "full_depth_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": true
+    },
+    "reprice_pnl_60s": {
+      "horizon": "60s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "quote_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": false
+    },
+    "full_depth_reprice_pnl_60s": {
+      "horizon": "60s",
+      "accounting_lane": "repricing",
+      "strategy_profile": "repricing_momentum",
+      "required_execution_contract": "full_depth_repricing_exit",
+      "event_level_accounting": false,
+      "official_settlement_required": false,
+      "full_depth_entry_required": true
+    },
+    "settlement_executable_pnl": {
+      "horizon": "5m",
+      "accounting_lane": "settlement_probability",
+      "strategy_profile": "settlement_probability",
+      "required_execution_contract": "top_of_book_settlement_entry",
+      "event_level_accounting": true,
+      "official_settlement_required": true,
+      "full_depth_entry_required": false
+    },
+    "full_depth_settlement_executable_pnl": {
+      "horizon": "5m",
+      "accounting_lane": "settlement_probability",
+      "strategy_profile": "settlement_probability",
+      "required_execution_contract": "full_depth_settlement_entry",
+      "event_level_accounting": true,
+      "official_settlement_required": true,
+      "full_depth_entry_required": true
+    },
+    "tradeable_full_depth_settlement_pnl": {
+      "horizon": "5m",
+      "accounting_lane": "settlement_probability",
+      "strategy_profile": "settlement_probability",
+      "required_execution_contract": "full_depth_settlement_entry",
+      "event_level_accounting": true,
+      "official_settlement_required": true,
+      "full_depth_entry_required": true
+    }
+  }
+}

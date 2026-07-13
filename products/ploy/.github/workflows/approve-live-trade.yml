@@ -1,0 +1,338 @@
+name: Approve Live Trade
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_sha:
+        description: "Exact 40-character main SHA already deployed to ploy-trade-1"
+        required: true
+      runtime_replay_run_id:
+        description: "Successful Runtime Candidate Replay run ID for deploy_sha"
+        required: true
+      parity_run_id:
+        description: "Successful Recorded Replay Dry-run Parity run ID for deploy_sha"
+        required: true
+      min_replay_trades:
+        description: "Minimum independent executable-replay event trades"
+        required: true
+        default: "20"
+      min_dryrun_closed_trades:
+        description: "Minimum closed dry-run trades"
+        required: true
+        default: "30"
+      max_drawdown_usd:
+        description: "Maximum accepted absolute dry-run drawdown in USD"
+        required: true
+        default: "25"
+      risk_confirmation:
+        description: "Type exactly: I APPROVE LIVE RISK AT 5 USD MAX EXPOSURE"
+        required: true
+
+concurrency:
+  group: ploy-trade-host
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  validate-evidence:
+    name: Validate exact-SHA replay, drawdown, and parity evidence
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_sha: ${{ steps.validate.outputs.deploy_sha }}
+
+    steps:
+      - name: Checkout approved SHA
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.deploy_sha }}
+
+      - name: Validate main provenance and explicit risk acknowledgement
+        env:
+          DEPLOY_SHA: ${{ inputs.deploy_sha }}
+          RISK_CONFIRMATION: ${{ inputs.risk_confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" == "main" ]] || {
+            echo "live approval must be dispatched from main" >&2
+            exit 1
+          }
+          [[ "${DEPLOY_SHA}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "deploy_sha must be 40 lowercase hex characters" >&2
+            exit 1
+          }
+          git fetch --no-tags --depth=1 origin main
+          [[ "$(git rev-parse HEAD)" == "${DEPLOY_SHA}" ]] || exit 1
+          [[ "$(git rev-parse origin/main)" == "${DEPLOY_SHA}" ]] || {
+            echo "deploy_sha is not the current origin/main SHA" >&2
+            exit 1
+          }
+          [[ "${RISK_CONFIRMATION}" == "I APPROVE LIVE RISK AT 5 USD MAX EXPOSURE" ]] || {
+            echo "risk confirmation does not match the required acknowledgement" >&2
+            exit 1
+          }
+          python3 - <<'PY'
+          import json
+          import tomllib
+          from decimal import Decimal
+          from pathlib import Path
+
+          manifest = json.loads(
+              Path("config/deployments/pm5d.threelayer.live.json").read_text(encoding="utf-8")
+          )
+          strategy = tomllib.loads(
+              Path("config/strategies/02-pm5d-threelayer.live.toml").read_text(encoding="utf-8")
+          )
+          cap = Decimal(str(manifest["max_gross_exposure"]))
+          stake = Decimal(str(strategy["strategy"]["stake_usd"]))
+          if manifest.get("desired_state") != "paused" or manifest.get("runtime_mode") != "live":
+              raise SystemExit("live manifest must remain runtime_mode=live desired_state=paused")
+          if cap <= 0 or cap > Decimal("5") or stake <= 0 or stake > cap:
+              raise SystemExit(f"bounded live risk invalid: stake={stake} cap={cap}")
+          PY
+
+      - name: Validate source workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_SHA: ${{ inputs.deploy_sha }}
+          REPLAY_RUN_ID: ${{ inputs.runtime_replay_run_id }}
+          PARITY_RUN_ID: ${{ inputs.parity_run_id }}
+        run: |
+          set -euo pipefail
+          validate_run() {
+            local run_id="$1" expected_path="$2"
+            local payload
+            payload="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
+            [[ "$(jq -r .conclusion <<<"${payload}")" == "success" ]] || {
+              echo "run ${run_id} did not conclude success" >&2
+              exit 1
+            }
+            [[ "$(jq -r .head_sha <<<"${payload}")" == "${DEPLOY_SHA}" ]] || {
+              echo "run ${run_id} head SHA does not match deploy_sha" >&2
+              exit 1
+            }
+            [[ "$(jq -r .path <<<"${payload}")" == "${expected_path}" ]] || {
+              echo "run ${run_id} is not from ${expected_path}" >&2
+              exit 1
+            }
+          }
+          validate_run "${REPLAY_RUN_ID}" ".github/workflows/runtime-candidate-replay.yml"
+          validate_run "${PARITY_RUN_ID}" ".github/workflows/recorded-replay-parity.yml"
+
+      - name: Download immutable evidence artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPLAY_RUN_ID: ${{ inputs.runtime_replay_run_id }}
+          PARITY_RUN_ID: ${{ inputs.parity_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/replay evidence/parity evidence/inputs
+          gh run download "${REPLAY_RUN_ID}" \
+            --name "runtime-candidate-replay-${REPLAY_RUN_ID}" --dir evidence/replay
+          gh run download "${PARITY_RUN_ID}" \
+            --name "recorded-replay-parity-${PARITY_RUN_ID}" --dir evidence/parity
+          gh run download "${PARITY_RUN_ID}" \
+            --name "recorded-replay-inputs-${PARITY_RUN_ID}" --dir evidence/inputs
+
+      - name: Validate promotion evidence and bounded risk
+        id: validate
+        env:
+          DEPLOY_SHA: ${{ inputs.deploy_sha }}
+          MIN_REPLAY_TRADES: ${{ inputs.min_replay_trades }}
+          MIN_DRYRUN_CLOSED_TRADES: ${{ inputs.min_dryrun_closed_trades }}
+          MAX_DRAWDOWN_USD: ${{ inputs.max_drawdown_usd }}
+          REPLAY_RUN_ID: ${{ inputs.runtime_replay_run_id }}
+          PARITY_RUN_ID: ${{ inputs.parity_run_id }}
+        run: |
+          set -euo pipefail
+          replay="$(find evidence/replay -name candidate-strategy-replay.json -type f -print -quit)"
+          parity="$(find evidence/parity -name parity-evaluation.json -type f -print -quit)"
+          parity_provenance="$(find evidence/parity -name approval-provenance.json -type f -print -quit)"
+          dryrun="$(find evidence/inputs -name dryrun.json -type f -print -quit)"
+          [[ -n "${replay}" && -n "${parity}" && -n "${parity_provenance}" && -n "${dryrun}" ]]
+          source_config=config/strategies/02-pm5d-threelayer.settlement-probability-btc-eth-dryrun.toml
+          live_config=config/strategies/02-pm5d-threelayer.live.toml
+          source_config_sha256="$(sha256sum "${source_config}" | cut -d ' ' -f1)"
+          live_config_sha256="$(sha256sum "${live_config}" | cut -d ' ' -f1)"
+          runtime_score="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["strategy"]["three_layer_autofactor_runtime_score"])' "${source_config}")"
+          python3 scripts/validate_live_promotion_evidence.py \
+            --replay "${replay}" \
+            --parity "${parity}" \
+            --parity-provenance "${parity_provenance}" \
+            --dryrun "${dryrun}" \
+            --git-sha "${DEPLOY_SHA}" \
+            --min-replay-trades "${MIN_REPLAY_TRADES}" \
+            --min-dryrun-closed-trades "${MIN_DRYRUN_CLOSED_TRADES}" \
+            --max-drawdown-usd "${MAX_DRAWDOWN_USD}" \
+            --expected-deployment-id "pm5d.threelayer.settlement-probability-btc-eth.dryrun" \
+            --expected-strategy-profile "settlement_probability" \
+            --expected-runtime-score "${runtime_score}" \
+            --expected-config-sha256 "${source_config_sha256}" \
+            --output evidence/live-promotion-validation.json
+          LIVE_CONFIG_SHA256="${live_config_sha256}" SOURCE_CONFIG_SHA256="${source_config_sha256}" \
+            python3 - "${replay}" "${parity}" "${parity_provenance}" "${dryrun}" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          def sha256(path):
+              return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+          receipt = {
+              "schema_version": 1,
+              "deploy_sha": os.environ["DEPLOY_SHA"],
+              "approval_workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "runtime_replay_run_id": os.environ["REPLAY_RUN_ID"],
+              "parity_run_id": os.environ["PARITY_RUN_ID"],
+              "min_replay_trades": int(os.environ["MIN_REPLAY_TRADES"]),
+              "min_dryrun_closed_trades": int(os.environ["MIN_DRYRUN_CLOSED_TRADES"]),
+              "max_drawdown_usd": float(os.environ["MAX_DRAWDOWN_USD"]),
+              "deployment_id": "pm5d.threelayer.live",
+              "source_deployment_id": "pm5d.threelayer.settlement-probability-btc-eth.dryrun",
+              "source_config_sha256": os.environ["SOURCE_CONFIG_SHA256"],
+              "live_config_sha256": os.environ["LIVE_CONFIG_SHA256"],
+              "max_gross_exposure": "5",
+              "ready_for_human_live_approval": True,
+              "evidence_sha256": {
+                  "runtime_replay": sha256(sys.argv[1]),
+                  "parity": sha256(sys.argv[2]),
+                  "parity_provenance": sha256(sys.argv[3]),
+                  "dryrun": sha256(sys.argv[4]),
+              },
+          }
+          pathlib.Path("evidence/live-approval-receipt.json").write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+          echo "deploy_sha=${DEPLOY_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload live-approval evidence package
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-approval-evidence-${{ github.run_id }}
+          path: evidence/
+          retention-days: 90
+
+  human-approved-live:
+    name: Human-approved bounded live resume
+    needs: validate-evidence
+    runs-on: ubuntu-latest
+    environment: ploy-trade-live
+
+    steps:
+      - name: Download validated approval package
+        uses: actions/download-artifact@v8
+        with:
+          name: live-approval-evidence-${{ github.run_id }}
+          path: evidence
+
+      - name: Configure pinned SSH
+        env:
+          PLOY_TRADE_1_KNOWN_HOSTS: ${{ secrets.PLOY_TRADE_1_KNOWN_HOSTS }}
+          PLOY_TRADE_1_SSH_KEY: ${{ secrets.PLOY_TRADE_1_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "${PLOY_TRADE_1_KNOWN_HOSTS}" && -n "${PLOY_TRADE_1_SSH_KEY}" ]]
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${PLOY_TRADE_1_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          printf '%s\n' "${PLOY_TRADE_1_SSH_KEY}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/known_hosts ~/.ssh/deploy_key
+          cat > ~/.ssh/config <<EOF
+          Host ploy-trade-1
+            HostName ${{ secrets.PLOY_TRADE_1_HOST }}
+            User root
+            IdentityFile ~/.ssh/deploy_key
+            HostKeyAlias ploy-trade-1
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ConnectTimeout 30
+          EOF
+
+      - name: Persist approval receipt and resume live
+        env:
+          DEPLOY_SHA: ${{ needs.validate-evidence.outputs.deploy_sha }}
+        run: |
+          set -euo pipefail
+          ssh ploy-trade-1 "install -d -m 0750 -o root -g ploy /opt/ploy/data/live-approvals"
+          scp evidence/live-approval-receipt.json \
+            "ploy-trade-1:/opt/ploy/data/live-approvals/${GITHUB_RUN_ID}.json"
+          # shellcheck disable=SC2087
+          ssh ploy-trade-1 /bin/bash -s -- "${DEPLOY_SHA}" <<'REMOTE'
+          set -euo pipefail
+          deploy_sha="$1"
+          postflight=/opt/ploy/current/scripts/verify_trade_host_postflight.sh
+          ployctl=/opt/ploy/current/bin/ployctl
+          gate=/opt/ploy/current/scripts/drills/pm5d_threelayer_live_gate.sh
+          approval_archive="/opt/ploy/data/live-approvals/${GITHUB_RUN_ID}.json"
+          pending_approval=/opt/ploy/data/live-approvals/pending.json
+
+          chmod 0640 "${approval_archive}"
+          chown root:ploy "${approval_archive}"
+          set -a
+          # shellcheck disable=SC1091
+          . /opt/ploy/.env
+          set +a
+          principal="$("${ployctl}" trading principal)"
+          python3 - "${approval_archive}" "${pending_approval}" "${principal}" <<'PY'
+          import datetime
+          import json
+          import pathlib
+          import sys
+
+          source, destination, principal = sys.argv[1:]
+          payload = json.loads(pathlib.Path(source).read_text(encoding="utf-8"))
+          payload["account_id"] = principal
+          payload["expires_at"] = (
+              datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=15)
+          ).isoformat()
+          target = pathlib.Path(destination)
+          temporary = target.with_suffix(".tmp")
+          temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          temporary.replace(target)
+          PY
+          chmod 0640 "${pending_approval}"
+          chown root:ploy "${pending_approval}"
+          cleanup_failed_approval() {
+            "${ployctl}" deployments pause pm5d.threelayer.live >/dev/null 2>&1 || true
+            rm -f "${pending_approval}"
+          }
+          trap cleanup_failed_approval ERR
+
+          gate_output="$("${gate}" --skip-dry-run-drill 2>&1)"
+          printf '%s\n' "${gate_output}"
+          if [[ "${gate_output}" == *"STAGED-WITH-WARNINGS"* ]]; then
+            echo "live readiness warnings remain active" >&2
+            exit 1
+          fi
+          "${postflight}" "${deploy_sha}" paused
+          "${ployctl}" deployments resume pm5d.threelayer.live
+          ready=0
+          for _ in $(seq 1 30); do
+            if "${postflight}" "${deploy_sha}" running; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "${ready}" -ne 1 ]]; then
+            echo "live postflight failed; deployment was paused" >&2
+            exit 1
+          fi
+          trap - ERR
+          rm -f "${pending_approval}"
+          REMOTE
+
+      - name: Live approval summary
+        run: |
+          {
+            echo "## Human-approved live resume"
+            echo "- Deploy SHA: \`${{ needs.validate-evidence.outputs.deploy_sha }}\`"
+            echo "- Runtime replay: \`${{ inputs.runtime_replay_run_id }}\`"
+            echo "- Recorded parity: \`${{ inputs.parity_run_id }}\`"
+            echo "- Exposure cap: \`5 USD\`"
+            echo "- Rollback: automatic pause on failed observed-running or venue-health postflight"
+          } >> "$GITHUB_STEP_SUMMARY"

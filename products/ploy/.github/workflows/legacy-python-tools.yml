@@ -1,0 +1,30 @@
+name: Legacy Python Tools
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/legacy-python-tools.yml"
+      - "scripts/**/*.py"
+      - "tests/test_*.py"
+      - "Dockerfile.collector"
+  workflow_dispatch:
+
+concurrency:
+  group: legacy-python-tools-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: Legacy Python unittest compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Run legacy Python unittest suite
+        run: python3 -m unittest discover -s tests -p 'test_*.py'

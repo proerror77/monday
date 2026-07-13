@@ -1,0 +1,49 @@
+# ⚠️  LEGACY FORMAT — for old binary only. DO NOT use with StrategyRuntime.
+# ⚠️  New system uses 02-pm5d.unified.toml. Delete this after migration.
+#
+# Polymarket 5m directional strategy — backtest-matched params
+# Uses momentum adapter with directional_mode = true (Binance as oracle)
+#
+# Aligned to backtest defaults (DirectionalBacktestConfig::default()):
+#   cooldown 60s, min_time 60s, max_positions 3, min_edge 5%, max_entry 85¢
+
+[strategy]
+name = "pm_5m_directional"
+enabled = true
+mode = "predictive"
+
+[entry]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+# Directional mode: log-normal probability model on Binance spot
+directional_mode = true
+directional_vol_floor = 0.0012
+
+# Probability model thresholds
+min_edge = 5.0           # 5% min edge — match backtest entry_threshold (adapter divides by 100)
+max_entry = 85.0         # 0.85 max entry price — match backtest (adapter divides by 100)
+min_move = 0.05          # min CEX move %
+
+# Binance L2 confirmation
+min_obi_confirmation = 5.0  # OBI threshold % (adapter divides by 100)
+
+# Position sizing
+shares_per_trade = 25.0
+max_positions = 3.0
+
+[timing]
+min_time_remaining = 60.0    # seconds — match backtest gate
+max_time_remaining = 300.0   # seconds
+cooldown_secs = 60.0         # match backtest gate
+
+[risk]
+shares = 25.0
+max_positions = 3.0
+max_daily_trades = 1000.0
+allowed_window_secs = [300, 900]
+use_kelly_sizing = true
+kelly_fraction_cap = 0.25
+
+[exit]
+exit_edge_floor_pct = 20.0
+exit_price_band_pct = 12.0

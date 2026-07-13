@@ -1,0 +1,51 @@
+# Momentum Strategy Default Configuration
+# Copy and customize for your trading setup
+
+[strategy]
+name = "momentum"
+enabled = true
+mode = "predictive"  # "predictive" or "confirmatory"
+
+[entry]
+# Symbols to track (Binance tickers)
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+
+# Minimum CEX price move to trigger entry (%)
+min_move = 0.5  # Production: 0.5% minimum momentum
+
+# Maximum entry price on Polymarket (cents)
+max_entry = 55.0  # Production: max 55 cents (must be float)
+
+# Minimum edge required (%)
+min_edge = 5.0  # Production: 5% minimum edge
+
+[exit]
+# Binary options: minimum modeled edge floor (%) before forced exit
+exit_edge_floor_pct = 20.0
+
+# Binary options: adverse price-band threshold (%) for risk exit
+exit_price_band_pct = 12.0
+
+# NOTE:
+# Hold-to-resolution is controlled by [strategy].mode:
+# - "confirmatory" => hold to resolution
+# - "predictive"   => allow early exits
+
+[timing]
+# Entry window before resolution (seconds)
+min_time_remaining = 300.0  # 5 minutes
+max_time_remaining = 900.0  # 15 minutes
+cooldown_secs = 60.0
+
+[risk]
+# Shares per trade (~$1 at 30-35¢ per share)
+shares = 3.0
+
+# Maximum concurrent positions
+max_positions = 5.0
+
+# Daily trade cap (0 = unlimited)
+max_daily_trades = 50.0
+
+# Optional fixed USD sizing (overrides shares when set)
+# fixed_amount_usd = 1.0

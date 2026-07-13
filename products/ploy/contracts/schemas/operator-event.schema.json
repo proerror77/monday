@@ -1,0 +1,1362 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OperatorEvent",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/LogEntry"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "log"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/TradeResponse"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "trade"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/PositionResponse"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "position"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/MarketData"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "market"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/StatusUpdate"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "status"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/SystemSnapshotEvent"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "system_snapshot"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/DeploymentSnapshotEvent"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "deployment_snapshot"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/TradingSnapshotEvent"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "trading_snapshot"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/MetricsSnapshotEvent"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "metrics_snapshot"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/AlertSnapshotEvent"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "alert_snapshot"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/OversightSnapshotEvent"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "oversight_snapshot"
+          ]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "data",
+        "type"
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/definitions/ProposalSnapshotEvent"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "proposal_snapshot"
+          ]
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "ActiveAlert": {
+      "type": "object",
+      "required": [
+        "alert_id",
+        "kind",
+        "message",
+        "severity",
+        "source_id",
+        "triggered_at"
+      ],
+      "properties": {
+        "alert_id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/AlertKind"
+        },
+        "message": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/definitions/AlertSeverity"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "triggered_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "AlertKind": {
+      "type": "string",
+      "enum": [
+        "source_stale"
+      ]
+    },
+    "AlertSeverity": {
+      "type": "string",
+      "enum": [
+        "warning",
+        "critical"
+      ]
+    },
+    "AlertSnapshotEvent": {
+      "type": "object",
+      "required": [
+        "alerts"
+      ],
+      "properties": {
+        "alerts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ActiveAlert"
+          }
+        }
+      }
+    },
+    "DeploymentRuntimeMode": {
+      "type": "string",
+      "enum": [
+        "paper",
+        "live"
+      ]
+    },
+    "DeploymentSnapshotEvent": {
+      "type": "object",
+      "required": [
+        "deployments"
+      ],
+      "properties": {
+        "deployments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DeploymentSummary"
+          }
+        }
+      }
+    },
+    "DeploymentState": {
+      "type": "string",
+      "enum": [
+        "enabled",
+        "draining",
+        "disabled",
+        "archived"
+      ]
+    },
+    "DeploymentSummary": {
+      "type": "object",
+      "required": [
+        "deployment_id",
+        "desired_state",
+        "observed_state"
+      ],
+      "properties": {
+        "account_id": {
+          "default": "default",
+          "type": "string"
+        },
+        "deployment_id": {
+          "type": "string"
+        },
+        "deployment_state": {
+          "default": "enabled",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DeploymentState"
+            }
+          ]
+        },
+        "desired_state": {
+          "$ref": "#/definitions/DesiredState"
+        },
+        "max_gross_exposure": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "observed_state": {
+          "$ref": "#/definitions/ObservedState"
+        },
+        "runtime_mode": {
+          "default": "paper",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DeploymentRuntimeMode"
+            }
+          ]
+        }
+      }
+    },
+    "DesiredState": {
+      "type": "string",
+      "enum": [
+        "running",
+        "paused",
+        "stopped"
+      ]
+    },
+    "FillSnapshot": {
+      "type": "object",
+      "required": [
+        "fee",
+        "fill_id",
+        "order_id",
+        "price",
+        "quantity",
+        "side",
+        "timestamp",
+        "token_id"
+      ],
+      "properties": {
+        "fee": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "fill_id": {
+          "type": "string"
+        },
+        "order_id": {
+          "type": "string"
+        },
+        "price": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "quantity": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "side": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "token_id": {
+          "type": "string"
+        }
+      }
+    },
+    "HeartbeatState": {
+      "type": "string",
+      "enum": [
+        "healthy",
+        "stale"
+      ]
+    },
+    "HeartbeatStatus": {
+      "type": "object",
+      "required": [
+        "source_id",
+        "source_kind",
+        "stale_after_seconds",
+        "state"
+      ],
+      "properties": {
+        "last_seen_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "stale_after_seconds": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "state": {
+          "$ref": "#/definitions/HeartbeatState"
+        }
+      }
+    },
+    "IntentPurpose": {
+      "type": "string",
+      "enum": [
+        "entry",
+        "exit",
+        "reduce",
+        "hedge",
+        "cancel"
+      ]
+    },
+    "LogEntry": {
+      "type": "object",
+      "required": [
+        "component",
+        "level",
+        "message",
+        "timestamp"
+      ],
+      "properties": {
+        "component": {
+          "type": "string"
+        },
+        "level": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "metadata": true,
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "MarketData": {
+      "type": "object",
+      "required": [
+        "best_ask",
+        "best_bid",
+        "last_price",
+        "spread",
+        "timestamp",
+        "token_id",
+        "token_name",
+        "volume_24h"
+      ],
+      "properties": {
+        "best_ask": {
+          "type": "number",
+          "format": "double"
+        },
+        "best_bid": {
+          "type": "number",
+          "format": "double"
+        },
+        "last_price": {
+          "type": "number",
+          "format": "double"
+        },
+        "spread": {
+          "type": "number",
+          "format": "double"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "token_id": {
+          "type": "string"
+        },
+        "token_name": {
+          "type": "string"
+        },
+        "volume_24h": {
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "MetricsSnapshotEvent": {
+      "type": "object",
+      "required": [
+        "metrics"
+      ],
+      "properties": {
+        "metrics": {
+          "$ref": "#/definitions/PlatformMetrics"
+        }
+      }
+    },
+    "ObservedState": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "degraded",
+        "paused",
+        "stopped",
+        "failed"
+      ]
+    },
+    "OrderSnapshot": {
+      "type": "object",
+      "required": [
+        "filled_qty",
+        "intent_id",
+        "order_id",
+        "requested_qty",
+        "state",
+        "token_id"
+      ],
+      "properties": {
+        "filled_qty": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "idempotency_key": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "intent_id": {
+          "type": "string"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit_price": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "order_id": {
+          "type": "string"
+        },
+        "rejection_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested_qty": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "revision": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "state": {
+          "type": "string"
+        },
+        "state_changed_at": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "token_id": {
+          "type": "string"
+        },
+        "venue_order_history": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "venue_order_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "OversightRecommendedAction": {
+      "type": "object",
+      "required": [
+        "kind",
+        "operator_command",
+        "target"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "operator_command": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      }
+    },
+    "OversightReport": {
+      "type": "object",
+      "required": [
+        "deployments_reviewed",
+        "platform_status",
+        "recommended_actions",
+        "signal_count",
+        "signals",
+        "timestamp"
+      ],
+      "properties": {
+        "deployments_reviewed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "platform_status": {
+          "type": "string"
+        },
+        "recommended_actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OversightRecommendedAction"
+          }
+        },
+        "signal_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "signals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OversightSignal"
+          }
+        },
+        "timestamp": {
+          "type": "string"
+        }
+      }
+    },
+    "OversightSignal": {
+      "type": "object",
+      "required": [
+        "evidence",
+        "kind",
+        "message",
+        "recommended_action",
+        "severity"
+      ],
+      "properties": {
+        "deployment_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "recommended_action": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        }
+      }
+    },
+    "OversightSnapshotEvent": {
+      "type": "object",
+      "required": [
+        "oversight"
+      ],
+      "properties": {
+        "oversight": {
+          "$ref": "#/definitions/OversightReport"
+        }
+      }
+    },
+    "PlatformMetrics": {
+      "type": "object",
+      "required": [
+        "active_alerts",
+        "degraded_deployments",
+        "heartbeats",
+        "live_deployments",
+        "live_reconcile_failures",
+        "stale_sources",
+        "total_deployments"
+      ],
+      "properties": {
+        "active_alerts": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "degraded_deployments": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "heartbeats": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/HeartbeatStatus"
+          }
+        },
+        "host_cpu_pressure_milli_percent": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "host_load_average_1m_milli": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "host_memory_available_mb": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "last_live_reconcile_success_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_trade_time": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "live_deployments": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "live_reconcile_failures": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "process_memory_mb": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "stale_sources": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "total_deployments": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "PnlSnapshotResponse": {
+      "type": "object",
+      "required": [
+        "net_pnl",
+        "realized_pnl",
+        "total_fees",
+        "unrealized_pnl"
+      ],
+      "properties": {
+        "net_pnl": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "realized_pnl": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "total_fees": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "unrealized_pnl": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        }
+      }
+    },
+    "PositionResponse": {
+      "type": "object",
+      "required": [
+        "current_price",
+        "duration_seconds",
+        "entry_price",
+        "entry_time",
+        "shares",
+        "side",
+        "token_id",
+        "token_name",
+        "unrealized_pnl"
+      ],
+      "properties": {
+        "current_price": {
+          "type": "number",
+          "format": "double"
+        },
+        "duration_seconds": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "entry_price": {
+          "type": "number",
+          "format": "double"
+        },
+        "entry_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "shares": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "side": {
+          "type": "string"
+        },
+        "token_id": {
+          "type": "string"
+        },
+        "token_name": {
+          "type": "string"
+        },
+        "unrealized_pnl": {
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "PositionSnapshotResponse": {
+      "type": "object",
+      "required": [
+        "avg_entry_price",
+        "net_qty",
+        "realized_pnl",
+        "token_id"
+      ],
+      "properties": {
+        "avg_entry_price": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "net_qty": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "realized_pnl": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "token_id": {
+          "type": "string"
+        }
+      }
+    },
+    "ProposalActionKind": {
+      "type": "string",
+      "enum": [
+        "pause_deployment",
+        "drain_deployment",
+        "reduce_max_exposure"
+      ]
+    },
+    "ProposalSnapshotEvent": {
+      "type": "object",
+      "required": [
+        "proposals"
+      ],
+      "properties": {
+        "proposals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SafetyProposal"
+          }
+        }
+      }
+    },
+    "ProposalStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "approved",
+        "rejected",
+        "failed"
+      ]
+    },
+    "RiskSnapshotResponse": {
+      "type": "object",
+      "required": [
+        "active_orders",
+        "gross_exposure",
+        "open_positions",
+        "pending_intents",
+        "reserved_order_exposure",
+        "total_gross_exposure"
+      ],
+      "properties": {
+        "active_orders": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "gross_exposure": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "open_positions": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "pending_intents": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "reserved_order_exposure": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "total_gross_exposure": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        }
+      }
+    },
+    "SafetyProposal": {
+      "type": "object",
+      "required": [
+        "action_kind",
+        "created_at",
+        "evidence",
+        "proposal_id",
+        "rationale",
+        "status",
+        "target_deployment_id"
+      ],
+      "properties": {
+        "action_kind": {
+          "$ref": "#/definitions/ProposalActionKind"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "decided_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "decision_note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "proposal_id": {
+          "type": "string"
+        },
+        "proposed_max_gross_exposure": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "source_run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/ProposalStatus"
+        },
+        "target_deployment_id": {
+          "type": "string"
+        }
+      }
+    },
+    "StatusUpdate": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "type": "string"
+        }
+      }
+    },
+    "SystemSnapshotEvent": {
+      "type": "object",
+      "required": [
+        "system"
+      ],
+      "properties": {
+        "system": {
+          "$ref": "#/definitions/SystemStatus"
+        }
+      }
+    },
+    "SystemStatus": {
+      "type": "object",
+      "required": [
+        "database_connected",
+        "error_count_1h",
+        "status",
+        "strategy",
+        "uptime_seconds",
+        "version",
+        "websocket_connected"
+      ],
+      "properties": {
+        "active_alert_count": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "database_connected": {
+          "type": "boolean"
+        },
+        "error_count_1h": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "last_live_reconcile_error": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_live_reconcile_success_at": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_trade_time": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "live_reconcile_failures": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "next_live_reconcile_at": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "stale_source_count": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "status": {
+          "type": "string"
+        },
+        "strategy": {
+          "type": "string"
+        },
+        "uptime_seconds": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "version": {
+          "type": "string"
+        },
+        "websocket_connected": {
+          "type": "boolean"
+        }
+      }
+    },
+    "TradeResponse": {
+      "type": "object",
+      "required": [
+        "entry_price",
+        "id",
+        "shares",
+        "side",
+        "status",
+        "timestamp",
+        "token_id",
+        "token_name"
+      ],
+      "properties": {
+        "entry_price": {
+          "type": "number",
+          "format": "double"
+        },
+        "error_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exit_price": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "id": {
+          "type": "string"
+        },
+        "pnl": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "shares": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "side": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "token_id": {
+          "type": "string"
+        },
+        "token_name": {
+          "type": "string"
+        }
+      }
+    },
+    "TradingIntentSnapshot": {
+      "type": "object",
+      "required": [
+        "created_at",
+        "intent_id",
+        "market_id",
+        "purpose",
+        "quantity",
+        "side",
+        "token_id"
+      ],
+      "properties": {
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "intent_id": {
+          "type": "string"
+        },
+        "limit_price": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "market_id": {
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/definitions/IntentPurpose"
+        },
+        "quantity": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "side": {
+          "type": "string"
+        },
+        "token_id": {
+          "type": "string"
+        }
+      }
+    },
+    "TradingSnapshotEvent": {
+      "type": "object",
+      "required": [
+        "trading"
+      ],
+      "properties": {
+        "trading": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TradingStateSnapshot"
+          }
+        }
+      }
+    },
+    "TradingStateSnapshot": {
+      "type": "object",
+      "required": [
+        "deployment_id",
+        "fills",
+        "intents",
+        "orders",
+        "pnl",
+        "positions",
+        "risk",
+        "runtime_mode"
+      ],
+      "properties": {
+        "deployment_id": {
+          "type": "string"
+        },
+        "fills": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/FillSnapshot"
+          }
+        },
+        "intents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TradingIntentSnapshot"
+          }
+        },
+        "orders": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/OrderSnapshot"
+          }
+        },
+        "pnl": {
+          "$ref": "#/definitions/PnlSnapshotResponse"
+        },
+        "positions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PositionSnapshotResponse"
+          }
+        },
+        "risk": {
+          "$ref": "#/definitions/RiskSnapshotResponse"
+        },
+        "runtime_mode": {
+          "$ref": "#/definitions/DeploymentRuntimeMode"
+        }
+      }
+    }
+  }
+}

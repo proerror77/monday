@@ -1,0 +1,377 @@
+name: Optimize strategy params (snapshot-backed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref"
+        required: true
+        default: "main"
+      train_start:
+        description: "Train start date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-15"
+      train_end:
+        description: "Train end date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-15"
+      val_start:
+        description: "Validation start date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-20"
+      val_end:
+        description: "Validation end date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-20"
+      trials:
+        description: "Number of optimization trials"
+        required: true
+        default: "5"
+      strategy_profile:
+        description: "Snapshot optimizer profile: mixed, champion, obi_soft, obi_hard, continuation_soft, repricing_momentum, cex_direction_first, stable_direction, stable_reversal, stable_reversal_soft, stable_reversal_fillable"
+        required: false
+        default: "mixed"
+      symbols:
+        description: "Comma-separated symbols to optimize"
+        required: false
+        default: "BTCUSDT,ETHUSDT"
+      snapshot_run_id:
+        description: "Research Snapshot workflow run id"
+        required: true
+        default: ""
+      options_json:
+        description: "Advanced options JSON: timestamps, timeout, local snapshot registry, min_trades, issue_number"
+        required: false
+        default: '{"train_start_ts":"","train_end_ts":"","val_start_ts":"","val_end_ts":"","optimize_timeout_minutes":90,"issue_number":"","snapshot_registry_dir":"","min_trades":""}'
+
+concurrency:
+  group: optimize-${{ github.event.inputs.git_ref || github.ref }}-${{ github.event.inputs.strategy_profile || 'mixed' }}-${{ github.event.inputs.snapshot_run_id }}-${{ github.event.inputs.train_start }}-${{ github.event.inputs.train_end }}-${{ github.event.inputs.val_start }}-${{ github.event.inputs.val_end }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  optimize:
+    name: Build and run optimize on ploy-ci-1
+    runs-on: [self-hosted, ploy-ci-1]
+    timeout-minutes: 150
+    environment: ploy-ci-1
+
+    steps:
+      - name: Repair runner workspace permissions
+        run: |
+          if [ -d "${GITHUB_WORKSPACE}" ]; then
+            sudo chown -R "$(id -un):$(id -gn)" "${GITHUB_WORKSPACE}" || true
+            sudo rm -rf "${GITHUB_WORKSPACE}/target" "${GITHUB_WORKSPACE}/.cargo-lock" || true
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Add cargo to PATH
+        run: echo "/home/runner/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Configure snapshot optimizer cargo target
+        run: |
+          scripts/configure_research_cargo_target.sh \
+            --profile pm5d-snapshot-optimize \
+            --features default
+
+      - name: Parse advanced options
+        env:
+          OPTIONS_JSON: ${{ github.event.inputs.options_json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          defaults = {
+              "train_start_ts": "",
+              "train_end_ts": "",
+              "val_start_ts": "",
+              "val_end_ts": "",
+              "optimize_timeout_minutes": "90",
+              "issue_number": "",
+              "snapshot_registry_dir": "",
+              "min_trades": "",
+          }
+          bool_keys = set()
+          raw = os.environ.get("OPTIONS_JSON", "").strip()
+          data = json.loads(raw) if raw else {}
+          if not isinstance(data, dict):
+              raise SystemExit("options_json must be a JSON object")
+          unknown = sorted(set(data) - set(defaults))
+          if unknown:
+              raise SystemExit(f"unknown options_json keys: {', '.join(unknown)}")
+
+          values = dict(defaults)
+          for key, value in data.items():
+              if key in bool_keys:
+                  if isinstance(value, bool):
+                      values[key] = "true" if value else "false"
+                  elif str(value).lower() in {"true", "false"}:
+                      values[key] = str(value).lower()
+                  else:
+                      raise SystemExit(f"options_json value for {key} must be boolean")
+              else:
+                  values[key] = str(value)
+              if key == "min_trades" and values[key]:
+                  try:
+                      parsed = int(values[key])
+                  except ValueError as exc:
+                      raise SystemExit("options_json value for min_trades must be an integer") from exc
+                  if parsed < 1:
+                      raise SystemExit("options_json value for min_trades must be >= 1")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key, value in values.items():
+                  if "\n" in value:
+                      raise SystemExit(f"options_json value for {key} must be single-line")
+                  handle.write(f"OPT_{key.upper()}={value}\n")
+          PY
+
+      - name: Require snapshot artifact
+        run: |
+          set -euo pipefail
+          if [ -z "${{ github.event.inputs.snapshot_run_id }}" ]; then
+            echo "snapshot_run_id is required; run research-snapshot.yml first and pass its retained artifact run id." >&2
+            exit 2
+          fi
+
+      - name: Download research snapshot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SNAPSHOT_RUN_ID: ${{ github.event.inputs.snapshot_run_id }}
+        run: |
+          set -euo pipefail
+          rm -rf artifacts/research-snapshot
+          registry_args=()
+          if [ -n "${OPT_SNAPSHOT_REGISTRY_DIR}" ]; then
+            registry_args=(--registry-dir "${OPT_SNAPSHOT_REGISTRY_DIR}")
+          fi
+          if scripts/restore_research_snapshot.sh \
+            --run-id "${SNAPSHOT_RUN_ID}" \
+            --output-dir artifacts/research-snapshot \
+            --require manifest.json \
+            --require quality.md \
+            "${registry_args[@]}"; then
+            echo "Restored runner-local research snapshot."
+            exit 0
+          fi
+          cache_args=()
+          if [ -n "${RUNNER_WORKSPACE:-}" ]; then
+            cache_args=(--cache-dir "${RUNNER_WORKSPACE}/_ploy-research-artifacts")
+          fi
+          if python3 scripts/download_github_artifact.py \
+            --run-id "${SNAPSHOT_RUN_ID}" \
+            --name "research-snapshot-${SNAPSHOT_RUN_ID}" \
+            --output-dir artifacts/research-snapshot \
+            --require manifest.json \
+            --require quality.md \
+            "${cache_args[@]}"; then
+            echo "Downloaded standalone research snapshot artifact."
+          else
+            echo "Standalone research snapshot artifact not found; trying embedded downstream artifacts."
+            python3 scripts/download_github_artifact.py \
+              --run-id "${SNAPSHOT_RUN_ID}" \
+              --name "factor-review-v2-${SNAPSHOT_RUN_ID}" \
+              --strip-prefix research-snapshot \
+              --output-dir artifacts/research-snapshot \
+              --require manifest.json \
+              --require quality.md \
+              "${cache_args[@]}" \
+            || python3 scripts/download_github_artifact.py \
+              --run-id "${SNAPSHOT_RUN_ID}" \
+              --name "factor-walk-forward-v2-${SNAPSHOT_RUN_ID}" \
+              --strip-prefix research-snapshot \
+              --output-dir artifacts/research-snapshot \
+              --require manifest.json \
+              --require quality.md \
+              "${cache_args[@]}"
+          fi
+
+      - name: Build optimize runner
+        run: |
+          set -euo pipefail
+          . /home/runner/.cargo/env
+          cargo_target_dir="${CARGO_TARGET_DIR:-target}"
+          mkdir -p target/release/examples
+          cargo build --release --locked \
+            -p ploy-research \
+            --example three_layer_snapshot_optimize
+          cp "${cargo_target_dir}/release/examples/three_layer_snapshot_optimize" target/release/examples/optimize-runner
+          chmod +x target/release/examples/optimize-runner
+
+      - name: Publish snapshot provenance
+        if: ${{ hashFiles('artifacts/research-snapshot/manifest.json') != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/optimize
+          if command -v python3 >/dev/null 2>&1; then
+            python3 <<'PY' > artifacts/optimize/snapshot-provenance.txt
+          import json
+
+          with open("artifacts/research-snapshot/manifest.json", encoding="utf-8") as fh:
+              manifest = json.load(fh)
+
+          def value(name):
+              raw = manifest.get(name, "")
+              if isinstance(raw, list):
+                  return ",".join(str(item) for item in raw)
+              if isinstance(raw, bool):
+                  return str(raw).lower()
+              return raw
+
+          lines = [
+              "# Research Snapshot Provenance",
+              f"schema_version={value('schema_version')}",
+              f"snapshot_hash={value('snapshot_hash')}",
+              f"generated_at={value('generated_at')}",
+              f"git_sha={value('git_sha')}",
+              f"symbols={value('symbols')}",
+              f"start={value('start')}",
+              f"end={value('end')}",
+              f"immutable_input={value('immutable_input')}",
+              f"optimizer_data_dir={value('optimizer_data_dir')}",
+              f"data_requirements={value('data_requirements')}",
+              f"data_audit_status={value('data_audit_status')}",
+              f"data_audit_report={value('data_audit_report')}",
+              f"include_deribit={value('include_deribit')}",
+          ]
+          print("\n".join(str(line) for line in lines))
+          PY
+          else
+            {
+              echo "# Research Snapshot Provenance"
+              echo "python3_missing=true"
+              sed -n '1,120p' artifacts/research-snapshot/manifest.json
+            } > artifacts/optimize/snapshot-provenance.txt
+          fi
+          cat artifacts/optimize/snapshot-provenance.txt >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Run optimize
+        run: |
+          set -euo pipefail
+          . /home/runner/.cargo/env
+          mkdir -p artifacts/optimize
+          started=$(date +%s)
+          test -f artifacts/research-snapshot/manifest.json
+
+          time_flags=()
+          if [ -n "${OPT_TRAIN_START_TS}" ]; then
+            time_flags+=(--train-start-ts "${OPT_TRAIN_START_TS}")
+          fi
+          if [ -n "${OPT_TRAIN_END_TS}" ]; then
+            time_flags+=(--train-end-ts "${OPT_TRAIN_END_TS}")
+          fi
+          if [ -n "${OPT_VAL_START_TS}" ]; then
+            time_flags+=(--val-start-ts "${OPT_VAL_START_TS}")
+          fi
+          if [ -n "${OPT_VAL_END_TS}" ]; then
+            time_flags+=(--val-end-ts "${OPT_VAL_END_TS}")
+          fi
+
+          snapshot_flags=()
+          if [ -n "${OPT_MIN_TRADES}" ]; then
+            snapshot_flags+=(--min-trades "${OPT_MIN_TRADES}")
+          fi
+
+          set +e
+          timeout --preserve-status "${OPT_OPTIMIZE_TIMEOUT_MINUTES}m" \
+            ./target/release/examples/optimize-runner \
+              --snapshot-dir artifacts/research-snapshot \
+              --train-start "${{ github.event.inputs.train_start }}" \
+              --train-end "${{ github.event.inputs.train_end }}" \
+              --val-start "${{ github.event.inputs.val_start }}" \
+              --val-end "${{ github.event.inputs.val_end }}" \
+              --symbols "${{ github.event.inputs.symbols }}" \
+              --trials "${{ github.event.inputs.trials }}" \
+              --strategy-profile "${{ github.event.inputs.strategy_profile }}" \
+              --stake-usd 15 \
+              --output-dir artifacts/optimize \
+              "${time_flags[@]}" \
+              "${snapshot_flags[@]}" \
+              2>&1 | tee artifacts/optimize/report.txt
+          status=${PIPESTATUS[0]}
+
+          elapsed=$(( $(date +%s) - started ))
+          printf '{"phase":"optimize_workflow_step","wall_secs":%s,"status":%s,"snapshot_backed":%s}\n' \
+            "${elapsed}" "${status}" "true" \
+            > artifacts/optimize/workflow-timing.json
+          {
+            echo "## Optimize host health"
+            echo '```'
+            date -u
+            free -h || true
+            df -h artifacts/research-snapshot || true
+            ps -eo pid,ppid,stat,%mem,%cpu,comm,args --sort=-%mem | head -25 || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          {
+            echo "## Optimize timing"
+            echo '```json'
+            if [ -f artifacts/optimize/timing.json ]; then
+              cat artifacts/optimize/timing.json
+            else
+              cat artifacts/optimize/workflow-timing.json
+            fi
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+
+      - name: Upload optimize provenance
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: optimize-provenance-${{ github.run_id }}
+          path: artifacts/optimize
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Comment optimize evidence on issue
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { applyResearchIssueLabels } = require("./.github/scripts/research-issue-labels.js");
+            const issueNumberRaw = process.env.OPT_ISSUE_NUMBER || "";
+            if (!issueNumberRaw) {
+              core.info("No issue_number configured in options_json; skipping issue comment.");
+              return;
+            }
+            const issue_number = Number(issueNumberRaw);
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = [
+              "Optimize evidence:",
+              "",
+              `- Workflow: ${context.workflow}`,
+              `- Run URL: ${runUrl}`,
+              `- Git ref: ${{ github.event.inputs.git_ref }}`,
+              `- Dataset/window: train ${{ github.event.inputs.train_start }} -> ${{ github.event.inputs.train_end }}, validation ${{ github.event.inputs.val_start }} -> ${{ github.event.inputs.val_end }}`,
+              `- Symbols: ${{ github.event.inputs.symbols }}`,
+              `- Artifact: \`optimize-provenance-${process.env.GITHUB_RUN_ID}\``,
+              "- Decision: pending"
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body
+            });
+            await applyResearchIssueLabels({
+              github,
+              context,
+              core,
+              issue_number,
+              labels: ["evidence:optimize", "decision:pending"]
+            });

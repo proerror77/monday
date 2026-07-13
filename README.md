@@ -36,6 +36,7 @@ The repository provides the durable goal loop and CLI. Time-based or event-based
 | Runtime attribution and follow-up learning | `implemented` | Signed deployment/strategy-scoped events; validator-gated lab policy adoption |
 | Live-small runtime activation | `disabled` | Human eligibility evidence does not bypass the runtime fail-closed gate |
 | Python ML workspace | `legacy-prototype` | Not production control-plane or execution authority; migrate only with Rust parity evidence |
+| PLOY product workspace | `integrated-product` | `products/ploy` owns prediction-market product, operator UI, sidecar, and research capabilities; Monday risk, OMS, and execution remain authoritative |
 | Real alpha profitability | `not claimed` | Requires real point-in-time data, valid evaluation, and venue soak evidence |
 
 ## Architecture
@@ -92,5 +93,7 @@ Ordinary changes should use package-scoped checks. Run a release graph, containe
 - [Current approved design](docs/superpowers/specs/2026-07-11-loop-engineer-production-hardening-design.md)
 - [Current implementation plan](docs/superpowers/plans/2026-07-11-loop-engineer-production-hardening.md)
 - [Design document status](docs/superpowers/README.md)
+- [PLOY integration boundary](docs/architecture/PLOY_INTEGRATION.md)
+- [PLOY product workspace](products/ploy/README.md)
 
 DuckDB is the local research control-plane source of truth. Raw and large derived market data belongs in content-addressed trace/Parquet artifacts; ClickHouse is optional analytics storage, not control-plane authority.

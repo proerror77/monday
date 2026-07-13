@@ -1,0 +1,60 @@
+[account]
+id = "default"
+
+[market]
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+rest_url = "https://clob.polymarket.com"
+market_slug = "nba-comeback"
+
+[strategy]
+shares = 20
+window_min = 2
+move_pct = 0.15
+sum_target = 1.0
+fee_buffer = 0.005
+slippage_buffer = 0.02
+profit_buffer = 0.01
+
+[execution]
+order_timeout_ms = 5000
+max_retries = 3
+max_spread_bps = 500
+poll_interval_ms = 500
+
+[risk]
+max_single_exposure_usd = 100
+min_remaining_seconds = 30
+max_consecutive_failures = 3
+daily_loss_limit_usd = 500
+leg2_force_close_seconds = 20
+
+[database]
+url = "postgres://localhost/ploy"
+max_connections = 5
+
+[dry_run]
+enabled = true
+
+[logging]
+level = "info"
+json = false
+
+[nba_comeback]
+enabled = true
+min_edge = 0.05
+max_entry_price = 0.75
+shares = 50
+cooldown_secs = 300
+max_daily_spend_usd = 100
+min_deficit = 1
+max_deficit = 15
+target_quarter = 3
+espn_poll_interval_secs = 30
+min_comeback_rate = 0.15
+season = "2025-26"
+performance_daily_loss_limit_usd = 30
+performance_min_settled_trades = 10
+performance_min_win_rate = 0.45
+performance_low_winrate_multiplier = 0.60
+performance_loss_streak_threshold = 3
+performance_loss_streak_multiplier = 0.50

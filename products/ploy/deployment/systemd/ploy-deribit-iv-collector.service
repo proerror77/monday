@@ -1,0 +1,27 @@
+[Unit]
+Description=Ploy Deribit IV Collector
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ploy
+Environment=DERIBIT_IV_CURRENCIES=BTC,ETH,SOL
+Environment=DERIBIT_IV_POLL_SECS=30
+Environment=PLOY_DATABASE__URL=postgresql://postgres:postgres@localhost:5432/ploy
+ExecStartPre=/bin/sleep 23
+ExecStart=/opt/ploy/bin/ploy-runner collect-deribit-iv \
+    --currencies ${DERIBIT_IV_CURRENCIES} \
+    --poll-secs ${DERIBIT_IV_POLL_SECS}
+Restart=always
+RestartSec=23
+StandardOutput=journal
+StandardError=journal
+
+MemoryHigh=256M
+MemoryMax=512M
+CPUQuota=25%
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

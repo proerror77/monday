@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket Public Trade Collector
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ploy
+Environment=PLOY_PM_TRADE_COLLECTOR_REFRESH_SECS=30
+Environment=PLOY_PM_TRADE_COLLECTOR_DELAY_MS=500
+ExecStart=/opt/ploy/bin/ploy-runner collect-pm-trades \
+    --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT \
+    --db-url postgresql://postgres:postgres@localhost:5432/ploy
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+MemoryHigh=512M
+MemoryMax=768M
+CPUQuota=30%
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target
