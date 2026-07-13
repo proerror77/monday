@@ -1,0 +1,25 @@
+[package]
+name = "hft-execution-adapter-binance-prediction"
+version = "0.1.0"
+edition = "2021"
+description = "Binance W3W Prediction execution adapter"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+execution = { package = "hft-execution", path = "../../execution" }
+async-trait = { workspace = true }
+anyhow = "1"
+binance-sdk = { version = "61.0.0", default-features = false, features = ["rustls-tls", "w3w_prediction"] }
+futures = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[lib]
+name = "execution_adapter_binance_prediction"

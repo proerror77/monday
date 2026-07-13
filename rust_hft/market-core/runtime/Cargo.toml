@@ -35,6 +35,7 @@ adapter-ondo-perps-data = { package = "hft-data-adapter-ondo-perps", path = "../
 # Execution adapters (optional)
 adapter-bitget-execution = { package = "hft-execution-adapter-bitget", path = "../../execution-gateway/adapters/adapter-bitget", optional = true }
 adapter-binance-execution = { package = "hft-execution-adapter-binance", path = "../../execution-gateway/adapters/adapter-binance", optional = true }
+adapter-binance-prediction-execution = { package = "hft-execution-adapter-binance-prediction", path = "../../execution-gateway/adapters/adapter-binance-prediction", optional = true }
 adapter-backpack-execution = { package = "hft-execution-adapter-backpack", path = "../../execution-gateway/adapters/adapter-backpack", optional = true }
 adapter-bybit-execution = { package = "hft-execution-adapter-bybit", path = "../../execution-gateway/adapters/adapter-bybit", optional = true }
 adapter-okx-execution = { package = "hft-execution-adapter-okx", path = "../../execution-gateway/adapters/adapter-okx", optional = true }
@@ -115,6 +116,7 @@ adapter-ondo-perps-data = ["dep:adapter-ondo-perps-data"]
 # Execution adapters
 adapter-bitget-execution = ["dep:adapter-bitget-execution"]
 adapter-binance-execution = ["dep:adapter-binance-execution"]
+adapter-binance-prediction-execution = ["dep:adapter-binance-prediction-execution"]
 adapter-backpack-execution = ["dep:adapter-backpack-execution"]
 adapter-bybit-execution = ["dep:adapter-bybit-execution"]
 adapter-okx-execution = ["dep:adapter-okx-execution"]
@@ -143,6 +145,7 @@ infra-secrets = ["dep:infra-secrets"]
 # Convenience features
 bitget = ["adapter-bitget-data", "adapter-bitget-execution"]
 binance = ["adapter-binance-data", "adapter-binance-execution"]
+binance-prediction = ["adapter-binance-prediction-execution"]
 backpack = ["adapter-backpack-data", "adapter-backpack-execution"]
 bybit = ["adapter-bybit-data", "adapter-bybit-execution"]
 okx = ["adapter-okx-execution"]
@@ -153,4 +156,4 @@ grvt = ["adapter-grvt-data", "adapter-grvt-execution"]
 ondo-perps = ["adapter-ondo-perps-data", "adapter-ondo-perps-execution"]
 mock = ["adapter-mock-data"]
 all-strategies = ["strategy-trend", "strategy-arbitrage", "strategy-imbalance", "strategy-formula", "strategy-dl", "strategy-lob-flow-grid"]
-full = ["bitget", "binance", "bybit", "okx", "hyperliquid", "asterdex", "lighter", "backpack", "grvt", "ondo-perps", "all-strategies", "adapter-mock-data"]
+full = ["bitget", "binance", "binance-prediction", "bybit", "okx", "hyperliquid", "asterdex", "lighter", "backpack", "grvt", "ondo-perps", "all-strategies", "adapter-mock-data"]

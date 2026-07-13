@@ -539,6 +539,7 @@ fn convert_risk_config(risk: shared::RiskConfig) -> RiskConfig {
 fn map_venue_type(venue_id: VenueId) -> VenueType {
     match venue_id {
         VenueId::BINANCE => VenueType::Binance,
+        VenueId::BINANCE_PREDICTION => VenueType::BinancePrediction,
         VenueId::BITGET => VenueType::Bitget,
         VenueId::BYBIT => VenueType::Bybit,
         VenueId::OKX => VenueType::Okx,
@@ -1218,5 +1219,69 @@ risk:
         assert!(error
             .to_string()
             .contains("balance_reconcile_tolerance_usd"));
+    }
+
+    #[test]
+    fn loads_binance_prediction_as_an_execution_only_venue() {
+        let config = load_config_from_str(
+            r#"
+engine:
+  queue_capacity: 1024
+  stale_us: 1000000
+  top_n: 20
+venues:
+  - name: binance-prediction
+    venue_type: BinancePrediction
+    rest: https://api.binance.com
+    api_key: test-key
+    secret: test-secret
+    execution_mode: Paper
+    capabilities:
+      ws_order_placement: false
+      snapshot_crc: false
+      all_in_one_topics: false
+      private_ws_heartbeat: false
+    execution_config:
+      wallet_address: "0x1234"
+      wallet_id: wallet-1
+      account_type: SPOT
+      funding_source: CEX
+risk:
+  risk_type: Default
+  global_position_limit: 0
+  global_notional_limit: 0
+  max_daily_trades: 0
+  max_orders_per_second: 0
+  staleness_threshold_us: 0
+strategies: []
+"#,
+        )
+        .expect("load Binance Prediction config");
+
+        assert_eq!(config.venues[0].venue_type, VenueType::BinancePrediction);
+        assert_eq!(
+            config.venues[0]
+                .execution_config
+                .as_ref()
+                .and_then(|value| value.get("wallet_id"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("wallet-1")
+        );
+    }
+
+    #[test]
+    fn binance_prediction_live_example_stays_loadable() {
+        let content = include_str!("../../../../config/dev/binance_prediction_live.yaml.example")
+            .replace("${BINANCE_PREDICTION_API_KEY}", "test-key")
+            .replace("${BINANCE_PREDICTION_API_SECRET}", "test-secret")
+            .replace("${BINANCE_PREDICTION_WALLET_ADDRESS}", "0x1234")
+            .replace("${BINANCE_PREDICTION_WALLET_ID}", "wallet-1");
+
+        let config = load_config_from_str(&content).expect("load Binance Prediction live example");
+
+        assert_eq!(config.venues[0].venue_type, VenueType::BinancePrediction);
+        assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Live"));
+        assert!(config.strategies.is_empty());
+        assert_eq!(config.risk.global_notional_limit, Decimal::ZERO);
     }
 }

@@ -406,6 +406,7 @@ pub struct VenueConfig {
 pub enum VenueType {
     Bitget,
     Binance,
+    BinancePrediction,
     Bybit,
     Okx,
     Hyperliquid,

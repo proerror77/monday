@@ -15,6 +15,7 @@ impl SystemBuilder {
         match venue.venue_type {
             VenueType::Bitget => self.register_bitget_adapters(venue),
             VenueType::Binance => self.register_binance_adapters(venue),
+            VenueType::BinancePrediction => self.register_binance_prediction_adapters(venue),
             VenueType::Bybit => self.register_bybit_adapters(venue),
             VenueType::Okx => self.register_okx_adapters(venue),
             VenueType::Hyperliquid => self.register_hyperliquid_adapters(venue),
@@ -37,6 +38,62 @@ impl SystemBuilder {
 }
 
 impl SystemBuilder {
+    #[cfg(feature = "adapter-binance-prediction-execution")]
+    pub(crate) fn register_binance_prediction_adapters(mut self, venue: &VenueConfig) -> Self {
+        use adapter_binance_prediction_execution as prediction;
+
+        let settings = venue
+            .execution_config
+            .clone()
+            .and_then(|value| {
+                serde_yaml::from_value::<prediction::BinancePredictionVenueConfig>(value).ok()
+            });
+        let Some(settings) = settings else {
+            warn!("Binance Prediction requires execution_config with wallet and funding settings");
+            return self;
+        };
+        let mode = match venue.execution_mode.as_deref().unwrap_or("Paper") {
+            "Live" => prediction::ExecutionMode::Live,
+            "Testnet" => prediction::ExecutionMode::Testnet,
+            _ => prediction::ExecutionMode::Paper,
+        };
+        let config = prediction::BinancePredictionExecutionConfig {
+            api_key: venue.api_key.clone().unwrap_or_default(),
+            api_secret: venue.secret.clone().unwrap_or_default(),
+            wallet_address: settings.wallet_address,
+            wallet_id: settings.wallet_id,
+            rest_base_url: venue
+                .rest
+                .clone()
+                .unwrap_or_else(|| "https://api.binance.com".to_string()),
+            timeout_ms: settings.timeout_ms,
+            mode,
+            account_type: settings.account_type,
+            funding_source: settings.funding_source,
+        };
+        match prediction::BinancePredictionExecutionClient::new(config) {
+            Ok(client) => {
+                let account = venue
+                    .account_id
+                    .as_ref()
+                    .map(|value| hft_core::AccountId(value.clone()));
+                self = self.register_execution_client_with_key(
+                    client,
+                    hft_core::VenueId::BINANCE_PREDICTION,
+                    account,
+                );
+            }
+            Err(error) => warn!(%error, "failed to configure Binance Prediction execution"),
+        }
+        self
+    }
+
+    #[cfg(not(feature = "adapter-binance-prediction-execution"))]
+    pub(crate) fn register_binance_prediction_adapters(self, _venue: &VenueConfig) -> Self {
+        warn!("Binance Prediction execution adapter is not enabled");
+        self
+    }
+
     #[cfg(feature = "adapter-bitget-data")]
     pub(crate) fn register_bitget_adapters(mut self, venue: &VenueConfig) -> Self {
         info!("註冊 Bitget 適配器");
@@ -642,7 +699,54 @@ fn yaml_get_u64(map: &Mapping, key: &str) -> Option<u64> {
 #[allow(unused_imports)]
 mod tests {
     use super::*;
+    use super::super::{SystemConfig, VenueCapabilities};
     use shared_instrument::InstrumentId;
+
+    #[cfg(feature = "adapter-binance-prediction-execution")]
+    #[test]
+    fn binance_prediction_registers_as_execution_only_client() {
+        let venue = VenueConfig {
+            name: "binance-prediction".to_string(),
+            account_id: Some("prediction-main".to_string()),
+            venue_type: VenueType::BinancePrediction,
+            ws_public: None,
+            ws_private: None,
+            rest: Some("https://api.binance.com".to_string()),
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+            execution_mode: Some("Paper".to_string()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: false,
+            symbol_catalog: Vec::<InstrumentId>::new(),
+            data_config: None,
+            execution_config: Some(
+                serde_yaml::from_str(
+                    r#"
+wallet_address: "0x1234"
+wallet_id: wallet-1
+account_type: SPOT
+funding_source: CEX
+"#,
+                )
+                .unwrap(),
+            ),
+        };
+        let mut config = SystemConfig::default();
+        config.venues.push(venue);
+
+        let builder = SystemBuilder::new(config).register_execution_clients_from_config();
+
+        assert_eq!(builder.execution_clients.len(), 1);
+        assert_eq!(
+            builder.execution_client_venues,
+            vec![hft_core::VenueId::BINANCE_PREDICTION]
+        );
+    }
 
     #[cfg(feature = "adapter-backpack-execution")]
     #[test]

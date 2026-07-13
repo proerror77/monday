@@ -55,6 +55,7 @@ members = [
     "execution-gateway/execution",
     "execution-gateway/adapters/adapter-bitget",
     "execution-gateway/adapters/adapter-binance",
+    "execution-gateway/adapters/adapter-binance-prediction",
     "execution-gateway/adapters/adapter-okx",
     "execution-gateway/adapters/adapter-hyperliquid",
     "execution-gateway/adapters/adapter-bybit",

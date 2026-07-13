@@ -795,6 +795,10 @@ impl BinanceExecutionClient {
                 "Binance brokerage equities must use a dedicated equities adapter, not /api/v3/order"
                     .to_string(),
             )),
+            ProductType::PredictionMarket => Err(hft_core::HftError::Execution(
+                "Binance prediction-market orders must use the dedicated W3W Prediction adapter"
+                    .to_string(),
+            )),
         }
     }
 }

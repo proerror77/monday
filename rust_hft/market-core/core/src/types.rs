@@ -30,6 +30,7 @@ impl VenueId {
     pub const BINANCE_TOKENIZED_SECURITIES: VenueId = VenueId(102);
     pub const BINANCE_FUTURES: VenueId = VenueId(103);
     pub const BINANCE_BROKERAGE_EQUITIES: VenueId = VenueId(104);
+    pub const BINANCE_PREDICTION: VenueId = VenueId(105);
     pub const MOCK: VenueId = VenueId(99);
 
     pub fn as_str(&self) -> &'static str {
@@ -48,6 +49,7 @@ impl VenueId {
             Self::BINANCE_TOKENIZED_SECURITIES => "BINANCE_TOKENIZED_SECURITIES",
             Self::BINANCE_FUTURES => "BINANCE_FUTURES",
             Self::BINANCE_BROKERAGE_EQUITIES => "BINANCE_BROKERAGE_EQUITIES",
+            Self::BINANCE_PREDICTION => "BINANCE_PREDICTION",
             Self::MOCK => "MOCK",
             _ => "UNKNOWN",
         }
@@ -72,6 +74,9 @@ impl VenueId {
             "BINANCE_FUTURES" | "BINANCE-FUTURES" => Some(Self::BINANCE_FUTURES),
             "BINANCE_BROKERAGE_EQUITIES" | "BINANCE-BROKERAGE-EQUITIES" => {
                 Some(Self::BINANCE_BROKERAGE_EQUITIES)
+            }
+            "BINANCE_PREDICTION" | "BINANCE-PREDICTION" | "W3W_PREDICTION" => {
+                Some(Self::BINANCE_PREDICTION)
             }
             "MOCK" => Some(Self::MOCK),
             _ => None,
@@ -310,6 +315,7 @@ pub enum AssetClass {
     Etf,
     PreIpo,
     Rwa,
+    PredictionMarket,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -320,6 +326,7 @@ pub enum ProductType {
     Perp,
     TokenizedSecuritySpot,
     BrokerageEquity,
+    PredictionMarket,
 }
 
 impl ProductType {
@@ -330,6 +337,7 @@ impl ProductType {
             Self::Perp => "PERP",
             Self::TokenizedSecuritySpot => "TOKENIZED_SECURITY_SPOT",
             Self::BrokerageEquity => "BROKERAGE_EQUITY",
+            Self::PredictionMarket => "PREDICTION_MARKET",
         }
     }
 }
@@ -470,6 +478,19 @@ impl InstrumentSpec {
         }
     }
 
+    pub fn prediction_market_outcome(token_id: Symbol) -> Self {
+        Self {
+            symbol: token_id,
+            venue: VenueId::BINANCE_PREDICTION,
+            asset_class: AssetClass::PredictionMarket,
+            product_type: ProductType::PredictionMarket,
+            regulatory_profile: RegulatoryProfile::RestrictedJurisdiction,
+            underlying_symbol: None,
+            issuer: Some("Binance W3W Prediction".to_string()),
+            quote_currency: Some("USDT".to_string()),
+        }
+    }
+
     pub fn instrument_key(&self) -> InstrumentKey {
         InstrumentKey::from_spec(self)
     }
@@ -526,6 +547,23 @@ mod instrument_key_tests {
             RegulatoryProfile::RestrictedJurisdiction
         );
         assert_eq!(spec.instrument_key().storage_key(), "ONDO_PERPS:PERP:TSLA");
+    }
+
+    #[test]
+    fn binance_prediction_has_explicit_venue_and_product_semantics() {
+        let spec = InstrumentSpec::prediction_market_outcome(Symbol::new("112233"));
+
+        assert_eq!(
+            VenueId::from_str("binance-prediction"),
+            Some(VenueId::BINANCE_PREDICTION)
+        );
+        assert_eq!(spec.venue, VenueId::BINANCE_PREDICTION);
+        assert_eq!(spec.asset_class, AssetClass::PredictionMarket);
+        assert_eq!(spec.product_type, ProductType::PredictionMarket);
+        assert_eq!(
+            spec.instrument_key().storage_key(),
+            "BINANCE_PREDICTION:PREDICTION_MARKET:112233"
+        );
     }
 }
 

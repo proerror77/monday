@@ -57,6 +57,10 @@ impl SystemBuilder {
         venue: &VenueConfig,
         instruments: &[InstrumentSpec],
     ) -> Self {
+        if venue.venue_type == VenueType::BinancePrediction {
+            info!("Binance Prediction is execution-only; skipping streaming market adapter");
+            return self;
+        }
         let venue_id = to_venue_id(&venue.venue_type);
 
         let base_instruments: Vec<InstrumentSpec> = if !venue.symbol_catalog.is_empty() {
@@ -130,6 +134,7 @@ fn instrument_for_venue(symbol: Symbol, venue: VenueId) -> InstrumentSpec {
 fn to_venue_id(venue_type: &VenueType) -> VenueId {
     match venue_type {
         VenueType::Binance => VenueId::BINANCE,
+        VenueType::BinancePrediction => VenueId::BINANCE_PREDICTION,
         VenueType::Bitget => VenueId::BITGET,
         VenueType::Bybit => VenueId::BYBIT,
         VenueType::Hyperliquid => VenueId::HYPERLIQUID,

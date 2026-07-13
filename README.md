@@ -25,6 +25,7 @@ The repository provides the durable goal loop and CLI. Time-based or event-based
 | Capability | State | Boundary |
 | --- | --- | --- |
 | Binance closed-candle OHLCV v2 Data Missions | `governed` | Content-addressed trace, immutable DuckDB registry, point-in-time and quality checks |
+| Binance W3W Prediction order adapter | `implemented, activation disabled` | Official SDK wallet verification, quote/place/cancel, balance, and open-order reconciliation; fill/settlement promotion still requires a dedicated acceptance gate |
 | Tick/LOB and multi-venue streaming connectors | `runtime-only` | Connector availability is not a governed research-dataset claim |
 | Formula search with GP, MCTS, and Bayesian optimization | `governed` | Eligible for evaluator v2 and Formula-only promotion |
 | Offline Q-learning | `lab-only` | Search-policy experiment; blocked from holdout, promotion, allocation, and runtime authority |
@@ -68,6 +69,8 @@ cargo clippy --locked -p alpha-domain -p alpha-store -p alpha-engine -p alpha-ha
 cargo clippy --locked -p hft-collector --all-targets --features collector-binance --no-deps -- -D warnings
 cargo test --locked -p hft-live --features dl-strategy
 cargo test --locked -p hft-live --no-default-features --features formula-strategy,binance --test deployment_envelope
+cargo test --locked -p hft-execution-adapter-binance-prediction
+cargo test --locked -p hft-runtime --features binance-prediction
 cargo test --locked -p hft-live --no-default-features --features formula-strategy,bitget --test deployment_artifacts
 cargo audit --no-fetch
 ```

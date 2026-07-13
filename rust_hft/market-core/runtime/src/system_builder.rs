@@ -692,6 +692,7 @@ impl SystemBuilder {
 fn venue_type_to_venue_id(venue_type: &VenueType) -> VenueId {
     match venue_type {
         VenueType::Binance => VenueId::BINANCE,
+        VenueType::BinancePrediction => VenueId::BINANCE_PREDICTION,
         VenueType::Bitget => VenueId::BITGET,
         VenueType::Bybit => VenueId::BYBIT,
         VenueType::Okx => VenueId::OKX,

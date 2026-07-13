@@ -678,6 +678,12 @@ impl MarketStream for BinanceMarketStream {
                         instrument.symbol
                     )));
                 }
+                ProductType::PredictionMarket => {
+                    return Err(HftError::Network(format!(
+                        "Binance prediction markets must use the W3W Prediction REST API: {}",
+                        instrument.symbol
+                    )));
+                }
             }
         }
 
@@ -708,6 +714,7 @@ impl MarketStream for BinanceMarketStream {
                     match instrument.product_type {
                         ProductType::Futures | ProductType::Perp => "derivatives",
                         ProductType::BrokerageEquity => "brokerage equities",
+                        ProductType::PredictionMarket => "prediction",
                         _ => unreachable!(),
                     },
                     instrument.symbol

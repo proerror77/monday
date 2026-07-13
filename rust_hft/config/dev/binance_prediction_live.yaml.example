@@ -1,0 +1,44 @@
+schema_version: v2
+quotes_only: false
+
+engine:
+  queue_capacity: 1024
+  stale_us: 1000000
+  top_n: 20
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  balance_reconcile_tolerance_usd: 1
+  auto_cancel_exchange_only: false
+
+venues:
+  - name: binance-prediction
+    account_id: binance-prediction-main
+    venue_type: BINANCE_PREDICTION
+    rest: "https://api.binance.com"
+    api_key: "${BINANCE_PREDICTION_API_KEY}"
+    secret: "${BINANCE_PREDICTION_API_SECRET}"
+    execution_mode: Live
+    capabilities:
+      supports_incremental_book: false
+      supports_private_ws: false
+      allows_post_only: false
+    simulate_execution: false
+    execution_config:
+      wallet_address: "${BINANCE_PREDICTION_WALLET_ADDRESS}"
+      wallet_id: "${BINANCE_PREDICTION_WALLET_ID}"
+      account_type: SPOT
+      funding_source: CEX
+      timeout_ms: 3000
+
+# Execution-only venue: a strategy must target BINANCE_PREDICTION explicitly and use the
+# outcome token ID as OrderIntent.symbol. Live orders also require envelope max_slippage_bps.
+strategies: []
+
+# Zero limits keep this example fail-closed until an approved deployment supplies real limits.
+risk:
+  risk_type: Default
+  global_position_limit: 0
+  global_notional_limit: 0
+  max_daily_trades: 0
+  max_orders_per_second: 0
+  staleness_threshold_us: 1000000

@@ -43,13 +43,14 @@ default = ["bitget", "formula-strategy", "metrics", "simd"]
 # 交易所適配器 (轉發到 runtime)
 bitget = ["runtime/bitget"]
 binance = ["runtime/binance"]
+binance-prediction = ["runtime/binance-prediction"]
 bybit = ["runtime/bybit"]
 okx = ["runtime/okx"]
 hyperliquid = ["runtime/hyperliquid"]
 ondo-perps = ["runtime/ondo-perps"]
 asterdex = ["runtime/asterdex"]
 mock = ["runtime/mock"]
-all-exchanges = ["bitget", "binance", "bybit", "okx", "hyperliquid", "ondo-perps", "asterdex"]
+all-exchanges = ["bitget", "binance", "binance-prediction", "bybit", "okx", "hyperliquid", "ondo-perps", "asterdex"]
 
 # 策略 (轉發到 runtime)
 trend-strategy = ["runtime/strategy-trend"]
