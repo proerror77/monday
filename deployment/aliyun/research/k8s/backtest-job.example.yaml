@@ -1,0 +1,92 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: monday-backtest-example
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: monday-backtest
+    app.kubernetes.io/part-of: monday
+spec:
+  suspend: true
+  completionMode: Indexed
+  completions: 8
+  parallelism: 4
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: monday-backtest
+        app.kubernetes.io/part-of: monday
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backtest
+          image: registry-vpc.ap-northeast-1.aliyuncs.com/monday/research-runner:REPLACE_WITH_IMMUTABLE_TAG
+          imagePullPolicy: IfNotPresent
+          args:
+            - --binary
+            - /usr/local/bin/hft-backtest
+            - --config
+            - /work/config/default.yaml
+            - --grid
+            - /work/config/param_grid.yaml
+            - --shard-index
+            - $(JOB_COMPLETION_INDEX)
+            - --shard-count
+            - "8"
+            - --output
+            - /work/results/$(JOB_COMPLETION_INDEX)
+          env:
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          volumeMounts:
+            - name: config
+              mountPath: /work/config
+              readOnly: true
+            - name: data
+              mountPath: /work/data
+              readOnly: true
+            - name: results
+              mountPath: /work/results
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: monday-backtest-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: monday-backtest-cache
+            readOnly: true
+        - name: results
+          persistentVolumeClaim:
+            claimName: monday-backtest-results
+        - name: tmp
+          emptyDir: {}

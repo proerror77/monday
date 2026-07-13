@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.91-bookworm AS builder
+
+WORKDIR /work
+ENV RUST_MIN_STACK=33554432
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
+    cmake \
+    mold \
+    pkg-config \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/work/target,sharing=locked \
+    cargo --config 'build.rustc-wrapper=""' build \
+    --release \
+    --locked \
+    -p hft-backtest \
+    && cp /work/target/release/hft-backtest /work/hft-backtest
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3 \
+    python3-yaml \
+    tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 research
+
+COPY --from=builder /work/hft-backtest /usr/local/bin/hft-backtest
+COPY scripts/backtest/param_scan.py /opt/monday/param_scan.py
+
+RUN mkdir -p /work/config /work/data /work/results \
+    && chown -R research:research /work /opt/monday
+
+USER research
+WORKDIR /work
+ENV HFT_BACKTEST_BIN=/usr/local/bin/hft-backtest
+
+ENTRYPOINT ["/usr/bin/tini", "--", "python3", "/opt/monday/param_scan.py"]

@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monday-research
+  labels:
+    app.kubernetes.io/part-of: monday
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: monday-research-quota
+  namespace: monday-research
+spec:
+  hard:
+    requests.cpu: "80"
+    requests.memory: 160Gi
+    limits.cpu: "80"
+    limits.memory: 160Gi
+    pods: "50"
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: monday-research-limits
+  namespace: monday-research
+spec:
+  limits:
+    - type: Container
+      defaultRequest:
+        cpu: "1"
+        memory: 2Gi
+      default:
+        cpu: "4"
+        memory: 8Gi

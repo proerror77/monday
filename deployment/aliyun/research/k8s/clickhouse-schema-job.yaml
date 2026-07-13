@@ -1,0 +1,98 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: monday-clickhouse-schema
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: clickhouse-schema
+    app.kubernetes.io/part-of: monday
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: clickhouse-schema
+        app.kubernetes.io/part-of: monday
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: schema
+          image: clickhouse/clickhouse-server:25.6-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ceu"]
+          args:
+            - |
+              set -- clickhouse-client \
+                --host "$CLICKHOUSE_HOST" \
+                --port "$CLICKHOUSE_PORT" \
+                --user "$CLICKHOUSE_USER" \
+                --password "$CLICKHOUSE_PASSWORD"
+              if [ "$CLICKHOUSE_SECURE" = "true" ]; then
+                set -- "$@" --secure
+              fi
+              "$@" --multiquery < /schema/schema.sql
+          env:
+            - name: CLICKHOUSE_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: monday-clickhouse
+                  key: host
+            - name: CLICKHOUSE_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: monday-clickhouse
+                  key: port
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: monday-clickhouse
+                  key: user
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: monday-clickhouse
+                  key: password
+            - name: CLICKHOUSE_SECURE
+              valueFrom:
+                secretKeyRef:
+                  name: monday-clickhouse
+                  key: secure
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 101
+            runAsGroup: 101
+          volumeMounts:
+            - name: schema
+              mountPath: /schema
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: schema
+          configMap:
+            name: monday-clickhouse-schema
+        - name: tmp
+          emptyDir: {}
