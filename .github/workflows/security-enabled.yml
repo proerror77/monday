@@ -28,11 +28,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run Semgrep
+        # Nested PLOY workflows are preserved as historical source evidence and
+        # cannot execute from their product-local path. Active root workflows,
+        # application code, and the rest of the repository remain in scope.
         run: >-
           semgrep scan
           --config p/rust
           --config p/security-audit
           --config p/owasp-top-ten
+          --exclude products/ploy/.github/workflows
           --sarif
           --output semgrep.sarif
           .
