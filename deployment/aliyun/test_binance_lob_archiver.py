@@ -348,9 +348,9 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             patch.object(ARCHIVER, "TASK_CANCEL_TIMEOUT_SECONDS", 0.01),
             self.assertLogs("binance-lob-archiver", level="ERROR"),
         ):
-            pending = await ARCHIVER.cancel_tasks_bounded((task,))
+            with self.assertRaises(ARCHIVER.TaskCancellationStuck):
+                await ARCHIVER.cancel_tasks_bounded((task,))
 
-        self.assertEqual(pending, 1)
         release.set()
         await task
 

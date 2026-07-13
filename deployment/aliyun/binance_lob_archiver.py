@@ -69,6 +69,7 @@ OSS_COPY_TIMEOUT_SECONDS = int(os.getenv("OSS_COPY_TIMEOUT_SECONDS", "300"))
 PROCESS_WATCHDOG_SECONDS = int(os.getenv("PROCESS_WATCHDOG_SECONDS", "180"))
 TASK_CANCEL_TIMEOUT_SECONDS = int(os.getenv("TASK_CANCEL_TIMEOUT_SECONDS", "5"))
 LAST_DATA_AT = time.monotonic()
+PROCESS_WATCHDOG_ARMED = False
 UPLOAD_STATUS: dict[str, str | None] = {
     "last_success_at": None,
     "last_error_at": None,
@@ -95,6 +96,10 @@ class SnapshotUnavailable(RuntimeError):
         self.symbol = symbol.upper()
         self.status = status
         super().__init__(f"snapshot unavailable symbol={self.symbol} status={status}")
+
+
+class TaskCancellationStuck(RuntimeError):
+    pass
 
 
 class PendingBudget:
@@ -674,6 +679,8 @@ def run_process_watchdog() -> None:
     interval = max(1.0, min(10.0, PROCESS_WATCHDOG_SECONDS / 4))
     while True:
         time.sleep(interval)
+        if not PROCESS_WATCHDOG_ARMED:
+            continue
         now = time.monotonic()
         if process_watchdog_expired(LAST_DATA_AT, now):
             LOG.critical(
@@ -683,9 +690,9 @@ def run_process_watchdog() -> None:
             os._exit(75)
 
 
-async def cancel_tasks_bounded(tasks: tuple[asyncio.Task, ...]) -> int:
+async def cancel_tasks_bounded(tasks: tuple[asyncio.Task, ...]) -> None:
     if not tasks:
-        return 0
+        return
     for task in tasks:
         task.cancel()
     _, pending = await asyncio.wait(
@@ -696,7 +703,9 @@ async def cancel_tasks_bounded(tasks: tuple[asyncio.Task, ...]) -> int:
             "task cancellation timed out pending=%s",
             len(pending),
         )
-    return len(pending)
+        raise TaskCancellationStuck(
+            f"task cancellation timed out pending={len(pending)}"
+        )
 
 
 def bridge_timed_out(
@@ -1064,8 +1073,11 @@ async def run_session(
 
 async def collect(stop: asyncio.Event) -> None:
     global SYMBOLS, SECURITY_TOKEN_SYMBOLS, EXCLUDED_SYMBOLS
+    global LAST_DATA_AT, PROCESS_WATCHDOG_ARMED
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
     recover_parts()
+    LAST_DATA_AT = time.monotonic()
+    PROCESS_WATCHDOG_ARMED = True
     runtime = ArchiveRuntime()
     backoff = 1
     initial_budget = PendingBudget(MAX_PENDING_DIFFS_TOTAL)
@@ -1115,6 +1127,15 @@ async def collect(stop: asyncio.Event) -> None:
                     )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
+            except TaskCancellationStuck:
+                write_health(
+                    states, session_id, "fatal_task_stall", runtime.total_gaps
+                )
+                LOG.critical(
+                    "receiver cancellation stuck; exiting for systemd restart",
+                    exc_info=True,
+                )
+                raise
             except Exception:
                 write_health(states, session_id, "reconnecting", runtime.total_gaps)
                 LOG.exception("websocket session failed; reconnecting in %ss", backoff)
