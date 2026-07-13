@@ -43,10 +43,14 @@ files locally and uses DuckDB for filtering, joins, feature datasets, run lineag
 and result metadata. The Rust `apps/replay` / `apps/backtest` path owns order-book
 replay, fees, latency, slippage, fills, and capacity simulation.
 
-This is a top-100 LOB replay contract, not a complete full-depth book. It is
-appropriate for Top-20/Top-50 imbalance and flow research. A strategy requiring
-deeper market-impact modeling must collect deeper snapshots in a separately
-benchmarked dataset.
+This is a deterministic replay contract for the state captured from a Top-100
+snapshot seed plus sequence-checked diffs; it is not a complete venue-depth
+contract. Deep unchanged levels can move into the visible range after enough
+near-book deletions without appearing in a diff, so manifests explicitly set
+`venue_depth_complete=false`. Top-20/Top-50 imbalance research must validate the
+acceptable snapshot age and churn window for each experiment. Strategies that
+require guaranteed depth completeness or market-impact modeling need a separately
+benchmarked deeper or periodically refreshed snapshot dataset.
 
 ClickHouse is optional for always-on shared analytics, dashboards, and derived
 realtime features. It is not required for the first backtest pipeline and should

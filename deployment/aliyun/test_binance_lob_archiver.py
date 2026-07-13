@@ -384,6 +384,42 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((await queue.get())[0], "snapshot")
 
+    async def test_initial_and_resync_snapshots_can_share_one_limiter(self):
+        calls = []
+
+        class Limiter:
+            async def fetch(self, symbol):
+                calls.append(symbol)
+                return {
+                    "symbol": symbol.upper(),
+                    "received_at_ns": len(calls),
+                    "request_started_at_ns": len(calls),
+                    "snapshot": {"lastUpdateId": len(calls), "bids": [], "asks": []},
+                }
+
+        queue = ARCHIVER.asyncio.Queue()
+        limiter = Limiter()
+        with patch.object(ARCHIVER, "SYMBOLS", ("btcusdt", "ethusdt")):
+            await ARCHIVER.produce_snapshots(queue, limiter)
+        await ARCHIVER.produce_snapshot("solusdt", queue, limiter)
+
+        self.assertEqual(calls, ["btcusdt", "ethusdt", "solusdt"])
+
+    async def test_unavailable_symbol_is_removed_from_refreshed_catalog(self):
+        symbols, security_tokens = ARCHIVER.exclude_unavailable_symbol(
+            "BADUSDT",
+            ("badusdt", "btcusdt"),
+            ("badusdt",),
+        )
+
+        self.assertEqual(symbols, ("btcusdt",))
+        self.assertEqual(security_tokens, ())
+
+    async def test_only_non_rate_limit_4xx_refreshes_symbol_catalog(self):
+        self.assertTrue(ARCHIVER.is_catalog_snapshot_error(400))
+        self.assertFalse(ARCHIVER.is_catalog_snapshot_error(429))
+        self.assertFalse(ARCHIVER.is_catalog_snapshot_error(500))
+
 
 if __name__ == "__main__":
     unittest.main()

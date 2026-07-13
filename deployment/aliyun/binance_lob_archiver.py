@@ -36,6 +36,7 @@ SYMBOLS = tuple(
     if item.strip()
 )
 SECURITY_TOKEN_SYMBOLS: tuple[str, ...] = ()
+EXCLUDED_SYMBOLS: tuple[str, ...] = ()
 MODE = os.getenv("DEPTH_MODE", "diff").strip().lower()
 SEGMENT_SECONDS = max(60, int(os.getenv("SEGMENT_SECONDS", "3600")))
 SPOOL_DIR = Path(os.getenv("SPOOL_DIR", "/data/monday/spool/binance-lob"))
@@ -84,6 +85,13 @@ class SequenceGap(RuntimeError):
             f"{symbol} sequence gap expected={expected} "
             f"received={first_update_id}-{final_update_id}"
         )
+
+
+class SnapshotUnavailable(RuntimeError):
+    def __init__(self, symbol: str, status: int) -> None:
+        self.symbol = symbol.upper()
+        self.status = status
+        super().__init__(f"snapshot unavailable symbol={self.symbol} status={status}")
 
 
 class PendingBudget:
@@ -331,7 +339,10 @@ def finalize_segment(
         "mode": MODE,
         "symbols": list(SYMBOLS),
         "security_token_symbols": list(SECURITY_TOKEN_SYMBOLS),
+        "excluded_symbols": list(EXCLUDED_SYMBOLS),
         "snapshot_limit": SNAPSHOT_LIMIT,
+        "replay_scope": "captured_snapshot_seed_plus_sequence_checked_diffs",
+        "venue_depth_complete": False,
         "events": sum(counts.values()),
         "event_types": dict(sorted(counts.items())),
         "has_replay_safe_checkpoint": replay_safe and counts["checkpoint"] > 0,
@@ -570,17 +581,53 @@ async def receive_url(url: str, queue: asyncio.Queue, stop: asyncio.Event) -> No
                 await queue.put(("diff", time.time_ns(), json.loads(message)))
 
 
-async def produce_snapshots(queue: asyncio.Queue) -> None:
-    interval = 1 / SNAPSHOT_REQUESTS_PER_SECOND
+async def produce_snapshots(
+    queue: asyncio.Queue,
+    limiter: "SnapshotRateLimiter | None" = None,
+) -> None:
+    limiter = limiter or SnapshotRateLimiter(SNAPSHOT_REQUESTS_PER_SECOND)
     for symbol in SYMBOLS:
-        started = time.monotonic()
-        snapshot = await asyncio.to_thread(fetch_snapshot_sync, symbol)
+        try:
+            snapshot = await limiter.fetch(symbol)
+        except HTTPError as error:
+            if is_catalog_snapshot_error(error.code):
+                raise SnapshotUnavailable(symbol, error.code) from error
+            raise
         await queue.put(("snapshot", snapshot["received_at_ns"], snapshot))
-        await asyncio.sleep(max(0, interval - (time.monotonic() - started)))
 
 
-async def produce_snapshot(symbol: str, queue: asyncio.Queue) -> None:
-    snapshot = await asyncio.to_thread(fetch_snapshot_sync, symbol)
+class SnapshotRateLimiter:
+    def __init__(self, requests_per_second: float) -> None:
+        self.interval = 1 / requests_per_second
+        self.next_started_at = 0.0
+        self.lock = asyncio.Lock()
+
+    async def fetch(self, symbol: str) -> dict:
+        async with self.lock:
+            now = time.monotonic()
+            delay = max(0.0, self.next_started_at - now)
+            if delay:
+                await asyncio.sleep(delay)
+            self.next_started_at = time.monotonic() + self.interval
+        return await asyncio.to_thread(fetch_snapshot_sync, symbol)
+
+
+def is_catalog_snapshot_error(status: int) -> bool:
+    return 400 <= status < 500 and status != 429
+
+
+async def produce_snapshot(
+    symbol: str,
+    queue: asyncio.Queue,
+    limiter: SnapshotRateLimiter | None = None,
+) -> None:
+    limiter = limiter or SnapshotRateLimiter(SNAPSHOT_REQUESTS_PER_SECOND)
+    try:
+        snapshot = await limiter.fetch(symbol)
+    except HTTPError as error:
+        if is_catalog_snapshot_error(error.code):
+            raise SnapshotUnavailable(symbol, error.code) from error
+        raise
     await queue.put(("snapshot", snapshot["received_at_ns"], snapshot))
 
 
@@ -608,6 +655,18 @@ def bridge_timed_out(
 
 def begin_resync(now: float) -> tuple[bool, float]:
     return False, now + SYNC_TIMEOUT_SECONDS
+
+
+def exclude_unavailable_symbol(
+    symbol: str,
+    symbols: tuple[str, ...],
+    security_tokens: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    unavailable = symbol.lower()
+    return (
+        tuple(item for item in symbols if item != unavailable),
+        tuple(item for item in security_tokens if item != unavailable),
+    )
 
 
 def disk_headroom() -> tuple[float, bool]:
@@ -640,6 +699,7 @@ def write_health(
         "dataset": DATASET,
         "symbol_count": len(states),
         "security_token_count": len(SECURITY_TOKEN_SYMBOLS),
+        "excluded_symbols": list(EXCLUDED_SYMBOLS),
         "session_id": session_id,
         "sequence_gaps": gaps,
         "disk_free_gb": disk_free_gb,
@@ -770,9 +830,10 @@ async def run_session(
     receivers = [
         asyncio.create_task(receive_url(url, queue, stop)) for url in stream_urls()
     ]
-    snapshotter = asyncio.create_task(produce_snapshots(queue))
+    snapshot_limiter = SnapshotRateLimiter(SNAPSHOT_REQUESTS_PER_SECOND)
+    snapshotter = asyncio.create_task(produce_snapshots(queue, snapshot_limiter))
     tasks = [*receivers, snapshotter]
-    resync_tasks: set[asyncio.Task] = set()
+    resync_tasks: dict[str, asyncio.Task] = {}
     LOG.info(
         "connected market=%s symbols=%s websocket_shards=%s session=%s",
         MARKET,
@@ -860,11 +921,12 @@ async def run_session(
                 previously_synced, sync_deadline = begin_resync(time.monotonic())
                 write_health(states, session_id, "resyncing", runtime.total_gaps)
                 await runtime.rotate(states, session_id, "sequence_gap")
-                resync_tasks.add(
-                    asyncio.create_task(
-                        produce_snapshot(gap.symbol.lower(), queue)
+                if gap.symbol not in resync_tasks or resync_tasks[gap.symbol].done():
+                    resync_tasks[gap.symbol] = asyncio.create_task(
+                        produce_snapshot(
+                            gap.symbol.lower(), queue, snapshot_limiter
+                        )
                     )
-                )
                 continue
 
             if snapshotter.done():
@@ -888,10 +950,10 @@ async def run_session(
                 for receiver in receivers:
                     if receiver.done():
                         await receiver
-                for task in tuple(resync_tasks):
+                for symbol, task in tuple(resync_tasks.items()):
                     if task.done():
                         await task
-                        resync_tasks.remove(task)
+                        del resync_tasks[symbol]
                 last_task_check = now
             if now - last_disk_check >= 60:
                 warn_if_disk_low()
@@ -901,9 +963,11 @@ async def run_session(
         failure = error
         raise
     finally:
-        for task in [*tasks, *resync_tasks]:
+        for task in [*tasks, *resync_tasks.values()]:
             task.cancel()
-        await asyncio.gather(*tasks, *resync_tasks, return_exceptions=True)
+        await asyncio.gather(
+            *tasks, *resync_tasks.values(), return_exceptions=True
+        )
         archive_only = isinstance(failure, SequenceGap)
         drain_gap: SequenceGap | None = None
         while not queue.empty():
@@ -947,6 +1011,7 @@ async def run_session(
 
 
 async def collect(stop: asyncio.Event) -> None:
+    global SYMBOLS, SECURITY_TOKEN_SYMBOLS, EXCLUDED_SYMBOLS
     SPOOL_DIR.mkdir(parents=True, exist_ok=True)
     recover_parts()
     runtime = ArchiveRuntime()
@@ -975,6 +1040,27 @@ async def collect(stop: asyncio.Event) -> None:
                 write_health(states, session_id, "sequence_gap", runtime.total_gaps)
                 LOG.exception("sequence gap; reconnecting in %ss", backoff)
                 await runtime.rotate(states, session_id, "sequence_gap")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+            except SnapshotUnavailable as error:
+                write_health(
+                    states, session_id, "catalog_refresh", runtime.total_gaps
+                )
+                LOG.exception(
+                    "snapshot rejected; refreshing catalog and excluding %s",
+                    error.symbol,
+                )
+                await runtime.rotate(states, session_id, "snapshot_unavailable")
+                if SYMBOLS_SETTING.upper() == "ALL":
+                    discovered, security_tokens = await asyncio.to_thread(
+                        discover_symbols_sync
+                    )
+                    SYMBOLS, SECURITY_TOKEN_SYMBOLS = exclude_unavailable_symbol(
+                        error.symbol, discovered, security_tokens
+                    )
+                    EXCLUDED_SYMBOLS = tuple(
+                        sorted({*EXCLUDED_SYMBOLS, error.symbol.lower()})
+                    )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
             except Exception:
@@ -1010,6 +1096,10 @@ def self_test() -> None:
         assert manifest is not None
         metadata = json.loads(manifest.read_text())
         assert metadata["schema"] == "binance.lob_tape.v2"
+        assert metadata["replay_scope"] == (
+            "captured_snapshot_seed_plus_sequence_checked_diffs"
+        )
+        assert metadata["venue_depth_complete"] is False
         assert metadata["event_types"] == {"checkpoint": 1, "snapshot": 1}
         assert metadata["sha256"] == sha256(manifest.with_name(metadata["file"]))
     print("self-test: ok")
