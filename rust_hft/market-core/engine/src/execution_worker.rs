@@ -13,16 +13,20 @@ use futures::{FutureExt, StreamExt};
 use hft_core::{now_micros, AccountId, HftError, LatencyStage, OrderId, Price, Quantity};
 use hft_core::{Symbol, VenueId};
 use ports::{
-    AccountBalance, BoxStream, ExecutionClient, ExecutionEvent, ExecutionRouter, OpenOrder,
-    OrderIntent, OrderIntentEnvelope,
+    AccountBalance, ExecutionClient, ExecutionEvent, ExecutionRouter, OpenOrder, OrderIntent,
+    OrderIntentEnvelope,
 };
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+type IndexedExecutionStream =
+    Pin<Box<dyn futures::Stream<Item = (usize, Result<ExecutionEvent, HftError>)> + Send>>;
 
 /// 客户端选择策略
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,7 +120,7 @@ pub struct ExecutionWorker {
     config: ExecutionWorkerConfig,
     queues: WorkerQueues,
     execution_clients: Vec<Box<dyn ExecutionClient>>,
-    execution_streams: SelectAll<BoxStream<ExecutionEvent>>,
+    execution_streams: SelectAll<IndexedExecutionStream>,
     stats: ExecutionWorkerStats,
     /// 订单 ID 到客户端索引的映射
     order_to_client: FxHashMap<OrderId, usize>,
@@ -142,8 +146,10 @@ pub struct ExecutionWorker {
     /// Emergency is sticky for the worker lifetime; restart is required to re-arm execution.
     accepting_intents: bool,
     emergency_latched: bool,
+    stream_recovery_pending: bool,
+    client_connected: Vec<bool>,
     intents_buf: Vec<OrderIntentEnvelope>,
-    execution_events_buf: Vec<ExecutionEvent>,
+    execution_events_buf: Vec<(usize, ExecutionEvent)>,
 }
 
 impl ExecutionWorker {
@@ -207,6 +213,7 @@ impl ExecutionWorker {
     ) -> Self {
         let latency_monitor = Arc::new(LatencyMonitor::new(config.latency_monitor.clone()));
         let batch_size = config.batch_size;
+        let client_count = execution_clients.len();
 
         Self {
             config,
@@ -227,6 +234,8 @@ impl ExecutionWorker {
             account_to_client: FxHashMap::default(),
             accepting_intents: true,
             emergency_latched: false,
+            stream_recovery_pending: false,
+            client_connected: vec![true; client_count],
             intents_buf: Vec::with_capacity(batch_size),
             execution_events_buf: Vec::with_capacity(batch_size),
         }
@@ -243,6 +252,7 @@ impl ExecutionWorker {
     ) -> Self {
         let latency_monitor = Arc::new(LatencyMonitor::new(config.latency_monitor.clone()));
         let batch_size = config.batch_size;
+        let client_count = execution_clients.len();
 
         Self {
             config,
@@ -263,6 +273,8 @@ impl ExecutionWorker {
             account_to_client: FxHashMap::default(),
             accepting_intents: true,
             emergency_latched: false,
+            stream_recovery_pending: false,
+            client_connected: vec![true; client_count],
             intents_buf: Vec::with_capacity(batch_size),
             execution_events_buf: Vec::with_capacity(batch_size),
         }
@@ -414,7 +426,8 @@ impl ExecutionWorker {
         for (idx, client) in self.execution_clients.iter().enumerate() {
             match client.execution_stream().await {
                 Ok(stream) => {
-                    self.execution_streams.push(stream);
+                    self.execution_streams
+                        .push(Box::pin(stream.map(move |result| (idx, result))));
                     debug!("执行客户端 {} 回报流准备完成", idx);
                 }
                 Err(e) => {
@@ -673,14 +686,14 @@ impl ExecutionWorker {
         let mut events_count = 0;
         let mut execution_events = std::mem::take(&mut self.execution_events_buf);
         execution_events.clear();
-        let mut stream_failed = false;
+        let mut stream_failed = None;
 
         while execution_events.len() < self.config.batch_size {
             match self.execution_streams.next().now_or_never() {
-                Some(Some(Ok(event))) => execution_events.push(event),
-                Some(Some(Err(e))) => {
+                Some(Some((client_idx, Ok(event)))) => execution_events.push((client_idx, event)),
+                Some(Some((client_idx, Err(e)))) => {
                     warn!("执行回报流错误: {}", e);
-                    stream_failed = true;
+                    stream_failed = Some(client_idx);
                     break;
                 }
                 Some(None) => {
@@ -688,62 +701,115 @@ impl ExecutionWorker {
                         continue;
                     }
                     debug!("所有执行回报流已结束");
-                    stream_failed = true;
+                    self.accepting_intents = false;
+                    self.stream_recovery_pending = true;
+                    self.client_connected.fill(false);
                     break;
                 }
                 None => break,
             }
         }
 
-        if stream_failed {
+        if let Some(client_idx) = stream_failed {
             self.accepting_intents = false;
-            self.emergency_latched = true;
-            execution_events.push(ExecutionEvent::ConnectionStatus {
-                connected: false,
-                timestamp: now_micros(),
-            });
+            self.stream_recovery_pending = true;
+            if let Some(connected) = self.client_connected.get_mut(client_idx) {
+                *connected = false;
+            }
+            execution_events.push((
+                client_idx,
+                ExecutionEvent::ConnectionStatus {
+                    connected: false,
+                    timestamp: now_micros(),
+                },
+            ));
         }
 
-        for event in execution_events.drain(..) {
+        let mut requires_reconciliation = false;
+        for (client_idx, event) in execution_events.drain(..) {
+            requires_reconciliation |= matches!(
+                event,
+                ExecutionEvent::ConnectionStatus {
+                    connected: true,
+                    ..
+                } | ExecutionEvent::ReconciliationRequired { .. }
+            );
+            self.update_connection_tracking(client_idx, &event);
             self.update_execution_tracking(&event);
             self.queues.send_event_reliable(event).await;
             self.stats.events_sent += 1;
             events_count += 1;
         }
         self.execution_events_buf = execution_events;
+        if requires_reconciliation {
+            self.reconcile_open_orders().await;
+        }
 
         events_count
     }
 
     async fn handle_execution_stream_item(
         &mut self,
-        item: Option<Result<ExecutionEvent, HftError>>,
+        item: Option<(usize, Result<ExecutionEvent, HftError>)>,
     ) {
         match item {
-            Some(Ok(event)) => {
+            Some((client_idx, Ok(event))) => {
+                let requires_reconciliation = matches!(
+                    event,
+                    ExecutionEvent::ConnectionStatus {
+                        connected: true,
+                        ..
+                    } | ExecutionEvent::ReconciliationRequired { .. }
+                );
+                self.update_connection_tracking(client_idx, &event);
                 self.update_execution_tracking(&event);
                 self.queues.send_event_reliable(event).await;
                 self.stats.events_sent += 1;
+                if requires_reconciliation {
+                    self.reconcile_open_orders().await;
+                }
             }
-            Some(Err(error)) => {
+            Some((client_idx, Err(error))) => {
                 warn!("执行回报流错误: {}", error);
-                self.latch_on_execution_stream_failure().await;
+                self.latch_on_execution_stream_failure(client_idx).await;
             }
             None => {
                 warn!("所有执行回报流已结束");
-                self.latch_on_execution_stream_failure().await;
+                self.accepting_intents = false;
+                self.stream_recovery_pending = true;
+                self.client_connected.fill(false);
+                self.queues
+                    .send_event_reliable(ExecutionEvent::ConnectionStatus {
+                        connected: false,
+                        timestamp: now_micros(),
+                    })
+                    .await;
             }
+        }
+    }
+
+    fn update_connection_tracking(&mut self, client_idx: usize, event: &ExecutionEvent) {
+        match event {
+            ExecutionEvent::ConnectionStatus { connected, .. } => {
+                if let Some(state) = self.client_connected.get_mut(client_idx) {
+                    *state = *connected;
+                }
+                if !connected {
+                    self.accepting_intents = false;
+                    self.stream_recovery_pending = true;
+                }
+            }
+            ExecutionEvent::ReconciliationRequired { reason, .. } => {
+                warn!(client_idx, %reason, "private execution events were missed; reconciliation required");
+                self.accepting_intents = false;
+                self.stream_recovery_pending = true;
+            }
+            _ => {}
         }
     }
 
     fn update_execution_tracking(&mut self, event: &ExecutionEvent) {
         match event {
-            ExecutionEvent::ConnectionStatus {
-                connected: false, ..
-            } => {
-                self.accepting_intents = false;
-                self.emergency_latched = true;
-            }
             ExecutionEvent::OrderAck { order_id, .. } => {
                 self.pending_acks.remove(order_id);
             }
@@ -792,9 +858,12 @@ impl ExecutionWorker {
         }
     }
 
-    async fn latch_on_execution_stream_failure(&mut self) {
+    async fn latch_on_execution_stream_failure(&mut self, client_idx: usize) {
         self.accepting_intents = false;
-        self.emergency_latched = true;
+        self.stream_recovery_pending = true;
+        if let Some(connected) = self.client_connected.get_mut(client_idx) {
+            *connected = false;
+        }
         self.queues
             .send_event_reliable(ExecutionEvent::ConnectionStatus {
                 connected: false,
@@ -943,6 +1012,8 @@ impl ExecutionWorker {
             ControlCommand::SetIntake { enabled, reply } => {
                 let result = if enabled && self.emergency_latched {
                     Err("execution intake is emergency-latched; restart required".to_string())
+                } else if enabled && self.stream_recovery_pending {
+                    Err("execution intake is waiting for private-stream reconciliation".to_string())
                 } else {
                     self.accepting_intents = enabled;
                     Ok(())
@@ -1296,7 +1367,48 @@ impl ExecutionWorker {
         if self.config.auto_cancel_exchange_only {
             debug!("exchange-only auto-cancel requires a runtime OMS comparison");
         }
+        if self.stream_recovery_pending
+            && complete
+            && self.client_connected.iter().all(|connected| *connected)
+            && self.recovery_snapshot_matches(&snapshot)
+        {
+            self.stream_recovery_pending = false;
+            if !self.emergency_latched {
+                self.accepting_intents = true;
+                info!("private execution streams reconciled; execution intake restored");
+            }
+        }
         complete
+    }
+
+    fn recovery_snapshot_matches(&self, snapshot: &WorkerReconcileSnapshot) -> bool {
+        for client in &snapshot.clients {
+            let Ok(exchange_orders) = &client.open_orders else {
+                return false;
+            };
+            let local_orders = self
+                .tracked_orders
+                .iter()
+                .filter(|(order_id, _)| {
+                    self.order_to_client.get(*order_id).copied() == Some(client.client_index)
+                })
+                .collect::<Vec<_>>();
+            if local_orders.len() != exchange_orders.len() {
+                return false;
+            }
+            for (local_id, local) in local_orders {
+                let Some(exchange) = exchange_orders.iter().find(|order| {
+                    order.order_id == *local_id
+                        || order.client_order_id.as_deref() == Some(local_id.0.as_str())
+                }) else {
+                    return false;
+                };
+                if exchange.remaining_quantity != local.remaining_quantity {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     async fn collect_reconcile_snapshot(
@@ -1344,6 +1456,7 @@ impl ExecutionWorker {
 mod tests {
     use super::*;
     use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
+    use ports::BoxStream;
     use ports::{ConnectionHealth, HftResult, OrderIntent};
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
@@ -1368,6 +1481,7 @@ mod tests {
     struct MockExecutionState {
         placed: Vec<Symbol>,
         canceled: Vec<OrderId>,
+        open_orders: Vec<OpenOrder>,
     }
 
     struct MockExecutionClient {
@@ -1414,7 +1528,7 @@ mod tests {
             if self.list_error {
                 Err(HftError::Network("open-order snapshot failed".to_string()))
             } else {
-                Ok(Vec::new())
+                Ok(self.state.lock().unwrap().open_orders.clone())
             }
         }
 
@@ -1695,6 +1809,118 @@ mod tests {
         assert_eq!(snapshot.clients.len(), 1);
         assert!(snapshot.clients[0].open_orders.is_err());
         assert!(!snapshot.is_complete());
+    }
+
+    #[tokio::test]
+    async fn private_stream_event_gap_restores_intake_after_exact_order_match() {
+        let local_id = OrderId("client-1".to_string());
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            open_orders: vec![OpenOrder {
+                order_id: OrderId("exchange-7".to_string()),
+                client_order_id: Some(local_id.0.clone()),
+                symbol: Symbol::new("BTCUSDT"),
+                side: Side::Buy,
+                order_type: OrderType::Limit,
+                original_quantity: Quantity::from_f64(1.0).unwrap(),
+                remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                filled_quantity: Quantity::zero(),
+                price: Some(Price::from_f64(100.0).unwrap()),
+                status: ports::OrderStatus::Acknowledged,
+                created_at: 1,
+                updated_at: 1,
+            }],
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state,
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker.order_to_client.insert(local_id.clone(), 0);
+        worker.tracked_orders.insert(
+            local_id,
+            TrackedOrder {
+                symbol: Symbol::new("BTCUSDT"),
+                strategy_id: "test".to_string(),
+                venue: Some(VenueId::MOCK),
+                account_id: None,
+                remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                processed_fill_ids: HashSet::new(),
+            },
+        );
+        worker.update_connection_tracking(
+            0,
+            &ExecutionEvent::ReconciliationRequired {
+                reason: "broadcast subscriber lagged".to_string(),
+                timestamp: 1,
+            },
+        );
+        assert!(worker.client_connected[0]);
+        assert!(!worker.accepting_intents);
+
+        assert!(worker.reconcile_open_orders().await);
+        assert!(worker.accepting_intents);
+        assert!(!worker.stream_recovery_pending);
+    }
+
+    #[tokio::test]
+    async fn private_stream_reconnect_stays_latched_when_local_order_is_missing() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let local_id = OrderId("client-missing".to_string());
+        worker.order_to_client.insert(local_id.clone(), 0);
+        worker.tracked_orders.insert(
+            local_id,
+            TrackedOrder {
+                symbol: Symbol::new("BTCUSDT"),
+                strategy_id: "test".to_string(),
+                venue: Some(VenueId::MOCK),
+                account_id: None,
+                remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                processed_fill_ids: HashSet::new(),
+            },
+        );
+        worker.update_connection_tracking(
+            0,
+            &ExecutionEvent::ConnectionStatus {
+                connected: false,
+                timestamp: 1,
+            },
+        );
+        worker.update_connection_tracking(
+            0,
+            &ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp: 2,
+            },
+        );
+
+        assert!(worker.reconcile_open_orders().await);
+        assert!(!worker.accepting_intents);
+        assert!(worker.stream_recovery_pending);
     }
 
     #[tokio::test]

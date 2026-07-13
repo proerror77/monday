@@ -516,6 +516,12 @@ pub enum ExecutionEvent {
         connected: bool,
         timestamp: Timestamp,
     },
+    /// The transport is still connected, but one or more private events were missed.
+    /// Order intake must remain disabled until an authoritative reconciliation succeeds.
+    ReconciliationRequired {
+        reason: String,
+        timestamp: Timestamp,
+    },
 }
 
 /// 套利機會事件
