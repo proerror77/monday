@@ -327,6 +327,7 @@ jobs:
       - clippy-strict
       - container-scan
       - secret-detection
+      - sbom
     if: always()
     steps:
       - name: Download cargo audit results
@@ -342,6 +343,7 @@ jobs:
           path: license-report
 
       - name: Download SBOM
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/download-artifact@v4
         with:
           name: sbom
@@ -373,7 +375,9 @@ jobs:
           echo "## Artifacts" >> security-summary.md
           echo "- Audit results: cargo-audit-results/audit-results.json" >> security-summary.md
           echo "- License report: license-report/licenses.json" >> security-summary.md
-          echo "- SBOM: sbom.json" >> security-summary.md
+          if [ -f sbom/sbom.json ]; then
+            echo "- SBOM: sbom/sbom.json" >> security-summary.md
+          fi
 
           cat security-summary.md
 
