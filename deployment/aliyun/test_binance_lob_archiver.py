@@ -219,6 +219,21 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         finalize.assert_not_called()
         self.assertIn("invalid middle", logs.output[0])
 
+    async def test_recovery_quarantines_schema_invalid_middle_json(self):
+        path = ARCHIVER.SPOOL_DIR / "part-1.jsonl.part"
+        valid = b'{"received_at_ns":1,"type":"diff"}\n'
+        path.write_bytes(valid + b"null\n" + valid)
+
+        with (
+            patch.object(ARCHIVER, "finalize_segment") as finalize,
+            self.assertLogs("binance-lob-archiver", level="ERROR"),
+        ):
+            ARCHIVER.recover_parts()
+
+        self.assertFalse(path.exists())
+        self.assertTrue(path.with_suffix(path.suffix + ".corrupt").exists())
+        finalize.assert_not_called()
+
     async def test_partial_market_state_cannot_emit_replay_safe_checkpoint(self):
         runtime = ARCHIVER.ArchiveRuntime()
         synced = ARCHIVER.OrderBookState("BTCUSDT")

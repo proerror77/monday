@@ -447,6 +447,8 @@ def recover_parts() -> None:
                     break
                 try:
                     event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise ValueError("archive event must be a JSON object")
                     received = int(event["received_at_ns"])
                     event_type = event.get("type")
                     if event_type is None:
@@ -457,7 +459,13 @@ def recover_parts() -> None:
                         start_ns = received
                     end_ns = received
                     valid_lines += 1
-                except (ValueError, KeyError, json.JSONDecodeError):
+                except (
+                    AttributeError,
+                    TypeError,
+                    ValueError,
+                    KeyError,
+                    json.JSONDecodeError,
+                ):
                     if source.read(1):
                         quarantine = path.with_suffix(path.suffix + ".corrupt")
                         source.close()
