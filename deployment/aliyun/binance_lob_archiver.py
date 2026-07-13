@@ -436,11 +436,15 @@ def recover_parts() -> None:
         counts = Counter()
         start_ns = end_ns = path.stat().st_mtime_ns
         schema = "binance.lob_tape.v2"
-        dropped = 0
         valid_lines = 0
-        recovering = path.with_suffix(path.suffix + ".recovering")
-        with path.open("rb") as source, recovering.open("wb") as target:
-            for line in source:
+        corrupted = False
+        path.with_suffix(path.suffix + ".recovering").unlink(missing_ok=True)
+        with path.open("rb+") as source:
+            while True:
+                line_start = source.tell()
+                line = source.readline()
+                if not line:
+                    break
                 try:
                     event = json.loads(line)
                     received = int(event["received_at_ns"])
@@ -452,17 +456,30 @@ def recover_parts() -> None:
                     if valid_lines == 0:
                         start_ns = received
                     end_ns = received
-                    target.write(line if line.endswith(b"\n") else line + b"\n")
                     valid_lines += 1
                 except (ValueError, KeyError, json.JSONDecodeError):
-                    dropped += 1
-            target.flush()
-            os.fsync(target.fileno())
-        recovering.replace(path)
-        if dropped:
-            LOG.warning(
-                "recovery dropped %s invalid JSONL line(s): %s", dropped, path
-            )
+                    if source.read(1):
+                        quarantine = path.with_suffix(path.suffix + ".corrupt")
+                        source.close()
+                        path.replace(quarantine)
+                        LOG.error(
+                            "recovery quarantined JSONL with an invalid middle "
+                            "record: %s",
+                            quarantine,
+                        )
+                        corrupted = True
+                    else:
+                        source.seek(line_start)
+                        source.truncate()
+                        source.flush()
+                        os.fsync(source.fileno())
+                        LOG.warning(
+                            "recovery dropped 1 invalid trailing JSONL line: %s",
+                            path,
+                        )
+                    break
+        if corrupted:
+            continue
         finalize_segment(
             path,
             counts,

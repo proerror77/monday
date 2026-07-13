@@ -201,7 +201,23 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(path.read_bytes(), valid)
         counts = finalize.call_args.args[1]
         self.assertEqual(counts, ARCHIVER.Counter({"diff": 1}))
-        self.assertIn("dropped 1 invalid", logs.output[0])
+        self.assertIn("invalid trailing", logs.output[0])
+
+    async def test_recovery_quarantines_invalid_middle_json(self):
+        path = ARCHIVER.SPOOL_DIR / "part-1.jsonl.part"
+        valid = b'{"received_at_ns":1,"type":"diff"}\n'
+        path.write_bytes(valid + b"not-json\n" + valid)
+
+        with (
+            patch.object(ARCHIVER, "finalize_segment") as finalize,
+            self.assertLogs("binance-lob-archiver", level="ERROR") as logs,
+        ):
+            ARCHIVER.recover_parts()
+
+        self.assertFalse(path.exists())
+        self.assertTrue(path.with_suffix(path.suffix + ".corrupt").exists())
+        finalize.assert_not_called()
+        self.assertIn("invalid middle", logs.output[0])
 
     async def test_partial_market_state_cannot_emit_replay_safe_checkpoint(self):
         runtime = ARCHIVER.ArchiveRuntime()
