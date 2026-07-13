@@ -166,6 +166,23 @@ impl BinanceSigner {
         format!("{}&signature={}", query, signature)
     }
 
+    /// Add the authentication fields required by Binance Spot WebSocket API SIGNED requests.
+    pub fn sign_ws_api_params(&self, params: &mut HashMap<String, String>) {
+        params.insert("apiKey".to_string(), self.credentials.api_key.clone());
+        params.insert(
+            "timestamp".to_string(),
+            Self::current_timestamp().to_string(),
+        );
+        let mut query_pairs: Vec<_> = params.iter().collect();
+        query_pairs.sort_by_key(|(key, _)| *key);
+        let query = query_pairs
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        params.insert("signature".to_string(), self.sign_query(&query));
+    }
+
     /// 生成请求头
     pub fn generate_headers(&self) -> HashMap<String, String> {
         let mut headers = HashMap::new();
@@ -384,6 +401,21 @@ mod tests {
         let query = signer.sign_request(&mut params);
         assert!(query.contains("signature="));
         assert!(query.contains("timestamp="));
+    }
+
+    #[test]
+    fn binance_ws_api_params_include_stable_auth_fields() {
+        let signer = BinanceSigner::new(BinanceCredentials::new(
+            "test_key".to_string(),
+            "test_secret".to_string(),
+        ));
+        let mut params = HashMap::from([("symbol".to_string(), "BTCUSDT".to_string())]);
+
+        signer.sign_ws_api_params(&mut params);
+
+        assert_eq!(params.get("apiKey").map(String::as_str), Some("test_key"));
+        assert!(params.contains_key("timestamp"));
+        assert_eq!(params.get("signature").map(String::len), Some(64));
     }
 
     #[test]
