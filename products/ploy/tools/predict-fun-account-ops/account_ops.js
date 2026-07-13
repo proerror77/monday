@@ -7,6 +7,11 @@ const { JsonRpcProvider, Wallet, getAddress, parseUnits } = require("ethers");
 const { ChainId, OrderBuilder, Side } = require("@predictdotfun/sdk");
 
 const PLAN_TTL_MS = 10 * 60 * 1000;
+const MONDAY_WRITE_DISABLED = "is disabled inside Monday; route execution and reconciliation through rust_hft";
+
+function rejectMondayWrite(operation) {
+  throw new Error(`${operation} ${MONDAY_WRITE_DISABLED}`);
+}
 const OFFICIAL_NETWORKS = Object.freeze({
   56: "https://api.predict.fun",
   97: "https://api-testnet.predict.fun",
@@ -328,7 +333,7 @@ async function checkApprovals(plan, session) {
 }
 
 async function executeApprovals(plan, expectedHash, env = process.env, dependencies = {}) {
-  if (env.PLOY_PREDICT_APPROVAL_WRITE_ENABLED !== "true") throw new Error("Predict approval writes are disabled");
+  rejectMondayWrite("Predict approval execution");
   const context = runtimeContext(env);
   validatePlan(plan, context, expectedHash, nowFrom(dependencies));
   const session = dependencies.session || await makeWalletSession(context, env);
@@ -431,7 +436,7 @@ function assertMarketUnchanged(plan, market) {
 }
 
 async function executeOrderPlan(plan, expectedHash, env = process.env, dependencies = {}) {
-  if (env.PLOY_PREDICT_ACCOUNT_OPS_WRITE_ENABLED !== "true") throw new Error("Predict account-op writes are disabled");
+  rejectMondayWrite("Predict order execution");
   const context = runtimeContext(env);
   validatePlan(plan, context, expectedHash, nowFrom(dependencies));
   const market = dependencies.market || await fetchMarket(plan.market.id, context, env);
@@ -501,7 +506,7 @@ function positionAmountWei(amount) {
 }
 
 async function executeRedeemPlan(plan, expectedHash, env = process.env, dependencies = {}) {
-  if (env.PLOY_PREDICT_ACCOUNT_OPS_WRITE_ENABLED !== "true") throw new Error("Predict account-op writes are disabled");
+  rejectMondayWrite("Predict redemption execution");
   const context = runtimeContext(env);
   validatePlan(plan, context, expectedHash, nowFrom(dependencies));
   const positions = dependencies.positions || await fetchPositions(context, env);
@@ -538,7 +543,7 @@ async function executeRedeemPlan(plan, expectedHash, env = process.env, dependen
 }
 
 async function reconcileOrder(plan, expectedHash, env = process.env, dependencies = {}) {
-  if (env.PLOY_PREDICT_RECONCILE_WRITE_ENABLED !== "true") throw new Error("Predict reconciliation writes are disabled");
+  rejectMondayWrite("Predict order reconciliation");
   const context = runtimeContext(env);
   validatePlan(plan, context, expectedHash, nowFrom(dependencies), true);
   const operationIdValue = operationId(plan);
@@ -567,7 +572,7 @@ async function reconcileOrder(plan, expectedHash, env = process.env, dependencie
 }
 
 async function reconcileRedeem(plan, expectedHash, env = process.env, dependencies = {}) {
-  if (env.PLOY_PREDICT_RECONCILE_WRITE_ENABLED !== "true") throw new Error("Predict reconciliation writes are disabled");
+  rejectMondayWrite("Predict redemption reconciliation");
   const context = runtimeContext(env);
   validatePlan(plan, context, expectedHash, nowFrom(dependencies), true);
   const operationIdValue = operationId(plan);

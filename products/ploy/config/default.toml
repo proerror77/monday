@@ -71,10 +71,11 @@ hard_disable_internal_agents = false
 # then builds a conservative "true probability" estimate per company and compares
 # against Polymarket order book asks to find mispricing.
 #
-# To enable any live order path, use the workspace control plane
-# (`new-ployd` / `ployctl` / deployment manifests), set authentication env
-# vars, and complete the explicit deployment checklist. Do not use the archived
-# single-binary `ploy run` path for new live work.
+# Historical standalone PLOY control-plane and deployment instructions are not
+# operational inside Monday. This configuration cannot enable live execution.
+# Any future connection to an order path requires a separate reviewed Monday change
+# that routes through Monday's `rust_hft` risk, OMS, reconciliation, and execution
+# authority.
 #
 # [event_edge_agent]
 # enabled = false

@@ -1,5 +1,9 @@
 # Emergency Stop
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 ## Option 1: API Stop (Preferred)
 
 Sends a graceful shutdown signal through the application. Cancels open orders

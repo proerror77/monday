@@ -1,5 +1,9 @@
 # Strategy Runtime Evidence Reset Runbook
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 This runbook is for clearing contaminated dry-run or paper strategy runtime
 evidence after a strategy cutover. It intentionally does not reset raw market
 data, official settlements, Polymarket metadata, Binance/Deribit data, or CLOB

@@ -1,20 +1,25 @@
 # Platform Deploy Runbook
 
-## Deployment Paths
+> **Historical standalone PLOY runbook.** The workflows and host paths below are
+> retained as migration evidence only. They are nested under `products/ploy`, are
+> not executed by GitHub, and are not approved Monday deployment entrypoints.
+> Monday `rust_hft` remains the only production execution authority.
 
-Aliyun host mutation is split by role:
+## Historical Deployment Paths
+
+The former standalone Aliyun host mutation topology was split by role:
 
 - `.github/workflows/deploy-tango-1-1.yml`: data collection, research,
   replay, and dry-run only. The bundle contains no live manifest, live config,
   signing key, or live-resume gate.
 - `.github/workflows/deploy-trade.yml`: immutable exact-main-SHA trade control
   plane, installed under `/opt/ploy/releases/<sha>` and staged paused.
-- `.github/workflows/approve-live-trade.yml`: the only live resume path, behind
+- `.github/workflows/approve-live-trade.yml`: the former live resume path, behind
   artifact validation and the protected `ploy-trade-live` human environment.
 
-`.github/workflows/release-platform.yml` is build-only. It packages and
-checksums the portable platform bundle but has no remote host credentials or
-deployment job, so it cannot become a third production path.
+`.github/workflows/release-platform.yml` was build-only. It packaged and
+checksummed the portable platform bundle without remote host credentials or a
+deployment job.
 
 ## Host Identity Bootstrap
 

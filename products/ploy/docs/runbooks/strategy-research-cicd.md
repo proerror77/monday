@@ -1,5 +1,9 @@
 # Strategy-Agnostic Research and Runtime CI/CD Runbook
 
+> **Historical standalone PLOY workflow guide.** Workflow references below point to
+> nested PLOY files that GitHub does not execute inside Monday. Use the root
+> `.github/workflows/ploy-ci.yml` for current PLOY validation.
+
 This runbook defines the generic path for any strategy family to move from an
 idea to research evidence, implementation, dry-run observation, parity review,
 and promotion or rejection.

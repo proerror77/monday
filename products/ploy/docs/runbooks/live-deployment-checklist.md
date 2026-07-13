@@ -1,5 +1,9 @@
 # Live Deployment Checklist
 
+> **Historical standalone PLOY checklist.** Do not use this document to deploy or
+> resume trading from Monday. The referenced nested workflows and former hosts are
+> inactive migration evidence; PLOY live execution remains disabled.
+
 ## Goal
 
 Validate a remote `ployd` host before enabling real live trading.

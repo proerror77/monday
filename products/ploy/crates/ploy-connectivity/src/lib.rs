@@ -182,6 +182,48 @@ pub trait LiveExecutionGateway: Send + Sync + std::fmt::Debug {
     }
 }
 
+pub const MONDAY_LIVE_EXECUTION_DISABLED: &str =
+    "PLOY live execution is disabled in Monday; rust_hft is the only production execution authority";
+
+fn monday_live_execution_disabled_error() -> ExecutionError {
+    ExecutionError::Configuration(MONDAY_LIVE_EXECUTION_DISABLED.to_string())
+}
+
+/// Production gateway for the PLOY workspace after its migration into Monday.
+///
+/// Every live operation fails closed. Test-only gateway injection remains in
+/// `ploy-daemon-host`, but production entrypoints cannot replace this gateway.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DisabledLiveExecutionGateway;
+
+impl LiveExecutionGateway for DisabledLiveExecutionGateway {
+    fn probe(&self) -> Result<(), ExecutionError> {
+        Err(monday_live_execution_disabled_error())
+    }
+
+    fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
+        Err(monday_live_execution_disabled_error())
+    }
+
+    fn cancel(
+        &self,
+        _request: &CancellationRequest,
+    ) -> Result<CancellationOutcome, ExecutionError> {
+        Err(monday_live_execution_disabled_error())
+    }
+
+    fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
+        Err(monday_live_execution_disabled_error())
+    }
+
+    fn reconcile_fills(
+        &self,
+        _tracked_orders: &[TrackedOrder],
+    ) -> Result<Vec<FillRecord>, ExecutionError> {
+        Err(monday_live_execution_disabled_error())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StaticExecutionGateway {
     probe_result: Result<(), ExecutionError>,
@@ -549,7 +591,7 @@ impl UserEventStream {
 }
 
 #[derive(Debug, Clone)]
-pub struct PolymarketExecutionGateway {
+struct PolymarketExecutionGateway {
     config: PolymarketExecutionConfig,
     runtime: Arc<tokio::runtime::Runtime>,
     signer: Arc<OnceLock<PrivateKeySigner>>,
@@ -559,11 +601,11 @@ pub struct PolymarketExecutionGateway {
 }
 
 impl PolymarketExecutionGateway {
-    pub fn from_env() -> Result<Self, ExecutionError> {
+    fn from_env() -> Result<Self, ExecutionError> {
         Ok(Self::new(PolymarketExecutionConfig::from_env()?))
     }
 
-    pub fn new(config: PolymarketExecutionConfig) -> Self {
+    fn new(config: PolymarketExecutionConfig) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("ploy-polymarket-gateway")
@@ -668,7 +710,7 @@ impl PolymarketExecutionGateway {
         }
     }
 
-    pub fn account_readiness(
+    fn account_readiness(
         &self,
         required_pusd: Decimal,
     ) -> Result<PolymarketAccountReadiness, ExecutionError> {
@@ -1903,10 +1945,11 @@ mod tests {
         normalize_order_quantity, polymarket_execution_principal, raw_balance_to_pusd,
         tracked_rest_order_observation, tracked_trade_fill, tracked_user_trade_fill,
         tracked_user_trade_matches, trade_side, unique_token_ids, wallet_signature_type,
-        BufferedUserEvent, CancellationOutcome, CancellationRequest, ExecutionError,
-        ExecutionOutcome, ExecutionRequest, LiveExecutionGateway, OrderExecutionType,
-        OrderObservation, PolymarketExecutionConfig, PolymarketExecutionGateway, ReplaceOutcome,
-        ReplaceRequest, StaticExecutionGateway, TrackedOrder, UserEventStream, WalletSignatureType,
+        BufferedUserEvent, CancellationOutcome, CancellationRequest, DisabledLiveExecutionGateway,
+        ExecutionError, ExecutionOutcome, ExecutionRequest, LiveExecutionGateway,
+        OrderExecutionType, OrderObservation, PolymarketExecutionConfig,
+        PolymarketExecutionGateway, ReplaceOutcome, ReplaceRequest, StaticExecutionGateway,
+        TrackedOrder, UserEventStream, WalletSignatureType, MONDAY_LIVE_EXECUTION_DISABLED,
     };
     use chrono::Utc;
     use ploy_trading::{FillRecord, TradeSide};
@@ -1946,6 +1989,45 @@ mod tests {
                 venue_order_id: "venue-order-1".to_string()
             }
         );
+    }
+
+    #[test]
+    fn monday_disabled_gateway_rejects_every_live_operation() {
+        let gateway = DisabledLiveExecutionGateway;
+        let request = ExecutionRequest {
+            order_id: "order-1".to_string(),
+            token_id: "1".to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(1),
+            limit_price: Some(dec!(0.55)),
+            order_type: OrderExecutionType::GTC,
+            aggressive_ticks: 0,
+        };
+        let cancel = CancellationRequest {
+            order_id: "order-1".to_string(),
+            venue_order_id: "venue-order-1".to_string(),
+        };
+        let replace = ReplaceRequest {
+            order_id: "order-1".to_string(),
+            venue_order_id: "venue-order-1".to_string(),
+            token_id: "1".to_string(),
+            side: TradeSide::Buy,
+            quantity: dec!(1),
+            limit_price: Some(dec!(0.56)),
+        };
+        let tracked = TrackedOrder {
+            order_id: "order-1".to_string(),
+            venue_order_id: "venue-order-1".to_string(),
+            token_id: "1".to_string(),
+            side: TradeSide::Buy,
+        };
+        let expected = ExecutionError::Configuration(MONDAY_LIVE_EXECUTION_DISABLED.to_string());
+
+        assert_eq!(gateway.probe(), Err(expected.clone()));
+        assert_eq!(gateway.submit(&request), Err(expected.clone()));
+        assert_eq!(gateway.cancel(&cancel), Err(expected.clone()));
+        assert_eq!(gateway.replace(&replace), Err(expected.clone()));
+        assert_eq!(gateway.reconcile_fills(&[tracked]), Err(expected));
     }
 
     #[test]
@@ -2159,7 +2241,7 @@ mod tests {
     #[test]
     fn readiness_uses_a_dedicated_client_with_heartbeats_stopped() {
         let source = include_str!("lib.rs");
-        let readiness = &source[source.find("pub fn account_readiness").unwrap()..];
+        let readiness = &source[source.find("fn account_readiness").unwrap()..];
         let readiness = &readiness[..readiness.find("impl LiveExecutionGateway").unwrap()];
 
         assert!(readiness.contains("derive_api_key(&signer, None)"));

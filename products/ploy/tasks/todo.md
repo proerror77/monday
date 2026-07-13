@@ -16,7 +16,7 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [x] Replace standalone agent/session state with Monday-local instructions.
 - [x] Add and validate dedicated PLOY CI at the Monday repository root.
 - [x] Pass repository secret scanning and focused Rust/TypeScript validation.
-- [ ] Complete standards/spec review and address findings.
+- [x] Complete standards/spec review and address findings.
 - [ ] Merge the Monday migration PR.
 - [ ] Redirect and archive the former PLOY repository.
 

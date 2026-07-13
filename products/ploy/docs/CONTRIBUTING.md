@@ -1,157 +1,60 @@
-# Contributing to Ploy
+# Contributing to the PLOY product workspace
 
-Guidelines for contributing to the Ploy Polymarket trading bot.
+PLOY is developed inside Monday at `products/ploy`. Follow the Monday root
+`CLAUDE.md`, `products/ploy/AGENTS.md`, and
+`docs/architecture/PLOY_INTEGRATION.md` before changing architecture or runtime
+boundaries.
 
-## Development Setup
+## Safety boundary
 
-### Prerequisites
+- Monday `rust_hft` is the only production authority for risk, OMS,
+  reconciliation, cancellation, replacement, and execution.
+- PLOY live execution remains disabled.
+- Do not activate nested PLOY deployment workflows or former standalone host paths.
+- Do not add credentials, local runtime state, or generated agent sessions to Git.
 
-- **Rust** via [rustup](https://rustup.rs/). The repository pins the exact
-  toolchain in `rust-toolchain.toml`; run `rustup show active-toolchain` after
-  checkout to confirm your shell is using it.
-- **PostgreSQL 15+** -- used for event registry, position tracking, and audit logs
-- **pkg-config**, **libssl-dev**, **libpq-dev** (Linux) or equivalent (macOS: `brew install postgresql openssl`)
-- **Node.js 18+** (only if working on the NBA Swing frontend)
+## Development setup
 
-### Clone and Build
+Use the toolchains pinned by this workspace: Rust `1.91` and Node `22`. Run commands
+from `products/ploy`.
 
-```bash
-git clone <repo-url> && cd ploy
-
-# Default platform spine build
-cargo build -p new-ployd -p new-ploy-runner -p ployctl -p ploytui
-
-# Focused daemon / runner loops
-cargo build -p new-ployd
-cargo build -p new-ploy-runner  # slim default replay runner
-cargo build -p new-ploy-runner --features full  # full live/dry-run runner
-```
-
-### Environment
-
-Create a `.env` file (never committed) with at minimum:
-
-```
-DATABASE_URL=postgres://ploy:ploy@localhost:5432/ploy
-```
-
-Additional variables depend on which domain agents you run (Polymarket API keys, Grok API key, etc.). See the project configuration files for the full list.
-
-## Git Workflow
-
-### Branch Naming
-
-| Prefix      | Purpose                        |
-|-------------|--------------------------------|
-| `feat/`     | New features                   |
-| `fix/`      | Bug fixes                      |
-| `refactor/` | Code restructuring (no behavior change) |
-| `docs/`     | Documentation only             |
-| `test/`     | Adding or updating tests       |
-| `chore/`    | Build, CI, dependency updates  |
-
-Example: `feat/kelly-scaling-in`, `fix/circuit-breaker-reset`
-
-### Commit Messages
-
-Follow the **atomic commit** convention -- one commit per logical change.
-
-Format:
-
-```
-type(scope): short description
-```
-
-**Types**: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`
-
-**Rules**:
-- Keep refactors, formatting, and behavior changes in **separate** commits.
-- Each commit must build (`cargo build`) and pass relevant tests.
-- Avoid WIP commits on shared branches.
-
-Good examples:
-
-```
-feat(agents): add ML/ONNX model loading for crypto + RL
-fix(circuit_breaker): reset half_open_successes on state transition
-refactor(engine): extract slippage protection into separate module
-docs: update agent framework design with Phase 1.5 Kelly scaling-in
-```
-
-### Pull Request Process
-
-1. Create a feature branch from `main`.
-2. Make atomic commits following the conventions above.
-3. Push and open a PR with a clear description of the changes.
-4. Ensure CI passes (formatting, clippy, build, tests).
-5. Request review if the change touches risk management, order execution, or security-sensitive code.
-
-## CI/CD
-
-### Test Pipeline
-
-Every push to `main` and every pull request triggers the **Test** workflow (`.github/workflows/test.yml`), which now validates the current workspace spine directly:
-
-1. **Build** -- package-scoped workspace build for `new-ployd`, `new-ploy-runner`, `ployctl`, `ploytui`, `ploy-daemon-host`, `ploy-runner-host`, and supporting crates
-2. **Tests** -- package-scoped workspace tests (against a PostgreSQL 15 service container where needed)
-
-A separate release/deploy path can still build release artifacts, but the default CI lane now covers the shipped runner and the new ownership crates directly.
-
-### Deployment Pipelines
-
-Named host workflows own deployment: `deploy-tango-1-1.yml` for the
-research/data/dry-run host and `deploy-trade.yml` for the immutable paused trade
-control plane. `approve-live-trade.yml` is the only live resume path and uses a
-protected human environment. `release-platform.yml` is build-only portable
-artifact verification and cannot mutate a host.
-
-## Running Tests
+Start with focused checks:
 
 ```bash
-# Run the default platform spine
-cargo test -p new-ployd -p new-ploy-runner -p ployctl -p ploytui
-
-# Run a specific package
-cargo test -p ploy-daemon-host
-cargo test -p ploy-runner-host
-
-# Run a specific test
-cargo test test_name
-
-# Run a specific package/module slice
-cargo test -p ploy-platform-runtime --lib
+cargo +1.91 metadata --locked --no-deps --format-version 1
+cargo +1.91 fmt --all -- --check
+cargo +1.91 test --locked -p ploy-connectivity -p ploy-daemon-host
+cargo +1.91 check --locked -p new-ploy-runner --features full
 ```
 
-A running PostgreSQL instance is required for integration tests. Set `DATABASE_URL` in your environment or `.env` file.
+Frontend and sidecar examples:
 
-## Code Style
+```bash
+npm --prefix ploy-frontend ci
+npm --prefix ploy-frontend run contracts:check
+npm --prefix ploy-frontend run lint
+npm --prefix ploy-frontend run build
 
-- Run `cargo fmt` before committing.
-- Run `cargo clippy --all-targets` and address warnings.
-- Use `thiserror` for library-style errors, `anyhow` sparingly at application boundaries.
-- Prefer `rust_decimal::Decimal` over floating-point for monetary values.
-- Use `zeroize` for any secret material (private keys, API keys).
-- Keep `unsafe` blocks to zero; the codebase currently has none.
-
-## Project Structure
-
+npm --prefix ploy-sidecar ci
+npm --prefix ploy-sidecar run contracts:check
+npm --prefix ploy-sidecar test
+npm --prefix ploy-sidecar run build
 ```
-apps/
-  new-ployd/         -- Next-generation daemon entrypoint
-  new-ploy-runner/   -- Next-generation runner entrypoint
-  ployctl/           -- Operator CLI
-  ploytui/           -- Operator TUI
-crates/
-  ploy-daemon-host/      -- Daemon host/bootstrap crate
-  ploy-runner-host/      -- Runner CLI host crate
-  ploy-control-client/   -- Shared operator client transport
-  ploy-market-data/      -- Collector/feed/scanner/discovery
-  ploy-platform/         -- Control-plane core
-  ploy-platform-runtime/ -- Runtime orchestration ownership
-  ploy-trading/          -- Canonical trading lifecycle
-  ploy-deployments/      -- Worker protocol + supervisor
-  ploy-operator-contracts/ -- Shared API/event contracts
-  ploy-strategy-runtime/ -- Strategy runtime ownership
-  ploy-strategy-bundles/ -- Strategy definitions and composition
-  ploy-research/         -- Replay/backtest consumers
-```
+
+Do not start a local PostgreSQL service for routine validation. Database-backed
+tests run in the root Monday workflow `.github/workflows/ploy-ci.yml`.
+
+## Change discipline
+
+- Keep commits atomic and use `type(scope): summary` subjects.
+- Preserve unrelated changes and use package-scoped checks while iterating.
+- Update tests for behavior changes and update operator contracts when schemas change.
+- Run `git diff --check` and the relevant product checks before opening a PR.
+- Changes that affect execution authority, risk, secrets, or deployment require an
+  explicit architecture and security review.
+
+## Pull requests
+
+Open PLOY changes against `proerror77/monday`. The root PLOY CI workflow owns the
+current Rust, frontend, sidecar, schema, audit, and integration lanes. Nested workflows
+under `products/ploy/.github/workflows` are historical source material only.

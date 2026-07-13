@@ -1,5 +1,9 @@
 # tango-1-1 DB Schema & Code Map
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 - Generated at: 2026-03-02T05:23:49Z
 - Host: tango-1-1
 - Database: ploy (via /root/ploy/.env -> DATABASE_URL)

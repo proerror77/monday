@@ -1,5 +1,9 @@
 # Predict.fun Account Operations
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 Status: guarded operator adapter, packaged on the paused trade host. It is not
 an automatic `ployd` execution venue and it never runs on the research host.
 

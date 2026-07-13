@@ -32,6 +32,11 @@ const CONTRACTS = Object.freeze({
 });
 const DATA_API = "https://data-api.polymarket.com";
 const PLAN_TTL_MS = 10 * 60 * 1000;
+const MONDAY_WRITE_DISABLED = "is disabled inside Monday; route execution and reconciliation through rust_hft";
+
+function rejectMondayWrite(operation) {
+  throw new Error(`${operation} ${MONDAY_WRITE_DISABLED}`);
+}
 
 const REDEEM_ABI = [{
   type: "function",
@@ -283,7 +288,7 @@ function makeRelayClient(env = process.env) {
 }
 
 async function executePlan(plan, expectedHash, env = process.env, dependencies = {}) {
-  if (env.PLOY_ACCOUNT_OPS_WRITE_ENABLED !== "true") throw new Error("account-ops writes are disabled");
+  rejectMondayWrite("Polymarket account-op execution");
   const context = runtimeContext(env);
   validatePlan(plan, context, expectedHash);
   const { ledger, lock } = ledgerPaths(env);
@@ -359,6 +364,7 @@ async function executePlan(plan, expectedHash, env = process.env, dependencies =
 }
 
 async function reconcileOperation(operationId, env = process.env, dependencies = {}) {
+  rejectMondayWrite("Polymarket account-op reconciliation");
   if (!operationId) throw new Error("operation id is required");
   const context = runtimeContext(env);
   const { ledger } = ledgerPaths(env);
@@ -397,6 +403,7 @@ async function reconcileOperation(operationId, env = process.env, dependencies =
 }
 
 async function reconcileTransaction(transactionId, env = process.env, dependencies = {}) {
+  rejectMondayWrite("Polymarket account-op reconciliation");
   if (!transactionId) throw new Error("transaction id is required");
   const context = runtimeContext(env);
   const { ledger, lock } = ledgerPaths(env);

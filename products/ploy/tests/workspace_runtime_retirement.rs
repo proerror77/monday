@@ -1,4 +1,6 @@
+use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 const RETIRED_SOURCE_PATHS: &[&str] = &[
     "apps/ploy-runner",
@@ -9,6 +11,7 @@ const RETIRED_SOURCE_PATHS: &[&str] = &[
     "nginx.conf",
     "start.sh",
     "stop.sh",
+    "ploy-openclaw",
     "src/CLAUDE.md",
     "src/account",
     "src/adapters",
@@ -84,4 +87,193 @@ fn workspace_root_keeps_only_the_shim_surface() {
         "legacy root runtime paths still present:\n{}",
         still_present.join("\n")
     );
+}
+
+#[test]
+fn openclaw_compatibility_example_rejects_remote_mutations() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rpc = repo_root.join("examples/openclaw/skill-ploy-rpc/bin/ployrpc");
+    let ctl = repo_root.join("examples/openclaw/skill-ploy-rpc/bin/ployctl");
+
+    let rpc_output = Command::new("bash")
+        .arg(&rpc)
+        .arg("pm.submit_limit")
+        .arg("{}")
+        .env_remove("PLOY_TRADING_HOST")
+        .env_remove("PLOY_TRADING_SSH_OPTS")
+        .output()
+        .expect("run read-only RPC wrapper");
+    assert!(!rpc_output.status.success());
+    assert!(String::from_utf8_lossy(&rpc_output.stderr).contains("disabled in Monday"));
+
+    let ctl_output = Command::new("bash")
+        .arg(&ctl)
+        .arg("stop")
+        .env_remove("PLOY_TRADING_HOST")
+        .env_remove("PLOY_TRADING_SSH_OPTS")
+        .output()
+        .expect("run read-only control wrapper");
+    assert!(!ctl_output.status.success());
+    assert!(String::from_utf8_lossy(&ctl_output.stderr).contains("disabled in Monday"));
+
+    for relative in [
+        "examples/openclaw/README.md",
+        "examples/openclaw/skill-ploy-rpc/SKILL.md",
+        "examples/openclaw/skill-ploy-rpc/prompts/autonomous_event_trader.md",
+        "examples/openclaw/skill-ploy-rpc/prompts/autonomous_multi_source_trader.md",
+        "docs/OPENCLAW_INTEGRATION.md",
+    ] {
+        let body = fs::read_to_string(repo_root.join(relative)).expect("read OpenClaw document");
+        for forbidden in [
+            "PLOY_RPC_WRITE_ENABLED",
+            "pm.submit_limit",
+            "pm.cancel_order",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "{relative} still advertises retired write surface {forbidden}"
+            );
+        }
+    }
+}
+
+fn collect_markdown_files(root: &Path, files: &mut Vec<std::path::PathBuf>) {
+    for entry in fs::read_dir(root).expect("read documentation directory") {
+        let path = entry.expect("documentation entry").path();
+        if path.is_dir() {
+            if matches!(
+                path.file_name().and_then(|value| value.to_str()),
+                Some("archive" | "dist" | "node_modules" | "target")
+            ) {
+                continue;
+            }
+            collect_markdown_files(&path, files);
+        } else if path.extension().and_then(|value| value.to_str()) == Some("md") {
+            files.push(path);
+        }
+    }
+}
+
+#[test]
+fn standalone_operational_docs_are_explicitly_marked_historical() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for relative_root in [
+        "docs",
+        "config",
+        "examples",
+        "ploy-frontend",
+        "ploy-sidecar",
+        "tasks",
+    ] {
+        collect_markdown_files(&repo_root.join(relative_root), &mut files);
+    }
+
+    let markers = [
+        ".github/workflows/deploy-",
+        ".github/workflows/approve-",
+        ".github/workflows/release-platform",
+        "/opt/ploy",
+        "tango-1-1",
+        "ploy-trade-1",
+        "systemctl",
+        "PLOY_RPC_WRITE_ENABLED",
+        "pm.submit_limit",
+        "pm.cancel_order",
+        "vercel --prod",
+        "git remote add origin",
+    ];
+    let current_exceptions = ["docs/operations/data-jobs-inventory.md"];
+    let mut unmarked = Vec::new();
+
+    for path in files {
+        let relative = path
+            .strip_prefix(repo_root)
+            .expect("documentation path under repository root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative.starts_with("docs/archive/")
+            || relative.starts_with("docs/plans/")
+            || relative.starts_with("docs/reviews/")
+            || relative.starts_with("docs/superpowers/")
+            || relative.starts_with("tasks/research_evidence/")
+            || (relative.starts_with("tasks/") && relative.contains("_audit_"))
+            || current_exceptions.contains(&relative.as_str())
+        {
+            continue;
+        }
+
+        let body = fs::read_to_string(&path).expect("read operational document");
+        if markers.iter().any(|marker| body.contains(marker))
+            && !body.contains("Historical standalone PLOY")
+        {
+            unmarked.push(relative);
+        }
+    }
+
+    assert!(
+        unmarked.is_empty(),
+        "standalone operational docs lack the historical marker:\n{}",
+        unmarked.join("\n")
+    );
+}
+
+#[test]
+fn default_config_does_not_advertise_live_enablement() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let body = fs::read_to_string(repo_root.join("config/default.toml"))
+        .expect("read default configuration");
+
+    for retired_instruction in [
+        "To enable any live order path",
+        "complete the explicit deployment checklist",
+    ] {
+        assert!(
+            !body.contains(retired_instruction),
+            "default config still advertises retired live enablement: {retired_instruction}"
+        );
+    }
+    assert!(
+        body.contains("separate reviewed Monday change"),
+        "default config must name the reviewed Monday authority gate"
+    );
+}
+
+#[test]
+fn account_operation_mutations_reject_before_legacy_write_paths() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (relative, surfaces) in [
+        (
+            "tools/polymarket-account-ops/account_ops.js",
+            &["executePlan", "reconcileOperation", "reconcileTransaction"][..],
+        ),
+        (
+            "tools/predict-fun-account-ops/account_ops.js",
+            &[
+                "executeApprovals",
+                "executeOrderPlan",
+                "executeRedeemPlan",
+                "reconcileOrder",
+                "reconcileRedeem",
+            ][..],
+        ),
+    ] {
+        let body = fs::read_to_string(repo_root.join(relative)).expect("read account-op tool");
+        assert!(
+            !body.contains("WRITE_ENABLED"),
+            "{relative} must not expose a legacy environment write gate"
+        );
+        for surface in surfaces {
+            let signature = format!("async function {surface}");
+            let function = body
+                .split_once(&signature)
+                .unwrap_or_else(|| panic!("{relative} is missing {signature}"))
+                .1;
+            let entry = function.lines().take(3).collect::<Vec<_>>().join("\n");
+            assert!(
+                entry.contains("rejectMondayWrite"),
+                "{relative}::{surface} must reject before credentials, network, or ledger access"
+            );
+        }
+    }
 }

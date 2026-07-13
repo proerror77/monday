@@ -10,6 +10,7 @@ use ploy_strategy_bundles::config::MarketDataSource;
 use ploy_strategy_bundles::{
     Feed, FullConfig, LiveFeed, RecordingFeed, RuntimeMode, StrategyLogic,
 };
+#[cfg(feature = "live-execution")]
 use ploy_trading::TradingRuntime;
 use sqlx::postgres::PgPoolOptions;
 use std::env;

@@ -1,5 +1,9 @@
 # Event ML AutoML Workflow
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 This is the canonical research workflow for PM 5-minute event datasets before
 moving a signal toward DL, RL, backtest optimization, or live dry-run.
 

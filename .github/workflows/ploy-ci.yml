@@ -326,8 +326,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  rust-runner-live:
-    name: Rust runner live/default
+  rust-runner-full:
+    name: Rust runner full/default (live execution disabled)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -349,18 +349,18 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: products/ploy
-          shared-key: rust-runner-live-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          shared-key: rust-runner-full-${{ hashFiles('products/ploy/**/Cargo.lock') }}
 
       - name: Cache sccache
         uses: actions/cache@v5
         with:
           path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-runner-live-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          key: ${{ runner.os }}-sccache-runner-full-${{ hashFiles('products/ploy/**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-sccache-runner-live-
+            ${{ runner.os }}-sccache-runner-full-
             ${{ runner.os }}-sccache-
 
-      - name: Check runner slim/default and full/live contracts
+      - name: Check runner slim/default and full non-executing contracts
         env:
           RUSTC_WRAPPER: sccache
         run: |
@@ -383,7 +383,12 @@ jobs:
             -p ploy-strategy-bundles \
             -p ploy-connectivity \
             --features ploy-runner-host/full,ploy-strategy-runtime/full
-          echo "### Rust runner live/default lane" >> "$GITHUB_STEP_SUMMARY"
+          if cargo tree --locked -p new-ploy-runner --features full -e features \
+            | grep -q 'live-execution'; then
+            echo "new-ploy-runner full feature must not enable live-execution" >&2
+            exit 1
+          fi
+          echo "### Rust runner full/default non-executing lane" >> "$GITHUB_STEP_SUMMARY"
           echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show sccache stats
@@ -391,7 +396,7 @@ jobs:
         run: |
           sccache --show-stats | tee /tmp/sccache-stats.txt || true
           {
-            echo "### sccache: rust-runner-live"
+            echo "### sccache: rust-runner-full"
             echo '```'
             cat /tmp/sccache-stats.txt
             echo '```'
@@ -536,7 +541,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   frontend-sidecar:
-    name: Frontend and sidecar
+    name: Frontend, sidecar, and account tools
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -551,6 +556,8 @@ jobs:
           cache-dependency-path: |
             products/ploy/ploy-frontend/package-lock.json
             products/ploy/ploy-sidecar/package-lock.json
+            products/ploy/tools/polymarket-account-ops/package-lock.json
+            products/ploy/tools/predict-fun-account-ops/package-lock.json
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -589,8 +596,16 @@ jobs:
           npm test --prefix ploy-sidecar
           npm run build --prefix ploy-sidecar
           npm audit --omit=dev --audit-level=moderate --prefix ploy-sidecar
-          echo "### Frontend and sidecar lane" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Frontend, sidecar, and account tools lane" >> "$GITHUB_STEP_SUMMARY"
           echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate fail-closed account tools
+        run: |
+          set -euo pipefail
+          npm ci --prefix tools/polymarket-account-ops
+          npm test --prefix tools/polymarket-account-ops
+          npm ci --prefix tools/predict-fun-account-ops
+          npm test --prefix tools/predict-fun-account-ops
 
   integration-regressions:
     name: Rust integration regressions

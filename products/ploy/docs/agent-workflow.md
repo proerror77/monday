@@ -1,5 +1,9 @@
 # Agent Workflow Reference
 
+> **Historical standalone PLOY agent policy.** This file is retained as migration
+> evidence and is not the current instruction source. Follow the Monday root
+> `CLAUDE.md`, `products/ploy/AGENTS.md`, and `docs/architecture/PLOY_INTEGRATION.md`.
+
 Use this file for detailed agent workflow policy. Keep `AGENTS.md` and
 `CLAUDE.md` short and repo-specific, then link here for the long-form process
 rules.
@@ -117,10 +121,10 @@ rules.
   required.
 - On trading hosts, do not build Rust source on-host. Build in CI and deploy
   release artifacts only.
-- Use `.github/workflows/deploy-tango-1-1.yml` for the research/data host and
-  `.github/workflows/deploy-trade.yml` for the immutable paused trade host.
-  Live resume is restricted to `.github/workflows/approve-live-trade.yml`.
-  `.github/workflows/release-platform.yml` is build-only.
+- Historical only: `.github/workflows/deploy-tango-1-1.yml`,
+  `.github/workflows/deploy-trade.yml`, `.github/workflows/approve-live-trade.yml`,
+  and `.github/workflows/release-platform.yml` are nested standalone contracts,
+  not active Monday workflows or deployment authority.
 - Live services should keep these systemd guardrails:
   - `Restart=always`
   - `RestartSec=5`

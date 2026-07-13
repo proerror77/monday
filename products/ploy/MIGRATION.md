@@ -7,13 +7,22 @@ PLOY was imported into `proerror77/monday` at `products/ploy` on 2026-07-14.
 - Repository: `https://github.com/proerror77/ploy`
 - Branch: `main`
 - SHA: `8ce4e0f150173a44030294101f4b1371cbdf80bc`
-- Import: exact tracked snapshot via `git archive`
+- Import: adapted tracked snapshot produced from `git archive`
 - Historical local docs: commit `5de411bbe8889284b47fe9932821af077d2962fc`
+
+The source archive is the provenance baseline, but the Monday tree is intentionally
+not byte-identical. See [MIGRATION_ADAPTATIONS.md](MIGRATION_ADAPTATIONS.md) for
+the path and SHA-256 manifest covering renamed, changed, replaced, and omitted material.
 
 ## Runtime status
 
 - Live trading: disabled
 - Monday execution authority: `rust_hft`
+- PLOY production gateway: rejects probe, submit, cancel, replace, and reconcile
+- Standard runner `full` feature: does not include legacy `live-execution`
+- Polymarket and Predict account tools: planning and read checks remain available;
+  approval, execution, redemption, and reconciliation writes reject unconditionally
+- Write-capable standalone `ploy-openclaw`: relocated under the historical archive
 - Legacy PLOY deploy workflows: retained only as nested, inactive source material
 - Legacy secrets/environments: not copied
 

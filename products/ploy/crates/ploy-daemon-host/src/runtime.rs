@@ -3,7 +3,7 @@ use crate::events::EventBroker;
 use crate::http::publish_snapshot_events;
 use chrono::{DateTime, Utc};
 use ploy_connectivity::{
-    ExecutionError, ExecutionOutcome, LiveExecutionGateway, PolymarketExecutionGateway,
+    DisabledLiveExecutionGateway, ExecutionError, ExecutionOutcome, LiveExecutionGateway,
 };
 use ploy_deployments::WorkerSupervisor;
 use ploy_operator_contracts::{
@@ -134,12 +134,18 @@ pub struct PloyDaemon {
 
 impl PloyDaemon {
     pub fn boot(config: &PlatformConfig) -> io::Result<Self> {
-        let gateway = PolymarketExecutionGateway::from_env()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        Self::boot_with_live_execution(config, Box::new(gateway))
+        Self::boot_with_gateway(config, Box::new(DisabledLiveExecutionGateway))
     }
 
-    pub fn boot_with_live_execution(
+    #[cfg(test)]
+    pub(crate) fn boot_with_live_execution(
+        config: &PlatformConfig,
+        live_execution: Box<dyn LiveExecutionGateway>,
+    ) -> io::Result<Self> {
+        Self::boot_with_gateway(config, live_execution)
+    }
+
+    fn boot_with_gateway(
         config: &PlatformConfig,
         live_execution: Box<dyn LiveExecutionGateway>,
     ) -> io::Result<Self> {
@@ -1372,7 +1378,7 @@ mod tests {
     use ploy_connectivity::{
         CancellationOutcome, CancellationRequest, ExecutionError, ExecutionOutcome,
         ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest,
-        StaticExecutionGateway,
+        StaticExecutionGateway, MONDAY_LIVE_EXECUTION_DISABLED,
     };
     use ploy_operator_contracts::{
         DeploymentApplyRequest, DeploymentControlRequest, DeploymentRuntimeMode, DeploymentState,
@@ -1431,6 +1437,24 @@ mod tests {
             deployment_state: DeploymentState::Enabled,
             desired_state: DesiredState::Paused,
         }
+    }
+
+    #[test]
+    fn production_boot_wires_the_monday_disabled_live_gateway() {
+        let root = temp_dir("monday-disabled-live");
+        let runtime_root = root.join("run/platform");
+        let config = PlatformConfig {
+            registry_file: root.join("data/state/deployments.json"),
+            runtime_root: runtime_root.clone(),
+            status_file: runtime_root.join("system-status.json"),
+            deployment_status_file: runtime_root.join("deployments.json"),
+            trading_state_file: runtime_root.join("trading-state.json"),
+            ..PlatformConfig::default()
+        };
+        let daemon = PloyDaemon::boot(&config).expect("boot with disabled live execution");
+        let expected = ExecutionError::Configuration(MONDAY_LIVE_EXECUTION_DISABLED.to_string());
+
+        assert_eq!(daemon.live_execution.probe(), Err(expected));
     }
 
     #[test]

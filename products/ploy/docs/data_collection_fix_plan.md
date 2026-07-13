@@ -1,5 +1,9 @@
 # Polymarket 5m Binary Options 数据收集完整修复方案
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 > Historical note (2026-05-24): this document is an April 2026 incident plan,
 > not the current implementation runbook. The old `apps/ploy-runner/*`
 > ownership path has been retired. Current data collection ownership lives in

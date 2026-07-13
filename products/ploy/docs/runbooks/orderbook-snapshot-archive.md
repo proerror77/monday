@@ -1,5 +1,9 @@
 # CLOB Orderbook Snapshot Archive
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 ## Final Storage Policy
 
 Keep full-fidelity Polymarket CLOB orderbook snapshots, but split storage by

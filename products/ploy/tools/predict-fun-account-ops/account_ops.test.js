@@ -13,6 +13,7 @@ const {
   executeRedeemPlan,
   loadWalletSecret,
   makeWalletSession,
+  reconcileOrder,
   reconcileRedeem,
   sha256,
   validatePlan,
@@ -111,6 +112,23 @@ test("wallet session rejects non-HTTPS RPC before loading a signer", async () =>
   }), /must use HTTPS/);
 });
 
+test("Monday rejects every Predict mutation even when legacy write flags are set", async () => {
+  const env = {
+    PLOY_PREDICT_ACCOUNT_OPS_WRITE_ENABLED: "true",
+    PLOY_PREDICT_APPROVAL_WRITE_ENABLED: "true",
+    PLOY_PREDICT_RECONCILE_WRITE_ENABLED: "true",
+  };
+  const dependencies = new Proxy({}, {
+    get() { throw new Error("legacy dependency must not be reached"); },
+  });
+
+  await assert.rejects(() => executeApprovals({}, "ignored", env, dependencies), /disabled inside Monday/);
+  await assert.rejects(() => executeOrderPlan({}, "ignored", env, dependencies), /disabled inside Monday/);
+  await assert.rejects(() => executeRedeemPlan({}, "ignored", env, dependencies), /disabled inside Monday/);
+  await assert.rejects(() => reconcileOrder({}, "ignored", env, dependencies), /disabled inside Monday/);
+  await assert.rejects(() => reconcileRedeem({}, "ignored", env, dependencies), /disabled inside Monday/);
+});
+
 function runtimeEnv(tmp) {
   return {
     PLOY_LIVE_ACCOUNT_ID: CONTEXT.account,
@@ -137,7 +155,7 @@ function fakeOrderSession() {
   } };
 }
 
-test("order execution is write-gated and submits one official SDK payload", async () => {
+test.skip("historical standalone order execution submitted one official SDK payload", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "predict-order-"));
   const plan = buildOrderPlan(MARKET, {
     marketId: 42, tokenId: "111", side: "BUY", quantity: "10", limitPrice: "0.425",
@@ -160,7 +178,7 @@ test("order execution is write-gated and submits one official SDK payload", asyn
   assert.deepEqual(events.map((event) => event.state), ["submitting", "submitted"]);
 });
 
-test("order execution rechecks expiry immediately before submission", async () => {
+test.skip("historical standalone order execution rechecked expiry before submission", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "predict-expiry-"));
   const generatedAt = 1_700_000_000_000;
   const plan = buildOrderPlan(MARKET, {
@@ -181,7 +199,7 @@ test("order execution rechecks expiry immediately before submission", async () =
   assert.equal(fs.existsSync(path.join(tmp, "ledger.jsonl.lock")), false);
 });
 
-test("approval execution rechecks TTL before every approval transaction", async () => {
+test.skip("historical standalone approval execution rechecked TTL before each transaction", async () => {
   const generatedAt = 1_700_000_000_000;
   const plan = buildOrderPlan(MARKET, {
     marketId: 42, tokenId: "111", side: "BUY", quantity: "10", limitPrice: "0.425",
@@ -202,7 +220,7 @@ test("approval execution rechecks TTL before every approval transaction", async 
   assert.deepEqual(submitted, ["one"]);
 });
 
-test("order execution rejects outcome metadata drift before signing", async () => {
+test.skip("historical standalone order execution rejected metadata drift before signing", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "predict-outcome-drift-"));
   const plan = buildOrderPlan(MARKET, {
     marketId: 42, tokenId: "111", side: "BUY", quantity: "10", limitPrice: "0.425",
@@ -216,7 +234,7 @@ test("order execution rejects outcome metadata drift before signing", async () =
   }, { market: changed, session: fakeOrderSession(), jwt: "jwt" }), /outcome metadata changed/);
 });
 
-test("redemption execution routes neg-risk amount through official SDK and records receipt", async () => {
+test.skip("historical standalone redemption routed through the official SDK", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "predict-redeem-"));
   const positions = [{
     amount: "2500000000000000000",
@@ -240,7 +258,7 @@ test("redemption execution routes neg-risk amount through official SDK and recor
   assert.deepEqual(events.map((event) => event.state), ["submitting", "confirmed"]);
 });
 
-test("confirmed redemption retains its owner lock when ledger persistence fails", async () => {
+test.skip("historical standalone redemption retained its lock after persistence failure", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "predict-ledger-failure-"));
   const positions = [{
     amount: "2500000000000000000",
@@ -263,7 +281,7 @@ test("confirmed redemption retains its owner lock when ledger persistence fails"
   assert.equal(fs.existsSync(path.join(tmp, "ledger.jsonl.lock", "owner.json")), true);
 });
 
-test("redemption reconciliation only clears the lock owned by an exact settled plan", async () => {
+test.skip("historical standalone redemption reconciliation cleared an exact settled lock", async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "predict-reconcile-"));
   const positions = [{
     amount: "2500000000000000000",

@@ -1,5 +1,9 @@
 # Polymarket V2 Indexer Sidecar
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 This runbook integrates the Envio `polymarket-v2-indexer` as a sidecar data
 source for Ploy.
 

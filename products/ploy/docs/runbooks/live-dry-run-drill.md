@@ -1,5 +1,8 @@
 # Live Dry-Run Drill
 
+> **Historical standalone PLOY drill.** It is retained for provenance and does not
+> define a Monday deployment or promotion path. PLOY live execution remains disabled.
+
 ## Goal
 
 Run a repeatable remote-host readiness drill for a future live deployment

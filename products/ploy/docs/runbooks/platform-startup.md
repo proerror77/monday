@@ -1,5 +1,9 @@
 # Platform Startup Runbook
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 ## Goal
 
 Start the single-host trading platform runtime with:

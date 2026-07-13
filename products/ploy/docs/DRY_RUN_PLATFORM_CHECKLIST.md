@@ -1,5 +1,9 @@
 # Dry-Run Platform Checklist
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 本文件用于每次上線前的「非下單」檢核，所有項目 pass 後再進入 live dry-run/staging。
 
 ## 0. 前置條件

@@ -118,10 +118,21 @@ test("custody relayer rejects unsupported deposit/poly1271 wallets", () => {
 });
 
 test("execute refuses to enter account operations while writes are disabled", async () => {
-  await assert.rejects(() => executePlan({}, "ignored", {}), /writes are disabled/);
+  await assert.rejects(() => executePlan({}, "ignored", {}), /disabled inside Monday/);
 });
 
-test("execute retains the lock when the relayer submission response is lost", async (t) => {
+test("Monday rejects every account-op mutation even when legacy write flags are set", async () => {
+  const env = { PLOY_ACCOUNT_OPS_WRITE_ENABLED: "true" };
+  const dependencies = new Proxy({}, {
+    get() { throw new Error("legacy dependency must not be reached"); },
+  });
+
+  await assert.rejects(() => executePlan({}, "ignored", env, dependencies), /disabled inside Monday/);
+  await assert.rejects(() => reconcileOperation("operation", env, dependencies), /disabled inside Monday/);
+  await assert.rejects(() => reconcileTransaction("transaction", env, dependencies), /disabled inside Monday/);
+});
+
+test.skip("historical standalone execution retained a lock after an unknown relayer response", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ploy-redeem-submit-unknown-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const ledger = path.join(directory, "redeem-ledger.jsonl");
@@ -151,7 +162,7 @@ test("execute retains the lock when the relayer submission response is lost", as
   assert.equal(readLedger(ledger).at(-1).state, "submission_unknown");
 });
 
-test("operation reconciliation discovers one exact relayer transaction before reconciling", async (t) => {
+test.skip("historical standalone reconciliation discovered an exact relayer transaction", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ploy-redeem-operation-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const ledger = path.join(directory, "redeem-ledger.jsonl");
@@ -199,7 +210,7 @@ test("operation reconciliation discovers one exact relayer transaction before re
   assert.equal(readLedger(ledger).some((event) => event.discoveredByOperation), true);
 });
 
-test("reconcile clears the lock only after the exact mined transaction disappears from Data API", async (t) => {
+test.skip("historical standalone reconciliation cleared a settled transaction lock", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ploy-redeem-reconcile-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const ledger = path.join(directory, "redeem-ledger.jsonl");
@@ -231,7 +242,7 @@ test("reconcile clears the lock only after the exact mined transaction disappear
   assert.equal(readLedger(ledger).at(-1).balanceAfter, "125");
 });
 
-test("reconcile retains the lock while the relayer transaction is pending", async (t) => {
+test.skip("historical standalone reconciliation retained a pending transaction lock", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ploy-redeem-pending-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const ledger = path.join(directory, "redeem-ledger.jsonl");

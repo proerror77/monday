@@ -9,7 +9,7 @@ description = "Next-generation strategy runtime ownership boundary for Ploy"
 
 [features]
 default = ["replay"]
-full = ["backtest-db", "db-recorder", "live", "live-execution", "replay"]
+full = ["backtest-db", "db-recorder", "live", "replay"]
 backtest-db = ["dep:ploy-feed-loaders", "dep:sqlx"]
 db-recorder = ["dep:sqlx"]
 live = ["db-recorder", "dep:ploy-market-data", "ploy-market-data/live"]

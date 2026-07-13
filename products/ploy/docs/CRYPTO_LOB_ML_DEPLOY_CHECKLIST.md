@@ -1,5 +1,9 @@
 # Crypto LOB ML Deployment Checklist
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 本清单用于 `crypto_lob_ml` 在生产环境上线时的 Go/No-Go 决策。
 
 ## 1. 适用范围

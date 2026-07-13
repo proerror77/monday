@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  status|logs) ;;
+  ""|-h|--help|help)
+    echo "Usage: ployctl status|logs" >&2
+    exit 2
+    ;;
+  *)
+    echo "PLOY remote control mutations are disabled in Monday: $cmd" >&2
+    exit 3
+    ;;
+esac
+
 host="${PLOY_TRADING_HOST:-}"
 if [[ -z "$host" ]]; then
   echo "PLOY_TRADING_HOST is required (example: ploy@1.2.3.4)" >&2
@@ -13,26 +28,4 @@ if [[ -n "${PLOY_TRADING_SSH_OPTS:-}" ]]; then
   ssh_opts+=(${PLOY_TRADING_SSH_OPTS})
 fi
 
-cmd="${1:-}"
-shift || true
-
-case "$cmd" in
-  status|stop|rpc)
-    exec ssh "${ssh_opts[@]}" "$host" "$cmd" "$@"
-    ;;
-  start)
-    # start <trade> <dry_run>
-    exec ssh "${ssh_opts[@]}" "$host" "$cmd" "$@"
-    ;;
-  logs)
-    exec ssh "${ssh_opts[@]}" "$host" "$cmd" "$@"
-    ;;
-  ""|-h|--help|help)
-    echo "Usage: ployctl status|start|stop|logs|rpc" >&2
-    exit 2
-    ;;
-  *)
-    echo "Unsupported subcommand: $cmd" >&2
-    exit 2
-    ;;
-esac
+exec ssh "${ssh_opts[@]}" "$host" "$cmd" "$@"

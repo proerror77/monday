@@ -1,59 +1,41 @@
 ---
-name: ploy-rpc
-description: Remote-control a ploy trading machine over SSH (JSON-RPC tools for research + trading).
+name: ploy-rpc-read-only
+description: Query allowlisted PLOY research and market-data methods over SSH without remote mutations.
 metadata:
   {
-    "openclaw": { "emoji": "📈", "requires": { "anyBins": ["ssh"] } },
+    "openclaw": { "emoji": "🔎", "requires": { "anyBins": ["ssh"] } },
   }
 ---
 
-# ploy-rpc (OpenClaw skill)
+# PLOY read-only research skill
 
-This skill provides simple command wrappers around a remote `ploy` instance:
+This historical compatibility skill is restricted to research reads. Monday's
+`rust_hft` runtime owns production execution; this skill cannot start or stop a
+remote runtime and cannot submit, cancel, or replace orders.
 
-- `ployctl status|start|stop|logs`
-- `ployrpc <method> [params-json]`
-- `ingest_feeds <feeds.json>` (RSS/Atom ingest + dedupe state)
+## Required environment
 
-It is designed to be safe with SSH forced-command allowlists.
-
-## Required env vars
-
-- `PLOY_TRADING_HOST` (example: `ploy@1.2.3.4`)
-
-Optional:
-
-- `PLOY_TRADING_SSH_OPTS` (example: `-i ~/.ssh/ploy -o StrictHostKeyChecking=yes`)
+- `PLOY_TRADING_HOST`, for example `ploy@1.2.3.4`.
+- Optional `PLOY_TRADING_SSH_OPTS`, for example
+  `-i ~/.ssh/ploy -o StrictHostKeyChecking=yes`.
 
 ## Commands
 
 ```bash
 ./bin/ployctl status
-./bin/ployctl start false true
 ./bin/ployctl logs 200
-./bin/ployctl stop
-```
-
-```bash
 ./bin/ployrpc system.describe
-./bin/ployrpc pm.search_markets '{"query":"best ai model end of february"}'
-./bin/ployrpc event_edge.scan '{"title":"Which company has the best AI model end of February?"}'
+./bin/ployrpc pm.search_markets '{"query":"best ai model"}'
+./bin/ployrpc pm.get_event_details '{"market_id":"example"}'
+./bin/ployrpc pm.get_order_book '{"token_id":"123"}'
+./bin/ployrpc event_edge.scan '{"title":"Example event"}'
 ```
 
-### Multi-source discovery (RSS/Atom)
-
-Copy `./config/feeds.example.json` to `./config/feeds.json`, edit URLs, then:
+Feed ingestion remains local and non-executing:
 
 ```bash
 ./bin/ingest_feeds ./config/feeds.json
 ```
 
-## Trading (write operations)
-
-Write ops depend on the trading machine having `PLOY_RPC_WRITE_ENABLED=true`.
-
-Example:
-
-```bash
-./bin/ployrpc pm.submit_limit '{"token_id":"123","order_side":"BUY","shares":50,"limit_price":"0.72","market_side":"UP"}'
-```
+All unlisted RPC methods fail closed before SSH. Treat the output as research evidence,
+not as permission to trade or mutate a host.

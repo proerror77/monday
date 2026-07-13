@@ -1,5 +1,9 @@
 # Rollback
 
+> **Historical standalone PLOY operations.** Host, systemd, secret, and nested
+> workflow commands below are retained as migration evidence only. They do not
+> define a current Monday deployment or execution path.
+
 ## When to Use
 
 - A new release causes crashes, order failures, or unexpected behavior.

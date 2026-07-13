@@ -1,5 +1,12 @@
 # Lessons
 
+> **Historical standalone PLOY:** entries that mention former hosts, nested
+> deployment workflows, system services, or remote recovery commands are retained
+> only as incident history. They are not Monday operating instructions. Those
+> hosts and workflows have no execution authority inside Monday, and live or host
+> mutation remains disabled unless a separate reviewed Monday change establishes
+> a new authority path.
+
 ## 2026-07-13
 
 - Pattern: A five-minute prediction-market event was mistaken for a
@@ -58,12 +65,12 @@
   - Keep commits atomic and avoid including unrelated local changes.
   - Report commit SHA and push result in final response.
 
-- Pattern: User strategy operations run on remote host (`tango-1-1`), not local workstation.
-- Rule: For strategy/environment checks, deployment, startup validation, and runtime diagnostics, default to remote execution on `tango-1-1`. Use local checks only when explicitly requested.
-- Remote-first checklist:
-  - Verify target context first: `ssh tango-1-1 'hostname; pwd'`.
-  - Read env/config on remote paths before concluding readiness.
-  - Run strategy/platform start/health checks on `tango-1-1` and report remote results as source of truth.
+- Historical pattern: standalone strategy operations previously ran on the former
+  `tango-1-1` host rather than on a workstation.
+- Retired rule: do not use the former remote-first checklist for Monday work.
+  `tango-1-1` is not a current authority or deployment target, and this migration
+  does not authorize SSH, startup, deployment, service recovery, or health-check
+  mutations on it.
 
 ## 2026-03-05
 
