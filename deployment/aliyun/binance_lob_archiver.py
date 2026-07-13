@@ -66,6 +66,9 @@ MAX_PENDING_DIFFS_TOTAL = int(os.getenv("MAX_PENDING_DIFFS_TOTAL", "250000"))
 MIN_FREE_GB = int(os.getenv("MIN_FREE_GB", "20"))
 ZSTD_TIMEOUT_SECONDS = int(os.getenv("ZSTD_TIMEOUT_SECONDS", "300"))
 OSS_COPY_TIMEOUT_SECONDS = int(os.getenv("OSS_COPY_TIMEOUT_SECONDS", "300"))
+PROCESS_WATCHDOG_SECONDS = int(os.getenv("PROCESS_WATCHDOG_SECONDS", "180"))
+TASK_CANCEL_TIMEOUT_SECONDS = int(os.getenv("TASK_CANCEL_TIMEOUT_SECONDS", "5"))
+LAST_DATA_AT = time.monotonic()
 UPLOAD_STATUS: dict[str, str | None] = {
     "last_success_at": None,
     "last_error_at": None,
@@ -597,6 +600,7 @@ def fetch_snapshot_sync(symbol: str) -> dict:
 
 
 async def receive_url(url: str, queue: asyncio.Queue, stop: asyncio.Event) -> None:
+    global LAST_DATA_AT
     async with connect(
         url, open_timeout=20, ping_interval=20, max_size=8 * 1024 * 1024
     ) as websocket:
@@ -610,6 +614,7 @@ async def receive_url(url: str, queue: asyncio.Queue, stop: asyncio.Event) -> No
                     f"no depth frames for {STALL_TIMEOUT_SECONDS}s on websocket shard"
                 )
             if isinstance(message, str):
+                LAST_DATA_AT = time.monotonic()
                 await queue.put(("diff", time.time_ns(), json.loads(message)))
 
 
@@ -659,6 +664,39 @@ def frame_data(frame: dict) -> tuple[str, dict]:
 
 def is_stalled(last_frame_at: float, now: float) -> bool:
     return now - last_frame_at > STALL_TIMEOUT_SECONDS
+
+
+def process_watchdog_expired(last_data_at: float, now: float) -> bool:
+    return now - last_data_at > PROCESS_WATCHDOG_SECONDS
+
+
+def run_process_watchdog() -> None:
+    interval = max(1.0, min(10.0, PROCESS_WATCHDOG_SECONDS / 4))
+    while True:
+        time.sleep(interval)
+        now = time.monotonic()
+        if process_watchdog_expired(LAST_DATA_AT, now):
+            LOG.critical(
+                "process watchdog exiting after %.1fs without market data",
+                now - LAST_DATA_AT,
+            )
+            os._exit(75)
+
+
+async def cancel_tasks_bounded(tasks: tuple[asyncio.Task, ...]) -> int:
+    if not tasks:
+        return 0
+    for task in tasks:
+        task.cancel()
+    _, pending = await asyncio.wait(
+        tasks, timeout=TASK_CANCEL_TIMEOUT_SECONDS
+    )
+    if pending:
+        LOG.error(
+            "task cancellation timed out pending=%s",
+            len(pending),
+        )
+    return len(pending)
 
 
 def bridge_timed_out(
@@ -981,11 +1019,7 @@ async def run_session(
         failure = error
         raise
     finally:
-        for task in [*tasks, *resync_tasks.values()]:
-            task.cancel()
-        await asyncio.gather(
-            *tasks, *resync_tasks.values(), return_exceptions=True
-        )
+        await cancel_tasks_bounded(tuple([*tasks, *resync_tasks.values()]))
         archive_only = isinstance(failure, SequenceGap)
         drain_gap: SequenceGap | None = None
         while not queue.empty():
@@ -1152,6 +1186,11 @@ def main() -> None:
     if STARTUP_DELAY_SECONDS:
         LOG.info("startup delay=%ss", STARTUP_DELAY_SECONDS)
         time.sleep(STARTUP_DELAY_SECONDS)
+    threading.Thread(
+        target=run_process_watchdog,
+        name=f"binance-data-watchdog-{MARKET}",
+        daemon=True,
+    ).start()
     loop.run_until_complete(collect(stop))
 
 

@@ -328,6 +328,32 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(ARCHIVER.is_stalled(100, 160))
             self.assertTrue(ARCHIVER.is_stalled(100, 160.1))
 
+    async def test_process_watchdog_has_independent_deadline(self):
+        with patch.object(ARCHIVER, "PROCESS_WATCHDOG_SECONDS", 180):
+            self.assertFalse(ARCHIVER.process_watchdog_expired(100, 280))
+            self.assertTrue(ARCHIVER.process_watchdog_expired(100, 280.1))
+
+    async def test_task_cancellation_is_bounded(self):
+        release = ARCHIVER.asyncio.Event()
+
+        async def stubborn():
+            try:
+                await release.wait()
+            except ARCHIVER.asyncio.CancelledError:
+                await release.wait()
+
+        task = ARCHIVER.asyncio.create_task(stubborn())
+        await ARCHIVER.asyncio.sleep(0)
+        with (
+            patch.object(ARCHIVER, "TASK_CANCEL_TIMEOUT_SECONDS", 0.01),
+            self.assertLogs("binance-lob-archiver", level="ERROR"),
+        ):
+            pending = await ARCHIVER.cancel_tasks_bounded((task,))
+
+        self.assertEqual(pending, 1)
+        release.set()
+        await task
+
     async def test_resync_does_not_reuse_expired_initial_deadline(self):
         self.assertTrue(ARCHIVER.bridge_timed_out(False, 100, 101))
         self.assertFalse(ARCHIVER.bridge_timed_out(True, 100, 101))

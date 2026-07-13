@@ -16,8 +16,11 @@ symbol coverage, bridge state, gap count, free disk space, and whether the 20GiB
 warning threshold is active. It also reports pending upload count, last upload
 success/error, and an upload warning so OSS failures cannot look fully healthy.
 A silent WebSocket shard fails after
-`STALL_TIMEOUT_SECONDS`; systemd then restarts the service. Low disk space emits a
-warning but does not pause collection. Successfully uploaded segments are deleted
+`STALL_TIMEOUT_SECONDS`. Receiver cleanup is bounded to five seconds so a stuck
+WebSocket close handshake cannot block reconnection. A separate process watchdog
+exits after 180 seconds without any market-data frame, allowing systemd to recover
+even if the asyncio loop deadlocks. Low disk space emits a warning but does not
+pause collection. Successfully uploaded segments are deleted
 from the local spool immediately. Pending segments are retained when OSS upload
 fails so the collector never creates a silent data hole merely to reclaim space.
 The shared pending-diff budget still bounds initialization bursts. Services restart
