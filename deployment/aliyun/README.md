@@ -23,6 +23,10 @@ fails so the collector never creates a silent data hole merely to reclaim space.
 The shared pending-diff budget still bounds initialization bursts. Services restart
 every six hours to refresh the active-symbol catalog.
 
+The snapshot bridge timeout is 120 seconds after the last initial snapshot request
+finishes. This gives the full-market queue time to apply the tail of Spot and USD-M
+snapshots without turning normal initialization backlog into a reconnect loop.
+
 Current coverage:
 
 - `spot`: every active Binance spot symbol; `TRD_GRP_261` symbols are tagged as
