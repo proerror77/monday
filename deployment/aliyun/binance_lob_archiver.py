@@ -62,7 +62,6 @@ SNAPSHOT_RETRY_ATTEMPTS = max(
 )
 MAX_PENDING_DIFFS_TOTAL = int(os.getenv("MAX_PENDING_DIFFS_TOTAL", "250000"))
 MIN_FREE_GB = int(os.getenv("MIN_FREE_GB", "20"))
-DISK_RETRY_SECONDS = int(os.getenv("DISK_RETRY_SECONDS", "300"))
 ZSTD_TIMEOUT_SECONDS = int(os.getenv("ZSTD_TIMEOUT_SECONDS", "300"))
 OSS_COPY_TIMEOUT_SECONDS = int(os.getenv("OSS_COPY_TIMEOUT_SECONDS", "300"))
 
@@ -79,10 +78,6 @@ class SequenceGap(RuntimeError):
             f"{symbol} sequence gap expected={expected} "
             f"received={first_update_id}-{final_update_id}"
         )
-
-
-class DiskSpaceLow(RuntimeError):
-    pass
 
 
 class PendingBudget:
@@ -567,18 +562,28 @@ def bridge_timed_out(
     )
 
 
-def ensure_disk_headroom() -> None:
-    free = shutil.disk_usage(SPOOL_DIR).free
-    minimum = MIN_FREE_GB * 1024**3
-    if free < minimum:
-        raise DiskSpaceLow(
-            f"spool free space below {MIN_FREE_GB}GiB: {free / 1024**3:.1f}GiB"
+def disk_headroom() -> tuple[float, bool]:
+    free_gb = shutil.disk_usage(SPOOL_DIR).free / 1024**3
+    return round(free_gb, 1), free_gb < MIN_FREE_GB
+
+
+def warn_if_disk_low() -> tuple[float, bool]:
+    free_gb, warning = disk_headroom()
+    if warning:
+        LOG.warning(
+            "spool free space below %sGiB: %.1fGiB; continuing collection; "
+            "successfully uploaded segments are removed locally, but pending "
+            "segments are retained to prevent data loss",
+            MIN_FREE_GB,
+            free_gb,
         )
+    return free_gb, warning
 
 
 def write_health(
     states: dict[str, OrderBookState], session_id: str, status: str, gaps: int
 ) -> None:
+    disk_free_gb, disk_warning = disk_headroom()
     health = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "status": status,
@@ -588,6 +593,9 @@ def write_health(
         "security_token_count": len(SECURITY_TOKEN_SYMBOLS),
         "session_id": session_id,
         "sequence_gaps": gaps,
+        "disk_free_gb": disk_free_gb,
+        "disk_warning": disk_warning,
+        "disk_warning_threshold_gb": MIN_FREE_GB,
         "symbols": {
             symbol: {
                 "synced": state.synced,
@@ -749,7 +757,7 @@ async def run_session(
                     await runtime.rotate(states, session_id, "scheduled")
                 now = time.monotonic()
                 if now - last_disk_check >= 60:
-                    ensure_disk_headroom()
+                    warn_if_disk_low()
                     last_disk_check = now
                 await runtime.retry_uploads_if_due()
                 continue
@@ -824,7 +832,7 @@ async def run_session(
                         resync_tasks.remove(task)
                 last_task_check = now
             if now - last_disk_check >= 60:
-                ensure_disk_headroom()
+                warn_if_disk_low()
                 last_disk_check = now
             await runtime.retry_uploads_if_due()
     except BaseException as error:
@@ -908,11 +916,6 @@ async def collect(stop: asyncio.Event) -> None:
                 await runtime.rotate(states, session_id, "sequence_gap")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
-            except DiskSpaceLow:
-                write_health(states, session_id, "disk_low", runtime.total_gaps)
-                LOG.exception("disk watermark reached; pausing collection")
-                await runtime.rotate(states, session_id, "disk_low")
-                await asyncio.sleep(DISK_RETRY_SECONDS)
             except Exception:
                 write_health(states, session_id, "reconnecting", runtime.total_gaps)
                 LOG.exception("websocket session failed; reconnecting in %ss", backoff)

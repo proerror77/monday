@@ -207,7 +207,7 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ARCHIVER.bridge_timed_out(False, 100, 101))
         self.assertFalse(ARCHIVER.bridge_timed_out(True, 100, 101))
 
-    async def test_disk_watermark_fails_closed(self):
+    async def test_disk_watermark_warns_without_stopping_collection(self):
         with (
             patch.object(ARCHIVER, "MIN_FREE_GB", 20),
             patch.object(
@@ -215,9 +215,31 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                 "disk_usage",
                 return_value=SimpleNamespace(free=19 * 1024**3),
             ),
+            self.assertLogs("binance-lob-archiver", level="WARNING") as logs,
         ):
-            with self.assertRaises(ARCHIVER.DiskSpaceLow):
-                ARCHIVER.ensure_disk_headroom()
+            free_gb, warning = ARCHIVER.warn_if_disk_low()
+
+        self.assertEqual(free_gb, 19.0)
+        self.assertTrue(warning)
+        self.assertIn("continuing collection", logs.output[0])
+
+    async def test_health_reports_disk_warning(self):
+        state = ARCHIVER.OrderBookState("BTCUSDT")
+        with patch.object(
+            ARCHIVER,
+            "disk_headroom",
+            return_value=(19.0, True),
+        ):
+            ARCHIVER.write_health(
+                {"BTCUSDT": state}, "session-1", "synced", 0
+            )
+
+        health = ARCHIVER.json.loads(
+            (ARCHIVER.SPOOL_DIR / "health.json").read_text()
+        )
+        self.assertEqual(health["disk_free_gb"], 19.0)
+        self.assertTrue(health["disk_warning"])
+        self.assertEqual(health["disk_warning_threshold_gb"], 20)
 
     async def test_streams_are_split_into_bounded_websocket_shards(self):
         with (

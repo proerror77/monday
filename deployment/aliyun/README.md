@@ -12,10 +12,13 @@ Each service opens bounded WebSocket shards, records every diff, fetches a REST
 Top-100 snapshot, validates sequence continuity, writes replay checkpoints, compresses
 hourly segments, and uploads `.jsonl.zst`, `manifest.json`, and `_SUCCESS` to OSS.
 `health.json` under `/data/monday/spool/binance-lob/<market>/` reports freshness,
-symbol coverage, bridge state, and gap count. A silent WebSocket shard fails after
-`STALL_TIMEOUT_SECONDS`; systemd then restarts the service.
-The shared pending-diff budget and 20GiB free-space watermark fail closed before
-an initialization burst or OSS outage can exhaust the 2C8G host. Services restart
+symbol coverage, bridge state, gap count, free disk space, and whether the 20GiB
+warning threshold is active. A silent WebSocket shard fails after
+`STALL_TIMEOUT_SECONDS`; systemd then restarts the service. Low disk space emits a
+warning but does not pause collection. Successfully uploaded segments are deleted
+from the local spool immediately. Pending segments are retained when OSS upload
+fails so the collector never creates a silent data hole merely to reclaim space.
+The shared pending-diff budget still bounds initialization bursts. Services restart
 every six hours to refresh the active-symbol catalog.
 
 Current coverage:
