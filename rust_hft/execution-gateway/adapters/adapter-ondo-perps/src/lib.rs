@@ -428,6 +428,7 @@ impl TryFrom<RawOpenOrder> for OpenOrder {
         };
         Ok(OpenOrder {
             order_id: OrderId(order.order_id),
+            client_order_id: None,
             symbol: Symbol::from(order.market),
             side,
             order_type,

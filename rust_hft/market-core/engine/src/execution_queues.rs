@@ -289,7 +289,7 @@ impl WorkerQueues {
     }
 
     /// 发送执行回报到引擎 (非阻塞)
-    pub fn send_event(&mut self, event: ExecutionEvent) -> Result<(), ExecutionEvent> {
+    pub fn send_event(&mut self, event: ExecutionEvent) -> Result<(), Box<ExecutionEvent>> {
         match self.event_producer.send(event) {
             Ok(()) => {
                 self.stats.events_sent += 1;
@@ -302,7 +302,7 @@ impl WorkerQueues {
             Err(event) => {
                 self.stats.event_queue_full_count += 1;
                 warn!("回报队列满载，等待引擎释放空间: {:?}", event);
-                Err(event)
+                Err(Box::new(event))
             }
         }
     }
@@ -313,7 +313,7 @@ impl WorkerQueues {
             match self.send_event(event) {
                 Ok(()) => return,
                 Err(rejected) => {
-                    event = rejected;
+                    event = *rejected;
                     self.event_space_notify.notified().await;
                 }
             }

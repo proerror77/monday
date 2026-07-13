@@ -134,6 +134,7 @@ fn convert_shared_config(shared_cfg: SharedSystemConfig) -> Result<SystemConfig,
     let engine = SystemEngineConfig {
         queue_capacity: shared_cfg.engine.queue_capacity,
         stale_us: shared_cfg.engine.stale_us,
+        intent_max_latency_us: 3_000,
         top_n: shared_cfg.engine.top_n,
         flip_policy: FlipPolicy::OnUpdate,
         cpu_affinity: CpuAffinityConfig::default(),

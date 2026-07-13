@@ -59,6 +59,21 @@ pub struct WsMetrics {
 
 pub type WsConnection = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// Apply TCP_NODELAY through the TLS wrapper instead of only handling plain WebSockets.
+pub fn set_ws_tcp_nodelay(
+    stream: &MaybeTlsStream<TcpStream>,
+    enabled: bool,
+) -> std::io::Result<()> {
+    match stream {
+        MaybeTlsStream::Plain(stream) => stream.set_nodelay(enabled),
+        MaybeTlsStream::Rustls(stream) => stream.get_ref().0.set_nodelay(enabled),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported WebSocket TLS transport",
+        )),
+    }
+}
+
 #[derive(Debug)]
 pub struct WsClient {
     pub cfg: WsClientConfig,
@@ -93,20 +108,17 @@ impl WsClient {
         ws_config.accept_unmasked_frames = false;
         let ws_config = Some(ws_config);
 
-        match connect_async_with_config(&self.cfg.url, ws_config, false).await {
+        match connect_async_with_config(&self.cfg.url, ws_config, self.cfg.tcp_nodelay).await {
             Ok((ws_stream, response)) => {
                 info!("WebSocket 連接成功，狀態碼: {}", response.status());
 
                 // 如果配置啟用了 TCP_NODELAY，設置 TCP 選項
                 if self.cfg.tcp_nodelay {
-                    if let MaybeTlsStream::Plain(ref stream) = ws_stream.get_ref() {
-                        if let Err(e) = stream.set_nodelay(true) {
-                            warn!("無法設置 TCP_NODELAY: {}", e);
-                        } else {
-                            debug!("已啟用 TCP_NODELAY 以降低延遲");
-                        }
+                    if let Err(e) = set_ws_tcp_nodelay(ws_stream.get_ref(), true) {
+                        warn!("無法設置 TCP_NODELAY: {}", e);
+                    } else {
+                        debug!("已啟用 TCP_NODELAY 以降低延遲");
                     }
-                    // 對於 TLS 連接，底層 TCP 流不直接可訪問，依賴於 TLS 庫的默認設置
                 }
 
                 self.connection = Some(ws_stream);
@@ -531,5 +543,22 @@ mod tests {
 
         assert_eq!(payload.as_ref(), b"market-data");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_nodelay_reaches_the_underlying_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = TcpStream::connect(address).await.unwrap();
+        let _server = server.await.unwrap();
+        let stream = MaybeTlsStream::Plain(client);
+
+        set_ws_tcp_nodelay(&stream, true).unwrap();
+
+        match stream {
+            MaybeTlsStream::Plain(stream) => assert!(stream.nodelay().unwrap()),
+            _ => unreachable!(),
+        }
     }
 }

@@ -176,6 +176,8 @@ impl TrackedMarketEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenOrder {
     pub order_id: OrderId,
+    #[serde(default)]
+    pub client_order_id: Option<String>,
     pub symbol: Symbol,
     pub side: Side,
     pub order_type: OrderType,
@@ -450,6 +452,8 @@ pub enum ExecutionEvent {
     /// 來源：ExecutionWorker 在下單成功後立即派發（Paper/Live 通用）
     OrderNew {
         order_id: OrderId,
+        #[serde(default)]
+        client_order_id: Option<String>,
         symbol: Symbol,
         side: Side,
         quantity: Quantity,

@@ -879,7 +879,104 @@ fn strategy_order_reaches_worker_with_lifecycle_and_idempotency_key() {
     let envelope = &envelopes[0];
     assert!(!envelope.client_order_id.is_empty());
     assert_eq!(envelope.lifecycle.source_book_seq, Some(700));
-    assert!(envelope.lifecycle.max_latency_us.is_some());
+    assert_eq!(envelope.lifecycle.max_latency_us, Some(3_000));
     assert!(envelope.lifecycle.valid_until > envelope.lifecycle.created_ts);
     assert_eq!(envelope.intent.strategy_id, "one-shot");
+}
+
+#[test]
+fn intent_from_an_older_event_in_the_same_batch_is_rejected() {
+    let mut config = EngineConfig::default();
+    config.ingestion.stale_threshold_us = 1_000_000;
+    let mut engine = Engine::new(config);
+    let ingester = engine.create_event_ingester_pair();
+    let (engine_queues, mut worker_queues) =
+        create_execution_queues(ExecutionQueueConfig::default());
+    engine.set_execution_queues(engine_queues);
+    engine.register_strategy(OneShotOrderStrategy { emitted: false });
+
+    let mut ingester = ingester.lock().expect("ingester lock");
+    ingester
+        .ingest(MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: now_micros(),
+            bids: vec![level(100.0, 2.0)],
+            asks: vec![level(101.0, 2.0)],
+            sequence: 700,
+            source_venue: Some(VenueId::BINANCE),
+        }))
+        .expect("snapshot accepted");
+    ingester
+        .ingest(MarketEvent::Update(BookUpdate {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: now_micros(),
+            bids: vec![level(100.0, 3.0)],
+            asks: vec![],
+            first_sequence: Some(701),
+            sequence: 701,
+            is_snapshot: false,
+            source_venue: Some(VenueId::BINANCE),
+        }))
+        .expect("delta accepted");
+    drop(ingester);
+
+    engine.tick().expect("strategy tick");
+
+    assert!(worker_queues.receive_envelopes().is_empty());
+}
+
+#[test]
+fn market_consumers_rotate_without_exceeding_the_global_tick_budget() {
+    let mut config = EngineConfig::default();
+    config.max_events_per_cycle = 1;
+    config.ingestion.stale_threshold_us = 1_000_000;
+    let mut engine = Engine::new(config);
+    let first = engine.create_event_ingester_pair();
+    let second = engine.create_event_ingester_pair();
+
+    let snapshot = |symbol: &str, sequence| {
+        MarketEvent::Snapshot(MarketSnapshot {
+            symbol: Symbol::new(symbol),
+            timestamp: now_micros(),
+            bids: vec![level(100.0, 2.0)],
+            asks: vec![level(101.0, 2.0)],
+            sequence,
+            source_venue: Some(VenueId::BINANCE),
+        })
+    };
+    first
+        .lock()
+        .unwrap()
+        .ingest(snapshot("BTCUSDT", 1))
+        .unwrap();
+    first
+        .lock()
+        .unwrap()
+        .ingest(MarketEvent::Update(BookUpdate {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: now_micros(),
+            bids: vec![level(100.0, 3.0)],
+            asks: vec![],
+            first_sequence: Some(2),
+            sequence: 2,
+            is_snapshot: false,
+            source_venue: Some(VenueId::BINANCE),
+        }))
+        .unwrap();
+    second
+        .lock()
+        .unwrap()
+        .ingest(snapshot("ETHUSDT", 1))
+        .unwrap();
+
+    assert_eq!(engine.tick().unwrap().events_processed, 1);
+    assert_eq!(engine.tick().unwrap().events_processed, 1);
+
+    let view = engine.get_market_view();
+    assert!(view
+        .get_orderbook(&hft_core::VenueSymbol::new(
+            VenueId::BINANCE,
+            Symbol::new("ETHUSDT"),
+        ))
+        .is_some());
 }

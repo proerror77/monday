@@ -36,6 +36,9 @@ pub struct SystemEngineConfig {
     pub queue_capacity: usize,
     #[serde(default = "default_stale_us")]
     pub stale_us: u64,
+    /// Maximum local quote-to-submission age; do not derive this from public feed cadence.
+    #[serde(default = "default_intent_max_latency_us")]
+    pub intent_max_latency_us: u64,
     #[serde(default = "default_top_n")]
     pub top_n: usize,
     #[serde(default)]
@@ -64,6 +67,10 @@ fn default_queue_capacity() -> usize {
 }
 
 fn default_stale_us() -> u64 {
+    3000
+}
+
+fn default_intent_max_latency_us() -> u64 {
     3000
 }
 

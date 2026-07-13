@@ -2,7 +2,7 @@
 
 use crate::events::*;
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use hft_core::*;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
@@ -25,6 +25,18 @@ pub trait MarketStream: Send + Sync {
     /// 訂閱指定品種，返回統一事件流
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>>;
 
+    /// Latency-aware stream. Adapters with frame timing override this; other adapters retain the
+    /// stable MarketEvent API and begin tracking at their publish boundary.
+    async fn subscribe_tracked(
+        &self,
+        symbols: Vec<Symbol>,
+    ) -> HftResult<BoxStream<TrackedMarketEvent>> {
+        let stream = self.subscribe(symbols).await?;
+        Ok(Box::pin(
+            stream.map(|result| result.map(TrackedMarketEvent::new)),
+        ))
+    }
+
     /// 訂閱帶產品語義的品種。默認降級到 symbol-only，具體 adapter 可覆寫。
     async fn subscribe_instruments(
         &self,
@@ -35,6 +47,17 @@ pub trait MarketStream: Send + Sync {
             .map(|instrument| instrument.symbol)
             .collect();
         self.subscribe(symbols).await
+    }
+
+    async fn subscribe_tracked_instruments(
+        &self,
+        instruments: Vec<InstrumentSpec>,
+    ) -> HftResult<BoxStream<TrackedMarketEvent>> {
+        let symbols = instruments
+            .into_iter()
+            .map(|instrument| instrument.symbol)
+            .collect();
+        self.subscribe_tracked(symbols).await
     }
 
     /// 健康檢查

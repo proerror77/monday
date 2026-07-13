@@ -213,8 +213,16 @@ impl BinanceWebSocket {
     /// # }
     /// ```
     pub async fn receive_message_bytes(&mut self) -> HftResult<Option<Bytes>> {
+        self.receive_message_bytes_with_metrics()
+            .await
+            .map(|message| message.map(|(bytes, _)| bytes))
+    }
+
+    pub async fn receive_message_bytes_with_metrics(
+        &mut self,
+    ) -> HftResult<Option<(Bytes, integration::WsFrameMetrics)>> {
         match self.client.receive_message_bytes().await {
-            Ok(Some((bytes, _metrics))) => Ok(Some(bytes)),
+            Ok(Some(message)) => Ok(Some(message)),
             Ok(None) => Ok(None),
             Err(e) => Err(HftError::Network(format!("接收消息失敗: {}", e))),
         }

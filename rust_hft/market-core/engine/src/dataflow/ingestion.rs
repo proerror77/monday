@@ -397,9 +397,22 @@ impl EventIngester {
     /// Lossless production ingestion. Queue pressure is propagated to the adapter task instead of
     /// dropping a sequence-bearing book delta.
     pub async fn ingest_lossless(&mut self, event: MarketEvent) -> Result<(), HftError> {
+        let received_at = current_timestamp_us();
+        let mut tracker = LatencyTracker::from_time(received_at);
+        tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+        tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
+        self.ingest_tracked_lossless(TrackedMarketEvent { event, tracker })
+            .await
+    }
+
+    /// Lossless ingestion for adapters that already measured frame receive and parse boundaries.
+    pub async fn ingest_tracked_lossless(
+        &mut self,
+        mut tracked_event: TrackedMarketEvent,
+    ) -> Result<(), HftError> {
         self.metrics.events_received += 1;
         let received_at = current_timestamp_us();
-        let event_ts = self.extract_timestamp(&event);
+        let event_ts = self.extract_timestamp(&tracked_event.event);
         if let Some(timestamp) = event_ts {
             let delay = received_at.saturating_sub(timestamp);
             self.metrics.record_latency(delay);
@@ -408,13 +421,32 @@ impl EventIngester {
             }
         }
 
-        // Exchange time remains in MarketEvent. Runtime latency and order validity start at the
-        // local adapter boundary so batched public feeds are not mistaken for local queue delay.
-        let mut tracker = LatencyTracker::from_time(received_at);
-        tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
-        tracker.record_stage_with_offset(LatencyStage::Parsing, 0);
-        tracker.record_stage(LatencyStage::Ingestion);
-        let mut tracked_event = TrackedMarketEvent { event, tracker };
+        if !tracked_event
+            .tracker
+            .stage_offsets
+            .iter()
+            .any(|(stage, _)| *stage == LatencyStage::WsReceive)
+        {
+            tracked_event
+                .tracker
+                .record_stage_with_offset(LatencyStage::WsReceive, 0);
+        }
+        if !tracked_event
+            .tracker
+            .stage_offsets
+            .iter()
+            .any(|(stage, _)| *stage == LatencyStage::Parsing)
+        {
+            let offset = tracked_event
+                .tracker
+                .stage_offsets
+                .last()
+                .map_or(0, |(_, offset)| *offset);
+            tracked_event
+                .tracker
+                .record_stage_with_offset(LatencyStage::Parsing, offset);
+        }
+        tracked_event.tracker.record_stage(LatencyStage::Ingestion);
 
         loop {
             match self.producer.send(tracked_event) {
@@ -538,11 +570,22 @@ impl EventConsumer {
     }
 
     /// 消費事件，返回是否應該觸發快照發佈
-    pub fn consume_events(&mut self, mut callback: impl FnMut(TrackedMarketEvent) -> bool) -> bool {
+    pub fn consume_events(&mut self, callback: impl FnMut(TrackedMarketEvent) -> bool) -> bool {
+        self.consume_events_up_to(u32::MAX, callback)
+    }
+
+    pub fn consume_events_up_to(
+        &mut self,
+        max_events: u32,
+        mut callback: impl FnMut(TrackedMarketEvent) -> bool,
+    ) -> bool {
+        if max_events == 0 {
+            return false;
+        }
         let mut should_flip = false;
         let mut events_processed: u32 = 0;
         let utilization = self.consumer.utilization();
-        let batch_limit: u32 = if utilization > 0.8 { 256 } else { 64 };
+        let batch_limit: u32 = (if utilization > 0.8 { 256 } else { 64 }).min(max_events);
 
         // 批量消費事件
         while let Some(tracked_event) = self.consumer.recv() {
@@ -798,5 +841,46 @@ mod tests {
             panic!("expected snapshot");
         };
         assert_eq!(snapshot.timestamp, 1);
+    }
+
+    #[tokio::test]
+    async fn tracked_lossless_ingestion_preserves_adapter_receive_and_parse_stages() {
+        let (mut ingester, mut consumer) = EventIngester::new(IngestionConfig::default());
+        let origin = hft_core::monotonic_micros();
+        let mut tracker = LatencyTracker::from_monotonic(origin);
+        tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+        tracker.record_stage_with_offset(LatencyStage::Parsing, 7);
+        let tracked = TrackedMarketEvent {
+            event: MarketEvent::Snapshot(MarketSnapshot {
+                symbol: Symbol::new("BTCUSDT"),
+                timestamp: current_timestamp_us(),
+                bids: vec![],
+                asks: vec![],
+                sequence: 1,
+                source_venue: None,
+            }),
+            tracker,
+        };
+
+        ingester.ingest_tracked_lossless(tracked).await.unwrap();
+
+        let mut received = Vec::new();
+        consumer.consume_events(|tracked| {
+            received.push(tracked);
+            false
+        });
+        let tracked = &received[0];
+        assert_eq!(
+            tracked
+                .tracker
+                .get_measurement(LatencyStage::Parsing)
+                .unwrap()
+                .duration_micros,
+            7
+        );
+        assert!(tracked
+            .tracker
+            .get_measurement(LatencyStage::Ingestion)
+            .is_some());
     }
 }

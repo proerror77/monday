@@ -2,11 +2,14 @@
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use hft_core::{HftError, HftResult, Price, Quantity, Symbol, VenueId};
+use futures::StreamExt;
+use hft_core::{
+    HftError, HftResult, LatencyStage, LatencyTracker, Price, Quantity, Symbol, VenueId,
+};
 use integration::ws::{WsClient, WsClientConfig};
 use ports::{
     BookLevel, BookUpdate, BoxStream, ConnectionHealth, MarketEvent, MarketSnapshot, MarketStream,
-    TopOfBook, Trade,
+    TopOfBook, TrackedMarketEvent, Trade,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 use std::collections::HashMap;
@@ -21,7 +24,7 @@ const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 4096;
 #[derive(Debug)]
 struct QueuedMarketEvent {
     generation: u64,
-    event: MarketEvent,
+    event: TrackedMarketEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +55,7 @@ fn multiplex_market_events(
     mut data_rx: mpsc::Receiver<QueuedMarketEvent>,
     mut control_rx: watch::Receiver<Option<StreamInvalidation>>,
     generation: Arc<AtomicU64>,
-) -> BoxStream<MarketEvent> {
+) -> BoxStream<TrackedMarketEvent> {
     Box::pin(async_stream::stream! {
         let mut control_open = true;
         loop {
@@ -70,11 +73,11 @@ fn multiplex_market_events(
                     if invalidation.generation != generation.load(Ordering::Acquire) {
                         continue;
                     }
-                    yield Ok(MarketEvent::Disconnect {
+                    yield Ok(TrackedMarketEvent::new(MarketEvent::Disconnect {
                         reason: invalidation.reason,
                         source_venue: Some(VenueId::BYBIT),
                         symbol: None,
-                    });
+                    }));
                     if let Some(error) = invalidation.error {
                         yield Err(error);
                     }
@@ -362,6 +365,16 @@ impl BybitMarketStream {
 #[async_trait]
 impl MarketStream for BybitMarketStream {
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>> {
+        let stream = self.subscribe_tracked(symbols).await?;
+        Ok(Box::pin(
+            stream.map(|result| result.map(|tracked| tracked.event)),
+        ))
+    }
+
+    async fn subscribe_tracked(
+        &self,
+        symbols: Vec<Symbol>,
+    ) -> HftResult<BoxStream<TrackedMarketEvent>> {
         if symbols.is_empty() {
             return Err(HftError::new("Bybit symbols cannot be empty"));
         }
@@ -452,7 +465,7 @@ impl MarketStream for BybitMarketStream {
                                         next_ping = tokio::time::Instant::now()
                                             + std::time::Duration::from_secs(20);
                                     }
-                                    Ok(Ok(Some((bytes, _metrics)))) => {
+                                    Ok(Ok(Some((bytes, mut metrics)))) => {
                                         last_heartbeat
                                             .store(hft_core::now_micros(), Ordering::Release);
                                         let mut bytes = match bytes.try_into_mut() {
@@ -469,6 +482,7 @@ impl MarketStream for BybitMarketStream {
                                             },
                                         ) {
                                             Ok(events) => {
+                                                metrics.mark_parsed();
                                                 if !events.is_empty()
                                                     && live_since.elapsed()
                                                         >= std::time::Duration::from_secs(30)
@@ -476,10 +490,27 @@ impl MarketStream for BybitMarketStream {
                                                     attempts = 0;
                                                 }
                                                 for event in events {
+                                                    let mut tracker =
+                                                        LatencyTracker::from_monotonic(
+                                                            metrics.received_at_us,
+                                                        );
+                                                    tracker.record_stage_with_offset(
+                                                        LatencyStage::WsReceive,
+                                                        0,
+                                                    );
+                                                    tracker.record_stage_with_offset(
+                                                        LatencyStage::Parsing,
+                                                        metrics
+                                                            .parsed_at_us
+                                                            .saturating_sub(metrics.received_at_us),
+                                                    );
                                                     let queued = QueuedMarketEvent {
                                                         generation: task_generation
                                                             .load(Ordering::Acquire),
-                                                        event,
+                                                        event: TrackedMarketEvent {
+                                                            event,
+                                                            tracker,
+                                                        },
                                                     };
                                                     match tx.try_send(queued) {
                                                         Ok(()) => {}
@@ -896,7 +927,7 @@ mod tests {
         data_tx
             .try_send(QueuedMarketEvent {
                 generation: 1,
-                event: old,
+                event: TrackedMarketEvent::new(old),
             })
             .unwrap();
         publish_invalidation(
@@ -918,7 +949,7 @@ mod tests {
         data_tx
             .try_send(QueuedMarketEvent {
                 generation: 2,
-                event: fresh,
+                event: TrackedMarketEvent::new(fresh),
             })
             .unwrap();
         drop(data_tx);
@@ -927,9 +958,16 @@ mod tests {
         let mut stream = multiplex_market_events(data_rx, control_rx, generation);
         assert!(matches!(
             stream.next().await,
-            Some(Ok(MarketEvent::Disconnect { .. }))
+            Some(Ok(TrackedMarketEvent {
+                event: MarketEvent::Disconnect { .. },
+                ..
+            }))
         ));
-        let Some(Ok(MarketEvent::Trade(trade))) = stream.next().await else {
+        let Some(Ok(TrackedMarketEvent {
+            event: MarketEvent::Trade(trade),
+            ..
+        })) = stream.next().await
+        else {
             panic!("expected fresh generation after invalidation");
         };
         assert_eq!(trade.trade_id, "fresh");

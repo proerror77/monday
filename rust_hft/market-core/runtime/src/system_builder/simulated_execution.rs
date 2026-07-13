@@ -106,6 +106,7 @@ impl ExecutionClient for SimulatedExecutionClient {
 
         self.send_event(ExecutionEvent::OrderNew {
             order_id: order_id.clone(),
+            client_order_id: None,
             symbol: intent.symbol.clone(),
             side: intent.side,
             quantity: intent.quantity,
@@ -124,6 +125,7 @@ impl ExecutionClient for SimulatedExecutionClient {
             order_id.clone(),
             OpenOrder {
                 order_id: order_id.clone(),
+                client_order_id: None,
                 symbol: intent.symbol.clone(),
                 side: intent.side,
                 order_type: intent.order_type,

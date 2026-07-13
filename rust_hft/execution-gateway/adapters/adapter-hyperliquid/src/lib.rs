@@ -1095,6 +1095,7 @@ impl HyperliquidExecutionClient {
 
         Ok(OpenOrder {
             order_id: our_order_id,
+            client_order_id: None,
             symbol,
             side,
             order_type,

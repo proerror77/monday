@@ -18,7 +18,7 @@ use dataflow::{EventConsumer, IngestionConfig};
 use execution_queues::EngineQueues;
 use hft_core::{
     now_micros, HftError, HftResult, LatencyStage, LatencyTracker, OrderType, Side, Symbol,
-    Timestamp, VenueId,
+    Timestamp, VenueId, VenueSymbol,
 };
 use latency_monitor::{LatencyMonitor, LatencyMonitorConfig};
 use ports::Trade as MarketTrade;
@@ -89,6 +89,8 @@ pub struct EventBroadcasters {
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub ingestion: IngestionConfig,
+    /// Maximum local quote-to-submission age. This is independent from exchange feed cadence.
+    pub intent_max_latency_us: u64,
     pub max_events_per_cycle: u32,
     pub aggregation_symbols: Vec<Symbol>,
     pub top_n: usize,
@@ -107,6 +109,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             ingestion: IngestionConfig::default(),
+            intent_max_latency_us: 3_000,
             max_events_per_cycle: 100,
             aggregation_symbols: vec![],
             top_n: 10,
@@ -712,7 +715,11 @@ impl Engine {
 
         for (idx, consumer) in self.event_consumers.iter_mut().enumerate() {
             let mut consumer_events = 0;
-            let consumer_should_flip = consumer.consume_events(|event| {
+            let remaining = self
+                .config
+                .max_events_per_cycle
+                .saturating_sub(total_events);
+            let consumer_should_flip = consumer.consume_events_up_to(remaining, |event| {
                 consumer_events += 1;
                 total_events += 1;
                 result.events_processed += 1;
@@ -827,6 +834,9 @@ impl Engine {
             if total_events >= self.config.max_events_per_cycle {
                 break;
             }
+        }
+        if self.event_consumers.len() > 1 {
+            self.event_consumers.rotate_left(1);
         }
 
         result.events_total = total_events;
@@ -965,6 +975,7 @@ impl Engine {
         // 0. 先處理 OrderNew：註冊訂單元資料（供 Portfolio/OMS 使用）
         if let ExecutionEvent::OrderNew {
             order_id,
+            client_order_id,
             symbol,
             side,
             quantity,
@@ -978,7 +989,7 @@ impl Engine {
             if let Some(om) = &mut self.order_manager {
                 om.register_order(ports::RegisterOrderParams {
                     order_id: order_id.clone(),
-                    client_order_id: None,
+                    client_order_id: client_order_id.clone(),
                     symbol: symbol.clone(),
                     side: *side,
                     qty: *quantity,
@@ -1128,7 +1139,7 @@ impl Engine {
         let account_view = self.get_account_view();
 
         // 處理所有待處理的市場事件（包括真實的 Bar 事件）
-        let events_to_process = std::mem::take(&mut self.pending_market_events);
+        let mut events_to_process = std::mem::take(&mut self.pending_market_events);
 
         for pending in &events_to_process {
             let event = &pending.event;
@@ -1187,11 +1198,11 @@ impl Engine {
                 }
 
                 // 使用策略實例 ID（而非類型名稱）進行事件過濾
-                let unknown_id = "unknown".to_string();
                 let strategy_instance_id = self
                     .strategy_instance_ids
                     .get(strategy_idx)
-                    .unwrap_or(&unknown_id);
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
 
                 // 事件範疇過濾（使用策略顯式語義）：單場策略僅處理綁定場域事件
                 let mut should_process = true;
@@ -1334,11 +1345,17 @@ impl Engine {
 
             // 發送通過風控的意圖到执行队列
             let execution_start = now_micros();
+            let latest_book_seq = l2_book.and_then(|book| {
+                self.aggregation_engine
+                    .orderbooks
+                    .get(&VenueSymbol::new(book.venue, book.symbol.clone()))
+                    .map(|snapshot| snapshot.sequence)
+            });
             if let Some(queues) = &mut self.execution_queues {
                 let mut dropped = 0usize;
                 for intent in intents_to_send.drain(..) {
                     let created_ts = received_at;
-                    let max_latency_us = self.config.ingestion.stale_threshold_us.max(1);
+                    let max_latency_us = self.config.intent_max_latency_us.max(1);
                     let mut lifecycle = ports::OrderIntentLifecycle::new(
                         created_ts,
                         created_ts.saturating_add(max_latency_us),
@@ -1351,7 +1368,6 @@ impl Engine {
                         ports::MarketEvent::Quote(quote) => Some(quote.sequence),
                         _ => None,
                     });
-                    let latest_book_seq = lifecycle.source_book_seq;
                     let envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
                     if queues
                         .send_lifecycle_intent_with_book_seq(
@@ -1396,6 +1412,9 @@ impl Engine {
             infra_metrics::MetricsRegistry::global()
                 .record_execution_latency(execution_latency as f64);
         }
+
+        events_to_process.clear();
+        self.pending_market_events = events_to_process;
 
         Ok(())
     }
