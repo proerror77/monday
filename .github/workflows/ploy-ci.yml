@@ -101,6 +101,21 @@ jobs:
       - name: Validate frontend route contract
         run: node ploy-frontend/scripts/check-route-contract.mjs
 
+      - name: Validate Python safety helpers
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_psql_connection.py'
+          python3 -m py_compile \
+            scripts/psql_connection.py \
+            scripts/report_strategy.py \
+            scripts/report_market_data_health.py \
+            scripts/deribit_atm_greeks_collector.py \
+            scripts/audit_market_data_gaps.py
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --requirement examples/openclaw/skill-ploy-rpc/requirements.txt
+          python3 -m py_compile examples/openclaw/skill-ploy-rpc/bin/ingest_feeds.py
+
       - name: Reject retired routes, insecure SSH, and reset bypasses
         run: |
           set -euo pipefail

@@ -7,7 +7,8 @@ import hashlib
 import json
 import sys
 import urllib.request
-import xml.etree.ElementTree as ET
+
+from defusedxml import ElementTree as ET
 
 
 def _text(el: ET.Element | None) -> str | None:
@@ -61,7 +62,9 @@ def _fetch_xml(url: str, timeout: int) -> ET.Element:
         method="GET",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = resp.read()
+        data = resp.read(5 * 1024 * 1024 + 1)
+    if len(data) > 5 * 1024 * 1024:
+        raise ValueError("feed exceeds the 5 MiB safety limit")
     return ET.fromstring(data)
 
 

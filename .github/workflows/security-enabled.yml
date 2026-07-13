@@ -37,6 +37,7 @@ jobs:
           --config p/security-audit
           --config p/owasp-top-ten
           --exclude products/ploy/.github/workflows
+          --exclude products/ploy/infra
           --sarif
           --output semgrep.sarif
           .

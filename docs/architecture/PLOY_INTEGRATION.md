@@ -55,10 +55,10 @@ Seven documents from local PLOY commit `5de411bbe8889284b47fe9932821af077d2962fc
 - Monday's existing Rust workspace stays rooted at `rust_hft` and keeps its own toolchain and CI.
 - PLOY stays rooted at `products/ploy`, uses Rust `1.91` and Node `22`, and has a dedicated root workflow at `.github/workflows/ploy-ci.yml`.
 - PLOY-only changes do not run Monday's Rust or Docker build matrices; repository-wide security checks still scan the full diff.
-- Semgrep excludes the nested historical PLOY workflow directory because those
-  files are preserved evidence rather than executable Monday workflows. Root
-  workflows and active source remain scanned, and tracked-secret detection still
-  covers the complete repository tree.
+- Semgrep excludes the nested historical PLOY workflow and infrastructure
+  directories because those files are preserved evidence rather than executable
+  Monday delivery paths. Root workflows and active source remain scanned, and
+  tracked-secret detection still covers the complete repository tree.
 - The active PLOY runtime entrypoints are `new-ployd`, `new-ploy-runner`, `ployctl`, and `ploytui`. The root `ploy` crate is a compatibility shim.
 - `PloyDaemon::boot` installs `DisabledLiveExecutionGateway`; production code
   cannot inject the private Polymarket gateway, and the standard runner `full`

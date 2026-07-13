@@ -34,6 +34,7 @@ remote runtime and cannot submit, cancel, or replace orders.
 Feed ingestion remains local and non-executing:
 
 ```bash
+python3 -m pip install -r ./requirements.txt
 ./bin/ingest_feeds ./config/feeds.json
 ```
 

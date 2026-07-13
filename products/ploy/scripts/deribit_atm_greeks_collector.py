@@ -19,6 +19,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+try:
+    from scripts.psql_connection import psql_environment
+except ModuleNotFoundError:
+    from psql_connection import psql_environment
+
 API_BASE = os.getenv("DERIBIT_API_BASE", "https://www.deribit.com/api/v2/public")
 CURRENCIES = [
     c.strip().upper()
@@ -33,8 +38,6 @@ DB_URL = (
     or os.getenv("DATABASE_URL")
     or "postgresql://postgres:postgres@localhost:5432/ploy"
 )
-PSQL_BIN = os.getenv("PSQL_BIN", "psql")
-
 RUNNING = True
 
 
@@ -49,13 +52,15 @@ def _on_signal(signum: int, _frame: Any) -> None:
 
 
 def _run_psql(sql: str, at_mode: bool = False) -> str:
-    cmd = [PSQL_BIN, DB_URL, "-v", "ON_ERROR_STOP=1", "-X"]
+    cmd = ["psql", "-v", "ON_ERROR_STOP=1", "-X"]
     if at_mode:
         cmd.extend(["-A", "-t", "-F", "\t"])
-    cmd.extend(["-c", sql])
+    cmd.extend(["-f", "-"])
 
     proc = subprocess.run(
         cmd,
+        input=sql,
+        env=psql_environment(DB_URL),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

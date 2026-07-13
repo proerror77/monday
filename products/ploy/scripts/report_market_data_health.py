@@ -13,6 +13,11 @@ import sys
 from datetime import datetime, timezone
 from typing import Optional
 
+try:
+    from scripts.psql_connection import psql_environment
+except ModuleNotFoundError:
+    from psql_connection import psql_environment
+
 DB_URL = (
     os.environ.get("PLOY_DATABASE__URL")
     or os.environ.get("DATABASE_URL")
@@ -28,10 +33,19 @@ def run_sql(query: str, timeout: int = 10) -> str:
         "-A",
         "-v",
         "ON_ERROR_STOP=1",
-        "-c",
-        query,
+        "-f",
+        "-",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # The executable and arguments are fixed; the validated URL is projected only
+    # into libpq PG* variables and the SQL travels over stdin.
+    result = subprocess.run(
+        cmd,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+        input=query,
+        env=psql_environment(DB_URL),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip())
     return result.stdout.strip()

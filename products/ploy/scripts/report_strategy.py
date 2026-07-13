@@ -2,7 +2,7 @@
 """Generate a self-contained HTML strategy performance report.
 
 Usage:
-    python3 scripts/report_strategy.py [--since YYYY-MM-DD] [--host HOST]
+    python3 scripts/report_strategy.py [--since YYYY-MM-DD]
 
 Output: reports/strategy_report.html
 """
@@ -14,7 +14,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-HOST = os.environ.get("PLOY_RESEARCH_HOST", "tango-1-1")
+try:
+    from scripts.psql_connection import psql_environment
+except ModuleNotFoundError:
+    from psql_connection import psql_environment
+
 SINCE = None
 CONFIG_PATH = "config/strategies/02-pm5d-threelayer.unified.toml"
 DB_URL = (
@@ -26,8 +30,16 @@ DB_URL = (
 for i, arg in enumerate(sys.argv[1:], 1):
     if arg == "--since" and i < len(sys.argv) - 1:
         SINCE = sys.argv[i + 1]
-    elif arg == "--host" and i < len(sys.argv) - 1:
-        HOST = sys.argv[i + 1]
+
+if os.environ.get("PLOY_RESEARCH_HOST") or "--host" in sys.argv:
+    raise SystemExit(
+        "remote report execution is disabled inside Monday; configure DATABASE_URL instead"
+    )
+if SINCE:
+    try:
+        datetime.strptime(SINCE, "%Y-%m-%d")
+    except ValueError as exc:
+        raise SystemExit("--since must use YYYY-MM-DD") from exc
 
 SINCE_FILTER = f"AND COALESCE(closed_at, opened_at) >= '{SINCE}T00:00:00+08'" if SINCE else ""
 DAILY_FILTER = f"AND trading_day_cst >= '{SINCE}'" if SINCE else ""
@@ -35,26 +47,15 @@ ORDERS_FILTER = f"AND created_at >= '{SINCE}T00:00:00+08'" if SINCE else ""
 
 
 def run_sql(query: str) -> str:
-    if HOST in {"local", "localhost", "127.0.0.1", "self"}:
-        cmd = [
-            "psql",
-            DB_URL,
-            "-t",
-            "-A",
-            "-F",
-            "|",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            query,
-        ]
-    else:
-        cmd = [
-            "ssh",
-            HOST,
-            f'PGPASSWORD=postgres psql -U postgres -d ploy -t -A -F"|" -c "{query}"',
-        ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    cmd = ["psql", "-t", "-A", "-F", "|", "-v", "ON_ERROR_STOP=1", "-f", "-"]
+    result = subprocess.run(
+        cmd,
+        input=query,
+        env=psql_environment(DB_URL),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     lines = [
         l for l in result.stdout.strip().split("\n")
         if l and not l.startswith("perl:") and "LANGUAGE" not in l
@@ -64,7 +65,7 @@ def run_sql(query: str) -> str:
 
 # --- Fetch data ---
 
-print(f"Fetching data from {HOST}...")
+print("Fetching data from the configured PostgreSQL endpoint...")
 
 # Q1: All closed trades for cumulative PnL + detail table.
 # Strategy sizing is requested in USD stake, while fills are recorded as shares.
