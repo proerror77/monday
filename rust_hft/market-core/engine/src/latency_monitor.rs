@@ -5,10 +5,8 @@
 use hdrhistogram::Histogram;
 use hft_core::latency::LatencyStageStats;
 use hft_core::{now_micros, LatencyStage};
-use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// 延遲監控配置
@@ -46,13 +44,76 @@ impl Default for LatencyMonitorConfig {
 
 const LATENCY_HISTOGRAM_MAX_US: u64 = 120_000_000; // 120 秒，可覆蓋極端情況
 const LATENCY_HISTOGRAM_SIGFIGS: u8 = 3;
+const LATENCY_STAGE_COUNT: usize = 9;
+
+#[derive(Debug)]
+struct AtomicLatencyWindow {
+    cursor: AtomicU64,
+    samples: Box<[AtomicU64]>,
+}
+
+impl AtomicLatencyWindow {
+    fn new(capacity: usize) -> Self {
+        let samples = (0..capacity.max(1))
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            cursor: AtomicU64::new(0),
+            samples,
+        }
+    }
+
+    #[inline]
+    fn record(&self, value: u64) {
+        let slot = self.cursor.fetch_add(1, Ordering::Relaxed) as usize % self.samples.len();
+        self.samples[slot].store(value.saturating_add(1), Ordering::Release);
+    }
+
+    fn record_into_histogram(&self, histogram: &mut Histogram<u64>) -> usize {
+        let mut count = 0;
+        for sample in &self.samples {
+            let encoded = sample.load(Ordering::Acquire);
+            if encoded == 0 {
+                continue;
+            }
+            let value = encoded - 1;
+            if histogram.record(value.max(1)).is_ok() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn reset(&self) {
+        self.cursor.store(0, Ordering::Relaxed);
+        for sample in &self.samples {
+            sample.store(0, Ordering::Release);
+        }
+    }
+}
+
+#[inline]
+const fn stage_index(stage: LatencyStage) -> usize {
+    match stage {
+        LatencyStage::WsReceive => 0,
+        LatencyStage::Parsing => 1,
+        LatencyStage::Ingestion => 2,
+        LatencyStage::Aggregation => 3,
+        LatencyStage::Strategy => 4,
+        LatencyStage::Risk => 5,
+        LatencyStage::Execution => 6,
+        LatencyStage::Submission => 7,
+        LatencyStage::EndToEnd => 8,
+    }
+}
 
 /// 延遲監控服務
 #[derive(Debug)]
 pub struct LatencyMonitor {
     config: LatencyMonitorConfig,
-    /// 各階段最近樣本（僅保留 window_size 筆）
-    samples: Arc<Mutex<HashMap<LatencyStage, VecDeque<u64>>>>,
+    /// Fixed-capacity lock-free windows. Recording performs one fetch_add and one atomic store.
+    samples: [AtomicLatencyWindow; LATENCY_STAGE_COUNT],
     /// 最後報告時間（微秒）
     last_report_time: AtomicU64,
 }
@@ -60,62 +121,27 @@ pub struct LatencyMonitor {
 impl LatencyMonitor {
     /// 創建新的延遲監控器
     pub fn new(config: LatencyMonitorConfig) -> Self {
+        let window_size = config.window_size.max(1);
         Self {
             config,
-            samples: Arc::new(Mutex::new(HashMap::new())),
+            samples: std::array::from_fn(|_| AtomicLatencyWindow::new(window_size)),
             last_report_time: AtomicU64::new(now_micros()),
         }
     }
 
     /// 記錄延遲測量
+    #[inline]
     pub fn record_latency(&self, stage: LatencyStage, latency_micros: u64) {
-        // 檢查是否超過告警閾值
-        if let Some(&threshold) = self.config.alert_thresholds.get(&stage) {
-            if latency_micros > threshold {
-                warn!(
-                    "延遲告警: {} 階段延遲 {}μs 超過閾值 {}μs",
-                    stage.as_str(),
-                    latency_micros,
-                    threshold
-                );
-            }
-        }
-
-        // 保存樣本（僅保留最近 window_size 筆）
-        {
-            let mut samples = self.samples.lock();
-            let dq = samples
-                .entry(stage)
-                .or_insert_with(|| VecDeque::with_capacity(self.config.window_size));
-            if dq.len() >= self.config.window_size {
-                dq.pop_front();
-            }
-            dq.push_back(latency_micros);
-        }
-
-        // 檢查是否需要生成報告
-        self.maybe_generate_report();
+        self.samples[stage_index(stage)].record(latency_micros);
     }
 
     /// 獲取指定階段的統計信息
     pub fn get_stage_stats(&self, stage: LatencyStage) -> Option<LatencyStageStats> {
-        let samples = self.samples.lock();
-        if let Some(dq) = samples.get(&stage) {
-            if !dq.is_empty() {
-                // 重建 HDR 直方圖用于統計
-                let mut histogram = Histogram::new_with_bounds(
-                    1,
-                    LATENCY_HISTOGRAM_MAX_US,
-                    LATENCY_HISTOGRAM_SIGFIGS,
-                )
+        let mut histogram =
+            Histogram::new_with_bounds(1, LATENCY_HISTOGRAM_MAX_US, LATENCY_HISTOGRAM_SIGFIGS)
                 .expect("latency histogram bounds");
-                for &v in dq.iter() {
-                    if let Err(err) = histogram.record(v) {
-                        warn!("延遲統計記錄失敗: {}", err);
-                    }
-                }
-                return Some(LatencyStageStats::from_histogram(stage, &histogram));
-            }
+        if self.samples[stage_index(stage)].record_into_histogram(&mut histogram) > 0 {
+            return Some(LatencyStageStats::from_histogram(stage, &histogram));
         }
         None
     }
@@ -124,19 +150,8 @@ impl LatencyMonitor {
     pub fn get_all_stats(&self) -> HashMap<LatencyStage, LatencyStageStats> {
         let mut all_stats = HashMap::new();
 
-        let samples = self.samples.lock();
-        for (&stage, dq) in samples.iter() {
-            if !dq.is_empty() {
-                let mut histogram = Histogram::new_with_bounds(
-                    1,
-                    LATENCY_HISTOGRAM_MAX_US,
-                    LATENCY_HISTOGRAM_SIGFIGS,
-                )
-                .expect("latency histogram bounds");
-                for &v in dq.iter() {
-                    let _ = histogram.record(v);
-                }
-                let stats = LatencyStageStats::from_histogram(stage, &histogram);
+        for stage in LatencyStage::all_stages() {
+            if let Some(stats) = self.get_stage_stats(stage) {
                 all_stats.insert(stage, stats);
             }
         }
@@ -146,12 +161,14 @@ impl LatencyMonitor {
 
     /// 重置統計數據
     pub fn reset_stats(&self) {
-        self.samples.lock().clear();
+        for samples in &self.samples {
+            samples.reset();
+        }
         self.last_report_time.store(now_micros(), Ordering::Relaxed);
     }
 
     /// 檢查並生成定期報告
-    fn maybe_generate_report(&self) {
+    pub fn report_if_due(&self) {
         let now = now_micros();
         let last = self.last_report_time.load(Ordering::Relaxed);
         let elapsed_ms = (now - last) / 1000;
@@ -242,6 +259,7 @@ pub enum LatencyHealth {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]

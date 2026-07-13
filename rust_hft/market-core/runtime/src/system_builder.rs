@@ -581,8 +581,10 @@ impl SystemBuilder {
                 flip_policy: self.config.engine.flip_policy.clone(),
                 backpressure_policy: engine::dataflow::BackpressurePolicy::DropNew, // 默认丢弃新事件，保持稳定性
             },
+            intent_max_latency_us: self.config.engine.intent_max_latency_us,
             max_events_per_cycle: 100,
-            aggregation_symbols: vec![], // top_n 暫時不用，留待聚合層實現
+            aggregation_symbols: vec![],
+            top_n: self.config.engine.top_n,
             latency_monitor: engine::latency_monitor::LatencyMonitorConfig::default(),
         };
 
@@ -822,7 +824,7 @@ impl SystemRuntime {
                     {
                         let caps = venue_cfg
                             .as_ref()
-                            .map(|cfg| parse_binance_capabilities(cfg))
+                            .map(parse_binance_capabilities)
                             .unwrap_or_else(|| {
                                 adapter_binance_data::capabilities::BinanceCapabilities::default()
                             });
@@ -841,7 +843,18 @@ impl SystemRuntime {
                     }
                 }
                 VenueType::Bybit => {
-                    warn!("Bybit 適配器為占位符實現，跳過註冊");
+                    #[cfg(feature = "adapter-bybit-data")]
+                    {
+                        let mut stream = adapter_bybit_data::BybitMarketStream::new();
+                        if let Some(cfg) = &venue_cfg {
+                            if let Some(ws_url) = &cfg.ws_public {
+                                stream = stream.with_ws_url(ws_url.clone());
+                            }
+                        }
+                        let consumer = bridge.bridge_stream(stream, symbols).await?;
+                        self.engine.lock().await.register_event_consumer(consumer);
+                        info!("Bybit 行情已橋接至引擎");
+                    }
                 }
                 VenueType::Grvt => {
                     #[cfg(feature = "adapter-grvt-data")]
@@ -1288,6 +1301,40 @@ impl SystemRuntime {
     pub async fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("停止系統運行時...");
 
+        if requires_authoritative_balance_reconciliation(&self.config)
+            && self.exec_control_tx.is_some()
+        {
+            let control = self.execution_control_handle();
+            let cancellation = control.emergency_stop(true).await?;
+            if !cancellation.is_complete() {
+                return Err(HftError::Execution(format!(
+                    "live shutdown cancellation incomplete: attempted={}, succeeded={}, failed={}",
+                    cancellation.requested,
+                    cancellation.submitted.len(),
+                    cancellation.failures.len()
+                ))
+                .into());
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let report = control.reconcile(false).await?;
+                if report.healthy {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(HftError::Execution(format!(
+                        "live shutdown reconciliation failed: complete={}, exchange_only={}, local_only={}, quantity_mismatch={}",
+                        report.complete,
+                        report.order_report.exchange_only.len(),
+                        report.order_report.local_only.len(),
+                        report.order_report.qty_mismatch.len(),
+                    ))
+                    .into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
         // 🔥 修復資源洩漏：優雅關閉 AdapterBridge（在停止引擎之前）
         if let Some(mut bridge) = self.adapter_bridge.take() {
             bridge.shutdown().await;
@@ -1488,10 +1535,14 @@ async fn engine_event_loop(engine_arc: Arc<Mutex<Engine>>, notify: Arc<Notify>) 
             }
         };
 
-        let prev_stats = guard.get_statistics();
         let tick_result = guard.tick();
         let new_stats = guard.get_statistics();
-        let had_activity = new_stats.cycle_count > prev_stats.cycle_count;
+        let had_activity = tick_result.as_ref().is_ok_and(|result| {
+            result.events_total > 0
+                || result.execution_events_processed > 0
+                || result.orders_generated > 0
+                || result.snapshot_published
+        });
         let running = new_stats.is_running;
         drop(guard);
 
@@ -1539,6 +1590,7 @@ impl Default for SystemConfig {
             engine: SystemEngineConfig {
                 queue_capacity: 32768,
                 stale_us: 3000,
+                intent_max_latency_us: 3000,
                 top_n: 10,
                 flip_policy: FlipPolicy::OnUpdate,
                 cpu_affinity: CpuAffinityConfig::default(),

@@ -400,12 +400,22 @@ impl OmsCore {
     ) -> ReconciliationReport {
         let mut report = ReconciliationReport::default();
 
-        // Build a set of exchange order IDs for quick lookup
-        let exchange_ids: HashSet<_> = exchange_orders.iter().map(|o| &o.order_id).collect();
+        let mut matched_local_ids = HashSet::new();
 
         // Check for exchange-only and quantity mismatches
         for ex_order in exchange_orders {
-            if let Some(local_order) = self.orders.get(&ex_order.order_id) {
+            let local = self.orders.get_key_value(&ex_order.order_id).or_else(|| {
+                ex_order
+                    .client_order_id
+                    .as_ref()
+                    .and_then(|client_order_id| {
+                        self.orders.iter().find(|(_, order)| {
+                            order.client_order_id.as_ref() == Some(client_order_id)
+                        })
+                    })
+            });
+            if let Some((local_order_id, local_order)) = local {
+                matched_local_ids.insert(local_order_id.clone());
                 // Order exists in both - check for quantity mismatch
                 let exchange_filled = ex_order.filled_quantity;
                 let local_filled = local_order.cum_qty;
@@ -428,7 +438,7 @@ impl OmsCore {
             if matches!(
                 record.status,
                 OrderStatus::New | OrderStatus::Acknowledged | OrderStatus::PartiallyFilled
-            ) && !exchange_ids.contains(order_id)
+            ) && !matched_local_ids.contains(order_id)
             {
                 report.local_only.push(LocalOnlyOrder {
                     order_id: order_id.clone(),
@@ -1004,6 +1014,7 @@ mod tests {
     fn create_exchange_order(id: &str, symbol: &str, filled: f64) -> ports::OpenOrder {
         ports::OpenOrder {
             order_id: OrderId(id.into()),
+            client_order_id: None,
             symbol: Symbol::new(symbol),
             side: Side::Buy,
             order_type: hft_core::OrderType::Limit,
@@ -1044,6 +1055,31 @@ mod tests {
 
         assert!(!report.has_discrepancies());
         assert_eq!(report.total_discrepancies(), 0);
+    }
+
+    #[test]
+    fn reconciliation_matches_exchange_order_by_client_id() {
+        let mut oms = OmsCore::new();
+        let local_id = OrderId("provisional-client-1".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: local_id.clone(),
+            client_order_id: Some("client-1".into()),
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(1.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+        let _ = oms.on_execution_event(&ExecutionEvent::OrderAck {
+            order_id: local_id,
+            timestamp: 0,
+        });
+        let mut exchange_order = create_exchange_order("123", "BTCUSDT", 0.0);
+        exchange_order.client_order_id = Some("client-1".into());
+
+        let report = oms.reconcile_with_exchange(&[exchange_order]);
+
+        assert!(!report.has_discrepancies());
     }
 
     #[test]

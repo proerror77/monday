@@ -291,7 +291,11 @@ impl MarketStream for MockEventAdapter {
 
         let stream = stream! {
             // 空流，用於測試架構
-            yield Ok(MarketEvent::Disconnect { reason: "Mock adapter test".to_string() });
+            yield Ok(MarketEvent::Disconnect {
+                reason: "Mock adapter test".to_string(),
+                source_venue: None,
+                symbol: None,
+            });
         };
 
         Ok(Box::pin(stream))

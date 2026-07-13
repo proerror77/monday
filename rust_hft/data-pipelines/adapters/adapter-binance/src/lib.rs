@@ -3,11 +3,21 @@
 //! - WebSocket 實時流 + REST 快照初始化
 
 use async_trait::async_trait;
-use futures::stream;
-use hft_core::{HftError, HftResult, InstrumentSpec, ProductType, Symbol, Timestamp};
+use bytes::BytesMut;
+use futures::StreamExt;
+use hft_core::{
+    now_micros, HftError, HftResult, InstrumentSpec, LatencyStage, LatencyTracker, ProductType,
+    Symbol,
+};
+use integration::WsFrameMetrics;
 use ports::events::MarketSnapshot;
-use ports::{BoxStream, ConnectionHealth, MarketEvent, MarketStream};
-use tokio::sync::mpsc;
+use ports::{
+    BookUpdate, BoxStream, ConnectionHealth, MarketEvent, MarketStream, TrackedMarketEvent,
+};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
 mod converter;
@@ -22,6 +32,151 @@ pub use rest::BinanceRestClient;
 pub use websocket::BinanceWebSocket;
 
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 4096;
+const DEFAULT_SYNC_BUFFER_CAPACITY: usize = 16_384;
+const REST_SNAPSHOT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug)]
+struct QueuedMarketEvent {
+    generation: u64,
+    event: TrackedMarketEvent,
+}
+
+#[derive(Debug, Clone)]
+struct StreamInvalidation {
+    generation: u64,
+    reason: String,
+    error: Option<HftError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePublishError {
+    Full,
+    Closed,
+}
+
+fn publish_invalidation(
+    generation: &AtomicU64,
+    control_tx: &watch::Sender<Option<StreamInvalidation>>,
+    reason: String,
+    error: Option<HftError>,
+) {
+    let generation = generation.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    control_tx.send_replace(Some(StreamInvalidation {
+        generation,
+        reason,
+        error,
+    }));
+}
+
+fn try_queue_market_event(
+    tx: &mpsc::Sender<QueuedMarketEvent>,
+    generation: &AtomicU64,
+    event: TrackedMarketEvent,
+) -> Result<(), QueuePublishError> {
+    match tx.try_send(QueuedMarketEvent {
+        generation: generation.load(Ordering::Acquire),
+        event,
+    }) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => Err(QueuePublishError::Full),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(QueuePublishError::Closed),
+    }
+}
+
+fn multiplex_market_events(
+    mut data_rx: mpsc::Receiver<QueuedMarketEvent>,
+    mut control_rx: watch::Receiver<Option<StreamInvalidation>>,
+    generation: Arc<AtomicU64>,
+) -> BoxStream<TrackedMarketEvent> {
+    Box::pin(async_stream::stream! {
+        let mut control_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                changed = control_rx.changed(), if control_open => {
+                    if changed.is_err() {
+                        control_open = false;
+                        continue;
+                    }
+                    let invalidation = control_rx.borrow_and_update().clone();
+                    let Some(invalidation) = invalidation else {
+                        continue;
+                    };
+                    if invalidation.generation != generation.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    yield Ok(TrackedMarketEvent::new(MarketEvent::Disconnect {
+                        reason: invalidation.reason,
+                        source_venue: Some(hft_core::VenueId::BINANCE),
+                        symbol: None,
+                    }));
+                    if let Some(error) = invalidation.error {
+                        yield Err(error);
+                    }
+                }
+                queued = data_rx.recv() => {
+                    let Some(queued) = queued else {
+                        break;
+                    };
+                    if queued.generation == generation.load(Ordering::Acquire) {
+                        yield Ok(queued.event);
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[derive(Debug, Default)]
+struct DepthSequenceTracker {
+    last_update_ids: HashMap<Symbol, u64>,
+}
+
+impl DepthSequenceTracker {
+    fn from_snapshots(snapshots: &[MarketSnapshot]) -> Self {
+        Self {
+            last_update_ids: snapshots
+                .iter()
+                .map(|snapshot| (snapshot.symbol.clone(), snapshot.sequence))
+                .collect(),
+        }
+    }
+
+    /// Returns `true` when the event must be forwarded and `false` for a stale depth event.
+    fn validate_and_advance(&mut self, event: &MarketEvent) -> HftResult<bool> {
+        let MarketEvent::Update(BookUpdate {
+            symbol,
+            first_sequence,
+            sequence,
+            ..
+        }) = event
+        else {
+            return Ok(true);
+        };
+        let Some(previous) = self.last_update_ids.get(symbol).copied() else {
+            return Err(HftError::Network(format!(
+                "Binance depth update arrived before snapshot for {}",
+                symbol.as_str()
+            )));
+        };
+        let expected = previous.saturating_add(1);
+        if *sequence < expected {
+            return Ok(false);
+        }
+        let first = first_sequence.unwrap_or(*sequence);
+        if first > expected {
+            return Err(HftError::Network(format!(
+                "Binance depth sequence gap for {}: expected {}, received {}-{}",
+                symbol.as_str(),
+                expected,
+                first,
+                sequence
+            )));
+        }
+        self.last_update_ids.insert(symbol.clone(), *sequence);
+        Ok(true)
+    }
+}
 
 pub mod capabilities {
     #[derive(Debug, Clone)]
@@ -46,8 +201,8 @@ pub mod capabilities {
 pub struct BinanceMarketStream {
     caps: capabilities::BinanceCapabilities,
     rest_client: BinanceRestClient,
-    is_connected: bool,
-    last_heartbeat: Timestamp,
+    is_connected: Arc<AtomicBool>,
+    last_heartbeat: Arc<AtomicU64>,
     ws_base_url: String,
 }
 
@@ -62,8 +217,8 @@ impl BinanceMarketStream {
         Self {
             caps: Default::default(),
             rest_client: BinanceRestClient::new(),
-            is_connected: false,
-            last_heartbeat: 0,
+            is_connected: Arc::new(AtomicBool::new(false)),
+            last_heartbeat: Arc::new(AtomicU64::new(0)),
             ws_base_url: websocket::WS_BASE_URL.to_string(),
         }
     }
@@ -72,8 +227,8 @@ impl BinanceMarketStream {
         Self {
             caps,
             rest_client: BinanceRestClient::new(),
-            is_connected: false,
-            last_heartbeat: 0,
+            is_connected: Arc::new(AtomicBool::new(false)),
+            last_heartbeat: Arc::new(AtomicU64::new(0)),
             ws_base_url: websocket::WS_BASE_URL.to_string(),
         }
     }
@@ -97,13 +252,79 @@ impl BinanceMarketStream {
             .unwrap_or(DEFAULT_EVENT_QUEUE_CAPACITY)
     }
 
+    fn sync_buffer_capacity() -> usize {
+        std::env::var("BINANCE_SYNC_BUFFER_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|capacity| *capacity > 0)
+            .unwrap_or(DEFAULT_SYNC_BUFFER_CAPACITY)
+    }
+
+    fn snapshot_depth() -> u16 {
+        std::env::var("BINANCE_SNAPSHOT_DEPTH")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|depth| matches!(*depth, 100 | 500 | 1000 | 5000))
+            .unwrap_or(5000)
+    }
+
+    fn uses_ws_snapshot_depth() -> bool {
+        websocket::uses_partial_depth_stream()
+    }
+
+    fn rest_snapshot_cooldown_remaining(
+        last_snapshot_at: Option<tokio::time::Instant>,
+    ) -> std::time::Duration {
+        last_snapshot_at.map_or(std::time::Duration::ZERO, |previous| {
+            REST_SNAPSHOT_COOLDOWN.saturating_sub(previous.elapsed())
+        })
+    }
+
+    async fn wait_for_rest_snapshot_budget(
+        ws_client: &mut BinanceWebSocket,
+        last_snapshot_at: Option<tokio::time::Instant>,
+    ) -> HftResult<()> {
+        let remaining = Self::rest_snapshot_cooldown_remaining(last_snapshot_at);
+        if remaining.is_zero() {
+            return Ok(());
+        }
+
+        let wait = tokio::time::sleep(remaining);
+        tokio::pin!(wait);
+        loop {
+            tokio::select! {
+                () = &mut wait => return Ok(()),
+                message = ws_client.receive_message_bytes_with_metrics() => {
+                    let (bytes, metrics) = message?.ok_or_else(|| {
+                        HftError::Network(
+                            "Binance WebSocket closed while REST snapshot budget cooled down"
+                                .to_string(),
+                        )
+                    })?;
+                    // Keep the socket drained, but do not publish an unsynchronized generation.
+                    let _ = Self::parse_tracked_socket_event(bytes, metrics)?;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn buffer_during_snapshot_sync(event: MarketEvent) -> Option<MarketEvent> {
+        matches!(event, MarketEvent::Update(_)).then_some(event)
+    }
+
     /// 獲取訂單簿快照（用於初始化）
-    async fn get_initial_snapshots(&self, symbols: &[Symbol]) -> HftResult<Vec<MarketSnapshot>> {
+    async fn get_initial_snapshots(
+        rest_client: &BinanceRestClient,
+        symbols: &[Symbol],
+    ) -> HftResult<Vec<MarketSnapshot>> {
         let mut snapshots = Vec::new();
 
         for symbol in symbols {
             info!("獲取 {:?} 的初始快照", symbol);
-            let depth = self.rest_client.get_depth(symbol, Some(100)).await?;
+            let depth = rest_client
+                .get_depth(symbol, Some(Self::snapshot_depth()))
+                .await?;
             // 使用本地時間（毫秒）轉換為微秒
             let timestamp = (chrono::Utc::now().timestamp_millis() as u64) * 1000;
 
@@ -115,144 +336,323 @@ impl BinanceMarketStream {
 
         Ok(snapshots)
     }
-}
 
-fn try_send_stream_event(
-    tx: &mpsc::Sender<HftResult<MarketEvent>>,
-    event: HftResult<MarketEvent>,
-) -> bool {
-    match tx.try_send(event) {
-        Ok(()) => true,
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            warn!("Binance event queue full, dropping stale stream event");
-            true
+    fn parse_socket_event(bytes: bytes::Bytes) -> HftResult<Option<MarketEvent>> {
+        let mut bytes = match bytes.try_into_mut() {
+            Ok(bytes) => bytes,
+            Err(bytes) => BytesMut::from(bytes.as_ref()),
+        };
+        MessageConverter::parse_stream_message_bytes(&mut bytes)
+    }
+
+    fn parse_tracked_socket_event(
+        bytes: bytes::Bytes,
+        mut metrics: WsFrameMetrics,
+    ) -> HftResult<Option<TrackedMarketEvent>> {
+        let event = Self::parse_socket_event(bytes)?;
+        metrics.mark_parsed();
+        Ok(event.map(|event| {
+            let mut tracker = LatencyTracker::from_monotonic(metrics.received_at_us);
+            tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+            tracker.record_stage_with_offset(
+                LatencyStage::Parsing,
+                metrics.parsed_at_us.saturating_sub(metrics.received_at_us),
+            );
+            TrackedMarketEvent { event, tracker }
+        }))
+    }
+
+    async fn synchronize_books(
+        ws_client: &mut BinanceWebSocket,
+        rest_client: &BinanceRestClient,
+        symbols: &[Symbol],
+        buffer_capacity: usize,
+    ) -> HftResult<(Vec<MarketSnapshot>, VecDeque<TrackedMarketEvent>)> {
+        let snapshot_future = Self::get_initial_snapshots(rest_client, symbols);
+        tokio::pin!(snapshot_future);
+        let mut buffered_events = VecDeque::with_capacity(buffer_capacity.min(1024));
+
+        loop {
+            tokio::select! {
+                snapshots = &mut snapshot_future => {
+                    return snapshots.map(|snapshots| (snapshots, buffered_events));
+                }
+                message = ws_client.receive_message_bytes_with_metrics() => {
+                    let (bytes, metrics) = message?.ok_or_else(|| {
+                        HftError::Network("Binance WebSocket closed during snapshot sync".to_string())
+                    })?;
+                    if let Some(event) = Self::parse_tracked_socket_event(bytes, metrics)? {
+                        if !matches!(&event.event, MarketEvent::Update(_)) {
+                            continue;
+                        }
+                        if buffered_events.len() >= buffer_capacity {
+                            return Err(HftError::Network(format!(
+                                "Binance snapshot sync buffer exceeded {} events",
+                                buffer_capacity
+                            )));
+                        }
+                        buffered_events.push_back(event);
+                    }
+                }
+            }
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
     }
 }
 
 #[async_trait]
 impl MarketStream for BinanceMarketStream {
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>> {
+        let stream = self.subscribe_tracked(symbols).await?;
+        Ok(Box::pin(
+            stream.map(|result| result.map(|tracked| tracked.event)),
+        ))
+    }
+
+    async fn subscribe_tracked(
+        &self,
+        symbols: Vec<Symbol>,
+    ) -> HftResult<BoxStream<TrackedMarketEvent>> {
         if symbols.is_empty() {
             return Err(HftError::new("品種列表不能為空"));
         }
 
         info!("訂閱 Binance 市場數據，品種: {:?}", symbols);
 
-        // 創建事件通道
-        let (tx, mut rx) = mpsc::channel(Self::event_queue_capacity());
-
-        // 如果啟用了初始快照，先獲取快照
-        if self.caps.snapshot_crc {
-            match self.get_initial_snapshots(&symbols).await {
-                Ok(snapshots) => {
-                    for snapshot in snapshots {
-                        match tx.try_send(Ok(MarketEvent::Snapshot(snapshot))) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                return Err(HftError::new("Binance 初始快照事件通道已滿"));
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                return Err(HftError::new("Binance 事件通道已關閉"));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("獲取初始快照失敗: {}，將僅使用 WebSocket 增量數據", e);
-                }
-            }
+        let uses_ws_snapshot_depth = Self::uses_ws_snapshot_depth();
+        if !uses_ws_snapshot_depth && (!self.caps.snapshot_crc || !self.caps.rest_fallback) {
+            return Err(HftError::Config(
+                "Binance diff-depth requires the REST snapshot bridge; use partial20 for a WebSocket-only feed"
+                    .to_string(),
+            ));
         }
 
-        // 啟動 WebSocket 流
-        // 注意：這裡我們需要 clone self，但是 self 是 &self，所以需要重新設計
-        // 為了演示目的，我們先創建一個簡單的流
+        let event_queue_capacity = Self::event_queue_capacity();
+        let (tx, rx) = mpsc::channel(event_queue_capacity);
+        let generation = Arc::new(AtomicU64::new(1));
+        let (control_tx, control_rx) = watch::channel(None);
+
+        // Default mode is a WebSocket-only partial-depth snapshot stream. Full diff-depth mode is
+        // opt-in and uses one rate-budgeted REST snapshot while explicitly buffering WS events.
         let mut ws_client = BinanceWebSocket::with_base_url(self.ws_base_url.clone());
-        let symbols_clone = symbols.clone();
+        let rest_client = self.rest_client.clone();
+        let snapshot_enabled = !uses_ws_snapshot_depth;
+        let sync_buffer_capacity = Self::sync_buffer_capacity();
+        let auto_reconnect = self.caps.auto_reconnect;
+        let is_connected = Arc::clone(&self.is_connected);
+        let last_heartbeat = Arc::clone(&self.last_heartbeat);
+        let task_generation = Arc::clone(&generation);
 
         tokio::spawn(async move {
-            // 使用共用重連配置
             use adapters_common::calculate_exponential_backoff;
-            use adapters_common::ws_helpers::constants::{
-                DEFAULT_BASE_DELAY_MS, DEFAULT_MAX_ATTEMPTS,
-            };
+            use adapters_common::ws_helpers::constants::DEFAULT_BASE_DELAY_MS;
 
             let mut attempts: u32 = 0;
+            let mut last_rest_snapshot_at: Option<tokio::time::Instant> = None;
 
             loop {
-                match ws_client.connect_and_subscribe(symbols_clone.clone()).await {
+                let mut invalidation_error = None;
+                let mut invalidation_reason =
+                    "Binance public stream requires a fresh synchronized snapshot".to_string();
+                match ws_client.connect_and_subscribe(symbols.clone()).await {
                     Ok(()) => {
-                        attempts = 0; // 成功連上，重置計數
-                        loop {
-                            match ws_client.receive_message().await {
-                                Ok(Some(text)) => {
-                                    match MessageConverter::parse_stream_message(&text) {
-                                        Ok(Some(event)) => {
-                                            if !try_send_stream_event(&tx, Ok(event)) {
-                                                return;
-                                            }
-                                        }
-                                        Ok(None) => {}
-                                        Err(e) => {
-                                            if !try_send_stream_event(&tx, Err(e)) {
-                                                return;
-                                            }
+                        let (snapshots, mut buffered_events) = if snapshot_enabled {
+                            let synchronized = async {
+                                BinanceMarketStream::wait_for_rest_snapshot_budget(
+                                    &mut ws_client,
+                                    last_rest_snapshot_at,
+                                )
+                                .await?;
+                                last_rest_snapshot_at = Some(tokio::time::Instant::now());
+                                BinanceMarketStream::synchronize_books(
+                                    &mut ws_client,
+                                    &rest_client,
+                                    &symbols,
+                                    sync_buffer_capacity,
+                                )
+                                .await
+                            }
+                            .await;
+                            match synchronized {
+                                Ok(synchronized) => synchronized,
+                                Err(error) => {
+                                    invalidation_reason =
+                                        "Binance REST snapshot bridge failed".to_string();
+                                    invalidation_error = Some(error);
+                                    (Vec::new(), VecDeque::new())
+                                }
+                            }
+                        } else {
+                            (Vec::new(), VecDeque::new())
+                        };
+
+                        if snapshot_enabled && snapshots.is_empty() {
+                            // Synchronization failed; invalidate the previous venue book below.
+                        } else {
+                            let mut sequence_tracker = snapshot_enabled
+                                .then(|| DepthSequenceTracker::from_snapshots(&snapshots));
+                            'generation: {
+                                for snapshot in snapshots {
+                                    match try_queue_market_event(
+                                        &tx,
+                                        &task_generation,
+                                        TrackedMarketEvent::new(MarketEvent::Snapshot(snapshot)),
+                                    ) {
+                                        Ok(()) => {}
+                                        Err(QueuePublishError::Closed) => return,
+                                        Err(QueuePublishError::Full) => {
+                                            invalidation_reason = format!(
+                                                "Binance event queue exceeded {event_queue_capacity} events; rebuilding from snapshot"
+                                            );
+                                            invalidation_error = Some(HftError::Network(
+                                                invalidation_reason.clone(),
+                                            ));
+                                            break 'generation;
                                         }
                                     }
                                 }
-                                Ok(None) => {
-                                    warn!("Binance WS 關閉，準備重連");
-                                    break;
-                                }
-                                Err(e) => {
-                                    error!("Binance WS 錯誤: {}，準備重連", e);
-                                    if !try_send_stream_event(&tx, Err(e)) {
-                                        return;
+
+                                while let Some(event) = buffered_events.pop_front() {
+                                    let forward = match sequence_tracker.as_mut() {
+                                        Some(tracker) => tracker.validate_and_advance(&event.event),
+                                        None => Ok(true),
+                                    };
+                                    match forward {
+                                        Ok(true) => {
+                                            match try_queue_market_event(
+                                                &tx,
+                                                &task_generation,
+                                                event,
+                                            ) {
+                                                Ok(()) => {}
+                                                Err(QueuePublishError::Closed) => return,
+                                                Err(QueuePublishError::Full) => {
+                                                    invalidation_reason = format!(
+                                                        "Binance event queue exceeded {event_queue_capacity} events; rebuilding from snapshot"
+                                                    );
+                                                    invalidation_error = Some(HftError::Network(
+                                                        invalidation_reason.clone(),
+                                                    ));
+                                                    break 'generation;
+                                                }
+                                            }
+                                        }
+                                        Ok(false) => {}
+                                        Err(error) => {
+                                            invalidation_reason =
+                                                "Binance buffered depth sequence gap".to_string();
+                                            invalidation_error = Some(error);
+                                            break 'generation;
+                                        }
                                     }
-                                    break;
+                                }
+
+                                is_connected.store(true, Ordering::Release);
+                                last_heartbeat.store(now_micros(), Ordering::Release);
+                                let live_since = tokio::time::Instant::now();
+                                loop {
+                                    match ws_client.receive_message_bytes_with_metrics().await {
+                                        Ok(Some((bytes, metrics))) => {
+                                            if live_since.elapsed()
+                                                >= std::time::Duration::from_secs(30)
+                                            {
+                                                attempts = 0;
+                                            }
+                                            last_heartbeat.store(now_micros(), Ordering::Release);
+                                            match BinanceMarketStream::parse_tracked_socket_event(
+                                                bytes, metrics,
+                                            ) {
+                                                Ok(Some(event)) => {
+                                                    let forward = match sequence_tracker.as_mut() {
+                                                        Some(tracker) => tracker
+                                                            .validate_and_advance(&event.event),
+                                                        None => Ok(true),
+                                                    };
+                                                    match forward {
+                                                        Ok(true) => {
+                                                            match try_queue_market_event(
+                                                                &tx,
+                                                                &task_generation,
+                                                                event,
+                                                            ) {
+                                                                Ok(()) => {}
+                                                                Err(QueuePublishError::Closed) => {
+                                                                    return
+                                                                }
+                                                                Err(QueuePublishError::Full) => {
+                                                                    invalidation_reason = format!(
+                                                                        "Binance event queue exceeded {event_queue_capacity} events; rebuilding from snapshot"
+                                                                    );
+                                                                    invalidation_error =
+                                                                        Some(HftError::Network(
+                                                                            invalidation_reason
+                                                                                .clone(),
+                                                                        ));
+                                                                    break 'generation;
+                                                                }
+                                                            }
+                                                        }
+                                                        Ok(false) => {}
+                                                        Err(error) => {
+                                                            invalidation_reason =
+                                                                "Binance live depth sequence gap"
+                                                                    .to_string();
+                                                            invalidation_error = Some(error);
+                                                            break 'generation;
+                                                        }
+                                                    }
+                                                }
+                                                Ok(None) => {}
+                                                Err(error) => {
+                                                    invalidation_reason =
+                                                        "Binance market frame rejected".to_string();
+                                                    invalidation_error = Some(error);
+                                                    break 'generation;
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            warn!("Binance WS 關閉，準備重連");
+                                            break;
+                                        }
+                                        Err(error) => {
+                                            error!("Binance WS 錯誤: {}，準備重連", error);
+                                            invalidation_error = Some(error);
+                                            break 'generation;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    Err(e) => {
-                        error!("Binance WS 連接失敗: {}", e);
-                        attempts += 1;
-                        if attempts > DEFAULT_MAX_ATTEMPTS {
-                            let _ = try_send_stream_event(
-                                &tx,
-                                Err(HftError::Network(format!("WS 重連失敗次數過多: {}", e))),
-                            );
-                            return;
-                        }
-                        let delay = calculate_exponential_backoff(attempts, DEFAULT_BASE_DELAY_MS);
-                        tokio::time::sleep(delay).await;
-                        continue;
+                    Err(error) => {
+                        error!("Binance WS 連接失敗: {}", error);
+                        invalidation_reason =
+                            "Binance public WebSocket connection failed".to_string();
+                        invalidation_error = Some(error);
                     }
                 }
 
-                // 斷開後的退避重連
-                attempts += 1;
-                if attempts > DEFAULT_MAX_ATTEMPTS {
-                    let _ = try_send_stream_event(
-                        &tx,
-                        Err(HftError::Network("WS 重連失敗次數過多".to_string())),
-                    );
+                is_connected.store(false, Ordering::Release);
+                publish_invalidation(
+                    &task_generation,
+                    &control_tx,
+                    invalidation_reason,
+                    invalidation_error,
+                );
+                if control_tx.is_closed() {
                     return;
                 }
+
+                if !auto_reconnect {
+                    return;
+                }
+                attempts += 1;
                 let delay = calculate_exponential_backoff(attempts, DEFAULT_BASE_DELAY_MS);
                 tokio::time::sleep(delay).await;
             }
         });
 
-        // 創建流
-        let stream = stream::poll_fn(move |cx| match rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(event)) => std::task::Poll::Ready(Some(event)),
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        });
-
-        Ok(Box::pin(stream))
+        Ok(multiplex_market_events(rx, control_rx, generation))
     }
 
     async fn subscribe_instruments(
@@ -291,25 +691,55 @@ impl MarketStream for BinanceMarketStream {
         .await
     }
 
+    async fn subscribe_tracked_instruments(
+        &self,
+        instruments: Vec<InstrumentSpec>,
+    ) -> HftResult<BoxStream<TrackedMarketEvent>> {
+        if instruments.is_empty() {
+            return Err(HftError::new("商品列表不能為空"));
+        }
+        for instrument in &instruments {
+            if !matches!(
+                instrument.product_type,
+                ProductType::Spot | ProductType::TokenizedSecuritySpot
+            ) {
+                return Err(HftError::Network(format!(
+                    "Binance {} market data must use its dedicated adapter: {}",
+                    match instrument.product_type {
+                        ProductType::Futures | ProductType::Perp => "derivatives",
+                        ProductType::BrokerageEquity => "brokerage equities",
+                        _ => unreachable!(),
+                    },
+                    instrument.symbol
+                )));
+            }
+        }
+        self.subscribe_tracked(
+            instruments
+                .into_iter()
+                .map(|instrument| instrument.symbol)
+                .collect(),
+        )
+        .await
+    }
+
     async fn health(&self) -> ConnectionHealth {
         ConnectionHealth {
-            connected: self.is_connected,
+            connected: self.is_connected.load(Ordering::Acquire),
             latency_ms: None,
-            last_heartbeat: self.last_heartbeat,
+            last_heartbeat: self.last_heartbeat.load(Ordering::Acquire),
         }
     }
 
     async fn connect(&mut self) -> HftResult<()> {
-        // 測試連通性
-        self.rest_client.ping().await?;
-        self.is_connected = true;
-        self.last_heartbeat = chrono::Utc::now().timestamp_millis() as u64;
-        info!("Binance 適配器連接成功");
+        // `subscribe` owns the WebSocket lifecycle. Do not spend REST request weight merely to
+        // probe connectivity; health becomes true only after synchronized market data is live.
+        self.is_connected.store(false, Ordering::Release);
         Ok(())
     }
 
     async fn disconnect(&mut self) -> HftResult<()> {
-        self.is_connected = false;
+        self.is_connected.store(false, Ordering::Release);
         info!("Binance 適配器已斷開");
         Ok(())
     }
@@ -319,12 +749,13 @@ impl MarketStream for BinanceMarketStream {
 mod tests {
     use super::*;
     use capabilities::BinanceCapabilities;
+    use futures::StreamExt;
 
     #[test]
     fn test_binance_market_stream_default() {
         let stream = BinanceMarketStream::default();
-        assert!(!stream.is_connected);
-        assert_eq!(stream.last_heartbeat, 0);
+        assert!(!stream.is_connected.load(Ordering::Acquire));
+        assert_eq!(stream.last_heartbeat.load(Ordering::Acquire), 0);
         assert!(stream.caps.snapshot_crc);
         assert!(stream.caps.rest_fallback);
         assert!(stream.caps.auto_reconnect);
@@ -333,7 +764,7 @@ mod tests {
     #[test]
     fn test_binance_market_stream_new() {
         let stream = BinanceMarketStream::new();
-        assert!(!stream.is_connected);
+        assert!(!stream.is_connected.load(Ordering::Acquire));
         assert_eq!(stream.ws_base_url, websocket::WS_BASE_URL);
     }
 
@@ -380,7 +811,7 @@ mod tests {
     fn test_with_rest_base_url() {
         let stream = BinanceMarketStream::new().with_rest_base_url("https://custom.binance.com");
         // The rest_client is updated internally
-        assert!(!stream.is_connected);
+        assert!(!stream.is_connected.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -396,11 +827,11 @@ mod tests {
     #[tokio::test]
     async fn test_disconnect() {
         let mut stream = BinanceMarketStream::new();
-        stream.is_connected = true;
+        stream.is_connected.store(true, Ordering::Release);
 
         let result = stream.disconnect().await;
         assert!(result.is_ok());
-        assert!(!stream.is_connected);
+        assert!(!stream.is_connected.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -409,6 +840,43 @@ mod tests {
         let result = stream.subscribe(vec![]).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Binance public WebSocket"]
+    async fn live_ws_only_mode_delivers_depth_and_realtime_quote() {
+        let ws_url = std::env::var("BINANCE_WS_SMOKE_URL")
+            .unwrap_or_else(|_| websocket::WS_BASE_URL.to_string());
+        let stream = BinanceMarketStream::new().with_ws_base_url(ws_url);
+        let mut events = stream
+            .subscribe(vec![Symbol::new("BTCUSDT")])
+            .await
+            .expect("public subscription");
+
+        let (saw_depth, saw_quote, saw_trade) =
+            tokio::time::timeout(std::time::Duration::from_secs(15), async move {
+                let mut saw_depth = false;
+                let mut saw_quote = false;
+                let mut saw_trade = false;
+                while let Some(event) = events.next().await {
+                    match event.expect("valid public event") {
+                        MarketEvent::Snapshot(_) => saw_depth = true,
+                        MarketEvent::Quote(_) => saw_quote = true,
+                        MarketEvent::Trade(_) => saw_trade = true,
+                        _ => {}
+                    }
+                    if saw_depth && saw_quote && saw_trade {
+                        break;
+                    }
+                }
+                (saw_depth, saw_quote, saw_trade)
+            })
+            .await
+            .expect("Binance public feed timeout");
+
+        assert!(saw_depth, "expected WebSocket L20 snapshot");
+        assert!(saw_quote, "expected real-time bookTicker quote");
+        assert!(saw_trade, "expected real-time raw trade");
     }
 
     #[tokio::test]
@@ -448,5 +916,139 @@ mod tests {
         assert_eq!(cloned.snapshot_crc, caps.snapshot_crc);
         assert_eq!(cloned.rest_fallback, caps.rest_fallback);
         assert_eq!(cloned.auto_reconnect, caps.auto_reconnect);
+    }
+
+    #[test]
+    fn diff_depth_tracker_bridges_snapshot_and_rejects_gap() {
+        let symbol = Symbol::new("BTCUSDT");
+        let snapshots = vec![MarketSnapshot {
+            symbol: symbol.clone(),
+            timestamp: 1,
+            bids: Vec::new(),
+            asks: Vec::new(),
+            sequence: 100,
+            source_venue: Some(hft_core::VenueId::BINANCE),
+        }];
+        let mut tracker = DepthSequenceTracker::from_snapshots(&snapshots);
+        let update = |first_sequence, sequence| {
+            MarketEvent::Update(BookUpdate {
+                symbol: symbol.clone(),
+                timestamp: 2,
+                bids: Vec::new(),
+                asks: Vec::new(),
+                first_sequence: Some(first_sequence),
+                sequence,
+                is_snapshot: false,
+                source_venue: Some(hft_core::VenueId::BINANCE),
+            })
+        };
+
+        assert!(!tracker.validate_and_advance(&update(90, 100)).unwrap());
+        assert!(tracker.validate_and_advance(&update(99, 101)).unwrap());
+        assert!(tracker.validate_and_advance(&update(103, 103)).is_err());
+    }
+
+    #[test]
+    fn snapshot_recovery_buffers_depth_only() {
+        let update = MarketEvent::Update(BookUpdate {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 2,
+            bids: Vec::new(),
+            asks: Vec::new(),
+            first_sequence: Some(101),
+            sequence: 101,
+            is_snapshot: false,
+            source_venue: Some(hft_core::VenueId::BINANCE),
+        });
+        let quote = MarketEvent::Quote(ports::TopOfBook {
+            symbol: Symbol::new("BTCUSDT"),
+            timestamp: 2,
+            sequence: 101,
+            bid: ports::BookLevel::new_unchecked(100.0, 1.0),
+            ask: ports::BookLevel::new_unchecked(101.0, 1.0),
+            source_venue: Some(hft_core::VenueId::BINANCE),
+        });
+
+        assert!(BinanceMarketStream::buffer_during_snapshot_sync(update).is_some());
+        assert!(BinanceMarketStream::buffer_during_snapshot_sync(quote).is_none());
+    }
+
+    #[test]
+    fn rest_snapshot_cooldown_is_scoped_to_snapshot_fetch() {
+        let previous = tokio::time::Instant::now();
+        let remaining = BinanceMarketStream::rest_snapshot_cooldown_remaining(Some(previous));
+
+        assert!(remaining > std::time::Duration::ZERO);
+        assert!(remaining <= std::time::Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn invalidation_discards_queued_old_generation_before_fresh_data() {
+        let generation = Arc::new(AtomicU64::new(1));
+        let (data_tx, data_rx) = mpsc::channel(2);
+        let (control_tx, control_rx) = watch::channel(None);
+        let snapshot = |sequence| {
+            TrackedMarketEvent::new(MarketEvent::Snapshot(MarketSnapshot {
+                symbol: Symbol::new("BTCUSDT"),
+                timestamp: sequence,
+                bids: Vec::new(),
+                asks: Vec::new(),
+                sequence,
+                source_venue: Some(hft_core::VenueId::BINANCE),
+            }))
+        };
+        data_tx
+            .try_send(QueuedMarketEvent {
+                generation: 1,
+                event: snapshot(1),
+            })
+            .unwrap();
+        publish_invalidation(&generation, &control_tx, "queue overflow".to_string(), None);
+        data_tx
+            .try_send(QueuedMarketEvent {
+                generation: 2,
+                event: snapshot(2),
+            })
+            .unwrap();
+        drop(data_tx);
+        drop(control_tx);
+
+        let mut stream = multiplex_market_events(data_rx, control_rx, generation);
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(TrackedMarketEvent {
+                event: MarketEvent::Disconnect { .. },
+                ..
+            }))
+        ));
+        let Some(Ok(TrackedMarketEvent {
+            event: MarketEvent::Snapshot(snapshot),
+            ..
+        })) = stream.next().await
+        else {
+            panic!("expected fresh snapshot after invalidation");
+        };
+        assert_eq!(snapshot.sequence, 2);
+    }
+
+    #[test]
+    fn tracked_parser_preserves_receive_to_parse_latency() {
+        let received_at = hft_core::monotonic_micros();
+        let message = bytes::Bytes::from_static(
+            br#"{"stream":"btcusdt@depth20@100ms","data":{"lastUpdateId":101,"bids":[["45000.00","0.1"]],"asks":[["45100.00","0.2"]]}}"#,
+        );
+
+        let tracked = BinanceMarketStream::parse_tracked_socket_event(
+            message,
+            WsFrameMetrics::new(received_at, 0),
+        )
+        .unwrap()
+        .expect("tracked depth event");
+
+        assert!(matches!(tracked.event, MarketEvent::Snapshot(_)));
+        assert!(tracked
+            .tracker
+            .get_measurement(LatencyStage::Parsing)
+            .is_some());
     }
 }

@@ -278,6 +278,8 @@ impl MarketStream for OndoPerpsMarketStream {
                 if tx
                     .send(Ok(MarketEvent::Disconnect {
                         reason: disconnect_reason,
+                        source_venue: Some(VenueId::ONDO_PERPS),
+                        symbol: None,
                     }))
                     .await
                     .is_err()

@@ -2,7 +2,7 @@
 
 use crate::events::*;
 use async_trait::async_trait;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use hft_core::*;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
@@ -25,6 +25,18 @@ pub trait MarketStream: Send + Sync {
     /// 訂閱指定品種，返回統一事件流
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>>;
 
+    /// Latency-aware stream. Adapters with frame timing override this; other adapters retain the
+    /// stable MarketEvent API and begin tracking at their publish boundary.
+    async fn subscribe_tracked(
+        &self,
+        symbols: Vec<Symbol>,
+    ) -> HftResult<BoxStream<TrackedMarketEvent>> {
+        let stream = self.subscribe(symbols).await?;
+        Ok(Box::pin(
+            stream.map(|result| result.map(TrackedMarketEvent::new)),
+        ))
+    }
+
     /// 訂閱帶產品語義的品種。默認降級到 symbol-only，具體 adapter 可覆寫。
     async fn subscribe_instruments(
         &self,
@@ -35,6 +47,17 @@ pub trait MarketStream: Send + Sync {
             .map(|instrument| instrument.symbol)
             .collect();
         self.subscribe(symbols).await
+    }
+
+    async fn subscribe_tracked_instruments(
+        &self,
+        instruments: Vec<InstrumentSpec>,
+    ) -> HftResult<BoxStream<TrackedMarketEvent>> {
+        let symbols = instruments
+            .into_iter()
+            .map(|instrument| instrument.symbol)
+            .collect();
+        self.subscribe_tracked(symbols).await
     }
 
     /// 健康檢查
@@ -52,6 +75,11 @@ pub trait MarketStream: Send + Sync {
 pub trait ExecutionClient: Send + Sync {
     /// 下單 (live/mock 實現不同)
     async fn place_order(&mut self, intent: OrderIntent) -> HftResult<OrderId>;
+
+    /// Idempotent live-order boundary. Adapters should forward `client_order_id` to the venue.
+    async fn place_order_envelope(&mut self, envelope: &OrderIntentEnvelope) -> HftResult<OrderId> {
+        self.place_order(envelope.intent.clone()).await
+    }
 
     /// 帶 VenueSpec 校驗的下單
     async fn place_order_with_spec(
@@ -176,9 +204,44 @@ pub enum VenueScope {
     Cross,
 }
 
+/// Read-only, sequence-validated L2 book exposed to strategies on the hot path.
+///
+/// The engine owns and rebuilds this view from snapshots and price-keyed deltas.
+/// Strategies must not maintain a second interpretation of exchange delta semantics.
+#[derive(Debug, Clone, Copy)]
+pub struct L2BookView<'a> {
+    pub symbol: &'a Symbol,
+    pub venue: VenueId,
+    pub timestamp: Timestamp,
+    pub sequence: u64,
+    pub bid_prices: &'a [FixedPrice],
+    pub bid_quantities: &'a [FixedQuantity],
+    pub ask_prices: &'a [FixedPrice],
+    pub ask_quantities: &'a [FixedQuantity],
+}
+
+/// Stable strategy input. `book` is present when the event identifies a venue and symbol
+/// whose canonical L2 state is currently synchronized.
+#[derive(Debug, Clone, Copy)]
+pub struct StrategyContext<'a> {
+    pub account: &'a AccountView,
+    pub book: Option<L2BookView<'a>>,
+}
+
 pub trait Strategy: Send + Sync {
     /// 處理市場事件，返回交易意圖
     fn on_market_event(&mut self, event: &MarketEvent, account: &AccountView) -> Vec<OrderIntent>;
+
+    /// Process an event with the engine's latest canonical L2 state.
+    ///
+    /// Existing non-LOB strategies remain source-compatible through this default implementation.
+    fn on_market_event_with_context(
+        &mut self,
+        event: &MarketEvent,
+        context: &StrategyContext<'_>,
+    ) -> Vec<OrderIntent> {
+        self.on_market_event(event, context.account)
+    }
 
     /// 處理執行事件 (成交回報等)
     fn on_execution_event(

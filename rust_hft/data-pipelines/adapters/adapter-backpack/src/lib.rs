@@ -402,6 +402,7 @@ fn handle_depth_event(
             timestamp,
             bids,
             asks,
+            first_sequence: evt.first_update_id,
             sequence,
             is_snapshot: false,
             source_venue: Some(VenueId::BACKPACK),

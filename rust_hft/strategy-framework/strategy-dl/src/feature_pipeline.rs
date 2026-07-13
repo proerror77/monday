@@ -9,7 +9,7 @@
 use crate::config::FeatureConfig;
 use hft_core::{HftError, HftResult, Timestamp};
 use ndarray::Array1;
-use ports::MarketEvent;
+use ports::{L2BookView, MarketEvent};
 use std::collections::VecDeque;
 use tracing::{debug, warn};
 
@@ -101,6 +101,15 @@ impl FeatureExtractor {
         }
     }
 
+    /// Extract features from the engine's sequence-validated canonical L2 book.
+    pub fn extract_book_features(
+        &mut self,
+        book: L2BookView<'_>,
+    ) -> HftResult<Option<Array1<f32>>> {
+        let topn = self.convert_book_to_topn(book)?;
+        self.process_topn_features(&topn)
+    }
+
     /// 轉換市場快照為 TopN 格式
     fn convert_to_topn(&self, snapshot: &ports::MarketSnapshot) -> HftResult<TopNSnapshot> {
         let n = self
@@ -155,6 +164,61 @@ impl FeatureExtractor {
             timestamp: snapshot.timestamp,
             mid_price,
             spread,
+            total_bid_volume,
+            total_ask_volume,
+        })
+    }
+
+    fn convert_book_to_topn(&self, book: L2BookView<'_>) -> HftResult<TopNSnapshot> {
+        let n = self
+            .config
+            .top_n
+            .min(book.bid_prices.len())
+            .min(book.bid_quantities.len())
+            .min(book.ask_prices.len())
+            .min(book.ask_quantities.len());
+        if n == 0 {
+            return Err(HftError::Parse("訂單簿為空".to_string()));
+        }
+
+        let bids: Vec<(f64, f64)> = book
+            .bid_prices
+            .iter()
+            .zip(book.bid_quantities)
+            .take(n)
+            .map(|(price, quantity)| (price.to_f64(), quantity.to_f64()))
+            .collect();
+        let asks: Vec<(f64, f64)> = book
+            .ask_prices
+            .iter()
+            .zip(book.ask_quantities)
+            .take(n)
+            .map(|(price, quantity)| (price.to_f64(), quantity.to_f64()))
+            .collect();
+        if bids.iter().chain(&asks).any(|(price, quantity)| {
+            !price.is_finite() || !quantity.is_finite() || *price <= 0.0 || *quantity < 0.0
+        }) {
+            return Err(HftError::Parse("訂單簿包含無效價格或數量".to_string()));
+        }
+        if bids.windows(2).any(|levels| levels[0].0 < levels[1].0)
+            || asks.windows(2).any(|levels| levels[0].0 > levels[1].0)
+        {
+            return Err(HftError::Parse("訂單簿價格排序無效".to_string()));
+        }
+
+        let best_bid = bids[0].0;
+        let best_ask = asks[0].0;
+        if best_ask <= best_bid {
+            return Err(HftError::Parse("訂單簿交叉".to_string()));
+        }
+        let total_bid_volume = bids.iter().map(|level| level.1).sum();
+        let total_ask_volume = asks.iter().map(|level| level.1).sum();
+        Ok(TopNSnapshot {
+            bids,
+            asks,
+            timestamp: book.timestamp,
+            mid_price: (best_bid + best_ask) * 0.5,
+            spread: best_ask - best_bid,
             total_bid_volume,
             total_ask_volume,
         })
@@ -526,6 +590,21 @@ impl FeaturePipeline {
         }
     }
 
+    pub fn process_book(
+        &mut self,
+        symbol: &str,
+        book: L2BookView<'_>,
+    ) -> HftResult<Option<Array1<f32>>> {
+        if let Some(extractor) = self.extractors.get_mut(symbol) {
+            extractor.extract_book_features(book)
+        } else {
+            Err(HftError::Config(format!(
+                "未找到品種的特徵提取器: {}",
+                symbol
+            )))
+        }
+    }
+
     /// 獲取所有品種的統計信息
     pub fn get_all_stats(&self) -> std::collections::HashMap<String, FeatureExtractorStats> {
         self.extractors
@@ -570,8 +649,8 @@ impl RunningStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::Symbol;
-    use ports::{BookLevel, MarketSnapshot};
+    use hft_core::{FixedPrice, FixedQuantity, Symbol, VenueId};
+    use ports::{BookLevel, L2BookView, MarketSnapshot};
 
     fn create_test_snapshot() -> MarketSnapshot {
         MarketSnapshot {
@@ -611,6 +690,33 @@ mod tests {
         assert_eq!(topn.asks.len(), 2);
         assert_eq!(topn.mid_price, 100.5); // (100 + 101) / 2
         assert_eq!(topn.spread, 1.0); // 101 - 100
+    }
+
+    #[test]
+    fn canonical_book_conversion_uses_rebuilt_l2() {
+        let config = FeatureConfig::default();
+        let extractor = FeatureExtractor::new(config);
+        let symbol = Symbol::new("BTCUSDT");
+        let bid_prices = [FixedPrice::from_f64(100.5), FixedPrice::from_f64(100.0)];
+        let bid_quantities = [FixedQuantity::from_f64(10.0), FixedQuantity::from_f64(5.0)];
+        let ask_prices = [FixedPrice::from_f64(100.75), FixedPrice::from_f64(101.0)];
+        let ask_quantities = [FixedQuantity::from_f64(8.0), FixedQuantity::from_f64(12.0)];
+        let book = L2BookView {
+            symbol: &symbol,
+            venue: VenueId::BINANCE,
+            timestamp: 2,
+            sequence: 2,
+            bid_prices: &bid_prices,
+            bid_quantities: &bid_quantities,
+            ask_prices: &ask_prices,
+            ask_quantities: &ask_quantities,
+        };
+
+        let topn = extractor.convert_book_to_topn(book).unwrap();
+
+        assert_eq!(topn.bids[0], (100.5, 10.0));
+        assert_eq!(topn.asks[0], (100.75, 8.0));
+        assert_eq!(topn.mid_price, 100.625);
     }
 
     #[test]

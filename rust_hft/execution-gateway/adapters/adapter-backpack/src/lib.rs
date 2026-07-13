@@ -389,6 +389,7 @@ impl BackpackExecutionClient {
 
         self.emit_event(ExecutionEvent::OrderNew {
             order_id: order_id.clone(),
+            client_order_id: None,
             symbol: intent.symbol.clone(),
             side: intent.side,
             quantity: intent.quantity,
@@ -625,6 +626,7 @@ impl OrderRecord {
 
         Ok(OpenOrder {
             order_id: OrderId(self.id),
+            client_order_id: None,
             symbol: Symbol::from(self.symbol),
             side,
             order_type,

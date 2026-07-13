@@ -7,8 +7,28 @@ use tracing::{debug, info};
 
 pub const REST_BASE_URL: &str = "https://api.binance.com";
 
+fn classify_http_error(status: u16, retry_after: Option<&str>, body: &str) -> HftError {
+    let retry = retry_after
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("; retry-after={value}s"))
+        .unwrap_or_default();
+    let message = format!("Binance public REST {status}{retry}: {body}");
+    match status {
+        418 | 429 => HftError::RateLimit(message),
+        400..=499 => HftError::Exchange(message),
+        _ => HftError::Network(message),
+    }
+}
+
+#[derive(Clone)]
 pub struct BinanceRestClient {
     client: integration::http::HttpClient,
+}
+
+impl Default for BinanceRestClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BinanceRestClient {
@@ -44,21 +64,15 @@ impl BinanceRestClient {
             .map_err(|e| HftError::Network(format!("REST API 請求失敗: {}", e)))?;
 
         if !response.status().is_success() {
-            let status = response.status();
+            let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body = response.text().await.unwrap_or_default();
 
-            // 嘗試解析錯誤響應
-            if let Ok(error) = Self::parse_json::<BinanceError>(&body) {
-                return Err(HftError::Exchange(format!(
-                    "Binance API 錯誤 {}: {} ({})",
-                    status, error.msg, error.code
-                )));
-            }
-
-            return Err(HftError::Network(format!(
-                "API 請求失敗 {}: {}",
-                status, body
-            )));
+            return Err(classify_http_error(status, retry_after.as_deref(), &body));
         }
 
         let text = response
@@ -111,6 +125,18 @@ impl BinanceRestClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limit_response_preserves_retry_after() {
+        let error = classify_http_error(
+            429,
+            Some("60"),
+            r#"{"code":-1003,"msg":"Too many requests"}"#,
+        );
+        assert!(
+            matches!(error, HftError::RateLimit(message) if message.contains("retry-after=60s"))
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires live Binance network"]

@@ -268,6 +268,7 @@ fn parse_okx_open_orders_response(response: OkxOpenOrdersResponse) -> HftResult<
 
             Ok(OpenOrder {
                 order_id: OrderId(it.ord_id),
+                client_order_id: None,
                 symbol: hft_core::Symbol::from(it.inst_id),
                 side,
                 order_type,

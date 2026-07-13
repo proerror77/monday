@@ -481,6 +481,7 @@ fn parse_bitget_open_order(
     Ok((
         OpenOrder {
             order_id: OrderId(item.order_id),
+            client_order_id: item.client_order_id,
             symbol: hft_core::Symbol::from(symbol),
             side,
             order_type,

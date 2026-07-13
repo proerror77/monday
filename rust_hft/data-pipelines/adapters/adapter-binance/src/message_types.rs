@@ -22,7 +22,7 @@ pub struct DepthUpdate {
     #[serde(rename = "s")]
     pub symbol: String, // Symbol
     #[serde(rename = "U")]
-    pub _first_update_id: u64, // First update ID in event
+    pub first_update_id: u64, // First update ID in event
     #[serde(rename = "u")]
     pub final_update_id: u64, // Final update ID in event
     #[serde(rename = "b")]
@@ -47,15 +47,18 @@ pub struct TradeEvent {
     #[serde(rename = "q")]
     pub quantity: String, // Quantity
     #[serde(rename = "b")]
-    pub _buyer_order_id: u64, // Buyer order ID
+    #[serde(default)]
+    pub _buyer_order_id: Option<u64>, // Legacy buyer order ID
     #[serde(rename = "a")]
-    pub _seller_order_id: u64, // Seller order ID
+    #[serde(default)]
+    pub _seller_order_id: Option<u64>, // Legacy seller order ID
     #[serde(rename = "T")]
     pub trade_time: u64, // Trade time
     #[serde(rename = "m")]
     pub is_buyer_maker: bool, // Is the buyer the market maker?
     #[serde(rename = "M")]
-    pub _ignore: bool, // Ignore
+    #[serde(default)]
+    pub _ignore: Option<bool>, // Legacy ignore field
 }
 
 /// Binance K線事件
@@ -121,10 +124,8 @@ pub struct StreamMessage {
 /// Binance L1 最優買賣（bookTicker）
 #[derive(Debug, Clone, Deserialize)]
 pub struct BookTickerEvent {
-    #[serde(rename = "e")]
-    pub _event_type: String, // "bookTicker"
-    #[serde(rename = "E")]
-    pub event_time: u64,
+    #[serde(rename = "u")]
+    pub update_id: u64,
     #[serde(rename = "s")]
     pub symbol: String,
     #[serde(rename = "b")]
@@ -135,11 +136,4 @@ pub struct BookTickerEvent {
     pub best_ask_price: String,
     #[serde(rename = "A")]
     pub best_ask_qty: String,
-}
-
-/// REST API 響應錯誤
-#[derive(Debug, Clone, Deserialize)]
-pub struct BinanceError {
-    pub code: i32,
-    pub msg: String,
 }

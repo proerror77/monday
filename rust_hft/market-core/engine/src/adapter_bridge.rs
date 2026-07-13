@@ -73,12 +73,13 @@ impl AdapterBridge {
         }
 
         // 訂閱數據流
-        let event_stream = stream
-            .subscribe(symbols)
-            .await
-            .map_err(|e| HftError::Generic {
-                message: format!("訂閱失敗: {}", e),
-            })?;
+        let event_stream =
+            stream
+                .subscribe_tracked(symbols)
+                .await
+                .map_err(|e| HftError::Generic {
+                    message: format!("訂閱失敗: {}", e),
+                })?;
 
         self.spawn_ingestion_task(event_stream, ingester);
         self.is_running = true;
@@ -106,7 +107,7 @@ impl AdapterBridge {
         }
 
         let event_stream = stream
-            .subscribe_instruments(instruments)
+            .subscribe_tracked_instruments(instruments)
             .await
             .map_err(|e| HftError::Generic {
                 message: format!("訂閱失敗: {}", e),
@@ -120,7 +121,7 @@ impl AdapterBridge {
 
     fn spawn_ingestion_task(
         &self,
-        event_stream: ports::BoxStream<ports::MarketEvent>,
+        event_stream: ports::BoxStream<ports::TrackedMarketEvent>,
         mut ingester: EventIngester,
     ) {
         let shutdown_listener = self.shutdown_notify.clone();
@@ -137,10 +138,10 @@ impl AdapterBridge {
 
                     event_result = event_stream.next() => {
                         match event_result {
-                            Some(Ok(event)) => {
+                            Some(Ok(tracked_event)) => {
                                 events_processed += 1;
 
-                                match &event {
+                                match &tracked_event.event {
                                     ports::MarketEvent::Bar(bar) => {
                                         trace!(
                                             seq = events_processed,
@@ -181,7 +182,7 @@ impl AdapterBridge {
                                     }
                                 }
 
-                                if let Err(e) = ingester.ingest(event) {
+                                if let Err(e) = ingester.ingest_tracked_lossless(tracked_event).await {
                                     tracing::error!("攝取事件失敗: {}", e);
                                 } else {
                                     trace!("事件成功攝取到 ring buffer");

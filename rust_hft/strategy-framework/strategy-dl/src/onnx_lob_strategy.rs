@@ -1,7 +1,8 @@
 use hft_core::{HftError, HftResult, OrderType, Price, Quantity, Side, Symbol, TimeInForce};
 use hft_infer_onnx::{OnnxPredictor, MAX_ONNX_INPUT_ELEMENTS};
 use ports::{
-    AccountView, BookLevel, ExecutionEvent, MarketEvent, MarketSnapshot, OrderIntent, Strategy,
+    AccountView, BookLevel, ExecutionEvent, L2BookView, MarketEvent, MarketSnapshot, OrderIntent,
+    Strategy, StrategyContext,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -166,6 +167,41 @@ impl LobFrame {
 
         Ok((Self { channels }, mid_decimal))
     }
+
+    fn from_book(book: L2BookView<'_>, top_n: usize) -> Result<(Self, Decimal), String> {
+        let best_bid = book
+            .bid_prices
+            .first()
+            .ok_or_else(|| "empty bid book".to_string())?;
+        let best_ask = book
+            .ask_prices
+            .first()
+            .ok_or_else(|| "empty ask book".to_string())?;
+        if *best_bid <= hft_core::FixedPrice::ZERO || *best_ask <= *best_bid {
+            return Err("best prices must be positive and uncrossed".to_string());
+        }
+
+        let bid_price = best_bid.to_f64();
+        let ask_price = best_ask.to_f64();
+        let mid = (bid_price + ask_price) * 0.5;
+        let mid_decimal = Price::from(hft_core::FixedPrice::mid(*best_bid, *best_ask)).0;
+        let bids = extract_fixed_levels(book.bid_prices, book.bid_quantities, top_n, true)?;
+        let asks = extract_fixed_levels(book.ask_prices, book.ask_quantities, top_n, false)?;
+        let channels: [Vec<f32>; 4] = [
+            bids.iter()
+                .map(|(price, _)| (*price - mid) as f32)
+                .collect(),
+            bids.iter().map(|(_, qty)| qty.ln_1p() as f32).collect(),
+            asks.iter()
+                .map(|(price, _)| (*price - mid) as f32)
+                .collect(),
+            asks.iter().map(|(_, qty)| qty.ln_1p() as f32).collect(),
+        ];
+        if channels.iter().flatten().any(|value| !value.is_finite()) {
+            return Err("book features must be finite".to_string());
+        }
+        Ok((Self { channels }, mid_decimal))
+    }
 }
 
 fn extract_levels(
@@ -204,6 +240,92 @@ fn extract_levels(
 
     values.resize(top_n, (0.0, 0.0));
     Ok(values)
+}
+
+fn extract_fixed_levels(
+    prices: &[hft_core::FixedPrice],
+    quantities: &[hft_core::FixedQuantity],
+    top_n: usize,
+    descending: bool,
+) -> Result<Vec<(f64, f64)>, String> {
+    if prices.len() != quantities.len() {
+        return Err("book price and quantity lengths differ".to_string());
+    }
+    let mut values = Vec::with_capacity(top_n);
+    let mut previous_price = None;
+    for (price, quantity) in prices.iter().zip(quantities).take(top_n) {
+        let price = price.to_f64();
+        let quantity = quantity.to_f64();
+        if !price.is_finite() || price <= 0.0 {
+            return Err("book prices must be finite and positive".to_string());
+        }
+        if !quantity.is_finite() || quantity < 0.0 {
+            return Err("book quantities must be finite and nonnegative".to_string());
+        }
+        if let Some(previous) = previous_price {
+            let out_of_order = if descending {
+                price > previous
+            } else {
+                price < previous
+            };
+            if out_of_order {
+                return Err("book levels are not price sorted".to_string());
+            }
+        }
+        previous_price = Some(price);
+        values.push((price, quantity));
+    }
+    values.resize(top_n, (0.0, 0.0));
+    Ok(values)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LobExecutionContext {
+    symbol_venue: hft_core::VenueId,
+    best_bid: Decimal,
+    best_ask: Decimal,
+}
+
+impl LobExecutionContext {
+    fn from_snapshot(snapshot: &MarketSnapshot) -> Result<Self, String> {
+        Ok(Self {
+            symbol_venue: snapshot
+                .source_venue
+                .ok_or_else(|| "snapshot source_venue is required".to_string())?,
+            best_bid: snapshot
+                .bids
+                .first()
+                .map(|level| level.price.0)
+                .filter(|price| *price > Decimal::ZERO)
+                .ok_or_else(|| "best bid is required".to_string())?,
+            best_ask: snapshot
+                .asks
+                .first()
+                .map(|level| level.price.0)
+                .filter(|price| *price > Decimal::ZERO)
+                .ok_or_else(|| "best ask is required".to_string())?,
+        })
+    }
+
+    fn from_book(book: L2BookView<'_>) -> Result<Self, String> {
+        Ok(Self {
+            symbol_venue: book.venue,
+            best_bid: Price::from(
+                *book
+                    .bid_prices
+                    .first()
+                    .ok_or_else(|| "best bid is required".to_string())?,
+            )
+            .0,
+            best_ask: Price::from(
+                *book
+                    .ask_prices
+                    .first()
+                    .ok_or_else(|| "best ask is required".to_string())?,
+            )
+            .0,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -367,10 +489,35 @@ impl OnnxLobStrategy {
                 return Vec::new();
             }
         };
+        let execution_context = LobExecutionContext::from_snapshot(snapshot);
+        self.handle_frame(&snapshot.symbol, frame, execution_context)
+    }
+
+    fn handle_book(&mut self, book: L2BookView<'_>) -> Vec<OrderIntent> {
+        if !self.states.contains_key(book.symbol) {
+            return Vec::new();
+        }
+        let (frame, _) = match LobFrame::from_book(book, self.config.top_n) {
+            Ok(features) => features,
+            Err(error) => {
+                self.record_failure(book.symbol, error, true);
+                return Vec::new();
+            }
+        };
+        let execution_context = LobExecutionContext::from_book(book);
+        self.handle_frame(book.symbol, frame, execution_context)
+    }
+
+    fn handle_frame(
+        &mut self,
+        symbol: &Symbol,
+        frame: LobFrame,
+        execution_context: Result<LobExecutionContext, String>,
+    ) -> Vec<OrderIntent> {
         let input = {
             let state = self
                 .states
-                .get_mut(&snapshot.symbol)
+                .get_mut(symbol)
                 .expect("configured symbol state must exist");
             state.window.push(frame);
             match state.window.full_input() {
@@ -382,7 +529,7 @@ impl OnnxLobStrategy {
         let output = match self.predictor.infer(&input) {
             Ok(output) => output,
             Err(error) => {
-                self.record_failure(&snapshot.symbol, error.to_string(), false);
+                self.record_failure(symbol, error.to_string(), false);
                 return Vec::new();
             }
         };
@@ -390,34 +537,32 @@ impl OnnxLobStrategy {
             Some(signal) if signal.is_finite() => signal,
             Some(_) => {
                 self.record_failure(
-                    &snapshot.symbol,
+                    symbol,
                     "first model output is not finite".to_string(),
                     false,
                 );
                 return Vec::new();
             }
             None => {
-                self.record_failure(
-                    &snapshot.symbol,
-                    "model returned no outputs".to_string(),
-                    false,
-                );
+                self.record_failure(symbol, "model returned no outputs".to_string(), false);
                 return Vec::new();
             }
         };
 
         let previous_side = self
             .states
-            .get(&snapshot.symbol)
+            .get(symbol)
             .expect("configured symbol state must exist")
             .last_side;
         let (emit_side, current_side) =
             signal_crossing(signal, self.config.output_threshold, previous_side);
         let order = match emit_side {
-            Some(side) => match build_order(&self.config, snapshot, side) {
+            Some(side) => match execution_context
+                .and_then(|context| build_order(&self.config, symbol, context, side))
+            {
                 Ok(order) => Some(order),
                 Err(error) => {
-                    self.record_failure(&snapshot.symbol, error, false);
+                    self.record_failure(symbol, error, false);
                     return Vec::new();
                 }
             },
@@ -426,7 +571,7 @@ impl OnnxLobStrategy {
 
         let state = self
             .states
-            .get_mut(&snapshot.symbol)
+            .get_mut(symbol)
             .expect("configured symbol state must exist");
         state.failures.clear();
         state.last_side = current_side;
@@ -453,18 +598,17 @@ fn signal_crossing(
 
 fn build_order(
     config: &OnnxLobStrategyConfig,
-    snapshot: &MarketSnapshot,
+    symbol: &Symbol,
+    context: LobExecutionContext,
     side: Side,
 ) -> Result<OrderIntent, String> {
-    let target_venue = snapshot
-        .source_venue
-        .ok_or_else(|| "snapshot source_venue is required".to_string())?;
     let limit_price = match side {
-        Side::Buy => snapshot.asks.first().map(|level| level.price.0),
-        Side::Sell => snapshot.bids.first().map(|level| level.price.0),
+        Side::Buy => context.best_ask,
+        Side::Sell => context.best_bid,
+    };
+    if limit_price <= Decimal::ZERO {
+        return Err("executable limit price is required".to_string());
     }
-    .filter(|price| *price > Decimal::ZERO)
-    .ok_or_else(|| "executable limit price is required".to_string())?;
     let quantity = config
         .max_order_notional
         .checked_div(limit_price)
@@ -472,14 +616,14 @@ fn build_order(
         .ok_or_else(|| "order quantity cannot be represented".to_string())?;
 
     Ok(OrderIntent::crypto_spot(
-        snapshot.symbol.clone(),
+        symbol.clone(),
         side,
         Quantity(quantity),
         OrderType::Limit,
         Some(Price(limit_price)),
         TimeInForce::IOC,
         config.name.clone(),
-        Some(target_venue),
+        Some(context.symbol_venue),
     ))
 }
 
@@ -487,6 +631,27 @@ impl Strategy for OnnxLobStrategy {
     fn on_market_event(&mut self, event: &MarketEvent, _account: &AccountView) -> Vec<OrderIntent> {
         match event {
             MarketEvent::Snapshot(snapshot) => self.handle_snapshot(snapshot),
+            _ => Vec::new(),
+        }
+    }
+
+    fn on_market_event_with_context(
+        &mut self,
+        event: &MarketEvent,
+        context: &StrategyContext<'_>,
+    ) -> Vec<OrderIntent> {
+        match event {
+            MarketEvent::Snapshot(snapshot) if self.states.contains_key(&snapshot.symbol) => {
+                context
+                    .book
+                    .map_or_else(Vec::new, |book| self.handle_book(book))
+            }
+            MarketEvent::Update(update) if self.states.contains_key(&update.symbol) => context
+                .book
+                .map_or_else(Vec::new, |book| self.handle_book(book)),
+            MarketEvent::Quote(quote) if self.states.contains_key(&quote.symbol) => context
+                .book
+                .map_or_else(Vec::new, |book| self.handle_book(book)),
             _ => Vec::new(),
         }
     }
@@ -515,8 +680,8 @@ impl Strategy for OnnxLobStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::{AssetClass, ProductType, Symbol, VenueId};
-    use ports::{BookLevel, MarketSnapshot};
+    use hft_core::{AssetClass, FixedPrice, FixedQuantity, ProductType, Symbol, VenueId};
+    use ports::{BookLevel, L2BookView, MarketSnapshot};
     use rust_decimal::Decimal;
     use sha2::Digest as _;
     use std::path::PathBuf;
@@ -638,6 +803,31 @@ mod tests {
     }
 
     #[test]
+    fn extracts_onnx_frame_from_canonical_lob_view() {
+        let symbol = Symbol::new("BTCUSDT");
+        let bid_prices = [FixedPrice::from_f64(100.0), FixedPrice::from_f64(99.0)];
+        let bid_quantities = [FixedQuantity::from_f64(3.0), FixedQuantity::from_f64(8.0)];
+        let ask_prices = [FixedPrice::from_f64(101.0), FixedPrice::from_f64(102.0)];
+        let ask_quantities = [FixedQuantity::from_f64(15.0), FixedQuantity::from_f64(24.0)];
+        let book = L2BookView {
+            symbol: &symbol,
+            venue: VenueId::BINANCE_SPOT,
+            timestamp: 2,
+            sequence: 2,
+            bid_prices: &bid_prices,
+            bid_quantities: &bid_quantities,
+            ask_prices: &ask_prices,
+            ask_quantities: &ask_quantities,
+        };
+
+        let (frame, mid) = LobFrame::from_book(book, 2).unwrap();
+
+        assert_eq!(mid, Decimal::new(1005, 1));
+        assert_eq!(frame.channels[0], vec![-0.5, -1.5]);
+        assert_eq!(frame.channels[2], vec![0.5, 1.5]);
+    }
+
+    #[test]
     fn rejects_empty_and_crossed_books() {
         let mut malformed = snapshot();
         malformed.bids.clear();
@@ -708,7 +898,8 @@ mod tests {
     fn builds_bounded_crypto_spot_limit_ioc_with_source_venue() {
         let cfg = config();
         let snapshot = snapshot();
-        let order = build_order(&cfg, &snapshot, Side::Buy).unwrap();
+        let context = LobExecutionContext::from_snapshot(&snapshot).unwrap();
+        let order = build_order(&cfg, &snapshot.symbol, context, Side::Buy).unwrap();
 
         assert_eq!(order.asset_class, AssetClass::Crypto);
         assert_eq!(order.product_type, ProductType::Spot);
@@ -726,7 +917,7 @@ mod tests {
 
         let mut no_venue = snapshot;
         no_venue.source_venue = None;
-        assert!(build_order(&cfg, &no_venue, Side::Buy).is_err());
+        assert!(LobExecutionContext::from_snapshot(&no_venue).is_err());
     }
 
     #[test]
