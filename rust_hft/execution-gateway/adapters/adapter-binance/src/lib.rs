@@ -15,9 +15,11 @@ use integration::{
     http::{HttpClient, HttpClientConfig},
     signing::{BinanceCredentials, BinanceSigner},
 };
-use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope};
+use ports::{
+    AccountBalance, BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope,
+};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -74,6 +76,102 @@ fn classify_binance_http_error(
     }
 }
 
+fn publish_binance_execution_report(
+    tx: &broadcast::Sender<ExecutionEvent>,
+    value: &serde_json::Value,
+) {
+    if value.get("e").and_then(|entry| entry.as_str()) != Some("executionReport") {
+        return;
+    }
+    let order_id = value
+        .get("c")
+        .and_then(|entry| entry.as_str())
+        .filter(|client_order_id| !client_order_id.is_empty())
+        .map(|client_order_id| OrderId(client_order_id.to_string()))
+        .or_else(|| {
+            value
+                .get("i")
+                .and_then(|entry| entry.as_i64())
+                .filter(|order_id| *order_id > 0)
+                .map(|order_id| OrderId(order_id.to_string()))
+        });
+    let Some(order_id) = order_id else {
+        return;
+    };
+    let timestamp = value
+        .get("E")
+        .and_then(|entry| entry.as_u64())
+        .unwrap_or_else(|| hft_core::now_micros() / 1000)
+        .saturating_mul(1000);
+    let status = value
+        .get("X")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or("");
+
+    match status {
+        "NEW" => {
+            let _ = tx.send(ExecutionEvent::OrderAck {
+                order_id: order_id.clone(),
+                timestamp,
+            });
+        }
+        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
+            let _ = tx.send(ExecutionEvent::OrderCanceled {
+                order_id: order_id.clone(),
+                timestamp,
+            });
+        }
+        "REJECTED" => {
+            let reason = value
+                .get("r")
+                .and_then(|entry| entry.as_str())
+                .filter(|reason| !reason.is_empty() && *reason != "NONE")
+                .unwrap_or("Exchange rejected")
+                .to_string();
+            let _ = tx.send(ExecutionEvent::OrderReject {
+                order_id: order_id.clone(),
+                reason,
+                timestamp,
+            });
+        }
+        _ => {}
+    }
+
+    if value.get("x").and_then(|entry| entry.as_str()) != Some("TRADE") {
+        return;
+    }
+    let quantity = value
+        .get("l")
+        .and_then(|entry| entry.as_str())
+        .and_then(|value| Quantity::from_str(value).ok())
+        .filter(|quantity| *quantity > Quantity::zero());
+    let price = value
+        .get("L")
+        .and_then(|entry| entry.as_str())
+        .and_then(|value| Price::from_str(value).ok())
+        .filter(|price| *price > Price::zero());
+    let execution_id = value
+        .get("t")
+        .and_then(|entry| entry.as_i64())
+        .filter(|trade_id| *trade_id >= 0)
+        .map(|trade_id| trade_id.to_string())
+        .or_else(|| {
+            value
+                .get("I")
+                .and_then(|entry| entry.as_i64())
+                .map(|execution_id| execution_id.to_string())
+        });
+    if let (Some(quantity), Some(price), Some(execution_id)) = (quantity, price, execution_id) {
+        let _ = tx.send(ExecutionEvent::Fill {
+            fill_id: format!("BNFILL-{}-{execution_id}", order_id.0),
+            order_id,
+            price,
+            quantity,
+            timestamp,
+        });
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[allow(dead_code)]
 struct BinanceOrder {
@@ -93,6 +191,125 @@ struct BinanceOrder {
     update_time: u64,
     side: String,
     r#type: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BinanceBalance {
+    asset: String,
+    free: String,
+    locked: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BinanceAccountResponse {
+    balances: Vec<BinanceBalance>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct BinanceSymbolInfo {
+    symbol: String,
+    status: String,
+    baseAsset: String,
+    quoteAsset: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BinanceExchangeInfo {
+    symbols: Vec<BinanceSymbolInfo>,
+}
+
+#[derive(serde::Deserialize)]
+struct BinanceTickerPrice {
+    symbol: String,
+    price: String,
+}
+
+fn binance_usd_rate(
+    asset: &str,
+    graph: &HashMap<String, Vec<(String, Decimal)>>,
+) -> Option<Decimal> {
+    const USD_ASSETS: &[&str] = &["USD", "USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI"];
+    if USD_ASSETS.contains(&asset) {
+        return Some(Decimal::ONE);
+    }
+    let mut queue = VecDeque::from([(asset.to_string(), Decimal::ONE)]);
+    let mut visited = HashSet::from([asset.to_string()]);
+    while let Some((current, rate)) = queue.pop_front() {
+        for (next, edge_rate) in graph.get(&current).into_iter().flatten() {
+            let next_rate = rate * *edge_rate;
+            if USD_ASSETS.contains(&next.as_str()) {
+                return Some(next_rate);
+            }
+            if visited.insert(next.clone()) {
+                queue.push_back((next.clone(), next_rate));
+            }
+        }
+    }
+    None
+}
+
+fn value_binance_balances(
+    account: BinanceAccountResponse,
+    exchange: BinanceExchangeInfo,
+    tickers: Vec<BinanceTickerPrice>,
+) -> HftResult<Vec<AccountBalance>> {
+    let ticker_prices = tickers
+        .into_iter()
+        .filter_map(|ticker| {
+            ticker
+                .price
+                .parse::<Decimal>()
+                .ok()
+                .filter(|price| *price > Decimal::ZERO)
+                .map(|price| (ticker.symbol, price))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut graph: HashMap<String, Vec<(String, Decimal)>> = HashMap::new();
+    for symbol in exchange
+        .symbols
+        .into_iter()
+        .filter(|symbol| symbol.status == "TRADING")
+    {
+        let Some(price) = ticker_prices.get(&symbol.symbol).copied() else {
+            continue;
+        };
+        graph
+            .entry(symbol.baseAsset.clone())
+            .or_default()
+            .push((symbol.quoteAsset.clone(), price));
+        graph
+            .entry(symbol.quoteAsset)
+            .or_default()
+            .push((symbol.baseAsset, Decimal::ONE / price));
+    }
+
+    account
+        .balances
+        .into_iter()
+        .map(|balance| {
+            let available = balance.free.parse::<Decimal>().map_err(|error| {
+                hft_core::HftError::Parse(format!(
+                    "Binance {} free balance: {error}",
+                    balance.asset
+                ))
+            })?;
+            let frozen = balance.locked.parse::<Decimal>().map_err(|error| {
+                hft_core::HftError::Parse(format!(
+                    "Binance {} locked balance: {error}",
+                    balance.asset
+                ))
+            })?;
+            let total = available + frozen;
+            Ok(AccountBalance {
+                usd_value: binance_usd_rate(&balance.asset, &graph).map(|rate| total * rate),
+                asset: balance.asset,
+                available,
+                frozen,
+                total,
+            })
+        })
+        .collect()
 }
 
 fn parse_binance_open_order(order: BinanceOrder) -> HftResult<OpenOrder> {
@@ -185,6 +402,7 @@ fn parse_binance_open_order(order: BinanceOrder) -> HftResult<OpenOrder> {
 
     Ok(OpenOrder {
         order_id: hft_core::OrderId(order.order_id.to_string()),
+        client_order_id: Some(order.client_order_id),
         symbol: hft_core::Symbol::from(order.symbol),
         side,
         order_type,
@@ -384,6 +602,8 @@ impl ExecutionClient for BinanceExecutionClient {
             if self.http_client.is_none() {
                 self.ensure_http()?;
             }
+            self.order_symbol
+                .insert(client_order_id.clone(), intent.symbol.as_str().to_string());
             let signer = self.get_signer()?;
             let http = self.get_http()?;
 
@@ -467,15 +687,7 @@ impl ExecutionClient for BinanceExecutionClient {
                 )));
             }
 
-            let oid = OrderId(pr.order_id.to_string());
-            self.order_symbol.insert(oid.0.clone(), pr.symbol);
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(ExecutionEvent::OrderAck {
-                    order_id: oid.clone(),
-                    timestamp: hft_core::now_micros(),
-                });
-            }
-            return Ok(oid);
+            return Ok(OrderId(client_order_id));
         }
 
         // Paper: 立即回傳訂單ID並廣播 ACK/Fill
@@ -525,7 +737,18 @@ impl ExecutionClient for BinanceExecutionClient {
     }
 
     async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
-        if uses_exchange_api(self.mode) && self.signer.is_some() {
+        if uses_exchange_api(self.mode) {
+            if self.signer.is_none() {
+                return Err(hft_core::HftError::Authentication(
+                    "Binance live/testnet cancel requires API credentials".to_string(),
+                ));
+            }
+            let symbol = self.order_symbol.get(&order_id.0).cloned().ok_or_else(|| {
+                hft_core::HftError::OrderNotFound(format!(
+                    "Binance cancel requires known symbol metadata for order {}",
+                    order_id.0
+                ))
+            })?;
             if self.http_client.is_none() {
                 self.ensure_http()?;
             }
@@ -534,11 +757,6 @@ impl ExecutionClient for BinanceExecutionClient {
                 .as_ref()
                 .ok_or_else(|| hft_core::HftError::Authentication("缺少API憑證".to_string()))?;
             let http_client = self.get_http()?.clone();
-            let symbol = self
-                .order_symbol
-                .get(&order_id.0)
-                .cloned()
-                .unwrap_or_else(|| "BTCUSDT".to_string());
             let order_id_str = order_id.0.clone();
             let signer_clone = signer.clone();
 
@@ -550,15 +768,59 @@ impl ExecutionClient for BinanceExecutionClient {
                     let sig = signer_clone.clone();
                     async move {
                         let mut params: HashMap<String, String> = HashMap::new();
-                        params.insert("symbol".to_string(), sym);
-                        params.insert("orderId".to_string(), oid);
+                        params.insert("symbol".to_string(), sym.clone());
+                        if oid.parse::<u64>().is_ok() {
+                            params.insert("orderId".to_string(), oid.clone());
+                        } else {
+                            params.insert("origClientOrderId".to_string(), oid.clone());
+                        }
                         params.insert("recvWindow".to_string(), "5000".to_string());
                         let signed_query = sig.sign_request(&mut params);
                         let path = format!("/api/v3/order?{}", signed_query);
                         let headers = sig.generate_headers();
-                        http.signed_request(reqwest::Method::DELETE, &path, Some(headers), None)
+                        let response = http
+                            .signed_request(reqwest::Method::DELETE, &path, Some(headers), None)
                             .await
                             .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
+                        if !response.status().is_success() {
+                            let status = response.status();
+                            let retry_after = response
+                                .headers()
+                                .get(reqwest::header::RETRY_AFTER)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned);
+                            let body = response.text().await.unwrap_or_default();
+                            return Err(classify_binance_http_error(
+                                status,
+                                retry_after.as_deref(),
+                                &body,
+                            ));
+                        }
+                        #[derive(serde::Deserialize)]
+                        struct CancelResponse {
+                            symbol: String,
+                            #[serde(rename = "orderId")]
+                            order_id: u64,
+                            #[serde(rename = "clientOrderId")]
+                            client_order_id: String,
+                        }
+                        let response: CancelResponse =
+                            HttpClient::parse_json(response).await.map_err(|error| {
+                                hft_core::HftError::Execution(format!(
+                                    "Binance cancel response could not be decoded: {error}"
+                                ))
+                            })?;
+                        let identifier_matches = if oid.parse::<u64>().is_ok() {
+                            response.order_id.to_string() == oid
+                        } else {
+                            response.client_order_id == oid
+                        };
+                        if response.symbol != sym || !identifier_matches {
+                            return Err(hft_core::HftError::Execution(
+                                "Binance cancel response did not match the requested order"
+                                    .to_string(),
+                            ));
+                        }
                         Ok(())
                     }
                 })
@@ -582,6 +844,7 @@ impl ExecutionClient for BinanceExecutionClient {
             }
 
             if result.is_ok() {
+                self.order_symbol.remove(&order_id.0);
                 if let Some(ref tx) = self.event_tx {
                     let _ = tx.send(ExecutionEvent::OrderCanceled {
                         order_id: order_id.clone(),
@@ -607,48 +870,13 @@ impl ExecutionClient for BinanceExecutionClient {
         new_price: Option<Price>,
     ) -> HftResult<()> {
         if uses_exchange_api(self.mode) {
-            // Binance 原生修改有限制，這裡採用 Cancel + New 的簡化策略
             if new_quantity.is_none() && new_price.is_none() {
                 return Ok(());
             }
-            let _symbol = self
-                .order_symbol
-                .get(&order_id.0)
-                .cloned()
-                .unwrap_or_else(|| "BTCUSDT".to_string());
-
-            // 取消原單（已帶韌性機制）
-            let cancel_result = self.cancel_order(order_id).await;
-
-            // 簡化：按剩餘資料重下一張限價/市價單（需由上層提供完整 intent 更佳）
-            warn!("Binance 修改訂單以撤單重下實現: order_id={}", order_id.0);
-
-            // 處理撤單結果
-            if let Err(ref e) = cancel_result {
-                // 發送修改失敗告警
-                self.send_execution_alert(
-                    ExecutionAlert::new(
-                        ExecutionAlertType::RetriesExhausted,
-                        "binance",
-                        "modify_order",
-                        format!("修改訂單時撤單失敗 (order_id={}): {}", order_id.0, e),
-                    )
-                    .with_error(e.to_string()),
-                );
-                return cancel_result;
-            }
-
-            // 撤單成功，發送修改事件
-            // 無法重建完整意圖，僅回傳修改事件以避免阻塞（可後續改為攜帶原意圖）
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(ExecutionEvent::OrderModified {
-                    order_id: order_id.clone(),
-                    new_quantity,
-                    new_price,
-                    timestamp: hft_core::now_micros(),
-                });
-            }
-            return Ok(());
+            return Err(hft_core::HftError::Config(format!(
+                "Binance live modify is disabled for order {}; use an explicit cancel-then-new intent",
+                order_id.0
+            )));
         }
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderModified {
@@ -677,6 +905,75 @@ impl ExecutionClient for BinanceExecutionClient {
         } else {
             Ok(Box::pin(stream::empty()))
         }
+    }
+
+    async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
+        if !uses_exchange_api(self.mode) {
+            return Err(hft_core::HftError::Config(
+                "Binance authoritative balances require live/testnet mode".to_string(),
+            ));
+        }
+        let signer = self.get_signer()?;
+        let http = self.get_http()?;
+        let mut params = HashMap::from([
+            ("omitZeroBalances".to_string(), "true".to_string()),
+            ("recvWindow".to_string(), "5000".to_string()),
+        ]);
+        let account_path = format!("/api/v3/account?{}", signer.sign_request(&mut params));
+        let account_response = http
+            .get(&account_path, Some(signer.generate_headers()))
+            .await
+            .map_err(|error| hft_core::HftError::Network(error.to_string()))?;
+        if !account_response.status().is_success() {
+            let status = account_response.status();
+            let retry_after = account_response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = account_response.text().await.unwrap_or_default();
+            return Err(classify_binance_http_error(
+                status,
+                retry_after.as_deref(),
+                &body,
+            ));
+        }
+        let account: BinanceAccountResponse = HttpClient::parse_json(account_response)
+            .await
+            .map_err(|error| {
+                hft_core::HftError::Parse(format!("Binance account response: {error}"))
+            })?;
+
+        let exchange_response = http
+            .get("/api/v3/exchangeInfo", None)
+            .await
+            .map_err(|error| hft_core::HftError::Network(error.to_string()))?;
+        if !exchange_response.status().is_success() {
+            let status = exchange_response.status();
+            let body = exchange_response.text().await.unwrap_or_default();
+            return Err(classify_binance_http_error(status, None, &body));
+        }
+        let exchange: BinanceExchangeInfo = HttpClient::parse_json(exchange_response)
+            .await
+            .map_err(|error| {
+                hft_core::HftError::Parse(format!("Binance exchangeInfo response: {error}"))
+            })?;
+
+        let ticker_response = http
+            .get("/api/v3/ticker/price", None)
+            .await
+            .map_err(|error| hft_core::HftError::Network(error.to_string()))?;
+        if !ticker_response.status().is_success() {
+            let status = ticker_response.status();
+            let body = ticker_response.text().await.unwrap_or_default();
+            return Err(classify_binance_http_error(status, None, &body));
+        }
+        let tickers: Vec<BinanceTickerPrice> = HttpClient::parse_json(ticker_response)
+            .await
+            .map_err(|error| {
+                hft_core::HftError::Parse(format!("Binance ticker response: {error}"))
+            })?;
+        value_binance_balances(account, exchange, tickers)
     }
 
     async fn connect(&mut self) -> HftResult<()> {
@@ -739,6 +1036,20 @@ impl ExecutionClient for BinanceExecutionClient {
                 )
                 .await
                 .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let body = resp.text().await.unwrap_or_default();
+                return Err(classify_binance_http_error(
+                    status,
+                    retry_after.as_deref(),
+                    &body,
+                ));
+            }
             #[derive(serde::Deserialize)]
             struct Lk {
                 #[serde(rename = "listenKey")]
@@ -756,100 +1067,35 @@ impl ExecutionClient for BinanceExecutionClient {
                 lk.listen_key
             );
             let ws_tx = tx.clone();
+            let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+                .await
+                .map_err(|error| {
+                    hft_core::HftError::Network(format!(
+                        "Binance private WS initial connection failed: {error}"
+                    ))
+                })?;
+            if let Err(error) = integration::ws::set_ws_tcp_nodelay(ws.get_ref(), true) {
+                warn!(error = %error, "Binance private WS TCP_NODELAY failed");
+            }
+            info!("Binance 私有 WS 已連線");
             tokio::spawn(async move {
-                match tokio_tungstenite::connect_async(&url).await {
-                    Ok((mut ws, _)) => {
-                        info!("Binance 私有 WS 已連線");
-                        let _ = ws_tx.send(ExecutionEvent::ConnectionStatus {
-                            connected: true,
-                            timestamp: hft_core::now_micros(),
-                        });
-                        while let Some(msg) = ws.next().await {
-                            match msg {
-                                Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) => {
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                        // 解析 executionReport
-                                        if v.get("e").and_then(|e| e.as_str())
-                                            == Some("executionReport")
-                                        {
-                                            let status =
-                                                v.get("X").and_then(|x| x.as_str()).unwrap_or("");
-                                            let order_id = v
-                                                .get("i")
-                                                .and_then(|x| x.as_i64())
-                                                .unwrap_or(0)
-                                                .to_string();
-                                            let ts = v
-                                                .get("E")
-                                                .and_then(|x| x.as_u64())
-                                                .unwrap_or_else(|| hft_core::now_micros() / 1000);
-                                            let ts_us = ts * 1000; // ms -> μs
-                                            match status {
-                                                "NEW" => {
-                                                    let _ = ws_tx.send(ExecutionEvent::OrderAck {
-                                                        order_id: OrderId(order_id.clone()),
-                                                        timestamp: ts_us,
-                                                    });
-                                                }
-                                                "CANCELED" => {
-                                                    let _ =
-                                                        ws_tx.send(ExecutionEvent::OrderCanceled {
-                                                            order_id: OrderId(order_id.clone()),
-                                                            timestamp: ts_us,
-                                                        });
-                                                }
-                                                "REJECTED" => {
-                                                    let _ =
-                                                        ws_tx.send(ExecutionEvent::OrderReject {
-                                                            order_id: OrderId(order_id.clone()),
-                                                            reason: "Exchange rejected".to_string(),
-                                                            timestamp: ts_us,
-                                                        });
-                                                }
-                                                _ => {
-                                                    // 成交
-                                                    let last_qty = v
-                                                        .get("l")
-                                                        .and_then(|x| x.as_str())
-                                                        .and_then(|s| {
-                                                            hft_core::Quantity::from_str(s).ok()
-                                                        });
-                                                    let last_px = v
-                                                        .get("L")
-                                                        .and_then(|x| x.as_str())
-                                                        .and_then(|s| {
-                                                            hft_core::Price::from_str(s).ok()
-                                                        });
-                                                    if let (Some(q), Some(p)) = (last_qty, last_px)
-                                                    {
-                                                        let fill_id =
-                                                            format!("BNFILL-{}-{}", order_id, ts);
-                                                        let _ = ws_tx.send(ExecutionEvent::Fill {
-                                                            order_id: OrderId(order_id.clone()),
-                                                            price: p,
-                                                            quantity: q,
-                                                            timestamp: ts_us,
-                                                            fill_id,
-                                                        });
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
-                                    warn!("Binance 私有 WS 關閉");
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!("Binance 私有 WS 錯誤: {}", e);
-                                    break;
-                                }
-                                _ => {}
+                while let Some(msg) = ws.next().await {
+                    match msg {
+                        Ok(tokio_tungstenite::tungstenite::Message::Text(txt)) => {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                publish_binance_execution_report(&ws_tx, &v);
                             }
                         }
+                        Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
+                            warn!("Binance 私有 WS 關閉");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Binance 私有 WS 錯誤: {}", e);
+                            break;
+                        }
+                        _ => {}
                     }
-                    Err(e) => warn!("Binance 私有 WS 連接失敗: {}", e),
                 }
                 let _ = ws_tx.send(ExecutionEvent::ConnectionStatus {
                     connected: false,
@@ -951,6 +1197,21 @@ impl ExecutionClient for BinanceExecutionClient {
             .await
             .map_err(|e| hft_core::HftError::Network(e.to_string()))?;
 
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = resp.text().await.unwrap_or_default();
+            return Err(classify_binance_http_error(
+                status,
+                retry_after.as_deref(),
+                &body,
+            ));
+        }
+
         let items: Vec<BinanceOrder> = HttpClient::parse_json(resp)
             .await
             .map_err(|e| hft_core::HftError::Serialization(e.to_string()))?;
@@ -1001,6 +1262,123 @@ mod tests {
             classify_binance_http_error(reqwest::StatusCode::IM_A_TEAPOT, None, "IP banned"),
             hft_core::HftError::RateLimit(_)
         ));
+    }
+
+    #[test]
+    fn private_fills_use_exchange_trade_id_and_expiry_is_terminal() {
+        let (tx, mut rx) = broadcast::channel(8);
+        for trade_id in [41, 42] {
+            publish_binance_execution_report(
+                &tx,
+                &serde_json::json!({
+                    "e": "executionReport",
+                    "E": 123,
+                    "x": "TRADE",
+                    "X": "PARTIALLY_FILLED",
+                    "i": 7,
+                    "t": trade_id,
+                    "l": "0.1",
+                    "L": "100"
+                }),
+            );
+        }
+        let first = rx.try_recv().expect("first fill");
+        let second = rx.try_recv().expect("second fill");
+        let (
+            ExecutionEvent::Fill { fill_id: first, .. },
+            ExecutionEvent::Fill {
+                fill_id: second, ..
+            },
+        ) = (first, second)
+        else {
+            panic!("expected two fills");
+        };
+        assert_ne!(first, second);
+        assert!(first.ends_with("-41"));
+        assert!(second.ends_with("-42"));
+
+        publish_binance_execution_report(
+            &tx,
+            &serde_json::json!({
+                "e": "executionReport",
+                "E": 124,
+                "x": "EXPIRED",
+                "X": "EXPIRED",
+                "i": 7,
+                "t": -1,
+                "l": "0",
+                "L": "0"
+            }),
+        );
+        assert!(matches!(
+            rx.try_recv().expect("expiry event"),
+            ExecutionEvent::OrderCanceled { .. }
+        ));
+    }
+
+    #[test]
+    fn private_reports_prefer_the_stable_client_order_id() {
+        let (tx, mut rx) = broadcast::channel(2);
+        publish_binance_execution_report(
+            &tx,
+            &serde_json::json!({
+                "e": "executionReport",
+                "E": 123,
+                "x": "NEW",
+                "X": "NEW",
+                "i": 7,
+                "c": "client-42"
+            }),
+        );
+
+        assert!(matches!(
+            rx.try_recv().expect("ack event"),
+            ExecutionEvent::OrderAck { order_id, .. }
+                if order_id == OrderId("client-42".to_string())
+        ));
+    }
+
+    #[test]
+    fn balance_valuation_uses_multi_hop_exchange_prices() {
+        let balances = value_binance_balances(
+            BinanceAccountResponse {
+                balances: vec![BinanceBalance {
+                    asset: "ETH".to_string(),
+                    free: "2".to_string(),
+                    locked: "0.5".to_string(),
+                }],
+            },
+            BinanceExchangeInfo {
+                symbols: vec![
+                    BinanceSymbolInfo {
+                        symbol: "ETHBTC".to_string(),
+                        status: "TRADING".to_string(),
+                        baseAsset: "ETH".to_string(),
+                        quoteAsset: "BTC".to_string(),
+                    },
+                    BinanceSymbolInfo {
+                        symbol: "BTCUSDT".to_string(),
+                        status: "TRADING".to_string(),
+                        baseAsset: "BTC".to_string(),
+                        quoteAsset: "USDT".to_string(),
+                    },
+                ],
+            },
+            vec![
+                BinanceTickerPrice {
+                    symbol: "ETHBTC".to_string(),
+                    price: "0.05".to_string(),
+                },
+                BinanceTickerPrice {
+                    symbol: "BTCUSDT".to_string(),
+                    price: "60000".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(balances[0].total, Decimal::new(25, 1));
+        assert_eq!(balances[0].usd_value, Some(Decimal::new(7500, 0)));
     }
 
     #[test]
@@ -1433,6 +1811,48 @@ mod tests {
         let order_id = OrderId("test_order_123".to_string());
         let result = client.cancel_order(&order_id).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn live_cancel_never_falls_back_to_paper_without_credentials() {
+        let mut client = BinanceExecutionClient::new(make_test_config(ExecutionMode::Live));
+
+        let error = client
+            .cancel_order(&OrderId("1".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, hft_core::HftError::Authentication(_)));
+    }
+
+    #[tokio::test]
+    async fn live_cancel_rejects_unknown_symbol_instead_of_defaulting_to_btc() {
+        let mut config = make_test_config(ExecutionMode::Live);
+        config.credentials = BinanceCredentials::new("key".to_string(), "secret".to_string());
+        let mut client = BinanceExecutionClient::new(config);
+
+        let error = client
+            .cancel_order(&OrderId("1".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, hft_core::HftError::OrderNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn live_modify_is_rejected_before_canceling_the_original_order() {
+        let mut client = BinanceExecutionClient::new(make_test_config(ExecutionMode::Live));
+
+        let error = client
+            .modify_order(
+                &OrderId("1".to_string()),
+                None,
+                Some(Price::from_f64(100.0).unwrap()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, hft_core::HftError::Config(_)));
     }
 
     #[tokio::test]

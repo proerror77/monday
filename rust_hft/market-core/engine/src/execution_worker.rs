@@ -100,6 +100,15 @@ struct TrackedOrder {
     strategy_id: String,
     venue: Option<VenueId>,
     account_id: Option<AccountId>,
+    remaining_quantity: Quantity,
+    processed_fill_ids: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingAck {
+    symbol: Symbol,
+    submitted_at: Instant,
+    cancel_sent: bool,
 }
 
 /// 执行 Worker - 在独立 Tokio 任务中运行
@@ -122,8 +131,8 @@ pub struct ExecutionWorker {
     router: Option<Box<dyn ExecutionRouter>>,
     /// Venue 到客戶端索引的映射（用於新路由系統）
     venue_to_client: HashMap<VenueId, usize>,
-    /// 等待 Ack 的訂單：order_id -> (symbol, 下單時間)
-    pending_acks: FxHashMap<OrderId, (Symbol, Instant)>,
+    /// 等待 Ack 的訂單。超時後保持追蹤，直到收到交易所終態。
+    pending_acks: FxHashMap<OrderId, PendingAck>,
     /// 上次對帳時間
     last_reconcile: Instant,
     /// 策略到客戶端索引的映射（同交易所多帳戶路由）
@@ -156,14 +165,17 @@ impl ExecutionWorker {
         let now = Instant::now();
         let timeout = Duration::from_millis(self.config.ack_timeout_ms);
         let mut timed_out: Vec<(OrderId, Symbol)> = Vec::new();
-        self.pending_acks.retain(|oid, (sym, ts)| {
-            if now.duration_since(*ts) > timeout {
-                timed_out.push((oid.clone(), sym.clone()));
-                false
-            } else {
-                true
+        for (order_id, pending) in &mut self.pending_acks {
+            if !pending.cancel_sent && now.duration_since(pending.submitted_at) > timeout {
+                pending.cancel_sent = true;
+                timed_out.push((order_id.clone(), pending.symbol.clone()));
             }
-        });
+        }
+
+        if !timed_out.is_empty() {
+            self.accepting_intents = false;
+            self.emergency_latched = true;
+        }
 
         for (order_id, symbol) in &timed_out {
             let client_idx = match self.order_to_client.get(order_id).copied() {
@@ -175,6 +187,10 @@ impl ExecutionWorker {
                 let sym = symbol.clone();
                 if let Err(e) = client.cancel_order(&oid).await {
                     tracing::warn!("Ack timeout cancel failed: {} - {}", oid.0, e);
+                    if let Some(pending) = self.pending_acks.get_mut(order_id) {
+                        pending.submitted_at = Instant::now();
+                        pending.cancel_sent = false;
+                    }
                 } else {
                     tracing::info!("Ack timeout: cancel sent for {} ({})", oid.0, sym.as_str());
                 }
@@ -279,7 +295,14 @@ impl ExecutionWorker {
                 had_activity = true;
             }
 
-            // 1. 处理意图队列中的新订单
+            // 1. Prioritize private execution events so a queued disconnect is observed before
+            // accepting another order intent.
+            let events_received = self.poll_execution_events().await;
+            if events_received > 0 {
+                had_activity = true;
+            }
+
+            // 2. 处理意图队列中的新订单
             let mut intents = std::mem::take(&mut self.intents_buf);
             intents.clear();
             self.queues.receive_envelopes_into(&mut intents);
@@ -289,12 +312,6 @@ impl ExecutionWorker {
             }
             intents.clear();
             self.intents_buf = intents;
-
-            // 2. 处理执行回报流
-            let events_received = self.poll_execution_events().await;
-            if events_received > 0 {
-                had_activity = true;
-            }
 
             // 檢查 Ack 超時並嘗試取消
             if self.config.ack_timeout_ms > 0 {
@@ -339,11 +356,11 @@ impl ExecutionWorker {
                             last_activity = Instant::now();
                         }
                     }
-                    _ = intent_notify.notified() => {
-                        last_activity = Instant::now();
-                    }
                     item = self.execution_streams.next(), if has_execution_stream => {
                         self.handle_execution_stream_item(item).await;
+                        last_activity = Instant::now();
+                    }
+                    _ = intent_notify.notified() => {
                         last_activity = Instant::now();
                     }
                     _ = sleep(maintenance_wait) => {}
@@ -468,9 +485,14 @@ impl ExecutionWorker {
                 .await
             {
                 Ok(order_id) => {
-                    let execution_latency = now_micros().saturating_sub(execution_start);
+                    let submitted_at = now_micros();
+                    let execution_latency = submitted_at.saturating_sub(execution_start);
                     self.latency_monitor
                         .record_latency(LatencyStage::Submission, execution_latency);
+                    self.latency_monitor.record_latency(
+                        LatencyStage::EndToEnd,
+                        submitted_at.saturating_sub(envelope.lifecycle.created_ts),
+                    );
                     self.stats.recent_execution_latency_micros = Some(execution_latency);
                     #[cfg(feature = "metrics")]
                     infra_metrics::MetricsRegistry::global()
@@ -495,6 +517,8 @@ impl ExecutionWorker {
                             strategy_id: intent.strategy_id.clone(),
                             venue: venue_for_client,
                             account_id,
+                            remaining_quantity: intent.quantity,
+                            processed_fill_ids: HashSet::new(),
                         },
                     );
 
@@ -511,9 +535,11 @@ impl ExecutionWorker {
                     } = envelope.intent;
 
                     let symbol_for_ack = symbol.clone();
+                    let client_order_id = envelope.client_order_id.clone();
 
                     let new_event = ExecutionEvent::OrderNew {
                         order_id: order_id.clone(),
+                        client_order_id: Some(client_order_id),
                         symbol,
                         side,
                         quantity,
@@ -527,8 +553,14 @@ impl ExecutionWorker {
                     debug!("訂單執行成功，延遲: {}μs", execution_latency);
 
                     // 標記等待 Ack
-                    self.pending_acks
-                        .insert(order_id.clone(), (symbol_for_ack, Instant::now()));
+                    self.pending_acks.insert(
+                        order_id.clone(),
+                        PendingAck {
+                            symbol: symbol_for_ack,
+                            submitted_at: Instant::now(),
+                            cancel_sent: false,
+                        },
+                    );
                 }
                 Err(e) => {
                     let execution_latency = now_micros().saturating_sub(execution_start);
@@ -539,6 +571,54 @@ impl ExecutionWorker {
                     if outcome_unknown {
                         self.accepting_intents = false;
                         self.emergency_latched = true;
+
+                        // The venue may already own this order. Keep a provisional local record
+                        // under the stable client id so private reports, reconciliation, and
+                        // emergency cancellation cannot lose it.
+                        let order_id = OrderId(envelope.client_order_id.clone());
+                        let intent = &envelope.intent;
+                        let venue = intent
+                            .target_venue
+                            .or_else(|| self.venue_for_client(client_idx));
+                        let account_id =
+                            self.account_to_client
+                                .iter()
+                                .find_map(|(account_id, index)| {
+                                    (*index == client_idx).then_some(account_id.clone())
+                                });
+                        self.order_to_client.insert(order_id.clone(), client_idx);
+                        self.tracked_orders.insert(
+                            order_id.clone(),
+                            TrackedOrder {
+                                symbol: intent.symbol.clone(),
+                                strategy_id: intent.strategy_id.clone(),
+                                venue,
+                                account_id,
+                                remaining_quantity: intent.quantity,
+                                processed_fill_ids: HashSet::new(),
+                            },
+                        );
+                        self.pending_acks.insert(
+                            order_id.clone(),
+                            PendingAck {
+                                symbol: intent.symbol.clone(),
+                                submitted_at: Instant::now(),
+                                cancel_sent: false,
+                            },
+                        );
+                        self.queues
+                            .send_event_reliable(ExecutionEvent::OrderNew {
+                                order_id,
+                                client_order_id: Some(envelope.client_order_id.clone()),
+                                symbol: intent.symbol.clone(),
+                                side: intent.side,
+                                quantity: intent.quantity,
+                                requested_price: intent.price,
+                                timestamp: now_micros(),
+                                venue,
+                                strategy_id: intent.strategy_id.clone(),
+                            })
+                            .await;
                     }
                     warn!(
                         client_order_id = %envelope.client_order_id,
@@ -546,19 +626,14 @@ impl ExecutionWorker {
                         "下单失败: {}",
                         e
                     );
-                    let reject_event = ExecutionEvent::OrderReject {
-                        order_id: OrderId(envelope.client_order_id.clone()),
-                        reason: if outcome_unknown {
-                            format!(
-                                "submission outcome unknown; execution intake latched; reconcile client order id {}: {}",
-                                envelope.client_order_id, e
-                            )
-                        } else {
-                            format!("Worker 下单失败: {}", e)
-                        },
-                        timestamp: now_micros(),
-                    };
-                    self.queues.send_event_reliable(reject_event).await;
+                    if !outcome_unknown {
+                        let reject_event = ExecutionEvent::OrderReject {
+                            order_id: OrderId(envelope.client_order_id.clone()),
+                            reason: format!("Worker 下单失败: {}", e),
+                            timestamp: now_micros(),
+                        };
+                        self.queues.send_event_reliable(reject_event).await;
+                    }
                 }
             }
         }
@@ -671,6 +746,40 @@ impl ExecutionWorker {
             }
             ExecutionEvent::OrderAck { order_id, .. } => {
                 self.pending_acks.remove(order_id);
+            }
+            ExecutionEvent::Fill {
+                order_id,
+                quantity,
+                fill_id,
+                ..
+            } => {
+                let mut terminal = false;
+                if let Some(order) = self.tracked_orders.get_mut(order_id) {
+                    if !fill_id.is_empty() && !order.processed_fill_ids.insert(fill_id.clone()) {
+                        return;
+                    }
+                    if quantity.0 >= order.remaining_quantity.0 {
+                        if quantity.0 > order.remaining_quantity.0 {
+                            warn!(
+                                order_id = %order_id.0,
+                                fill_quantity = %quantity.0,
+                                remaining_quantity = %order.remaining_quantity.0,
+                                "fill exceeds locally tracked remaining quantity; execution intake latched"
+                            );
+                            self.accepting_intents = false;
+                            self.emergency_latched = true;
+                        }
+                        terminal = true;
+                    } else {
+                        order.remaining_quantity =
+                            Quantity(order.remaining_quantity.0 - quantity.0);
+                    }
+                }
+                if terminal {
+                    self.pending_acks.remove(order_id);
+                    self.order_to_client.remove(order_id);
+                    self.tracked_orders.remove(order_id);
+                }
             }
             ExecutionEvent::OrderCanceled { order_id, .. }
             | ExecutionEvent::OrderReject { order_id, .. }
@@ -1263,19 +1372,29 @@ mod tests {
 
     struct MockExecutionClient {
         state: Arc<StdMutex<MockExecutionState>>,
+        place_error: bool,
         list_error: bool,
+        cancel_error: bool,
     }
 
     #[async_trait::async_trait]
     impl ExecutionClient for MockExecutionClient {
         async fn place_order(&mut self, intent: OrderIntent) -> HftResult<OrderId> {
             self.state.lock().unwrap().placed.push(intent.symbol);
-            Ok(OrderId("placed".to_string()))
+            if self.place_error {
+                Err(HftError::Network("submission outcome unknown".to_string()))
+            } else {
+                Ok(OrderId("placed".to_string()))
+            }
         }
 
         async fn cancel_order(&mut self, order_id: &OrderId) -> HftResult<()> {
             self.state.lock().unwrap().canceled.push(order_id.clone());
-            Ok(())
+            if self.cancel_error {
+                Err(HftError::Network("cancel outcome unknown".to_string()))
+            } else {
+                Ok(())
+            }
         }
 
         async fn modify_order(
@@ -1435,7 +1554,9 @@ mod tests {
         let state = Arc::new(StdMutex::new(MockExecutionState::default()));
         let client = MockExecutionClient {
             state: state.clone(),
+            place_error: false,
             list_error: false,
+            cancel_error: false,
         };
         let (mut engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
@@ -1458,6 +1579,8 @@ mod tests {
                 strategy_id: "test_strategy".to_string(),
                 venue: Some(VenueId::MOCK),
                 account_id: None,
+                remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                processed_fill_ids: HashSet::new(),
             },
         );
         let (reply, report) = oneshot::channel();
@@ -1492,7 +1615,9 @@ mod tests {
     fn regular_cancel_scopes_include_only_matching_worker_tracked_orders() {
         let client = MockExecutionClient {
             state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
             list_error: false,
+            cancel_error: false,
         };
         let (_engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
@@ -1510,6 +1635,8 @@ mod tests {
                 strategy_id: "alpha".to_string(),
                 venue: Some(VenueId::MOCK),
                 account_id: None,
+                remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                processed_fill_ids: HashSet::new(),
             },
         );
         worker.tracked_orders.insert(
@@ -1519,6 +1646,8 @@ mod tests {
                 strategy_id: "beta".to_string(),
                 venue: Some(VenueId::MOCK),
                 account_id: None,
+                remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                processed_fill_ids: HashSet::new(),
             },
         );
 
@@ -1548,7 +1677,9 @@ mod tests {
     async fn reconciliation_snapshot_is_incomplete_on_client_error() {
         let client = MockExecutionClient {
             state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
             list_error: true,
+            cancel_error: false,
         };
         let (_engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
@@ -1564,5 +1695,129 @@ mod tests {
         assert_eq!(snapshot.clients.len(), 1);
         assert!(snapshot.clients[0].open_orders.is_err());
         assert!(!snapshot.is_complete());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_submission_keeps_a_provisional_order_for_reconciliation() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: true,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        engine_queues
+            .send_intent(create_test_intent("BTCUSDT"))
+            .expect("queue intent");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let mut queued = worker.queues.receive_envelopes();
+        let client_order_id = queued[0].client_order_id.clone();
+
+        worker.process_order_intents(&mut queued).await;
+
+        let provisional_id = OrderId(client_order_id.clone());
+        assert!(!worker.accepting_intents);
+        assert!(worker.emergency_latched);
+        assert!(worker.tracked_orders.contains_key(&provisional_id));
+        assert!(worker.pending_acks.contains_key(&provisional_id));
+        let mut events = Vec::new();
+        engine_queues.receive_events_into(&mut events);
+        assert!(matches!(
+            events.as_slice(),
+            [ExecutionEvent::OrderNew {
+                order_id,
+                client_order_id: Some(event_client_id),
+                ..
+            }] if order_id == &provisional_id && event_client_id == &client_order_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn ack_timeout_latches_intake_and_keeps_the_order_pending_when_cancel_fails() {
+        let state = Arc::new(StdMutex::new(MockExecutionState::default()));
+        let client = MockExecutionClient {
+            state: state.clone(),
+            place_error: false,
+            list_error: false,
+            cancel_error: true,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig {
+                ack_timeout_ms: 1,
+                ..ExecutionWorkerConfig::default()
+            },
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let order_id = OrderId("unknown-order".to_string());
+        worker.order_to_client.insert(order_id.clone(), 0);
+        worker.pending_acks.insert(
+            order_id.clone(),
+            PendingAck {
+                symbol: Symbol::new("BTCUSDT"),
+                submitted_at: Instant::now() - Duration::from_millis(10),
+                cancel_sent: false,
+            },
+        );
+
+        assert_eq!(worker.check_ack_timeouts().await, 1);
+        assert!(!worker.accepting_intents);
+        assert!(worker.emergency_latched);
+        assert!(worker.pending_acks.contains_key(&order_id));
+        assert_eq!(state.lock().unwrap().canceled, vec![order_id]);
+    }
+
+    #[test]
+    fn terminal_fill_removes_worker_order_tracking() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let order_id = OrderId("filled-order".to_string());
+        worker.order_to_client.insert(order_id.clone(), 0);
+        worker.tracked_orders.insert(
+            order_id.clone(),
+            TrackedOrder {
+                symbol: Symbol::new("BTCUSDT"),
+                strategy_id: "test".to_string(),
+                venue: Some(VenueId::MOCK),
+                account_id: None,
+                remaining_quantity: Quantity::from_f64(1.0).unwrap(),
+                processed_fill_ids: HashSet::new(),
+            },
+        );
+
+        worker.update_execution_tracking(&ExecutionEvent::Fill {
+            order_id: order_id.clone(),
+            price: Price::from_f64(100.0).unwrap(),
+            quantity: Quantity::from_f64(1.0).unwrap(),
+            timestamp: now_micros(),
+            fill_id: "fill-1".to_string(),
+        });
+
+        assert!(!worker.tracked_orders.contains_key(&order_id));
+        assert!(!worker.order_to_client.contains_key(&order_id));
     }
 }

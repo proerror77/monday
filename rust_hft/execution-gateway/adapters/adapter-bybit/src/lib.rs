@@ -15,7 +15,11 @@ use integration::{
     http::{HttpClient, HttpClientConfig},
     signing::{BybitCredentials, BybitSigner},
 };
-use ports::{BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope};
+use ports::{
+    AccountBalance, BoxStream, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntentEnvelope,
+};
+use rust_decimal::Decimal;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
@@ -40,12 +44,15 @@ pub struct BybitExecutionClient {
     // 告警回調
     alert_callback: Option<AlertCallback>,
     next_client_order_id: Option<String>,
+    order_symbol: HashMap<String, String>,
 }
 
 #[derive(serde::Deserialize)]
 #[allow(non_snake_case)]
 struct BybitOpenOrdersItem {
     orderId: String,
+    #[serde(default)]
+    orderLinkId: String,
     symbol: String,
     side: String,
     orderType: String,
@@ -60,6 +67,8 @@ struct BybitOpenOrdersItem {
 #[derive(serde::Deserialize)]
 struct BybitOpenOrdersData {
     list: Vec<BybitOpenOrdersItem>,
+    #[serde(default, rename = "nextPageCursor")]
+    next_page_cursor: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -70,9 +79,74 @@ struct BybitOpenOrdersResponse {
     result: Option<BybitOpenOrdersData>,
 }
 
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct BybitWalletCoin {
+    coin: String,
+    walletBalance: String,
+    locked: String,
+    usdValue: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BybitWalletAccount {
+    coin: Vec<BybitWalletCoin>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(non_snake_case)]
+struct BybitWalletResponse {
+    retCode: i64,
+    retMsg: String,
+    #[serde(default)]
+    result: serde_json::Value,
+}
+
+fn parse_bybit_wallet_response(response: BybitWalletResponse) -> HftResult<Vec<AccountBalance>> {
+    if response.retCode != 0 {
+        return Err(classify_bybit_response_error(
+            "wallet balance",
+            response.retCode,
+            &response.retMsg,
+        ));
+    }
+    let accounts: Vec<BybitWalletAccount> =
+        serde_json::from_value(
+            response.result.get("list").cloned().ok_or_else(|| {
+                HftError::Parse("Bybit wallet response missing result.list".into())
+            })?,
+        )
+        .map_err(|error| HftError::Parse(format!("Bybit wallet response: {error}")))?;
+    let mut balances = Vec::new();
+    for coin in accounts.into_iter().flat_map(|account| account.coin) {
+        let total = coin.walletBalance.parse::<Decimal>().map_err(|error| {
+            HftError::Parse(format!("Bybit {} walletBalance: {error}", coin.coin))
+        })?;
+        let frozen = coin
+            .locked
+            .parse::<Decimal>()
+            .map_err(|error| HftError::Parse(format!("Bybit {} locked: {error}", coin.coin)))?;
+        let usd_value = coin
+            .usdValue
+            .parse::<Decimal>()
+            .map_err(|error| HftError::Parse(format!("Bybit {} usdValue: {error}", coin.coin)))?;
+        balances.push(AccountBalance {
+            asset: coin.coin,
+            available: total - frozen,
+            frozen,
+            total,
+            usd_value: Some(usd_value),
+        });
+    }
+    Ok(balances)
+}
+
 fn classify_bybit_response_error(operation: &str, code: i64, message: &str) -> HftError {
     let detail = format!("Bybit {operation} failed: {code} {message}");
     match code {
+        10000 | 10016 | 170007 | 170146 => HftError::Network(format!(
+            "ambiguous submission outcome; reconcile by orderLinkId: {detail}"
+        )),
         10006 | 10429 | 20003 => HftError::RateLimit(detail),
         10003 | 10004 | 10005 | 10007 => HftError::Authentication(detail),
         _ => HftError::Exchange(detail),
@@ -104,6 +178,7 @@ impl BybitExecutionClient {
             resilient_executor: None,
             alert_callback: None,
             next_client_order_id: None,
+            order_symbol: HashMap::new(),
         })
     }
 
@@ -286,6 +361,7 @@ fn parse_bybit_open_orders_response(
 
             Ok(OpenOrder {
                 order_id: OrderId(it.orderId),
+                client_order_id: (!it.orderLinkId.is_empty()).then_some(it.orderLinkId),
                 symbol: hft_core::Symbol::from(it.symbol),
                 side,
                 order_type,
@@ -389,10 +465,17 @@ fn publish_private_ws_event(tx: &broadcast::Sender<ExecutionEvent>, value: &serd
 
     for entry in entries {
         let order_id = entry
-            .get("orderId")
+            .get("orderLinkId")
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty())
-            .map(|value| OrderId(value.to_string()));
+            .map(|value| OrderId(value.to_string()))
+            .or_else(|| {
+                entry
+                    .get("orderId")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| OrderId(value.to_string()))
+            });
         let Some(order_id) = order_id else {
             continue;
         };
@@ -415,9 +498,22 @@ fn publish_private_ws_event(tx: &broadcast::Sender<ExecutionEvent>, value: &serd
                         timestamp,
                     });
                 }
-                "Cancelled" | "Rejected" => {
+                "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" => {
                     let _ = tx.send(ExecutionEvent::OrderCanceled {
                         order_id,
+                        timestamp,
+                    });
+                }
+                "Rejected" => {
+                    let reason = entry
+                        .get("rejectReason")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("Exchange rejected")
+                        .to_string();
+                    let _ = tx.send(ExecutionEvent::OrderReject {
+                        order_id,
+                        reason,
                         timestamp,
                     });
                 }
@@ -482,6 +578,8 @@ impl ExecutionClient for BybitExecutionClient {
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
             self.ensure_http()?;
+            self.order_symbol
+                .insert(client_order_id.clone(), intent.symbol.as_str().to_string());
             let http = self.get_http()?;
             #[derive(serde::Serialize)]
             #[serde(rename_all = "camelCase")]
@@ -568,7 +666,7 @@ impl ExecutionClient for BybitExecutionClient {
                     client_order_id, returned_link_id
                 )));
             }
-            let ord_id = r
+            let _exchange_order_id = r
                 .result
                 .get("orderId")
                 .and_then(|v| v.as_str())
@@ -579,13 +677,7 @@ impl ExecutionClient for BybitExecutionClient {
                     )
                 })?
                 .to_string();
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(ExecutionEvent::OrderAck {
-                    order_id: OrderId(ord_id.clone()),
-                    timestamp: hft_core::now_micros(),
-                });
-            }
-            return Ok(OrderId(ord_id));
+            return Ok(OrderId(client_order_id));
         }
         // Paper
         let oid = OrderId(client_order_id);
@@ -620,23 +712,32 @@ impl ExecutionClient for BybitExecutionClient {
             self.ensure_http()?;
             let http_client = self.get_http()?.clone();
             let order_id_str = order_id.0.clone();
+            let symbol = self.order_symbol.get(&order_id.0).cloned().ok_or_else(|| {
+                HftError::OrderNotFound(format!(
+                    "Bybit cancel requires known symbol metadata for order {}",
+                    order_id.0
+                ))
+            })?;
             let signer_clone = self.signer.clone();
 
             let result = self
                 .execute_with_resilience(|| {
                     let http = http_client.clone();
                     let oid = order_id_str.clone();
+                    let sym = symbol.clone();
                     let sig = signer_clone.clone();
                     async move {
                         #[derive(serde::Serialize)]
                         #[serde(rename_all = "camelCase")]
                         struct Req {
                             category: String,
-                            order_id: String,
+                            symbol: String,
+                            order_link_id: String,
                         }
                         let req = Req {
                             category: "spot".to_string(),
-                            order_id: oid,
+                            symbol: sym,
+                            order_link_id: oid,
                         };
                         let body = serde_json::to_string(&req)
                             .map_err(|e| HftError::Serialization(e.to_string()))?;
@@ -650,6 +751,11 @@ impl ExecutionClient for BybitExecutionClient {
                             )
                             .await
                             .map_err(|e| HftError::Network(e.to_string()))?;
+                        if !resp.status().is_success() {
+                            let status = resp.status();
+                            let body = resp.text().await.unwrap_or_default();
+                            return Err(classify_bybit_http_error(status, &body));
+                        }
                         #[derive(serde::Deserialize)]
                         #[allow(non_snake_case)]
                         struct Resp {
@@ -660,10 +766,11 @@ impl ExecutionClient for BybitExecutionClient {
                             .await
                             .map_err(|e| HftError::Serialization(e.to_string()))?;
                         if r.retCode != 0 {
-                            return Err(HftError::Exchange(format!(
-                                "Bybit 撤單失敗: {} {}",
-                                r.retCode, r.retMsg
-                            )));
+                            return Err(classify_bybit_response_error(
+                                "order cancel",
+                                r.retCode,
+                                &r.retMsg,
+                            ));
                         }
                         Ok(())
                     }
@@ -687,14 +794,6 @@ impl ExecutionClient for BybitExecutionClient {
                 }
             }
 
-            if result.is_ok() {
-                if let Some(ref tx) = self.event_tx {
-                    let _ = tx.send(ExecutionEvent::OrderCanceled {
-                        order_id: order_id.clone(),
-                        timestamp: hft_core::now_micros(),
-                    });
-                }
-            }
             return result;
         }
         if let Some(ref tx) = self.event_tx {
@@ -716,95 +815,13 @@ impl ExecutionClient for BybitExecutionClient {
             self.config.mode,
             ExecutionMode::Live | ExecutionMode::Testnet
         ) {
-            self.ensure_http()?;
-            let http_client = self.get_http()?.clone();
-            let order_id_str = order_id.0.clone();
-            let signer_clone = self.signer.clone();
-            let qty_str = new_quantity.map(|q| q.0.to_string());
-            let price_str = new_price.map(|p| p.0.to_string());
-
-            let result = self
-                .execute_with_resilience(|| {
-                    let http = http_client.clone();
-                    let oid = order_id_str.clone();
-                    let sig = signer_clone.clone();
-                    let qty = qty_str.clone();
-                    let px = price_str.clone();
-                    async move {
-                        #[derive(serde::Serialize)]
-                        #[serde(rename_all = "camelCase")]
-                        struct Req {
-                            category: String,
-                            order_id: String,
-                            qty: Option<String>,
-                            price: Option<String>,
-                        }
-                        let req = Req {
-                            category: "spot".to_string(),
-                            order_id: oid,
-                            qty,
-                            price: px,
-                        };
-                        let body = serde_json::to_string(&req)
-                            .map_err(|e| HftError::Serialization(e.to_string()))?;
-                        let headers = sig.generate_headers("POST", "/v5/order/amend", &body, None);
-                        let resp = http
-                            .signed_request(
-                                reqwest::Method::POST,
-                                "/v5/order/amend",
-                                Some(headers),
-                                Some(body),
-                            )
-                            .await
-                            .map_err(|e| HftError::Network(e.to_string()))?;
-                        #[derive(serde::Deserialize)]
-                        #[allow(non_snake_case)]
-                        struct Resp {
-                            retCode: i64,
-                            retMsg: String,
-                        }
-                        let r: Resp = HttpClient::parse_json(resp)
-                            .await
-                            .map_err(|e| HftError::Serialization(e.to_string()))?;
-                        if r.retCode != 0 {
-                            return Err(HftError::Exchange(format!(
-                                "Bybit 改單失敗: {} {}",
-                                r.retCode, r.retMsg
-                            )));
-                        }
-                        Ok(())
-                    }
-                })
-                .await;
-
-            // 如果熔斷器開啟，發送告警
-            if let Err(ref e) = result {
-                if let Some(ref executor) = self.resilient_executor {
-                    if executor.circuit_breaker.state().await == CircuitState::Open {
-                        self.send_execution_alert(
-                            ExecutionAlert::new(
-                                ExecutionAlertType::CircuitOpen,
-                                "bybit",
-                                "modify_order",
-                                format!("改單失敗且熔斷器已開啟 (order_id={}): {}", order_id.0, e),
-                            )
-                            .with_error(e.to_string()),
-                        );
-                    }
-                }
+            if new_quantity.is_none() && new_price.is_none() {
+                return Ok(());
             }
-
-            if result.is_ok() {
-                if let Some(ref tx) = self.event_tx {
-                    let _ = tx.send(ExecutionEvent::OrderModified {
-                        order_id: order_id.clone(),
-                        new_quantity,
-                        new_price,
-                        timestamp: hft_core::now_micros(),
-                    });
-                }
-            }
-            return result;
+            return Err(HftError::Config(format!(
+                "Bybit live modify is disabled for order {}; asynchronous amend confirmation is not implemented",
+                order_id.0
+            )));
         }
         if let Some(ref tx) = self.event_tx {
             let _ = tx.send(ExecutionEvent::OrderModified {
@@ -828,6 +845,39 @@ impl ExecutionClient for BybitExecutionClient {
             return Ok(Box::pin(s));
         }
         Ok(Box::pin(futures::stream::empty()))
+    }
+
+    async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
+        if !matches!(
+            self.config.mode,
+            ExecutionMode::Live | ExecutionMode::Testnet
+        ) {
+            return Err(HftError::Config(
+                "Bybit authoritative balances require live/testnet mode".to_string(),
+            ));
+        }
+        let http = self
+            .http
+            .as_ref()
+            .ok_or_else(|| HftError::Config("Bybit HTTP client is not connected".to_string()))?;
+        let query = "accountType=UNIFIED";
+        let path = format!("/v5/account/wallet-balance?{query}");
+        let headers =
+            self.signer
+                .generate_headers("GET", "/v5/account/wallet-balance", query, None);
+        let response = http
+            .get(&path, Some(headers))
+            .await
+            .map_err(|error| HftError::Network(error.to_string()))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(classify_bybit_http_error(status, &body));
+        }
+        let response: BybitWalletResponse = HttpClient::parse_json(response)
+            .await
+            .map_err(|error| HftError::Parse(format!("Bybit wallet response: {error}")))?;
+        parse_bybit_wallet_response(response)
     }
 
     async fn connect(&mut self) -> HftResult<()> {
@@ -885,6 +935,9 @@ impl ExecutionClient for BybitExecutionClient {
             let (mut ws, _) = tokio_tungstenite::connect_async(&self.config.ws_private_url)
                 .await
                 .map_err(|error| HftError::Network(error.to_string()))?;
+            if let Err(error) = integration::ws::set_ws_tcp_nodelay(ws.get_ref(), true) {
+                warn!(error = %error, "Bybit private WS TCP_NODELAY failed");
+            }
             let expires = BybitSigner::current_timestamp().saturating_add(1_000);
             let auth = bybit_private_ws_auth_payload(&self.config.credentials, expires);
             ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -988,20 +1041,54 @@ impl ExecutionClient for BybitExecutionClient {
             &http_local
         };
 
-        // GET /v5/order/realtime?category=spot
-        let path = "/v5/order/realtime?category=spot";
-        let headers =
-            self.signer
-                .generate_headers("GET", "/v5/order/realtime", "category=spot", None);
-        let resp = http
-            .signed_request(reqwest::Method::GET, path, Some(headers), None)
-            .await
-            .map_err(|e| HftError::Network(e.to_string()))?;
-
-        let r: BybitOpenOrdersResponse = integration::http::HttpClient::parse_json(resp)
-            .await
-            .map_err(|e| HftError::Serialization(e.to_string()))?;
-        parse_bybit_open_orders_response(r)
+        let mut cursor: Option<String> = None;
+        let mut orders = Vec::new();
+        for _ in 0..100 {
+            let query = {
+                let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+                serializer
+                    .append_pair("category", "spot")
+                    .append_pair("limit", "50");
+                if let Some(cursor) = &cursor {
+                    serializer.append_pair("cursor", cursor);
+                }
+                serializer.finish()
+            };
+            let path = format!("/v5/order/realtime?{query}");
+            let headers = self
+                .signer
+                .generate_headers("GET", "/v5/order/realtime", &query, None);
+            let response = http
+                .get(&path, Some(headers))
+                .await
+                .map_err(|error| HftError::Network(error.to_string()))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(classify_bybit_http_error(status, &body));
+            }
+            let response: BybitOpenOrdersResponse = HttpClient::parse_json(response)
+                .await
+                .map_err(|error| HftError::Parse(format!("Bybit open orders: {error}")))?;
+            let next_cursor = response
+                .result
+                .as_ref()
+                .map(|result| result.next_page_cursor.clone())
+                .unwrap_or_default();
+            orders.extend(parse_bybit_open_orders_response(response)?);
+            if next_cursor.is_empty() {
+                return Ok(orders);
+            }
+            if cursor.as_deref() == Some(next_cursor.as_str()) {
+                return Err(HftError::Exchange(
+                    "Bybit open-order pagination cursor did not advance".to_string(),
+                ));
+            }
+            cursor = Some(next_cursor);
+        }
+        Err(HftError::Exchange(
+            "Bybit open-order pagination exceeded 100 pages".to_string(),
+        ))
     }
 }
 
@@ -1250,6 +1337,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_modify_fails_before_network_io() {
+        let config = make_test_config(ExecutionMode::Live);
+        let mut client = BybitExecutionClient::new(config).unwrap();
+
+        let error = client
+            .modify_order(
+                &OrderId("exchange-order".to_string()),
+                Some(Quantity::from_f64(0.002).unwrap()),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, HftError::Config(message) if message.contains("disabled")));
+    }
+
+    #[tokio::test]
     async fn test_execution_stream_before_connect() {
         let config = make_test_config(ExecutionMode::Paper);
         let client = BybitExecutionClient::new(config).unwrap();
@@ -1346,6 +1450,22 @@ mod tests {
     }
 
     #[test]
+    fn wallet_parser_preserves_exchange_usd_valuation() {
+        let response: BybitWalletResponse = serde_json::from_str(
+            r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"coin":[{"coin":"BTC","walletBalance":"1.5","locked":"0.2","usdValue":"90000"}]}]}}"#,
+        )
+        .unwrap();
+
+        let balances = parse_bybit_wallet_response(response).unwrap();
+
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, "BTC");
+        assert_eq!(balances[0].available, Decimal::new(13, 1));
+        assert_eq!(balances[0].frozen, Decimal::new(2, 1));
+        assert_eq!(balances[0].usd_value, Some(Decimal::new(90000, 0)));
+    }
+
+    #[test]
     fn test_parse_bybit_open_orders_unknown_side_fails() {
         let response = BybitOpenOrdersResponse {
             retCode: 0,
@@ -1353,6 +1473,7 @@ mod tests {
             result: Some(BybitOpenOrdersData {
                 list: vec![BybitOpenOrdersItem {
                     orderId: "1".to_string(),
+                    orderLinkId: "client-1".to_string(),
                     symbol: "BTCUSDT".to_string(),
                     side: "Hold".to_string(),
                     orderType: "Limit".to_string(),
@@ -1363,10 +1484,72 @@ mod tests {
                     createdTime: "1".to_string(),
                     updatedTime: "2".to_string(),
                 }],
+                next_page_cursor: String::new(),
             }),
         };
 
         let result = parse_bybit_open_orders_response(response);
         assert!(matches!(result, Err(HftError::Parse(message)) if message.contains("未知 side")));
+    }
+
+    #[test]
+    fn private_order_rejection_is_not_reported_as_cancellation() {
+        let (tx, mut rx) = broadcast::channel(4);
+        publish_private_ws_event(
+            &tx,
+            &serde_json::json!({
+                "topic": "order",
+                "data": [{
+                    "orderId": "rejected-order",
+                    "orderLinkId": "client-rejected-order",
+                    "updatedTime": "123",
+                    "orderStatus": "Rejected",
+                    "rejectReason": "EC_OrderCheckFailed"
+                }]
+            }),
+        );
+
+        match rx.try_recv().expect("rejection event") {
+            ExecutionEvent::OrderReject {
+                order_id, reason, ..
+            } => {
+                assert_eq!(order_id, OrderId("client-rejected-order".to_string()));
+                assert!(reason.contains("EC_OrderCheckFailed"));
+            }
+            event => panic!("expected rejection, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn private_spot_terminal_cancel_statuses_close_the_order() {
+        for status in ["PartiallyFilledCanceled", "Deactivated"] {
+            let (tx, mut rx) = broadcast::channel(2);
+            publish_private_ws_event(
+                &tx,
+                &serde_json::json!({
+                    "topic": "order",
+                    "data": [{
+                        "orderId": "terminal-order",
+                        "updatedTime": "123",
+                        "orderStatus": status
+                    }]
+                }),
+            );
+
+            assert!(matches!(
+                rx.try_recv().expect("terminal cancellation event"),
+                ExecutionEvent::OrderCanceled { order_id, .. }
+                    if order_id == OrderId("terminal-order".to_string())
+            ));
+        }
+    }
+}
+#[test]
+fn order_creation_timeouts_are_ambiguous_not_exchange_rejections() {
+    for code in [10000, 10016, 170007, 170146] {
+        assert!(matches!(
+            classify_bybit_response_error("order create", code, "timeout"),
+            HftError::Network(_)
+        ));
     }
 }

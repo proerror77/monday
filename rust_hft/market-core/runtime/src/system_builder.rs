@@ -581,6 +581,7 @@ impl SystemBuilder {
                 flip_policy: self.config.engine.flip_policy.clone(),
                 backpressure_policy: engine::dataflow::BackpressurePolicy::DropNew, // 默认丢弃新事件，保持稳定性
             },
+            intent_max_latency_us: self.config.engine.intent_max_latency_us,
             max_events_per_cycle: 100,
             aggregation_symbols: vec![],
             top_n: self.config.engine.top_n,
@@ -1300,6 +1301,40 @@ impl SystemRuntime {
     pub async fn stop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         info!("停止系統運行時...");
 
+        if requires_authoritative_balance_reconciliation(&self.config)
+            && self.exec_control_tx.is_some()
+        {
+            let control = self.execution_control_handle();
+            let cancellation = control.emergency_stop(true).await?;
+            if !cancellation.is_complete() {
+                return Err(HftError::Execution(format!(
+                    "live shutdown cancellation incomplete: attempted={}, succeeded={}, failed={}",
+                    cancellation.requested,
+                    cancellation.submitted.len(),
+                    cancellation.failures.len()
+                ))
+                .into());
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let report = control.reconcile(false).await?;
+                if report.healthy {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(HftError::Execution(format!(
+                        "live shutdown reconciliation failed: complete={}, exchange_only={}, local_only={}, quantity_mismatch={}",
+                        report.complete,
+                        report.order_report.exchange_only.len(),
+                        report.order_report.local_only.len(),
+                        report.order_report.qty_mismatch.len(),
+                    ))
+                    .into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
         // 🔥 修復資源洩漏：優雅關閉 AdapterBridge（在停止引擎之前）
         if let Some(mut bridge) = self.adapter_bridge.take() {
             bridge.shutdown().await;
@@ -1555,6 +1590,7 @@ impl Default for SystemConfig {
             engine: SystemEngineConfig {
                 queue_capacity: 32768,
                 stale_us: 3000,
+                intent_max_latency_us: 3000,
                 top_n: 10,
                 flip_policy: FlipPolicy::OnUpdate,
                 cpu_affinity: CpuAffinityConfig::default(),

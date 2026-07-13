@@ -741,6 +741,7 @@ impl ExecutionClient for AsterdexExecutionClient {
 
             out.push(OpenOrder {
                 order_id: hft_core::OrderId(it.order_id.to_string()),
+                client_order_id: None,
                 symbol: hft_core::Symbol::from(it.symbol),
                 side,
                 order_type,

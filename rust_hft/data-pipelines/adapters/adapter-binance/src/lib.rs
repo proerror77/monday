@@ -4,9 +4,16 @@
 
 use async_trait::async_trait;
 use bytes::BytesMut;
-use hft_core::{now_micros, HftError, HftResult, InstrumentSpec, ProductType, Symbol};
+use futures::StreamExt;
+use hft_core::{
+    now_micros, HftError, HftResult, InstrumentSpec, LatencyStage, LatencyTracker, ProductType,
+    Symbol,
+};
+use integration::WsFrameMetrics;
 use ports::events::MarketSnapshot;
-use ports::{BookUpdate, BoxStream, ConnectionHealth, MarketEvent, MarketStream};
+use ports::{
+    BookUpdate, BoxStream, ConnectionHealth, MarketEvent, MarketStream, TrackedMarketEvent,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -31,7 +38,7 @@ const REST_SNAPSHOT_COOLDOWN: std::time::Duration = std::time::Duration::from_se
 #[derive(Debug)]
 struct QueuedMarketEvent {
     generation: u64,
-    event: MarketEvent,
+    event: TrackedMarketEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +71,7 @@ fn publish_invalidation(
 fn try_queue_market_event(
     tx: &mpsc::Sender<QueuedMarketEvent>,
     generation: &AtomicU64,
-    event: MarketEvent,
+    event: TrackedMarketEvent,
 ) -> Result<(), QueuePublishError> {
     match tx.try_send(QueuedMarketEvent {
         generation: generation.load(Ordering::Acquire),
@@ -80,7 +87,7 @@ fn multiplex_market_events(
     mut data_rx: mpsc::Receiver<QueuedMarketEvent>,
     mut control_rx: watch::Receiver<Option<StreamInvalidation>>,
     generation: Arc<AtomicU64>,
-) -> BoxStream<MarketEvent> {
+) -> BoxStream<TrackedMarketEvent> {
     Box::pin(async_stream::stream! {
         let mut control_open = true;
         loop {
@@ -98,11 +105,11 @@ fn multiplex_market_events(
                     if invalidation.generation != generation.load(Ordering::Acquire) {
                         continue;
                     }
-                    yield Ok(MarketEvent::Disconnect {
+                    yield Ok(TrackedMarketEvent::new(MarketEvent::Disconnect {
                         reason: invalidation.reason,
                         source_venue: Some(hft_core::VenueId::BINANCE),
                         symbol: None,
-                    });
+                    }));
                     if let Some(error) = invalidation.error {
                         yield Err(error);
                     }
@@ -287,20 +294,21 @@ impl BinanceMarketStream {
         loop {
             tokio::select! {
                 () = &mut wait => return Ok(()),
-                message = ws_client.receive_message_bytes() => {
-                    let bytes = message?.ok_or_else(|| {
+                message = ws_client.receive_message_bytes_with_metrics() => {
+                    let (bytes, metrics) = message?.ok_or_else(|| {
                         HftError::Network(
                             "Binance WebSocket closed while REST snapshot budget cooled down"
                                 .to_string(),
                         )
                     })?;
                     // Keep the socket drained, but do not publish an unsynchronized generation.
-                    let _ = Self::parse_socket_event(bytes)?;
+                    let _ = Self::parse_tracked_socket_event(bytes, metrics)?;
                 }
             }
         }
     }
 
+    #[cfg(test)]
     fn buffer_during_snapshot_sync(event: MarketEvent) -> Option<MarketEvent> {
         matches!(event, MarketEvent::Update(_)).then_some(event)
     }
@@ -337,12 +345,29 @@ impl BinanceMarketStream {
         MessageConverter::parse_stream_message_bytes(&mut bytes)
     }
 
+    fn parse_tracked_socket_event(
+        bytes: bytes::Bytes,
+        mut metrics: WsFrameMetrics,
+    ) -> HftResult<Option<TrackedMarketEvent>> {
+        let event = Self::parse_socket_event(bytes)?;
+        metrics.mark_parsed();
+        Ok(event.map(|event| {
+            let mut tracker = LatencyTracker::from_monotonic(metrics.received_at_us);
+            tracker.record_stage_with_offset(LatencyStage::WsReceive, 0);
+            tracker.record_stage_with_offset(
+                LatencyStage::Parsing,
+                metrics.parsed_at_us.saturating_sub(metrics.received_at_us),
+            );
+            TrackedMarketEvent { event, tracker }
+        }))
+    }
+
     async fn synchronize_books(
         ws_client: &mut BinanceWebSocket,
         rest_client: &BinanceRestClient,
         symbols: &[Symbol],
         buffer_capacity: usize,
-    ) -> HftResult<(Vec<MarketSnapshot>, VecDeque<MarketEvent>)> {
+    ) -> HftResult<(Vec<MarketSnapshot>, VecDeque<TrackedMarketEvent>)> {
         let snapshot_future = Self::get_initial_snapshots(rest_client, symbols);
         tokio::pin!(snapshot_future);
         let mut buffered_events = VecDeque::with_capacity(buffer_capacity.min(1024));
@@ -352,13 +377,14 @@ impl BinanceMarketStream {
                 snapshots = &mut snapshot_future => {
                     return snapshots.map(|snapshots| (snapshots, buffered_events));
                 }
-                message = ws_client.receive_message_bytes() => {
-                    let bytes = message?.ok_or_else(|| {
+                message = ws_client.receive_message_bytes_with_metrics() => {
+                    let (bytes, metrics) = message?.ok_or_else(|| {
                         HftError::Network("Binance WebSocket closed during snapshot sync".to_string())
                     })?;
-                    if let Some(event) = Self::parse_socket_event(bytes)?
-                        .and_then(Self::buffer_during_snapshot_sync)
-                    {
+                    if let Some(event) = Self::parse_tracked_socket_event(bytes, metrics)? {
+                        if !matches!(&event.event, MarketEvent::Update(_)) {
+                            continue;
+                        }
                         if buffered_events.len() >= buffer_capacity {
                             return Err(HftError::Network(format!(
                                 "Binance snapshot sync buffer exceeded {} events",
@@ -376,6 +402,16 @@ impl BinanceMarketStream {
 #[async_trait]
 impl MarketStream for BinanceMarketStream {
     async fn subscribe(&self, symbols: Vec<Symbol>) -> HftResult<BoxStream<MarketEvent>> {
+        let stream = self.subscribe_tracked(symbols).await?;
+        Ok(Box::pin(
+            stream.map(|result| result.map(|tracked| tracked.event)),
+        ))
+    }
+
+    async fn subscribe_tracked(
+        &self,
+        symbols: Vec<Symbol>,
+    ) -> HftResult<BoxStream<TrackedMarketEvent>> {
         if symbols.is_empty() {
             return Err(HftError::new("品種列表不能為空"));
         }
@@ -459,7 +495,7 @@ impl MarketStream for BinanceMarketStream {
                                     match try_queue_market_event(
                                         &tx,
                                         &task_generation,
-                                        MarketEvent::Snapshot(snapshot),
+                                        TrackedMarketEvent::new(MarketEvent::Snapshot(snapshot)),
                                     ) {
                                         Ok(()) => {}
                                         Err(QueuePublishError::Closed) => return,
@@ -477,7 +513,7 @@ impl MarketStream for BinanceMarketStream {
 
                                 while let Some(event) = buffered_events.pop_front() {
                                     let forward = match sequence_tracker.as_mut() {
-                                        Some(tracker) => tracker.validate_and_advance(&event),
+                                        Some(tracker) => tracker.validate_and_advance(&event.event),
                                         None => Ok(true),
                                     };
                                     match forward {
@@ -514,20 +550,21 @@ impl MarketStream for BinanceMarketStream {
                                 last_heartbeat.store(now_micros(), Ordering::Release);
                                 let live_since = tokio::time::Instant::now();
                                 loop {
-                                    match ws_client.receive_message_bytes().await {
-                                        Ok(Some(bytes)) => {
+                                    match ws_client.receive_message_bytes_with_metrics().await {
+                                        Ok(Some((bytes, metrics))) => {
                                             if live_since.elapsed()
                                                 >= std::time::Duration::from_secs(30)
                                             {
                                                 attempts = 0;
                                             }
                                             last_heartbeat.store(now_micros(), Ordering::Release);
-                                            match BinanceMarketStream::parse_socket_event(bytes) {
+                                            match BinanceMarketStream::parse_tracked_socket_event(
+                                                bytes, metrics,
+                                            ) {
                                                 Ok(Some(event)) => {
                                                     let forward = match sequence_tracker.as_mut() {
-                                                        Some(tracker) => {
-                                                            tracker.validate_and_advance(&event)
-                                                        }
+                                                        Some(tracker) => tracker
+                                                            .validate_and_advance(&event.event),
                                                         None => Ok(true),
                                                     };
                                                     match forward {
@@ -646,6 +683,38 @@ impl MarketStream for BinanceMarketStream {
 
         info!("訂閱 Binance 商品市場數據: {:?}", instruments);
         self.subscribe(
+            instruments
+                .into_iter()
+                .map(|instrument| instrument.symbol)
+                .collect(),
+        )
+        .await
+    }
+
+    async fn subscribe_tracked_instruments(
+        &self,
+        instruments: Vec<InstrumentSpec>,
+    ) -> HftResult<BoxStream<TrackedMarketEvent>> {
+        if instruments.is_empty() {
+            return Err(HftError::new("商品列表不能為空"));
+        }
+        for instrument in &instruments {
+            if !matches!(
+                instrument.product_type,
+                ProductType::Spot | ProductType::TokenizedSecuritySpot
+            ) {
+                return Err(HftError::Network(format!(
+                    "Binance {} market data must use its dedicated adapter: {}",
+                    match instrument.product_type {
+                        ProductType::Futures | ProductType::Perp => "derivatives",
+                        ProductType::BrokerageEquity => "brokerage equities",
+                        _ => unreachable!(),
+                    },
+                    instrument.symbol
+                )));
+            }
+        }
+        self.subscribe_tracked(
             instruments
                 .into_iter()
                 .map(|instrument| instrument.symbol)
@@ -919,14 +988,14 @@ mod tests {
         let (data_tx, data_rx) = mpsc::channel(2);
         let (control_tx, control_rx) = watch::channel(None);
         let snapshot = |sequence| {
-            MarketEvent::Snapshot(MarketSnapshot {
+            TrackedMarketEvent::new(MarketEvent::Snapshot(MarketSnapshot {
                 symbol: Symbol::new("BTCUSDT"),
                 timestamp: sequence,
                 bids: Vec::new(),
                 asks: Vec::new(),
                 sequence,
                 source_venue: Some(hft_core::VenueId::BINANCE),
-            })
+            }))
         };
         data_tx
             .try_send(QueuedMarketEvent {
@@ -947,11 +1016,39 @@ mod tests {
         let mut stream = multiplex_market_events(data_rx, control_rx, generation);
         assert!(matches!(
             stream.next().await,
-            Some(Ok(MarketEvent::Disconnect { .. }))
+            Some(Ok(TrackedMarketEvent {
+                event: MarketEvent::Disconnect { .. },
+                ..
+            }))
         ));
-        let Some(Ok(MarketEvent::Snapshot(snapshot))) = stream.next().await else {
+        let Some(Ok(TrackedMarketEvent {
+            event: MarketEvent::Snapshot(snapshot),
+            ..
+        })) = stream.next().await
+        else {
             panic!("expected fresh snapshot after invalidation");
         };
         assert_eq!(snapshot.sequence, 2);
+    }
+
+    #[test]
+    fn tracked_parser_preserves_receive_to_parse_latency() {
+        let received_at = hft_core::monotonic_micros();
+        let message = bytes::Bytes::from_static(
+            br#"{"stream":"btcusdt@depth20@100ms","data":{"lastUpdateId":101,"bids":[["45000.00","0.1"]],"asks":[["45100.00","0.2"]]}}"#,
+        );
+
+        let tracked = BinanceMarketStream::parse_tracked_socket_event(
+            message,
+            WsFrameMetrics::new(received_at, 0),
+        )
+        .unwrap()
+        .expect("tracked depth event");
+
+        assert!(matches!(tracked.event, MarketEvent::Snapshot(_)));
+        assert!(tracked
+            .tracker
+            .get_measurement(LatencyStage::Parsing)
+            .is_some());
     }
 }
