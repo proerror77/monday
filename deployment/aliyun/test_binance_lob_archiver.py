@@ -405,20 +405,47 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, ["btcusdt", "ethusdt", "solusdt"])
 
-    async def test_unavailable_symbol_is_removed_from_refreshed_catalog(self):
-        symbols, security_tokens = ARCHIVER.exclude_unavailable_symbol(
-            "BADUSDT",
-            ("badusdt", "btcusdt"),
-            ("badusdt",),
+    async def test_all_unavailable_symbols_stay_out_of_refreshed_catalog(self):
+        symbols, security_tokens = ARCHIVER.exclude_unavailable_symbols(
+            ("badusdt", "oldusdt"),
+            ("badusdt", "btcusdt", "oldusdt"),
+            ("badusdt", "oldusdt"),
         )
 
         self.assertEqual(symbols, ("btcusdt",))
         self.assertEqual(security_tokens, ())
 
-    async def test_only_non_rate_limit_4xx_refreshes_symbol_catalog(self):
-        self.assertTrue(ARCHIVER.is_catalog_snapshot_error(400))
-        self.assertFalse(ARCHIVER.is_catalog_snapshot_error(429))
-        self.assertFalse(ARCHIVER.is_catalog_snapshot_error(500))
+    async def test_only_binance_invalid_symbol_error_refreshes_catalog(self):
+        invalid_symbol = HTTPError(
+            "https://example.test/depth",
+            400,
+            "Bad Request",
+            Message(),
+            io.BytesIO(b'{"code":-1121,"msg":"Invalid symbol."}'),
+        )
+        with patch.object(
+            ARCHIVER.urllib.request,
+            "urlopen",
+            side_effect=invalid_symbol,
+        ):
+            with self.assertRaises(ARCHIVER.SnapshotUnavailable):
+                ARCHIVER.fetch_snapshot_sync("badusdt")
+
+    async def test_host_wide_403_does_not_exclude_symbol(self):
+        forbidden = HTTPError(
+            "https://example.test/depth",
+            403,
+            "Forbidden",
+            Message(),
+            io.BytesIO(b"forbidden"),
+        )
+        with patch.object(
+            ARCHIVER.urllib.request,
+            "urlopen",
+            side_effect=forbidden,
+        ):
+            with self.assertRaises(HTTPError):
+                ARCHIVER.fetch_snapshot_sync("btcusdt")
 
 
 if __name__ == "__main__":

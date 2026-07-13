@@ -537,6 +537,13 @@ def fetch_snapshot_sync(symbol: str) -> dict:
                 snapshot = json.load(response)
             break
         except HTTPError as error:
+            if error.code == 400:
+                try:
+                    payload = json.load(error)
+                except (ValueError, json.JSONDecodeError):
+                    payload = {}
+                if payload.get("code") == -1121:
+                    raise SnapshotUnavailable(symbol, error.code) from error
             retryable = error.code == 429 or 500 <= error.code < 600
             if not retryable or attempt + 1 == SNAPSHOT_RETRY_ATTEMPTS:
                 raise
@@ -587,12 +594,7 @@ async def produce_snapshots(
 ) -> None:
     limiter = limiter or SnapshotRateLimiter(SNAPSHOT_REQUESTS_PER_SECOND)
     for symbol in SYMBOLS:
-        try:
-            snapshot = await limiter.fetch(symbol)
-        except HTTPError as error:
-            if is_catalog_snapshot_error(error.code):
-                raise SnapshotUnavailable(symbol, error.code) from error
-            raise
+        snapshot = await limiter.fetch(symbol)
         await queue.put(("snapshot", snapshot["received_at_ns"], snapshot))
 
 
@@ -612,22 +614,13 @@ class SnapshotRateLimiter:
         return await asyncio.to_thread(fetch_snapshot_sync, symbol)
 
 
-def is_catalog_snapshot_error(status: int) -> bool:
-    return 400 <= status < 500 and status != 429
-
-
 async def produce_snapshot(
     symbol: str,
     queue: asyncio.Queue,
     limiter: SnapshotRateLimiter | None = None,
 ) -> None:
     limiter = limiter or SnapshotRateLimiter(SNAPSHOT_REQUESTS_PER_SECOND)
-    try:
-        snapshot = await limiter.fetch(symbol)
-    except HTTPError as error:
-        if is_catalog_snapshot_error(error.code):
-            raise SnapshotUnavailable(symbol, error.code) from error
-        raise
+    snapshot = await limiter.fetch(symbol)
     await queue.put(("snapshot", snapshot["received_at_ns"], snapshot))
 
 
@@ -657,15 +650,15 @@ def begin_resync(now: float) -> tuple[bool, float]:
     return False, now + SYNC_TIMEOUT_SECONDS
 
 
-def exclude_unavailable_symbol(
-    symbol: str,
+def exclude_unavailable_symbols(
+    excluded_symbols: tuple[str, ...],
     symbols: tuple[str, ...],
     security_tokens: tuple[str, ...],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    unavailable = symbol.lower()
+    excluded = {symbol.lower() for symbol in excluded_symbols}
     return (
-        tuple(item for item in symbols if item != unavailable),
-        tuple(item for item in security_tokens if item != unavailable),
+        tuple(item for item in symbols if item not in excluded),
+        tuple(item for item in security_tokens if item not in excluded),
     )
 
 
@@ -1055,11 +1048,11 @@ async def collect(stop: asyncio.Event) -> None:
                     discovered, security_tokens = await asyncio.to_thread(
                         discover_symbols_sync
                     )
-                    SYMBOLS, SECURITY_TOKEN_SYMBOLS = exclude_unavailable_symbol(
-                        error.symbol, discovered, security_tokens
-                    )
                     EXCLUDED_SYMBOLS = tuple(
                         sorted({*EXCLUDED_SYMBOLS, error.symbol.lower()})
+                    )
+                    SYMBOLS, SECURITY_TOKEN_SYMBOLS = exclude_unavailable_symbols(
+                        EXCLUDED_SYMBOLS, discovered, security_tokens
                     )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
