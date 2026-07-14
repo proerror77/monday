@@ -13,7 +13,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
@@ -35,7 +35,7 @@ struct Config {
     shard_id: String,
     symbols: Vec<String>,
     security_token_symbols: Vec<String>,
-    excluded_symbols: Vec<String>,
+    excluded_symbols: Arc<RwLock<BTreeSet<String>>>,
     ws_shard_size: usize,
     snapshot_limit: u64,
     snapshot_requests_per_second: f64,
@@ -91,7 +91,7 @@ impl Config {
             shard_id: env_string("SHARD_ID", "all"),
             symbols: catalog.symbols,
             security_token_symbols: catalog.security_token_symbols,
-            excluded_symbols: catalog.excluded_symbols,
+            excluded_symbols: Arc::new(RwLock::new(catalog.excluded_symbols.into_iter().collect())),
             ws_shard_size: env_parse("WS_SHARD_SIZE", 100_usize)?.max(1),
             snapshot_limit: env_parse("SNAPSHOT_LIMIT", 100_u64)?,
             snapshot_requests_per_second: env_parse("SNAPSHOT_REQUESTS_PER_SECOND", 15_f64)?,
@@ -122,9 +122,9 @@ impl Config {
             market: self.market,
             dataset: self.dataset.clone(),
             shard_id: self.shard_id.clone(),
-            symbols: self.symbols.clone(),
+            symbols: self.active_symbols(),
             security_token_symbols: self.security_token_symbols.clone(),
-            excluded_symbols: self.excluded_symbols.clone(),
+            excluded_symbols: self.excluded_symbols(),
             snapshot_limit: self.snapshot_limit,
             zstd_timeout: self.zstd_timeout,
         }
@@ -135,7 +135,7 @@ impl Config {
             Market::Spot => "wss://data-stream.binance.vision/stream?streams=",
             Market::Usdm => "wss://fstream.binance.com/stream?streams=",
         };
-        self.symbols
+        self.active_symbols()
             .chunks(self.ws_shard_size)
             .map(|symbols| {
                 format!(
@@ -148,6 +148,38 @@ impl Config {
                 )
             })
             .collect()
+    }
+
+    fn active_symbols(&self) -> Vec<String> {
+        let excluded = self.excluded_symbols.read().expect("catalog lock poisoned");
+        self.symbols
+            .iter()
+            .filter(|symbol| !excluded.contains(*symbol))
+            .cloned()
+            .collect()
+    }
+
+    fn excluded_symbols(&self) -> Vec<String> {
+        self.excluded_symbols
+            .read()
+            .expect("catalog lock poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn exclude_symbol(&self, symbol: &str) {
+        self.excluded_symbols
+            .write()
+            .expect("catalog lock poisoned")
+            .insert(symbol.to_owned());
+    }
+
+    fn is_excluded(&self, symbol: &str) -> bool {
+        self.excluded_symbols
+            .read()
+            .expect("catalog lock poisoned")
+            .contains(symbol)
     }
 }
 
@@ -170,6 +202,11 @@ enum Event {
         request_started_at_ns: u64,
         snapshot: Value,
     },
+    ExcludeSymbol {
+        symbol: String,
+        reason: String,
+    },
+    InitialSnapshotsComplete,
 }
 
 #[derive(Debug)]
@@ -177,6 +214,32 @@ enum TaskExit {
     Stopped(Option<Event>),
     SnapshotComplete,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProcessAction {
+    None,
+    Resnapshot(String),
+    Excluded,
+    InitialSnapshotsComplete,
+}
+
+#[derive(Debug)]
+struct SnapshotUnavailable {
+    symbol: String,
+    status: reqwest::StatusCode,
+}
+
+impl std::fmt::Display for SnapshotUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "snapshot unavailable symbol={} status={}",
+            self.symbol, self.status
+        )
+    }
+}
+
+impl std::error::Error for SnapshotUnavailable {}
 
 #[derive(Clone)]
 struct ProcessWatchdog {
@@ -257,12 +320,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = Arc::new(Config::from_env().await?);
-    let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout)?;
     std::fs::create_dir_all(&config.spool_dir)?;
     let recovered = recover_parts(&config.segment_config())?;
     if !recovered.is_empty() {
         info!(segments = recovered.len(), "recovered interrupted segments");
     }
+    let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let upload_task = tokio::spawn(upload_loop(config.clone(), shutdown_rx.clone()));
     let shutdown_signal = tokio::spawn(wait_for_signal(shutdown_tx.clone()));
@@ -292,6 +355,10 @@ async fn run_session(
     watchdog: ProcessWatchdog,
 ) -> anyhow::Result<()> {
     let session_id = format!("{:x}-{}", now_ns()?, std::process::id());
+    let active_symbols = config.active_symbols();
+    if active_symbols.is_empty() {
+        anyhow::bail!("no active symbols remain after runtime exclusions");
+    }
     let (sender, mut receiver) = mpsc::channel(config.max_buffered_diffs);
     let (session_stop_tx, session_stop_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
@@ -309,8 +376,7 @@ async fn run_session(
         sender.clone(),
         session_stop_rx.clone(),
     ));
-    let mut states = config
-        .symbols
+    let mut states = active_symbols
         .iter()
         .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, config.market)))
         .collect::<HashMap<_, _>>();
@@ -321,7 +387,7 @@ async fn run_session(
         json!({
             "session_id": session_id,
             "market": config.market.as_str(),
-            "symbols": config.symbols.len(),
+            "symbols": active_symbols.len(),
             "websocket_shards": config.stream_urls().len(),
         }),
         now_ns()?,
@@ -329,9 +395,10 @@ async fn run_session(
     let mut sequence_gaps = 0_u64;
     let mut last_health = Instant::now() - Duration::from_secs(60);
     let mut failure = None;
-    let mut sync_deadline = Some(Instant::now() + config.sync_timeout);
+    let mut sync_deadline = None;
 
     loop {
+        let mut pending_action = ProcessAction::None;
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -341,13 +408,9 @@ async fn run_session(
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 match joined {
                     Some(Ok(Ok(TaskExit::Stopped(Some(event))))) => {
-                        if let Some(symbol) = process_event(
-                            &mut segment, &mut states, &mut budget, &session_id, event, &mut sequence_gaps
-                        )? {
-                            segment = rotate_segment(segment, &config, &states, &session_id, "sequence_gap")?;
-                            sync_deadline = Some(Instant::now() + config.sync_timeout);
-                            tasks.spawn(produce_snapshot(config.clone(), symbol, sender.clone(), session_stop_rx.clone()));
-                        }
+                        pending_action = process_event(
+                            &config, &mut segment, &mut states, &mut budget, &session_id, event, &mut sequence_gaps
+                        )?;
                     }
                     Some(Ok(Ok(TaskExit::SnapshotComplete))) => {},
                     Some(Ok(Ok(TaskExit::Stopped(None)))) if *session_stop_rx.borrow() => {},
@@ -370,14 +433,9 @@ async fn run_session(
                 match event {
                     Some(event) => {
                         match process_event(
-                            &mut segment, &mut states, &mut budget, &session_id, event, &mut sequence_gaps
+                            &config, &mut segment, &mut states, &mut budget, &session_id, event, &mut sequence_gaps
                         ) {
-                            Ok(Some(symbol)) => {
-                                segment = rotate_segment(segment, &config, &states, &session_id, "sequence_gap")?;
-                                sync_deadline = Some(Instant::now() + config.sync_timeout);
-                                tasks.spawn(produce_snapshot(config.clone(), symbol, sender.clone(), session_stop_rx.clone()));
-                            }
-                            Ok(None) => {}
+                            Ok(action) => pending_action = action,
                             Err(error) => {
                                 failure = Some(error);
                                 break;
@@ -391,6 +449,27 @@ async fn run_session(
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+
+        match pending_action {
+            ProcessAction::None => {}
+            ProcessAction::Resnapshot(symbol) => {
+                segment = rotate_segment(segment, &config, &states, &session_id, "sequence_gap")?;
+                sync_deadline = Some(Instant::now() + config.sync_timeout);
+                tasks.spawn(produce_snapshot(
+                    config.clone(),
+                    symbol,
+                    sender.clone(),
+                    session_stop_rx.clone(),
+                ));
+            }
+            ProcessAction::Excluded => {
+                segment =
+                    rotate_segment(segment, &config, &states, &session_id, "symbol_excluded")?;
+            }
+            ProcessAction::InitialSnapshotsComplete => {
+                sync_deadline = Some(Instant::now() + config.sync_timeout);
+            }
         }
 
         // This must live outside the biased select: under continuous market
@@ -443,7 +522,7 @@ async fn run_session(
     while let Ok(event) = receiver.try_recv() {
         archive_only(&mut segment, &session_id, event)?;
     }
-    let _ = close_segment(segment, &states, &session_id, "shutdown")?;
+    let _ = close_segment(segment, &config, &states, &session_id, "shutdown")?;
     write_health(
         &config.spool_dir,
         config.market,
@@ -477,24 +556,28 @@ fn sync_timed_out(
 }
 
 fn process_event(
+    config: &Config,
     segment: &mut Segment,
     states: &mut HashMap<String, OrderBookState>,
     budget: &mut PendingBudget,
     session_id: &str,
     event: Event,
     sequence_gaps: &mut u64,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<ProcessAction> {
     match event {
         Event::Diff {
             received_at_ns,
             frame,
         } => {
+            let diff = DepthDiff::from_frame(&frame)?;
+            if config.is_excluded(&diff.symbol) {
+                return Ok(ProcessAction::None);
+            }
             segment.write(
                 "diff",
                 json!({"session_id":session_id,"frame":frame}),
                 received_at_ns,
             )?;
-            let diff = DepthDiff::from_frame(&frame)?;
             let state = states
                 .get_mut(&diff.symbol)
                 .ok_or_else(|| anyhow::anyhow!("unconfigured symbol {}", diff.symbol))?;
@@ -510,7 +593,7 @@ fn process_event(
                 {
                     let symbol = gap.symbol.clone();
                     state.invalidate_for_resync(budget);
-                    return Ok(Some(symbol));
+                    return Ok(ProcessAction::Resnapshot(symbol));
                 }
                 return Err(error);
             }
@@ -521,6 +604,9 @@ fn process_event(
             request_started_at_ns,
             snapshot,
         } => {
+            if config.is_excluded(&symbol) {
+                return Ok(ProcessAction::None);
+            }
             segment.write(
                 "snapshot",
                 json!({
@@ -546,13 +632,29 @@ fn process_event(
                 {
                     let symbol = gap.symbol.clone();
                     state.invalidate_for_resync(budget);
-                    return Ok(Some(symbol));
+                    return Ok(ProcessAction::Resnapshot(symbol));
                 }
                 return Err(error);
             }
         }
+        Event::ExcludeSymbol { symbol, reason } => {
+            config.exclude_symbol(&symbol);
+            if let Some(mut state) = states.remove(&symbol) {
+                state.invalidate_for_resync(budget);
+            }
+            segment.mark_replay_unsafe();
+            segment.write(
+                "symbol_excluded",
+                json!({"session_id":session_id,"symbol":symbol,"reason":reason}),
+                now_ns()?,
+            )?;
+            return Ok(ProcessAction::Excluded);
+        }
+        Event::InitialSnapshotsComplete => {
+            return Ok(ProcessAction::InitialSnapshotsComplete);
+        }
     }
-    Ok(None)
+    Ok(ProcessAction::None)
 }
 
 fn segment_due(segment: &Segment, segment_seconds: u64) -> anyhow::Result<bool> {
@@ -593,6 +695,17 @@ fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow
             }),
             received_at_ns,
         ),
+        Event::ExcludeSymbol { symbol, reason } => segment.write(
+            "symbol_excluded",
+            json!({
+                "session_id":session_id,
+                "archived_only":true,
+                "symbol":symbol,
+                "reason":reason,
+            }),
+            now_ns()?,
+        ),
+        Event::InitialSnapshotsComplete => Ok(()),
     }
 }
 
@@ -603,16 +716,23 @@ fn rotate_segment(
     session_id: &str,
     reason: &str,
 ) -> anyhow::Result<Segment> {
-    close_segment(segment, states, session_id, reason)?;
+    close_segment(segment, config, states, session_id, reason)?;
     Segment::create(config.segment_config(), now_ns()?)
 }
 
 fn close_segment(
     mut segment: Segment,
+    config: &Config,
     states: &HashMap<String, OrderBookState>,
     session_id: &str,
     reason: &str,
 ) -> anyhow::Result<Option<hft_collector::lob_archiver::SegmentArtifacts>> {
+    let catalog = config.segment_config();
+    segment.update_catalog(
+        catalog.symbols,
+        catalog.security_token_symbols,
+        catalog.excluded_symbols,
+    );
     if states.values().all(|state| state.synced && state.bridged) {
         for state in states.values() {
             segment.write(
@@ -673,12 +793,30 @@ async fn produce_snapshots(
         .timeout(Duration::from_secs(15))
         .build()?;
     let interval = Duration::from_secs_f64(1.0 / config.snapshot_requests_per_second.max(0.1));
-    for symbol in &config.symbols {
+    for symbol in config.active_symbols() {
         if *shutdown.borrow() {
             return Ok(TaskExit::Stopped(None));
         }
         let started = now_ns()?;
-        let snapshot = fetch_snapshot(&client, &config, symbol).await?;
+        let snapshot = match fetch_snapshot(&client, &config, &symbol, &mut shutdown).await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return Ok(TaskExit::Stopped(None)),
+            Err(error) => {
+                if error.downcast_ref::<SnapshotUnavailable>().is_some() {
+                    let event = Event::ExcludeSymbol {
+                        symbol: symbol.clone(),
+                        reason: error.to_string(),
+                    };
+                    match send_or_shutdown(&sender, event, &mut shutdown).await? {
+                        SendOutcome::Sent => continue,
+                        SendOutcome::Shutdown(event) => {
+                            return Ok(TaskExit::Stopped(Some(event)));
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
         let event = Event::Snapshot {
             received_at_ns: now_ns()?,
             symbol: symbol.clone(),
@@ -689,7 +827,13 @@ async fn produce_snapshots(
             SendOutcome::Sent => {}
             SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
         }
-        tokio::time::sleep(interval).await;
+        if wait_or_shutdown(&mut shutdown, interval).await {
+            return Ok(TaskExit::Stopped(None));
+        }
+    }
+    match send_or_shutdown(&sender, Event::InitialSnapshotsComplete, &mut shutdown).await? {
+        SendOutcome::Sent => {}
+        SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
     }
     // Keep the producer alive so a normal completion is not mistaken for a session failure.
     shutdown.changed().await?;
@@ -706,7 +850,23 @@ async fn produce_snapshot(
         .timeout(Duration::from_secs(15))
         .build()?;
     let started = now_ns()?;
-    let snapshot = fetch_snapshot(&client, &config, &symbol).await?;
+    let snapshot = match fetch_snapshot(&client, &config, &symbol, &mut shutdown).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return Ok(TaskExit::Stopped(None)),
+        Err(error) => {
+            if error.downcast_ref::<SnapshotUnavailable>().is_some() {
+                let event = Event::ExcludeSymbol {
+                    symbol,
+                    reason: error.to_string(),
+                };
+                return match send_or_shutdown(&sender, event, &mut shutdown).await? {
+                    SendOutcome::Sent => Ok(TaskExit::SnapshotComplete),
+                    SendOutcome::Shutdown(event) => Ok(TaskExit::Stopped(Some(event))),
+                };
+            }
+            return Err(error);
+        }
+    };
     let event = Event::Snapshot {
         received_at_ns: now_ns()?,
         symbol,
@@ -723,7 +883,8 @@ async fn fetch_snapshot(
     client: &reqwest::Client,
     config: &Config,
     symbol: &str,
-) -> anyhow::Result<Value> {
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<Option<Value>> {
     let path = match config.market {
         Market::Spot => "/api/v3/depth",
         Market::Usdm => "/fapi/v1/depth",
@@ -745,12 +906,24 @@ async fn fetch_snapshot(
             {
                 anyhow::bail!("snapshot missing lastUpdateId for {symbol}");
             }
-            return Ok(snapshot);
+            return Ok(Some(snapshot));
         }
         let retryable =
             status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
         if !retryable || attempt + 1 == config.snapshot_retry_attempts {
             let body = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|payload| payload["code"].as_i64())
+                    == Some(-1121)
+            {
+                return Err(SnapshotUnavailable {
+                    symbol: symbol.to_owned(),
+                    status,
+                }
+                .into());
+            }
             anyhow::bail!("snapshot failed symbol={symbol} status={status} body={body}");
         }
         let delay = snapshot_retry_delay(
@@ -761,9 +934,22 @@ async fn fetch_snapshot(
             attempt,
         );
         warn!(%symbol, %status, ?delay, "snapshot request retrying");
-        tokio::time::sleep(delay).await;
+        if wait_or_shutdown(shutdown, delay).await {
+            return Ok(None);
+        }
     }
     unreachable!("snapshot_retry_attempts is at least one")
+}
+
+async fn wait_or_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        _ = tokio::time::sleep(delay) => false,
+    }
 }
 
 fn snapshot_retry_delay(retry_after: Option<&str>, attempt: usize) -> Duration {
@@ -820,8 +1006,6 @@ fn parse_symbol_catalog(market: Market, payload: &Value) -> anyhow::Result<Symbo
             .any(|permission| permission == "TRD_GRP_261");
         if is_security_token {
             security_tokens.insert(symbol.clone());
-            excluded.insert(symbol);
-            continue;
         }
         symbols.insert(symbol);
     }
@@ -1031,7 +1215,7 @@ mod tests {
             shard_id: "all".into(),
             symbols: vec!["BTCUSDT".into()],
             security_token_symbols: vec![],
-            excluded_symbols: vec![],
+            excluded_symbols: Arc::new(RwLock::new(BTreeSet::new())),
             ws_shard_size: 100,
             snapshot_limit: 100,
             snapshot_requests_per_second: 15.0,
@@ -1065,17 +1249,18 @@ mod tests {
             ]}),
         )
         .unwrap();
-        assert_eq!(catalog.symbols, ["BTCUSDT"]);
+        assert_eq!(catalog.symbols, ["BTCUSDT", "SECURITYUSDT"]);
         assert_eq!(catalog.security_token_symbols, ["SECURITYUSDT"]);
-        assert_eq!(catalog.excluded_symbols, ["BLOCKEDUSDT", "SECURITYUSDT"]);
+        assert_eq!(catalog.excluded_symbols, ["BLOCKEDUSDT"]);
 
         let mut config = test_config("http://unused".into());
         config.symbols = catalog.symbols;
         config.security_token_symbols = catalog.security_token_symbols;
-        config.excluded_symbols = catalog.excluded_symbols;
+        config.excluded_symbols =
+            Arc::new(RwLock::new(catalog.excluded_symbols.into_iter().collect()));
         let manifest = config.segment_config();
         assert_eq!(manifest.security_token_symbols, ["SECURITYUSDT"]);
-        assert_eq!(manifest.excluded_symbols, ["BLOCKEDUSDT", "SECURITYUSDT"]);
+        assert_eq!(manifest.excluded_symbols, ["BLOCKEDUSDT"]);
     }
 
     #[tokio::test]
@@ -1095,10 +1280,150 @@ mod tests {
             }
         });
         let config = test_config(format!("http://{address}"));
-        let snapshot = fetch_snapshot(&reqwest::Client::new(), &config, "BTCUSDT")
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let snapshot = fetch_snapshot(&reqwest::Client::new(), &config, "BTCUSDT", &mut shutdown)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(snapshot["lastUpdateId"], 1);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_completion_is_emitted_after_last_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 38\r\nConnection: close\r\n\r\n{\"lastUpdateId\":1,\"bids\":[],\"asks\":[]}";
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let mut config = test_config(format!("http://{address}"));
+        config.symbols = vec!["BTCUSDT".into(), "ETHUSDT".into()];
+        config.snapshot_requests_per_second = 1_000.0;
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let producer = tokio::spawn(produce_snapshots(Arc::new(config), sender, shutdown_rx));
+
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { .. })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { .. })
+        ));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::InitialSnapshotsComplete)
+        ));
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            producer.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_snapshot_is_not_retried_and_becomes_persistent_manifest_exclusion() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let body = "{\"code\":-1121,\"msg\":\"Invalid symbol.\"}";
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let root = env::temp_dir().join(format!("monday-exclusion-test-{}", now_ns().unwrap()));
+        let mut config = test_config(format!("http://{address}"));
+        config.spool_dir = root.clone();
+        config.symbols = vec!["BTCUSDT".into(), "BADUSDT".into()];
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let error = fetch_snapshot(&reqwest::Client::new(), &config, "BADUSDT", &mut shutdown)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<SnapshotUnavailable>().is_some());
+        server.join().unwrap();
+
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let mut states = config
+            .active_symbols()
+            .into_iter()
+            .map(|symbol| (symbol.clone(), OrderBookState::new(symbol, Market::Spot)))
+            .collect::<HashMap<_, _>>();
+        let mut budget = PendingBudget::new(10);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let action = process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            Event::ExcludeSymbol {
+                symbol: "BADUSDT".into(),
+                reason: error.to_string(),
+            },
+            &mut 0,
+        )
+        .unwrap();
+        assert_eq!(action, ProcessAction::Excluded);
+        assert_eq!(config.active_symbols(), ["BTCUSDT"]);
+        assert!(config.is_excluded("BADUSDT"));
+        assert!(!states.contains_key("BADUSDT"));
+
+        let artifacts = close_segment(segment, &config, &states, "session-1", "test")
+            .unwrap()
+            .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["symbols"], json!(["BTCUSDT"]));
+        assert_eq!(manifest["excluded_symbols"], json!(["BADUSDT"]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_after_backoff_stops_immediately_on_shutdown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let response = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let config = test_config(format!("http://{address}"));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            fetch_snapshot(
+                &reqwest::Client::new(),
+                &config,
+                "BTCUSDT",
+                &mut shutdown_rx,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown must beat 60s Retry-After")
+            .unwrap()
+            .unwrap();
+        assert!(result.is_none());
         server.join().unwrap();
     }
 

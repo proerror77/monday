@@ -466,6 +466,17 @@ impl Segment {
         self.replay_safe = false;
     }
 
+    pub fn update_catalog(
+        &mut self,
+        symbols: Vec<String>,
+        security_token_symbols: Vec<String>,
+        excluded_symbols: Vec<String>,
+    ) {
+        self.config.symbols = symbols;
+        self.config.security_token_symbols = security_token_symbols;
+        self.config.excluded_symbols = excluded_symbols;
+    }
+
     pub fn event_count(&self, event_type: &str) -> u64 {
         self.counts.get(event_type).copied().unwrap_or(0)
     }
