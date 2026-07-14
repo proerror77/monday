@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -408,6 +408,39 @@ pub struct Segment {
     writer: BufWriter<File>,
     counts: BTreeMap<String, u64>,
     replay_safe: bool,
+    snapshot_ready_symbols: BTreeSet<String>,
+    bridged_symbols: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadinessSummary {
+    snapshot_ready_count: usize,
+    bridged_count: usize,
+    snapshot_only_symbols: Vec<String>,
+    all_symbols_bridged: bool,
+}
+
+fn readiness_summary<'a>(
+    symbol_count: usize,
+    states: impl Iterator<Item = (&'a str, bool, bool)>,
+) -> ReadinessSummary {
+    let mut snapshot_ready_count = 0;
+    let mut bridged_count = 0;
+    let mut snapshot_only_symbols = Vec::new();
+    for (symbol, synced, bridged) in states {
+        snapshot_ready_count += usize::from(synced);
+        bridged_count += usize::from(synced && bridged);
+        if synced && !bridged {
+            snapshot_only_symbols.push(symbol.to_owned());
+        }
+    }
+    snapshot_only_symbols.sort();
+    ReadinessSummary {
+        snapshot_ready_count,
+        bridged_count,
+        snapshot_only_symbols,
+        all_symbols_bridged: symbol_count > 0 && bridged_count == symbol_count,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +472,8 @@ impl Segment {
             writer: BufWriter::with_capacity(1024 * 1024, file),
             counts: BTreeMap::new(),
             replay_safe: true,
+            snapshot_ready_symbols: BTreeSet::new(),
+            bridged_symbols: BTreeSet::new(),
         })
     }
 
@@ -455,6 +490,16 @@ impl Segment {
         let payload = payload
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("archive payload must be an object"))?;
+        if event_type == "checkpoint" {
+            if let Some(symbol) = payload.get("symbol").and_then(Value::as_str) {
+                if payload.get("synced").and_then(Value::as_bool) == Some(true) {
+                    self.snapshot_ready_symbols.insert(symbol.to_owned());
+                }
+                if payload.get("bridged").and_then(Value::as_bool) == Some(true) {
+                    self.bridged_symbols.insert(symbol.to_owned());
+                }
+            }
+        }
         envelope.extend(payload.clone());
         serde_json::to_writer(&mut self.writer, &envelope)?;
         self.writer.write_all(b"\n")?;
@@ -483,6 +528,16 @@ impl Segment {
 
     pub fn close(mut self) -> anyhow::Result<Option<SegmentArtifacts>> {
         let has_replay_safe_checkpoint = self.replay_safe && self.event_count("checkpoint") > 0;
+        let readiness = readiness_summary(
+            self.config.symbols.len(),
+            self.config.symbols.iter().map(|symbol| {
+                (
+                    symbol.as_str(),
+                    self.snapshot_ready_symbols.contains(symbol),
+                    self.bridged_symbols.contains(symbol),
+                )
+            }),
+        );
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
         drop(self.writer);
@@ -497,6 +552,7 @@ impl Segment {
             self.start_ns,
             self.end_ns,
             has_replay_safe_checkpoint,
+            readiness,
         )
         .map(Some)
     }
@@ -509,6 +565,7 @@ fn finalize_segment(
     start_ns: u64,
     end_ns: u64,
     has_replay_safe_checkpoint: bool,
+    readiness: ReadinessSummary,
 ) -> anyhow::Result<SegmentArtifacts> {
     let data = path.with_file_name(format!("part-{start_ns}.jsonl.zst"));
     let temporary_data = data.with_extension("zst.tmp");
@@ -545,6 +602,10 @@ fn finalize_segment(
         "events": events,
         "event_types": counts,
         "has_replay_safe_checkpoint": has_replay_safe_checkpoint,
+        "snapshot_ready_count": readiness.snapshot_ready_count,
+        "bridged_count": readiness.bridged_count,
+        "snapshot_only_symbols": readiness.snapshot_only_symbols,
+        "all_symbols_bridged": readiness.all_symbols_bridged,
         "start_received_at_ns": start_ns,
         "end_received_at_ns": end_ns,
         "date": date,
@@ -640,7 +701,19 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
             continue;
         }
         artifacts.push(finalize_segment(
-            config, &path, counts, start_ns, end_ns, false,
+            config,
+            &path,
+            counts,
+            start_ns,
+            end_ns,
+            false,
+            readiness_summary(
+                config.symbols.len(),
+                config
+                    .symbols
+                    .iter()
+                    .map(|symbol| (symbol.as_str(), false, false)),
+            ),
         )?);
     }
     Ok(artifacts)
@@ -700,6 +773,12 @@ pub fn write_health(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    let readiness = readiness_summary(
+        states.len(),
+        states
+            .iter()
+            .map(|(symbol, state)| (symbol.as_str(), state.synced, state.bridged)),
+    );
     atomic_write_json(
         &spool_dir.join("health.json"),
         &json!({
@@ -709,6 +788,10 @@ pub fn write_health(
             "market": market.as_str(),
             "dataset": dataset,
             "symbol_count": states.len(),
+            "snapshot_ready_count": readiness.snapshot_ready_count,
+            "bridged_count": readiness.bridged_count,
+            "snapshot_only_symbols": readiness.snapshot_only_symbols,
+            "all_symbols_bridged": readiness.all_symbols_bridged,
             "session_id": session_id,
             "sequence_gaps": sequence_gaps,
             "pending_upload_segments": pending_upload_segments,
@@ -1049,6 +1132,10 @@ mod tests {
             serde_json::from_reader(File::open(root.join("health.json")).unwrap()).unwrap();
         assert_eq!(health["upload_warning"], true);
         assert_eq!(health["last_upload_error"], "oss down");
+        assert_eq!(health["snapshot_ready_count"], 0);
+        assert_eq!(health["bridged_count"], 0);
+        assert_eq!(health["snapshot_only_symbols"], json!([]));
+        assert_eq!(health["all_symbols_bridged"], false);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1076,7 +1163,7 @@ mod tests {
         segment
             .write(
                 "checkpoint",
-                json!({"symbol":"BTCUSDT"}),
+                json!({"symbol":"BTCUSDT", "synced":true, "bridged":true}),
                 segment.start_ns + 1,
             )
             .unwrap();
@@ -1089,6 +1176,10 @@ mod tests {
             json!({"checkpoint":1,"snapshot":1})
         );
         assert_eq!(manifest["has_replay_safe_checkpoint"], true);
+        assert_eq!(manifest["snapshot_ready_count"], 1);
+        assert_eq!(manifest["bridged_count"], 1);
+        assert_eq!(manifest["snapshot_only_symbols"], json!([]));
+        assert_eq!(manifest["all_symbols_bridged"], true);
         assert_eq!(manifest["sha256"], artifacts.sha256);
         assert!(!artifacts.success.exists());
         write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();

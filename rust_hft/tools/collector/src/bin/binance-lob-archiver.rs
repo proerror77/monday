@@ -478,20 +478,20 @@ async fn run_session(
             segment = rotate_segment(segment, &config, &states, &session_id, "scheduled")?;
         }
 
-        if states.values().all(|state| state.synced && state.bridged) {
+        if states.values().all(|state| state.synced) {
             sync_deadline = None;
         } else if sync_timed_out(&states, sync_deadline, Instant::now()) {
             let missing = states
                 .iter()
-                .filter(|(_, state)| !state.synced || !state.bridged)
+                .filter(|(_, state)| !state.synced)
                 .map(|(symbol, _)| symbol.as_str())
                 .collect::<Vec<_>>();
-            failure = Some(anyhow::anyhow!("snapshot bridge timed out: {missing:?}"));
+            failure = Some(anyhow::anyhow!("snapshot sync timed out: {missing:?}"));
             break;
         }
 
         if last_health.elapsed() >= Duration::from_secs(30) {
-            let status = if states.values().all(|state| state.synced && state.bridged) {
+            let status = if states.values().all(|state| state.synced) {
                 "synced"
             } else {
                 "syncing"
@@ -550,9 +550,7 @@ fn sync_timed_out(
     deadline: Option<Instant>,
     now: Instant,
 ) -> bool {
-    deadline.is_some_and(|deadline| {
-        now > deadline && states.values().any(|state| !state.synced || !state.bridged)
-    })
+    deadline.is_some_and(|deadline| now > deadline && states.values().any(|state| !state.synced))
 }
 
 fn process_event(
@@ -733,7 +731,7 @@ fn close_segment(
         catalog.security_token_symbols,
         catalog.excluded_symbols,
     );
-    if states.values().all(|state| state.synced && state.bridged) {
+    if states.values().all(|state| state.synced) {
         for state in states.values() {
             segment.write(
                 "checkpoint",
@@ -1455,6 +1453,180 @@ mod tests {
             181_001,
             Duration::from_secs(180)
         ));
+    }
+
+    #[test]
+    fn snapshot_only_silent_symbol_is_synced_and_closes_replay_safe() {
+        assert!(Command::new("zstd")
+            .arg("--version")
+            .output()
+            .expect("zstd is required for segment lifecycle tests")
+            .status
+            .success());
+        let root = env::temp_dir().join(format!("monday-silent-symbol-test-{}", now_ns().unwrap()));
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.clone();
+        config.symbols = vec!["BTCUSDT".into(), "TUSDUSDT".into()];
+        let mut silent = OrderBookState::new("TUSDUSDT", Market::Spot);
+        let mut bridged = OrderBookState::new("BTCUSDT", Market::Spot);
+        let mut budget = PendingBudget::new(2);
+        silent
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 100,
+                    "bids": [["1", "1"]],
+                    "asks": [["2", "1"]]
+                }),
+                &mut budget,
+            )
+            .unwrap();
+        bridged
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 100,
+                    "bids": [["100", "1"]],
+                    "asks": [["102", "1"]]
+                }),
+                &mut budget,
+            )
+            .unwrap();
+        bridged
+            .apply_diff(
+                DepthDiff {
+                    symbol: "BTCUSDT".into(),
+                    first_update_id: 101,
+                    final_update_id: 101,
+                    previous_update_id: None,
+                    bids: vec![["100".into(), "2".into()]],
+                    asks: vec![],
+                },
+                &mut budget,
+            )
+            .unwrap();
+        assert!(silent.synced);
+        assert!(!silent.bridged);
+        assert!(bridged.synced);
+        assert!(bridged.bridged);
+        let states = HashMap::from([
+            ("BTCUSDT".to_owned(), bridged),
+            ("TUSDUSDT".to_owned(), silent),
+        ]);
+
+        assert!(!sync_timed_out(
+            &states,
+            Some(Instant::now() - Duration::from_secs(1)),
+            Instant::now(),
+        ));
+
+        let segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let artifacts = close_segment(segment, &config, &states, "session-1", "test")
+            .unwrap()
+            .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["has_replay_safe_checkpoint"], true);
+        assert_eq!(manifest["snapshot_ready_count"], 2);
+        assert_eq!(manifest["bridged_count"], 1);
+        assert_eq!(manifest["snapshot_only_symbols"], json!(["TUSDUSDT"]));
+        assert_eq!(manifest["all_symbols_bridged"], false);
+        let output = Command::new("zstd")
+            .args(["-q", "-d", "-c"])
+            .arg(artifacts.data)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let checkpoint = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["symbol"] == "TUSDUSDT")
+            .unwrap();
+        assert_eq!(checkpoint["type"], "checkpoint");
+        assert_eq!(checkpoint["replay_safe"], true);
+        assert_eq!(checkpoint["synced"], true);
+        assert_eq!(checkpoint["bridged"], false);
+
+        write_health(
+            &root,
+            config.market,
+            &config.dataset,
+            "session-1",
+            "synced",
+            0,
+            1,
+            QueueHealth {
+                capacity: 1,
+                remaining_capacity: 1,
+                saturated: false,
+            },
+            &states,
+        )
+        .unwrap();
+        let health: Value =
+            serde_json::from_reader(std::fs::File::open(root.join("health.json")).unwrap())
+                .unwrap();
+        assert_eq!(health["snapshot_ready_count"], 2);
+        assert_eq!(health["bridged_count"], 1);
+        assert_eq!(health["snapshot_only_symbols"], json!(["TUSDUSDT"]));
+        assert_eq!(health["all_symbols_bridged"], false);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_snapshot_times_out_and_closes_replay_unsafe() {
+        assert!(Command::new("zstd")
+            .arg("--version")
+            .output()
+            .expect("zstd is required for segment lifecycle tests")
+            .status
+            .success());
+        let root = env::temp_dir().join(format!(
+            "monday-missing-snapshot-test-{}",
+            now_ns().unwrap()
+        ));
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.clone();
+        config.symbols = vec!["MISSINGUSDT".into()];
+        let mut states = HashMap::from([(
+            "MISSINGUSDT".to_owned(),
+            OrderBookState::new("MISSINGUSDT", Market::Spot),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            Event::Diff {
+                received_at_ns: now_ns().unwrap(),
+                frame: json!({
+                    "stream": "missingusdt@depth@100ms",
+                    "data": {"s": "MISSINGUSDT", "U": 101, "u": 101, "b": [], "a": []}
+                }),
+            },
+            &mut 0,
+        )
+        .unwrap();
+        let now = Instant::now();
+        assert!(sync_timed_out(
+            &states,
+            Some(now - Duration::from_millis(1)),
+            now,
+        ));
+
+        let artifacts = close_segment(segment, &config, &states, "session-1", "test")
+            .unwrap()
+            .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["has_replay_safe_checkpoint"], false);
+        assert_eq!(manifest["snapshot_ready_count"], 0);
+        assert_eq!(manifest["bridged_count"], 0);
+        assert_eq!(manifest["snapshot_only_symbols"], json!([]));
+        assert_eq!(manifest["all_symbols_bridged"], false);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

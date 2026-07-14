@@ -217,6 +217,13 @@ impl Replay {
         }
     }
 
+    fn ensure_series_can_be_replaced(&self) -> Result<()> {
+        if self.state.as_ref().is_some_and(|state| !state.bridged) {
+            bail!("snapshot-only replay series cannot be replaced before its first valid diff");
+        }
+        Ok(())
+    }
+
     fn process_event(&mut self, event: Value) -> Result<()> {
         let received_at_ns = json_u64(&event, "received_at_ns")?;
         match event.get("type").and_then(Value::as_str) {
@@ -237,6 +244,7 @@ impl Replay {
             apply_diff(&mut snapshot, pending, &self.symbol, self.market)?;
         }
         if self.state.is_some() {
+            self.ensure_series_can_be_replaced()?;
             self.emit_before(received_at_ns)?;
         }
         self.start_series(snapshot, received_at_ns)?;
@@ -251,6 +259,7 @@ impl Replay {
             ),
             None => self.start_series(checkpoint, received_at_ns)?,
             Some(state) if state.session_id != checkpoint.session_id => {
+                self.ensure_series_can_be_replaced()?;
                 self.start_series(checkpoint, received_at_ns)?
             }
             Some(_) => {
@@ -274,6 +283,7 @@ impl Replay {
             return Ok(());
         };
         if session_id != current_session {
+            self.ensure_series_can_be_replaced()?;
             self.state = None;
             self.next_bucket_ns = None;
             self.pending_diffs = vec![event];
@@ -333,6 +343,9 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     }
     if !replay.saw_seed {
         bail!("no replay seed found for {symbol}");
+    }
+    if replay.state.as_ref().is_some_and(|state| !state.bridged) {
+        bail!("snapshot-only replay series never received a valid first diff");
     }
 
     let revision = source_revision(&segments);
@@ -525,14 +538,16 @@ fn install_snapshot(event: &Value) -> Result<BookState> {
 fn install_checkpoint(event: &Value) -> Result<BookState> {
     if event.get("replay_safe").and_then(Value::as_bool) != Some(true)
         || event.get("synced").and_then(Value::as_bool) != Some(true)
-        || event.get("bridged").and_then(Value::as_bool) != Some(true)
     {
         bail!("checkpoint is not replay safe");
     }
     Ok(BookState {
         session_id: event_session_id(event)?.to_string(),
         last_update_id: json_u64(event, "last_update_id")?,
-        bridged: true,
+        bridged: event
+            .get("bridged")
+            .and_then(Value::as_bool)
+            .context("checkpoint has no bridged state")?,
         bids: parse_levels(event.get("bids"), "bid")?,
         asks: parse_levels(event.get("asks"), "ask")?,
     })
@@ -935,6 +950,22 @@ mod tests {
         })
     }
 
+    fn snapshot_only_checkpoint() -> Value {
+        json!({
+            "received_at_ns": event_ns(0.2),
+            "type": "checkpoint",
+            "reason": "scheduled",
+            "replay_safe": true,
+            "session_id": "session-1",
+            "symbol": "BTCUSDT",
+            "last_update_id": 100,
+            "synced": true,
+            "bridged": false,
+            "bids": [["100", "10"], ["99", "5"]],
+            "asks": [["102", "4"], ["103", "6"]]
+        })
+    }
+
     fn valid_events() -> Vec<Value> {
         vec![
             diff(0.05, 99, 101, 98, json!([]), json!([["101", "8"]])),
@@ -1067,6 +1098,89 @@ mod tests {
         let error = materialize(&fixture.args()).unwrap_err().to_string();
 
         assert!(error.contains("diffs arrived before replay seed"));
+    }
+
+    #[test]
+    fn delayed_spot_diff_bridges_snapshot_only_checkpoint() {
+        let mut state = install_checkpoint(&snapshot_only_checkpoint()).unwrap();
+        assert!(!state.bridged);
+
+        apply_diff(
+            &mut state,
+            &diff(0.3, 101, 102, 100, json!([]), json!([["102", "3"]])),
+            "BTCUSDT",
+            Market::Spot,
+        )
+        .unwrap();
+
+        assert!(state.bridged);
+        assert_eq!(state.last_update_id, 102);
+    }
+
+    #[test]
+    fn delayed_usdm_diff_bridges_snapshot_only_checkpoint() {
+        let mut state = install_checkpoint(&snapshot_only_checkpoint()).unwrap();
+        assert!(!state.bridged);
+
+        apply_diff(
+            &mut state,
+            &diff(0.3, 101, 102, 100, json!([]), json!([["102", "3"]])),
+            "BTCUSDT",
+            Market::Usdm,
+        )
+        .unwrap();
+
+        assert!(state.bridged);
+        assert_eq!(state.last_update_id, 102);
+    }
+
+    #[test]
+    fn invalid_delayed_spot_diff_rejects_snapshot_only_checkpoint() {
+        let mut state = install_checkpoint(&snapshot_only_checkpoint()).unwrap();
+
+        let error = apply_diff(
+            &mut state,
+            &diff(0.3, 102, 102, 100, json!([]), json!([["102", "3"]])),
+            "BTCUSDT",
+            Market::Spot,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Binance sequence gap"));
+        assert!(!state.bridged);
+    }
+
+    #[test]
+    fn invalid_delayed_usdm_diff_rejects_snapshot_only_checkpoint() {
+        let mut state = install_checkpoint(&snapshot_only_checkpoint()).unwrap();
+
+        let error = apply_diff(
+            &mut state,
+            &diff(0.3, 102, 102, 99, json!([]), json!([["102", "3"]])),
+            "BTCUSDT",
+            Market::Usdm,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Binance sequence gap"));
+        assert!(!state.bridged);
+    }
+
+    #[test]
+    fn snapshot_only_checkpoints_never_publish_without_a_valid_first_diff() {
+        let mut events = Vec::new();
+        for second in [0.2, 3.2, 6.2] {
+            let mut checkpoint = snapshot_only_checkpoint();
+            checkpoint["received_at_ns"] = json!(event_ns(second));
+            events.push(checkpoint);
+        }
+        let fixture = Fixture::new(&events);
+
+        let error = materialize(&fixture.args()).unwrap_err().to_string();
+
+        assert!(error.contains("never received a valid first diff"));
     }
 
     #[test]
