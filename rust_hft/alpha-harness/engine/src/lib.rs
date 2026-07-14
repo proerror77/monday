@@ -8,7 +8,10 @@ pub mod learning;
 pub mod llm;
 
 use alpha_domain::{CandidateArtifact, EngineKind};
-pub use alpha_domain::{CandidateEvaluation, EvaluationMetrics, FoldEvaluationMetrics};
+pub use alpha_domain::{
+    CandidateEvaluation, EvaluationMetrics, FoldEvaluationMetrics, FoldPredictiveMetrics,
+    PredictiveMetrics,
+};
 #[cfg(feature = "kernel")]
 use alpha_domain::{
     IterationVerdict, MissionStatus, MissionTerminalReason, ResearchIteration, SearchBudgetLimit,
@@ -17,9 +20,9 @@ use alpha_domain::{
 use alpha_store::{AlphaStore, EvaluationRecord, MissionLineage, RunCheckpoint, StoreError};
 #[cfg(feature = "kernel")]
 use chrono::Utc;
-use evaluation::EngineContext;
 #[cfg(feature = "kernel")]
 use evaluation::PreparedDataset;
+use evaluation::{EngineContext, ProposalContext};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "kernel")]
 use thiserror::Error;
@@ -68,7 +71,7 @@ pub trait ProposalEngine {
         &mut self,
         mission_id: &str,
         iteration_index: usize,
-        context: &EngineContext<'_>,
+        context: &ProposalContext<'_>,
         remaining: &RemainingBudget,
     ) -> Result<EngineProposal, String>;
 
@@ -122,7 +125,7 @@ where
         &mut self,
         mission_id: &str,
         iteration_index: usize,
-        context: &EngineContext<'_>,
+        context: &ProposalContext<'_>,
         remaining: &RemainingBudget,
     ) -> Result<EngineProposal, String> {
         (**self).propose(mission_id, iteration_index, context, remaining)
@@ -288,7 +291,8 @@ where
             .collect::<Result<std::collections::BTreeSet<_>, _>>()
             .map_err(|error| EngineError::Evaluation(error.to_string()))?;
         let mut new_iterations = 0;
-        let context = dataset.engine_context();
+        let proposal_context = dataset.proposal_context();
+        let evaluation_context = dataset.engine_context();
 
         if kept >= mission.completion_policy.min_kept_candidates {
             let reason = MissionTerminalReason::CompletionPolicySatisfied {
@@ -324,9 +328,9 @@ where
             let created_at = Utc::now();
             let remaining = remaining_budget(&mission.search_budget, &usage);
             let started = std::time::Instant::now();
-            let proposal = self
-                .proposal_engine
-                .propose(mission_id, index, &context, &remaining);
+            let proposal =
+                self.proposal_engine
+                    .propose(mission_id, index, &proposal_context, &remaining);
             let (iteration, candidate, evaluation) = match proposal {
                 Ok(mut proposal) => {
                     proposal.elapsed_ms = proposal
@@ -346,7 +350,7 @@ where
                         Err("proposal duplicated an existing candidate artifact".to_string())
                     } else if within_budget {
                         self.evaluator
-                            .evaluate(&proposal, &context)
+                            .evaluate(&proposal, &evaluation_context)
                             .and_then(|result| {
                                 result.validate().map_err(|error| error.to_string())?;
                                 Ok(result)
@@ -533,6 +537,8 @@ fn historical_observations(
             .ok_or_else(|| {
                 EngineError::Evaluation("historical evaluation is missing".to_string())
             })?;
+        let evaluation =
+            historical_evaluation(&evaluation.record.payload).map_err(EngineError::Evaluation)?;
         observations.push(HistoricalObservation {
             proposal: EngineProposal {
                 candidate_id: candidate_id.to_string(),
@@ -542,11 +548,27 @@ fn historical_observations(
                 tokens: 0,
                 elapsed_ms: 0,
             },
-            evaluation: serde_json::from_value(evaluation.record.payload.clone())
-                .map_err(|error| EngineError::Evaluation(error.to_string()))?,
+            evaluation,
         });
     }
     Ok(observations)
+}
+
+#[cfg(feature = "kernel")]
+fn historical_evaluation(payload: &serde_json::Value) -> Result<CandidateEvaluation, String> {
+    let evaluation: CandidateEvaluation =
+        serde_json::from_value(payload.clone()).map_err(|error| error.to_string())?;
+    // These exact prior-release schemas may be replayed for search state only.
+    let pre_predictive_schema = matches!(
+        evaluation.evaluator_version.as_str(),
+        "purged-walk-forward-v2" | "onnx-purged-walk-forward-v1"
+    );
+    if !pre_predictive_schema {
+        evaluation
+            .validate()
+            .map_err(|error| format!("historical evaluation is invalid: {error}"))?;
+    }
+    Ok(evaluation)
 }
 
 #[cfg(feature = "kernel")]
@@ -631,11 +653,11 @@ mod tests {
             &mut self,
             mission_id: &str,
             iteration_index: usize,
-            context: &EngineContext<'_>,
+            context: &ProposalContext<'_>,
             remaining: &RemainingBudget,
         ) -> Result<EngineProposal, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(context.rows().len(), 40);
+            assert_eq!(context.row_count(), 40);
             assert!(remaining.candidates > 0);
             if self.crash {
                 return Err("fixture crash".to_string());
@@ -668,11 +690,18 @@ mod tests {
                 evaluator_version: "fixture-v1".to_string(),
                 evaluator_config: serde_json::json!({"fixture": true}),
                 metrics: EvaluationMetrics {
+                    predictive: PredictiveMetrics::from_folds(vec![FoldPredictiveMetrics {
+                        fold_index: 1,
+                        row_count: context.rows().len(),
+                        time_series_ic: Some(1.0),
+                        time_series_rank_ic: Some(1.0),
+                    }]),
                     row_count: context.rows().len(),
                     trade_count: context.rows().len(),
                     mean_net_return: 1.0,
                     cumulative_net_return: context.rows().len() as f64,
                     max_drawdown: 0.0,
+                    net_sharpe: 1.0,
                     raw_score: 1.0,
                     adjusted_score: 1.0,
                     folds: vec![FoldEvaluationMetrics {
@@ -682,6 +711,7 @@ mod tests {
                         mean_net_return: 1.0,
                         cumulative_net_return: context.rows().len() as f64,
                         max_drawdown: 0.0,
+                        net_sharpe: 1.0,
                         raw_score: 1.0,
                     }],
                 },
@@ -744,6 +774,43 @@ mod tests {
             "holdout-1",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn historical_evaluation_compatibility_is_limited_to_pre_predictive_versions() {
+        fn remove_predictive_fields(payload: &mut serde_json::Value) {
+            let metrics = payload["metrics"].as_object_mut().unwrap();
+            metrics.remove("predictive");
+            metrics.remove("net_sharpe");
+            for fold in metrics["folds"].as_array_mut().unwrap() {
+                fold.as_object_mut().unwrap().remove("net_sharpe");
+            }
+        }
+
+        let input = dataset();
+        let evaluation = PassingEvaluator
+            .evaluate(
+                &EngineProposal {
+                    candidate_id: "candidate-1".to_string(),
+                    hypothesis: "fixture".to_string(),
+                    artifact: CandidateArtifact::Program(serde_json::json!({"op": "identity"})),
+                    expansions: 1,
+                    tokens: 0,
+                    elapsed_ms: 1,
+                },
+                &input.engine_context(),
+            )
+            .unwrap();
+        let mut malformed_current = serde_json::to_value(&evaluation).unwrap();
+        remove_predictive_fields(&mut malformed_current);
+        assert!(historical_evaluation(&malformed_current).is_err());
+
+        let mut legacy = malformed_current;
+        legacy["evaluator_version"] = serde_json::json!("purged-walk-forward-v2");
+        let restored = historical_evaluation(&legacy).unwrap();
+        assert_eq!(restored.score, evaluation.score);
+        assert!(restored.metrics.net_sharpe.is_nan());
+        assert!(restored.validate().is_err());
     }
 
     #[test]

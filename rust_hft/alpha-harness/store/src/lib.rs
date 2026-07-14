@@ -2,11 +2,13 @@
 
 use alpha_domain::{
     canonical_json_hash, AllowedIntentType, AttributionKind, AttributionMode, CandidateArtifact,
-    CandidateEvaluation, DeploymentEnvelope, EngineKind, FormulaEvaluatorConfig, LearningDirective,
-    LiveSmallEligibilityEvidence, LoopRun, MissionStatus, MissionTerminalReason, PromotionRecord,
-    ResearchIteration, ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
-    SearchPolicyRevision, SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
-    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    CandidateEvaluation, DeploymentEnvelope, EngineKind, FormulaEvaluatorConfig, IterationVerdict,
+    LearningDirective, LiveSmallEligibilityEvidence, LoopRun, MissionStatus, MissionTerminalReason,
+    PromotionRecord, ResearchIteration, ResearchMission, RuntimeAttributionEvent,
+    SearchBudgetUsage, SearchPolicyRevision, SignedDeploymentEnvelope, StrategyBundle,
+    StrategyBundleArtifact, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
+    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    WALK_FORWARD_EVALUATOR_VERSION,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
@@ -26,6 +28,10 @@ const MIGRATION_002: &str = include_str!("../migrations/002_promotion_bundles.sq
 const MIGRATION_003: &str = include_str!("../migrations/003_loop_runs_and_engine_checkpoints.sql");
 const INTEGRITY_KEY_ENV: &str = "ALPHA_STORE_INTEGRITY_KEY_HEX";
 const INTEGRITY_KEY_BYTES: usize = 32;
+
+fn sealed_evaluation_revision_id(candidate_id: &str, evaluator_version: &str) -> String {
+    format!("sealed-evaluation:{evaluator_version}:{candidate_id}")
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -817,6 +823,49 @@ impl AlphaStore {
         )
     }
 
+    fn has_canonical_walk_forward_evidence(
+        &self,
+        mission: &ResearchMission,
+        candidate_id: &str,
+        candidate_iteration: &ResearchIteration,
+        candidate_artifact: &CandidateArtifact,
+    ) -> Result<bool, StoreError> {
+        let expected_version = match candidate_artifact {
+            CandidateArtifact::Formula(_) => WALK_FORWARD_EVALUATOR_VERSION,
+            CandidateArtifact::OnnxModel(_) => ONNX_WALK_FORWARD_EVALUATOR_VERSION,
+            _ => return Ok(false),
+        };
+        let Some(evaluation_id) = candidate_iteration.evaluation_artifact_id.as_deref() else {
+            return Ok(false);
+        };
+        let stored = match read_json_row::<EvaluationRecord>(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM evaluation_artifacts WHERE evaluation_id = ?",
+            evaluation_id,
+        ) {
+            Ok(stored) => stored,
+            Err(StoreError::NotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let Ok(evaluation) = serde_json::from_value::<CandidateEvaluation>(stored.payload.clone())
+        else {
+            return Ok(false);
+        };
+        if evaluation.validate().is_err() {
+            return Ok(false);
+        }
+        let expected_config = FormulaEvaluatorConfig::for_mission(mission).map_err(domain_error)?;
+        Ok(candidate_iteration.mission_id == mission.mission_id
+            && candidate_iteration.candidate_artifact_id.as_deref() == Some(candidate_id)
+            && candidate_iteration.verdict == IterationVerdict::Keep
+            && stored.mission_id == mission.mission_id
+            && stored.candidate_id == candidate_id
+            && stored.evaluation_id == evaluation_id
+            && evaluation.passed
+            && evaluation.evaluator_version == expected_version
+            && evaluation.formula_config().map_err(domain_error)? == expected_config)
+    }
+
     pub fn promote_candidate(
         &mut self,
         bundle: &StrategyBundle,
@@ -865,6 +914,23 @@ impl AlphaStore {
         if mission.dataset_manifest_id != bundle.dataset_manifest_id {
             return Err(StoreError::Domain(
                 "promotion dataset does not match mission".to_string(),
+            ));
+        }
+        if !self.has_canonical_walk_forward_evidence(
+            &mission,
+            &bundle.candidate_id,
+            &candidate_iteration,
+            &candidate_artifact,
+        )? {
+            return Err(StoreError::Domain(
+                "promotion candidate lacks canonical walk-forward evidence".to_string(),
+            ));
+        }
+        let expected_sealed_evaluation_id =
+            sealed_evaluation_revision_id(&bundle.candidate_id, &bundle.evaluator_version);
+        if promotion.sealed_evaluation_id != expected_sealed_evaluation_id {
+            return Err(StoreError::Domain(
+                "promotion sealed evaluation revision id is not canonical".to_string(),
             ));
         }
         let sealed = self.get_registry_revision(&promotion.sealed_evaluation_id)?;
@@ -1284,13 +1350,18 @@ impl AlphaStore {
             let Some(evaluation_value) = revision.payload.get("evaluation") else {
                 continue;
             };
-            let evaluator_version = evaluation_value
+            let Some(evaluator_version) = evaluation_value
                 .get("evaluator_version")
-                .and_then(serde_json::Value::as_str);
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
             if !matches!(
                 evaluator_version,
-                Some(SEALED_HOLDOUT_EVALUATOR_VERSION | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION)
-            ) {
+                SEALED_HOLDOUT_EVALUATOR_VERSION | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+            ) || revision.revision_id
+                != sealed_evaluation_revision_id(&revision.asset_id, evaluator_version)
+            {
                 continue;
             }
             let evaluation: CandidateEvaluation =
@@ -1329,10 +1400,10 @@ impl AlphaStore {
                 (&candidate_artifact, evaluator_version),
                 (
                     CandidateArtifact::Formula(_),
-                    Some(SEALED_HOLDOUT_EVALUATOR_VERSION)
+                    SEALED_HOLDOUT_EVALUATOR_VERSION
                 ) | (
                     CandidateArtifact::OnnxModel(_),
-                    Some(ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION)
+                    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
                 )
             );
             let candidate_iteration: ResearchIteration = read_json_row(
@@ -1343,6 +1414,12 @@ impl AlphaStore {
             if candidate_iteration.engine == EngineKind::OfflineReinforcementLearning
                 || candidate_iteration.candidate_artifact_id.as_deref()
                     != Some(revision.asset_id.as_str())
+                || !self.has_canonical_walk_forward_evidence(
+                    &mission,
+                    &revision.asset_id,
+                    &candidate_iteration,
+                    &candidate_artifact,
+                )?
             {
                 continue;
             }
@@ -2375,35 +2452,70 @@ mod tests {
         iteration
     }
 
-    fn sealed_evaluation() -> serde_json::Value {
+    fn evaluation_fixture(evaluator_version: &str, fold_count: usize) -> serde_json::Value {
         let config = FormulaEvaluatorConfig::for_trials(3).unwrap();
         let raw_score = 4.0;
         let adjusted_score = config.adjusted_score(raw_score).unwrap();
-        serde_json::json!({
-            "passed": true,
-            "score": adjusted_score,
-            "failure_reasons": [],
-            "evaluator_version": SEALED_HOLDOUT_EVALUATOR_VERSION,
-            "evaluator_config": config,
-            "metrics": {
-                "row_count": 30,
-                "trade_count": 30,
-                "mean_net_return": 0.001,
-                "cumulative_net_return": 0.03,
-                "max_drawdown": 0.01,
-                "raw_score": raw_score,
-                "adjusted_score": adjusted_score,
-                "folds": [{
-                    "fold_index": 1,
+        let predictive_folds = (1..=fold_count)
+            .map(|fold_index| {
+                serde_json::json!({
+                    "fold_index": fold_index,
+                    "row_count": 30,
+                    "time_series_ic": 0.1,
+                    "time_series_rank_ic": 0.1
+                })
+            })
+            .collect::<Vec<_>>();
+        let trading_folds = (1..=fold_count)
+            .map(|fold_index| {
+                serde_json::json!({
+                    "fold_index": fold_index,
                     "row_count": 30,
                     "trade_count": 30,
                     "mean_net_return": 0.001,
                     "cumulative_net_return": 0.03,
                     "max_drawdown": 0.01,
+                    "net_sharpe": 1.0,
                     "raw_score": raw_score
-                }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let icir = (fold_count > 1).then_some(0.1 / f64::EPSILON);
+        serde_json::json!({
+            "passed": true,
+            "score": adjusted_score,
+            "failure_reasons": [],
+            "evaluator_version": evaluator_version,
+            "evaluator_config": config,
+            "metrics": {
+                "predictive": {
+                    "row_count": fold_count * 30,
+                    "time_series_ic": 0.1,
+                    "time_series_rank_ic": 0.1,
+                    "time_series_icir": icir,
+                    "time_series_rank_icir": icir,
+                    "positive_ic_ratio": 1.0,
+                    "folds": predictive_folds
+                },
+                "row_count": fold_count * 30,
+                "trade_count": fold_count * 30,
+                "mean_net_return": 0.001,
+                "cumulative_net_return": fold_count as f64 * 0.03,
+                "max_drawdown": 0.01,
+                "net_sharpe": 1.0,
+                "raw_score": raw_score,
+                "adjusted_score": adjusted_score,
+                "folds": trading_folds
             }
         })
+    }
+
+    fn sealed_evaluation() -> serde_json::Value {
+        evaluation_fixture(SEALED_HOLDOUT_EVALUATOR_VERSION, 1)
+    }
+
+    fn walk_forward_evaluation() -> serde_json::Value {
+        evaluation_fixture(WALK_FORWARD_EVALUATOR_VERSION, 2)
     }
 
     fn persist_formula_promotion(
@@ -2418,16 +2530,36 @@ mod tests {
         now: DateTime<Utc>,
         engine: EngineKind,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
+        try_persist_formula_promotion_with_evidence(store, now, engine, true, None)
+    }
+
+    fn try_persist_formula_promotion_with_evidence(
+        store: &mut AlphaStore,
+        now: DateTime<Utc>,
+        engine: EngineKind,
+        include_walk_forward: bool,
+        sealed_revision_id: Option<&str>,
+    ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
             "signal".to_string(),
         )));
         let mut candidate_iteration = iteration();
         candidate_iteration.engine = engine;
+        let walk_forward = include_walk_forward.then(|| EvaluationRecord {
+            evaluation_id: "evaluation-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: "candidate-1".to_string(),
+            payload: walk_forward_evaluation(),
+            created_at: now,
+        });
+        candidate_iteration.evaluation_artifact_id = walk_forward
+            .as_ref()
+            .map(|evaluation| evaluation.evaluation_id.clone());
         store
             .append_iteration(
                 &candidate_iteration,
                 Some(("candidate-1", &candidate)),
-                None,
+                walk_forward.as_ref(),
             )
             .unwrap();
         let candidate_hash = store.mission_lineage("mission-1").unwrap().candidates[0]
@@ -2435,7 +2567,12 @@ mod tests {
             .clone();
         let evaluation = sealed_evaluation();
         let sealed = RegistryRevision {
-            revision_id: "sealed-evaluation:candidate-1".to_string(),
+            revision_id: sealed_revision_id.map(str::to_owned).unwrap_or_else(|| {
+                format!(
+                    "sealed-evaluation:{}:candidate-1",
+                    SEALED_HOLDOUT_EVALUATOR_VERSION
+                )
+            }),
             registry_kind: "sealed_evaluation".to_string(),
             asset_id: "candidate-1".to_string(),
             parent_revision_id: None,
@@ -2595,6 +2732,93 @@ mod tests {
     }
 
     #[test]
+    fn promotion_rejects_missing_walk_forward_evidence_without_partial_bundle() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+
+        let error = try_persist_formula_promotion_with_evidence(
+            &mut store,
+            Utc::now(),
+            EngineKind::ManualSeed,
+            false,
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("canonical walk-forward"));
+        assert!(matches!(
+            store.get_strategy_bundle("bundle:candidate-1"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn noncanonical_sealed_revision_cannot_promote_or_advance_holdout() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+
+        let error = try_persist_formula_promotion_with_evidence(
+            &mut store,
+            Utc::now(),
+            EngineKind::ManualSeed,
+            true,
+            Some("legacy-sealed-evaluation:candidate-1"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("revision id is not canonical"));
+        assert!(matches!(
+            store.get_strategy_bundle("bundle:candidate-1"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.get_promotion("promotion-1"),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(
+            store
+                .sealed_passed_candidate_for_mission("mission-1")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_walk_forward_evidence_is_not_canonical() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let mission = mission();
+        store.create_mission(&mission).unwrap();
+        let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
+            "signal".to_string(),
+        )));
+        let mut iteration = iteration();
+        iteration.evaluation_artifact_id = Some("evaluation-1".to_string());
+        let mut payload = walk_forward_evaluation();
+        payload["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("predictive");
+        let evaluation = EvaluationRecord {
+            evaluation_id: "evaluation-1".to_string(),
+            mission_id: mission.mission_id.clone(),
+            candidate_id: "candidate-1".to_string(),
+            payload,
+            created_at: Utc::now(),
+        };
+        store
+            .append_iteration(
+                &iteration,
+                Some(("candidate-1", &candidate)),
+                Some(&evaluation),
+            )
+            .unwrap();
+
+        assert!(!store
+            .has_canonical_walk_forward_evidence(&mission, "candidate-1", &iteration, &candidate,)
+            .unwrap());
+    }
+
+    #[test]
     fn promotion_recomputes_sealed_config_and_metrics_hashes() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
@@ -2704,7 +2928,10 @@ mod tests {
         let evaluation = sealed_evaluation();
         store
             .put_registry_revision(&RegistryRevision {
-                revision_id: "sealed-evaluation:candidate-1".to_string(),
+                revision_id: format!(
+                    "sealed-evaluation:{}:candidate-1",
+                    SEALED_HOLDOUT_EVALUATOR_VERSION
+                ),
                 registry_kind: "sealed_evaluation".to_string(),
                 asset_id: "candidate-1".to_string(),
                 parent_revision_id: None,
@@ -2746,7 +2973,10 @@ mod tests {
             evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
             evaluator_config_hash,
             evaluation_metrics_hash,
-            sealed_evaluation_id: "sealed-evaluation:candidate-1".to_string(),
+            sealed_evaluation_id: format!(
+                "sealed-evaluation:{}:candidate-1",
+                SEALED_HOLDOUT_EVALUATOR_VERSION
+            ),
             sealed_evaluation_hash: evaluation_hash,
             bundle_id: bundle.bundle_id.clone(),
             bundle_hash: bundle.bundle_hash.clone(),
@@ -3412,7 +3642,10 @@ mod tests {
             .clone();
         store
             .put_registry_revision(&RegistryRevision {
-                revision_id: "sealed-evaluation:candidate-1".to_string(),
+                revision_id: format!(
+                    "sealed-evaluation:{}:candidate-1",
+                    SEALED_HOLDOUT_EVALUATOR_VERSION
+                ),
                 registry_kind: "sealed_evaluation".to_string(),
                 asset_id: "candidate-1".to_string(),
                 parent_revision_id: None,

@@ -1,4 +1,4 @@
-use crate::{evaluation::EngineContext, EngineProposal, ProposalEngine, RemainingBudget};
+use crate::{evaluation::ProposalContext, EngineProposal, ProposalEngine, RemainingBudget};
 use alpha_domain::{CandidateArtifact, EngineKind};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
 use serde::{Deserialize, Serialize};
@@ -131,14 +131,12 @@ impl ProposalEngine for OfflineRlEngine {
         &mut self,
         mission_id: &str,
         iteration_index: usize,
-        context: &EngineContext<'_>,
+        context: &ProposalContext<'_>,
         _remaining: &RemainingBudget,
     ) -> Result<EngineProposal, String> {
         let signal = context
-            .rows()
-            .last()
-            .ok_or_else(|| "offline RL requires research rows".to_string())?
-            .signal;
+            .latest_signal()
+            .ok_or_else(|| "offline RL requires research rows".to_string())?;
         let state = if signal > 0.0 {
             "positive"
         } else if signal < 0.0 {
@@ -210,7 +208,7 @@ mod tests {
             .propose(
                 "mission",
                 0,
-                &super::super::test_dataset().engine_context(),
+                &super::super::test_dataset().proposal_context(),
                 &RemainingBudget {
                     candidates: 1,
                     expansions: 0,

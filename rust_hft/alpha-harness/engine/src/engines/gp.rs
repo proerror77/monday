@@ -1,6 +1,6 @@
 use super::DeterministicRng;
 use crate::{
-    evaluation::EngineContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
+    evaluation::ProposalContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
     ProposalEngine, RemainingBudget,
 };
 use alpha_domain::{CandidateArtifact, EngineKind};
@@ -101,7 +101,7 @@ impl ProposalEngine for GeneticProgrammingEngine {
         &mut self,
         mission_id: &str,
         iteration_index: usize,
-        _context: &EngineContext<'_>,
+        _context: &ProposalContext<'_>,
         remaining: &RemainingBudget,
     ) -> Result<EngineProposal, String> {
         if remaining.expansions == 0 {
