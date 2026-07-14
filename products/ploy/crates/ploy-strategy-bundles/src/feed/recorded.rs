@@ -4,7 +4,7 @@
 //! NDJSON log. `RecordedFeed` replays the exact same update sequence back into
 //! the strategy runtime.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,56 @@ const FLUSH_EVERY_RECORDS: usize = 256;
 pub struct RecordingLimits {
     pub max_records: Option<u64>,
     pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingKind {
+    SpotPrice,
+    AggTrade,
+    Quote,
+    L2,
+    L2Depth,
+    EventDiscovered,
+    EventExpired,
+    SportsState,
+    SportsPregame,
+    SportsLive,
+    ReferencePrice,
+    Kline,
+}
+
+impl RecordingKind {
+    fn matches(self, update: &MarketUpdate) -> bool {
+        matches!(
+            (self, update),
+            (Self::SpotPrice, MarketUpdate::SpotPrice { .. })
+                | (Self::AggTrade, MarketUpdate::AggTrade { .. })
+                | (Self::Quote, MarketUpdate::Quote { .. })
+                | (Self::L2, MarketUpdate::L2 { .. })
+                | (Self::L2Depth, MarketUpdate::L2Depth { .. })
+                | (Self::EventDiscovered, MarketUpdate::EventDiscovered { .. })
+                | (Self::EventExpired, MarketUpdate::EventExpired { .. })
+                | (Self::SportsState, MarketUpdate::SportsState { .. })
+                | (Self::SportsPregame, MarketUpdate::SportsPregame { .. })
+                | (Self::SportsLive, MarketUpdate::SportsLive { .. })
+                | (Self::ReferencePrice, MarketUpdate::ReferencePrice { .. })
+                | (Self::Kline, MarketUpdate::Kline { .. })
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingPolicy {
+    pub limits: RecordingLimits,
+    /// Empty preserves the historical behavior of recording every update kind.
+    pub include_kinds: Vec<RecordingKind>,
+    /// Minimum event-time spacing between recorded quotes for the same token.
+    pub quote_sample_ms: Option<u64>,
+    /// Maximum number of bid/ask levels persisted per quote.
+    pub quote_depth_levels: Option<usize>,
+    /// Persist quotes only while their discovered event is active.
+    pub event_scoped_quotes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,11 +232,15 @@ impl Drop for MarketUpdateLogWriter {
 pub struct RecordingFeed<F> {
     inner: F,
     writer: Option<MarketUpdateLogWriter>,
+    policy: RecordingPolicy,
+    last_quote_recorded_at: HashMap<String, DateTime<Utc>>,
+    event_tokens: HashMap<String, [String; 2]>,
+    quote_token_end_times: HashMap<String, DateTime<Utc>>,
 }
 
 impl<F> RecordingFeed<F> {
     pub fn new(inner: F, path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::with_limits(inner, path, RecordingLimits::default())
+        Self::with_policy(inner, path, RecordingPolicy::default())
     }
 
     pub fn with_limits(
@@ -194,10 +248,109 @@ impl<F> RecordingFeed<F> {
         path: impl AsRef<Path>,
         limits: RecordingLimits,
     ) -> io::Result<Self> {
+        Self::with_policy(
+            inner,
+            path,
+            RecordingPolicy {
+                limits,
+                ..RecordingPolicy::default()
+            },
+        )
+    }
+
+    pub fn with_policy(
+        inner: F,
+        path: impl AsRef<Path>,
+        policy: RecordingPolicy,
+    ) -> io::Result<Self> {
         Ok(Self {
             inner,
-            writer: Some(MarketUpdateLogWriter::create_with_limits(path, limits)?),
+            writer: Some(MarketUpdateLogWriter::create_with_limits(
+                path,
+                policy.limits,
+            )?),
+            policy,
+            last_quote_recorded_at: HashMap::new(),
+            event_tokens: HashMap::new(),
+            quote_token_end_times: HashMap::new(),
         })
+    }
+
+    fn prepare_recorded_update(&mut self, update: &MarketUpdate) -> Option<MarketUpdate> {
+        if self.policy.event_scoped_quotes {
+            match update {
+                MarketUpdate::EventDiscovered {
+                    event_id,
+                    up_token,
+                    down_token,
+                    end_time,
+                    ..
+                } => {
+                    let tokens = [up_token.to_string(), down_token.to_string()];
+                    for token in &tokens {
+                        self.quote_token_end_times.insert(token.clone(), *end_time);
+                    }
+                    self.event_tokens.insert(event_id.to_string(), tokens);
+                }
+                MarketUpdate::EventExpired { event_id, .. } => {
+                    if let Some(tokens) = self.event_tokens.remove(event_id.as_ref()) {
+                        for token in tokens {
+                            self.quote_token_end_times.remove(&token);
+                        }
+                    }
+                }
+                MarketUpdate::Quote { token_id, ts, .. } => {
+                    if !self
+                        .quote_token_end_times
+                        .get(token_id.as_ref())
+                        .is_some_and(|end_time| *ts <= *end_time)
+                    {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !self.policy.include_kinds.is_empty()
+            && !self
+                .policy
+                .include_kinds
+                .iter()
+                .any(|kind| kind.matches(update))
+        {
+            return None;
+        }
+
+        let mut recorded = update.clone();
+        if let MarketUpdate::Quote {
+            token_id,
+            bid_levels,
+            ask_levels,
+            ts,
+            ..
+        } = &mut recorded
+        {
+            if let Some(sample_ms) = self.policy.quote_sample_ms.filter(|value| *value > 0) {
+                let sample_ms = i64::try_from(sample_ms).unwrap_or(i64::MAX);
+                if self
+                    .last_quote_recorded_at
+                    .get(token_id.as_ref())
+                    .is_some_and(|last| *ts < *last + chrono::Duration::milliseconds(sample_ms))
+                {
+                    return None;
+                }
+                self.last_quote_recorded_at
+                    .insert(token_id.to_string(), *ts);
+            }
+
+            if let Some(depth) = self.policy.quote_depth_levels {
+                bid_levels.truncate(depth);
+                ask_levels.truncate(depth);
+            }
+        }
+
+        Some(recorded)
     }
 }
 
@@ -208,9 +361,16 @@ where
 {
     async fn next(&mut self) -> Option<MarketUpdate> {
         let update = self.inner.next().await?;
+        let recorded_update = if self.writer.is_some() {
+            self.prepare_recorded_update(&update)
+        } else {
+            None
+        };
 
-        if let Some(writer) = self.writer.as_mut() {
-            match writer.append(&update) {
+        if let (Some(writer), Some(recorded_update)) =
+            (self.writer.as_mut(), recorded_update.as_ref())
+        {
+            match writer.append(recorded_update) {
                 Ok(AppendOutcome::Written) => {}
                 Ok(AppendOutcome::LimitReached) => {
                     info!(
@@ -296,6 +456,7 @@ impl Feed for RecordedFeed {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     fn temp_log_path(name: &str) -> PathBuf {
@@ -426,6 +587,130 @@ mod tests {
 
         assert_eq!(forwarded, updates);
         assert_eq!(replayed, updates[..2]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn recording_feed_bounds_prediction_market_tape_without_changing_forwarded_updates() {
+        let now = Utc::now();
+        let quote = |token: &str, millis: i64, bid: Decimal| MarketUpdate::Quote {
+            token_id: token.into(),
+            bid: Some(bid),
+            ask: Some(bid + dec!(0.01)),
+            bid_size: Some(dec!(10)),
+            ask_size: Some(dec!(11)),
+            bid_levels: vec![
+                ploy_market_contracts::BookLevel {
+                    price: bid,
+                    size: dec!(10),
+                },
+                ploy_market_contracts::BookLevel {
+                    price: bid - dec!(0.01),
+                    size: dec!(12),
+                },
+            ],
+            ask_levels: vec![
+                ploy_market_contracts::BookLevel {
+                    price: bid + dec!(0.01),
+                    size: dec!(11),
+                },
+                ploy_market_contracts::BookLevel {
+                    price: bid + dec!(0.02),
+                    size: dec!(13),
+                },
+            ],
+            ts: now + Duration::milliseconds(millis),
+        };
+        let updates = vec![
+            MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price: dec!(100000),
+                ts: now,
+            },
+            MarketUpdate::EventDiscovered {
+                event_id: "evt-1".into(),
+                symbol: "BTCUSDT".into(),
+                up_token: "up-1".into(),
+                down_token: "down-1".into(),
+                end_time: now + Duration::minutes(5),
+                window_secs: 300,
+                price_to_beat: Some(dec!(100000)),
+                resolved_up_won: None,
+            },
+            quote("up-1", 0, dec!(0.49)),
+            quote("up-1", 100, dec!(0.50)),
+            quote("down-1", 100, dec!(0.48)),
+            quote("up-1", 600, dec!(0.51)),
+            quote("orphan", 700, dec!(0.52)),
+            quote("up-1", 301_000, dec!(0.53)),
+            MarketUpdate::ReferencePrice {
+                symbol: "btc/usd".into(),
+                source: "chainlink".into(),
+                asset_class: "crypto".into(),
+                price: dec!(100001),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: now + Duration::seconds(1),
+            },
+        ];
+
+        let path = temp_log_path("recording-feed-bounded-prediction-market");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(updates.clone()),
+            &path,
+            RecordingPolicy {
+                limits: RecordingLimits::default(),
+                include_kinds: vec![
+                    RecordingKind::Quote,
+                    RecordingKind::EventDiscovered,
+                    RecordingKind::EventExpired,
+                    RecordingKind::ReferencePrice,
+                ],
+                quote_sample_ms: Some(500),
+                quote_depth_levels: Some(1),
+                event_scoped_quotes: true,
+            },
+        )
+        .unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Some(update) = feed.next().await {
+            forwarded.push(update);
+        }
+        drop(feed);
+
+        let mut replay = RecordedFeed::from_path(&path).unwrap();
+        let mut replayed = Vec::new();
+        while let Some(update) = replay.next().await {
+            replayed.push(update);
+        }
+
+        assert_eq!(forwarded, updates);
+        assert_eq!(replayed.len(), 5);
+        assert!(matches!(replayed[0], MarketUpdate::EventDiscovered { .. }));
+        let recorded_quotes = replayed
+            .iter()
+            .filter_map(|update| match update {
+                MarketUpdate::Quote {
+                    token_id,
+                    bid,
+                    bid_levels,
+                    ask_levels,
+                    ..
+                } => Some((token_id.as_ref(), *bid, bid_levels.len(), ask_levels.len())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recorded_quotes,
+            vec![
+                ("up-1", Some(dec!(0.49)), 1, 1),
+                ("down-1", Some(dec!(0.48)), 1, 1),
+                ("up-1", Some(dec!(0.51)), 1, 1),
+            ]
+        );
+        assert!(matches!(replayed[4], MarketUpdate::ReferencePrice { .. }));
 
         let _ = fs::remove_file(path);
     }

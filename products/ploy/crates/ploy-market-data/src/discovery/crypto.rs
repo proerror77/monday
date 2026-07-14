@@ -54,6 +54,9 @@ async fn normalize_crypto_market(
     let question = market.question.as_deref().unwrap_or("");
     let event = market.events.as_ref().and_then(|events| events.first());
     let market_start_time = crypto_market_start_time(market, event);
+    if market_start_time.is_some_and(|start_time| start_time > now) {
+        return None;
+    }
 
     let strategy_symbol = infer_crypto_strategy_symbol(question)?;
 
@@ -70,6 +73,9 @@ async fn normalize_crypto_market(
     }
 
     let end_time = market.end_date?;
+    if end_time <= now {
+        return None;
+    }
     let window_secs = (end_time - now).num_seconds().max(0) as u64;
     let market_window_secs = infer_market_window_secs(market_start_time, end_time, question);
     if !matches!(market_window_secs, Some(300 | 900)) {
@@ -236,11 +242,29 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
 
-    use super::{crypto_market_start_time, discover_crypto_markets, infer_market_window_secs};
+    use super::{
+        crypto_market_start_time, discover_crypto_markets, infer_crypto_strategy_symbol,
+        infer_market_window_secs,
+    };
     use crate::reference_prices::{
         new_reference_price_registry, upsert_reference_price, ReferenceAssetClass,
         ReferencePriceKey, ReferencePriceSnapshot, ReferencePriceSource,
     };
+
+    #[test]
+    fn recognizes_all_seven_configured_crypto_assets() {
+        for (question, symbol) in [
+            ("Bitcoin Up or Down 5m", "BTCUSDT"),
+            ("Ethereum Up or Down 5m", "ETHUSDT"),
+            ("Solana Up or Down 5m", "SOLUSDT"),
+            ("XRP Up or Down 5m", "XRPUSDT"),
+            ("Dogecoin Up or Down 5m", "DOGEUSDT"),
+            ("Hyperliquid Up or Down 5m", "HYPEUSDT"),
+            ("BNB Up or Down 5m", "BNBUSDT"),
+        ] {
+            assert_eq!(infer_crypto_strategy_symbol(question), Some(symbol));
+        }
+    }
 
     #[tokio::test]
     async fn normalizes_crypto_updown_markets_into_catalog_descriptors() {
@@ -335,6 +359,32 @@ mod tests {
         .await;
 
         assert_eq!(discovered.len(), 1, "15-minute markets should be kept");
+    }
+
+    #[tokio::test]
+    async fn ignores_crypto_markets_that_have_not_started() {
+        let registry = new_reference_price_registry();
+        let market: polymarket_client_sdk::gamma::types::response::Market =
+            serde_json::from_value(json!({
+                "id": "market-future",
+                "question": "Will Bitcoin be up or down in 15 minutes?",
+                "endDate": "2026-04-06T00:30:00Z",
+                "eventStartTime": "2026-04-06T00:15:00Z",
+                "clobTokenIds": "[\"111\",\"222\"]",
+                "active": true,
+                "acceptingOrders": true
+            }))
+            .unwrap();
+
+        let discovered = discover_crypto_markets(
+            &[market],
+            &["BTCUSDT".to_string()],
+            &registry,
+            Utc.with_ymd_and_hms(2026, 4, 6, 0, 10, 0).unwrap(),
+        )
+        .await;
+
+        assert!(discovered.is_empty());
     }
 
     #[tokio::test]

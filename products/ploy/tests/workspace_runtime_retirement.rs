@@ -277,3 +277,44 @@ fn account_operation_mutations_reject_before_legacy_write_paths() {
         }
     }
 }
+
+#[test]
+fn monday_polymarket_data_service_is_read_only_and_fail_closed() {
+    let ploy_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let monday_root = ploy_root
+        .parent()
+        .and_then(Path::parent)
+        .expect("products/ploy must live inside Monday");
+    let config =
+        fs::read_to_string(monday_root.join("deployment/aliyun/polymarket-market-tape.toml"))
+            .expect("read Polymarket market-data config");
+    let service =
+        fs::read_to_string(monday_root.join("deployment/aliyun/polymarket-market-tape.service"))
+            .expect("read Polymarket market-data service");
+
+    for required in [
+        "mode = \"dryrun\"",
+        "strategy_variant = \"noop\"",
+        "market_data_source = \"external_direct\"",
+        "record_market_updates_to = \"/data/monday/spool/polymarket/market-updates.ndjson\"",
+        "record_market_updates_include_kinds = [\"quote\", \"event_discovered\", \"event_expired\", \"reference_price\"]",
+        "record_market_updates_quote_sample_ms = 1000",
+        "record_market_updates_quote_depth_levels = 1",
+        "record_market_updates_event_scoped_quotes = true",
+        "symbols = [\"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\", \"XRPUSDT\", \"DOGEUSDT\", \"HYPEUSDT\", \"BNBUSDT\"]",
+    ] {
+        assert!(config.contains(required), "config missing {required}");
+    }
+    for required in [
+        "User=hftcollector",
+        "--dry-run",
+        "NoNewPrivileges=true",
+        "ProtectSystem=strict",
+        "ReadWritePaths=/data/monday/spool/polymarket",
+    ] {
+        assert!(service.contains(required), "service missing {required}");
+    }
+    for forbidden in ["live-execution", "PRIVATE_KEY", "EnvironmentFile="] {
+        assert!(!service.contains(forbidden), "service contains {forbidden}");
+    }
+}

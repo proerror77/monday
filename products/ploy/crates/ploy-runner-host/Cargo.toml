@@ -20,6 +20,7 @@ ploy-deployments.workspace = true
 ploy-market-data = { path = "../ploy-market-data", optional = true, default-features = false }
 ploy-strategy-bundles = { path = "../ploy-strategy-bundles", default-features = false }
 ploy-strategy-runtime = { path = "../ploy-strategy-runtime", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "chrono"], optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing.workspace = true

@@ -7,7 +7,7 @@
 //! The same `StrategyRuntime` drives backtest, dry-run, and live trading —
 //! only the trait implementations differ.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use ploy_trading::{OrderState, PnlSnapshot, RiskSnapshot, TradingIntent, TradingRuntime};
@@ -207,6 +207,9 @@ where
         let mut full_depth_fills_observed: u64 = 0;
         let mut last_eval_ts: Option<DateTime<Utc>> = None;
         let mut pending_live_orders = self.initial_pending_live_orders();
+        let mut event_tokens: HashMap<String, [String; 2]> = HashMap::new();
+        let mut quote_token_end_times: HashMap<String, DateTime<Utc>> = HashMap::new();
+        let mut retired_quote_tokens: HashSet<String> = HashSet::new();
 
         info!(
             mode = ?self.config.mode,
@@ -216,6 +219,55 @@ where
 
         'runtime: while let Some(update) = self.feed.next().await {
             updates_processed += 1;
+
+            match &update {
+                MarketUpdate::EventDiscovered {
+                    event_id,
+                    up_token,
+                    down_token,
+                    end_time,
+                    ..
+                } => {
+                    let tokens = [up_token.to_string(), down_token.to_string()];
+                    retired_quote_tokens.remove(&tokens[0]);
+                    retired_quote_tokens.remove(&tokens[1]);
+                    quote_token_end_times.insert(tokens[0].clone(), *end_time);
+                    quote_token_end_times.insert(tokens[1].clone(), *end_time);
+                    event_tokens.insert(event_id.to_string(), tokens);
+                }
+                MarketUpdate::EventExpired { event_id, .. } => {
+                    if let Some(tokens) = event_tokens.remove(event_id.as_ref()) {
+                        for token in tokens {
+                            quote_token_end_times.remove(&token);
+                            retired_quote_tokens.insert(token);
+                        }
+                    }
+                }
+                MarketUpdate::Quote { token_id, ts, .. } => {
+                    let expired = retired_quote_tokens.contains(token_id.as_ref())
+                        || quote_token_end_times
+                            .get(token_id.as_ref())
+                            .is_some_and(|end_time| *ts > *end_time);
+                    if expired {
+                        retired_quote_tokens.insert(token_id.to_string());
+                        debug!(
+                            token_id = %token_id,
+                            "Dropping quote for expired event token before runtime evaluation",
+                        );
+                        if self
+                            .config
+                            .max_updates
+                            .is_some_and(|max| updates_processed >= max)
+                        {
+                            info!(updates = updates_processed, "Max updates reached, stopping");
+                            break 'runtime;
+                        }
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+
             if let MarketUpdate::Quote {
                 bid_levels,
                 ask_levels,
@@ -1025,6 +1077,10 @@ mod tests {
         updates: Arc<Mutex<Vec<&'static str>>>,
     }
 
+    struct QuoteTokenStrategy {
+        tokens: Arc<Mutex<Vec<String>>>,
+    }
+
     impl StrategyLogic for CountingStrategy {
         fn on_update(
             &mut self,
@@ -1047,6 +1103,26 @@ mod tests {
 
         fn name(&self) -> &str {
             "counting_strategy"
+        }
+    }
+
+    impl StrategyLogic for QuoteTokenStrategy {
+        fn on_update(
+            &mut self,
+            update: &MarketUpdate,
+            _positions: &PositionLedger,
+            _orders: &OrderLedger,
+        ) -> Vec<StrategyDecision> {
+            if let MarketUpdate::Quote { token_id, .. } = update {
+                self.tokens.lock().unwrap().push(token_id.to_string());
+            }
+            vec![]
+        }
+
+        fn on_fill(&mut self, _fill: &FillRecord) {}
+
+        fn name(&self) -> &str {
+            "quote_token_strategy"
         }
     }
 
@@ -1125,6 +1201,83 @@ mod tests {
             seen_updates.lock().unwrap().as_slice(),
             ["spot", "quote", "quote"]
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_drops_quotes_for_expired_event_tokens_before_strategy_evaluation() {
+        let now = Utc::now();
+        let seen_tokens = Arc::new(Mutex::new(Vec::new()));
+        let feed = MultiUpdateFeed {
+            updates: VecDeque::from(vec![
+                MarketUpdate::EventDiscovered {
+                    event_id: "old".into(),
+                    symbol: "BTCUSDT".into(),
+                    up_token: "up-old".into(),
+                    down_token: "down-old".into(),
+                    end_time: now + Duration::seconds(1),
+                    window_secs: 300,
+                    price_to_beat: Some(dec!(100000)),
+                    resolved_up_won: None,
+                },
+                MarketUpdate::EventDiscovered {
+                    event_id: "next".into(),
+                    symbol: "BTCUSDT".into(),
+                    up_token: "up-next".into(),
+                    down_token: "down-next".into(),
+                    end_time: now + Duration::seconds(120),
+                    window_secs: 300,
+                    price_to_beat: Some(dec!(100000)),
+                    resolved_up_won: None,
+                },
+                MarketUpdate::Quote {
+                    token_id: "up-old".into(),
+                    bid: Some(dec!(0.99)),
+                    ask: Some(dec!(1.00)),
+                    bid_size: None,
+                    ask_size: None,
+                    bid_levels: vec![],
+                    ask_levels: vec![],
+                    ts: now + Duration::seconds(2),
+                },
+                MarketUpdate::EventExpired {
+                    event_id: "old".into(),
+                    end_time: now + Duration::seconds(1),
+                    resolved_up_won: None,
+                },
+                MarketUpdate::Quote {
+                    token_id: "up-next".into(),
+                    bid: Some(dec!(0.49)),
+                    ask: Some(dec!(0.50)),
+                    bid_size: None,
+                    ask_size: None,
+                    bid_levels: vec![],
+                    ask_levels: vec![],
+                    ts: now + Duration::seconds(2),
+                },
+            ]),
+        };
+        let strategy = QuoteTokenStrategy {
+            tokens: seen_tokens.clone(),
+        };
+        let config = RuntimeConfig {
+            mode: RuntimeMode::DryRun,
+            throttle_hz: None,
+            max_updates: None,
+            skip_settlement_exits: false,
+        };
+
+        let mut runtime = StrategyRuntime::new(
+            strategy,
+            feed,
+            RejectingExecutor,
+            Box::new(NullRecorder),
+            config,
+        );
+        let result = runtime.run().await;
+
+        assert_eq!(result.updates_processed, 5);
+        assert_eq!(result.quote_updates_observed, 1);
+        assert_eq!(seen_tokens.lock().unwrap().as_slice(), ["up-next"]);
     }
 
     struct FillCountingStrategy {
