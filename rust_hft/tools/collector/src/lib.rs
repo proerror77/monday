@@ -1,6 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 pub mod feature_matrix;
+pub mod lob_archiver;
 pub mod source_catalog;
 
 pub use feature_matrix::{
