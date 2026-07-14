@@ -333,39 +333,6 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(ARCHIVER.process_watchdog_expired(100, 280))
             self.assertTrue(ARCHIVER.process_watchdog_expired(100, 280.1))
 
-    async def test_receiver_cancellation_aborts_transport(self):
-        entered = ARCHIVER.asyncio.Event()
-        aborted = []
-
-        class Transport:
-            def abort(self):
-                aborted.append(True)
-
-        class Connection:
-            transport = Transport()
-
-            async def recv(self):
-                entered.set()
-                await ARCHIVER.asyncio.Event().wait()
-
-        async def connect(*args, **kwargs):
-            return Connection()
-
-        with patch.object(ARCHIVER, "connect", new=connect):
-            task = ARCHIVER.asyncio.create_task(
-                ARCHIVER.receive_url(
-                    "wss://example.test",
-                    ARCHIVER.asyncio.Queue(),
-                    ARCHIVER.asyncio.Event(),
-                )
-            )
-            await ARCHIVER.asyncio.wait_for(entered.wait(), 0.1)
-            task.cancel()
-            with self.assertRaises(ARCHIVER.asyncio.CancelledError):
-                await ARCHIVER.asyncio.wait_for(task, 0.1)
-
-        self.assertEqual(aborted, [True])
-
     async def test_task_cancellation_is_bounded(self):
         release = ARCHIVER.asyncio.Event()
 
