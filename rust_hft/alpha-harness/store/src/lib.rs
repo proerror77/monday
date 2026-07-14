@@ -29,6 +29,10 @@ const MIGRATION_003: &str = include_str!("../migrations/003_loop_runs_and_engine
 const INTEGRITY_KEY_ENV: &str = "ALPHA_STORE_INTEGRITY_KEY_HEX";
 const INTEGRITY_KEY_BYTES: usize = 32;
 
+fn sealed_evaluation_revision_id(candidate_id: &str, evaluator_version: &str) -> String {
+    format!("sealed-evaluation:{evaluator_version}:{candidate_id}")
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("record already exists")]
@@ -922,6 +926,13 @@ impl AlphaStore {
                 "promotion candidate lacks canonical walk-forward evidence".to_string(),
             ));
         }
+        let expected_sealed_evaluation_id =
+            sealed_evaluation_revision_id(&bundle.candidate_id, &bundle.evaluator_version);
+        if promotion.sealed_evaluation_id != expected_sealed_evaluation_id {
+            return Err(StoreError::Domain(
+                "promotion sealed evaluation revision id is not canonical".to_string(),
+            ));
+        }
         let sealed = self.get_registry_revision(&promotion.sealed_evaluation_id)?;
         let sealed_evaluation = sealed
             .payload
@@ -1339,13 +1350,18 @@ impl AlphaStore {
             let Some(evaluation_value) = revision.payload.get("evaluation") else {
                 continue;
             };
-            let evaluator_version = evaluation_value
+            let Some(evaluator_version) = evaluation_value
                 .get("evaluator_version")
-                .and_then(serde_json::Value::as_str);
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
             if !matches!(
                 evaluator_version,
-                Some(SEALED_HOLDOUT_EVALUATOR_VERSION | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION)
-            ) {
+                SEALED_HOLDOUT_EVALUATOR_VERSION | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+            ) || revision.revision_id
+                != sealed_evaluation_revision_id(&revision.asset_id, evaluator_version)
+            {
                 continue;
             }
             let evaluation: CandidateEvaluation =
@@ -1382,13 +1398,11 @@ impl AlphaStore {
                 serde_json::from_str(&candidate_json).map_err(serialization_error)?;
             let evaluator_matches_artifact = matches!(
                 (&candidate_artifact, evaluator_version),
-                (
-                    CandidateArtifact::Formula(_),
-                    Some(SEALED_HOLDOUT_EVALUATOR_VERSION)
-                ) | (
-                    CandidateArtifact::OnnxModel(_),
-                    Some(ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION)
-                )
+                (CandidateArtifact::Formula(_), SEALED_HOLDOUT_EVALUATOR_VERSION)
+                    | (
+                        CandidateArtifact::OnnxModel(_),
+                        ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+                    )
             );
             let candidate_iteration: ResearchIteration = read_json_row(
                 &self.connection,
@@ -2514,7 +2528,7 @@ mod tests {
         now: DateTime<Utc>,
         engine: EngineKind,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
-        try_persist_formula_promotion_with_evidence(store, now, engine, true)
+        try_persist_formula_promotion_with_evidence(store, now, engine, true, None)
     }
 
     fn try_persist_formula_promotion_with_evidence(
@@ -2522,6 +2536,7 @@ mod tests {
         now: DateTime<Utc>,
         engine: EngineKind,
         include_walk_forward: bool,
+        sealed_revision_id: Option<&str>,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
             "signal".to_string(),
@@ -2550,10 +2565,12 @@ mod tests {
             .clone();
         let evaluation = sealed_evaluation();
         let sealed = RegistryRevision {
-            revision_id: format!(
-                "sealed-evaluation:{}:candidate-1",
-                SEALED_HOLDOUT_EVALUATOR_VERSION
-            ),
+            revision_id: sealed_revision_id.map(str::to_owned).unwrap_or_else(|| {
+                format!(
+                    "sealed-evaluation:{}:candidate-1",
+                    SEALED_HOLDOUT_EVALUATOR_VERSION
+                )
+            }),
             registry_kind: "sealed_evaluation".to_string(),
             asset_id: "candidate-1".to_string(),
             parent_revision_id: None,
@@ -2722,6 +2739,7 @@ mod tests {
             Utc::now(),
             EngineKind::ManualSeed,
             false,
+            None,
         )
         .unwrap_err();
 
@@ -2730,6 +2748,37 @@ mod tests {
             store.get_strategy_bundle("bundle:candidate-1"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn noncanonical_sealed_revision_cannot_promote_or_advance_holdout() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+
+        let error = try_persist_formula_promotion_with_evidence(
+            &mut store,
+            Utc::now(),
+            EngineKind::ManualSeed,
+            true,
+            Some("legacy-sealed-evaluation:candidate-1"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("revision id is not canonical"));
+        assert!(matches!(
+            store.get_strategy_bundle("bundle:candidate-1"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.get_promotion("promotion-1"),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(
+            store
+                .sealed_passed_candidate_for_mission("mission-1")
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
