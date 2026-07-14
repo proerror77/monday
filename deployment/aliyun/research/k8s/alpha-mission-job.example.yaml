@@ -190,7 +190,10 @@ spec:
                               archive.write(path, path.relative_to("/work"))
               payload = bundle.read_bytes()
               request = urllib.request.Request(
-                  os.environ["RESULT_PUT_URL"], data=payload, method="PUT"
+                  os.environ["RESULT_PUT_URL"],
+                  data=payload,
+                  method="PUT",
+                  headers={"x-oss-forbid-overwrite": "true"},
               )
               with urllib.request.urlopen(request, timeout=120) as response:
                   if response.status not in (200, 201):
