@@ -202,6 +202,42 @@ Docker Desktop can validate an arm64 image locally, but compiling x86 Rust under
 QEMU is slower and can fail inside the emulator even when the Dockerfile and
 source are valid.
 
+Keep the amd64 builder disposable, but attach one reusable 200 GiB PL1 ESSD as
+`/build-cache`. Create it with `DeleteWithInstance=false`, format it only on the
+first attachment, mount it by UUID from `/etc/fstab`, then run:
+
+```bash
+deployment/aliyun/research/builder/enable-persistent-build-cache.sh
+```
+
+The script refuses to overwrite an unrelated `/etc/docker/daemon.json`. Once
+Docker reports `/build-cache/docker` as its root, the existing BuildKit cache
+mounts in `Dockerfile.research` survive builder stop/recreation without adding
+`cargo-chef` or `sccache`.
+
+Example Tokyo disk lifecycle:
+
+```bash
+aliyun ecs CreateDisk \
+  --RegionId ap-northeast-1 \
+  --ZoneId REPLACE_BUILDER_ZONE \
+  --DiskName monday-rust-build-cache \
+  --DiskCategory cloud_essd \
+  --PerformanceLevel PL1 \
+  --Size 200
+
+aliyun ecs AttachDisk \
+  --RegionId ap-northeast-1 \
+  --InstanceId REPLACE_BUILDER_INSTANCE_ID \
+  --DiskId REPLACE_CACHE_DISK_ID \
+  --DeleteWithInstance false
+```
+
+On first attachment only, identify the new empty device with `lsblk`, create an
+ext4 filesystem, mount it at `/build-cache`, and persist its UUID in
+`/etc/fstab`. On later builders, attach and mount the existing filesystem; do
+not format it again.
+
 The image contains three stable entrypoints:
 
 - `/usr/local/bin/hft-backtest`

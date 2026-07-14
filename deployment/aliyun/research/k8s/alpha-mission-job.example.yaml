@@ -31,183 +31,60 @@ spec:
         - name: alpha-mission
           image: monday/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
           imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-ec"]
+          command: ["/usr/local/bin/alpha-harness"]
           args:
-            - |
-              mkdir -p /work/input /work/artifacts /work/results
-              case "$ENGINE" in
-                mcts|bayesian) ;;
-                *) echo "unsupported durable Mission engine: $ENGINE" >&2; exit 2 ;;
-              esac
-              python3 - <<'PY'
-              import hashlib
-              import json
-              import os
-              import urllib.request
-
-              urllib.request.urlretrieve(os.environ["FEATURE_URL"], "/work/input/features.jsonl")
-              urllib.request.urlretrieve(
-                  os.environ["MATERIALIZATION_URL"],
-                  "/work/input/materialization.json",
-              )
-              materialization_bytes = open("/work/input/materialization.json", "rb").read()
-              materialization_hash = hashlib.sha256(materialization_bytes).hexdigest()
-              if materialization_hash != os.environ["MATERIALIZATION_SHA256"]:
-                  raise RuntimeError("materialization manifest SHA256 mismatch")
-              materialization = json.loads(materialization_bytes)
-              feature_hash = hashlib.sha256(
-                  open("/work/input/features.jsonl", "rb").read()
-              ).hexdigest()
-              if feature_hash != materialization["artifact_sha256"]:
-                  raise RuntimeError("PIT feature artifact does not match materialization")
-              if not materialization.get("source_segments"):
-                  raise RuntimeError("materialization has no raw source evidence")
-              PY
-              alpha-harness data import-features \
-                --db /work/results/alpha.duckdb \
-                --mission-id "$DATA_MISSION_ID" \
-                --input /work/input/features.jsonl \
-                --artifact-dir /work/artifacts \
-                --manifest-out /work/results/feature-manifest.json \
-                > /work/results/data-import.json
-              python3 - <<'PY'
-              import json
-              import os
-              from datetime import datetime, timezone
-
-              now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-              dataset = json.load(open("/work/results/feature-manifest.json"))
-              materialization = json.load(open("/work/input/materialization.json"))
-              source_key = f"binance-{materialization['market']}-lob"
-              if dataset["symbol"] != materialization["symbol"]:
-                  raise RuntimeError("registered feature symbol does not match raw lineage")
-              if dataset["source_revisions"].get(source_key) != materialization["source_revision"]:
-                  raise RuntimeError("registered feature revision does not match raw lineage")
-              with open("/work/results/materialization.json", "w") as target:
-                  json.dump(materialization, target, indent=2, sort_keys=True)
-              mission = {
-                  "mission_id": os.environ["MISSION_ID"],
-                  "objective": "Find a cost-aware, out-of-sample LOB factor for BTCUSDT USD-M",
-                  "hypothesis_scope": "Top-5 LOB imbalance and order-flow dynamics at a five-second horizon",
-                  "mutable_scope": ["factor_ast"],
-                  "dataset_manifest_id": dataset["manifest_id"],
-                  "baseline_artifact_id": None,
-                  "validation_mode": "MissionValidator",
-                  "validator_spec": {"multiple_testing_trials": 8},
-                  "search_budget": {
-                      "max_candidates": 8,
-                      "max_expansions": 40,
-                      "max_tokens": 0,
-                      "max_seconds": 300,
-                  },
-                  "completion_policy": {"min_kept_candidates": 1},
-                  "prompt_snapshot_id": None,
-                  "search_policy_snapshot_id": f"{os.environ['ENGINE']}-lob-pit-v1",
-                  "status": "Pending",
-                  "terminal_reason": None,
-                  "created_at": now,
-                  "updated_at": now,
-              }
-              with open("/work/results/mission.json", "w") as target:
-                  json.dump(mission, target, indent=2, sort_keys=True)
-              PY
-              alpha-harness mission create \
-                --db /work/results/alpha.duckdb \
-                --mission /work/results/mission.json \
-                > /work/results/mission-create.json
-              alpha-harness mission run \
-                --db /work/results/alpha.duckdb \
-                --mission-id "$MISSION_ID" \
-                --engine "$ENGINE" \
-                --seed "$SEED" \
-                --feature-fields "$FEATURE_FIELDS" \
-                --dataset-manifest /work/results/feature-manifest.json \
-                --initial-train-rows 800 \
-                --validation-rows 240 \
-                --fold-count 3 \
-                --purge-rows 5 \
-                --embargo-rows 5 \
-                --sealed-holdout-rows 300 \
-                --fee-bps 2.0 \
-                --funding-bps 0.0 \
-                --latency-bps 0.5 \
-                --max-new-iterations 8 \
-                > /work/results/mission-run.json
-              alpha-harness mission status \
-                --db /work/results/alpha.duckdb \
-                --mission-id "$MISSION_ID" \
-                > /work/results/mission-status.json
-              alpha-harness candidate list \
-                --db /work/results/alpha.duckdb \
-                --mission-id "$MISSION_ID" \
-                > /work/results/candidates.json
-              python3 - <<'PY'
-              import json
-
-              evidence = json.load(open("/work/results/candidates.json"))
-              kept = sorted({
-                  item["record"]["candidate_id"]
-                  for item in evidence["evaluations"]
-                  if item["record"]["payload"].get("passed") is True
-                  and item["record"]["payload"].get("evaluator_version")
-                      == "purged-walk-forward-v2"
-              })
-              with open("/work/results/kept-candidates.txt", "w") as target:
-                  target.write("".join(f"{candidate_id}\n" for candidate_id in kept))
-              PY
-              : > /work/results/sealed-evaluations.jsonl
-              while IFS= read -r candidate_id; do
-                [ -n "$candidate_id" ] || continue
-                alpha-harness evaluate \
-                  --db /work/results/alpha.duckdb \
-                  --mission-id "$MISSION_ID" \
-                  --candidate-id "$candidate_id" \
-                  --dataset-manifest /work/results/feature-manifest.json \
-                  --initial-train-rows 800 \
-                  --validation-rows 240 \
-                  --fold-count 3 \
-                  --purge-rows 5 \
-                  --embargo-rows 5 \
-                  --sealed-holdout-rows 300 \
-                  --fee-bps 2.0 \
-                  --funding-bps 0.0 \
-                  --latency-bps 0.5 \
-                  >> /work/results/sealed-evaluations.jsonl
-              done < /work/results/kept-candidates.txt
-              python3 - <<'PY'
-              import hashlib
-              import json
-              import os
-              import urllib.request
-              import zipfile
-              from pathlib import Path
-
-              bundle = Path("/work/results.zip")
-              with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                  for root in (Path("/work/results"), Path("/work/artifacts")):
-                      for path in sorted(root.rglob("*")):
-                          if path.is_file():
-                              archive.write(path, path.relative_to("/work"))
-              payload = bundle.read_bytes()
-              request = urllib.request.Request(
-                  os.environ["RESULT_PUT_URL"],
-                  data=payload,
-                  method="PUT",
-                  headers={
-                      "Content-Type": "application/zip",
-                      "x-oss-forbid-overwrite": "true",
-                  },
-              )
-              with urllib.request.urlopen(request, timeout=120) as response:
-                  if response.status not in (200, 201):
-                      raise RuntimeError(f"result upload failed: {response.status}")
-              print(json.dumps({
-                  "mission_id": os.environ["MISSION_ID"],
-                  "engine": os.environ["ENGINE"],
-                  "bundle_bytes": len(payload),
-                  "bundle_sha256": hashlib.sha256(payload).hexdigest(),
-              }, sort_keys=True))
-              PY
+            - mission
+            - execute
+            - --work-dir
+            - /work
+            - --feature-url
+            - $(FEATURE_URL)
+            - --materialization-url
+            - $(MATERIALIZATION_URL)
+            - --materialization-sha256
+            - $(MATERIALIZATION_SHA256)
+            - --result-put-url
+            - $(RESULT_PUT_URL)
+            - --data-mission-id
+            - $(DATA_MISSION_ID)
+            - --mission-id
+            - $(MISSION_ID)
+            - --engine
+            - $(ENGINE)
+            - --seed
+            - $(SEED)
+            - --feature-fields
+            - $(FEATURE_FIELDS)
+            - --max-candidates
+            - "8"
+            - --max-expansions
+            - "40"
+            - --max-seconds
+            - "300"
+            - --max-new-iterations
+            - "8"
+            - --objective
+            - Find a cost-aware, out-of-sample LOB factor for BTCUSDT USD-M
+            - --hypothesis-scope
+            - Top-5 LOB imbalance and order-flow dynamics at a five-second horizon
+            - --initial-train-rows
+            - "800"
+            - --validation-rows
+            - "240"
+            - --fold-count
+            - "3"
+            - --purge-rows
+            - "5"
+            - --embargo-rows
+            - "5"
+            - --sealed-holdout-rows
+            - "300"
+            - --fee-bps
+            - "2.0"
+            - --funding-bps
+            - "0.0"
+            - --latency-bps
+            - "0.5"
           env:
             - name: FEATURE_URL
               valueFrom:
