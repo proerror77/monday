@@ -63,10 +63,9 @@ Seven documents from local PLOY commit `5de411bbe8889284b47fe9932821af077d2962fc
 - `PloyDaemon::boot` installs `DisabledLiveExecutionGateway`; production code
   cannot inject the private Polymarket gateway, and the standard runner `full`
   feature does not enable its legacy control-plane live executor.
-- The active account-operation tools may still build and validate typed plans,
-  inspect public/account state, and report approval status. Order submission,
-  approval transactions, redemption, and reconciliation mutations reject
-  unconditionally inside Monday, even when former standalone write flags are set.
+- The standalone Node account-operation packages are retired. Polymarket account,
+  order, cancellation, and reconciliation operations remain in `rust_hft`; PLOY
+  does not retain a second execution path.
 
 ## Operations and archive boundary
 

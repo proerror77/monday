@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-source_path="$(readlink -f "${BASH_SOURCE[0]}")"
-tool_dir="$(cd "$(dirname "${source_path}")" && pwd -P)"
-exec "${tool_dir}/../../bin/node" "${tool_dir}/cli.js" "$@"

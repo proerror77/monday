@@ -44,12 +44,3 @@ export async function harnessEventsPath(): Promise<string> {
   await mkdir(dirname(eventsPath), { recursive: true });
   return eventsPath;
 }
-
-export async function harnessSelfModificationsPath(): Promise<string> {
-  const configured = process.env.PLOY_HARNESS_SELF_MODIFICATIONS_FILE;
-  const selfModPath = configured
-    ? resolve(configured)
-    : resolve(dirname(await agentRunsLogPath()), "harness-self-modifications.jsonl");
-  await mkdir(dirname(selfModPath), { recursive: true });
-  return selfModPath;
-}

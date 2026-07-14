@@ -24,31 +24,10 @@ class TradeHostPostflightTests(unittest.TestCase):
         self.root = pathlib.Path(self.temp.name)
         release = self.root / "releases" / SHA
         (release / "bin").mkdir(parents=True)
-        for name in ("ployd", "ployctl", "ploy-runner", "node"):
+        for name in ("ployd", "ployctl", "ploy-runner"):
             executable(release / "bin" / name, "#!/bin/sh\nexit 0\n")
-        account_ops = release / "tools" / "polymarket-account-ops"
-        account_ops.mkdir(parents=True)
-        executable(account_ops / "cli.js", "#!/usr/bin/env node\n")
-        executable(account_ops / "ploy-account-ops", "#!/bin/sh\nexit 0\n")
-        (account_ops / "account_ops.js").write_text("module.exports = {};\n", encoding="utf-8")
-        predict_ops = release / "tools" / "predict-fun-account-ops"
-        predict_ops.mkdir(parents=True)
-        executable(predict_ops / "cli.js", "#!/usr/bin/env node\n")
-        executable(predict_ops / "ploy-predict-account-ops", "#!/bin/sh\nexit 0\n")
-        (predict_ops / "account_ops.js").write_text("module.exports = {};\n", encoding="utf-8")
         (self.root / "bin").mkdir(parents=True)
-        (self.root / "bin" / "ploy-account-ops").symlink_to(
-            pathlib.Path("../current/tools/polymarket-account-ops/ploy-account-ops")
-        )
-        (self.root / "bin" / "ploy-predict-account-ops").symlink_to(
-            pathlib.Path("../current/tools/predict-fun-account-ops/ploy-predict-account-ops")
-        )
-        account_state = self.root / "data" / "account-ops"
-        account_state.mkdir(parents=True, mode=0o700)
-        account_state.chmod(0o700)
-        manifest_files = [release / "bin" / name for name in ("ployd", "ployctl", "ploy-runner", "node")]
-        manifest_files.extend([account_ops / "cli.js", account_ops / "account_ops.js", account_ops / "ploy-account-ops"])
-        manifest_files.extend([predict_ops / "cli.js", predict_ops / "account_ops.js", predict_ops / "ploy-predict-account-ops"])
+        manifest_files = [release / "bin" / name for name in ("ployd", "ployctl", "ploy-runner")]
         (release / "FILES.sha256").write_text(
             "".join(
                 f"{hashlib.sha256(item.read_bytes()).hexdigest()}  ./{item.relative_to(release)}\n"
@@ -63,11 +42,7 @@ class TradeHostPostflightTests(unittest.TestCase):
         (self.root / "current").symlink_to(pathlib.Path("releases") / SHA)
         (self.root / ".env").write_text(
             f"PLOY_RELEASE_SHA={SHA}\n"
-            f"PLOY_LIVE_APPROVAL_FILE={self.root}/data/live-approvals/pending.json\n"
-            "PLOY_ACCOUNT_OPS_WRITE_ENABLED=false\n"
-            "PLOY_PREDICT_ACCOUNT_OPS_WRITE_ENABLED=false\n"
-            "PLOY_PREDICT_APPROVAL_WRITE_ENABLED=false\n"
-            "PLOY_PREDICT_RECONCILE_WRITE_ENABLED=false\n",
+            f"PLOY_LIVE_APPROVAL_FILE={self.root}/data/live-approvals/pending.json\n",
             encoding="utf-8",
         )
 
@@ -92,7 +67,6 @@ exit 1
         )
         executable(self.bin / "curl", "#!/bin/sh\nexit 0\n")
         executable(self.bin / "pgrep", "#!/bin/sh\nexit ${FAKE_PGREP_EXIT:-1}\n")
-        executable(self.bin / "stat", "#!/bin/sh\necho root:root:700\n")
         executable(
             self.bin / "ployctl",
             """#!/bin/sh
@@ -118,7 +92,6 @@ fi
                 "PLOYCTL": str(self.bin / "ployctl"),
                 "CURL": str(self.bin / "curl"),
                 "PGREP": str(self.bin / "pgrep"),
-                "STAT": str(self.bin / "stat"),
                 **overrides,
             }
         )
@@ -147,14 +120,6 @@ fi
             with self.subTest(key=key):
                 result = self.run_postflight(**{key: value})
                 self.assertNotEqual(result.returncode, 0)
-
-    def test_duplicate_predict_write_gate_fails_closed(self):
-        with (self.root / ".env").open("a", encoding="utf-8") as handle:
-            handle.write("PLOY_PREDICT_ACCOUNT_OPS_WRITE_ENABLED=true\n")
-        result = self.run_postflight()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must appear exactly once", result.stderr)
-
 
 if __name__ == "__main__":
     unittest.main()

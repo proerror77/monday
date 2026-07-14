@@ -15,10 +15,8 @@ reconciliation, cancellation, replacement, and order execution.
   and fill-reconciliation operations.
 - The real Polymarket execution gateway is private to `ploy-connectivity` and cannot
   be injected by a production PLOY entrypoint.
-- Account-operation tools are planning/read surfaces only inside Monday. Legacy
-  environment flags cannot enable order submission, approval transactions,
-  redemption, or reconciliation mutations; those calls reject before credentials,
-  SDK sessions, network requests, or ledgers are touched.
+- The standalone Node account-operation tools are retired. Polymarket account,
+  order, cancellation, and reconciliation operations belong to `rust_hft`.
 - The standard `new-ploy-runner --features full` build does not enable the legacy
   `live-execution` feature.
 - Workflows under `products/ploy/.github/workflows` are historical source material.

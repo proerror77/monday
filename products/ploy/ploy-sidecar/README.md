@@ -188,8 +188,6 @@ ploy-sidecar/
 │   │   └── ploy-backend.ts   Ploy Rust backend MCP server
 │   ├── schemas/
 │   │   └── output.ts         Structured output JSON schema
-│   └── hooks/
-│       └── risk-guard.ts     Optional paper-mode deployment guard
 ├── .env.example
 └── package.json
 ```

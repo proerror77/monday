@@ -8,7 +8,7 @@
     "dev": "tsx src/index.ts",
     "build": "tsc",
     "contracts:check": "node ../scripts/export_operator_contract_types.mjs --check",
-    "test": "tsx src/runtime/admission.ts && tsx src/runtime/evaluator.ts && tsx src/runtime/codex-cli.ts && tsx src/runtime/poll-loop.ts && tsx src/runtime/run-requests.ts && tsx src/runtime/self-modification.ts && SIDECAR_SELF_TEST=true tsx src/index.ts",
+    "test": "tsx src/runtime/admission.ts && tsx src/runtime/evaluator.ts && tsx src/runtime/codex-cli.ts && tsx src/runtime/poll-loop.ts && tsx src/runtime/run-requests.ts && SIDECAR_SELF_TEST=true tsx src/index.ts",
     "start": "node dist/index.js"
   },
   "devDependencies": {
