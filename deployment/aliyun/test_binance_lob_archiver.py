@@ -334,6 +334,9 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(ARCHIVER.process_watchdog_expired(100, 280.1))
 
     async def test_task_cancellation_is_bounded(self):
+        self.assertEqual(
+            ARCHIVER.task_cancelling(SimpleNamespace()), "unsupported"
+        )
         release = ARCHIVER.asyncio.Event()
 
         async def stubborn():

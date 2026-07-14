@@ -690,6 +690,10 @@ def run_process_watchdog() -> None:
             os._exit(75)
 
 
+def task_cancelling(task: asyncio.Task) -> int | str:
+    return task.cancelling() if hasattr(task, "cancelling") else "unsupported"
+
+
 async def cancel_tasks_bounded(tasks: tuple[asyncio.Task, ...]) -> None:
     if not tasks:
         return
@@ -711,7 +715,7 @@ async def cancel_tasks_bounded(tasks: tuple[asyncio.Task, ...]) -> None:
                 task.get_name(),
                 task.get_coro().__qualname__,
                 cancel_requested[task],
-                task.cancelling(),
+                task_cancelling(task),
                 location,
             )
         raise TaskCancellationStuck(
