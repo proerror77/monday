@@ -193,7 +193,10 @@ spec:
                   os.environ["RESULT_PUT_URL"],
                   data=payload,
                   method="PUT",
-                  headers={"x-oss-forbid-overwrite": "true"},
+                  headers={
+                      "Content-Type": "application/zip",
+                      "x-oss-forbid-overwrite": "true",
+                  },
               )
               with urllib.request.urlopen(request, timeout=120) as response:
                   if response.status not in (200, 201):
