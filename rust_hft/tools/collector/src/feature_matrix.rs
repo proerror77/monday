@@ -111,12 +111,7 @@ pub fn import_feature_dataset(
     let created_at = Utc::now();
     let facts = validate_rows(&rows, created_at)?;
 
-    let mut bytes = Vec::new();
-    for row in &rows {
-        serde_json::to_writer(&mut bytes, row)
-            .map_err(|error| format!("failed to serialize feature row: {error}"))?;
-        bytes.push(b'\n');
-    }
+    let bytes = input_bytes;
     let hash = hex::encode(Sha256::digest(&bytes));
     std::fs::create_dir_all(artifact_dir)
         .map_err(|error| format!("failed to create feature artifact directory: {error}"))?;
@@ -306,6 +301,10 @@ mod tests {
         let loaded = read_feature_rows(&manifest).unwrap();
 
         assert_eq!(loaded.len(), 4);
+        assert_eq!(
+            std::fs::read(&input).unwrap(),
+            std::fs::read(&manifest.artifact_path).unwrap()
+        );
         assert!(manifest.modalities.contains(&DataModality::Lob));
         assert!(manifest.modalities.contains(&DataModality::OnChain));
         assert_eq!(

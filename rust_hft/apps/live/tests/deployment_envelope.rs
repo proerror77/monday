@@ -1,6 +1,7 @@
 use alpha_domain::{
     deployment_scope_hash, sign_envelope, AllowedIntentType, ApprovalClass, DeploymentEnvelope,
     RuntimeApprovalEvidence, RuntimeEnvelopePolicy, StrategyBundle,
+    SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use chrono::{Duration, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -108,7 +109,7 @@ fn formula_bundle(now: chrono::DateTime<Utc>) -> StrategyBundle {
         "candidate_id": "candidate-1",
         "candidate_content_hash": "1".repeat(64),
         "dataset_manifest_id": "dataset-1",
-        "evaluator_version": "sealed-holdout-v2",
+        "evaluator_version": SEALED_HOLDOUT_EVALUATOR_VERSION,
         "evaluator_config_hash": "3".repeat(64),
         "evaluation_metrics_hash": "4".repeat(64),
         "sealed_evaluation_hash": "2".repeat(64),

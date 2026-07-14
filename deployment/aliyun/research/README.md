@@ -27,6 +27,14 @@ The storage authority remains split deliberately:
 - DuckDB has one writer and owns research/control-plane lineage. Parallel Pods
   must never open the same DuckDB file for writes.
 
+The first Agentic Alpha path uses the Rust `lob-pit-materializer` binary to
+validate the raw segment, replay Binance's Spot or USD-M sequence contract, and
+emit one-second point-in-time rows. It rejects missing `_SUCCESS` markers,
+SHA-256 mismatch, sequence gaps, unseeded diffs, and closing checkpoints that
+do not match the replayed full book. Feature rows and the materialization report
+are published to SHA-256-named immutable paths. Forward-mid labels are only
+exposed at the future bucket's availability time.
+
 No exchange credential belongs in this namespace. Research Pods receive public
 datasets, ClickHouse read credentials, and result-write authority only.
 
@@ -48,8 +56,13 @@ Recommended first production shape:
 
 - Managed ClickHouse, 8 vCPU / 32 GiB, private VPC endpoint, 200 GiB cache.
 - ACK Standard control plane.
-- Autoscaled Spot worker pool, `ecs.c7.2xlarge` (8 vCPU / 16 GiB), 100 GiB PL1
-  work disk, zero idle research nodes where the node-pool policy supports it.
+- One Spot system node, `ecs.u1-c1m2.large` (2 vCPU / 4 GiB), with a 40 GiB
+  PL0 system disk. The economy bootstrap runs one CoreDNS replica; use two
+  system nodes and two replicas when research-plane HA matters.
+- Autoscaled Spot worker pool, `ecs.u1-c1m4.xlarge` (4 vCPU / 16 GiB), with a
+  40 GiB PL0 system disk and 100 GiB PL1 work disk. The pool is labeled
+  `workload=backtest`, scales from zero to four nodes, and returns to zero after
+  jobs finish.
 - One backtest Pod per worker; each Pod processes a batch of parameters.
 - A prebuilt image from `rust_hft/deployment/docker/Dockerfile.research`.
 
@@ -69,7 +82,8 @@ not return a complete international price sheet.
 | Recommended 4C8G compute-optimized trading ECS, 80 GiB PL1 | CNY 886.69/month |
 | Self-managed 4C16G ClickHouse, 40 GiB system + 500 GiB PL1 | CNY 1,546.48/month |
 | Managed ClickHouse 8C32G with 200 GiB cache | about CNY 2,434/month |
-| Spot 8C16G worker with 40 GiB system + 100 GiB PL1 | CNY 0.812/hour |
+| Spot 2C4G ACK system node with 40 GiB PL0 | about CNY 82-87/month |
+| Spot 4C16G worker with 40 GiB PL0 + 100 GiB PL1 | about CNY 0.342/hour |
 | OSS raw + Parquet, 14-day retention | about CNY 50/month |
 | OSS raw + Parquet, 30-day retention | about CNY 100/month |
 | Private networking, logs, alerts, small requests | CNY 50-150/month |
@@ -88,6 +102,12 @@ recommended profile is the best operational trade-off once the system runs
 daily parallel research. The economy profile is cheaper but makes ClickHouse
 backup, upgrades, failure recovery, and disk operations the operator's job.
 
+The current ACK bootstrap therefore idles at roughly CNY 102-137/month before
+OSS: CNY 82-87 for the system node plus an estimated CNY 20-50 for the private
+API load balancer and small monitoring traffic. Research compute adds about CNY
+34 per 100 worker-hours at the 2026-07-14 Tokyo Spot price. These figures do not
+include ClickHouse, which is not deployed yet.
+
 For the recommended profile, keep a CNY 4,800-5,200 monthly payment budget until
 the first complete invoice is available. That margin covers managed ClickHouse
 durable storage, Spot-price movement, NAT/logging variance, snapshots, and
@@ -100,7 +120,8 @@ not fully price.
    `vpc-6wesy84ixw2esl6lb3ov5`, preferably zone `ap-northeast-1b`.
 2. Create a database account with DDL rights only for schema initialization;
    create a separate read/write application account afterward.
-3. Create an ACK Standard cluster and a Spot research node pool. Do not place
+3. Create an ACK Standard cluster, the small system node pool, and the Spot
+   research node pool. Label research nodes `workload=backtest`. Do not place
    the trading runtime or its credentials in this cluster.
 4. Publish the research image once per source revision. Parameter changes reuse
    the same immutable image and do not compile Rust again.
@@ -180,6 +201,54 @@ Build the `linux/amd64` image on a native amd64 CI/ACR builder. Apple Silicon
 Docker Desktop can validate an arm64 image locally, but compiling x86 Rust under
 QEMU is slower and can fail inside the emulator even when the Dockerfile and
 source are valid.
+
+Keep the amd64 builder disposable, but attach one reusable 200 GiB PL1 ESSD as
+`/build-cache`. Create it with `DeleteWithInstance=false`, format it only on the
+first attachment, mount it by UUID from `/etc/fstab`, then run:
+
+```bash
+deployment/aliyun/research/builder/enable-persistent-build-cache.sh
+```
+
+The script refuses to overwrite an unrelated `/etc/docker/daemon.json`. Once
+Docker reports `/build-cache/docker` as its root, the existing BuildKit cache
+mounts in `Dockerfile.research` survive builder stop/recreation without adding
+`cargo-chef` or `sccache`.
+
+Example Tokyo disk lifecycle:
+
+```bash
+aliyun ecs CreateDisk \
+  --RegionId ap-northeast-1 \
+  --ZoneId REPLACE_BUILDER_ZONE \
+  --DiskName monday-rust-build-cache \
+  --DiskCategory cloud_essd \
+  --PerformanceLevel PL1 \
+  --Size 200
+
+aliyun ecs AttachDisk \
+  --RegionId ap-northeast-1 \
+  --InstanceId REPLACE_BUILDER_INSTANCE_ID \
+  --DiskId REPLACE_CACHE_DISK_ID \
+  --DeleteWithInstance false
+```
+
+On first attachment only, identify the new empty device with `lsblk`, create an
+ext4 filesystem, mount it at `/build-cache`, and persist its UUID in
+`/etc/fstab`. On later builders, attach and mount the existing filesystem; do
+not format it again.
+
+The image contains three stable entrypoints:
+
+- `/usr/local/bin/hft-backtest`
+- `/usr/local/bin/alpha-harness`
+- `/usr/local/bin/lob-pit-materializer`
+
+`k8s/alpha-mission-job.example.yaml` runs one MCTS or Bayesian mission against a
+pre-materialized PIT feature file. The one-time signed OSS URLs belong in a
+Kubernetes Secret and must never be committed. Use distinct DuckDB files and
+result objects per parallel Mission; a later single-writer aggregator may merge
+their immutable evidence.
 
 Run many parameter batches without rebuilding:
 

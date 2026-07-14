@@ -1,4 +1,4 @@
-use crate::{evaluation::EngineContext, EngineProposal, ProposalEngine, RemainingBudget};
+use crate::{evaluation::ProposalContext, EngineProposal, ProposalEngine, RemainingBudget};
 use alpha_domain::{CandidateArtifact, EngineKind};
 use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
 use serde::{Deserialize, Serialize};
@@ -333,7 +333,7 @@ impl ProposalEngine for LlmProposalEngine {
         &mut self,
         mission_id: &str,
         iteration_index: usize,
-        context: &EngineContext<'_>,
+        context: &ProposalContext<'_>,
         remaining: &RemainingBudget,
     ) -> Result<EngineProposal, String> {
         if remaining.tokens == 0 {
@@ -341,8 +341,8 @@ impl ProposalEngine for LlmProposalEngine {
         }
         let prompt = format!(
             "Mission: {mission_id}. Available research rows: {}. Walk-forward folds: {}. Sealed holdout id: {}. Registered feature fields: {:?}. Propose one testable factor hypothesis using only one registered field and the allowed operator grammar.",
-            context.rows().len(),
-            context.folds().len(),
+            context.row_count(),
+            context.fold_count(),
             context.sealed_holdout_id(),
             self.allowed_fields,
         );

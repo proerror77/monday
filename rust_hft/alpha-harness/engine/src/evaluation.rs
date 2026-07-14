@@ -75,6 +75,31 @@ impl<'a> EngineContext<'a> {
     }
 }
 
+pub struct ProposalContext<'a> {
+    row_count: usize,
+    fold_count: usize,
+    sealed_holdout_id: &'a str,
+    latest_signal: Option<f64>,
+}
+
+impl ProposalContext<'_> {
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    pub fn fold_count(&self) -> usize {
+        self.fold_count
+    }
+
+    pub fn sealed_holdout_id(&self) -> &str {
+        self.sealed_holdout_id
+    }
+
+    pub fn latest_signal(&self) -> Option<f64> {
+        self.latest_signal
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedDataset {
     rows: Vec<ResearchRow>,
@@ -84,6 +109,16 @@ pub struct PreparedDataset {
 }
 
 impl PreparedDataset {
+    pub fn proposal_context(&self) -> ProposalContext<'_> {
+        let research_rows = &self.rows[..self.plan.sealed_holdout.start];
+        ProposalContext {
+            row_count: research_rows.len(),
+            fold_count: self.plan.folds.len(),
+            sealed_holdout_id: &self.sealed_holdout_id,
+            latest_signal: research_rows.last().map(|row| row.signal),
+        }
+    }
+
     pub fn engine_context(&self) -> EngineContext<'_> {
         EngineContext {
             rows: &self.rows[..self.plan.sealed_holdout.start],
@@ -240,6 +275,17 @@ mod tests {
         let context = dataset.engine_context();
         assert_eq!(context.rows().len(), 40);
         assert_eq!(evaluate_sealed_holdout(&dataset, |rows| rows.len()), 10);
+    }
+
+    #[test]
+    fn proposal_context_exposes_only_label_free_metadata() {
+        let dataset = prepare_dataset(rows(50), &config(), "holdout-1").unwrap();
+        let context = dataset.proposal_context();
+
+        assert_eq!(context.row_count(), 40);
+        assert_eq!(context.fold_count(), 3);
+        assert_eq!(context.sealed_holdout_id(), "holdout-1");
+        assert_eq!(context.latest_signal(), Some(39.0));
     }
 
     #[test]

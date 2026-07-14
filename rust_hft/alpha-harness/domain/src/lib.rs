@@ -11,10 +11,10 @@ use thiserror::Error;
 
 pub const MAX_ONNX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_ONNX_TENSOR_ELEMENTS: usize = 4 * 1024 * 1024;
-pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v2";
-pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v2";
-pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v1";
-pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v1";
+pub const SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "sealed-holdout-v3";
+pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v3";
+pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v2";
+pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v2";
 pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -96,6 +96,11 @@ pub enum MultipleTestingAdjustment {
 pub struct FormulaEvaluatorConfig {
     pub min_validation_rows: usize,
     pub min_trades: usize,
+    pub min_time_series_ic: f64,
+    pub min_time_series_rank_ic: f64,
+    pub min_time_series_icir: f64,
+    pub min_time_series_rank_icir: f64,
+    pub min_positive_ic_ratio: f64,
     pub min_fold_mean_return: f64,
     pub min_aggregate_score: f64,
     pub max_drawdown: f64,
@@ -109,6 +114,11 @@ impl Default for FormulaEvaluatorConfig {
         Self {
             min_validation_rows: 30,
             min_trades: 30,
+            min_time_series_ic: 0.01,
+            min_time_series_rank_ic: 0.01,
+            min_time_series_icir: 0.5,
+            min_time_series_rank_icir: 0.5,
+            min_positive_ic_ratio: 0.6,
             min_fold_mean_return: 0.000_001,
             min_aggregate_score: 2.0,
             max_drawdown: 0.20,
@@ -142,13 +152,46 @@ impl FormulaEvaluatorConfig {
         if multiple_testing_trials < mission.search_budget.max_candidates {
             return Err(DomainError::InvalidEvaluatorConfiguration);
         }
-        Self::for_trials(multiple_testing_trials)
+        let mut config = Self::for_trials(multiple_testing_trials)?;
+        if let Some(value) = optional_config_f64(&mission.validator_spec, "min_time_series_ic")? {
+            config.min_time_series_ic = value;
+        }
+        if let Some(value) =
+            optional_config_f64(&mission.validator_spec, "min_time_series_rank_ic")?
+        {
+            config.min_time_series_rank_ic = value;
+        }
+        if let Some(value) = optional_config_f64(&mission.validator_spec, "min_time_series_icir")? {
+            config.min_time_series_icir = value;
+        }
+        if let Some(value) =
+            optional_config_f64(&mission.validator_spec, "min_time_series_rank_icir")?
+        {
+            config.min_time_series_rank_icir = value;
+        }
+        if let Some(value) = optional_config_f64(&mission.validator_spec, "min_positive_ic_ratio")?
+        {
+            config.min_positive_ic_ratio = value;
+        }
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.min_validation_rows < 2
             || self.min_trades == 0
             || self.min_trades > self.min_validation_rows
+            || !self.min_time_series_ic.is_finite()
+            || !(0.0..=1.0).contains(&self.min_time_series_ic)
+            || !self.min_time_series_rank_ic.is_finite()
+            || !(0.0..=1.0).contains(&self.min_time_series_rank_ic)
+            || !self.min_time_series_icir.is_finite()
+            || self.min_time_series_icir <= 0.0
+            || !self.min_time_series_rank_icir.is_finite()
+            || self.min_time_series_rank_icir <= 0.0
+            || !self.min_positive_ic_ratio.is_finite()
+            || !(0.0..=1.0).contains(&self.min_positive_ic_ratio)
+            || self.min_positive_ic_ratio <= 0.0
             || !self.min_fold_mean_return.is_finite()
             || self.min_fold_mean_return <= 0.0
             || !self.min_aggregate_score.is_finite()
@@ -184,6 +227,21 @@ impl FormulaEvaluatorConfig {
     }
 }
 
+fn optional_config_f64(spec: &serde_json::Value, key: &str) -> Result<Option<f64>, DomainError> {
+    spec.get(key)
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or(DomainError::InvalidEvaluatorConfiguration)
+        })
+        .transpose()
+}
+
+fn missing_evaluation_metric() -> f64 {
+    f64::NAN
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FoldEvaluationMetrics {
     pub fold_index: usize,
@@ -192,16 +250,119 @@ pub struct FoldEvaluationMetrics {
     pub mean_net_return: f64,
     pub cumulative_net_return: f64,
     pub max_drawdown: f64,
+    #[serde(default = "missing_evaluation_metric")]
+    pub net_sharpe: f64,
     pub raw_score: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FoldPredictiveMetrics {
+    pub fold_index: usize,
+    pub row_count: usize,
+    pub time_series_ic: Option<f64>,
+    pub time_series_rank_ic: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PredictiveMetrics {
+    pub row_count: usize,
+    pub time_series_ic: Option<f64>,
+    pub time_series_rank_ic: Option<f64>,
+    pub time_series_icir: Option<f64>,
+    pub time_series_rank_icir: Option<f64>,
+    pub positive_ic_ratio: f64,
+    pub folds: Vec<FoldPredictiveMetrics>,
+}
+
+impl PredictiveMetrics {
+    pub fn from_folds(folds: Vec<FoldPredictiveMetrics>) -> Self {
+        let row_count = folds.iter().map(|fold| fold.row_count).sum();
+        let ics = folds
+            .iter()
+            .filter_map(|fold| fold.time_series_ic)
+            .collect::<Vec<_>>();
+        let rank_ics = folds
+            .iter()
+            .filter_map(|fold| fold.time_series_rank_ic)
+            .collect::<Vec<_>>();
+        let time_series_ic = complete_mean(&ics, folds.len());
+        let time_series_rank_ic = complete_mean(&rank_ics, folds.len());
+        let time_series_icir =
+            (ics.len() == folds.len() && ics.len() > 1).then(|| information_ratio(&ics));
+        let time_series_rank_icir = (rank_ics.len() == folds.len() && rank_ics.len() > 1)
+            .then(|| information_ratio(&rank_ics));
+        let positive_ic_ratio = if folds.is_empty() {
+            0.0
+        } else {
+            ics.iter().filter(|ic| **ic > 0.0).count() as f64 / folds.len() as f64
+        };
+        Self {
+            row_count,
+            time_series_ic,
+            time_series_rank_ic,
+            time_series_icir,
+            time_series_rank_icir,
+            positive_ic_ratio,
+            folds,
+        }
+    }
+
+    fn valid_for(&self, trading_folds: &[FoldEvaluationMetrics]) -> bool {
+        let expected = Self::from_folds(self.folds.clone());
+        self.row_count > 0
+            && self.folds.len() == trading_folds.len()
+            && self
+                .folds
+                .iter()
+                .zip(trading_folds)
+                .all(|(predictive, trading)| {
+                    predictive.fold_index == trading.fold_index
+                        && predictive.row_count == trading.row_count
+                        && predictive.fold_index > 0
+                        && predictive.row_count > 0
+                        && optional_finite_in_unit_interval(predictive.time_series_ic)
+                        && optional_finite_in_unit_interval(predictive.time_series_rank_ic)
+                })
+            && optional_approximately_equal(self.time_series_ic, expected.time_series_ic)
+            && optional_approximately_equal(self.time_series_rank_ic, expected.time_series_rank_ic)
+            && optional_approximately_equal(self.time_series_icir, expected.time_series_icir)
+            && optional_approximately_equal(
+                self.time_series_rank_icir,
+                expected.time_series_rank_icir,
+            )
+            && approximately_equal(self.positive_ic_ratio, expected.positive_ic_ratio)
+            && (0.0..=1.0).contains(&self.positive_ic_ratio)
+    }
+
+    fn passes(&self, config: &FormulaEvaluatorConfig, require_icir: bool) -> bool {
+        self.time_series_ic
+            .is_some_and(|ic| ic >= config.min_time_series_ic)
+            && self
+                .time_series_rank_ic
+                .is_some_and(|ic| ic >= config.min_time_series_rank_ic)
+            && (!require_icir
+                || self
+                    .time_series_icir
+                    .is_some_and(|icir| icir >= config.min_time_series_icir))
+            && (!require_icir
+                || self
+                    .time_series_rank_icir
+                    .is_some_and(|icir| icir >= config.min_time_series_rank_icir))
+            && self.positive_ic_ratio >= config.min_positive_ic_ratio
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationMetrics {
+    #[serde(default)]
+    pub predictive: PredictiveMetrics,
     pub row_count: usize,
     pub trade_count: usize,
     pub mean_net_return: f64,
     pub cumulative_net_return: f64,
     pub max_drawdown: f64,
+    #[serde(default = "missing_evaluation_metric")]
+    pub net_sharpe: f64,
     pub raw_score: f64,
     pub adjusted_score: f64,
     pub folds: Vec<FoldEvaluationMetrics>,
@@ -223,6 +384,7 @@ impl CandidateEvaluation {
             self.metrics.mean_net_return,
             self.metrics.cumulative_net_return,
             self.metrics.max_drawdown,
+            self.metrics.net_sharpe,
             self.metrics.raw_score,
             self.metrics.adjusted_score,
         ]
@@ -233,6 +395,7 @@ impl CandidateEvaluation {
                     fold.mean_net_return,
                     fold.cumulative_net_return,
                     fold.max_drawdown,
+                    fold.net_sharpe,
                     fold.raw_score,
                 ]
                 .iter()
@@ -270,6 +433,13 @@ impl CandidateEvaluation {
             .map(|fold| fold.raw_score)
             .sum::<f64>()
             / self.metrics.folds.len().max(1) as f64;
+        let net_sharpe = self
+            .metrics
+            .folds
+            .iter()
+            .map(|fold| fold.net_sharpe)
+            .sum::<f64>()
+            / self.metrics.folds.len().max(1) as f64;
         if self.evaluator_version.trim().is_empty()
             || !self.evaluator_config.is_object()
             || self.metrics.row_count == 0
@@ -277,6 +447,8 @@ impl CandidateEvaluation {
             || !self.score.is_finite()
             || !finite_metrics
             || self.metrics.max_drawdown < 0.0
+            || !self.metrics.predictive.valid_for(&self.metrics.folds)
+            || self.metrics.predictive.row_count != self.metrics.row_count
             || self.score.to_bits() != self.metrics.adjusted_score.to_bits()
             || self.passed != self.failure_reasons.is_empty()
             || row_count != self.metrics.row_count
@@ -284,6 +456,7 @@ impl CandidateEvaluation {
             || !approximately_equal(cumulative_net_return, self.metrics.cumulative_net_return)
             || !approximately_equal(weighted_mean, self.metrics.mean_net_return)
             || !approximately_equal(maximum_drawdown, self.metrics.max_drawdown)
+            || !approximately_equal(net_sharpe, self.metrics.net_sharpe)
             || !approximately_equal(raw_score, self.metrics.raw_score)
         {
             return Err(DomainError::InvalidEvaluationEvidence);
@@ -296,12 +469,18 @@ impl CandidateEvaluation {
                 | ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
         ) {
             let config = self.formula_config()?;
-            let policy_passed = self.metrics.folds.iter().all(|fold| {
-                fold.row_count >= config.min_validation_rows
-                    && fold.trade_count >= config.min_trades
-                    && fold.mean_net_return > config.min_fold_mean_return
-                    && fold.max_drawdown <= config.max_drawdown
-            }) && self.metrics.adjusted_score >= config.min_aggregate_score;
+            let require_icir = matches!(
+                self.evaluator_version.as_str(),
+                WALK_FORWARD_EVALUATOR_VERSION | ONNX_WALK_FORWARD_EVALUATOR_VERSION
+            );
+            let policy_passed = self.metrics.predictive.passes(&config, require_icir)
+                && self.metrics.folds.iter().all(|fold| {
+                    fold.row_count >= config.min_validation_rows
+                        && fold.trade_count >= config.min_trades
+                        && fold.mean_net_return > config.min_fold_mean_return
+                        && fold.max_drawdown <= config.max_drawdown
+                })
+                && self.metrics.adjusted_score >= config.min_aggregate_score;
             if self.passed != policy_passed
                 || !approximately_equal(
                     config.adjusted_score(self.metrics.raw_score)?,
@@ -324,7 +503,36 @@ impl CandidateEvaluation {
 
 fn approximately_equal(left: f64, right: f64) -> bool {
     let scale = left.abs().max(right.abs()).max(1.0);
-    (left - right).abs() <= f64::EPSILON * 16.0 * scale
+    (left - right).abs() <= f64::EPSILON * 256.0 * scale
+}
+
+fn complete_mean(values: &[f64], expected_len: usize) -> Option<f64> {
+    (expected_len > 0 && values.len() == expected_len)
+        .then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn information_ratio(values: &[f64]) -> f64 {
+    let average = values.iter().sum::<f64>() / values.len() as f64;
+    let deviation = (values
+        .iter()
+        .map(|value| (value - average).powi(2))
+        .sum::<f64>()
+        / values.len() as f64)
+        .sqrt();
+    // ponytail: epsilon floor keeps stable factors finite; replace with bootstrap intervals if calibration demands it.
+    average / deviation.max(f64::EPSILON)
+}
+
+fn optional_finite_in_unit_interval(value: Option<f64>) -> bool {
+    value.is_none_or(|value| value.is_finite() && (-1.0..=1.0).contains(&value))
+}
+
+fn optional_approximately_equal(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => approximately_equal(left, right),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2119,11 +2327,18 @@ mod tests {
             evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
             evaluator_config: serde_json::to_value(&config).unwrap(),
             metrics: EvaluationMetrics {
+                predictive: PredictiveMetrics::from_folds(vec![FoldPredictiveMetrics {
+                    fold_index: 1,
+                    row_count: 30,
+                    time_series_ic: Some(0.1),
+                    time_series_rank_ic: Some(0.1),
+                }]),
                 row_count: 30,
                 trade_count: 30,
                 mean_net_return: 0.001,
                 cumulative_net_return: 0.03,
                 max_drawdown: 0.01,
+                net_sharpe: 1.0,
                 raw_score,
                 adjusted_score,
                 folds: vec![FoldEvaluationMetrics {
@@ -2133,11 +2348,43 @@ mod tests {
                     mean_net_return: 0.001,
                     cumulative_net_return: 0.03,
                     max_drawdown: 0.01,
+                    net_sharpe: 1.0,
                     raw_score,
                 }],
             },
         };
         assert!(evaluation.validate().is_ok());
+
+        let mut legacy_value = serde_json::to_value(&evaluation).unwrap();
+        legacy_value["evaluator_version"] = serde_json::json!("purged-walk-forward-v2");
+        let legacy_metrics = legacy_value["metrics"].as_object_mut().unwrap();
+        legacy_metrics.remove("predictive");
+        legacy_metrics.remove("net_sharpe");
+        for fold in legacy_metrics["folds"].as_array_mut().unwrap() {
+            fold.as_object_mut().unwrap().remove("net_sharpe");
+        }
+        let legacy: CandidateEvaluation = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(legacy.score, adjusted_score);
+        assert!(legacy.metrics.net_sharpe.is_nan());
+        assert!(legacy.metrics.folds[0].net_sharpe.is_nan());
+        assert_eq!(
+            legacy.validate(),
+            Err(DomainError::InvalidEvaluationEvidence)
+        );
+
+        let mut tampered_predictive = evaluation.clone();
+        tampered_predictive.metrics.predictive.time_series_ic = Some(0.9);
+        assert_eq!(
+            tampered_predictive.validate(),
+            Err(DomainError::InvalidEvaluationEvidence)
+        );
+
+        let mut tampered_sharpe = evaluation.clone();
+        tampered_sharpe.metrics.net_sharpe = 2.0;
+        assert_eq!(
+            tampered_sharpe.validate(),
+            Err(DomainError::InvalidEvaluationEvidence)
+        );
 
         evaluation.metrics.trade_count = 0;
         evaluation.metrics.folds[0].trade_count = 0;
@@ -2162,6 +2409,40 @@ mod tests {
         assert_eq!(
             FormulaEvaluatorConfig::for_mission(&mission),
             Err(DomainError::InvalidEvaluatorConfiguration)
+        );
+    }
+
+    #[test]
+    fn mission_can_configure_predictive_quality_gates() {
+        let mut mission = mission(Utc::now());
+        mission.validator_spec = serde_json::json!({
+            "min_time_series_ic": 0.02,
+            "min_time_series_rank_ic": 0.03,
+            "min_time_series_icir": 0.7,
+            "min_time_series_rank_icir": 0.8,
+            "min_positive_ic_ratio": 0.75
+        });
+
+        let config = FormulaEvaluatorConfig::for_mission(&mission).unwrap();
+
+        assert_eq!(config.min_time_series_ic, 0.02);
+        assert_eq!(config.min_time_series_rank_ic, 0.03);
+        assert_eq!(config.min_time_series_icir, 0.7);
+        assert_eq!(config.min_time_series_rank_icir, 0.8);
+        assert_eq!(config.min_positive_ic_ratio, 0.75);
+    }
+
+    #[test]
+    fn evaluator_versions_identify_predictive_evidence() {
+        assert_eq!(WALK_FORWARD_EVALUATOR_VERSION, "purged-walk-forward-v3");
+        assert_eq!(SEALED_HOLDOUT_EVALUATOR_VERSION, "sealed-holdout-v3");
+        assert_eq!(
+            ONNX_WALK_FORWARD_EVALUATOR_VERSION,
+            "onnx-purged-walk-forward-v2"
+        );
+        assert_eq!(
+            ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
+            "onnx-sealed-holdout-v2"
         );
     }
 

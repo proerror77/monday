@@ -8,6 +8,7 @@ RequiresMountsFor=/data
 Type=simple
 User=hftcollector
 Group=hftcollector
+StateDirectory=hft-collector
 EnvironmentFile=/etc/monday/binance-lob-archiver-%i.env
 ExecStart=/opt/monday/venv/bin/python /opt/monday/binance_lob_archiver.py
 Restart=always
