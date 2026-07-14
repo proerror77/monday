@@ -8,11 +8,13 @@ use hft_collector::lob_archiver::{
     SegmentConfig, SendOutcome, RAW_SCHEMA,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -32,6 +34,8 @@ struct Config {
     dataset: String,
     shard_id: String,
     symbols: Vec<String>,
+    security_token_symbols: Vec<String>,
+    excluded_symbols: Vec<String>,
     ws_shard_size: usize,
     snapshot_limit: u64,
     snapshot_requests_per_second: f64,
@@ -40,6 +44,9 @@ struct Config {
     max_buffered_diffs: usize,
     max_pending_diffs: usize,
     stall_timeout: Duration,
+    sync_timeout: Duration,
+    process_watchdog_timeout: Duration,
+    snapshot_retry_attempts: usize,
     rest_base: String,
     oss_bucket: String,
     oss_endpoint: String,
@@ -62,23 +69,29 @@ impl Config {
             Market::Usdm => "https://fapi.binance.com".into(),
         });
         let setting = env_string("SYMBOLS", "btcusdt");
-        let symbols = if setting.eq_ignore_ascii_case("ALL") {
+        let catalog = if setting.eq_ignore_ascii_case("ALL") {
             discover_symbols(market, &rest_base).await?
         } else {
-            setting
-                .split(',')
-                .map(|symbol| symbol.trim().to_ascii_uppercase())
-                .filter(|symbol| !symbol.is_empty())
-                .collect()
+            SymbolCatalog {
+                symbols: setting
+                    .split(',')
+                    .map(|symbol| symbol.trim().to_ascii_uppercase())
+                    .filter(|symbol| !symbol.is_empty())
+                    .collect(),
+                security_token_symbols: Vec::new(),
+                excluded_symbols: Vec::new(),
+            }
         };
-        if symbols.is_empty() {
+        if catalog.symbols.is_empty() {
             anyhow::bail!("SYMBOLS must not be empty");
         }
         Ok(Self {
             market,
             dataset: env_string("DATASET", &format!("{}_all", market.as_str())),
             shard_id: env_string("SHARD_ID", "all"),
-            symbols,
+            symbols: catalog.symbols,
+            security_token_symbols: catalog.security_token_symbols,
+            excluded_symbols: catalog.excluded_symbols,
             ws_shard_size: env_parse("WS_SHARD_SIZE", 100_usize)?.max(1),
             snapshot_limit: env_parse("SNAPSHOT_LIMIT", 100_u64)?,
             snapshot_requests_per_second: env_parse("SNAPSHOT_REQUESTS_PER_SECOND", 15_f64)?,
@@ -87,6 +100,12 @@ impl Config {
             max_buffered_diffs: env_parse("MAX_BUFFERED_DIFFS", 250_000_usize)?.max(1),
             max_pending_diffs: env_parse("MAX_PENDING_DIFFS_TOTAL", 250_000_usize)?.max(1),
             stall_timeout: Duration::from_secs(env_parse("STALL_TIMEOUT_SECONDS", 60_u64)?),
+            sync_timeout: Duration::from_secs(env_parse("SYNC_TIMEOUT_SECONDS", 120_u64)?),
+            process_watchdog_timeout: Duration::from_secs(env_parse(
+                "PROCESS_WATCHDOG_SECONDS",
+                180_u64,
+            )?),
+            snapshot_retry_attempts: env_parse("SNAPSHOT_RETRY_ATTEMPTS", 6_usize)?.max(1),
             rest_base,
             oss_bucket: env_string("OSS_BUCKET", "monday-lob-apne1-1045353359"),
             oss_endpoint: env_string("OSS_ENDPOINT", "oss-ap-northeast-1-internal.aliyuncs.com"),
@@ -104,8 +123,8 @@ impl Config {
             dataset: self.dataset.clone(),
             shard_id: self.shard_id.clone(),
             symbols: self.symbols.clone(),
-            security_token_symbols: Vec::new(),
-            excluded_symbols: Vec::new(),
+            security_token_symbols: self.security_token_symbols.clone(),
+            excluded_symbols: self.excluded_symbols.clone(),
             snapshot_limit: self.snapshot_limit,
             zstd_timeout: self.zstd_timeout,
         }
@@ -132,6 +151,13 @@ impl Config {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolCatalog {
+    symbols: Vec<String>,
+    security_token_symbols: Vec<String>,
+    excluded_symbols: Vec<String>,
+}
+
 #[derive(Debug)]
 enum Event {
     Diff {
@@ -152,6 +178,74 @@ enum TaskExit {
     SnapshotComplete,
 }
 
+#[derive(Clone)]
+struct ProcessWatchdog {
+    inner: Arc<ProcessWatchdogInner>,
+}
+
+struct ProcessWatchdogInner {
+    started: Instant,
+    last_data_ms: AtomicU64,
+    armed: AtomicBool,
+    shutdown: AtomicBool,
+}
+
+impl ProcessWatchdog {
+    fn start(timeout: Duration) -> anyhow::Result<Self> {
+        let watchdog = Self {
+            inner: Arc::new(ProcessWatchdogInner {
+                started: Instant::now(),
+                last_data_ms: AtomicU64::new(0),
+                armed: AtomicBool::new(false),
+                shutdown: AtomicBool::new(false),
+            }),
+        };
+        let monitor = watchdog.clone();
+        thread::Builder::new()
+            .name("binance-lob-process-watchdog".into())
+            .spawn(move || {
+                let interval = timeout
+                    .div_f64(4.0)
+                    .clamp(Duration::from_secs(1), Duration::from_secs(10));
+                while !monitor.inner.shutdown.load(Ordering::Relaxed) {
+                    thread::sleep(interval);
+                    let now_ms = monitor.elapsed_ms();
+                    let last_ms = monitor.inner.last_data_ms.load(Ordering::Relaxed);
+                    if monitor.inner.armed.load(Ordering::Relaxed)
+                        && process_watchdog_expired(last_ms, now_ms, timeout)
+                    {
+                        error!(
+                            silent_ms = now_ms.saturating_sub(last_ms),
+                            "process watchdog exiting after market-data stall"
+                        );
+                        std::process::exit(75);
+                    }
+                }
+            })?;
+        watchdog.mark_data();
+        watchdog.inner.armed.store(true, Ordering::Relaxed);
+        Ok(watchdog)
+    }
+
+    fn mark_data(&self) {
+        self.inner
+            .last_data_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    fn stop(&self) {
+        self.inner.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.inner.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+fn process_watchdog_expired(last_data_ms: u64, now_ms: u64, timeout: Duration) -> bool {
+    now_ms.saturating_sub(last_data_ms) > timeout.as_millis() as u64
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -163,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = Arc::new(Config::from_env().await?);
+    let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout)?;
     std::fs::create_dir_all(&config.spool_dir)?;
     let recovered = recover_parts(&config.segment_config())?;
     if !recovered.is_empty() {
@@ -174,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut backoff = 1_u64;
     while !*shutdown_rx.borrow() {
-        match run_session(config.clone(), shutdown_rx.clone()).await {
+        match run_session(config.clone(), shutdown_rx.clone(), watchdog.clone()).await {
             Ok(()) if *shutdown_rx.borrow() => break,
             Ok(()) => backoff = 1,
             Err(error) => {
@@ -185,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let _ = shutdown_tx.send(true);
+    watchdog.stop();
     upload_task.await?;
     shutdown_signal.abort();
     Ok(())
@@ -193,6 +289,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_session(
     config: Arc<Config>,
     mut shutdown: watch::Receiver<bool>,
+    watchdog: ProcessWatchdog,
 ) -> anyhow::Result<()> {
     let session_id = format!("{:x}-{}", now_ns()?, std::process::id());
     let (sender, mut receiver) = mpsc::channel(config.max_buffered_diffs);
@@ -204,6 +301,7 @@ async fn run_session(
             sender.clone(),
             session_stop_rx.clone(),
             config.stall_timeout,
+            watchdog.clone(),
         ));
     }
     tasks.spawn(produce_snapshots(
@@ -231,6 +329,7 @@ async fn run_session(
     let mut sequence_gaps = 0_u64;
     let mut last_health = Instant::now() - Duration::from_secs(60);
     let mut failure = None;
+    let mut sync_deadline = Some(Instant::now() + config.sync_timeout);
 
     loop {
         tokio::select! {
@@ -246,6 +345,7 @@ async fn run_session(
                             &mut segment, &mut states, &mut budget, &session_id, event, &mut sequence_gaps
                         )? {
                             segment = rotate_segment(segment, &config, &states, &session_id, "sequence_gap")?;
+                            sync_deadline = Some(Instant::now() + config.sync_timeout);
                             tasks.spawn(produce_snapshot(config.clone(), symbol, sender.clone(), session_stop_rx.clone()));
                         }
                     }
@@ -274,6 +374,7 @@ async fn run_session(
                         ) {
                             Ok(Some(symbol)) => {
                                 segment = rotate_segment(segment, &config, &states, &session_id, "sequence_gap")?;
+                                sync_deadline = Some(Instant::now() + config.sync_timeout);
                                 tasks.spawn(produce_snapshot(config.clone(), symbol, sender.clone(), session_stop_rx.clone()));
                             }
                             Ok(None) => {}
@@ -294,6 +395,18 @@ async fn run_session(
                     segment = rotate_segment(segment, &config, &states, &session_id, "scheduled")?;
                 }
             }
+        }
+
+        if states.values().all(|state| state.synced && state.bridged) {
+            sync_deadline = None;
+        } else if sync_timed_out(&states, sync_deadline, Instant::now()) {
+            let missing = states
+                .iter()
+                .filter(|(_, state)| !state.synced || !state.bridged)
+                .map(|(symbol, _)| symbol.as_str())
+                .collect::<Vec<_>>();
+            failure = Some(anyhow::anyhow!("snapshot bridge timed out: {missing:?}"));
+            break;
         }
 
         if last_health.elapsed() >= Duration::from_secs(30) {
@@ -349,6 +462,16 @@ async fn run_session(
     } else {
         Ok(())
     }
+}
+
+fn sync_timed_out(
+    states: &HashMap<String, OrderBookState>,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> bool {
+    deadline.is_some_and(|deadline| {
+        now > deadline && states.values().any(|state| !state.synced || !state.bridged)
+    })
 }
 
 fn process_event(
@@ -504,6 +627,7 @@ async fn receive_url(
     sender: mpsc::Sender<Event>,
     mut shutdown: watch::Receiver<bool>,
     stall_timeout: Duration,
+    watchdog: ProcessWatchdog,
 ) -> anyhow::Result<TaskExit> {
     let (mut websocket, _) = tokio::time::timeout(Duration::from_secs(20), connect_async(&url))
         .await
@@ -522,6 +646,7 @@ async fn receive_url(
             }
         };
         if let Message::Text(text) = message {
+            watchdog.mark_data();
             let event = Event::Diff {
                 received_at_ns: now_ns()?,
                 frame: serde_json::from_str(&text)?,
@@ -548,19 +673,7 @@ async fn produce_snapshots(
             return Ok(TaskExit::Stopped(None));
         }
         let started = now_ns()?;
-        let path = match config.market {
-            Market::Spot => "/api/v3/depth",
-            Market::Usdm => "/fapi/v1/depth",
-        };
-        let limit = config.snapshot_limit.to_string();
-        let snapshot = client
-            .get(format!("{}{path}", config.rest_base))
-            .query(&[("symbol", symbol.as_str()), ("limit", limit.as_str())])
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
+        let snapshot = fetch_snapshot(&client, &config, symbol).await?;
         let event = Event::Snapshot {
             received_at_ns: now_ns()?,
             symbol: symbol.clone(),
@@ -588,19 +701,7 @@ async fn produce_snapshot(
         .timeout(Duration::from_secs(15))
         .build()?;
     let started = now_ns()?;
-    let path = match config.market {
-        Market::Spot => "/api/v3/depth",
-        Market::Usdm => "/fapi/v1/depth",
-    };
-    let limit = config.snapshot_limit.to_string();
-    let snapshot = client
-        .get(format!("{}{path}", config.rest_base))
-        .query(&[("symbol", symbol.as_str()), ("limit", limit.as_str())])
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<Value>()
-        .await?;
+    let snapshot = fetch_snapshot(&client, &config, &symbol).await?;
     let event = Event::Snapshot {
         received_at_ns: now_ns()?,
         symbol,
@@ -613,7 +714,62 @@ async fn produce_snapshot(
     }
 }
 
-async fn discover_symbols(market: Market, rest_base: &str) -> anyhow::Result<Vec<String>> {
+async fn fetch_snapshot(
+    client: &reqwest::Client,
+    config: &Config,
+    symbol: &str,
+) -> anyhow::Result<Value> {
+    let path = match config.market {
+        Market::Spot => "/api/v3/depth",
+        Market::Usdm => "/fapi/v1/depth",
+    };
+    let limit = config.snapshot_limit.to_string();
+    for attempt in 0..config.snapshot_retry_attempts {
+        let response = client
+            .get(format!("{}{path}", config.rest_base))
+            .query(&[("symbol", symbol), ("limit", limit.as_str())])
+            .send()
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            let snapshot = response.json::<Value>().await?;
+            if snapshot
+                .get("lastUpdateId")
+                .and_then(Value::as_u64)
+                .is_none()
+            {
+                anyhow::bail!("snapshot missing lastUpdateId for {symbol}");
+            }
+            return Ok(snapshot);
+        }
+        let retryable =
+            status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+        if !retryable || attempt + 1 == config.snapshot_retry_attempts {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("snapshot failed symbol={symbol} status={status} body={body}");
+        }
+        let delay = snapshot_retry_delay(
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            attempt,
+        );
+        warn!(%symbol, %status, ?delay, "snapshot request retrying");
+        tokio::time::sleep(delay).await;
+    }
+    unreachable!("snapshot_retry_attempts is at least one")
+}
+
+fn snapshot_retry_delay(retry_after: Option<&str>, attempt: usize) -> Duration {
+    retry_after
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(Duration::from_secs_f64)
+        .unwrap_or_else(|| Duration::from_secs(1_u64 << attempt.min(5)))
+        .min(Duration::from_secs(60))
+}
+
+async fn discover_symbols(market: Market, rest_base: &str) -> anyhow::Result<SymbolCatalog> {
     let path = match market {
         Market::Spot => "/api/v3/exchangeInfo",
         Market::Usdm => "/fapi/v1/exchangeInfo",
@@ -625,16 +781,50 @@ async fn discover_symbols(market: Market, rest_base: &str) -> anyhow::Result<Vec
         .error_for_status()?
         .json()
         .await?;
-    let mut symbols = payload["symbols"]
+    parse_symbol_catalog(market, &payload)
+}
+
+fn parse_symbol_catalog(market: Market, payload: &Value) -> anyhow::Result<SymbolCatalog> {
+    let entries = payload["symbols"]
         .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|item| item["status"] == "TRADING")
-        .filter(|item| market != Market::Usdm || item["contractType"] == "PERPETUAL")
-        .filter_map(|item| item["symbol"].as_str().map(str::to_owned))
-        .collect::<Vec<_>>();
-    symbols.sort();
-    Ok(symbols)
+        .ok_or_else(|| anyhow::anyhow!("exchangeInfo missing symbols"))?;
+    let mut symbols = BTreeSet::new();
+    let mut security_tokens = BTreeSet::new();
+    let mut excluded = BTreeSet::new();
+    for item in entries {
+        let Some(symbol) = item["symbol"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        if item["status"] != "TRADING" {
+            continue;
+        }
+        if market == Market::Usdm && item["contractType"] != "PERPETUAL" {
+            continue;
+        }
+        if market == Market::Spot
+            && item.get("isSpotTradingAllowed").and_then(Value::as_bool) == Some(false)
+        {
+            excluded.insert(symbol);
+            continue;
+        }
+        let is_security_token = item["permissionSets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|group| group.as_array().into_iter().flatten())
+            .any(|permission| permission == "TRD_GRP_261");
+        if is_security_token {
+            security_tokens.insert(symbol.clone());
+            excluded.insert(symbol);
+            continue;
+        }
+        symbols.insert(symbol);
+    }
+    Ok(SymbolCatalog {
+        symbols: symbols.into_iter().collect(),
+        security_token_symbols: security_tokens.into_iter().collect(),
+        excluded_symbols: excluded.into_iter().collect(),
+    })
 }
 
 async fn upload_loop(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) {
@@ -821,4 +1011,128 @@ fn self_test() -> anyhow::Result<()> {
     std::fs::remove_dir_all(root)?;
     println!("self-test: ok");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn test_config(rest_base: String) -> Config {
+        Config {
+            market: Market::Spot,
+            dataset: "spot_all".into(),
+            shard_id: "all".into(),
+            symbols: vec!["BTCUSDT".into()],
+            security_token_symbols: vec![],
+            excluded_symbols: vec![],
+            ws_shard_size: 100,
+            snapshot_limit: 100,
+            snapshot_requests_per_second: 15.0,
+            segment_seconds: 3600,
+            spool_dir: env::temp_dir(),
+            max_buffered_diffs: 100,
+            max_pending_diffs: 100,
+            stall_timeout: Duration::from_secs(60),
+            sync_timeout: Duration::from_secs(120),
+            process_watchdog_timeout: Duration::from_secs(180),
+            snapshot_retry_attempts: 3,
+            rest_base,
+            oss_bucket: "bucket".into(),
+            oss_endpoint: "endpoint".into(),
+            oss_region: "region".into(),
+            aliyun_profile: "profile".into(),
+            zstd_timeout: Duration::from_secs(30),
+            oss_copy_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn all_catalog_excludes_non_spot_and_security_tokens_and_records_manifest_sets() {
+        let catalog = parse_symbol_catalog(
+            Market::Spot,
+            &json!({"symbols":[
+                {"symbol":"BTCUSDT","status":"TRADING","isSpotTradingAllowed":true,"permissionSets":[["SPOT"]]},
+                {"symbol":"BLOCKEDUSDT","status":"TRADING","isSpotTradingAllowed":false,"permissionSets":[["SPOT"]]},
+                {"symbol":"SECURITYUSDT","status":"TRADING","isSpotTradingAllowed":true,"permissionSets":[["SPOT","TRD_GRP_261"]]},
+                {"symbol":"HALTEDUSDT","status":"BREAK","isSpotTradingAllowed":true,"permissionSets":[["SPOT"]]}
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(catalog.symbols, ["BTCUSDT"]);
+        assert_eq!(catalog.security_token_symbols, ["SECURITYUSDT"]);
+        assert_eq!(catalog.excluded_symbols, ["BLOCKEDUSDT", "SECURITYUSDT"]);
+
+        let mut config = test_config("http://unused".into());
+        config.symbols = catalog.symbols;
+        config.security_token_symbols = catalog.security_token_symbols;
+        config.excluded_symbols = catalog.excluded_symbols;
+        let manifest = config.segment_config();
+        assert_eq!(manifest.security_token_symbols, ["SECURITYUSDT"]);
+        assert_eq!(manifest.excluded_symbols, ["BLOCKEDUSDT", "SECURITYUSDT"]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_retries_429_and_5xx_then_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for response in [
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 38\r\nConnection: close\r\n\r\n{\"lastUpdateId\":1,\"bids\":[],\"asks\":[]}",
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let config = test_config(format!("http://{address}"));
+        let snapshot = fetch_snapshot(&reqwest::Client::new(), &config, "BTCUSDT")
+            .await
+            .unwrap();
+        assert_eq!(snapshot["lastUpdateId"], 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sync_and_process_watchdogs_trip_only_after_deadline() {
+        let states = HashMap::from([(
+            "BTCUSDT".into(),
+            OrderBookState::new("BTCUSDT", Market::Spot),
+        )]);
+        let now = Instant::now();
+        assert!(!sync_timed_out(
+            &states,
+            Some(now + Duration::from_secs(1)),
+            now
+        ));
+        assert!(sync_timed_out(
+            &states,
+            Some(now - Duration::from_millis(1)),
+            now
+        ));
+        assert!(!process_watchdog_expired(
+            1_000,
+            181_000,
+            Duration::from_secs(180)
+        ));
+        assert!(process_watchdog_expired(
+            1_000,
+            181_001,
+            Duration::from_secs(180)
+        ));
+    }
+
+    #[test]
+    fn snapshot_backoff_honors_retry_after_and_caps_exponential_delay() {
+        assert_eq!(
+            snapshot_retry_delay(Some("0.25"), 0),
+            Duration::from_millis(250)
+        );
+        assert_eq!(snapshot_retry_delay(None, 0), Duration::from_secs(1));
+        assert_eq!(snapshot_retry_delay(None, 99), Duration::from_secs(32));
+    }
 }
