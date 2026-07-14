@@ -390,11 +390,13 @@ async fn run_session(
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                if segment_due(&segment, config.segment_seconds)? {
-                    segment = rotate_segment(segment, &config, &states, &session_id, "scheduled")?;
-                }
-            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+
+        // This must live outside the biased select: under continuous market
+        // data receiver.recv() is always ready and the timer branch can starve.
+        if segment_due(&segment, config.segment_seconds)? {
+            segment = rotate_segment(segment, &config, &states, &session_id, "scheduled")?;
         }
 
         if states.values().all(|state| state.synced && state.bridged) {
@@ -554,10 +556,13 @@ fn process_event(
 }
 
 fn segment_due(segment: &Segment, segment_seconds: u64) -> anyhow::Result<bool> {
-    let now = now_ns()?;
+    segment_due_at(segment.start_ns, now_ns()?, segment_seconds)
+}
+
+fn segment_due_at(start_ns: u64, now_ns: u64, segment_seconds: u64) -> anyhow::Result<bool> {
     Ok(
-        now.saturating_sub(segment.start_ns) >= segment_seconds * 1_000_000_000
-            || segment_partition(segment.start_ns)? != segment_partition(now)?,
+        now_ns.saturating_sub(start_ns) >= segment_seconds * 1_000_000_000
+            || segment_partition(start_ns)? != segment_partition(now_ns)?,
     )
 }
 
@@ -1134,5 +1139,31 @@ mod tests {
         );
         assert_eq!(snapshot_retry_delay(None, 0), Duration::from_secs(1));
         assert_eq!(snapshot_retry_delay(None, 99), Duration::from_secs(32));
+    }
+
+    #[tokio::test]
+    async fn hot_queue_cannot_starve_post_select_rotation_check() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        for value in 0..8 {
+            sender.send(value).await.unwrap();
+        }
+        let start_ns = 1_700_000_000_000_000_000_u64;
+        let mut now_ns = start_ns;
+        let mut rotated = false;
+        for _ in 0..8 {
+            tokio::select! {
+                biased;
+                value = receiver.recv() => assert!(value.is_some()),
+                _ = tokio::time::sleep(Duration::from_secs(3600)) => {
+                    panic!("hot queue unexpectedly selected timer")
+                }
+            }
+            now_ns += 10_000_000_000;
+            if segment_due_at(start_ns, now_ns, 60).unwrap() {
+                rotated = true;
+                break;
+            }
+        }
+        assert!(rotated, "post-select maintenance must rotate a hot queue");
     }
 }
