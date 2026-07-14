@@ -3,6 +3,7 @@ Description=Rust Binance LOB archiver shadow (%i)
 After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
 
 [Service]
 Type=simple

@@ -115,6 +115,8 @@ running Python units:
 ```bash
 sudo install -D -m 0755 target/release/binance-lob-archiver \
   /opt/monday/bin/binance-lob-archiver
+sudo install -d -m 0750 -o hftcollector -g hftcollector \
+  /data/monday/spool/binance-lob-rust-shadow/{spot,usdm}
 sudo install -m 0644 ../deployment/aliyun/binance-lob-archiver-rust@.service \
   /etc/systemd/system/binance-lob-archiver-rust@.service
 sudo install -m 0640 ../deployment/aliyun/binance-lob-archiver-rust-spot.env \
