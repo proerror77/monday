@@ -1,0 +1,26 @@
+[package]
+name = "hft-data-adapter-polymarket"
+version = "0.1.0"
+edition = "2021"
+description = "Polymarket CLOB public market data adapter"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+
+async-trait = "0.1"
+futures = "0.3"
+polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.0", features = ["clob", "ws"] }
+rust_decimal = { version = "1.33", features = ["serde"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["macros", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "stream", "rustls-tls-webpki-roots"] }
+tracing = "0.1"
+
+[lib]
+name = "adapter_polymarket_data"
+
+# ponytail: temporary standalone workspace for TDD before the parent task registers this crate.
+[workspace]
+resolver = "2"

@@ -1,0 +1,33 @@
+[package]
+name = "hft-execution-adapter-polymarket"
+version = "0.1.0"
+edition = "2021"
+description = "Monday-native Polymarket execution adapter"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+execution = { package = "hft-execution", path = "../../execution" }
+alloy = { version = "1", default-features = false, features = ["signer-local"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.0", features = ["clob", "heartbeats", "ws"] }
+rust_decimal = { version = "1.33", features = ["serde"] }
+secrecy = { version = "0.8", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+rust_decimal_macros = "1"
+tokio = { version = "1", features = ["full"] }
+
+[lib]
+name = "execution_adapter_polymarket"
+
+# Remove this when rust_hft/Cargo.toml adds the adapter as a workspace member.
+[workspace]
