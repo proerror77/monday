@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.91-bullseye AS builder
+
+WORKDIR /work
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang \
+    cmake \
+    mold \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/work/target,sharing=locked \
+    cargo --config 'build.rustc-wrapper=""' build \
+    --release \
+    --locked \
+    --no-default-features \
+    -p hft-collector \
+    --bin binance-lob-archiver \
+    && install -D -m 0755 /work/target/release/binance-lob-archiver \
+       /out/bin/binance-lob-archiver
+
+FROM debian:bookworm-slim AS aliyun-cli
+
+ARG TARGETARCH
+ARG ALIYUN_CLI_VERSION=3.4.6
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$TARGETARCH" in \
+         amd64) sha256=9f7c993bd1b16c530f219bc1976bf78057879db4b1bae857b2952676eb7466f6 ;; \
+         arm64) sha256=042833125a21dcafb6279811db4e4e772049404421ae60b565a3123147959092 ;; \
+         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+       esac \
+    && archive="aliyun-cli-linux-${ALIYUN_CLI_VERSION}-${TARGETARCH}.tgz" \
+    && curl -fsSLo "/tmp/$archive" \
+       "https://aliyuncli.alicdn.com/$archive" \
+    && echo "$sha256  /tmp/$archive" | sha256sum -c - \
+    && tar -xzf "/tmp/$archive" -C /usr/local/bin aliyun \
+    && aliyun version
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    tini \
+    zstd \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1000 hftcollector \
+    && mkdir -p /data/monday/spool/binance-lob-rust-shadow \
+    && chown -R hftcollector:hftcollector /data/monday
+
+COPY --from=builder /out/bin/binance-lob-archiver /usr/local/bin/binance-lob-archiver
+COPY --from=aliyun-cli /usr/local/bin/aliyun /usr/local/bin/aliyun
+
+USER hftcollector
+ENV RUST_LOG=info
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/binance-lob-archiver"]

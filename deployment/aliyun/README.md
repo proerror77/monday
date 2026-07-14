@@ -85,3 +85,60 @@ benchmarked deeper or periodically refreshed snapshot dataset.
 ClickHouse is optional for always-on shared analytics, dashboards, and derived
 realtime features. It is not required for the first backtest pipeline and should
 not duplicate the complete raw OSS tape.
+
+## Rust collector shadow rollout
+
+The Rust replacement runs beside the Python collector first. Its service name,
+spool directory, and OSS dataset are deliberately separate, so installing or
+starting it neither stops the Python services nor overwrites their objects:
+
+| Market | Service | Local spool | OSS dataset |
+| --- | --- | --- | --- |
+| Spot | `binance-lob-archiver-rust@spot` | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
+| USD-M | `binance-lob-archiver-rust@usdm` | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
+
+Both shadow examples start with `BTCUSDT` only. Keep that bounded scope through
+two successful segment rotations and uploads; switch `SYMBOLS=ALL` only after
+health, replay continuity, and resource use pass the shadow gate.
+
+Build and verify the binary from `rust_hft/`:
+
+```bash
+cargo build --release --locked --no-default-features \
+  -p hft-collector --bin binance-lob-archiver
+target/release/binance-lob-archiver --self-test
+```
+
+Install the binary and the Rust-only service templates without changing the
+running Python units:
+
+```bash
+sudo install -D -m 0755 target/release/binance-lob-archiver \
+  /opt/monday/bin/binance-lob-archiver
+sudo install -m 0644 ../deployment/aliyun/binance-lob-archiver-rust@.service \
+  /etc/systemd/system/binance-lob-archiver-rust@.service
+sudo install -m 0640 ../deployment/aliyun/binance-lob-archiver-rust-spot.env \
+  /etc/monday/binance-lob-archiver-rust-spot.env
+sudo install -m 0640 ../deployment/aliyun/binance-lob-archiver-rust-usdm.env \
+  /etc/monday/binance-lob-archiver-rust-usdm.env
+sudo systemctl daemon-reload
+```
+
+Starting shadow collection is a separate, explicit operation:
+
+```bash
+sudo systemctl start binance-lob-archiver-rust@spot.service
+sudo systemctl start binance-lob-archiver-rust@usdm.service
+jq . /data/monday/spool/binance-lob-rust-shadow/{spot,usdm}/health.json
+```
+
+The container image is built from the Rust workspace root and includes pinned
+Alibaba Cloud CLI checksums plus `zstd`:
+
+```bash
+docker build -f deployment/docker/Dockerfile.binance-lob-archiver \
+  -t monday/binance-lob-archiver:shadow .
+```
+
+For container use, mount the shadow spool read-write and provide an ECS RAM-role
+Alibaba Cloud CLI profile. Do not inject long-lived access keys into the image.
