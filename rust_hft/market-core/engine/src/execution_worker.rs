@@ -544,7 +544,6 @@ impl ExecutionWorker {
                         price,
                         time_in_force: _,
                         strategy_id,
-                        target_venue: _,
                         ..
                     } = envelope.intent;
 

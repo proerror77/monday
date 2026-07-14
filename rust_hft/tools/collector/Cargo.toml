@@ -6,11 +6,12 @@ description = "多交易所數據收集器：WebSocket → ClickHouse"
 
 [dependencies]
 # 核心異步運行時
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 
 # WebSocket + HTTP 客戶端（統一使用 rustls）
 tokio-tungstenite = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 
 # ClickHouse 客戶端
 clickhouse = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -30,6 +31,7 @@ rust_decimal = { version = "1", features = ["serde"] }
 ordered-float = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+engine = { package = "hft-engine", path = "../../market-core/engine" }
 
 # CLI 參數解析
 clap = { version = "4", features = ["derive"] }
@@ -67,6 +69,10 @@ duckdb = ["dep:duckdb"]
 [[bin]]
 name = "hft-collector"
 path = "src/main.rs"
+
+[[bin]]
+name = "binance-lob-archiver"
+path = "src/bin/binance-lob-archiver.rs"
 
 [lib]
 name = "hft_collector"

@@ -21,6 +21,8 @@ jobs:
             file: rust_hft/deployment/docker/Dockerfile.research
           - repository: hft-trading
             file: rust_hft/deployment/docker/Dockerfile.trading
+          - repository: binance-lob-archiver
+            file: rust_hft/deployment/docker/Dockerfile.binance-lob-archiver
 
     steps:
       - name: Checkout
@@ -51,3 +53,25 @@ jobs:
       - name: Record immutable image
         run: |
           echo '${{ matrix.repository }}=${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Extract collector binary for bare-metal ECS
+        if: matrix.repository == 'binance-lob-archiver'
+        env:
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ github.sha }}
+        run: |
+          mkdir -p artifact
+          docker pull "$IMAGE"
+          container_id=$(docker create "$IMAGE")
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container_id:/usr/local/bin/binance-lob-archiver" artifact/binance-lob-archiver
+          chmod 0755 artifact/binance-lob-archiver
+          sha256sum artifact/binance-lob-archiver | tee artifact/binance-lob-archiver.sha256
+
+      - name: Upload collector binary artifact
+        if: matrix.repository == 'binance-lob-archiver'
+        uses: actions/upload-artifact@v4
+        with:
+          name: binance-lob-archiver-linux-amd64-${{ github.sha }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
