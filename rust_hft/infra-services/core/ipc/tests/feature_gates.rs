@@ -25,6 +25,36 @@ fn message_serialization_works() {
     assert!(json.contains("GetStatus"));
 }
 
+#[test]
+fn operator_account_cancel_and_replace_commands_roundtrip() {
+    let commands = [
+        Command::InspectExecutionAccounts,
+        Command::CancelOrdersFiltered {
+            symbol: Some(hft_core::Symbol::new("123")),
+            venue: Some("POLYMARKET".to_string()),
+        },
+        Command::CancelOrderById {
+            order_id: "venue-order-1".to_string(),
+        },
+        Command::ReplaceOrder {
+            order_id: "venue-order-1".to_string(),
+            symbol: hft_core::Symbol::new("123"),
+            new_quantity: Some(rust_decimal::Decimal::ONE),
+            new_price: Some(rust_decimal::Decimal::new(51, 2)),
+        },
+    ];
+
+    for command in commands {
+        let encoded = serde_json::to_string(&command).expect("serialize operator command");
+        let decoded: Command =
+            serde_json::from_str(&encoded).expect("deserialize operator command");
+        assert_eq!(
+            std::mem::discriminant(&decoded),
+            std::mem::discriminant(&command)
+        );
+    }
+}
+
 #[cfg(feature = "ipc")]
 #[test]
 fn ipc_functionality_available_with_feature() {
@@ -50,7 +80,7 @@ fn request_id_is_uuid_with_feature() {
 
     // With IPC feature, RequestId should be UUID
     let id: RequestId = uuid::Uuid::new_v4();
-    assert!(id.to_string().len() > 0);
+    assert!(!id.to_string().is_empty());
 }
 
 #[cfg(not(feature = "ipc"))]
@@ -106,7 +136,7 @@ fn serialization_roundtrip_with_messagepack() {
 
     // Serialize
     let bytes = encode::to_vec(&message).expect("Failed to serialize");
-    assert!(bytes.len() > 0);
+    assert!(!bytes.is_empty());
 
     // Deserialize
     let decoded: IPCMessage = decode::from_slice(&bytes).expect("Failed to deserialize");
@@ -115,6 +145,165 @@ fn serialization_roundtrip_with_messagepack() {
         IPCPayload::Command(Command::GetStatus) => {}
         _ => panic!("Wrong payload type after roundtrip"),
     }
+}
+
+#[cfg(feature = "ipc")]
+#[tokio::test]
+async fn ipc_server_requires_the_request_token_and_never_echoes_it() {
+    use hft_ipc::{handlers::MockCommandHandler, IPCClient, IPCServer};
+
+    let directory = tempfile::tempdir().expect("temporary IPC directory");
+    let socket_path = directory.path().join("authenticated.sock");
+    let server = IPCServer::new_with_auth(
+        &socket_path,
+        MockCommandHandler,
+        Some("expected-token".to_string()),
+    );
+    let server_task = tokio::spawn(async move { server.start().await });
+    for _ in 0..100 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        socket_path.exists(),
+        "authenticated IPC socket did not bind"
+    );
+
+    let denied = IPCClient::new(&socket_path)
+        .with_auth_token("wrong-token")
+        .get_status()
+        .await
+        .expect("authentication rejection response");
+    assert!(matches!(
+        denied,
+        Response::Error {
+            code: Some(401),
+            ..
+        }
+    ));
+    assert!(IPCClient::new(&socket_path)
+        .with_auth_token("wrong-token")
+        .subscribe_status()
+        .await
+        .is_err());
+    let accepted = IPCClient::new(&socket_path)
+        .with_auth_token("expected-token")
+        .get_status()
+        .await
+        .expect("authenticated status response");
+    assert!(matches!(accepted, Response::Data(_)));
+    let subscription = IPCClient::new(&socket_path)
+        .with_auth_token("expected-token")
+        .subscribe_status()
+        .await
+        .expect("authenticated status subscription");
+    drop(subscription);
+
+    server_task.abort();
+    let _ = server_task.await;
+}
+
+#[cfg(feature = "ipc")]
+#[tokio::test]
+async fn active_ipc_socket_cannot_be_taken_over_by_a_second_server() {
+    use hft_ipc::{IPCError, PreparedIPCListener};
+
+    let directory = tempfile::tempdir().expect("temporary IPC directory");
+    let socket_path = directory.path().join("single-owner.sock");
+    let first = PreparedIPCListener::bind(&socket_path).expect("first server binds");
+
+    let error = match PreparedIPCListener::bind(&socket_path) {
+        Ok(second) => {
+            drop(second);
+            panic!("second server must not take over an active IPC socket");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            IPCError::Io(ref error) if error.kind() == std::io::ErrorKind::AddrInUse
+        ),
+        "unexpected takeover error: {error:?}"
+    );
+    assert!(
+        tokio::net::UnixStream::connect(&socket_path).await.is_ok(),
+        "the first server remains reachable after the rejected takeover"
+    );
+
+    drop(first);
+    assert!(!socket_path.exists());
+}
+
+#[cfg(feature = "ipc")]
+#[tokio::test]
+async fn old_listener_drop_does_not_remove_a_replacement_socket_inode() {
+    use hft_ipc::PreparedIPCListener;
+
+    let directory = tempfile::tempdir().expect("temporary IPC directory");
+    let socket_path = directory.path().join("inode-owned.sock");
+    let first = PreparedIPCListener::bind(&socket_path).expect("first server binds");
+    std::fs::remove_file(&socket_path).expect("simulate replacement of the socket path");
+    let replacement = std::os::unix::net::UnixListener::bind(&socket_path)
+        .expect("an uncoordinated replacement socket binds");
+
+    drop(first);
+    assert!(
+        socket_path.exists(),
+        "old listener must not unlink the replacement server's inode"
+    );
+
+    drop(replacement);
+    std::fs::remove_file(&socket_path).expect("remove replacement socket");
+    assert!(!socket_path.exists());
+}
+
+#[cfg(feature = "ipc")]
+#[tokio::test]
+async fn concurrent_stale_socket_claim_has_exactly_one_owner() {
+    use hft_ipc::{IPCError, PreparedIPCListener};
+    use std::sync::Arc;
+
+    let directory = tempfile::tempdir().expect("temporary IPC directory");
+    let socket_path = directory.path().join("concurrent-stale.sock");
+    drop(std::os::unix::net::UnixListener::bind(&socket_path).expect("create stale socket inode"));
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let finish = Arc::new(tokio::sync::Barrier::new(2));
+    let contender = |start: Arc<tokio::sync::Barrier>, finish: Arc<tokio::sync::Barrier>| {
+        let socket_path = socket_path.clone();
+        async move {
+            start.wait().await;
+            let result = PreparedIPCListener::bind(socket_path);
+            finish.wait().await;
+            result
+        }
+    };
+
+    let (first, second) = tokio::join!(
+        contender(Arc::clone(&start), Arc::clone(&finish)),
+        contender(start, finish)
+    );
+    let outcomes = [first, second];
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(IPCError::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse
+            ))
+            .count(),
+        1
+    );
+    assert!(
+        tokio::net::UnixStream::connect(&socket_path).await.is_ok(),
+        "the winning listener remains reachable"
+    );
+
+    drop(outcomes);
+    assert!(!socket_path.exists());
 }
 
 #[test]

@@ -72,6 +72,7 @@ pub struct QueueStats {
     pub intent_expired_count: u64,
     pub intent_stale_count: u64,
     pub intent_max_latency_count: u64,
+    pub intent_order_notional_count: u64,
 }
 
 /// 帶生命週期 envelope 的意圖提交失敗原因。
@@ -187,6 +188,11 @@ impl EngineQueues {
                     }
                     OrderIntentRejectReason::MaxLatencyExceeded { .. } => {
                         self.stats.intent_max_latency_count += 1;
+                    }
+                    OrderIntentRejectReason::InvalidMaxOrderNotional { .. }
+                    | OrderIntentRejectReason::OrderNotionalUnpriceable { .. }
+                    | OrderIntentRejectReason::MaxOrderNotionalExceeded { .. } => {
+                        self.stats.intent_order_notional_count += 1;
                     }
                 }
                 Err(LifecycleIntentSubmitError::LifecycleRejected {

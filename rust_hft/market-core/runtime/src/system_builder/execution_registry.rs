@@ -24,6 +24,7 @@ impl SystemBuilder {
             VenueType::Lighter => self.register_lighter_adapters(venue),
             VenueType::Backpack => self.register_backpack_adapters(venue),
             VenueType::OndoPerps => self.register_ondo_perps_adapters(venue),
+            VenueType::Polymarket => self.register_polymarket_adapters(venue),
             VenueType::Mock => {
                 if venue.simulate_execution {
                     info!("Mock: 使用模擬執行客戶端 (SimulatedExecutionClient)");
@@ -38,16 +39,111 @@ impl SystemBuilder {
 }
 
 impl SystemBuilder {
+    #[cfg(feature = "adapter-polymarket-execution")]
+    pub(crate) fn register_polymarket_adapters(mut self, venue: &VenueConfig) -> Self {
+        use adapter_polymarket_execution::{
+            PolymarketExecutionClient, PolymarketExecutionConfig, WalletSignatureType,
+        };
+        use secrecy::SecretString;
+        use std::str::FromStr;
+
+        if venue.simulate_execution {
+            info!(
+                "Polymarket simulate_execution is enabled; registering Monday simulated execution"
+            );
+            return self.register_simulated_execution_client(hft_core::VenueId::POLYMARKET);
+        }
+        if !venue
+            .execution_mode
+            .as_deref()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("live"))
+        {
+            info!("Polymarket live execution is disabled; registering Monday simulated execution");
+            return self.register_simulated_execution_client(hft_core::VenueId::POLYMARKET);
+        }
+
+        let settings = match venue.execution_config.clone() {
+            Some(value) => {
+                match serde_yaml::from_value::<PolymarketRuntimeExecutionConfig>(value) {
+                    Ok(settings) => settings,
+                    Err(error) => {
+                        warn!(%error, "Polymarket execution_config is invalid; signature_type must be explicit");
+                        return self;
+                    }
+                }
+            }
+            None => {
+                warn!("Polymarket Live execution requires execution_config.signature_type");
+                return self;
+            }
+        };
+        let signature_type = match WalletSignatureType::from_str(&settings.signature_type) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "Polymarket execution signature_type is invalid");
+                return self;
+            }
+        };
+        let config = PolymarketExecutionConfig {
+            host: venue
+                .rest
+                .clone()
+                .unwrap_or_else(|| "https://clob.polymarket.com".to_string()),
+            ws_url: venue
+                .ws_private
+                .clone()
+                .or_else(|| venue.ws_public.clone())
+                .unwrap_or_else(|| "wss://ws-subscriptions-clob.polymarket.com".to_string()),
+            data_api_host: settings.data_api_host,
+            private_key: venue
+                .secret
+                .clone()
+                .filter(|value| !value.trim().is_empty() && !value.contains("${"))
+                .map(|value| SecretString::new(value.into())),
+            funder: settings.funder,
+            signature_type,
+            use_server_time: settings.use_server_time,
+            minimum_collateral: settings.minimum_collateral,
+        };
+        match PolymarketExecutionClient::new(config) {
+            Ok(client) => {
+                let account = venue
+                    .account_id
+                    .as_ref()
+                    .map(|value| hft_core::AccountId(value.clone()));
+                self = self.register_execution_client_with_key(
+                    client,
+                    hft_core::VenueId::POLYMARKET,
+                    account,
+                );
+                info!("registered Monday-native Polymarket live execution client");
+            }
+            Err(error) => warn!(%error, "Polymarket live execution is not configured"),
+        }
+        self
+    }
+
+    #[cfg(not(feature = "adapter-polymarket-execution"))]
+    pub(crate) fn register_polymarket_adapters(self, venue: &VenueConfig) -> Self {
+        if venue
+            .execution_mode
+            .as_deref()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("live"))
+        {
+            warn!("Polymarket live execution adapter is not enabled");
+            self
+        } else {
+            self.register_simulated_execution_client(hft_core::VenueId::POLYMARKET)
+        }
+    }
+
     #[cfg(feature = "adapter-binance-prediction-execution")]
     pub(crate) fn register_binance_prediction_adapters(mut self, venue: &VenueConfig) -> Self {
         use adapter_binance_prediction_execution as prediction;
 
-        let settings = venue
-            .execution_config
-            .clone()
-            .and_then(|value| {
-                serde_yaml::from_value::<prediction::BinancePredictionVenueConfig>(value).ok()
-            });
+        let settings = venue.execution_config.clone().and_then(|value| {
+            serde_yaml::from_value::<prediction::BinancePredictionVenueConfig>(value).ok()
+        });
         let Some(settings) = settings else {
             warn!("Binance Prediction requires execution_config with wallet and funding settings");
             return self;
@@ -564,6 +660,30 @@ impl SystemBuilder {
     }
 }
 
+#[cfg(feature = "adapter-polymarket-execution")]
+#[derive(Debug, serde::Deserialize)]
+struct PolymarketRuntimeExecutionConfig {
+    #[serde(default = "default_polymarket_data_api_host")]
+    data_api_host: String,
+    #[serde(default)]
+    funder: Option<String>,
+    signature_type: String,
+    #[serde(default = "default_true")]
+    use_server_time: bool,
+    #[serde(default)]
+    minimum_collateral: rust_decimal::Decimal,
+}
+
+#[cfg(feature = "adapter-polymarket-execution")]
+fn default_polymarket_data_api_host() -> String {
+    "https://data-api.polymarket.com".to_string()
+}
+
+#[cfg(feature = "adapter-polymarket-execution")]
+const fn default_true() -> bool {
+    true
+}
+
 #[cfg(feature = "adapter-backpack-execution")]
 fn build_backpack_execution_config(
     venue: &VenueConfig,
@@ -698,8 +818,8 @@ fn yaml_get_u64(map: &Mapping, key: &str) -> Option<u64> {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
-    use super::*;
     use super::super::{SystemConfig, VenueCapabilities};
+    use super::*;
     use shared_instrument::InstrumentId;
 
     #[cfg(feature = "adapter-binance-prediction-execution")]

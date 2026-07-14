@@ -1,0 +1,29 @@
+[package]
+name = "hft-execution-adapter-polymarket"
+version = "0.1.0"
+edition = "2021"
+description = "Monday-native Polymarket CLOB live execution adapter"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+alloy = { version = "1.6.3", default-features = false, features = ["signer-local"] }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.0", features = ["clob", "ws", "data", "heartbeats"] }
+rust_decimal = { workspace = true }
+secrecy = "0.10"
+serde = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+url = "2"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[lib]
+name = "execution_adapter_polymarket"

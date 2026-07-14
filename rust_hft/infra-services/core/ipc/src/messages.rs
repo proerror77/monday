@@ -27,6 +27,9 @@ pub struct IPCMessage {
     pub timestamp: u64,
     /// Message payload
     pub payload: IPCPayload,
+    /// Optional per-request bearer token. Responses never echo it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
 }
 
 #[cfg(feature = "ipc")]
@@ -39,6 +42,7 @@ impl IPCMessage {
                 .unwrap()
                 .as_nanos() as u64,
             payload,
+            auth_token: None,
         }
     }
 }
@@ -53,6 +57,7 @@ impl IPCMessage {
                 .unwrap()
                 .as_nanos() as u64,
             payload,
+            auth_token: None,
         }
     }
 }
@@ -124,6 +129,22 @@ pub enum Command {
         strategy_id: String,
         params: SharedStrategyParams,
     },
+    /// Get venue-authoritative execution account state from every configured client
+    InspectExecutionAccounts,
+    /// Cancel OMS-open orders matching the optional symbol and venue filters
+    CancelOrdersFiltered {
+        symbol: Option<Symbol>,
+        venue: Option<String>,
+    },
+    /// Cancel a single OMS-tracked order by ID
+    CancelOrderById { order_id: String },
+    /// Cancel-confirm-replace an OMS-tracked order without increasing quantity
+    ReplaceOrder {
+        order_id: String,
+        symbol: Symbol,
+        new_quantity: Option<Decimal>,
+        new_price: Option<Decimal>,
+    },
 }
 
 /// Command responses
@@ -150,6 +171,77 @@ pub enum ResponseData {
     OpenOrders(Vec<Order>),
     /// Result of cancel commands
     CancelResult(CancelStats),
+    /// Venue-authoritative balances, positions, orders, and recent fills
+    ExecutionAccounts(ExecutionAccountInspection),
+}
+
+/// A venue snapshot distinguishes unsupported capabilities from failed requests and empty data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthoritativeSnapshot<T> {
+    Unsupported,
+    Data(T),
+    Error(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionAccountInspection {
+    pub clients: Vec<ExecutionAccountSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionAccountSnapshot {
+    pub client_index: u32,
+    pub venue: Option<String>,
+    pub account_id: Option<String>,
+    pub open_orders: AuthoritativeSnapshot<Vec<ExecutionOpenOrder>>,
+    pub balances: AuthoritativeSnapshot<Vec<ExecutionBalance>>,
+    pub positions: AuthoritativeSnapshot<Vec<ExecutionPosition>>,
+    pub recent_fills: AuthoritativeSnapshot<Vec<ExecutionFill>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionOpenOrder {
+    pub order_id: String,
+    pub client_order_id: Option<String>,
+    pub symbol: Symbol,
+    pub side: OrderSide,
+    pub order_type: String,
+    pub original_quantity: Decimal,
+    pub remaining_quantity: Decimal,
+    pub filled_quantity: Decimal,
+    pub price: Option<Decimal>,
+    pub status: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionBalance {
+    pub asset: String,
+    pub available: Decimal,
+    pub frozen: Decimal,
+    pub total: Decimal,
+    pub usd_value: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionPosition {
+    pub symbol: Symbol,
+    pub quantity: Decimal,
+    pub average_price: Decimal,
+    pub unrealized_pnl: Decimal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionFill {
+    pub fill_id: String,
+    pub order_id: String,
+    pub symbol: Symbol,
+    pub side: OrderSide,
+    pub price: Decimal,
+    pub quantity: Decimal,
+    pub fee: Option<Decimal>,
+    pub timestamp: u64,
 }
 
 /// Cancel command result statistics

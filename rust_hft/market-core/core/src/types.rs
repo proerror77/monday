@@ -26,6 +26,7 @@ impl VenueId {
     pub const BACKPACK: VenueId = VenueId(8);
     pub const GRVT: VenueId = VenueId(9);
     pub const ONDO_PERPS: VenueId = VenueId(10);
+    pub const POLYMARKET: VenueId = VenueId(11);
     pub const BINANCE_SPOT: VenueId = VenueId(101);
     pub const BINANCE_TOKENIZED_SECURITIES: VenueId = VenueId(102);
     pub const BINANCE_FUTURES: VenueId = VenueId(103);
@@ -45,6 +46,7 @@ impl VenueId {
             Self::BACKPACK => "BACKPACK",
             Self::GRVT => "GRVT",
             Self::ONDO_PERPS => "ONDO_PERPS",
+            Self::POLYMARKET => "POLYMARKET",
             Self::BINANCE_SPOT => "BINANCE_SPOT",
             Self::BINANCE_TOKENIZED_SECURITIES => "BINANCE_TOKENIZED_SECURITIES",
             Self::BINANCE_FUTURES => "BINANCE_FUTURES",
@@ -67,6 +69,7 @@ impl VenueId {
             "BACKPACK" => Some(Self::BACKPACK),
             "GRVT" => Some(Self::GRVT),
             "ONDO_PERPS" | "ONDO-PERPS" => Some(Self::ONDO_PERPS),
+            "POLYMARKET" | "POLY_MARKET" | "POLY-MARKET" => Some(Self::POLYMARKET),
             "BINANCE_SPOT" | "BINANCE-SPOT" => Some(Self::BINANCE_SPOT),
             "BINANCE_TOKENIZED_SECURITIES" | "BINANCE-TOKENIZED-SECURITIES" | "BINANCE_BSTOCKS" => {
                 Some(Self::BINANCE_TOKENIZED_SECURITIES)
@@ -491,6 +494,19 @@ impl InstrumentSpec {
         }
     }
 
+    pub fn polymarket_outcome(token_id: Symbol) -> Self {
+        Self {
+            symbol: token_id,
+            venue: VenueId::POLYMARKET,
+            asset_class: AssetClass::PredictionMarket,
+            product_type: ProductType::PredictionMarket,
+            regulatory_profile: RegulatoryProfile::RestrictedJurisdiction,
+            underlying_symbol: None,
+            issuer: Some("Polymarket".to_string()),
+            quote_currency: Some("USDC".to_string()),
+        }
+    }
+
     pub fn instrument_key(&self) -> InstrumentKey {
         InstrumentKey::from_spec(self)
     }
@@ -506,6 +522,20 @@ mod instrument_key_tests {
 
         assert_eq!(key.storage_key(), "BINANCE:SPOT:BTCUSDT");
         assert_eq!(key.legacy_venue_symbol_key(), "BINANCE:BTCUSDT");
+    }
+
+    #[test]
+    fn polymarket_outcome_has_stable_prediction_market_identity() {
+        let spec = InstrumentSpec::polymarket_outcome(Symbol::new("123456789"));
+
+        assert_eq!(VenueId::from_str("polymarket"), Some(VenueId::POLYMARKET));
+        assert_eq!(spec.venue, VenueId::POLYMARKET);
+        assert_eq!(spec.asset_class, AssetClass::PredictionMarket);
+        assert_eq!(spec.product_type, ProductType::PredictionMarket);
+        assert_eq!(
+            spec.instrument_key().storage_key(),
+            "POLYMARKET:PREDICTION_MARKET:123456789"
+        );
     }
 
     #[test]

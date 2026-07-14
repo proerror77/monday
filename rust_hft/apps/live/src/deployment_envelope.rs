@@ -188,10 +188,18 @@ impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
                 proposed.quotes_only = false;
             }
             ActivationMode::LiveSmall => {
-                return Err(
-                    "live-small activation is disabled until universal order-size and slippage gates consume the envelope limits"
-                        .to_string(),
-                )
+                if proposed.venues[*venue_index].venue_type != runtime::VenueType::Polymarket {
+                    return Err(
+                        "live-small activation is restricted to Polymarket venues".to_string()
+                    );
+                }
+                if request.artifact != ActivationArtifact::Formula {
+                    return Err(
+                        "live-small Polymarket activation requires a Formula artifact".to_string(),
+                    );
+                }
+                proposed.venues[*venue_index].execution_mode = Some("Live".to_string());
+                proposed.quotes_only = false;
             }
         }
         apply_strategy_bundle(&mut proposed, request, self.bundle, self.bundle_path)?;
@@ -241,6 +249,7 @@ fn apply_strategy_bundle(
     let requested_notional = positive_decimal("max_notional", request.max_notional)?;
     let requested_symbol = positive_decimal("max_symbol_exposure", request.max_symbol_exposure)?;
     let requested_order = positive_decimal("max_order_size", request.max_order_size)?;
+    let max_slippage_bps = integer_slippage_bps(request.max_slippage_bps)?;
     if hard_notional <= rust_decimal::Decimal::ZERO {
         return Err("runtime hard notional limit disables strategy activation".to_string());
     }
@@ -307,6 +316,8 @@ fn apply_strategy_bundle(
         }
     };
 
+    config.engine.intent_max_slippage_bps = Some(max_slippage_bps);
+    config.engine.intent_max_order_notional = Some(order_notional);
     config.risk.global_notional_limit = total_notional;
     config.venues.retain(|venue| {
         venue.name.eq_ignore_ascii_case(&request.venue)
@@ -343,6 +354,15 @@ fn positive_decimal(name: &str, value: f64) -> Result<rust_decimal::Decimal, Str
         return Err(format!("deployment {name} must be positive"));
     }
     Ok(value)
+}
+
+fn integer_slippage_bps(value: f64) -> Result<i32, String> {
+    if !value.is_finite() || value.trunc() != value || !(1.0..=10_000.0).contains(&value) {
+        return Err(
+            "deployment max_slippage_bps must be a finite integer in 1..=10000".to_string(),
+        );
+    }
+    Ok(value as i32)
 }
 
 fn verify_onnx_artifact(

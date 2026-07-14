@@ -25,7 +25,7 @@ pub mod server;
 #[cfg(feature = "ipc")]
 pub use client::IPCClient;
 #[cfg(feature = "ipc")]
-pub use server::IPCServer;
+pub use server::{IPCServer, PreparedIPCListener};
 
 /// IPC communication errors
 #[derive(thiserror::Error, Debug)]

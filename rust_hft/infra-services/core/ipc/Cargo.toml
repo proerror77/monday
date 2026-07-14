@@ -17,6 +17,8 @@ tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time"
 rmp-serde = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["serde"], optional = true }
 async-trait = { workspace = true, optional = true }
+fs4 = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 
 # Internal dependencies
 hft-core = { path = "../../../market-core/core" }
@@ -25,7 +27,7 @@ shared_config = { package = "hft-shared-config", path = "../../../shared/config"
 [features]
 default = []
 # Full IPC functionality with Unix Domain Socket server/client
-ipc = ["dep:tokio", "dep:rmp-serde", "dep:uuid", "dep:async-trait"]
+ipc = ["dep:tokio", "dep:rmp-serde", "dep:uuid", "dep:async-trait", "dep:fs4", "dep:libc"]
 
 [dev-dependencies]
 tempfile = "3.8"

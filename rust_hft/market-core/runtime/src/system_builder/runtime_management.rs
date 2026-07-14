@@ -3,7 +3,7 @@
 use super::SystemRuntime;
 // use crate::portfolio_manager::PortfolioManager; // 未使用，移除
 use engine; // for types in signatures
-use hft_core::HftError;
+use hft_core::{HftError, OrderId, Price, Quantity, Symbol};
 use std::sync::Arc;
 
 impl SystemRuntime {
@@ -15,6 +15,7 @@ impl SystemRuntime {
             execution_enabled,
         )
         .with_balance_tolerance_usd(self.config.engine.balance_reconcile_tolerance_usd)
+        .with_operation_gate(self.execution_control_gate.clone())
     }
 
     /// 為 IPC 創建共享實例，避免雙實例問題
@@ -23,6 +24,7 @@ impl SystemRuntime {
     pub(crate) fn clone_for_ipc(&self) -> SystemRuntime {
         SystemRuntime {
             engine: self.engine.clone(),
+            execution_control_gate: self.execution_control_gate.clone(),
             config: self.config.clone(),
             tasks: vec![],                  // IPC 專用空任務列表
             execution_worker_tasks: vec![], // IPC 專用空任務列表
@@ -55,4 +57,23 @@ impl SystemRuntime {
             .await
     }
 
+    /// Fetch venue-authoritative balances, positions, open orders, and recent fills.
+    pub async fn inspect_execution_accounts(
+        &self,
+    ) -> Result<engine::execution_worker::WorkerReconcileSnapshot, HftError> {
+        self.execution_control_handle().inspect_account().await
+    }
+
+    /// Replace an open order through the execution worker and venue adapter.
+    pub async fn replace_order(
+        &self,
+        order_id: OrderId,
+        symbol: Symbol,
+        new_quantity: Option<Quantity>,
+        new_price: Option<Price>,
+    ) -> Result<(), HftError> {
+        self.execution_control_handle()
+            .replace_order(order_id, symbol, new_quantity, new_price)
+            .await
+    }
 }

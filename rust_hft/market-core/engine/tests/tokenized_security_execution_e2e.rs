@@ -54,6 +54,10 @@ impl ExecutionClient for RecordingExecutionClient {
         ])))
     }
 
+    fn execution_stream_may_complete(&self) -> bool {
+        true
+    }
+
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
         Ok(Vec::new())
     }

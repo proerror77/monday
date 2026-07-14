@@ -127,6 +127,7 @@ fn instrument_for_venue(symbol: Symbol, venue: VenueId) -> InstrumentSpec {
             InstrumentSpec::tokenized_security_spot(symbol, venue)
         }
         VenueId::ONDO_PERPS => InstrumentSpec::ondo_perp(symbol),
+        VenueId::POLYMARKET => InstrumentSpec::polymarket_outcome(symbol),
         _ => InstrumentSpec::crypto_spot(symbol, venue),
     }
 }
@@ -143,6 +144,7 @@ fn to_venue_id(venue_type: &VenueType) -> VenueId {
         VenueType::Asterdex => VenueId::ASTERDEX,
         VenueType::Lighter => VenueId::LIGHTER,
         VenueType::OndoPerps => VenueId::ONDO_PERPS,
+        VenueType::Polymarket => VenueId::POLYMARKET,
         VenueType::Mock => VenueId::MOCK,
         VenueType::Okx => VenueId::OKX,
     }
@@ -278,6 +280,41 @@ mod tests {
         assert_eq!(
             instruments,
             &[InstrumentSpec::ondo_perp(Symbol::new("TSLA"))]
+        );
+    }
+
+    #[test]
+    fn polymarket_catalog_preserves_outcome_token_identity() {
+        let mut config = SystemConfig::default();
+        config.venues.push(VenueConfig {
+            name: "polymarket".into(),
+            account_id: None,
+            venue_type: VenueType::Polymarket,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: None,
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: false,
+            symbol_catalog: vec![InstrumentId::new("123456789@POLYMARKET")],
+            data_config: None,
+            execution_config: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        });
+
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        let (venue, _, instruments) = &builder.market_stream_plans[0];
+
+        assert_eq!(*venue, VenueType::Polymarket);
+        assert_eq!(
+            instruments,
+            &[InstrumentSpec::polymarket_outcome(Symbol::new("123456789"))]
         );
     }
 

@@ -172,6 +172,7 @@ impl MultiAccountPortfolio {
         let order_id = match event {
             ExecutionEvent::OrderAck { order_id, .. } => order_id,
             ExecutionEvent::Fill { order_id, .. } => order_id,
+            ExecutionEvent::FeeCharged { order_id, .. } => order_id,
             ExecutionEvent::OrderCanceled { order_id, .. } => order_id,
             ExecutionEvent::OrderReject { order_id, .. } => order_id,
             ExecutionEvent::OrderModified { order_id, .. } => order_id,

@@ -1,0 +1,37 @@
+schema_version: v2
+quotes_only: true
+
+engine:
+  queue_capacity: 16384
+  stale_us: 1000000
+  top_n: 20
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  balance_reconcile_tolerance_usd: 1
+
+venues:
+  - name: polymarket-public
+    venue_type: Polymarket
+    ws_public: "wss://ws-subscriptions-clob.polymarket.com"
+    rest: "https://clob.polymarket.com"
+    execution_mode: Paper
+    simulate_execution: false
+    symbol_catalog:
+      # A Polymarket outcome token ID, not a condition ID or human market slug.
+      - "${POLYMARKET_TOKEN_ID}@POLYMARKET"
+    capabilities:
+      ws_order_placement: false
+      snapshot_crc: false
+      all_in_one_topics: true
+      private_ws_heartbeat: false
+      use_incremental_books: true
+
+strategies: []
+
+risk:
+  risk_type: Default
+  global_position_limit: 0
+  global_notional_limit: 0
+  max_daily_trades: 0
+  max_orders_per_second: 0
+  staleness_threshold_us: 1000000

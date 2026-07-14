@@ -354,8 +354,11 @@ fn validate_startup_authority(
     config: &SystemConfig,
     has_signed_activation: bool,
 ) -> anyhow::Result<()> {
-    if !has_signed_activation && (!config.quotes_only || !config.strategies.is_empty()) {
-        anyhow::bail!("execution-capable hft-live startup requires a signed deployment envelope");
+    // A venue-authenticated process with no strategies is an operator control session: it can
+    // inspect and cancel orders, but there is no producer for a new OrderIntent. Any configured
+    // strategy remains deployment-governed, including Paper and Shadow modes.
+    if !has_signed_activation && !config.strategies.is_empty() {
+        anyhow::bail!("strategy-capable hft-live startup requires a signed deployment envelope");
     }
     Ok(())
 }
@@ -521,7 +524,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unsigned_live_startup_is_limited_to_empty_quotes_only_config() {
+    fn unsigned_startup_allows_empty_operator_control_but_never_a_strategy() {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/prod/system.yaml");
         let mut config = SystemBuilder::from_yaml(path.to_str().unwrap())
@@ -531,6 +534,23 @@ mod tests {
         assert!(validate_startup_authority(&config, false).is_ok());
 
         config.quotes_only = false;
+        assert!(validate_startup_authority(&config, false).is_ok());
+        config.strategies.push(runtime::StrategyConfig {
+            name: "unsigned".to_string(),
+            strategy_type: runtime::StrategyType::Imbalance,
+            symbols: vec![hft_core::Symbol::new("BTCUSDT")],
+            params: runtime::StrategyParams::Imbalance {
+                obi_threshold: 0.1,
+                lot: rust_decimal::Decimal::ONE,
+                top_levels: 1,
+            },
+            risk_limits: runtime::StrategyRiskLimits {
+                max_notional: rust_decimal::Decimal::ONE,
+                max_position: rust_decimal::Decimal::ONE,
+                daily_loss_limit: rust_decimal::Decimal::ONE,
+                cooldown_ms: 1,
+            },
+        });
         assert!(validate_startup_authority(&config, false).is_err());
         assert!(validate_startup_authority(&config, true).is_ok());
     }

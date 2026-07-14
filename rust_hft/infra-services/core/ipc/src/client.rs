@@ -15,6 +15,7 @@ use tracing::{debug, error};
 pub struct IPCClient {
     socket_path: String,
     default_timeout: Duration,
+    auth_token: Option<String>,
 }
 
 impl IPCClient {
@@ -23,12 +24,21 @@ impl IPCClient {
         Self {
             socket_path: socket_path.as_ref().to_string_lossy().to_string(),
             default_timeout: Duration::from_secs(30),
+            auth_token: std::env::var("HFT_IPC_AUTH_TOKEN")
+                .or_else(|_| std::env::var("HFT_IPC_TOKEN"))
+                .ok(),
         }
     }
 
     /// Set default timeout for commands
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.default_timeout = timeout;
+        self
+    }
+
+    /// Set the bearer token required by a server configured with `HFT_IPC_AUTH_TOKEN`.
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
         self
     }
 
@@ -57,7 +67,8 @@ impl IPCClient {
         let mut stream = UnixStream::connect(&self.socket_path).await?;
 
         // Create message
-        let message = IPCMessage::new(IPCPayload::Command(command));
+        let mut message = IPCMessage::new(IPCPayload::Command(command));
+        message.auth_token.clone_from(&self.auth_token);
         let message_id = message.id;
 
         // Send message
@@ -83,7 +94,29 @@ impl IPCClient {
 
     /// Subscribe to status updates
     pub async fn subscribe_status(&self) -> IPCResult<StatusSubscription> {
-        let stream = UnixStream::connect(&self.socket_path).await?;
+        let mut stream = UnixStream::connect(&self.socket_path).await?;
+        // Authenticate the connection before the server is allowed to forward broadcasts.
+        // GetStatus is read-only and doubles as a backwards-compatible handshake.
+        let mut handshake = IPCMessage::new(IPCPayload::Command(Command::GetStatus));
+        handshake.auth_token.clone_from(&self.auth_token);
+        let handshake_id = handshake.id;
+        Self::write_message(&mut stream, &handshake).await?;
+        loop {
+            let response = Self::read_message(&mut stream).await?.ok_or_else(|| {
+                IPCError::Handler("Connection closed during status authentication".to_string())
+            })?;
+            if response.id != handshake_id {
+                continue;
+            }
+            if let IPCPayload::Response(response) = response.payload {
+                match response {
+                    Response::Error { message, .. } => {
+                        return Err(IPCError::Handler(message));
+                    }
+                    _ => break,
+                }
+            }
+        }
         let (status_tx, status_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
@@ -233,9 +266,47 @@ impl IPCClient {
         self.send_command(Command::GetOpenOrders).await
     }
 
+    /// Get venue-authoritative execution balances, positions, orders, and recent fills.
+    pub async fn inspect_execution_accounts(&self) -> IPCResult<Response> {
+        self.send_command(Command::InspectExecutionAccounts).await
+    }
+
     /// Cancel all orders
     pub async fn cancel_all_orders(&self) -> IPCResult<Response> {
         self.send_command(Command::CancelAllOrders).await
+    }
+
+    /// Cancel OMS-open orders matching optional symbol and venue filters.
+    pub async fn cancel_orders_filtered(
+        &self,
+        symbol: Option<hft_core::Symbol>,
+        venue: Option<String>,
+    ) -> IPCResult<Response> {
+        self.send_command(Command::CancelOrdersFiltered { symbol, venue })
+            .await
+    }
+
+    /// Cancel one OMS-tracked or authoritatively discovered open order by venue order ID.
+    pub async fn cancel_order_by_id(&self, order_id: String) -> IPCResult<Response> {
+        self.send_command(Command::CancelOrderById { order_id })
+            .await
+    }
+
+    /// Replace an OMS-tracked order without increasing its risk-reviewed quantity.
+    pub async fn replace_order(
+        &self,
+        order_id: String,
+        symbol: hft_core::Symbol,
+        new_quantity: Option<rust_decimal::Decimal>,
+        new_price: Option<rust_decimal::Decimal>,
+    ) -> IPCResult<Response> {
+        self.send_command(Command::ReplaceOrder {
+            order_id,
+            symbol,
+            new_quantity,
+            new_price,
+        })
+        .await
     }
 
     /// Cancel orders for a specific strategy

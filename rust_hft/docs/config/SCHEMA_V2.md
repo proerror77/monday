@@ -8,7 +8,6 @@ engine:
   top_n: 10
   ack_timeout_ms: 3000
   reconcile_interval_ms: 5000
-  auto_cancel_exchange_only: false
 
 venues:
   - name: binance
@@ -53,6 +52,7 @@ risk:
 - `risk`：目前保留原有欄位，`enhanced` 與 `strategy_overrides` 預計後續強型別化。
 - `instrument catalog`：預設從 `config/instruments.yaml` 載入，可由環境變數 `HFT_INSTRUMENT_CATALOG` 指定自訂路徑。
 - `venue catalog`：建議同步維護 `config/venues.yaml`，提供 endpoint 與能力旗標，可透過環境變數 `HFT_VENUE_CATALOG` 指定自訂路徑，後續 loader 會自動合併。
+- `auto_cancel_exchange_only`：僅保留舊配置解析相容性；設為 `true` 會在啟動驗證時失敗。交換端孤兒單必須由可比對 OMS 的 runtime 控制面處理。
 
 更多範例可參考 `shared/config/examples/system_v2.yaml`。
 

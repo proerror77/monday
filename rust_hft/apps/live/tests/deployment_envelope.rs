@@ -39,9 +39,9 @@ fn directory(name: &str) -> PathBuf {
 
 fn policy(envelope: &DeploymentEnvelope) -> RuntimeEnvelopePolicy {
     RuntimeEnvelopePolicy {
-        account_id: "account-1".to_string(),
-        venue: "binance".to_string(),
-        allowed_instruments: vec!["BTCUSDT".to_string()],
+        account_id: envelope.account_id.clone(),
+        venue: envelope.venue.clone(),
+        allowed_instruments: envelope.instruments.clone(),
         allowed_intent_types: vec![
             AllowedIntentType::LoadFactor,
             AllowedIntentType::LoadModel,
@@ -214,6 +214,16 @@ fn configured_runtime() -> runtime::SystemConfig {
     config.risk.global_notional_limit = rust_decimal::Decimal::from(2_000);
     config.risk.max_orders_per_second = 10;
     config.risk.max_daily_loss = rust_decimal::Decimal::from(100);
+    config.engine.intent_max_latency_us = 1_000_000;
+    config
+}
+
+fn configured_polymarket_runtime() -> runtime::SystemConfig {
+    let mut config = configured_runtime();
+    let venue = &mut config.venues[0];
+    venue.name = "polymarket-main".to_string();
+    venue.venue_type = runtime::VenueType::Polymarket;
+    venue.symbol_catalog[0].0 = "123456789@POLYMARKET".to_string();
     config
 }
 
@@ -287,6 +297,11 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
     assert!(!config.quotes_only);
     assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Paper"));
     assert_eq!(config.strategies.len(), 1);
+    assert_eq!(config.engine.intent_max_slippage_bps, Some(5));
+    assert_eq!(
+        config.engine.intent_max_order_notional,
+        Some(rust_decimal::Decimal::from(100))
+    );
     assert_eq!(config.strategies[0].name, bundle.bundle_id);
     let runtime = runtime::SystemBuilder::new(config.clone())
         .auto_register_adapters_strict()
@@ -374,9 +389,10 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
         .register_strategies_from_config_strict()
         .unwrap()
         .build();
-    let (execution_receiver, market_reader, notify) = {
+    let (execution_receiver, mut diagnostic_receiver, market_reader, notify) = {
         let engine = system.engine.lock().await;
         (
+            engine.subscribe_execution_events(),
             engine.subscribe_execution_events(),
             engine.market_reader(),
             engine.get_wakeup_notify(),
@@ -431,7 +447,7 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
             symbol: Symbol::new("BTCUSDT"),
             timestamp: hft_core::now_micros(),
             bids: vec![BookLevel::new_unchecked(99.0, 3.0)],
-            asks: vec![BookLevel::new_unchecked(101.0, 1.0)],
+            asks: vec![BookLevel::new_unchecked(100.0, 1.0)],
             sequence: 1,
             source_venue: Some(VenueId::BINANCE),
         }))
@@ -447,10 +463,16 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
         if has_fill {
             break;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "shadow paper execution did not emit a fill"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let statistics = system.engine.lock().await.get_statistics();
+            let mut execution_events = Vec::new();
+            while let Ok(event) = diagnostic_receiver.try_recv() {
+                execution_events.push(event);
+            }
+            panic!(
+                "shadow paper execution did not emit a fill: {statistics:?}; events={execution_events:?}"
+            );
+        }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
@@ -779,28 +801,26 @@ fn concurrent_startups_serialize_nonce_reservation_and_recheck_the_ledger() {
 }
 
 #[test]
-fn live_small_fails_closed_until_order_limits_are_in_the_hot_path() {
+fn live_small_polymarket_formula_activation_is_allowed() {
     let now = Utc::now();
     let key = SigningKey::from_bytes(&[7_u8; 32]);
     let trusted = trusted(&key);
     let directory = directory("live-small-disabled");
-    let signed = sign_envelope(
-        envelope(
-            now,
-            "live-small-1",
-            "nonce-live-small",
-            AllowedIntentType::StartLiveSmall,
-            ApprovalClass::HumanApprovedLiveSmall,
-        ),
-        "key-1",
-        &key,
-    )
-    .unwrap();
-    let mut config = configured_runtime();
+    let mut unsigned = envelope(
+        now,
+        "live-small-1",
+        "nonce-live-small",
+        AllowedIntentType::StartLiveSmall,
+        ApprovalClass::HumanApprovedLiveSmall,
+    );
+    unsigned.venue = "polymarket-main".to_string();
+    unsigned.instruments = vec!["123456789".to_string()];
+    let signed = sign_envelope(unsigned, "key-1", &key).unwrap();
+    let mut config = configured_polymarket_runtime();
     let bundle = formula_bundle(now);
     let bundle_path = directory.join("bundle.json");
     let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
-    assert!(intake(
+    let request = intake(
         &signed,
         &trusted,
         &policy(&signed.envelope),
@@ -808,10 +828,154 @@ fn live_small_fails_closed_until_order_limits_are_in_the_hot_path() {
         &directory,
         &mut adapter,
     )
-    .is_err());
-    assert!(!RuntimeNonceLedger::open(directory.join("nonces.jsonl"))
-        .unwrap()
-        .contains("nonce-live-small"));
+    .expect("human-approved Polymarket Formula LiveSmall");
+    assert_eq!(request.mode, ActivationMode::LiveSmall);
+    drop(adapter);
+    assert!(!config.quotes_only);
+    assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Live"));
+    assert_eq!(config.strategies.len(), 1);
+    assert_eq!(config.engine.intent_max_slippage_bps, Some(5));
+    assert_eq!(
+        config.engine.intent_max_order_notional,
+        Some(rust_decimal::Decimal::from(100))
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn live_small_rejects_other_venues_and_onnx_artifacts() {
+    let now = Utc::now();
+    let key = SigningKey::from_bytes(&[7_u8; 32]);
+    let trusted = trusted(&key);
+    let directory = directory("live-small-boundary");
+
+    let formula = formula_bundle(now);
+    let mut unsigned = envelope(
+        now,
+        "live-small-binance",
+        "nonce-live-small-binance",
+        AllowedIntentType::StartLiveSmall,
+        ApprovalClass::HumanApprovedLiveSmall,
+    );
+    unsigned.venue = "polymarket-main".to_string();
+    unsigned.instruments = vec!["123456789".to_string()];
+    let non_polymarket = sign_envelope(unsigned, "key-1", &key).unwrap();
+    let mut binance_config = configured_runtime();
+    binance_config.venues[0].name = "polymarket-main".to_string();
+    binance_config.venues[0].symbol_catalog[0].0 = "123456789@BINANCE".to_string();
+    let formula_bundle_path = directory.join("formula-bundle.json");
+    let mut binance_adapter =
+        SystemConfigActivationAdapter::new(&mut binance_config, &formula, &formula_bundle_path);
+    let error = intake(
+        &non_polymarket,
+        &trusted,
+        &policy(&non_polymarket.envelope),
+        now,
+        &directory,
+        &mut binance_adapter,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("restricted to Polymarket"));
+
+    let onnx = onnx_bundle(now, "model.onnx", 1, &"f".repeat(64), 4);
+    let mut unsigned = envelope(
+        now,
+        "live-small-onnx",
+        "nonce-live-small-onnx",
+        AllowedIntentType::StartLiveSmall,
+        ApprovalClass::HumanApprovedLiveSmall,
+    );
+    unsigned.asset_revision_id = onnx.candidate_id.clone();
+    unsigned.bundle_id = onnx.bundle_id.clone();
+    unsigned.bundle_hash = onnx.bundle_hash.clone();
+    unsigned.venue = "polymarket-main".to_string();
+    unsigned.instruments = vec!["123456789".to_string()];
+    unsigned.allowed_intent_types = vec![
+        AllowedIntentType::LoadModel,
+        AllowedIntentType::StartLiveSmall,
+    ];
+    let onnx_request = sign_envelope(unsigned, "key-1", &key).unwrap();
+    let mut polymarket_config = configured_polymarket_runtime();
+    let onnx_bundle_path = directory.join("onnx-bundle.json");
+    let mut onnx_adapter =
+        SystemConfigActivationAdapter::new(&mut polymarket_config, &onnx, &onnx_bundle_path);
+    let error = intake(
+        &onnx_request,
+        &trusted,
+        &policy(&onnx_request.envelope),
+        now,
+        &directory,
+        &mut onnx_adapter,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("requires a Formula artifact"));
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn deployment_slippage_requires_a_finite_integer_bps() {
+    let now = Utc::now();
+    let bundle = formula_bundle(now);
+    let directory = directory("slippage-bps-validation");
+    let bundle_path = directory.join("bundle.json");
+
+    for value in [0.0, 1.5, 10_001.0, f64::INFINITY, f64::NAN] {
+        let mut config = configured_runtime();
+        let request = ActivationRequest {
+            deployment_id: "slippage-validation".to_string(),
+            asset_revision_id: bundle.candidate_id.clone(),
+            promotion_id: "promotion-1".to_string(),
+            bundle_id: bundle.bundle_id.clone(),
+            bundle_hash: bundle.bundle_hash.clone(),
+            account_id: "account-1".to_string(),
+            venue: "binance".to_string(),
+            instruments: vec!["BTCUSDT".to_string()],
+            artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
+            mode: ActivationMode::Paper,
+            max_notional: 1_000.0,
+            max_symbol_exposure: 500.0,
+            max_order_size: 100.0,
+            max_slippage_bps: value,
+        };
+        let error = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
+            .activate(&request)
+            .unwrap_err();
+        assert!(error.contains("finite integer in 1..=10000"));
+        assert_eq!(config.engine.intent_max_slippage_bps, None);
+        assert_eq!(config.engine.intent_max_order_notional, None);
+    }
+
+    for value in [1.0, 10_000.0] {
+        let mut config = configured_runtime();
+        let request = ActivationRequest {
+            deployment_id: "slippage-boundary".to_string(),
+            asset_revision_id: bundle.candidate_id.clone(),
+            promotion_id: "promotion-1".to_string(),
+            bundle_id: bundle.bundle_id.clone(),
+            bundle_hash: bundle.bundle_hash.clone(),
+            account_id: "account-1".to_string(),
+            venue: "binance".to_string(),
+            instruments: vec!["BTCUSDT".to_string()],
+            artifact: hft_live::deployment_envelope::ActivationArtifact::Formula,
+            mode: ActivationMode::Paper,
+            max_notional: 1_000.0,
+            max_symbol_exposure: 500.0,
+            max_order_size: 100.0,
+            max_slippage_bps: value,
+        };
+        SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path)
+            .activate(&request)
+            .expect("inclusive slippage boundary");
+        assert_eq!(config.engine.intent_max_slippage_bps, Some(value as i32));
+        assert_eq!(
+            config.engine.intent_max_order_notional,
+            Some(rust_decimal::Decimal::from(100))
+        );
+    }
+
     std::fs::remove_dir_all(directory).unwrap();
 }
 
