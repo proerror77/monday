@@ -145,3 +145,4 @@ AWSCLIV2.pkg
 /hft-collector-linux*
 /hft-collector-darwin*
 .omx/
+.worktrees

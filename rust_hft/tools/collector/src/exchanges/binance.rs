@@ -46,6 +46,13 @@ impl BinanceExchange {
         list.dedup();
         list
     }
+
+    fn websocket_endpoint() -> String {
+        std::env::var("BINANCE_WS_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "wss://stream.binance.com:9443/ws".to_string())
+    }
 }
 
 impl BinanceExchange {}
@@ -57,7 +64,7 @@ impl Exchange for BinanceExchange {
     }
 
     fn websocket_url(&self) -> String {
-        "wss://stream.binance.com:9443/ws/".to_string()
+        Self::websocket_endpoint()
     }
 
     async fn websocket_plan(&self, symbols: &[String]) -> Result<WebsocketPlan> {
@@ -116,7 +123,7 @@ impl Exchange for BinanceExchange {
             "params": streams,
             "id": rand::random::<u32>(),
         });
-        let url = "wss://stream.binance.com:9443/ws".to_string();
+        let url = Self::websocket_endpoint();
 
         Ok(WebsocketPlan {
             url,

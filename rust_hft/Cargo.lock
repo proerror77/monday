@@ -2375,6 +2375,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest",
  "rust_decimal",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

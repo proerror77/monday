@@ -4,7 +4,7 @@ mod db;
 mod exchanges;
 mod spool;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use clickhouse::Client;
 use exchanges::{
@@ -22,6 +22,7 @@ use tokio_tungstenite::{
     tungstenite::{http::Request, Message},
 };
 use tracing::{error, info, warn};
+use url::Url;
 
 #[derive(Default, Clone, Debug)]
 struct SymbolGap {
@@ -271,6 +272,80 @@ fn chunk_size_for_exchange(exchange: &str) -> usize {
     }
 }
 
+fn install_rustls_provider() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .map_err(|_| anyhow::anyhow!("failed to install rustls ring CryptoProvider"))?;
+    }
+    Ok(())
+}
+
+fn binance_ws_proxy() -> Option<Url> {
+    [
+        "BINANCE_WS_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .into_iter()
+    .find_map(|key| std::env::var(key).ok())
+    .filter(|value| !value.trim().is_empty())
+    .and_then(|value| Url::parse(&value).ok())
+    .filter(|proxy| proxy.scheme() == "http")
+}
+
+fn validate_connect_response(response: &[u8]) -> Result<()> {
+    let header = std::str::from_utf8(response).context("proxy CONNECT response is not UTF-8")?;
+    if header.starts_with("HTTP/1.1 200") || header.starts_with("HTTP/1.0 200") {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "proxy CONNECT failed: {}",
+            header.lines().next().unwrap_or("empty response")
+        ))
+    }
+}
+
+async fn connect_via_http_proxy(proxy: &Url, target: &Url) -> Result<tokio::net::TcpStream> {
+    let proxy_host = proxy.host_str().context("proxy URL has no host")?;
+    let proxy_port = proxy
+        .port_or_known_default()
+        .context("proxy URL has no port")?;
+    let target_host = target.host_str().context("WebSocket URL has no host")?;
+    let target_port = target
+        .port_or_known_default()
+        .context("WebSocket URL has no port")?;
+    let mut stream = tokio::net::TcpStream::connect((proxy_host, proxy_port))
+        .await
+        .context("failed to connect to HTTP proxy")?;
+    stream.set_nodelay(true)?;
+
+    let authority = format!("{target_host}:{target_port}");
+    let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .context("failed to write proxy CONNECT request")?;
+
+    let mut response = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 512];
+    while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = tokio::io::AsyncReadExt::read(&mut stream, &mut chunk)
+            .await
+            .context("failed to read proxy CONNECT response")?;
+        if read == 0 {
+            return Err(anyhow::anyhow!("proxy closed before CONNECT completed"));
+        }
+        response.extend_from_slice(&chunk[..read]);
+        if response.len() > 16 * 1024 {
+            return Err(anyhow::anyhow!("proxy CONNECT response exceeded 16 KiB"));
+        }
+    }
+    validate_connect_response(&response)?;
+    Ok(stream)
+}
+
 fn chunk_symbols(symbols: &[String], chunk_size: usize) -> Vec<Vec<String>> {
     if chunk_size == 0 || symbols.len() <= chunk_size {
         return vec![symbols.to_vec()];
@@ -325,7 +400,7 @@ async fn filter_exchange_symbols(exchange: &str, symbols: Vec<String>) -> Vec<St
 
     match exchange_lc.as_str() {
         "binance" | "binance_futures" | "binance-futures" | "binancefutures" => {
-            match fetch_binance_symbols().await {
+            match fetch_binance_symbols(&normalized).await {
                 Ok(supported) => filter_with_supported(exchange, normalized, &supported),
                 Err(err) => {
                     warn!(
@@ -362,7 +437,16 @@ async fn filter_exchange_symbols(exchange: &str, symbols: Vec<String>) -> Vec<St
     }
 }
 
-async fn fetch_binance_symbols() -> Result<HashSet<String>> {
+fn binance_exchange_info_url(symbols: &[String]) -> Result<Url> {
+    let mut url = Url::parse("https://api.binance.com/api/v3/exchangeInfo")?;
+    if !symbols.is_empty() {
+        url.query_pairs_mut()
+            .append_pair("symbols", &serde_json::to_string(symbols)?);
+    }
+    Ok(url)
+}
+
+async fn fetch_binance_symbols(symbols: &[String]) -> Result<HashSet<String>> {
     #[derive(Deserialize)]
     struct BinanceSymbolInfo {
         symbol: String,
@@ -377,7 +461,7 @@ async fn fetch_binance_symbols() -> Result<HashSet<String>> {
     }
 
     let resp: BinanceExchangeInfo = reqwest::Client::new()
-        .get("https://api.binance.com/api/v3/exchangeInfo")
+        .get(binance_exchange_info_url(symbols)?)
         .timeout(Duration::from_secs(10))
         .send()
         .await?
@@ -510,6 +594,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_rustls_provider()?;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -609,6 +694,38 @@ async fn main() -> Result<()> {
     } else {
         futures::future::join_all(tasks).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installs_a_process_crypto_provider() {
+        install_rustls_provider().unwrap();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn validates_http_connect_status() {
+        assert!(validate_connect_response(b"HTTP/1.1 200 Connection established\r\n\r\n").is_ok());
+        assert!(
+            validate_connect_response(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn narrows_binance_product_query_to_requested_symbols() {
+        let url = binance_exchange_info_url(&["BTCUSDT".to_string()]).unwrap();
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "symbols")
+                .unwrap()
+                .1,
+            "[\"BTCUSDT\"]"
+        );
     }
 }
 
@@ -824,7 +941,36 @@ async fn run_exchange_session(
         info!("[{}] 連接 WebSocket: {}", session_label, ws_url);
 
         let custom_headers = exchange.websocket_headers();
-        let connect_res = if !custom_headers.is_empty() {
+        let connect_res = if exchange_name == "binance" && custom_headers.is_empty() {
+            if let Some(proxy) = binance_ws_proxy() {
+                let target = match Url::parse(&ws_url) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        error!(
+                            "[{}] Binance WebSocket URL 無效: {:?}",
+                            session_label, error
+                        );
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(max_backoff);
+                        continue;
+                    }
+                };
+                match connect_via_http_proxy(&proxy, &target).await {
+                    Ok(stream) => tokio_tungstenite::client_async_tls(&ws_url, stream).await,
+                    Err(error) => {
+                        error!(
+                            "[{}] Binance HTTP proxy CONNECT 失敗: {:?}",
+                            session_label, error
+                        );
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(max_backoff);
+                        continue;
+                    }
+                }
+            } else {
+                connect_async(&ws_url).await
+            }
+        } else if !custom_headers.is_empty() {
             let mut req = Request::builder()
                 .uri(&ws_url)
                 .header(

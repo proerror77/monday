@@ -12,6 +12,20 @@ Research code may emit typed candidates and signed deployment envelopes. It must
 
 Read [README.md](README.md), [rust_hft/ARCHITECTURE.md](rust_hft/ARCHITECTURE.md), and [rust_hft/alpha-harness/README.md](rust_hft/alpha-harness/README.md) before architecture changes.
 
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub; external pull requests are not a triage request surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five canonical Matt workflow label names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use a single-context layout. See `docs/agents/domain.md`.
+
 ## Engineering Rules
 
 - Prefer Rust for durable production paths.
