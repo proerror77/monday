@@ -26,9 +26,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --locked \
     -p hft-collector \
     --bin lob-pit-materializer \
-    && cp /work/target/release/hft-backtest /work/hft-backtest \
-    && cp /work/target/release/alpha-harness /work/alpha-harness \
-    && cp /work/target/release/lob-pit-materializer /work/lob-pit-materializer
+    && install -D -m 0755 /work/target/release/hft-backtest /out/bin/hft-backtest \
+    && install -D -m 0755 /work/target/release/alpha-harness /out/bin/alpha-harness \
+    && install -D -m 0755 /work/target/release/lob-pit-materializer /out/bin/lob-pit-materializer
 
 FROM debian:bookworm-slim AS runtime
 
@@ -41,9 +41,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 research
 
-COPY --from=builder /work/hft-backtest /usr/local/bin/hft-backtest
-COPY --from=builder /work/alpha-harness /usr/local/bin/alpha-harness
-COPY --from=builder /work/lob-pit-materializer /usr/local/bin/lob-pit-materializer
+COPY --from=builder /out/bin/hft-backtest /usr/local/bin/hft-backtest
+COPY --from=builder /out/bin/alpha-harness /usr/local/bin/alpha-harness
+COPY --from=builder /out/bin/lob-pit-materializer /usr/local/bin/lob-pit-materializer
 COPY scripts/backtest/param_scan.py /opt/monday/param_scan.py
 
 RUN mkdir -p /work/config /work/data /work/results \
