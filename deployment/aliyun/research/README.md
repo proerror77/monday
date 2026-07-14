@@ -48,8 +48,13 @@ Recommended first production shape:
 
 - Managed ClickHouse, 8 vCPU / 32 GiB, private VPC endpoint, 200 GiB cache.
 - ACK Standard control plane.
-- Autoscaled Spot worker pool, `ecs.c7.2xlarge` (8 vCPU / 16 GiB), 100 GiB PL1
-  work disk, zero idle research nodes where the node-pool policy supports it.
+- One Spot system node, `ecs.u1-c1m2.large` (2 vCPU / 4 GiB), with a 40 GiB
+  PL0 system disk. The economy bootstrap runs one CoreDNS replica; use two
+  system nodes and two replicas when research-plane HA matters.
+- Autoscaled Spot worker pool, `ecs.u1-c1m4.xlarge` (4 vCPU / 16 GiB), with a
+  40 GiB PL0 system disk and 100 GiB PL1 work disk. The pool is labeled
+  `workload=backtest`, scales from zero to four nodes, and returns to zero after
+  jobs finish.
 - One backtest Pod per worker; each Pod processes a batch of parameters.
 - A prebuilt image from `rust_hft/deployment/docker/Dockerfile.research`.
 
@@ -69,7 +74,8 @@ not return a complete international price sheet.
 | Recommended 4C8G compute-optimized trading ECS, 80 GiB PL1 | CNY 886.69/month |
 | Self-managed 4C16G ClickHouse, 40 GiB system + 500 GiB PL1 | CNY 1,546.48/month |
 | Managed ClickHouse 8C32G with 200 GiB cache | about CNY 2,434/month |
-| Spot 8C16G worker with 40 GiB system + 100 GiB PL1 | CNY 0.812/hour |
+| Spot 2C4G ACK system node with 40 GiB PL0 | about CNY 82-87/month |
+| Spot 4C16G worker with 40 GiB PL0 + 100 GiB PL1 | about CNY 0.342/hour |
 | OSS raw + Parquet, 14-day retention | about CNY 50/month |
 | OSS raw + Parquet, 30-day retention | about CNY 100/month |
 | Private networking, logs, alerts, small requests | CNY 50-150/month |
@@ -88,6 +94,12 @@ recommended profile is the best operational trade-off once the system runs
 daily parallel research. The economy profile is cheaper but makes ClickHouse
 backup, upgrades, failure recovery, and disk operations the operator's job.
 
+The current ACK bootstrap therefore idles at roughly CNY 102-137/month before
+OSS: CNY 82-87 for the system node plus an estimated CNY 20-50 for the private
+API load balancer and small monitoring traffic. Research compute adds about CNY
+34 per 100 worker-hours at the 2026-07-14 Tokyo Spot price. These figures do not
+include ClickHouse, which is not deployed yet.
+
 For the recommended profile, keep a CNY 4,800-5,200 monthly payment budget until
 the first complete invoice is available. That margin covers managed ClickHouse
 durable storage, Spot-price movement, NAT/logging variance, snapshots, and
@@ -100,7 +112,8 @@ not fully price.
    `vpc-6wesy84ixw2esl6lb3ov5`, preferably zone `ap-northeast-1b`.
 2. Create a database account with DDL rights only for schema initialization;
    create a separate read/write application account afterward.
-3. Create an ACK Standard cluster and a Spot research node pool. Do not place
+3. Create an ACK Standard cluster, the small system node pool, and the Spot
+   research node pool. Label research nodes `workload=backtest`. Do not place
    the trading runtime or its credentials in this cluster.
 4. Publish the research image once per source revision. Parameter changes reuse
    the same immutable image and do not compile Rust again.
