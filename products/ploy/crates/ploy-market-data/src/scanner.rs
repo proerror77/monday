@@ -167,7 +167,7 @@ pub fn spawn_market_scanner(
 
             expire_tracked_events(&tx, &mut tracked, pool.as_ref(), now).await;
 
-            let request = crypto_markets_request(now, 6);
+            let request = crypto_markets_request(now, DEFAULT_DISCOVERY_LOOKAHEAD_MINUTES);
 
             match fetch_markets(&request, CRYPTO_DISCOVERY_MAX_MARKETS).await {
                 Ok(markets) => {

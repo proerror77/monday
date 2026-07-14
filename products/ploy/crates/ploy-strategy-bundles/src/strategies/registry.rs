@@ -3,7 +3,7 @@ use crate::strategies::{
     diff_enhanced::DiffEnhancedConfig, diff_regular::DiffRegularConfig,
     prob_chase::ProbChaseConfig, prob_reversal::ProbReversalConfig, sweep::SweepConfig,
 };
-use crate::traits::StrategyLogic;
+use crate::traits::{MarketUpdate, StrategyDecision, StrategyLogic};
 use crate::{
     BayesianDirectionalStrategy, DiffEnhancedStrategy, DiffRegularStrategy, DirectionalStrategy,
     MeanReversionStrategy, ProbChaseStrategy, ProbReversalStrategy, ReversalStrategy,
@@ -11,6 +11,25 @@ use crate::{
 };
 use rust_decimal::Decimal;
 use tracing::info;
+
+struct NoopStrategy;
+
+impl StrategyLogic for NoopStrategy {
+    fn on_update(
+        &mut self,
+        _update: &MarketUpdate,
+        _positions: &ploy_trading::PositionLedger,
+        _orders: &ploy_trading::OrderLedger,
+    ) -> Vec<StrategyDecision> {
+        Vec::new()
+    }
+
+    fn on_fill(&mut self, _fill: &ploy_trading::FillRecord) {}
+
+    fn name(&self) -> &str {
+        "noop"
+    }
+}
 
 #[must_use]
 pub fn canonical_strategy_variant(raw: &str) -> String {
@@ -27,6 +46,7 @@ pub fn canonical_strategy_variant(raw: &str) -> String {
         "sweep" | "s3" | "s3_sweep" => "sweep".to_string(),
         "prob_reversal" | "prob-reversal" | "s4" | "s4_reversal" => "prob_reversal".to_string(),
         "prob_chase" | "prob-chase" | "s5" | "s5_prob_chase" => "prob_chase".to_string(),
+        "noop" => "noop".to_string(),
         other => other.to_string(),
     }
 }
@@ -43,6 +63,7 @@ pub enum StrategyKind {
     Sweep,
     ProbReversal,
     ProbChase,
+    Noop,
     Unknown(String),
 }
 
@@ -60,6 +81,7 @@ impl StrategyKind {
             "sweep" => Self::Sweep,
             "prob_reversal" => Self::ProbReversal,
             "prob_chase" => Self::ProbChase,
+            "noop" => Self::Noop,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -77,6 +99,7 @@ impl StrategyKind {
             Self::Sweep => "sweep",
             Self::ProbReversal => "prob_reversal",
             Self::ProbChase => "prob_chase",
+            Self::Noop => "noop",
             Self::Unknown(name) => name.as_str(),
         }
     }
@@ -219,10 +242,11 @@ pub fn build_strategy(config: &FullConfig) -> Box<dyn StrategyLogic> {
                 config.strategy.clone(),
             )))
         }
+        "noop" => Box::new(NoopStrategy),
         _ => {
             eprintln!(
                 "Unsupported strategy_variant `{configured_variant}` in config. \
-                 Supported runtime variants: directional, directional_bayes, mean_reversion, reversal, three_layer, diff_enhanced, diff_regular, sweep, prob_reversal, prob_chase, v1, v2, v3, v4, s1, s2, s3, s4, s5."
+                 Supported runtime variants: directional, directional_bayes, mean_reversion, reversal, three_layer, diff_enhanced, diff_regular, sweep, prob_reversal, prob_chase, noop, v1, v2, v3, v4, s1, s2, s3, s4, s5."
             );
             std::process::exit(1);
         }
@@ -232,7 +256,10 @@ pub fn build_strategy(config: &FullConfig) -> Box<dyn StrategyLogic> {
 #[cfg(test)]
 mod tests {
     use super::{build_strategy, canonical_strategy_variant, StrategyKind};
-    use crate::FullConfig;
+    use crate::{FullConfig, MarketUpdate};
+    use chrono::Utc;
+    use ploy_trading::{OrderLedger, PositionLedger};
+    use rust_decimal_macros::dec;
 
     #[test]
     fn canonical_strategy_variant_normalizes_roadmap_aliases() {
@@ -313,5 +340,34 @@ strategy_variant = "{variant}"
             let strategy = build_strategy(&config);
             assert_eq!(strategy.name(), expected_name);
         }
+    }
+
+    #[test]
+    fn noop_variant_observes_market_data_without_emitting_orders() {
+        let config = FullConfig::from_toml(
+            r#"
+[runtime]
+mode = "dryrun"
+strategy_variant = "noop"
+
+[strategy]
+symbols = ["BTCUSDT"]
+"#,
+        )
+        .unwrap();
+        let mut strategy = build_strategy(&config);
+
+        let decisions = strategy.on_update(
+            &MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price: dec!(100000),
+                ts: Utc::now(),
+            },
+            &PositionLedger::default(),
+            &OrderLedger::default(),
+        );
+
+        assert_eq!(strategy.name(), "noop");
+        assert!(decisions.is_empty());
     }
 }

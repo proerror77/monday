@@ -15,5 +15,6 @@ pub use options::HistoricalLoadOptions;
 #[cfg(feature = "parquet-feed")]
 pub use parquet_stream::StreamingParquetFeed;
 pub use recorded::{
-    RecordedFeed, RecordedFeedError, RecordedMarketUpdate, RecordingFeed, RecordingLimits,
+    RecordedFeed, RecordedFeedError, RecordedMarketUpdate, RecordingFeed, RecordingKind,
+    RecordingLimits, RecordingPolicy,
 };

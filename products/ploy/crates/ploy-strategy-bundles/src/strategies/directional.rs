@@ -1950,6 +1950,58 @@ mod tests {
     }
 
     #[test]
+    fn expired_event_rolls_to_the_next_events_tokens() {
+        let mut config = default_config();
+        config.min_time_remaining_secs = 0;
+        config.max_time_remaining_secs = 900;
+        let mut strat = DirectionalStrategy::new(config);
+        let now = Utc::now();
+        let positions = PositionLedger::default();
+        let orders = OrderLedger::default();
+
+        for (event_id, up_token, down_token, end_time) in [
+            ("old", "up-old", "down-old", now),
+            (
+                "next",
+                "up-next",
+                "down-next",
+                now + chrono::Duration::minutes(5),
+            ),
+        ] {
+            strat.on_update(
+                &MarketUpdate::EventDiscovered {
+                    event_id: event_id.into(),
+                    symbol: "BTCUSDT".into(),
+                    up_token: up_token.into(),
+                    down_token: down_token.into(),
+                    end_time,
+                    window_secs: 300,
+                    price_to_beat: Some(dec!(100000)),
+                    resolved_up_won: None,
+                },
+                &positions,
+                &orders,
+            );
+        }
+
+        strat.on_update(
+            &MarketUpdate::EventExpired {
+                event_id: "old".into(),
+                end_time: now,
+                resolved_up_won: None,
+            },
+            &positions,
+            &orders,
+        );
+
+        let event = strat.pick_event("BTCUSDT", now).expect("next event");
+        let intent = strat.build_intent(&event, Direction::Up, dec!(0.50), now);
+        assert_eq!(event.event_id.as_ref(), "next");
+        assert_eq!(intent.market_id, "next");
+        assert_eq!(intent.token_id, "up-next");
+    }
+
+    #[test]
     fn cooldown_blocks_entry() {
         let config = default_config();
         let mut strat = DirectionalStrategy::new(config);

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use crate::engine::{RuntimeConfig, RuntimeMode};
 use crate::executor::SimulatedExecutorConfig;
-use crate::feed::RecordingLimits;
+use crate::feed::{RecordingKind, RecordingLimits, RecordingPolicy};
 use crate::strategies::directional::DirectionalConfig;
 
 /// Top-level config deserialized from a TOML file.
@@ -82,6 +82,16 @@ pub struct RuntimeSection {
     pub record_market_updates_max_records: Option<u64>,
     /// Optional hard cap for a bounded canonical `MarketUpdate` recording.
     pub record_market_updates_max_bytes: Option<u64>,
+    /// Optional allow-list of update kinds to persist. Empty records all kinds.
+    #[serde(default)]
+    pub record_market_updates_include_kinds: Vec<RecordingKind>,
+    /// Optional per-token quote sampling interval for the persisted tape.
+    pub record_market_updates_quote_sample_ms: Option<u64>,
+    /// Optional maximum bid/ask depth persisted per quote.
+    pub record_market_updates_quote_depth_levels: Option<usize>,
+    /// Restrict persisted quotes to tokens belonging to an active discovered event.
+    #[serde(default)]
+    pub record_market_updates_event_scoped_quotes: bool,
     /// Source boundary for live/dry-run market data.
     ///
     /// Defaults to `local_db`, where strategy runners consume collector-persisted
@@ -410,6 +420,16 @@ impl FullConfig {
         }
     }
 
+    pub fn record_market_updates_policy(&self) -> RecordingPolicy {
+        RecordingPolicy {
+            limits: self.record_market_updates_limits(),
+            include_kinds: self.runtime.record_market_updates_include_kinds.clone(),
+            quote_sample_ms: self.runtime.record_market_updates_quote_sample_ms,
+            quote_depth_levels: self.runtime.record_market_updates_quote_depth_levels,
+            event_scoped_quotes: self.runtime.record_market_updates_event_scoped_quotes,
+        }
+    }
+
     pub fn replay_market_updates_path(&self) -> Option<&Path> {
         self.runtime.replay_market_updates_from.as_deref()
     }
@@ -649,6 +669,10 @@ max_updates = 10000
 record_market_updates_to = "tmp/sample.ndjson"
 record_market_updates_max_records = 1000
 record_market_updates_max_bytes = 1048576
+record_market_updates_include_kinds = ["quote", "event_discovered", "event_expired", "reference_price"]
+record_market_updates_quote_sample_ms = 500
+record_market_updates_quote_depth_levels = 5
+record_market_updates_event_scoped_quotes = true
 market_data_source = "external_direct"
 
 [strategy]
@@ -702,6 +726,24 @@ max_sweep_price_delta = 0.003
             RecordingLimits {
                 max_records: Some(1000),
                 max_bytes: Some(1_048_576)
+            }
+        );
+        assert_eq!(
+            config.record_market_updates_policy(),
+            RecordingPolicy {
+                limits: RecordingLimits {
+                    max_records: Some(1000),
+                    max_bytes: Some(1_048_576),
+                },
+                include_kinds: vec![
+                    RecordingKind::Quote,
+                    RecordingKind::EventDiscovered,
+                    RecordingKind::EventExpired,
+                    RecordingKind::ReferencePrice,
+                ],
+                quote_sample_ms: Some(500),
+                quote_depth_levels: Some(5),
+                event_scoped_quotes: true,
             }
         );
         assert_eq!(

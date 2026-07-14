@@ -8,6 +8,26 @@ systemctl status binance-lob-archiver@usdm.service
 journalctl -u 'binance-lob-archiver@*' -f
 ```
 
+Polymarket public crypto market updates run separately in dry-run/no-op mode:
+
+```bash
+systemctl status polymarket-market-tape.service
+journalctl -u polymarket-market-tape.service -f
+```
+
+The initial scope is BTC, ETH, SOL, and XRP 5-minute/15-minute markets only.
+NBA, World Cup, general event, and weather catalogs remain disabled until this
+lane is stable and explicitly expanded.
+
+The service records normalized `MarketUpdate` NDJSON under
+`/data/monday/spool/polymarket/`. It has no credential environment file and cannot
+emit trading intents. To keep this research collector bounded, the tape stores only
+Polymarket quotes/lifecycle events plus reference prices, samples each token at most
+once per second, retains the top bid/ask level, and drops orphaned or post-expiry
+quotes from the persisted tape. Sampling affects the recording only; the runtime
+still receives every live quote. The runner restarts every six hours; the recorder
+rotates an existing tape before opening the next session.
+
 Each service opens bounded WebSocket shards, records every diff, fetches a REST
 Top-100 snapshot, validates sequence continuity, writes replay checkpoints, compresses
 hourly segments, and uploads `.jsonl.zst`, `manifest.json`, and `_SUCCESS` to OSS.
