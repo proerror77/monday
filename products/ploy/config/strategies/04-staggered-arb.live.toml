@@ -1,0 +1,47 @@
+# Staggered Arbitrage Strategy — 時間差套利
+# Live trading config — backtest-proven params (sum<0.85 + leg1<0.65)
+# Backtest: 54 trades, 88.9% win rate, Sharpe 141, +$164/3d
+
+[strategy]
+name = "staggered_arb"
+
+[entry]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+shares_per_trade = 20
+max_concurrent = 5
+direction_threshold = 0.04
+max_initial_sum = 0.92
+max_leg1_price = 0.65
+merge_target_sum = 0.95
+min_profit_target = 0.02
+min_ask_price = 0.05
+min_entry_sum = 0.70
+
+[timing]
+max_wait_secs = 120
+max_wait_pct = 0.30
+min_time_remaining = 45
+cooldown_secs = 5
+min_leg2_delay_secs = 3
+max_trades_per_event = 3
+entry_after_start_max_secs = 0   # 0 = disabled; rely on no_trade_last_secs instead
+no_trade_last_secs = 30          # only block last 30s (was 60s default)
+
+[risk]
+# === FUND MANAGEMENT ===
+# fixed_amount_usd disabled: use fixed shares_per_trade sizing
+min_balance_usd = 5.0           # Keep $5 reserve
+
+# === STAGGERED ARB SPECIFIC ===
+max_leg1_loss = 0.0             # Never accept leg1 loss
+force_complete_threshold = 0.00 # Apply forced-close only on timeout/time-safety/risk and sum >= threshold
+
+[model]
+mu = 0.0
+vol_lookback_secs = 600
+vol_floor = 0.003
+use_greeks = true
+
+[filter]
+allowed_windows = [300, 900]
+window_tolerance = 30

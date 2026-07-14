@@ -1,0 +1,36 @@
+[package]
+name = "ploy-strategy-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Next-generation strategy runtime ownership boundary for Ploy"
+
+[features]
+default = ["replay"]
+full = ["backtest-db", "db-recorder", "live", "replay"]
+backtest-db = ["dep:ploy-feed-loaders", "dep:sqlx"]
+db-recorder = ["dep:sqlx"]
+live = ["db-recorder", "dep:ploy-market-data", "ploy-market-data/live"]
+live-execution = ["dep:ploy-control-client", "dep:ploy-operator-contracts", "dep:ploy-platform-runtime"]
+replay = []
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+ploy-control-client = { workspace = true, optional = true }
+ploy-feed-loaders = { workspace = true, optional = true }
+ploy-market-data = { path = "../ploy-market-data", optional = true, default-features = false }
+ploy-operator-contracts = { workspace = true, optional = true }
+ploy-platform-runtime = { workspace = true, optional = true }
+ploy-strategy-bundles = { path = "../ploy-strategy-bundles", default-features = false }
+ploy-trading.workspace = true
+rust_decimal.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "chrono"], optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+rust_decimal.workspace = true

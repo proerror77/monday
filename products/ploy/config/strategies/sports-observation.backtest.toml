@@ -1,0 +1,19 @@
+[runtime]
+mode = "backtest"
+from = "2026-04-01T00:00:00Z"
+to = "2026-04-01T13:30:00Z"
+
+[strategy]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+[reference_data]
+capture_sports_state = true
+
+[backtest_data]
+include_reference_prices = false
+include_sports_state = true
+
+[execution]
+use_spread = false
+enable_partial_fills = false
+enable_market_impact = false

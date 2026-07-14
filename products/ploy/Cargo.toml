@@ -1,0 +1,125 @@
+[workspace]
+members = [
+    ".",
+    "apps/new-ployd",
+    "apps/ploy-backtest",
+    "apps/new-ploy-runner",
+    "apps/ploy-replay",
+    "apps/ployctl",
+    "apps/ploytui",
+    "crates/ploy-control-client",
+    "crates/ploy-connectivity",
+    "crates/ploy-daemon-host",
+    "crates/ploy-deployments",
+    "crates/ploy-feed-loaders",
+    "crates/ploy-market-contracts",
+    "crates/ploy-market-data",
+    "crates/ploy-operator-contracts",
+    "crates/ploy-platform",
+    "crates/ploy-platform-runtime",
+    "crates/ploy-research",
+    "crates/ploy-runner-host",
+    "crates/ploy-strategy-runtime",
+    "crates/ploy-strategy-bundles",
+    "crates/ploy-trading",
+]
+default-members = [
+    ".",
+    "apps/new-ployd",
+    "apps/new-ploy-runner",
+    "apps/ployctl",
+    "apps/ploytui",
+    "crates/ploy-control-client",
+    "crates/ploy-deployments",
+    "crates/ploy-daemon-host",
+    "crates/ploy-operator-contracts",
+    "crates/ploy-platform",
+    "crates/ploy-platform-runtime",
+    "crates/ploy-runner-host",
+    "crates/ploy-trading",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Ploy Contributors"]
+license = "MIT"
+repository = "https://github.com/proerror77/monday"
+
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+hmac = "0.12"
+ploy-control-client = { path = "crates/ploy-control-client" }
+ploy-connectivity = { path = "crates/ploy-connectivity" }
+ploy-deployments = { path = "crates/ploy-deployments" }
+ploy-daemon-host = { path = "crates/ploy-daemon-host" }
+ploy-feed-loaders = { path = "crates/ploy-feed-loaders" }
+ploy-market-contracts = { path = "crates/ploy-market-contracts" }
+ploy-market-data = { path = "crates/ploy-market-data" }
+ploy-operator-contracts = { path = "crates/ploy-operator-contracts" }
+ploy-platform = { path = "crates/ploy-platform" }
+ploy-platform-runtime = { path = "crates/ploy-platform-runtime" }
+ploy-research = { path = "crates/ploy-research" }
+ploy-runner-host = { path = "crates/ploy-runner-host" }
+ploy-strategy-runtime = { path = "crates/ploy-strategy-runtime" }
+ploy-strategy-bundles = { path = "crates/ploy-strategy-bundles" }
+ploy-trading = { path = "crates/ploy-trading" }
+rand = "0.8"
+rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }
+rust_decimal_macros = "1"
+secrecy = { version = "0.8", features = ["serde"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "rust_decimal", "json"] }
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+toml = "0.8"
+toml_edit = "0.22"
+async-trait = "0.1"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+optimizer = "1"
+polars = { version = "0.46", default-features = false, features = ["lazy", "fmt", "strings", "dtype-datetime", "dtype-date", "parquet"] }
+
+[package]
+name = "ploy"
+version.workspace = true
+edition.workspace = true
+description = "Compatibility shim for the ploy workspace layout"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dev-dependencies]
+ploy-deployments.workspace = true
+ploy-operator-contracts.workspace = true
+ploy-platform.workspace = true
+rust_decimal.workspace = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+opt-level = 2
+split-debuginfo = "packed"
+
+[profile.dev]
+debug = 1
+incremental = true
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+debug = 0
+opt-level = 1
+
+# Fast-but-optimized profile for local backtest / dry-run.
+# Usage: cargo build --profile fast   (or cargo run --profile fast)
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 8
+incremental = true
+debug = 1

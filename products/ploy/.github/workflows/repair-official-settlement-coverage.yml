@@ -1,0 +1,278 @@
+name: Repair Official Settlement Coverage
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref for orchestration files"
+        required: true
+        default: "main"
+      start_date:
+        description: "Fallback UTC start date when options_json.start_ts is empty"
+        required: true
+        default: "2026-05-16"
+      end_date:
+        description: "Fallback UTC end date when options_json.end_ts is empty"
+        required: true
+        default: "2026-05-18"
+      symbols:
+        description: "Comma-separated PM5D symbols"
+        required: true
+        default: "BTCUSDT,ETHUSDT,SOLUSDT"
+      options_json:
+        description: "Advanced options JSON: start_ts, end_ts, mode"
+        required: false
+        default: '{"start_ts":"","end_ts":"","mode":"dry_run"}'
+      execute_ack:
+        description: "Required for execute mode: repair-official-settlement-coverage"
+        required: false
+        default: ""
+      issue_number:
+        description: "Optional issue to comment with repair summary"
+        required: false
+        default: ""
+
+concurrency:
+  group: repair-official-settlement-${{ github.event.inputs.start_date }}-${{ github.event.inputs.end_date }}-${{ github.event.inputs.symbols }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  DEPLOY_HOST: ${{ vars.TANGO_1_1_HOST || vars.ALIYUN_ECS_HOST || secrets.TANGO_1_1_HOST || secrets.ALIYUN_ECS_HOST }}
+  DEPLOY_ROOT: ${{ vars.PLOY_DEPLOY_ROOT || '/opt/ploy' }}
+  REMOTE_DIR: /opt/ploy/tmp/repair-official-settlement-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  repair:
+    name: Repair bounded official settlement coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: tango-1-1
+
+    steps:
+      - name: Checkout orchestration code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Parse repair options
+        env:
+          OPTIONS_JSON: ${{ github.event.inputs.options_json }}
+          EXECUTE_ACK: ${{ github.event.inputs.execute_ack }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          defaults = {
+              "start_ts": "",
+              "end_ts": "",
+              "mode": "dry_run",
+          }
+          raw = os.environ.get("OPTIONS_JSON", "").strip()
+          data = json.loads(raw) if raw else {}
+          if not isinstance(data, dict):
+              raise SystemExit("options_json must be a JSON object")
+          unknown = sorted(set(data) - set(defaults))
+          if unknown:
+              raise SystemExit(f"unknown options_json keys: {', '.join(unknown)}")
+          values = dict(defaults)
+          for key, value in data.items():
+              values[key] = str(value).strip()
+          if values["mode"] not in {"dry_run", "execute"}:
+              raise SystemExit("options_json.mode must be dry_run or execute")
+          if (
+              values["mode"] == "execute"
+              and os.environ.get("EXECUTE_ACK") != "repair-official-settlement-coverage"
+          ):
+              raise SystemExit("execute mode requires execute_ack=repair-official-settlement-coverage")
+          if not values["start_ts"]:
+              values["start_ts"] = f"{os.environ['START_DATE']}T00:00:00Z"
+          if not values["end_ts"]:
+              values["end_ts"] = f"{os.environ['END_DATE']}T00:00:00Z"
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key, value in values.items():
+                  if "\n" in value:
+                      raise SystemExit(f"options_json value for {key} must be single-line")
+                  handle.write(f"SETTLEMENT_{key.upper()}={value}\n")
+          PY
+
+      - name: Configure SSH
+        env:
+          TANGO_1_1_SSH_KEY: ${{ secrets.TANGO_1_1_SSH_KEY }}
+          TANGO_SSH_KEY: ${{ secrets.TANGO_SSH_KEY }}
+          ALIYUN_ECS_SSH_KEY: ${{ secrets.ALIYUN_ECS_SSH_KEY }}
+          TANGO_1_1_KNOWN_HOSTS: ${{ secrets.TANGO_1_1_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "${DEPLOY_HOST}"
+          install -m 700 -d ~/.ssh
+          if [ -z "${TANGO_1_1_KNOWN_HOSTS}" ]; then
+            echo "TANGO_1_1_KNOWN_HOSTS secret is required for pinned SSH host verification" >&2
+            exit 1
+          fi
+          selected_key=""
+          if [ -n "${TANGO_1_1_SSH_KEY}" ]; then
+            selected_key="${TANGO_1_1_SSH_KEY}"
+          elif [ -n "${TANGO_SSH_KEY}" ]; then
+            selected_key="${TANGO_SSH_KEY}"
+          elif [ -n "${ALIYUN_ECS_SSH_KEY}" ]; then
+            selected_key="${ALIYUN_ECS_SSH_KEY}"
+          else
+            echo "No SSH key secret found for tango-1-1 in this workflow context." >&2
+            exit 1
+          fi
+          printf '%s\n' "${selected_key}" > ~/.ssh/tango_1_1_key
+          chmod 600 ~/.ssh/tango_1_1_key
+          ssh-keygen -y -f ~/.ssh/tango_1_1_key >/dev/null
+          printf '%s\n' "${TANGO_1_1_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host tango-1-1
+            HostName ${DEPLOY_HOST}
+            User root
+            IdentityFile ~/.ssh/tango_1_1_key
+            HostKeyAlias tango-1-1
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ServerAliveInterval 30
+            ServerAliveCountMax 20
+            ConnectTimeout 30
+          EOF
+
+      - name: Run bounded settlement repair on tango-1-1
+        env:
+          SYMBOLS: ${{ github.event.inputs.symbols }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/official-settlement-repair
+          ssh tango-1-1 /bin/bash -s -- "${REMOTE_DIR}" <<'EOF'
+          set -euo pipefail
+          mkdir -p "$1"
+          EOF
+          scp scripts/backfill_settlements.py tango-1-1:"${REMOTE_DIR}/backfill_settlements.py"
+
+          ssh tango-1-1 /bin/bash -s -- \
+            "${DEPLOY_ROOT}" \
+            "${REMOTE_DIR}" \
+            "${SETTLEMENT_START_TS}" \
+            "${SETTLEMENT_END_TS}" \
+            "${SYMBOLS}" \
+            "${SETTLEMENT_MODE}" \
+            "${GITHUB_RUN_ID}" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "official-settlement-repair-${GITHUB_RUN_ID}" <<'EOF'
+          set -euo pipefail
+          deploy_root="$1"
+          remote_dir="$2"
+          start_ts="$3"
+          end_ts="$4"
+          symbols="$5"
+          mode="$6"
+          workflow_run_id="$7"
+          workflow_run_url="$8"
+          artifact_name="$9"
+          set -a
+          . "${deploy_root}/.env"
+          set +a
+          : "${PLOY_DATABASE__URL:?PLOY_DATABASE__URL missing in ${deploy_root}/.env}"
+          case "${mode}" in
+            dry_run|execute) ;;
+            *) echo "mode must be dry_run or execute" >&2; exit 2 ;;
+          esac
+          python_bin="python3"
+          if [ -x "${deploy_root}/.venv/bin/python" ]; then
+            python_bin="${deploy_root}/.venv/bin/python"
+          elif [ -x "${deploy_root}/venv/bin/python" ]; then
+            python_bin="${deploy_root}/venv/bin/python"
+          fi
+          "${python_bin}" - <<'PY'
+          import asyncpg
+          import httpx
+          PY
+          args=(
+            "${remote_dir}/backfill_settlements.py"
+            --db-url "${PLOY_DATABASE__URL}"
+            --start-ts "${start_ts}"
+            --end-ts "${end_ts}"
+            --symbols "${symbols}"
+            --report-json "${remote_dir}/official-settlement-repair.json"
+          )
+          if [ "${mode}" = "dry_run" ]; then
+            args+=(--dry-run)
+          else
+            args+=(
+              --persist-coverage
+              --run-id "${workflow_run_id}"
+              --workflow-run-id "${workflow_run_id}"
+              --workflow-run-url "${workflow_run_url}"
+              --artifact-name "${artifact_name}"
+            )
+          fi
+          "${python_bin}" "${args[@]}"
+          python3 - <<'PY' "${remote_dir}/official-settlement-repair.json" "${remote_dir}/official-settlement-repair.md"
+          import json
+          import sys
+          from pathlib import Path
+
+          payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          lines = [
+              "# Official Settlement Repair",
+              "",
+              f"- Mode: `{'dry_run' if payload.get('dry_run') else 'execute'}`",
+              f"- Window: `{payload.get('start_ts')} -> {payload.get('end_ts')}`",
+              f"- Symbols: `{','.join(payload.get('symbols') or [])}`",
+              f"- Candidate markets: `{payload.get('candidate_market_count')}`",
+              f"- Would settle: `{payload.get('would_settle_count')}`",
+              f"- Settled: `{payload.get('settled_count')}`",
+              f"- Settlement tokens covered: `{payload.get('settlement_token_count')}`",
+              f"- Already matching: `{payload.get('unchanged_count')}`",
+              f"- Active reset: `{payload.get('active_reset_count')}`",
+              f"- Open markets: `{payload.get('open_market_count')}`",
+              f"- Malformed payloads: `{payload.get('malformed_payload_count')}`",
+              f"- Unresolved prices: `{payload.get('unresolved_price_count')}`",
+              f"- Token mismatches: `{payload.get('token_mismatch_count')}`",
+              f"- Skipped: `{payload.get('skipped_count')}`",
+              f"- Errors: `{payload.get('error_count')}`",
+              f"- Persisted coverage: `{payload.get('settlement_coverage_id', '')}`",
+              f"- Valid coverage: `{payload.get('valid')}`",
+              f"- Blockers: `{', '.join(payload.get('blockers') or [])}`",
+          ]
+          Path(sys.argv[2]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          EOF
+
+          scp "tango-1-1:${REMOTE_DIR}/official-settlement-repair.json" artifacts/official-settlement-repair/
+          scp "tango-1-1:${REMOTE_DIR}/official-settlement-repair.md" artifacts/official-settlement-repair/
+          cat artifacts/official-settlement-repair/official-settlement-repair.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup remote workspace
+        if: always()
+        run: |
+          ssh tango-1-1 /bin/bash -s -- "${REMOTE_DIR}" <<'EOF' || true
+          set -euo pipefail
+          rm -rf "$1"
+          EOF
+
+      - name: Upload settlement repair artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: official-settlement-repair-${{ github.run_id }}
+          path: artifacts/official-settlement-repair
+          if-no-files-found: error
+
+      - name: Comment settlement repair on issue
+        if: ${{ github.event.inputs.issue_number != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body-file artifacts/official-settlement-repair/official-settlement-repair.md

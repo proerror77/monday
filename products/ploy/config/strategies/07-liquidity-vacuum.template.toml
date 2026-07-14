@@ -1,0 +1,85 @@
+# Liquidity Vacuum Strategy Configuration (template)
+# This file defines parameters only. Strategy runtime wiring is a follow-up step.
+
+[strategy]
+name = "liquidity_vacuum"
+enabled = false
+mode = "contrarian"
+
+[signal]
+# Rolling feature window in seconds
+window_secs = 90
+
+# CEX anchor EMA period used for expected price
+ema_period = 200
+
+# Trigger thresholds (all must pass)
+price_move_threshold = 0.02
+volume_multiplier_threshold = 3.0
+order_concentration_threshold = 0.70
+entry_deviation_threshold = 0.12
+
+# Optional volatility-normalized entry gate (z-score of spot-vs-EMA deviation).
+# Set to 0 to disable and use fixed percentage entry_deviation_threshold.
+entry_zscore_threshold = 0.0
+zscore_lookback_samples = 180
+
+# expected_price = EMA(200) * (1 + sentiment_offset)
+sentiment_offset = 0.0
+
+[direction]
+# Crowd direction vote weights
+flow_weight = 0.70
+book_weight = 0.30
+
+# Minimum absolute vote to define crowd direction
+min_vote_abs = 0.70
+
+# Trade opposite to crowd when true
+trade_contrarian = true
+
+[entry]
+# Basic market quality guards
+max_spread_bps = 250
+min_liquidity_usd = 1000
+max_quote_age_ms = 1500
+clock_skew_tolerance_ms = 500
+
+# Event timing guard
+min_time_remaining_secs = 120
+max_time_remaining_secs = 3600
+
+[exit]
+# Hard stop-loss from entry price (25%)
+stop_loss_pct = 0.25
+
+# Take-profit on EMA reversion band (+/-3%)
+take_profit_ema_band_pct = 0.03
+
+# Optional z-score exits (set 0 to disable)
+take_profit_zscore_threshold = 0.0
+stop_loss_zscore_threshold = 0.0
+
+# Optional max holding time in seconds (0 disables)
+max_holding_secs = 0
+
+# Always flatten before resolution
+force_exit_before_resolution_secs = 30
+
+[risk]
+shares = 100
+max_positions = 3
+cooldown_secs = 60
+max_daily_trades = 20
+max_notional_usd = 2000
+
+[data]
+# CEX symbol used for expected price and deviation
+cex_symbol = "BTCUSDT"
+
+# Optional symbol-specific sentiment bias override
+# symbol_sentiment_offsets = { BTCUSDT = 0.0, ETHUSDT = 0.0 }
+
+[backtest]
+# If true, require replay report with dataset and parameter hashes
+require_reproducible_report = true

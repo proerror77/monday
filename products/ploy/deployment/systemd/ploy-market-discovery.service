@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket Market Discovery Collector
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/ploy
+ExecStart=/opt/ploy/bin/ploy-runner collect-markets \
+    --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT \
+    --db-url postgresql://postgres:postgres@localhost:5432/ploy
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+MemoryHigh=512M
+MemoryMax=768M
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

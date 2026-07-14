@@ -1,0 +1,101 @@
+{
+  // ── Gateway ─────────────────────────────────────────
+  "gateway": {
+    "port": 18789,
+    "bind": "127.0.0.1"
+  },
+
+  // ── Agent Configuration ─────────────────────────────
+  "agents": {
+    "defaults": {
+      "workspace": "./workspace",
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-6"
+      },
+      "heartbeat": {
+        "every": "2m",
+        "target": "last",
+        "activeHours": {
+          "start": "00:00",
+          "end": "23:59",
+          "timezone": "Asia/Taipei"
+        },
+        "prompt": "Read HEARTBEAT.md and follow it strictly. Reply HEARTBEAT_OK if nothing needs attention.",
+        "model": "anthropic/claude-sonnet-4-6",
+        "ackMaxChars": 500
+      },
+      "memorySearch": {
+        "provider": "openai",
+        "query": {
+          "hybrid": {
+            "enabled": true,
+            "vectorWeight": 0.7,
+            "textWeight": 0.3
+          }
+        }
+      },
+      "compaction": {
+        "reserveTokensFloor": 20000,
+        "memoryFlush": { "enabled": true }
+      }
+    },
+    "list": [
+      {
+        "id": "ploy-meta",
+        "default": true
+      }
+    ]
+  },
+
+  // ── Skills ──────────────────────────────────────────
+  "skills": {
+    "load": {
+      "watch": true
+    }
+  },
+
+  // ── Tools ───────────────────────────────────────────
+  "tools": {
+    "exec": {
+      "host": "gateway"
+    },
+    "web": {
+      "search": { "provider": "brave" }
+    }
+  },
+
+  // ── Cron Jobs ───────────────────────────────────────
+  "cron": {
+    "enabled": true,
+    "maxConcurrentRuns": 1,
+    "sessionRetention": "24h"
+  },
+
+  // ── Webhook Ingress (Ploy → OpenClaw) ──────────────
+  "hooks": {
+    "enabled": true,
+    "path": "/hooks",
+    "defaultSessionKey": "hook:ploy",
+    "mappings": [
+      {
+        "match": { "path": "ploy-alert" },
+        "action": "agent",
+        "agentId": "ploy-meta",
+        "deliver": true
+      },
+      {
+        "match": { "path": "ploy-regime-change" },
+        "action": "agent",
+        "agentId": "ploy-meta",
+        "deliver": true
+      }
+    ]
+  },
+
+  // ── Environment ─────────────────────────────────────
+  "env": {
+    "vars": {
+      "PLOY_API_BASE": "http://localhost:8081"
+    }
+  }
+}

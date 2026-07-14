@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+method="${1:-}"
+params="${2:-{}}"
+
+if [[ -z "$method" ]]; then
+  echo "Usage: ployrpc <method> [params-json]" >&2
+  exit 2
+fi
+
+case "$method" in
+  system.describe|system.status|pm.search_markets|pm.get_event_details|pm.get_order_book|pm.get_account_summary|pm.get_positions|pm.get_open_orders|event_edge.scan|multi_outcome.analyze)
+    ;;
+  *)
+    echo "PLOY RPC write and unlisted methods are disabled in Monday: $method" >&2
+    exit 3
+    ;;
+esac
+
+host="${PLOY_TRADING_HOST:-}"
+if [[ -z "$host" ]]; then
+  echo "PLOY_TRADING_HOST is required (example: ploy@1.2.3.4)" >&2
+  exit 2
+fi
+
+ssh_opts=()
+if [[ -n "${PLOY_TRADING_SSH_OPTS:-}" ]]; then
+  # shellcheck disable=SC2206
+  ssh_opts+=(${PLOY_TRADING_SSH_OPTS})
+fi
+
+# Simple id: nanoseconds if available, else seconds.
+id="$(date +%s%N 2>/dev/null || date +%s)"
+
+printf '{"jsonrpc":"2.0","id":%s,"method":"%s","params":%s}\n' "$id" "$method" "$params" \
+  | ssh "${ssh_opts[@]}" "$host" "rpc"

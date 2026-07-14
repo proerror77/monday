@@ -1,0 +1,13 @@
+[package]
+name = "ploytui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin terminal console for the ploy control plane"
+
+[dependencies]
+ploy-control-client.workspace = true
+ploy-operator-contracts.workspace = true
+chrono.workspace = true

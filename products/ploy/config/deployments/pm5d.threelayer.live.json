@@ -1,0 +1,8 @@
+{
+  "deployment_id": "pm5d.threelayer.live",
+  "bundle_id": "02-pm5d-threelayer.live",
+  "account_id": "live-wallet-must-be-rendered",
+  "max_gross_exposure": "5.00",
+  "runtime_mode": "live",
+  "desired_state": "paused"
+}

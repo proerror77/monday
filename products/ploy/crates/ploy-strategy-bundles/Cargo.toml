@@ -1,0 +1,37 @@
+[package]
+name = "ploy-strategy-bundles"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ploy strategy bundle runtime crate"
+
+[features]
+default = []
+parquet-feed = ["dep:duckdb"]
+
+[dependencies]
+duckdb = { version = "1.1", features = ["chrono"], optional = true }
+async-trait.workspace = true
+chrono.workspace = true
+ploy-market-contracts.workspace = true
+ploy-operator-contracts.workspace = true
+ploy-trading.workspace = true
+rust_decimal.workspace = true
+rust_decimal_macros.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, optional = false }
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+ploy-feed-loaders.workspace = true
+rust_decimal_macros.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

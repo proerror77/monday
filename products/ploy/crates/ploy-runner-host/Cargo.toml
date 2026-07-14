@@ -1,0 +1,26 @@
+[package]
+name = "ploy-runner-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI host crate for the Ploy strategy runner"
+
+[features]
+default = ["lean-replay"]
+full = ["ops", "run-full"]
+lean-backtest = ["ploy-strategy-runtime/backtest-db"]
+lean-replay = ["ploy-strategy-runtime/replay"]
+ops = ["dep:ploy-market-data", "dep:sqlx", "ploy-market-data/live"]
+run-full = ["ploy-strategy-runtime/full"]
+
+[dependencies]
+ploy-deployments.workspace = true
+ploy-market-data = { path = "../ploy-market-data", optional = true, default-features = false }
+ploy-strategy-bundles = { path = "../ploy-strategy-bundles", default-features = false }
+ploy-strategy-runtime = { path = "../ploy-strategy-runtime", default-features = false }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "chrono"], optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

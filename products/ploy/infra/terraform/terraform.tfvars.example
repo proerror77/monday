@@ -1,0 +1,27 @@
+# Ploy Trading Bot - Terraform Variables Example
+# Copy this file to terraform.tfvars and fill in your values
+
+# AWS Region
+aws_region = "us-east-1"
+
+# Environment
+environment = "prod"
+
+# EC2 Configuration
+ec2_instance_type = "t3.small"
+ec2_key_name      = "ploy-key"
+
+# Restrict SSH access to your IP (recommended)
+ssh_allowed_cidr = ["YOUR_IP/32"]
+
+# RDS Configuration
+db_instance_class = "db.t3.micro"
+db_name           = "ploy"
+db_username       = "ploy"
+db_password       = "CHANGE_ME_STRONG_PASSWORD"
+
+# Trading Configuration
+trading_symbol = "BTCUSDT"
+trading_market = "will-btc-go-up-15m"
+trade_size     = 1.0
+max_position   = 50.0

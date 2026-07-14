@@ -22,6 +22,7 @@ pip-delete-this-directory.txt
 *.pdb
 Cargo.lock
 !/rust_hft/Cargo.lock
+!products/ploy/**/Cargo.lock
 
 # IDE files
 .vscode/
@@ -54,11 +55,16 @@ rust_hft/redis/data/
 *.onnx
 *.pkl
 models/
+!products/ploy/models/
+!products/ploy/models/**
 
 # Data files
 *.jsonl
 *.json
 *.csv
+!products/ploy/**/*.json
+!products/ploy/**/*.jsonl
+!products/ploy/**/*.csv
 *.xlsx
 *.zip
 test_data/

@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DeploymentSummary",
+  "type": "object",
+  "required": [
+    "deployment_id",
+    "desired_state",
+    "observed_state"
+  ],
+  "properties": {
+    "account_id": {
+      "default": "default",
+      "type": "string"
+    },
+    "deployment_id": {
+      "type": "string"
+    },
+    "deployment_state": {
+      "default": "enabled",
+      "allOf": [
+        {
+          "$ref": "#/definitions/DeploymentState"
+        }
+      ]
+    },
+    "desired_state": {
+      "$ref": "#/definitions/DesiredState"
+    },
+    "max_gross_exposure": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+    },
+    "observed_state": {
+      "$ref": "#/definitions/ObservedState"
+    },
+    "runtime_mode": {
+      "default": "paper",
+      "allOf": [
+        {
+          "$ref": "#/definitions/DeploymentRuntimeMode"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "DeploymentRuntimeMode": {
+      "type": "string",
+      "enum": [
+        "paper",
+        "live"
+      ]
+    },
+    "DeploymentState": {
+      "type": "string",
+      "enum": [
+        "enabled",
+        "draining",
+        "disabled",
+        "archived"
+      ]
+    },
+    "DesiredState": {
+      "type": "string",
+      "enum": [
+        "running",
+        "paused",
+        "stopped"
+      ]
+    },
+    "ObservedState": {
+      "type": "string",
+      "enum": [
+        "starting",
+        "running",
+        "degraded",
+        "paused",
+        "stopped",
+        "failed"
+      ]
+    }
+  }
+}

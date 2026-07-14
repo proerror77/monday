@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Ploy maintenance periodically
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=6h
+Persistent=true
+Unit=ploy-maintenance.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,199 @@
+-- Migration: 033_fix_settlement_view_join_and_confirmed_flag
+-- Description: Fix settlement_prices CTE to join only on token_id (not event_id+token_id),
+--              and add is_confirmed column to distinguish official vs spot-fallback settlements.
+--
+-- Root cause: The previous view joined settlement_prices on
+--   sp.event_id = f.event_id AND sp.token_id = f.token_id
+-- where sp.event_id was aliased from market_slug. But fills store event_id as a numeric
+-- string (e.g. "1888667") while pm_token_settlements.market_slug may be
+-- "eth-updown-5m-1775547900" for the same token. Since token_id is the PK of
+-- pm_token_settlements (unique), joining only on token_id is correct and sufficient.
+--
+-- Also adds is_confirmed: true when the exit price comes from official settlement data
+-- (either directly matched or corrected), false when using spot-price fallback.
+
+DROP VIEW IF EXISTS strategy_runtime_daily_track_record;
+DROP VIEW IF EXISTS strategy_runtime_event_track_record;
+
+CREATE VIEW strategy_runtime_event_track_record AS
+WITH settlement_prices AS (
+    SELECT
+        token_id,
+        CASE
+            WHEN settled_price >= 0.99 THEN 1.0::NUMERIC
+            WHEN settled_price <= 0.01 THEN 0.0::NUMERIC
+            ELSE settled_price
+        END AS official_price
+    FROM pm_token_settlements
+    WHERE resolved = true
+),
+normalized_fills AS (
+    SELECT
+        f.runtime_mode,
+        f.strategy_id,
+        f.deployment_id,
+        COALESCE(NULLIF(f.event_id, ''), f.intent_id) AS trade_key,
+        f.event_id,
+        f.intent_id,
+        f.symbol,
+        f.token_id,
+        f.market_side,
+        f.fill_side,
+        f.quantity,
+        f.price AS recorded_price,
+        sp.official_price AS official_settlement_price,
+        -- Use official settlement price for settlement exits when available
+        CASE
+            WHEN f.fill_side = 'SELL'
+                AND f.intent_id LIKE 'settle_%'
+                AND sp.official_price IS NOT NULL
+            THEN sp.official_price
+            ELSE f.price
+        END AS effective_price,
+        -- Flag when official price differs from what was recorded (spot fallback was wrong)
+        CASE
+            WHEN f.fill_side = 'SELL'
+                AND f.intent_id LIKE 'settle_%'
+                AND sp.official_price IS NOT NULL
+                AND ABS(f.price - sp.official_price) > 0.00000001::NUMERIC
+            THEN true
+            ELSE false
+        END AS settlement_corrected,
+        f.fee,
+        f.fill_timestamp
+    FROM strategy_runtime_fills f
+    LEFT JOIN settlement_prices sp ON sp.token_id = f.token_id
+),
+aggregated AS (
+    SELECT
+        runtime_mode,
+        strategy_id,
+        deployment_id,
+        trade_key,
+        MAX(event_id) AS event_id,
+        MIN(intent_id) AS intent_id,
+        MAX(symbol) AS symbol,
+        MAX(token_id) AS token_id,
+        MAX(market_side) AS market_side,
+        BOOL_OR(settlement_corrected) AS settlement_corrected,
+        MIN(fill_timestamp) AS first_fill_at,
+        MAX(fill_timestamp) AS last_fill_at,
+        MIN(fill_timestamp) FILTER (WHERE fill_side = 'BUY') AS opened_at,
+        MAX(fill_timestamp) FILTER (WHERE fill_side = 'SELL') AS closed_at,
+        COUNT(*) AS fill_count,
+        COUNT(*) FILTER (WHERE fill_side = 'BUY') AS buy_fill_count,
+        COUNT(*) FILTER (WHERE fill_side = 'SELL') AS sell_fill_count,
+        COALESCE(SUM(quantity) FILTER (WHERE fill_side = 'BUY'), 0::NUMERIC) AS buy_quantity,
+        COALESCE(SUM(quantity) FILTER (WHERE fill_side = 'SELL'), 0::NUMERIC) AS sell_quantity,
+        COALESCE(
+            SUM(quantity * recorded_price) FILTER (WHERE fill_side = 'SELL'),
+            0::NUMERIC
+        ) AS recorded_sell_notional,
+        COALESCE(
+            SUM(quantity * effective_price) FILTER (WHERE fill_side = 'BUY'),
+            0::NUMERIC
+        ) AS buy_notional,
+        COALESCE(
+            SUM(quantity * effective_price) FILTER (WHERE fill_side = 'SELL'),
+            0::NUMERIC
+        ) AS sell_notional,
+        MAX(official_settlement_price) FILTER (
+            WHERE fill_side = 'SELL'
+              AND intent_id LIKE 'settle_%'
+              AND official_settlement_price IS NOT NULL
+        ) AS official_exit_price,
+        -- is_confirmed: true when exit price is backed by official settlement data
+        -- false when using spot-price fallback (current_spot >= open_price heuristic)
+        BOOL_OR(
+            fill_side = 'SELL'
+            AND intent_id LIKE 'settle_%'
+            AND official_settlement_price IS NOT NULL
+        ) AS has_official_settlement,
+        COALESCE(SUM(fee), 0::NUMERIC) AS total_fee
+    FROM normalized_fills
+    GROUP BY runtime_mode, strategy_id, deployment_id, trade_key
+)
+SELECT
+    runtime_mode,
+    strategy_id,
+    deployment_id,
+    trade_key,
+    event_id,
+    intent_id,
+    symbol,
+    token_id,
+    market_side,
+    first_fill_at,
+    last_fill_at,
+    opened_at,
+    closed_at,
+    fill_count,
+    buy_fill_count,
+    sell_fill_count,
+    buy_quantity,
+    sell_quantity,
+    buy_notional,
+    sell_notional,
+    recorded_sell_notional,
+    total_fee,
+    CASE
+        WHEN buy_quantity > 0 THEN buy_notional / buy_quantity
+        ELSE NULL
+    END AS avg_entry_price,
+    CASE
+        WHEN sell_quantity > 0 THEN recorded_sell_notional / sell_quantity
+        ELSE NULL
+    END AS recorded_exit_price,
+    official_exit_price,
+    CASE
+        WHEN sell_quantity > 0 THEN sell_notional / sell_quantity
+        ELSE NULL
+    END AS avg_exit_price,
+    settlement_corrected,
+    -- is_confirmed: the exit price is backed by official Polymarket settlement data.
+    -- When false, the exit used a spot-price heuristic (current >= open) which may be wrong.
+    has_official_settlement AS is_confirmed,
+    sell_notional - buy_notional AS gross_pnl,
+    sell_notional - buy_notional - total_fee AS net_pnl,
+    buy_quantity > 0
+        AND sell_quantity > 0
+        AND ABS(buy_quantity - sell_quantity) <= 0.00000001::NUMERIC AS is_closed,
+    CASE
+        WHEN buy_quantity > sell_quantity THEN buy_quantity - sell_quantity
+        ELSE 0::NUMERIC
+    END AS open_quantity
+FROM aggregated;
+
+CREATE VIEW strategy_runtime_daily_track_record AS
+SELECT
+    runtime_mode,
+    strategy_id,
+    deployment_id,
+    (COALESCE(closed_at, last_fill_at) AT TIME ZONE 'Asia/Shanghai')::date AS trading_day_cst,
+    COUNT(*) AS trade_count,
+    COUNT(*) FILTER (WHERE is_closed) AS closed_trade_count,
+    COUNT(*) FILTER (WHERE is_closed AND is_confirmed) AS confirmed_trade_count,
+    COUNT(*) FILTER (WHERE is_closed AND settlement_corrected) AS corrected_trade_count,
+    -- Win/loss counts for confirmed trades only (official settlement data)
+    COUNT(*) FILTER (WHERE is_closed AND is_confirmed AND net_pnl > 0) AS winning_trade_count,
+    COUNT(*) FILTER (WHERE is_closed AND is_confirmed AND net_pnl < 0) AS losing_trade_count,
+    -- Win/loss counts including spot-fallback settlements
+    COUNT(*) FILTER (WHERE is_closed AND net_pnl > 0) AS winning_trade_count_all,
+    COUNT(*) FILTER (WHERE is_closed AND net_pnl < 0) AS losing_trade_count_all,
+    COALESCE(SUM(buy_notional), 0::NUMERIC) AS total_buy_notional,
+    COALESCE(SUM(sell_notional), 0::NUMERIC) AS total_sell_notional,
+    COALESCE(SUM(recorded_sell_notional), 0::NUMERIC) AS total_recorded_sell_notional,
+    COALESCE(SUM(total_fee), 0::NUMERIC) AS total_fee,
+    COALESCE(SUM(gross_pnl), 0::NUMERIC) AS gross_pnl,
+    COALESCE(SUM(net_pnl), 0::NUMERIC) AS net_pnl,
+    COALESCE(AVG(net_pnl), 0::NUMERIC) AS avg_net_pnl,
+    -- Confirmed-only PnL (excludes spot-fallback trades)
+    COALESCE(SUM(net_pnl) FILTER (WHERE is_confirmed), 0::NUMERIC) AS confirmed_net_pnl,
+    COALESCE(AVG(net_pnl) FILTER (WHERE is_confirmed), 0::NUMERIC) AS confirmed_avg_net_pnl,
+    COALESCE(SUM(open_quantity), 0::NUMERIC) AS residual_open_quantity
+FROM strategy_runtime_event_track_record
+GROUP BY
+    runtime_mode,
+    strategy_id,
+    deployment_id,
+    (COALESCE(closed_at, last_fill_at) AT TIME ZONE 'Asia/Shanghai')::date;

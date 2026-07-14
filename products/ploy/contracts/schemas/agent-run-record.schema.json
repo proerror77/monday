@@ -1,0 +1,125 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentRunRecord",
+  "type": "object",
+  "required": [
+    "cycle_kind",
+    "deployment_count",
+    "model",
+    "operator_recommendations",
+    "oversight_alerts",
+    "oversight_playbook_count",
+    "oversight_signal_count",
+    "research_reports",
+    "run_id",
+    "started_at",
+    "status",
+    "tool_calls"
+  ],
+  "properties": {
+    "cycle_kind": {
+      "type": "string"
+    },
+    "deployment_count": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "evaluation": true,
+    "failure_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "finished_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "model": {
+      "type": "string"
+    },
+    "operator_recommendations": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "output_summary": true,
+    "oversight_alerts": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "oversight_playbook_count": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "oversight_signal_count": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "platform_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "research_reports": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "runtime_context": true,
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string"
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/AgentToolCallRecord"
+      }
+    },
+    "total_cost_usd": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    }
+  },
+  "definitions": {
+    "AgentToolCallRecord": {
+      "type": "object",
+      "required": [
+        "name",
+        "status"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

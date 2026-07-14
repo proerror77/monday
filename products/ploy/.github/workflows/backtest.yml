@@ -1,0 +1,366 @@
+name: Strategy Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref to build (branch, tag, or SHA)"
+        required: true
+        default: "main"
+      start_date:
+        description: "Backtest start date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-10"
+      end_date:
+        description: "Backtest end date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-15"
+      config:
+        description: "Strategy config path (relative to repo root)"
+        required: true
+        default: "config/strategies/02-pm5d-threelayer.unified.toml"
+      data_dir:
+        description: "Parquet replay root (full-depth orderbook_snapshots preferred; leave empty for DB)"
+        required: false
+        default: ""
+      sync_parquet_data:
+        description: "Sync replay Parquet and the selected full-depth CLOB window from Tango"
+        required: false
+        default: "false"
+      issue_number:
+        description: "Optional GitHub issue number for posting backtest evidence"
+        required: false
+        default: ""
+
+concurrency:
+  group: backtest-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  backtest:
+    name: Build and run backtest on ploy-ci-1
+    runs-on: [self-hosted, ploy-ci-1]
+    timeout-minutes: 75
+    environment: ploy-ci-1
+
+    steps:
+      - name: Repair runner workspace permissions
+        run: |
+          if [ -d "${GITHUB_WORKSPACE}" ]; then
+            sudo chown -R "$(id -un):$(id -gn)" "${GITHUB_WORKSPACE}" || true
+            sudo rm -rf "${GITHUB_WORKSPACE}/.cargo-lock" || true
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Add cargo to PATH
+        run: echo "/home/runner/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build run_backtest
+        env:
+          DATA_DIR: ${{ github.event.inputs.data_dir }}
+        run: |
+          set -euo pipefail
+          . /home/runner/.cargo/env
+          cargo_args=(
+            build
+            --release
+            --locked
+            -p ploy-strategy-bundles
+            --example run_backtest
+          )
+          if [ -n "$DATA_DIR" ]; then
+            cargo_args+=(--features ploy-strategy-bundles/parquet-feed)
+          fi
+          cargo "${cargo_args[@]}"
+
+      - name: Sync Parquet data from Tango-1-1
+        if: ${{ github.event.inputs.data_dir != '' && github.event.inputs.sync_parquet_data == 'true' }}
+        env:
+          DATA_DIR: ${{ github.event.inputs.data_dir }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+          TANGO_1_1_KNOWN_HOSTS: ${{ secrets.TANGO_1_1_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          if [ -z "${TANGO_1_1_KNOWN_HOSTS}" ]; then
+            echo "TANGO_1_1_KNOWN_HOSTS secret is required for pinned SSH host verification" >&2
+            exit 1
+          fi
+          echo "${{ secrets.TANGO_SSH_KEY }}" > ~/.ssh/tango_key
+          chmod 600 ~/.ssh/tango_key
+          printf '%s\n' "${TANGO_1_1_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          mkdir -p "${DATA_DIR}"
+          rsync -az \
+            -e "ssh -i ~/.ssh/tango_key -o HostKeyAlias=tango-1-1 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts" \
+            root@172.16.0.204:/opt/ploy/data/parquet/ \
+            "${DATA_DIR}/"
+          start_epoch="$(date -u -d "${START_DATE} 00:00:00" +%s)"
+          end_epoch="$(date -u -d "${END_DATE} +1 day 00:00:00" +%s)"
+          current_epoch="$start_epoch"
+          while [ "$current_epoch" -lt "$end_epoch" ]; do
+            day="$(TZ=Asia/Shanghai date -d "@${current_epoch}" +%F)"
+            hour="$(TZ=Asia/Shanghai date -d "@${current_epoch}" +%H)"
+            hour_dir="${DATA_DIR}/orderbook_snapshots/date=${day}/hour=${hour}"
+            mkdir -p "${hour_dir}"
+            rsync -az \
+              -e "ssh -i ~/.ssh/tango_key -o HostKeyAlias=tango-1-1 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=~/.ssh/known_hosts" \
+              "root@172.16.0.204:/opt/ploy/data/lake/orderbook_snapshots/date=${day}/hour=${hour}/" \
+              "${hour_dir}/"
+            HOUR_DIR="${hour_dir}" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          hour_dir = Path(os.environ["HOUR_DIR"])
+          marker = hour_dir / "_SUCCESS"
+          manifest_path = hour_dir / "manifest.json"
+          parquet_path = hour_dir / "snapshots.parquet"
+          if not marker.is_file() or not manifest_path.is_file() or not parquet_path.is_file():
+              raise SystemExit(f"incomplete full-depth archive hour: {hour_dir}")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          if manifest.get("full_fidelity") is not True or int(manifest.get("row_count") or 0) <= 0:
+              raise SystemExit(f"invalid full-depth manifest: {manifest_path}")
+          digest = hashlib.sha256(parquet_path.read_bytes()).hexdigest()
+          if digest != manifest.get("sha256"):
+              raise SystemExit(f"full-depth archive checksum mismatch: {parquet_path}")
+          PY
+            current_epoch="$((current_epoch + 3600))"
+          done
+
+      - name: Run backtest
+        env:
+          CONFIG: ${{ github.event.inputs.config }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+          GIT_REF: ${{ github.event.inputs.git_ref }}
+          DATA_DIR: ${{ github.event.inputs.data_dir }}
+          SYNC_PARQUET_DATA: ${{ github.event.inputs.sync_parquet_data }}
+          PLOY_RESEARCH_DATABASE_URL: ${{ secrets.PLOY_RESEARCH_DATABASE_URL || vars.PLOY_RESEARCH_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/backtest
+          extra_args=()
+          if [ -n "$DATA_DIR" ]; then
+            if [ ! -d "$DATA_DIR" ]; then
+              echo "DATA_DIR '$DATA_DIR' does not exist (sync_parquet_data=$SYNC_PARQUET_DATA); set sync_parquet_data=true or leave data_dir empty to use DB" >&2
+              exit 2
+            fi
+            extra_args=(--data-dir "$DATA_DIR")
+          elif [ -z "${PLOY_RESEARCH_DATABASE_URL}" ]; then
+            echo "PLOY_RESEARCH_DATABASE_URL is required when data_dir is empty" >&2
+            exit 1
+          fi
+          if [ -n "${PLOY_RESEARCH_DATABASE_URL}" ]; then
+            db_host="$(python3 -c 'import os; from urllib.parse import urlparse; print(urlparse(os.environ["PLOY_RESEARCH_DATABASE_URL"]).hostname or "")')"
+            if [ "${db_host}" != "172.16.0.204" ]; then
+              echo "PLOY_RESEARCH_DATABASE_URL must target Tango-1-1 private VPC endpoint 172.16.0.204" >&2
+              exit 1
+            fi
+            extra_args+=(--db-url "${PLOY_RESEARCH_DATABASE_URL}")
+          fi
+          ./target/release/examples/run_backtest \
+            --config "${CONFIG}" \
+            --start-date "${START_DATE}" \
+            --end-date "${END_DATE}" \
+            --git-ref "${GIT_REF}" \
+            --output-json artifacts/backtest/evaluation.json \
+            "${extra_args[@]}"
+
+      - name: Publish backtest summary
+        if: always()
+        env:
+          CONFIG: ${{ github.event.inputs.config }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+          GIT_REF: ${{ github.event.inputs.git_ref }}
+        run: |
+          evidence_stage="diagnostic"
+          promotion_ready="false"
+          promotion_decision="diagnostic_backtest_only"
+          if [ -f artifacts/backtest/evaluation.json ]; then
+            readarray -t evidence < <(python3 - <<'PY'
+          import json
+          data = json.load(open("artifacts/backtest/evaluation.json", encoding="utf-8"))
+          print(data.get("evidence_stage") or "diagnostic")
+          print(str(data.get("promotion_ready") is True).lower())
+          print(data.get("promotion_decision") or "diagnostic_backtest_only")
+          PY
+            )
+            evidence_stage="${evidence[0]}"
+            promotion_ready="${evidence[1]}"
+            promotion_decision="${evidence[2]}"
+          fi
+          {
+            echo "## Strategy Backtest"
+            echo ""
+            echo "Evidence stage: \`${evidence_stage}\`"
+            echo "Promotion ready: \`${promotion_ready}\`"
+            echo "Promotion decision: \`${promotion_decision}\`"
+            echo ""
+            printf '%s\n' "- Window: ${START_DATE} -> ${END_DATE}"
+            printf '%s\n' "- Config: \`${CONFIG}\`"
+            printf '%s\n' "- Git ref: \`${GIT_REF}\`"
+            if [ -f artifacts/backtest/evaluation.json ]; then
+              echo "- Artifact: \`backtest-evaluation-${{ github.run_id }}\`"
+              echo ""
+              echo '```json'
+              python3 -c 'import json; data=json.load(open("artifacts/backtest/evaluation.json")); print(json.dumps({"producer": data.get("producer"), "replay_mode": data.get("replay_mode"), "evidence_stage": data.get("evidence_stage"), "promotion_ready": data.get("promotion_ready"), "promotion_decision": data.get("promotion_decision"), "canonical_result": data.get("canonical_result"), "source": data.get("source"), "data_surfaces": data.get("data_surfaces"), "metrics": data.get("metrics"), "risk_flags": data.get("risk_flags"), "blocking_risk_flags": data.get("blocking_risk_flags"), "advisory_flags": data.get("advisory_flags")}, indent=2, sort_keys=True))'
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage backtest evidence contract
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/backtest
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evaluation_path = Path("artifacts/backtest/evaluation.json")
+          evaluation = json.loads(evaluation_path.read_text(encoding="utf-8")) if evaluation_path.exists() else {}
+          stage = evaluation.get("evidence_stage") or "diagnostic"
+          decision = evaluation.get("promotion_decision") or "diagnostic_backtest_only"
+          reason = (
+              "Executable replay evidence still requires runtime scorer parity and dry-run parity before promotion."
+              if stage == "executable_replay"
+              else "Backtest evidence is diagnostic/replay accounting only; executable replay and parity evidence are still required."
+          )
+          contract = {
+              "schema_version": 1,
+              "kind": "research_evidence_stage",
+              "workflow": "backtest.yml",
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "evidence_stage": stage,
+              "promotion_ready": False,
+              "promotion_decision": decision,
+              "allowed_next_stage": "runtime_parity",
+              "blocked_next_stages": ["dry_run_candidate", "live_candidate"],
+              "reason": reason,
+          }
+          Path("artifacts/backtest/evidence-stage.json").write_text(
+              json.dumps(contract, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          Path("artifacts/backtest/evidence-stage.md").write_text(
+              "# Backtest Evidence Stage\n\n"
+              f"- Evidence stage: `{stage}`\n"
+              "- Promotion ready: `false`\n"
+              f"- Promotion decision: `{decision}`\n"
+              "- Allowed next stage: `runtime_parity`\n"
+              "- Blocked next stages: `dry_run_candidate`, `live_candidate`\n\n"
+              f"{reason}\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload backtest evaluation artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backtest-evaluation-${{ github.run_id }}
+          path: artifacts/backtest/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Comment backtest evidence on issue
+        if: ${{ always() && github.event.inputs.issue_number != '' }}
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+          CONFIG: ${{ github.event.inputs.config }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+          GIT_REF: ${{ github.event.inputs.git_ref }}
+        with:
+          script: |
+            const fs = require("fs");
+            const { applyResearchIssueLabels, labelsForDecision } = require("./.github/scripts/research-issue-labels.js");
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            let metrics = null;
+            let riskFlags = [];
+            let blockingRiskFlags = [];
+            let advisoryFlags = [];
+            let evidenceStage = "diagnostic";
+            let promotionReady = false;
+            let decision = "diagnostic_backtest_only";
+            if (fs.existsSync("artifacts/backtest/evaluation.json")) {
+              const data = JSON.parse(fs.readFileSync("artifacts/backtest/evaluation.json", "utf8"));
+              metrics = data.metrics || null;
+              evidenceStage = data.evidence_stage || "diagnostic";
+              promotionReady = data.promotion_ready === true;
+              decision = data.promotion_decision || "diagnostic_backtest_only";
+              riskFlags = data.risk_flags || [];
+              blockingRiskFlags = data.blocking_risk_flags || [];
+              advisoryFlags = data.advisory_flags || [];
+              if (data.promotion_ready === true) {
+                riskFlags.push("backtest_promotion_ready_ignored");
+                blockingRiskFlags.push("diagnostic_backtest_not_promotion_evidence");
+              }
+              if (!metrics || Object.keys(metrics).length === 0) {
+                riskFlags.push("missing_headline_metrics");
+                blockingRiskFlags.push("missing_headline_metrics");
+                decision = "fix-workflow-or-artifact";
+              }
+            } else {
+              riskFlags.push("missing_evaluation_artifact");
+              blockingRiskFlags.push("missing_evaluation_artifact");
+              decision = "fix-workflow-or-data-source";
+            }
+            const headlineMetrics = metrics && Object.keys(metrics).length > 0
+              ? JSON.stringify(metrics)
+              : "unavailable";
+            const body = [
+              "Backtest evidence:",
+              "",
+              `- Workflow: ${context.workflow}`,
+              `- Run URL: ${runUrl}`,
+              `- Git ref: ${process.env.GIT_REF}`,
+              `- Dataset/window: ${process.env.START_DATE} -> ${process.env.END_DATE}`,
+              `- Config: \`${process.env.CONFIG}\``,
+              `- Artifact: \`backtest-evaluation-${process.env.GITHUB_RUN_ID}\``,
+              `- Evidence stage: \`${evidenceStage}\``,
+              `- Promotion ready: \`${promotionReady}\``,
+              `- Headline metrics: \`${headlineMetrics}\``,
+              `- Artifact caveats: \`${riskFlags.join(", ") || "none"}\``,
+              `- Blocking promotion flags: \`${blockingRiskFlags.join(", ") || "none"}\``,
+              `- Advisory flags: \`${advisoryFlags.join(", ") || "none"}\``,
+              `- Decision: ${decision}`
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body
+            });
+            const stageLabel = evidenceStage === "executable_replay"
+              ? "evidence:executable-replay"
+              : "evidence:diagnostic";
+            const labels = ["evidence:backtest", stageLabel, ...labelsForDecision(decision)];
+            if (blockingRiskFlags.some((flag) => String(flag).includes("parity"))) {
+              labels.push("parity:blocked");
+            }
+            if (riskFlags.includes("missing_headline_metrics")) {
+              labels.push("evidence:missing-metrics");
+            }
+            if (riskFlags.includes("missing_evaluation_artifact")) {
+              labels.push("evidence:missing-artifact");
+            }
+            await applyResearchIssueLabels({ github, context, core, issue_number, labels });

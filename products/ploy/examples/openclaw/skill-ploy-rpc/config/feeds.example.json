@@ -1,0 +1,14 @@
+{
+  "feeds": [
+    {
+      "source": "Polymarket Blog",
+      "url": "https://polymarket.com/blog/rss.xml",
+      "limit": 20
+    },
+    {
+      "source": "Example News RSS",
+      "url": "https://example.com/rss.xml",
+      "limit": 30
+    }
+  ]
+}

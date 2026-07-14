@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PaperIntentRequest",
+  "type": "object",
+  "required": [
+    "market_id",
+    "purpose",
+    "quantity",
+    "side",
+    "token_id"
+  ],
+  "properties": {
+    "idempotency_key": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "limit_price": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+    },
+    "market_id": {
+      "type": "string"
+    },
+    "purpose": {
+      "$ref": "#/definitions/IntentPurpose"
+    },
+    "quantity": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+    },
+    "side": {
+      "type": "string"
+    },
+    "token_id": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "IntentPurpose": {
+      "type": "string",
+      "enum": [
+        "entry",
+        "exit",
+        "reduce",
+        "hedge",
+        "cancel"
+      ]
+    }
+  }
+}

@@ -1,0 +1,135 @@
+# Polymarket Trading Bot Configuration
+# Override with environment variables: PLOY_MARKET__WS_URL, etc.
+
+[market]
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+rest_url = "https://clob.polymarket.com"
+market_slug = "sol-updown-15m"
+# Optional exchange-specific overrides.
+# exchange_ws_url = ""
+# exchange_rest_url = ""
+# SOL 15m UP/DOWN market
+# Series ID: 10423
+# Gamma API: https://gamma-api.polymarket.com/series/10423
+
+[strategy]
+shares = 20                     # Number of shares per leg
+window_min = 2                  # Minutes to watch for dump after round start
+move_pct = 0.15                 # 15% drop triggers Leg1
+sum_target = 1.0                # Raw sum threshold (typically 1.0 for binary markets)
+fee_buffer = 0.005              # 0.5% fee estimate
+slippage_buffer = 0.02          # 2% slippage buffer
+profit_buffer = 0.01            # 1% minimum profit target
+# Effective target = sum_target - 0.005 - 0.02 - 0.01
+
+[execution]
+exchange = "polymarket"        # polymarket | kalshi
+# kalshi is currently gated behind: PLOY_ENABLE_KALSHI_EXPERIMENTAL=true
+order_timeout_ms = 5000         # 5 second timeout for order fills
+max_retries = 3                 # Retry order submission up to 3 times
+max_spread_bps = 500            # 5% max spread (anti-fake-dump)
+poll_interval_ms = 500          # Poll order status every 500ms
+
+[kalshi]
+base_url = "https://api.elections.kalshi.com/trade-api/v2"
+# api_key = ""
+# api_secret = ""
+
+[risk]
+max_single_exposure_usd = 100   # Max $100 per Leg1
+min_remaining_seconds = 30      # Block new Leg1 if < 30s remaining
+max_consecutive_failures = 3    # Circuit breaker after 3 failed cycles
+daily_loss_limit_usd = 500      # Halt trading if daily loss >= $500
+leg2_force_close_seconds = 20   # Force Leg2 action with 20s remaining
+
+[database]
+url = "postgres://localhost/ploy"
+max_connections = 5
+
+[dry_run]
+enabled = true                  # Start in dry run mode for safety
+
+[logging]
+level = "info"
+json = false
+
+# Agent framework control-plane mode.
+# Set mode=openclaw + hard_disable_internal_agents=true to force OpenClaw-only runtime.
+[agent_framework]
+mode = "internal"
+hard_disable_internal_agents = false
+
+# =============================================================================
+# Optional always-on agent: Arena leaderboard → Polymarket event mispricing scan
+# =============================================================================
+#
+# This is designed for markets like:
+# "Which company has the best AI model end of February?"
+#
+# It fetches the Arena Text leaderboard via a proxy:
+#   https://r.jina.ai/https://arena.ai/leaderboard/text
+# then builds a conservative "true probability" estimate per company and compares
+# against Polymarket order book asks to find mispricing.
+#
+# Historical standalone PLOY control-plane and deployment instructions are not
+# operational inside Monday. This configuration cannot enable live execution.
+# Any future connection to an order path requires a separate reviewed Monday change
+# that routes through Monday's `rust_hft` risk, OMS, reconciliation, and execution
+# authority.
+#
+# [event_edge_agent]
+# enabled = false
+# framework = "deterministic" # or "event_driven" or "claude_agent_sdk"
+# # Note: `claude_agent_sdk` requires the Claude Code CLI installed + authenticated on this host.
+# trade = false
+# interval_secs = 30
+# min_edge = 0.08
+# max_entry = 0.75
+# shares = 100
+# cooldown_secs = 120
+# max_daily_spend_usd = 50
+# model = ""                 # optional (e.g. "opus", "claude-opus-4-6", or "MiniMax-M2.5" with ANTHROPIC_BASE_URL)
+# claude_max_turns = 20
+# titles = ["Which company has the best AI model end of February?"]
+# event_ids = []
+
+# =============================================================================
+# NBA Q3→Q4 Comeback Trading Agent
+# =============================================================================
+#
+# Scans live NBA games via ESPN, identifies teams trailing in Q3 with high
+# historical comeback rates, and buys YES shares on Polymarket when the
+# market underprices their win probability.
+#
+# [nba_comeback]
+# enabled = false
+# min_edge = 0.05
+# max_entry_price = 0.75
+# shares = 50
+# cooldown_secs = 300
+# max_daily_spend_usd = 100
+# min_deficit = 1
+# max_deficit = 15
+# target_quarter = 3
+# espn_poll_interval_secs = 30
+# min_comeback_rate = 0.15
+# season = "2025-26"
+# performance_daily_loss_limit_usd = 30
+# performance_min_settled_trades = 10
+# performance_min_win_rate = 0.45
+# performance_low_winrate_multiplier = 0.60
+# performance_loss_streak_threshold = 3
+# performance_loss_streak_multiplier = 0.50
+
+# =============================================================================
+# Event Registry — shared event pool for cross-strategy discovery
+# =============================================================================
+#
+# Background scanner that populates the event_registry table.
+# Events flow: discovered → researched → monitoring → trade
+#
+# [event_registry]
+# enabled = false
+# scan_interval_secs = 300
+# sports_keywords = ["NBA", "NFL"]
+# general_keywords = []

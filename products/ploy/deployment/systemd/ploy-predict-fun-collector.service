@@ -1,0 +1,26 @@
+[Unit]
+Description=Ploy Predict.fun Market Data Collector
+After=postgresql.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/ploy/predict-fun.env
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ploy
+EnvironmentFile=/etc/ploy/predict-fun.env
+Environment=PLOY_DATABASE__URL=postgresql://postgres:postgres@localhost:5432/ploy
+Environment=PLOY_PREDICT_FUN_REFRESH_SECS=30
+Environment=PLOY_PREDICT_FUN_MARKET_DELAY_MS=300
+ExecStartPre=/bin/sleep 23
+ExecStart=/opt/ploy/bin/ploy-runner collect-predict-fun
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+MemoryHigh=1280M
+MemoryMax=1536M
+CPUQuota=80%
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

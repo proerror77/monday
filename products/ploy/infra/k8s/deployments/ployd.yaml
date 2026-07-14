@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ployd
+  namespace: ploy
+  labels:
+    app: ployd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ployd
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ployd
+    spec:
+      shareProcessNamespace: true
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: ployd
+        image: registry-vpc.ap-northeast-1.aliyuncs.com/ploy/ploy-runner:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+          name: http
+        envFrom:
+        - secretRef:
+            name: ploy-secrets
+        - configMapRef:
+            name: ploy-config
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1536Mi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: ploy-data
+          mountPath: /opt/ploy/data
+        - name: ploy-logs
+          mountPath: /opt/ploy/logs
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 3
+        securityContext:
+          capabilities:
+            add: ["SYS_PTRACE"]
+      volumes:
+      - name: ploy-data
+        persistentVolumeClaim:
+          claimName: ploy-data-pvc
+      - name: ploy-logs
+        emptyDir: {}
+      nodeSelector:
+        node-pool: trading
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ploy-data-pvc
+  namespace: ploy
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: alicloud-disk-essd
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ployd
+  namespace: ploy
+spec:
+  selector:
+    app: ployd
+  ports:
+  - port: 8081
+    targetPort: 8081
+    name: http

@@ -1,0 +1,24 @@
+[Unit]
+Description=Ploy CLOB Orderbook Snapshot Parquet Archive
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ploy
+EnvironmentFile=-/opt/ploy/.env
+Environment=HOME=/opt/ploy
+ExecStart=/bin/bash /opt/ploy/scripts/archive_clob_orderbook_snapshots_backfill.sh
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/ploy/data/lake
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ploy-orderbook-snapshot-archive
+
+[Install]
+WantedBy=multi-user.target

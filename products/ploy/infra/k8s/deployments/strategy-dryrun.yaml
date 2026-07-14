@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ploy-strategy-dryrun
+  namespace: ploy
+  labels:
+    app: ploy-strategy-dryrun
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ploy-strategy-dryrun
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ploy-strategy-dryrun
+    spec:
+      containers:
+      - name: strategy
+        image: registry-vpc.ap-northeast-1.aliyuncs.com/ploy/ploy-runner:latest
+        imagePullPolicy: Always
+        args: ["--config", "/opt/ploy/config/strategies/02-pm5d-threelayer.unified.toml"]
+        envFrom:
+        - secretRef:
+            name: ploy-secrets
+        - configMapRef:
+            name: ploy-config
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1536Mi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: strategy-config
+          mountPath: /opt/ploy/config/strategies
+          readOnly: true
+      volumes:
+      - name: strategy-config
+        configMap:
+          name: strategy-configs
+      nodeSelector:
+        node-pool: trading

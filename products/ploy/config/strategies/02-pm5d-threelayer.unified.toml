@@ -1,0 +1,66 @@
+# Three-layer scoring strategy — unified config
+# Same file drives backtest, dry-run, and live — change [runtime].mode only
+#
+# Scoring model: direction(50%) + edge(35%) + confirmation bonus(15%)
+# Entry when total_score > min_entry_score
+# OBI uses 5s EWMA smoothing for 10 Hz LOB data
+
+[runtime]
+strategy_variant = "three_layer"
+mode = "dryrun"
+throttle_hz = 10
+
+[strategy]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+
+vol_floor = 0.001
+min_probability = 0.51
+min_z_score = 0.20
+
+min_entry_price = 0.10
+max_entry_price = 0.85
+no_trade_zone_min = 0.45
+no_trade_zone_max = 0.55
+
+min_edge = 0.0316
+
+min_time_remaining_secs = 69
+max_time_remaining_secs = 99
+cooldown_secs = 35
+
+stake_usd = 5.0
+max_positions = 1000
+max_daily_trades = 1000
+allowed_window_secs = [300]
+
+# Optimized parameters (TPE 200 trials, train Apr 10-13, val Apr 14-15)
+# Train: Sharpe=137.8, 239 trades, +$5,743
+# Val:   Sharpe=141.7, 1017 trades, +$25,689
+three_layer_min_entry_score = 0.25
+three_layer_min_direction_prob = 0.6297
+three_layer_min_distance_over_sigma = 0.4622
+three_layer_min_confirmation_score = 0.2472
+three_layer_min_drift_confirmation = 0.000546
+three_layer_min_edge = 0.0316
+three_layer_min_reward_risk = 1.2630
+three_layer_take_profit_ask = 0.8437
+three_layer_stop_distance_pct = 0.0152
+three_layer_max_pm_lag_secs = 15
+
+[execution]
+use_spread = true
+spread_pct = 0.08
+enable_partial_fills = false
+min_fill_pct = 0.5
+enable_market_impact = true
+impact_coefficient = 0.1
+default_depth_shares = 500
+require_lob_liquidity = true
+
+[reference_data]
+capture_sports_state = false
+
+[backtest_data]
+include_reference_prices = false
+include_sports_state = false
+require_official_settlement = true

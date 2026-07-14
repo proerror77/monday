@@ -1,0 +1,24 @@
+[package]
+name = "ploy-platform-runtime"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Next-generation platform runtime ownership boundary for Ploy"
+
+[dependencies]
+chrono.workspace = true
+ploy-connectivity.workspace = true
+ploy-deployments.workspace = true
+ploy-operator-contracts.workspace = true
+ploy-platform.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ploy-trading.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rust_decimal.workspace = true
+rust_decimal_macros.workspace = true

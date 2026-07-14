@@ -1,0 +1,19 @@
+[Unit]
+Description=Ploy Platform Watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+ExecStart=/bin/bash -c 'for root in /root/ploy /opt/ploy; do if [[ -x "$root/scripts/ploy_platform_watchdog.sh" ]]; then export PLOY_PLATFORM_WATCHDOG_ROOT="$root"; exec "$root/scripts/ploy_platform_watchdog.sh"; fi; done; echo "ploy-platform-watchdog: missing watchdog script under /root/ploy or /opt/ploy" >&2; exit 1'
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/root/ploy/run /opt/ploy/run
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ploy-platform-watchdog

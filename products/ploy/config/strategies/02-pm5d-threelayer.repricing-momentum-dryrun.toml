@@ -1,0 +1,67 @@
+# Three-layer repricing-momentum dry-run config
+# Snapshot optimizer run 25273384677, snapshot 762ae7751ad08a21
+# Dry-run-only candidate: BTC/ETH/SOL full-depth executable validation passed
+# with 200 validation trades. Not a live config.
+
+[runtime]
+strategy_variant = "three_layer"
+mode = "dryrun"
+throttle_hz = 10
+
+[strategy]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+vol_floor = 0.001
+min_probability = 0.51
+min_z_score = 0.20
+
+min_entry_price = 0.10
+max_entry_price = 0.85
+no_trade_zone_min = 0.45
+no_trade_zone_max = 0.55
+
+min_edge = 0.0
+
+min_time_remaining_secs = 51
+max_time_remaining_secs = 157
+cooldown_secs = 30
+
+stake_usd = 15.0
+max_positions = 1000
+max_daily_trades = 1000
+allowed_window_secs = [300, 900]
+
+three_layer_strategy_profile = "repricing_momentum"
+three_layer_min_entry_score = 0.130086
+three_layer_min_direction_prob = 0.516123
+three_layer_min_distance_over_sigma = 0.450048
+three_layer_min_confirmation_score = 0.094075
+three_layer_require_confirmation = false
+three_layer_min_drift_confirmation = -0.00016137
+three_layer_min_edge = 0.015719
+three_layer_min_reward_risk = 1.929725
+three_layer_alpha_contrarian = true
+three_layer_cex_contrarian = false
+three_layer_probability_shrink = 0.894320
+three_layer_probability_haircut = 0.058442
+three_layer_take_profit_ask = 0.8437
+three_layer_stop_distance_pct = 0.0152
+three_layer_max_pm_lag_secs = 15
+
+[execution]
+use_spread = true
+spread_pct = 0.08
+enable_partial_fills = false
+min_fill_pct = 0.5
+enable_market_impact = true
+impact_coefficient = 0.1
+default_depth_shares = 500
+require_lob_liquidity = true
+
+[reference_data]
+capture_sports_state = false
+
+[backtest_data]
+include_reference_prices = false
+include_sports_state = false
+require_official_settlement = true

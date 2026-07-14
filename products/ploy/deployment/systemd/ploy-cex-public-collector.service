@@ -1,0 +1,28 @@
+[Unit]
+Description=Ploy Public CEX Market Data Collector
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ploy
+Environment=PLOY_CEX_ASSETS=BTC,ETH,SOL
+Environment=PLOY_CEX_FUTURES_POLL_SECS=5
+Environment=PLOY_CEX_LOB_SAMPLE_MS=1000
+Environment=PLOY_DATABASE__URL=postgresql://postgres:postgres@localhost:5432/ploy
+ExecStartPre=/bin/sleep 19
+ExecStart=/opt/ploy/bin/ploy-runner collect-cex-public \
+    --assets ${PLOY_CEX_ASSETS} \
+    --poll-secs ${PLOY_CEX_FUTURES_POLL_SECS} \
+    --sample-ms ${PLOY_CEX_LOB_SAMPLE_MS}
+Restart=always
+RestartSec=11
+StandardOutput=journal
+StandardError=journal
+MemoryHigh=512M
+MemoryMax=1024M
+CPUQuota=80%
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

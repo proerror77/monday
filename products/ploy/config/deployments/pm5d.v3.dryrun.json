@@ -1,0 +1,8 @@
+{
+  "deployment_id": "pm5d.v3.dryrun",
+  "bundle_id": "02-pm5d.v3-dryrun",
+  "account_id": "paper:pm5d-dryrun",
+  "max_gross_exposure": "5.00",
+  "runtime_mode": "paper",
+  "desired_state": "running"
+}

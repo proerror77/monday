@@ -1,0 +1,11 @@
+[Unit]
+Description=Run bounded orderbook snapshot retention periodically
+
+[Timer]
+OnBootSec=12m
+OnCalendar=hourly
+Persistent=true
+Unit=ploy-orderbook-snapshot-retention.service
+
+[Install]
+WantedBy=timers.target

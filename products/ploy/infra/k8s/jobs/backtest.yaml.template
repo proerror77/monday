@@ -1,0 +1,37 @@
+# Usage: envsubst < backtest.yaml.template | kubectl apply -f -
+# Required env vars: CONFIG, START_DATE, END_DATE, JOB_SUFFIX
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backtest-${JOB_SUFFIX}
+  namespace: ploy
+spec:
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: backtest
+        image: registry-vpc.ap-northeast-1.aliyuncs.com/ploy/ploy-research:latest
+        command: ["/opt/ploy/bin/run_backtest"]
+        args:
+        - "--config"
+        - "${CONFIG}"
+        - "--start-date"
+        - "${START_DATE}"
+        - "--end-date"
+        - "${END_DATE}"
+        - "--db-url"
+        - "$(DATABASE_URL)"
+        envFrom:
+        - secretRef:
+            name: ploy-secrets
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "4000m"
+          limits:
+            memory: "14Gi"
+            cpu: "8000m"
+      nodeSelector:
+        node-pool: backtest

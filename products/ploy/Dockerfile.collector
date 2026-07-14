@@ -1,0 +1,19 @@
+# Runtime image for Binance data collectors (Python)
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir asyncpg websockets psycopg2-binary
+
+COPY scripts/binance_price_collector.py ./
+COPY scripts/binance_lob_collector.py ./
+COPY scripts/binance_aggtrade_collector.py ./
+
+ENV PYTHONUNBUFFERED=1
+
+# Override CMD to select which collector to run
+# e.g. CMD ["python", "binance_price_collector.py"]

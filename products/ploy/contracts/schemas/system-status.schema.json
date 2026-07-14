@@ -1,0 +1,87 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SystemStatus",
+  "type": "object",
+  "required": [
+    "database_connected",
+    "error_count_1h",
+    "status",
+    "strategy",
+    "uptime_seconds",
+    "version",
+    "websocket_connected"
+  ],
+  "properties": {
+    "active_alert_count": {
+      "default": 0,
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "database_connected": {
+      "type": "boolean"
+    },
+    "error_count_1h": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "last_live_reconcile_error": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_live_reconcile_success_at": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_trade_time": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "live_reconcile_failures": {
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "next_live_reconcile_at": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "stale_source_count": {
+      "default": 0,
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "status": {
+      "type": "string"
+    },
+    "strategy": {
+      "type": "string"
+    },
+    "uptime_seconds": {
+      "type": "integer",
+      "format": "int64"
+    },
+    "version": {
+      "type": "string"
+    },
+    "websocket_connected": {
+      "type": "boolean"
+    }
+  }
+}

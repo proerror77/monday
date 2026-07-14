@@ -1,0 +1,68 @@
+# Three-layer OBI-soft dry-run config
+# Snapshot optimizer run 25046098899, snapshot 5bfb253100d3f573
+
+[runtime]
+strategy_variant = "three_layer"
+mode = "dryrun"
+throttle_hz = 10
+# Canonical live-feed capture for replaying current/candidate configs against
+# the same MarketUpdate sequence. Keep this on one PM5D profile to avoid
+# duplicating high-frequency L2/aggTrade logs across parallel dry-runs.
+record_market_updates_to = "/opt/ploy/data/recordings/pm5d-threelayer-canonical.ndjson"
+record_market_updates_max_records = 300000
+record_market_updates_max_bytes = 268435456
+
+[strategy]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+
+vol_floor = 0.001
+min_probability = 0.51
+min_z_score = 0.20
+
+min_entry_price = 0.10
+max_entry_price = 0.85
+no_trade_zone_min = 0.45
+no_trade_zone_max = 0.55
+
+min_edge = 0.0316
+
+min_time_remaining_secs = 93
+max_time_remaining_secs = 213
+cooldown_secs = 35
+
+stake_usd = 15.0
+max_positions = 1000
+max_daily_trades = 1000
+allowed_window_secs = [300, 900]
+
+three_layer_strategy_profile = "obi_soft"
+three_layer_min_entry_score = 0.500422
+three_layer_min_direction_prob = 0.560897
+three_layer_min_distance_over_sigma = -0.185344
+three_layer_min_confirmation_score = 0.041704
+three_layer_min_drift_confirmation = -0.00017463
+three_layer_min_edge = 0.041937
+three_layer_min_reward_risk = 0.275789
+three_layer_alpha_contrarian = true
+three_layer_cex_contrarian = false
+three_layer_take_profit_ask = 0.8437
+three_layer_stop_distance_pct = 0.0152
+three_layer_max_pm_lag_secs = 15
+
+[execution]
+use_spread = true
+spread_pct = 0.08
+enable_partial_fills = false
+min_fill_pct = 0.5
+enable_market_impact = true
+impact_coefficient = 0.1
+default_depth_shares = 500
+require_lob_liquidity = true
+
+[reference_data]
+capture_sports_state = false
+
+[backtest_data]
+include_reference_prices = false
+include_sports_state = false
+require_official_settlement = true
