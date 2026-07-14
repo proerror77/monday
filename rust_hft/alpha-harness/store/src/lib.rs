@@ -2386,11 +2386,26 @@ mod tests {
             "evaluator_version": SEALED_HOLDOUT_EVALUATOR_VERSION,
             "evaluator_config": config,
             "metrics": {
+                "predictive": {
+                    "row_count": 30,
+                    "time_series_ic": 0.1,
+                    "time_series_rank_ic": 0.1,
+                    "time_series_icir": null,
+                    "time_series_rank_icir": null,
+                    "positive_ic_ratio": 1.0,
+                    "folds": [{
+                        "fold_index": 1,
+                        "row_count": 30,
+                        "time_series_ic": 0.1,
+                        "time_series_rank_ic": 0.1
+                    }]
+                },
                 "row_count": 30,
                 "trade_count": 30,
                 "mean_net_return": 0.001,
                 "cumulative_net_return": 0.03,
                 "max_drawdown": 0.01,
+                "net_sharpe": 1.0,
                 "raw_score": raw_score,
                 "adjusted_score": adjusted_score,
                 "folds": [{
@@ -2400,6 +2415,7 @@ mod tests {
                     "mean_net_return": 0.001,
                     "cumulative_net_return": 0.03,
                     "max_drawdown": 0.01,
+                    "net_sharpe": 1.0,
                     "raw_score": raw_score
                 }]
             }
@@ -2435,7 +2451,10 @@ mod tests {
             .clone();
         let evaluation = sealed_evaluation();
         let sealed = RegistryRevision {
-            revision_id: "sealed-evaluation:candidate-1".to_string(),
+            revision_id: format!(
+                "sealed-evaluation:{}:candidate-1",
+                SEALED_HOLDOUT_EVALUATOR_VERSION
+            ),
             registry_kind: "sealed_evaluation".to_string(),
             asset_id: "candidate-1".to_string(),
             parent_revision_id: None,
@@ -2704,7 +2723,10 @@ mod tests {
         let evaluation = sealed_evaluation();
         store
             .put_registry_revision(&RegistryRevision {
-                revision_id: "sealed-evaluation:candidate-1".to_string(),
+                revision_id: format!(
+                    "sealed-evaluation:{}:candidate-1",
+                    SEALED_HOLDOUT_EVALUATOR_VERSION
+                ),
                 registry_kind: "sealed_evaluation".to_string(),
                 asset_id: "candidate-1".to_string(),
                 parent_revision_id: None,
@@ -2746,7 +2768,10 @@ mod tests {
             evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
             evaluator_config_hash,
             evaluation_metrics_hash,
-            sealed_evaluation_id: "sealed-evaluation:candidate-1".to_string(),
+            sealed_evaluation_id: format!(
+                "sealed-evaluation:{}:candidate-1",
+                SEALED_HOLDOUT_EVALUATOR_VERSION
+            ),
             sealed_evaluation_hash: evaluation_hash,
             bundle_id: bundle.bundle_id.clone(),
             bundle_hash: bundle.bundle_hash.clone(),
@@ -3412,7 +3437,10 @@ mod tests {
             .clone();
         store
             .put_registry_revision(&RegistryRevision {
-                revision_id: "sealed-evaluation:candidate-1".to_string(),
+                revision_id: format!(
+                    "sealed-evaluation:{}:candidate-1",
+                    SEALED_HOLDOUT_EVALUATOR_VERSION
+                ),
                 registry_kind: "sealed_evaluation".to_string(),
                 asset_id: "candidate-1".to_string(),
                 parent_revision_id: None,

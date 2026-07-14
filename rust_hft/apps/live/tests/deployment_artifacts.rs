@@ -1,7 +1,7 @@
 use std::path::Path;
 
 #[cfg(all(feature = "formula-strategy", feature = "bitget"))]
-use alpha_domain::StrategyBundle;
+use alpha_domain::{StrategyBundle, SEALED_HOLDOUT_EVALUATOR_VERSION};
 #[cfg(all(feature = "formula-strategy", feature = "bitget"))]
 use chrono::Utc;
 #[cfg(all(feature = "formula-strategy", feature = "bitget"))]
@@ -22,7 +22,7 @@ fn formula_bundle() -> StrategyBundle {
         "candidate_id": "candidate-1",
         "candidate_content_hash": "1".repeat(64),
         "dataset_manifest_id": "dataset-1",
-        "evaluator_version": "sealed-holdout-v2",
+        "evaluator_version": SEALED_HOLDOUT_EVALUATOR_VERSION,
         "evaluator_config_hash": "3".repeat(64),
         "evaluation_metrics_hash": "4".repeat(64),
         "sealed_evaluation_hash": "2".repeat(64),

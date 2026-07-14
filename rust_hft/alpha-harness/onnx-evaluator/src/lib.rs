@@ -202,7 +202,7 @@ mod tests {
             infer_signals(&model(), &rows, |input| Ok::<_, String>(vec![input[0]])).unwrap();
         let policy = FormulaEvaluator::for_trials(1).unwrap();
         let evaluation = policy
-            .evaluate_onnx_signals(&rows, &signals, std::iter::once(0..rows.len()), false)
+            .evaluate_onnx_signals(&rows, &signals, [0..250, 250..500], false)
             .unwrap();
         assert!(evaluation.passed);
     }

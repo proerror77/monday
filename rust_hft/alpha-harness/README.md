@@ -92,7 +92,9 @@ cargo run -p alpha-harness -- mission learn \
   --repeated-failure-threshold 3
 ```
 
-Only a canonical Formula v2 walk-forward Keep candidate can access the sealed holdout. The evaluator persists rows, trades, post-cost edge, drawdown, raw score, adjusted score, config, and version; config and metrics hashes are bound into promotion and bundle hashes. A mission may pre-register a larger multiple-testing family through `validator_spec.multiple_testing_trials`, but it cannot declare fewer trials than its candidate budget. Repeated failures generate one idempotent follow-up mission and learning directive. Add `--llm-critic` for a bounded real failure explanation.
+Only a canonical Formula v3 walk-forward Keep candidate can access the sealed holdout. Candidate generators receive label-free proposal metadata; only the evaluator can read labels. Before position mapping, the evaluator persists per-fold time-series IC, RankIC, ICIR, RankICIR, and positive-IC ratio. After mapping, it persists rows, trades, post-cost edge, drawdown, per-observation net Sharpe, raw score, and adjusted score. The Sharpe value is deliberately not annualized because dataset frequency is not yet part of the evaluation contract.
+
+Mission `validator_spec` may override `min_time_series_ic`, `min_time_series_rank_ic`, `min_time_series_icir`, `min_time_series_rank_icir`, and `min_positive_ic_ratio`. It may also pre-register a larger multiple-testing family through `multiple_testing_trials`, but cannot declare fewer trials than its candidate budget. Config and metric hashes are bound into versioned sealed evidence, promotion, and bundle hashes. Repeated failures generate one idempotent follow-up mission and learning directive. Add `--llm-critic` for a bounded real failure explanation.
 
 Runtime feedback and search policy revisions enter through typed JSON:
 

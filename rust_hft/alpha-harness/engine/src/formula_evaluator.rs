@@ -1,7 +1,7 @@
 use crate::{
     evaluation::{evaluate_sealed_holdout, EngineContext, PreparedDataset, ResearchRow},
     CandidateEvaluation, CandidateEvaluator, EngineProposal, EvaluationMetrics,
-    FoldEvaluationMetrics,
+    FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
 };
 use alpha_domain::{CandidateArtifact, SEALED_HOLDOUT_EVALUATOR_VERSION};
 pub use alpha_domain::{
@@ -91,6 +91,7 @@ impl FormulaEvaluator {
         }
 
         let mut fold_metrics = Vec::new();
+        let mut predictive_folds = Vec::new();
         let mut all_returns = Vec::new();
         let mut failures = Vec::new();
         for (fold_index, range) in ranges.into_iter().enumerate() {
@@ -98,7 +99,19 @@ impl FormulaEvaluator {
                 return Err("evaluation range is too short or out of bounds".to_string());
             }
             let (returns, trade_count) = net_returns(rows, signals, range.clone());
+            let factor_values = &signals[range.clone()];
+            let labels = range
+                .clone()
+                .map(|index| rows[index].label)
+                .collect::<Vec<_>>();
+            predictive_folds.push(FoldPredictiveMetrics {
+                fold_index: fold_index + 1,
+                row_count: range.len(),
+                time_series_ic: pearson_correlation(factor_values, &labels),
+                time_series_rank_ic: spearman_correlation(factor_values, &labels),
+            });
             let mean = mean(&returns);
+            let net_sharpe = sharpe_ratio(&returns, mean);
             let raw_score = t_statistic(&returns, mean);
             let max_drawdown = max_drawdown(&returns);
             if trade_count < self.config.min_trades {
@@ -132,12 +145,58 @@ impl FormulaEvaluator {
                 mean_net_return: mean,
                 cumulative_net_return: returns.iter().sum(),
                 max_drawdown,
+                net_sharpe,
                 raw_score,
             });
             all_returns.extend(returns);
         }
         if fold_metrics.is_empty() {
             return Err("evaluation has no folds".to_string());
+        }
+        let predictive = PredictiveMetrics::from_folds(predictive_folds);
+        if predictive
+            .time_series_ic
+            .is_none_or(|ic| ic < self.config.min_time_series_ic)
+        {
+            failures.push(format!(
+                "time-series IC does not meet {:.8}",
+                self.config.min_time_series_ic
+            ));
+        }
+        if predictive
+            .time_series_rank_ic
+            .is_none_or(|ic| ic < self.config.min_time_series_rank_ic)
+        {
+            failures.push(format!(
+                "time-series RankIC does not meet {:.8}",
+                self.config.min_time_series_rank_ic
+            ));
+        }
+        if fold_metrics.len() > 1
+            && predictive
+                .time_series_icir
+                .is_none_or(|icir| icir < self.config.min_time_series_icir)
+        {
+            failures.push(format!(
+                "time-series ICIR does not meet {:.8}",
+                self.config.min_time_series_icir
+            ));
+        }
+        if fold_metrics.len() > 1
+            && predictive
+                .time_series_rank_icir
+                .is_none_or(|icir| icir < self.config.min_time_series_rank_icir)
+        {
+            failures.push(format!(
+                "time-series RankICIR does not meet {:.8}",
+                self.config.min_time_series_rank_icir
+            ));
+        }
+        if predictive.positive_ic_ratio < self.config.min_positive_ic_ratio {
+            failures.push(format!(
+                "positive IC ratio {:.8} is below {:.8}",
+                predictive.positive_ic_ratio, self.config.min_positive_ic_ratio
+            ));
         }
         let raw_score = mean(
             &fold_metrics
@@ -156,6 +215,7 @@ impl FormulaEvaluator {
             ));
         }
         let metrics = EvaluationMetrics {
+            predictive,
             row_count: all_returns.len(),
             trade_count: fold_metrics.iter().map(|fold| fold.trade_count).sum(),
             mean_net_return: mean(&all_returns),
@@ -164,6 +224,12 @@ impl FormulaEvaluator {
                 .iter()
                 .map(|fold| fold.max_drawdown)
                 .fold(0.0, f64::max),
+            net_sharpe: mean(
+                &fold_metrics
+                    .iter()
+                    .map(|fold| fold.net_sharpe)
+                    .collect::<Vec<_>>(),
+            ),
             raw_score,
             adjusted_score,
             folds: fold_metrics,
@@ -427,6 +493,52 @@ fn standard_deviation(values: &[f64], average: f64) -> f64 {
         .sqrt()
 }
 
+fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
+    if left.len() != right.len() || left.len() < 2 {
+        return None;
+    }
+    let left_mean = mean(left);
+    let right_mean = mean(right);
+    let mut covariance = 0.0;
+    let mut left_variance = 0.0;
+    let mut right_variance = 0.0;
+    for (left, right) in left.iter().zip(right) {
+        let left_centered = left - left_mean;
+        let right_centered = right - right_mean;
+        covariance += left_centered * right_centered;
+        left_variance += left_centered.powi(2);
+        right_variance += right_centered.powi(2);
+    }
+    let denominator = (left_variance * right_variance).sqrt();
+    (denominator > f64::EPSILON).then(|| (covariance / denominator).clamp(-1.0, 1.0))
+}
+
+fn spearman_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
+    pearson_correlation(&average_ranks(left)?, &average_ranks(right)?)
+}
+
+fn average_ranks(values: &[f64]) -> Option<Vec<f64>> {
+    if values.len() < 2 || values.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut indices = (0..values.len()).collect::<Vec<_>>();
+    indices.sort_by(|left, right| values[*left].total_cmp(&values[*right]));
+    let mut ranks = vec![0.0; values.len()];
+    let mut start = 0;
+    while start < indices.len() {
+        let mut end = start + 1;
+        while end < indices.len() && values[indices[end]] == values[indices[start]] {
+            end += 1;
+        }
+        let average_rank = (start + end + 1) as f64 / 2.0;
+        for index in &indices[start..end] {
+            ranks[*index] = average_rank;
+        }
+        start = end;
+    }
+    Some(ranks)
+}
+
 fn t_statistic(values: &[f64], average: f64) -> f64 {
     let deviation = standard_deviation(values, average);
     if deviation <= f64::EPSILON {
@@ -439,6 +551,12 @@ fn t_statistic(values: &[f64], average: f64) -> f64 {
     } else {
         average / (deviation / (values.len() as f64).sqrt())
     }
+}
+
+fn sharpe_ratio(values: &[f64], average: f64) -> f64 {
+    let deviation = standard_deviation(values, average);
+    // ponytail: this is a per-observation Sharpe; annualize only after dataset frequency is explicit.
+    average / deviation.max(f64::EPSILON)
 }
 
 fn max_drawdown(returns: &[f64]) -> f64 {
@@ -525,6 +643,52 @@ mod tests {
     }
 
     #[test]
+    fn causal_signal_records_predictive_metrics_before_trading_mapping() {
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
+            "signal".to_string(),
+        )));
+
+        let result = evaluator
+            .evaluate(&proposal, &dataset(0.0).engine_context())
+            .unwrap();
+
+        assert_eq!(result.metrics.predictive.time_series_ic, Some(1.0));
+        assert_eq!(result.metrics.predictive.time_series_rank_ic, Some(1.0));
+        assert!(result.metrics.predictive.time_series_icir.unwrap() > 1.0);
+        assert!(result.metrics.predictive.time_series_rank_icir.unwrap() > 1.0);
+        assert_eq!(result.metrics.predictive.positive_ic_ratio, 1.0);
+        assert_eq!(result.metrics.predictive.folds.len(), 3);
+        assert!(result.metrics.net_sharpe > 0.0);
+    }
+
+    #[test]
+    fn rank_factor_keeps_predictive_evidence_but_cannot_bypass_trading_gate() {
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let proposal = proposal(
+            FactorAst::call(
+                FactorOperator::Rank,
+                vec![FactorAst::Terminal(FactorTerminal::Field(
+                    "signal".to_string(),
+                ))],
+            )
+            .unwrap(),
+        );
+
+        let result = evaluator
+            .evaluate(&proposal, &dataset(0.0).engine_context())
+            .unwrap();
+
+        assert!(result.metrics.predictive.time_series_rank_ic.unwrap() > 0.0);
+        assert_eq!(result.metrics.trade_count, 3);
+        assert!(!result.passed);
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.contains("trades")));
+    }
+
+    #[test]
     fn registered_point_in_time_feature_can_drive_a_formula() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
@@ -600,6 +764,10 @@ mod tests {
             .failure_reasons
             .iter()
             .any(|reason| reason.contains("positive net edge")));
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.contains("time-series IC")));
     }
 
     #[test]

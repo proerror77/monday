@@ -224,19 +224,12 @@ pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
 
 pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
     let mut store = AlphaStore::open(&args.db)?;
-    let revision_id = format!("sealed-evaluation:{}", args.candidate_id);
-    let existing = match store.get_registry_revision(&revision_id) {
-        Ok(existing) => Some(existing),
-        Err(StoreError::NotFound) => None,
-        Err(error) => return Err(error.into()),
-    };
-
     let lineage = store.mission_lineage(&args.mission_id)?;
     if !validated_walk_forward_candidates_in_lineage(&lineage)?
         .iter()
         .any(|candidate_id| candidate_id == &args.candidate_id)
     {
-        bail!("candidate lacks canonical v2 walk-forward evidence");
+        bail!("candidate lacks canonical v3 walk-forward evidence");
     }
     let candidate = lineage
         .candidates
@@ -256,11 +249,12 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
     if iteration.engine == alpha_domain::EngineKind::OfflineReinforcementLearning {
         bail!("offline RL candidates are lab search-policy output and cannot access holdout");
     }
-    let is_onnx = matches!(candidate.artifact, CandidateArtifact::OnnxModel(_));
-    let expected_sealed_version = if is_onnx {
-        ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
-    } else {
-        SEALED_HOLDOUT_EVALUATOR_VERSION
+    let expected_sealed_version = sealed_evaluator_version(&candidate.artifact)?;
+    let revision_id = sealed_evaluation_revision_id(&args.candidate_id, expected_sealed_version);
+    let existing = match store.get_registry_revision(&revision_id) {
+        Ok(existing) => Some(existing),
+        Err(StoreError::NotFound) => None,
+        Err(error) => return Err(error.into()),
     };
 
     if let Some(existing) = existing {
@@ -300,7 +294,7 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
             || existing_evaluation.evaluator_version != expected_sealed_version
             || existing_evaluation.evaluator_config != expected_config
         {
-            bail!("existing sealed evaluation is not canonical v2 evidence for this candidate");
+            bail!("existing sealed evaluation is not canonical v3 evidence for this candidate");
         }
         return print_json(&existing);
     }
@@ -370,6 +364,18 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
     print_json(&revision)
 }
 
+fn sealed_evaluator_version(artifact: &CandidateArtifact) -> anyhow::Result<&'static str> {
+    match artifact {
+        CandidateArtifact::Formula(_) => Ok(SEALED_HOLDOUT_EVALUATOR_VERSION),
+        CandidateArtifact::OnnxModel(_) => Ok(ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION),
+        _ => bail!("candidate artifact has no governed sealed evaluator"),
+    }
+}
+
+pub(crate) fn sealed_evaluation_revision_id(candidate_id: &str, evaluator_version: &str) -> String {
+    format!("sealed-evaluation:{evaluator_version}:{candidate_id}")
+}
+
 fn verified_model_path(model: &OnnxModelCandidate, root: &Path) -> anyhow::Result<PathBuf> {
     let uri = model.artifact.uri.as_str();
     let relative = Path::new(uri);
@@ -410,7 +416,14 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
     let bundle_out = args.bundle_out.clone();
     let model_root = args.model_root.clone();
     let mut store = AlphaStore::open(&args.db)?;
-    let sealed_id = format!("sealed-evaluation:{}", args.candidate_id);
+    let lineage = store.mission_lineage(&args.mission_id)?;
+    let candidate = lineage
+        .candidates
+        .iter()
+        .find(|candidate| candidate.candidate_id == args.candidate_id)
+        .context("candidate does not belong to mission")?;
+    let expected_sealed_version = sealed_evaluator_version(&candidate.artifact)?;
+    let sealed_id = sealed_evaluation_revision_id(&args.candidate_id, expected_sealed_version);
     let sealed = store.get_registry_revision(&sealed_id)?;
     let sealed_evaluation = sealed
         .payload
@@ -419,15 +432,12 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         .context("sealed evaluation payload is incomplete")?;
     let evaluation: CandidateEvaluation = serde_json::from_value(sealed_evaluation.clone())?;
     evaluation.validate().map_err(anyhow::Error::new)?;
+    if evaluation.evaluator_version != expected_sealed_version {
+        bail!("candidate sealed evaluation uses the wrong evaluator version");
+    }
     if !evaluation.passed {
         bail!("candidate failed sealed holdout and cannot be promoted");
     }
-    let lineage = store.mission_lineage(&args.mission_id)?;
-    let candidate = lineage
-        .candidates
-        .iter()
-        .find(|candidate| candidate.candidate_id == args.candidate_id)
-        .context("candidate does not belong to mission")?;
     if sealed.asset_id != candidate.candidate_id
         || sealed
             .payload
@@ -789,7 +799,7 @@ mod tests {
             "candidate_id": "candidate-1",
             "candidate_content_hash": "1".repeat(64),
             "dataset_manifest_id": "dataset-1",
-            "evaluator_version": "sealed-holdout-v2",
+            "evaluator_version": SEALED_HOLDOUT_EVALUATOR_VERSION,
             "evaluator_config_hash": "2".repeat(64),
             "evaluation_metrics_hash": "3".repeat(64),
             "sealed_evaluation_hash": "4".repeat(64),
@@ -810,7 +820,10 @@ mod tests {
             evaluator_version: bundle.evaluator_version.clone(),
             evaluator_config_hash: bundle.evaluator_config_hash.clone(),
             evaluation_metrics_hash: bundle.evaluation_metrics_hash.clone(),
-            sealed_evaluation_id: "sealed-evaluation:candidate-1".to_string(),
+            sealed_evaluation_id: sealed_evaluation_revision_id(
+                "candidate-1",
+                SEALED_HOLDOUT_EVALUATOR_VERSION,
+            ),
             sealed_evaluation_hash: bundle.sealed_evaluation_hash.clone(),
             bundle_id: bundle.bundle_id.clone(),
             bundle_hash: bundle.bundle_hash.clone(),
@@ -843,6 +856,14 @@ mod tests {
         assert!(
             ensure_exact_promotion_replay(&promotion, &bundle, &promotion, &different_bundle)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn sealed_revision_id_is_bound_to_evaluator_version() {
+        assert_eq!(
+            sealed_evaluation_revision_id("candidate-1", SEALED_HOLDOUT_EVALUATOR_VERSION),
+            "sealed-evaluation:sealed-holdout-v3:candidate-1"
         );
     }
 
