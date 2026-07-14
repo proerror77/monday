@@ -955,6 +955,7 @@ async fn wait_or_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration)
 fn snapshot_retry_delay(retry_after: Option<&str>, attempt: usize) -> Duration {
     retry_after
         .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
         .map(Duration::from_secs_f64)
         .unwrap_or_else(|| Duration::from_secs(1_u64 << attempt.min(5)))
         .min(Duration::from_secs(60))
@@ -1464,6 +1465,8 @@ mod tests {
         );
         assert_eq!(snapshot_retry_delay(None, 0), Duration::from_secs(1));
         assert_eq!(snapshot_retry_delay(None, 99), Duration::from_secs(32));
+        assert_eq!(snapshot_retry_delay(Some("NaN"), 0), Duration::from_secs(1));
+        assert_eq!(snapshot_retry_delay(Some("-1"), 1), Duration::from_secs(2));
     }
 
     #[tokio::test]
