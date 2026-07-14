@@ -1,0 +1,710 @@
+name: PLOY Product CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "products/ploy/**"
+      - ".github/workflows/ploy-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "products/ploy/**"
+      - ".github/workflows/ploy-ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ploy-product-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: products/ploy
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  SQLX_CLI_VERSION: 0.8.6
+  SCCACHE_CACHE_SIZE: 10G
+
+jobs:
+  commit-hygiene:
+    name: Commit hygiene
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check commit subjects
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          range="${BASE_SHA}..HEAD"
+          echo "Checking commit subjects in range: ${range}"
+          git log --oneline "${range}"
+
+          bad_commits="$(git log --format='%h %s' "${range}" | grep -E '^[0-9a-f]+ (WIP|wip|fixup!|squash!)' || true)"
+          if [ -n "${bad_commits}" ]; then
+            echo "Found non-atomic/WIP commit subjects:"
+            echo "${bad_commits}"
+            echo "Please squash or rewrite commit messages before merge."
+            exit 1
+          fi
+
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Run actionlint
+        run: |
+          "${HOME}/go/bin/actionlint" -color -config-file .github/actionlint.yaml ../../.github/workflows/ploy-ci.yml .github/workflows/*.yml
+
+  rust-format:
+    name: Rust formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91
+          components: rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+  safety-scans:
+    name: Retired route and SSH safety scans
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Validate frontend route contract
+        run: node ploy-frontend/scripts/check-route-contract.mjs
+
+      - name: Validate Python safety helpers
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_psql_connection.py'
+          python3 -m py_compile \
+            scripts/psql_connection.py \
+            scripts/report_strategy.py \
+            scripts/report_market_data_health.py \
+            scripts/deribit_atm_greeks_collector.py \
+            scripts/audit_market_data_gaps.py
+          python3 -m pip install \
+            --disable-pip-version-check \
+            --requirement examples/openclaw/skill-ploy-rpc/requirements.txt
+          python3 -m py_compile examples/openclaw/skill-ploy-rpc/bin/ingest_feeds.py
+
+      - name: Reject retired routes, insecure SSH, and reset bypasses
+        run: |
+          set -euo pipefail
+          run_forbidden_scan() {
+            label="$1"
+            pattern="$2"
+            shift 2
+            set +e
+            if command -v rg >/dev/null 2>&1; then
+              rg -n -- "${pattern}" "$@"
+            else
+              grep -R -n -E -- "${pattern}" "$@"
+            fi
+            scan_status=$?
+            set -e
+            case "${scan_status}" in
+              0)
+                echo "forbidden ${label} match found" >&2
+                exit 1
+                ;;
+              1)
+                return 0
+                ;;
+              *)
+                echo "${label} scanner error (rg exit ${scan_status})" >&2
+                exit "${scan_status}"
+                ;;
+            esac
+          }
+
+          run_forbidden_scan \
+            "retired frontend route" \
+            "/stats/|'/(trades|positions|security/events|system/start|config|agent/|sidecar/)" \
+            ploy-frontend/src/services/api.ts
+          run_forbidden_scan \
+            "insecure SSH or reset bypass" \
+            'StrictHostKeyChecking[[:space:]=]+no|UserKnownHostsFile[[:space:]=]+/dev/null|allow[_-]?running' \
+            .github/workflows
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Run cargo audit
+        run: |
+          # Temporary exception: sqlx 0.8.6 keeps an unused mysql driver chain in Cargo.lock,
+          # which pulls `rsa` despite this workspace having no reachable mysql runtime path.
+          # RustSec lists no fixed release; remove this ignore when sqlx drops the lockfile edge.
+          cargo audit --ignore RUSTSEC-2023-0071
+
+  rust-control-plane:
+    name: Rust control-plane/core
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: ploy
+          POSTGRES_PASSWORD: ${{ github.run_id }}
+          POSTGRES_DB: ploy_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91
+          components: clippy, rustfmt
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libpq-dev clang lld
+          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: products/ploy
+          shared-key: rust-control-plane-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+
+      - name: Cache sccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-control-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-control-
+            ${{ runner.os }}-sccache-
+
+      - name: Install SQLx CLI
+        run: |
+          cargo install sqlx-cli \
+            --locked \
+            --version "${SQLX_CLI_VERSION}" \
+            --no-default-features \
+            --features rustls,postgres
+
+      - name: Prepare database schema
+        env:
+          DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+        run: sqlx migrate run
+
+      - name: Build and test control-plane/core lane
+        env:
+          DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+          RUSTC_WRAPPER: sccache
+        run: |
+          set -euo pipefail
+          SECONDS=0
+          cargo build --locked \
+            -p ploy-daemon-host \
+            -p new-ployd \
+            -p ployctl \
+            -p ploy-control-client \
+            -p ploytui \
+            -p ploy-deployments \
+            -p ploy-operator-contracts \
+            -p ploy-platform \
+            -p ploy-platform-runtime \
+            -p ploy-trading
+          cargo test --locked \
+            -p ploy-daemon-host \
+            -p new-ployd \
+            -p ployctl \
+            -p ploy-control-client \
+            -p ploytui \
+            -p ploy-deployments \
+            -p ploy-operator-contracts \
+            -p ploy-platform \
+            -p ploy-platform-runtime \
+            -p ploy-trading
+          echo "### Rust control-plane/core lane" >> "$GITHUB_STEP_SUMMARY"
+          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show sccache stats
+        if: always()
+        run: |
+          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          {
+            echo "### sccache: rust-control-plane"
+            echo '```'
+            cat /tmp/sccache-stats.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rust-runner-lean:
+    name: Rust runner lean replay/backtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev clang lld
+          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: products/ploy
+          shared-key: rust-runner-lean-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+
+      - name: Cache sccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-runner-lean-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-runner-lean-
+            ${{ runner.os }}-sccache-
+
+      - name: Check lean runner lane
+        env:
+          RUSTC_WRAPPER: sccache
+        run: |
+          set -euo pipefail
+          SECONDS=0
+          cargo check --locked -p ploy-strategy-bundles --no-default-features --lib
+          cargo check --locked -p ploy-market-data --no-default-features --lib
+          cargo check --locked -p ploy-strategy-runtime --no-default-features --lib
+          cargo check --locked -p ploy-replay
+          echo "### Rust runner lean lane" >> "$GITHUB_STEP_SUMMARY"
+          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show sccache stats
+        if: always()
+        run: |
+          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          {
+            echo "### sccache: rust-runner-lean"
+            echo '```'
+            cat /tmp/sccache-stats.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rust-runner-full:
+    name: Rust runner full/default (live execution disabled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev clang lld
+          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: products/ploy
+          shared-key: rust-runner-full-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+
+      - name: Cache sccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-runner-full-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-runner-full-
+            ${{ runner.os }}-sccache-
+
+      - name: Check runner slim/default and full non-executing contracts
+        env:
+          RUSTC_WRAPPER: sccache
+        run: |
+          set -euo pipefail
+          SECONDS=0
+          cargo test --locked \
+            -p new-ploy-runner \
+            -p ploy-backtest \
+            -p ploy-runner-host \
+            -p ploy-strategy-runtime \
+            -p ploy-strategy-bundles \
+            -p ploy-connectivity
+          cargo check --locked \
+            -p new-ploy-runner \
+            --features full
+          cargo check --locked \
+            -p ploy-backtest \
+            -p ploy-runner-host \
+            -p ploy-strategy-runtime \
+            -p ploy-strategy-bundles \
+            -p ploy-connectivity \
+            --features ploy-runner-host/full,ploy-strategy-runtime/full
+          if cargo tree --locked -p new-ploy-runner --features full -e features \
+            | grep -q 'live-execution'; then
+            echo "new-ploy-runner full feature must not enable live-execution" >&2
+            exit 1
+          fi
+          echo "### Rust runner full/default non-executing lane" >> "$GITHUB_STEP_SUMMARY"
+          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show sccache stats
+        if: always()
+        run: |
+          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          {
+            echo "### sccache: rust-runner-full"
+            echo '```'
+            cat /tmp/sccache-stats.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rust-market-data:
+    name: Rust market-data ops
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev clang lld
+          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: products/ploy
+          shared-key: rust-market-data-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+
+      - name: Cache sccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-market-data-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-market-data-
+            ${{ runner.os }}-sccache-
+
+      - name: Check market-data ops lane
+        env:
+          RUSTC_WRAPPER: sccache
+        run: |
+          set -euo pipefail
+          SECONDS=0
+          cargo check --locked -p ploy-market-data --features live --lib
+          echo "### Rust market-data ops lane" >> "$GITHUB_STEP_SUMMARY"
+          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show sccache stats
+        if: always()
+        run: |
+          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          {
+            echo "### sccache: rust-market-data"
+            echo '```'
+            cat /tmp/sccache-stats.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  rust-research-heavy:
+    name: Rust research heavy features
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: ploy
+          POSTGRES_PASSWORD: ${{ github.run_id }}
+          POSTGRES_DB: ploy_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libpq-dev clang lld
+          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: products/ploy
+          shared-key: rust-research-heavy-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+
+      - name: Cache sccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-research-heavy-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-research-heavy-
+            ${{ runner.os }}-sccache-
+
+      - name: Install SQLx CLI
+        run: |
+          cargo install sqlx-cli \
+            --locked \
+            --version "${SQLX_CLI_VERSION}" \
+            --no-default-features \
+            --features rustls,postgres
+
+      - name: Prepare database schema
+        env:
+          DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+        run: sqlx migrate run
+
+      - name: Check research heavy lane
+        env:
+          DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+          RUSTC_WRAPPER: sccache
+        run: |
+          set -euo pipefail
+          SECONDS=0
+          cargo check --locked -p ploy-research --features db,polars-export,ml,rl,strategy-runtime --lib
+          echo "### Rust research heavy lane" >> "$GITHUB_STEP_SUMMARY"
+          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show sccache stats
+        if: always()
+        run: |
+          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          {
+            echo "### sccache: rust-research-heavy"
+            echo '```'
+            cat /tmp/sccache-stats.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  frontend-sidecar:
+    name: Frontend, sidecar, and account tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            products/ploy/ploy-frontend/package-lock.json
+            products/ploy/ploy-sidecar/package-lock.json
+            products/ploy/tools/polymarket-account-ops/package-lock.json
+            products/ploy/tools/predict-fun-account-ops/package-lock.json
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: products/ploy
+          shared-key: frontend-sidecar-contracts-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+
+      - name: Validate frontend
+        run: |
+          set -euo pipefail
+          SECONDS=0
+          cargo run --locked -p ploy-operator-contracts --example export_schemas -- --check
+          node scripts/export_operator_contract_types.mjs --check
+          npm ci --prefix ploy-frontend
+          npm run contracts:check --prefix ploy-frontend
+          npm run lint --prefix ploy-frontend
+          npm run build --prefix ploy-frontend
+          npm audit --omit=dev --audit-level=moderate --prefix ploy-frontend
+          oversized_chunks="$(find ploy-frontend/dist/assets -type f -name '*.js' -size +500k -print)"
+          if [ -n "${oversized_chunks}" ]; then
+            echo "frontend JavaScript chunks exceed 500 KiB:" >&2
+            echo "${oversized_chunks}" >&2
+            exit 1
+          fi
+
+      - name: Validate sidecar
+        run: |
+          set -euo pipefail
+          npm ci --prefix ploy-sidecar
+          npm run contracts:check --prefix ploy-sidecar
+          npm test --prefix ploy-sidecar
+          npm run build --prefix ploy-sidecar
+          npm audit --omit=dev --audit-level=moderate --prefix ploy-sidecar
+          echo "### Frontend, sidecar, and account tools lane" >> "$GITHUB_STEP_SUMMARY"
+          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate fail-closed account tools
+        run: |
+          set -euo pipefail
+          npm ci --prefix tools/polymarket-account-ops
+          npm test --prefix tools/polymarket-account-ops
+          npm ci --prefix tools/predict-fun-account-ops
+          npm test --prefix tools/predict-fun-account-ops
+
+  integration-regressions:
+    name: Rust integration regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: ploy
+          POSTGRES_PASSWORD: ${{ github.run_id }}
+          POSTGRES_DB: ploy_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.91
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libpq-dev clang lld
+          sudo apt-get install -y sccache || cargo install sccache --locked
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: products/ploy
+          shared-key: rust-integration-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+
+      - name: Cache sccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/sccache
+          key: ${{ runner.os }}-sccache-integration-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-sccache-integration-
+            ${{ runner.os }}-sccache-
+
+      - name: Install SQLx CLI
+        run: |
+          cargo install sqlx-cli \
+            --locked \
+            --version "${SQLX_CLI_VERSION}" \
+            --no-default-features \
+            --features rustls,postgres
+
+      - name: Prepare database schema
+        env:
+          DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+        run: sqlx migrate run
+
+      - name: Run integration regressions
+        env:
+          DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+          RUSTC_WRAPPER: sccache
+        run: |
+          set -euo pipefail
+          SECONDS=0
+          cargo test --locked -p ploy --test platform_release_workflow
+          cargo test --locked -p ploy --test platform_smoke
+          cargo test --locked -p ploy --test workspace_runtime_retirement
+          cargo test --locked -p ploy --test workflow_security ci_runs_dependency_vulnerability_audit -- --exact
+          cargo test --locked -p ploy --test workflow_security checked_in_platform_service_enforces_guardrails -- --exact
+          echo "### Rust integration regressions lane" >> "$GITHUB_STEP_SUMMARY"
+          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show sccache stats
+        if: always()
+        run: |
+          sccache --show-stats | tee /tmp/sccache-stats.txt || true
+          {
+            echo "### sccache: rust-integration"
+            echo '```'
+            cat /tmp/sccache-stats.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

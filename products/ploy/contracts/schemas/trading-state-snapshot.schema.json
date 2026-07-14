@@ -1,0 +1,338 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TradingStateSnapshot",
+  "type": "object",
+  "required": [
+    "deployment_id",
+    "fills",
+    "intents",
+    "orders",
+    "pnl",
+    "positions",
+    "risk",
+    "runtime_mode"
+  ],
+  "properties": {
+    "deployment_id": {
+      "type": "string"
+    },
+    "fills": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/FillSnapshot"
+      }
+    },
+    "intents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/TradingIntentSnapshot"
+      }
+    },
+    "orders": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/OrderSnapshot"
+      }
+    },
+    "pnl": {
+      "$ref": "#/definitions/PnlSnapshotResponse"
+    },
+    "positions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PositionSnapshotResponse"
+      }
+    },
+    "risk": {
+      "$ref": "#/definitions/RiskSnapshotResponse"
+    },
+    "runtime_mode": {
+      "$ref": "#/definitions/DeploymentRuntimeMode"
+    }
+  },
+  "definitions": {
+    "DeploymentRuntimeMode": {
+      "type": "string",
+      "enum": [
+        "paper",
+        "live"
+      ]
+    },
+    "FillSnapshot": {
+      "type": "object",
+      "required": [
+        "fee",
+        "fill_id",
+        "order_id",
+        "price",
+        "quantity",
+        "side",
+        "timestamp",
+        "token_id"
+      ],
+      "properties": {
+        "fee": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "fill_id": {
+          "type": "string"
+        },
+        "order_id": {
+          "type": "string"
+        },
+        "price": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "quantity": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "side": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "token_id": {
+          "type": "string"
+        }
+      }
+    },
+    "IntentPurpose": {
+      "type": "string",
+      "enum": [
+        "entry",
+        "exit",
+        "reduce",
+        "hedge",
+        "cancel"
+      ]
+    },
+    "OrderSnapshot": {
+      "type": "object",
+      "required": [
+        "filled_qty",
+        "intent_id",
+        "order_id",
+        "requested_qty",
+        "state",
+        "token_id"
+      ],
+      "properties": {
+        "filled_qty": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "idempotency_key": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "intent_id": {
+          "type": "string"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit_price": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "order_id": {
+          "type": "string"
+        },
+        "rejection_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested_qty": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "revision": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "state": {
+          "type": "string"
+        },
+        "state_changed_at": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "token_id": {
+          "type": "string"
+        },
+        "venue_order_history": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "venue_order_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "PnlSnapshotResponse": {
+      "type": "object",
+      "required": [
+        "net_pnl",
+        "realized_pnl",
+        "total_fees",
+        "unrealized_pnl"
+      ],
+      "properties": {
+        "net_pnl": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "realized_pnl": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "total_fees": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "unrealized_pnl": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        }
+      }
+    },
+    "PositionSnapshotResponse": {
+      "type": "object",
+      "required": [
+        "avg_entry_price",
+        "net_qty",
+        "realized_pnl",
+        "token_id"
+      ],
+      "properties": {
+        "avg_entry_price": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "net_qty": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "realized_pnl": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "token_id": {
+          "type": "string"
+        }
+      }
+    },
+    "RiskSnapshotResponse": {
+      "type": "object",
+      "required": [
+        "active_orders",
+        "gross_exposure",
+        "open_positions",
+        "pending_intents",
+        "reserved_order_exposure",
+        "total_gross_exposure"
+      ],
+      "properties": {
+        "active_orders": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "gross_exposure": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "open_positions": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "pending_intents": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "reserved_order_exposure": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "total_gross_exposure": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        }
+      }
+    },
+    "TradingIntentSnapshot": {
+      "type": "object",
+      "required": [
+        "created_at",
+        "intent_id",
+        "market_id",
+        "purpose",
+        "quantity",
+        "side",
+        "token_id"
+      ],
+      "properties": {
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "intent_id": {
+          "type": "string"
+        },
+        "limit_price": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "market_id": {
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/definitions/IntentPurpose"
+        },
+        "quantity": {
+          "type": "string",
+          "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+        },
+        "side": {
+          "type": "string"
+        },
+        "token_id": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

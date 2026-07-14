@@ -1,0 +1,8 @@
+{
+  "deployment_id": "example.live.dry-run",
+  "bundle_id": "example-drill",
+  "account_id": "paper:live-drill",
+  "max_gross_exposure": "2.00",
+  "runtime_mode": "paper",
+  "desired_state": "running"
+}

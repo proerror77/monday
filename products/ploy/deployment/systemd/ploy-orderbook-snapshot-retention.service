@@ -1,0 +1,23 @@
+[Unit]
+Description=Ploy bounded orderbook snapshot retention
+After=network-online.target postgresql.service postgresql@16-main.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ploy
+Environment=PLOY_ORDERBOOK_SNAPSHOT_RETENTION_DAYS=2
+Environment=PLOY_ORDERBOOK_SNAPSHOT_BATCH_SIZE=25000
+Environment=PLOY_ORDERBOOK_SNAPSHOT_MAX_BATCHES=2
+Environment=PLOY_CLOB_BOOK_REQUIRE_ARCHIVE=true
+ExecStart=/bin/bash /opt/ploy/scripts/ploy_orderbook_snapshot_retention.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ploy-orderbook-snapshot-retention
+
+[Install]
+WantedBy=multi-user.target

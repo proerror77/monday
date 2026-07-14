@@ -1,0 +1,142 @@
+[
+  {
+    "id": "crypto-pattern-memory-5m",
+    "strategy": "pattern_memory",
+    "domain": "Crypto",
+    "market_selector": {
+      "mode": "dynamic",
+      "domain": "Crypto",
+      "query": "BTC ETH SOL XRP 5m",
+      "min_liquidity_usd": 15000,
+      "max_spread_bps": 400,
+      "min_time_remaining_secs": 3600,
+      "max_time_remaining_secs": 43200
+    },
+    "timeframe": "5m",
+    "enabled": true,
+    "allocator_profile": "conservative",
+    "risk_profile": "default",
+    "priority": 100,
+    "cooldown_secs": 60
+  },
+  {
+    "id": "crypto-pattern-memory-15m",
+    "strategy": "pattern_memory",
+    "domain": "Crypto",
+    "market_selector": {
+      "mode": "dynamic",
+      "domain": "Crypto",
+      "query": "BTC ETH SOL XRP 15m",
+      "min_liquidity_usd": 15000,
+      "max_spread_bps": 350,
+      "min_time_remaining_secs": 3600,
+      "max_time_remaining_secs": 172800
+    },
+    "timeframe": "15m",
+    "enabled": true,
+    "allocator_profile": "conservative",
+    "risk_profile": "default",
+    "priority": 100,
+    "cooldown_secs": 60
+  },
+  {
+    "id": "crypto-momentum-5m",
+    "strategy": "momentum",
+    "domain": "Crypto",
+    "market_selector": {
+      "mode": "dynamic",
+      "domain": "Crypto",
+      "query": "BTC ETH SOL XRP 5m",
+      "min_liquidity_usd": 12000,
+      "max_spread_bps": 400,
+      "min_time_remaining_secs": 3600,
+      "max_time_remaining_secs": 43200
+    },
+    "timeframe": "5m",
+    "enabled": true,
+    "allocator_profile": "conservative",
+    "risk_profile": "default",
+    "priority": 90,
+    "cooldown_secs": 90
+  },
+  {
+    "id": "crypto-momentum-15m",
+    "strategy": "momentum",
+    "domain": "Crypto",
+    "market_selector": {
+      "mode": "dynamic",
+      "domain": "Crypto",
+      "query": "BTC ETH SOL XRP 15m",
+      "min_liquidity_usd": 12000,
+      "max_spread_bps": 350,
+      "min_time_remaining_secs": 3600,
+      "max_time_remaining_secs": 172800
+    },
+    "timeframe": "15m",
+    "enabled": true,
+    "allocator_profile": "conservative",
+    "risk_profile": "default",
+    "priority": 90,
+    "cooldown_secs": 90
+  },
+  {
+    "id": "crypto-split-arb-5m",
+    "strategy": "split_arb",
+    "domain": "Crypto",
+    "market_selector": {
+      "mode": "dynamic",
+      "domain": "Crypto",
+      "query": "BTC ETH SOL XRP 5m",
+      "min_liquidity_usd": 15000,
+      "max_spread_bps": 400,
+      "min_time_remaining_secs": 3600,
+      "max_time_remaining_secs": 43200
+    },
+    "timeframe": "5m",
+    "enabled": true,
+    "allocator_profile": "conservative",
+    "risk_profile": "default",
+    "priority": 80,
+    "cooldown_secs": 120
+  },
+  {
+    "id": "crypto-split-arb-15m",
+    "strategy": "split_arb",
+    "domain": "Crypto",
+    "market_selector": {
+      "mode": "dynamic",
+      "domain": "Crypto",
+      "query": "BTC ETH SOL XRP 15m",
+      "min_liquidity_usd": 15000,
+      "max_spread_bps": 350,
+      "min_time_remaining_secs": 3600,
+      "max_time_remaining_secs": 172800
+    },
+    "timeframe": "15m",
+    "enabled": true,
+    "allocator_profile": "conservative",
+    "risk_profile": "default",
+    "priority": 80,
+    "cooldown_secs": 120
+  },
+  {
+    "id": "sports-nba-15m",
+    "strategy": "sports",
+    "domain": "Sports",
+    "market_selector": {
+      "mode": "dynamic",
+      "domain": "Sports",
+      "query": "NBA",
+      "min_liquidity_usd": 8000,
+      "max_spread_bps": 450,
+      "min_time_remaining_secs": 900,
+      "max_time_remaining_secs": 172800
+    },
+    "timeframe": "15m",
+    "enabled": true,
+    "allocator_profile": "balanced",
+    "risk_profile": "default",
+    "priority": 95,
+    "cooldown_secs": 120
+  }
+]

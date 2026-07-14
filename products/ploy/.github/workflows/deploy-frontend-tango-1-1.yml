@@ -1,0 +1,153 @@
+name: Deploy frontend to tango-1-1
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref to deploy (branch, tag, or SHA)"
+        required: true
+        default: "main"
+
+concurrency:
+  group: deploy-frontend-tango-1-1-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_HOST: ${{ secrets.TANGO_1_1_HOST }}
+  DEPLOY_ROOT: ${{ vars.PLOY_DEPLOY_ROOT || '/opt/ploy' }}
+
+jobs:
+  build-and-deploy-frontend:
+    name: Build and deploy frontend to tango-1-1
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: tango-1-1
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Validate deploy provenance
+        env:
+          INPUT_GIT_REF: ${{ github.event.inputs.git_ref }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "frontend deploy must dispatch the workflow from main; got ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+          if [ "${INPUT_GIT_REF}" != "main" ]; then
+            echo "frontend deploy must use git_ref=main; got ${INPUT_GIT_REF}" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin main
+          checked_out_sha="$(git rev-parse HEAD)"
+          main_sha="$(git rev-parse origin/main)"
+          if [ "${checked_out_sha}" != "${main_sha}" ]; then
+            echo "checked-out deploy SHA ${checked_out_sha} does not match origin/main ${main_sha}" >&2
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ploy-frontend/package-lock.json
+
+      - name: Build frontend
+        run: |
+          npm ci --prefix ploy-frontend
+          npm run contracts:check --prefix ploy-frontend
+          npm run build --prefix ploy-frontend
+          tar -C ploy-frontend/dist -czf ploy-frontend-dist.tar.gz .
+
+      - name: Configure SSH for deploy
+        env:
+          TANGO_1_1_KNOWN_HOSTS: ${{ secrets.TANGO_1_1_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          if [ -z "${TANGO_1_1_KNOWN_HOSTS}" ]; then
+            echo "TANGO_1_1_KNOWN_HOSTS secret is required for pinned SSH host verification" >&2
+            exit 1
+          fi
+          printf '%s\n' "${TANGO_1_1_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          printf '%s\n' '${{ secrets.TANGO_1_1_SSH_KEY }}' > ~/.ssh/tango_1_1_key
+          chmod 600 ~/.ssh/tango_1_1_key
+          cat > ~/.ssh/config <<EOF
+          Host tango-1-1
+            HostName ${DEPLOY_HOST}
+            HostKeyAlias tango-1-1
+            User root
+            IdentityFile ~/.ssh/tango_1_1_key
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ServerAliveInterval 30
+            ServerAliveCountMax 20
+            ConnectTimeout 30
+          EOF
+
+      - name: Prepare remote directory
+        run: |
+          # shellcheck disable=SC2029
+          ssh tango-1-1 "mkdir -p ${DEPLOY_ROOT}/tmp"
+
+      - name: Upload frontend bundle
+        run: |
+          scp ploy-frontend-dist.tar.gz "tango-1-1:${DEPLOY_ROOT}/tmp/ploy-frontend-dist.tar.gz"
+          scp deployment/nginx/ploy-frontend.conf "tango-1-1:${DEPLOY_ROOT}/tmp/ploy-frontend.nginx"
+
+      - name: Install frontend and reload nginx
+        run: |
+          # shellcheck disable=SC2029
+          ssh tango-1-1 DEPLOY_ROOT="${DEPLOY_ROOT}" /bin/bash <<'EOF'
+            set -euo pipefail
+
+            [ -r "${DEPLOY_ROOT}/.env" ] || { echo "missing readable ${DEPLOY_ROOT}/.env" >&2; exit 2; }
+            set -a
+            . "${DEPLOY_ROOT}/.env"
+            set +a
+            api_token="${PLOY_ADMIN_TOKEN:-${PLOY_API_ADMIN_TOKEN:-${PLOY_API_KEY:-}}}"
+            [ -n "${api_token}" ] || { echo "ployd admin token is not configured on host" >&2; exit 2; }
+
+            mkdir -p "${DEPLOY_ROOT}/tmp" "${DEPLOY_ROOT}/frontend.next"
+            rm -rf "${DEPLOY_ROOT}/frontend.next"
+            mkdir -p "${DEPLOY_ROOT}/frontend.next"
+            tar -C "${DEPLOY_ROOT}/frontend.next" -xzf "${DEPLOY_ROOT}/tmp/ploy-frontend-dist.tar.gz"
+
+            rm -rf "${DEPLOY_ROOT}/frontend.prev"
+            if [ -d "${DEPLOY_ROOT}/frontend" ]; then
+              mv "${DEPLOY_ROOT}/frontend" "${DEPLOY_ROOT}/frontend.prev"
+            fi
+            mv "${DEPLOY_ROOT}/frontend.next" "${DEPLOY_ROOT}/frontend"
+            chown -R root:root "${DEPLOY_ROOT}/frontend"
+
+            install -m 0644 "${DEPLOY_ROOT}/tmp/ploy-frontend.nginx" /etc/nginx/sites-available/ploy-report
+            ln -sfn /etc/nginx/sites-available/ploy-report /etc/nginx/sites-enabled/ploy-report
+            nginx -t
+            systemctl reload nginx
+
+            curl -fsS --retry 5 --retry-all-errors --retry-delay 1 http://127.0.0.1/ >/dev/null
+            curl -fsS --retry 5 --retry-all-errors --retry-delay 1 http://127.0.0.1/parity >/dev/null
+            curl -fsS --retry 5 --retry-all-errors --retry-delay 1 \
+              -H "Authorization: Bearer ${api_token}" \
+              http://127.0.0.1/api/system/status >/dev/null
+          EOF
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "## Frontend deployment to tango-1-1"
+            echo "- Target: \`${{ secrets.TANGO_1_1_HOST }}\`"
+            echo "- Root: \`${DEPLOY_ROOT}/frontend\`"
+            echo "- Nginx: \`/etc/nginx/sites-available/ploy-report\`"
+            echo "- Git ref: \`${{ github.event.inputs.git_ref }}\`"
+            echo "- Runtime impact: frontend static files only; no ployd restart"
+          } >> "$GITHUB_STEP_SUMMARY"

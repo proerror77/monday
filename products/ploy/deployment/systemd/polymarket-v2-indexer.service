@@ -1,0 +1,27 @@
+[Unit]
+Description=Envio Polymarket V2 Indexer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/polymarket-v2-indexer
+EnvironmentFile=/opt/polymarket-v2-indexer/.env
+Environment=TUI_OFF=true
+Environment=ENVIO_HOST=127.0.0.1
+Environment=ENVIO_PORT=8080
+ExecStart=/usr/bin/pnpm start
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-v2-indexer
+
+# Keep the indexer bounded away from trading services. The indexer is a
+# reconciliation sidecar, not a realtime execution dependency.
+MemoryHigh=1024M
+MemoryMax=2048M
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

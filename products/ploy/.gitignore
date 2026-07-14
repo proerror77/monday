@@ -1,0 +1,63 @@
+# Rust
+/target/
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment & secrets
+.env
+.env.local
+.env.production.backup
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+runtime_logs/
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Runtime artifacts
+data/
+reports/
+results/
+models/
+
+# Tool artifacts
+.serena/
+.playwright-mcp/
+gen_parts/
+
+# Git worktrees (ephemeral, recreated per session)
+.worktrees/
+.codex/worktrees/
+
+# Codex/Claude sessions (legacy monolith, superseded by workspace crates)
+.codex-session-*/
+
+# Sidecar build artifacts
+ploy-sidecar/dist/
+
+# Skill development (not part of trading system)
+skill-creator-updated/
+skills/
+.omx/

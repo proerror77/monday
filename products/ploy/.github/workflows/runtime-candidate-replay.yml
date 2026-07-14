@@ -1,0 +1,653 @@
+name: Runtime Candidate Replay
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_id:
+        description: "Deployment id used for replay evidence rows"
+        required: true
+        default: "pm5d.threelayer.settlement-probability-btc-eth.dryrun"
+      config_path:
+        description: "Remote strategy config path on tango-1-1"
+        required: true
+        default: "/opt/ploy/config/strategies/02-pm5d-threelayer.settlement-probability-btc-eth-dryrun.toml"
+      recording_path:
+        description: "Remote MarketUpdate NDJSON recording path on tango-1-1"
+        required: true
+        default: "/opt/ploy/data/recordings/pm5d-threelayer-settlement-probability-btc-eth.ndjson"
+      runtime_score:
+        description: "Exact runtime score expected by promotion evaluator"
+        required: true
+        default: "autofactor_formula:mut_auto_settlement_model_full_depth_settlement_edge_x_capacity_spread_adjusted"
+      strategy_profile:
+        description: "Expected strategy profile"
+        required: true
+        default: "settlement_probability"
+      issue_number:
+        description: "GitHub issue to receive replay evidence comments; defaults to the runtime evidence issue"
+        required: false
+        default: "538"
+      min_trade_count:
+        description: "Minimum filled entry trades required"
+        required: false
+        default: "50"
+      min_fill_rate:
+        description: "Minimum entry fill rate required"
+        required: false
+        default: "0.30"
+      min_roi:
+        description: "Minimum replay ROI required"
+        required: false
+        default: "0"
+      options_json:
+        description: "Advanced options JSON: full_depth_entry, skip_settlement_exits, three_layer_min_entry_score, source_target, source_horizon, persist_research_trace"
+        required: false
+        default: '{"full_depth_entry":true,"skip_settlement_exits":false,"source_target":"full_depth_settlement_executable_pnl","source_horizon":"5m","persist_research_trace":true}'
+concurrency:
+  group: runtime-candidate-replay-${{ github.event.inputs.deployment_id }}-${{ github.event.inputs.runtime_score }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PLATFORM_TARGET: x86_64-unknown-linux-gnu
+  DEPLOY_HOST: ${{ secrets.TANGO_1_1_HOST }}
+  REPLAY_EVIDENCE_ISSUE: ${{ github.event.inputs.issue_number || '538' }}
+
+jobs:
+  runtime-candidate-replay:
+    name: Build runtime candidate replay artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: tango-1-1-build-only
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Parse advanced options
+        env:
+          OPTIONS_JSON: ${{ github.event.inputs.options_json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from decimal import Decimal, InvalidOperation
+
+          defaults = {
+              "full_depth_entry": "true",
+              "skip_settlement_exits": "false",
+              "three_layer_min_entry_score": "",
+              "source_target": "full_depth_settlement_executable_pnl",
+              "source_horizon": "5m",
+              "persist_research_trace": "true",
+          }
+          bool_keys = {"full_depth_entry", "skip_settlement_exits", "persist_research_trace"}
+          threshold_keys = {"three_layer_min_entry_score"}
+          string_keys = {"source_target", "source_horizon"}
+          allowed_thresholds = {Decimal("0.05"), Decimal("0.10"), Decimal("0.15"), Decimal("0.25")}
+          raw = os.environ.get("OPTIONS_JSON", "").strip()
+          data = json.loads(raw) if raw else {}
+          if not isinstance(data, dict):
+              raise SystemExit("options_json must be a JSON object")
+          unknown = sorted(set(data) - set(defaults))
+          if unknown:
+              raise SystemExit(f"unknown options_json keys: {', '.join(unknown)}")
+
+          values = dict(defaults)
+          for key, value in data.items():
+              if key in bool_keys:
+                  if isinstance(value, bool):
+                      values[key] = "true" if value else "false"
+                  elif str(value).lower() in {"true", "false"}:
+                      values[key] = str(value).lower()
+                  else:
+                      raise SystemExit(f"options_json value for {key} must be boolean")
+              elif key in threshold_keys:
+                  if value in (None, ""):
+                      values[key] = ""
+                      continue
+                  try:
+                      threshold = Decimal(str(value))
+                  except (InvalidOperation, ValueError):
+                      raise SystemExit(f"options_json value for {key} must be decimal") from None
+                  if threshold not in allowed_thresholds:
+                      allowed = ", ".join(str(item) for item in sorted(allowed_thresholds))
+                      raise SystemExit(f"options_json value for {key} must be one of: {allowed}")
+                  values[key] = format(threshold, "f")
+              elif key in string_keys:
+                  values[key] = str(value).strip()
+                  if not values[key]:
+                      raise SystemExit(f"options_json value for {key} must be non-empty")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"REPLAY_FULL_DEPTH_ENTRY={values['full_depth_entry']}\n")
+              handle.write(f"REPLAY_SKIP_SETTLEMENT_EXITS={values['skip_settlement_exits']}\n")
+              handle.write(f"REPLAY_PERSIST_RESEARCH_TRACE={values['persist_research_trace']}\n")
+              handle.write(f"REPLAY_SOURCE_TARGET={values['source_target']}\n")
+              handle.write(f"REPLAY_SOURCE_HORIZON={values['source_horizon']}\n")
+              handle.write(
+                  "REPLAY_THREE_LAYER_MIN_ENTRY_SCORE="
+                  f"{values['three_layer_min_entry_score']}\n"
+              )
+          print(
+              "resolved runtime replay options: "
+              + ", ".join(f"{key}={value}" for key, value in sorted(values.items()))
+          )
+          PY
+
+      - name: Build replay runner from workflow ref
+        run: |
+          set -euo pipefail
+          cargo build --release --locked \
+            --target "${PLATFORM_TARGET}" \
+            --features new-ploy-runner/full \
+            -p new-ploy-runner
+          strip "target/${PLATFORM_TARGET}/release/new-ploy-runner" || true
+
+      - name: Configure SSH
+        env:
+          TANGO_1_1_SSH_KEY: ${{ secrets.TANGO_1_1_SSH_KEY }}
+          TANGO_SSH_KEY: ${{ secrets.TANGO_SSH_KEY }}
+          ALIYUN_ECS_SSH_KEY: ${{ secrets.ALIYUN_ECS_SSH_KEY }}
+          TANGO_1_1_KNOWN_HOSTS: ${{ secrets.TANGO_1_1_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "${DEPLOY_HOST}"
+          install -m 700 -d ~/.ssh
+          if [ -z "${TANGO_1_1_KNOWN_HOSTS}" ]; then
+            echo "TANGO_1_1_KNOWN_HOSTS secret is required for pinned SSH host verification" >&2
+            exit 1
+          fi
+          key_source=""
+          selected_key=""
+          if [ -n "${TANGO_1_1_SSH_KEY}" ]; then
+            selected_key="${TANGO_1_1_SSH_KEY}"
+            key_source="TANGO_1_1_SSH_KEY"
+          elif [ -n "${TANGO_SSH_KEY}" ]; then
+            selected_key="${TANGO_SSH_KEY}"
+            key_source="TANGO_SSH_KEY"
+          elif [ -n "${ALIYUN_ECS_SSH_KEY}" ]; then
+            selected_key="${ALIYUN_ECS_SSH_KEY}"
+            key_source="ALIYUN_ECS_SSH_KEY"
+          else
+            echo "No SSH key secret found for tango-1-1 in this workflow context." >&2
+            exit 1
+          fi
+          printf '%s\n' "${TANGO_1_1_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          printf '%s\n' "${selected_key}" > ~/.ssh/tango_1_1_key
+          chmod 600 ~/.ssh/tango_1_1_key
+          echo "tango-1-1-key-source=${key_source}"
+          ssh-keygen -y -f ~/.ssh/tango_1_1_key >/dev/null
+          cat > ~/.ssh/config <<EOF
+          Host tango-1-1
+            HostName ${DEPLOY_HOST}
+            User root
+            IdentityFile ~/.ssh/tango_1_1_key
+            HostKeyAlias tango-1-1
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ServerAliveInterval 30
+            ServerAliveCountMax 20
+            ConnectTimeout 30
+          EOF
+
+      - name: Run runtime replay on tango-1-1
+        env:
+          DEPLOYMENT_ID: ${{ github.event.inputs.deployment_id }}
+          CONFIG_PATH: ${{ github.event.inputs.config_path }}
+          RECORDING_PATH: ${{ github.event.inputs.recording_path }}
+          RUNTIME_SCORE: ${{ github.event.inputs.runtime_score }}
+          SKIP_SETTLEMENT_EXITS: ${{ env.REPLAY_SKIP_SETTLEMENT_EXITS }}
+          MIN_ENTRY_SCORE_OVERRIDE: ${{ env.REPLAY_THREE_LAYER_MIN_ENTRY_SCORE }}
+          REMOTE_DIR: /opt/ploy/tmp/runtime-candidate-replay-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/runtime-replay
+
+          ssh tango-1-1 /bin/bash -s -- "${REMOTE_DIR}" <<'EOF'
+          set -euo pipefail
+          mkdir -p "$1"
+          EOF
+          scp "target/${PLATFORM_TARGET}/release/new-ploy-runner" \
+            tango-1-1:"${REMOTE_DIR}/ploy-runner"
+          scp scripts/enrich_recording_official_settlement.py \
+            tango-1-1:"${REMOTE_DIR}/enrich_recording_official_settlement.py"
+          scp scripts/enrich_replay_runtime_evidence.py \
+            tango-1-1:"${REMOTE_DIR}/enrich_replay_runtime_evidence.py"
+          scp scripts/extract_official_settlement_evidence.py \
+            tango-1-1:"${REMOTE_DIR}/extract_official_settlement_evidence.py"
+
+          # shellcheck disable=SC2029
+          ssh tango-1-1 /bin/bash -s -- \
+            "${DEPLOYMENT_ID}" \
+            "${CONFIG_PATH}" \
+            "${RECORDING_PATH}" \
+            "${REMOTE_DIR}" \
+            "${RUNTIME_SCORE}" \
+            "${SKIP_SETTLEMENT_EXITS}" \
+            "${MIN_ENTRY_SCORE_OVERRIDE}" <<'EOF'
+          set -euo pipefail
+          deployment_id="$1"
+          config_path="$2"
+          recording_path="$3"
+          remote_dir="$4"
+          runtime_score="$5"
+          skip_settlement_exits="$6"
+          min_entry_score_override="${7:-}"
+          case "${skip_settlement_exits}" in
+            true|false) ;;
+            *) echo "skip_settlement_exits must be true or false" >&2; exit 1 ;;
+          esac
+
+          mkdir -p "${remote_dir}"
+          chmod +x "${remote_dir}/ploy-runner"
+          test -x "${remote_dir}/ploy-runner"
+          test -r "${config_path}"
+          test -r "${recording_path}"
+
+          recording_provenance="${remote_dir}/recording-provenance.json"
+          recording_sha256="$(sha256sum "${recording_path}" | awk '{print $1}')"
+          recording_size_bytes="$(stat -c '%s' "${recording_path}")"
+          recording_mtime_epoch="$(stat -c '%Y' "${recording_path}")"
+          python3 - "${recording_path}" "${recording_sha256}" "${recording_size_bytes}" "${recording_mtime_epoch}" "${recording_provenance}" <<'PY'
+          import datetime as dt
+          import json
+          import sys
+          from pathlib import Path
+
+          path, sha256, size_bytes, mtime_epoch, output = sys.argv[1:]
+          mtime = dt.datetime.fromtimestamp(int(mtime_epoch), tz=dt.timezone.utc)
+          Path(output).write_text(
+              json.dumps(
+                  {
+                      "schema_version": "recording_provenance.v1",
+                      "recording_path": path,
+                      "recording_sha256": sha256,
+                      "recording_size_bytes": int(size_bytes),
+                      "recording_mtime_epoch": int(mtime_epoch),
+                      "recording_mtime_utc": mtime.isoformat().replace("+00:00", "Z"),
+                  },
+                  indent=2,
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          set -a
+          . /opt/ploy/.env
+          set +a
+          if [ -n "${PLOY_DATABASE__URL:-}" ]; then
+            PSQL=(psql "${PLOY_DATABASE__URL}" -v ON_ERROR_STOP=1 -t -A)
+          else
+            PSQL=(env PGPASSWORD="${PLOY_DB_PASSWORD:?PLOY_DB_PASSWORD is required}" psql -U postgres -d ploy -v ON_ERROR_STOP=1 -t -A)
+          fi
+
+          official_token_ids_json="${remote_dir}/official-settlement-token-ids.json"
+          official_token_ids_tsv="${remote_dir}/official-settlement-token-ids.tsv"
+          official_db_rows_json="${remote_dir}/official-settlement-db-rows.json"
+          settlements_json="${remote_dir}/official-settlements.json"
+          official_settlement_report="${remote_dir}/official-settlement-report.json"
+          enriched_recording="${remote_dir}/recording-official-settlement.ndjson"
+
+          python3 "${remote_dir}/extract_official_settlement_evidence.py" \
+            --recording "${recording_path}" \
+            --output-token-ids "${official_token_ids_json}"
+          python3 - "${official_token_ids_json}" "${official_token_ids_tsv}" <<'PY'
+          import json
+          import sys
+
+          src, dst = sys.argv[1:]
+          token_ids = json.load(open(src, encoding="utf-8"))
+          with open(dst, "w", encoding="utf-8") as handle:
+              for token_id in token_ids:
+                  handle.write(str(token_id).replace("\t", "").replace("\n", ""))
+                  handle.write("\n")
+          PY
+
+          "${PSQL[@]}" <<SQL
+          CREATE TEMP TABLE replay_token_ids(token_id TEXT);
+          \\copy replay_token_ids(token_id) FROM '${official_token_ids_tsv}'
+          \\o ${official_db_rows_json}
+          SELECT COALESCE(
+            jsonb_agg(
+              jsonb_build_object(
+                'token_id', s.token_id,
+                'market_slug', s.market_slug,
+                'outcome', s.outcome,
+                'settlement', s.settled_price::text,
+                'resolved', s.resolved,
+                'resolved_at', s.resolved_at
+              )
+              ORDER BY s.token_id
+            ),
+            '[]'::jsonb
+          )::text
+          FROM pm_token_settlements s
+          JOIN replay_token_ids t ON t.token_id = s.token_id
+          WHERE s.resolved = true
+            AND s.settled_price IS NOT NULL;
+          \\o
+          SQL
+
+          python3 "${remote_dir}/extract_official_settlement_evidence.py" \
+            --recording "${recording_path}" \
+            --db-settlements-json "${official_db_rows_json}" \
+            --output-json "${settlements_json}" \
+            --report-json "${official_settlement_report}"
+
+          python3 "${remote_dir}/enrich_recording_official_settlement.py" \
+            --input "${recording_path}" \
+            --output "${enriched_recording}" \
+            --settlements-json "${settlements_json}" \
+            --report-json "${remote_dir}/recording-enrichment.json"
+          test -s "${enriched_recording}"
+
+          replay_config="${remote_dir}/replay.toml"
+          python3 - "${config_path}" "${enriched_recording}" "${replay_config}" "${runtime_score}" "${skip_settlement_exits}" "${min_entry_score_override}" <<'PY'
+          import json
+          import sys
+
+          src, recording, dst, runtime_score, skip_settlement_exits, min_entry_score_override = sys.argv[1:]
+          if not runtime_score:
+              raise SystemExit("runtime_score is required")
+          if "\n" in runtime_score or "\r" in runtime_score:
+              raise SystemExit("runtime_score must be single-line")
+          lines = []
+          inserted_replay_path = False
+          wrote_runtime_score = False
+          wrote_min_entry_score = False
+          source_lines = open(src, encoding="utf-8").read().splitlines()
+          has_runtime_score = any(
+              line.strip().startswith("three_layer_autofactor_runtime_score")
+              for line in source_lines
+          )
+          runtime_score_line = (
+              "three_layer_autofactor_runtime_score = "
+              f"{json.dumps(runtime_score, ensure_ascii=True)}"
+          )
+          for raw in source_lines:
+              stripped = raw.strip()
+              if stripped.startswith("mode = "):
+                  lines.append('mode = "replay"')
+                  lines.append(f"skip_settlement_exits = {skip_settlement_exits}")
+                  lines.append(f'replay_market_updates_from = "{recording}"')
+                  inserted_replay_path = True
+                  continue
+              if stripped.startswith("skip_settlement_exits"):
+                  continue
+              if stripped.startswith("record_market_updates_to"):
+                  continue
+              if stripped.startswith("record_market_updates_max_"):
+                  continue
+              if stripped.startswith("three_layer_autofactor_runtime_score"):
+                  lines.append(runtime_score_line)
+                  wrote_runtime_score = True
+                  continue
+              if min_entry_score_override and stripped.startswith("three_layer_min_entry_score"):
+                  lines.append(f"three_layer_min_entry_score = {min_entry_score_override}")
+                  wrote_min_entry_score = True
+                  continue
+              lines.append(raw)
+              if stripped.startswith("strategy_profile") and not has_runtime_score:
+                  lines.append(runtime_score_line)
+                  wrote_runtime_score = True
+          if not inserted_replay_path:
+              raise SystemExit("runtime mode line not found in source config")
+          if not wrote_runtime_score:
+              raise SystemExit("strategy_profile/runtime score location not found in source config")
+          if min_entry_score_override and not wrote_min_entry_score:
+              raise SystemExit("three_layer_min_entry_score override requested but source config has no three_layer_min_entry_score line")
+          with open(dst, "w", encoding="utf-8") as handle:
+              handle.write("\n".join(lines) + "\n")
+          PY
+
+          timeout 600 "${remote_dir}/ploy-runner" run \
+            --config "${replay_config}" \
+            --deployment-id "${deployment_id}" \
+            --output-json "${remote_dir}/runtime-evaluation.json"
+
+          python3 "${remote_dir}/enrich_replay_runtime_evidence.py" \
+            --input-json "${remote_dir}/runtime-evaluation.json" \
+            --output-json "${remote_dir}/runtime-evaluation.json" \
+            --settlements-json "${settlements_json}" \
+            --report-json "${remote_dir}/runtime-evidence-enrichment.json"
+
+          ls -lh "${remote_dir}/runtime-evaluation.json" "${official_settlement_report}" "${remote_dir}/recording-enrichment.json" "${remote_dir}/runtime-evidence-enrichment.json" "${recording_provenance}"
+          EOF
+
+          scp tango-1-1:"${REMOTE_DIR}/runtime-evaluation.json" artifacts/runtime-replay/runtime-evaluation.json
+          scp tango-1-1:"${REMOTE_DIR}/official-settlement-report.json" artifacts/runtime-replay/official-settlement-report.json
+          scp tango-1-1:"${REMOTE_DIR}/recording-enrichment.json" artifacts/runtime-replay/recording-enrichment.json
+          scp tango-1-1:"${REMOTE_DIR}/runtime-evidence-enrichment.json" artifacts/runtime-replay/runtime-evidence-enrichment.json
+          scp tango-1-1:"${REMOTE_DIR}/recording-provenance.json" artifacts/runtime-replay/recording-provenance.json
+
+      - name: Build candidate strategy replay artifact
+        env:
+          RUNTIME_SCORE: ${{ github.event.inputs.runtime_score }}
+          STRATEGY_PROFILE: ${{ github.event.inputs.strategy_profile }}
+          MIN_TRADE_COUNT: ${{ github.event.inputs.min_trade_count }}
+          MIN_FILL_RATE: ${{ github.event.inputs.min_fill_rate }}
+          MIN_ROI: ${{ github.event.inputs.min_roi }}
+          FULL_DEPTH_ENTRY: ${{ env.REPLAY_FULL_DEPTH_ENTRY }}
+          CONFIGURED_ENTRY_THRESHOLD: ${{ env.REPLAY_THREE_LAYER_MIN_ENTRY_SCORE || '0.25' }}
+          SOURCE_TARGET: ${{ env.REPLAY_SOURCE_TARGET }}
+          SOURCE_HORIZON: ${{ env.REPLAY_SOURCE_HORIZON }}
+        run: |
+          set -euo pipefail
+          recording_sha256="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("artifacts/runtime-replay/recording-provenance.json")
+          if not path.is_file():
+              raise SystemExit("recording-provenance.json missing")
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          print(payload.get("recording_sha256") or "")
+          PY
+          )"
+          if [ -z "${recording_sha256}" ]; then
+            echo "recording sha256 missing from recording-provenance.json" >&2
+            exit 1
+          fi
+          args=(
+            --runtime-evaluation-json artifacts/runtime-replay/runtime-evaluation.json
+            --runtime-score "${RUNTIME_SCORE}"
+            --strategy-profile "${STRATEGY_PROFILE}"
+            --deployment-id "${{ github.event.inputs.deployment_id }}"
+            --workflow-run-id "${GITHUB_RUN_ID}"
+            --workflow-run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            --artifact-name "runtime-candidate-replay-${GITHUB_RUN_ID}"
+            --recording-path "${{ github.event.inputs.recording_path }}"
+            --recording-sha256 "${recording_sha256}"
+            --config-path "${{ github.event.inputs.config_path }}"
+            --runner-source "${GITHUB_WORKFLOW}:${GITHUB_REF_NAME}"
+            --runner-git-sha "${GITHUB_SHA}"
+            --source-target "${SOURCE_TARGET}"
+            --source-horizon "${SOURCE_HORIZON}"
+            --min-trade-count "${MIN_TRADE_COUNT}"
+            --min-fill-rate "${MIN_FILL_RATE}"
+            --min-roi "${MIN_ROI}"
+            --configured-entry-threshold "${CONFIGURED_ENTRY_THRESHOLD}"
+            --evidence "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            --output-json artifacts/runtime-replay/candidate-strategy-replay.json
+            --output-md artifacts/runtime-replay/candidate-strategy-replay.md
+          )
+          if [ "${FULL_DEPTH_ENTRY}" = "true" ]; then
+            args+=(--full-depth-entry)
+          fi
+          python3 scripts/build_runtime_candidate_strategy_replay.py "${args[@]}"
+
+      - name: Persist runtime replay frontier to Research OS
+        env:
+          REMOTE_DIR: /opt/ploy/tmp/runtime-candidate-replay-${{ github.run_id }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ARTIFACT_NAME: runtime-candidate-replay-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          test -f artifacts/runtime-replay/candidate-strategy-replay.json
+          persist_research_trace="${REPLAY_PERSIST_RESEARCH_TRACE:-true}"
+          case "${persist_research_trace}" in
+            true|false) ;;
+            *) echo "REPLAY_PERSIST_RESEARCH_TRACE must be true or false" >&2; exit 2 ;;
+          esac
+
+          scp scripts/persist_candidate_replay_tape.py \
+            tango-1-1:"${REMOTE_DIR}/persist_candidate_replay_tape.py"
+          scp artifacts/runtime-replay/candidate-strategy-replay.json \
+            tango-1-1:"${REMOTE_DIR}/candidate-strategy-replay.json"
+
+          # shellcheck disable=SC2029
+          ssh tango-1-1 /bin/bash -s -- \
+            "${REMOTE_DIR}" \
+            "${GITHUB_RUN_ID}" \
+            "${WORKFLOW_RUN_URL}" \
+            "${ARTIFACT_NAME}" \
+            "${persist_research_trace}" <<'EOF'
+          set -euo pipefail
+          remote_dir="$1"
+          workflow_run_id="$2"
+          workflow_run_url="$3"
+          artifact_name="$4"
+          persist_research_trace="$5"
+          case "${persist_research_trace}" in
+            true|false) ;;
+            *) echo "persist_research_trace must be true or false" >&2; exit 2 ;;
+          esac
+
+          set -a
+          . /opt/ploy/.env
+          set +a
+          python_bin="python3"
+          if [ -x /opt/ploy/.venv/bin/python ]; then
+            python_bin="/opt/ploy/.venv/bin/python"
+          elif [ -x /opt/ploy/venv/bin/python ]; then
+            python_bin="/opt/ploy/venv/bin/python"
+          fi
+          persist_args=(
+            "${remote_dir}/persist_candidate_replay_tape.py"
+            --candidate-replay-json "${remote_dir}/candidate-strategy-replay.json"
+            --run-id "${workflow_run_id}"
+            --source-workflow "runtime-candidate-replay.yml"
+            --workflow-run-id "${workflow_run_id}"
+            --workflow-run-url "${workflow_run_url}"
+            --artifact-name "${artifact_name}"
+            --report-json "${remote_dir}/candidate-replay-persist.json"
+          )
+          if [ "${persist_research_trace}" = "true" ]; then
+            test -n "${PLOY_DATABASE__URL:-}"
+            "${python_bin}" - <<'PY'
+          import asyncpg
+          PY
+            "${python_bin}" "${persist_args[@]}" --db-url "${PLOY_DATABASE__URL}"
+          else
+            "${python_bin}" "${persist_args[@]}" --dry-run
+          fi
+          EOF
+
+          scp tango-1-1:"${REMOTE_DIR}/candidate-replay-persist.json" \
+            artifacts/runtime-replay/candidate-replay-persist.json
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          payload = json.loads(
+              Path("artifacts/runtime-replay/candidate-replay-persist.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          print("")
+          print("## Durable Research OS replay frontier")
+          print("")
+          print(f"- Dry run: `{payload.get('dry_run')}`")
+          print(f"- Candidate replay id: `{payload.get('candidate_replay_id')}`")
+          print(f"- Runtime score: `{payload.get('runtime_score')}`")
+          print(f"- Promotion decision: `{payload.get('promotion_decision')}`")
+          blockers = payload.get("blocking_risk_flags") or []
+          print(f"- Blocking flags: `{', '.join(blockers) if blockers else '<none>'}`")
+          PY
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## Runtime Candidate Replay"
+            echo ""
+            echo "- Deployment: \`${{ github.event.inputs.deployment_id }}\`"
+            echo "- Config: \`${{ github.event.inputs.config_path }}\`"
+            echo "- Recording: \`${{ github.event.inputs.recording_path }}\`"
+            if [ -f artifacts/runtime-replay/recording-provenance.json ]; then
+              echo "- Recording SHA256: \`$(python3 -c 'import json; print(json.load(open("artifacts/runtime-replay/recording-provenance.json")).get("recording_sha256", ""))')\`"
+            fi
+            echo "- Runtime score: \`${{ github.event.inputs.runtime_score }}\`"
+            echo "- Artifact: \`runtime-candidate-replay-${{ github.run_id }}\`"
+            if [ -f artifacts/runtime-replay/candidate-strategy-replay.json ]; then
+              echo ""
+              echo '```json'
+              python3 -c 'import json; data=json.load(open("artifacts/runtime-replay/candidate-strategy-replay.json")); print(json.dumps({"promotion_ready": data.get("promotion_ready"), "basis": data.get("basis"), "metrics": data.get("metrics"), "score_counterfactual": data.get("score_counterfactual"), "blocking_risk_flags": data.get("blocking_risk_flags")}, indent=2, sort_keys=True))'
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload runtime replay artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-candidate-replay-${{ github.run_id }}
+          path: artifacts/runtime-replay/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Comment replay evidence on issue
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const issue_number = Number(process.env.REPLAY_EVIDENCE_ISSUE);
+            if (!Number.isInteger(issue_number) || issue_number <= 0) {
+              throw new Error(`REPLAY_EVIDENCE_ISSUE must be a positive integer, got ${process.env.REPLAY_EVIDENCE_ISSUE}`);
+            }
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            let ready = false;
+            let metrics = {};
+            let scoreCounterfactual = {};
+            let blockers = ["missing_candidate_strategy_replay_artifact"];
+            if (fs.existsSync("artifacts/runtime-replay/candidate-strategy-replay.json")) {
+              const data = JSON.parse(fs.readFileSync("artifacts/runtime-replay/candidate-strategy-replay.json", "utf8"));
+              ready = Boolean(data.promotion_ready);
+              metrics = data.metrics || {};
+              scoreCounterfactual = data.score_counterfactual || {};
+              blockers = data.blocking_risk_flags || [];
+            }
+            const body = [
+              "Runtime candidate replay evidence:",
+              "",
+              `- Workflow: ${context.workflow}`,
+              `- Run URL: ${runUrl}`,
+              `- Deployment: \`${{ github.event.inputs.deployment_id }}\``,
+              `- Config: \`${{ github.event.inputs.config_path }}\``,
+              `- Recording: \`${{ github.event.inputs.recording_path }}\``,
+              `- Runtime score: \`${{ github.event.inputs.runtime_score }}\``,
+              `- Artifact: \`runtime-candidate-replay-${process.env.GITHUB_RUN_ID}\``,
+              `- Promotion ready: \`${ready}\``,
+              `- Trade count: \`${metrics.trade_count ?? "n/a"}\``,
+              `- Unique events: \`${metrics.unique_event_count ?? "n/a"}\``,
+              `- Entry fill rate: \`${metrics.entry_fill_rate ?? "n/a"}\``,
+              `- ROI: \`${metrics.roi ?? "n/a"}\``,
+              `- Score counterfactual: \`${scoreCounterfactual.diagnosis ?? "n/a"}\``,
+              `- Blocking flags: \`${blockers.join(", ") || "none"}\``
+            ].join("\n");
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body
+            });

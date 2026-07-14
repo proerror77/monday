@@ -1,0 +1,41 @@
+# Bayesian directional backtest parity check
+# Same params as 02-pm5d.backtest-parity.toml but uses Bayesian posterior fusion.
+
+[runtime]
+mode = "backtest"
+strategy_variant = "directional_bayes"
+from = "2026-04-09T00:00:00Z"
+to   = "2026-04-09T11:30:00Z"
+
+[strategy]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+
+vol_floor = 0.001
+min_probability = 0.5253
+min_z_score = 0.35
+
+min_entry_price = 0.15
+max_entry_price = 0.85
+no_trade_zone_min = 0.45
+no_trade_zone_max = 0.55
+
+min_edge = 0.0367
+
+min_time_remaining_secs = 60
+max_time_remaining_secs = 240
+cooldown_secs = 71
+
+stake_usd = 25.0
+max_positions = 10
+max_daily_trades = 1000
+allowed_window_secs = [300, 900]
+
+[execution]
+use_spread = false
+enable_partial_fills = false
+enable_market_impact = false
+
+[backtest_data]
+include_reference_prices = false
+include_sports_state = false
+require_official_settlement = true

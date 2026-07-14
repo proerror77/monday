@@ -1,0 +1,381 @@
+name: Sync dry-run strategy config to tango-1-1
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref; execute=true requires main"
+        required: true
+        default: "main"
+      deployment_id:
+        description: "Dry-run deployment id to restart after config sync"
+        required: true
+        default: "pm5d.threelayer.settlement-probability-btc-eth.dryrun"
+      strategy_config_path:
+        description: "Repo strategy TOML path to sync"
+        required: true
+        default: "config/strategies/02-pm5d-threelayer.settlement-probability-btc-eth-dryrun.toml"
+      execute:
+        description: "Install the config and restart only the target dry-run worker"
+        type: boolean
+        required: true
+        default: false
+      force_restart:
+        description: "Restart the target dry-run worker even when the remote config already matches"
+        type: boolean
+        required: false
+        default: false
+      rotate_recording:
+        description: "Archive the strategy recording file from the candidate config before restart"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: sync-dryrun-strategy-config-${{ github.event.inputs.deployment_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_HOST: ${{ secrets.TANGO_1_1_HOST }}
+  DEPLOY_ROOT: ${{ vars.PLOY_DEPLOY_ROOT || '/opt/ploy' }}
+
+jobs:
+  sync-config:
+    name: Sync dry-run strategy config
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: tango-1-1
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Validate inputs
+        env:
+          DEPLOYMENT_ID: ${{ github.event.inputs.deployment_id }}
+          STRATEGY_CONFIG_PATH: ${{ github.event.inputs.strategy_config_path }}
+          EXECUTE: ${{ github.event.inputs.execute }}
+          FORCE_RESTART: ${{ github.event.inputs.force_restart }}
+          ROTATE_RECORDING: ${{ github.event.inputs.rotate_recording }}
+          INPUT_GIT_REF: ${{ github.event.inputs.git_ref }}
+        run: |
+          set -euo pipefail
+
+          case "${DEPLOYMENT_ID}" in
+            *.dryrun) ;;
+            *)
+              echo "deployment_id must be a dry-run deployment ending in .dryrun: ${DEPLOYMENT_ID}" >&2
+              exit 2
+              ;;
+          esac
+
+          case "${STRATEGY_CONFIG_PATH}" in
+            config/strategies/*.toml) ;;
+            *)
+              echo "strategy_config_path must be under config/strategies and end with .toml: ${STRATEGY_CONFIG_PATH}" >&2
+              exit 2
+              ;;
+          esac
+          test -f "${STRATEGY_CONFIG_PATH}"
+
+          if [ "${ROTATE_RECORDING}" = "true" ] && [ "${EXECUTE}" != "true" ]; then
+            echo "rotate_recording=true requires execute=true" >&2
+            exit 2
+          fi
+          if [ "${FORCE_RESTART}" = "true" ] && [ "${EXECUTE}" != "true" ]; then
+            echo "force_restart=true requires execute=true" >&2
+            exit 2
+          fi
+
+          if [ "${EXECUTE}" = "true" ]; then
+            if [ "${GITHUB_REF_NAME}" != "main" ]; then
+              echo "execute=true must dispatch the workflow from main; got ${GITHUB_REF_NAME}" >&2
+              exit 2
+            fi
+            if [ "${INPUT_GIT_REF}" != "main" ]; then
+              echo "execute=true must use git_ref=main; got ${INPUT_GIT_REF}" >&2
+              exit 2
+            fi
+            git fetch --no-tags --depth=1 origin main
+            checked_out_sha="$(git rev-parse HEAD)"
+            main_sha="$(git rev-parse origin/main)"
+            if [ "${checked_out_sha}" != "${main_sha}" ]; then
+              echo "checked-out SHA ${checked_out_sha} does not match origin/main ${main_sha}" >&2
+              exit 2
+            fi
+          fi
+
+      - name: Configure SSH
+        env:
+          TANGO_1_1_KNOWN_HOSTS: ${{ secrets.TANGO_1_1_KNOWN_HOSTS }}
+          TANGO_1_1_SSH_KEY: ${{ secrets.TANGO_1_1_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          if [ -z "${TANGO_1_1_KNOWN_HOSTS}" ]; then
+            echo "TANGO_1_1_KNOWN_HOSTS secret is required for pinned SSH host verification" >&2
+            exit 1
+          fi
+          printf '%s\n' "${TANGO_1_1_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          printf '%s\n' "${TANGO_1_1_SSH_KEY}" > ~/.ssh/tango_1_1_key
+          chmod 600 ~/.ssh/tango_1_1_key
+          cat > ~/.ssh/config <<EOF
+          Host tango-1-1
+            HostName ${DEPLOY_HOST}
+            User root
+            IdentityFile ~/.ssh/tango_1_1_key
+            HostKeyAlias tango-1-1
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ServerAliveInterval 30
+            ServerAliveCountMax 20
+            ConnectTimeout 30
+          EOF
+
+      - name: Sync config or preview diff
+        env:
+          DEPLOYMENT_ID: ${{ github.event.inputs.deployment_id }}
+          STRATEGY_CONFIG_PATH: ${{ github.event.inputs.strategy_config_path }}
+          EXECUTE: ${{ github.event.inputs.execute }}
+          FORCE_RESTART: ${{ github.event.inputs.force_restart }}
+          ROTATE_RECORDING: ${{ github.event.inputs.rotate_recording }}
+          REMOTE_DIR: /opt/ploy/tmp/sync-dryrun-strategy-config-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/sync-dryrun-strategy-config
+
+          target_name="$(basename "${STRATEGY_CONFIG_PATH}")"
+          remote_config="${DEPLOY_ROOT}/config/strategies/${target_name}"
+
+          ssh tango-1-1 /bin/bash -s -- "${REMOTE_DIR}" <<'EOF'
+          set -euo pipefail
+          mkdir -p "$1"
+          EOF
+          scp "${STRATEGY_CONFIG_PATH}" "tango-1-1:${REMOTE_DIR}/${target_name}.candidate"
+
+          ssh tango-1-1 /bin/bash -s -- \
+            "${DEPLOYMENT_ID}" \
+            "${remote_config}" \
+            "${REMOTE_DIR}/${target_name}.candidate" \
+            "${REMOTE_DIR}" \
+            "${EXECUTE}" \
+            "${DEPLOY_ROOT}" \
+            "${FORCE_RESTART}" \
+            "${ROTATE_RECORDING}" <<'EOF'
+          set -euo pipefail
+          deployment_id="$1"
+          remote_config="$2"
+          candidate_config="$3"
+          remote_dir="$4"
+          execute="$5"
+          deploy_root="$6"
+          force_restart="$7"
+          rotate_recording="$8"
+
+          status_json="${remote_dir}/sync-status.json"
+          diff_path="${remote_dir}/config-diff.txt"
+          recording_archive_path=""
+
+          require_live_paused() {
+            local live_status
+            local live_line
+            live_status="$("${deploy_root}/bin/ployctl" deployments inspect pm5d.threelayer.live 2>&1)"
+            printf '%s\n' "${live_status}"
+            live_line="$(printf '%s\n' "${live_status}" | awk '$1 == "pm5d.threelayer.live" { print; exit }')"
+            case "${live_line}" in
+              *"desired=Paused"*"observed=Paused"*) ;;
+              *)
+                echo "pm5d.threelayer.live must remain desired=Paused observed=Paused" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          wait_for_state() {
+            local expected="$1"
+            local line
+            for _ in $(seq 1 20); do
+              line="$("${deploy_root}/bin/ployctl" deployments inspect "${deployment_id}" 2>&1 | awk -v id="${deployment_id}" '$1 == id { print; exit }')"
+              printf '%s\n' "${line}"
+              case "${line}" in
+                *"observed=${expected}"*) return 0 ;;
+              esac
+              sleep 1
+            done
+            echo "deployment ${deployment_id} did not reach observed=${expected}" >&2
+            exit 1
+          }
+
+          require_flat_risk() {
+            curl -fsS http://127.0.0.1:8081/api/trading/state > "${remote_dir}/trading-state.json"
+            python3 - "${deployment_id}" "${remote_dir}/trading-state.json" <<'PY'
+          import json
+          import sys
+          deployment_id = sys.argv[1]
+          path = sys.argv[2]
+          rows = json.load(open(path, encoding="utf-8"))
+          row = next((item for item in rows if item.get("deployment_id") == deployment_id), None)
+          if row is None:
+              raise SystemExit(f"deployment not present in trading state: {deployment_id}")
+          risk = row.get("risk") or {}
+          fields = {
+              "pending_intents": int(risk.get("pending_intents") or 0),
+              "active_orders": int(risk.get("active_orders") or 0),
+              "open_positions": int(risk.get("open_positions") or 0),
+          }
+          if any(fields.values()):
+              raise SystemExit(f"refusing config sync while deployment is not flat: {fields}")
+          print(f"target deployment is flat: {fields}")
+          PY
+          }
+
+          candidate_recording_path() {
+            python3 - "${candidate_config}" <<'PY'
+          import re
+          import sys
+          path = sys.argv[1]
+          in_runtime = False
+          for raw in open(path, encoding="utf-8"):
+              line = raw.strip()
+              if line.startswith("[") and line.endswith("]"):
+                  in_runtime = line == "[runtime]"
+                  continue
+              if not in_runtime:
+                  continue
+              match = re.match(r'^record_market_updates_to\s*=\s*"([^"]+)"\s*$', line)
+              if match:
+                  print(match.group(1))
+                  raise SystemExit(0)
+          raise SystemExit(0)
+          PY
+          }
+
+          rotate_candidate_recording() {
+            local recording_path
+            local archive_path
+            local stamp
+            recording_path="$(candidate_recording_path)"
+            if [ -z "${recording_path}" ]; then
+              echo "candidate config has no record_market_updates_to; nothing to rotate"
+              return 0
+            fi
+            case "${recording_path}" in
+              "${deploy_root}/data/recordings/"*.ndjson) ;;
+              *)
+                echo "refusing to rotate unexpected recording path: ${recording_path}" >&2
+                exit 2
+                ;;
+            esac
+            if [ ! -e "${recording_path}" ]; then
+              echo "recording path does not exist yet: ${recording_path}"
+              return 0
+            fi
+            stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+            archive_path="${recording_path%.ndjson}.${stamp}.ndjson"
+            mv "${recording_path}" "${archive_path}"
+            recording_archive_path="${archive_path}"
+            echo "archived recording ${recording_path} -> ${archive_path}"
+          }
+
+          test -x "${deploy_root}/bin/ployctl"
+          test -r "${candidate_config}"
+          test -r "${remote_config}"
+          require_live_paused
+          require_flat_risk
+
+          if cmp -s "${candidate_config}" "${remote_config}"; then
+            changed=false
+            printf 'candidate config matches remote config\n' > "${diff_path}"
+          else
+            changed=true
+            diff -u "${remote_config}" "${candidate_config}" > "${diff_path}" || true
+          fi
+
+          restarted=false
+          if [ "${execute}" = "true" ] && { [ "${changed}" = "true" ] || [ "${force_restart}" = "true" ] || [ "${rotate_recording}" = "true" ]; }; then
+            if [ "${changed}" = "true" ]; then
+              install -m 0644 "${candidate_config}" "${remote_config}"
+            fi
+            if [ "${rotate_recording}" = "true" ]; then
+              rotate_candidate_recording
+            fi
+            "${deploy_root}/bin/ployctl" deployments pause "${deployment_id}"
+            wait_for_state Paused
+            "${deploy_root}/bin/ployctl" deployments resume "${deployment_id}"
+            wait_for_state Running
+            curl -fsS http://127.0.0.1:8081/health
+            curl -fsS http://127.0.0.1:8081/api/reports/dry-run \
+              | "${deploy_root}/scripts/check_dryrun_report_contract.py"
+            restarted=true
+          fi
+
+          python3 - "${status_json}" "${deployment_id}" "${remote_config}" "${execute}" "${changed}" "${force_restart}" "${rotate_recording}" "${restarted}" "${recording_archive_path}" <<'PY'
+          import json
+          import sys
+          (
+              path,
+              deployment_id,
+              remote_config,
+              execute,
+              changed,
+              force_restart,
+              rotate_recording,
+              restarted,
+              recording_archive_path,
+          ) = sys.argv[1:10]
+          payload = {
+              "deployment_id": deployment_id,
+              "remote_config": remote_config,
+              "execute": execute == "true",
+              "changed": changed == "true",
+              "force_restart": force_restart == "true",
+              "rotate_recording": rotate_recording == "true",
+              "restarted": restarted == "true",
+              "recording_archive_path": recording_archive_path or None,
+              "status": "synced" if restarted == "true" else "preview",
+          }
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          PY
+          EOF
+
+          scp "tango-1-1:${REMOTE_DIR}/sync-status.json" artifacts/sync-dryrun-strategy-config/sync-status.json
+          scp "tango-1-1:${REMOTE_DIR}/config-diff.txt" artifacts/sync-dryrun-strategy-config/config-diff.txt
+          cat artifacts/sync-dryrun-strategy-config/sync-status.json
+
+      - name: Upload sync artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sync-dryrun-strategy-config-${{ github.run_id }}
+          path: artifacts/sync-dryrun-strategy-config/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## Dry-run Strategy Config Sync"
+            echo ""
+            echo "- Deployment: \`${{ github.event.inputs.deployment_id }}\`"
+            echo "- Strategy config: \`${{ github.event.inputs.strategy_config_path }}\`"
+            echo "- Execute: \`${{ github.event.inputs.execute }}\`"
+            echo "- Force restart: \`${{ github.event.inputs.force_restart }}\`"
+            echo "- Rotate recording: \`${{ github.event.inputs.rotate_recording }}\`"
+            if [ -f artifacts/sync-dryrun-strategy-config/sync-status.json ]; then
+              echo ""
+              echo "Status:"
+              echo '```json'
+              cat artifacts/sync-dryrun-strategy-config/sync-status.json
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

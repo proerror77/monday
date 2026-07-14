@@ -1,0 +1,54 @@
+# Ploy Production Configuration Example
+# Copy this to production.toml and fill in your credentials
+
+[polymarket]
+# API credentials (from Polymarket dashboard)
+api_key = "your-api-key"
+api_secret = "your-api-secret"
+passphrase = "your-passphrase"
+
+# Wallet for signing orders
+private_key = "0x..."  # Your Ethereum private key
+
+# API endpoints
+rest_url = "https://clob.polymarket.com"
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+[binance]
+# No auth needed for public WebSocket
+ws_url = "wss://stream.binance.com:9443/ws"
+
+[database]
+# PostgreSQL connection (optional, for trade history)
+url = "postgresql://user:password@localhost:5432/ploy"
+
+[risk]
+# Platform-level risk limits
+max_single_order_value = 100.0      # USD per order
+max_total_exposure = 500.0          # Total USD exposure
+max_daily_loss = 200.0              # Stop trading if exceeded
+circuit_breaker_threshold = 5       # Consecutive failures to pause
+
+[agents.crypto]
+# Crypto agent settings
+enabled = true
+coins = ["BTC", "ETH", "SOL"]
+sum_threshold = 0.96                # Enter when sum of asks < this
+default_shares = 100
+exit_edge_floor = 0.02              # exit when modeled edge floor is reached
+exit_price_band = 0.05              # exit on adverse price band
+
+[agents.rl_crypto]
+# RL-powered agent settings (requires --features rl)
+enabled = true
+online_learning = true
+exploration_rate = 0.1
+model_checkpoint = "./models/latest.bin"
+
+[logging]
+level = "info"                      # debug, info, warn, error
+format = "json"                     # json or pretty
+
+[agent_framework]
+mode = "openclaw"
+hard_disable_internal_agents = true

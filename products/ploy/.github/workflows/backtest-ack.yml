@@ -1,0 +1,69 @@
+name: Backtest on ACK
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref (for config files)"
+        required: true
+        default: "main"
+      start_date:
+        description: "Backtest start date (YYYY-MM-DD)"
+        required: true
+        default: "2026-03-28"
+      end_date:
+        description: "Backtest end date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-03"
+      config:
+        description: "Strategy config path"
+        required: true
+        default: "config/strategies/02-pm5d.unified.toml"
+
+jobs:
+  backtest:
+    name: Submit backtest Job to ACK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.ACK_KUBECONFIG }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Submit backtest Job
+        run: |
+          JOB_SUFFIX=$(date +%Y%m%d-%H%M%S)
+          export JOB_SUFFIX CONFIG START_DATE END_DATE
+          CONFIG="${{ github.event.inputs.config }}"
+          START_DATE="${{ github.event.inputs.start_date }}"
+          END_DATE="${{ github.event.inputs.end_date }}"
+          envsubst < infra/k8s/jobs/backtest.yaml.template | kubectl apply -f -
+          echo "JOB_NAME=backtest-${JOB_SUFFIX}" >> "$GITHUB_ENV"
+
+      - name: Wait for Job completion
+        run: |
+          kubectl wait job/"${JOB_NAME}" \
+            -n ploy \
+            --for=condition=complete \
+            --timeout=3600s
+
+      - name: Get Job logs
+        if: always()
+        run: |
+          kubectl logs job/"${JOB_NAME}" -n ploy || true
+
+      - name: Cleanup Job
+        if: always()
+        run: |
+          kubectl delete job/"${JOB_NAME}" -n ploy --ignore-not-found

@@ -1,0 +1,112 @@
+[package]
+name = "ploy-research"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ploy research and backtesting crate"
+
+[features]
+default = []
+full = ["db", "polars-export", "ml", "rl", "strategy-runtime"]
+db = ["dep:sqlx", "dep:ploy-feed-loaders"]
+polars-export = ["dep:polars"]
+ml = []
+rl = ["dep:burn", "dep:burn-ndarray"]
+strategy-runtime = []
+
+[dependencies]
+rand.workspace = true
+chrono.workspace = true
+polars = { workspace = true, optional = true }
+ploy-market-contracts.workspace = true
+ploy-operator-contracts.workspace = true
+ploy-feed-loaders = { workspace = true, optional = true }
+ploy-strategy-bundles.workspace = true
+ploy-trading.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing.workspace = true
+uuid.workspace = true
+anyhow = "1"
+burn = { version = "0.17", default-features = false, features = ["ndarray", "autodiff", "std"], optional = true }
+burn-ndarray = { version = "0.17", optional = true }
+optimizer.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true
+
+[[example]]
+name = "event_dataset_baseline"
+path = "examples/event_dataset_baseline.rs"
+required-features = ["polars-export"]
+
+[[example]]
+name = "event_dataset_coverage"
+path = "examples/event_dataset_coverage.rs"
+required-features = ["polars-export"]
+
+[[example]]
+name = "event_dataset_rolling_windows"
+path = "examples/event_dataset_rolling_windows.rs"
+required-features = ["polars-export"]
+
+[[example]]
+name = "event_factor_attribution"
+path = "examples/event_factor_attribution.rs"
+required-features = ["polars-export"]
+
+[[example]]
+name = "event_ml_workflow"
+path = "examples/event_ml_workflow.rs"
+required-features = ["polars-export"]
+
+[[example]]
+name = "event_ml_architecture"
+path = "examples/event_ml_architecture.rs"
+
+[[example]]
+name = "event_ml_walk_forward"
+path = "examples/event_ml_walk_forward.rs"
+
+[[example]]
+name = "event_ml_rolling_workflow"
+path = "examples/event_ml_rolling_workflow.rs"
+
+[[example]]
+name = "factor_review_v2"
+path = "examples/factor_review_v2.rs"
+required-features = ["db"]
+
+[[example]]
+name = "factor_walk_forward_v2"
+path = "examples/factor_walk_forward_v2.rs"
+required-features = ["db"]
+
+[[example]]
+name = "research_snapshot_compile"
+path = "examples/research_snapshot_compile.rs"
+required-features = ["db"]
+
+[[example]]
+name = "persist_research_trace"
+path = "examples/persist_research_trace.rs"
+required-features = ["db"]
+
+[[example]]
+name = "research_trace_plan"
+path = "examples/research_trace_plan.rs"
+required-features = ["db"]
+
+[[example]]
+name = "research_snapshot_parity"
+path = "examples/research_snapshot_parity.rs"
+
+[[example]]
+name = "three_layer_snapshot_optimize"
+path = "examples/three_layer_snapshot_optimize.rs"

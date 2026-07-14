@@ -35,3 +35,17 @@ cargo clippy -p hft-collector --all-targets --features collector-binance --no-de
 ```
 
 Do not compile the entire workspace for ordinary changes. Run `cargo metadata --locked --no-deps` after workspace graph changes.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues for `proerror77/monday`; external pull requests are not a triage request surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the repository's single-context domain-doc layout. See `docs/agents/domain.md`.

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cfg="${1:-}"
+if [[ -z "$cfg" ]]; then
+  echo "Usage: ingest_feeds <feeds.json>" >&2
+  exit 2
+fi
+
+state="${PLOY_FEED_STATE_FILE:-./state/feeds_state.json}"
+mkdir -p "$(dirname "$state")"
+
+exec python3 "$(dirname "$0")/ingest_feeds.py" --config "$cfg" --state "$state"

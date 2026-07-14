@@ -1,0 +1,472 @@
+name: Event ML rolling evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref"
+        required: true
+        default: "main"
+      start_date:
+        description: "Dataset start date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-24"
+      end_date:
+        description: "Dataset end date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-25"
+      symbols:
+        description: "Comma-separated Binance symbols"
+        required: true
+        default: "BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,BNBUSDT,XRPUSDT"
+      child_window_events:
+        description: "Chronological events per child event-root dataset"
+        required: true
+        default: "150"
+      run_workflow:
+        description: "Run full event_ml_rolling_workflow after dataset split"
+        required: false
+        default: "true"
+      source_dataset_run_id:
+        description: "Existing event-ml-rolling-datasets artifact run id; required for artifact-backed evidence on GitHub-hosted runner"
+        required: true
+        default: ""
+      options_json:
+        description: "Advanced options JSON: sampling, entry/tolerance, logistic search grid, source_dataset_artifact_name, handoff runtime/parity gates, PR-only config promotion"
+        required: false
+        default: '{"lob_sample_secs":30,"max_quote_age_secs":30,"entry_secs":60,"tolerance_secs":30,"search_l2":"0,0.001,0.01","search_min_edge":"0,0.02,0.05","search_learning_rate":"0.03,0.05","search_epochs":500,"source_dataset_artifact_name":"","required_strategy_profile":"event_ml_supervised_tabular","runtime_score":"","replay_parity_ready":"false","create_handoff_issue":"false","create_config_pr":"false","strategy_config":"config/strategies/02-pm5d-threelayer.settlement-probability-btc-eth-dryrun.toml","model_artifact_path":""}'
+
+concurrency:
+  group: event-ml-rolling-evidence-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  build-event-ml-examples:
+    name: Build event ML examples on GitHub-hosted runner
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          cache-targets: "true"
+          key: event-ml-rolling-build-${{ hashFiles('crates/ploy-research/**', 'crates/ploy-feed-loaders/**', 'Cargo.lock') }}
+
+      - name: Build local event ML executors
+        run: |
+          set -euo pipefail
+          cargo build --locked \
+            -p ploy-research \
+            --features polars-export \
+            --example event_dataset_rolling_windows \
+            --example event_ml_rolling_workflow \
+            --example event_ml_workflow \
+            --example event_dataset_coverage \
+            --example event_factor_attribution \
+            --example event_dataset_baseline \
+            --example event_ml_walk_forward
+
+      - name: Stage event ML binaries
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/event-ml-bin
+          for binary in \
+            event_dataset_rolling_windows \
+            event_ml_rolling_workflow \
+            event_ml_workflow \
+            event_dataset_coverage \
+            event_factor_attribution \
+            event_dataset_baseline \
+            event_ml_walk_forward
+          do
+            cp "target/debug/examples/${binary}" "artifacts/event-ml-bin/${binary}"
+          done
+
+      - name: Upload event ML binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: event-ml-example-binaries-${{ github.run_id }}
+          path: artifacts/event-ml-bin/
+          retention-days: 3
+
+  reject-missing-source-dataset:
+    name: Reject missing event-root dataset artifact
+    if: ${{ github.event.inputs.source_dataset_run_id == '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Explain artifact-only Event ML path
+        run: |
+          {
+            echo "## Event ML rolling evidence"
+            echo ""
+            echo "This workflow is now artifact-backed only."
+            echo "Create or retain an event-root dataset artifact first, then dispatch this workflow with source_dataset_run_id."
+            echo "The former ploy-ci-1 direct-DB export branch has been removed from the active Event ML research chain."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "event-ml-rolling-evidence requires source_dataset_run_id; direct DB export is no longer available from this workflow." >&2
+          exit 2
+
+  hosted-event-ml-from-artifact:
+    name: Generate event ML rolling evidence from artifact on GitHub-hosted runner
+    if: ${{ github.event.inputs.source_dataset_run_id != '' }}
+    runs-on: ubuntu-latest
+    needs: build-event-ml-examples
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Download event ML binaries
+        uses: actions/download-artifact@v7
+        with:
+          name: event-ml-example-binaries-${{ github.run_id }}
+          path: artifacts/event-ml-bin
+
+      - name: Prepare event ML binaries
+        run: chmod +x artifacts/event-ml-bin/*
+
+      - name: Parse advanced options
+        env:
+          OPTIONS_JSON: ${{ github.event.inputs.options_json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          defaults = {
+              "lob_sample_secs": "30",
+              "max_quote_age_secs": "30",
+              "entry_secs": "60",
+              "tolerance_secs": "30",
+              "search_l2": "0,0.001,0.01",
+              "search_min_edge": "0,0.02,0.05",
+              "search_learning_rate": "0.03,0.05",
+              "search_epochs": "500",
+              "source_dataset_artifact_name": "",
+              "required_strategy_profile": "event_ml_supervised_tabular",
+              "runtime_score": "",
+              "replay_parity_ready": "false",
+              "create_handoff_issue": "false",
+              "create_config_pr": "false",
+              "strategy_config": "config/strategies/02-pm5d-threelayer.settlement-probability-btc-eth-dryrun.toml",
+              "model_artifact_path": "",
+          }
+          raw = os.environ.get("OPTIONS_JSON", "").strip()
+          data = json.loads(raw) if raw else {}
+          if not isinstance(data, dict):
+              raise SystemExit("options_json must be a JSON object")
+          unknown = sorted(set(data) - set(defaults))
+          if unknown:
+              raise SystemExit(f"unknown options_json keys: {', '.join(unknown)}")
+          values = dict(defaults)
+          values.update({key: str(value) for key, value in data.items()})
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key, value in values.items():
+                  if "\n" in value:
+                      raise SystemExit(f"options_json value for {key} must be single-line")
+                  handle.write(f"EVENT_ML_{key.upper()}={value}\n")
+          PY
+
+      - name: Download source event-root dataset artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_DATASET_RUN_ID: ${{ github.event.inputs.source_dataset_run_id }}
+        run: |
+          set -euo pipefail
+          rm -rf artifacts/event-ml artifacts/event-ml-source
+          mkdir -p artifacts/event-ml
+
+          artifact_name="${EVENT_ML_SOURCE_DATASET_ARTIFACT_NAME}"
+          if [ -z "${artifact_name}" ]; then
+            artifact_name="event-ml-rolling-datasets-${SOURCE_DATASET_RUN_ID}"
+          fi
+
+          python3 scripts/download_github_artifact.py \
+            --run-id "${SOURCE_DATASET_RUN_ID}" \
+            --name "${artifact_name}" \
+            --output-dir artifacts/event-ml-source
+
+          if [ -d artifacts/event-ml-source/source_event_root ]; then
+            cp -a artifacts/event-ml-source/. artifacts/event-ml/
+          elif [ -d artifacts/event-ml-source/artifacts/event-ml/source_event_root ]; then
+            cp -a artifacts/event-ml-source/artifacts/event-ml/. artifacts/event-ml/
+          else
+            echo "Dataset artifact must contain source_event_root/event_manifest.json" >&2
+            find artifacts/event-ml-source -maxdepth 4 -type f -print >&2
+            exit 2
+          fi
+
+          test -f artifacts/event-ml/source_event_root/event_manifest.json
+
+      - name: Split source dataset into rolling windows
+        run: |
+          set -euo pipefail
+          rm -rf artifacts/event-ml/rolling_datasets
+          mkdir -p artifacts/event-ml/reports
+
+          artifacts/event-ml-bin/event_dataset_rolling_windows \
+            --dataset artifacts/event-ml/source_event_root \
+            --window-events "${{ github.event.inputs.child_window_events }}" \
+            --output-root artifacts/event-ml/rolling_datasets \
+            | tee artifacts/event-ml/reports/rolling_dataset_split.txt
+
+      - name: Run canonical rolling ML workflow
+        if: ${{ github.event.inputs.run_workflow == 'true' }}
+        run: |
+          set -euo pipefail
+
+          DATASETS="$(paste -sd, artifacts/event-ml/rolling_datasets/rolling_datasets.txt)"
+          handoff_args=(
+            --required-strategy-profile "${EVENT_ML_REQUIRED_STRATEGY_PROFILE}"
+          )
+          if [ -n "${EVENT_ML_RUNTIME_SCORE}" ]; then
+            handoff_args+=(--runtime-score "${EVENT_ML_RUNTIME_SCORE}")
+          fi
+          case "${EVENT_ML_REPLAY_PARITY_READY}" in
+            true|True|1|yes|YES) handoff_args+=(--replay-parity-ready) ;;
+          esac
+          artifacts/event-ml-bin/event_ml_rolling_workflow \
+            --datasets "${DATASETS}" \
+            --output-root artifacts/event-ml/rolling_workflow \
+            --entry-secs "${EVENT_ML_ENTRY_SECS}" \
+            --tolerance-secs "${EVENT_ML_TOLERANCE_SECS}" \
+            --search-l2 "${EVENT_ML_SEARCH_L2}" \
+            --search-min-edge "${EVENT_ML_SEARCH_MIN_EDGE}" \
+            --search-learning-rate "${EVENT_ML_SEARCH_LEARNING_RATE}" \
+            --search-epochs "${EVENT_ML_SEARCH_EPOCHS}" \
+            "${handoff_args[@]}" \
+            | tee artifacts/event-ml/reports/rolling_workflow.txt
+
+      - name: Create config PR from ready Event ML handoff
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.inputs.git_ref }}
+        run: |
+          set -euo pipefail
+          case "${EVENT_ML_CREATE_CONFIG_PR:-false}" in
+            true|True|1|yes|YES) ;;
+            *)
+              echo "create_config_pr is not true; skipping config PR creation."
+              exit 0
+              ;;
+          esac
+          handoff_json="$(find artifacts/event-ml/rolling_workflow -path '*/walk_forward/event_ml_strategy_handoff.json' 2>/dev/null | sort | tail -1 || true)"
+          if [ -z "${handoff_json}" ] || [ ! -f "${handoff_json}" ]; then
+            echo "Event ML handoff JSON missing; skipping config PR creation."
+            exit 0
+          fi
+          status="$(HANDOFF_JSON="${handoff_json}" python3 - <<'PY'
+          import json
+          import os
+          with open(os.environ["HANDOFF_JSON"], encoding="utf-8") as handle:
+              print(json.load(handle).get("status", "blocked"))
+          PY
+          )"
+          if [ "${status}" != "ready" ]; then
+            echo "Event ML handoff status is ${status}; no config PR will be created."
+            exit 0
+          fi
+          case "${EVENT_ML_STRATEGY_CONFIG}" in
+            config/strategies/*.toml) ;;
+            *)
+              echo "strategy_config must be a config/strategies/*.toml path" >&2
+              exit 2
+              ;;
+          esac
+          if [ -z "${EVENT_ML_MODEL_ARTIFACT_PATH}" ]; then
+            echo "options_json.model_artifact_path is required when create_config_pr=true and handoff is ready" >&2
+            exit 2
+          fi
+
+          mkdir -p artifacts/event-ml/reports/event-ml-config-handoff
+          python3 scripts/apply_event_ml_handoff_to_config.py \
+            --handoff-json "${handoff_json}" \
+            --config "${EVENT_ML_STRATEGY_CONFIG}" \
+            --model-path "${EVENT_ML_MODEL_ARTIFACT_PATH}" \
+            --output-json artifacts/event-ml/reports/event-ml-config-handoff/config-handoff.json \
+            --output-md artifacts/event-ml/reports/event-ml-config-handoff/config-handoff.md
+          changed="$(python3 - <<'PY'
+          import json
+          with open("artifacts/event-ml/reports/event-ml-config-handoff/config-handoff.json", encoding="utf-8") as handle:
+              print("true" if json.load(handle).get("changed") else "false")
+          PY
+          )"
+          if [ "${changed}" != "true" ]; then
+            echo "Config already matches selected Event ML handoff; no PR will be created."
+            exit 0
+          fi
+
+          branch="event-ml/hosted-handoff-${GITHUB_RUN_ID}"
+          git switch -c "${branch}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${EVENT_ML_STRATEGY_CONFIG}"
+          git commit \
+            -m "Promote hosted Event ML handoff into dry-run config" \
+            -m "A hosted Event ML rolling evidence run produced a ready dry-run handoff whose runtime model differs from the checked-in dry-run config. This applies only the runtime score and reviewed model artifact path, leaving execution, risk, and kill-switch settings unchanged." \
+            -m "Constraint: Generated from hosted Event ML artifact status=ready" \
+            -m "Constraint: Dry-run config only; no deploy or live order path" \
+            -m "Rejected: Direct deployment from Event ML research workflow | config changes must pass PR review and CI first" \
+            -m "Confidence: medium" \
+            -m "Scope-risk: narrow" \
+            -m "Tested: event-ml-rolling-evidence.yml create_config_pr path" \
+            -m "Not-tested: dry-run deployment/replay after config change"
+          git push origin "${branch}"
+
+          {
+            cat artifacts/event-ml/reports/event-ml-config-handoff/config-handoff.md
+            echo ""
+            echo "Source hosted Event ML run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Source dataset run: ${{ github.event.inputs.source_dataset_run_id }}"
+            echo ""
+            echo "This PR is generated from a ready hosted Event ML handoff artifact. It does not deploy and does not enable live trading."
+          } > artifacts/event-ml/reports/event-ml-config-handoff/pr-body.md
+          gh pr create \
+            --base "${BASE_REF}" \
+            --head "${branch}" \
+            --title "Promote hosted Event ML handoff into dry-run config" \
+            --body-file artifacts/event-ml/reports/event-ml-config-handoff/pr-body.md
+
+      - name: Collect compact reports
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/event-ml artifacts/event-ml-report-bundle
+          find artifacts/event-ml -type f \
+            \( -name '*.json' -o -name '*.md' -o -name '*.txt' \) \
+            ! -path '*/observations_*.parquet' \
+            ! -path '*/event_summaries_*.parquet' \
+            ! -path '*/event_index.parquet' \
+            ! -path '*/split_assignments.parquet' \
+            -print0 > /tmp/event-ml-report-files
+          if [ -s /tmp/event-ml-report-files ]; then
+            tar --null -T /tmp/event-ml-report-files -czf artifacts/event-ml-report-bundle/event-ml-reports.tar.gz
+          else
+            echo "No event ML reports were produced." > artifacts/event-ml-report-bundle/NO_REPORTS.txt
+          fi
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## Event ML rolling evidence"
+            echo ""
+            echo "- Runner: \`ubuntu-latest\`"
+            echo "- Source dataset run: \`${{ github.event.inputs.source_dataset_run_id }}\`"
+            echo "- Window: ${{ github.event.inputs.start_date }} -> ${{ github.event.inputs.end_date }}"
+            echo "- Symbols: ${{ github.event.inputs.symbols }}"
+            echo "- Source windows: artifact-backed"
+            echo "- Child window events: ${{ github.event.inputs.child_window_events }}"
+            echo "- Run workflow: ${{ github.event.inputs.run_workflow }}"
+            echo ""
+
+            if [ -f artifacts/event-ml/source_event_root/event_manifest.json ]; then
+              echo "### Source dataset"
+              echo '```json'
+              jq '.stats' artifacts/event-ml/source_event_root/event_manifest.json || true
+              echo '```'
+            fi
+
+            if [ -f artifacts/event-ml/rolling_datasets/rolling_datasets_report.json ]; then
+              echo "### Rolling dataset split"
+              echo '```json'
+              jq '{exported_windows, skipped_events, windows: [.windows[] | {id, events, events_per_split}]}' artifacts/event-ml/rolling_datasets/rolling_datasets_report.json || true
+              echo '```'
+            fi
+
+            if [ -f artifacts/event-ml/rolling_workflow/rolling_workflow_report.json ]; then
+              echo "### Rolling workflow"
+              echo '```json'
+              jq '{dataset_count, min_windows, final_walk_forward_report, final_strategy_handoff_report, windows: [.windows[] | {id, status, prior_run_dirs: (.prior_run_dirs | length)}]}' artifacts/event-ml/rolling_workflow/rolling_workflow_report.json || true
+              echo '```'
+            fi
+
+            FINAL_WALK_FORWARD_REPORT="$(find artifacts/event-ml/rolling_workflow -path '*/walk_forward/walk_forward_report.json' 2>/dev/null | sort | tail -1 || true)"
+            if [ -n "${FINAL_WALK_FORWARD_REPORT}" ] && [ -f "${FINAL_WALK_FORWARD_REPORT}" ]; then
+              echo "### Final walk-forward readiness"
+              echo '```json'
+              jq '.readiness' "${FINAL_WALK_FORWARD_REPORT}" || true
+              echo '```'
+            fi
+
+            FINAL_HANDOFF_REPORT="$(find artifacts/event-ml/rolling_workflow -path '*/walk_forward/event_ml_strategy_handoff.json' 2>/dev/null | sort | tail -1 || true)"
+            if [ -n "${FINAL_HANDOFF_REPORT}" ] && [ -f "${FINAL_HANDOFF_REPORT}" ]; then
+              echo "### Final strategy handoff"
+              echo '```json'
+              jq '{status, recommended_action, blocked_gate_ids, runtime_score, replay_parity_ready}' "${FINAL_HANDOFF_REPORT}" || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create ready Event ML handoff issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "${EVENT_ML_CREATE_HANDOFF_ISSUE:-false}" in
+            true|True|1|yes|YES) ;;
+            *)
+              echo "create_handoff_issue is not true; skipping handoff issue creation."
+              exit 0
+              ;;
+          esac
+
+          handoff_json="$(find artifacts/event-ml/rolling_workflow -path '*/walk_forward/event_ml_strategy_handoff.json' 2>/dev/null | sort | tail -1 || true)"
+          handoff_md="$(find artifacts/event-ml/rolling_workflow -path '*/walk_forward/event_ml_strategy_handoff.md' 2>/dev/null | sort | tail -1 || true)"
+          if [ -z "${handoff_json}" ] || [ -z "${handoff_md}" ] || [ ! -f "${handoff_json}" ] || [ ! -f "${handoff_md}" ]; then
+            echo "Event ML handoff artifacts missing; skipping issue creation."
+            exit 0
+          fi
+          status="$(HANDOFF_JSON="${handoff_json}" python3 - <<'PY'
+          import json
+          import os
+          with open(os.environ["HANDOFF_JSON"], encoding="utf-8") as handle:
+              print(json.load(handle).get("status", "blocked"))
+          PY
+          )"
+          if [ "${status}" != "ready" ]; then
+            echo "Event ML handoff status is ${status}; no dry-run issue will be created."
+            exit 0
+          fi
+
+          mkdir -p artifacts/event-ml/reports
+          {
+            cat "${handoff_md}"
+            echo ""
+            echo "Source Event ML rolling evidence run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo ""
+            echo "This issue is generated from a ready Event ML handoff artifact. It does not deploy and does not enable live trading."
+          } > artifacts/event-ml/reports/event_ml_handoff_issue.md
+          gh issue create \
+            --title "Promote Event ML strategy handoff to dry-run" \
+            --body-file artifacts/event-ml/reports/event_ml_handoff_issue.md
+
+      - name: Upload compact report bundle
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: event-ml-rolling-reports-${{ github.run_id }}
+          path: artifacts/event-ml-report-bundle/
+          retention-days: 14

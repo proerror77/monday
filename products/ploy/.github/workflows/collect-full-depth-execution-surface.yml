@@ -1,0 +1,370 @@
+name: Collect Full-Depth Execution Surface
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_ref:
+        description: "Git ref for orchestration files"
+        required: true
+        default: "main"
+      start_date:
+        description: "Fallback UTC start date when options_json.start_ts is empty"
+        required: true
+        default: "2026-05-16"
+      end_date:
+        description: "Fallback UTC end date when options_json.end_ts is empty"
+        required: true
+        default: "2026-05-18"
+      options_json:
+        description: "Advanced options JSON: start_ts, end_ts, max_hours, archive_root, fail_if_incomplete, persist_research_trace"
+        required: false
+        default: '{"start_ts":"","end_ts":"","max_hours":48,"archive_root":"/opt/ploy/data/lake","fail_if_incomplete":true,"persist_research_trace":true}'
+      issue_number:
+        description: "Optional issue to comment with collection summary"
+        required: false
+        default: ""
+
+concurrency:
+  group: full-depth-execution-surface-${{ github.event.inputs.start_date }}-${{ github.event.inputs.end_date }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  DEPLOY_HOST: ${{ vars.TANGO_1_1_HOST || vars.ALIYUN_ECS_HOST || secrets.TANGO_1_1_HOST || secrets.ALIYUN_ECS_HOST }}
+  DEPLOY_ROOT: ${{ vars.PLOY_DEPLOY_ROOT || '/opt/ploy' }}
+  REMOTE_DIR: /opt/ploy/tmp/full-depth-execution-surface-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  collect:
+    name: Collect full-fidelity CLOB execution surface
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: tango-1-1
+
+    steps:
+      - name: Checkout orchestration code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Parse collection options
+        env:
+          OPTIONS_JSON: ${{ github.event.inputs.options_json }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          defaults = {
+              "start_ts": "",
+              "end_ts": "",
+              "max_hours": "48",
+              "archive_root": "/opt/ploy/data/lake",
+              "fail_if_incomplete": "true",
+              "persist_research_trace": "true",
+          }
+          bool_keys = {"fail_if_incomplete", "persist_research_trace"}
+          raw = os.environ.get("OPTIONS_JSON", "").strip()
+          data = json.loads(raw) if raw else {}
+          if not isinstance(data, dict):
+              raise SystemExit("options_json must be a JSON object")
+          unknown = sorted(set(data) - set(defaults))
+          if unknown:
+              raise SystemExit(f"unknown options_json keys: {', '.join(unknown)}")
+
+          values = dict(defaults)
+          for key, value in data.items():
+              if key in bool_keys:
+                  if isinstance(value, bool):
+                      values[key] = "true" if value else "false"
+                  elif str(value).lower() in {"true", "false"}:
+                      values[key] = str(value).lower()
+                  else:
+                      raise SystemExit(f"options_json value for {key} must be boolean")
+              else:
+                  values[key] = str(value).strip()
+
+          if not values["start_ts"]:
+              values["start_ts"] = f"{os.environ['START_DATE']}T00:00:00Z"
+          if not values["end_ts"]:
+              values["end_ts"] = f"{os.environ['END_DATE']}T00:00:00Z"
+          if not values["max_hours"].isdigit() or int(values["max_hours"]) < 1:
+              raise SystemExit("options_json.max_hours must be a positive integer")
+          if "\n" in values["archive_root"] or not values["archive_root"].startswith("/"):
+              raise SystemExit("options_json.archive_root must be an absolute single-line path")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key, value in values.items():
+                  if "\n" in value:
+                      raise SystemExit(f"options_json value for {key} must be single-line")
+                  handle.write(f"SURFACE_{key.upper()}={value}\n")
+          PY
+
+      - name: Configure SSH
+        env:
+          TANGO_1_1_SSH_KEY: ${{ secrets.TANGO_1_1_SSH_KEY }}
+          TANGO_SSH_KEY: ${{ secrets.TANGO_SSH_KEY }}
+          ALIYUN_ECS_SSH_KEY: ${{ secrets.ALIYUN_ECS_SSH_KEY }}
+          TANGO_1_1_KNOWN_HOSTS: ${{ secrets.TANGO_1_1_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "${DEPLOY_HOST}"
+          install -m 700 -d ~/.ssh
+          if [ -z "${TANGO_1_1_KNOWN_HOSTS}" ]; then
+            echo "TANGO_1_1_KNOWN_HOSTS secret is required for pinned SSH host verification" >&2
+            exit 1
+          fi
+          selected_key=""
+          if [ -n "${TANGO_1_1_SSH_KEY}" ]; then
+            selected_key="${TANGO_1_1_SSH_KEY}"
+          elif [ -n "${TANGO_SSH_KEY}" ]; then
+            selected_key="${TANGO_SSH_KEY}"
+          elif [ -n "${ALIYUN_ECS_SSH_KEY}" ]; then
+            selected_key="${ALIYUN_ECS_SSH_KEY}"
+          else
+            echo "No SSH key secret found for tango-1-1 in this workflow context." >&2
+            exit 1
+          fi
+          printf '%s\n' "${selected_key}" > ~/.ssh/tango_1_1_key
+          chmod 600 ~/.ssh/tango_1_1_key
+          ssh-keygen -y -f ~/.ssh/tango_1_1_key >/dev/null
+          printf '%s\n' "${TANGO_1_1_KNOWN_HOSTS}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host tango-1-1
+            HostName ${DEPLOY_HOST}
+            User root
+            IdentityFile ~/.ssh/tango_1_1_key
+            HostKeyAlias tango-1-1
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            ServerAliveInterval 30
+            ServerAliveCountMax 20
+            ConnectTimeout 30
+          EOF
+
+      - name: Collect full-depth archive hours on tango-1-1
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/full-depth-execution-surface
+          ssh tango-1-1 /bin/bash -s -- "${REMOTE_DIR}" <<'EOF'
+          set -euo pipefail
+          mkdir -p "$1"
+          EOF
+          scp scripts/persist_full_depth_execution_surface.py \
+            tango-1-1:"${REMOTE_DIR}/persist_full_depth_execution_surface.py"
+          ssh tango-1-1 /bin/bash -s -- \
+            "${DEPLOY_ROOT}" \
+            "${REMOTE_DIR}" \
+            "${SURFACE_START_TS}" \
+            "${SURFACE_END_TS}" \
+            "${SURFACE_MAX_HOURS}" \
+            "${SURFACE_ARCHIVE_ROOT}" \
+            "${SURFACE_FAIL_IF_INCOMPLETE}" \
+            "${SURFACE_PERSIST_RESEARCH_TRACE}" \
+            "${GITHUB_RUN_ID}" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "full-depth-execution-surface-${GITHUB_RUN_ID}" <<'EOF'
+          set -euo pipefail
+          deploy_root="$1"
+          remote_dir="$2"
+          start_ts="$3"
+          end_ts="$4"
+          max_hours="$5"
+          archive_root="$6"
+          fail_if_incomplete="$7"
+          persist_research_trace="$8"
+          workflow_run_id="$9"
+          workflow_run_url="${10}"
+          artifact_name="${11}"
+          mkdir -p "${remote_dir}/manifests"
+          set -a
+          . "${deploy_root}/.env"
+          set +a
+          : "${PLOY_DATABASE__URL:?PLOY_DATABASE__URL missing in ${deploy_root}/.env}"
+          export DATABASE_URL="${PLOY_DATABASE__URL}"
+
+          export_script="${deploy_root}/scripts/export_clob_orderbook_snapshots_parquet.sh"
+          test -x "${export_script}"
+          start_epoch="$(date -u -d "${start_ts}" +%s)"
+          end_epoch="$(date -u -d "${end_ts}" +%s)"
+          if [ "${end_epoch}" -le "${start_epoch}" ]; then
+            echo "end_ts must be after start_ts" >&2
+            exit 2
+          fi
+
+          checked=0
+          exported=0
+          existing=0
+          incomplete=false
+          current="${start_epoch}"
+          while [ "${current}" -lt "${end_epoch}" ]; do
+            if [ "${checked}" -ge "${max_hours}" ]; then
+              incomplete=true
+              break
+            fi
+            checked=$((checked + 1))
+            export_date="$(TZ=Asia/Shanghai date -d "@${current}" +%Y-%m-%d)"
+            export_hour="$(TZ=Asia/Shanghai date -d "@${current}" +%H)"
+            hour_dir="${archive_root}/orderbook_snapshots/date=${export_date}/hour=${export_hour}"
+            marker="${hour_dir}/_SUCCESS"
+            if [ -f "${marker}" ]; then
+              existing=$((existing + 1))
+            else
+              nice -n 10 ionice -c2 -n7 \
+                "${export_script}" --date "${export_date}" --hour "${export_hour}" --out-dir "${archive_root}"
+              exported=$((exported + 1))
+            fi
+            cp "${hour_dir}/manifest.json" "${remote_dir}/manifests/${export_date}-${export_hour}.json"
+            current=$((current + 3600))
+          done
+
+          python3 - <<'PY' \
+            "${remote_dir}" \
+            "${start_ts}" \
+            "${end_ts}" \
+            "${max_hours}" \
+            "${archive_root}" \
+            "${checked}" \
+            "${existing}" \
+            "${exported}" \
+            "${incomplete}" \
+            "${workflow_run_id}" \
+            "${workflow_run_url}" \
+            "${artifact_name}"
+          import json
+          import sys
+          from pathlib import Path
+
+          remote_dir = Path(sys.argv[1])
+          manifests = []
+          for path in sorted((remote_dir / "manifests").glob("*.json")):
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              payload["manifest_path"] = str(path)
+              manifests.append(payload)
+          row_count = sum(int(item.get("row_count") or 0) for item in manifests)
+          out = {
+              "schema_version": "full_depth_execution_surface.v1",
+              "surface": "clob_orderbook_snapshots",
+              "source": "orderbook_snapshot_archive",
+              "start_ts": sys.argv[2],
+              "end_ts": sys.argv[3],
+              "max_hours": int(sys.argv[4]),
+              "archive_root": sys.argv[5],
+              "checked_hours": int(sys.argv[6]),
+              "existing_hours": int(sys.argv[7]),
+              "exported_hours": int(sys.argv[8]),
+              "incomplete": sys.argv[9] == "true",
+              "full_fidelity": all(item.get("full_fidelity") is True for item in manifests),
+              "row_count": row_count,
+              "source_workflow": "collect-full-depth-execution-surface.yml",
+              "workflow_run_id": sys.argv[10],
+              "workflow_run_url": sys.argv[11],
+              "artifact_name": sys.argv[12],
+              "manifests": manifests,
+          }
+          (remote_dir / "full-depth-execution-surface.json").write_text(
+              json.dumps(out, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          lines = [
+              "# Full-Depth Execution Surface",
+              "",
+              f"- Surface: `{out['surface']}`",
+              f"- Source: `{out['source']}`",
+              f"- Window: `{out['start_ts']} -> {out['end_ts']}`",
+              f"- Checked hours: `{out['checked_hours']}`",
+              f"- Existing hours: `{out['existing_hours']}`",
+              f"- Exported hours: `{out['exported_hours']}`",
+              f"- Incomplete: `{out['incomplete']}`",
+              f"- Full fidelity: `{out['full_fidelity']}`",
+              f"- Rows: `{out['row_count']}`",
+          ]
+          (remote_dir / "full-depth-execution-surface.md").write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          if [ "${fail_if_incomplete}" = "true" ] && [ "${incomplete}" = "true" ]; then
+            echo "full-depth execution-surface collection incomplete" >&2
+            exit 3
+          fi
+          python_bin="python3"
+          if [ -x "${deploy_root}/.venv/bin/python" ]; then
+            python_bin="${deploy_root}/.venv/bin/python"
+          elif [ -x "${deploy_root}/venv/bin/python" ]; then
+            python_bin="${deploy_root}/venv/bin/python"
+          fi
+          persist_args=(
+            "${remote_dir}/persist_full_depth_execution_surface.py"
+            --surface-json "${remote_dir}/full-depth-execution-surface.json"
+            --run-id "collect-full-depth-execution-surface:${workflow_run_id}"
+            --workflow-run-id "${workflow_run_id}"
+            --workflow-run-url "${workflow_run_url}"
+            --artifact-name "${artifact_name}"
+            --report-json "${remote_dir}/full-depth-execution-surface-persist.json"
+          )
+          if [ "${persist_research_trace}" = "true" ]; then
+            "${python_bin}" - <<'PY'
+          import asyncpg
+          PY
+            "${python_bin}" "${persist_args[@]}" --db-url "${PLOY_DATABASE__URL}" --require-valid
+          else
+            "${python_bin}" "${persist_args[@]}" --dry-run
+          fi
+          EOF
+
+          scp "tango-1-1:${REMOTE_DIR}/full-depth-execution-surface.json" artifacts/full-depth-execution-surface/
+          scp "tango-1-1:${REMOTE_DIR}/full-depth-execution-surface.md" artifacts/full-depth-execution-surface/
+          scp "tango-1-1:${REMOTE_DIR}/full-depth-execution-surface-persist.json" artifacts/full-depth-execution-surface/
+          cat artifacts/full-depth-execution-surface/full-depth-execution-surface.md >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          payload = json.loads(
+              Path("artifacts/full-depth-execution-surface/full-depth-execution-surface-persist.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+          print("")
+          print("## Durable Trace Persistence")
+          print("")
+          print(f"- Dry run: `{payload.get('dry_run')}`")
+          print(f"- Valid: `{payload.get('valid')}`")
+          print(f"- Surface id: `{payload.get('full_depth_execution_surface_id')}`")
+          blockers = payload.get("blockers") or []
+          print(f"- Blockers: `{', '.join(blockers) if blockers else '<none>'}`")
+          PY
+
+      - name: Cleanup remote workspace
+        if: always()
+        run: |
+          ssh tango-1-1 /bin/bash -s -- "${REMOTE_DIR}" <<'EOF' || true
+          set -euo pipefail
+          rm -rf "$1"
+          EOF
+
+      - name: Upload execution surface artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-depth-execution-surface-${{ github.run_id }}
+          path: artifacts/full-depth-execution-surface
+          if-no-files-found: error
+
+      - name: Comment execution surface on issue
+        if: ${{ github.event.inputs.issue_number != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body-file artifacts/full-depth-execution-surface/full-depth-execution-surface.md

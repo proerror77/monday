@@ -1,0 +1,109 @@
+{
+  "baseline_json": "docs/data_plane_baseline/phase0-seed-20260303.baseline.json",
+  "breach_count": 0,
+  "breaches": [],
+  "drop_pct": 0.05,
+  "generated_at": "2026-03-03T04:06:53Z",
+  "interval_secs": 921.181640625,
+  "sample_count": 94,
+  "samples_jsonl": "docs/data_plane_baseline/phase0-seed-20260303.samples.jsonl",
+  "series_details": [
+    {
+      "baseline_rps": 1.2281433100000463,
+      "key": "binance_kline|BTCUSDT",
+      "latest_rps": 1.2287155144445003,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 1.166736144500044,
+      "scope": "symbol"
+    },
+    {
+      "baseline_rps": 1.1257904811110995,
+      "key": "binance_kline|ETHUSDT",
+      "latest_rps": 1.1263191988888948,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 1.0695009570555445,
+      "scope": "symbol"
+    },
+    {
+      "baseline_rps": 24.562719726667016,
+      "key": "binance_spot|BTCUSDT",
+      "latest_rps": 24.574163817777816,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 23.334583740333663,
+      "scope": "symbol"
+    },
+    {
+      "baseline_rps": 18.42197113111098,
+      "key": "binance_spot|ETHUSDT",
+      "latest_rps": 18.430677795556065,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 17.50087257455543,
+      "scope": "symbol"
+    },
+    {
+      "baseline_rps": 2.456270141111066,
+      "key": "chainlink_rtds|BTCUSDT",
+      "latest_rps": 2.457414551111093,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 2.3334566340555125,
+      "scope": "symbol"
+    },
+    {
+      "baseline_rps": 2.2515759277777074,
+      "key": "chainlink_rtds|ETHUSDT",
+      "latest_rps": 2.2526316833333113,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 2.138997131388822,
+      "scope": "symbol"
+    },
+    {
+      "baseline_rps": 7.675827025555384,
+      "key": "polymarket_ws|0xpm-btc",
+      "latest_rps": 7.679426193333283,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 7.2920356742776145,
+      "scope": "symbol"
+    },
+    {
+      "baseline_rps": 6.959416503333487,
+      "key": "polymarket_ws|0xpm-eth",
+      "latest_rps": 6.962684936666758,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 6.611445678166812,
+      "scope": "symbol"
+    },
+    {
+      "baseline_rps": 2.353883437777792,
+      "key": "binance_kline",
+      "latest_rps": 2.3550222777778336,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 2.2361892658889024,
+      "scope": "source"
+    },
+    {
+      "baseline_rps": 42.98370208777694,
+      "key": "binance_spot",
+      "latest_rps": 43.004626464444314,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 40.83451698338809,
+      "scope": "source"
+    },
+    {
+      "baseline_rps": 4.7077352900001115,
+      "key": "chainlink_rtds",
+      "latest_rps": 4.710034026666803,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 4.472348525500106,
+      "scope": "source"
+    },
+    {
+      "baseline_rps": 14.634916230000348,
+      "key": "polymarket_ws",
+      "latest_rps": 14.64200775222232,
+      "max_consecutive_breach_secs": 0.0,
+      "min_allowed_rps": 13.90317041850033,
+      "scope": "source"
+    }
+  ],
+  "sustain_secs": 60.0
+}

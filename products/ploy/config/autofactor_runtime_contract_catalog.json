@@ -1,0 +1,117 @@
+{
+  "schema_version": "autofactor_runtime_contract_catalog.v1",
+  "research_input_mappings": {
+    "conservative_settlement_edge": {
+      "runtime_input_names": ["settlement_edge"],
+      "projection": "settlement_edge_projection"
+    },
+    "full_depth_settlement_edge": {
+      "runtime_input_names": ["settlement_edge"],
+      "projection": "settlement_edge_projection"
+    },
+    "model_conservative_settlement_edge": {
+      "runtime_input_names": ["settlement_edge"],
+      "projection": "settlement_edge_projection"
+    },
+    "model_full_depth_settlement_edge": {
+      "runtime_input_names": ["settlement_edge"],
+      "projection": "settlement_edge_projection"
+    },
+    "settlement_edge": {
+      "runtime_input_names": ["settlement_edge"],
+      "projection": "settlement_edge_projection"
+    },
+    "near_strike_score": {
+      "runtime_input_names": ["direction_sign", "distance_over_sigma"],
+      "projection": "runtime_near_strike_score"
+    },
+    "entry_capacity_score": {
+      "runtime_input_names": ["entry_capacity_ratio"],
+      "projection": "runtime_entry_capacity_score"
+    },
+    "full_depth_entry_fillable_gate": {
+      "runtime_input_names": ["entry_capacity_ratio"],
+      "projection": "runtime_full_depth_entry_gate"
+    },
+    "entry_price_quality_score": {
+      "runtime_input_names": ["entry_price"],
+      "projection": "runtime_entry_price_quality_score"
+    },
+    "external_move_since_poly_update": {
+      "runtime_input_names": ["direction_sign", "drift_30s"],
+      "projection": "runtime_side_drift_30s"
+    },
+    "cex_return_30s_side": {
+      "runtime_input_names": ["direction_sign", "drift_30s"],
+      "projection": "runtime_side_drift_30s"
+    },
+    "sigma_horizon_pos": {
+      "runtime_input_names": ["sigma_horizon"],
+      "projection": "runtime_sigma_horizon"
+    },
+    "poly_quote_age": {
+      "runtime_input_names": ["pm_lag_secs"],
+      "projection": "runtime_quote_age"
+    },
+    "side_spread": {
+      "runtime_input_names": ["side_spread"],
+      "projection": "runtime_native_input"
+    },
+    "entry_price": {
+      "runtime_input_names": ["entry_price"],
+      "projection": "runtime_native_input"
+    },
+    "distance_over_sigma": {
+      "runtime_input_names": ["distance_over_sigma"],
+      "projection": "runtime_native_input"
+    },
+    "direction_sign": {
+      "runtime_input_names": ["direction_sign"],
+      "projection": "runtime_native_input"
+    },
+    "drift_30s": {
+      "runtime_input_names": ["drift_30s"],
+      "projection": "runtime_native_input"
+    },
+    "sigma_horizon": {
+      "runtime_input_names": ["sigma_horizon"],
+      "projection": "runtime_native_input"
+    },
+    "entry_capacity_ratio": {
+      "runtime_input_names": ["entry_capacity_ratio"],
+      "projection": "runtime_native_input"
+    },
+    "pm_lag_secs": {
+      "runtime_input_names": ["pm_lag_secs"],
+      "projection": "runtime_native_input"
+    },
+    "external_pressure": {
+      "blocker": "runtime_input_semantics_mismatch:external_pressure"
+    },
+    "iv_change_1m": {
+      "blocker": "runtime_input_not_supplied:iv_change_1m"
+    }
+  },
+  "formula_blockers": [
+    {
+      "match": "prefix",
+      "value": "auto_settlement_bayes_",
+      "blocker": "runtime_contract_unmapped_bayes_formula"
+    },
+    {
+      "match": "prefix",
+      "value": "poly_lag_pressure",
+      "blocker": "runtime_input_semantics_mismatch:external_pressure"
+    },
+    {
+      "match": "contains",
+      "value": "external_pressure",
+      "blocker": "runtime_input_semantics_mismatch:external_pressure"
+    },
+    {
+      "match": "contains",
+      "value": "iv_change",
+      "blocker": "runtime_input_not_supplied:iv_change_1m"
+    }
+  ]
+}

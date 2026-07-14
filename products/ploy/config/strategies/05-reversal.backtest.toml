@@ -1,0 +1,40 @@
+[runtime]
+mode = "backtest"
+strategy_variant = "reversal"
+
+[strategy]
+symbols = ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"]
+reversal_max_distance_pct = 0.020
+reversal_max_drift_flip_age_secs = 30
+reversal_min_post_flip_drift = 0.00005
+reversal_lob_depth_pct = 0.001
+reversal_min_lob_depth_ratio = 1.0
+reversal_max_ask_for_reversal = 0.35
+reversal_max_pm_lag_secs = 60
+min_time_remaining_secs = 45
+max_time_remaining_secs = 270
+min_edge = 0.02
+reversal_take_profit_ask = 0.60
+reversal_stop_distance_pct = 0.030
+cooldown_secs = 60
+stake_usd = 10.0
+max_positions = 1000
+max_daily_trades = 1000
+allowed_window_secs = [300]
+
+[execution]
+use_spread = false
+spread_pct = 0.02
+enable_partial_fills = false
+min_fill_pct = 0.5
+enable_market_impact = false
+impact_coefficient = 0.1
+default_depth_shares = 500
+
+[reference_data]
+capture_sports_state = false
+
+[backtest_data]
+include_reference_prices = false
+include_sports_state = false
+require_official_settlement = true

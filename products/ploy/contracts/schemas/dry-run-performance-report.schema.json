@@ -1,0 +1,1130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DryRunPerformanceReport",
+  "type": "object",
+  "required": [
+    "by_window",
+    "closed_trades",
+    "daily",
+    "daily_by_window",
+    "equity_curve",
+    "generated_at",
+    "metrics",
+    "open_positions",
+    "pairing",
+    "recent_closed",
+    "strategies",
+    "summary",
+    "symbols",
+    "symbols_by_window"
+  ],
+  "properties": {
+    "by_window": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunWindowRow"
+      }
+    },
+    "closed_trades": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunClosedTradeRow"
+      }
+    },
+    "daily": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunDailyRow"
+      }
+    },
+    "daily_by_window": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunDailyWindowRow"
+      }
+    },
+    "equity_curve": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunEquityPoint"
+      }
+    },
+    "execution_diagnostics": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DryRunExecutionDiagnostics"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "hourly": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunHourlyRow"
+      }
+    },
+    "hourly_by_window": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunHourlyWindowRow"
+      }
+    },
+    "metrics": {
+      "$ref": "#/definitions/DryRunMetrics"
+    },
+    "open_positions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunOpenPositionRow"
+      }
+    },
+    "pairing": {
+      "$ref": "#/definitions/DryRunPairingReport"
+    },
+    "recent_closed": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunClosedTradeRow"
+      }
+    },
+    "runtime_evidence": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DryRunRuntimeEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "strategies": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunStrategyReport"
+      }
+    },
+    "summary": {
+      "$ref": "#/definitions/DryRunSummary"
+    },
+    "symbols": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunSymbolRow"
+      }
+    },
+    "symbols_by_window": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/DryRunSymbolRow"
+      }
+    }
+  },
+  "definitions": {
+    "DryRunClosedTradeRow": {
+      "type": "object",
+      "required": [
+        "exit_type",
+        "net_pnl",
+        "notional",
+        "quantity",
+        "window_label"
+      ],
+      "properties": {
+        "closed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deployment_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entry_price": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "entry_time_remaining_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "event_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exit_price": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "exit_type": {
+          "type": "string"
+        },
+        "experiment_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "market_side": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "net_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "notional": {
+          "type": "number",
+          "format": "double"
+        },
+        "opened_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quantity": {
+          "type": "number",
+          "format": "double"
+        },
+        "runtime_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "strategy_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trade_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window_label": {
+          "type": "string"
+        },
+        "window_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "DryRunDailyRow": {
+      "type": "object",
+      "required": [
+        "closed_trade_count",
+        "confirmed_pnl",
+        "confirmed_trade_count",
+        "fees",
+        "losses",
+        "net_pnl",
+        "open_quantity",
+        "trade_count",
+        "wins"
+      ],
+      "properties": {
+        "closed_trade_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "confirmed_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "confirmed_trade_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "fees": {
+          "type": "number",
+          "format": "double"
+        },
+        "losses": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "net_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "open_quantity": {
+          "type": "number",
+          "format": "double"
+        },
+        "trade_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "trading_day_cst": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wins": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DryRunDailyWindowRow": {
+      "type": "object",
+      "required": [
+        "closed_trade_count",
+        "losses",
+        "net_pnl",
+        "trade_count",
+        "trading_day_cst",
+        "window_label",
+        "wins"
+      ],
+      "properties": {
+        "closed_trade_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "losses": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "net_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "trade_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "trading_day_cst": {
+          "type": "string"
+        },
+        "window_label": {
+          "type": "string"
+        },
+        "window_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "wins": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DryRunEquityPoint": {
+      "type": "object",
+      "required": [
+        "cumulative",
+        "drawdown",
+        "index",
+        "label",
+        "pnl"
+      ],
+      "properties": {
+        "cumulative": {
+          "type": "number",
+          "format": "double"
+        },
+        "drawdown": {
+          "type": "number",
+          "format": "double"
+        },
+        "index": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "label": {
+          "type": "string"
+        },
+        "pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "DryRunExecutionDiagnostics": {
+      "type": "object",
+      "required": [
+        "basis",
+        "partial_buy_threshold_pct",
+        "strategies",
+        "summary"
+      ],
+      "properties": {
+        "basis": {
+          "type": "string"
+        },
+        "partial_buy_threshold_pct": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "strategies": {
+          "type": "array",
+          "items": true
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "DryRunHourlyRow": {
+      "type": "object",
+      "required": [
+        "closed_trade_count",
+        "cumulative_pnl",
+        "drawdown",
+        "losses",
+        "net_pnl",
+        "trade_count",
+        "trading_hour_cst",
+        "wins"
+      ],
+      "properties": {
+        "closed_trade_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "cumulative_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "drawdown": {
+          "type": "number",
+          "format": "double"
+        },
+        "losses": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "net_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "trade_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "trading_hour_cst": {
+          "type": "string"
+        },
+        "wins": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DryRunHourlyWindowRow": {
+      "type": "object",
+      "required": [
+        "closed_trade_count",
+        "losses",
+        "net_pnl",
+        "trade_count",
+        "trading_hour_cst",
+        "window_label",
+        "wins"
+      ],
+      "properties": {
+        "closed_trade_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "losses": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "net_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "trade_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "trading_hour_cst": {
+          "type": "string"
+        },
+        "window_label": {
+          "type": "string"
+        },
+        "window_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "wins": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DryRunMetrics": {
+      "type": "object",
+      "required": [
+        "equity_points",
+        "gross_loss",
+        "gross_profit",
+        "max_drawdown"
+      ],
+      "properties": {
+        "avg_trade": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "closed_trade_count_for_sharpe": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "daily_sharpe_basis": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "equity_points": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "gross_loss": {
+          "type": "number",
+          "format": "double"
+        },
+        "gross_profit": {
+          "type": "number",
+          "format": "double"
+        },
+        "max_drawdown": {
+          "type": "number",
+          "format": "double"
+        },
+        "profit_factor": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/NumberOrText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sharpe": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "sharpe_basis": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sharpe_daily_ann": {
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "sharpe_per_trade": {
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
+    },
+    "DryRunOpenPositionRow": {
+      "type": "object",
+      "required": [
+        "notional",
+        "quantity",
+        "window_label"
+      ],
+      "properties": {
+        "deployment_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entry_price": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "entry_time_remaining_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "event_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "experiment_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "market_side": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notional": {
+          "type": "number",
+          "format": "double"
+        },
+        "opened_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "quantity": {
+          "type": "number",
+          "format": "double"
+        },
+        "runtime_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "strategy_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trade_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window_label": {
+          "type": "string"
+        },
+        "window_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "DryRunPairingReport": {
+      "type": "object",
+      "required": [
+        "current_view_rows",
+        "fills_in_mixed_event_groups",
+        "mixed_event_groups",
+        "pair_key",
+        "side_aware_rows"
+      ],
+      "properties": {
+        "current_view_rows": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "fills_in_mixed_event_groups": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "mixed_event_groups": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "pair_key": {
+          "type": "string"
+        },
+        "side_aware_rows": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DryRunRuntimeEvidence": {
+      "type": "object",
+      "required": [
+        "basis",
+        "schema_version"
+      ],
+      "properties": {
+        "basis": {
+          "type": "string"
+        },
+        "events": {
+          "default": [],
+          "type": "array",
+          "items": true
+        },
+        "fills": {
+          "default": [],
+          "type": "array",
+          "items": true
+        },
+        "orders": {
+          "default": [],
+          "type": "array",
+          "items": true
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DryRunStrategyReport": {
+      "type": "object",
+      "required": [
+        "by_window",
+        "closed_trades",
+        "daily",
+        "daily_by_window",
+        "deployment_id",
+        "equity_curve",
+        "label",
+        "metrics",
+        "open_positions",
+        "recent_closed",
+        "runtime_mode",
+        "strategy_id",
+        "summary",
+        "symbols",
+        "symbols_by_window"
+      ],
+      "properties": {
+        "by_window": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunWindowRow"
+          }
+        },
+        "closed_trades": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunClosedTradeRow"
+          }
+        },
+        "daily": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunDailyRow"
+          }
+        },
+        "daily_by_window": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunDailyWindowRow"
+          }
+        },
+        "deployment_id": {
+          "type": "string"
+        },
+        "equity_curve": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunEquityPoint"
+          }
+        },
+        "execution_diagnostics": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DryRunExecutionDiagnostics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "experiment_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hourly": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunHourlyRow"
+          }
+        },
+        "hourly_by_window": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunHourlyWindowRow"
+          }
+        },
+        "label": {
+          "type": "string"
+        },
+        "metrics": {
+          "$ref": "#/definitions/DryRunMetrics"
+        },
+        "open_positions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunOpenPositionRow"
+          }
+        },
+        "recent_closed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunClosedTradeRow"
+          }
+        },
+        "runtime_mode": {
+          "type": "string"
+        },
+        "strategy_id": {
+          "type": "string"
+        },
+        "summary": {
+          "$ref": "#/definitions/DryRunSummary"
+        },
+        "symbols": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunSymbolRow"
+          }
+        },
+        "symbols_by_window": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/DryRunSymbolRow"
+          }
+        }
+      }
+    },
+    "DryRunSummary": {
+      "type": "object",
+      "required": [
+        "closed_trades",
+        "losses",
+        "open_exposure",
+        "open_positions",
+        "realized_pnl",
+        "total_fees",
+        "total_trades",
+        "win_rate_pct",
+        "wins"
+      ],
+      "properties": {
+        "closed_trades": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "latest_closed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "latest_opened_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "losses": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "open_exposure": {
+          "type": "number",
+          "format": "double"
+        },
+        "open_positions": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "realized_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "total_fees": {
+          "type": "number",
+          "format": "double"
+        },
+        "total_trades": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "win_rate_pct": {
+          "type": "number",
+          "format": "double"
+        },
+        "wins": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DryRunSymbolRow": {
+      "type": "object",
+      "required": [
+        "losses",
+        "net_pnl",
+        "symbol",
+        "trades",
+        "wins"
+      ],
+      "properties": {
+        "avg_entry": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "losses": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "net_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "symbol": {
+          "type": "string"
+        },
+        "trades": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "window_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "wins": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "DryRunWindowRow": {
+      "type": "object",
+      "required": [
+        "closed_trades",
+        "losses",
+        "realized_pnl",
+        "total_trades",
+        "win_rate_pct",
+        "window_label",
+        "wins"
+      ],
+      "properties": {
+        "avg_entry": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "avg_pnl": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "closed_trades": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "losses": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "max_entry_ttr_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "min_entry_ttr_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "realized_pnl": {
+          "type": "number",
+          "format": "double"
+        },
+        "total_trades": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        },
+        "win_rate_pct": {
+          "type": "number",
+          "format": "double"
+        },
+        "window_label": {
+          "type": "string"
+        },
+        "window_secs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "wins": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0.0
+        }
+      }
+    },
+    "NumberOrText": {
+      "anyOf": [
+        {
+          "type": "number",
+          "format": "double"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    }
+  }
+}

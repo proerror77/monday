@@ -1,0 +1,18 @@
+[package]
+name = "new-ploy-runner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bootstrap shell for the next-generation Ploy strategy runner"
+
+[features]
+default = ["lean-replay"]
+full = ["ploy-runner-host/full"]
+lean-backtest = ["ploy-runner-host/lean-backtest"]
+lean-replay = ["ploy-runner-host/lean-replay"]
+
+[dependencies]
+ploy-runner-host = { path = "../../crates/ploy-runner-host", default-features = false }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

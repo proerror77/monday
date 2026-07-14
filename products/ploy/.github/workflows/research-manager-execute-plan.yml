@@ -1,0 +1,118 @@
+name: Research Manager Execute Plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan_run_id:
+        description: "Research Trace Plan workflow run id"
+        required: true
+      plan_artifact_name:
+        description: "Plan artifact name; defaults to research-trace-plan-<plan_run_id>"
+        required: false
+        default: ""
+      mode:
+        description: "dry_run or execute"
+        required: true
+        default: "dry_run"
+      execute_ack:
+        description: "Required value for execute mode: execute-research-manager-plan"
+        required: false
+        default: ""
+      git_ref:
+        description: "Git ref for follow-up research dispatches"
+        required: true
+        default: "main"
+      snapshot_run_id:
+        description: "Optional snapshot run id for hosted walk-forward continuations"
+        required: false
+        default: ""
+      symbols:
+        description: "Comma-separated symbols for follow-up research dispatches"
+        required: false
+        default: "BTCUSDT,ETHUSDT,SOLUSDT"
+      stake_usd:
+        description: "Fixed notional for follow-up research dispatches"
+        required: true
+        default: "15"
+      chain_remaining:
+        description: "Maximum remaining chained hosted walk-forward dispatches"
+        required: true
+        default: "1"
+      issue_number:
+        description: "Optional issue to comment with executor summary"
+        required: false
+        default: ""
+
+concurrency:
+  group: research-manager-execute-plan-${{ github.event.inputs.plan_run_id }}
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+jobs:
+  execute-plan:
+    name: Build bounded Research Manager executor plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout orchestration code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git_ref }}
+
+      - name: Download Research Trace Plan artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PLAN_RUN_ID: ${{ github.event.inputs.plan_run_id }}
+          PLAN_ARTIFACT_NAME: ${{ github.event.inputs.plan_artifact_name }}
+        run: |
+          set -euo pipefail
+          artifact_name="${PLAN_ARTIFACT_NAME}"
+          if [ -z "${artifact_name}" ]; then
+            artifact_name="research-trace-plan-${PLAN_RUN_ID}"
+          fi
+          rm -rf artifacts/research-trace-plan
+          python3 scripts/download_github_artifact.py \
+            --run-id "${PLAN_RUN_ID}" \
+            --name "${artifact_name}" \
+            --output-dir artifacts/research-trace-plan \
+            --require research-trace-plan.json
+
+      - name: Build executor artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/research_manager_execute_plan.py \
+            --plan-json artifacts/research-trace-plan/research-trace-plan.json \
+            --output-dir artifacts/research-manager-executor \
+            --mode "${{ github.event.inputs.mode }}" \
+            --execute-ack "${{ github.event.inputs.execute_ack }}" \
+            --git-ref "${{ github.event.inputs.git_ref }}" \
+            --snapshot-run-id "${{ github.event.inputs.snapshot_run_id }}" \
+            --symbols "${{ github.event.inputs.symbols }}" \
+            --stake-usd "${{ github.event.inputs.stake_usd }}" \
+            --chain-remaining "${{ github.event.inputs.chain_remaining }}" \
+            --runtime-issue-number "${{ github.event.inputs.issue_number }}"
+          cat artifacts/research-manager-executor/research-manager-executor.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload executor artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-manager-executor-${{ github.run_id }}
+          path: artifacts/research-manager-executor
+          if-no-files-found: error
+
+      - name: Comment executor plan on issue
+        if: ${{ github.event.inputs.issue_number != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          gh issue comment "${ISSUE_NUMBER}" \
+            --body-file artifacts/research-manager-executor/research-manager-executor.md

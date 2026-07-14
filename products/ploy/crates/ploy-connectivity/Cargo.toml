@@ -1,0 +1,26 @@
+[package]
+name = "ploy-connectivity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ploy connectivity crate"
+
+[dependencies]
+alloy = { version = "1", default-features = false, features = ["signer-local"] }
+chrono.workspace = true
+futures = "0.3"
+ploy-market-contracts.workspace = true
+ploy-trading.workspace = true
+polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.0", features = ["clob", "heartbeats", "ws"] }
+rust_decimal.workspace = true
+rust_decimal_macros.workspace = true
+secrecy.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true
+serde_json.workspace = true

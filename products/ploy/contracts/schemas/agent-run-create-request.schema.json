@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentRunCreateRequest",
+  "type": "object",
+  "required": [
+    "autonomy_mode",
+    "budget_usd",
+    "max_turns",
+    "objective",
+    "run_contract",
+    "run_packet",
+    "strategy_profile",
+    "symbols",
+    "target_evidence"
+  ],
+  "properties": {
+    "autonomy_mode": {
+      "type": "string"
+    },
+    "budget_usd": {
+      "type": "number",
+      "format": "double"
+    },
+    "max_turns": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "objective": {
+      "type": "string"
+    },
+    "run_contract": {
+      "type": "string"
+    },
+    "run_packet": {
+      "type": "string"
+    },
+    "strategy_profile": {
+      "type": "string"
+    },
+    "symbols": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "target_evidence": {
+      "type": "string"
+    }
+  }
+}

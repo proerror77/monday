@@ -1,0 +1,27 @@
+[Unit]
+Description=Binance Spot Price Collector
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ploy
+Environment=BINANCE_PRICE_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT
+Environment=BINANCE_PRICE_COMMIT_BATCH_SIZE=25
+Environment=PLOY_DATABASE__URL=postgresql://postgres:postgres@localhost:5432/ploy
+ExecStartPre=/bin/sleep 7
+ExecStart=/opt/ploy/bin/ploy-runner collect-binance-price \
+    --symbols ${BINANCE_PRICE_SYMBOLS} \
+    --batch-size ${BINANCE_PRICE_COMMIT_BATCH_SIZE}
+Restart=always
+RestartSec=7
+StandardOutput=journal
+StandardError=journal
+
+MemoryHigh=256M
+MemoryMax=512M
+CPUQuota=35%
+OOMPolicy=kill
+
+[Install]
+WantedBy=multi-user.target

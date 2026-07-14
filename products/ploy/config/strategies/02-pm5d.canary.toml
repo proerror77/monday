@@ -1,0 +1,47 @@
+# ⚠️  LEGACY FORMAT — for old binary only. DO NOT use with StrategyRuntime.
+# ⚠️  New system uses 02-pm5d.unified.toml. Delete this after migration.
+#
+# Polymarket 5m directional strategy
+# Live canary profile — BTC only, derived from cross-window stability sweep.
+# Timing gates match backtest report (2026-03-26).
+
+[strategy]
+name = "pm_5m_directional"
+enabled = true
+mode = "predictive"
+
+[entry]
+symbols = ["BTCUSDT"]
+
+# Directional mode: log-normal probability model on Binance spot
+directional_mode = true
+directional_vol_floor = 0.0012
+
+# Probability model thresholds
+min_edge = 3.0           # 3% (adapter divides by 100)
+max_entry = 75.0         # 0.75 (adapter divides by 100)
+min_move = 0.05
+
+# Binance L2 confirmation
+min_obi_confirmation = 5.0
+
+# Position sizing
+shares_per_trade = 25.0
+max_positions = 3.0
+
+[timing]
+min_time_remaining = 60.0    # match backtest gate
+max_time_remaining = 300.0
+cooldown_secs = 60.0         # match backtest gate
+
+[risk]
+shares = 25.0
+max_positions = 3.0
+max_daily_trades = 0.0
+allowed_window_secs = [300, 900]
+use_kelly_sizing = true
+kelly_fraction_cap = 0.25
+
+[exit]
+exit_edge_floor_pct = 20.0
+exit_price_band_pct = 12.0

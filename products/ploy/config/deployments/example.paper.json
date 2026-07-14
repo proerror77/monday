@@ -1,0 +1,8 @@
+{
+  "deployment_id": "example.paper",
+  "bundle_id": "example",
+  "account_id": "paper:example",
+  "max_gross_exposure": "5.00",
+  "runtime_mode": "paper",
+  "desired_state": "running"
+}

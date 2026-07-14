@@ -1,0 +1,73 @@
+{
+  "mutations": [
+    {
+      "base_factor": "auto_settlement_conservative_settlement_edge",
+      "mutation_type": "add_near_strike_interaction",
+      "name": "llm_conservative_settlement_edge_near_strike"
+    },
+    {
+      "base_factor": "auto_settlement_conservative_settlement_edge",
+      "mutation_type": "add_capacity_gate",
+      "name": "llm_conservative_settlement_edge_capacity",
+      "feature": "entry_capacity_score"
+    },
+    {
+      "base_factor": "auto_settlement_conservative_settlement_edge",
+      "mutation_type": "add_feature_gate",
+      "name": "llm_conservative_settlement_edge_liquidity_gated_model_prob",
+      "feature": "side_model_prob"
+    },
+    {
+      "base_factor": "auto_settlement_conservative_settlement_edge",
+      "mutation_type": "add_feature_gate",
+      "name": "llm_conservative_settlement_edge_fair_prob_gate",
+      "feature": "side_fair_prob"
+    },
+    {
+      "base_factor": "auto_settlement_conservative_settlement_edge",
+      "mutation_type": "replace_denominator",
+      "name": "llm_conservative_settlement_edge_distance_scaled",
+      "denominator_feature": "side_distance_over_sigma",
+      "constant": 0.25
+    },
+    {
+      "base_factor": "auto_settlement_conservative_settlement_edge",
+      "mutation_type": "add_spread_penalty",
+      "name": "llm_conservative_settlement_edge_spread_penalty",
+      "constant": 0.01
+    },
+    {
+      "base_factor": "auto_settlement_full_depth_settlement_edge",
+      "mutation_type": "add_near_strike_interaction",
+      "name": "llm_full_depth_settlement_edge_near_strike"
+    },
+    {
+      "base_factor": "auto_settlement_full_depth_settlement_edge",
+      "mutation_type": "add_capacity_gate",
+      "name": "llm_full_depth_settlement_edge_capacity",
+      "feature": "entry_capacity_score"
+    },
+    {
+      "base_factor": "auto_settlement_full_depth_settlement_edge",
+      "mutation_type": "clip_or_squash",
+      "name": "llm_full_depth_settlement_edge_squashed"
+    },
+    {
+      "base_factor": "spread_adjusted_external_move",
+      "mutation_type": "add_near_strike_interaction",
+      "name": "llm_repricing_external_move_near_strike"
+    },
+    {
+      "base_factor": "spread_adjusted_external_move",
+      "mutation_type": "add_capacity_gate",
+      "name": "llm_repricing_external_move_capacity",
+      "feature": "entry_capacity_score"
+    },
+    {
+      "base_factor": "spread_adjusted_external_move",
+      "mutation_type": "change_time_window",
+      "name": "llm_repricing_external_move_rolling_30s",
+      "window": 30
+    }
+  ]
+}

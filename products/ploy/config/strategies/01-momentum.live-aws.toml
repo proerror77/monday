@@ -1,0 +1,39 @@
+# Momentum Strategy - AWS Live Production
+# Max $2 per trade, confirmatory mode
+
+[strategy]
+name = "momentum-live"
+enabled = true
+mode = "confirmatory"  # Safer: buy confirmed winners
+
+[entry]
+# Symbols to track (Binance tickers)
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+# Minimum CEX price move to trigger entry (%)
+min_move = 0.5  # 0.5% minimum momentum
+
+# Maximum entry price on Polymarket (cents)
+max_entry = 50.0  # Max 50 cents for ~$2 per trade with 4 shares
+
+# Minimum edge required (%)
+min_edge = 5.0  # 5% minimum edge
+
+[exit]
+# Hold to resolution (confirmatory mode)
+hold_to_resolution = true
+
+[timing]
+# Entry window before resolution (seconds) - confirmatory mode
+min_time_remaining = 60   # Min 1 minute left
+max_time_remaining = 300  # Max 5 minutes left
+
+[risk]
+# Shares per trade: 4 shares × 50¢ = $2 max
+shares = 4
+
+# Maximum concurrent positions
+max_positions = 3
+
+# Daily loss limit
+max_daily_loss = 20.0
