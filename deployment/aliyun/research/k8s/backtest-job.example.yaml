@@ -21,6 +21,8 @@ spec:
     spec:
       restartPolicy: Never
       automountServiceAccountToken: false
+      nodeSelector:
+        workload: backtest
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -53,11 +55,11 @@ spec:
                   fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
           resources:
             requests:
-              cpu: "4"
+              cpu: "3500m"
               memory: 8Gi
             limits:
-              cpu: "8"
-              memory: 16Gi
+              cpu: "3500m"
+              memory: 12Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

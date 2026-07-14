@@ -540,7 +540,7 @@ mod tests {
     use crate::{
         cli::{
             DatasetArgs, EngineChoice, EvaluateArgs, FeedbackLogArgs, PromoteArgs, RunMissionArgs,
-            SignDeploymentArgs,
+            SignDeploymentArgs, ValidationArgs,
         },
         data_mission, governance,
     };
@@ -849,15 +849,17 @@ mod tests {
                 max_new_iterations: None,
                 dataset: DatasetArgs {
                     dataset_manifest: db.with_extension("missing-manifest.json"),
-                    initial_train_rows: 1,
-                    validation_rows: 1,
-                    fold_count: 1,
-                    purge_rows: 0,
-                    embargo_rows: 0,
-                    sealed_holdout_rows: 1,
-                    fee_bps: 1.0,
-                    funding_bps: 0.0,
-                    latency_bps: 0.5,
+                    validation: ValidationArgs {
+                        initial_train_rows: 1,
+                        validation_rows: 1,
+                        fold_count: 1,
+                        purge_rows: 0,
+                        embargo_rows: 0,
+                        sealed_holdout_rows: 1,
+                        fee_bps: 1.0,
+                        funding_bps: 0.0,
+                        latency_bps: 0.5,
+                    },
                 },
             },
             loop_run_id: format!("loop-{mission_id}"),
@@ -1446,26 +1448,28 @@ mod tests {
         .unwrap();
         let dataset_args = DatasetArgs {
             dataset_manifest: manifest_path.clone(),
-            initial_train_rows: 100,
-            validation_rows: 96,
-            fold_count: 3,
-            purge_rows: 1,
-            embargo_rows: 1,
-            sealed_holdout_rows: 96,
-            fee_bps: 0.0,
-            funding_bps: 0.0,
-            latency_bps: 0.0,
+            validation: ValidationArgs {
+                initial_train_rows: 100,
+                validation_rows: 96,
+                fold_count: 3,
+                purge_rows: 1,
+                embargo_rows: 1,
+                sealed_holdout_rows: 96,
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                latency_bps: 0.0,
+            },
         };
         let research_rows = data_mission::load_research_rows(&manifest, 0.0, 0.0, 0.0).unwrap();
         let prepared = prepare_dataset(
             research_rows,
             &WalkForwardConfig {
-                initial_train_rows: dataset_args.initial_train_rows,
-                validation_rows: dataset_args.validation_rows,
-                fold_count: dataset_args.fold_count,
-                purge_rows: dataset_args.purge_rows,
-                embargo_rows: dataset_args.embargo_rows,
-                sealed_holdout_rows: dataset_args.sealed_holdout_rows,
+                initial_train_rows: dataset_args.validation.initial_train_rows,
+                validation_rows: dataset_args.validation.validation_rows,
+                fold_count: dataset_args.validation.fold_count,
+                purge_rows: dataset_args.validation.purge_rows,
+                embargo_rows: dataset_args.validation.embargo_rows,
+                sealed_holdout_rows: dataset_args.validation.sealed_holdout_rows,
             },
             format!("sealed:{}", manifest.manifest_id),
         )

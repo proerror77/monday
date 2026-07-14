@@ -1,0 +1,138 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: REPLACE_MISSION_JOB_NAME
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: monday-alpha-mission
+    app.kubernetes.io/part-of: monday
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: monday-alpha-mission
+        app.kubernetes.io/part-of: monday
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: backtest
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: alpha-mission
+          image: monday/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/alpha-harness"]
+          args:
+            - mission
+            - execute
+            - --work-dir
+            - /work
+            - --feature-url
+            - $(FEATURE_URL)
+            - --materialization-url
+            - $(MATERIALIZATION_URL)
+            - --materialization-sha256
+            - $(MATERIALIZATION_SHA256)
+            - --result-put-url
+            - $(RESULT_PUT_URL)
+            - --data-mission-id
+            - $(DATA_MISSION_ID)
+            - --mission-id
+            - $(MISSION_ID)
+            - --engine
+            - $(ENGINE)
+            - --seed
+            - $(SEED)
+            - --feature-fields
+            - $(FEATURE_FIELDS)
+            - --max-candidates
+            - "8"
+            - --max-expansions
+            - "40"
+            - --max-seconds
+            - "300"
+            - --max-new-iterations
+            - "8"
+            - --objective
+            - Find a cost-aware, out-of-sample LOB factor for BTCUSDT USD-M
+            - --hypothesis-scope
+            - Top-5 LOB imbalance and order-flow dynamics at a five-second horizon
+            - --initial-train-rows
+            - "800"
+            - --validation-rows
+            - "240"
+            - --fold-count
+            - "3"
+            - --purge-rows
+            - "5"
+            - --embargo-rows
+            - "5"
+            - --sealed-holdout-rows
+            - "300"
+            - --fee-bps
+            - "2.0"
+            - --funding-bps
+            - "0.0"
+            - --latency-bps
+            - "0.5"
+          env:
+            - name: FEATURE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: feature-url
+            - name: RESULT_PUT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: result-put-url
+            - name: MATERIALIZATION_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: materialization-url
+            - name: MATERIALIZATION_SHA256
+              value: REPLACE_MATERIALIZATION_SHA256
+            - name: DATA_MISSION_ID
+              value: REPLACE_DATA_MISSION_ID
+            - name: MISSION_ID
+              value: REPLACE_MISSION_ID
+            - name: ENGINE
+              value: REPLACE_ENGINE
+            - name: FEATURE_FIELDS
+              value: REPLACE_FEATURE_FIELDS
+            - name: SEED
+              value: "7"
+          resources:
+            requests:
+              cpu: "3500m"
+              memory: 8Gi
+            limits:
+              cpu: "3500m"
+              memory: 12Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: work
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: tmp
+          emptyDir: {}

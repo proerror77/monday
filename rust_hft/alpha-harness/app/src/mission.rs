@@ -56,19 +56,19 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
         bail!("mission dataset id does not match the supplied manifest");
     }
     let rows = manifest.load_rows(
-        args.dataset.fee_bps,
-        args.dataset.funding_bps,
-        args.dataset.latency_bps,
+        args.dataset.validation.fee_bps,
+        args.dataset.validation.funding_bps,
+        args.dataset.validation.latency_bps,
     )?;
     let dataset = prepare_dataset(
         rows,
         &WalkForwardConfig {
-            initial_train_rows: args.dataset.initial_train_rows,
-            validation_rows: args.dataset.validation_rows,
-            fold_count: args.dataset.fold_count,
-            purge_rows: args.dataset.purge_rows,
-            embargo_rows: args.dataset.embargo_rows,
-            sealed_holdout_rows: args.dataset.sealed_holdout_rows,
+            initial_train_rows: args.dataset.validation.initial_train_rows,
+            validation_rows: args.dataset.validation.validation_rows,
+            fold_count: args.dataset.validation.fold_count,
+            purge_rows: args.dataset.validation.purge_rows,
+            embargo_rows: args.dataset.validation.embargo_rows,
+            sealed_holdout_rows: args.dataset.validation.sealed_holdout_rows,
         },
         format!("sealed:{}", manifest.manifest_id()),
     )?;

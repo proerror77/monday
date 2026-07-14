@@ -1,4 +1,4 @@
-use crate::{data_mission, governance, loop_control, mission};
+use crate::{data_mission, governance, loop_control, mission, mission_runner};
 use alpha_store::AlphaStore;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -57,6 +57,7 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum MissionCommand {
     Create(CreateMissionArgs),
+    Execute(Box<ExecuteMissionArgs>),
     Run(RunMissionArgs),
     Resume(RunMissionArgs),
     Status(MissionStatusArgs),
@@ -138,6 +139,12 @@ pub struct MissionStatusArgs {
 pub struct DatasetArgs {
     #[arg(long)]
     pub dataset_manifest: PathBuf,
+    #[command(flatten)]
+    pub validation: ValidationArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ValidationArgs {
     #[arg(long, default_value_t = 200)]
     pub initial_train_rows: usize,
     #[arg(long, default_value_t = 64)]
@@ -156,6 +163,44 @@ pub struct DatasetArgs {
     pub funding_bps: f64,
     #[arg(long, default_value_t = 0.5)]
     pub latency_bps: f64,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ExecuteMissionArgs {
+    #[arg(long)]
+    pub work_dir: PathBuf,
+    #[arg(long)]
+    pub feature_url: String,
+    #[arg(long)]
+    pub materialization_url: String,
+    #[arg(long)]
+    pub materialization_sha256: String,
+    #[arg(long)]
+    pub result_put_url: String,
+    #[arg(long)]
+    pub data_mission_id: String,
+    #[arg(long)]
+    pub mission_id: String,
+    #[arg(long, value_enum)]
+    pub engine: EngineChoice,
+    #[arg(long, value_delimiter = ',')]
+    pub feature_fields: Vec<String>,
+    #[arg(long, default_value_t = 7)]
+    pub seed: u64,
+    #[arg(long, default_value_t = 8)]
+    pub max_candidates: usize,
+    #[arg(long, default_value_t = 40)]
+    pub max_expansions: u64,
+    #[arg(long, default_value_t = 300)]
+    pub max_seconds: u64,
+    #[arg(long, default_value_t = 8)]
+    pub max_new_iterations: usize,
+    #[arg(long, default_value = "Find a cost-aware, out-of-sample LOB factor")]
+    pub objective: String,
+    #[arg(long, default_value = "LOB imbalance and order-flow dynamics")]
+    pub hypothesis_scope: String,
+    #[command(flatten)]
+    pub validation: ValidationArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, serde::Serialize)]
@@ -397,6 +442,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 store.create_mission(&mission)?;
                 print_json(&mission)
             }
+            MissionCommand::Execute(args) => mission_runner::execute(*args),
             MissionCommand::Run(args) => mission::run_mission(args, false),
             MissionCommand::Resume(args) => mission::run_mission(args, true),
             MissionCommand::Status(args) => mission::mission_status(args),
@@ -510,6 +556,30 @@ mod tests {
             "BTCUSDT",
             "--artifact-dir",
             "artifacts",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "mission",
+            "execute",
+            "--work-dir",
+            "work",
+            "--feature-url",
+            "features.jsonl",
+            "--materialization-url",
+            "materialization.json",
+            "--materialization-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--result-put-url",
+            "results.zip",
+            "--data-mission-id",
+            "data-1",
+            "--mission-id",
+            "mission-1",
+            "--engine",
+            "mcts",
+            "--feature-fields",
+            "book_imbalance_top5,ofi_top5",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([

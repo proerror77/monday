@@ -105,10 +105,13 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "hft-collector",
+ "hft-research-manifest",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "zip 6.0.0",
 ]
 
 [[package]]

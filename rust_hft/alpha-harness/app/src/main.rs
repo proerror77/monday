@@ -3,6 +3,7 @@ mod data_mission;
 mod governance;
 mod loop_control;
 mod mission;
+mod mission_runner;
 
 use clap::Parser;
 
