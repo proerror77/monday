@@ -3,7 +3,9 @@ use crate::{
     CandidateEvaluation, CandidateEvaluator, EngineProposal, EvaluationMetrics,
     FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
 };
-use alpha_domain::{CandidateArtifact, SEALED_HOLDOUT_EVALUATOR_VERSION};
+use alpha_domain::{
+    CandidateArtifact, ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
+};
 pub use alpha_domain::{
     FormulaEvaluatorConfig, MultipleTestingAdjustment, WALK_FORWARD_EVALUATOR_VERSION,
 };
@@ -75,9 +77,14 @@ impl FormulaEvaluator {
         rows: &[ResearchRow],
         signals: &[f64],
         ranges: &[std::ops::Range<usize>],
+        evaluator_version: &str,
     ) -> PredictiveGateResult {
         let predictive = predictive_metrics(rows, signals, ranges);
         let mut failures = Vec::new();
+        let require_icir = matches!(
+            evaluator_version,
+            WALK_FORWARD_EVALUATOR_VERSION | ONNX_WALK_FORWARD_EVALUATOR_VERSION
+        );
         if predictive
             .time_series_ic
             .is_none_or(|ic| ic < self.config.min_time_series_ic)
@@ -96,7 +103,7 @@ impl FormulaEvaluator {
                 self.config.min_time_series_rank_ic
             ));
         }
-        if ranges.len() > 1
+        if require_icir
             && predictive
                 .time_series_icir
                 .is_none_or(|icir| icir < self.config.min_time_series_icir)
@@ -106,7 +113,7 @@ impl FormulaEvaluator {
                 self.config.min_time_series_icir
             ));
         }
-        if ranges.len() > 1
+        if require_icir
             && predictive
                 .time_series_rank_icir
                 .is_none_or(|icir| icir < self.config.min_time_series_rank_icir)
@@ -192,7 +199,7 @@ impl FormulaEvaluator {
         }
 
         // Position mapping requires this token, so predictive gates cannot be skipped.
-        let mut predictive_stage = self.predictive_gates(rows, signals, &ranges);
+        let mut predictive_stage = self.predictive_gates(rows, signals, &ranges, evaluator_version);
 
         let mut fold_metrics = Vec::with_capacity(ranges.len());
         let mut all_returns = Vec::new();
@@ -724,7 +731,12 @@ mod tests {
             .map(|fold| fold.validation.clone())
             .collect::<Vec<_>>();
 
-        let predictive_stage = evaluator.predictive_gates(context.rows(), &signals, &ranges);
+        let predictive_stage = evaluator.predictive_gates(
+            context.rows(),
+            &signals,
+            &ranges,
+            WALK_FORWARD_EVALUATOR_VERSION,
+        );
 
         assert_eq!(predictive_stage.predictive.time_series_ic, Some(1.0));
         assert!(predictive_stage
@@ -740,6 +752,45 @@ mod tests {
             pearson_correlation(&[1.0e-12, 2.0e-12, 3.0e-12], &[2.0e-12, 4.0e-12, 6.0e-12],),
             Some(1.0)
         );
+    }
+
+    #[test]
+    fn single_fold_walk_forward_records_missing_icir_as_a_failed_evaluation() {
+        let input = prepare_dataset(
+            rows(0.0),
+            &WalkForwardConfig {
+                initial_train_rows: 200,
+                validation_rows: 64,
+                fold_count: 1,
+                purge_rows: 1,
+                embargo_rows: 1,
+                sealed_holdout_rows: 64,
+            },
+            "single-fold",
+        )
+        .unwrap();
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let result = evaluator
+            .evaluate(
+                &proposal(FactorAst::Terminal(FactorTerminal::Field(
+                    "signal".to_string(),
+                ))),
+                &input.engine_context(),
+            )
+            .unwrap();
+
+        assert!(!result.passed);
+        assert_eq!(result.metrics.predictive.time_series_icir, None);
+        assert_eq!(result.metrics.predictive.time_series_rank_icir, None);
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.starts_with("time-series ICIR")));
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.starts_with("time-series RankICIR")));
+        result.validate().unwrap();
     }
 
     #[test]

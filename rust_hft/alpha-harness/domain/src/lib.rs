@@ -238,6 +238,10 @@ fn optional_config_f64(spec: &serde_json::Value, key: &str) -> Result<Option<f64
         .transpose()
 }
 
+fn missing_evaluation_metric() -> f64 {
+    f64::NAN
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FoldEvaluationMetrics {
     pub fold_index: usize,
@@ -246,6 +250,7 @@ pub struct FoldEvaluationMetrics {
     pub mean_net_return: f64,
     pub cumulative_net_return: f64,
     pub max_drawdown: f64,
+    #[serde(default = "missing_evaluation_metric")]
     pub net_sharpe: f64,
     pub raw_score: f64,
 }
@@ -258,7 +263,7 @@ pub struct FoldPredictiveMetrics {
     pub time_series_rank_ic: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PredictiveMetrics {
     pub row_count: usize,
     pub time_series_ic: Option<f64>,
@@ -349,12 +354,14 @@ impl PredictiveMetrics {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationMetrics {
+    #[serde(default)]
     pub predictive: PredictiveMetrics,
     pub row_count: usize,
     pub trade_count: usize,
     pub mean_net_return: f64,
     pub cumulative_net_return: f64,
     pub max_drawdown: f64,
+    #[serde(default = "missing_evaluation_metric")]
     pub net_sharpe: f64,
     pub raw_score: f64,
     pub adjusted_score: f64,
@@ -2347,6 +2354,23 @@ mod tests {
             },
         };
         assert!(evaluation.validate().is_ok());
+
+        let mut legacy_value = serde_json::to_value(&evaluation).unwrap();
+        legacy_value["evaluator_version"] = serde_json::json!("purged-walk-forward-v2");
+        let legacy_metrics = legacy_value["metrics"].as_object_mut().unwrap();
+        legacy_metrics.remove("predictive");
+        legacy_metrics.remove("net_sharpe");
+        for fold in legacy_metrics["folds"].as_array_mut().unwrap() {
+            fold.as_object_mut().unwrap().remove("net_sharpe");
+        }
+        let legacy: CandidateEvaluation = serde_json::from_value(legacy_value).unwrap();
+        assert_eq!(legacy.score, adjusted_score);
+        assert!(legacy.metrics.net_sharpe.is_nan());
+        assert!(legacy.metrics.folds[0].net_sharpe.is_nan());
+        assert_eq!(
+            legacy.validate(),
+            Err(DomainError::InvalidEvaluationEvidence)
+        );
 
         let mut tampered_predictive = evaluation.clone();
         tampered_predictive.metrics.predictive.time_series_ic = Some(0.9);

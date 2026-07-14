@@ -843,9 +843,13 @@ impl AlphaStore {
             Err(StoreError::NotFound) => return Ok(false),
             Err(error) => return Err(error),
         };
-        let evaluation: CandidateEvaluation =
-            serde_json::from_value(stored.payload.clone()).map_err(serialization_error)?;
-        evaluation.validate().map_err(domain_error)?;
+        let Ok(evaluation) = serde_json::from_value::<CandidateEvaluation>(stored.payload.clone())
+        else {
+            return Ok(false);
+        };
+        if evaluation.validate().is_err() {
+            return Ok(false);
+        }
         let expected_config = FormulaEvaluatorConfig::for_mission(mission).map_err(domain_error)?;
         Ok(candidate_iteration.mission_id == mission.mission_id
             && candidate_iteration.candidate_artifact_id.as_deref() == Some(candidate_id)
@@ -2726,6 +2730,41 @@ mod tests {
             store.get_strategy_bundle("bundle:candidate-1"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn malformed_walk_forward_evidence_is_not_canonical() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let mission = mission();
+        store.create_mission(&mission).unwrap();
+        let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
+            "signal".to_string(),
+        )));
+        let mut iteration = iteration();
+        iteration.evaluation_artifact_id = Some("evaluation-1".to_string());
+        let mut payload = walk_forward_evaluation();
+        payload["metrics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("predictive");
+        let evaluation = EvaluationRecord {
+            evaluation_id: "evaluation-1".to_string(),
+            mission_id: mission.mission_id.clone(),
+            candidate_id: "candidate-1".to_string(),
+            payload,
+            created_at: Utc::now(),
+        };
+        store
+            .append_iteration(
+                &iteration,
+                Some(("candidate-1", &candidate)),
+                Some(&evaluation),
+            )
+            .unwrap();
+
+        assert!(!store
+            .has_canonical_walk_forward_evidence(&mission, "candidate-1", &iteration, &candidate,)
+            .unwrap());
     }
 
     #[test]

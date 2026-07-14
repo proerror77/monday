@@ -68,16 +68,6 @@ fn validated_walk_forward_candidates_in_lineage(
         ) else {
             continue;
         };
-        let Some(candidate) = lineage
-            .candidates
-            .iter()
-            .find(|candidate| candidate.candidate_id == candidate_id)
-        else {
-            continue;
-        };
-        if !matches!(candidate.artifact, CandidateArtifact::Formula(_)) {
-            continue;
-        }
         let Some(stored) = lineage.evaluations.iter().find(|stored| {
             stored.record.evaluation_id == evaluation_id
                 && stored.record.candidate_id == candidate_id
@@ -767,7 +757,13 @@ fn read_trusted_attribution_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alpha_domain::{sign_runtime_attribution_event, AllowedIntentType};
+    use alpha_domain::{
+        sign_runtime_attribution_event, AllowedIntentType, MissionCompletionPolicy,
+        ResearchMission, SearchBudget, TensorElementType, TensorSpec, ValidatorMode,
+        LOB_ONNX_PREPROCESSING_VERSION,
+    };
+    use alpha_engine::evaluation::ResearchRow;
+    use alpha_store::{StoredCandidate, StoredEvaluation};
     use chrono::Duration;
 
     fn live_small_envelope() -> DeploymentEnvelope {
@@ -838,6 +834,57 @@ mod tests {
         (promotion, bundle)
     }
 
+    fn research_mission() -> ResearchMission {
+        let now = Utc::now();
+        ResearchMission {
+            mission_id: "mission-1".to_string(),
+            objective: "validate ONNX governance".to_string(),
+            hypothesis_scope: "LOB flow".to_string(),
+            mutable_scope: vec!["model".to_string()],
+            dataset_manifest_id: serde_json::from_value(serde_json::json!("dataset-1")).unwrap(),
+            baseline_artifact_id: None,
+            validation_mode: ValidatorMode::MissionValidator,
+            validator_spec: serde_json::json!({}),
+            search_budget: SearchBudget {
+                max_candidates: 1,
+                max_expansions: 1,
+                max_tokens: 0,
+                max_seconds: 30,
+            },
+            completion_policy: MissionCompletionPolicy::default(),
+            prompt_snapshot_id: None,
+            search_policy_snapshot_id: "policy-1".to_string(),
+            status: MissionStatus::Pending,
+            terminal_reason: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn onnx_candidate() -> CandidateArtifact {
+        CandidateArtifact::OnnxModel(OnnxModelCandidate {
+            artifact: serde_json::from_value(serde_json::json!({
+                "uri": "model.onnx",
+                "content_type": "application/onnx",
+                "checksum": "a".repeat(64),
+            }))
+            .unwrap(),
+            byte_len: 1,
+            opset: 17,
+            preprocessing_version: LOB_ONNX_PREPROCESSING_VERSION.to_string(),
+            inputs: vec![TensorSpec {
+                name: "lob".to_string(),
+                element_type: TensorElementType::Float32,
+                dimensions: vec![Some(1), Some(4), Some(1), Some(1)],
+            }],
+            output: TensorSpec {
+                name: "signal".to_string(),
+                element_type: TensorElementType::Float32,
+                dimensions: vec![Some(1), Some(1)],
+            },
+        })
+    }
+
     #[test]
     fn promotion_idempotency_requires_an_exact_replay_binding() {
         let (promotion, bundle) = promotion_fixture();
@@ -870,6 +917,75 @@ mod tests {
         assert_eq!(
             sealed_evaluation_revision_id("candidate-1", SEALED_HOLDOUT_EVALUATOR_VERSION),
             "sealed-evaluation:sealed-holdout-v3:candidate-1"
+        );
+    }
+
+    #[test]
+    fn canonical_onnx_walk_forward_candidate_reaches_governance() {
+        let mission = research_mission();
+        let start = Utc::now();
+        let rows = (0..64)
+            .map(|index| ResearchRow {
+                available_time: start + Duration::seconds(index),
+                signal: if index % 2 == 0 { 1.0 } else { -1.0 },
+                features: BTreeMap::new(),
+                label: if index % 2 == 0 { 0.01 } else { -0.01 },
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                latency_bps: 0.0,
+            })
+            .collect::<Vec<_>>();
+        let signals = rows.iter().map(|row| row.signal).collect::<Vec<_>>();
+        let evaluation = FormulaEvaluator::for_mission(&mission)
+            .unwrap()
+            .evaluate_onnx_signals(&rows, &signals, [0..32, 32..64], false)
+            .unwrap();
+        assert!(evaluation.passed);
+        let created_at = Utc::now();
+        let lineage = MissionLineage {
+            mission,
+            iterations: vec![ResearchIteration {
+                iteration_id: "iteration-1".to_string(),
+                mission_id: "mission-1".to_string(),
+                parent_candidate_ids: vec![],
+                engine: EngineKind::ManualSeed,
+                hypothesis: "ONNX model predicts next return".to_string(),
+                candidate_artifact_id: Some("candidate-1".to_string()),
+                evaluation_artifact_id: Some("evaluation-1".to_string()),
+                budget_usage: SearchBudgetUsage {
+                    candidates: 1,
+                    expansions: 1,
+                    tokens: 0,
+                    elapsed_ms: 1,
+                },
+                verdict: IterationVerdict::Keep,
+                failure_class: None,
+                failure_explanation: None,
+                created_at,
+            }],
+            candidates: vec![StoredCandidate {
+                candidate_id: "candidate-1".to_string(),
+                mission_id: "mission-1".to_string(),
+                iteration_id: "iteration-1".to_string(),
+                artifact: onnx_candidate(),
+                content_hash: "a".repeat(64),
+                created_at,
+            }],
+            evaluations: vec![StoredEvaluation {
+                record: EvaluationRecord {
+                    evaluation_id: "evaluation-1".to_string(),
+                    mission_id: "mission-1".to_string(),
+                    candidate_id: "candidate-1".to_string(),
+                    payload: serde_json::to_value(evaluation).unwrap(),
+                    created_at,
+                },
+                content_hash: "b".repeat(64),
+            }],
+        };
+
+        assert_eq!(
+            validated_walk_forward_candidates_in_lineage(&lineage).unwrap(),
+            vec!["candidate-1".to_string()]
         );
     }
 

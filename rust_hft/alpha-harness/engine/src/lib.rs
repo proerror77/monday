@@ -537,6 +537,8 @@ fn historical_observations(
             .ok_or_else(|| {
                 EngineError::Evaluation("historical evaluation is missing".to_string())
             })?;
+        let evaluation =
+            historical_evaluation(&evaluation.record.payload).map_err(EngineError::Evaluation)?;
         observations.push(HistoricalObservation {
             proposal: EngineProposal {
                 candidate_id: candidate_id.to_string(),
@@ -546,11 +548,27 @@ fn historical_observations(
                 tokens: 0,
                 elapsed_ms: 0,
             },
-            evaluation: serde_json::from_value(evaluation.record.payload.clone())
-                .map_err(|error| EngineError::Evaluation(error.to_string()))?,
+            evaluation,
         });
     }
     Ok(observations)
+}
+
+#[cfg(feature = "kernel")]
+fn historical_evaluation(payload: &serde_json::Value) -> Result<CandidateEvaluation, String> {
+    let evaluation: CandidateEvaluation =
+        serde_json::from_value(payload.clone()).map_err(|error| error.to_string())?;
+    // These exact prior-release schemas may be replayed for search state only.
+    let pre_predictive_schema = matches!(
+        evaluation.evaluator_version.as_str(),
+        "purged-walk-forward-v2" | "onnx-purged-walk-forward-v1"
+    );
+    if !pre_predictive_schema {
+        evaluation
+            .validate()
+            .map_err(|error| format!("historical evaluation is invalid: {error}"))?;
+    }
+    Ok(evaluation)
 }
 
 #[cfg(feature = "kernel")]
@@ -756,6 +774,43 @@ mod tests {
             "holdout-1",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn historical_evaluation_compatibility_is_limited_to_pre_predictive_versions() {
+        fn remove_predictive_fields(payload: &mut serde_json::Value) {
+            let metrics = payload["metrics"].as_object_mut().unwrap();
+            metrics.remove("predictive");
+            metrics.remove("net_sharpe");
+            for fold in metrics["folds"].as_array_mut().unwrap() {
+                fold.as_object_mut().unwrap().remove("net_sharpe");
+            }
+        }
+
+        let input = dataset();
+        let evaluation = PassingEvaluator
+            .evaluate(
+                &EngineProposal {
+                    candidate_id: "candidate-1".to_string(),
+                    hypothesis: "fixture".to_string(),
+                    artifact: CandidateArtifact::Program(serde_json::json!({"op": "identity"})),
+                    expansions: 1,
+                    tokens: 0,
+                    elapsed_ms: 1,
+                },
+                &input.engine_context(),
+            )
+            .unwrap();
+        let mut malformed_current = serde_json::to_value(&evaluation).unwrap();
+        remove_predictive_fields(&mut malformed_current);
+        assert!(historical_evaluation(&malformed_current).is_err());
+
+        let mut legacy = malformed_current;
+        legacy["evaluator_version"] = serde_json::json!("purged-walk-forward-v2");
+        let restored = historical_evaluation(&legacy).unwrap();
+        assert_eq!(restored.score, evaluation.score);
+        assert!(restored.metrics.net_sharpe.is_nan());
+        assert!(restored.validate().is_err());
     }
 
     #[test]
