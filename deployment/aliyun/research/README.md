@@ -27,13 +27,13 @@ The storage authority remains split deliberately:
 - DuckDB has one writer and owns research/control-plane lineage. Parallel Pods
   must never open the same DuckDB file for writes.
 
-The first Agentic Alpha path uses
-`rust_hft/scripts/research/lob_pit_materializer.py` to validate the raw segment,
-replay Binance's Spot or USD-M sequence contract, and emit one-second
-point-in-time rows. It rejects missing `_SUCCESS` markers, SHA-256 mismatch,
-sequence gaps, unseeded diffs, and closing checkpoints that do not match the
-replayed full book. Forward-mid labels are only exposed at the future bucket's
-availability time.
+The first Agentic Alpha path uses the Rust `lob-pit-materializer` binary to
+validate the raw segment, replay Binance's Spot or USD-M sequence contract, and
+emit one-second point-in-time rows. It rejects missing `_SUCCESS` markers,
+SHA-256 mismatch, sequence gaps, unseeded diffs, and closing checkpoints that
+do not match the replayed full book. Feature rows and the materialization report
+are published to SHA-256-named immutable paths. Forward-mid labels are only
+exposed at the future bucket's availability time.
 
 No exchange credential belongs in this namespace. Research Pods receive public
 datasets, ClickHouse read credentials, and result-write authority only.
