@@ -1398,11 +1398,13 @@ impl AlphaStore {
                 serde_json::from_str(&candidate_json).map_err(serialization_error)?;
             let evaluator_matches_artifact = matches!(
                 (&candidate_artifact, evaluator_version),
-                (CandidateArtifact::Formula(_), SEALED_HOLDOUT_EVALUATOR_VERSION)
-                    | (
-                        CandidateArtifact::OnnxModel(_),
-                        ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
-                    )
+                (
+                    CandidateArtifact::Formula(_),
+                    SEALED_HOLDOUT_EVALUATOR_VERSION
+                ) | (
+                    CandidateArtifact::OnnxModel(_),
+                    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+                )
             );
             let candidate_iteration: ResearchIteration = read_json_row(
                 &self.connection,
