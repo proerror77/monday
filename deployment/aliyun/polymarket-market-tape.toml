@@ -12,7 +12,7 @@ record_market_updates_event_scoped_quotes = true
 skip_settlement_exits = true
 
 [strategy]
-symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "HYPEUSDT", "BNBUSDT"]
 
 [reference_data]
 capture_sports_state = false
