@@ -2,11 +2,13 @@
 
 use alpha_domain::{
     canonical_json_hash, AllowedIntentType, AttributionKind, AttributionMode, CandidateArtifact,
-    CandidateEvaluation, DeploymentEnvelope, EngineKind, FormulaEvaluatorConfig, LearningDirective,
-    LiveSmallEligibilityEvidence, LoopRun, MissionStatus, MissionTerminalReason, PromotionRecord,
-    ResearchIteration, ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
-    SearchPolicyRevision, SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
-    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    CandidateEvaluation, DeploymentEnvelope, EngineKind, FormulaEvaluatorConfig, IterationVerdict,
+    LearningDirective, LiveSmallEligibilityEvidence, LoopRun, MissionStatus, MissionTerminalReason,
+    PromotionRecord, ResearchIteration, ResearchMission, RuntimeAttributionEvent,
+    SearchBudgetUsage, SearchPolicyRevision, SignedDeploymentEnvelope, StrategyBundle,
+    StrategyBundleArtifact, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
+    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    WALK_FORWARD_EVALUATOR_VERSION,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
@@ -817,6 +819,45 @@ impl AlphaStore {
         )
     }
 
+    fn has_canonical_walk_forward_evidence(
+        &self,
+        mission: &ResearchMission,
+        candidate_id: &str,
+        candidate_iteration: &ResearchIteration,
+        candidate_artifact: &CandidateArtifact,
+    ) -> Result<bool, StoreError> {
+        let expected_version = match candidate_artifact {
+            CandidateArtifact::Formula(_) => WALK_FORWARD_EVALUATOR_VERSION,
+            CandidateArtifact::OnnxModel(_) => ONNX_WALK_FORWARD_EVALUATOR_VERSION,
+            _ => return Ok(false),
+        };
+        let Some(evaluation_id) = candidate_iteration.evaluation_artifact_id.as_deref() else {
+            return Ok(false);
+        };
+        let stored = match read_json_row::<EvaluationRecord>(
+            &self.connection,
+            "SELECT payload_json, content_hash FROM evaluation_artifacts WHERE evaluation_id = ?",
+            evaluation_id,
+        ) {
+            Ok(stored) => stored,
+            Err(StoreError::NotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let evaluation: CandidateEvaluation =
+            serde_json::from_value(stored.payload.clone()).map_err(serialization_error)?;
+        evaluation.validate().map_err(domain_error)?;
+        let expected_config = FormulaEvaluatorConfig::for_mission(mission).map_err(domain_error)?;
+        Ok(candidate_iteration.mission_id == mission.mission_id
+            && candidate_iteration.candidate_artifact_id.as_deref() == Some(candidate_id)
+            && candidate_iteration.verdict == IterationVerdict::Keep
+            && stored.mission_id == mission.mission_id
+            && stored.candidate_id == candidate_id
+            && stored.evaluation_id == evaluation_id
+            && evaluation.passed
+            && evaluation.evaluator_version == expected_version
+            && evaluation.formula_config().map_err(domain_error)? == expected_config)
+    }
+
     pub fn promote_candidate(
         &mut self,
         bundle: &StrategyBundle,
@@ -865,6 +906,16 @@ impl AlphaStore {
         if mission.dataset_manifest_id != bundle.dataset_manifest_id {
             return Err(StoreError::Domain(
                 "promotion dataset does not match mission".to_string(),
+            ));
+        }
+        if !self.has_canonical_walk_forward_evidence(
+            &mission,
+            &bundle.candidate_id,
+            &candidate_iteration,
+            &candidate_artifact,
+        )? {
+            return Err(StoreError::Domain(
+                "promotion candidate lacks canonical walk-forward evidence".to_string(),
             ));
         }
         let sealed = self.get_registry_revision(&promotion.sealed_evaluation_id)?;
@@ -1343,6 +1394,12 @@ impl AlphaStore {
             if candidate_iteration.engine == EngineKind::OfflineReinforcementLearning
                 || candidate_iteration.candidate_artifact_id.as_deref()
                     != Some(revision.asset_id.as_str())
+                || !self.has_canonical_walk_forward_evidence(
+                    &mission,
+                    &revision.asset_id,
+                    &candidate_iteration,
+                    &candidate_artifact,
+                )?
             {
                 continue;
             }
@@ -2375,41 +2432,24 @@ mod tests {
         iteration
     }
 
-    fn sealed_evaluation() -> serde_json::Value {
+    fn evaluation_fixture(evaluator_version: &str, fold_count: usize) -> serde_json::Value {
         let config = FormulaEvaluatorConfig::for_trials(3).unwrap();
         let raw_score = 4.0;
         let adjusted_score = config.adjusted_score(raw_score).unwrap();
-        serde_json::json!({
-            "passed": true,
-            "score": adjusted_score,
-            "failure_reasons": [],
-            "evaluator_version": SEALED_HOLDOUT_EVALUATOR_VERSION,
-            "evaluator_config": config,
-            "metrics": {
-                "predictive": {
+        let predictive_folds = (1..=fold_count)
+            .map(|fold_index| {
+                serde_json::json!({
+                    "fold_index": fold_index,
                     "row_count": 30,
                     "time_series_ic": 0.1,
-                    "time_series_rank_ic": 0.1,
-                    "time_series_icir": null,
-                    "time_series_rank_icir": null,
-                    "positive_ic_ratio": 1.0,
-                    "folds": [{
-                        "fold_index": 1,
-                        "row_count": 30,
-                        "time_series_ic": 0.1,
-                        "time_series_rank_ic": 0.1
-                    }]
-                },
-                "row_count": 30,
-                "trade_count": 30,
-                "mean_net_return": 0.001,
-                "cumulative_net_return": 0.03,
-                "max_drawdown": 0.01,
-                "net_sharpe": 1.0,
-                "raw_score": raw_score,
-                "adjusted_score": adjusted_score,
-                "folds": [{
-                    "fold_index": 1,
+                    "time_series_rank_ic": 0.1
+                })
+            })
+            .collect::<Vec<_>>();
+        let trading_folds = (1..=fold_count)
+            .map(|fold_index| {
+                serde_json::json!({
+                    "fold_index": fold_index,
                     "row_count": 30,
                     "trade_count": 30,
                     "mean_net_return": 0.001,
@@ -2417,9 +2457,45 @@ mod tests {
                     "max_drawdown": 0.01,
                     "net_sharpe": 1.0,
                     "raw_score": raw_score
-                }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let icir = (fold_count > 1).then_some(0.1 / f64::EPSILON);
+        serde_json::json!({
+            "passed": true,
+            "score": adjusted_score,
+            "failure_reasons": [],
+            "evaluator_version": evaluator_version,
+            "evaluator_config": config,
+            "metrics": {
+                "predictive": {
+                    "row_count": fold_count * 30,
+                    "time_series_ic": 0.1,
+                    "time_series_rank_ic": 0.1,
+                    "time_series_icir": icir,
+                    "time_series_rank_icir": icir,
+                    "positive_ic_ratio": 1.0,
+                    "folds": predictive_folds
+                },
+                "row_count": fold_count * 30,
+                "trade_count": fold_count * 30,
+                "mean_net_return": 0.001,
+                "cumulative_net_return": fold_count as f64 * 0.03,
+                "max_drawdown": 0.01,
+                "net_sharpe": 1.0,
+                "raw_score": raw_score,
+                "adjusted_score": adjusted_score,
+                "folds": trading_folds
             }
         })
+    }
+
+    fn sealed_evaluation() -> serde_json::Value {
+        evaluation_fixture(SEALED_HOLDOUT_EVALUATOR_VERSION, 1)
+    }
+
+    fn walk_forward_evaluation() -> serde_json::Value {
+        evaluation_fixture(WALK_FORWARD_EVALUATOR_VERSION, 2)
     }
 
     fn persist_formula_promotion(
@@ -2434,16 +2510,35 @@ mod tests {
         now: DateTime<Utc>,
         engine: EngineKind,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
+        try_persist_formula_promotion_with_evidence(store, now, engine, true)
+    }
+
+    fn try_persist_formula_promotion_with_evidence(
+        store: &mut AlphaStore,
+        now: DateTime<Utc>,
+        engine: EngineKind,
+        include_walk_forward: bool,
+    ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
             "signal".to_string(),
         )));
         let mut candidate_iteration = iteration();
         candidate_iteration.engine = engine;
+        let walk_forward = include_walk_forward.then(|| EvaluationRecord {
+            evaluation_id: "evaluation-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: "candidate-1".to_string(),
+            payload: walk_forward_evaluation(),
+            created_at: now,
+        });
+        candidate_iteration.evaluation_artifact_id = walk_forward
+            .as_ref()
+            .map(|evaluation| evaluation.evaluation_id.clone());
         store
             .append_iteration(
                 &candidate_iteration,
                 Some(("candidate-1", &candidate)),
-                None,
+                walk_forward.as_ref(),
             )
             .unwrap();
         let candidate_hash = store.mission_lineage("mission-1").unwrap().candidates[0]
@@ -2611,6 +2706,26 @@ mod tests {
             store.get_strategy_bundle("bundle:candidate-1").unwrap(),
             bundle
         );
+    }
+
+    #[test]
+    fn promotion_rejects_missing_walk_forward_evidence_without_partial_bundle() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+
+        let error = try_persist_formula_promotion_with_evidence(
+            &mut store,
+            Utc::now(),
+            EngineKind::ManualSeed,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("canonical walk-forward"));
+        assert!(matches!(
+            store.get_strategy_bundle("bundle:candidate-1"),
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[test]

@@ -422,6 +422,12 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         .iter()
         .find(|candidate| candidate.candidate_id == args.candidate_id)
         .context("candidate does not belong to mission")?;
+    if !validated_walk_forward_candidates_in_lineage(&lineage)?
+        .iter()
+        .any(|candidate_id| candidate_id == &args.candidate_id)
+    {
+        bail!("candidate lacks canonical v3 walk-forward evidence");
+    }
     let expected_sealed_version = sealed_evaluator_version(&candidate.artifact)?;
     let sealed_id = sealed_evaluation_revision_id(&args.candidate_id, expected_sealed_version);
     let sealed = store.get_registry_revision(&sealed_id)?;

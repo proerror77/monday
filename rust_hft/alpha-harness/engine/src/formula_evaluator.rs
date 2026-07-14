@@ -15,6 +15,39 @@ pub struct FormulaEvaluator {
     config: FormulaEvaluatorConfig,
 }
 
+struct PredictiveGateResult {
+    predictive: PredictiveMetrics,
+    failures: Vec<String>,
+}
+
+impl PredictiveGateResult {
+    fn map_positions_to_net_returns(
+        &self,
+        rows: &[ResearchRow],
+        signals: &[f64],
+        range: std::ops::Range<usize>,
+    ) -> (Vec<f64>, usize) {
+        let mut previous_position = 0.0;
+        let mut trade_count = 0;
+        let returns = range
+            .map(|index| {
+                let position = signal_position(signals[index]);
+                let turnover = (position - previous_position).abs();
+                if turnover > f64::EPSILON {
+                    trade_count += 1;
+                }
+                previous_position = position;
+                let row = &rows[index];
+                let transaction_cost =
+                    (row.fee_bps.max(0.0) + row.latency_bps.max(0.0)) * turnover / BPS;
+                let funding_cost = row.funding_bps.max(0.0) * position.abs() / BPS;
+                position * row.label - transaction_cost - funding_cost
+            })
+            .collect();
+        (returns, trade_count)
+    }
+}
+
 impl FormulaEvaluator {
     pub fn for_trials(multiple_testing_trials: usize) -> Result<Self, String> {
         Self::new(
@@ -35,6 +68,64 @@ impl FormulaEvaluator {
     pub fn config_evidence(&self) -> Result<serde_json::Value, String> {
         serde_json::to_value(&self.config)
             .map_err(|error| format!("failed to serialize evaluator config: {error}"))
+    }
+
+    fn predictive_gates(
+        &self,
+        rows: &[ResearchRow],
+        signals: &[f64],
+        ranges: &[std::ops::Range<usize>],
+    ) -> PredictiveGateResult {
+        let predictive = predictive_metrics(rows, signals, ranges);
+        let mut failures = Vec::new();
+        if predictive
+            .time_series_ic
+            .is_none_or(|ic| ic < self.config.min_time_series_ic)
+        {
+            failures.push(format!(
+                "time-series IC does not meet {:.8}",
+                self.config.min_time_series_ic
+            ));
+        }
+        if predictive
+            .time_series_rank_ic
+            .is_none_or(|ic| ic < self.config.min_time_series_rank_ic)
+        {
+            failures.push(format!(
+                "time-series RankIC does not meet {:.8}",
+                self.config.min_time_series_rank_ic
+            ));
+        }
+        if ranges.len() > 1
+            && predictive
+                .time_series_icir
+                .is_none_or(|icir| icir < self.config.min_time_series_icir)
+        {
+            failures.push(format!(
+                "time-series ICIR does not meet {:.8}",
+                self.config.min_time_series_icir
+            ));
+        }
+        if ranges.len() > 1
+            && predictive
+                .time_series_rank_icir
+                .is_none_or(|icir| icir < self.config.min_time_series_rank_icir)
+        {
+            failures.push(format!(
+                "time-series RankICIR does not meet {:.8}",
+                self.config.min_time_series_rank_icir
+            ));
+        }
+        if predictive.positive_ic_ratio < self.config.min_positive_ic_ratio {
+            failures.push(format!(
+                "positive IC ratio {:.8} is below {:.8}",
+                predictive.positive_ic_ratio, self.config.min_positive_ic_ratio
+            ));
+        }
+        PredictiveGateResult {
+            predictive,
+            failures,
+        }
     }
 
     pub fn evaluate_onnx_signals(
@@ -90,32 +181,30 @@ impl FormulaEvaluator {
             return Err("formula produced an invalid or unbounded signal".to_string());
         }
 
-        let mut fold_metrics = Vec::new();
-        let mut predictive_folds = Vec::new();
-        let mut all_returns = Vec::new();
-        let mut failures = Vec::new();
-        for (fold_index, range) in ranges.into_iter().enumerate() {
+        let ranges = ranges.into_iter().collect::<Vec<_>>();
+        if ranges.is_empty() {
+            return Err("evaluation has no folds".to_string());
+        }
+        for range in &ranges {
             if range.len() < self.config.min_validation_rows || range.end > rows.len() {
                 return Err("evaluation range is too short or out of bounds".to_string());
             }
-            let (returns, trade_count) = net_returns(rows, signals, range.clone());
-            let factor_values = &signals[range.clone()];
-            let labels = range
-                .clone()
-                .map(|index| rows[index].label)
-                .collect::<Vec<_>>();
-            predictive_folds.push(FoldPredictiveMetrics {
-                fold_index: fold_index + 1,
-                row_count: range.len(),
-                time_series_ic: pearson_correlation(factor_values, &labels),
-                time_series_rank_ic: spearman_correlation(factor_values, &labels),
-            });
+        }
+
+        // Position mapping requires this token, so predictive gates cannot be skipped.
+        let mut predictive_stage = self.predictive_gates(rows, signals, &ranges);
+
+        let mut fold_metrics = Vec::with_capacity(ranges.len());
+        let mut all_returns = Vec::new();
+        for (fold_index, range) in ranges.into_iter().enumerate() {
+            let (returns, trade_count) =
+                predictive_stage.map_positions_to_net_returns(rows, signals, range);
             let mean = mean(&returns);
             let net_sharpe = sharpe_ratio(&returns, mean);
             let raw_score = t_statistic(&returns, mean);
             let max_drawdown = max_drawdown(&returns);
             if trade_count < self.config.min_trades {
-                failures.push(format!(
+                predictive_stage.failures.push(format!(
                     "fold {} trades {} are below {}",
                     fold_index + 1,
                     trade_count,
@@ -123,7 +212,7 @@ impl FormulaEvaluator {
                 ));
             }
             if mean <= self.config.min_fold_mean_return {
-                failures.push(format!(
+                predictive_stage.failures.push(format!(
                     "fold {} does not establish positive net edge: mean {:.8} must exceed {:.8}",
                     fold_index + 1,
                     mean,
@@ -131,7 +220,7 @@ impl FormulaEvaluator {
                 ));
             }
             if max_drawdown > self.config.max_drawdown {
-                failures.push(format!(
+                predictive_stage.failures.push(format!(
                     "fold {} drawdown {:.8} exceeds {:.8}",
                     fold_index + 1,
                     max_drawdown,
@@ -150,54 +239,6 @@ impl FormulaEvaluator {
             });
             all_returns.extend(returns);
         }
-        if fold_metrics.is_empty() {
-            return Err("evaluation has no folds".to_string());
-        }
-        let predictive = PredictiveMetrics::from_folds(predictive_folds);
-        if predictive
-            .time_series_ic
-            .is_none_or(|ic| ic < self.config.min_time_series_ic)
-        {
-            failures.push(format!(
-                "time-series IC does not meet {:.8}",
-                self.config.min_time_series_ic
-            ));
-        }
-        if predictive
-            .time_series_rank_ic
-            .is_none_or(|ic| ic < self.config.min_time_series_rank_ic)
-        {
-            failures.push(format!(
-                "time-series RankIC does not meet {:.8}",
-                self.config.min_time_series_rank_ic
-            ));
-        }
-        if fold_metrics.len() > 1
-            && predictive
-                .time_series_icir
-                .is_none_or(|icir| icir < self.config.min_time_series_icir)
-        {
-            failures.push(format!(
-                "time-series ICIR does not meet {:.8}",
-                self.config.min_time_series_icir
-            ));
-        }
-        if fold_metrics.len() > 1
-            && predictive
-                .time_series_rank_icir
-                .is_none_or(|icir| icir < self.config.min_time_series_rank_icir)
-        {
-            failures.push(format!(
-                "time-series RankICIR does not meet {:.8}",
-                self.config.min_time_series_rank_icir
-            ));
-        }
-        if predictive.positive_ic_ratio < self.config.min_positive_ic_ratio {
-            failures.push(format!(
-                "positive IC ratio {:.8} is below {:.8}",
-                predictive.positive_ic_ratio, self.config.min_positive_ic_ratio
-            ));
-        }
         let raw_score = mean(
             &fold_metrics
                 .iter()
@@ -209,11 +250,15 @@ impl FormulaEvaluator {
             .adjusted_score(raw_score)
             .map_err(|error| error.to_string())?;
         if adjusted_score < self.config.min_aggregate_score {
-            failures.push(format!(
+            predictive_stage.failures.push(format!(
                 "multiple-testing-adjusted score {:.8} is below {:.8}",
                 adjusted_score, self.config.min_aggregate_score
             ));
         }
+        let PredictiveGateResult {
+            predictive,
+            failures,
+        } = predictive_stage;
         let metrics = EvaluationMetrics {
             predictive,
             row_count: all_returns.len(),
@@ -447,29 +492,30 @@ fn expanding_rank(values: &[f64]) -> Result<Vec<f64>, String> {
         .collect())
 }
 
-fn net_returns(
+fn predictive_metrics(
     rows: &[ResearchRow],
     signals: &[f64],
-    range: std::ops::Range<usize>,
-) -> (Vec<f64>, usize) {
-    let mut previous_position = 0.0;
-    let mut trade_count = 0;
-    let returns = range
-        .map(|index| {
-            let position = signal_position(signals[index]);
-            let turnover = (position - previous_position).abs();
-            if turnover > f64::EPSILON {
-                trade_count += 1;
-            }
-            previous_position = position;
-            let row = &rows[index];
-            let transaction_cost =
-                (row.fee_bps.max(0.0) + row.latency_bps.max(0.0)) * turnover / BPS;
-            let funding_cost = row.funding_bps.max(0.0) * position.abs() / BPS;
-            position * row.label - transaction_cost - funding_cost
-        })
-        .collect();
-    (returns, trade_count)
+    ranges: &[std::ops::Range<usize>],
+) -> PredictiveMetrics {
+    PredictiveMetrics::from_folds(
+        ranges
+            .iter()
+            .enumerate()
+            .map(|(fold_index, range)| {
+                let factor_values = &signals[range.clone()];
+                let labels = range
+                    .clone()
+                    .map(|index| rows[index].label)
+                    .collect::<Vec<_>>();
+                FoldPredictiveMetrics {
+                    fold_index: fold_index + 1,
+                    row_count: range.len(),
+                    time_series_ic: pearson_correlation(factor_values, &labels),
+                    time_series_rank_ic: spearman_correlation(factor_values, &labels),
+                }
+            })
+            .collect(),
+    )
 }
 
 fn signal_position(signal: f64) -> f64 {
@@ -510,7 +556,7 @@ fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
         right_variance += right_centered.powi(2);
     }
     let denominator = (left_variance * right_variance).sqrt();
-    (denominator > f64::EPSILON).then(|| (covariance / denominator).clamp(-1.0, 1.0))
+    (denominator > 0.0).then(|| (covariance / denominator).clamp(-1.0, 1.0))
 }
 
 fn spearman_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
@@ -660,6 +706,40 @@ mod tests {
         assert_eq!(result.metrics.predictive.positive_ic_ratio, 1.0);
         assert_eq!(result.metrics.predictive.folds.len(), 3);
         assert!(result.metrics.net_sharpe > 0.0);
+    }
+
+    #[test]
+    fn predictive_gate_stage_is_required_before_trade_mapping() {
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let dataset = dataset(f64::MAX);
+        let context = dataset.engine_context();
+        let signals = context
+            .rows()
+            .iter()
+            .map(|row| row.signal)
+            .collect::<Vec<_>>();
+        let ranges = context
+            .folds()
+            .iter()
+            .map(|fold| fold.validation.clone())
+            .collect::<Vec<_>>();
+
+        let predictive_stage = evaluator.predictive_gates(context.rows(), &signals, &ranges);
+
+        assert_eq!(predictive_stage.predictive.time_series_ic, Some(1.0));
+        assert!(predictive_stage
+            .map_positions_to_net_returns(context.rows(), &signals, ranges[0].clone())
+            .0
+            .iter()
+            .any(|value| !value.is_finite()));
+    }
+
+    #[test]
+    fn pearson_ic_is_scale_invariant_for_small_finite_values() {
+        assert_eq!(
+            pearson_correlation(&[1.0e-12, 2.0e-12, 3.0e-12], &[2.0e-12, 4.0e-12, 6.0e-12],),
+            Some(1.0)
+        );
     }
 
     #[test]
