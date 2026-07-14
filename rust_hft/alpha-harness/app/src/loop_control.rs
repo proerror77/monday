@@ -288,7 +288,7 @@ fn progress_completed_mission(
         LoopStage::WalkForwardKept,
         LoopStageStatus::Completed,
         format!(
-            "{research_reason}; canonical v2 walk-forward candidates: {}",
+            "{research_reason}; canonical v3 walk-forward candidates: {}",
             walk_forward_candidates.join(",")
         ),
     )?;
@@ -555,7 +555,7 @@ mod tests {
         evaluation::{prepare_dataset, WalkForwardConfig},
         formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
         CandidateEvaluation, CandidateEvaluator, EngineProposal, EvaluationMetrics,
-        FoldEvaluationMetrics,
+        FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
     };
     use alpha_store::{ApprovalRecord, EvaluationRecord, MemoryRecord, RegistryRevision};
     use chrono::Duration;
@@ -584,12 +584,7 @@ mod tests {
         let start = created_at - Duration::minutes(500);
         let rows = (0..500)
             .scan(100.0_f64, |close, index| {
-                let return_rate = match index % 4 {
-                    0 => 0.001,
-                    1 => 0.01,
-                    2 => -0.001,
-                    _ => -0.01,
-                };
+                let return_rate = if (index / 3) % 2 == 0 { 0.01 } else { -0.01 };
                 *close *= 1.0 + return_rate;
                 let close = *close;
                 let event_time = start + Duration::minutes(i64::from(index));
@@ -878,6 +873,33 @@ mod tests {
 
     fn canonical_evaluation(version: &str, max_candidates: usize) -> CandidateEvaluation {
         let evaluator = FormulaEvaluator::for_trials(max_candidates).unwrap();
+        let fold_count = if version == WALK_FORWARD_EVALUATOR_VERSION {
+            2
+        } else {
+            1
+        };
+        let folds = (1..=fold_count)
+            .map(|fold_index| FoldEvaluationMetrics {
+                fold_index,
+                row_count: 30,
+                trade_count: 30,
+                mean_net_return: 0.001,
+                cumulative_net_return: 0.03,
+                max_drawdown: 0.01,
+                net_sharpe: 1.0,
+                raw_score: 2.0,
+            })
+            .collect::<Vec<_>>();
+        let predictive = PredictiveMetrics::from_folds(
+            (1..=fold_count)
+                .map(|fold_index| FoldPredictiveMetrics {
+                    fold_index,
+                    row_count: 30,
+                    time_series_ic: Some(0.1),
+                    time_series_rank_ic: Some(0.1),
+                })
+                .collect(),
+        );
         CandidateEvaluation {
             passed: true,
             score: 2.0,
@@ -885,22 +907,16 @@ mod tests {
             evaluator_version: version.to_string(),
             evaluator_config: evaluator.config_evidence().unwrap(),
             metrics: EvaluationMetrics {
-                row_count: 30,
-                trade_count: 30,
+                predictive,
+                row_count: 30 * fold_count,
+                trade_count: 30 * fold_count,
                 mean_net_return: 0.001,
-                cumulative_net_return: 0.03,
+                cumulative_net_return: 0.03 * fold_count as f64,
                 max_drawdown: 0.01,
+                net_sharpe: 1.0,
                 raw_score: 2.0,
                 adjusted_score: 2.0,
-                folds: vec![FoldEvaluationMetrics {
-                    fold_index: 1,
-                    row_count: 30,
-                    trade_count: 30,
-                    mean_net_return: 0.001,
-                    cumulative_net_return: 0.03,
-                    max_drawdown: 0.01,
-                    raw_score: 2.0,
-                }],
+                folds,
             },
         }
     }
@@ -980,7 +996,10 @@ mod tests {
             .content_hash;
         store
             .put_registry_revision(&RegistryRevision {
-                revision_id: format!("sealed-evaluation:{candidate_id}"),
+                revision_id: governance::sealed_evaluation_revision_id(
+                    candidate_id,
+                    SEALED_HOLDOUT_EVALUATOR_VERSION,
+                ),
                 registry_kind: "sealed_evaluation".to_string(),
                 asset_id: candidate_id.to_string(),
                 parent_revision_id: None,
@@ -1156,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_keep_without_v2_evaluation_cannot_reach_walk_forward_stage() {
+    fn manual_keep_without_v3_evaluation_cannot_reach_walk_forward_stage() {
         let db = temp_db_path("alpha-loop-legacy-walk-forward");
         let mission_id = "mission-loop";
         let candidate_id = "candidate-legacy";
@@ -1225,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sealed_record_is_not_reported_as_an_idempotent_v2_evaluation() {
+    fn legacy_sealed_record_is_not_reported_as_an_idempotent_v3_evaluation() {
         let db = temp_db_path("alpha-loop-legacy-sealed");
         let mission_id = "mission-loop";
         let candidate_id = "candidate-1";
@@ -1236,7 +1255,10 @@ mod tests {
             .clone();
         store
             .put_registry_revision(&RegistryRevision {
-                revision_id: format!("sealed-evaluation:{candidate_id}"),
+                revision_id: governance::sealed_evaluation_revision_id(
+                    candidate_id,
+                    SEALED_HOLDOUT_EVALUATOR_VERSION,
+                ),
                 registry_kind: "sealed_evaluation".to_string(),
                 asset_id: candidate_id.to_string(),
                 parent_revision_id: None,
@@ -1427,12 +1449,12 @@ mod tests {
         let dataset_args = DatasetArgs {
             dataset_manifest: manifest_path.clone(),
             validation: ValidationArgs {
-                initial_train_rows: 200,
-                validation_rows: 64,
+                initial_train_rows: 100,
+                validation_rows: 96,
                 fold_count: 3,
                 purge_rows: 1,
                 embargo_rows: 1,
-                sealed_holdout_rows: 64,
+                sealed_holdout_rows: 96,
                 fee_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.0,

@@ -1,6 +1,6 @@
 use super::DeterministicRng;
 use crate::{
-    evaluation::EngineContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
+    evaluation::ProposalContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
     ProposalEngine, ProposalEngineCheckpoint, RemainingBudget,
 };
 use alpha_domain::{CandidateArtifact, EngineKind};
@@ -217,7 +217,7 @@ impl ProposalEngine for MctsEngine {
         &mut self,
         mission_id: &str,
         iteration_index: usize,
-        _context: &EngineContext<'_>,
+        _context: &ProposalContext<'_>,
         remaining: &RemainingBudget,
     ) -> Result<EngineProposal, String> {
         if remaining.expansions == 0 {
@@ -466,11 +466,13 @@ mod tests {
             evaluator_version: "test".to_string(),
             evaluator_config: serde_json::json!({"fixture": true}),
             metrics: crate::EvaluationMetrics {
+                predictive: crate::PredictiveMetrics::from_folds(vec![]),
                 row_count: 1,
                 trade_count: 1,
                 mean_net_return: score,
                 cumulative_net_return: score,
                 max_drawdown: 0.0,
+                net_sharpe: score,
                 raw_score: score,
                 adjusted_score: score,
                 folds: vec![],
@@ -481,7 +483,7 @@ mod tests {
     fn advance(engine: &mut MctsEngine, iteration: usize, score: f64) -> EngineProposal {
         let dataset = super::super::test_dataset();
         let proposal = engine
-            .propose("mission", iteration, &dataset.engine_context(), &budget())
+            .propose("mission", iteration, &dataset.proposal_context(), &budget())
             .unwrap();
         engine.observe(&proposal, &evaluation(score));
         proposal
@@ -513,7 +515,7 @@ mod tests {
         advance(&mut engine, 0, 0.5);
         let dataset = super::super::test_dataset();
         let pending = engine
-            .propose("mission", 1, &dataset.engine_context(), &budget())
+            .propose("mission", 1, &dataset.proposal_context(), &budget())
             .unwrap();
         let checkpoint = engine.checkpoint().unwrap();
 
@@ -545,10 +547,10 @@ mod tests {
         let dataset = super::super::test_dataset();
 
         let expected = uninterrupted
-            .propose("mission", 3, &dataset.engine_context(), &budget())
+            .propose("mission", 3, &dataset.proposal_context(), &budget())
             .unwrap();
         let actual = restored
-            .propose("mission", 3, &dataset.engine_context(), &budget())
+            .propose("mission", 3, &dataset.proposal_context(), &budget())
             .unwrap();
 
         assert_eq!(actual, expected);
@@ -589,7 +591,7 @@ mod tests {
         let mut engine = MctsEngine::new(3, "oi", "imbalance", 1.4, 3).unwrap();
         let dataset = super::super::test_dataset();
         let proposal = engine
-            .propose("mission", 0, &dataset.engine_context(), &budget())
+            .propose("mission", 0, &dataset.proposal_context(), &budget())
             .unwrap();
         assert!(engine.candidates.contains_key(&proposal.candidate_id));
 

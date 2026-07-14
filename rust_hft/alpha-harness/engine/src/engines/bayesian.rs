@@ -1,5 +1,5 @@
 use crate::{
-    evaluation::EngineContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
+    evaluation::ProposalContext, CandidateEvaluation, EngineProposal, HistoricalObservation,
     ProposalEngine, ProposalEngineCheckpoint, RemainingBudget,
 };
 use alpha_domain::{CandidateArtifact, EngineKind};
@@ -188,7 +188,7 @@ impl ProposalEngine for BayesianOptimizerEngine {
         &mut self,
         mission_id: &str,
         iteration_index: usize,
-        _context: &EngineContext<'_>,
+        _context: &ProposalContext<'_>,
         _remaining: &RemainingBudget,
     ) -> Result<EngineProposal, String> {
         let point = self.choose_point()?;
@@ -418,11 +418,13 @@ mod tests {
             evaluator_version: "test".to_string(),
             evaluator_config: serde_json::json!({"fixture": true}),
             metrics: crate::EvaluationMetrics {
+                predictive: crate::PredictiveMetrics::from_folds(vec![]),
                 row_count: 1,
                 trade_count: 1,
                 mean_net_return: score,
                 cumulative_net_return: score,
                 max_drawdown: 0.0,
+                net_sharpe: score,
                 raw_score: score,
                 adjusted_score: score,
                 folds: vec![],
@@ -437,7 +439,7 @@ mod tests {
     ) -> EngineProposal {
         let dataset = super::super::test_dataset();
         let proposal = engine
-            .propose("mission", iteration, &dataset.engine_context(), &budget())
+            .propose("mission", iteration, &dataset.proposal_context(), &budget())
             .unwrap();
         engine.observe(&proposal, &evaluation(score));
         proposal
@@ -461,7 +463,7 @@ mod tests {
         advance(&mut engine, 1, 0.8);
         let dataset = super::super::test_dataset();
         let pending = engine
-            .propose("mission", 2, &dataset.engine_context(), &budget())
+            .propose("mission", 2, &dataset.proposal_context(), &budget())
             .unwrap();
         let checkpoint = engine.checkpoint().unwrap();
 
@@ -494,10 +496,10 @@ mod tests {
         let dataset = super::super::test_dataset();
 
         let expected = uninterrupted
-            .propose("mission", 4, &dataset.engine_context(), &budget())
+            .propose("mission", 4, &dataset.proposal_context(), &budget())
             .unwrap();
         let actual = restored
-            .propose("mission", 4, &dataset.engine_context(), &budget())
+            .propose("mission", 4, &dataset.proposal_context(), &budget())
             .unwrap();
 
         assert_eq!(actual, expected);
@@ -538,7 +540,7 @@ mod tests {
             BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap();
         let dataset = super::super::test_dataset();
         let proposal = engine
-            .propose("mission", 0, &dataset.engine_context(), &budget())
+            .propose("mission", 0, &dataset.proposal_context(), &budget())
             .unwrap();
         assert!(engine.pending.contains_key(&proposal.candidate_id));
 

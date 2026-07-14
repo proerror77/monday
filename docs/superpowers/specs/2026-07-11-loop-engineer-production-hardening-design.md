@@ -64,7 +64,9 @@ The governed producer supports Formula candidates and externally trained ONNX ca
 ## Research Integrity
 
 - A no-trade candidate cannot pass.
-- Defaults require a positive edge margin, minimum observations, minimum trades, bounded drawdown, and a multiple-testing-adjusted score.
+- Candidate generators receive a label-free proposal context; validation labels remain evaluator-only.
+- Predictive gates run before position mapping and persist time-series IC, RankIC, ICIR, RankICIR, and positive-IC ratio.
+- Trading evidence retains per-observation net Sharpe for non-annualized diagnostics. Trading gates enforce post-cost edge, minimum observations and trades, bounded drawdown, and a multiple-testing-adjusted score.
 - Sealed holdout remains one-time and promotion-only.
 - Data missions reject partial candles, duplicate timestamps, interval gaps, invalid OHLC relationships, negative volume, stale acquisition, and manifest mismatches.
 - Source catalog entries distinguish advertised connector capability from implemented governed acquisition capability.

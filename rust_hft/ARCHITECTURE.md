@@ -84,11 +84,12 @@ Streaming connector availability is a runtime capability, not proof that the sam
 
 ## Evaluation And Promotion
 
-- Formula signals use causal operators and an explicit zero position for zero signal.
-- Purged walk-forward and sealed-holdout v2 evidence persists per-fold and aggregate rows, trades, post-cost return, drawdown, raw score, adjusted score, config, and failure reasons.
+- Formula signals use causal operators and an explicit zero position for zero signal. Proposal engines receive label-free metadata rather than evaluation rows.
+- Purged walk-forward and sealed-holdout v3 evidence evaluates raw factor values before position mapping with time-series IC, RankIC, ICIR, RankICIR, and positive-IC ratio.
+- Trading evidence then persists per-fold and aggregate rows, trades, post-cost return, drawdown, per-observation net Sharpe, raw score, adjusted score, config, and failure reasons.
 - Mission policy pre-registers the multiple-testing family; the evaluator applies a Gaussian expected-maximum haircut without claiming full DSR or PBO.
 - Domain and store layers recompute evidence, evaluator config/metrics hashes, candidate binding, and bundle hash before promotion.
-- Only a canonical Formula v2 candidate can be promoted by the current producer.
+- Only a canonical Formula v3 candidate with predictive and trading gates can be promoted by the current producer.
 - Offline RL remains lab-only and is blocked from holdout and promotion.
 - ONNX remains runtime schema compatibility only until point-in-time training lineage and a governed model evaluator are implemented.
 
