@@ -25,8 +25,11 @@ emit trading intents. To keep this research collector bounded, the tape stores o
 Polymarket quotes/lifecycle events plus reference prices, samples each token at most
 once per second, retains the top bid/ask level, and drops orphaned or post-expiry
 quotes from the persisted tape. Sampling affects the recording only; the runtime
-still receives every live quote. The runner restarts every six hours; the recorder
-rotates an existing tape before opening the next session.
+still receives every live quote for active event tokens. Quotes timestamped after
+their event end are rejected before executor or strategy evaluation, so a late quote
+from an expired 5-minute/15-minute market cannot trigger a trade in the next event.
+The runner restarts every six hours; the recorder rotates an existing tape before
+opening the next session.
 
 Each service opens bounded WebSocket shards, records every diff, fetches a REST
 Top-100 snapshot, validates sequence continuity, writes replay checkpoints, compresses
