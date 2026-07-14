@@ -27,6 +27,14 @@ The storage authority remains split deliberately:
 - DuckDB has one writer and owns research/control-plane lineage. Parallel Pods
   must never open the same DuckDB file for writes.
 
+The first Agentic Alpha path uses
+`rust_hft/scripts/research/lob_pit_materializer.py` to validate the raw segment,
+replay Binance's Spot or USD-M sequence contract, and emit one-second
+point-in-time rows. It rejects missing `_SUCCESS` markers, SHA-256 mismatch,
+sequence gaps, unseeded diffs, and closing checkpoints that do not match the
+replayed full book. Forward-mid labels are only exposed at the future bucket's
+availability time.
+
 No exchange credential belongs in this namespace. Research Pods receive public
 datasets, ClickHouse read credentials, and result-write authority only.
 
@@ -193,6 +201,18 @@ Build the `linux/amd64` image on a native amd64 CI/ACR builder. Apple Silicon
 Docker Desktop can validate an arm64 image locally, but compiling x86 Rust under
 QEMU is slower and can fail inside the emulator even when the Dockerfile and
 source are valid.
+
+The image contains three stable entrypoints:
+
+- `/usr/local/bin/hft-backtest`
+- `/usr/local/bin/alpha-harness`
+- `/usr/local/bin/lob-pit-materializer`
+
+`k8s/alpha-mission-job.example.yaml` runs one MCTS or Bayesian mission against a
+pre-materialized PIT feature file. The one-time signed OSS URLs belong in a
+Kubernetes Secret and must never be committed. Use distinct DuckDB files and
+result objects per parallel Mission; a later single-writer aggregator may merge
+their immutable evidence.
 
 Run many parameter batches without rebuilding:
 

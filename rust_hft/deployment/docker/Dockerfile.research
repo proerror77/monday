@@ -20,7 +20,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --release \
     --locked \
     -p hft-backtest \
-    && cp /work/target/release/hft-backtest /work/hft-backtest
+    -p alpha-harness \
+    && cp /work/target/release/hft-backtest /work/hft-backtest \
+    && cp /work/target/release/alpha-harness /work/alpha-harness
 
 FROM debian:bookworm-slim AS runtime
 
@@ -29,17 +31,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-yaml \
     tini \
+    zstd \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 research
 
 COPY --from=builder /work/hft-backtest /usr/local/bin/hft-backtest
+COPY --from=builder /work/alpha-harness /usr/local/bin/alpha-harness
 COPY scripts/backtest/param_scan.py /opt/monday/param_scan.py
+COPY scripts/research/lob_pit_materializer.py /usr/local/bin/lob-pit-materializer
 
 RUN mkdir -p /work/config /work/data /work/results \
+    && chmod 0755 /usr/local/bin/lob-pit-materializer \
     && chown -R research:research /work /opt/monday
 
 USER research
 WORKDIR /work
 ENV HFT_BACKTEST_BIN=/usr/local/bin/hft-backtest
+ENV ALPHA_HARNESS_BIN=/usr/local/bin/alpha-harness
 
 ENTRYPOINT ["/usr/bin/tini", "--", "python3", "/opt/monday/param_scan.py"]

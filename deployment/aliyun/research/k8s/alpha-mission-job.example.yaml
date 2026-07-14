@@ -1,0 +1,179 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: REPLACE_MISSION_JOB_NAME
+  namespace: monday-research
+  labels:
+    app.kubernetes.io/name: monday-alpha-mission
+    app.kubernetes.io/part-of: monday
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: monday-alpha-mission
+        app.kubernetes.io/part-of: monday
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      nodeSelector:
+        workload: backtest
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: alpha-mission
+          image: monday/research-runner:REPLACE_WITH_IMMUTABLE_TAG
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              mkdir -p /work/input /work/artifacts /work/results
+              python3 -c 'import os, urllib.request; urllib.request.urlretrieve(os.environ["FEATURE_URL"], "/work/input/features.jsonl")'
+              alpha-harness data import-features \
+                --db /work/results/alpha.duckdb \
+                --mission-id "$DATA_MISSION_ID" \
+                --input /work/input/features.jsonl \
+                --artifact-dir /work/artifacts \
+                --manifest-out /work/results/feature-manifest.json \
+                > /work/results/data-import.json
+              python3 - <<'PY'
+              import json
+              import os
+              from datetime import datetime, timezone
+
+              now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+              dataset = json.load(open("/work/results/feature-manifest.json"))
+              mission = {
+                  "mission_id": os.environ["MISSION_ID"],
+                  "objective": "Find a cost-aware, out-of-sample LOB factor for BTCUSDT USD-M",
+                  "hypothesis_scope": "Top-5 LOB imbalance and order-flow dynamics at a five-second horizon",
+                  "mutable_scope": ["factor_ast"],
+                  "dataset_manifest_id": dataset["manifest_id"],
+                  "baseline_artifact_id": None,
+                  "validation_mode": "MissionValidator",
+                  "validator_spec": {"multiple_testing_trials": 8},
+                  "search_budget": {
+                      "max_candidates": 8,
+                      "max_expansions": 40,
+                      "max_tokens": 0,
+                      "max_seconds": 300,
+                  },
+                  "completion_policy": {"min_kept_candidates": 1},
+                  "prompt_snapshot_id": None,
+                  "search_policy_snapshot_id": f"{os.environ['ENGINE']}-lob-pit-v1",
+                  "status": "Pending",
+                  "terminal_reason": None,
+                  "created_at": now,
+                  "updated_at": now,
+              }
+              with open("/work/results/mission.json", "w") as target:
+                  json.dump(mission, target, indent=2, sort_keys=True)
+              PY
+              alpha-harness mission create \
+                --db /work/results/alpha.duckdb \
+                --mission /work/results/mission.json \
+                > /work/results/mission-create.json
+              alpha-harness mission run \
+                --db /work/results/alpha.duckdb \
+                --mission-id "$MISSION_ID" \
+                --engine "$ENGINE" \
+                --seed "$SEED" \
+                --feature-fields "$FEATURE_FIELDS" \
+                --dataset-manifest /work/results/feature-manifest.json \
+                --initial-train-rows 800 \
+                --validation-rows 240 \
+                --fold-count 3 \
+                --purge-rows 5 \
+                --embargo-rows 5 \
+                --sealed-holdout-rows 300 \
+                --fee-bps 2.0 \
+                --funding-bps 0.0 \
+                --latency-bps 0.5 \
+                --max-new-iterations 8 \
+                > /work/results/mission-run.json
+              alpha-harness mission status \
+                --db /work/results/alpha.duckdb \
+                --mission-id "$MISSION_ID" \
+                > /work/results/mission-status.json
+              alpha-harness candidate list \
+                --db /work/results/alpha.duckdb \
+                --mission-id "$MISSION_ID" \
+                > /work/results/candidates.json
+              python3 - <<'PY'
+              import hashlib
+              import json
+              import os
+              import urllib.request
+              import zipfile
+              from pathlib import Path
+
+              bundle = Path("/work/results.zip")
+              with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                  for root in (Path("/work/results"), Path("/work/artifacts")):
+                      for path in sorted(root.rglob("*")):
+                          if path.is_file():
+                              archive.write(path, path.relative_to("/work"))
+              payload = bundle.read_bytes()
+              request = urllib.request.Request(
+                  os.environ["RESULT_PUT_URL"], data=payload, method="PUT"
+              )
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  if response.status not in (200, 201):
+                      raise RuntimeError(f"result upload failed: {response.status}")
+              print(json.dumps({
+                  "mission_id": os.environ["MISSION_ID"],
+                  "engine": os.environ["ENGINE"],
+                  "bundle_bytes": len(payload),
+                  "bundle_sha256": hashlib.sha256(payload).hexdigest(),
+              }, sort_keys=True))
+              PY
+          env:
+            - name: FEATURE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: feature-url
+            - name: RESULT_PUT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: result-put-url
+            - name: DATA_MISSION_ID
+              value: REPLACE_DATA_MISSION_ID
+            - name: MISSION_ID
+              value: REPLACE_MISSION_ID
+            - name: ENGINE
+              value: REPLACE_ENGINE
+            - name: FEATURE_FIELDS
+              value: REPLACE_FEATURE_FIELDS
+            - name: SEED
+              value: "7"
+          resources:
+            requests:
+              cpu: "3500m"
+              memory: 8Gi
+            limits:
+              cpu: "3500m"
+              memory: 12Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: work
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: tmp
+          emptyDir: {}
