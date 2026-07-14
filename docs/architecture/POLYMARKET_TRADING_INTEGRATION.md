@@ -92,10 +92,12 @@ Live wiring is shown in [polymarket_live.yaml.example](../../rust_hft/config/dev
 An authenticated no-strategy process may start without a deployment envelope only for account
 inspection, reconciliation, and OMS-aware cancellation. It has no place-order IPC method, and every
 risk-increasing IPC mutation is denied. As soon as any strategy is configured, `hft-live` requires a
-signed deployment envelope, including Paper and Shadow startup. `LiveSmall` is enabled only for a
-human-approved Formula artifact targeting a configured Polymarket venue. Other venues and ONNX
-artifacts remain fail-closed. The signed envelope must carry finite positive notional, symbol,
-order-size, and integer slippage limits; Monday intersects them with the runtime hard limits.
+signed deployment envelope, including Paper and Shadow startup. `LiveSmall` remains fail-closed for
+Polymarket and every other venue until the repository's real-venue acceptance gate is completed;
+human approval alone cannot bypass it. Paper and Shadow envelopes must still carry finite positive
+notional, symbol, order-size, and integer slippage limits, which Monday intersects with the runtime
+hard limits. The same fields are already enforced by the execution hot path so a later, separately
+reviewed live-enablement change does not need to weaken the contract.
 
 The legacy `engine.auto_cancel_exchange_only` option is rejected when set to `true`. A worker does
 not own enough restored OMS context to classify exchange-only orders safely after restart; use the
@@ -128,12 +130,12 @@ The local `GetAccount`/`GetPositions` commands are not substitutes for
 3. Reconcile open orders, balances, positions, and recent fills until the report is complete. If an
    external order already has matched quantity, restore/reconcile Monday's OMS and portfolio state
    and restart instead of trying to clear the recovery latch in place.
-4. Move from the zero-limit operator example to a separately reviewed production config with
-   explicit non-zero hard position/notional/rate limits. Then sign a human-approved Polymarket
-   Formula deployment with stricter non-zero notional, order-size, and slippage limits and a single
-   approved token. The zero-limit example itself intentionally cannot be activated for trading.
-5. Place a real-money canary only under separate user authorization, then verify private events,
-   fee accounting, REST catch-up, cancellation, and final account reconciliation.
+4. Under a separate real-venue acceptance task, prepare a reviewed production config with explicit
+   non-zero hard position/notional/rate limits and a human-approved Polymarket Formula envelope.
+   The current runtime still rejects `LiveSmall`, including this otherwise eligible envelope.
+5. Only after that task changes and reviews the fail-closed gate, place a real-money canary under
+   separate user authorization and verify private events, fee accounting, REST catch-up,
+   cancellation, reduce-only exit, order sizing, slippage, and final account reconciliation.
 
 Building or passing no-money tests does not prove a live canary. Real trading remains disabled by
 default and this repository change does not submit a funded order.

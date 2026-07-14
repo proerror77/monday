@@ -219,15 +219,6 @@ fn configured_runtime() -> runtime::SystemConfig {
     config
 }
 
-fn configured_polymarket_runtime() -> runtime::SystemConfig {
-    let mut config = configured_runtime();
-    let venue = &mut config.venues[0];
-    venue.name = "polymarket-main".to_string();
-    venue.venue_type = runtime::VenueType::Polymarket;
-    venue.symbol_catalog[0].0 = "123456789@POLYMARKET".to_string();
-    config
-}
-
 #[test]
 #[cfg(all(feature = "formula-strategy", feature = "binance"))]
 fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
@@ -802,7 +793,7 @@ fn concurrent_startups_serialize_nonce_reservation_and_recheck_the_ledger() {
 }
 
 #[test]
-fn live_small_polymarket_formula_activation_is_allowed() {
+fn live_small_polymarket_formula_activation_remains_fail_closed() {
     let now = Utc::now();
     let key = SigningKey::from_bytes(&[7_u8; 32]);
     let trusted = trusted(&key);
@@ -817,11 +808,14 @@ fn live_small_polymarket_formula_activation_is_allowed() {
     unsigned.venue = "polymarket-main".to_string();
     unsigned.instruments = vec!["123456789".to_string()];
     let signed = sign_envelope(unsigned, "key-1", &key).unwrap();
-    let mut config = configured_polymarket_runtime();
+    let mut config = configured_runtime();
+    config.venues[0].name = "polymarket-main".to_string();
+    config.venues[0].venue_type = runtime::VenueType::Polymarket;
+    config.venues[0].symbol_catalog[0].0 = "123456789@POLYMARKET".to_string();
     let bundle = formula_bundle(now);
     let bundle_path = directory.join("bundle.json");
     let mut adapter = SystemConfigActivationAdapter::new(&mut config, &bundle, &bundle_path);
-    let request = intake(
+    let error = intake(
         &signed,
         &trusted,
         &policy(&signed.envelope),
@@ -829,90 +823,16 @@ fn live_small_polymarket_formula_activation_is_allowed() {
         &directory,
         &mut adapter,
     )
-    .expect("human-approved Polymarket Formula LiveSmall");
-    assert_eq!(request.mode, ActivationMode::LiveSmall);
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("live-small activation is disabled"));
     drop(adapter);
-    assert!(!config.quotes_only);
-    assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Live"));
-    assert_eq!(config.strategies.len(), 1);
-    assert_eq!(config.engine.intent_max_slippage_bps, Some(5));
-    assert_eq!(
-        config.engine.intent_max_order_notional,
-        Some(rust_decimal::Decimal::from(100))
-    );
-    std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-fn live_small_rejects_other_venues_and_onnx_artifacts() {
-    let now = Utc::now();
-    let key = SigningKey::from_bytes(&[7_u8; 32]);
-    let trusted = trusted(&key);
-    let directory = directory("live-small-boundary");
-
-    let formula = formula_bundle(now);
-    let mut unsigned = envelope(
-        now,
-        "live-small-binance",
-        "nonce-live-small-binance",
-        AllowedIntentType::StartLiveSmall,
-        ApprovalClass::HumanApprovedLiveSmall,
-    );
-    unsigned.venue = "polymarket-main".to_string();
-    unsigned.instruments = vec!["123456789".to_string()];
-    let non_polymarket = sign_envelope(unsigned, "key-1", &key).unwrap();
-    let mut binance_config = configured_runtime();
-    binance_config.venues[0].name = "polymarket-main".to_string();
-    binance_config.venues[0].symbol_catalog[0].0 = "123456789@BINANCE".to_string();
-    let formula_bundle_path = directory.join("formula-bundle.json");
-    let mut binance_adapter =
-        SystemConfigActivationAdapter::new(&mut binance_config, &formula, &formula_bundle_path);
-    let error = intake(
-        &non_polymarket,
-        &trusted,
-        &policy(&non_polymarket.envelope),
-        now,
-        &directory,
-        &mut binance_adapter,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("restricted to Polymarket"));
-
-    let onnx = onnx_bundle(now, "model.onnx", 1, &"f".repeat(64), 4);
-    let mut unsigned = envelope(
-        now,
-        "live-small-onnx",
-        "nonce-live-small-onnx",
-        AllowedIntentType::StartLiveSmall,
-        ApprovalClass::HumanApprovedLiveSmall,
-    );
-    unsigned.asset_revision_id = onnx.candidate_id.clone();
-    unsigned.bundle_id = onnx.bundle_id.clone();
-    unsigned.bundle_hash = onnx.bundle_hash.clone();
-    unsigned.venue = "polymarket-main".to_string();
-    unsigned.instruments = vec!["123456789".to_string()];
-    unsigned.allowed_intent_types = vec![
-        AllowedIntentType::LoadModel,
-        AllowedIntentType::StartLiveSmall,
-    ];
-    let onnx_request = sign_envelope(unsigned, "key-1", &key).unwrap();
-    let mut polymarket_config = configured_polymarket_runtime();
-    let onnx_bundle_path = directory.join("onnx-bundle.json");
-    let mut onnx_adapter =
-        SystemConfigActivationAdapter::new(&mut polymarket_config, &onnx, &onnx_bundle_path);
-    let error = intake(
-        &onnx_request,
-        &trusted,
-        &policy(&onnx_request.envelope),
-        now,
-        &directory,
-        &mut onnx_adapter,
-    )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("requires a Formula artifact"));
-
+    assert!(config.quotes_only);
+    assert_eq!(config.venues[0].execution_mode, None);
+    assert!(config.strategies.is_empty());
+    assert!(!RuntimeNonceLedger::open(directory.join("nonces.jsonl"))
+        .unwrap()
+        .contains("nonce-live-small"));
     std::fs::remove_dir_all(directory).unwrap();
 }
 

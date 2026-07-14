@@ -5,6 +5,11 @@ PLOY is maintained inside the [Monday repository](https://github.com/proerror77/
 prediction-market product, research, agent sidecar, and operator code can evolve
 without joining Monday's `rust_hft` Cargo graph.
 
+The durable runtime is Rust and TypeScript is limited to `ploy-frontend`. Imported
+Python research/compatibility utilities remain only behind explicit parity gates;
+the root CI checks them for source compatibility but does not deploy the nested
+historical PLOY workflows.
+
 ## Execution boundary
 
 Monday's `rust_hft` runtime is the only production authority for risk, OMS,

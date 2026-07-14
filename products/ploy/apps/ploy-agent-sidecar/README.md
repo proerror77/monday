@@ -37,11 +37,12 @@ state at startup and before every model run. Missing credentials, HTTP 401, or
 an unavailable control plane fail closed before any model invocation; the worker
 never silently substitutes an on-disk snapshot.
 
-The platform release bundle includes `bin/ploy-agent-sidecar` and
-`deployment/ploy-agent-sidecar.service`. Installation is intentionally
-opt-in: configure the shared token and a trusted `CODEX_CLI_BIN` (or Grok
-credentials), install the unit, then enable it. The unit fails closed and
-restarts if it races the daemon startup preflight.
+There is intentionally no approved deployment package or systemd unit for this
+worker yet. The nested PLOY deployment workflows are historical material, not
+Monday deployment entrypoints. For local validation, configure the shared token
+and a trusted `CODEX_CLI_BIN` (or Grok credentials) and run the binary directly.
+A separately reviewed Monday deployment task must define secret injection,
+process supervision, and evidence-adapter packaging before enabling it on a host.
 
 The worker lease enforces exactly one sidecar process for each file-backed queue
 directory. JSONL recovery covers process crashes and uses synced appends, but

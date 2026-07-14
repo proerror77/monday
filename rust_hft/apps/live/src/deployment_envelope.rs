@@ -188,18 +188,10 @@ impl RuntimeActivationAdapter for SystemConfigActivationAdapter<'_> {
                 proposed.quotes_only = false;
             }
             ActivationMode::LiveSmall => {
-                if proposed.venues[*venue_index].venue_type != runtime::VenueType::Polymarket {
-                    return Err(
-                        "live-small activation is restricted to Polymarket venues".to_string()
-                    );
-                }
-                if request.artifact != ActivationArtifact::Formula {
-                    return Err(
-                        "live-small Polymarket activation requires a Formula artifact".to_string(),
-                    );
-                }
-                proposed.venues[*venue_index].execution_mode = Some("Live".to_string());
-                proposed.quotes_only = false;
+                return Err(
+                    "live-small activation is disabled until real-venue reconciliation, reduce-only exit, order-size, and slippage acceptance tests pass"
+                        .to_string(),
+                );
             }
         }
         apply_strategy_bundle(&mut proposed, request, self.bundle, self.bundle_path)?;

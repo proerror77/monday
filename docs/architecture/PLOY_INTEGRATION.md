@@ -46,6 +46,21 @@ The complete path and SHA-256 record is in
 
 The original `.github`, `deployment`, and `infra` trees remain under `products/ploy` for source compatibility and historical evidence. GitHub does not execute nested workflows. They are not Monday deployment entrypoints.
 
+## Language boundary
+
+- Durable Monday market data, account, order, reconciliation, sidecar, report,
+  backtest, and monitoring paths are Rust. TypeScript is limited to the operator
+  frontend.
+- Python remains only where behavior has not yet earned Rust parity: the legacy ML
+  workspace, the Python LOB archiver during Rust shadow comparison, and imported
+  PLOY research/compatibility utilities. Root CI may compile or fixture-test those
+  files, but it does not make the nested PLOY deployment workflows active.
+- Shell remains for host bootstrap, CI command composition, and package installation;
+  no shell script owns trading decisions, risk, OMS, or exchange mutations.
+- The Rust sidecar is built and tested but has no approved deployment package. Its
+  missing evidence adapters fail closed and require a separate parity and deployment
+  review rather than falling back to Python or user-global tools.
+
 ## Historical local-only documents
 
 Seven documents from local PLOY commit `5de411bbe8889284b47fe9932821af077d2962fc` are preserved under `products/ploy/docs/archive/local-readiness-2026-07-11`. They are explicitly stale: they target the standalone PLOY/Tango topology and must not be treated as current Monday plans.

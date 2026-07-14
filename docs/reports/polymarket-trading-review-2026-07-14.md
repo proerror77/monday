@@ -22,7 +22,7 @@ No funded order was submitted during this review.
 | Account | Added paginated open orders, balances, positions, confirmed recent fills, fee fields, authoritative IPC inspection, and pristine Polymarket bootstrap. |
 | Reconciliation | Added venue/account-scoped positions, pre-subscription event buffering, private-stream gap latching, account-wide REST catch-up, bounded fill/fee dedupe, fail-closed unknown activity, and a periodic pause/drain/snapshot barrier. |
 | Recovery | Exchange-only startup orders enter a sticky Paused mode with authoritative REST inspection/cancellation but no placement/replacement. A clean latch requires strict catch-up, a second empty order snapshot, and readiness checks; pre-start matched quantity requires state restoration and restart. |
-| Activation | Added unsigned no-strategy operator control for inspection/cancellation only; any strategy still needs a signed deployment. Enabled human-approved LiveSmall only for Polymarket Formula deployments with intersected hard limits; other live artifacts/venues stay disabled. |
+| Activation | Added unsigned no-strategy operator control for inspection/cancellation only; any strategy still needs a signed Paper/Shadow deployment. `LiveSmall` remains fail-closed for Polymarket and every other venue until the separate real-venue acceptance gate is completed. |
 
 Important safety decisions:
 
@@ -75,6 +75,8 @@ The current network egress is reported by Polymarket as `blocked=true`, country 
 The Monday repository contains no funded Polymarket private key, and the current shell has no
 `POLYMARKET_PRIVATE_KEY`, token ID, signature type, or funder configured. Consequently the review
 proves the public quote path and no-money execution contracts, but does not claim authenticated
-account or funded-order proof. Live activation must be performed from a permitted deployment
-jurisdiction with an externally supplied signer, followed by the activation sequence in
-`docs/architecture/POLYMARKET_TRADING_INTEGRATION.md`.
+account or funded-order proof. The authenticated account/cancel path can be exercised in the
+zero-limit no-strategy operator mode, but funded activation remains rejected even from a permitted
+deployment jurisdiction. A later acceptance task needs an externally supplied signer, the full
+activation sequence in `docs/architecture/POLYMARKET_TRADING_INTEGRATION.md`, and a separately
+reviewed change to the `LiveSmall` fail-closed gate.

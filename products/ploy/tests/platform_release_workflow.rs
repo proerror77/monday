@@ -9,7 +9,7 @@ fn repo_file(relative_path: &str) -> String {
 }
 
 #[test]
-fn release_platform_workflow_builds_new_workspace_binaries() {
+fn release_platform_workflow_builds_only_approved_workspace_binaries() {
     let content = repo_file(".github/workflows/release-platform.yml");
     let mut offenders = Vec::new();
 
@@ -17,15 +17,12 @@ fn release_platform_workflow_builds_new_workspace_binaries() {
         "cargo build --release --locked",
         "new-ployd",
         "new-ploy-runner",
-        "-p ploy-agent-sidecar",
         "-p ployctl",
         "-p ploytui",
         "bin/ployd",
-        "bin/ploy-agent-sidecar",
         "bin/ployctl",
         "bin/ploytui",
         "deployment/ployd.service",
-        "deployment/ploy-agent-sidecar.service",
         "deployment/ploy-maintenance.service",
         "deployment/ploy-maintenance.timer",
         "deployment/ploy-platform-watchdog.service",
@@ -45,6 +42,12 @@ fn release_platform_workflow_builds_new_workspace_binaries() {
     if content.contains("target/release/ploy") {
         offenders
             .push("release-platform.yml: still references legacy target/release/ploy".to_string());
+    }
+    if content.contains("ploy-agent-sidecar") {
+        offenders.push(
+            "release-platform.yml must not package the research sidecar through the historical PLOY deployment lane"
+                .to_string(),
+        );
     }
     if content.contains("uses: appleboy/") || content.contains("environment: production") {
         offenders.push(

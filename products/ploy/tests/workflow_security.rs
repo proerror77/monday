@@ -1485,34 +1485,3 @@ fn checked_in_platform_service_enforces_guardrails() {
         offenders.join("\n")
     );
 }
-
-#[test]
-fn checked_in_agent_sidecar_service_is_bounded_and_opt_in() {
-    let content = workflow_contents("deployment/ploy-agent-sidecar.service");
-    let required = [
-        "Requires=ployd.service",
-        "EnvironmentFile=/opt/ploy/.env",
-        "ExecStart=/opt/ploy/bin/ploy-agent-sidecar",
-        "Restart=on-failure",
-        "MemoryHigh=384M",
-        "MemoryMax=512M",
-        "NoNewPrivileges=true",
-        "ProtectSystem=full",
-        "ProtectHome=true",
-        "StateDirectoryMode=0700",
-        "ReadWritePaths=/opt/ploy/run /var/lib/ploy-agent-sidecar",
-    ];
-    let mut offenders = Vec::new();
-    for needle in required {
-        if !content.contains(needle) {
-            offenders.push(format!(
-                "deployment/ploy-agent-sidecar.service: missing guardrail `{needle}`"
-            ));
-        }
-    }
-    assert!(
-        offenders.is_empty(),
-        "checked-in sidecar service guardrail check failed:\n{}",
-        offenders.join("\n")
-    );
-}
