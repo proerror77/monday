@@ -1,0 +1,33 @@
+[Unit]
+Description=Monday Polymarket public market-data tape
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+
+[Service]
+Type=simple
+User=hftcollector
+Group=hftcollector
+WorkingDirectory=/opt/monday
+Environment=RUST_LOG=info
+ExecStart=/opt/monday/bin/new-ploy-runner \
+    --config /etc/monday/polymarket-market-tape.toml \
+    --deployment-id polymarket-market-data-ecs \
+    --dry-run
+Restart=always
+RestartSec=5
+RuntimeMaxSec=21600
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/monday/spool/polymarket
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0027
+CPUQuota=30%
+MemoryHigh=384M
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

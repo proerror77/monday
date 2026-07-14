@@ -70,6 +70,7 @@ fn program_name(args: &[String]) -> String {
 }
 
 pub async fn run_with_args(args: Vec<String>) {
+    install_tls_crypto_provider();
     init_tracing();
 
     let command = args.get(1).map(|s| s.as_str());
@@ -187,6 +188,14 @@ fn normalize_mode_args(mut args: Vec<String>) -> Vec<String> {
     args
 }
 
+fn install_tls_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    assert!(
+        rustls::crypto::CryptoProvider::get_default().is_some(),
+        "failed to install a process-level Rustls CryptoProvider"
+    );
+}
+
 fn init_tracing() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| {
@@ -202,4 +211,13 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .try_init();
+}
+
+#[cfg(test)]
+mod tls_tests {
+    #[test]
+    fn runner_installs_a_process_tls_provider() {
+        super::install_tls_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 }

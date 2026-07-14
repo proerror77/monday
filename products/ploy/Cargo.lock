@@ -5222,6 +5222,7 @@ dependencies = [
  "ploy-market-data",
  "ploy-strategy-bundles",
  "ploy-strategy-runtime",
+ "rustls",
  "sqlx",
  "tokio",
  "tracing",

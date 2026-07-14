@@ -20,6 +20,13 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [ ] Merge the Monday migration PR.
 - [ ] Redirect and archive the former PLOY repository.
 
+## Polymarket public data on Monday ECS
+
+- [x] Add a no-op strategy that consumes market data without emitting orders.
+- [x] Add a fail-closed ECS config and hardened systemd service.
+- [x] Build and install the Linux runner artifact.
+- [x] Enable the BTC/ETH/SOL/XRP 5-minute/15-minute service and verify event rollover, token-mapped quotes, and zero intents/fills.
+
 ## Safety
 
 - Live trading stays disabled.

@@ -643,10 +643,10 @@ async fn run_live_or_dry_run(
 
     let feed: Box<dyn Feed> = if let Some(record_path) = config.record_market_updates_path() {
         Box::new(
-            RecordingFeed::with_limits(
+            RecordingFeed::with_policy(
                 LiveFeed::new(rx),
                 record_path,
-                config.record_market_updates_limits(),
+                config.record_market_updates_policy(),
             )
             .unwrap_or_else(|error| {
                 eprintln!(

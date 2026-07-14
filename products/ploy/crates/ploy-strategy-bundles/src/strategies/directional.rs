@@ -1637,16 +1637,8 @@ impl StrategyLogic for DirectionalStrategy {
                     debug!(symbol = %symbol, event_id = %event_id, window_secs = *window_secs, "Ignoring disallowed event window");
                     return vec![];
                 }
-                // Use feed_time (last seen spot/quote timestamp) as "now" so that
-                // replay runs are deterministic and don't drop historical windows
-                // that arrived before the first spot tick.
-                // Fall back to the event's own end_time only when no feed time is
-                // known yet — this keeps the window alive until spot data arrives.
-                let now = self
-                    .feed_time
-                    .unwrap_or_else(|| *end_time - chrono::Duration::seconds(1));
                 let mut stale_expired = Vec::new();
-                if let Some(existing) = self.events.get(symbol) {
+                if let (Some(now), Some(existing)) = (self.feed_time, self.events.get(symbol)) {
                     stale_expired = existing
                         .iter()
                         .filter(|event| {
@@ -1687,6 +1679,18 @@ impl StrategyLogic for DirectionalStrategy {
                 // If we already have a cached quote for either token, try entry now.
                 let has_cached_quote =
                     self.quotes.contains_key(up_token) || self.quotes.contains_key(down_token);
+                let evaluation_time = self
+                    .feed_time
+                    .or_else(|| {
+                        [up_token, down_token]
+                            .into_iter()
+                            .filter_map(|token| self.quotes.get(token).map(|quote| quote.ts))
+                            .max()
+                    })
+                    .unwrap_or_else(|| {
+                        let window_secs = i64::try_from(*window_secs).unwrap_or(i64::MAX);
+                        *end_time - chrono::Duration::seconds(window_secs)
+                    });
                 if has_cached_quote
                     && self
                         .config
@@ -1694,9 +1698,9 @@ impl StrategyLogic for DirectionalStrategy {
                         .iter()
                         .any(|s| s.as_str() == symbol.as_ref())
                     && self.daily_trade_cap_allows_entry()
-                    && !self.in_cooldown(symbol, now)
+                    && !self.in_cooldown(symbol, evaluation_time)
                 {
-                    return self.try_entry(symbol, positions, orders, now);
+                    return self.try_entry(symbol, positions, orders, evaluation_time);
                 }
                 vec![]
             }
@@ -1717,12 +1721,12 @@ impl StrategyLogic for DirectionalStrategy {
                     }
                 }
 
-                for event in matching_events {
-                    if !self.event_has_open_position(&event, positions) {
+                for event in &matching_events {
+                    if !self.event_has_open_position(event, positions) {
                         continue;
                     }
 
-                    let Some(up_won) = self.resolve_expired_event_outcome(&event, *settlement)
+                    let Some(up_won) = self.resolve_expired_event_outcome(event, *settlement)
                     else {
                         warn!(
                             event_id = %event_id,
@@ -1733,10 +1737,16 @@ impl StrategyLogic for DirectionalStrategy {
                         continue;
                     };
 
-                    exits.extend(self.build_settlement_exits(&event, *end_time, up_won, positions));
+                    exits.extend(self.build_settlement_exits(event, *end_time, up_won, positions));
                 }
 
                 if remove_event {
+                    for event in &matching_events {
+                        self.token_symbol.remove(event.up_token.as_ref());
+                        self.token_symbol.remove(event.down_token.as_ref());
+                        self.quotes.remove(event.up_token.as_ref());
+                        self.quotes.remove(event.down_token.as_ref());
+                    }
                     for events in self.events.values_mut() {
                         events.retain(|e| e.event_id != *event_id);
                     }
@@ -1947,6 +1957,163 @@ mod tests {
 
         let picked = strat.pick_event("BTCUSDT", now).unwrap();
         assert_eq!(picked.event_id.as_ref(), "e1"); // nearer one
+    }
+
+    #[test]
+    fn expired_event_quote_cannot_trigger_next_event_trade_and_fresh_next_quote_can() {
+        let mut strat = DirectionalStrategy::new(default_config());
+        let now = Utc::now();
+        let positions = PositionLedger::default();
+
+        // Discover the expiring 5m event, its next 5m event, and the concurrent
+        // 15m event before any feed timestamp exists. A later-window discovery
+        // must not make the nearer event look expired.
+        for (event_id, up_token, down_token, end_time, window_secs) in [
+            (
+                "old",
+                "up-old",
+                "down-old",
+                now + chrono::Duration::seconds(1),
+                300,
+            ),
+            (
+                "next",
+                "up-next",
+                "down-next",
+                now + chrono::Duration::seconds(120),
+                300,
+            ),
+            (
+                "parallel-15m",
+                "up-15m",
+                "down-15m",
+                now + chrono::Duration::seconds(600),
+                900,
+            ),
+        ] {
+            strat.on_update(
+                &MarketUpdate::EventDiscovered {
+                    event_id: event_id.into(),
+                    symbol: "BTCUSDT".into(),
+                    up_token: up_token.into(),
+                    down_token: down_token.into(),
+                    end_time,
+                    window_secs,
+                    price_to_beat: Some(dec!(100000)),
+                    resolved_up_won: None,
+                },
+                &positions,
+                &OrderLedger::default(),
+            );
+        }
+
+        for (token_id, bid, ask) in [
+            ("up-next", dec!(0.29), dec!(0.30)),
+            ("down-next", dec!(0.69), dec!(0.70)),
+        ] {
+            strat.on_update(
+                &MarketUpdate::Quote {
+                    token_id: token_id.into(),
+                    bid: Some(bid),
+                    ask: Some(ask),
+                    ts: now,
+                    bid_size: None,
+                    ask_size: None,
+                    bid_levels: Vec::new(),
+                    ask_levels: Vec::new(),
+                },
+                &positions,
+                &OrderLedger::default(),
+            );
+        }
+
+        let mut blocking_orders = OrderLedger::default();
+        blocking_orders.insert_from_intent(
+            "order-next",
+            &TradingIntent {
+                intent_id: "intent-next".into(),
+                deployment_id: "test".into(),
+                market_id: "next".into(),
+                token_id: "up-next".into(),
+                side: TradeSide::Buy,
+                quantity: dec!(10),
+                limit_price: Some(dec!(0.30)),
+                purpose: IntentPurpose::Entry,
+                created_at: now,
+            },
+        );
+        blocking_orders.acknowledge("order-next", "venue-next");
+
+        let blocked = strat.on_update(
+            &MarketUpdate::SpotPrice {
+                symbol: "BTCUSDT".into(),
+                price: dec!(101500),
+                ts: now + chrono::Duration::milliseconds(500),
+            },
+            &positions,
+            &blocking_orders,
+        );
+        assert!(
+            blocked.is_empty(),
+            "active next-event order should block entry"
+        );
+
+        strat.on_update(
+            &MarketUpdate::EventExpired {
+                event_id: "old".into(),
+                end_time: now + chrono::Duration::seconds(1),
+                resolved_up_won: None,
+            },
+            &positions,
+            &OrderLedger::default(),
+        );
+
+        let stale_quote_decisions = strat.on_update(
+            &MarketUpdate::Quote {
+                token_id: "up-old".into(),
+                bid: Some(dec!(0.99)),
+                ask: Some(dec!(1.00)),
+                ts: now + chrono::Duration::seconds(2),
+                bid_size: None,
+                ask_size: None,
+                bid_levels: Vec::new(),
+                ask_levels: Vec::new(),
+            },
+            &positions,
+            &OrderLedger::default(),
+        );
+        assert!(
+            stale_quote_decisions.is_empty(),
+            "a quote for the expired event must not trigger a trade in another event"
+        );
+
+        let decisions = strat.on_update(
+            &MarketUpdate::Quote {
+                token_id: "up-next".into(),
+                bid: Some(dec!(0.30)),
+                ask: Some(dec!(0.31)),
+                ts: now + chrono::Duration::seconds(3),
+                bid_size: None,
+                ask_size: None,
+                bid_levels: Vec::new(),
+                ask_levels: Vec::new(),
+            },
+            &positions,
+            &OrderLedger::default(),
+        );
+
+        assert_eq!(
+            decisions.len(),
+            1,
+            "fresh next-event quote should unlock entry"
+        );
+        match &decisions[0] {
+            StrategyDecision::Enter { intent, .. } => {
+                assert_eq!(intent.market_id, "next");
+                assert_eq!(intent.token_id, "up-next");
+            }
+            other => panic!("Expected Enter, got {other:?}"),
+        }
     }
 
     #[test]
