@@ -607,11 +607,7 @@ def fetch_snapshot_sync(symbol: str) -> dict:
 async def receive_url(url: str, queue: asyncio.Queue, stop: asyncio.Event) -> None:
     global LAST_DATA_AT
     async with connect(
-        url,
-        open_timeout=20,
-        close_timeout=1,
-        ping_interval=20,
-        max_size=8 * 1024 * 1024,
+        url, open_timeout=20, ping_interval=20, max_size=8 * 1024 * 1024
     ) as websocket:
         while not stop.is_set():
             try:

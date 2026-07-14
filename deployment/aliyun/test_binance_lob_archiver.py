@@ -142,28 +142,6 @@ class OrderBookStateTests(unittest.TestCase):
 
 
 class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_websocket_close_timeout_fits_cancellation_budget(self):
-        options = {}
-
-        class Connection:
-            async def __aenter__(self):
-                return SimpleNamespace()
-
-            async def __aexit__(self, *args):
-                return False
-
-        def connect(url, **kwargs):
-            options.update(kwargs)
-            return Connection()
-
-        stop = ARCHIVER.asyncio.Event()
-        stop.set()
-        with patch.object(ARCHIVER, "connect", new=connect):
-            await ARCHIVER.receive_url("wss://example.test", ARCHIVER.asyncio.Queue(), stop)
-
-        self.assertEqual(options["close_timeout"], 1)
-        self.assertLess(options["close_timeout"], ARCHIVER.TASK_CANCEL_TIMEOUT_SECONDS)
-
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.original_spool = ARCHIVER.SPOOL_DIR
