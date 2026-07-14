@@ -342,14 +342,20 @@ class RuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             except ARCHIVER.asyncio.CancelledError:
                 await release.wait()
 
-        task = ARCHIVER.asyncio.create_task(stubborn())
+        task = ARCHIVER.asyncio.create_task(stubborn(), name="stubborn-test")
         await ARCHIVER.asyncio.sleep(0)
         with (
             patch.object(ARCHIVER, "TASK_CANCEL_TIMEOUT_SECONDS", 0.01),
-            self.assertLogs("binance-lob-archiver", level="ERROR"),
+            self.assertLogs("binance-lob-archiver", level="ERROR") as logs,
         ):
             with self.assertRaises(ARCHIVER.TaskCancellationStuck):
                 await ARCHIVER.cancel_tasks_bounded((task,))
+
+        self.assertIn("name=stubborn-test", logs.output[0])
+        self.assertIn("coro=RuntimeContractTests", logs.output[0])
+        self.assertIn("cancel_requested=True", logs.output[0])
+        self.assertIn("cancelling=1", logs.output[0])
+        self.assertIn("location=stubborn:", logs.output[0])
 
         release.set()
         await task

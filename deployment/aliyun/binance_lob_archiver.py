@@ -693,16 +693,27 @@ def run_process_watchdog() -> None:
 async def cancel_tasks_bounded(tasks: tuple[asyncio.Task, ...]) -> None:
     if not tasks:
         return
-    for task in tasks:
-        task.cancel()
+    cancel_requested = {task: task.cancel() for task in tasks}
     _, pending = await asyncio.wait(
         tasks, timeout=TASK_CANCEL_TIMEOUT_SECONDS
     )
     if pending:
-        LOG.error(
-            "task cancellation timed out pending=%s",
-            len(pending),
-        )
+        for task in pending:
+            stack = task.get_stack(limit=1)
+            location = (
+                f"{stack[-1].f_code.co_name}:{stack[-1].f_lineno}"
+                if stack
+                else "unknown"
+            )
+            LOG.error(
+                "task cancellation timed out name=%s coro=%s "
+                "cancel_requested=%s cancelling=%s location=%s",
+                task.get_name(),
+                task.get_coro().__qualname__,
+                cancel_requested[task],
+                task.cancelling(),
+                location,
+            )
         raise TaskCancellationStuck(
             f"task cancellation timed out pending={len(pending)}"
         )
@@ -893,10 +904,15 @@ async def run_session(
     queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_BUFFERED_DIFFS)
     failure: BaseException | None = None
     receivers = [
-        asyncio.create_task(receive_url(url, queue, stop)) for url in stream_urls()
+        asyncio.create_task(
+            receive_url(url, queue, stop), name=f"receiver-{index}"
+        )
+        for index, url in enumerate(stream_urls())
     ]
     snapshot_limiter = SnapshotRateLimiter(SNAPSHOT_REQUESTS_PER_SECOND)
-    snapshotter = asyncio.create_task(produce_snapshots(queue, snapshot_limiter))
+    snapshotter = asyncio.create_task(
+        produce_snapshots(queue, snapshot_limiter), name="snapshotter"
+    )
     tasks = [*receivers, snapshotter]
     resync_tasks: dict[str, asyncio.Task] = {}
     LOG.info(
@@ -990,7 +1006,8 @@ async def run_session(
                     resync_tasks[gap.symbol] = asyncio.create_task(
                         produce_snapshot(
                             gap.symbol.lower(), queue, snapshot_limiter
-                        )
+                        ),
+                        name=f"resync-{gap.symbol}",
                     )
                 continue
 
@@ -1028,6 +1045,11 @@ async def run_session(
         failure = error
         raise
     finally:
+        LOG.info(
+            "cancelling session tasks queue_size=%s queue_maxsize=%s",
+            queue.qsize(),
+            queue.maxsize,
+        )
         await cancel_tasks_bounded(tuple([*tasks, *resync_tasks.values()]))
         archive_only = isinstance(failure, SequenceGap)
         drain_gap: SequenceGap | None = None
