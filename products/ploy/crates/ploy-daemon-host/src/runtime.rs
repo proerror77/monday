@@ -1840,18 +1840,30 @@ mod tests {
         )
         .expect("paper snapshot");
         let pid_file = runtime_root.join("workers/mismatch.live.pid");
+        let ready_file = runtime_root.join("workers/mismatch.live.ready");
         fs::create_dir_all(pid_file.parent().expect("pid parent")).expect("pid parent");
         let mut legacy = std::process::Command::new("/bin/sh")
             .args([
                 "-c",
-                "sleep 30; :",
+                "touch \"$READY_FILE\"; sleep 30; :",
                 "worker",
                 "--deployment-id",
                 "mismatch.live",
             ])
+            .env("READY_FILE", &ready_file)
             .spawn()
             .expect("legacy worker");
-        fs::write(&pid_file, format!("{}\n", legacy.id())).expect("pidfile");
+        let legacy_pid = legacy.id();
+        let ready = (0..100).any(|_| {
+            if ready_file.exists() {
+                true
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(ready, "legacy worker did not finish exec setup");
+        fs::write(&pid_file, format!("{legacy_pid}\n")).expect("pidfile");
 
         let daemon = PloyDaemon::boot(&config).expect("fail-closed boot");
         let record = daemon.inspect_deployment("mismatch.live").expect("record");

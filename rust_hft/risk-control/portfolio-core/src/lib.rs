@@ -77,39 +77,61 @@ impl Portfolio {
         self.order_meta.insert(order_id, (symbol, side));
     }
 
-    /// 處理執行事件，僅處理 Fill/Balance 類事件
+    /// 處理執行事件，僅處理 Fill/Fee/Balance 類事件
     pub fn on_execution_event(&mut self, event: &ExecutionEvent) {
-        if let ExecutionEvent::Fill {
-            order_id,
-            price,
-            quantity,
-            fill_id,
-            ..
-        } = event
-        {
-            if quantity.0 <= Decimal::ZERO {
-                warn!(
-                    order_id = %order_id.0,
-                    quantity = %quantity.0,
-                    "ignoring fill with non-positive quantity"
-                );
-                return;
-            }
-            if let Some((symbol, side)) = self.order_meta.get(order_id).cloned() {
-                // De-duplication: skip duplicated fill_id for this order
-                let set = self.processed_fill_ids.entry(order_id.clone()).or_default();
-                if !fill_id.is_empty() && set.contains(fill_id) {
-                    // duplicate, ignore
-                } else {
-                    if !fill_id.is_empty() {
-                        set.insert(fill_id.clone());
+        match event {
+            ExecutionEvent::Fill {
+                order_id,
+                price,
+                quantity,
+                fill_id,
+                ..
+            } => {
+                if quantity.0 <= Decimal::ZERO {
+                    warn!(
+                        order_id = %order_id.0,
+                        quantity = %quantity.0,
+                        "ignoring fill with non-positive quantity"
+                    );
+                    return;
+                }
+                if let Some((symbol, side)) = self.order_meta.get(order_id).cloned() {
+                    // De-duplication: skip duplicated fill_id for this order
+                    let set = self.processed_fill_ids.entry(order_id.clone()).or_default();
+                    if fill_id.is_empty() || !set.contains(fill_id) {
+                        if !fill_id.is_empty() {
+                            set.insert(fill_id.clone());
+                        }
+                        self.apply_fill(&symbol, side, *price, *quantity);
+                        // Fill price is the freshest executable fallback mark observed by this ledger.
+                        self.market_prices.insert(symbol.clone(), *price);
+                        self.recalculate_unrealized_pnl();
                     }
-                    self.apply_fill(&symbol, side, *price, *quantity);
-                    // Fill price is the freshest executable fallback mark observed by this ledger.
-                    self.market_prices.insert(symbol.clone(), *price);
-                    self.recalculate_unrealized_pnl();
                 }
             }
+            ExecutionEvent::FeeCharged {
+                order_id,
+                amount,
+                fill_id,
+                ..
+            } => {
+                if *amount < Decimal::ZERO {
+                    warn!(order_id = %order_id.0, amount = %amount, "ignoring negative fee");
+                    return;
+                }
+                if self.order_meta.contains_key(order_id) {
+                    let fee_id = format!("fee:{fill_id}");
+                    let set = self.processed_fill_ids.entry(order_id.clone()).or_default();
+                    if set.insert(fee_id) {
+                        self.view.cash_balance -= *amount;
+                        self.view.realized_pnl -= *amount;
+                        self.update_drawdown_stats();
+                    }
+                } else {
+                    warn!(order_id = %order_id.0, "ignoring fee for unknown order");
+                }
+            }
+            _ => {}
         }
         // 每次更新後發佈只讀快照
         self.snapshot.store(Arc::new(self.view.clone()));
@@ -345,6 +367,26 @@ mod tests {
             symbol.clone(),
             Price(Decimal::from(price)),
         )]));
+    }
+
+    #[test]
+    fn venue_fee_is_idempotent_and_reduces_cash_and_realized_pnl() {
+        let mut portfolio = Portfolio::with_cash_balance(Decimal::from(100));
+        let order_id = OrderId("fee-order".into());
+        portfolio.register_order(order_id.clone(), Symbol::new("123"), Side::Buy);
+        let fee = ExecutionEvent::FeeCharged {
+            order_id,
+            amount: Decimal::new(175, 2),
+            timestamp: 0,
+            fill_id: "fill-1".into(),
+        };
+
+        portfolio.on_execution_event(&fee);
+        portfolio.on_execution_event(&fee);
+
+        let view = portfolio.reader().load();
+        assert_eq!(view.cash_balance, Decimal::new(9825, 2));
+        assert_eq!(view.realized_pnl, Decimal::new(-175, 2));
     }
 
     #[test]

@@ -547,6 +547,16 @@ impl SystemBuilder {
     /// failure and duplicate instance ID as a startup error.
     pub fn auto_register_adapters_strict(mut self) -> HftResult<Self> {
         info!("strictly auto-registering adapters and strategies");
+        self.config
+            .engine
+            .validate_intent_execution_limits()
+            .map_err(HftError::Config)?;
+        if self.config.engine.auto_cancel_exchange_only {
+            return Err(HftError::Config(
+                "engine.auto_cancel_exchange_only is deprecated and unsupported; use the runtime OMS-aware cancellation control plane"
+                    .to_string(),
+            ));
+        }
         self = self.register_market_streams_from_config();
         let quotes_only = quotes_only_enabled(&self.config);
         if quotes_only {
@@ -590,6 +600,17 @@ impl SystemBuilder {
 
         // 創建引擎
         let mut engine = Engine::new(engine_config);
+        if self.config.engine.auto_cancel_exchange_only {
+            error!("unsupported auto_cancel_exchange_only requested; engine remains paused");
+            engine.pause_trading();
+        }
+        if let Err(error) = engine.set_intent_execution_limits(
+            self.config.engine.intent_max_slippage_bps,
+            self.config.engine.intent_max_order_notional,
+        ) {
+            error!(%error, "invalid intent execution limits; engine remains paused");
+            engine.pause_trading();
+        }
 
         // 🔥 P0: 依賴注入 - 創建並注入 OMS 與 Portfolio
         {
@@ -675,6 +696,7 @@ impl SystemBuilder {
 
         SystemRuntime {
             engine: Arc::new(Mutex::new(engine)),
+            execution_control_gate: Arc::new(Mutex::new(())),
             config: self.config,
             tasks: Vec::new(),
             execution_worker_tasks: Vec::new(),
@@ -702,6 +724,7 @@ fn venue_type_to_venue_id(venue_type: &VenueType) -> VenueId {
         VenueType::Lighter => VenueId::LIGHTER,
         VenueType::Backpack => VenueId::BACKPACK,
         VenueType::OndoPerps => VenueId::ONDO_PERPS,
+        VenueType::Polymarket => VenueId::POLYMARKET,
         VenueType::Mock => VenueId::MOCK,
     }
 }
@@ -709,6 +732,7 @@ fn venue_type_to_venue_id(venue_type: &VenueType) -> VenueId {
 /// 系統運行時
 pub struct SystemRuntime {
     pub engine: Arc<Mutex<Engine>>,
+    execution_control_gate: Arc<Mutex<()>>,
     pub config: SystemConfig,
     // 後台任務控制
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -751,9 +775,22 @@ fn requires_authoritative_balance_reconciliation(config: &SystemConfig) -> bool 
 impl SystemRuntime {
     /// 啟動系統
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.start_with_ipc_socket_path(None).await
+    }
+
+    async fn start_with_ipc_socket_path(
+        &mut self,
+        #[allow(unused_variables)] ipc_socket_path: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         info!("啟動系統運行時...");
+        #[cfg(feature = "infra-ipc")]
+        let prepared_ipc =
+            crate::ipc_handler::prepare_ipc_server(ipc_socket_path).map_err(|error| {
+                HftError::Execution(format!("failed to prepare IPC control server: {error}"))
+            })?;
         let require_authoritative_balances =
             requires_authoritative_balance_reconciliation(&self.config);
+        let operator_control_only = self.config.strategies.is_empty();
 
         // 1) 橋接市場流（依登記規劃）
         let bridge_cfg = engine::AdapterBridgeConfig {
@@ -901,6 +938,20 @@ impl SystemRuntime {
                         info!("Ondo Perps 行情已橋接至引擎");
                     }
                 }
+                VenueType::Polymarket => {
+                    #[cfg(feature = "adapter-polymarket-data")]
+                    {
+                        let mut stream = adapter_polymarket_data::PolymarketMarketStream::new();
+                        if let Some(cfg) = &venue_cfg {
+                            if let Some(ws_url) = &cfg.ws_public {
+                                stream = stream.with_ws_url(ws_url.clone());
+                            }
+                        }
+                        let consumer = bridge.bridge_instrument_stream(stream, instruments).await?;
+                        self.engine.lock().await.register_event_consumer(consumer);
+                        info!("Polymarket public CLOB market data bridged into the engine");
+                    }
+                }
                 VenueType::Backpack => {
                     #[cfg(feature = "adapter-backpack-data")]
                     {
@@ -980,7 +1031,6 @@ impl SystemRuntime {
                 ack_timeout_ms: self.config.engine.ack_timeout_ms,
                 // Runtime owns OMS-aware reconciliation; the worker only supplies snapshots.
                 reconcile_interval_ms: 0,
-                auto_cancel_exchange_only: self.config.engine.auto_cancel_exchange_only,
                 ..Default::default()
             };
 
@@ -1103,10 +1153,33 @@ impl SystemRuntime {
             let control = self.execution_control_handle();
             let startup_reconciliation = async {
                 control.pause_trading().await?;
-                let report = control.reconcile(true).await?;
+                let mut report = control.reconcile(true).await?;
+                // A no-strategy live runtime is an operator recovery surface, not an authority to
+                // adopt venue state into Monday's in-memory portfolio. In particular, an account
+                // with exchange-only orders must still reach IPC inspection/cancellation while
+                // remaining paused; bootstrap intentionally rejects such orders.
+                if !operator_control_only
+                    && !report.healthy
+                    && control
+                        .bootstrap_pristine_account(&report.worker_snapshot)
+                        .await?
+                {
+                    info!("bootstrapped pristine portfolio from authoritative venue account");
+                    report = control.reconcile(true).await?;
+                }
                 if !report.healthy {
+                    if operator_control_only {
+                        warn!(
+                            complete = report.complete,
+                            exchange_only = report.order_report.exchange_only.len(),
+                            local_only = report.order_report.local_only.len(),
+                            quantity_mismatch = report.order_report.qty_mismatch.len(),
+                            "authoritative account is not reconciled; starting no-strategy operator control with execution intake paused"
+                        );
+                        return Ok::<(), HftError>(());
+                    }
                     return Err(HftError::Execution(format!(
-                        "initial live reconciliation failed: complete={}, exchange_only={}, local_only={}, quantity_mismatch={}, balance_complete={}, balance_difference_usd={:?}",
+                        "initial live reconciliation failed: complete={}, exchange_only={}, local_only={}, quantity_mismatch={}, balance_complete={}, balance_difference_usd={:?}, position_complete={}, position_exchange_only={}, position_local_only={}, position_quantity_mismatch={}",
                         report.complete,
                         report.order_report.exchange_only.len(),
                         report.order_report.local_only.len(),
@@ -1119,15 +1192,50 @@ impl SystemRuntime {
                             .balance_report
                             .as_ref()
                             .and_then(|balances| balances.difference_usd),
+                        report
+                            .position_report
+                            .as_ref()
+                            .is_none_or(|positions| positions.complete),
+                        report
+                            .position_report
+                            .as_ref()
+                            .map_or(0, |positions| positions.exchange_only.len()),
+                        report
+                            .position_report
+                            .as_ref()
+                            .map_or(0, |positions| positions.local_only.len()),
+                        report
+                            .position_report
+                            .as_ref()
+                            .map_or(0, |positions| positions.quantity_mismatch.len()),
                     )));
                 }
-                control.resume_trading().await
+                if operator_control_only {
+                    info!(
+                        "authoritative account is reconciled; no-strategy operator control remains paused"
+                    );
+                    Ok(())
+                } else {
+                    control.resume_trading().await
+                }
             }
             .await;
             if let Err(error) = startup_reconciliation {
                 self.abort_execution_workers().await;
                 return Err(Box::new(error));
             }
+        }
+
+        // The control socket is already bound and secured. Attach the fully wired runtime before
+        // any strategy-processing loop can consume queued market events.
+        #[cfg(feature = "infra-ipc")]
+        {
+            let runtime_arc = Arc::new(Mutex::new(self.clone_for_ipc()));
+            self.ipc_task = Some(crate::ipc_handler::start_prepared_ipc_server(
+                runtime_arc,
+                prepared_ipc,
+            ));
+            info!("IPC control server started");
         }
 
         // 3) 啟動引擎主循環（後台，事件驅動）
@@ -1157,7 +1265,7 @@ impl SystemRuntime {
                     if !engine.lock().await.get_statistics().is_running {
                         break;
                     }
-                    match control.reconcile(include_balances).await {
+                    match control.reconcile_guarded(include_balances).await {
                         Ok(report) if report.healthy => {
                             tracing::debug!("runtime order reconciliation healthy");
                         }
@@ -1175,29 +1283,27 @@ impl SystemRuntime {
                                     .balance_report
                                     .as_ref()
                                     .and_then(|balances| balances.difference_usd),
+                                position_complete = report
+                                    .position_report
+                                    .as_ref()
+                                    .is_none_or(|positions| positions.complete),
+                                position_exchange_only = report
+                                    .position_report
+                                    .as_ref()
+                                    .map_or(0, |positions| positions.exchange_only.len()),
+                                position_local_only = report
+                                    .position_report
+                                    .as_ref()
+                                    .map_or(0, |positions| positions.local_only.len()),
+                                position_quantity_mismatch = report
+                                    .position_report
+                                    .as_ref()
+                                    .map_or(0, |positions| positions.quantity_mismatch.len()),
                                 "runtime order reconciliation unhealthy; pausing new intents"
                             );
-                            let mode = engine.lock().await.trading_mode();
-                            if matches!(
-                                mode,
-                                engine::TradingMode::Normal | engine::TradingMode::Degraded
-                            ) {
-                                if let Err(error) = control.pause_trading().await {
-                                    tracing::error!(%error, "failed to disable execution intake");
-                                }
-                            }
                         }
                         Err(error) => {
-                            tracing::error!(%error, "runtime reconciliation failed; pausing new intents");
-                            let mode = engine.lock().await.trading_mode();
-                            if matches!(
-                                mode,
-                                engine::TradingMode::Normal | engine::TradingMode::Degraded
-                            ) {
-                                if let Err(error) = control.pause_trading().await {
-                                    tracing::error!(%error, "failed to disable execution intake");
-                                }
-                            }
+                            tracing::error!(%error, "runtime reconciliation failed; execution remains paused");
                         }
                     }
                 }
@@ -1282,16 +1388,6 @@ impl SystemRuntime {
                 self.spawn_clickhouse_writer(clickhouse_config.clone())
                     .await?;
             }
-        }
-
-        // Start IPC control server if enabled
-        #[cfg(feature = "infra-ipc")]
-        {
-            // 使用 Arc::new(Mutex::new(self)) 來避免創建新實例
-            // 但由於 self 的生命週期問題，我們需要重構為使用共享的 runtime_arc
-            let runtime_arc = Arc::new(Mutex::new(self.clone_for_ipc()));
-            self.ipc_task = Some(crate::ipc_handler::start_ipc_server(runtime_arc, None));
-            info!("IPC control server started");
         }
 
         info!("系統運行時已啟動（引擎背景運行）");
@@ -1592,6 +1688,8 @@ impl Default for SystemConfig {
                 queue_capacity: 32768,
                 stale_us: 3000,
                 intent_max_latency_us: 3000,
+                intent_max_slippage_bps: None,
+                intent_max_order_notional: None,
                 top_n: 10,
                 flip_policy: FlipPolicy::OnUpdate,
                 cpu_affinity: CpuAffinityConfig::default(),
@@ -1631,14 +1729,110 @@ impl Default for SystemConfig {
 mod tests {
     use async_trait::async_trait;
     use futures::stream;
-    use ports::{AccountBalance, BoxStream, ConnectionHealth, ExecutionEvent, OpenOrder};
+    use ports::{
+        AccountBalance, AccountView, BookLevel, BoxStream, ConnectionHealth, ExecutionEvent,
+        MarketEvent, MarketSnapshot, OpenOrder, Strategy,
+    };
     use rust_decimal::Decimal;
     use shared_instrument::InstrumentId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
     struct AuthoritativeBalanceClient {
         equity_usd: Decimal,
+        open_orders: Vec<OpenOrder>,
+    }
+
+    struct CountingExecutionClient {
+        placements: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ExecutionClient for CountingExecutionClient {
+        async fn place_order(
+            &mut self,
+            _intent: ports::OrderIntent,
+        ) -> HftResult<hft_core::OrderId> {
+            self.placements.fetch_add(1, Ordering::SeqCst);
+            Ok(hft_core::OrderId("should-not-place".to_string()))
+        }
+
+        async fn cancel_order(&mut self, _order_id: &hft_core::OrderId) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn modify_order(
+            &mut self,
+            _order_id: &hft_core::OrderId,
+            _new_quantity: Option<hft_core::Quantity>,
+            _new_price: Option<hft_core::Price>,
+        ) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>> {
+            Ok(Box::pin(stream::pending()))
+        }
+
+        async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
+            Ok(Vec::new())
+        }
+
+        async fn connect(&mut self) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> HftResult<()> {
+            Ok(())
+        }
+
+        async fn health(&self) -> ConnectionHealth {
+            ConnectionHealth {
+                connected: true,
+                latency_ms: Some(0.0),
+                last_heartbeat: 0,
+            }
+        }
+    }
+
+    struct OrderOnMarketEvent {
+        emitted: bool,
+    }
+
+    impl Strategy for OrderOnMarketEvent {
+        fn on_market_event(
+            &mut self,
+            _event: &MarketEvent,
+            _account: &AccountView,
+        ) -> Vec<ports::OrderIntent> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            vec![ports::OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                hft_core::Side::Buy,
+                hft_core::Quantity(Decimal::ONE),
+                hft_core::OrderType::Limit,
+                Some(hft_core::Price(Decimal::from(100))),
+                hft_core::TimeInForce::GTC,
+                "ipc-startup-regression".to_string(),
+                None,
+            )]
+        }
+
+        fn on_execution_event(
+            &mut self,
+            _event: &ExecutionEvent,
+            _account: &AccountView,
+        ) -> Vec<ports::OrderIntent> {
+            Vec::new()
+        }
+
+        fn name(&self) -> &str {
+            "ipc-startup-regression"
+        }
     }
 
     #[async_trait]
@@ -1670,7 +1864,7 @@ mod tests {
         }
 
         async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>> {
-            Ok(Vec::new())
+            Ok(self.open_orders.clone())
         }
 
         async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
@@ -1724,6 +1918,20 @@ mod tests {
         }
     }
 
+    fn configured_strategy() -> StrategyConfig {
+        StrategyConfig {
+            name: "startup-authority-test".to_string(),
+            strategy_type: StrategyType::Trend,
+            symbols: vec![Symbol::new("BTCUSDT")],
+            params: StrategyParams::Trend {
+                ema_fast: 12,
+                ema_slow: 26,
+                rsi_period: 14,
+            },
+            risk_limits: StrategyRiskLimits::default(),
+        }
+    }
+
     #[test]
     fn only_real_live_execution_requires_authoritative_balance_reconciliation() {
         let mut config = SystemConfig {
@@ -1744,10 +1952,84 @@ mod tests {
         assert!(!requires_authoritative_balance_reconciliation(&config));
     }
 
+    #[test]
+    fn invalid_intent_execution_limits_fail_closed_before_runtime_start() {
+        let mut config = SystemConfig::default();
+        config.engine.intent_max_slippage_bps = Some(10_001);
+
+        let Err(error) = SystemBuilder::new(config.clone()).auto_register_adapters_strict() else {
+            panic!("strict registration accepted invalid intent limits");
+        };
+        assert!(error.to_string().contains("intent_max_slippage_bps"));
+
+        let runtime = SystemBuilder::new(config).build();
+        assert_eq!(
+            runtime.engine.try_lock().unwrap().trading_mode(),
+            engine::TradingMode::Paused
+        );
+    }
+
+    #[test]
+    fn deprecated_exchange_only_auto_cancel_fails_closed_before_runtime_start() {
+        let mut config = SystemConfig::default();
+        config.engine.auto_cancel_exchange_only = true;
+
+        let Err(error) = SystemBuilder::new(config.clone()).auto_register_adapters_strict() else {
+            panic!("strict registration accepted unsupported exchange-only auto-cancel");
+        };
+        assert!(error.to_string().contains("auto_cancel_exchange_only"));
+
+        let runtime = SystemBuilder::new(config).build();
+        assert_eq!(
+            runtime.engine.try_lock().unwrap().trading_mode(),
+            engine::TradingMode::Paused
+        );
+    }
+
+    #[test]
+    fn builder_writes_verified_execution_limits_into_engine() {
+        let mut config = SystemConfig::default();
+        config.engine.intent_max_slippage_bps = Some(25);
+        config.engine.intent_max_order_notional = Some(Decimal::from(50));
+        let runtime = SystemBuilder::new(config).build();
+        let (engine_queues, mut worker_queues) =
+            create_execution_queues(ExecutionQueueConfig::default());
+        let mut engine = runtime.engine.try_lock().expect("engine lock");
+        engine.set_execution_queues(engine_queues);
+
+        let mut intent = ports::OrderIntent::crypto_spot(
+            Symbol::new("BTCUSDT"),
+            Side::Buy,
+            Quantity::from_f64(1.0).unwrap(),
+            OrderType::Limit,
+            Some(Price::from_f64(100.0).unwrap()),
+            TimeInForce::GTC,
+            "builder-limits".to_string(),
+            Some(VenueId::MOCK),
+        );
+        assert!(matches!(
+            engine.submit_order_intent(intent.clone()),
+            Err(HftError::Risk(_))
+        ));
+
+        intent.quantity = Quantity::from_f64(0.4).unwrap();
+        engine
+            .submit_order_intent(intent)
+            .expect("order below configured notional limit");
+        let envelopes = worker_queues.receive_envelopes();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].lifecycle.max_slippage_bps, Some(25));
+        assert_eq!(
+            envelopes[0].lifecycle.max_order_notional,
+            Some(Decimal::from(50))
+        );
+    }
+
     #[tokio::test]
     async fn live_runtime_reconciles_before_starting_engine_loop() {
         let mut config = SystemConfig {
             venues: vec![live_venue_config()],
+            strategies: vec![configured_strategy()],
             ..Default::default()
         };
         config.engine.reconcile_interval_ms = 0;
@@ -1755,6 +2037,7 @@ mod tests {
             .register_execution_client_with_venue(
                 AuthoritativeBalanceClient {
                     equity_usd: Decimal::from(100),
+                    open_orders: Vec::new(),
                 },
                 VenueId::MOCK,
             )
@@ -1773,6 +2056,159 @@ mod tests {
             engine::TradingMode::Paused
         );
         assert!(runtime.execution_worker_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
+    async fn no_strategy_live_runtime_starts_paused_for_operator_recovery() {
+        let mut config = SystemConfig {
+            venues: vec![live_venue_config()],
+            ..Default::default()
+        };
+        config.engine.reconcile_interval_ms = 0;
+        let mut runtime = SystemBuilder::new(config)
+            .register_execution_client_with_venue(
+                AuthoritativeBalanceClient {
+                    equity_usd: Decimal::from(100),
+                    open_orders: Vec::new(),
+                },
+                VenueId::MOCK,
+            )
+            .build();
+
+        runtime
+            .start()
+            .await
+            .expect("no-strategy recovery control must start fail-closed");
+
+        assert_eq!(
+            runtime.engine.lock().await.trading_mode(),
+            engine::TradingMode::Paused
+        );
+        assert!(!runtime.execution_worker_tasks.is_empty());
+        runtime
+            .stop()
+            .await
+            .expect("operator runtime stops cleanly");
+    }
+
+    #[cfg(feature = "infra-ipc")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ipc_prepare_failure_precedes_engine_loop_and_queued_order_execution() {
+        let placements = Arc::new(AtomicUsize::new(0));
+        let mut runtime = SystemBuilder::new(SystemConfig::default())
+            .register_execution_client(CountingExecutionClient {
+                placements: Arc::clone(&placements),
+            })
+            .build();
+        let ingester = {
+            let mut engine = runtime.engine.lock().await;
+            engine.register_strategy(OrderOnMarketEvent { emitted: false });
+            engine.create_event_ingester_pair()
+        };
+        ingester
+            .lock()
+            .expect("event ingester")
+            .ingest(MarketEvent::Snapshot(MarketSnapshot {
+                symbol: Symbol::new("BTCUSDT"),
+                timestamp: hft_core::now_micros(),
+                bids: vec![BookLevel {
+                    price: hft_core::Price(Decimal::from(100)),
+                    quantity: hft_core::Quantity(Decimal::ONE),
+                }],
+                asks: vec![BookLevel {
+                    price: hft_core::Price(Decimal::from(101)),
+                    quantity: hft_core::Quantity(Decimal::ONE),
+                }],
+                sequence: 1,
+                source_venue: Some(VenueId::BINANCE),
+            }))
+            .expect("queue a strategy-producing market event");
+
+        let directory = tempfile::tempdir().expect("temporary IPC directory");
+        let parent_file = directory.path().join("not-a-directory");
+        std::fs::write(&parent_file, b"occupied").expect("create blocking path component");
+        let error = runtime
+            .start_with_ipc_socket_path(Some(
+                parent_file
+                    .join("operator.sock")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .expect_err("IPC preparation must fail closed");
+        assert!(error.to_string().contains("failed to prepare IPC"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(runtime.tasks.is_empty(), "engine loop must not be spawned");
+        assert!(
+            runtime.execution_worker_tasks.is_empty(),
+            "execution worker must not be spawned"
+        );
+        assert_eq!(placements.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime
+                .engine
+                .lock()
+                .await
+                .get_statistics()
+                .orders_submitted,
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
+    async fn no_strategy_polymarket_runtime_keeps_exchange_only_orders_in_paused_recovery() {
+        let mut config = SystemConfig {
+            venues: vec![live_venue_config()],
+            ..Default::default()
+        };
+        config.engine.reconcile_interval_ms = 0;
+        let external_order = OpenOrder {
+            order_id: hft_core::OrderId("external-venue-order".to_string()),
+            client_order_id: None,
+            symbol: Symbol::new("123"),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            original_quantity: Quantity(Decimal::from(5)),
+            remaining_quantity: Quantity(Decimal::from(5)),
+            filled_quantity: Quantity(Decimal::ZERO),
+            price: Some(Price(Decimal::new(5, 1))),
+            status: ports::OrderStatus::Accepted,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let mut runtime = SystemBuilder::new(config)
+            .register_execution_client_with_venue(
+                AuthoritativeBalanceClient {
+                    equity_usd: Decimal::from(100),
+                    open_orders: vec![external_order],
+                },
+                VenueId::POLYMARKET,
+            )
+            .build();
+
+        runtime
+            .start()
+            .await
+            .expect("exchange-only order must remain available to paused operator recovery");
+
+        assert_eq!(
+            runtime.engine.lock().await.trading_mode(),
+            engine::TradingMode::Paused
+        );
+        assert!(!runtime.execution_worker_tasks.is_empty());
+        runtime
+            .stop()
+            .await
+            .expect_err("shutdown remains fail-closed until the external order is canceled");
+        #[cfg(feature = "infra-ipc")]
+        if let Some(ipc_task) = runtime.ipc_task.take() {
+            ipc_task.abort();
+            let _ = ipc_task.await;
+        }
     }
 
     #[cfg(feature = "adapter-backpack-data")]
@@ -2201,6 +2637,7 @@ default_symbols:
     }
 
     #[tokio::test]
+    #[cfg_attr(feature = "infra-ipc", serial_test::serial)]
     async fn quotes_only_config_does_not_start_execution_workers() {
         let config = SystemConfig {
             quotes_only: true,

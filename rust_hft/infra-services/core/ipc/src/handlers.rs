@@ -104,13 +104,22 @@ impl CommandHandler for DefaultCommandHandler {
                 // TODO: Return real open orders
                 Response::Data(ResponseData::OpenOrders(vec![]))
             }
+            Command::InspectExecutionAccounts => Response::Data(ResponseData::ExecutionAccounts(
+                crate::ExecutionAccountInspection { clients: vec![] },
+            )),
             Command::CancelAllOrders => Response::Ok,
+            Command::CancelOrdersFiltered { .. } => Response::Ok,
             Command::CancelOrdersForSymbol { symbol: _ } => Response::Ok,
             Command::CancelOrdersForStrategy { strategy_id: _ } => Response::Ok,
             Command::CancelOrder {
                 order_id: _,
                 symbol: _,
             } => Response::Ok,
+            Command::CancelOrderById { order_id: _ } => Response::Ok,
+            Command::ReplaceOrder { order_id, .. } => Response::Error {
+                message: format!("Replace order {order_id} not implemented yet"),
+                code: Some(501),
+            },
             Command::SetTradingMode { mode } => {
                 // TODO: Implement trading mode change
                 Response::Error {

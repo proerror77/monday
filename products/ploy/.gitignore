@@ -41,6 +41,7 @@ data/
 reports/
 results/
 models/
+run/
 
 # Tool artifacts
 .serena/
@@ -53,9 +54,6 @@ gen_parts/
 
 # Codex/Claude sessions (legacy monolith, superseded by workspace crates)
 .codex-session-*/
-
-# Sidecar build artifacts
-ploy-sidecar/dist/
 
 # Skill development (not part of trading system)
 skill-creator-updated/

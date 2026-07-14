@@ -25,7 +25,6 @@ surface:
 
 - 46 Python helper scripts under `scripts/`.
 - 23 Python unit test files under `tests/`.
-- `Dockerfile.collector`, which still packages Python collector scripts.
 - Several research/operator workflows that call `python3` for JSON glue,
   artifact analysis, or compatibility scripts.
 

@@ -38,7 +38,7 @@ collector-health signoff.
 | Deployment manifest exists for paper/dry-run only | `config/deployments/pm5d.threelayer.settlement-probability-btc-eth.dryrun.json`; PR #335 | Complete |
 | Tango deploy workflow installs the settlement config | `.github/workflows/deploy-tango-1-1.yml`; deploy run `25370757209` and later `25373476802` | Complete |
 | Old repricing dry-run is paused while settlement dry-run runs | Remote `ployctl deployments inspect`: settlement desired/observed `Running`, repricing `Paused` | Complete |
-| Dry-run report exposes the strategy label | `scripts/report_dryrun_summary.py`; dry-run label `TL Settlement Probability BTC/ETH` | Complete |
+| Dry-run report exposes the strategy label | `crates/ploy-daemon-host/src/reports.rs`; dry-run label `TL Settlement Probability BTC/ETH` | Complete |
 | Runtime order evidence includes q/edge audit context | PR #336; deployed SHA `d87261d0cc153babc68ae799a424b294d6a0e154`; post-deploy orders show `signal_p_hat`, `signal_edge`, `signal_entry_price` | Complete |
 | Runtime full-depth sweep mechanism is implemented | PR #341; merge SHA `8f0bb71718832299dfe9780d6f73aba868d05b99`; `MarketUpdate::Quote` carries full-depth levels and `SimulatedExecutor` sweeps them when present | Complete |
 | Runtime full-depth sweep mechanism is deployed | Deploy run `25377605431`; settlement dry-run config deployed with `visible_depth_haircut=0.5` and `max_sweep_levels=3` | Complete |

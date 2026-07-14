@@ -18,7 +18,12 @@ spec:
       containers:
       - name: collector
         image: registry-vpc.ap-northeast-1.aliyuncs.com/ploy/ploy-collector:latest
-        command: ["python", "binance_aggtrade_collector.py"]
+        args:
+        - collect-binance-aggtrade
+        - --symbols
+        - $(BINANCE_AGGTRADE_SYMBOLS)
+        - --batch-size
+        - "50"
         envFrom:
         - secretRef:
             name: ploy-secrets

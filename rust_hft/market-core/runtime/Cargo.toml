@@ -31,6 +31,7 @@ adapter-asterdex-data = { package = "hft-data-adapter-asterdex", path = "../../d
 adapter-lighter-data = { package = "hft-data-adapter-lighter", path = "../../data-pipelines/adapters/adapter-lighter", optional = true }
 adapter-grvt-data = { package = "hft-data-adapter-grvt", path = "../../data-pipelines/adapters/adapter-grvt", optional = true }
 adapter-ondo-perps-data = { package = "hft-data-adapter-ondo-perps", path = "../../data-pipelines/adapters/adapter-ondo-perps", optional = true }
+adapter-polymarket-data = { package = "hft-data-adapter-polymarket", path = "../../data-pipelines/adapters/adapter-polymarket", optional = true }
 
 # Execution adapters (optional)
 adapter-bitget-execution = { package = "hft-execution-adapter-bitget", path = "../../execution-gateway/adapters/adapter-bitget", optional = true }
@@ -45,6 +46,7 @@ adapter-asterdex-execution = { package = "hft-execution-adapter-asterdex", path 
 adapter-lighter-execution = { package = "hft-execution-adapter-lighter", path = "../../execution-gateway/adapters/adapter-lighter", optional = true }
 adapter-grvt-execution = { package = "hft-execution-adapter-grvt", path = "../../execution-gateway/adapters/adapter-grvt", optional = true }
 adapter-ondo-perps-execution = { package = "hft-execution-adapter-ondo-perps", path = "../../execution-gateway/adapters/adapter-ondo-perps", optional = true }
+adapter-polymarket-execution = { package = "hft-execution-adapter-polymarket", path = "../../execution-gateway/adapters/adapter-polymarket", optional = true }
 
 # Strategy libraries (optional)
 strategy-trend = { package = "hft-strategy-trend", path = "../../strategy-framework/strategies/trend", optional = true }
@@ -78,6 +80,7 @@ futures = { workspace = true }
 core_affinity = "0.8"
 thiserror = "1.0"
 sysinfo = "0.30"
+secrecy = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -112,6 +115,7 @@ adapter-asterdex-data = ["dep:adapter-asterdex-data"]
 adapter-lighter-data = ["dep:adapter-lighter-data"]
 adapter-grvt-data = ["dep:adapter-grvt-data"]
 adapter-ondo-perps-data = ["dep:adapter-ondo-perps-data"]
+adapter-polymarket-data = ["dep:adapter-polymarket-data"]
 
 # Execution adapters
 adapter-bitget-execution = ["dep:adapter-bitget-execution"]
@@ -126,6 +130,7 @@ adapter-asterdex-execution = ["dep:adapter-asterdex-execution"]
 adapter-lighter-execution = ["dep:adapter-lighter-execution"]
 adapter-grvt-execution = ["dep:adapter-grvt-execution"]
 adapter-ondo-perps-execution = ["dep:adapter-ondo-perps-execution"]
+adapter-polymarket-execution = ["dep:adapter-polymarket-execution", "dep:secrecy"]
 
 # Strategies
 strategy-trend = ["dep:strategy-trend"]
@@ -154,6 +159,7 @@ asterdex = ["adapter-asterdex-data", "adapter-asterdex-execution"]
 lighter = ["adapter-lighter-data", "adapter-lighter-execution"]
 grvt = ["adapter-grvt-data", "adapter-grvt-execution"]
 ondo-perps = ["adapter-ondo-perps-data", "adapter-ondo-perps-execution"]
+polymarket = ["adapter-polymarket-data", "adapter-polymarket-execution"]
 mock = ["adapter-mock-data"]
 all-strategies = ["strategy-trend", "strategy-arbitrage", "strategy-imbalance", "strategy-formula", "strategy-dl", "strategy-lob-flow-grid"]
-full = ["bitget", "binance", "binance-prediction", "bybit", "okx", "hyperliquid", "asterdex", "lighter", "backpack", "grvt", "ondo-perps", "all-strategies", "adapter-mock-data"]
+full = ["bitget", "binance", "binance-prediction", "bybit", "okx", "hyperliquid", "asterdex", "lighter", "backpack", "grvt", "ondo-perps", "polymarket", "all-strategies", "adapter-mock-data"]

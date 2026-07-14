@@ -39,6 +39,12 @@ pub struct SystemEngineConfig {
     /// Maximum local quote-to-submission age; do not derive this from public feed cadence.
     #[serde(default = "default_intent_max_latency_us")]
     pub intent_max_latency_us: u64,
+    /// Verified deployment ceiling attached to every order intent.
+    #[serde(default)]
+    pub intent_max_slippage_bps: Option<i32>,
+    /// Verified deployment notional ceiling attached to every order intent.
+    #[serde(default)]
+    pub intent_max_order_notional: Option<Decimal>,
     #[serde(default = "default_top_n")]
     pub top_n: usize,
     #[serde(default)]
@@ -54,12 +60,31 @@ pub struct SystemEngineConfig {
     /// Maximum absolute USD difference accepted between exchange and local equity.
     #[serde(default = "default_balance_reconcile_tolerance_usd")]
     pub balance_reconcile_tolerance_usd: Decimal,
-    /// Auto-cancel exchange-only orders discovered in reconciliation
+    /// Deprecated compatibility field. Runtime validation rejects `true`; cancellations require
+    /// the OMS-aware runtime control plane.
     #[serde(default)]
     pub auto_cancel_exchange_only: bool,
     /// 執行隊列與 worker 設定
     #[serde(default)]
     pub execution_queue: ExecutionQueueSettings,
+}
+
+impl SystemEngineConfig {
+    pub(crate) fn validate_intent_execution_limits(&self) -> Result<(), String> {
+        if self
+            .intent_max_slippage_bps
+            .is_some_and(|value| !(1..=10_000).contains(&value))
+        {
+            return Err("engine.intent_max_slippage_bps must be in 1..=10000".to_string());
+        }
+        if self
+            .intent_max_order_notional
+            .is_some_and(|value| value <= Decimal::ZERO)
+        {
+            return Err("engine.intent_max_order_notional must be positive".to_string());
+        }
+        Ok(())
+    }
 }
 
 fn default_queue_capacity() -> usize {
@@ -415,6 +440,7 @@ pub enum VenueType {
     Lighter,
     Backpack,
     OndoPerps,
+    Polymarket,
     Mock,
 }
 

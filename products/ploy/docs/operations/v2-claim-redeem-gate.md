@@ -1,6 +1,10 @@
 # V2 Claim/Redeem Gate For SDK And Claimer Cleanup
 
-Status: retired claimer replaced by explicit, write-disabled account ops.
+> **Historical standalone PLOY operations.** The Node account-operation package
+> described below has been removed from Monday. Polymarket account and order
+> operations now belong exclusively to `rust_hft`.
+
+Status: retired claimer and retired standalone account-operations package.
 
 This gate still controls Phase 9 SDK slimming. Phase 10 claimer retirement has
 been applied after the operator confirmed the account settlement flow has

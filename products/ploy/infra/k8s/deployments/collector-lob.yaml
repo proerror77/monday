@@ -18,7 +18,14 @@ spec:
       containers:
       - name: collector
         image: registry-vpc.ap-northeast-1.aliyuncs.com/ploy/ploy-collector:latest
-        command: ["python", "binance_lob_collector.py"]
+        args:
+        - collect-binance-lob
+        - --symbols
+        - $(BINANCE_LOB_SYMBOLS)
+        - --depth
+        - $(BINANCE_LOB_LEVELS)
+        - --batch-size
+        - "25"
         envFrom:
         - secretRef:
             name: ploy-secrets

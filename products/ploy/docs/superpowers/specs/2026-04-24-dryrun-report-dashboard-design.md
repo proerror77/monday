@@ -321,7 +321,7 @@ Navigation rules:
 Recommended implementation:
 
 - keep server-side HTML generation for now
-- split the current monolithic `report_strategy.py` into reusable data query + render helpers
+- keep the Rust data-query and HTML-render helpers reusable in `crates/ploy-daemon-host/src/reports.rs`
 - add a new multi-strategy report generator alongside the single-strategy report
 - keep `ployd` as the HTTP delivery layer
 

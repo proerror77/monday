@@ -177,6 +177,9 @@ pub struct Engine {
     order_account_map: FxHashMap<hft_core::OrderId, hft_core::AccountId>,
     /// 策略到帳戶映射（Phase 1：由 runtime 配置）
     strategy_account_mapping: FxHashMap<String, hft_core::AccountId>,
+    /// Limits copied from a verified deployment envelope and attached to every generated intent.
+    intent_max_slippage_bps: Option<i32>,
+    intent_max_order_notional: Option<rust_decimal::Decimal>,
 }
 
 impl Engine {
@@ -249,6 +252,46 @@ impl Engine {
             disabled_strategy_indices: std::collections::HashSet::new(),
             order_account_map: FxHashMap::default(),
             strategy_account_mapping: FxHashMap::default(),
+            intent_max_slippage_bps: None,
+            intent_max_order_notional: None,
+        }
+    }
+
+    /// Attach verified deployment ceilings to every strategy intent at the engine boundary.
+    pub fn set_intent_execution_limits(
+        &mut self,
+        max_slippage_bps: Option<i32>,
+        max_order_notional: Option<rust_decimal::Decimal>,
+    ) -> HftResult<()> {
+        if max_slippage_bps.is_some_and(|value| !(1..=10_000).contains(&value)) {
+            return Err(HftError::Config(
+                "intent max_slippage_bps must be in 1..=10000".to_string(),
+            ));
+        }
+        if max_order_notional.is_some_and(|value| value <= rust_decimal::Decimal::ZERO) {
+            return Err(HftError::Config(
+                "intent max_order_notional must be positive".to_string(),
+            ));
+        }
+        self.intent_max_slippage_bps = max_slippage_bps;
+        self.intent_max_order_notional = max_order_notional;
+        Ok(())
+    }
+
+    fn apply_intent_execution_limits(&self, lifecycle: &mut ports::OrderIntentLifecycle) {
+        if let Some(configured) = self.intent_max_slippage_bps {
+            lifecycle.max_slippage_bps = Some(
+                lifecycle
+                    .max_slippage_bps
+                    .map_or(configured, |existing| existing.min(configured)),
+            );
+        }
+        if let Some(configured) = self.intent_max_order_notional {
+            lifecycle.max_order_notional = Some(
+                lifecycle
+                    .max_order_notional
+                    .map_or(configured, |existing| existing.min(configured)),
+            );
         }
     }
 
@@ -406,6 +449,7 @@ impl Engine {
     pub fn import_portfolio_state(&mut self, state: ports::PortfolioState) {
         if let Some(pm) = &mut self.portfolio_manager {
             pm.import_state(state);
+            self.account_snapshots.store(pm.reader().load());
         }
     }
 
@@ -637,17 +681,27 @@ impl Engine {
     /// 提交訂單意圖到執行隊列（用於 dry-run 測試）
     pub fn submit_order_intent(&mut self, intent: ports::OrderIntent) -> Result<(), HftError> {
         self.ensure_accepting_new_intents()?;
+        let now = now_micros();
+        let mut lifecycle = ports::OrderIntentLifecycle::new(now, Timestamp::MAX);
+        self.apply_intent_execution_limits(&mut lifecycle);
+        let envelope = ports::OrderIntentEnvelope::new(intent, lifecycle);
         if let Some(queues) = &mut self.execution_queues {
-            match queues.send_intent(intent) {
+            match queues.send_lifecycle_intent(envelope, now) {
                 Ok(()) => {
                     debug!("成功提交訂單意圖到執行隊列");
                     Ok(())
                 }
-                Err(rejected_intent) => {
+                Err(execution_queues::LifecycleIntentSubmitError::LifecycleRejected {
+                    reason,
+                    ..
+                }) => Err(HftError::Risk(format!(
+                    "intent execution limit rejected order: {reason:?}"
+                ))),
+                Err(execution_queues::LifecycleIntentSubmitError::QueueFull { envelope }) => {
                     warn!(
                         "執行隊列滿載，訂單意圖被拒絕: {} {}",
-                        rejected_intent.symbol.as_str(),
-                        rejected_intent.quantity.0
+                        envelope.intent.symbol.as_str(),
+                        envelope.intent.quantity.0
                     );
                     Err(HftError::Execution("執行隊列滿載".to_string()))
                 }
@@ -663,11 +717,12 @@ impl Engine {
     /// 用於 live/paper/shadow 路徑在進入 execution worker 前拒絕過期或過時意圖。
     pub fn submit_order_intent_envelope(
         &mut self,
-        envelope: ports::OrderIntentEnvelope,
+        mut envelope: ports::OrderIntentEnvelope,
         now: hft_core::Timestamp,
         latest_book_seq: Option<u64>,
     ) -> Result<(), HftError> {
         self.ensure_accepting_new_intents()?;
+        self.apply_intent_execution_limits(&mut envelope.lifecycle);
         if let Some(queues) = &mut self.execution_queues {
             match queues.send_lifecycle_intent_with_book_seq(envelope, now, latest_book_seq) {
                 Ok(()) => {
@@ -1361,6 +1416,8 @@ impl Engine {
                         created_ts.saturating_add(max_latency_us),
                     );
                     lifecycle.max_latency_us = Some(max_latency_us);
+                    lifecycle.max_slippage_bps = self.intent_max_slippage_bps;
+                    lifecycle.max_order_notional = self.intent_max_order_notional;
                     lifecycle.source_feature_ts = exchange_timestamp;
                     lifecycle.source_book_seq = l2_book.map(|book| book.sequence).or(match event {
                         ports::MarketEvent::Snapshot(snapshot) => Some(snapshot.sequence),
@@ -2067,6 +2124,49 @@ mod tests {
             engine.submit_order_intent(test_intent()),
             Err(HftError::Risk(_))
         ));
+    }
+
+    #[test]
+    fn configured_execution_limits_cannot_be_bypassed_by_direct_or_custom_envelopes() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let (engine_queues, mut worker_queues) =
+            create_execution_queues(ExecutionQueueConfig::default());
+        engine.set_execution_queues(engine_queues);
+        engine
+            .set_intent_execution_limits(Some(25), Some(rust_decimal::Decimal::from(50)))
+            .expect("valid execution limits");
+
+        let error = engine
+            .submit_order_intent(test_intent())
+            .expect_err("100 notional order exceeds configured ceiling");
+        assert!(matches!(error, HftError::Risk(_)));
+        assert!(worker_queues.receive_intents().is_empty());
+
+        let mut permissive = OrderIntentLifecycle::new(1, 10);
+        permissive.max_slippage_bps = Some(100);
+        permissive.max_order_notional = Some(rust_decimal::Decimal::from(500));
+        let error = engine
+            .submit_order_intent_envelope(
+                OrderIntentEnvelope::new(test_intent(), permissive),
+                1,
+                None,
+            )
+            .expect_err("custom envelope cannot loosen configured ceiling");
+        assert!(matches!(error, HftError::Execution(_)));
+        assert!(worker_queues.receive_intents().is_empty());
+
+        let mut allowed = test_intent();
+        allowed.quantity = Quantity(rust_decimal::Decimal::new(4, 1));
+        engine
+            .submit_order_intent(allowed)
+            .expect("40 notional order stays within configured ceiling");
+        let intents = worker_queues.receive_envelopes();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].lifecycle.max_slippage_bps, Some(25));
+        assert_eq!(
+            intents[0].lifecycle.max_order_notional,
+            Some(rust_decimal::Decimal::from(50))
+        );
     }
 
     #[test]

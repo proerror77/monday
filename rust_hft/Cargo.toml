@@ -36,6 +36,7 @@ members = [
     "data-pipelines/adapters/adapter-lighter",
     "data-pipelines/adapters/adapter-grvt",
     "data-pipelines/adapters/adapter-ondo-perps",
+    "data-pipelines/adapters/adapter-polymarket",
 
     # Strategy Framework
     "strategy-framework/strategy-dl",
@@ -64,6 +65,7 @@ members = [
     "execution-gateway/adapters/adapter-lighter",
     "execution-gateway/adapters/adapter-grvt",
     "execution-gateway/adapters/adapter-ondo-perps",
+    "execution-gateway/adapters/adapter-polymarket",
 
     # Infra Services
     "infra-services/core/artifact-store",

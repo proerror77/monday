@@ -1,6 +1,7 @@
 mod config;
 mod engine;
 mod event;
+mod sweep;
 
 use std::path::{Path, PathBuf};
 
@@ -20,9 +21,21 @@ struct Args {
     /// 覆蓋策略參數檔（可只保留 strategy 區段）
     #[arg(long)]
     params: Option<String>,
+    /// 參數格點檔（含 strategy 區段）
+    #[arg(long, conflicts_with = "params")]
+    grid: Option<String>,
     /// 輸出目錄（預設寫入目前路徑）
-    #[arg(long)]
+    #[arg(long, conflicts_with = "grid")]
     output_dir: Option<String>,
+    /// 參數掃描輸出根目錄
+    #[arg(long, requires = "grid")]
+    output: Option<String>,
+    /// 參數掃描分片索引
+    #[arg(long, requires = "grid")]
+    shard_index: Option<usize>,
+    /// 參數掃描總分片數
+    #[arg(long, requires = "grid")]
+    shard_count: Option<usize>,
     /// 僅檢查配置，不運行回測
     #[arg(long)]
     dry_run: bool,
@@ -32,6 +45,19 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
 
     let args = Args::parse();
+
+    if let Some(grid) = args.grid.as_deref() {
+        let shard_index = resolve_usize(args.shard_index, "JOB_COMPLETION_INDEX", 0)?;
+        let shard_count = resolve_usize(args.shard_count, "BACKTEST_SHARD_COUNT", 1)?;
+        return sweep::run(sweep::SweepOptions {
+            config_path: &args.config,
+            grid_path: grid,
+            output_root: args.output.as_deref().unwrap_or("runs/backtest-sweep"),
+            shard_index,
+            shard_count,
+            dry_run: args.dry_run,
+        });
+    }
 
     let mut cfg = BacktestConfig::from_file(&args.config)?;
     if let Some(params_path) = args.params {
@@ -55,6 +81,19 @@ fn main() -> anyhow::Result<()> {
     print_summary(&result.summary);
 
     Ok(())
+}
+
+fn resolve_usize(value: Option<usize>, env_name: &str, fallback: usize) -> anyhow::Result<usize> {
+    if let Some(value) = value {
+        return Ok(value);
+    }
+    match std::env::var(env_name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .with_context(|| format!("環境變數 {env_name} 必須是非負整數")),
+        Err(std::env::VarError::NotPresent) => Ok(fallback),
+        Err(error) => Err(error).with_context(|| format!("無法讀取環境變數 {env_name}")),
+    }
 }
 
 fn apply_strategy_overrides(cfg: &mut BacktestConfig, path: &str) -> anyhow::Result<()> {

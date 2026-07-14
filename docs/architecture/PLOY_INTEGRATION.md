@@ -2,7 +2,7 @@
 
 ## Outcome
 
-PLOY is maintained inside Monday as the independent Rust and TypeScript product workspace at `products/ploy`. The import preserves PLOY's product, prediction-market, research, frontend, sidecar, control-plane, and compatibility code without merging its Cargo graph into `rust_hft`.
+PLOY is maintained inside Monday as an independent Rust product workspace with a TypeScript frontend at `products/ploy`. The import preserves PLOY's product, prediction-market, research, frontend, sidecar, control-plane, and compatibility code without merging its Cargo graph into `rust_hft`.
 
 Monday remains the repository and production authority. In particular:
 
@@ -46,6 +46,21 @@ The complete path and SHA-256 record is in
 
 The original `.github`, `deployment`, and `infra` trees remain under `products/ploy` for source compatibility and historical evidence. GitHub does not execute nested workflows. They are not Monday deployment entrypoints.
 
+## Language boundary
+
+- Durable Monday market data, account, order, reconciliation, sidecar, report,
+  backtest, and monitoring paths are Rust. TypeScript is limited to the operator
+  frontend.
+- Python remains only where behavior has not yet earned Rust parity: the legacy ML
+  workspace, the Python LOB archiver during Rust shadow comparison, and imported
+  PLOY research/compatibility utilities. Root CI may compile or fixture-test those
+  files, but it does not make the nested PLOY deployment workflows active.
+- Shell remains for host bootstrap, CI command composition, and package installation;
+  no shell script owns trading decisions, risk, OMS, or exchange mutations.
+- The Rust sidecar is built and tested but has no approved deployment package. Its
+  missing evidence adapters fail closed and require a separate parity and deployment
+  review rather than falling back to Python or user-global tools.
+
 ## Historical local-only documents
 
 Seven documents from local PLOY commit `5de411bbe8889284b47fe9932821af077d2962fc` are preserved under `products/ploy/docs/archive/local-readiness-2026-07-11`. They are explicitly stale: they target the standalone PLOY/Tango topology and must not be treated as current Monday plans.
@@ -59,14 +74,13 @@ Seven documents from local PLOY commit `5de411bbe8889284b47fe9932821af077d2962fc
   directories because those files are preserved evidence rather than executable
   Monday delivery paths. Root workflows and active source remain scanned, and
   tracked-secret detection still covers the complete repository tree.
-- The active PLOY runtime entrypoints are `new-ployd`, `new-ploy-runner`, `ployctl`, and `ploytui`. The root `ploy` crate is a compatibility shim.
+- The active PLOY runtime entrypoints are `new-ployd`, `ploy-agent-sidecar`, `new-ploy-runner`, `ployctl`, and `ploytui`. The root `ploy` crate is a compatibility shim.
 - `PloyDaemon::boot` installs `DisabledLiveExecutionGateway`; production code
   cannot inject the private Polymarket gateway, and the standard runner `full`
   feature does not enable its legacy control-plane live executor.
-- The active account-operation tools may still build and validate typed plans,
-  inspect public/account state, and report approval status. Order submission,
-  approval transactions, redemption, and reconciliation mutations reject
-  unconditionally inside Monday, even when former standalone write flags are set.
+- The standalone Node account-operation packages are retired. Polymarket account,
+  order, cancellation, and reconciliation operations remain in `rust_hft`; PLOY
+  does not retain a second execution path.
 
 ## Operations and archive boundary
 
@@ -80,7 +94,7 @@ The archived issue index remains available at `https://github.com/proerror77/plo
 
 - The adapted PLOY source snapshot and local-only design documents are preserved with explicit provenance.
 - PLOY builds and tests from `products/ploy` without joining the `rust_hft` Cargo workspace.
-- Frontend and sidecar contract checks run from the Monday repository.
+- Frontend contract checks and Rust sidecar tests run from the Monday repository.
 - Repository secret scanning passes without expanding the allowlist.
 - No legacy PLOY workflow is activated at the Monday workflow root.
 - The former PLOY repository is redirected to Monday and archived only after the Monday migration PR is merged and green.

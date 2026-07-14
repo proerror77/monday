@@ -90,8 +90,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust_hft
+
       - name: Check tracked secrets
-        run: bash ./scripts/check-tracked-secrets.sh
+        run: cargo test --manifest-path rust_hft/Cargo.toml -p hft-infra-secrets --test tracked_secrets_contract --locked -- --nocapture
 
   # ============================================================================
   # License Compliance

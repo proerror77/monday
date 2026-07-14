@@ -79,8 +79,8 @@ cargo audit --no-fetch
 From the repository root:
 
 ```bash
-bash scripts/check-tracked-secrets.sh
-bash scripts/check-deployment-contract.sh
+cargo test --manifest-path rust_hft/Cargo.toml -p hft-infra-secrets --test tracked_secrets_contract --locked -- --nocapture
+cargo test --manifest-path rust_hft/Cargo.toml -p hft-live --no-default-features --test deployment_artifacts --locked
 ```
 
 Ordinary changes should use package-scoped checks. Run a release graph, container build, and Kubernetes dry-run once at a production gate, not after every edit.

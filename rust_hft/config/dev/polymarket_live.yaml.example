@@ -1,0 +1,53 @@
+schema_version: v2
+quotes_only: false
+
+engine:
+  queue_capacity: 16384
+  stale_us: 1000000
+  intent_max_latency_us: 1000000
+  top_n: 20
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  balance_reconcile_tolerance_usd: 1
+
+venues:
+  - name: polymarket-main
+    account_id: polymarket-main
+    venue_type: Polymarket
+    ws_public: "wss://ws-subscriptions-clob.polymarket.com"
+    ws_private: "wss://ws-subscriptions-clob.polymarket.com"
+    rest: "https://clob.polymarket.com"
+    # The SDK derives L2 API credentials from this signer. Do not configure a CLOB API secret here.
+    secret: "${POLYMARKET_PRIVATE_KEY}"
+    execution_mode: Live
+    simulate_execution: false
+    symbol_catalog:
+      - "${POLYMARKET_TOKEN_ID}@POLYMARKET"
+    capabilities:
+      ws_order_placement: false
+      snapshot_crc: false
+      all_in_one_topics: true
+      private_ws_heartbeat: true
+      use_incremental_books: true
+    execution_config:
+      data_api_host: "https://data-api.polymarket.com"
+      # New API users should use poly1271 with an explicit verified funder, as recommended by
+      # Polymarket. Existing EOA, Proxy, or Safe users must select the type matching that account.
+      signature_type: "${POLYMARKET_SIGNATURE_TYPE}"
+      use_server_time: true
+      minimum_collateral: 0
+      # Required for poly1271. Existing Proxy/Safe users may set the verified derived funder.
+      # funder: "${POLYMARKET_FUNDER}"
+
+# No strategy is enabled by this example. A reviewed deployment must supply a PredictionMarket
+# intent targeting POLYMARKET and non-zero limits before an order can reach execution.
+strategies: []
+
+# Zero limits deliberately keep order intake fail-closed.
+risk:
+  risk_type: Default
+  global_position_limit: 0
+  global_notional_limit: 0
+  max_daily_trades: 0
+  max_orders_per_second: 0
+  staleness_threshold_us: 1000000

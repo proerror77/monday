@@ -191,6 +191,120 @@ pub struct AgentRunCreateRequest {
     pub run_contract: String,
 }
 
+pub const AGENT_OBJECTIVE_MAX_BYTES: usize = 4 * 1024;
+pub const AGENT_RUN_PACKET_MAX_BYTES: usize = 64 * 1024;
+pub const AGENT_RUN_CONTRACT_MAX_BYTES: usize = 32 * 1024;
+pub const AGENT_RUN_TOTAL_TEXT_MAX_BYTES: usize = 96 * 1024;
+pub const AGENT_SYMBOLS_MAX: usize = 32;
+
+pub fn agent_run_contract_value<'a>(
+    contract: &'a str,
+    key: &str,
+) -> Result<Option<&'a str>, String> {
+    let mut value = None;
+    for line in contract.lines() {
+        let Some((candidate, candidate_value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        if candidate.trim() != key {
+            continue;
+        }
+        if value.is_some() {
+            return Err(format!("run_contract contains duplicate `{key}` keys"));
+        }
+        value = Some(candidate_value.trim());
+    }
+    Ok(value)
+}
+
+pub fn validate_agent_run_contract(contract: &str) -> Result<(), String> {
+    if agent_run_contract_value(contract, "completion_signal")? != Some("\"required\"") {
+        return Err("run_contract must include completion_signal = \"required\"".to_string());
+    }
+    for key in [
+        "requires_data_audit",
+        "requires_grok_decision",
+        "requires_executable_replay",
+        "requires_full_depth_clob",
+        "requires_runtime_parity",
+        "requires_operator_approval",
+    ] {
+        if let Some(value) = agent_run_contract_value(contract, key)? {
+            if !matches!(value, "true" | "false") {
+                return Err(format!("run_contract `{key}` must be true or false"));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_agent_run_create_request(request: &AgentRunCreateRequest) -> Result<(), String> {
+    if request.max_turns == 0
+        || request.max_turns > 30
+        || !request.budget_usd.is_finite()
+        || request.budget_usd <= 0.0
+        || request.budget_usd > 1.0
+    {
+        return Err("max_turns must be 1..=30 and budget_usd must be (0, 1]".to_string());
+    }
+    if request.objective.trim().is_empty() || request.objective.len() > AGENT_OBJECTIVE_MAX_BYTES {
+        return Err(format!(
+            "objective must be non-empty and at most {AGENT_OBJECTIVE_MAX_BYTES} bytes"
+        ));
+    }
+    if request.strategy_profile.trim().is_empty() || request.strategy_profile.len() > 256 {
+        return Err("strategy_profile must be non-empty and at most 256 bytes".to_string());
+    }
+    if !matches!(
+        request.autonomy_mode.as_str(),
+        "research_until_blocked" | "paper_candidate" | "monitor_only"
+    ) {
+        return Err("autonomy_mode is not supported".to_string());
+    }
+    if !matches!(
+        request.target_evidence.as_str(),
+        "diagnostic" | "factor_attribution" | "executable_replay" | "dry_run_candidate"
+    ) {
+        return Err("target_evidence is not supported".to_string());
+    }
+    if request.symbols.len() > AGENT_SYMBOLS_MAX
+        || request
+            .symbols
+            .iter()
+            .any(|symbol| symbol.trim().is_empty() || symbol.len() > 128)
+    {
+        return Err(format!(
+            "symbols must contain at most {AGENT_SYMBOLS_MAX} non-empty values of at most 128 bytes"
+        ));
+    }
+    if request.run_packet.len() > AGENT_RUN_PACKET_MAX_BYTES {
+        return Err(format!(
+            "run_packet must be at most {AGENT_RUN_PACKET_MAX_BYTES} bytes"
+        ));
+    }
+    if request.run_contract.len() > AGENT_RUN_CONTRACT_MAX_BYTES {
+        return Err(format!(
+            "run_contract must be at most {AGENT_RUN_CONTRACT_MAX_BYTES} bytes"
+        ));
+    }
+    validate_agent_run_contract(&request.run_contract)?;
+    let total_text_bytes = request
+        .objective
+        .len()
+        .saturating_add(request.strategy_profile.len())
+        .saturating_add(request.autonomy_mode.len())
+        .saturating_add(request.target_evidence.len())
+        .saturating_add(request.run_packet.len())
+        .saturating_add(request.run_contract.len())
+        .saturating_add(request.symbols.iter().map(String::len).sum::<usize>());
+    if total_text_bytes > AGENT_RUN_TOTAL_TEXT_MAX_BYTES {
+        return Err(format!(
+            "agent request text must be at most {AGENT_RUN_TOTAL_TEXT_MAX_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentRunCreateResponse {
     pub run_id: String,
@@ -288,5 +402,56 @@ pub fn compute_oversight_report(
         deployments_reviewed: deployments.len(),
         signals,
         recommended_actions: actions,
+    }
+}
+
+#[cfg(test)]
+mod agent_run_request_tests {
+    use super::*;
+
+    fn request() -> AgentRunCreateRequest {
+        AgentRunCreateRequest {
+            objective: "bounded research".to_string(),
+            strategy_profile: "test.agent".to_string(),
+            autonomy_mode: "monitor_only".to_string(),
+            target_evidence: "diagnostic".to_string(),
+            symbols: vec!["BTC".to_string()],
+            max_turns: 3,
+            budget_usd: 0.25,
+            run_packet: "packet".to_string(),
+            run_contract: "completion_signal = \"required\"".to_string(),
+        }
+    }
+
+    #[test]
+    fn agent_run_admission_bounds_text_and_enum_inputs() {
+        assert!(validate_agent_run_create_request(&request()).is_ok());
+
+        let mut oversized = request();
+        oversized.run_packet = "x".repeat(AGENT_RUN_PACKET_MAX_BYTES + 1);
+        assert!(validate_agent_run_create_request(&oversized).is_err());
+
+        let mut invalid = request();
+        invalid.autonomy_mode = "live_until_filled".to_string();
+        assert!(validate_agent_run_create_request(&invalid).is_err());
+
+        let mut too_many_symbols = request();
+        too_many_symbols.symbols = vec!["BTC".to_string(); AGENT_SYMBOLS_MAX + 1];
+        assert!(validate_agent_run_create_request(&too_many_symbols).is_err());
+
+        let mut missing_completion_sentinel = request();
+        missing_completion_sentinel.run_contract = "requires_operator_approval = true".to_string();
+        assert_eq!(
+            validate_agent_run_create_request(&missing_completion_sentinel),
+            Err("run_contract must include completion_signal = \"required\"".to_string())
+        );
+
+        let mut duplicate_completion_sentinel = request();
+        duplicate_completion_sentinel.run_contract =
+            "completion_signal = \"optional\"\ncompletion_signal = \"required\"".to_string();
+        assert_eq!(
+            validate_agent_run_create_request(&duplicate_completion_sentinel),
+            Err("run_contract contains duplicate `completion_signal` keys".to_string())
+        );
     }
 }

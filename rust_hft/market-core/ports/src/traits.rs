@@ -105,6 +105,12 @@ pub trait ExecutionClient: Send + Sync {
     /// 執行回報流 (填充、ACK、拒絕等)
     async fn execution_stream(&self) -> HftResult<BoxStream<ExecutionEvent>>;
 
+    /// Whether normal completion is part of this client's execution-stream contract.
+    /// Live venue adapters must keep the default fail-closed behavior.
+    fn execution_stream_may_complete(&self) -> bool {
+        false
+    }
+
     /// 獲取未結訂單列表 (用於對賬)
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>>;
 
@@ -112,6 +118,30 @@ pub trait ExecutionClient: Send + Sync {
     async fn get_balance(&self) -> HftResult<Vec<AccountBalance>> {
         Err(HftError::Config(
             "execution client does not support authoritative balance snapshots".to_string(),
+        ))
+    }
+
+    /// Whether this client can return an account-level position snapshot.
+    fn supports_position_snapshot(&self) -> bool {
+        false
+    }
+
+    /// Fetches current venue positions for account inspection and reconciliation.
+    async fn get_positions(&self) -> HftResult<Vec<Position>> {
+        Err(HftError::Config(
+            "execution client does not support authoritative position snapshots".to_string(),
+        ))
+    }
+
+    /// Whether this client can return a recent authoritative fill snapshot.
+    fn supports_recent_fills_snapshot(&self) -> bool {
+        false
+    }
+
+    /// Fetches recent account fills. Adapters must page until their venue reports completion.
+    async fn list_recent_fills(&self) -> HftResult<Vec<AccountFill>> {
+        Err(HftError::Config(
+            "execution client does not support recent fill snapshots".to_string(),
         ))
     }
 
@@ -134,6 +164,19 @@ pub struct AccountBalance {
     pub total: rust_decimal::Decimal,
     /// 估值（以報價幣計價，如 USD）
     pub usd_value: Option<rust_decimal::Decimal>,
+}
+
+/// Account-level fill record used by control-plane inspection and REST catch-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountFill {
+    pub fill_id: String,
+    pub order_id: OrderId,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub price: Price,
+    pub quantity: Quantity,
+    pub fee: Option<rust_decimal::Decimal>,
+    pub timestamp: Timestamp,
 }
 
 /// 帳戶視圖 (策略決策用)
@@ -451,6 +494,23 @@ impl VenueSpec {
         }
     }
 
+    /// Polymarket tick size and minimum order size are market-specific and fetched by the live
+    /// adapter immediately before signing. Zero precision/minimum values deliberately preserve
+    /// the risk-reviewed intent here; the venue adapter remains the authoritative precision gate.
+    pub fn polymarket_outcome() -> Self {
+        Self {
+            name: "POLYMARKET".to_string(),
+            tick_size: Price(rust_decimal::Decimal::ZERO),
+            lot_size: Quantity(rust_decimal::Decimal::ZERO),
+            min_qty: Quantity(rust_decimal::Decimal::ZERO),
+            max_quantity: None,
+            min_notional: rust_decimal::Decimal::ZERO,
+            maker_fee_bps: None,
+            taker_fee_bps: None,
+            rate_limit: None,
+        }
+    }
+
     /// 構建預設的 VenueSpec 映射
     pub fn build_default_venue_specs() -> std::collections::HashMap<VenueId, VenueSpec> {
         let mut specs = std::collections::HashMap::new();
@@ -462,6 +522,7 @@ impl VenueSpec {
         specs.insert(hft_core::VenueId::BACKPACK, Self::backpack_spot());
         specs.insert(hft_core::VenueId::LIGHTER, Self::lighter_spot());
         specs.insert(hft_core::VenueId::GRVT, Self::grvt_perp());
+        specs.insert(hft_core::VenueId::POLYMARKET, Self::polymarket_outcome());
         specs
     }
 }
@@ -726,4 +787,22 @@ pub trait PortfolioManager: Send + Sync {
 
     /// 導入 Portfolio 狀態（供恢復/持久化使用）
     fn import_state(&mut self, state: PortfolioState);
+}
+
+#[cfg(test)]
+mod venue_spec_tests {
+    use super::*;
+
+    #[test]
+    fn polymarket_uses_dynamic_venue_precision_without_skipping_risk_routing() {
+        let specs = VenueSpec::build_default_venue_specs();
+        let spec = specs
+            .get(&VenueId::POLYMARKET)
+            .expect("Polymarket must have a risk-routing VenueSpec");
+
+        assert_eq!(spec.name, "POLYMARKET");
+        assert_eq!(spec.tick_size.0, rust_decimal::Decimal::ZERO);
+        assert_eq!(spec.lot_size.0, rust_decimal::Decimal::ZERO);
+        assert_eq!(spec.min_notional, rust_decimal::Decimal::ZERO);
+    }
 }

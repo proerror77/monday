@@ -34,8 +34,6 @@ FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    python3 \
-    python3-yaml \
     tini \
     zstd \
     && rm -rf /var/lib/apt/lists/* \
@@ -44,14 +42,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /out/bin/hft-backtest /usr/local/bin/hft-backtest
 COPY --from=builder /out/bin/alpha-harness /usr/local/bin/alpha-harness
 COPY --from=builder /out/bin/lob-pit-materializer /usr/local/bin/lob-pit-materializer
-COPY scripts/backtest/param_scan.py /opt/monday/param_scan.py
 
 RUN mkdir -p /work/config /work/data /work/results \
-    && chown -R research:research /work /opt/monday
+    && chown -R research:research /work
 
 USER research
 WORKDIR /work
-ENV HFT_BACKTEST_BIN=/usr/local/bin/hft-backtest
 ENV ALPHA_HARNESS_BIN=/usr/local/bin/alpha-harness
 
-ENTRYPOINT ["/usr/bin/tini", "--", "python3", "/opt/monday/param_scan.py"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hft-backtest"]

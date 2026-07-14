@@ -27,7 +27,7 @@ cargo +1.91 test --locked -p ploy-connectivity -p ploy-daemon-host
 cargo +1.91 check --locked -p new-ploy-runner --features full
 ```
 
-Frontend and sidecar examples:
+Frontend and Rust sidecar examples:
 
 ```bash
 npm --prefix ploy-frontend ci
@@ -35,10 +35,8 @@ npm --prefix ploy-frontend run contracts:check
 npm --prefix ploy-frontend run lint
 npm --prefix ploy-frontend run build
 
-npm --prefix ploy-sidecar ci
-npm --prefix ploy-sidecar run contracts:check
-npm --prefix ploy-sidecar test
-npm --prefix ploy-sidecar run build
+cargo +1.91 test --locked -p ploy-agent-sidecar
+cargo +1.91 clippy --locked -p ploy-agent-sidecar --all-targets --no-deps -- -D warnings
 ```
 
 Do not start a local PostgreSQL service for routine validation. Database-backed
@@ -56,5 +54,5 @@ tests run in the root Monday workflow `.github/workflows/ploy-ci.yml`.
 ## Pull requests
 
 Open PLOY changes against `proerror77/monday`. The root PLOY CI workflow owns the
-current Rust, frontend, sidecar, schema, audit, and integration lanes. Nested workflows
+current Rust, frontend, schema, audit, and integration lanes. Nested workflows
 under `products/ploy/.github/workflows` are historical source material only.

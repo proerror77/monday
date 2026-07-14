@@ -1,15 +1,19 @@
 use crate::events::EventBroker;
+use crate::reports::{
+    generate_dry_run_summary_json, generate_market_data_health_json, generate_strategy_report_html,
+};
 use crate::runtime::{next_paper_intent_id, PloyDaemon, PreparedIntentSubmission};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use ploy_operator_contracts::{
-    compute_oversight_report, AgentRunCreateRequest, AgentRunCreateResponse, AgentRunRecord,
-    AlertSnapshotEvent, AuditLogEntry, ControlPlaneErrorResponse, DeploymentApplyRequest,
-    DeploymentControlRequest, DeploymentDiagnosticsReport, DeploymentSnapshotEvent,
-    DiagnosticsEvidence, DiagnosticsFinding, DryRunPerformanceReport, IntentPurpose,
-    MetricsSnapshotEvent, OperatorEvent, OrderReplaceRequest, OversightSnapshotEvent,
-    PaperIntentRequest, PlatformDiagnosticsReport, ProposalCreateRequest, ProposalDecisionRequest,
-    ProposalSnapshotEvent, StatusUpdate, SystemSnapshotEvent, SystemStatus, TradingSnapshotEvent,
+    compute_oversight_report, validate_agent_run_create_request, AgentRunCreateRequest,
+    AgentRunCreateResponse, AgentRunRecord, AlertSnapshotEvent, AuditLogEntry,
+    ControlPlaneErrorResponse, DeploymentApplyRequest, DeploymentControlRequest,
+    DeploymentDiagnosticsReport, DeploymentSnapshotEvent, DiagnosticsEvidence, DiagnosticsFinding,
+    IntentPurpose, MetricsSnapshotEvent, OperatorEvent, OrderReplaceRequest,
+    OversightSnapshotEvent, PaperIntentRequest, PlatformDiagnosticsReport, ProposalCreateRequest,
+    ProposalDecisionRequest, ProposalSnapshotEvent, StatusUpdate, SystemSnapshotEvent,
+    SystemStatus, TradingSnapshotEvent,
 };
 use ploy_platform_runtime::runtime_support::IntentAdmissionSource;
 use ploy_trading::{TradeSide, TradingIntent};
@@ -18,10 +22,9 @@ use serde::Serialize;
 use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +42,7 @@ pub struct AppState {
 const ADMIN_SESSION_COOKIE_NAME: &str = "ploy_admin_session";
 const AUDIT_LOG_TAIL_LIMIT: usize = 200;
 const MAX_HTTP_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_JSONL_TAIL_BYTES: usize = 1024 * 1024;
 type HmacSha256 = Hmac<Sha256>;
 static REQUEST_RATE_LIMITER: OnceLock<Mutex<RateLimiter>> = OnceLock::new();
 
@@ -200,128 +204,22 @@ fn build_strategy_report_html(state: &Arc<AppState>, since: Option<&str>) -> (u1
         Err(_) => return html_error(503, "daemon lock poisoned"),
     };
 
-    let script_path = host_root.join("scripts/report_strategy.py");
-    if !script_path.exists() {
-        return html_error(
-            500,
-            &format!(
-                "strategy report script not found: {}",
-                script_path.display()
-            ),
-        );
-    }
-
-    let report_path = host_root.join("reports/strategy_report.html");
-    if let Some(parent) = report_path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            return html_error(500, &format!("failed to create report directory: {err}"));
-        }
-    }
-
-    let mut command = Command::new("python3");
-    command
-        .arg(&script_path)
-        .arg("--host")
-        .arg("local")
-        .current_dir(&host_root)
-        .env("PLOY_RESEARCH_HOST", "local");
-    if let Some(since) = since {
-        command.arg("--since").arg(since);
-    }
-
-    let output = match command.output() {
-        Ok(output) => output,
-        Err(err) => {
-            return html_error(
-                500,
-                &format!("failed to start strategy report generator: {err}"),
-            );
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let message = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!("report generator exited with status {}", output.status)
-        };
-        return html_error(500, &message);
-    }
-
-    match fs::read_to_string(&report_path) {
+    match generate_strategy_report_html(&host_root, since) {
         Ok(body) => (200, body),
-        Err(err) => html_error(
-            500,
-            &format!(
-                "strategy report was generated but could not be read from {}: {err}",
-                report_path.display()
-            ),
-        ),
+        Err(err) => html_error(500, &err),
     }
 }
 
 fn build_market_data_health_json(state: &Arc<AppState>) -> (u16, String) {
-    let host_root = match state.daemon.lock() {
-        Ok(daemon) => host_root_from_runtime_root(&daemon.config.runtime_root),
+    match state.daemon.lock() {
+        Ok(_) => {}
         Err(_) => return json_error(503, "daemon_lock_poisoned", None),
-    };
-
-    let script_path = host_root.join("scripts/report_market_data_health.py");
-    if !script_path.exists() {
-        return json_error(
-            500,
-            "market_data_health_script_missing",
-            Some(format!(
-                "market data health script not found: {}",
-                script_path.display()
-            )),
-        );
     }
 
-    let output = match Command::new("python3")
-        .arg(&script_path)
-        .current_dir(&host_root)
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) => {
-            return json_error(
-                500,
-                "market_data_health_script_failed",
-                Some(format!("failed to start market data health script: {err}")),
-            );
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let message = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!(
-                "market data health script exited with status {}",
-                output.status
-            )
-        };
-        return json_error(500, "market_data_health_unavailable", Some(message));
-    }
-
-    let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if body.is_empty() {
-        return json_error(
-            500,
-            "market_data_health_empty",
-            Some("market data health script returned an empty response".to_string()),
-        );
-    }
-
-    (200, body)
+    report_json_response(
+        generate_market_data_health_json(),
+        "market_data_health_unavailable",
+    )
 }
 
 fn build_dry_run_summary_json(state: &Arc<AppState>) -> (u16, String) {
@@ -330,75 +228,17 @@ fn build_dry_run_summary_json(state: &Arc<AppState>) -> (u16, String) {
         Err(_) => return json_error(503, "daemon_lock_poisoned", None),
     };
 
-    let script_path = host_root.join("scripts/report_dryrun_summary.py");
-    if !script_path.exists() {
-        return json_error(
-            500,
-            "dry_run_summary_script_missing",
-            Some(format!(
-                "dry-run summary script not found: {}",
-                script_path.display()
-            )),
-        );
-    }
-
-    let output = match Command::new("python3")
-        .arg(&script_path)
-        .current_dir(&host_root)
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) => {
-            return json_error(
-                500,
-                "dry_run_summary_script_failed",
-                Some(format!("failed to start dry-run summary script: {err}")),
-            );
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let message = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!(
-                "dry-run summary script exited with status {}",
-                output.status
-            )
-        };
-        return json_error(500, "dry_run_summary_unavailable", Some(message));
-    }
-
-    let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if body.is_empty() {
-        return json_error(
-            500,
-            "dry_run_summary_empty",
-            Some("dry-run summary script returned an empty response".to_string()),
-        );
-    }
-
-    let report: DryRunPerformanceReport = match serde_json::from_str(&body) {
-        Ok(report) => report,
-        Err(err) => {
-            return json_error(
-                500,
-                "dry_run_summary_invalid",
-                Some(format!(
-                    "dry-run summary script returned payload outside the operator contract: {err}"
-                )),
-            );
-        }
-    };
-
-    (
-        200,
-        serde_json::to_string(&report).unwrap_or_else(|_| body.to_string()),
+    report_json_response(
+        generate_dry_run_summary_json(&host_root),
+        "dry_run_summary_unavailable",
     )
+}
+
+fn report_json_response(result: Result<String, String>, error: &str) -> (u16, String) {
+    match result {
+        Ok(body) => (200, body),
+        Err(message) => json_error(500, error, Some(message)),
+    }
 }
 
 fn html_error(status_code: u16, message: &str) -> (u16, String) {
@@ -1120,13 +960,90 @@ fn append_jsonl<T>(path: &PathBuf, value: &T) -> io::Result<()>
 where
     T: Serialize,
 {
+    let _lock = lock_jsonl(path)?;
+    append_jsonl_unlocked(path, value)
+}
+
+fn append_jsonl_unlocked<T>(path: &Path, value: &T) -> io::Result<()>
+where
+    T: Serialize,
+{
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    normalize_complete_jsonl_tail(path)?;
+    let mut body =
+        serde_json::to_vec(value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    body.push(b'\n');
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    let body = serde_json::to_string(value)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    writeln!(file, "{body}")
+    file.write_all(&body)?;
+    file.sync_data()
+}
+
+fn normalize_complete_jsonl_tail(path: &Path) -> io::Result<()> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut final_byte = [0_u8; 1];
+    file.read_exact(&mut final_byte)?;
+    if final_byte[0] == b'\n' {
+        return Ok(());
+    }
+
+    let read_len = usize::try_from(len.min(MAX_JSONL_TAIL_BYTES as u64))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "JSONL tail is too large"))?;
+    let start = len - read_len as u64;
+    file.seek(SeekFrom::Start(start))?;
+    let mut suffix = vec![0_u8; read_len];
+    file.read_exact(&mut suffix)?;
+    let tail_start = suffix
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|position| position + 1)
+        .unwrap_or_default();
+    if start > 0 && tail_start == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("JSONL tail exceeds {MAX_JSONL_TAIL_BYTES} bytes"),
+        ));
+    }
+    serde_json::from_slice::<serde_json::Value>(&suffix[tail_start..]).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to append after truncated JSONL tail: {err}"),
+        )
+    })?;
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(b"\n")?;
+    file.sync_data()
+}
+
+fn lock_jsonl(path: &Path) -> io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = suffixed_path(path, ".lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn read_recent_audit_entries(path: &PathBuf, limit: usize) -> io::Result<Vec<AuditLogEntry>> {
@@ -1299,15 +1216,16 @@ fn queue_agent_run_request(
         evaluation: None,
     };
 
-    append_jsonl(&agent_runs_file, &queued)?;
-    append_jsonl(
+    let _queue_lock = lock_jsonl(&request_file)?;
+    append_jsonl_unlocked(
         &request_file,
         &serde_json::json!({
-            "run_id": run_id,
+            "run_id": run_id.clone(),
             "created_at": created_at,
             "request": request,
         }),
     )?;
+    append_jsonl(&agent_runs_file, &queued)?;
 
     Ok(AgentRunCreateResponse {
         run_id: queued.run_id,
@@ -2188,17 +2106,8 @@ fn handle_runtime_request_from(
                 Ok(request) => request,
                 Err(err) => return json_error(400, "invalid_json", Some(err.to_string())),
             };
-            if request.max_turns == 0
-                || request.max_turns > 30
-                || !request.budget_usd.is_finite()
-                || request.budget_usd <= 0.0
-                || request.budget_usd > 1.0
-            {
-                return json_error(
-                    400,
-                    "agent_run_limits_exceeded",
-                    Some("max_turns must be 1..=30 and budget_usd must be (0, 1]".to_string()),
-                );
+            if let Err(reason) = validate_agent_run_create_request(&request) {
+                return json_error(400, "agent_run_limits_exceeded", Some(reason));
             }
             match queue_agent_run_request(state, request) {
                 Ok(response) => (
@@ -2719,11 +2628,12 @@ fn write_sse_event(stream: &mut TcpStream, event: &OperatorEvent) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        access_allowed, admin_session_cookie, append_audit_entry, client_ip, content_length,
-        handle_api_request, handle_authenticated_runtime_request, handle_connection,
-        handle_runtime_request, header_end_offset, intent_admission_source, rate_limit_key,
-        request_auth_level, required_access, response_headers, route_request, snapshot_events,
-        AppState, AuthLevel, RateLimiter, ADMIN_SESSION_COOKIE_NAME,
+        access_allowed, admin_session_cookie, append_audit_entry, append_jsonl, client_ip,
+        content_length, handle_api_request, handle_authenticated_runtime_request,
+        handle_connection, handle_runtime_request, header_end_offset, intent_admission_source,
+        rate_limit_key, report_json_response, request_auth_level, required_access,
+        response_headers, route_request, snapshot_events, AppState, AuthLevel, RateLimiter,
+        ADMIN_SESSION_COOKIE_NAME,
     };
     use crate::events::EventBroker;
     use chrono::{Duration, Utc};
@@ -2746,7 +2656,7 @@ mod tests {
     };
     use std::collections::VecDeque;
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::{self, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2878,6 +2788,30 @@ mod tests {
     fn request_reader_helpers_accept_large_content_length() {
         let headers = b"POST /api/proposals HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4096";
         assert_eq!(content_length(headers).expect("content length"), 4096);
+    }
+
+    #[test]
+    fn report_json_error_preserves_control_plane_envelope() {
+        for error in [
+            "market_data_health_unavailable",
+            "dry_run_summary_unavailable",
+        ] {
+            let (status, body) = report_json_response(Err("database offline".to_string()), error);
+            let payload: serde_json::Value = serde_json::from_str(&body).expect("JSON envelope");
+
+            assert_eq!(status, 500);
+            assert_eq!(payload["error"], error);
+            assert_eq!(payload["message"], "database offline");
+        }
+    }
+
+    #[test]
+    fn report_json_success_is_returned_without_rewriting() {
+        let body = "{\"generated_at\":\"2026-04-29T00:00:00Z\"}".to_string();
+        assert_eq!(
+            report_json_response(Ok(body.clone()), "unused"),
+            (200, body)
+        );
     }
 
     #[test]
@@ -4872,7 +4806,7 @@ mod tests {
             "max_turns": 30,
             "budget_usd": 1.0,
             "run_packet": "# packet",
-            "run_contract": "[agentic_strategy_run]"
+            "run_contract": "[agentic_strategy_run]\ncompletion_signal = \"required\""
         })
         .to_string();
 
@@ -4931,6 +4865,40 @@ mod tests {
             assert_eq!(status_code, 400);
             assert!(body.contains("invalid_json"));
         }
+    }
+
+    #[test]
+    fn append_jsonl_normalizes_a_complete_tail_without_newline() {
+        let root = temp_dir("jsonl-complete-tail");
+        let path = root.join("events.jsonl");
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(&path, br#"{"first":1}"#).expect("write complete tail");
+
+        append_jsonl(&path, &serde_json::json!({"second": 2})).expect("append record");
+
+        let body = fs::read_to_string(&path).expect("read JSONL");
+        assert_eq!(body.lines().count(), 2);
+        for line in body.lines() {
+            serde_json::from_str::<serde_json::Value>(line).expect("valid line");
+        }
+    }
+
+    #[test]
+    fn append_jsonl_refuses_to_join_onto_a_truncated_tail() {
+        let root = temp_dir("jsonl-truncated-tail");
+        let path = root.join("events.jsonl");
+        fs::create_dir_all(&root).expect("create temp root");
+        fs::write(&path, br#"{"first":"truncated"#).expect("write truncated tail");
+
+        let error = append_jsonl(&path, &serde_json::json!({"second": 2}))
+            .expect_err("truncated tail must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("truncated JSONL tail"));
+        assert_eq!(
+            fs::read(&path).expect("preserved tail"),
+            br#"{"first":"truncated"#
+        );
     }
 
     #[test]

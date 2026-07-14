@@ -20,6 +20,7 @@ ECS_SERVICE="${ECS_SERVICE:-listing-monitor}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+RUST_HFT_DIR="$(cd "$PROJECT_DIR/../.." && pwd)"
 
 # Colors for output
 RED='\033[0;31m'
@@ -41,8 +42,10 @@ log_error() {
 
 build() {
     log_info "Building Docker image..."
-    cd "$PROJECT_DIR"
-    docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+    docker build \
+        --file "$PROJECT_DIR/Dockerfile" \
+        --tag "${IMAGE_NAME}:${IMAGE_TAG}" \
+        "$RUST_HFT_DIR"
     log_info "Build complete: ${IMAGE_NAME}:${IMAGE_TAG}"
 }
 

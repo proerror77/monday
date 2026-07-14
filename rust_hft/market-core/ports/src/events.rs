@@ -268,6 +268,32 @@ impl OrderIntent {
         self.compliance_context = compliance_context;
         self
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prediction_market(
+        symbol: Symbol,
+        side: Side,
+        quantity: Quantity,
+        order_type: OrderType,
+        price: Option<Price>,
+        time_in_force: TimeInForce,
+        strategy_id: String,
+        target_venue: VenueId,
+    ) -> Self {
+        Self {
+            symbol,
+            asset_class: AssetClass::PredictionMarket,
+            product_type: ProductType::PredictionMarket,
+            compliance_context: ComplianceContext::default(),
+            side,
+            quantity,
+            order_type,
+            price,
+            time_in_force,
+            strategy_id,
+            target_venue: Some(target_venue),
+        }
+    }
 }
 
 /// OrderIntent 的生命週期元資料。
@@ -283,6 +309,9 @@ pub struct OrderIntentLifecycle {
     pub source_feature_ts: Option<Timestamp>,
     pub max_latency_us: Option<u64>,
     pub max_slippage_bps: Option<i32>,
+    /// Signed deployment ceiling consumed again at the final execution boundary.
+    #[serde(default)]
+    pub max_order_notional: Option<rust_decimal::Decimal>,
     #[serde(default)]
     pub reduce_only: bool,
 }
@@ -296,6 +325,7 @@ impl Default for OrderIntentLifecycle {
             source_feature_ts: None,
             max_latency_us: None,
             max_slippage_bps: None,
+            max_order_notional: None,
             reduce_only: false,
         }
     }
@@ -414,7 +444,8 @@ impl OrderIntentEnvelope {
         now: Timestamp,
         latest_book_seq: Option<u64>,
     ) -> Result<(), OrderIntentRejectReason> {
-        self.lifecycle.validate_pre_risk(now, latest_book_seq)
+        self.lifecycle.validate_pre_risk(now, latest_book_seq)?;
+        self.validate_order_notional()
     }
 
     pub fn validate_pre_execution(
@@ -422,7 +453,31 @@ impl OrderIntentEnvelope {
         now: Timestamp,
         latest_book_seq: Option<u64>,
     ) -> Result<(), OrderIntentRejectReason> {
-        self.lifecycle.validate_pre_execution(now, latest_book_seq)
+        self.lifecycle
+            .validate_pre_execution(now, latest_book_seq)?;
+        self.validate_order_notional()
+    }
+
+    fn validate_order_notional(&self) -> Result<(), OrderIntentRejectReason> {
+        let Some(max_order_notional) = self.lifecycle.max_order_notional else {
+            return Ok(());
+        };
+        if max_order_notional <= rust_decimal::Decimal::ZERO {
+            return Err(OrderIntentRejectReason::InvalidMaxOrderNotional { max_order_notional });
+        }
+        let Some(price) = self.intent.price else {
+            return Err(OrderIntentRejectReason::OrderNotionalUnpriceable { max_order_notional });
+        };
+        let Some(order_notional) = self.intent.quantity.0.checked_mul(price.0) else {
+            return Err(OrderIntentRejectReason::OrderNotionalUnpriceable { max_order_notional });
+        };
+        if order_notional > max_order_notional {
+            return Err(OrderIntentRejectReason::MaxOrderNotionalExceeded {
+                order_notional,
+                max_order_notional,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -442,6 +497,16 @@ pub enum OrderIntentRejectReason {
         created_ts: Timestamp,
         elapsed_us: u64,
         max_latency_us: u64,
+    },
+    InvalidMaxOrderNotional {
+        max_order_notional: rust_decimal::Decimal,
+    },
+    OrderNotionalUnpriceable {
+        max_order_notional: rust_decimal::Decimal,
+    },
+    MaxOrderNotionalExceeded {
+        order_notional: rust_decimal::Decimal,
+        max_order_notional: rust_decimal::Decimal,
     },
 }
 
@@ -477,6 +542,13 @@ pub enum ExecutionEvent {
         order_id: OrderId,
         price: Price,
         quantity: Quantity,
+        timestamp: Timestamp,
+        fill_id: String,
+    },
+    /// Venue-confirmed trading fee charged for a fill. `amount` is a positive quote-currency cost.
+    FeeCharged {
+        order_id: OrderId,
+        amount: rust_decimal::Decimal,
         timestamp: Timestamp,
         fill_id: String,
     },
@@ -620,5 +692,58 @@ mod tests {
         lifecycle.max_latency_us = Some(25);
 
         assert_eq!(lifecycle.validate_pre_risk(1_025, Some(42)), Ok(()));
+    }
+
+    #[test]
+    fn envelope_rejects_order_above_signed_notional_ceiling() {
+        let mut lifecycle = lifecycle(1_000, 2_000);
+        lifecycle.max_order_notional = Some(rust_decimal::Decimal::from(100));
+        let envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(rust_decimal::Decimal::from(11)),
+                OrderType::Limit,
+                Some(Price(rust_decimal::Decimal::from(10))),
+                TimeInForce::IOC,
+                "bounded".to_string(),
+                Some(VenueId::BINANCE_SPOT),
+            ),
+            lifecycle,
+        );
+
+        assert_eq!(
+            envelope.validate_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::MaxOrderNotionalExceeded {
+                order_notional: rust_decimal::Decimal::from(110),
+                max_order_notional: rust_decimal::Decimal::from(100),
+            })
+        );
+    }
+
+    #[test]
+    fn signed_notional_ceiling_fails_closed_without_an_executable_price() {
+        let mut lifecycle = lifecycle(1_000, 2_000);
+        lifecycle.max_order_notional = Some(rust_decimal::Decimal::from(100));
+        let envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(rust_decimal::Decimal::ONE),
+                OrderType::Market,
+                None,
+                TimeInForce::IOC,
+                "bounded".to_string(),
+                Some(VenueId::BINANCE_SPOT),
+            ),
+            lifecycle,
+        );
+
+        assert_eq!(
+            envelope.validate_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::OrderNotionalUnpriceable {
+                max_order_notional: rust_decimal::Decimal::from(100),
+            })
+        );
     }
 }

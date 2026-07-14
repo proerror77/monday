@@ -48,9 +48,10 @@ bybit = ["runtime/bybit"]
 okx = ["runtime/okx"]
 hyperliquid = ["runtime/hyperliquid"]
 ondo-perps = ["runtime/ondo-perps"]
+polymarket = ["runtime/polymarket", "ipc"]
 asterdex = ["runtime/asterdex"]
 mock = ["runtime/mock"]
-all-exchanges = ["bitget", "binance", "binance-prediction", "bybit", "okx", "hyperliquid", "ondo-perps", "asterdex"]
+all-exchanges = ["bitget", "binance", "binance-prediction", "bybit", "okx", "hyperliquid", "ondo-perps", "polymarket", "asterdex"]
 
 # 策略 (轉發到 runtime)
 trend-strategy = ["runtime/strategy-trend"]
@@ -78,7 +79,8 @@ metrics = [
   "infra-metrics/http-server"
 ]
 grpc = ["dep:hft-grpc-server"]
-full-infra = ["clickhouse", "redis", "metrics", "grpc"]
+ipc = ["runtime/infra-ipc"]
+full-infra = ["clickhouse", "redis", "metrics", "grpc", "ipc"]
 
 # SIMD 優化 (生產環境應默認啟用)
 simd = ["runtime/json-simd"]

@@ -73,6 +73,7 @@ pub(crate) fn load_config_from_str(
     // Legacy path first for backwards compatibility
     if let Ok(mut config) = serde_yaml::from_str::<SystemConfig>(&expanded_content) {
         normalize_accounts(&mut config);
+        normalize_execution_modes(&mut config);
         validate_runtime_config(&config)
             .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
         return Ok(config);
@@ -90,6 +91,7 @@ pub(crate) fn load_config_from_str(
             let mut cfg = convert_shared_config(shared_cfg)
                 .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
             cfg.quotes_only = quotes_only_flag;
+            normalize_execution_modes(&mut cfg);
             validate_runtime_config(&cfg)
                 .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
             return Ok(cfg);
@@ -113,15 +115,90 @@ fn legacy_load_with_templates(content: &str) -> Result<SystemConfig, Box<dyn std
     }
     let mut config: SystemConfig = serde_yaml::from_value(root)?;
     normalize_accounts(&mut config);
+    normalize_execution_modes(&mut config);
     validate_runtime_config(&config)
         .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
     Ok(config)
 }
 
+fn normalize_execution_modes(config: &mut SystemConfig) {
+    for venue in &mut config.venues {
+        let Some(mode) = venue.execution_mode.as_mut() else {
+            continue;
+        };
+        if mode.eq_ignore_ascii_case("paper") {
+            *mode = "Paper".to_string();
+        } else if mode.eq_ignore_ascii_case("live") {
+            *mode = "Live".to_string();
+        } else if mode.eq_ignore_ascii_case("testnet") {
+            *mode = "Testnet".to_string();
+        }
+    }
+}
+
 fn validate_runtime_config(config: &SystemConfig) -> Result<(), LoaderError> {
     let mut errors = Vec::new();
+    if let Err(error) = config.engine.validate_intent_execution_limits() {
+        errors.push(error);
+    }
     if config.engine.balance_reconcile_tolerance_usd < Decimal::ZERO {
         errors.push("engine.balance_reconcile_tolerance_usd must be non-negative".to_string());
+    }
+    if config.engine.auto_cancel_exchange_only {
+        errors.push(
+            "engine.auto_cancel_exchange_only is deprecated and unsupported because only the runtime OMS control plane can safely classify exchange-only orders"
+                .to_string(),
+        );
+    }
+    for venue in &config.venues {
+        if let Some(mode) = venue.execution_mode.as_deref() {
+            if !mode.eq_ignore_ascii_case("paper")
+                && !mode.eq_ignore_ascii_case("live")
+                && !mode.eq_ignore_ascii_case("testnet")
+            {
+                errors.push(format!(
+                    "venue '{}' execution_mode '{}' is invalid; expected Paper, Live, or Testnet",
+                    venue.name, mode
+                ));
+            }
+        }
+        if venue.venue_type == VenueType::Polymarket
+            && venue
+                .execution_mode
+                .as_deref()
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("testnet"))
+        {
+            errors.push(format!(
+                "venue '{}' Polymarket does not support Testnet execution_mode",
+                venue.name
+            ));
+        }
+        if venue.venue_type == VenueType::Polymarket
+            && venue
+                .execution_mode
+                .as_deref()
+                .is_some_and(|mode| mode.eq_ignore_ascii_case("live"))
+        {
+            if venue.simulate_execution {
+                errors.push(format!(
+                    "venue '{}' Polymarket Live execution cannot set simulate_execution=true",
+                    venue.name
+                ));
+            }
+            let signature_type = venue
+                .execution_config
+                .as_ref()
+                .and_then(|value| value.get("signature_type"))
+                .and_then(YamlValue::as_str);
+            if !signature_type
+                .is_some_and(|value| !value.trim().is_empty() && !value.contains("${"))
+            {
+                errors.push(format!(
+                    "venue '{}' Polymarket Live execution requires an explicit execution_config.signature_type",
+                    venue.name
+                ));
+            }
+        }
     }
     if errors.is_empty() {
         Ok(())
@@ -135,6 +212,8 @@ fn convert_shared_config(shared_cfg: SharedSystemConfig) -> Result<SystemConfig,
         queue_capacity: shared_cfg.engine.queue_capacity,
         stale_us: shared_cfg.engine.stale_us,
         intent_max_latency_us: 3_000,
+        intent_max_slippage_bps: None,
+        intent_max_order_notional: None,
         top_n: shared_cfg.engine.top_n,
         flip_policy: FlipPolicy::OnUpdate,
         cpu_affinity: CpuAffinityConfig::default(),
@@ -548,6 +627,7 @@ fn map_venue_type(venue_id: VenueId) -> VenueType {
         VenueId::ASTERDEX => VenueType::Asterdex,
         VenueId::BACKPACK => VenueType::Backpack,
         VenueId::ONDO_PERPS => VenueType::OndoPerps,
+        VenueId::POLYMARKET => VenueType::Polymarket,
         VenueId::MOCK => VenueType::Mock,
         _ => VenueType::Mock,
     }
@@ -1222,6 +1302,32 @@ risk:
     }
 
     #[test]
+    fn invalid_intent_execution_limits_are_rejected() {
+        let mut config = SystemConfig::default();
+        config.engine.intent_max_slippage_bps = Some(0);
+        let yaml = serde_yaml::to_string(&config).expect("serialize config");
+        let error = load_config_from_str(&yaml).expect_err("invalid slippage limit");
+        assert!(error.to_string().contains("intent_max_slippage_bps"));
+
+        let mut config = SystemConfig::default();
+        config.engine.intent_max_order_notional = Some(Decimal::ZERO);
+        let yaml = serde_yaml::to_string(&config).expect("serialize config");
+        let error = load_config_from_str(&yaml).expect_err("invalid order-notional limit");
+        assert!(error.to_string().contains("intent_max_order_notional"));
+    }
+
+    #[test]
+    fn unsafe_worker_only_exchange_order_auto_cancel_is_rejected() {
+        let mut config = SystemConfig::default();
+        config.engine.auto_cancel_exchange_only = true;
+        let yaml = serde_yaml::to_string(&config).expect("serialize config");
+
+        let error = load_config_from_str(&yaml).expect_err("unsupported auto-cancel");
+        assert!(error.to_string().contains("auto_cancel_exchange_only"));
+        assert!(error.to_string().contains("deprecated and unsupported"));
+    }
+
+    #[test]
     fn loads_binance_prediction_as_an_execution_only_venue() {
         let config = load_config_from_str(
             r#"
@@ -1283,5 +1389,179 @@ strategies: []
         assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Live"));
         assert!(config.strategies.is_empty());
         assert_eq!(config.risk.global_notional_limit, Decimal::ZERO);
+    }
+
+    #[test]
+    fn polymarket_examples_keep_token_identity_and_live_fail_closed() {
+        let quotes = include_str!("../../../../config/dev/polymarket_quotes_only.yaml.example")
+            .replace("${POLYMARKET_TOKEN_ID}", "123456789");
+        let quotes = load_config_from_str(&quotes).expect("load Polymarket quotes example");
+        assert!(quotes.quotes_only);
+        assert_eq!(quotes.venues[0].venue_type, VenueType::Polymarket);
+        assert_eq!(
+            quotes.venues[0].symbol_catalog[0].venue_id(),
+            Some(VenueId::POLYMARKET)
+        );
+
+        let live = include_str!("../../../../config/dev/polymarket_live.yaml.example")
+            .replace("${POLYMARKET_TOKEN_ID}", "123456789")
+            .replace("${POLYMARKET_PRIVATE_KEY}", "not-a-real-private-key")
+            .replace("${POLYMARKET_SIGNATURE_TYPE}", "eoa");
+        let live = load_config_from_str(&live).expect("load Polymarket live example");
+        assert!(!live.quotes_only);
+        assert_eq!(live.venues[0].venue_type, VenueType::Polymarket);
+        assert_eq!(live.venues[0].execution_mode.as_deref(), Some("Live"));
+        assert!(live.strategies.is_empty());
+        assert_eq!(live.risk.global_notional_limit, Decimal::ZERO);
+    }
+
+    #[test]
+    fn polymarket_live_requires_explicit_signature_type() {
+        let live = include_str!("../../../../config/dev/polymarket_live.yaml.example")
+            .replace("${POLYMARKET_TOKEN_ID}", "123456789")
+            .replace("${POLYMARKET_PRIVATE_KEY}", "not-a-real-private-key")
+            .replace(
+                "      signature_type: \"${POLYMARKET_SIGNATURE_TYPE}\"\n",
+                "",
+            );
+
+        let error = load_config_from_str(&live).expect_err("missing signature_type");
+
+        assert!(error.to_string().contains("signature_type"));
+    }
+
+    #[test]
+    fn unknown_execution_mode_is_rejected() {
+        let live = include_str!("../../../../config/dev/polymarket_live.yaml.example")
+            .replace("${POLYMARKET_TOKEN_ID}", "123456789")
+            .replace("${POLYMARKET_PRIVATE_KEY}", "not-a-real-private-key")
+            .replace("${POLYMARKET_SIGNATURE_TYPE}", "eoa")
+            .replace("execution_mode: Live", "execution_mode: Lvie");
+
+        let error = load_config_from_str(&live).expect_err("unknown execution_mode");
+
+        assert!(error.to_string().contains("execution_mode"));
+        assert!(error.to_string().contains("Lvie"));
+    }
+
+    #[test]
+    fn execution_mode_is_case_insensitive() {
+        let live = include_str!("../../../../config/dev/polymarket_live.yaml.example")
+            .replace("${POLYMARKET_TOKEN_ID}", "123456789")
+            .replace("${POLYMARKET_PRIVATE_KEY}", "not-a-real-private-key")
+            .replace("${POLYMARKET_SIGNATURE_TYPE}", "eoa")
+            .replace("execution_mode: Live", "execution_mode: lIvE");
+
+        let config = load_config_from_str(&live).expect("case-insensitive execution_mode");
+
+        assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Live"));
+    }
+
+    #[test]
+    fn testnet_execution_mode_remains_available_for_supported_venues() {
+        let config = load_config_from_str(
+            r#"
+engine: {}
+venues:
+  - name: binance-test
+    venue_type: Binance
+    execution_mode: tEsTnEt
+    capabilities:
+      ws_order_placement: false
+      snapshot_crc: false
+      all_in_one_topics: false
+      private_ws_heartbeat: false
+  - name: binance-prediction-test
+    venue_type: BinancePrediction
+    execution_mode: tEsTnEt
+    capabilities:
+      ws_order_placement: false
+      snapshot_crc: false
+      all_in_one_topics: false
+      private_ws_heartbeat: false
+  - name: bybit-test
+    venue_type: Bybit
+    execution_mode: tEsTnEt
+    capabilities:
+      ws_order_placement: false
+      snapshot_crc: false
+      all_in_one_topics: false
+      private_ws_heartbeat: false
+risk:
+  risk_type: Default
+  global_position_limit: 0
+  global_notional_limit: 0
+  max_daily_trades: 0
+  max_orders_per_second: 0
+  staleness_threshold_us: 0
+strategies: []
+"#,
+        )
+        .expect("supported Testnet mode");
+
+        assert_eq!(config.venues.len(), 3);
+        assert!(config
+            .venues
+            .iter()
+            .all(|venue| venue.execution_mode.as_deref() == Some("Testnet")));
+    }
+
+    #[test]
+    fn account_driven_config_preserves_testnet_execution_mode() {
+        let config: YamlValue =
+            serde_yaml::from_str(include_str!("../../../../config/dev/system_accounts.yaml"))
+                .expect("parse account-driven config");
+        let bybit = config["accounts"]
+            .as_sequence()
+            .expect("accounts list")
+            .iter()
+            .find(|account| account["id"].as_str() == Some("bybit_test"))
+            .expect("Bybit account");
+
+        assert_eq!(bybit["venue_type"].as_str(), Some("Bybit"));
+        assert_eq!(bybit["execution_mode"].as_str(), Some("Testnet"));
+    }
+
+    #[test]
+    fn polymarket_testnet_execution_mode_is_rejected() {
+        let live = include_str!("../../../../config/dev/polymarket_live.yaml.example")
+            .replace("${POLYMARKET_TOKEN_ID}", "123456789")
+            .replace("${POLYMARKET_PRIVATE_KEY}", "not-a-real-private-key")
+            .replace("${POLYMARKET_SIGNATURE_TYPE}", "eoa")
+            .replace("execution_mode: Live", "execution_mode: Testnet");
+
+        let error = load_config_from_str(&live).expect_err("Polymarket Testnet");
+
+        assert!(error
+            .to_string()
+            .contains("Polymarket does not support Testnet"));
+    }
+
+    #[test]
+    fn polymarket_live_cannot_skip_reconciliation_via_simulation_flag() {
+        let live = include_str!("../../../../config/dev/polymarket_live.yaml.example")
+            .replace("${POLYMARKET_TOKEN_ID}", "123456789")
+            .replace("${POLYMARKET_PRIVATE_KEY}", "not-a-real-private-key")
+            .replace("${POLYMARKET_SIGNATURE_TYPE}", "eoa")
+            .replace("simulate_execution: false", "simulate_execution: true");
+
+        let error = load_config_from_str(&live).expect_err("ambiguous Live simulation flag");
+
+        assert!(error.to_string().contains("simulate_execution=true"));
+    }
+
+    #[test]
+    fn polymarket_live_rejects_unexpanded_signature_type() {
+        let live = include_str!("../../../../config/dev/polymarket_live.yaml.example")
+            .replace("${POLYMARKET_TOKEN_ID}", "123456789")
+            .replace("${POLYMARKET_PRIVATE_KEY}", "not-a-real-private-key")
+            .replace(
+                "${POLYMARKET_SIGNATURE_TYPE}",
+                "${secret:polymarket::signature_type}",
+            );
+
+        let error = load_config_from_str(&live).expect_err("unexpanded signature_type");
+
+        assert!(error.to_string().contains("signature_type"));
     }
 }

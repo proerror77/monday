@@ -75,14 +75,16 @@ fn ci_runs_dependency_vulnerability_audit() {
         ),
         ("-size +500k", "frontend chunk limit"),
         (
-            "npm run contracts:check --prefix ploy-sidecar",
-            "sidecar contracts",
+            "cargo build --locked \\\n            -p ploy-agent-sidecar",
+            "Rust sidecar build",
         ),
-        ("npm test --prefix ploy-sidecar", "sidecar tests"),
-        ("npm run build --prefix ploy-sidecar", "sidecar build"),
         (
-            "npm audit --omit=dev --audit-level=moderate --prefix ploy-sidecar",
-            "sidecar audit",
+            "cargo test --locked \\\n            -p ploy-agent-sidecar",
+            "Rust sidecar tests",
+        ),
+        (
+            "cargo clippy --locked -p ploy-agent-sidecar --all-targets --no-deps -- -D warnings",
+            "Rust sidecar clippy",
         ),
         (
             "node ploy-frontend/scripts/check-route-contract.mjs",

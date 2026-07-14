@@ -143,6 +143,10 @@ impl OmsCore {
                     let previous_status = ord.status;
                     ord.status = if new_cum_qty >= ord.qty.0 {
                         OrderStatus::Filled
+                    } else if previous_status == OrderStatus::Canceled {
+                        // IOC/FAK cancellation can race its confirmed partial fill. Preserve the
+                        // terminal remainder state while still accounting the late fill.
+                        OrderStatus::Canceled
                     } else {
                         OrderStatus::PartiallyFilled
                     };
@@ -223,8 +227,10 @@ impl OmsCore {
                         // 重新檢查是否應該變為已成交狀態
                         ord.status = if ord.cum_qty.0 >= ord.qty.0 {
                             OrderStatus::Filled
-                        } else {
+                        } else if ord.cum_qty.0 > rust_decimal::Decimal::ZERO {
                             OrderStatus::PartiallyFilled
+                        } else {
+                            previous_status
                         };
                     }
                     // 注意：修改價格不會影響已有的平均成交價
@@ -590,7 +596,7 @@ impl ports::OrderManager for OmsCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_core::{OrderId, Price, Quantity, Symbol};
+    use hft_core::{OrderId, Price, Quantity, Symbol, VenueId};
 
     #[test]
     fn test_ack_and_fill() {
@@ -922,6 +928,39 @@ mod tests {
     }
 
     #[test]
+    fn late_partial_fill_after_ioc_cancel_stays_terminal() {
+        let mut oms = OmsCore::new();
+        let order_id = OrderId("IOC-LATE-FILL".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: order_id.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("123"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(5.0).unwrap(),
+            venue: Some(VenueId::POLYMARKET),
+            strategy_id: Some("test".into()),
+        });
+        oms.on_execution_event(&ExecutionEvent::OrderCanceled {
+            order_id: order_id.clone(),
+            timestamp: 1,
+        });
+
+        let update = oms
+            .on_execution_event(&ExecutionEvent::Fill {
+                order_id: order_id.clone(),
+                price: Price::from_f64(0.5).unwrap(),
+                quantity: Quantity::from_f64(2.0).unwrap(),
+                timestamp: 2,
+                fill_id: "late-confirmed".into(),
+            })
+            .expect("late fill is accounted");
+
+        assert_eq!(update.status, OrderStatus::Canceled);
+        assert_eq!(update.cum_qty, Quantity::from_f64(2.0).unwrap());
+        assert!(oms.get_open_orders().is_empty());
+    }
+
+    #[test]
     fn test_weighted_avg_price_calculation() {
         let mut oms = OmsCore::new();
         let oid = OrderId("AVG-1".into());
@@ -1009,6 +1048,37 @@ mod tests {
 
         // Order should now be Filled since cum_qty >= qty
         assert_eq!(update.status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn unfilled_order_modify_preserves_acknowledged_status() {
+        let mut oms = OmsCore::new();
+        let oid = OrderId("MOD-UNFILLED".into());
+        oms.register_order(RegisterOrderParams {
+            order_id: oid.clone(),
+            client_order_id: None,
+            symbol: Symbol::new("123"),
+            side: Side::Buy,
+            qty: Quantity::from_f64(10.0).unwrap(),
+            venue: None,
+            strategy_id: None,
+        });
+        let _ = oms.on_execution_event(&ExecutionEvent::OrderAck {
+            order_id: oid.clone(),
+            timestamp: 0,
+        });
+
+        let update = oms
+            .on_execution_event(&ExecutionEvent::OrderModified {
+                order_id: oid,
+                new_quantity: Some(Quantity::from_f64(8.0).unwrap()),
+                new_price: Some(Price::from_f64(0.4).unwrap()),
+                timestamp: 0,
+            })
+            .expect("order modified update");
+
+        assert_eq!(update.status, OrderStatus::Acknowledged);
+        assert_eq!(update.cum_qty, Quantity::zero());
     }
 
     fn create_exchange_order(id: &str, symbol: &str, filled: f64) -> ports::OpenOrder {

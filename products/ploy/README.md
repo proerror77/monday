@@ -1,9 +1,14 @@
 # PLOY product workspace
 
 PLOY is maintained inside the [Monday repository](https://github.com/proerror77/monday) at
-`products/ploy`. It remains an independent Rust and TypeScript workspace so its
-prediction-market product, research, frontend, sidecar, and operator code can evolve
+`products/ploy`. It remains an independent Rust workspace with a TypeScript frontend so its
+prediction-market product, research, agent sidecar, and operator code can evolve
 without joining Monday's `rust_hft` Cargo graph.
+
+The durable runtime is Rust and TypeScript is limited to `ploy-frontend`. Imported
+Python research/compatibility utilities remain only behind explicit parity gates;
+the root CI checks them for source compatibility but does not deploy the nested
+historical PLOY workflows.
 
 ## Execution boundary
 
@@ -15,10 +20,8 @@ reconciliation, cancellation, replacement, and order execution.
   and fill-reconciliation operations.
 - The real Polymarket execution gateway is private to `ploy-connectivity` and cannot
   be injected by a production PLOY entrypoint.
-- Account-operation tools are planning/read surfaces only inside Monday. Legacy
-  environment flags cannot enable order submission, approval transactions,
-  redemption, or reconciliation mutations; those calls reject before credentials,
-  SDK sessions, network requests, or ledgers are touched.
+- The standalone Node account-operation tools are retired. Polymarket account,
+  order, cancellation, and reconciliation operations belong to `rust_hft`.
 - The standard `new-ploy-runner --features full` build does not enable the legacy
   `live-execution` feature.
 - Workflows under `products/ploy/.github/workflows` are historical source material.
@@ -47,11 +50,13 @@ OMS, reconciliation, and approval gates.
 
 - `apps/new-ployd`: paper/control-plane daemon entrypoint
 - `apps/new-ploy-runner`: replay, backtest, dry-run, and research runner
+- `apps/ploy-agent-sidecar`: crash-safe, prompt-only research-agent queue worker;
+  contracts that require external evidence adapters fail closed until those
+  Rust adapters are bundled with the release
 - `apps/ployctl`: operator client
 - `apps/ploytui`: terminal operator console
 - `crates/ploy-*`: PLOY domain and runtime crates
 - `ploy-frontend`: operator frontend
-- `ploy-sidecar`: agent and product sidecar
 - `contracts`: shared JSON schemas
 - `config`: retained strategy and deployment examples
 - `docs`: current product docs plus explicitly archived standalone material
@@ -86,13 +91,11 @@ npm --prefix ploy-frontend run lint
 npm --prefix ploy-frontend run build
 ```
 
-Sidecar checks:
+Rust sidecar checks:
 
 ```bash
-npm --prefix ploy-sidecar ci
-npm --prefix ploy-sidecar run contracts:check
-npm --prefix ploy-sidecar test
-npm --prefix ploy-sidecar run build
+cargo +1.91 test --locked -p ploy-agent-sidecar
+cargo +1.91 clippy --locked -p ploy-agent-sidecar --all-targets --no-deps -- -D warnings
 ```
 
 Do not start a local PostgreSQL service for routine migration validation. Database-backed

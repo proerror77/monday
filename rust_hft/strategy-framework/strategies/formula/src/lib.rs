@@ -124,7 +124,7 @@ impl FormulaStrategy {
         else {
             return Vec::new();
         };
-        let Some(quantity) = self
+        let Some(raw_quantity) = self
             .config
             .max_order_notional
             .checked_div(limit_price)
@@ -132,18 +132,43 @@ impl FormulaStrategy {
         else {
             return Vec::new();
         };
+        // Polymarket CLOB share sizes are signed with two decimal places. Round down before the
+        // intent enters risk review so the adapter does not reject ordinary non-divisible prices
+        // and the signed notional ceiling can never be increased by normalization.
+        let quantity = if target_venue == hft_core::VenueId::POLYMARKET {
+            raw_quantity.trunc_with_scale(2)
+        } else {
+            raw_quantity
+        };
+        if quantity <= Decimal::ZERO {
+            return Vec::new();
+        }
 
         self.signal_state = next_state;
-        vec![OrderIntent::crypto_spot(
-            self.config.symbol.clone(),
-            side,
-            Quantity(quantity),
-            OrderType::Limit,
-            Some(Price(limit_price)),
-            TimeInForce::IOC,
-            self.config.name.clone(),
-            Some(target_venue),
-        )]
+        let intent = if target_venue == hft_core::VenueId::POLYMARKET {
+            OrderIntent::prediction_market(
+                self.config.symbol.clone(),
+                side,
+                Quantity(quantity),
+                OrderType::Limit,
+                Some(Price(limit_price)),
+                TimeInForce::IOC,
+                self.config.name.clone(),
+                target_venue,
+            )
+        } else {
+            OrderIntent::crypto_spot(
+                self.config.symbol.clone(),
+                side,
+                Quantity(quantity),
+                OrderType::Limit,
+                Some(Price(limit_price)),
+                TimeInForce::IOC,
+                self.config.name.clone(),
+                Some(target_venue),
+            )
+        };
+        vec![intent]
     }
 }
 
@@ -215,6 +240,13 @@ impl Strategy for FormulaStrategy {
         _account: &AccountView,
     ) -> Vec<OrderIntent> {
         Vec::new()
+    }
+
+    fn supported_asset_classes(&self) -> &'static [hft_core::AssetClass] {
+        &[
+            hft_core::AssetClass::Crypto,
+            hft_core::AssetClass::PredictionMarket,
+        ]
     }
 
     fn name(&self) -> &str {
@@ -701,6 +733,36 @@ mod tests {
         assert_eq!(order.target_venue, Some(VenueId::BITGET));
         assert_eq!(strategy.name(), "formula-test");
         assert_eq!(strategy.id(), "formula-test");
+    }
+
+    #[test]
+    fn polymarket_book_emits_prediction_market_intent() {
+        let mut config = config(field("book_imbalance"));
+        config.symbol = Symbol::from("123456789");
+        config.signal_threshold = 0.0;
+        let mut strategy = FormulaStrategy::new(config).unwrap();
+        let mut event = snapshot(3, 1);
+        let MarketEvent::Snapshot(snapshot) = &mut event else {
+            unreachable!();
+        };
+        snapshot.symbol = Symbol::from("123456789");
+        snapshot.bids[0].price = Price(Decimal::new(60, 2));
+        snapshot.asks[0].price = Price(Decimal::new(61, 2));
+        snapshot.source_venue = Some(VenueId::POLYMARKET);
+
+        let orders = intents(&mut strategy, &event);
+
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].asset_class, AssetClass::PredictionMarket);
+        assert_eq!(orders[0].product_type, ProductType::PredictionMarket);
+        assert_eq!(orders[0].target_venue, Some(VenueId::POLYMARKET));
+        assert_eq!(orders[0].price, Some(Price(Decimal::new(61, 2))));
+        assert_eq!(orders[0].quantity, Quantity(Decimal::new(16_393, 2)));
+        assert_eq!(orders[0].quantity.0.scale(), 2);
+        assert!(orders[0].quantity.0 * orders[0].price.unwrap().0 <= Decimal::from(100));
+        assert!(strategy
+            .supported_asset_classes()
+            .contains(&AssetClass::PredictionMarket));
     }
 
     #[test]

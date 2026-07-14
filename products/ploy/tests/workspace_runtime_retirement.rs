@@ -11,6 +11,8 @@ const RETIRED_SOURCE_PATHS: &[&str] = &[
     "nginx.conf",
     "start.sh",
     "stop.sh",
+    "tools/polymarket-account-ops",
+    "tools/predict-fun-account-ops",
     "ploy-openclaw",
     "src/CLAUDE.md",
     "src/account",
@@ -163,7 +165,7 @@ fn standalone_operational_docs_are_explicitly_marked_historical() {
         "config",
         "examples",
         "ploy-frontend",
-        "ploy-sidecar",
+        "apps/ploy-agent-sidecar",
         "tasks",
     ] {
         collect_markdown_files(&repo_root.join(relative_root), &mut files);
@@ -237,45 +239,6 @@ fn default_config_does_not_advertise_live_enablement() {
         body.contains("separate reviewed Monday change"),
         "default config must name the reviewed Monday authority gate"
     );
-}
-
-#[test]
-fn account_operation_mutations_reject_before_legacy_write_paths() {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for (relative, surfaces) in [
-        (
-            "tools/polymarket-account-ops/account_ops.js",
-            &["executePlan", "reconcileOperation", "reconcileTransaction"][..],
-        ),
-        (
-            "tools/predict-fun-account-ops/account_ops.js",
-            &[
-                "executeApprovals",
-                "executeOrderPlan",
-                "executeRedeemPlan",
-                "reconcileOrder",
-                "reconcileRedeem",
-            ][..],
-        ),
-    ] {
-        let body = fs::read_to_string(repo_root.join(relative)).expect("read account-op tool");
-        assert!(
-            !body.contains("WRITE_ENABLED"),
-            "{relative} must not expose a legacy environment write gate"
-        );
-        for surface in surfaces {
-            let signature = format!("async function {surface}");
-            let function = body
-                .split_once(&signature)
-                .unwrap_or_else(|| panic!("{relative} is missing {signature}"))
-                .1;
-            let entry = function.lines().take(3).collect::<Vec<_>>().join("\n");
-            assert!(
-                entry.contains("rejectMondayWrite"),
-                "{relative}::{surface} must reject before credentials, network, or ledger access"
-            );
-        }
-    }
 }
 
 #[test]

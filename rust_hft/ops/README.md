@@ -22,8 +22,8 @@ Use these canonical paths instead:
 From the repository root:
 
 ```bash
-bash scripts/check-tracked-secrets.sh
-bash scripts/check-deployment-contract.sh
+cargo test --manifest-path rust_hft/Cargo.toml -p hft-infra-secrets --test tracked_secrets_contract --locked -- --nocapture
+cargo test --manifest-path rust_hft/Cargo.toml -p hft-live --no-default-features --test deployment_artifacts --locked
 ```
 
 From `rust_hft/`:

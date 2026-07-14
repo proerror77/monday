@@ -20,8 +20,12 @@ impl BacktestConfig {
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let yaml = fs::read_to_string(&path)
             .with_context(|| format!("無法讀取配置檔: {}", path.as_ref().display()))?;
-        let mut cfg: BacktestConfig = serde_yaml::from_str(&yaml)
-            .with_context(|| format!("解析配置檔失敗: {}", path.as_ref().display()))?;
+        Self::from_yaml_str(&yaml, &path.as_ref().display().to_string())
+    }
+
+    pub fn from_yaml_str(yaml: &str, source: &str) -> anyhow::Result<Self> {
+        let mut cfg: BacktestConfig =
+            serde_yaml::from_str(yaml).with_context(|| format!("解析配置檔失敗: {source}"))?;
         cfg.normalize();
         Ok(cfg)
     }

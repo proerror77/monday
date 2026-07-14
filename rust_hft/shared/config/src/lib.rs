@@ -36,6 +36,7 @@ pub struct EngineConfig {
     pub reconcile_interval_ms: u64,
     #[serde(default = "default_balance_reconcile_tolerance_usd")]
     pub balance_reconcile_tolerance_usd: Decimal,
+    /// Deprecated compatibility field. Runtime validation rejects `true`.
     #[serde(default)]
     pub auto_cancel_exchange_only: bool,
 }

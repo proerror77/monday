@@ -8,7 +8,6 @@ SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 PLOYCTL="${PLOYCTL:-${ROOT_DIR}/current/bin/ployctl}"
 CURL="${CURL:-curl}"
 PGREP="${PGREP:-pgrep}"
-STAT="${STAT:-stat}"
 
 fail() {
   printf 'trade-host postflight failed: %s\n' "$*" >&2
@@ -29,37 +28,12 @@ current_dir="$(readlink -f "${ROOT_DIR}/current")"
 [[ -x "${release_dir}/bin/ployd" ]] || fail "ployd missing from immutable release"
 [[ -x "${release_dir}/bin/ployctl" ]] || fail "ployctl missing from immutable release"
 [[ -x "${release_dir}/bin/ploy-runner" ]] || fail "ploy-runner missing from immutable release"
-[[ -x "${release_dir}/bin/node" ]] || fail "bundled Node.js runtime missing from immutable release"
-[[ -x "${release_dir}/tools/polymarket-account-ops/cli.js" ]] || fail "account-ops CLI missing from immutable release"
-[[ -x "${release_dir}/tools/polymarket-account-ops/ploy-account-ops" ]] || fail "account-ops launcher missing from immutable release"
-[[ -L "${ROOT_DIR}/bin/ploy-account-ops" ]] || fail "account-ops CLI symlink is missing"
-[[ -x "${release_dir}/tools/predict-fun-account-ops/cli.js" ]] || fail "Predict account-ops CLI missing from immutable release"
-[[ -x "${release_dir}/tools/predict-fun-account-ops/ploy-predict-account-ops" ]] || fail "Predict account-ops launcher missing from immutable release"
-[[ -L "${ROOT_DIR}/bin/ploy-predict-account-ops" ]] || fail "Predict account-ops CLI symlink is missing"
 (cd "$release_dir" && sha256sum -c FILES.sha256 >/dev/null) \
   || fail "immutable release file checksum verification failed"
 grep -Fxq "PLOY_RELEASE_SHA=${EXPECTED_SHA}" "${ROOT_DIR}/.env" \
   || fail "PLOY_RELEASE_SHA is not bound to the immutable release"
 grep -Fxq "PLOY_LIVE_APPROVAL_FILE=${ROOT_DIR}/data/live-approvals/pending.json" "${ROOT_DIR}/.env" \
   || fail "runtime live-approval enforcement is not configured"
-grep -Fxq "PLOY_ACCOUNT_OPS_WRITE_ENABLED=false" "${ROOT_DIR}/.env" \
-  || fail "account-ops must remain write-disabled after deploy"
-require_unique_false() {
-  local key="$1"
-  [[ "$(grep -cE "^${key}=" "${ROOT_DIR}/.env")" == 1 ]] \
-    || fail "${key} must appear exactly once"
-  grep -Fxq "${key}=false" "${ROOT_DIR}/.env" \
-    || fail "${key} must remain disabled after deploy"
-}
-require_unique_false PLOY_PREDICT_ACCOUNT_OPS_WRITE_ENABLED
-require_unique_false PLOY_PREDICT_APPROVAL_WRITE_ENABLED
-require_unique_false PLOY_PREDICT_RECONCILE_WRITE_ENABLED
-[[ "$($STAT -c '%U:%G:%a' "${ROOT_DIR}/data/account-ops")" == "root:root:700" ]] \
-  || fail "account-ops state directory must be root:root mode 700"
-"${release_dir}/bin/node" -e "require('${release_dir}/tools/polymarket-account-ops/account_ops.js')" \
-  || fail "account-ops runtime dependencies are not loadable"
-"${release_dir}/bin/node" -e "require('${release_dir}/tools/predict-fun-account-ops/account_ops.js')" \
-  || fail "Predict account-ops runtime dependencies are not loadable"
 
 python3 - "$release_dir/release.json" "$EXPECTED_SHA" <<'PY'
 import json

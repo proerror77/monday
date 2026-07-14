@@ -197,14 +197,7 @@ jobs:
                   continue
               shutil.copy2(source, destination / source.name)
           PY
-          cp scripts/binance_aggtrade_collector.py dist/scripts/binance_aggtrade_collector.py
-          cp scripts/binance_price_collector.py dist/scripts/binance_price_collector.py
-          cp scripts/binance_lob_collector.py dist/scripts/binance_lob_collector.py
-          cp scripts/deribit_atm_greeks_collector.py dist/scripts/deribit_atm_greeks_collector.py
-          cp scripts/report_strategy.py dist/scripts/report_strategy.py
-          cp scripts/report_market_data_health.py dist/scripts/report_market_data_health.py
           cp scripts/audit_market_data_gaps.py dist/scripts/audit_market_data_gaps.py
-          cp scripts/report_dryrun_summary.py dist/scripts/report_dryrun_summary.py
           cp scripts/check_dryrun_report_contract.py dist/scripts/check_dryrun_report_contract.py
           cp scripts/import_polymarket_v2_indexer.py dist/scripts/import_polymarket_v2_indexer.py
           cp scripts/archive_clob_orderbook_snapshots_backfill.sh dist/scripts/archive_clob_orderbook_snapshots_backfill.sh
