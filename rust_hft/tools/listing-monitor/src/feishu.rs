@@ -1,14 +1,46 @@
-//! Feishu (Lark) webhook notification module
+//! Feishu (Lark) webhook notification module.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use serde_json::json;
 use tracing::{debug, error, warn};
 
-const FEISHU_WEBHOOK: &str =
-    "https://open.feishu.cn/open-apis/bot/v2/hook/2ad78ad0-0325-48e8-b0ed-d813774c810d";
+const FEISHU_WEBHOOK_ENV: &str = "FEISHU_WEBHOOK_URL";
+
+pub fn validate_config() -> Result<()> {
+    webhook_url().map(|_| ())
+}
+
+fn webhook_url() -> Result<reqwest::Url> {
+    parse_webhook_url(std::env::var(FEISHU_WEBHOOK_ENV).ok().as_deref())
+}
+
+fn parse_webhook_url(value: Option<&str>) -> Result<reqwest::Url> {
+    let value = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| {
+            format!("required environment variable {FEISHU_WEBHOOK_ENV} is missing")
+        })?;
+    let url = reqwest::Url::parse(value)
+        .with_context(|| format!("{FEISHU_WEBHOOK_ENV} is not a valid URL"))?;
+    if url.scheme() != "https" {
+        bail!("{FEISHU_WEBHOOK_ENV} must use HTTPS");
+    }
+    if !matches!(
+        url.host_str(),
+        Some("open.feishu.cn" | "open.larksuite.com")
+    ) {
+        bail!("{FEISHU_WEBHOOK_ENV} must use an official Feishu or Lark host");
+    }
+    if !url.path().starts_with("/open-apis/bot/v2/hook/") {
+        bail!("{FEISHU_WEBHOOK_ENV} must be a bot webhook URL");
+    }
+    Ok(url)
+}
 
 /// Send an alert to Feishu webhook
 pub async fn send_alert(title: &str, content: &str) -> Result<()> {
+    let webhook_url = webhook_url()?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -38,54 +70,48 @@ pub async fn send_alert(title: &str, content: &str) -> Result<()> {
 
     debug!("Sending Feishu alert: {}", title);
 
-    match client.post(FEISHU_WEBHOOK).json(&payload).send().await {
+    match client.post(webhook_url).json(&payload).send().await {
         Ok(resp) => {
             if resp.status().is_success() {
                 debug!("Feishu alert sent successfully");
                 Ok(())
             } else {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                warn!("Feishu webhook returned non-success status: {} - {}", status, body);
+                warn!("Feishu webhook returned non-success status: {}", status);
                 Ok(()) // Don't fail the whole loop for notification errors
             }
         }
         Err(e) => {
+            let e = e.without_url();
             error!("Failed to send Feishu alert: {}", e);
             Err(e.into())
         }
     }
 }
 
-/// Send a simple text message to Feishu
-pub async fn send_text(text: &str) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
-    let payload = json!({
-        "msg_type": "text",
-        "content": {
-            "text": text
-        }
-    });
-
-    client.post(FEISHU_WEBHOOK).json(&payload).send().await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    #[ignore] // Run manually: cargo test --package listing-monitor -- --ignored
-    async fn test_send_alert() {
-        let result = send_alert(
-            "Test Alert",
-            "This is a test message from listing-monitor",
-        )
-        .await;
-        assert!(result.is_ok());
+    #[test]
+    fn webhook_is_required_and_must_be_official_https() {
+        assert!(parse_webhook_url(None).is_err());
+        assert!(parse_webhook_url(Some(" ")).is_err());
+        assert!(
+            parse_webhook_url(Some("http://open.feishu.cn/open-apis/bot/v2/hook/test")).is_err()
+        );
+        assert!(parse_webhook_url(Some("https://example.com/hook/test")).is_err());
+        assert!(parse_webhook_url(Some("https://open.feishu.cn/other/path")).is_err());
+    }
+
+    #[test]
+    fn accepts_feishu_and_lark_webhook_hosts() {
+        assert!(
+            parse_webhook_url(Some("https://open.feishu.cn/open-apis/bot/v2/hook/test")).is_ok()
+        );
+        assert!(parse_webhook_url(Some(
+            "https://open.larksuite.com/open-apis/bot/v2/hook/test"
+        ))
+        .is_ok());
     }
 }

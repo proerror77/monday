@@ -29,13 +29,13 @@ struct AlphaToken {
     name: Option<String>,
     #[serde(rename = "chainId")]
     chain_id: Option<String>,
-    #[serde(rename = "contractAddress")]
-    contract_address: Option<String>,
 }
 
 impl AlphaToken {
     fn display_id(&self) -> String {
-        self.alpha_id.clone().unwrap_or_else(|| "unknown".to_string())
+        self.alpha_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     fn display_symbol(&self) -> String {
@@ -85,6 +85,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    feishu::validate_config()?;
     info!("Starting Binance Alpha Token Monitor");
     info!("Poll interval: {} seconds", POLL_INTERVAL_SECS);
 
@@ -94,8 +95,7 @@ async fn main() -> Result<()> {
     loop {
         match fetch_alpha_tokens().await {
             Ok(tokens) => {
-                let current_ids: HashSet<String> =
-                    tokens.iter().map(|t| t.display_id()).collect();
+                let current_ids: HashSet<String> = tokens.iter().map(|t| t.display_id()).collect();
 
                 let new_tokens: Vec<&AlphaToken> = tokens
                     .iter()
@@ -104,10 +104,7 @@ async fn main() -> Result<()> {
 
                 if !new_tokens.is_empty() {
                     if first_run {
-                        info!(
-                            "Initial load: {} Alpha tokens found",
-                            current_ids.len()
-                        );
+                        info!("Initial load: {} Alpha tokens found", current_ids.len());
                     } else {
                         info!("Detected {} new Alpha token(s)!", new_tokens.len());
 

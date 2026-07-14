@@ -1,0 +1,37 @@
+[Unit]
+Description=Ploy Rust Agent Sidecar
+Requires=ployd.service
+After=network-online.target ployd.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ploy
+Group=ploy
+WorkingDirectory=/opt/ploy
+EnvironmentFile=/opt/ploy/.env
+Environment=HOME=/var/lib/ploy-agent-sidecar
+Environment=CODEX_HOME=/var/lib/ploy-agent-sidecar/codex
+ExecStart=/opt/ploy/bin/ploy-agent-sidecar
+Restart=on-failure
+RestartSec=5
+MemoryHigh=384M
+MemoryMax=512M
+OOMPolicy=kill
+StateDirectory=ploy-agent-sidecar
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/ploy/run /var/lib/ploy-agent-sidecar
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ploy-agent-sidecar
+
+[Install]
+WantedBy=multi-user.target

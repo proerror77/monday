@@ -83,10 +83,12 @@ jobs:
             --target "${PLATFORM_TARGET}" \
             --features new-ploy-runner/full \
             -p new-ployd \
+            -p ploy-agent-sidecar \
             -p ployctl \
             -p ploytui \
             -p new-ploy-runner
           strip "target/${PLATFORM_TARGET}/release/new-ployd" || true
+          strip "target/${PLATFORM_TARGET}/release/ploy-agent-sidecar" || true
           strip "target/${PLATFORM_TARGET}/release/ployctl" || true
           strip "target/${PLATFORM_TARGET}/release/ploytui" || true
           strip "target/${PLATFORM_TARGET}/release/new-ploy-runner" || true
@@ -103,10 +105,12 @@ jobs:
             "${bundle_root}/scripts" \
             "${bundle_root}/scripts/drills"
           install -m 755 "target/${PLATFORM_TARGET}/release/new-ployd" "${bundle_root}/bin/ployd"
+          install -m 755 "target/${PLATFORM_TARGET}/release/ploy-agent-sidecar" "${bundle_root}/bin/ploy-agent-sidecar"
           install -m 755 "target/${PLATFORM_TARGET}/release/ployctl" "${bundle_root}/bin/ployctl"
           install -m 755 "target/${PLATFORM_TARGET}/release/ploytui" "${bundle_root}/bin/ploytui"
           install -m 755 "target/${PLATFORM_TARGET}/release/new-ploy-runner" "${bundle_root}/bin/ploy-runner"
           install -m 644 deployment/ployd.service "${bundle_root}/deployment/ployd.service"
+          install -m 644 deployment/ploy-agent-sidecar.service "${bundle_root}/deployment/ploy-agent-sidecar.service"
           install -m 644 deployment/ploy-maintenance.service "${bundle_root}/deployment/ploy-maintenance.service"
           install -m 644 deployment/ploy-maintenance.timer "${bundle_root}/deployment/ploy-maintenance.timer"
           install -m 644 deployment/ploy-platform-watchdog.service "${bundle_root}/deployment/ploy-platform-watchdog.service"

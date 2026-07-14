@@ -5,10 +5,7 @@ import process from "node:process";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const schemaDir = path.join(repoRoot, "contracts", "schemas");
-const targets = [
-  path.join(repoRoot, "ploy-frontend", "src", "types", "operator-contracts.ts"),
-  path.join(repoRoot, "ploy-sidecar", "src", "contracts", "operator-contracts.ts"),
-];
+const targets = [path.join(repoRoot, "ploy-frontend", "src", "types", "operator-contracts.ts")];
 const schemaFiles = [
   "deployment-summary.schema.json",
   "deployment-apply-request.schema.json",

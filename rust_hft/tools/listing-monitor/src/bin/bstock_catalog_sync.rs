@@ -97,11 +97,11 @@ async fn main() -> Result<()> {
 
 fn parse_symbol_filter(args: &[String]) -> Option<BTreeSet<String>> {
     parse_arg_value(args, "--symbols=").map(|value| {
-            value
-                .split(',')
-                .map(|symbol| symbol.trim().to_ascii_uppercase())
-                .filter(|symbol| !symbol.is_empty())
-                .collect()
+        value
+            .split(',')
+            .map(|symbol| symbol.trim().to_ascii_uppercase())
+            .filter(|symbol| !symbol.is_empty())
+            .collect()
     })
 }
 

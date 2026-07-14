@@ -56,8 +56,8 @@ The mounted secret key is referenced by `--deployment-feedback-signing-key`; `--
 From the repository root:
 
 ```bash
-bash scripts/check-tracked-secrets.sh
-bash scripts/check-deployment-contract.sh
+cargo test --manifest-path rust_hft/Cargo.toml -p hft-infra-secrets --test tracked_secrets_contract --locked -- --nocapture
+cargo test --manifest-path rust_hft/Cargo.toml -p hft-live --no-default-features --test deployment_artifacts --locked
 kubectl apply --dry-run=client -f rust_hft/deployment/k8s/
 ```
 

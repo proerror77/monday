@@ -35,9 +35,9 @@ jobs:
           aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
 
       - name: Build and push image
-        working-directory: rust_hft/tools/listing-monitor
+        working-directory: rust_hft
         run: |
-          docker build -t $IMAGE_NAME:latest .
+          docker build -f tools/listing-monitor/Dockerfile -t $IMAGE_NAME:latest .
           docker tag $IMAGE_NAME:latest $ECR_REGISTRY/$IMAGE_NAME:latest
           docker tag $IMAGE_NAME:latest $ECR_REGISTRY/$IMAGE_NAME:${{ github.sha }}
           docker push $ECR_REGISTRY/$IMAGE_NAME:latest
@@ -58,8 +58,12 @@ jobs:
               {
                 "name": "alpha-monitor",
                 "image": "${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}",
-                "command": ["python", "alpha_monitor.py"],
+                "command": ["/usr/local/bin/listing-monitor-alpha"],
                 "essential": true,
+                "secrets": [{
+                  "name": "FEISHU_WEBHOOK_URL",
+                  "valueFrom": "${{ secrets.FEISHU_WEBHOOK_SECRET_ARN }}"
+                }],
                 "logConfiguration": {
                   "logDriver": "awslogs",
                   "options": {
@@ -73,8 +77,12 @@ jobs:
               {
                 "name": "spot-monitor",
                 "image": "${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}",
-                "command": ["python", "spot_monitor.py"],
+                "command": ["/usr/local/bin/listing-monitor-spot"],
                 "essential": true,
+                "secrets": [{
+                  "name": "FEISHU_WEBHOOK_URL",
+                  "valueFrom": "${{ secrets.FEISHU_WEBHOOK_SECRET_ARN }}"
+                }],
                 "logConfiguration": {
                   "logDriver": "awslogs",
                   "options": {

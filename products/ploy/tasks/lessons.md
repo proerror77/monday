@@ -341,7 +341,7 @@
 ## 2026-04-07
 
 - Pattern: The user does not want new TypeScript by default when the same behavior can live in Rust.
-- Rule: On this repo, prefer Rust for new backend, control-plane, research, and oversight logic whenever it is feasible to run in Rust. Use TypeScript only for the existing frontend/sidecar shell where Rust is not yet the chosen host, and keep new TS additions minimal and bridge-like.
+- Rule: On this repo, use Rust for backend, control-plane, research, oversight, and the agent sidecar. TypeScript is limited to the existing frontend UI and its generated contract bindings.
 - Implementation guardrail:
   - Before adding non-trivial TS logic, ask whether the behavior can instead live in `ployctl`, `ployd`, or a Rust crate.
   - If TS is temporarily unavoidable, keep it as a thin wrapper over canonical Rust surfaces rather than embedding core logic there.

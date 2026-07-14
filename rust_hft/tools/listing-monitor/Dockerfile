@@ -1,13 +1,27 @@
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1.7
 
-WORKDIR /app
+FROM rust:1.91-bookworm AS builder
 
-RUN pip install --no-cache-dir requests
+WORKDIR /work
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/work/target,sharing=locked \
+    cargo build --release --locked -p listing-monitor \
+    --bin listing-monitor-alpha \
+    --bin listing-monitor-spot \
+    && install -D -m 0755 target/release/listing-monitor-alpha /out/listing-monitor-alpha \
+    && install -D -m 0755 target/release/listing-monitor-spot /out/listing-monitor-spot
 
-COPY alpha_monitor.py spot_monitor.py ./
+FROM debian:bookworm-slim AS runtime
 
-RUN useradd --create-home --uid 10001 appuser
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 appuser
+
+COPY --from=builder /out/listing-monitor-alpha /usr/local/bin/listing-monitor-alpha
+COPY --from=builder /out/listing-monitor-spot /usr/local/bin/listing-monitor-spot
+
 USER appuser
 
-# Default: alpha monitor
-CMD ["python", "alpha_monitor.py"]
+CMD ["/usr/local/bin/listing-monitor-alpha"]

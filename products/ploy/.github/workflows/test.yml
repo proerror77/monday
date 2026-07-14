@@ -223,6 +223,7 @@ jobs:
           set -euo pipefail
           SECONDS=0
           cargo build --locked \
+            -p ploy-agent-sidecar \
             -p ploy-daemon-host \
             -p new-ployd \
             -p ployctl \
@@ -234,6 +235,7 @@ jobs:
             -p ploy-platform-runtime \
             -p ploy-trading
           cargo test --locked \
+            -p ploy-agent-sidecar \
             -p ploy-daemon-host \
             -p new-ployd \
             -p ployctl \
@@ -244,6 +246,7 @@ jobs:
             -p ploy-platform \
             -p ploy-platform-runtime \
             -p ploy-trading
+          cargo clippy --locked -p ploy-agent-sidecar --all-targets --no-deps -- -D warnings
           echo "### Rust control-plane/core lane" >> "$GITHUB_STEP_SUMMARY"
           echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
 
@@ -521,8 +524,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  frontend-sidecar:
-    name: Frontend and sidecar
+  frontend:
+    name: Frontend
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -534,9 +537,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: |
-            ploy-frontend/package-lock.json
-            ploy-sidecar/package-lock.json
+          cache-dependency-path: ploy-frontend/package-lock.json
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -546,7 +547,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: frontend-sidecar-contracts-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: frontend-contracts-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Validate frontend
         run: |
@@ -566,16 +567,10 @@ jobs:
             exit 1
           fi
 
-      - name: Validate sidecar
+      - name: Summarize frontend lane
         run: |
-          set -euo pipefail
-          npm ci --prefix ploy-sidecar
-          npm run contracts:check --prefix ploy-sidecar
-          npm test --prefix ploy-sidecar
-          npm run build --prefix ploy-sidecar
-          npm audit --omit=dev --audit-level=moderate --prefix ploy-sidecar
-          echo "### Frontend and sidecar lane" >> "$GITHUB_STEP_SUMMARY"
-          echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Frontend lane" >> "$GITHUB_STEP_SUMMARY"
+          echo "TypeScript is limited to the operator UI; the agent sidecar runs in the Rust control-plane lane." >> "$GITHUB_STEP_SUMMARY"
 
   integration-regressions:
     name: Rust integration regressions
@@ -675,7 +670,7 @@ jobs:
       - rust-runner-live
       - rust-market-data
       - rust-research-heavy
-      - frontend-sidecar
+      - frontend
       - integration-regressions
     runs-on: ubuntu-latest
     if: ${{ failure() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}

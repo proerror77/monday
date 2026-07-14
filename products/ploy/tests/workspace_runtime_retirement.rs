@@ -165,7 +165,7 @@ fn standalone_operational_docs_are_explicitly_marked_historical() {
         "config",
         "examples",
         "ploy-frontend",
-        "ploy-sidecar",
+        "apps/ploy-agent-sidecar",
         "tasks",
     ] {
         collect_markdown_files(&repo_root.join(relative_root), &mut files);

@@ -60,8 +60,21 @@ impl ControlPlaneClient {
         self.read_trading_state_snapshot()
     }
 
+    /// Read the trading state from the live control plane without falling back
+    /// to a potentially stale on-disk snapshot.
+    pub fn live_trading_state(&self) -> Result<Vec<TradingStateSnapshot>, String> {
+        self.read_trading_state_over_http()
+    }
+
     pub fn system_snapshot(&self) -> Result<SystemStatus, String> {
         self.read_status_snapshot()
+    }
+
+    /// Read system status from the live control plane without snapshot
+    /// fallback. Long-running automation should use this when stale context
+    /// would be unsafe.
+    pub fn live_system_snapshot(&self) -> Result<SystemStatus, String> {
+        self.read_status_over_http()
     }
 
     pub fn audit_logs(&self) -> Result<Vec<AuditLogEntry>, String> {
@@ -78,6 +91,11 @@ impl ControlPlaneClient {
 
     pub fn deployment_summaries(&self) -> Result<Vec<DeploymentSummary>, String> {
         self.read_deployment_snapshots()
+    }
+
+    /// Read deployments from the live control plane without snapshot fallback.
+    pub fn live_deployment_summaries(&self) -> Result<Vec<DeploymentSummary>, String> {
+        self.read_deployments_over_http()
     }
 
     pub fn inspect_deployment(&self, deployment_id: &str) -> Result<DeploymentSummary, String> {

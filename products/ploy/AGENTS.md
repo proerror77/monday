@@ -12,7 +12,7 @@ This directory is the PLOY product workspace inside the Monday monorepo.
 ## Development workflow
 
 - Run Rust commands from `products/ploy`; this is an independent Cargo workspace pinned by `rust-toolchain.toml`.
-- Run frontend commands with `npm --prefix ploy-frontend` and sidecar commands with `npm --prefix ploy-sidecar`.
+- Run frontend commands with `npm --prefix ploy-frontend`; run sidecar checks with `cargo test -p ploy-agent-sidecar`.
 - Use `tasks/todo.md` for non-trivial work and keep changes atomic.
 - Use `apply_patch` for manual edits, preserve unrelated changes, and verify with focused checks before the full PLOY CI lane.
 - Do not run a local PostgreSQL instance. Database-backed validation belongs in GitHub Actions.

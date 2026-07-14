@@ -7,7 +7,6 @@ on:
       - ".github/workflows/legacy-python-tools.yml"
       - "scripts/**/*.py"
       - "tests/test_*.py"
-      - "Dockerfile.collector"
   workflow_dispatch:
 
 concurrency:

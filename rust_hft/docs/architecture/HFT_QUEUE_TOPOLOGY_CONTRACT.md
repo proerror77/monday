@@ -74,7 +74,8 @@ envelopes do not enter the execution worker queue.
 - Hot-path queues are bounded by default.
 - New unbounded channel usage must be classified in
   `docs/reports/UNBOUNDED_CHANNEL_AUDIT.md`; run
-  `scripts/audit_unbounded_channels.sh` before merging queue changes.
+  `cargo test -p hft-engine --test queue_topology_contract --locked` before
+  merging queue changes.
 - Queue-full behavior must be explicit in code, docs, and tests.
 - Execution events are state authority; if they cannot be enqueued, the system
   must alert/degrade and reconcile rather than continue as if nothing happened.

@@ -18,7 +18,12 @@ spec:
       containers:
       - name: collector
         image: registry-vpc.ap-northeast-1.aliyuncs.com/ploy/ploy-collector:latest
-        command: ["python", "binance_price_collector.py"]
+        args:
+        - collect-binance-price
+        - --symbols
+        - $(BINANCE_PRICE_SYMBOLS)
+        - --batch-size
+        - "25"
         envFrom:
         - secretRef:
             name: ploy-secrets

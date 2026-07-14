@@ -1,19 +1,22 @@
-# Runtime image for Binance data collectors (Python)
-FROM python:3.12-slim
+# Runtime image for the Rust market-data collectors.
+FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+RUN useradd -r -m -s /usr/sbin/nologin ploy && \
+    mkdir -p /opt/ploy/bin && \
+    chown -R ploy:ploy /opt/ploy
 
-RUN pip install --no-cache-dir asyncpg websockets psycopg2-binary
+COPY --chown=ploy:ploy target/x86_64-unknown-linux-gnu/release/new-ploy-runner /opt/ploy/bin/ploy-runner
+RUN chmod +x /opt/ploy/bin/ploy-runner
 
-COPY scripts/binance_price_collector.py ./
-COPY scripts/binance_lob_collector.py ./
-COPY scripts/binance_aggtrade_collector.py ./
+WORKDIR /opt/ploy
+USER ploy
 
-ENV PYTHONUNBUFFERED=1
-
-# Override CMD to select which collector to run
-# e.g. CMD ["python", "binance_price_collector.py"]
+ENV RUST_LOG=info,ploy=debug,sqlx=warn
+ENTRYPOINT ["/opt/ploy/bin/ploy-runner"]
+CMD ["--help"]

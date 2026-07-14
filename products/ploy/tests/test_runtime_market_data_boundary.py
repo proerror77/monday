@@ -62,7 +62,10 @@ class RuntimeMarketDataBoundaryTests(unittest.TestCase):
                 self.assertIn(exchange, text)
         self.assertIn('"cex-extended"', audit)
         self.assertIn("kind = 'liquidation'", health)
-        self.assertIn('"binance_liquidations"', (ROOT / "scripts/report_market_data_health.py").read_text())
+        self.assertIn(
+            'source_id: "binance_liquidations"',
+            (ROOT / "crates/ploy-daemon-host/src/reports.rs").read_text(),
+        )
         self.assertIn('?streams={}', collector)
 
     def test_pm5d_runtime_configs_default_to_local_market_data(self) -> None:

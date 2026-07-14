@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    feishu::validate_config()?;
     info!("Starting Binance Spot USDT Listing Monitor");
     info!("Poll interval: {} seconds", POLL_INTERVAL_SECS);
 
@@ -129,7 +130,11 @@ async fn main() -> Result<()> {
                         .collect();
 
                     if !delisted.is_empty() {
-                        warn!("Detected {} delisted symbol(s): {:?}", delisted.len(), delisted);
+                        warn!(
+                            "Detected {} delisted symbol(s): {:?}",
+                            delisted.len(),
+                            delisted
+                        );
 
                         let content = delisted
                             .iter()

@@ -108,9 +108,6 @@ jobs:
           cargo clippy -p hft-data-adapter-ondo-perps -p hft-execution-adapter-ondo-perps --all-targets --no-deps --locked -- -D warnings
           cargo check -p hft-live --features ondo-perps --locked
 
-      - name: Check production deployment contract
-        run: ../scripts/check-deployment-contract.sh
-
       - name: Verify governed data collector
         run: |
           cargo check -p hft-collector --locked
@@ -211,7 +208,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Audit unbounded channels
-        run: scripts/audit_unbounded_channels.sh
+        run: cargo test -p hft-engine --test queue_topology_contract --locked
 
       - name: Format hft-engine
         run: cargo fmt --check --package hft-engine

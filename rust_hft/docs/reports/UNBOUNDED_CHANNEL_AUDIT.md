@@ -13,7 +13,7 @@ rg -n "unbounded_channel|UnboundedSender|UnboundedReceiver" \
 Guard command, also wired into the root `Rust HFT Engine Fast Lane` CI job:
 
 ```bash
-scripts/audit_unbounded_channels.sh
+cargo test -p hft-engine --test queue_topology_contract --locked
 ```
 
 Classification:
@@ -65,7 +65,7 @@ streams:
 
 - Convert the remaining non-Binance/non-Bitget adapter outputs used by any
   trading runtime to bounded queues or an explicit latest-wins policy.
-- Keep `scripts/audit_unbounded_channels.sh` in CI so new unclassified
-  `unbounded_channel` usage fails before merge.
+- Keep `cargo test -p hft-engine --test queue_topology_contract --locked` in CI
+  so new unclassified `unbounded_channel` usage fails before merge.
 - Keep `ControlCommand` unbounded only while it remains low-rate control-plane
   traffic and never carries market data, order reports, fills, or hot signals.

@@ -253,8 +253,7 @@ their immutable evidence.
 Run many parameter batches without rebuilding:
 
 ```bash
-python3 rust_hft/scripts/backtest/param_scan.py \
-  --binary rust_hft/target/release/hft-backtest \
+cargo run --manifest-path rust_hft/Cargo.toml --release -p hft-backtest -- \
   --config rust_hft/config/backtest/default.yaml \
   --grid rust_hft/config/backtest/param_grid.yaml \
   --shard-index 0 \
@@ -262,5 +261,6 @@ python3 rust_hft/scripts/backtest/param_scan.py \
   --output rust_hft/runs/backtest-sweep
 ```
 
-The Docker BuildKit cache preserves Cargo registry, git, and target artifacts
-between image builds. ACK Jobs never run `cargo build` or `cargo run`.
+The research image runs the same Rust binary directly and contains no Python
+runtime. The Docker BuildKit cache preserves Cargo registry, git, and target
+artifacts between image builds. ACK Jobs never run `cargo build` or `cargo run`.

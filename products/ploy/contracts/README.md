@@ -3,9 +3,9 @@
 `ploy-operator-contracts` is the source of truth for control-plane DTOs.
 
 - Rust schema snapshots live in `contracts/schemas/*.schema.json`.
-- TypeScript contract types are generated from those snapshots into:
-  - `ploy-frontend/src/types/operator-contracts.ts`
-  - `ploy-sidecar/src/contracts/operator-contracts.ts`
+- TypeScript contract types are generated from those snapshots for the frontend at
+  `ploy-frontend/src/types/operator-contracts.ts`. The Rust sidecar imports
+  `ploy-operator-contracts` directly.
 
 Regenerate after changing Rust DTOs:
 

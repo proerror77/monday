@@ -1,0 +1,20 @@
+[package]
+name = "ploy-agent-sidecar"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Crash-safe Rust research-agent worker for the Ploy control plane"
+
+[dependencies]
+chrono.workspace = true
+libc.workspace = true
+ploy-control-client.workspace = true
+ploy-operator-contracts.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
