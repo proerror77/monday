@@ -31,8 +31,8 @@ accounts:
 
   - id: bybit_test
     venue_type: Bybit
-    rest: "https://api.bybit.com"
-    ws_private: "wss://stream.bybit.com/v5/private"
+    rest: "https://api-testnet.bybit.com"
+    ws_private: "wss://stream-testnet.bybit.com/v5/private"
     execution_mode: "Testnet"  # Live / Paper / Testnet
     credentials:
       api_key: "${BYBIT_API_KEY}"
