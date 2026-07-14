@@ -606,9 +606,10 @@ def fetch_snapshot_sync(symbol: str) -> dict:
 
 async def receive_url(url: str, queue: asyncio.Queue, stop: asyncio.Event) -> None:
     global LAST_DATA_AT
-    async with connect(
+    websocket = await connect(
         url, open_timeout=20, ping_interval=20, max_size=8 * 1024 * 1024
-    ) as websocket:
+    )
+    try:
         while not stop.is_set():
             try:
                 message = await asyncio.wait_for(
@@ -621,6 +622,8 @@ async def receive_url(url: str, queue: asyncio.Queue, stop: asyncio.Event) -> No
             if isinstance(message, str):
                 LAST_DATA_AT = time.monotonic()
                 await queue.put(("diff", time.time_ns(), json.loads(message)))
+    finally:
+        websocket.transport.abort()
 
 
 async def produce_snapshots(
