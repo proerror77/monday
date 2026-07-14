@@ -242,11 +242,29 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
 
-    use super::{crypto_market_start_time, discover_crypto_markets, infer_market_window_secs};
+    use super::{
+        crypto_market_start_time, discover_crypto_markets, infer_crypto_strategy_symbol,
+        infer_market_window_secs,
+    };
     use crate::reference_prices::{
         new_reference_price_registry, upsert_reference_price, ReferenceAssetClass,
         ReferencePriceKey, ReferencePriceSnapshot, ReferencePriceSource,
     };
+
+    #[test]
+    fn recognizes_all_seven_configured_crypto_assets() {
+        for (question, symbol) in [
+            ("Bitcoin Up or Down 5m", "BTCUSDT"),
+            ("Ethereum Up or Down 5m", "ETHUSDT"),
+            ("Solana Up or Down 5m", "SOLUSDT"),
+            ("XRP Up or Down 5m", "XRPUSDT"),
+            ("Dogecoin Up or Down 5m", "DOGEUSDT"),
+            ("Hyperliquid Up or Down 5m", "HYPEUSDT"),
+            ("BNB Up or Down 5m", "BNBUSDT"),
+        ] {
+            assert_eq!(infer_crypto_strategy_symbol(question), Some(symbol));
+        }
+    }
 
     #[tokio::test]
     async fn normalizes_crypto_updown_markets_into_catalog_descriptors() {

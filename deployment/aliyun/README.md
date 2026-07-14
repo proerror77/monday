@@ -15,9 +15,9 @@ systemctl status polymarket-market-tape.service
 journalctl -u polymarket-market-tape.service -f
 ```
 
-The initial scope is BTC, ETH, SOL, and XRP 5-minute/15-minute markets only.
-NBA, World Cup, general event, and weather catalogs remain disabled until this
-lane is stable and explicitly expanded.
+The initial scope is BTC, ETH, SOL, XRP, DOGE, HYPE, and BNB 5-minute/15-minute
+markets only. NBA, World Cup, general event, and weather catalogs remain disabled
+until this lane is stable and explicitly expanded.
 
 The service records normalized `MarketUpdate` NDJSON under
 `/data/monday/spool/polymarket/`. It has no credential environment file and cannot

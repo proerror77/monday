@@ -301,7 +301,7 @@ fn monday_polymarket_data_service_is_read_only_and_fail_closed() {
         "record_market_updates_quote_sample_ms = 1000",
         "record_market_updates_quote_depth_levels = 1",
         "record_market_updates_event_scoped_quotes = true",
-        "symbols = [\"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\", \"XRPUSDT\"]",
+        "symbols = [\"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\", \"XRPUSDT\", \"DOGEUSDT\", \"HYPEUSDT\", \"BNBUSDT\"]",
     ] {
         assert!(config.contains(required), "config missing {required}");
     }
