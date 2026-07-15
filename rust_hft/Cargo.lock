@@ -3517,6 +3517,7 @@ dependencies = [
  "hex",
  "hft-engine",
  "http 0.2.12",
+ "libc",
  "lz4",
  "once_cell",
  "ordered-float 4.6.0",

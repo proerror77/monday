@@ -10,6 +10,7 @@ use hft_collector::lob_archiver::{
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -87,8 +88,15 @@ impl SpoolLock {
             .truncate(false)
             .read(true)
             .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(&path)
             .with_context(|| format!("failed to open spool lock {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to inspect spool lock {}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            anyhow::bail!("spool lock is not a regular file: {}", path.display());
+        }
         if let Err(error) = fs4::FileExt::try_lock(&file) {
             let error = std::io::Error::from(error);
             if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -1287,7 +1295,33 @@ fn recover_uploaded_cleanups(spool_dir: &Path) -> anyhow::Result<usize> {
 }
 
 fn cleanup_uploaded_marker(marker: &Path) -> anyhow::Result<()> {
-    let metadata: Value = serde_json::from_reader(std::fs::File::open(marker)?)
+    let marker_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(marker)
+        .with_context(|| {
+            format!(
+                "failed to open uploaded cleanup marker {}",
+                marker.display()
+            )
+        })?;
+    if !marker_file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "failed to inspect uploaded cleanup marker {}",
+                marker.display()
+            )
+        })?
+        .file_type()
+        .is_file()
+    {
+        anyhow::bail!(
+            "uploaded cleanup marker is not a regular file: {}",
+            marker.display()
+        );
+    }
+    let metadata: Value = serde_json::from_reader(marker_file)
         .with_context(|| format!("invalid uploaded cleanup marker {}", marker.display()))?;
     if metadata["schema"] != UPLOADED_CLEANUP_SCHEMA {
         anyhow::bail!(
@@ -1296,6 +1330,35 @@ fn cleanup_uploaded_marker(marker: &Path) -> anyhow::Result<()> {
         );
     }
     let paths = cleanup_artifact_paths(marker, &metadata)?;
+    match std::fs::symlink_metadata(marker) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => anyhow::bail!(
+            "refusing non-regular uploaded cleanup marker: {}",
+            marker.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect uploaded cleanup marker {}",
+                    marker.display()
+                )
+            });
+        }
+    }
+    for path in &paths {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                anyhow::bail!("refusing non-regular uploaded artifact: {}", path.display())
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect uploaded artifact {}", path.display())
+                });
+            }
+        }
+    }
     for path in paths {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -1582,6 +1645,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_only_rejects_a_symlink_spool_lock_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let spool_dir =
+            env::temp_dir().join(format!("monday-spool-lock-symlink-{}", now_ns().unwrap()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let victim = spool_dir.join("victim");
+        std::fs::write(&victim, b"keep-me").unwrap();
+        let lock_path = spool_dir.join(SPOOL_LOCK_FILE);
+        symlink(&victim, &lock_path).unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error.to_string().contains("failed to open spool lock"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep-me");
+        assert!(std::fs::symlink_metadata(&lock_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!spool_dir.join("upload-status.json").exists());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn upload_only_rejects_an_interrupted_segment() {
         for suffix in ["jsonl.part", "jsonl.zst.tmp", "jsonl.part.corrupt"] {
             let spool_dir = env::temp_dir().join(format!(
@@ -1787,6 +1881,9 @@ mod tests {
 
         recover_uploaded_cleanups(&spool_dir).unwrap_err();
         assert!(marker.is_file());
+        assert!(data.is_file());
+        assert!(manifest.is_file());
+        assert!(success.is_dir());
 
         std::fs::remove_dir(&success).unwrap();
         assert_eq!(recover_uploaded_cleanups(&spool_dir).unwrap(), 1);
