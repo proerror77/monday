@@ -4,11 +4,11 @@ on:
   push:
     branches: [main, develop]
     paths-ignore:
-      - "products/ploy/**"
+      - "rust_hft/prediction-markets/**"
   pull_request:
     branches: [main, develop]
     paths-ignore:
-      - "products/ploy/**"
+      - "rust_hft/prediction-markets/**"
 
 permissions:
   contents: read
@@ -32,6 +32,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Enforce Monday module layout
+        working-directory: .
+        run: |
+          set -euo pipefail
+          test ! -e products/ploy
+          test -f rust_hft/prediction-markets/Cargo.toml
+          test -f rust_hft/data-pipelines/adapters/adapter-polymarket/Cargo.toml
+          test -f rust_hft/execution-gateway/adapters/adapter-polymarket/Cargo.toml
 
       - name: Enforce Rust-only research and runtime source
         working-directory: .

@@ -1,0 +1,7 @@
+# Historical PLOY images consumed prebuilt Rust binaries from this context. Keep the build
+# output available, but never copy local Python caches or virtual environments.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.venv/
+**/venv/

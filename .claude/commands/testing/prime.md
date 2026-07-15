@@ -31,9 +31,9 @@ cargo test --manifest-path rust_hft/Cargo.toml -p <package> --locked
 cargo clippy --manifest-path rust_hft/Cargo.toml -p <package> --all-targets --locked -- -D warnings
 cargo fmt --manifest-path rust_hft/Cargo.toml --package <package> -- --check
 
-cargo test --manifest-path products/ploy/Cargo.toml -p <package> --locked
-cargo clippy --manifest-path products/ploy/Cargo.toml -p <package> --all-targets --locked -- -D warnings
-cargo fmt --manifest-path products/ploy/Cargo.toml --package <package> -- --check
+cargo test --manifest-path rust_hft/prediction-markets/Cargo.toml -p <package> --locked
+cargo clippy --manifest-path rust_hft/prediction-markets/Cargo.toml -p <package> --all-targets --locked -- -D warnings
+cargo fmt --manifest-path rust_hft/prediction-markets/Cargo.toml --package <package> -- --check
 ```
 
 During diagnosis, prefer one test target or name filter. Expand to the package,
@@ -46,10 +46,10 @@ Read the relevant `package.json` scripts, then use the declared command. The PLO
 operator frontend currently uses:
 
 ```bash
-npm --prefix products/ploy/ploy-frontend ci
-npm --prefix products/ploy/ploy-frontend run contracts:check
-npm --prefix products/ploy/ploy-frontend run lint
-npm --prefix products/ploy/ploy-frontend run build
+npm --prefix rust_hft/prediction-markets/ploy-frontend ci
+npm --prefix rust_hft/prediction-markets/ploy-frontend run contracts:check
+npm --prefix rust_hft/prediction-markets/ploy-frontend run lint
+npm --prefix rust_hft/prediction-markets/ploy-frontend run build
 ```
 
 ## Execution rules

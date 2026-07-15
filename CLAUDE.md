@@ -4,13 +4,22 @@
 The current system is a Rust-first bounded Loop Engineer research/control plane plus a separately owned deterministic Rust trading runtime.
 
 - Research: `rust_hft/alpha-harness/*`
+- Prediction-market research and operator module: `rust_hft/prediction-markets`
 - Data acquisition: `rust_hft/tools/collector`
 - Runtime: `rust_hft/apps/live`
 - Risk, OMS, and execution: `rust_hft/risk-control` and `rust_hft/execution-gateway`
 
+Monday is one multi-venue trading system. Polymarket, Binance, OKX, and other
+exchanges are venue Adapters at the existing market-data and execution seams;
+they are not separate product authorities. `ploy-*` crate and binary names are
+temporary compatibility names inside the prediction-market module. Do not add a
+new `products/ploy` tree or a second order, risk, reconciliation, or execution
+path there. Existing compatibility contracts are migration debt and may only
+shrink; they have no concrete live venue Adapter.
+
 Research code may emit typed candidates and signed deployment envelopes. It must not import execution adapters, submit orders, broadcast transactions, increase risk caps, or resume a paused runtime.
 
-Read [README.md](README.md), [rust_hft/ARCHITECTURE.md](rust_hft/ARCHITECTURE.md), and [rust_hft/alpha-harness/README.md](rust_hft/alpha-harness/README.md) before architecture changes.
+Read [README.md](README.md), [rust_hft/ARCHITECTURE.md](rust_hft/ARCHITECTURE.md), [rust_hft/alpha-harness/README.md](rust_hft/alpha-harness/README.md), and [docs/architecture/REPOSITORY_LAYOUT.md](docs/architecture/REPOSITORY_LAYOUT.md) before architecture changes.
 
 ## Engineering Rules
 

@@ -57,6 +57,30 @@ flowchart TB
 
 The research crates do not depend on execution adapters and expose no order, cancel, wallet, or transaction command.
 
+## Multi-Venue And Market-Family Modules
+
+Monday is one trading system. Venue variation lives behind the market-data and
+execution interfaces, with one Adapter per exchange. The existing Binance,
+Polymarket, OKX, Hyperliquid, and other Adapters share the same runtime-owned
+risk, OMS, reconciliation, cancellation, and execution authority.
+
+Prediction markets are a market-family module at `prediction-markets`, not a
+parallel product or execution stack. That module owns event-settlement datasets,
+probability evaluation, replay, research, and operator views. Polymarket-specific
+connectivity stays in the canonical data and execution Adapter directories.
+Imported paper/runtime contracts inside the module are transitional migration
+debt, not production authority; they may only shrink until canonical Monday
+interfaces replace them.
+Continuous-contract and event-settlement research keep different evaluator
+implementations because their labels and evidence differ, while sharing Monday's
+governance and runtime interfaces.
+
+The nested Rust 1.91 workspace under `prediction-markets` is a transitional build
+seam for the imported PLOY code. Existing `ploy-*` names remain compatibility
+identifiers only; new core capabilities must be placed in the canonical Monday
+module that owns them. See `../docs/architecture/PREDICTION_MARKETS.md` and
+`../docs/architecture/REPOSITORY_LAYOUT.md`.
+
 ## Bounded Loop
 
 A `LoopRun` advances only through persisted evidence:
