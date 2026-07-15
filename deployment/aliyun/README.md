@@ -1,11 +1,20 @@
 # Aliyun Binance data host
 
-The Tokyo ECS runs two public-market-data services. Neither service submits orders.
+The Tokyo ECS runs the Rust Binance LOB archiver as two public-market-data
+services. Neither service has trading credentials or submits orders.
+The legacy Python collector, its systemd template, and its deployment tests have
+been removed; the Binance collector deployment lane is Rust-only.
+
+The current Rust production cutover completed on 2026-07-15 after a 3,672-second
+full-catalog shadow with zero restarts and sequence gaps plus Spot and USD-M OSS
+round-trip verification. The live evidence is stored under
+`/data/monday/evidence/cutovers/`; the rollout below is the required procedure for
+future collector releases and host replacements.
 
 ```bash
-systemctl status binance-lob-archiver@spot.service
-systemctl status binance-lob-archiver@usdm.service
-journalctl -u 'binance-lob-archiver@*' -f
+systemctl status binance-lob-archiver-production@spot.service
+systemctl status binance-lob-archiver-production@usdm.service
+journalctl -u 'binance-lob-archiver-production@*' -f
 ```
 
 Polymarket public crypto market updates run separately in dry-run/no-op mode:
@@ -167,61 +176,181 @@ ClickHouse is optional for always-on shared analytics, dashboards, and derived
 realtime features. It is not required for the first backtest pipeline and should
 not duplicate the complete raw OSS tape.
 
-## Rust collector shadow rollout
+## Rust-only collector release workflow
 
-The Rust replacement runs beside the Python collector first. Its service name,
-spool directory, and OSS dataset are deliberately separate, so installing or
-starting it neither stops the Python services nor overwrites their objects:
+The Binance collector deployment lane is Rust-only. The legacy Python collector,
+its systemd unit, and its deployment tests are removed. A release now has three
+separate operations:
 
-| Market | Service | Local spool | OSS dataset |
-| --- | --- | --- | --- |
-| Spot | `binance-lob-archiver-rust@spot` | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
-| USD-M | `binance-lob-archiver-rust@usdm` | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
+1. install a digest-pinned candidate without touching production;
+2. run a candidate-specific one-hour full-catalog shadow gate;
+3. cut over only by consuming that gate's immutable evidence.
 
-Both shadow examples start with `BTCUSDT` only. Keep that bounded scope through
-two successful segment rotations and uploads; switch `SYMBOLS=ALL` only after
-health, replay continuity, and resource use pass the shadow gate.
+All host operations go through Alibaba Cloud Assistant from the local Alibaba
+Cloud CLI. The scripts reject regions other than Tokyo
+(`ap-northeast-1`), use the configured `default` CLI profile, and never put a
+credential in command content. The ECS side uses `MondayLobEcsRole`.
 
-Build and verify the binary from `rust_hft/`:
+### 1. Install a candidate
 
-```bash
-cargo build --release --locked --no-default-features \
-  -p hft-collector --bin binance-lob-archiver
-target/release/binance-lob-archiver --self-test
-```
+The artifact must be a Linux x86-64 Rust binary produced by the approved build,
+uploaded to private OSS, and identified by its exact SHA-256. Do not upload a
+macOS `target/release` binary. The ACR collector image is a durable container
+publication, but the current bare ECS collector consumes the separately pinned
+OSS binary.
 
-Install the binary and the Rust-only service templates without changing the
-running Python units:
-
-```bash
-sudo install -D -m 0755 target/release/binance-lob-archiver \
-  /opt/monday/bin/binance-lob-archiver
-sudo install -d -m 0750 -o hftcollector -g hftcollector \
-  /data/monday/spool/binance-lob-rust-shadow/{spot,usdm}
-sudo install -m 0644 ../deployment/aliyun/binance-lob-archiver-rust@.service \
-  /etc/systemd/system/binance-lob-archiver-rust@.service
-sudo install -m 0640 ../deployment/aliyun/binance-lob-archiver-rust-spot.env \
-  /etc/monday/binance-lob-archiver-rust-spot.env
-sudo install -m 0640 ../deployment/aliyun/binance-lob-archiver-rust-usdm.env \
-  /etc/monday/binance-lob-archiver-rust-usdm.env
-sudo systemctl daemon-reload
-```
-
-Starting shadow collection is a separate, explicit operation:
+Run the committed installer from a clean checkout at `SOURCE_REVISION`:
 
 ```bash
-sudo systemctl start binance-lob-archiver-rust@spot.service
-sudo systemctl start binance-lob-archiver-rust@usdm.service
-jq . /data/monday/spool/binance-lob-rust-shadow/{spot,usdm}/health.json
+set -euo pipefail
+INSTANCE_ID=i-REPLACE \
+ARTIFACT_OSS_URI=oss://monday-lob-apne1-1045353359/releases/binance-lob-archiver/REPLACE/binance-lob-archiver \
+ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+SOURCE_REVISION=REPLACE_WITH_GIT_SHA \
+./deployment/aliyun/deploy-rust-lob-release.sh
 ```
 
-The container image is built from the Rust workspace root and includes pinned
-Alibaba Cloud CLI checksums plus `zstd`:
+The installer verifies that `SOURCE_REVISION` is the clean current `HEAD`,
+uploads a digest-addressed deployment bundle, waits for Cloud Assistant, verifies
+both OSS objects on the host, runs the binary self-test, and requires the
+`--upload-only` capability. It installs only the isolated shadow unit/env files
+and the shadow symlink. Production unit/env files remain staged under:
+
+```text
+/opt/monday/releases/binance-lob-archiver/<artifact-sha256>/deployment/
+```
+
+Candidate installation refuses an unmounted `/data`, an active shadow, a digest
+mismatch, or a concurrent release operation. It does not start any service and
+does not overwrite production configuration or the production symlink. A
+pre-existing artifact directory is reusable only when its binary, deployment
+assets, artifact URI, bundle digest, bundle URI, and source revision all match
+exactly; otherwise installation fails instead of rewriting historical release
+evidence. First installation is assembled in a sibling directory and renamed
+into place only after all identity checks pass.
+
+The committed shadow environments use `SYMBOLS=ALL`, ten-minute segments, the
+isolated spools below, and isolated OSS datasets:
+
+| Market | Shadow spool | Shadow dataset |
+| --- | --- | --- |
+| Spot | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
+| USD-M | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
+
+### 2. Run the one-hour full-catalog gate
+
+Start the gate through the same CLI wrapper:
 
 ```bash
-docker build -f deployment/docker/Dockerfile.binance-lob-archiver \
-  -t monday/binance-lob-archiver:shadow .
+set -euo pipefail
+ACTION=gate \
+INSTANCE_ID=i-REPLACE \
+ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+./deployment/aliyun/invoke-rust-lob-operation.sh
 ```
 
-For container use, mount the shadow spool read-write and provide an ECS RAM-role
-Alibaba Cloud CLI profile. Do not inject long-lived access keys into the image.
+The host gate owns the complete transition. It verifies the candidate and
+`SYMBOLS=ALL`, drains any previous isolated shadow data, restarts both units,
+waits for initial full-catalog health, freezes both session IDs and catalog
+digests, and then uses monotonic time to observe at least 3,600 seconds. It fails unless all of
+these are true for the entire candidate run:
+
+- both units stay active with `NRestarts=0`;
+- Spot has at least 1,000 symbols and USD-M at least 400;
+- every discovered symbol has a ready snapshot and sequence gaps remain zero;
+- neither session nor catalog membership changes, health never stops advancing
+  for more than 90 seconds, and the persistent upload-failure count is unchanged;
+- queue, disk, and upload warnings are false, while the persistent upload-failure
+  count does not increase during normal segment rotations;
+- CPU accounting and peak memory stay inside the systemd limits;
+- after stop, the candidate's `--upload-only` drain leaves no partial,
+  temporary, corrupt, compressed, success-marker, or cleanup-marker artifact;
+- for each market, at least two manifests created after gate start are downloaded
+  from OSS with their data object and reproduce the manifest SHA-256.
+
+A successful production gate writes:
+
+```text
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/run.json
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/gate.json
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/PASSED.sha256
+```
+
+Every invocation gets a new append-only run directory; prior gate evidence is
+never deleted or replaced. The marker hashes exactly that run's `gate.json`.
+Evidence also binds the clean source revision and deployment-bundle SHA-256, so
+unit or env changes cannot consume an older gate for the same binary. A second
+production gate for an identity that already has a passing run is refused, and
+cutover requires exactly one immutable passing run. A short test override is
+available only for script testing; it writes `passed=false` and never creates
+`PASSED.sha256`, so it cannot authorize cutover.
+
+### 3. Cut over or roll back
+
+After the production gate succeeds, invoke the cutover with the same immutable
+artifact digest:
+
+```bash
+set -euo pipefail
+ACTION=cutover \
+INSTANCE_ID=i-REPLACE \
+ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
+./deployment/aliyun/invoke-rust-lob-operation.sh
+```
+
+The host cutover revalidates the binary, release metadata, staged deployment
+files, gate JSON, marker hash, duration, full-catalog counts, and OSS round trips.
+Only then does it disable and stop the current production units. After production
+is stopped, it installs the target production unit/env files. Deleted legacy
+Python instance units must be inactive and disabled before the transition; they
+are included in the transition mask so they cannot become a second canonical
+writer.
+
+The drain is bootstrap-safe: it runs the digest-pinned target binary directly
+against the canonical production env, so the first upgrade does not depend on
+the old production binary supporting `--upload-only`. A new host is accepted
+only when the canonical spool contains no segment artifact. The script then
+atomically changes the production symlink and starts both services without
+enabling them. It verifies fresh full-catalog health, no warnings, zero restarts,
+and each process's `/proc/<pid>/exe` resolving to the requested release; only a
+verified candidate is enabled for reboot.
+
+Any failure after production stops triggers a fail-closed Rust-to-Rust restore of
+the previous digest-addressed binary. Before production stops, its deployment
+assets are copied into the unique cutover evidence directory and covered by a
+SHA-256 manifest; mutable `/etc` files are never written back into an old
+digest-addressed release. Rollback verifies that snapshot before use, removes
+candidate health, starts the old units while disabled, requires health written
+after that restart, and verifies full catalog, zero restarts, and the old
+`/proc/<pid>/exe` targets before enabling. If a safe restore cannot be proved,
+both production units remain disabled and masked. Cutover evidence is written
+under `/data/monday/evidence/cutovers/`.
+
+Rollback uses the same `ACTION=cutover` operation with a previously installed,
+previously gated artifact digest. There is no Python fallback and no manual
+symlink shortcut.
+
+### Upload cleanup and failure rules
+
+After all three OSS objects upload successfully, the Rust collector atomically
+writes an uploaded-cleanup marker. Restart recovery consumes that marker first,
+derives the only permitted data/manifest/success names from the marker's segment
+name, validates all three before deleting any file, removes them idempotently,
+fsyncs the directory, and removes the marker last. Cleanup temp files use
+exclusive creation and refuse symlinks or other non-regular stale paths. An
+interrupted or invalid cleanup marker makes
+`--upload-only` fail closed. Normal collection and upload-only drain also share
+an exclusive per-spool process lock, so they cannot mutate one market spool
+concurrently even if an operator bypasses the systemd transition mask. Recursive
+spool scans reject root, directory, and file symlinks rather than crossing into
+another market or filesystem.
+
+Do not manually delete a spool, repoint a release symlink, start a second
+canonical writer, or bypass `PASSED.sha256`. Do not open general SSH for a
+release. When a Cloud Assistant deadline expires, the local wrapper requests
+cancellation and waits for a terminal invocation state; host-side `flock`
+prevents a retry from racing an earlier operation.
+
+Full-catalog symbol discovery has a 15-second HTTP request timeout, so a stalled
+Binance `exchangeInfo` response fails startup instead of leaving an active but
+idle service until the systemd runtime limit.

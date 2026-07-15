@@ -27,6 +27,8 @@ hex = { workspace = true }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+fs4 = { workspace = true }
+libc = "0.2"
 rust_decimal = { version = "1", features = ["serde"] }
 ordered-float = "4"
 tracing = "0.1"
@@ -65,6 +67,9 @@ collector-hyperliquid = []
 collector-okx = []
 collector-asterdex = []
 duckdb = ["dep:duckdb"]
+
+[dev-dependencies]
+tempfile = "3.10"
 
 [[bin]]
 name = "hft-collector"
