@@ -15,6 +15,7 @@ readonly RUST_HEALTH_POLICY="$SCRIPT_DIR/polymarket-rust-health-policy.jq"
 readonly GATE="$SCRIPT_DIR/polymarket-raw-ops-shadow-gate.sh"
 readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
+readonly CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
 readonly README="$SCRIPT_DIR/README.md"
 
 if command -v gsha256sum >/dev/null 2>&1; then
@@ -1011,7 +1012,7 @@ grep -Fq 'readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL
 grep -Fq 'verify-shadow-parity' "$GATE"
 [[ ! -e "$SCRIPT_DIR/verify-polymarket-shadow-parity.py" ]]
 if grep -Fq 'python3 "$PARITY_VERIFIER"' "$GATE"; then
-  printf 'shadow gate still invokes the retired Python parity verifier\n' >&2
+  printf 'shadow gate still invokes the retired legacy parity verifier\n' >&2
   exit 1
 fi
 grep -Fq 'parity_window_ended_at_unix' "$GATE"
@@ -1335,6 +1336,12 @@ if grep -Fq 'deployment/aliyun/polymarket-reference-collector.service' "$README"
   printf 'README installs the production unit from a mutable checkout\n' >&2
   exit 1
 fi
+if grep -Fq ':(exclude,glob)deployment/aliyun/polymarket-raw-ops-' "$CI_WORKFLOW"; then
+  printf 'Rust-only CI excludes an entire migration-control script\n' >&2
+  exit 1
+fi
+grep -Fq -- '--allow-match-regex "${legacy_runtime_reference_allowlist}"' "$CI_WORKFLOW"
+grep -Fq 'deployment/aliyun/polymarket-raw-ops-cutover[.]sh:' "$CI_WORKFLOW"
 
 grep -Fq 'candidate CLI digest differs from the verified release manifest' "$GATE"
 grep -Fq 'source CLI revision differs from the verified release manifest' "$GATE"

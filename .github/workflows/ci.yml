@@ -61,16 +61,41 @@ jobs:
             pattern="$2"
             shift 2
             grep_args=(-n -I -E)
-            if [ "${1:-}" = "--ignore-case" ]; then
-              grep_args+=(-i)
-              shift
-            fi
+            allow_match_regex=
+            while :; do
+              case "${1:-}" in
+                --ignore-case)
+                  grep_args+=(-i)
+                  shift
+                  ;;
+                --allow-match-regex)
+                  allow_match_regex="$2"
+                  shift 2
+                  ;;
+                *) break ;;
+              esac
+            done
             set +e
             matches="$(git grep "${grep_args[@]}" "${pattern}" -- "$@")"
             scan_status=$?
             set -e
             case "${scan_status}" in
               0)
+                if [ -n "${allow_match_regex}" ]; then
+                  set +e
+                  unexpected_matches="$(printf '%s\n' "${matches}" \
+                    | grep -E -v "${allow_match_regex}")"
+                  allow_status=$?
+                  set -e
+                  case "${allow_status}" in
+                    0) matches="${unexpected_matches}" ;;
+                    1) return 0 ;;
+                    *)
+                      echo "${label} allowlist scanner failed with status ${allow_status}" >&2
+                      exit "${allow_status}"
+                      ;;
+                  esac
+                fi
                 echo "tracked ${label} is forbidden" >&2
                 printf '%s\n' "${matches}" >&2
                 exit 1
@@ -121,17 +146,17 @@ jobs:
             ':(exclude,glob)**/docs/reviews/**'
             ':(exclude,glob)**/docs/superpowers/**'
             ':(exclude,glob)**/tasks/research_evidence/**'
-            # These root-only migration controls must identify and snapshot the
-            # already-installed legacy runtime for parity and fail-closed rollback.
-            # They contain no legacy application source and are exact-file exceptions.
-            ':(exclude,glob)deployment/aliyun/polymarket-raw-ops-shadow-gate.sh'
-            ':(exclude,glob)deployment/aliyun/polymarket-raw-ops-cutover.sh'
-            ':(exclude,glob)deployment/aliyun/test-polymarket-raw-ops-control-plane.sh'
           )
+          # Root-only migration controls may identify the already-installed
+          # legacy runtime for parity and rollback, but may not add executable
+          # Python/package-manager commands. Every permitted match is anchored
+          # to an exact file and identity-only line; everything else is rejected.
+          legacy_runtime_reference_allowlist='^(deployment/aliyun/polymarket-raw-ops-cutover[.]sh:[0-9]+:readonly LEGACY_EXEC="/usr/bin/pyth[o]n3 [$]LEGACY_COLLECTOR"|deployment/aliyun/polymarket-raw-ops-cutover[.]sh:[0-9]+:readonly LEGACY_REFERENCE_UPLOAD_EXEC="/usr/bin/pyth[o]n3 [$]LEGACY_UPLOADER --spool-dir /data/monday/spool/polymarket-reference --dataset crypto_expiry_reference --quote-depth-levels 0 --quote-sample-ms 0"|deployment/aliyun/polymarket-raw-ops-shadow-gate[.]sh:[0-9]+:readonly LEGACY_EXEC=[^[:alnum:]]/usr/bin/pyth[o]n3 /opt/monday/bin/polymarket_reference_collector[.]py[^[:alnum:]]|deployment/aliyun/test-polymarket-raw-ops-control-plane[.]sh:[0-9]+:[[:space:]]+(exec_start|cmdline):"/usr/bin/pyth[o]n3 /opt/monday/bin/polymarket_reference_collector[.]py",)$'
           reject_python_text \
             "Python runtime or package-manager command" \
             'actions/setup-pyth[o]n@|astral-sh/setup-u[v]@|(^|[;&|()/[:space:]])(python([0-9]+([.][0-9]+)?)?|pip([0-9]+)?|pipx|pytest|poetry|pdm|rye|conda|mamba|hatch|tox|virtualenv)([[:space:]]|$)|(^|[;&|()/[:space:]])uv[[:space:]]+(run|sync|pip|venv|python)([[:space:]]|$)' \
             --ignore-case \
+            --allow-match-regex "${legacy_runtime_reference_allowlist}" \
             "${inline_command_pathspecs[@]}"
 
           rust_template_pathspecs=(

@@ -620,7 +620,7 @@ restore_legacy() (
   done
   verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
     "$rollback_invocation_id" "$rollback_health_policy" \
-    || die 'rollback did not preserve Python runtime identity and health'
+    || die 'rollback did not preserve legacy runtime identity and health'
   verify_saved_unit_state "$rollback_dir/state.json" \
     || die 'rollback did not restore the saved collector/timer state'
   verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
@@ -756,7 +756,7 @@ for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_UNIT" "$REFERENCE_UPLOAD_TIMER
 done
 legacy_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
 [[ $legacy_pid =~ ^[1-9][0-9]*$ ]] \
-  || die 'cutover requires a verifiable active Python reference collector PID'
+  || die 'cutover requires a verifiable active legacy reference collector PID'
 gate_legacy_pid=$(jq -er '.legacy_runtime.main_pid | select(type == "number" and floor == . and . > 0)' \
   "$gate_json") || die 'shadow gate has no valid legacy MainPID'
 gate_legacy_restarts=$(jq -er \
@@ -787,7 +787,7 @@ cutover_succeeded=false
 on_exit() {
   local status=$? restore_status=0
   if [[ $cutover_succeeded == false && $transition_started == true ]]; then
-    printf 'cutover failed; restoring snapshotted Python runtime\n' >&2
+    printf 'cutover failed; restoring snapshotted legacy runtime\n' >&2
     trap - EXIT
     prepare_rollback_evidence "$evidence_dir" || {
       printf 'refusing automatic rollback because success evidence could not be invalidated\n' >&2
@@ -808,7 +808,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# Drain with the still-installed Python uploader before changing any unit.
+# Drain with the still-installed legacy uploader before changing any unit.
 [[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
   || die 'OSS configuration changed before the cutover transition'
 transition_started=true

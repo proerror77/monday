@@ -405,7 +405,7 @@ exec 9>"$LOCK_FILE"
 flock -n 9 || die 'another Polymarket release operation is running'
 
 legacy_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT")
-[[ $legacy_pid =~ ^[1-9][0-9]*$ ]] || die 'active Python collector has no verifiable MainPID'
+[[ $legacy_pid =~ ^[1-9][0-9]*$ ]] || die 'active legacy collector has no verifiable MainPID'
 legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
 [[ $legacy_restarts =~ ^[0-9]+$ ]] \
   || die 'active legacy collector has no verifiable restart counter'
