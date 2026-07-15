@@ -722,27 +722,23 @@ pub fn verify_shadow_parity(config: &ShadowParityConfig) -> Result<bool> {
 mod tests {
     use super::*;
 
-    struct TestDir(PathBuf);
+    struct TestDir {
+        _temp: tempfile::TempDir,
+        path: PathBuf,
+    }
 
     impl TestDir {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "monday-polymarket-parity-{}-{:016x}",
-                std::process::id(),
-                random::<u64>()
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(fs::canonicalize(path).unwrap())
+            let temp = tempfile::Builder::new()
+                .prefix("monday-polymarket-parity-")
+                .tempdir()
+                .unwrap();
+            let path = fs::canonicalize(temp.path()).unwrap();
+            Self { _temp: temp, path }
         }
 
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            &self.path
         }
     }
 

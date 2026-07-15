@@ -1621,30 +1621,23 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::process::ExitStatus;
 
-    struct TestDir(PathBuf);
+    struct TestDir {
+        _temp: tempfile::TempDir,
+        path: PathBuf,
+    }
 
     impl TestDir {
         fn new() -> Self {
-            for _ in 0..32 {
-                let path = std::env::temp_dir().join(format!(
-                    "monday-polymarket-upload-test-{:016x}",
-                    random::<u64>()
-                ));
-                if fs::create_dir(&path).is_ok() {
-                    return Self(fs::canonicalize(path).unwrap());
-                }
-            }
-            panic!("could not create test directory")
+            let temp = tempfile::Builder::new()
+                .prefix("monday-polymarket-upload-test-")
+                .tempdir()
+                .unwrap();
+            let path = fs::canonicalize(temp.path()).unwrap();
+            Self { _temp: temp, path }
         }
 
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            &self.path
         }
     }
 

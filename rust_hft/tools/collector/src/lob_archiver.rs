@@ -1267,8 +1267,11 @@ mod tests {
     fn success_marker_atomic_write_does_not_follow_predictable_temp_symlink() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!("monday-marker-test-{}", now_ns().unwrap()));
-        fs::create_dir(&root).unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("monday-marker-test-")
+            .tempdir()
+            .unwrap();
+        let root = root.path();
         let data = root.join("segment.ndjson.zst");
         fs::write(&data, b"compressed").unwrap();
         let victim = root.join("victim");
@@ -1278,6 +1281,5 @@ mod tests {
         let marker = write_success_marker(&data, "abcd").unwrap();
         assert_eq!(fs::read_to_string(marker).unwrap(), "abcd\n");
         assert_eq!(fs::read(&victim).unwrap(), b"do-not-touch\n");
-        fs::remove_dir_all(root).unwrap();
     }
 }
