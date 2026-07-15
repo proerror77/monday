@@ -28,7 +28,7 @@ use ports::{
 };
 use rustc_hash::FxHashMap;
 use snapshot::SnapshotContainer;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::Notify;
@@ -83,6 +83,107 @@ pub struct EventBroadcasters {
     pub exec_event_tx: broadcast::Sender<ports::ExecutionEvent>,
     pub market_trade_tx: broadcast::Sender<MarketTrade>,
     pub market_event_tx: broadcast::Sender<ports::MarketEvent>,
+}
+
+const ACCOUNTING_EVENT_DEDUP_CAPACITY: usize = 200_000;
+
+struct AccountingEventDeduper {
+    ids: HashSet<(hft_core::OrderId, String)>,
+    fifo: VecDeque<(hft_core::OrderId, String)>,
+    capacity: usize,
+}
+
+impl AccountingEventDeduper {
+    fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            ids: HashSet::with_capacity(capacity),
+            fifo: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn insert(&mut self, key: (hft_core::OrderId, String)) -> bool {
+        if self.ids.contains(&key) {
+            return false;
+        }
+        if self.ids.len() >= self.capacity {
+            if let Some(expired) = self.fifo.pop_front() {
+                self.ids.remove(&expired);
+            }
+        }
+        self.fifo.push_back(key.clone());
+        self.ids.insert(key)
+    }
+
+    fn from_portfolio_state(state: &ports::PortfolioState, capacity: usize) -> HftResult<Self> {
+        let capacity = capacity.max(1);
+        let legacy_event_count = state
+            .processed_fill_ids
+            .values()
+            .try_fold(0_usize, |count, ids| count.checked_add(ids.len()))
+            .ok_or_else(|| {
+                HftError::Execution(
+                    "portfolio accounting replay state exceeds addressable capacity".to_string(),
+                )
+            })?;
+        let mut deduper = Self::with_capacity(capacity);
+
+        if !state.recent_accounting_event_ids.is_empty() {
+            if legacy_event_count > capacity && state.recent_accounting_event_ids.len() < capacity {
+                return Err(HftError::Execution(format!(
+                    "portfolio accounting replay journal is incomplete: {} processed IDs but only {} ordered recent keys",
+                    legacy_event_count,
+                    state.recent_accounting_event_ids.len()
+                )));
+            }
+            for (order_id, event_id) in &state.recent_accounting_event_ids {
+                let valid = event_id
+                    .strip_prefix("fill:")
+                    .or_else(|| event_id.strip_prefix("fee:"))
+                    .is_some_and(|fill_id| !fill_id.is_empty());
+                if !valid {
+                    return Err(HftError::Execution(format!(
+                        "portfolio accounting replay journal contains invalid key {event_id:?}"
+                    )));
+                }
+                deduper.insert((order_id.clone(), event_id.clone()));
+            }
+            return Ok(deduper);
+        }
+
+        if legacy_event_count > capacity {
+            return Err(HftError::Execution(format!(
+                "legacy portfolio state has {legacy_event_count} unordered accounting IDs, exceeding the deterministic replay capacity {capacity}"
+            )));
+        }
+
+        // Legacy states below capacity retain every key, so deterministic sorting affects only
+        // serialization stability and cannot evict a more recent event.
+        let mut legacy_keys = Vec::with_capacity(legacy_event_count);
+        for (order_id, event_ids) in &state.processed_fill_ids {
+            for event_id in event_ids {
+                if event_id.is_empty() {
+                    continue;
+                }
+                let key = event_id.strip_prefix("fee:").map_or_else(
+                    || format!("fill:{event_id}"),
+                    |fill_id| format!("fee:{fill_id}"),
+                );
+                legacy_keys.push((order_id.clone(), key));
+            }
+        }
+        legacy_keys.sort_by(|left, right| {
+            left.0
+                 .0
+                .cmp(&right.0 .0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        for key in legacy_keys {
+            deduper.insert(key);
+        }
+        Ok(deduper)
+    }
 }
 
 /// 引擎運行時配置
@@ -161,6 +262,10 @@ pub struct Engine {
     wakeup_notify: Arc<Notify>,
     /// 訂單提交時間（用於 Ack/Fill 延遲計算）
     order_submit_ts: FxHashMap<hft_core::OrderId, u64>,
+    /// End-to-end accounting idempotency boundary. Adapter recovery may replay an entire Fill/Fee
+    /// batch after cancellation, so suppress duplicates before OMS, portfolio, risk, metrics, and
+    /// broadcasts rather than relying on only some downstream consumers to deduplicate.
+    applied_accounting_event_ids: AccountingEventDeduper,
     /// 最近處理的市場事件時間戳（用於端到端延遲計算）
     recent_market_event_timestamp: Option<u64>,
     /// 延遲監控器 - 統一收集所有階段延遲
@@ -180,6 +285,7 @@ pub struct Engine {
     /// Limits copied from a verified deployment envelope and attached to every generated intent.
     intent_max_slippage_bps: Option<i32>,
     intent_max_order_notional: Option<rust_decimal::Decimal>,
+    intent_max_order_quantity: Option<rust_decimal::Decimal>,
 }
 
 impl Engine {
@@ -244,6 +350,9 @@ impl Engine {
             execution_events_buf: Vec::new(),
             wakeup_notify: Arc::new(Notify::new()),
             order_submit_ts: FxHashMap::default(),
+            applied_accounting_event_ids: AccountingEventDeduper::with_capacity(
+                ACCOUNTING_EVENT_DEDUP_CAPACITY,
+            ),
             recent_market_event_timestamp: None,
             latency_monitor,
             broadcasters,
@@ -254,6 +363,7 @@ impl Engine {
             strategy_account_mapping: FxHashMap::default(),
             intent_max_slippage_bps: None,
             intent_max_order_notional: None,
+            intent_max_order_quantity: None,
         }
     }
 
@@ -262,6 +372,7 @@ impl Engine {
         &mut self,
         max_slippage_bps: Option<i32>,
         max_order_notional: Option<rust_decimal::Decimal>,
+        max_order_quantity: Option<rust_decimal::Decimal>,
     ) -> HftResult<()> {
         if max_slippage_bps.is_some_and(|value| !(1..=10_000).contains(&value)) {
             return Err(HftError::Config(
@@ -273,8 +384,14 @@ impl Engine {
                 "intent max_order_notional must be positive".to_string(),
             ));
         }
+        if max_order_quantity.is_some_and(|value| value <= rust_decimal::Decimal::ZERO) {
+            return Err(HftError::Config(
+                "intent max_order_quantity must be positive".to_string(),
+            ));
+        }
         self.intent_max_slippage_bps = max_slippage_bps;
         self.intent_max_order_notional = max_order_notional;
+        self.intent_max_order_quantity = max_order_quantity;
         Ok(())
     }
 
@@ -290,6 +407,13 @@ impl Engine {
             lifecycle.max_order_notional = Some(
                 lifecycle
                     .max_order_notional
+                    .map_or(configured, |existing| existing.min(configured)),
+            );
+        }
+        if let Some(configured) = self.intent_max_order_quantity {
+            lifecycle.max_order_quantity = Some(
+                lifecycle
+                    .max_order_quantity
                     .map_or(configured, |existing| existing.min(configured)),
             );
         }
@@ -434,7 +558,8 @@ impl Engine {
 
     /// 導出 Portfolio 狀態（供恢復/持久化使用）
     pub fn export_portfolio_state(&self) -> ports::PortfolioState {
-        self.portfolio_manager
+        let mut state = self
+            .portfolio_manager
             .as_ref()
             .map(|pm| pm.export_state())
             .unwrap_or_else(|| ports::PortfolioState {
@@ -442,15 +567,27 @@ impl Engine {
                 order_meta: HashMap::new(),
                 market_prices: HashMap::new(),
                 processed_fill_ids: HashMap::new(),
-            })
+                recent_accounting_event_ids: Vec::new(),
+            });
+        state.recent_accounting_event_ids = self
+            .applied_accounting_event_ids
+            .fifo
+            .iter()
+            .cloned()
+            .collect();
+        state
     }
 
     /// 導入 Portfolio 狀態（供恢復/持久化使用）
-    pub fn import_portfolio_state(&mut self, state: ports::PortfolioState) {
+    pub fn import_portfolio_state(&mut self, state: ports::PortfolioState) -> HftResult<()> {
+        let restored_deduper =
+            AccountingEventDeduper::from_portfolio_state(&state, ACCOUNTING_EVENT_DEDUP_CAPACITY)?;
+        self.applied_accounting_event_ids = restored_deduper;
         if let Some(pm) = &mut self.portfolio_manager {
             pm.import_state(state);
             self.account_snapshots.store(pm.reader().load());
         }
+        Ok(())
     }
 
     /// 獲取所有階段的延遲統計數據
@@ -902,10 +1039,15 @@ impl Engine {
         execution_events_buf.clear();
         if let Some(queues) = &mut self.execution_queues {
             queues.receive_events_into(&mut execution_events_buf);
-            for ev in &execution_events_buf {
-                self.handle_execution_event(ev)?;
-                exec_processed += 1;
-                self.stats.execution_events_processed += 1;
+        }
+        for ev in &execution_events_buf {
+            self.handle_execution_event(ev)?;
+            exec_processed += 1;
+            self.stats.execution_events_processed += 1;
+            if let ExecutionEvent::ExecutionStreamSynchronized { stream_id, .. } = ev {
+                if let Some(queues) = &self.execution_queues {
+                    queues.acknowledge_applied_execution_stream(*stream_id);
+                }
             }
         }
         result.execution_events_processed = exec_processed;
@@ -1024,6 +1166,19 @@ impl Engine {
     /// 處理單個執行事件
     fn handle_execution_event(&mut self, event: &ExecutionEvent) -> Result<(), HftError> {
         debug!("處理執行事件: {:?}", event);
+        let accounting_key = match event {
+            ExecutionEvent::Fill {
+                order_id, fill_id, ..
+            } if !fill_id.is_empty() => Some((order_id.clone(), format!("fill:{fill_id}"))),
+            ExecutionEvent::FeeCharged {
+                order_id, fill_id, ..
+            } if !fill_id.is_empty() => Some((order_id.clone(), format!("fee:{fill_id}"))),
+            _ => None,
+        };
+        if accounting_key.is_some_and(|key| !self.applied_accounting_event_ids.insert(key)) {
+            debug!("忽略重放的成交/費用會計事件: {:?}", event);
+            return Ok(());
+        }
         // 廣播執行事件（最佳努力）
         let _ = self.broadcasters.exec_event_tx.send(event.clone());
 
@@ -1418,6 +1573,7 @@ impl Engine {
                     lifecycle.max_latency_us = Some(max_latency_us);
                     lifecycle.max_slippage_bps = self.intent_max_slippage_bps;
                     lifecycle.max_order_notional = self.intent_max_order_notional;
+                    lifecycle.max_order_quantity = self.intent_max_order_quantity;
                     lifecycle.source_feature_ts = exchange_timestamp;
                     lifecycle.source_book_seq = l2_book.map(|book| book.sequence).or(match event {
                         ports::MarketEvent::Snapshot(snapshot) => Some(snapshot.sequence),
@@ -2058,6 +2214,186 @@ mod tests {
     }
 
     #[test]
+    fn execution_stream_ack_is_emitted_only_after_engine_applies_the_marker() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let (engine_queues, mut worker_queues) =
+            create_execution_queues(ExecutionQueueConfig::default());
+        engine.set_execution_queues(engine_queues);
+        worker_queues
+            .send_event(ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 42,
+                connected: true,
+                timestamp: 1,
+            })
+            .expect("queue synchronization marker");
+
+        assert_eq!(worker_queues.try_receive_applied_execution_stream(), None);
+        engine.tick().expect("apply execution marker");
+        assert_eq!(
+            worker_queues.try_receive_applied_execution_stream(),
+            Some(42)
+        );
+    }
+
+    struct AccountingEventCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ports::RiskManager for AccountingEventCounter {
+        fn review_orders(
+            &mut self,
+            intents: Vec<OrderIntent>,
+            _account: &AccountView,
+            _venue_specs: &HashMap<String, VenueSpec>,
+        ) -> Vec<OrderIntent> {
+            intents
+        }
+
+        fn review(
+            &mut self,
+            intents: Vec<OrderIntent>,
+            _account: &AccountView,
+            _venue: &VenueSpec,
+        ) -> Vec<OrderIntent> {
+            intents
+        }
+
+        fn on_execution_event(&mut self, event: &ExecutionEvent) {
+            if matches!(
+                event,
+                ExecutionEvent::Fill { .. } | ExecutionEvent::FeeCharged { .. }
+            ) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+
+        fn emergency_stop(&mut self) -> Result<(), HftError> {
+            Ok(())
+        }
+
+        fn get_risk_metrics(&self) -> HashMap<String, rust_decimal::Decimal> {
+            HashMap::new()
+        }
+
+        fn should_halt_trading(&self, _account: &AccountView) -> bool {
+            false
+        }
+
+        fn risk_metrics(&self) -> ports::RiskMetrics {
+            ports::RiskMetrics {
+                max_drawdown: rust_decimal::Decimal::ZERO,
+                current_drawdown: rust_decimal::Decimal::ZERO,
+                var_1d: rust_decimal::Decimal::ZERO,
+                leverage: rust_decimal::Decimal::ZERO,
+                concentration_risk: rust_decimal::Decimal::ZERO,
+                order_rate: rust_decimal::Decimal::ZERO,
+                last_update: 0,
+            }
+        }
+    }
+
+    #[test]
+    fn replayed_fill_fee_batch_is_idempotent_before_risk_metrics_and_broadcasts() {
+        let mut engine = Engine::new(EngineConfig::default());
+        let accounting_events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        engine.register_risk_manager(AccountingEventCounter(std::sync::Arc::clone(
+            &accounting_events,
+        )));
+        let mut broadcasts = engine.subscribe_execution_events();
+        let order_id = hft_core::OrderId("logical-1".to_string());
+        let fill = ExecutionEvent::Fill {
+            order_id: order_id.clone(),
+            price: Price(rust_decimal::Decimal::new(5, 1)),
+            quantity: Quantity(rust_decimal::Decimal::ONE),
+            timestamp: 1,
+            fill_id: "fill-1".to_string(),
+        };
+        let fee = ExecutionEvent::FeeCharged {
+            order_id,
+            amount: rust_decimal::Decimal::new(1, 2),
+            timestamp: 1,
+            fill_id: "fill-1".to_string(),
+        };
+
+        engine.handle_execution_event(&fill).expect("first fill");
+        engine.handle_execution_event(&fee).expect("first fee");
+        engine.handle_execution_event(&fill).expect("replayed fill");
+        engine.handle_execution_event(&fee).expect("replayed fee");
+
+        assert_eq!(engine.stats.orders_filled, 1);
+        assert_eq!(
+            accounting_events.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "risk sees one Fill and one FeeCharged"
+        );
+        assert!(broadcasts.try_recv().is_ok());
+        assert!(broadcasts.try_recv().is_ok());
+        assert!(broadcasts.try_recv().is_err());
+    }
+
+    #[test]
+    fn accounting_event_deduper_has_a_bounded_replay_horizon() {
+        let mut deduper = AccountingEventDeduper::with_capacity(2);
+        let key = |id: &str| (hft_core::OrderId("logical-1".to_string()), id.to_string());
+
+        assert!(deduper.insert(key("fill:1")));
+        assert!(deduper.insert(key("fill:2")));
+        assert!(!deduper.insert(key("fill:1")));
+        assert!(deduper.insert(key("fill:3")));
+        assert_eq!(deduper.ids.len(), 2);
+        assert_eq!(deduper.fifo.len(), 2);
+        assert!(deduper.insert(key("fill:1")), "oldest ID was evicted");
+        assert_eq!(deduper.ids.len(), 2);
+    }
+
+    #[test]
+    fn accounting_event_deduper_restores_the_ordered_recent_horizon() {
+        let order_id = hft_core::OrderId("logical-1".to_string());
+        let state = ports::PortfolioState {
+            account_view: ports::AccountView::default(),
+            order_meta: HashMap::new(),
+            market_prices: HashMap::new(),
+            processed_fill_ids: HashMap::from([(
+                order_id.clone(),
+                HashSet::from([
+                    "old".to_string(),
+                    "recent-1".to_string(),
+                    "recent-2".to_string(),
+                ]),
+            )]),
+            recent_accounting_event_ids: vec![
+                (order_id.clone(), "fill:recent-1".to_string()),
+                (order_id.clone(), "fill:recent-2".to_string()),
+            ],
+        };
+
+        let mut restored =
+            AccountingEventDeduper::from_portfolio_state(&state, 2).expect("ordered replay state");
+
+        assert!(!restored.insert((order_id.clone(), "fill:recent-1".to_string())));
+        assert!(!restored.insert((order_id.clone(), "fill:recent-2".to_string())));
+        assert!(restored.insert((order_id, "fill:old".to_string())));
+    }
+
+    #[test]
+    fn accounting_event_deduper_rejects_oversized_unordered_legacy_state() {
+        let state = ports::PortfolioState {
+            account_view: ports::AccountView::default(),
+            order_meta: HashMap::new(),
+            market_prices: HashMap::new(),
+            processed_fill_ids: HashMap::from([(
+                hft_core::OrderId("logical-1".to_string()),
+                HashSet::from(["one".to_string(), "two".to_string(), "three".to_string()]),
+            )]),
+            recent_accounting_event_ids: Vec::new(),
+        };
+
+        let error = match AccountingEventDeduper::from_portfolio_state(&state, 2) {
+            Ok(_) => panic!("unordered state beyond the bounded horizon must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unordered accounting IDs"));
+    }
+
+    #[test]
     fn test_strategy_event_filtering_trait_based() {
         // 構造引擎
         let config = EngineConfig::default();
@@ -2133,7 +2469,11 @@ mod tests {
             create_execution_queues(ExecutionQueueConfig::default());
         engine.set_execution_queues(engine_queues);
         engine
-            .set_intent_execution_limits(Some(25), Some(rust_decimal::Decimal::from(50)))
+            .set_intent_execution_limits(
+                Some(25),
+                Some(rust_decimal::Decimal::from(50)),
+                Some(rust_decimal::Decimal::new(5, 1)),
+            )
             .expect("valid execution limits");
 
         let error = engine
@@ -2145,6 +2485,7 @@ mod tests {
         let mut permissive = OrderIntentLifecycle::new(1, 10);
         permissive.max_slippage_bps = Some(100);
         permissive.max_order_notional = Some(rust_decimal::Decimal::from(500));
+        permissive.max_order_quantity = Some(rust_decimal::Decimal::from(5));
         let error = engine
             .submit_order_intent_envelope(
                 OrderIntentEnvelope::new(test_intent(), permissive),
@@ -2166,6 +2507,10 @@ mod tests {
         assert_eq!(
             intents[0].lifecycle.max_order_notional,
             Some(rust_decimal::Decimal::from(50))
+        );
+        assert_eq!(
+            intents[0].lifecycle.max_order_quantity,
+            Some(rust_decimal::Decimal::new(5, 1))
         );
     }
 

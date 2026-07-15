@@ -240,13 +240,12 @@ fn apply_strategy_bundle(
     let hard_notional = config.risk.global_notional_limit;
     let requested_notional = positive_decimal("max_notional", request.max_notional)?;
     let requested_symbol = positive_decimal("max_symbol_exposure", request.max_symbol_exposure)?;
-    let requested_order = positive_decimal("max_order_size", request.max_order_size)?;
+    let requested_order_quantity = positive_decimal("max_order_size", request.max_order_size)?;
     let max_slippage_bps = integer_slippage_bps(request.max_slippage_bps)?;
     if hard_notional <= rust_decimal::Decimal::ZERO {
         return Err("runtime hard notional limit disables strategy activation".to_string());
     }
     let total_notional = hard_notional.min(requested_notional).min(requested_symbol);
-    let order_notional = total_notional.min(requested_order);
     let symbols = request
         .instruments
         .iter()
@@ -273,7 +272,7 @@ fn apply_strategy_bundle(
                     symbols,
                     params: runtime::StrategyParams::Formula {
                         ast: ast.clone(),
-                        max_order_notional: order_notional,
+                        max_order_notional: total_notional,
                         signal_threshold: 0.0,
                     },
                     risk_limits,
@@ -295,7 +294,7 @@ fn apply_strategy_bundle(
                         model_sha256: checksum,
                         top_n,
                         window_size,
-                        max_order_notional: order_notional,
+                        max_order_notional: total_notional,
                         output_threshold: 0.0,
                     },
                     risk_limits,
@@ -309,7 +308,8 @@ fn apply_strategy_bundle(
     };
 
     config.engine.intent_max_slippage_bps = Some(max_slippage_bps);
-    config.engine.intent_max_order_notional = Some(order_notional);
+    config.engine.intent_max_order_notional = Some(total_notional);
+    config.engine.intent_max_order_quantity = Some(requested_order_quantity);
     config.risk.global_notional_limit = total_notional;
     config.venues.retain(|venue| {
         venue.name.eq_ignore_ascii_case(&request.venue)
@@ -322,7 +322,7 @@ fn apply_strategy_bundle(
             strategy_id.clone(),
             runtime::StrategyRiskOverride {
                 max_position: Some(config.risk.global_position_limit),
-                max_notional: Some(order_notional),
+                max_notional: Some(total_notional),
                 max_orders_per_second: Some(config.risk.max_orders_per_second),
                 order_cooldown_ms: Some(100),
                 staleness_threshold_us: Some(config.risk.staleness_threshold_us),

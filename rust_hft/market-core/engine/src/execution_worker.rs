@@ -25,8 +25,20 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+enum IndexedExecutionStreamItem {
+    Event {
+        client_idx: usize,
+        result: Result<ExecutionEvent, HftError>,
+    },
+    Completed {
+        client_idx: usize,
+    },
+}
+
 type IndexedExecutionStream =
-    Pin<Box<dyn futures::Stream<Item = (usize, Result<ExecutionEvent, HftError>)> + Send>>;
+    Pin<Box<dyn futures::Stream<Item = IndexedExecutionStreamItem> + Send>>;
+
+const STREAM_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 客户端选择策略
 #[derive(Debug, Clone, Copy, Default)]
@@ -144,11 +156,26 @@ pub struct ExecutionWorker {
     account_to_client: FxHashMap<AccountId, usize>,
     /// Emergency is sticky for the worker lifetime; restart is required to re-arm execution.
     accepting_intents: bool,
+    /// Operator authorization is independent from transient stream recovery. Automatic recovery
+    /// may clear only its own latch and must never override an explicit SetIntake(false).
+    operator_intake_enabled: bool,
     emergency_latched: bool,
     stream_recovery_pending: bool,
     client_connected: Vec<bool>,
+    /// Per-client stream attach generation that must reach its matching tail marker before the
+    /// client can be considered connected again. This prevents stale ready events already in the
+    /// adapter backlog from reopening intake.
+    client_stream_barriers: Vec<Option<u64>>,
+    /// Highest globally unique stream generation observed for each client. A replacement stream
+    /// announces its barrier out-of-band before reading the old consumer backlog, so older queued
+    /// barriers must never supersede that newer generation.
+    client_latest_stream_id: Vec<u64>,
+    /// Matching synchronized markers remain fail-closed until the engine confirms that OMS,
+    /// portfolio, and risk state have applied every preceding execution report.
+    client_engine_ack_pending: Vec<Option<u64>>,
+    recovery_intent_drain_required: bool,
+    last_stream_recovery_attempt: Instant,
     intents_buf: Vec<OrderIntentEnvelope>,
-    execution_events_buf: Vec<(usize, ExecutionEvent)>,
 }
 
 impl ExecutionWorker {
@@ -232,11 +259,16 @@ impl ExecutionWorker {
             strategy_to_client: None,
             account_to_client: FxHashMap::default(),
             accepting_intents: true,
+            operator_intake_enabled: true,
             emergency_latched: false,
             stream_recovery_pending: false,
             client_connected: vec![true; client_count],
+            client_stream_barriers: vec![None; client_count],
+            client_latest_stream_id: vec![0; client_count],
+            client_engine_ack_pending: vec![None; client_count],
+            recovery_intent_drain_required: false,
+            last_stream_recovery_attempt: Instant::now(),
             intents_buf: Vec::with_capacity(batch_size),
-            execution_events_buf: Vec::with_capacity(batch_size),
         }
     }
 
@@ -271,11 +303,16 @@ impl ExecutionWorker {
             strategy_to_client: None,
             account_to_client: FxHashMap::default(),
             accepting_intents: true,
+            operator_intake_enabled: true,
             emergency_latched: false,
             stream_recovery_pending: false,
             client_connected: vec![true; client_count],
+            client_stream_barriers: vec![None; client_count],
+            client_latest_stream_id: vec![0; client_count],
+            client_engine_ack_pending: vec![None; client_count],
+            recovery_intent_drain_required: false,
+            last_stream_recovery_attempt: Instant::now(),
             intents_buf: Vec::with_capacity(batch_size),
-            execution_events_buf: Vec::with_capacity(batch_size),
         }
     }
 
@@ -312,17 +349,29 @@ impl ExecutionWorker {
             if events_received > 0 {
                 had_activity = true;
             }
-
-            // 2. 处理意图队列中的新订单
-            let mut intents = std::mem::take(&mut self.intents_buf);
-            intents.clear();
-            self.queues.receive_envelopes_into(&mut intents);
-            if !intents.is_empty() {
-                self.process_order_intents(&mut intents).await;
+            let applied_streams = self.poll_applied_execution_streams().await;
+            if applied_streams > 0 {
                 had_activity = true;
             }
-            intents.clear();
-            self.intents_buf = intents;
+            if self.retry_stream_recovery_if_due().await {
+                had_activity = true;
+            }
+
+            // Hitting the event batch limit does not prove that the private-event backlog is
+            // drained. Defer new intents for one more tick so a queued disconnect/fill behind the
+            // current item is observed before an order can be submitted.
+            if events_received < self.execution_event_batch_limit() {
+                // 2. 处理意图队列中的新订单
+                let mut intents = std::mem::take(&mut self.intents_buf);
+                intents.clear();
+                self.queues.receive_envelopes_into(&mut intents);
+                if !intents.is_empty() {
+                    self.process_order_intents(&mut intents).await;
+                    had_activity = true;
+                }
+                intents.clear();
+                self.intents_buf = intents;
+            }
 
             // 檢查 Ack 超時並嘗試取消
             if self.config.ack_timeout_ms > 0 {
@@ -357,6 +406,7 @@ impl ExecutionWorker {
             // 4. 空闲控制
             if !had_activity {
                 let intent_notify = self.queues.intent_notify();
+                let applied_stream_notify = self.queues.applied_stream_notify();
                 let has_execution_stream = !self.execution_streams.is_empty();
                 let maintenance_wait = Duration::from_millis(self.config.idle_sleep_ms.max(10));
                 tokio::select! {
@@ -369,6 +419,9 @@ impl ExecutionWorker {
                     }
                     item = self.execution_streams.next(), if has_execution_stream => {
                         self.handle_execution_stream_item(item).await;
+                        last_activity = Instant::now();
+                    }
+                    _ = applied_stream_notify.notified() => {
                         last_activity = Instant::now();
                     }
                     _ = intent_notify.notified() => {
@@ -425,8 +478,15 @@ impl ExecutionWorker {
         for (idx, client) in self.execution_clients.iter().enumerate() {
             match client.execution_stream().await {
                 Ok(stream) => {
-                    self.execution_streams
-                        .push(Box::pin(stream.map(move |result| (idx, result))));
+                    let indexed = stream
+                        .map(move |result| IndexedExecutionStreamItem::Event {
+                            client_idx: idx,
+                            result,
+                        })
+                        .chain(futures::stream::once(async move {
+                            IndexedExecutionStreamItem::Completed { client_idx: idx }
+                        }));
+                    self.execution_streams.push(Box::pin(indexed));
                     debug!("执行客户端 {} 回报流准备完成", idx);
                 }
                 Err(e) => {
@@ -457,9 +517,7 @@ impl ExecutionWorker {
         }
 
         for envelope in intents.drain(..) {
-            while let Ok(command) = self.control_rx.try_recv() {
-                self.handle_control_command(command).await;
-            }
+            self.drain_private_events_before_submission().await;
             if let Err(reason) = envelope.validate_pre_execution(now_micros(), None) {
                 let reject_event = ExecutionEvent::OrderReject {
                     order_id: OrderId(envelope.client_order_id.clone()),
@@ -654,6 +712,22 @@ impl ExecutionWorker {
         }
     }
 
+    /// Private reports outrank every new submission, including submissions already coalesced into
+    /// the same queue batch. Drain to a momentary boundary before each order so a disconnect or
+    /// reconciliation latch arriving during the previous HTTP await closes the remaining batch.
+    async fn drain_private_events_before_submission(&mut self) {
+        loop {
+            while let Ok(command) = self.control_rx.try_recv() {
+                self.handle_control_command(command).await;
+            }
+            let received = self.poll_execution_events().await;
+            self.poll_applied_execution_streams().await;
+            if received < self.execution_event_batch_limit() {
+                break;
+            }
+        }
+    }
+
     async fn reject_for_disabled_intake(&mut self, envelope: &OrderIntentEnvelope) {
         let reject_event = ExecutionEvent::OrderReject {
             order_id: OrderId(envelope.client_order_id.clone()),
@@ -669,17 +743,37 @@ impl ExecutionWorker {
 
     async fn reject_queued_intents_for_disabled_intake(&mut self) {
         let mut queued = Vec::new();
+        loop {
+            queued.clear();
+            self.queues.receive_envelopes_into(&mut queued);
+            if queued.is_empty() {
+                break;
+            }
+            self.stats.intents_processed += queued.len() as u64;
+            for envelope in queued.drain(..) {
+                self.reject_for_disabled_intake(&envelope).await;
+            }
+        }
+    }
+
+    /// Reject one bounded queue batch while recovery stays fail-closed. Recovery must not spin in
+    /// an unbounded drain loop because a continuously producing engine could otherwise prevent the
+    /// worker from ever polling its private report stream again.
+    async fn reject_one_queued_intent_batch_for_recovery(&mut self) -> bool {
+        let mut queued = Vec::new();
         self.queues.receive_envelopes_into(&mut queued);
         self.stats.intents_processed += queued.len() as u64;
-        for envelope in queued {
+        for envelope in queued.drain(..) {
             self.reject_for_disabled_intake(&envelope).await;
         }
+        !self.queues.has_pending_intents()
     }
 
     fn submission_outcome_may_be_unknown(error: &HftError) -> bool {
         !matches!(
             error,
             HftError::InvalidOrder(_)
+                | HftError::SubmissionNotAttempted(_)
                 | HftError::InsufficientBalance(_)
                 | HftError::Risk(_)
                 | HftError::Config(_)
@@ -695,125 +789,107 @@ impl ExecutionWorker {
     /// 轮询执行回报流
     async fn poll_execution_events(&mut self) -> u32 {
         let mut events_count = 0;
-        let mut execution_events = std::mem::take(&mut self.execution_events_buf);
-        execution_events.clear();
-        let mut stream_failed = None;
-
-        while execution_events.len() < self.config.batch_size {
+        let batch_limit = self.execution_event_batch_limit();
+        while events_count < batch_limit {
             match self.execution_streams.next().now_or_never() {
-                Some(Some((client_idx, Ok(event)))) => execution_events.push((client_idx, event)),
-                Some(Some((client_idx, Err(e)))) => {
+                Some(Some(IndexedExecutionStreamItem::Event {
+                    client_idx,
+                    result: Ok(event),
+                })) => {
+                    let requires_reconciliation =
+                        self.event_requires_reconciliation(client_idx, &event);
+                    self.update_connection_tracking(client_idx, &event);
+                    self.update_execution_tracking(&event);
+                    // Do not poll the adapter stream again until the downstream SPSC has accepted
+                    // this event. For replayable adapter batches, that next poll is the delivery
+                    // acknowledgement; cancellation during backpressure therefore replays rather
+                    // than losing the in-flight event.
+                    self.queues.send_event_reliable(event).await;
+                    self.stats.events_sent += 1;
+                    events_count += 1;
+                    if requires_reconciliation {
+                        self.attempt_stream_recovery().await;
+                    }
+                }
+                Some(Some(IndexedExecutionStreamItem::Event {
+                    client_idx,
+                    result: Err(e),
+                })) => {
                     warn!("执行回报流错误: {}", e);
-                    stream_failed = Some(client_idx);
+                    self.latch_on_execution_stream_failure(client_idx).await;
+                    break;
+                }
+                Some(Some(IndexedExecutionStreamItem::Completed { client_idx })) => {
+                    self.handle_execution_stream_completion(client_idx).await;
                     break;
                 }
                 Some(None) => {
-                    if !self.execution_streams.is_empty() {
-                        continue;
-                    }
-                    self.handle_execution_stream_completion().await;
+                    // Every production stream emits an explicit per-client Completed item before
+                    // SelectAll removes it. Reaching aggregate exhaustion therefore needs no
+                    // additional state transition.
                     break;
                 }
                 None => break,
             }
         }
-
-        if let Some(client_idx) = stream_failed {
-            self.accepting_intents = false;
-            self.stream_recovery_pending = true;
-            if let Some(connected) = self.client_connected.get_mut(client_idx) {
-                *connected = false;
-            }
-            execution_events.push((
-                client_idx,
-                ExecutionEvent::ConnectionStatus {
-                    connected: false,
-                    timestamp: now_micros(),
-                },
-            ));
-        }
-
-        let mut requires_reconciliation = false;
-        for (client_idx, event) in execution_events.drain(..) {
-            requires_reconciliation |= matches!(
-                event,
-                ExecutionEvent::ConnectionStatus {
-                    connected: true,
-                    ..
-                } | ExecutionEvent::ReconciliationRequired { .. }
-            );
-            self.update_connection_tracking(client_idx, &event);
-            self.update_execution_tracking(&event);
-            self.queues.send_event_reliable(event).await;
-            self.stats.events_sent += 1;
-            events_count += 1;
-        }
-        self.execution_events_buf = execution_events;
-        if requires_reconciliation {
-            self.reconcile_open_orders().await;
-        }
-
         events_count
     }
 
-    async fn handle_execution_stream_item(
-        &mut self,
-        item: Option<(usize, Result<ExecutionEvent, HftError>)>,
-    ) {
+    async fn handle_execution_stream_item(&mut self, item: Option<IndexedExecutionStreamItem>) {
         match item {
-            Some((client_idx, Ok(event))) => {
-                let requires_reconciliation = matches!(
-                    event,
-                    ExecutionEvent::ConnectionStatus {
-                        connected: true,
-                        ..
-                    } | ExecutionEvent::ReconciliationRequired { .. }
-                );
+            Some(IndexedExecutionStreamItem::Event {
+                client_idx,
+                result: Ok(event),
+            }) => {
+                let requires_reconciliation =
+                    self.event_requires_reconciliation(client_idx, &event);
                 self.update_connection_tracking(client_idx, &event);
                 self.update_execution_tracking(&event);
                 self.queues.send_event_reliable(event).await;
                 self.stats.events_sent += 1;
                 if requires_reconciliation {
-                    self.reconcile_open_orders().await;
+                    self.attempt_stream_recovery().await;
                 }
             }
-            Some((client_idx, Err(error))) => {
+            Some(IndexedExecutionStreamItem::Event {
+                client_idx,
+                result: Err(error),
+            }) => {
                 warn!("执行回报流错误: {}", error);
                 self.latch_on_execution_stream_failure(client_idx).await;
             }
-            None => {
-                self.handle_execution_stream_completion().await;
+            Some(IndexedExecutionStreamItem::Completed { client_idx }) => {
+                self.handle_execution_stream_completion(client_idx).await;
             }
+            None => {}
         }
     }
 
-    async fn handle_execution_stream_completion(&mut self) {
-        let explicitly_finite = !self.execution_clients.is_empty()
-            && self
-                .execution_clients
-                .iter()
-                .all(|client| client.execution_stream_may_complete());
-        let mut clients_healthy = explicitly_finite;
-        for client in &self.execution_clients {
-            if !client.health().await.connected {
-                clients_healthy = false;
-                break;
-            }
-        }
-        if clients_healthy {
+    async fn handle_execution_stream_completion(&mut self, client_idx: usize) {
+        let Some(client) = self.execution_clients.get(client_idx) else {
+            warn!(client_idx, "unknown execution report stream completed");
+            self.latch_stream_recovery();
+            return;
+        };
+        let explicitly_finite = client.execution_stream_may_complete();
+        let client_healthy = client.health().await.connected;
+        if explicitly_finite && client_healthy {
             warn!(
-                "explicitly finite execution report streams completed while clients remain healthy"
+                client_idx,
+                "explicitly finite execution report stream completed while client remains healthy"
             );
             return;
         }
 
         warn!(
+            client_idx,
             explicitly_finite,
-            "execution report streams ended without a healthy finite-stream contract"
+            "execution report stream ended without a healthy finite-stream contract"
         );
-        self.accepting_intents = false;
-        self.stream_recovery_pending = true;
-        self.client_connected.fill(false);
+        self.latch_stream_recovery();
+        if let Some(connected) = self.client_connected.get_mut(client_idx) {
+            *connected = false;
+        }
         self.queues
             .send_event_reliable(ExecutionEvent::ConnectionStatus {
                 connected: false,
@@ -825,21 +901,183 @@ impl ExecutionWorker {
     fn update_connection_tracking(&mut self, client_idx: usize, event: &ExecutionEvent) {
         match event {
             ExecutionEvent::ConnectionStatus { connected, .. } => {
-                if let Some(state) = self.client_connected.get_mut(client_idx) {
-                    *state = *connected;
+                let barrier_pending = self
+                    .client_stream_barriers
+                    .get(client_idx)
+                    .is_some_and(Option::is_some);
+                if !connected || !barrier_pending {
+                    if let Some(state) = self.client_connected.get_mut(client_idx) {
+                        *state = *connected;
+                    }
                 }
                 if !connected {
-                    self.accepting_intents = false;
-                    self.stream_recovery_pending = true;
+                    self.latch_stream_recovery();
+                }
+            }
+            ExecutionEvent::ExecutionStreamBarrier { stream_id, .. } => {
+                let is_newer = self
+                    .client_latest_stream_id
+                    .get_mut(client_idx)
+                    .is_some_and(|latest| {
+                        if *stream_id > *latest {
+                            *latest = *stream_id;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                if !is_newer {
+                    warn!(
+                        client_idx,
+                        stream_id, "ignored stale execution-stream barrier"
+                    );
+                    return;
+                }
+                if let Some(barrier) = self.client_stream_barriers.get_mut(client_idx) {
+                    *barrier = Some(*stream_id);
+                }
+                if let Some(pending) = self.client_engine_ack_pending.get_mut(client_idx) {
+                    *pending = None;
+                }
+                if let Some(state) = self.client_connected.get_mut(client_idx) {
+                    *state = false;
+                }
+                self.latch_stream_recovery();
+            }
+            ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id,
+                connected,
+                ..
+            } => {
+                let matches_current = self
+                    .client_stream_barriers
+                    .get(client_idx)
+                    .is_some_and(|barrier| *barrier == Some(*stream_id));
+                if matches_current {
+                    if let Some(barrier) = self.client_stream_barriers.get_mut(client_idx) {
+                        *barrier = None;
+                    }
+                    if let Some(pending) = self.client_engine_ack_pending.get_mut(client_idx) {
+                        *pending = Some(*stream_id);
+                    }
+                    if let Some(state) = self.client_connected.get_mut(client_idx) {
+                        *state = *connected;
+                    }
+                    self.latch_stream_recovery();
+                } else {
+                    warn!(
+                        client_idx,
+                        stream_id, "ignored stale execution-stream synchronization marker"
+                    );
                 }
             }
             ExecutionEvent::ReconciliationRequired { reason, .. } => {
-                warn!(client_idx, %reason, "private execution events were missed; reconciliation required");
-                self.accepting_intents = false;
-                self.stream_recovery_pending = true;
+                error!(
+                    client_idx,
+                    %reason,
+                    "private execution events were missed; intake remains closed until a newer stream generation is engine-applied, otherwise restart is required"
+                );
+                if let Some(state) = self.client_connected.get_mut(client_idx) {
+                    *state = false;
+                }
+                self.latch_stream_recovery();
             }
             _ => {}
         }
+    }
+
+    fn event_requires_reconciliation(&self, client_idx: usize, event: &ExecutionEvent) -> bool {
+        match event {
+            ExecutionEvent::ConnectionStatus {
+                connected: true, ..
+            } => {
+                self.client_stream_barriers
+                    .get(client_idx)
+                    .is_some_and(Option::is_none)
+                    && self
+                        .client_engine_ack_pending
+                        .get(client_idx)
+                        .is_some_and(Option::is_none)
+            }
+            ExecutionEvent::ReconciliationRequired { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn latch_stream_recovery(&mut self) {
+        self.accepting_intents = false;
+        self.stream_recovery_pending = true;
+        self.recovery_intent_drain_required = true;
+    }
+
+    fn execution_event_batch_limit(&self) -> u32 {
+        self.config
+            .batch_size
+            .clamp(1, u32::MAX as usize)
+            .try_into()
+            .expect("execution event batch limit is clamped to u32")
+    }
+
+    async fn poll_applied_execution_streams(&mut self) -> u32 {
+        let mut applied_count = 0;
+        let mut should_reconcile = false;
+        while let Some(stream_id) = self.queues.try_receive_applied_execution_stream() {
+            applied_count += 1;
+            let matched_client = self
+                .client_engine_ack_pending
+                .iter_mut()
+                .enumerate()
+                .find_map(|(client_idx, pending)| {
+                    (*pending == Some(stream_id)).then(|| {
+                        *pending = None;
+                        client_idx
+                    })
+                });
+            if let Some(client_idx) = matched_client {
+                if let Some(client) = self.execution_clients.get(client_idx) {
+                    client.acknowledge_execution_stream_applied(stream_id);
+                }
+                should_reconcile |= self
+                    .client_connected
+                    .get(client_idx)
+                    .copied()
+                    .unwrap_or(false);
+            } else {
+                warn!(
+                    stream_id,
+                    "ignored stale engine-applied execution-stream acknowledgement"
+                );
+            }
+        }
+        if should_reconcile {
+            self.attempt_stream_recovery().await;
+        }
+        applied_count
+    }
+
+    fn stream_recovery_ready_for_reconcile(&self) -> bool {
+        self.stream_recovery_pending
+            && self.client_stream_barriers.iter().all(Option::is_none)
+            && self.client_engine_ack_pending.iter().all(Option::is_none)
+            && self.client_connected.iter().all(|connected| *connected)
+    }
+
+    async fn attempt_stream_recovery(&mut self) -> bool {
+        if !self.stream_recovery_ready_for_reconcile() {
+            return false;
+        }
+        self.last_stream_recovery_attempt = Instant::now();
+        self.reconcile_open_orders().await
+    }
+
+    async fn retry_stream_recovery_if_due(&mut self) -> bool {
+        if !self.stream_recovery_ready_for_reconcile()
+            || self.last_stream_recovery_attempt.elapsed() < STREAM_RECOVERY_RETRY_INTERVAL
+        {
+            return false;
+        }
+        self.attempt_stream_recovery().await;
+        true
     }
 
     fn update_execution_tracking(&mut self, event: &ExecutionEvent) {
@@ -893,8 +1131,7 @@ impl ExecutionWorker {
     }
 
     async fn latch_on_execution_stream_failure(&mut self, client_idx: usize) {
-        self.accepting_intents = false;
-        self.stream_recovery_pending = true;
+        self.latch_stream_recovery();
         if let Some(connected) = self.client_connected.get_mut(client_idx) {
             *connected = false;
         }
@@ -1057,6 +1294,7 @@ impl ExecutionWorker {
                 } else if enabled && self.stream_recovery_pending {
                     Err("execution intake is waiting for private-stream reconciliation".to_string())
                 } else {
+                    self.operator_intake_enabled = enabled;
                     self.accepting_intents = enabled;
                     if !enabled {
                         // The acknowledgement is a real quiescence barrier: callers may start an
@@ -1507,18 +1745,43 @@ impl ExecutionWorker {
         if !complete {
             warn!("對帳快照不完整；系統不得將未知狀態視為無未結訂單");
         }
+        let clients_currently_healthy =
+            !self.stream_recovery_pending || self.execution_clients_currently_healthy().await;
         if self.stream_recovery_pending
             && complete
+            && clients_currently_healthy
             && self.client_connected.iter().all(|connected| *connected)
+            && self.client_stream_barriers.iter().all(Option::is_none)
+            && self.client_engine_ack_pending.iter().all(Option::is_none)
             && self.recovery_snapshot_matches(&snapshot)
         {
-            self.stream_recovery_pending = false;
-            if !self.emergency_latched {
-                self.accepting_intents = true;
-                info!("private execution streams reconciled; execution intake restored");
+            if self.recovery_intent_drain_required {
+                // Any intent queued before the engine-applied stream watermark was produced from
+                // stale account state. Drain one bounded batch per pass so a continuous producer
+                // cannot starve private-report polling; remain closed and retry until FIFO empty.
+                if !self.reject_one_queued_intent_batch_for_recovery().await {
+                    return complete;
+                }
+            }
+            if self.execution_clients_currently_healthy().await {
+                self.recovery_intent_drain_required = false;
+                self.stream_recovery_pending = false;
+                if self.operator_intake_enabled && !self.emergency_latched {
+                    self.accepting_intents = true;
+                    info!("private execution streams reconciled; execution intake restored");
+                }
             }
         }
         complete
+    }
+
+    async fn execution_clients_currently_healthy(&mut self) -> bool {
+        for client in &self.execution_clients {
+            if !client.health().await.connected {
+                return false;
+            }
+        }
+        true
     }
 
     fn recovery_snapshot_matches(&self, snapshot: &WorkerReconcileSnapshot) -> bool {
@@ -1615,6 +1878,67 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
 
+    #[tokio::test]
+    async fn downstream_backpressure_prevents_prefetching_the_next_adapter_event() {
+        let queue_config = crate::ExecutionQueueConfig {
+            intent_queue_capacity: 2,
+            event_queue_capacity: 2,
+            batch_size: 2,
+        };
+        let (_engine_queues, mut worker_queues) = crate::create_execution_queues(queue_config);
+        worker_queues
+            .send_event(ExecutionEvent::ConnectionStatus {
+                connected: false,
+                timestamp: 0,
+            })
+            .expect("fill the effective one-slot event ring");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig {
+                batch_size: 2,
+                ..Default::default()
+            },
+            worker_queues,
+            Vec::new(),
+            control_rx,
+        );
+        let polls = Arc::new(AtomicUsize::new(0));
+        let stream_polls = Arc::clone(&polls);
+        let stream = futures::stream::unfold(0_u64, move |timestamp| {
+            let stream_polls = Arc::clone(&stream_polls);
+            async move {
+                stream_polls.fetch_add(1, Ordering::AcqRel);
+                Some((
+                    IndexedExecutionStreamItem::Event {
+                        client_idx: 0,
+                        result: Ok::<_, HftError>(ExecutionEvent::OrderCanceled {
+                            order_id: OrderId(format!("event-{timestamp}")),
+                            timestamp,
+                        }),
+                    },
+                    timestamp + 1,
+                ))
+            }
+        });
+        worker.execution_streams.push(Box::pin(stream));
+
+        let poll_task = tokio::spawn(async move { worker.poll_execution_events().await });
+        for _ in 0..100 {
+            if polls.load(Ordering::Acquire) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(polls.load(Ordering::Acquire), 1);
+        assert!(
+            !poll_task.is_finished(),
+            "first event must be backpressured"
+        );
+        poll_task.abort();
+        let _ = poll_task.await;
+    }
+
     #[test]
     fn explicit_exchange_rejections_are_known_but_transport_failures_are_ambiguous() {
         assert!(!ExecutionWorker::submission_outcome_may_be_unknown(
@@ -1622,6 +1946,9 @@ mod tests {
         ));
         assert!(!ExecutionWorker::submission_outcome_may_be_unknown(
             &HftError::Exchange("invalid quantity".to_string())
+        ));
+        assert!(!ExecutionWorker::submission_outcome_may_be_unknown(
+            &HftError::SubmissionNotAttempted("private stream recovering".to_string())
         ));
         assert!(ExecutionWorker::submission_outcome_may_be_unknown(
             &HftError::Network("connection reset".to_string())
@@ -1638,6 +1965,7 @@ mod tests {
         open_orders: Vec<OpenOrder>,
         healthy: Option<bool>,
         finite_stream: bool,
+        disconnect_on_first_place: Option<mpsc::UnboundedSender<ExecutionEvent>>,
     }
 
     struct MockExecutionClient {
@@ -1650,7 +1978,19 @@ mod tests {
     #[async_trait::async_trait]
     impl ExecutionClient for MockExecutionClient {
         async fn place_order(&mut self, intent: OrderIntent) -> HftResult<OrderId> {
-            self.state.lock().unwrap().placed.push(intent.symbol);
+            let disconnect = {
+                let mut state = self.state.lock().unwrap();
+                state.placed.push(intent.symbol);
+                (state.placed.len() == 1)
+                    .then(|| state.disconnect_on_first_place.clone())
+                    .flatten()
+            };
+            if let Some(disconnect) = disconnect {
+                let _ = disconnect.send(ExecutionEvent::ConnectionStatus {
+                    connected: false,
+                    timestamp: now_micros(),
+                });
+            }
             if self.place_error {
                 Err(HftError::Network("submission outcome unknown".to_string()))
             } else {
@@ -1707,6 +2047,229 @@ mod tests {
                 last_heartbeat: now_micros(),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn stream_barrier_ignores_old_ready_until_matching_tail_after_fill_fee() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState {
+                healthy: Some(true),
+                ..Default::default()
+            })),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig {
+                batch_size: 1,
+                ..Default::default()
+            },
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let fill_id = "startup-fill".to_string();
+        let events = vec![
+            ExecutionEvent::ExecutionStreamBarrier {
+                stream_id: 2,
+                timestamp: 1,
+            },
+            ExecutionEvent::ConnectionStatus {
+                connected: true,
+                timestamp: 2,
+            },
+            ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 1,
+                connected: true,
+                timestamp: 3,
+            },
+            ExecutionEvent::Fill {
+                order_id: OrderId("logical-1".to_string()),
+                price: Price::from_f64(0.5).unwrap(),
+                quantity: Quantity::from_f64(1.0).unwrap(),
+                timestamp: 4,
+                fill_id: fill_id.clone(),
+            },
+            ExecutionEvent::FeeCharged {
+                order_id: OrderId("logical-1".to_string()),
+                amount: rust_decimal::Decimal::new(1, 2),
+                timestamp: 4,
+                fill_id,
+            },
+            ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 2,
+                connected: true,
+                timestamp: 5,
+            },
+        ];
+        worker
+            .execution_streams
+            .push(Box::pin(futures::stream::iter(events.into_iter().map(
+                |event| IndexedExecutionStreamItem::Event {
+                    client_idx: 0,
+                    result: Ok::<_, HftError>(event),
+                },
+            ))));
+
+        for _ in 0..5 {
+            assert_eq!(worker.poll_execution_events().await, 1);
+            assert!(!worker.accepting_intents);
+            assert_eq!(worker.client_stream_barriers[0], Some(2));
+            assert!(!worker.client_connected[0]);
+        }
+
+        assert_eq!(worker.poll_execution_events().await, 1);
+        assert!(!worker.accepting_intents);
+        assert!(worker.stream_recovery_pending);
+        assert_eq!(worker.client_stream_barriers[0], None);
+        assert_eq!(worker.client_engine_ack_pending[0], Some(2));
+
+        for _ in 0..40 {
+            engine_queues
+                .send_intent(create_test_intent("BTCUSDT"))
+                .expect("queue stale recovery intent");
+        }
+        engine_queues.acknowledge_applied_execution_stream(2);
+        assert_eq!(worker.poll_applied_execution_streams().await, 1);
+        assert!(!worker.accepting_intents);
+        assert!(worker.stream_recovery_pending);
+        assert_eq!(worker.client_engine_ack_pending[0], None);
+        assert!(worker.client_connected[0]);
+        assert!(worker.queues.has_pending_intents());
+        assert_eq!(worker.stats.orders_failed, 32);
+
+        let mut remaining = worker.queues.receive_envelopes();
+        worker.process_order_intents(&mut remaining).await;
+        assert!(!worker.queues.has_pending_intents());
+        assert_eq!(worker.stats.orders_failed, 40);
+        assert!(worker.attempt_stream_recovery().await);
+        assert!(worker.accepting_intents);
+        assert!(!worker.stream_recovery_pending);
+    }
+
+    #[test]
+    fn replacement_barrier_cannot_be_overwritten_by_an_older_stream_backlog() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+
+        worker.update_connection_tracking(
+            0,
+            &ExecutionEvent::ExecutionStreamBarrier {
+                stream_id: 20,
+                timestamp: 1,
+            },
+        );
+        worker.update_connection_tracking(
+            0,
+            &ExecutionEvent::ExecutionStreamBarrier {
+                stream_id: 10,
+                timestamp: 2,
+            },
+        );
+        worker.update_connection_tracking(
+            0,
+            &ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 10,
+                connected: true,
+                timestamp: 3,
+            },
+        );
+
+        assert_eq!(worker.client_latest_stream_id[0], 20);
+        assert_eq!(worker.client_stream_barriers[0], Some(20));
+        assert_eq!(worker.client_engine_ack_pending[0], None);
+        assert!(!worker.client_connected[0]);
+
+        worker.update_connection_tracking(
+            0,
+            &ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 20,
+                connected: true,
+                timestamp: 4,
+            },
+        );
+        assert_eq!(worker.client_stream_barriers[0], None);
+        assert_eq!(worker.client_engine_ack_pending[0], Some(20));
+        assert!(worker.client_connected[0]);
+    }
+
+    #[tokio::test]
+    async fn synchronized_marker_retries_recovery_after_current_health_recovers() {
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            healthy: Some(false),
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig {
+                batch_size: 1,
+                ..Default::default()
+            },
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker
+            .execution_streams
+            .push(Box::pin(futures::stream::iter(
+                [
+                    ExecutionEvent::ExecutionStreamBarrier {
+                        stream_id: 7,
+                        timestamp: 1,
+                    },
+                    ExecutionEvent::ExecutionStreamSynchronized {
+                        stream_id: 7,
+                        connected: true,
+                        timestamp: 2,
+                    },
+                ]
+                .into_iter()
+                .map(|event| IndexedExecutionStreamItem::Event {
+                    client_idx: 0,
+                    result: Ok::<_, HftError>(event),
+                }),
+            )));
+
+        assert_eq!(worker.poll_execution_events().await, 1);
+        assert_eq!(worker.poll_execution_events().await, 1);
+        assert_eq!(worker.client_engine_ack_pending[0], Some(7));
+        engine_queues.acknowledge_applied_execution_stream(7);
+        assert_eq!(worker.poll_applied_execution_streams().await, 1);
+        assert!(!worker.accepting_intents);
+        assert!(worker.stream_recovery_pending);
+        assert_eq!(worker.client_stream_barriers[0], None);
+        assert_eq!(worker.client_engine_ack_pending[0], None);
+
+        state.lock().unwrap().healthy = Some(true);
+        worker.last_stream_recovery_attempt = Instant::now() - STREAM_RECOVERY_RETRY_INTERVAL;
+        assert!(worker.retry_stream_recovery_if_due().await);
+        assert!(worker.accepting_intents);
+        assert!(!worker.stream_recovery_pending);
     }
 
     #[allow(dead_code)]
@@ -2070,7 +2633,7 @@ mod tests {
             vec![Box::new(live_client)],
             control_rx,
         );
-        live_worker.handle_execution_stream_completion().await;
+        live_worker.handle_execution_stream_completion(0).await;
         assert!(!live_worker.accepting_intents);
         assert!(live_worker.stream_recovery_pending);
 
@@ -2092,7 +2655,7 @@ mod tests {
             vec![Box::new(healthy_client)],
             control_rx,
         );
-        healthy_worker.handle_execution_stream_completion().await;
+        healthy_worker.handle_execution_stream_completion(0).await;
         assert!(healthy_worker.accepting_intents);
         assert!(!healthy_worker.stream_recovery_pending);
 
@@ -2116,10 +2679,148 @@ mod tests {
             control_rx,
         );
         disconnected_worker
-            .handle_execution_stream_completion()
+            .handle_execution_stream_completion(0)
             .await;
         assert!(!disconnected_worker.accepting_intents);
         assert!(disconnected_worker.stream_recovery_pending);
+    }
+
+    #[tokio::test]
+    async fn one_live_client_stream_completion_latches_a_multi_client_worker() {
+        let clients = (0..2)
+            .map(|_| {
+                Box::new(MockExecutionClient {
+                    state: Arc::new(StdMutex::new(MockExecutionState::default())),
+                    place_error: false,
+                    list_error: false,
+                    cancel_error: false,
+                }) as Box<dyn ExecutionClient>
+            })
+            .collect();
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            clients,
+            control_rx,
+        );
+        worker
+            .execution_streams
+            .push(Box::pin(futures::stream::iter([
+                IndexedExecutionStreamItem::Completed { client_idx: 0 },
+            ])));
+        worker
+            .execution_streams
+            .push(Box::pin(futures::stream::pending::<
+                IndexedExecutionStreamItem,
+            >()));
+
+        assert_eq!(worker.poll_execution_events().await, 0);
+        assert!(!worker.accepting_intents);
+        assert!(worker.stream_recovery_pending);
+        assert!(!worker.client_connected[0]);
+        assert!(worker.client_connected[1]);
+        assert!(!worker.execution_streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_first_submission_rejects_the_rest_of_the_batch() {
+        let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(StdMutex::new(MockExecutionState {
+            disconnect_on_first_place: Some(disconnect_tx),
+            ..Default::default()
+        }));
+        let client = MockExecutionClient {
+            state: Arc::clone(&state),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        engine_queues
+            .send_intent(create_test_intent("FIRST"))
+            .expect("queue first intent");
+        engine_queues
+            .send_intent(create_test_intent("SECOND"))
+            .expect("queue second intent");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        worker
+            .execution_streams
+            .push(Box::pin(futures::stream::unfold(
+                disconnect_rx,
+                |mut receiver| async move {
+                    receiver.recv().await.map(|event| {
+                        (
+                            IndexedExecutionStreamItem::Event {
+                                client_idx: 0,
+                                result: Ok(event),
+                            },
+                            receiver,
+                        )
+                    })
+                },
+            )));
+        let mut intents = worker.queues.receive_envelopes();
+
+        worker.process_order_intents(&mut intents).await;
+
+        assert_eq!(state.lock().unwrap().placed.len(), 1);
+        assert_eq!(worker.stats.orders_placed, 1);
+        assert_eq!(worker.stats.orders_failed, 1);
+        assert!(!worker.accepting_intents);
+        assert!(worker.stream_recovery_pending);
+    }
+
+    #[tokio::test]
+    async fn automatic_stream_recovery_does_not_override_operator_pause() {
+        let client = MockExecutionClient {
+            state: Arc::new(StdMutex::new(MockExecutionState::default())),
+            place_error: false,
+            list_error: false,
+            cancel_error: false,
+        };
+        let (_engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            vec![Box::new(client)],
+            control_rx,
+        );
+        let (pause_tx, pause_rx) = oneshot::channel();
+        worker
+            .handle_control_command(ControlCommand::SetIntake {
+                enabled: false,
+                reply: pause_tx,
+            })
+            .await;
+        assert!(pause_rx.await.expect("pause reply").is_ok());
+        assert!(!worker.operator_intake_enabled);
+
+        worker.latch_stream_recovery();
+        assert!(worker.reconcile_open_orders().await);
+        assert!(!worker.stream_recovery_pending);
+        assert!(!worker.accepting_intents);
+
+        let (resume_tx, resume_rx) = oneshot::channel();
+        worker
+            .handle_control_command(ControlCommand::SetIntake {
+                enabled: true,
+                reply: resume_tx,
+            })
+            .await;
+        assert!(resume_rx.await.expect("resume reply").is_ok());
+        assert!(worker.accepting_intents);
     }
 
     #[tokio::test]
@@ -2184,7 +2885,7 @@ mod tests {
             list_error: false,
             cancel_error: false,
         };
-        let (_engine_queues, worker_queues) =
+        let (engine_queues, worker_queues) =
             crate::create_execution_queues(crate::ExecutionQueueConfig::default());
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
         let mut worker = ExecutionWorker::new(
@@ -2214,10 +2915,29 @@ mod tests {
                 timestamp: 1,
             },
         );
-        assert!(worker.client_connected[0]);
+        assert!(!worker.client_connected[0]);
         assert!(!worker.accepting_intents);
 
-        assert!(worker.reconcile_open_orders().await);
+        worker.update_connection_tracking(
+            0,
+            &ExecutionEvent::ExecutionStreamBarrier {
+                stream_id: 17,
+                timestamp: 2,
+            },
+        );
+        worker.update_connection_tracking(
+            0,
+            &ExecutionEvent::ExecutionStreamSynchronized {
+                stream_id: 17,
+                connected: true,
+                timestamp: 3,
+            },
+        );
+        assert!(!worker.accepting_intents);
+        assert_eq!(worker.client_engine_ack_pending[0], Some(17));
+
+        engine_queues.acknowledge_applied_execution_stream(17);
+        assert_eq!(worker.poll_applied_execution_streams().await, 1);
         assert!(worker.accepting_intents);
         assert!(!worker.stream_recovery_pending);
     }

@@ -1052,7 +1052,9 @@ impl ExecutionClient for BinanceExecutionClient {
                     match result {
                         Ok(event) => Some(Ok(event)),
                         Err(e) => Some(Ok(ExecutionEvent::ReconciliationRequired {
-                            reason: format!("Binance private execution stream lagged: {e}"),
+                            reason: format!(
+                                "Binance private execution stream lagged and has no in-process watermark recovery; restart is required: {e}"
+                            ),
                             timestamp: hft_core::now_micros(),
                         })),
                     }

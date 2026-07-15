@@ -165,6 +165,14 @@ fn production_config_accepts_the_governed_paper_target() {
         .expect("canonical deployment target must resolve");
     assert!(!config.quotes_only);
     assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Paper"));
+    assert_eq!(
+        config.engine.intent_max_order_quantity,
+        Some(rust_decimal::Decimal::from(100))
+    );
+    assert_eq!(
+        config.engine.intent_max_order_notional,
+        Some(rust_decimal::Decimal::from(500))
+    );
     SystemBuilder::new(config)
         .auto_register_adapters_strict()
         .expect("paper target must have market, execution, and strategy implementations");

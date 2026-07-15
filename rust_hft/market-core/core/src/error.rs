@@ -19,6 +19,12 @@ pub enum HftError {
     #[error("執行錯誤: {0}")]
     Execution(String),
 
+    /// The adapter rejected the order before crossing the venue submission boundary. This is
+    /// deliberately distinct from transport/timeout failures after POST, whose outcome may be
+    /// unknown and therefore require emergency reconciliation.
+    #[error("訂單未提交: {0}")]
+    SubmissionNotAttempted(String),
+
     #[error("配置錯誤: {0}")]
     Config(String),
 

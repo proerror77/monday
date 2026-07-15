@@ -12,13 +12,15 @@ pub use multi_account::{
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use hft_core::{OrderId, Price, Quantity, Side, Symbol};
 use ports::{AccountView, ExecutionEvent, Position};
 use snapshot::SnapshotContainer;
 use tracing::{info, warn};
+
+const ACCOUNTING_EVENT_REPLAY_CAPACITY: usize = 200_000;
 
 /// Portfolio state that can be persisted
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +31,9 @@ pub struct PortfolioState {
     /// 已處理的成交ID（去重），恢復後避免重覆累計
     #[serde(default)]
     pub processed_fill_ids: HashMap<OrderId, HashSet<String>>,
+    /// Accounting event keys ordered oldest to newest for deterministic bounded recovery.
+    #[serde(default)]
+    pub recent_accounting_event_ids: Vec<(OrderId, String)>,
 }
 
 /// 最小 Portfolio：單帳戶，根據 fills 更新倉位/現金與 PnL
@@ -41,6 +46,8 @@ pub struct Portfolio {
     market_prices: HashMap<Symbol, Price>,
     // 已處理的成交 ID（去重）
     processed_fill_ids: HashMap<hft_core::OrderId, HashSet<String>>,
+    // Bounded chronological journal used to restore the engine replay horizon.
+    recent_accounting_event_ids: VecDeque<(OrderId, String)>,
 }
 
 impl Default for Portfolio {
@@ -53,6 +60,7 @@ impl Default for Portfolio {
             order_meta: HashMap::new(),
             market_prices: HashMap::new(),
             processed_fill_ids: HashMap::new(),
+            recent_accounting_event_ids: VecDeque::new(),
         }
     }
 }
@@ -97,10 +105,18 @@ impl Portfolio {
                 }
                 if let Some((symbol, side)) = self.order_meta.get(order_id).cloned() {
                     // De-duplication: skip duplicated fill_id for this order
-                    let set = self.processed_fill_ids.entry(order_id.clone()).or_default();
-                    if fill_id.is_empty() || !set.contains(fill_id) {
+                    let is_new = fill_id.is_empty()
+                        || self
+                            .processed_fill_ids
+                            .entry(order_id.clone())
+                            .or_default()
+                            .insert(fill_id.clone());
+                    if is_new {
                         if !fill_id.is_empty() {
-                            set.insert(fill_id.clone());
+                            self.record_accounting_event(
+                                order_id.clone(),
+                                format!("fill:{fill_id}"),
+                            );
                         }
                         self.apply_fill(&symbol, side, *price, *quantity);
                         // Fill price is the freshest executable fallback mark observed by this ledger.
@@ -121,8 +137,15 @@ impl Portfolio {
                 }
                 if self.order_meta.contains_key(order_id) {
                     let fee_id = format!("fee:{fill_id}");
-                    let set = self.processed_fill_ids.entry(order_id.clone()).or_default();
-                    if set.insert(fee_id) {
+                    let inserted = self
+                        .processed_fill_ids
+                        .entry(order_id.clone())
+                        .or_default()
+                        .insert(fee_id.clone());
+                    if inserted {
+                        if !fill_id.is_empty() {
+                            self.record_accounting_event(order_id.clone(), fee_id);
+                        }
                         self.view.cash_balance -= *amount;
                         self.view.realized_pnl -= *amount;
                         self.update_drawdown_stats();
@@ -139,6 +162,14 @@ impl Portfolio {
 
     pub fn reader(&self) -> Arc<dyn snapshot::SnapshotReader<AccountView>> {
         self.snapshot.reader()
+    }
+
+    fn record_accounting_event(&mut self, order_id: OrderId, event_id: String) {
+        if self.recent_accounting_event_ids.len() >= ACCOUNTING_EVENT_REPLAY_CAPACITY {
+            self.recent_accounting_event_ids.pop_front();
+        }
+        self.recent_accounting_event_ids
+            .push_back((order_id, event_id));
     }
 
     /// 更新市場價格並重新計算未實現盈虧
@@ -259,6 +290,7 @@ impl Portfolio {
             order_meta: self.order_meta.clone(),
             market_prices: self.market_prices.clone(),
             processed_fill_ids: self.processed_fill_ids.clone(),
+            recent_accounting_event_ids: self.recent_accounting_event_ids.iter().cloned().collect(),
         }
     }
 
@@ -275,6 +307,15 @@ impl Portfolio {
         self.order_meta = state.order_meta;
         self.market_prices = state.market_prices;
         self.processed_fill_ids = state.processed_fill_ids;
+        self.recent_accounting_event_ids = state
+            .recent_accounting_event_ids
+            .into_iter()
+            .rev()
+            .take(ACCOUNTING_EVENT_REPLAY_CAPACITY)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
 
         // Recalculate unrealized PnL with current market prices
         self.recalculate_unrealized_pnl();
@@ -322,6 +363,7 @@ impl ports::PortfolioManager for Portfolio {
             order_meta: internal_state.order_meta,
             market_prices: internal_state.market_prices,
             processed_fill_ids: internal_state.processed_fill_ids,
+            recent_accounting_event_ids: internal_state.recent_accounting_event_ids,
         }
     }
 
@@ -332,6 +374,7 @@ impl ports::PortfolioManager for Portfolio {
             order_meta: state.order_meta,
             market_prices: state.market_prices,
             processed_fill_ids: state.processed_fill_ids,
+            recent_accounting_event_ids: state.recent_accounting_event_ids,
         };
         self.import_state(internal_state);
     }

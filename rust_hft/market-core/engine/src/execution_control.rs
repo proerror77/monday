@@ -600,7 +600,8 @@ impl ExecutionControlHandle {
             order_meta: current.order_meta,
             market_prices: current.market_prices,
             processed_fill_ids: current.processed_fill_ids,
-        });
+            recent_accounting_event_ids: current.recent_accounting_event_ids,
+        })?;
         Ok(true)
     }
 
@@ -946,6 +947,7 @@ mod tests {
                     order_meta: HashMap::new(),
                     market_prices: HashMap::new(),
                     processed_fill_ids: HashMap::new(),
+                    recent_accounting_event_ids: Vec::new(),
                 },
                 snapshot: snapshot::SnapshotContainer::new(account_view),
             }

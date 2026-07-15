@@ -10,7 +10,7 @@ use ports::{AccountBalance, ExecutionClient};
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// 餘額同步配置
 #[derive(Debug, Clone)]
@@ -128,7 +128,12 @@ async fn run_balance_sync_loop<E: ExecutionClient + 'static>(
                 updated_state.account_view.cash_balance = quote_balance;
 
                 // 導入更新後的狀態
-                engine.import_portfolio_state(updated_state);
+                if let Err(import_error) = engine.import_portfolio_state(updated_state) {
+                    error!(
+                        error = %import_error,
+                        "refused to import balance update because accounting replay state is unsafe"
+                    );
+                }
             }
         }
     }
@@ -177,7 +182,9 @@ pub async fn sync_balance_once<E: ExecutionClient>(
     // 更新 Portfolio
     let mut state = engine.export_portfolio_state();
     state.account_view.cash_balance = quote_balance;
-    engine.import_portfolio_state(state);
+    engine
+        .import_portfolio_state(state)
+        .map_err(|error| format!("Portfolio 狀態導入失敗: {error}"))?;
 
     Ok(balances)
 }

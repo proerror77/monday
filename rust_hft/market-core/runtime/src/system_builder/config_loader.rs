@@ -214,6 +214,7 @@ fn convert_shared_config(shared_cfg: SharedSystemConfig) -> Result<SystemConfig,
         intent_max_latency_us: 3_000,
         intent_max_slippage_bps: None,
         intent_max_order_notional: None,
+        intent_max_order_quantity: None,
         top_n: shared_cfg.engine.top_n,
         flip_policy: FlipPolicy::OnUpdate,
         cpu_affinity: CpuAffinityConfig::default(),
@@ -1314,6 +1315,12 @@ risk:
         let yaml = serde_yaml::to_string(&config).expect("serialize config");
         let error = load_config_from_str(&yaml).expect_err("invalid order-notional limit");
         assert!(error.to_string().contains("intent_max_order_notional"));
+
+        let mut config = SystemConfig::default();
+        config.engine.intent_max_order_quantity = Some(Decimal::ZERO);
+        let yaml = serde_yaml::to_string(&config).expect("serialize config");
+        let error = load_config_from_str(&yaml).expect_err("invalid order-quantity limit");
+        assert!(error.to_string().contains("intent_max_order_quantity"));
     }
 
     #[test]

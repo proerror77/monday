@@ -292,6 +292,10 @@ fn convert_message(
             }
             let timestamp = timestamp_micros(trade.timestamp)?;
             let side = side(trade_side)?;
+            let fee_rate = trade
+                .fee_rate_bps
+                .map(|rate| rate.normalize().to_string())
+                .unwrap_or_else(|| "none".to_string());
             Ok(vec![MarketEvent::Trade(Trade {
                 symbol,
                 timestamp,
@@ -299,11 +303,11 @@ fn convert_message(
                 quantity: Quantity(quantity),
                 side,
                 // The market channel does not expose a venue trade ID. Include every stable
-                // execution field so same-millisecond, same-price trades with different size or
-                // side do not collapse in downstream dedupe.
+                // market and execution field so distinct fills do not collapse in downstream
+                // dedupe.
                 trade_id: format!(
-                    "{token}:{}:{}:{quantity}:{side:?}",
-                    trade.timestamp, trade.price
+                    "{}:{token}:{}:{}:{quantity}:{side:?}:{fee_rate}",
+                    trade.market, trade.timestamp, trade.price
                 ),
                 source_venue: Some(VenueId::POLYMARKET),
             })])
@@ -614,6 +618,31 @@ mod tests {
             r#"{"event_type":"last_trade_price","asset_id":"123","market":"$MARKET","price":"1.01","side":"SELL","size":"7","timestamp":"1004"}"#,
         );
         assert!(convert_message(invalid, &symbols(), &mut BookState::default()).is_err());
+    }
+
+    #[test]
+    fn last_trade_id_includes_market_and_fee_schedule_identity() {
+        let base = parse_one(
+            r#"{"event_type":"last_trade_price","asset_id":"123","market":"$MARKET","price":"0.61","side":"SELL","size":"7","fee_rate_bps":"100","timestamp":"1003"}"#,
+        );
+        let different_market = parse_one(
+            r#"{"event_type":"last_trade_price","asset_id":"123","market":"0x1111111111111111111111111111111111111111111111111111111111111111","price":"0.61","side":"SELL","size":"7","fee_rate_bps":"100","timestamp":"1003"}"#,
+        );
+        let different_fee_rate = parse_one(
+            r#"{"event_type":"last_trade_price","asset_id":"123","market":"$MARKET","price":"0.61","side":"SELL","size":"7","fee_rate_bps":"200","timestamp":"1003"}"#,
+        );
+
+        let trade_id = |message| {
+            let events = convert_message(message, &symbols(), &mut BookState::default()).unwrap();
+            let MarketEvent::Trade(trade) = &events[0] else {
+                panic!("expected trade")
+            };
+            trade.trade_id.clone()
+        };
+
+        let base_id = trade_id(base);
+        assert_ne!(base_id, trade_id(different_market));
+        assert_ne!(base_id, trade_id(different_fee_rate));
     }
 
     #[test]

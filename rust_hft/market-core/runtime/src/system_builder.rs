@@ -607,6 +607,7 @@ impl SystemBuilder {
         if let Err(error) = engine.set_intent_execution_limits(
             self.config.engine.intent_max_slippage_bps,
             self.config.engine.intent_max_order_notional,
+            self.config.engine.intent_max_order_quantity,
         ) {
             error!(%error, "invalid intent execution limits; engine remains paused");
             engine.pause_trading();
@@ -1690,6 +1691,7 @@ impl Default for SystemConfig {
                 intent_max_latency_us: 3000,
                 intent_max_slippage_bps: None,
                 intent_max_order_notional: None,
+                intent_max_order_quantity: None,
                 top_n: 10,
                 flip_policy: FlipPolicy::OnUpdate,
                 cpu_affinity: CpuAffinityConfig::default(),
@@ -1991,6 +1993,7 @@ mod tests {
         let mut config = SystemConfig::default();
         config.engine.intent_max_slippage_bps = Some(25);
         config.engine.intent_max_order_notional = Some(Decimal::from(50));
+        config.engine.intent_max_order_quantity = Some(Decimal::new(5, 1));
         let runtime = SystemBuilder::new(config).build();
         let (engine_queues, mut worker_queues) =
             create_execution_queues(ExecutionQueueConfig::default());
@@ -2022,6 +2025,10 @@ mod tests {
         assert_eq!(
             envelopes[0].lifecycle.max_order_notional,
             Some(Decimal::from(50))
+        );
+        assert_eq!(
+            envelopes[0].lifecycle.max_order_quantity,
+            Some(Decimal::new(5, 1))
         );
     }
 

@@ -45,6 +45,9 @@ pub struct SystemEngineConfig {
     /// Verified deployment notional ceiling attached to every order intent.
     #[serde(default)]
     pub intent_max_order_notional: Option<Decimal>,
+    /// Verified deployment quantity ceiling attached to every order intent.
+    #[serde(default)]
+    pub intent_max_order_quantity: Option<Decimal>,
     #[serde(default = "default_top_n")]
     pub top_n: usize,
     #[serde(default)]
@@ -82,6 +85,12 @@ impl SystemEngineConfig {
             .is_some_and(|value| value <= Decimal::ZERO)
         {
             return Err("engine.intent_max_order_notional must be positive".to_string());
+        }
+        if self
+            .intent_max_order_quantity
+            .is_some_and(|value| value <= Decimal::ZERO)
+        {
+            return Err("engine.intent_max_order_quantity must be positive".to_string());
         }
         Ok(())
     }

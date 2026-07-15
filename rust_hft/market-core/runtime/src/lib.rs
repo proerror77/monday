@@ -37,6 +37,7 @@ mod tests {
                 intent_max_latency_us: 3000,
                 intent_max_slippage_bps: None,
                 intent_max_order_notional: None,
+                intent_max_order_quantity: None,
                 top_n: 10,
                 flip_policy: FlipPolicy::OnUpdate,
                 cpu_affinity: CpuAffinityConfig::default(),
