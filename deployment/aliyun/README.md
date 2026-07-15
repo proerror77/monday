@@ -136,6 +136,16 @@ reintroduced as application code. The root-only shadow-gate and cutover controls
 remain part of the release bundle until the Python-to-Rust migration and its rollback
 retention window are complete; they do not collect data or execute trades.
 
+The one-hour shadow compares trades by event timestamp and exact stable record ID.
+Settlement parity uses each market's end time with a 15-minute lookback and a
+10-minute maturity lag, because independent 30-second polling schedules can record
+the same closed market on opposite sides of a wall-clock boundary. Every mature
+legacy settlement and metadata record must exist in Rust with the same canonical
+value. Additional valid Rust records are allowed, but a legacy-only record or any
+shared-value mismatch still fails closed. Field parity checks the governed record
+contract on both lanes rather than requiring every historical provider field to be
+identical.
+
 Obtain `polymarket-raw-ops` and its SHA-256 from the immutable collector build
 artifact. Verify the binary, source revision, control archive, control manifest,
 and deployment-bundle digest from the extracted artifact directory before

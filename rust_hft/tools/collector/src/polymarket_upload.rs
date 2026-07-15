@@ -389,7 +389,7 @@ fn unique_string_pair(
     Ok([strings[0].to_owned(), strings[1].to_owned()])
 }
 
-fn derived_trade_record_id(trade: &Map<String, Value>) -> String {
+pub(crate) fn derived_trade_record_id(trade: &Map<String, Value>) -> String {
     let parts = [
         value_text(trade.get("transactionHash")),
         value_text(trade.get("conditionId")),
@@ -404,7 +404,10 @@ fn derived_trade_record_id(trade: &Map<String, Value>) -> String {
     hex::encode(Sha256::digest(parts.join("|").as_bytes()))
 }
 
-fn validate_canonical_trade(update: &Map<String, Value>, line_number: usize) -> Result<String> {
+pub(crate) fn validate_canonical_trade(
+    update: &Map<String, Value>,
+    line_number: usize,
+) -> Result<String> {
     if update.get("record_id_version").and_then(Value::as_str) != Some("v2") {
         bail!("line {line_number}: polymarket_trade record_id_version must be v2");
     }
@@ -546,7 +549,22 @@ fn validate_market_context(
     Ok((tokens, outcomes))
 }
 
-fn validate_market_settlement(update: &Map<String, Value>, line_number: usize) -> Result<()> {
+pub(crate) fn validate_market_metadata(
+    update: &Map<String, Value>,
+    line_number: usize,
+) -> Result<()> {
+    for field in ["market_id", "condition_id", "symbol", "retrieved_at"] {
+        required_text(update, field, line_number)
+            .map_err(|_| anyhow!("line {line_number}: market_metadata requires {field}"))?;
+    }
+    validate_market_context(update, "market_metadata", line_number)?;
+    Ok(())
+}
+
+pub(crate) fn validate_market_settlement(
+    update: &Map<String, Value>,
+    line_number: usize,
+) -> Result<()> {
     let (tokens, outcomes) = validate_market_context(update, "market_settlement", line_number)?;
     let market = update
         .get("market")
@@ -864,12 +882,7 @@ fn scan_tape_with_identity(
 
         match kind {
             "market_metadata" => {
-                for field in ["market_id", "condition_id", "symbol", "retrieved_at"] {
-                    required_text(update, field, line_number).map_err(|_| {
-                        anyhow!("line {line_number}: market_metadata requires {field}")
-                    })?;
-                }
-                validate_market_context(update, "market_metadata", line_number)?;
+                validate_market_metadata(update, line_number)?;
                 metadata_contexts.insert(reference_context(update, line_number)?);
             }
             "polymarket_trade" => {
