@@ -88,7 +88,7 @@ impl SpoolLock {
             .truncate(false)
             .read(true)
             .write(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
             .with_context(|| format!("failed to open spool lock {}", path.display()))?;
         let metadata = file
@@ -1295,9 +1295,24 @@ fn recover_uploaded_cleanups(spool_dir: &Path) -> anyhow::Result<usize> {
 }
 
 fn cleanup_uploaded_marker(marker: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(marker) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => anyhow::bail!(
+            "refusing non-regular uploaded cleanup marker: {}",
+            marker.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect uploaded cleanup marker {}",
+                    marker.display()
+                )
+            });
+        }
+    }
     let marker_file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(marker)
         .with_context(|| {
             format!(
