@@ -315,7 +315,6 @@ fi
 
 jq -n '{
   updated_at:"2026-07-15T00:00:01Z",last_success_at:"2026-07-15T00:00:01Z",
-  cycle_started_at:"2026-07-15T00:00:00Z",cycle_duration_ms:1000,
   target_markets:14,api_errors:[],malformed_trade_rows:0,
   truncated_trade_markets:[],stale_trade_markets:[],stale_settlement_markets:[],
   overdue_unresolved_markets:[]
@@ -337,6 +336,7 @@ done
 
 jq -n '{
   updated_at:"2026-07-15T00:00:01Z",last_success_at:"2026-07-15T00:00:01Z",
+  cycle_started_at:"2026-07-15T00:00:00Z",cycle_duration_ms:1000,
   target_markets:14,missing_target_symbols:[],api_errors:[],malformed_trade_rows:0,
   trade_poll_budget:192,eligible_trade_markets:14,priority_trade_markets:8,
   selected_trade_markets:14,deferred_trade_markets:0,priority_trade_backlog:0,
