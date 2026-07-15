@@ -37,8 +37,14 @@ fi
 # shellcheck disable=SC1090
 . "$ADOPT"
 
-# Translate the Ubuntu host calls used by the helper for the macOS test host.
+# Translate the Ubuntu host calls used by the helper only on the macOS test
+# host. GitHub Actions already provides GNU stat, so preserve its arguments
+# there instead of interpreting them as BSD stat flags.
 stat() {
+  if [[ $(uname -s) != Darwin ]]; then
+    /usr/bin/stat "$@"
+    return
+  fi
   if [[ ${1:-} == -c ]]; then
     local format=$2
     shift 2
