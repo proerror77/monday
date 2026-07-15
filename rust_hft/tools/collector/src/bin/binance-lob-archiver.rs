@@ -13,7 +13,7 @@ use std::env;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -328,20 +328,31 @@ struct ProcessWatchdog {
 struct ProcessWatchdogInner {
     started: Instant,
     last_data_ms: AtomicU64,
-    armed: AtomicBool,
-    shutdown: AtomicBool,
+    state: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ProcessWatchdogState {
+    Disarmed = 0,
+    Armed = 1,
+    Firing = 2,
+    Stopped = 3,
 }
 
 impl ProcessWatchdog {
-    fn start(timeout: Duration) -> anyhow::Result<Self> {
-        let watchdog = Self {
+    fn new_state() -> Self {
+        Self {
             inner: Arc::new(ProcessWatchdogInner {
                 started: Instant::now(),
                 last_data_ms: AtomicU64::new(0),
-                armed: AtomicBool::new(false),
-                shutdown: AtomicBool::new(false),
+                state: AtomicU8::new(ProcessWatchdogState::Disarmed as u8),
             }),
-        };
+        }
+    }
+
+    fn start(timeout: Duration) -> anyhow::Result<Self> {
+        let watchdog = Self::new_state();
         let monitor = watchdog.clone();
         thread::Builder::new()
             .name("binance-lob-process-watchdog".into())
@@ -349,13 +360,11 @@ impl ProcessWatchdog {
                 let interval = timeout
                     .div_f64(4.0)
                     .clamp(Duration::from_secs(1), Duration::from_secs(10));
-                while !monitor.inner.shutdown.load(Ordering::Relaxed) {
+                while monitor.state() != ProcessWatchdogState::Stopped {
                     thread::sleep(interval);
                     let now_ms = monitor.elapsed_ms();
-                    let last_ms = monitor.inner.last_data_ms.load(Ordering::Relaxed);
-                    if monitor.inner.armed.load(Ordering::Relaxed)
-                        && process_watchdog_expired(last_ms, now_ms, timeout)
-                    {
+                    if monitor.try_begin_exit_at(now_ms, timeout) {
+                        let last_ms = monitor.inner.last_data_ms.load(Ordering::Relaxed);
                         error!(
                             silent_ms = now_ms.saturating_sub(last_ms),
                             "process watchdog exiting after market-data stall"
@@ -365,7 +374,7 @@ impl ProcessWatchdog {
                 }
             })?;
         watchdog.mark_data();
-        watchdog.inner.armed.store(true, Ordering::Relaxed);
+        anyhow::ensure!(watchdog.arm(), "process watchdog failed to arm");
         Ok(watchdog)
     }
 
@@ -375,8 +384,93 @@ impl ProcessWatchdog {
             .store(self.elapsed_ms(), Ordering::Relaxed);
     }
 
+    fn arm(&self) -> bool {
+        self.inner
+            .state
+            .compare_exchange(
+                ProcessWatchdogState::Disarmed as u8,
+                ProcessWatchdogState::Armed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn disarm(&self) -> bool {
+        loop {
+            match self.state() {
+                ProcessWatchdogState::Armed => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            ProcessWatchdogState::Armed as u8,
+                            ProcessWatchdogState::Disarmed as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                ProcessWatchdogState::Disarmed | ProcessWatchdogState::Stopped => return true,
+                ProcessWatchdogState::Firing => return false,
+            }
+        }
+    }
+
     fn stop(&self) {
-        self.inner.shutdown.store(true, Ordering::Relaxed);
+        loop {
+            let current = self.state();
+            match current {
+                ProcessWatchdogState::Stopped | ProcessWatchdogState::Firing => return,
+                ProcessWatchdogState::Disarmed | ProcessWatchdogState::Armed => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            current as u8,
+                            ProcessWatchdogState::Stopped as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn try_begin_exit_at(&self, now_ms: u64, timeout: Duration) -> bool {
+        if !process_watchdog_expired(
+            self.inner.last_data_ms.load(Ordering::Relaxed),
+            now_ms,
+            timeout,
+        ) {
+            return false;
+        }
+        self.inner
+            .state
+            .compare_exchange(
+                ProcessWatchdogState::Armed as u8,
+                ProcessWatchdogState::Firing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn state(&self) -> ProcessWatchdogState {
+        match self.inner.state.load(Ordering::Acquire) {
+            0 => ProcessWatchdogState::Disarmed,
+            1 => ProcessWatchdogState::Armed,
+            2 => ProcessWatchdogState::Firing,
+            3 => ProcessWatchdogState::Stopped,
+            state => unreachable!("invalid process watchdog state {state}"),
+        }
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -386,6 +480,17 @@ impl ProcessWatchdog {
 
 fn process_watchdog_expired(last_data_ms: u64, now_ms: u64, timeout: Duration) -> bool {
     now_ms.saturating_sub(last_data_ms) > timeout.as_millis() as u64
+}
+
+fn publish_global_shutdown(shutdown: &watch::Sender<bool>, watchdog: &ProcessWatchdog) -> bool {
+    // Publish shutdown only after the watchdog is disarmed. Receivers may spend
+    // up to ZSTD_TIMEOUT_SECONDS closing their final segment, which is expected
+    // progress and must not be mistaken for a market-data stall.
+    if !watchdog.disarm() {
+        return false;
+    }
+    let _ = shutdown.send(true);
+    true
 }
 
 #[tokio::main]
@@ -413,7 +518,7 @@ async fn main() -> anyhow::Result<()> {
     let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let upload_task = tokio::spawn(upload_loop(config.clone(), shutdown_rx.clone()));
-    let shutdown_signal = tokio::spawn(wait_for_signal(shutdown_tx.clone()));
+    let shutdown_signal = tokio::spawn(wait_for_signal(shutdown_tx.clone(), watchdog.clone()));
 
     let mut backoff = 1_u64;
     while !*shutdown_rx.borrow() {
@@ -427,7 +532,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let _ = shutdown_tx.send(true);
+    publish_global_shutdown(&shutdown_tx, &watchdog);
     watchdog.stop();
     upload_task.await?;
     shutdown_signal.abort();
@@ -487,8 +592,13 @@ async fn run_session(
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
-                changed?;
-                break;
+                if changed.is_err() || *shutdown.borrow() {
+                    // Defensive in case a future shutdown publisher bypasses
+                    // publish_global_shutdown: disarm before task drain and
+                    // final segment compression begin.
+                    watchdog.disarm();
+                    break;
+                }
             }
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 match joined {
@@ -1496,7 +1606,7 @@ fn upload_one(config: &UploadConfig, manifest: &Path) -> anyhow::Result<()> {
     cleanup_uploaded_marker(&marker)
 }
 
-async fn wait_for_signal(shutdown: watch::Sender<bool>) {
+async fn wait_for_signal(shutdown: watch::Sender<bool>, watchdog: ProcessWatchdog) {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -1509,7 +1619,7 @@ async fn wait_for_signal(shutdown: watch::Sender<bool>) {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
-    let _ = shutdown.send(true);
+    publish_global_shutdown(&shutdown, &watchdog);
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -1582,6 +1692,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Barrier;
 
     #[test]
     fn upload_only_cli_is_explicit_and_exclusive() {
@@ -2239,6 +2350,84 @@ mod tests {
             181_001,
             Duration::from_secs(180)
         ));
+    }
+
+    fn armed_watchdog() -> ProcessWatchdog {
+        let watchdog = ProcessWatchdog::new_state();
+        watchdog.inner.last_data_ms.store(1_000, Ordering::Relaxed);
+        assert!(watchdog.arm());
+        watchdog
+    }
+
+    #[tokio::test]
+    async fn global_shutdown_receiver_observes_a_disarmed_watchdog() {
+        let watchdog = armed_watchdog();
+        let observed_watchdog = watchdog.clone();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let receiver = tokio::spawn(async move {
+            shutdown_rx
+                .changed()
+                .await
+                .expect("observe global shutdown");
+            assert!(*shutdown_rx.borrow());
+            assert_eq!(observed_watchdog.state(), ProcessWatchdogState::Disarmed);
+            assert!(!observed_watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
+        });
+
+        assert!(publish_global_shutdown(&shutdown_tx, &watchdog));
+        receiver.await.expect("join shutdown observer");
+    }
+
+    #[test]
+    fn shutdown_disarm_and_watchdog_firing_are_one_atomic_race() {
+        for _ in 0..32 {
+            let watchdog = armed_watchdog();
+            let publisher_watchdog = watchdog.clone();
+            let firing_watchdog = watchdog.clone();
+            let barrier = Arc::new(Barrier::new(3));
+            let publisher_barrier = barrier.clone();
+            let firing_barrier = barrier.clone();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let publisher = thread::spawn(move || {
+                publisher_barrier.wait();
+                publish_global_shutdown(&shutdown_tx, &publisher_watchdog)
+            });
+            let firing = thread::spawn(move || {
+                firing_barrier.wait();
+                firing_watchdog.try_begin_exit_at(181_001, Duration::from_secs(180))
+            });
+            barrier.wait();
+
+            let published = publisher.join().expect("join shutdown publisher");
+            let claimed_exit = firing.join().expect("join watchdog firing claimant");
+            assert_ne!(published, claimed_exit);
+            assert_eq!(*shutdown_rx.borrow(), published);
+            assert_eq!(
+                watchdog.state(),
+                if published {
+                    ProcessWatchdogState::Disarmed
+                } else {
+                    ProcessWatchdogState::Firing
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_session_failure_path_keeps_watchdog_armed_for_reconnect() {
+        let watchdog = armed_watchdog();
+        let mut config = test_config("http://unused".into());
+        config.symbols.clear();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let error = run_session(Arc::new(config), shutdown_rx, watchdog.clone())
+            .await
+            .expect_err("empty session must return to the reconnect loop");
+
+        assert!(error.to_string().contains("no active symbols remain"));
+        assert_eq!(watchdog.state(), ProcessWatchdogState::Armed);
+        assert!(watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
     }
 
     #[test]
