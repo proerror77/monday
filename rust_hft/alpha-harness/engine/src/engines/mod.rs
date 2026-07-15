@@ -33,7 +33,10 @@ impl DeterministicRng {
 
 #[cfg(test)]
 fn test_dataset() -> crate::evaluation::PreparedDataset {
-    use crate::evaluation::{prepare_dataset, ResearchRow, WalkForwardConfig};
+    use crate::evaluation::{prepare_dataset, ResearchRow};
+    use alpha_domain::{
+        EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
+    };
     use chrono::{Duration, Utc};
 
     let start = Utc::now();
@@ -50,14 +53,26 @@ fn test_dataset() -> crate::evaluation::PreparedDataset {
         .collect();
     prepare_dataset(
         rows,
-        &WalkForwardConfig {
-            initial_train_rows: 1,
-            validation_rows: 1,
-            fold_count: 1,
-            purge_rows: 0,
-            embargo_rows: 0,
-            sealed_holdout_rows: 1,
-        },
+        &EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 1,
+                validation_rows: 1,
+                fold_count: 1,
+                purge_rows: 1,
+                embargo_rows: 0,
+                sealed_holdout_rows: 1,
+            },
+            EvaluationCostsV1 {
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                latency_bps: 0.0,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: 1_000,
+            },
+        )
+        .unwrap(),
         "engine-checkpoint-test",
     )
     .unwrap()

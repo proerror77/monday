@@ -465,6 +465,8 @@ mod tests {
             failure_reasons: vec![],
             evaluator_version: "test".to_string(),
             evaluator_config: serde_json::json!({"fixture": true}),
+            evaluation_protocol: None,
+            evaluation_protocol_hash: None,
             metrics: crate::EvaluationMetrics {
                 predictive: crate::PredictiveMetrics::from_folds(vec![]),
                 row_count: 1,

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+test-support = []
+
 [dependencies]
 alpha-domain = { path = "../domain" }
 chrono = { workspace = true, features = ["serde"] }

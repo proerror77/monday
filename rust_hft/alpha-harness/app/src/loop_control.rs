@@ -547,12 +547,13 @@ mod tests {
     use alpha_domain::{
         deployment_scope_hash, sign_runtime_attribution_event, AllowedIntentType, ApprovalClass,
         AttributionKind, AttributionOutcome, CandidateArtifact, DeploymentEnvelope, EngineKind,
+        EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
         IterationVerdict, LiveSmallEligibilityEvidence, MissionTerminalReason, ResearchIteration,
         ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
         SEALED_HOLDOUT_EVALUATOR_VERSION,
     };
     use alpha_engine::{
-        evaluation::{prepare_dataset, WalkForwardConfig},
+        evaluation::prepare_dataset,
         formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
         CandidateEvaluation, CandidateEvaluator, EngineProposal, EvaluationMetrics,
         FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
@@ -851,14 +852,16 @@ mod tests {
                     dataset_manifest: db.with_extension("missing-manifest.json"),
                     validation: ValidationArgs {
                         initial_train_rows: 1,
-                        validation_rows: 1,
-                        fold_count: 1,
-                        purge_rows: 0,
+                        validation_rows: 30,
+                        fold_count: 2,
+                        purge_rows: 1,
                         embargo_rows: 0,
-                        sealed_holdout_rows: 1,
+                        sealed_holdout_rows: 30,
                         fee_bps: 1.0,
                         funding_bps: 0.0,
                         latency_bps: 0.5,
+                        label_horizon_buckets: 1,
+                        observation_frequency_millis: 60_000,
                     },
                 },
             },
@@ -900,12 +903,35 @@ mod tests {
                 })
                 .collect(),
         );
+        let protocol = EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 1,
+                validation_rows: 30,
+                fold_count: 2,
+                purge_rows: 1,
+                embargo_rows: 0,
+                sealed_holdout_rows: 30,
+            },
+            EvaluationCostsV1 {
+                fee_bps: 1.0,
+                funding_bps: 0.0,
+                latency_bps: 0.5,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: 60_000,
+            },
+        )
+        .unwrap();
+        let protocol_hash = protocol.content_hash().unwrap();
         CandidateEvaluation {
             passed: true,
             score: 2.0,
             failure_reasons: vec![],
             evaluator_version: version.to_string(),
             evaluator_config: evaluator.config_evidence().unwrap(),
+            evaluation_protocol: Some(protocol),
+            evaluation_protocol_hash: Some(protocol_hash),
             metrics: EvaluationMetrics {
                 predictive,
                 row_count: 30 * fold_count,
@@ -931,10 +957,42 @@ mod tests {
         candidate_id: &str,
         engine: EngineKind,
     ) {
+        create_completed_mission_with_engine_and_dataset(
+            db,
+            mission_id,
+            candidate_id,
+            engine,
+            None,
+        );
+    }
+
+    fn create_completed_mission_with_engine_and_dataset(
+        db: &PathBuf,
+        mission_id: &str,
+        candidate_id: &str,
+        engine: EngineKind,
+        dataset: Option<&DatasetManifest>,
+    ) {
         let now = Utc::now();
         let mut store = AlphaStore::open(db).unwrap();
-        let mission = mission_fixture(now, mission_id);
+        let mut mission = mission_fixture(now, mission_id);
+        if let Some(dataset) = dataset {
+            mission.dataset_manifest_id =
+                serde_json::from_value(serde_json::json!(dataset.manifest_id)).unwrap();
+        }
         store.create_mission(&mission).unwrap();
+        if let Some(dataset) = dataset {
+            store
+                .put_registry_revision(&RegistryRevision {
+                    revision_id: dataset.manifest_id.clone(),
+                    registry_kind: "dataset".to_string(),
+                    asset_id: dataset.symbol.clone(),
+                    parent_revision_id: None,
+                    payload: serde_json::to_value(dataset).unwrap(),
+                    created_at: dataset.created_at,
+                })
+                .unwrap();
+        }
         let evaluation_id = format!("evaluation-{mission_id}");
         let iteration = ResearchIteration {
             iteration_id: format!("iteration-{mission_id}"),
@@ -986,6 +1044,12 @@ mod tests {
 
     fn add_sealed_holdout_pass(db: &PathBuf, mission_id: &str, candidate_id: &str) {
         let mut store = AlphaStore::open(db).unwrap();
+        let dataset_manifest_id = store
+            .get_mission(mission_id)
+            .unwrap()
+            .dataset_manifest_id
+            .as_str()
+            .to_string();
         let candidate_hash = store
             .mission_lineage(mission_id)
             .unwrap()
@@ -994,6 +1058,12 @@ mod tests {
             .find(|candidate| candidate.candidate_id == candidate_id)
             .unwrap()
             .content_hash;
+        let evaluation = canonical_evaluation(SEALED_HOLDOUT_EVALUATOR_VERSION, 1);
+        let evaluation_protocol_hash = evaluation
+            .evaluation_protocol_hash
+            .as_deref()
+            .unwrap()
+            .to_string();
         store
             .put_registry_revision(&RegistryRevision {
                 revision_id: governance::sealed_evaluation_revision_id(
@@ -1006,11 +1076,9 @@ mod tests {
                 payload: serde_json::json!({
                     "mission_id": mission_id,
                     "candidate_content_hash": candidate_hash,
-                    "dataset_manifest_id": "dataset-loop",
-                    "evaluation": canonical_evaluation(
-                        SEALED_HOLDOUT_EVALUATOR_VERSION,
-                        1,
-                    )
+                    "dataset_manifest_id": dataset_manifest_id,
+                    "evaluation_protocol_hash": evaluation_protocol_hash,
+                    "evaluation": evaluation,
                 }),
                 created_at: Utc::now(),
             })
@@ -1248,7 +1316,14 @@ mod tests {
         let db = temp_db_path("alpha-loop-legacy-sealed");
         let mission_id = "mission-loop";
         let candidate_id = "candidate-1";
-        create_completed_mission(&db, mission_id, candidate_id);
+        let (directory, manifest_path, manifest) = governed_dataset_fixture(mission_id);
+        create_completed_mission_with_engine_and_dataset(
+            &db,
+            mission_id,
+            candidate_id,
+            EngineKind::ManualSeed,
+            Some(&manifest),
+        );
         let mut store = AlphaStore::open(&db).unwrap();
         let candidate_hash = store.mission_lineage(mission_id).unwrap().candidates[0]
             .content_hash
@@ -1265,7 +1340,7 @@ mod tests {
                 payload: serde_json::json!({
                     "mission_id": mission_id,
                     "candidate_content_hash": candidate_hash,
-                    "dataset_manifest_id": "dataset-loop",
+                    "dataset_manifest_id": manifest.manifest_id,
                     "evaluation": {
                         "passed": true,
                         "score": 1.0,
@@ -1278,7 +1353,8 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        let mut args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        args.mission.dataset.dataset_manifest = manifest_path;
         let error = governance::evaluate(EvaluateArgs {
             db: db.clone(),
             mission_id: mission_id.to_string(),
@@ -1289,6 +1365,7 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("legacy or malformed"));
         let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1296,15 +1373,18 @@ mod tests {
         let db = temp_db_path("alpha-loop-offline-rl-lab");
         let mission_id = "mission-loop";
         let candidate_id = "candidate-rl";
-        create_completed_mission_with_engine(
+        let (directory, manifest_path, manifest) = governed_dataset_fixture(mission_id);
+        create_completed_mission_with_engine_and_dataset(
             &db,
             mission_id,
             candidate_id,
             EngineKind::OfflineReinforcementLearning,
+            Some(&manifest),
         );
         add_sealed_holdout_pass(&db, mission_id, candidate_id);
 
-        let args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        let mut args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        args.mission.dataset.dataset_manifest = manifest_path;
         let dataset = args.mission.dataset.clone();
         run_loop(args).unwrap();
         let run = AlphaStore::open(&db)
@@ -1334,6 +1414,7 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("lab search-policy output"));
         let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1458,19 +1539,20 @@ mod tests {
                 fee_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.0,
+                label_horizon_buckets: 1,
+                observation_frequency_millis: 60_000,
             },
         };
         let research_rows = data_mission::load_research_rows(&manifest, 0.0, 0.0, 0.0).unwrap();
         let prepared = prepare_dataset(
             research_rows,
-            &WalkForwardConfig {
-                initial_train_rows: dataset_args.validation.initial_train_rows,
-                validation_rows: dataset_args.validation.validation_rows,
-                fold_count: dataset_args.validation.fold_count,
-                purge_rows: dataset_args.validation.purge_rows,
-                embargo_rows: dataset_args.validation.embargo_rows,
-                sealed_holdout_rows: dataset_args.validation.sealed_holdout_rows,
-            },
+            &dataset_args
+                .validation
+                .evaluation_protocol(&alpha_domain::EvaluationLabelSpecV1 {
+                    horizon_buckets: 1,
+                    observation_frequency_millis: 60_000,
+                })
+                .unwrap(),
             format!("sealed:{}", manifest.manifest_id),
         )
         .unwrap();
@@ -1552,6 +1634,14 @@ mod tests {
             dataset: dataset_args.clone(),
         })
         .unwrap();
+        governance::evaluate(EvaluateArgs {
+            db: db.clone(),
+            mission_id: mission_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            model_root: None,
+            dataset: dataset_args.clone(),
+        })
+        .expect("the same evaluation protocol must reuse sealed evidence idempotently");
         governance::promote(PromoteArgs {
             db: db.clone(),
             mission_id: mission_id.to_string(),
@@ -1584,6 +1674,19 @@ mod tests {
             let evaluation = sealed.payload.get("evaluation").unwrap();
             let typed: CandidateEvaluation = serde_json::from_value(evaluation.clone()).unwrap();
             typed.validate().unwrap();
+            let (_, protocol_hash) = typed.protocol_binding().unwrap();
+            assert_eq!(
+                sealed
+                    .payload
+                    .get("evaluation_protocol_hash")
+                    .and_then(serde_json::Value::as_str),
+                Some(protocol_hash)
+            );
+            assert_eq!(bundle.evaluation_protocol_hash, protocol_hash);
+            assert_eq!(
+                promotion.record.evaluation_protocol_hash,
+                bundle.evaluation_protocol_hash
+            );
             assert_eq!(
                 bundle.evaluator_config_hash,
                 alpha_domain::canonical_json_hash(evaluation.get("evaluator_config").unwrap())

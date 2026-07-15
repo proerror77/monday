@@ -8,7 +8,7 @@ use alpha_engine::{
         BayesianOptimizerEngine, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
         OfflineTrace,
     },
-    evaluation::{prepare_dataset, WalkForwardConfig},
+    evaluation::prepare_dataset,
     formula_evaluator::FormulaEvaluator,
     learning::{close_learning_loop, FailureCritic, LearningConfig},
     llm::{LlmConfig, LlmProposalEngine, OpenAiCompatibleClient},
@@ -60,16 +60,11 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
         args.dataset.validation.funding_bps,
         args.dataset.validation.latency_bps,
     )?;
+    let labels = manifest.evaluation_label_spec()?;
+    let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
     let dataset = prepare_dataset(
         rows,
-        &WalkForwardConfig {
-            initial_train_rows: args.dataset.validation.initial_train_rows,
-            validation_rows: args.dataset.validation.validation_rows,
-            fold_count: args.dataset.validation.fold_count,
-            purge_rows: args.dataset.validation.purge_rows,
-            embargo_rows: args.dataset.validation.embargo_rows,
-            sealed_holdout_rows: args.dataset.validation.sealed_holdout_rows,
-        },
+        &protocol,
         format!("sealed:{}", manifest.manifest_id()),
     )?;
     let proposal_engine = build_engine(args, &dataset)?;

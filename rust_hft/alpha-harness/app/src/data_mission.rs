@@ -1,3 +1,4 @@
+use alpha_domain::EvaluationLabelSpecV1;
 use alpha_engine::evaluation::ResearchRow;
 use alpha_store::{AlphaStore, RegistryRevision};
 use anyhow::{bail, Context};
@@ -68,6 +69,24 @@ impl RegisteredResearchDataset {
             }
             Self::FeatureMatrix(manifest) => {
                 load_feature_research_rows(manifest, fee_bps, funding_bps, latency_bps)
+            }
+        }
+    }
+
+    pub fn evaluation_label_spec(&self) -> anyhow::Result<EvaluationLabelSpecV1> {
+        match self {
+            Self::Ohlcv(manifest) => Ok(EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: u64::try_from(manifest.interval.milliseconds())
+                    .context("OHLC interval is not a positive millisecond frequency")?,
+            }),
+            Self::FeatureMatrix(manifest) => {
+                // Re-read and validate the content-addressed PIT rows before trusting label facts.
+                read_feature_rows(manifest).map_err(anyhow::Error::msg)?;
+                Ok(EvaluationLabelSpecV1 {
+                    horizon_buckets: manifest.label_spec.horizon_buckets,
+                    observation_frequency_millis: manifest.label_spec.observation_frequency_millis,
+                })
             }
         }
     }
@@ -325,6 +344,13 @@ mod tests {
         write_json_atomic(&manifest_path, &manifest).unwrap();
 
         let registered = read_registered_research_dataset(&store, &manifest_path).unwrap();
+        assert_eq!(
+            registered.evaluation_label_spec().unwrap(),
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: 60_000,
+            }
+        );
         let loaded = registered.load_rows(1.0, 0.0, 0.5).unwrap();
 
         assert_eq!(loaded[0].available_time, rows[0].label_available_time);

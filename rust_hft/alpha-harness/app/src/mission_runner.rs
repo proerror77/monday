@@ -1,6 +1,7 @@
 use crate::{
     cli::{
         print_json, DatasetArgs, EngineChoice, EvaluateArgs, ExecuteMissionArgs, RunMissionArgs,
+        ValidationArgs,
     },
     data_mission, governance, mission,
 };
@@ -40,6 +41,8 @@ struct Materialization {
     source_revision: String,
     source_segments: Vec<SourceSegment>,
     artifact_sha256: String,
+    bucket_ms: u64,
+    label_horizon_buckets: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,7 +87,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     let materialization: Materialization =
         serde_json::from_slice(&std::fs::read(&materialization_path)?)
             .context("materialization manifest is invalid JSON")?;
-    validate_materialization(&materialization, &feature_sha256)?;
+    validate_materialization(&materialization, &feature_sha256, &args.validation)?;
 
     let db = results_dir.join("alpha.duckdb");
     let feature_manifest_path = results_dir.join("feature-manifest.json");
@@ -100,8 +103,10 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         || feature_manifest.source_revisions.get(&source_key)
             != Some(&materialization.source_revision)
         || feature_manifest.artifact_sha256 != feature_sha256
+        || feature_manifest.label_spec.horizon_buckets != materialization.label_horizon_buckets
+        || feature_manifest.label_spec.observation_frequency_millis != materialization.bucket_ms
     {
-        bail!("registered feature lineage does not match the materialization");
+        bail!("registered feature lineage or label facts do not match the materialization");
     }
     data_mission::write_json_atomic(&feature_manifest_path, &feature_manifest)?;
     data_mission::write_json_atomic(
@@ -255,6 +260,7 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
 fn validate_materialization(
     materialization: &Materialization,
     feature_sha256: &str,
+    validation: &ValidationArgs,
 ) -> anyhow::Result<()> {
     if materialization.dataset_kind != MATERIALIZATION_KIND
         || materialization.schema_version != MATERIALIZATION_SCHEMA
@@ -265,8 +271,15 @@ fn validate_materialization(
         || !matches!(materialization.market.as_str(), "spot" | "usdm")
         || materialization.source_revision.trim().is_empty()
         || materialization.source_segments.is_empty()
+        || materialization.bucket_ms == 0
+        || materialization.label_horizon_buckets == 0
     {
         bail!("materialization lineage is incomplete");
+    }
+    if materialization.bucket_ms != validation.observation_frequency_millis
+        || materialization.label_horizon_buckets != validation.label_horizon_buckets
+    {
+        bail!("evaluation label horizon or frequency does not match the materialization");
     }
     let artifact_sha256 = normalized_sha256("feature artifact", &materialization.artifact_sha256)?;
     for segment in &materialization.source_segments {
@@ -568,12 +581,14 @@ mod tests {
                 initial_train_rows: 40,
                 validation_rows: 30,
                 fold_count: 2,
-                purge_rows: 1,
+                purge_rows: 5,
                 embargo_rows: 1,
                 sealed_holdout_rows: 30,
                 fee_bps: 1.0,
                 funding_bps: 0.0,
                 latency_bps: 0.5,
+                label_horizon_buckets: 5,
+                observation_frequency_millis: 1_000,
             },
         };
         Fixture {
