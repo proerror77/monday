@@ -10,10 +10,10 @@ pub struct ThresholdRule {
 impl SignalSource for ThresholdRule {
     fn signal(&self, obs: &FactorObservation) -> Signal {
         let v = (self.extractor)(obs);
-        if self.buy_above.map_or(false, |t| v > t) {
+        if self.buy_above.is_some_and(|t| v > t) {
             return Signal::Buy;
         }
-        if self.sell_below.map_or(false, |t| v < t) {
+        if self.sell_below.is_some_and(|t| v < t) {
             return Signal::Sell;
         }
         Signal::Hold

@@ -19,9 +19,11 @@ The supported model lane is the native Burn binary-probability trainer in
   projects feature values from a closed, label-free registry against that exact
   content-addressed snapshot row; callers cannot supply feature values, clocks,
   outcomes, or settlement timestamps.
-- Snapshot v2 atomically reads the exact UP/DOWN token pair, its complementary
-  official outcome, and when both persisted token versions became locally
-  available. It uses the later of `resolved_at` and a content-changing
+- Snapshot v2 atomically reads the exact UP/DOWN token-primary-key pair, its
+  complementary official outcome, and when both persisted token versions became
+  locally available. Shared market identities must agree, but a numeric event
+  ID is not assumed to equal a human-readable market slug. It uses the later of
+  `resolved_at` and a content-changing
   `fetched_at` (which also covers legacy resolved rows). Snapshot construction,
   coverage checks, and the trainer reject missing, pre-settlement,
   inconsistent, or post-snapshot clocks.

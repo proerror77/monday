@@ -14,7 +14,7 @@ fn main() -> Result<()> {
     let markdown = event_ml_architecture_markdown(&architecture);
 
     if let Some(output_dir) = config.output_dir.as_ref() {
-        fs::create_dir_all(&output_dir)
+        fs::create_dir_all(output_dir)
             .with_context(|| format!("create output dir {}", output_dir.display()))?;
 
         let json_path = output_dir.join("event_ml_architecture.json");

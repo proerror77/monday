@@ -958,7 +958,7 @@ async fn load_official_binary_outcomes(
     pool: &sqlx::PgPool,
     observations: &[FactorObservation],
 ) -> Result<HashMap<OfficialOutcomeKey, OfficialBinaryOutcome>> {
-    let mut contracts = observations
+    let contracts = observations
         .iter()
         .map(|row| {
             (
@@ -968,6 +968,19 @@ async fn load_official_binary_outcomes(
             )
         })
         .collect::<Vec<_>>();
+    let mut connection = pool
+        .acquire()
+        .await
+        .context("acquire connection for official binary outcomes")?;
+    load_official_binary_outcomes_for_contracts(&mut connection, &contracts).await
+}
+
+#[cfg(feature = "db")]
+async fn load_official_binary_outcomes_for_contracts(
+    connection: &mut sqlx::PgConnection,
+    contracts: &[OfficialOutcomeKey],
+) -> Result<HashMap<OfficialOutcomeKey, OfficialBinaryOutcome>> {
+    let mut contracts = contracts.to_vec();
     contracts.sort();
     contracts.dedup();
     if contracts.is_empty() {
@@ -1005,22 +1018,37 @@ async fn load_official_binary_outcomes(
             ) AS label_observed_at
         FROM requested
         JOIN pm_token_settlements AS up_settlement
-          ON up_settlement.market_slug = requested.event_id
-         AND up_settlement.token_id = requested.up_token_id
+          ON up_settlement.token_id = requested.up_token_id
          AND up_settlement.resolved = TRUE
         JOIN pm_token_settlements AS down_settlement
-          ON down_settlement.market_slug = requested.event_id
-         AND down_settlement.token_id = requested.down_token_id
+          ON down_settlement.token_id = requested.down_token_id
          AND down_settlement.resolved = TRUE
         WHERE up_settlement.settled_price IN (0::numeric, 1::numeric)
           AND down_settlement.settled_price IN (0::numeric, 1::numeric)
           AND up_settlement.settled_price + down_settlement.settled_price = 1::numeric
+          AND (
+                (up_settlement.condition_id IS NOT NULL
+                 AND up_settlement.condition_id = down_settlement.condition_id)
+             OR (up_settlement.market_id IS NOT NULL
+                 AND up_settlement.market_id = down_settlement.market_id)
+             OR (up_settlement.market_slug IS NOT NULL
+                 AND up_settlement.market_slug = down_settlement.market_slug)
+          )
+          AND (up_settlement.condition_id IS NULL
+               OR down_settlement.condition_id IS NULL
+               OR up_settlement.condition_id = down_settlement.condition_id)
+          AND (up_settlement.market_id IS NULL
+               OR down_settlement.market_id IS NULL
+               OR up_settlement.market_id = down_settlement.market_id)
+          AND (up_settlement.market_slug IS NULL
+               OR down_settlement.market_slug IS NULL
+               OR up_settlement.market_slug = down_settlement.market_slug)
         "#,
     )
     .bind(&event_ids)
     .bind(&up_token_ids)
     .bind(&down_token_ids)
-    .fetch_all(pool)
+    .fetch_all(connection)
     .await
     .context("load exact official binary outcomes and observation clocks")?;
 
@@ -1867,6 +1895,171 @@ mod tests {
             exact_official_binary_outcome(&outcomes, "event-1", "up", "down"),
             Some(&expected)
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    #[ignore = "requires a migrated PostgreSQL database via PLOY_TEST_DATABASE_URL"]
+    async fn postgres_official_outcomes_use_token_primary_keys_and_version_clocks() {
+        let database_url = std::env::var("PLOY_TEST_DATABASE_URL").expect(
+            "PLOY_TEST_DATABASE_URL is required for the ignored PostgreSQL integration test",
+        );
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect to PostgreSQL fixture");
+        let mut transaction = pool.begin().await.expect("begin PostgreSQL fixture");
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let event_a = format!("1888667-{suffix}");
+        let event_b = format!("1888668-{suffix}");
+        let up_a = format!("up-a-{suffix}");
+        let down_a = format!("down-a-{suffix}");
+        let up_b = format!("up-b-{suffix}");
+        let down_b = format!("down-b-{suffix}");
+        let conflicting_down = format!("down-conflict-{suffix}");
+        let slug_a = format!("btc-updown-5m-{suffix}");
+        let slug_b = format!("sol-updown-5m-{suffix}");
+        let condition_b = format!("condition-b-{suffix}");
+        let conflicting_condition = format!("condition-conflict-{suffix}");
+        let market_b = format!("market-b-{suffix}");
+        let resolved_at = "2026-07-15T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let fetched_a_up = resolved_at + chrono::Duration::microseconds(10);
+        let fetched_a_down = resolved_at + chrono::Duration::microseconds(20);
+        let fetched_b_up = resolved_at + chrono::Duration::microseconds(30);
+        let fetched_b_down = resolved_at + chrono::Duration::microseconds(40);
+
+        let fixtures = [
+            (&up_a, None, None, &slug_a, 1_i32, fetched_a_up),
+            (&down_a, None, None, &slug_a, 0_i32, fetched_a_down),
+            (
+                &up_b,
+                Some(condition_b.as_str()),
+                Some(market_b.as_str()),
+                &slug_b,
+                0_i32,
+                fetched_b_up,
+            ),
+            (
+                &down_b,
+                Some(condition_b.as_str()),
+                Some(market_b.as_str()),
+                &slug_b,
+                1_i32,
+                fetched_b_down,
+            ),
+            (
+                &conflicting_down,
+                Some(conflicting_condition.as_str()),
+                Some(market_b.as_str()),
+                &slug_b,
+                1_i32,
+                fetched_b_down,
+            ),
+        ];
+        for (token_id, condition_id, market_id, market_slug, price, fetched_at) in fixtures {
+            sqlx::query(
+                r#"
+                INSERT INTO pm_token_settlements (
+                    token_id, condition_id, market_id, market_slug, outcome,
+                    settled_price, resolved, resolved_at, fetched_at
+                ) VALUES ($1, $2, $3, $4, 'fixture', $5::numeric, TRUE, $6, $7)
+                "#,
+            )
+            .bind(token_id)
+            .bind(condition_id)
+            .bind(market_id)
+            .bind(market_slug)
+            .bind(price)
+            .bind(resolved_at)
+            .bind(fetched_at)
+            .execute(&mut *transaction)
+            .await
+            .expect("insert official outcome fixture");
+        }
+
+        let contracts = vec![
+            (event_a.clone(), up_a.clone(), down_a.clone()),
+            (event_b.clone(), up_b.clone(), down_b.clone()),
+            (format!("cross-{suffix}"), up_a.clone(), down_b.clone()),
+            (
+                format!("identity-conflict-{suffix}"),
+                up_b.clone(),
+                conflicting_down.clone(),
+            ),
+        ];
+        let outcomes = load_official_binary_outcomes_for_contracts(&mut transaction, &contracts)
+            .await
+            .expect("load official outcome fixtures");
+        assert_eq!(
+            outcomes.get(&(event_a.clone(), up_a.clone(), down_a.clone())),
+            Some(&OfficialBinaryOutcome {
+                settlement_up: true,
+                observed_at: fetched_a_down,
+            })
+        );
+        assert_eq!(
+            outcomes.get(&(event_b.clone(), up_b.clone(), down_b.clone())),
+            Some(&OfficialBinaryOutcome {
+                settlement_up: false,
+                observed_at: fetched_b_down,
+            })
+        );
+        assert!(!outcomes.contains_key(&(format!("cross-{suffix}"), up_a.clone(), down_b.clone())));
+        assert!(!outcomes.contains_key(&(
+            format!("identity-conflict-{suffix}"),
+            up_b.clone(),
+            conflicting_down.clone(),
+        )));
+
+        let correction_observed_at = resolved_at + chrono::Duration::microseconds(100);
+        sqlx::query(
+            r#"
+            UPDATE pm_token_settlements
+            SET settled_price = CASE WHEN token_id = $1 THEN 0 ELSE 1 END,
+                fetched_at = $3
+            WHERE token_id = ANY($2::text[])
+            "#,
+        )
+        .bind(&up_a)
+        .bind(vec![up_a.clone(), down_a.clone()])
+        .bind(correction_observed_at)
+        .execute(&mut *transaction)
+        .await
+        .expect("apply official outcome correction fixture");
+        let corrected = load_official_binary_outcomes_for_contracts(
+            &mut transaction,
+            &[(event_a.clone(), up_a.clone(), down_a.clone())],
+        )
+        .await
+        .expect("reload corrected official outcome");
+        assert_eq!(
+            corrected.get(&(event_a.clone(), up_a.clone(), down_a.clone())),
+            Some(&OfficialBinaryOutcome {
+                settlement_up: false,
+                observed_at: correction_observed_at,
+            })
+        );
+
+        sqlx::query("UPDATE pm_token_settlements SET settled_price = 0 WHERE token_id = $1")
+            .bind(&down_b)
+            .execute(&mut *transaction)
+            .await
+            .expect("make the second pair non-complementary");
+        let non_complementary = load_official_binary_outcomes_for_contracts(
+            &mut transaction,
+            &[(event_b.clone(), up_b.clone(), down_b.clone())],
+        )
+        .await
+        .expect("query non-complementary fixture");
+        assert!(non_complementary.is_empty());
+
+        transaction
+            .rollback()
+            .await
+            .expect("roll back official outcome fixtures");
     }
 
     #[test]

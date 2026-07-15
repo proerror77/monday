@@ -561,8 +561,6 @@ impl ReturnBuffer {
     }
 }
 
-/// Load LOB snapshots for research, downsampled to one tick per `sample_every_secs` seconds.
-
 /// Rolling accumulator for LOB flow signals over a time window.
 struct LobFlowAccumulator {
     entries: VecDeque<(DateTime<Utc>, f64, f64, f64)>, // (ts, obi, depth_imbalance, microprice_offset_bps)
@@ -2288,7 +2286,10 @@ pub fn observations_to_frame(rows: &[FactorObservation]) -> PolarsResult<DataFra
     ]
 }
 
-fn row_factor_accessors() -> Vec<(&'static str, fn(&FactorObservation) -> f64)> {
+type RowFactorAccessor = (&'static str, fn(&FactorObservation) -> f64);
+type EventFactorAccessor = (&'static str, fn(&EventFactorSummary) -> f64);
+
+fn row_factor_accessors() -> Vec<RowFactorAccessor> {
     vec![
         ("signed_distance_to_beat", |row| row.signed_distance_to_beat),
         ("abs_distance_to_beat", |row| row.abs_distance_to_beat),
@@ -2348,7 +2349,7 @@ fn row_factor_accessors() -> Vec<(&'static str, fn(&FactorObservation) -> f64)> 
     ]
 }
 
-fn event_factor_accessors() -> Vec<(&'static str, fn(&EventFactorSummary) -> f64)> {
+fn event_factor_accessors() -> Vec<EventFactorAccessor> {
     vec![
         ("signed_distance_to_beat", |row| row.signed_distance_to_beat),
         ("abs_distance_to_beat", |row| row.abs_distance_to_beat),

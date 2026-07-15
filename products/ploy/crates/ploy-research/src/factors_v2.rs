@@ -598,9 +598,10 @@ pub struct PredictionResearchFeedback {
     pub candidates: Vec<PredictionResearchCandidateFeedback>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SettlementProbabilityDataQualityMode {
+    #[default]
     StrictContinuous,
     EventComplete,
 }
@@ -611,12 +612,6 @@ impl SettlementProbabilityDataQualityMode {
             Self::StrictContinuous => "strict_continuous",
             Self::EventComplete => "event_complete",
         }
-    }
-}
-
-impl Default for SettlementProbabilityDataQualityMode {
-    fn default() -> Self {
-        Self::StrictContinuous
     }
 }
 
@@ -1237,19 +1232,10 @@ pub struct LiquidityGateV1Report {
     pub metrics: FactorSelectionMetrics,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LiquidityGatedAlphaV1Options {
     pub gate: LiquidityGateV1Options,
     pub walk_forward: FactorWalkForwardOptions,
-}
-
-impl Default for LiquidityGatedAlphaV1Options {
-    fn default() -> Self {
-        Self {
-            gate: LiquidityGateV1Options::default(),
-            walk_forward: FactorWalkForwardOptions::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -6687,6 +6673,9 @@ fn bucket_num(value: f64) -> String {
     raw.replace('-', "m").replace('.', "p")
 }
 
+// Keep the promotion diagnostics named at the decision boundary; collapsing
+// them into positional tuples would make audit changes easier to miss.
+#[allow(clippy::too_many_arguments)]
 fn stability_decision(
     windows: usize,
     positive_window_ratio: f64,
@@ -6766,6 +6755,8 @@ fn decision_rank(decision: FactorStabilityDecision) -> usize {
     }
 }
 
+// Window identity is intentionally explicit in persisted evidence.
+#[allow(clippy::too_many_arguments)]
 fn fit_combo_v1_window(
     train_rows: &[&FactorObservationV2],
     test_rows: &[&FactorObservationV2],
@@ -7139,6 +7130,8 @@ fn aggregate_meta_label_windows(
     out
 }
 
+// Keep every promotion diagnostic named at this auditable decision boundary.
+#[allow(clippy::too_many_arguments)]
 fn meta_label_readiness_decision(
     windows: usize,
     positive_windows: usize,
@@ -7201,6 +7194,8 @@ fn meta_label_readiness_decision(
     (FactorStabilityDecision::Candidate, "passed".to_string())
 }
 
+// Window identity is intentionally explicit in persisted evidence.
+#[allow(clippy::too_many_arguments)]
 fn fit_walk_forward_factor(
     train_rows: &[&FactorObservationV2],
     test_rows: &[&FactorObservationV2],
@@ -7841,19 +7836,17 @@ pub fn build_full_depth_execution_matrix(
         rows.sort_by_key(|row| row.tick_ts);
     }
 
-    let mut groups: BTreeMap<
-        (
-            String,
-            &'static str,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        ),
-        Vec<FullDepthExecutionSample>,
-    > = BTreeMap::new();
+    type ExecutionGroupKey = (
+        String,
+        &'static str,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    );
+    let mut groups: BTreeMap<ExecutionGroupKey, Vec<FullDepthExecutionSample>> = BTreeMap::new();
     let stakes = if options.stakes_usd.is_empty() {
         vec![DEFAULT_STAKE_USD]
     } else {
@@ -12137,7 +12130,7 @@ mod tests {
             ..Default::default()
         };
         let boundary = build_factor_observations_v2_with_deribit_and_pm_books(
-            &[obs.clone()],
+            std::slice::from_ref(&obs),
             &[],
             &[book.clone()],
             &options,

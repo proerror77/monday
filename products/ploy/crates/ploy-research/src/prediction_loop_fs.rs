@@ -29,6 +29,7 @@ impl OutputLock {
         let path = output_dir.join(".prediction-research-loop.lock");
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -279,10 +280,7 @@ pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     serde_json::from_slice(&body).map_err(|error| format!("parse JSON {}: {error}", path.display()))
 }
 
-pub(crate) fn artifact_path<'a>(
-    output_root: &'a Path,
-    artifact: &ArtifactRef,
-) -> Result<PathBuf, String> {
+pub(crate) fn artifact_path(output_root: &Path, artifact: &ArtifactRef) -> Result<PathBuf, String> {
     let relative = Path::new(&artifact.path);
     if relative.is_absolute()
         || relative.components().any(|component| {

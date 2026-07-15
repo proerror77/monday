@@ -39,19 +39,19 @@ jobs:
           set -euo pipefail
 
           forbidden_paths="$(git ls-files \
-            ':(glob)**/*.py' \
-            ':(glob)**/*.pyw' \
-            ':(glob)**/*.ipynb' \
-            ':(glob)**/*.py[cod]' \
-            ':(glob)**/requirements*.txt' \
-            ':(glob)**/pyproject.toml' \
-            ':(glob)**/Pipfile' \
-            ':(glob)**/poetry.lock' \
-            ':(glob)**/pytest.ini' \
-            ':(glob)**/tox.ini' \
-            ':(glob)**/setup.py')"
+            ':(icase,glob)**/*.py' \
+            ':(icase,glob)**/*.pyw' \
+            ':(icase,glob)**/*.ipynb' \
+            ':(icase,glob)**/*.py[cod]' \
+            ':(icase,glob)**/requirements*.txt' \
+            ':(icase,glob)**/pyproject.toml' \
+            ':(icase,glob)**/Pipfile' \
+            ':(icase,glob)**/poetry.lock' \
+            ':(icase,glob)**/pytest.ini' \
+            ':(icase,glob)**/tox.ini' \
+            ':(icase,glob)**/setup.py')"
           if [ -n "${forbidden_paths}" ]; then
-            echo "tracked Python source, notebook, bytecode, or packaging artifact is forbidden" >&2
+            echo "tracked Py""thon source, notebook, bytecode, or packaging artifact is forbidden" >&2
             printf '%s\n' "${forbidden_paths}" >&2
             exit 1
           fi
@@ -96,25 +96,26 @@ jobs:
           reject_python_text \
             "Python shebang" \
             '^#!.*python([0-9]+([.][0-9]+)?)?([[:space:]]|$)' \
+            --ignore-case \
             "${shebang_pathspecs[@]}"
 
           inline_command_pathspecs=(
-            ':(glob)**/*.sh'
-            ':(glob)**/*.bash'
-            ':(glob)**/*.zsh'
-            ':(glob)**/*.yml'
-            ':(glob)**/*.yaml'
-            ':(glob)**/*.toml'
-            ':(glob)**/*.service'
-            ':(glob)**/*.timer'
-            ':(glob)**/*.socket'
-            ':(glob)**/*.conf'
-            ':(glob)**/Dockerfile*'
-            ':(glob)**/Makefile'
-            ':(glob)**/Justfile'
-            ':(glob)**/bin/*'
-            ':(glob)**/scripts/*'
-            ':(glob)**/scripts/**/*'
+            ':(icase,glob)**/*.sh'
+            ':(icase,glob)**/*.bash'
+            ':(icase,glob)**/*.zsh'
+            ':(icase,glob)**/*.yml'
+            ':(icase,glob)**/*.yaml'
+            ':(icase,glob)**/*.toml'
+            ':(icase,glob)**/*.service'
+            ':(icase,glob)**/*.timer'
+            ':(icase,glob)**/*.socket'
+            ':(icase,glob)**/*.conf'
+            ':(icase,glob)**/Dockerfile*'
+            ':(icase,glob)**/Makefile'
+            ':(icase,glob)**/Justfile'
+            ':(icase,glob)**/bin/*'
+            ':(icase,glob)**/scripts/*'
+            ':(icase,glob)**/scripts/**/*'
             ':(exclude,glob)**/docs/archive/**'
             ':(exclude,glob)**/docs/plans/**'
             ':(exclude,glob)**/docs/reviews/**'
@@ -124,6 +125,7 @@ jobs:
           reject_python_text \
             "Python runtime or package-manager command" \
             'actions/setup-pyth[o]n@|astral-sh/setup-u[v]@|(^|[;&|()/[:space:]])(python([0-9]+([.][0-9]+)?)?|pip([0-9]+)?|pipx|pytest|poetry|pdm|rye|conda|mamba|hatch|tox|virtualenv)([[:space:]]|$)|(^|[;&|()/[:space:]])uv[[:space:]]+(run|sync|pip|venv|python)([[:space:]]|$)' \
+            --ignore-case \
             "${inline_command_pathspecs[@]}"
 
           rust_template_pathspecs=(

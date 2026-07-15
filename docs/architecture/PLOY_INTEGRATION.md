@@ -70,9 +70,11 @@ must be rebuilt into a new snapshot. The mission binds the snapshot's strong
 `snapshot_contract_hash`, which covers the evaluator-visible manifest semantics
 and artifacts, rather than relying only on the legacy content hash.
 
-Prediction snapshot v2 atomically reads the exact UP/DOWN token pair, its
-complementary official outcome, and the local availability time of both
-persisted token versions from `pm_token_settlements`. Coverage gates reject
+Prediction snapshot v2 atomically reads the exact UP/DOWN token-primary-key
+pair, its complementary official outcome, and the local availability time of
+both persisted token versions from `pm_token_settlements`. It validates shared,
+non-conflicting market identities without assuming a numeric event ID equals a
+human-readable market slug. Coverage gates reject
 missing or impossible clocks, while the loader hashes and parses the same
 captured artifact bytes. Burn training accepts only a sealed snapshot reloaded
 against the mission's trusted `snapshot_contract_hash`. The shared walk-forward

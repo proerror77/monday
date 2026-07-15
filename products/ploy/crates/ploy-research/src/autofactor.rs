@@ -2233,7 +2233,7 @@ fn deterministic_mutation_layer(
                             (threshold * 100.0).round() as usize
                         ),
                         gate(seed.expr.clone(), input(feature), threshold),
-                        &format!(
+                        format!(
                             "add_feature_gate: discovery-only selector requiring {feature} >= {threshold:.2}; promotion still requires runtime replay.",
                         ),
                     );
@@ -2789,6 +2789,9 @@ fn top_bucket_event_decision_stats(
     (counts.len(), counts.values().copied().max().unwrap_or(0))
 }
 
+// These scalar diagnostics are kept named at the decision boundary so audit
+// output cannot silently depend on tuple position.
+#[allow(clippy::too_many_arguments)]
 fn autofactor_decision(
     n: usize,
     complexity: usize,

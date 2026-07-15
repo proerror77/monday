@@ -43,8 +43,9 @@ Prediction training additionally accepts only an immutable
 `VerifiedBinarySnapshot` handle. The loader verifies the snapshot's evaluator
 artifacts against a caller-supplied trusted `snapshot_contract_hash`; no public
 constructor or mutable accessor can bypass that check. Snapshot v2 atomically
-binds the exact UP/DOWN token pair, its complementary official outcome, and the
-locally recorded availability time of both persisted token versions. The loader
+binds the exact UP/DOWN token-primary-key pair, its complementary official
+outcome, and the locally recorded availability time of both persisted token
+versions without conflating numeric event IDs with market slugs. The loader
 hashes and parses the same captured artifact bytes, including the Parquet label
 clock at microsecond precision. Both Burn training and the shared walk-forward
 path used by the actual LoopRun cut off training labels by that availability

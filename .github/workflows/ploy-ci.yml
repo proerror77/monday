@@ -106,19 +106,19 @@ jobs:
           set -euo pipefail
 
           forbidden_paths="$(git ls-files \
-            ':(glob)**/*.py' \
-            ':(glob)**/*.pyw' \
-            ':(glob)**/*.ipynb' \
-            ':(glob)**/*.py[cod]' \
-            ':(glob)**/requirements*.txt' \
-            ':(glob)**/pyproject.toml' \
-            ':(glob)**/Pipfile' \
-            ':(glob)**/poetry.lock' \
-            ':(glob)**/pytest.ini' \
-            ':(glob)**/tox.ini' \
-            ':(glob)**/setup.py')"
+            ':(icase,glob)**/*.py' \
+            ':(icase,glob)**/*.pyw' \
+            ':(icase,glob)**/*.ipynb' \
+            ':(icase,glob)**/*.py[cod]' \
+            ':(icase,glob)**/requirements*.txt' \
+            ':(icase,glob)**/pyproject.toml' \
+            ':(icase,glob)**/Pipfile' \
+            ':(icase,glob)**/poetry.lock' \
+            ':(icase,glob)**/pytest.ini' \
+            ':(icase,glob)**/tox.ini' \
+            ':(icase,glob)**/setup.py')"
           if [ -n "${forbidden_paths}" ]; then
-            echo "tracked Python source, notebook, bytecode, or packaging artifact is forbidden" >&2
+            echo "tracked Py""thon source, notebook, bytecode, or packaging artifact is forbidden" >&2
             printf '%s\n' "${forbidden_paths}" >&2
             exit 1
           fi
@@ -127,8 +127,13 @@ jobs:
             label="$1"
             pattern="$2"
             shift 2
+            grep_args=(-n -I -E)
+            if [ "${1:-}" = "--ignore-case" ]; then
+              grep_args+=(-i)
+              shift
+            fi
             set +e
-            matches="$(git grep -n -I -E "${pattern}" -- "$@")"
+            matches="$(git grep "${grep_args[@]}" "${pattern}" -- "$@")"
             scan_status=$?
             set -e
             case "${scan_status}" in
@@ -158,25 +163,26 @@ jobs:
           reject_python_text \
             "Python shebang" \
             '^#!.*python([0-9]+([.][0-9]+)?)?([[:space:]]|$)' \
+            --ignore-case \
             "${shebang_pathspecs[@]}"
 
           inline_command_pathspecs=(
-            ':(glob)**/*.sh'
-            ':(glob)**/*.bash'
-            ':(glob)**/*.zsh'
-            ':(glob)**/*.yml'
-            ':(glob)**/*.yaml'
-            ':(glob)**/*.toml'
-            ':(glob)**/*.service'
-            ':(glob)**/*.timer'
-            ':(glob)**/*.socket'
-            ':(glob)**/*.conf'
-            ':(glob)**/Dockerfile*'
-            ':(glob)**/Makefile'
-            ':(glob)**/Justfile'
-            ':(glob)**/bin/*'
-            ':(glob)**/scripts/*'
-            ':(glob)**/scripts/**/*'
+            ':(icase,glob)**/*.sh'
+            ':(icase,glob)**/*.bash'
+            ':(icase,glob)**/*.zsh'
+            ':(icase,glob)**/*.yml'
+            ':(icase,glob)**/*.yaml'
+            ':(icase,glob)**/*.toml'
+            ':(icase,glob)**/*.service'
+            ':(icase,glob)**/*.timer'
+            ':(icase,glob)**/*.socket'
+            ':(icase,glob)**/*.conf'
+            ':(icase,glob)**/Dockerfile*'
+            ':(icase,glob)**/Makefile'
+            ':(icase,glob)**/Justfile'
+            ':(icase,glob)**/bin/*'
+            ':(icase,glob)**/scripts/*'
+            ':(icase,glob)**/scripts/**/*'
             ':(exclude,glob)**/docs/archive/**'
             ':(exclude,glob)**/docs/plans/**'
             ':(exclude,glob)**/docs/reviews/**'
@@ -186,6 +192,7 @@ jobs:
           reject_python_text \
             "Python runtime or package-manager command" \
             'actions/setup-pyth[o]n@|astral-sh/setup-u[v]@|(^|[;&|()/[:space:]])(python([0-9]+([.][0-9]+)?)?|pip([0-9]+)?|pipx|pytest|poetry|pdm|rye|conda|mamba|hatch|tox|virtualenv)([[:space:]]|$)|(^|[;&|()/[:space:]])uv[[:space:]]+(run|sync|pip|venv|python)([[:space:]]|$)' \
+            --ignore-case \
             "${inline_command_pathspecs[@]}"
 
           if git grep -n -E '(name = "(burn-tch|tch|torch-sys|pyo3[^"]*|cpython|rust-cpython|python3-sys|rustpython[^"]*)"|^[[:space:]]*(burn-tch|tch|torch-sys|pyo3([-_][A-Za-z0-9_-]+)?|cpython|rust-cpython|python3-sys|rustpython([-_][A-Za-z0-9_-]+)?)[[:space:]]*=)' -- \
@@ -579,6 +586,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.91
+          components: clippy
 
       - name: Install build dependencies
         run: |
@@ -608,6 +616,7 @@ jobs:
           cargo test --locked -p ploy-feed-loaders --lib
           cargo test --locked -p ploy-research --lib
           cargo test --locked -p ploy-research --features ml --lib
+          cargo clippy --locked -p ploy-research --features ml --all-targets --no-deps -- -D warnings
           cargo check --locked -p ploy-research --example prediction_research_loop
           cargo check --locked -p ploy-research --features db --example factor_walk_forward_v2
           cargo test --locked -p ploy-market-data --features audit --lib --examples
@@ -629,11 +638,17 @@ jobs:
       - name: Check research heavy lane
         env:
           DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
+          PLOY_TEST_DATABASE_URL: postgres://ploy:${{ github.run_id }}@localhost:5432/ploy_test
           RUSTC_WRAPPER: sccache
         run: |
           set -euo pipefail
           SECONDS=0
           cargo check --locked -p ploy-research --features db,polars-export,ml,rl,strategy-runtime --lib
+          cargo test --locked -p ploy-research --features db --lib -- --ignored --list \
+            | grep -F 'research_snapshot::tests::postgres_official_outcomes_use_token_primary_keys_and_version_clocks: test'
+          cargo test --locked -p ploy-research --features db \
+            research_snapshot::tests::postgres_official_outcomes_use_token_primary_keys_and_version_clocks \
+            --lib -- --ignored --exact
           echo "### Rust research heavy lane" >> "$GITHUB_STEP_SUMMARY"
           echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
 

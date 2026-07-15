@@ -820,10 +820,10 @@ fn unblocked_runtime_candidate_score(
     let version_ok = contract.get("version").and_then(serde_json::Value::as_str)
         == Some("autofactor_runtime_contract_v1");
     if !version_ok
-        || !contract
+        || contract
             .get("strategy_profile")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|profile| !profile.is_empty())
+            .is_none_or(|profile| profile.is_empty())
         || !json_array_empty(contract.get("blockers"))
     {
         return None;

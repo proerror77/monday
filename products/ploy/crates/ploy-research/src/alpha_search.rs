@@ -415,6 +415,9 @@ pub fn write_alpha_search_artifacts_with_state(
     )
 }
 
+// Keep the stable artifact-writer API explicit; grouping these optional evidence
+// inputs would be a breaking change for existing research callers.
+#[allow(clippy::too_many_arguments)]
 pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
     output_root: impl AsRef<Path>,
     target: &str,
@@ -946,9 +949,7 @@ fn strip_runtime_selector_gates(suffix: &str) -> Option<String> {
     let mut remaining_suffix = suffix.to_string();
     while let Some((remaining, selector)) = remaining_suffix.split_once("_select_") {
         let (_feature, raw_threshold, trailing_suffix) = parse_runtime_selector_gate(selector)?;
-        if parse_runtime_selector_threshold(raw_threshold).is_none() {
-            return None;
-        }
+        parse_runtime_selector_threshold(raw_threshold)?;
         remaining_suffix = format!("{remaining}{trailing_suffix}");
     }
     Some(remaining_suffix)
@@ -2593,7 +2594,7 @@ mod tests {
         grandchild.parent_name = Some(child.name.clone());
         grandchild.top_bucket_avg_label = 0.40;
 
-        let reports = vec![root, sibling, child, grandchild];
+        let reports = [root, sibling, child, grandchild];
         let metrics = reports
             .iter()
             .enumerate()
@@ -2735,7 +2736,7 @@ mod tests {
         one_event.top_bucket_unique_event_count = one_event.top_bucket_n;
         one_event.top_bucket_max_event_decisions = 1;
 
-        let reports = vec![repeated, one_event];
+        let reports = [repeated, one_event];
         let runtime_avoidances = Vec::new();
         let subtree_frequencies = Vec::new();
         let metrics = reports
@@ -2860,7 +2861,7 @@ mod tests {
             executable_edge_pass_min_edge: 5,
         };
         let runtime_avoidances = runtime_avoidances(Some(&feedback), None);
-        let reports = vec![collapsed, alternative];
+        let reports = [collapsed, alternative];
         let subtree_frequencies = Vec::new();
         let metrics = reports
             .iter()
@@ -2919,7 +2920,7 @@ mod tests {
             ..Default::default()
         };
         let prior_avoidances = runtime_avoidances(None, Some(&prior));
-        let reports = vec![squashed, spread_adjusted, alternative];
+        let reports = [squashed, spread_adjusted, alternative];
         let subtree_frequencies = Vec::new();
         let metrics = reports
             .iter()

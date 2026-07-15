@@ -4,7 +4,10 @@ use ploy_operator_contracts::Regime;
 
 const MIN_OBS: usize = 10;
 
-const FACTOR_EXTRACTORS: &[(&str, fn(&FactorObservation) -> f64)] = &[
+type FactorExtractor = (&'static str, fn(&FactorObservation) -> f64);
+type LabelExtractor = (&'static str, fn(&FactorObservation) -> Option<f64>);
+
+const FACTOR_EXTRACTORS: &[FactorExtractor] = &[
     ("distance_over_sigma", |o| o.distance_over_sigma),
     ("model_prob_up", |o| o.model_prob_up),
     ("drift_30s", |o| o.drift_30s),
@@ -38,7 +41,7 @@ fn event_bucket_id(event_id: &str) -> i64 {
     h.finish() as i64
 }
 
-const LABELS: &[(&str, fn(&FactorObservation) -> Option<f64>)] = &[
+const LABELS: &[LabelExtractor] = &[
     ("settlement_up", |o| Some(o.settlement_up)),
     ("future_up_ask_change_30s", |o| o.future_up_ask_change_30s),
 ];
