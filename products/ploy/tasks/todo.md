@@ -32,6 +32,25 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [x] Port the long-lived Polymarket reference collector and raw-tape uploader to Rust, and retire their Python runtime entry points.
 - [x] Coalesce Polymarket price-change batches before publishing quotes so transient crossed intermediate states are never recorded.
 
+## Research framework cleanup
+
+- [x] Adapt the prediction Loop to binary/digital-option factors by exposing a point-in-time Chainlink endpoint-probability component without duplicating the existing CEX model.
+- [x] Split every prediction walk-forward lane by event end so unresolved events cannot cross train/test boundaries.
+- [x] Run `ploy-research` library tests in the active root CI workflow.
+- [x] Preserve Monday's Factor Bank, Search Protocol, artifact/experiment/factor stores, `factorctl`, active DSL, manifest, and harness contracts while moving the prediction research loop into PLOY Rust.
+- [x] Pass governed mission context and bounded prior verdicts into LLM proposals, with code-enforced mutable scope.
+- [x] Gate prediction OOS evidence with Brier score, log loss, calibration error, settlement PnL, and event-level capacity.
+- [x] Route typed probability-blend candidates into the prediction evaluator and emit candidate-specific loop feedback.
+- [x] Add separate governed BTC and SOL five-minute mission templates; reject mixed-symbol missions and unresolved provenance.
+- [x] Add a resumable PLOY prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
+- [x] Implement the complete authoritative prediction LoopRun and tests in `ploy-research` Rust without introducing a Python runner; retire the Binance-to-opening-reference backfill helper.
+- [x] Recompute terminal provisional models from typed Brier, log-loss, ECE, settlement-PnL, and conservative-capacity metrics recorded in append-only feedback; require a separate sealed snapshot for final keep.
+- [x] Recover LLM provider, model, and usage provenance from the same content-addressed response envelope after a crash.
+- [x] Require explicit, non-empty Chainlink reference plus Binance spot/aggTrade/L2 snapshot surfaces, replayed by `received_at`, before a BTC/SOL LoopRun starts.
+- [x] Retire the legacy Binance-to-`price_to_beat` backfill path so Binance cannot override Chainlink opening/settlement authority.
+- [x] Enforce mission, symbol, horizon, and exact snapshot provenance again at the Rust evaluator boundary.
+- [x] Keep feedback mission-local and return no-OOS plus conservative-capacity failure reasons for every proposed blend.
+
 ## Safety
 
 - Live trading stays disabled.

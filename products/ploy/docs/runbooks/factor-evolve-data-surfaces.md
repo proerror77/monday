@@ -21,8 +21,9 @@ diagnostic search toward executable replay or dry-run handoff.
 
 | Surface | Current status | Taxonomy | Promotion rule |
 | --- | --- | --- | --- |
-| Binance aggTrade / spot ticks | Present | `required_for_prediction` | Required for crypto event movement features. |
-| Binance partial LOB snapshots | Present | `required_for_prediction` | Diagnostic only; not queue or passive-fill proof. |
+| Chainlink opening reference and close | Present for PM5D evidence | `required_for_prediction` | Contract truth for threshold and settlement; cannot be replaced by Binance. |
+| Binance aggTrade / spot ticks | Present | `required_for_prediction` | External predictor/repricing input only; never settlement or execution truth. |
+| Binance partial LOB snapshots | Present | `required_for_prediction` | External predictor/repricing diagnostic only; not settlement, queue, or passive-fill proof. |
 | Binance futures local book | Contract added; collector replay not first-class | `required_for_prediction` | `missing_blocks_promotion` for hypotheses that depend on sequence-correct depth imbalance. |
 | Polymarket quote ticks | Present | `required_for_execution` | Required for top-of-book state and quote freshness. |
 | Polymarket full CLOB snapshots | Present and archived | `required_for_execution` | `missing_blocks_promotion` for executable-price or capacity claims. |
@@ -48,6 +49,9 @@ diagnostic search toward executable replay or dry-run handoff.
 5. Runtime dry-run fills prove observed execution behavior only after a
    candidate exists. They do not replace historical executable replay or
    official settlement labels.
+6. Binance data cannot populate or backfill the Chainlink opening reference or
+   settlement label. Polymarket CLOB quotes and full depth are the only research
+   surfaces for executable price, fees, fillability, and capacity.
 
 ## Research Issue Checklist
 

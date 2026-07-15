@@ -1,5 +1,6 @@
 #!/bin/bash
-# 验证 price_to_beat 采集器是否正常工作
+# Verify Chainlink-owned price_to_beat coverage. This script must never be used
+# to justify a Binance-derived opening reference or settlement label.
 
 : "${PGPASSWORD:?Set PGPASSWORD before running this check}"
 psql -U postgres -d ploy << 'EOF'

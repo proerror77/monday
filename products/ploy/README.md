@@ -10,6 +10,11 @@ Python research/compatibility utilities remain only behind explicit parity gates
 the root CI checks them for source compatibility but does not deploy the nested
 historical PLOY workflows.
 
+The authoritative prediction-research LoopRun is implemented in Rust in
+`crates/ploy-research` and exposed by the `prediction_research_loop` example.
+Python helpers are compatibility or one-shot analysis tools; they do not own
+LoopRun state, evidence, evaluation, promotion, or execution authority.
+
 ## Execution boundary
 
 Monday's `rust_hft` runtime is the only production authority for risk, OMS,

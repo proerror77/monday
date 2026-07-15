@@ -220,14 +220,43 @@ pub struct NamedFactorExpr {
     pub parent_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmPriorSpec {
     #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub mission_id: Option<String>,
+    #[serde(default)]
+    pub data_snapshot_id: Option<String>,
+    #[serde(default)]
+    pub prompt_snapshot_id: Option<String>,
+    #[serde(default)]
+    pub search_policy_snapshot_id: Option<String>,
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub horizon: Option<String>,
+    #[serde(default)]
     pub mutations: Vec<LlmMutationSpec>,
+    #[serde(default)]
+    pub probability_blends: Vec<LlmProbabilityBlendSpec>,
     #[serde(default)]
     pub runtime_avoid_factors: Vec<RuntimeAvoidFactorSpec>,
     #[serde(default)]
     pub structural_avoid_signatures: Vec<StructuralAvoidSignatureSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmProbabilityBlendSpec {
+    pub name: String,
+    pub hypothesis: String,
+    pub market_midpoint_weight: f64,
+    #[serde(default)]
+    pub chainlink_digital_weight: f64,
+    pub distance_lob_vol_weight: f64,
+    pub event_surface_weight: f64,
+    pub existing_model_weight: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +287,8 @@ pub struct StructuralAvoidSignatureSpec {
 pub struct LlmMutationSpec {
     pub base_factor: String,
     pub mutation_type: String,
+    #[serde(default)]
+    pub hypothesis: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -1780,14 +1811,23 @@ fn llm_prior_mutation_candidates(
             .map(|name| sanitize_factor_name(name))
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("llm_{}_{}", base.name, suffix));
+        let mut notes = vec![format!(
+            "Typed LLM-prior mutation `{}` compiled from base factor `{}`.",
+            mutation.mutation_type, base.name
+        )];
+        if let Some(hypothesis) = mutation
+            .hypothesis
+            .as_deref()
+            .map(str::trim)
+            .filter(|hypothesis| !hypothesis.is_empty())
+        {
+            notes.push(format!("Falsifiable hypothesis: {hypothesis}"));
+        }
         out.push(NamedFactorExpr {
             name,
             expr,
             target: base.target.clone(),
-            notes: vec![format!(
-                "Typed LLM-prior mutation `{}` compiled from base factor `{}`.",
-                mutation.mutation_type, base.name
-            )],
+            notes,
             parent_name: Some(base.name.clone()),
         });
     }
@@ -3083,6 +3123,7 @@ mod tests {
             regime: Regime::Middle,
             side: ReviewSide::Up,
             side_model_prob: (0.50 + score * 0.01).clamp(0.01, 0.99),
+            side_chainlink_prob: f64::NAN,
             side_fair_prob: (0.50 + score * 0.01).clamp(0.01, 0.99),
             side_model_edge: score * 0.01,
             side_distance_over_sigma: 0.25,
@@ -3767,6 +3808,10 @@ mod tests {
             mutations: vec![LlmMutationSpec {
                 base_factor: "auto_settlement_model_full_depth_settlement_edge".to_string(),
                 mutation_type: "add_feature_gate".to_string(),
+                hypothesis: Some(
+                    "Near-strike observations should contain more settlement information."
+                        .to_string(),
+                ),
                 name: Some("llm_full_depth_edge_near_strike".to_string()),
                 feature: Some("near_strike_score".to_string()),
                 denominator_feature: None,
@@ -3775,6 +3820,7 @@ mod tests {
                 hi: None,
                 window: None,
             }],
+            ..Default::default()
         };
 
         let reports = mine_domain_autofactors_from_v2_with_guidance(
@@ -3818,6 +3864,9 @@ mod tests {
                     "auto_settlement_model_full_depth_settlement_edge_x_near_strike_x_capacity"
                         .to_string(),
                 mutation_type: "remove_component".to_string(),
+                hypothesis: Some(
+                    "Removing near-strike weighting should reveal whether it overfits.".to_string(),
+                ),
                 name: Some("llm_full_depth_edge_without_near_strike".to_string()),
                 feature: Some("near_strike_score".to_string()),
                 denominator_feature: None,
@@ -3826,6 +3875,7 @@ mod tests {
                 hi: None,
                 window: None,
             }],
+            ..Default::default()
         };
 
         let reports = mine_domain_autofactors_from_v2_with_guidance(

@@ -520,6 +520,14 @@ jobs:
             ${{ runner.os }}-sccache-research-heavy-
             ${{ runner.os }}-sccache-
 
+      - name: Test research core lane
+        env:
+          RUSTC_WRAPPER: sccache
+        run: |
+          cargo test --locked -p ploy-research --lib
+          cargo check --locked -p ploy-research --example prediction_research_loop
+          cargo check --locked -p ploy-research --features db --example factor_walk_forward_v2
+
       - name: Install SQLx CLI
         run: |
           cargo install sqlx-cli \

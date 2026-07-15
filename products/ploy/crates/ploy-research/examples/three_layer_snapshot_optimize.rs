@@ -2226,6 +2226,7 @@ mod tests {
             regime: Regime::Middle,
             side: ReviewSide::Up,
             side_model_prob,
+            side_chainlink_prob: f64::NAN,
             side_fair_prob: side_model_prob,
             side_model_edge: side_model_prob - entry_ask,
             side_distance_over_sigma: 0.25,
@@ -2317,6 +2318,14 @@ mod tests {
             exit_sweep_levels_15u: if fillable { 1.0 } else { 0.0 },
             entry_sweep_slippage_bps: 0.0,
             exit_sweep_slippage_bps: 0.0,
+            conservative_entry_sweep_avg_price_15u: entry_ask,
+            conservative_entry_sweep_shares_15u: if entry_ask > 0.0 {
+                15.0 / entry_ask
+            } else {
+                0.0
+            },
+            conservative_entry_sweep_levels_15u: if fillable { 1.0 } else { 0.0 },
+            conservative_entry_sweep_slippage_bps: 0.0,
             roundtrip_cost_usd: 0.0,
             roundtrip_pnl_now_15u: executable_pnl,
             roundtrip_pnl_now_full_depth_15u: executable_pnl,
@@ -2332,10 +2341,12 @@ mod tests {
             }),
             label_executable_pnl_15u: executable_pnl,
             label_full_depth_executable_pnl_15u: executable_pnl,
+            label_conservative_executable_pnl_15u: executable_pnl,
             label_executable_fillable: fillable,
             label_exit_fillable: fillable,
             label_full_depth_entry_fillable: fillable,
             label_full_depth_exit_fillable: fillable,
+            label_conservative_entry_fillable: fillable,
             label_future_exit_bid_change_5s: None,
             label_future_exit_bid_change_10s: None,
             label_future_exit_bid_change_30s: None,
@@ -2344,10 +2355,22 @@ mod tests {
             label_future_exit_pnl_10s: None,
             label_future_exit_pnl_30s: None,
             label_future_exit_pnl_60s: None,
+            label_future_exit_full_depth_pnl_5s: None,
+            label_future_exit_full_depth_pnl_10s: None,
+            label_future_exit_full_depth_pnl_30s: None,
+            label_future_exit_full_depth_pnl_60s: None,
+            label_future_exit_full_depth_value_5s: None,
+            label_future_exit_full_depth_value_10s: None,
+            label_future_exit_full_depth_value_30s: None,
+            label_future_exit_full_depth_value_60s: None,
             label_future_exit_fillable_5s: None,
             label_future_exit_fillable_10s: None,
             label_future_exit_fillable_30s: None,
             label_future_exit_fillable_60s: None,
+            label_future_exit_full_depth_fillable_5s: None,
+            label_future_exit_full_depth_fillable_10s: None,
+            label_future_exit_full_depth_fillable_30s: None,
+            label_future_exit_full_depth_fillable_60s: None,
         }
     }
 

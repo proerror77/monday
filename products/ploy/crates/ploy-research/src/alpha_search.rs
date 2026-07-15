@@ -2916,6 +2916,7 @@ mod tests {
                 reason: Some("runtime_pass_through_collapse".to_string()),
                 metrics: serde_json::Value::Null,
             }],
+            ..Default::default()
         };
         let prior_avoidances = runtime_avoidances(None, Some(&prior));
         let reports = vec![squashed, spread_adjusted, alternative];
@@ -2967,6 +2968,7 @@ mod tests {
                 reason: Some("runtime_pass_through_collapse".to_string()),
                 metrics: serde_json::Value::Null,
             }],
+            ..Default::default()
         };
         let composed_avoidances = runtime_avoidances(None, Some(&composed_prior));
         assert_eq!(
@@ -2997,6 +2999,7 @@ mod tests {
                 reason: Some("negative_runtime_edge".to_string()),
                 metrics: serde_json::Value::Null,
             }],
+            ..Default::default()
         };
         assert!(matching_runtime_avoidance(
             &selected_gate_variant,

@@ -14,6 +14,18 @@ use sqlx::PgPool;
 const EWMA_LAMBDA: f64 = 0.94;
 const RETURN_BUFFER_WINDOW_SECS: f64 = 300.0;
 
+/// Governed five-minute Chainlink boundary policy.
+///
+/// A boundary price is the latest non-carried RTDS source tick at or before
+/// the boundary, no older than this fixed tolerance. A tick at or after the
+/// boundary must also arrive within the same tolerance to prove that the
+/// boundary was observed. The selected and confirming ticks must not arrive
+/// before their source timestamps. This policy is intentionally independent
+/// of Polymarket quote-freshness configuration.
+pub const GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION: &str =
+    "chainlink_rtds_source_time_bracket_v1";
+pub const GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS: i64 = 30;
+
 fn nan_f64() -> f64 {
     f64::NAN
 }
@@ -86,6 +98,8 @@ pub struct FactorObservation {
     pub event_id: String,
     pub symbol: String,
     pub tick_ts: DateTime<Utc>,
+    #[serde(default)]
+    pub event_window_secs: i64,
     pub time_remaining_secs: i64,
     pub signed_distance_to_beat: f64,
     pub abs_distance_to_beat: f64,
@@ -125,6 +139,11 @@ pub struct FactorObservation {
     pub vol_gap: f64,
     pub distance_over_sigma: f64,
     pub model_prob_up: f64,
+    #[serde(
+        default = "nan_f64",
+        deserialize_with = "deserialize_nullable_f64_as_nan"
+    )]
+    pub chainlink_prob_up: f64,
     #[serde(
         default = "nan_f64",
         deserialize_with = "deserialize_nullable_f64_as_nan"
@@ -268,6 +287,7 @@ pub struct EventFactorSummary {
     pub vol_gap: f64,
     pub distance_over_sigma: f64,
     pub model_prob_up: f64,
+    pub chainlink_prob_up: f64,
     pub model_edge_up: f64,
     pub reward_risk_up: f64,
     pub reward_risk_down: f64,
@@ -397,9 +417,283 @@ struct EventState {
     end_time: Option<DateTime<Utc>>,
     window_secs: Option<i64>,
     price_to_beat: Option<f64>,
+    chainlink_open_candidate: Option<(DateTime<Utc>, f64)>,
+    chainlink_price_to_beat: Option<f64>,
+    chainlink_price_to_beat_available_at: Option<DateTime<Utc>>,
     resolved_up_won: Option<bool>,
     up_token: String,
     down_token: String,
+}
+
+#[derive(Clone)]
+struct SettlementBoundary {
+    symbol: String,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy)]
+struct ChainlinkBoundaryTick {
+    source_ts: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+    price: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ChainlinkOracleBoundaryEvidence {
+    pub boundary_ts: DateTime<Utc>,
+    pub price: f64,
+    pub source_ts: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub confirmation_source_ts: DateTime<Utc>,
+    pub confirmation_received_at: DateTime<Utc>,
+}
+
+impl ChainlinkOracleBoundaryEvidence {
+    fn available_at(self) -> DateTime<Utc> {
+        self.received_at.max(self.confirmation_received_at)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainlinkOracleFailureReason {
+    MissingOpen,
+    MissingClose,
+    MissingOfficial,
+    OfficialPayoutMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChainlinkOracleSettlementEvidence {
+    pub event_id: String,
+    pub symbol: String,
+    pub policy_version: String,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub open: Option<ChainlinkOracleBoundaryEvidence>,
+    pub close: Option<ChainlinkOracleBoundaryEvidence>,
+    pub chainlink_outcome_up: Option<bool>,
+    pub official_outcome_up: Option<bool>,
+    pub reasons: Vec<ChainlinkOracleFailureReason>,
+}
+
+impl ChainlinkOracleSettlementEvidence {
+    pub fn is_complete(&self) -> bool {
+        self.reasons.is_empty()
+            && self.open.is_some()
+            && self.close.is_some()
+            && self.chainlink_outcome_up.is_some()
+            && self.official_outcome_up.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainlinkOracleAuditFailure {
+    pub event_id: String,
+    pub reasons: Vec<ChainlinkOracleFailureReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainlinkOracleSettlementAudit {
+    pub policy_version: String,
+    pub max_boundary_age_secs: i64,
+    pub expected_events: usize,
+    pub accepted_events: usize,
+    pub missing_open_events: usize,
+    pub missing_close_events: usize,
+    pub missing_official_events: usize,
+    pub payout_mismatch_events: usize,
+    pub failures: Vec<ChainlinkOracleAuditFailure>,
+}
+
+impl Default for ChainlinkOracleSettlementAudit {
+    fn default() -> Self {
+        Self {
+            policy_version: GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION.to_string(),
+            max_boundary_age_secs: GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS,
+            expected_events: 0,
+            accepted_events: 0,
+            missing_open_events: 0,
+            missing_close_events: 0,
+            missing_official_events: 0,
+            payout_mismatch_events: 0,
+            failures: Vec::new(),
+        }
+    }
+}
+
+impl ChainlinkOracleSettlementAudit {
+    pub fn from_evidence(evidence: &[ChainlinkOracleSettlementEvidence]) -> Self {
+        let mut audit = Self {
+            expected_events: evidence.len(),
+            ..Self::default()
+        };
+        for event in evidence {
+            if event.is_complete() {
+                audit.accepted_events += 1;
+            }
+            for reason in &event.reasons {
+                match reason {
+                    ChainlinkOracleFailureReason::MissingOpen => audit.missing_open_events += 1,
+                    ChainlinkOracleFailureReason::MissingClose => audit.missing_close_events += 1,
+                    ChainlinkOracleFailureReason::MissingOfficial => {
+                        audit.missing_official_events += 1;
+                    }
+                    ChainlinkOracleFailureReason::OfficialPayoutMismatch => {
+                        audit.payout_mismatch_events += 1;
+                    }
+                }
+            }
+            if !event.reasons.is_empty() {
+                audit.failures.push(ChainlinkOracleAuditFailure {
+                    event_id: event.event_id.clone(),
+                    reasons: event.reasons.clone(),
+                });
+            }
+        }
+        audit
+    }
+
+    pub fn has_failures(&self) -> bool {
+        self.accepted_events != self.expected_events
+            || self.missing_open_events != 0
+            || self.missing_close_events != 0
+            || self.missing_official_events != 0
+            || self.payout_mismatch_events != 0
+            || !self.failures.is_empty()
+    }
+}
+
+fn boundary_price(
+    ticks: &[ChainlinkBoundaryTick],
+    boundary: DateTime<Utc>,
+) -> Option<ChainlinkOracleBoundaryEvidence> {
+    let max_age = chrono::Duration::seconds(GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS);
+    let latest_at_or_before = ticks
+        .iter()
+        .filter(|tick| {
+            tick.source_ts <= boundary
+                && boundary - tick.source_ts <= max_age
+                && tick.received_at >= tick.source_ts
+                && tick.received_at <= boundary + max_age
+        })
+        .max_by_key(|tick| (tick.source_ts, tick.received_at))?;
+    let confirmation = ticks
+        .iter()
+        .filter(|tick| {
+            tick.source_ts >= boundary
+                && tick.source_ts - boundary <= max_age
+                && tick.received_at >= tick.source_ts
+                && tick.received_at <= boundary + max_age
+        })
+        .min_by_key(|tick| (tick.source_ts, tick.received_at))?;
+    Some(ChainlinkOracleBoundaryEvidence {
+        boundary_ts: boundary,
+        price: latest_at_or_before.price,
+        source_ts: latest_at_or_before.source_ts,
+        received_at: latest_at_or_before.received_at,
+        confirmation_source_ts: confirmation.source_ts,
+        confirmation_received_at: confirmation.received_at,
+    })
+}
+
+fn governed_chainlink_settlement_outcomes(
+    updates: &[MarketUpdate],
+    official_outcomes: &HashMap<String, bool>,
+) -> Vec<ChainlinkOracleSettlementEvidence> {
+    let mut events = BTreeMap::<String, SettlementBoundary>::new();
+    let mut ticks_by_symbol = HashMap::<String, Vec<ChainlinkBoundaryTick>>::new();
+
+    for update in updates {
+        match update {
+            MarketUpdate::EventDiscovered {
+                event_id,
+                symbol,
+                end_time,
+                window_secs: 300,
+                ..
+            } => {
+                events.insert(
+                    event_id.to_string(),
+                    SettlementBoundary {
+                        symbol: normalized_underlying_symbol(symbol),
+                        start_time: *end_time - chrono::Duration::seconds(300),
+                        end_time: *end_time,
+                    },
+                );
+            }
+            MarketUpdate::ReferencePrice {
+                symbol,
+                source,
+                price,
+                is_carried_forward: false,
+                ts,
+                received_at: Some(received_at),
+                ..
+            } if source.eq_ignore_ascii_case("chainlink") => {
+                if let Some(price) = price.to_f64().filter(|price| *price > 0.0) {
+                    ticks_by_symbol
+                        .entry(normalized_underlying_symbol(symbol))
+                        .or_default()
+                        .push(ChainlinkBoundaryTick {
+                            source_ts: *ts,
+                            received_at: *received_at,
+                            price,
+                        });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for ticks in ticks_by_symbol.values_mut() {
+        ticks.sort_by_key(|tick| (tick.source_ts, tick.received_at));
+    }
+
+    events
+        .into_iter()
+        .map(|(event_id, event)| {
+            let ticks = ticks_by_symbol
+                .get(&event.symbol)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let open = boundary_price(ticks, event.start_time);
+            let close = boundary_price(ticks, event.end_time);
+            let chainlink_outcome_up = open
+                .zip(close)
+                .map(|(open, close)| close.price >= open.price);
+            let official_outcome_up = official_outcomes.get(&event_id).copied();
+            let mut reasons = Vec::new();
+            if open.is_none() {
+                reasons.push(ChainlinkOracleFailureReason::MissingOpen);
+            }
+            if close.is_none() {
+                reasons.push(ChainlinkOracleFailureReason::MissingClose);
+            }
+            if official_outcome_up.is_none() {
+                reasons.push(ChainlinkOracleFailureReason::MissingOfficial);
+            }
+            if chainlink_outcome_up
+                .zip(official_outcome_up)
+                .is_some_and(|(chainlink, official)| chainlink != official)
+            {
+                reasons.push(ChainlinkOracleFailureReason::OfficialPayoutMismatch);
+            }
+            ChainlinkOracleSettlementEvidence {
+                event_id,
+                symbol: event.symbol,
+                policy_version: GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION.to_string(),
+                start_time: event.start_time,
+                end_time: event.end_time,
+                open,
+                close,
+                chainlink_outcome_up,
+                official_outcome_up,
+                reasons,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -879,7 +1173,7 @@ pub async fn load_research_lob_snapshots_sampled(
             ) AS bucket_start
         )
         SELECT
-            lob.event_time,
+            lob.received_at,
             lob.symbol,
             COALESCE(lob.obi_5, 0) AS obi_5,
             COALESCE(lob.obi_10, 0) AS obi_10,
@@ -892,7 +1186,7 @@ pub async fn load_research_lob_snapshots_sampled(
         FROM buckets
         JOIN LATERAL (
             SELECT
-                event_time,
+                received_at,
                 symbol,
                 obi_5,
                 obi_10,
@@ -906,11 +1200,11 @@ pub async fn load_research_lob_snapshots_sampled(
             WHERE symbol = buckets.symbol
               AND event_time >= buckets.bucket_start
               AND event_time < buckets.bucket_start + ($4::text || ' seconds')::interval
-              AND event_time <= $3
+              AND received_at <= $3
             ORDER BY event_time DESC
             LIMIT 1
         ) AS lob ON true
-        ORDER BY lob.event_time
+        ORDER BY lob.received_at
         "#,
     )
     .bind(symbols)
@@ -1096,6 +1390,28 @@ pub fn build_factor_observations_with_lob_sampled(
     max_quote_age_secs: i64,
     observation_sample_secs: i64,
 ) -> Vec<FactorObservation> {
+    build_factor_observations_with_lob_sampled_and_oracle_evidence(
+        updates,
+        lob_snapshots,
+        max_quote_age_secs,
+        observation_sample_secs,
+    )
+    .observations
+}
+
+#[derive(Debug, Clone)]
+pub struct FactorObservationBuild {
+    pub observations: Vec<FactorObservation>,
+    pub oracle_settlement_evidence: Vec<ChainlinkOracleSettlementEvidence>,
+    pub oracle_settlement_audit: ChainlinkOracleSettlementAudit,
+}
+
+pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
+    updates: &[MarketUpdate],
+    lob_snapshots: &[ResearchLobSnapshot],
+    max_quote_age_secs: i64,
+    observation_sample_secs: i64,
+) -> FactorObservationBuild {
     let observation_sample_secs = observation_sample_secs.max(0);
     let mut final_outcomes: HashMap<String, bool> = HashMap::new();
     for update in updates {
@@ -1104,22 +1420,37 @@ pub fn build_factor_observations_with_lob_sampled(
                 event_id,
                 resolved_up_won: Some(outcome),
                 ..
+            } => {
+                final_outcomes
+                    .entry(event_id.to_string())
+                    .or_insert(*outcome);
             }
-            | MarketUpdate::EventExpired {
+            MarketUpdate::EventExpired {
                 event_id,
                 resolved_up_won: Some(outcome),
                 ..
             } => {
+                // The terminal official payout wins regardless of replay input
+                // order; discovery-time resolution is only a fallback.
                 final_outcomes.insert(event_id.to_string(), *outcome);
             }
             _ => {}
         }
     }
+    let oracle_settlement_evidence =
+        governed_chainlink_settlement_outcomes(updates, &final_outcomes);
+    let oracle_settlement_audit =
+        ChainlinkOracleSettlementAudit::from_evidence(&oracle_settlement_evidence);
+    let oracle_evidence_by_event = oracle_settlement_evidence
+        .iter()
+        .map(|evidence| (evidence.event_id.as_str(), evidence))
+        .collect::<HashMap<_, _>>();
 
     let mut buf_30s: HashMap<String, DriftBuffer> = HashMap::new();
     let mut buf_10s: HashMap<String, DriftBuffer> = HashMap::new();
     let mut drift_state: HashMap<String, DriftState> = HashMap::new();
     let mut spot: HashMap<String, (DateTime<Utc>, f64)> = HashMap::new();
+    let mut chainlink: HashMap<String, (DateTime<Utc>, DateTime<Utc>, f64)> = HashMap::new();
     let mut vol: HashMap<String, VolatilityState> = HashMap::new();
     let mut retbuf: HashMap<String, ReturnBuffer> = HashMap::new();
     let mut events: HashMap<String, EventState> = HashMap::new();
@@ -1141,7 +1472,7 @@ pub fn build_factor_observations_with_lob_sampled(
     }
 
     let mut ordered_updates: Vec<&MarketUpdate> = updates.iter().collect();
-    ordered_updates.sort_by_key(|update| update_sort_ts(update));
+    ordered_updates.sort_by_key(|update| (update_sort_ts(update), update_sort_priority(update)));
 
     for update in ordered_updates {
         match update {
@@ -1158,7 +1489,23 @@ pub fn build_factor_observations_with_lob_sampled(
             } => {
                 let event_id = event_id.to_string();
                 let symbol = symbol.to_string();
-                let resolved_up_won = final_outcomes.get(&*event_id).copied().or(*resolved_up_won);
+                // Five-minute crypto missions use the Chainlink boundary comparison as
+                // their label and require the official Polymarket payout to corroborate
+                // it. Missing boundary coverage or disagreement fails closed.
+                let governed_evidence = if *window_secs == 300 {
+                    oracle_evidence_by_event.get(event_id.as_str()).copied()
+                } else {
+                    None
+                };
+                let governed_evidence = governed_evidence.filter(|evidence| evidence.is_complete());
+                let governed_open = governed_evidence.and_then(|evidence| evidence.open);
+                let resolved_up_won = governed_evidence
+                    .and_then(|evidence| evidence.chainlink_outcome_up)
+                    .or_else(|| {
+                        (*window_secs != 300)
+                            .then(|| final_outcomes.get(&event_id).copied().or(*resolved_up_won))
+                            .flatten()
+                    });
                 events_by_symbol
                     .entry(symbol.clone())
                     .or_default()
@@ -1173,6 +1520,10 @@ pub fn build_factor_observations_with_lob_sampled(
                         end_time: Some(*end_time),
                         window_secs: Some(*window_secs as i64),
                         price_to_beat: price_to_beat.and_then(|value| value.to_f64()),
+                        chainlink_open_candidate: None,
+                        chainlink_price_to_beat: governed_open.map(|open| open.price),
+                        chainlink_price_to_beat_available_at: governed_open
+                            .map(ChainlinkOracleBoundaryEvidence::available_at),
                         resolved_up_won,
                         up_token: up_token.to_string(),
                         down_token: down_token.to_string(),
@@ -1185,7 +1536,9 @@ pub fn build_factor_observations_with_lob_sampled(
                 ..
             } => {
                 if let Some(event) = events.get_mut(&**event_id) {
-                    event.resolved_up_won = resolved_up_won.or(event.resolved_up_won);
+                    if event.window_secs != Some(300) {
+                        event.resolved_up_won = resolved_up_won.or(event.resolved_up_won);
+                    }
                 }
             }
             MarketUpdate::Quote {
@@ -1241,6 +1594,71 @@ pub fn build_factor_observations_with_lob_sampled(
                         obi_10: *obi,
                     },
                 );
+            }
+            MarketUpdate::ReferencePrice {
+                symbol,
+                source,
+                price,
+                is_carried_forward,
+                ts,
+                received_at,
+                ..
+            } => {
+                if !*is_carried_forward && source.eq_ignore_ascii_case("chainlink") {
+                    if let (Some(price), Some(available_at)) =
+                        (price.to_f64().filter(|price| *price > 0.0), *received_at)
+                    {
+                        let underlying = normalized_underlying_symbol(symbol);
+                        chainlink.insert(underlying.clone(), (*ts, available_at, price));
+
+                        let max_open_offset_secs = max_quote_age_secs.max(0) as f64;
+                        let matching_event_ids = events_by_symbol
+                            .iter()
+                            .filter(|(event_symbol, _)| {
+                                normalized_underlying_symbol(event_symbol) == underlying
+                            })
+                            .flat_map(|(_, event_ids)| event_ids.iter().cloned())
+                            .collect::<Vec<_>>();
+                        for event_id in matching_event_ids {
+                            let Some(event) = events.get_mut(&event_id) else {
+                                continue;
+                            };
+                            // Governed five-minute events use the single precomputed
+                            // oracle evidence object for both their strike and label.
+                            if event.window_secs == Some(300) {
+                                continue;
+                            }
+                            if event.chainlink_price_to_beat.is_some() {
+                                continue;
+                            }
+                            let Some(start_time) = event.start_time else {
+                                continue;
+                            };
+                            if *ts < start_time {
+                                let lead_secs =
+                                    (start_time - *ts).num_milliseconds() as f64 / 1000.0;
+                                if lead_secs <= max_open_offset_secs
+                                    && event
+                                        .chainlink_open_candidate
+                                        .is_none_or(|(candidate_ts, _)| *ts > candidate_ts)
+                                {
+                                    event.chainlink_open_candidate = Some((*ts, price));
+                                }
+                            } else {
+                                let delay_secs =
+                                    (*ts - start_time).num_milliseconds() as f64 / 1000.0;
+                                if delay_secs <= max_open_offset_secs {
+                                    // Freeze the last fresh pre-open tick once the first
+                                    // post-start tick makes the opening window observable.
+                                    event.chainlink_price_to_beat = event
+                                        .chainlink_open_candidate
+                                        .map(|(_, candidate_price)| candidate_price);
+                                    event.chainlink_price_to_beat_available_at = Some(available_at);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             MarketUpdate::SpotPrice { symbol, price, ts } => {
                 let Some(spot_price) = price.to_f64() else {
@@ -1370,7 +1788,31 @@ pub fn build_factor_observations_with_lob_sampled(
                     let Some(event) = events.get(event_id) else {
                         continue;
                     };
-                    let Some(price_to_beat) = event.price_to_beat else {
+                    let chainlink_price_to_beat = if event.window_secs == Some(300) {
+                        if event
+                            .chainlink_price_to_beat_available_at
+                            .is_none_or(|available_at| *ts < available_at)
+                        {
+                            continue;
+                        }
+                        event.chainlink_price_to_beat
+                    } else {
+                        event.chainlink_price_to_beat.or_else(|| {
+                            event
+                                .chainlink_open_candidate
+                                .map(|(_, candidate_price)| candidate_price)
+                        })
+                    };
+                    // Five-minute settlement research fails closed without a
+                    // point-in-time Chainlink opening reference. Historical
+                    // event metadata may have been populated from Binance and
+                    // is permitted only for other legacy horizons.
+                    let price_to_beat = if event.window_secs == Some(300) {
+                        chainlink_price_to_beat
+                    } else {
+                        chainlink_price_to_beat.or(event.price_to_beat)
+                    };
+                    let Some(price_to_beat) = price_to_beat else {
                         continue;
                     };
                     let Some(end_time) = event.end_time else {
@@ -1541,6 +1983,30 @@ pub fn build_factor_observations_with_lob_sampled(
 
                     let model_prob_up =
                         estimate_probability(price_to_beat, spot_price, sigma_horizon);
+                    let chainlink_prob_up = chainlink_price_to_beat
+                        .and_then(|chainlink_price_to_beat| {
+                            chainlink.get(&normalized_underlying_symbol(&sym)).and_then(
+                                |(source_ts, available_at, reference_price)| {
+                                    let source_lag_secs =
+                                        (*ts - *source_ts).num_milliseconds() as f64 / 1000.0;
+                                    let availability_lag_secs =
+                                        (*ts - *available_at).num_milliseconds() as f64 / 1000.0;
+                                    let max_age_secs = max_quote_age_secs.max(0) as f64;
+                                    (source_lag_secs >= 0.0
+                                        && source_lag_secs <= max_age_secs
+                                        && availability_lag_secs >= 0.0
+                                        && availability_lag_secs <= max_age_secs)
+                                        .then(|| {
+                                            estimate_probability(
+                                                chainlink_price_to_beat,
+                                                *reference_price,
+                                                sigma_horizon,
+                                            )
+                                        })
+                                },
+                            )
+                        })
+                        .unwrap_or(f64::NAN);
                     let model_edge_up = if up_ask.is_finite() {
                         model_prob_up - up_ask - crypto_fee_cost(up_ask)
                     } else {
@@ -1561,6 +2027,7 @@ pub fn build_factor_observations_with_lob_sampled(
                         event_id: event.event_id.clone(),
                         symbol: sym.clone(),
                         tick_ts: *ts,
+                        event_window_secs: event.window_secs.unwrap_or_default(),
                         time_remaining_secs: time_remaining,
                         signed_distance_to_beat: signed_distance,
                         abs_distance_to_beat: signed_distance.abs(),
@@ -1576,6 +2043,7 @@ pub fn build_factor_observations_with_lob_sampled(
                         vol_gap,
                         distance_over_sigma,
                         model_prob_up,
+                        chainlink_prob_up,
                         model_edge_up,
                         reward_risk_up,
                         reward_risk_down,
@@ -1658,7 +2126,11 @@ pub fn build_factor_observations_with_lob_sampled(
     rows.sort_by_key(|row| (row.event_id.clone(), row.tick_ts));
     attach_future_pm_labels(&mut rows, 30, LabelField::Change30s);
     attach_future_pm_labels(&mut rows, 60, LabelField::Change60s);
-    rows
+    FactorObservationBuild {
+        observations: rows,
+        oracle_settlement_evidence,
+        oracle_settlement_audit,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1727,6 +2199,7 @@ pub fn build_event_summaries(rows: &[FactorObservation]) -> Vec<EventFactorSumma
                 vol_gap: mean(rows.iter().map(|row| row.vol_gap)),
                 distance_over_sigma: mean(rows.iter().map(|row| row.distance_over_sigma)),
                 model_prob_up: mean(rows.iter().map(|row| row.model_prob_up)),
+                chainlink_prob_up: mean(rows.iter().map(|row| row.chainlink_prob_up)),
                 model_edge_up: mean(rows.iter().map(|row| row.model_edge_up)),
                 reward_risk_up: mean(rows.iter().map(|row| row.reward_risk_up)),
                 reward_risk_down: mean(rows.iter().map(|row| row.reward_risk_down)),
@@ -1960,6 +2433,7 @@ pub fn observations_to_frame(rows: &[FactorObservation]) -> PolarsResult<DataFra
         "event_id" => rows.iter().map(|row| row.event_id.as_str()).collect::<Vec<_>>(),
         "symbol" => rows.iter().map(|row| row.symbol.as_str()).collect::<Vec<_>>(),
         "tick_ts" => rows.iter().map(|row| row.tick_ts.timestamp_millis()).collect::<Vec<_>>(),
+        "event_window_secs" => rows.iter().map(|row| row.event_window_secs).collect::<Vec<_>>(),
         "time_remaining_secs" => rows.iter().map(|row| row.time_remaining_secs).collect::<Vec<_>>(),
         "signed_distance_to_beat" => rows.iter().map(|row| row.signed_distance_to_beat).collect::<Vec<_>>(),
         "abs_distance_to_beat" => rows.iter().map(|row| row.abs_distance_to_beat).collect::<Vec<_>>(),
@@ -1975,6 +2449,7 @@ pub fn observations_to_frame(rows: &[FactorObservation]) -> PolarsResult<DataFra
         "vol_gap" => rows.iter().map(|row| row.vol_gap).collect::<Vec<_>>(),
         "distance_over_sigma" => rows.iter().map(|row| row.distance_over_sigma).collect::<Vec<_>>(),
         "model_prob_up" => rows.iter().map(|row| row.model_prob_up).collect::<Vec<_>>(),
+        "chainlink_prob_up" => rows.iter().map(|row| row.chainlink_prob_up).collect::<Vec<_>>(),
         "model_edge_up" => rows.iter().map(|row| row.model_edge_up).collect::<Vec<_>>(),
         "reward_risk_up" => rows.iter().map(|row| row.reward_risk_up).collect::<Vec<_>>(),
         "reward_risk_down" => rows.iter().map(|row| row.reward_risk_down).collect::<Vec<_>>(),
@@ -2027,6 +2502,7 @@ fn row_factor_accessors() -> Vec<(&'static str, fn(&FactorObservation) -> f64)> 
         ("vol_gap", |row| row.vol_gap),
         ("distance_over_sigma", |row| row.distance_over_sigma),
         ("model_prob_up", |row| row.model_prob_up),
+        ("chainlink_prob_up", |row| row.chainlink_prob_up),
         ("model_edge_up", |row| row.model_edge_up),
         ("reward_risk_up", |row| row.reward_risk_up),
         ("reward_risk_down", |row| row.reward_risk_down),
@@ -2086,6 +2562,7 @@ fn event_factor_accessors() -> Vec<(&'static str, fn(&EventFactorSummary) -> f64
         ("vol_gap", |row| row.vol_gap),
         ("distance_over_sigma", |row| row.distance_over_sigma),
         ("model_prob_up", |row| row.model_prob_up),
+        ("chainlink_prob_up", |row| row.chainlink_prob_up),
         ("model_edge_up", |row| row.model_edge_up),
         ("reward_risk_up", |row| row.reward_risk_up),
         ("reward_risk_down", |row| row.reward_risk_down),
@@ -2155,6 +2632,18 @@ fn estimate_probability(s0: f64, st: f64, sigma_horizon: f64) -> f64 {
     }
     let z = (st / s0).ln() / sigma_horizon;
     normal_cdf(z)
+}
+
+pub fn normalized_underlying_symbol(raw: &str) -> String {
+    let normalized = raw.trim().to_ascii_uppercase().replace(['/', '-', '_'], "");
+    for quote in ["USDT", "USDC", "USD"] {
+        if let Some(base) = normalized.strip_suffix(quote) {
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    normalized
 }
 
 fn quote_mid(bid: f64, ask: f64) -> f64 {
@@ -2377,8 +2866,10 @@ fn update_sort_ts(update: &MarketUpdate) -> DateTime<Utc> {
         | MarketUpdate::SportsState { ts, .. }
         | MarketUpdate::SportsPregame { ts, .. }
         | MarketUpdate::SportsLive { ts, .. }
-        | MarketUpdate::ReferencePrice { ts, .. }
         | MarketUpdate::Kline { ts, .. } => *ts,
+        MarketUpdate::ReferencePrice {
+            ts, received_at, ..
+        } => received_at.unwrap_or(*ts),
         MarketUpdate::EventDiscovered {
             end_time,
             window_secs,
@@ -2387,6 +2878,14 @@ fn update_sort_ts(update: &MarketUpdate) -> DateTime<Utc> {
             *end_time - chrono::Duration::seconds(*window_secs as i64) - chrono::Duration::hours(1)
         }
         MarketUpdate::EventExpired { end_time, .. } => *end_time,
+    }
+}
+
+fn update_sort_priority(update: &MarketUpdate) -> u8 {
+    if matches!(update, MarketUpdate::ReferencePrice { .. }) {
+        0
+    } else {
+        1
     }
 }
 
@@ -2451,8 +2950,11 @@ pub fn export_observations_parquet(
 mod tests {
     use super::{
         attach_future_pm_labels, build_factor_observations_with_lob,
-        build_task_grain_derived_artifacts_for_event_ids, pearson_ic, spearman_ic,
-        FactorObservation, LabelField, PM_BOOK_SAMPLED_QUERY,
+        build_factor_observations_with_lob_sampled_and_oracle_evidence,
+        build_task_grain_derived_artifacts_for_event_ids, estimate_probability, pearson_ic,
+        spearman_ic, ChainlinkOracleFailureReason, FactorObservation, LabelField,
+        GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS, GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION,
+        PM_BOOK_SAMPLED_QUERY,
     };
     use chrono::{TimeZone, Utc};
     use ploy_market_contracts::MarketUpdate;
@@ -2460,6 +2962,70 @@ mod tests {
     #[cfg(feature = "db")]
     use serde_json::json;
     use std::sync::Arc;
+
+    fn chainlink_tick(ts_secs: i64, price: i64) -> MarketUpdate {
+        chainlink_tick_received(ts_secs, ts_secs, price)
+    }
+
+    fn chainlink_tick_received(ts_secs: i64, received_at_secs: i64, price: i64) -> MarketUpdate {
+        let ts = Utc.timestamp_opt(ts_secs, 0).unwrap();
+        MarketUpdate::ReferencePrice {
+            symbol: Arc::from("btc/usd"),
+            source: Arc::from("chainlink"),
+            asset_class: Arc::from("crypto"),
+            price: Decimal::new(price, 0),
+            full_accuracy_value: None,
+            is_carried_forward: false,
+            received_at: Some(Utc.timestamp_opt(received_at_secs, 0).unwrap()),
+            ts,
+        }
+    }
+
+    fn governed_five_minute_fixture(
+        official_outcome: bool,
+        close_price: Option<i64>,
+    ) -> Vec<MarketUpdate> {
+        let end = Utc.timestamp_opt(1000, 0).unwrap();
+        let mut updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("governed-evt"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: Some(Decimal::new(90, 0)),
+                resolved_up_won: None,
+            },
+            chainlink_tick(699, 100),
+            chainlink_tick(701, 100),
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(45, 2)),
+                ask: Some(Decimal::new(46, 2)),
+                bid_size: Some(Decimal::new(100, 0)),
+                ask_size: Some(Decimal::new(100, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: Utc.timestamp_opt(709, 0).unwrap(),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(101, 0),
+                ts: Utc.timestamp_opt(710, 0).unwrap(),
+            },
+        ];
+        if let Some(close_price) = close_price {
+            updates.push(chainlink_tick(999, close_price));
+            updates.push(chainlink_tick(1001, close_price));
+        }
+        updates.push(MarketUpdate::EventExpired {
+            event_id: Arc::from("governed-evt"),
+            end_time: end,
+            resolved_up_won: Some(official_outcome),
+        });
+        updates
+    }
 
     #[test]
     fn pm_book_sampler_uses_token_window_index_lookup() {
@@ -2481,6 +3047,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn binance_research_lob_replay_uses_arrival_time_without_losing_source_index() {
+        let source = include_str!("factors.rs");
+        let query = source
+            .split_once("pub async fn load_research_lob_snapshots_sampled")
+            .expect("research LOB loader")
+            .1
+            .split_once("pub async fn load_research_pm_book_snapshots_sampled")
+            .expect("research PM book loader")
+            .0;
+
+        assert!(query.contains("event_time >= buckets.bucket_start"));
+        assert!(query.contains("received_at <= $3"));
+        assert!(query.contains("ORDER BY lob.received_at"));
+    }
+
     fn test_factor_observation(
         event_id: &str,
         symbol: &str,
@@ -2494,6 +3076,7 @@ mod tests {
             tick_ts: chrono::DateTime::from_timestamp(tick_ts_secs, 0)
                 .unwrap()
                 .with_timezone(&Utc),
+            event_window_secs: 300,
             time_remaining_secs: 60,
             signed_distance_to_beat: 0.0,
             abs_distance_to_beat: 0.0,
@@ -2509,6 +3092,7 @@ mod tests {
             vol_gap: 0.0,
             distance_over_sigma: 0.0,
             model_prob_up: 0.5,
+            chainlink_prob_up: f64::NAN,
             model_edge_up: 0.0,
             reward_risk_up: 1.0,
             reward_risk_down: 1.0,
@@ -2622,6 +3206,284 @@ mod tests {
     }
 
     #[test]
+    fn legacy_snapshot_observation_defaults_missing_event_window_to_zero() {
+        let observation = test_factor_observation("evt", "BTCUSDT", 100, 1.0, None);
+        let mut json = serde_json::to_value(observation).expect("serialize observation");
+        json.as_object_mut()
+            .expect("observation object")
+            .remove("event_window_secs");
+
+        let decoded: FactorObservation =
+            serde_json::from_value(json).expect("deserialize legacy observation");
+
+        assert_eq!(decoded.event_window_secs, 0);
+    }
+
+    #[test]
+    fn five_minute_settlement_label_uses_chainlink_open_and_close() {
+        let rows = build_factor_observations_with_lob(
+            &governed_five_minute_fixture(true, Some(101)),
+            &[],
+            30,
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].settlement_up, 1.0);
+    }
+
+    #[test]
+    fn five_minute_settlement_label_requires_complete_chainlink_boundaries() {
+        let rows =
+            build_factor_observations_with_lob(&governed_five_minute_fixture(true, None), &[], 30);
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn five_minute_settlement_label_rejects_official_payout_disagreement() {
+        let rows = build_factor_observations_with_lob(
+            &governed_five_minute_fixture(false, Some(101)),
+            &[],
+            30,
+        );
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn five_minute_settlement_boundary_policy_is_independent_of_quote_freshness() {
+        let mut updates = governed_five_minute_fixture(true, Some(101));
+        for update in &mut updates {
+            if let MarketUpdate::Quote { ts, .. } = update {
+                *ts = Utc.timestamp_opt(710, 0).unwrap();
+            }
+        }
+        let rows = build_factor_observations_with_lob(&updates, &[], 0);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].settlement_up, 1.0);
+    }
+
+    #[test]
+    fn five_minute_observation_uses_the_same_corrected_open_as_its_label() {
+        let end = Utc.timestamp_opt(1000, 0).unwrap();
+        let updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("corrected-open"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: Some(Decimal::new(90, 0)),
+                resolved_up_won: None,
+            },
+            chainlink_tick_received(698, 698, 100),
+            chainlink_tick_received(701, 701, 101),
+            // A later-arriving, still-policy-valid correction is the latest
+            // source tick before the opening boundary.
+            chainlink_tick_received(699, 705, 110),
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(45, 2)),
+                ask: Some(Decimal::new(46, 2)),
+                bid_size: Some(Decimal::new(100, 0)),
+                ask_size: Some(Decimal::new(100, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: Utc.timestamp_opt(709, 0).unwrap(),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(105, 0),
+                ts: Utc.timestamp_opt(710, 0).unwrap(),
+            },
+            chainlink_tick(999, 105),
+            chainlink_tick(1001, 105),
+            MarketUpdate::EventExpired {
+                event_id: Arc::from("corrected-open"),
+                end_time: end,
+                resolved_up_won: Some(false),
+            },
+        ];
+
+        let rows = build_factor_observations_with_lob(&updates, &[], 30);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].settlement_up, 0.0);
+        assert!(rows[0].signed_distance_to_beat < 0.0);
+    }
+
+    #[test]
+    fn five_minute_oracle_evidence_records_fixed_pre_boundary_prices() {
+        let mut updates = governed_five_minute_fixture(true, Some(100));
+        updates.push(chainlink_tick(701, 250));
+        updates.push(chainlink_tick(1001, 300));
+
+        let build =
+            build_factor_observations_with_lob_sampled_and_oracle_evidence(&updates, &[], 30, 0);
+        let evidence = build
+            .oracle_settlement_evidence
+            .first()
+            .expect("one governed event");
+        let open = evidence.open.expect("governed open");
+        let close = evidence.close.expect("governed close");
+
+        assert_eq!(
+            evidence.policy_version,
+            GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION
+        );
+        assert_eq!(
+            open.price, 100.0,
+            "post-boundary price must not replace open"
+        );
+        assert_eq!(open.source_ts, Utc.timestamp_opt(699, 0).unwrap());
+        assert_eq!(open.received_at, Utc.timestamp_opt(699, 0).unwrap());
+        assert_eq!(
+            close.price, 100.0,
+            "post-boundary price must not replace close"
+        );
+        assert_eq!(close.source_ts, Utc.timestamp_opt(999, 0).unwrap());
+        assert_eq!(evidence.chainlink_outcome_up, Some(true));
+        assert!(evidence.reasons.is_empty());
+        assert_eq!(build.oracle_settlement_audit.expected_events, 1);
+        assert_eq!(build.oracle_settlement_audit.accepted_events, 1);
+    }
+
+    #[test]
+    fn five_minute_oracle_evidence_uses_late_ordered_correction_deterministically() {
+        let end = Utc.timestamp_opt(1000, 0).unwrap();
+        let updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("out-of-order-correction"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: None,
+                resolved_up_won: None,
+            },
+            chainlink_tick_received(701, 701, 101),
+            chainlink_tick_received(699, 705, 110),
+            chainlink_tick_received(698, 698, 100),
+            chainlink_tick_received(1001, 1001, 105),
+            chainlink_tick_received(999, 1005, 105),
+            MarketUpdate::EventExpired {
+                event_id: Arc::from("out-of-order-correction"),
+                end_time: end,
+                resolved_up_won: Some(false),
+            },
+            // A stale discovery record replayed after the terminal record must
+            // not replace the official terminal payout.
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("out-of-order-correction"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: None,
+                resolved_up_won: Some(true),
+            },
+        ];
+
+        let build =
+            build_factor_observations_with_lob_sampled_and_oracle_evidence(&updates, &[], 30, 0);
+        let evidence = &build.oracle_settlement_evidence[0];
+
+        assert_eq!(evidence.open.expect("open").price, 110.0);
+        assert_eq!(
+            evidence.open.expect("open").received_at,
+            Utc.timestamp_opt(705, 0).unwrap()
+        );
+        assert_eq!(evidence.close.expect("close").price, 105.0);
+        assert_eq!(evidence.chainlink_outcome_up, Some(false));
+        assert_eq!(evidence.official_outcome_up, Some(false));
+        assert!(evidence.is_complete());
+    }
+
+    #[test]
+    fn five_minute_oracle_audit_counts_missing_open_and_received_timeout() {
+        let mut updates = governed_five_minute_fixture(true, Some(101));
+        updates.retain(|update| {
+            !matches!(
+                update,
+                MarketUpdate::ReferencePrice { ts, .. }
+                    if *ts == Utc.timestamp_opt(699, 0).unwrap()
+                        || *ts == Utc.timestamp_opt(701, 0).unwrap()
+            )
+        });
+        updates.push(chainlink_tick_received(
+            699,
+            700 + GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS + 1,
+            100,
+        ));
+        updates.push(chainlink_tick(701, 100));
+
+        let build =
+            build_factor_observations_with_lob_sampled_and_oracle_evidence(&updates, &[], 30, 0);
+        let evidence = &build.oracle_settlement_evidence[0];
+
+        assert_eq!(evidence.open, None);
+        assert!(evidence
+            .reasons
+            .contains(&ChainlinkOracleFailureReason::MissingOpen));
+        assert_eq!(build.oracle_settlement_audit.expected_events, 1);
+        assert_eq!(build.oracle_settlement_audit.accepted_events, 0);
+        assert_eq!(build.oracle_settlement_audit.missing_open_events, 1);
+        assert!(build.oracle_settlement_audit.has_failures());
+    }
+
+    #[test]
+    fn five_minute_oracle_audit_counts_missing_close_and_official() {
+        let mut updates = governed_five_minute_fixture(true, None);
+        updates.retain(|update| !matches!(update, MarketUpdate::EventExpired { .. }));
+
+        let build =
+            build_factor_observations_with_lob_sampled_and_oracle_evidence(&updates, &[], 30, 0);
+        let evidence = &build.oracle_settlement_evidence[0];
+
+        assert!(evidence
+            .reasons
+            .contains(&ChainlinkOracleFailureReason::MissingClose));
+        assert!(evidence
+            .reasons
+            .contains(&ChainlinkOracleFailureReason::MissingOfficial));
+        assert_eq!(build.oracle_settlement_audit.missing_close_events, 1);
+        assert_eq!(build.oracle_settlement_audit.missing_official_events, 1);
+        assert_eq!(build.oracle_settlement_audit.failures.len(), 1);
+    }
+
+    #[test]
+    fn five_minute_oracle_tie_resolves_up_and_mismatch_is_audited() {
+        let accepted = build_factor_observations_with_lob_sampled_and_oracle_evidence(
+            &governed_five_minute_fixture(true, Some(100)),
+            &[],
+            30,
+            0,
+        );
+        assert_eq!(
+            accepted.oracle_settlement_evidence[0].chainlink_outcome_up,
+            Some(true),
+            "governed tie policy is Up"
+        );
+        assert!(!accepted.oracle_settlement_audit.has_failures());
+
+        let mismatch = build_factor_observations_with_lob_sampled_and_oracle_evidence(
+            &governed_five_minute_fixture(false, Some(100)),
+            &[],
+            30,
+            0,
+        );
+        assert_eq!(mismatch.oracle_settlement_audit.payout_mismatch_events, 1);
+        assert!(mismatch.oracle_settlement_audit.failures[0]
+            .reasons
+            .contains(&ChainlinkOracleFailureReason::OfficialPayoutMismatch));
+        assert!(mismatch.observations.is_empty());
+    }
+
+    #[test]
     fn factor_observations_only_include_active_event_window() {
         let start = Utc.timestamp_opt(700, 0).unwrap();
         let end = Utc.timestamp_opt(1000, 0).unwrap();
@@ -2635,6 +3497,42 @@ mod tests {
                 window_secs: 300,
                 price_to_beat: Some(Decimal::new(100, 0)),
                 resolved_up_won: None,
+            },
+            // Legacy reference evidence without an arrival time must not seed
+            // the new point-in-time component.
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: None,
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+            },
+            // The governed 5m row still needs an arrival-timestamped
+            // pre-open Chainlink reference.
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+            },
+            // A post-start tick alone is current-price evidence, not opening-strike
+            // provenance, so it must not make the component available either.
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(10001, 2),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(709, 0).unwrap()),
+                ts: Utc.timestamp_opt(708, 0).unwrap(),
             },
             MarketUpdate::Quote {
                 token_id: Arc::from("up"),
@@ -2666,6 +3564,8 @@ mod tests {
                 price: Decimal::new(100, 0),
                 ts: Utc.timestamp_opt(710, 0).unwrap(),
             },
+            chainlink_tick(999, 101),
+            chainlink_tick(1001, 101),
             MarketUpdate::EventExpired {
                 event_id: Arc::from("evt"),
                 end_time: end,
@@ -2677,7 +3577,168 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tick_ts, Utc.timestamp_opt(710, 0).unwrap());
+        assert_eq!(rows[0].event_window_secs, 300);
         assert!(rows[0].tick_ts >= start);
+        assert!(rows[0].chainlink_prob_up.is_finite());
+    }
+
+    #[test]
+    fn factor_observations_use_only_fresh_chainlink_binary_probability() {
+        let end = Utc.timestamp_opt(1000, 0).unwrap();
+        let updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("evt"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: Some(Decimal::new(90, 0)),
+                resolved_up_won: None,
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+            },
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(45, 2)),
+                ask: Some(Decimal::new(46, 2)),
+                bid_size: Some(Decimal::new(100, 0)),
+                ask_size: Some(Decimal::new(100, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: Utc.timestamp_opt(709, 0).unwrap(),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(102, 0),
+                ts: Utc.timestamp_opt(710, 0).unwrap(),
+            },
+            // Intentionally follows SpotPrice in input order. The availability-time
+            // tie-break must process the reference before the observation.
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(10001, 2),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(708, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(710, 0).unwrap()),
+            },
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(47, 2)),
+                ask: Some(Decimal::new(48, 2)),
+                bid_size: Some(Decimal::new(100, 0)),
+                ask_size: Some(Decimal::new(100, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: Utc.timestamp_opt(749, 0).unwrap(),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(103, 0),
+                ts: Utc.timestamp_opt(750, 0).unwrap(),
+            },
+            chainlink_tick(999, 101),
+            chainlink_tick(1001, 101),
+            MarketUpdate::EventExpired {
+                event_id: Arc::from("evt"),
+                end_time: end,
+                resolved_up_won: Some(true),
+            },
+        ];
+
+        let rows = build_factor_observations_with_lob(&updates, &[], 30);
+
+        assert_eq!(rows.len(), 2);
+        let expected = estimate_probability(100.0, 100.01, rows[0].sigma_horizon);
+        let expected_model = estimate_probability(100.0, 102.0, rows[0].sigma_horizon);
+        assert!((rows[0].chainlink_prob_up - expected).abs() < 1e-9);
+        assert!((rows[0].model_prob_up - expected_model).abs() < 1e-9);
+        assert!(rows[0].model_prob_up > rows[0].chainlink_prob_up);
+        assert!(rows[1].chainlink_prob_up.is_nan());
+    }
+
+    #[test]
+    fn factor_observations_do_not_see_delayed_chainlink_before_it_was_received() {
+        let end = Utc.timestamp_opt(1000, 0).unwrap();
+        let updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("evt"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: Some(Decimal::new(100, 0)),
+                resolved_up_won: None,
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+            },
+            // Confirm the governed opening boundary before the first
+            // observation; the later 708 source tick is separately delayed.
+            chainlink_tick(701, 100),
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(45, 2)),
+                ask: Some(Decimal::new(46, 2)),
+                bid_size: Some(Decimal::new(100, 0)),
+                ask_size: Some(Decimal::new(100, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: Utc.timestamp_opt(709, 0).unwrap(),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(101, 0),
+                ts: Utc.timestamp_opt(710, 0).unwrap(),
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(10001, 2),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(708, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(715, 0).unwrap()),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(101, 0),
+                ts: Utc.timestamp_opt(716, 0).unwrap(),
+            },
+            chainlink_tick(999, 101),
+            chainlink_tick(1001, 101),
+            MarketUpdate::EventExpired {
+                event_id: Arc::from("evt"),
+                end_time: end,
+                resolved_up_won: Some(true),
+            },
+        ];
+
+        let rows = build_factor_observations_with_lob(&updates, &[], 30);
+
+        assert_eq!(rows.len(), 2);
+        assert!((rows[0].chainlink_prob_up - 0.5).abs() < 1e-9);
+        assert!(rows[1].chainlink_prob_up > rows[0].chainlink_prob_up);
     }
 
     #[test]
@@ -2693,6 +3754,26 @@ mod tests {
                 window_secs: 300,
                 price_to_beat: Some(Decimal::new(100, 0)),
                 resolved_up_won: None,
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(700, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(700, 0).unwrap()),
             },
             MarketUpdate::Quote {
                 token_id: Arc::from("up"),
@@ -2719,6 +3800,8 @@ mod tests {
                 price: Decimal::new(99, 0),
                 ts: Utc.timestamp_opt(750, 0).unwrap(),
             },
+            chainlink_tick(999, 99),
+            chainlink_tick(1001, 99),
             MarketUpdate::EventExpired {
                 event_id: Arc::from("evt"),
                 end_time: end,
@@ -2747,6 +3830,26 @@ mod tests {
                 window_secs: 300,
                 price_to_beat: Some(Decimal::new(100, 0)),
                 resolved_up_won: None,
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(700, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(700, 0).unwrap()),
             },
             MarketUpdate::Quote {
                 token_id: Arc::from("up"),
@@ -2817,6 +3920,8 @@ mod tests {
                 price: Decimal::new(103, 0),
                 ts: Utc.timestamp_opt(779, 0).unwrap(),
             },
+            chainlink_tick(999, 101),
+            chainlink_tick(1001, 101),
             MarketUpdate::EventExpired {
                 event_id: Arc::from("evt"),
                 end_time: end,
@@ -2891,6 +3996,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts2,
+                    event_window_secs: 300,
                     time_remaining_secs: 10,
                     signed_distance_to_beat: 0.0,
                     abs_distance_to_beat: 0.0,
@@ -2906,6 +4012,7 @@ mod tests {
                     vol_gap: -0.8,
                     distance_over_sigma: 0.0,
                     model_prob_up: 0.5,
+                    chainlink_prob_up: f64::NAN,
                     model_edge_up: 0.0,
                     reward_risk_up: 1.0,
                     reward_risk_down: 0.5,
@@ -2948,6 +4055,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts0,
+                    event_window_secs: 300,
                     time_remaining_secs: 90,
                     signed_distance_to_beat: 0.0,
                     abs_distance_to_beat: 0.0,
@@ -2963,6 +4071,7 @@ mod tests {
                     vol_gap: -0.7,
                     distance_over_sigma: 0.0,
                     model_prob_up: 0.5,
+                    chainlink_prob_up: f64::NAN,
                     model_edge_up: 0.0,
                     reward_risk_up: 4.0,
                     reward_risk_down: 0.1,
@@ -3005,6 +4114,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts1,
+                    event_window_secs: 300,
                     time_remaining_secs: 50,
                     signed_distance_to_beat: 0.0,
                     abs_distance_to_beat: 0.0,
@@ -3020,6 +4130,7 @@ mod tests {
                     vol_gap: -0.6,
                     distance_over_sigma: 0.0,
                     model_prob_up: 0.5,
+                    chainlink_prob_up: f64::NAN,
                     model_edge_up: 0.0,
                     reward_risk_up: 0.6,
                     reward_risk_down: 1.5,

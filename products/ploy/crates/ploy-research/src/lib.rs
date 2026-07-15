@@ -13,6 +13,9 @@ pub mod factors_v2;
 #[cfg(any(feature = "ml", feature = "rl"))]
 pub mod model;
 pub mod orderbook;
+pub mod prediction_llm;
+pub mod prediction_loop;
+mod prediction_loop_fs;
 pub mod replay;
 pub mod research_os;
 pub mod research_snapshot;
@@ -52,9 +55,13 @@ pub use event_ml::{
 };
 pub use factors::{
     aggregate_factor_metrics, build_event_summaries, build_factor_observations,
-    build_factor_observations_with_lob, build_factor_observations_with_lob_sampled, factor_metrics,
-    AggregatedFactorMetric, EventFactorSummary, FactorMetric, FactorObservation,
-    ResearchLobSnapshot, ResearchPmBookLevel, ResearchPmBookSnapshot,
+    build_factor_observations_with_lob, build_factor_observations_with_lob_sampled,
+    build_factor_observations_with_lob_sampled_and_oracle_evidence, factor_metrics,
+    normalized_underlying_symbol, AggregatedFactorMetric, ChainlinkOracleAuditFailure,
+    ChainlinkOracleBoundaryEvidence, ChainlinkOracleFailureReason, ChainlinkOracleSettlementAudit,
+    ChainlinkOracleSettlementEvidence, EventFactorSummary, FactorMetric, FactorObservation,
+    FactorObservationBuild, ResearchLobSnapshot, ResearchPmBookLevel, ResearchPmBookSnapshot,
+    GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS, GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION,
 };
 #[cfg(feature = "polars-export")]
 pub use factors::{export_observations_parquet, observations_to_frame};
@@ -67,10 +74,12 @@ pub use replay::replay_fills;
 #[cfg(feature = "db")]
 pub use research_snapshot::{build_research_snapshot_from_database, ResearchSnapshotBuildOptions};
 pub use research_snapshot::{
-    load_research_snapshot, validate_snapshot_request, validate_snapshot_request_coverage,
-    write_research_snapshot, ResearchSnapshot, ResearchSnapshotArtifacts, ResearchSnapshotManifest,
-    ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource, ResearchSnapshotRequest,
-    ResearchSnapshotRowCounts, RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+    load_research_snapshot, validate_governed_chainlink_5m_settlement_audit,
+    validate_governed_chainlink_5m_settlement_evidence, validate_snapshot_request,
+    validate_snapshot_request_coverage, write_research_snapshot, ResearchSnapshot,
+    ResearchSnapshotArtifacts, ResearchSnapshotManifest, ResearchSnapshotPhaseTiming,
+    ResearchSnapshotPmBookSource, ResearchSnapshotRequest, ResearchSnapshotRowCounts,
+    RESEARCH_SNAPSHOT_SCHEMA_VERSION,
 };
 
 pub const CRATE_MARKER: &str = "ploy-research";
@@ -100,7 +109,8 @@ pub use autofactor::{
     mine_domain_autofactors_from_v2_with_mcts_plan, AutoFactorDecision, AutoFactorError,
     AutoFactorMatrix, AutoFactorOptions, AutoFactorReport, AutoFactorRuntimeContractCatalog,
     AutoFactorRuntimeFormulaBlocker, AutoFactorRuntimeInputContract, AutoFactorTargetContract,
-    AutoFactorV2Target, FactorExpr, LlmMutationSpec, LlmPriorSpec, NamedFactorExpr,
+    AutoFactorV2Target, FactorExpr, LlmMutationSpec, LlmPriorSpec, LlmProbabilityBlendSpec,
+    NamedFactorExpr,
 };
 pub use backtest::{run_binary_backtest, BacktestMetrics, SimulatedFill};
 pub use factors_new::{
@@ -111,9 +121,10 @@ pub use factors_v2::{
     build_data_health_report, build_factor_observations_v2,
     build_factor_observations_v2_with_deribit,
     build_factor_observations_v2_with_deribit_and_pm_books, build_factor_stability_report,
-    build_full_depth_execution_matrix, build_settlement_probability_promotion_gate_report,
-    build_settlement_probability_report, factor_v2_descriptors, format_factor_combo_v1_report,
-    format_factor_review_v2_report, format_factor_stability_report,
+    build_full_depth_execution_matrix, build_prediction_research_feedback,
+    build_settlement_probability_promotion_gate_report, build_settlement_probability_report,
+    build_settlement_probability_report_with_prior, factor_v2_descriptors,
+    format_factor_combo_v1_report, format_factor_review_v2_report, format_factor_stability_report,
     format_factor_walk_forward_v2_report, format_fillability_review_v1_report,
     format_full_depth_execution_matrix_report, format_liquidity_gate_v1_report,
     format_liquidity_gated_alpha_v1_report, format_meta_label_walk_forward_v1_report,
@@ -121,27 +132,31 @@ pub use factors_v2::{
     format_settlement_probability_report, format_settlement_probability_walk_forward_report,
     format_trade_formation_v1_report, liquidity_gate_v1_with_deribit,
     liquidity_gate_v1_with_deribit_and_pm_books, liquidity_gated_alpha_v1_with_deribit,
-    liquidity_gated_alpha_v1_with_deribit_and_pm_books, review_factors_v2,
-    review_factors_v2_with_deribit, review_factors_v2_with_deribit_and_pm_books,
+    liquidity_gated_alpha_v1_with_deribit_and_pm_books, recompute_prediction_research_outcome,
+    review_factors_v2, review_factors_v2_with_deribit, review_factors_v2_with_deribit_and_pm_books,
     review_factors_v2_with_deribit_and_pm_books_filtered, review_fillability_v1_with_deribit,
     review_fillability_v1_with_deribit_and_pm_books, review_repricing_ic_with_deribit,
     review_repricing_ic_with_deribit_and_pm_books, review_trade_formation_v1_with_deribit,
-    review_trade_formation_v1_with_deribit_and_pm_books, walk_forward_factor_combo_v1_with_deribit,
+    review_trade_formation_v1_with_deribit_and_pm_books, validate_prediction_research_prior,
+    walk_forward_factor_combo_v1_with_deribit,
     walk_forward_factor_combo_v1_with_deribit_and_pm_books, walk_forward_factors_v2_with_deribit,
     walk_forward_factors_v2_with_deribit_and_pm_books, walk_forward_meta_label_v1_with_deribit,
     walk_forward_meta_label_v1_with_deribit_and_pm_books,
-    walk_forward_settlement_probability_report, BinanceDirectionBucketSummary, DataHealthReport,
-    DeribitFeatureSnapshot, DirectionSideAuditLegSummary, DirectionSideAuditSummary,
-    ExecutableEvBucketSummary, FactorComboComponent, FactorComboV1Aggregate, FactorComboV1Options,
-    FactorComboV1Report, FactorComboV1Window, FactorFamily, FactorObservationV2,
-    FactorReviewOptions, FactorReviewV2Report, FactorSelectionMetrics, FactorStabilityDecision,
-    FactorStabilityOptions, FactorStabilityReport, FactorStabilityRow, FactorV2Descriptor,
-    FactorWalkForwardAggregate, FactorWalkForwardOptions, FactorWalkForwardReport,
-    FactorWalkForwardWindow, FillabilityBucketRow, FillabilityDecision, FillabilityReviewOptions,
-    FillabilityReviewReport, FullDepthExecutionMatrixOptions, FullDepthExecutionMatrixReport,
-    FullDepthExecutionMatrixRow, LiquidityGateV1Options, LiquidityGateV1Report,
-    LiquidityGatedAlphaV1Options, LiquidityGatedAlphaV1Report, MetaLabelWalkForwardAggregate,
-    MetaLabelWalkForwardOptions, MetaLabelWalkForwardReport, MetaLabelWalkForwardWindow,
+    walk_forward_settlement_probability_report,
+    walk_forward_settlement_probability_report_with_prior, BinanceDirectionBucketSummary,
+    DataHealthReport, DeribitFeatureSnapshot, DirectionSideAuditLegSummary,
+    DirectionSideAuditSummary, ExecutableEvBucketSummary, FactorComboComponent,
+    FactorComboV1Aggregate, FactorComboV1Options, FactorComboV1Report, FactorComboV1Window,
+    FactorFamily, FactorObservationV2, FactorReviewOptions, FactorReviewV2Report,
+    FactorSelectionMetrics, FactorStabilityDecision, FactorStabilityOptions, FactorStabilityReport,
+    FactorStabilityRow, FactorV2Descriptor, FactorWalkForwardAggregate, FactorWalkForwardOptions,
+    FactorWalkForwardReport, FactorWalkForwardWindow, FillabilityBucketRow, FillabilityDecision,
+    FillabilityReviewOptions, FillabilityReviewReport, FullDepthExecutionMatrixOptions,
+    FullDepthExecutionMatrixReport, FullDepthExecutionMatrixRow, LiquidityGateV1Options,
+    LiquidityGateV1Report, LiquidityGatedAlphaV1Options, LiquidityGatedAlphaV1Report,
+    MetaLabelWalkForwardAggregate, MetaLabelWalkForwardOptions, MetaLabelWalkForwardReport,
+    MetaLabelWalkForwardWindow, PredictionResearchCandidateFeedback,
+    PredictionResearchCandidateMetrics, PredictionResearchFeedback, PredictionResearchGatePolicy,
     RepricingIcOptions, RepricingIcReport, RepricingIcRow, ReviewSide,
     SettlementProbabilityAblationRow, SettlementProbabilityAntiOverfitRow,
     SettlementProbabilityBaselineRow, SettlementProbabilityCalibrationRow,

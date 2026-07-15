@@ -11,6 +11,63 @@ Monday remains the repository and production authority. In particular:
 - PLOY must not bypass Monday by submitting orders from its sidecar or legacy standalone deployment paths.
 - Live trading remains disabled. This migration does not deploy, resume, approve, or mutate any trading host.
 
+## Research framework boundary
+
+Monday intentionally keeps two evaluation frameworks because the labels, sampling units, and promotion evidence are different:
+
+| Research lane | Sampling unit and target | Primary evaluation | Owner |
+| --- | --- | --- | --- |
+| Derivatives / continuous contracts | Point-in-time time-series rows predicting future return | Purged walk-forward IC, RankIC, ICIR, post-cost return, turnover, and drawdown | `rust_hft/alpha-harness` |
+| Prediction markets | Event observations predicting an official binary settlement | Event-disjoint walk-forward Brier score, log loss, calibration error, full-depth settlement PnL, and capacity | `products/ploy/crates/ploy-research` |
+
+The lanes share repository governance, evidence provenance requirements, and the Monday execution-authority boundary. They do not share labels, fold construction, evaluator thresholds, or a Cargo graph. In particular, IC/ICIR may be diagnostic for a prediction-market feature, but it is not a prediction-market promotion gate; prediction rows must not be routed through the derivatives `FormulaEvaluator`.
+
+The prediction-market lane also keeps data authority explicit:
+
+- Chainlink provides the point-in-time opening reference and official settlement
+  truth for the governed five-minute crypto contracts.
+- Binance spot, aggTrade, and L2 data are external predictive and repricing
+  inputs only. They must never replace the opening reference, settlement oracle,
+  or Polymarket execution price.
+- Polymarket CLOB quotes and full depth provide market-implied probability,
+  executable entry price, fees, fillability, and capacity evidence.
+
+LLM proposal paths remain lane-specific as well. `alpha-harness` has a bounded,
+lab-only Formula proposer for derivatives missions. PLOY uses the versioned
+`prediction_research_mission.v1` JSON brief and its existing `LlmPriorSpec`; it
+does not import the alpha-harness Rust domain or loop runtime. Instead, PLOY has
+its own bounded Rust prediction-research LoopRun in `crates/ploy-research`, with
+`prediction_research_loop` as its CLI example, because an event settlement loop
+cannot reuse the derivatives return/IC state machine. No Python script is an
+authoritative prediction LoopRun or promotion surface. Standalone formula
+mutations may carry a falsifiable hypothesis and compile through AutoFactor as
+IC/ICIR diagnostics, but the prediction LoopRun accepts only typed
+probability-blend candidates. Those candidates enter PLOY's
+event-disjoint Brier/log-loss/calibration evaluator and return candidate-specific
+deterministic feedback, including conservative-depth capacity failure. The
+evaluator never invokes an LLM or accepts free-form trading instructions.
+
+Both loops share governance rules, not evaluator code. The derivatives LoopRun
+persists its state in `rust_hft/alpha-harness`; the prediction LoopRun persists
+one mission-bound state plus content-addressed iteration evidence under its PLOY
+output directory. Reusing an output directory with another mission, symbol, or
+data snapshot fails closed. Its five-minute evaluator accepts only observations
+persisted with `event_window_secs=300`; legacy observations default to zero and
+must be rebuilt into a new snapshot. The mission binds the snapshot's strong
+`snapshot_contract_hash`, which covers the evaluator-visible manifest semantics
+and artifacts, rather than relying only on the legacy content hash.
+
+The prediction LoopRun also keeps a durable state ledger for every LLM call and
+links each accepted proposal to its full retry lineage. The ledger is atomically
+checkpointed as attempts change state, while prompts, responses, priors,
+evaluator attempts, feedback, and deterministic decisions are content-addressed.
+Only artifacts already bound by committed LoopRun state can be replayed after a
+process crash; unbound orphan responses or evaluator outputs are never trusted
+as recovery evidence. Missing responses and rejected retries remain explicit
+evidence rather than disappearing from the budget. An adaptive prediction search
+can end only in a provisional pass; a separate sealed snapshot is required before
+final keep or promotion. Neither loop owns execution or live activation.
+
 ## Source and provenance
 
 - Source repository: `https://github.com/proerror77/ploy`
@@ -54,7 +111,9 @@ The original `.github`, `deployment`, and `infra` trees remain under `products/p
 - Python remains only where behavior has not yet earned Rust parity: the legacy ML
   workspace, the Python LOB archiver during Rust shadow comparison, and imported
   PLOY research/compatibility utilities. Root CI may compile or fixture-test those
-  files, but it does not make the nested PLOY deployment workflows active.
+  files, but they do not own prediction LoopRun state, evaluator evidence, or
+  promotion decisions, and root CI does not make the nested PLOY deployment
+  workflows active.
 - Shell remains for host bootstrap, CI command composition, and package installation;
   no shell script owns trading decisions, risk, OMS, or exchange mutations.
 - The Rust sidecar is built and tested but has no approved deployment package. Its

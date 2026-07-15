@@ -679,6 +679,7 @@ mod tests {
                 price: dec!(212.45),
                 full_accuracy_value: Some("212.450000".into()),
                 is_carried_forward: false,
+                received_at: Some(now + Duration::seconds(3)),
                 ts: now + Duration::seconds(3),
             },
         ];
@@ -971,6 +972,7 @@ mod tests {
                 price: dec!(100001),
                 full_accuracy_value: None,
                 is_carried_forward: false,
+                received_at: Some(now + Duration::seconds(1)),
                 ts: now + Duration::seconds(1),
             },
         ];

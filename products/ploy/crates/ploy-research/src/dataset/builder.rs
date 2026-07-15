@@ -271,7 +271,7 @@ mod tests {
         build_event_root_dataset, standard_event_root_dataset_artifacts, DatasetBuildError,
         EventRootDatasetBuildRequest,
     };
-    use crate::dataset::{DatasetSourceWindow, DatasetSplit, EventMetadataChronologyInput};
+    use crate::dataset::{DatasetSourceWindow, EventMetadataChronologyInput};
     use crate::factors::FactorObservation;
     use chrono::{Duration, TimeZone, Utc};
     use std::collections::HashSet;
@@ -452,6 +452,7 @@ mod tests {
             event_id: event_id.to_string(),
             symbol: symbol.to_string(),
             tick_ts: event_start + Duration::seconds(row_idx * 30),
+            event_window_secs: 300,
             time_remaining_secs: 300 - row_idx * 30,
             signed_distance_to_beat: 0.0,
             abs_distance_to_beat: 0.0,
@@ -467,6 +468,7 @@ mod tests {
             vol_gap: 0.0,
             distance_over_sigma: 0.0,
             model_prob_up: 0.5,
+            chainlink_prob_up: f64::NAN,
             model_edge_up: 0.0,
             reward_risk_up: 1.0,
             reward_risk_down: 1.0,
