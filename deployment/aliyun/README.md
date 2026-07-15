@@ -218,8 +218,11 @@ A silent WebSocket shard fails after
 `STALL_TIMEOUT_SECONDS`. Receiver cleanup is bounded to five seconds so a stuck
 WebSocket close handshake cannot block reconnection. A separate process watchdog
 exits after 180 seconds without any market-data frame, allowing systemd to recover
-even if the asyncio loop deadlocks. Low disk space emits a warning but does not
-pause collection. Successfully uploaded segments are deleted
+even if the runtime stalls. The watchdog remains armed across ordinary session
+reconnects, but global shutdown disarms it before shutdown becomes visible to
+session tasks. This prevents bounded final segment compression (up to
+`ZSTD_TIMEOUT_SECONDS`) from being mistaken for a market-data stall. Low disk
+space emits a warning but does not pause collection. Successfully uploaded segments are deleted
 from the local spool immediately. Pending segments are retained when OSS upload
 fails so the collector never creates a silent data hole merely to reclaim space.
 The shared pending-diff budget still bounds initialization bursts. Services restart
