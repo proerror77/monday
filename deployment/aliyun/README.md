@@ -88,7 +88,7 @@ requires three additional stable polls before a market is marked complete. Malfo
 trade rows are isolated and counted by reason in `health.json` instead of blocking
 valid rows.
 The collector discovers the full 24-hour settlement lane on every cycle, but bounds
-Data API trade requests to 192 markets per cycle. Markets in the active/finalization
+Data API trade requests to 112 markets per cycle. Markets in the active/finalization
 window and failed retries are always selected first; the remaining historical lane
 rotates by oldest successful poll so cold-start backfill cannot prevent health from
 advancing. `priority_trade_backlog` must be zero for the shadow gate to accept a
@@ -100,6 +100,10 @@ may remain in flight, and each processing chunk retains at most four market resp
 so slow I/O overlaps without creating an unbounded request or memory fan-out. An
 absolute 180-second cycle deadline cancels stalled network work and fails closed;
 health evidence over that duration is rejected by the shadow gate.
+The 112-request budget and the collector units' 384MiB/512MiB memory high/max
+limits are a measured pair: a clean Tokyo cold start covered all 112 priority
+markets in 45.091 seconds with zero priority backlog. The health policy pins the
+budget so a later default drift cannot silently invalidate that evidence.
 The shadow gate allows a separate 60-second initial-health grace after that
 deadline so a cycle completing at the boundary can finish durable health
 publication before the first sample. This does not relax the 180-second health

@@ -28,5 +28,5 @@ ReadWritePaths=/data/monday/spool/polymarket-reference-rust-shadow/%i
 RestrictAddressFamilies=AF_INET AF_INET6
 UMask=0027
 CPUQuota=20%
-MemoryHigh=256M
-MemoryMax=384M
+MemoryHigh=384M
+MemoryMax=512M

@@ -28,7 +28,7 @@ const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
-pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 192;
+pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
 const MIN_TRADE_REQUEST_SPACING: Duration = Duration::from_millis(100);
 const TARGET_MARKET_WINDOWS_SECS: [usize; 2] = [300, 900];
@@ -2107,6 +2107,7 @@ mod tests {
     fn settlement_discovery_capacity_covers_every_configured_five_and_fifteen_minute_market() {
         let default = ReferenceConfig::default();
         assert_eq!(default.max_markets, 10_000);
+        assert_eq!(default.max_trade_polls_per_cycle, 112);
         assert_eq!(
             default.max_trade_polls_per_cycle,
             DEFAULT_MAX_TRADE_POLLS_PER_CYCLE
