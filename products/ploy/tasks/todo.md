@@ -50,6 +50,7 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [x] Retire the legacy Binance-to-`price_to_beat` backfill path so Binance cannot override Chainlink opening/settlement authority.
 - [x] Enforce mission, symbol, horizon, and exact snapshot provenance again at the Rust evaluator boundary.
 - [x] Keep feedback mission-local and return no-OOS plus conservative-capacity failure reasons for every proposed blend.
+- [x] Add a governed Rust-only Burn binary probability lane with event-disjoint snapshot-bound inputs and content-addressed model evidence.
 
 ## Research framework cleanup
 
