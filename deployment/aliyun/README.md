@@ -109,6 +109,9 @@ deadline so a cycle completing at the boundary can finish durable health
 publication before the first sample. This does not relax the 180-second health
 policy: a real timeout still exits or restarts the candidate and fails the
 identity checks.
+The shadow unit uses `Type=exec`, so `systemctl start` returns only after the
+pinned Rust executable has completed `execve`; the first PID, executable, and
+command-line identity check cannot race a pre-exec service process.
 `cycle_started_at` preserves the API snapshot boundary, while `updated_at` and
 `last_success_at` are stamped only after tape and state durability completes;
 `cycle_duration_ms` makes the 90-second gate freshness budget directly auditable.

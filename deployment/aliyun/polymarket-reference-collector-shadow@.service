@@ -6,7 +6,7 @@ RequiresMountsFor=/data
 ConditionPathIsMountPoint=/data
 
 [Service]
-Type=simple
+Type=exec
 User=hftcollector
 Group=hftcollector
 EnvironmentFile=/run/monday/polymarket-reference-shadow-%i.env
