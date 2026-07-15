@@ -31,6 +31,29 @@ from an expired 5-minute/15-minute market cannot trigger a trade in the next eve
 The runner restarts every six hours; the recorder rotates an existing tape before
 opening the next session.
 
+Closed Polymarket sessions are validated, compressed, and uploaded every five
+minutes by `polymarket-market-tape-upload.timer`. The uploader ignores the active
+`market-updates.ndjson`, requires contiguous sequence numbers and monotonic record
+timestamps, then writes `.ndjson.zst`, `manifest.json`, and `_SUCCESS` under
+`lake/raw/venue=polymarket/dataset=crypto_expiry/`. Failed uploads retain the
+closed source tape for retry and surface the failure in
+`/data/monday/spool/polymarket/upload-status.json`.
+
+Install the uploader beside the existing tape service:
+
+```bash
+sudo install -m 0755 deployment/aliyun/polymarket_market_tape_upload.py \
+  /opt/monday/bin/polymarket_market_tape_upload.py
+sudo install -m 0640 deployment/aliyun/polymarket-market-tape-upload.env \
+  /etc/monday/polymarket-market-tape-upload.env
+sudo install -m 0644 deployment/aliyun/polymarket-market-tape-upload.service \
+  /etc/systemd/system/polymarket-market-tape-upload.service
+sudo install -m 0644 deployment/aliyun/polymarket-market-tape-upload.timer \
+  /etc/systemd/system/polymarket-market-tape-upload.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-market-tape-upload.timer
+```
+
 Each service opens bounded WebSocket shards, records every diff, fetches a REST
 Top-100 snapshot, validates sequence continuity, writes replay checkpoints, compresses
 hourly segments, and uploads `.jsonl.zst`, `manifest.json`, and `_SUCCESS` to OSS.
