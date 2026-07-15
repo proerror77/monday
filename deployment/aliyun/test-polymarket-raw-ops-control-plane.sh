@@ -337,6 +337,8 @@ done
 jq -n '{
   updated_at:"2026-07-15T00:00:01Z",last_success_at:"2026-07-15T00:00:01Z",
   target_markets:14,missing_target_symbols:[],api_errors:[],malformed_trade_rows:0,
+  trade_poll_budget:192,eligible_trade_markets:14,priority_trade_markets:8,
+  selected_trade_markets:14,deferred_trade_markets:0,priority_trade_backlog:0,trade_polls:14,
   truncated_trade_markets:[],non_object_trade_markets:[],invalid_settlement_markets:[],
   invalid_end_time_markets:[],stale_trade_markets:[],stale_settlement_markets:[],
   overdue_unresolved_markets:[]
@@ -344,6 +346,8 @@ jq -n '{
 jq -e -f "$RUST_HEALTH_POLICY" "$tmp_dir/rust-health.json" >/dev/null
 for mutation in \
   'del(.last_success_at)' \
+  '.priority_trade_backlog = 1' \
+  '.selected_trade_markets = 13' \
   '.missing_target_symbols = ["BTCUSDT"]' \
   '.api_errors = ["Gamma unavailable"]' \
   '.non_object_trade_markets = ["condition-1"]' \

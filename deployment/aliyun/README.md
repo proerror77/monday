@@ -87,6 +87,13 @@ trade polling continues for at least 30 minutes after the latest observed change
 requires three additional stable polls before a market is marked complete. Malformed
 trade rows are isolated and counted by reason in `health.json` instead of blocking
 valid rows.
+The collector discovers the full 24-hour settlement lane on every cycle, but bounds
+Data API trade requests to 192 markets per cycle. Markets in the active/finalization
+window and failed retries are always selected first; the remaining historical lane
+rotates by oldest successful poll so cold-start backfill cannot prevent health from
+advancing. `priority_trade_backlog` must be zero for the shadow gate to accept a
+health sample, while `deferred_trade_markets` makes bounded historical backfill
+explicit rather than silently claiming full-cycle trade coverage.
 Each append batch rolls back to its starting offset if write or fsync fails, so a retry
 cannot duplicate a durable prefix, suppress a required hourly metadata seed, or leave
 a partial record behind. A durable per-hour seed marker also forces Rust metadata when

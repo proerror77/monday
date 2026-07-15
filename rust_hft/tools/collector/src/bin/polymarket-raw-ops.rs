@@ -1,7 +1,9 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hft_collector::polymarket_parity::{verify_shadow_parity, ShadowParityConfig};
-use hft_collector::polymarket_raw::{run_reference, ReferenceConfig, DEFAULT_MAX_MARKETS_PER_LANE};
+use hft_collector::polymarket_raw::{
+    run_reference, ReferenceConfig, DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
+};
 use hft_collector::polymarket_upload::{run_upload, UploadConfig};
 use std::env;
 use std::path::PathBuf;
@@ -37,6 +39,8 @@ enum Command {
         settlement_lookback_secs: i64,
         #[arg(long, default_value_t = DEFAULT_MAX_MARKETS_PER_LANE)]
         max_markets: usize,
+        #[arg(long, default_value_t = DEFAULT_MAX_TRADE_POLLS_PER_CYCLE)]
+        max_trade_polls_per_cycle: usize,
         #[arg(long, default_value_t = 20.0)]
         http_timeout: f64,
         #[arg(long, default_value_t = 180.0)]
@@ -123,6 +127,7 @@ async fn main() -> Result<()> {
             market_lookback_secs,
             settlement_lookback_secs,
             max_markets,
+            max_trade_polls_per_cycle,
             http_timeout,
             stale_after_secs,
             trade_finalization_lag_secs,
@@ -137,6 +142,7 @@ async fn main() -> Result<()> {
                 market_lookback_secs,
                 settlement_lookback_secs,
                 max_markets,
+                max_trade_polls_per_cycle,
                 http_timeout: positive_duration(http_timeout, "HTTP timeout")?,
                 stale_after: positive_duration(stale_after_secs, "stale interval")?,
                 trade_finalization_lag_secs,
@@ -209,9 +215,18 @@ mod tests {
         let command = Cli::try_parse_from(["polymarket-raw-ops", "collect-reference"])
             .expect("default collector CLI must parse")
             .command;
-        let Command::CollectReference { max_markets, .. } = command else {
+        let Command::CollectReference {
+            max_markets,
+            max_trade_polls_per_cycle,
+            ..
+        } = command
+        else {
             panic!("collect-reference must select the collector command");
         };
         assert_eq!(max_markets, ReferenceConfig::default().max_markets);
+        assert_eq!(
+            max_trade_polls_per_cycle,
+            ReferenceConfig::default().max_trade_polls_per_cycle
+        );
     }
 }
