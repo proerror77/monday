@@ -2415,18 +2415,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_session_failure_path_keeps_watchdog_armed_for_reconnect() {
+    async fn run_session_task_failure_keeps_watchdog_armed_for_reconnect() {
         let watchdog = armed_watchdog();
-        let mut config = test_config("http://unused".into());
-        config.symbols.clear();
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let spool_dir = env::temp_dir().join(format!(
+            "monday-watchdog-reconnect-test-{}",
+            now_ns().unwrap()
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let mut config = test_config("http://[::1".into());
+        // The newline makes the websocket URL invalid while the malformed REST
+        // base makes the snapshot task fail too. Both failures happen only
+        // after run_session has created its segment and spawned its producers.
+        config.symbols = vec!["BAD\nSYMBOL".into()];
+        config.spool_dir = spool_dir.clone();
+        config.snapshot_retry_attempts = 1;
+        let config = Arc::new(config);
 
-        let error = run_session(Arc::new(config), shutdown_rx, watchdog.clone())
+        for attempt in 1..=2 {
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_session(config.clone(), shutdown_rx, watchdog.clone()),
+            )
             .await
-            .expect_err("empty session must return to the reconnect loop");
+            .unwrap_or_else(|_| panic!("session attempt {attempt} did not fail promptly"))
+            .expect_err("invalid producers must return to the reconnect loop");
+            assert!(!error.to_string().is_empty());
+            assert_eq!(watchdog.state(), ProcessWatchdogState::Armed);
+        }
 
-        assert!(error.to_string().contains("no active symbols remain"));
-        assert_eq!(watchdog.state(), ProcessWatchdogState::Armed);
+        std::fs::remove_dir_all(spool_dir).unwrap();
         assert!(watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
     }
 
