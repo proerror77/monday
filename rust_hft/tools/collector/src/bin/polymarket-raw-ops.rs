@@ -2,7 +2,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hft_collector::polymarket_parity::{verify_shadow_parity, ShadowParityConfig};
 use hft_collector::polymarket_raw::{
-    run_reference, ReferenceConfig, DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
+    run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
+    DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
 };
 use hft_collector::polymarket_upload::{run_upload, UploadConfig};
 use std::env;
@@ -41,6 +42,8 @@ enum Command {
         max_markets: usize,
         #[arg(long, default_value_t = DEFAULT_MAX_TRADE_POLLS_PER_CYCLE)]
         max_trade_polls_per_cycle: usize,
+        #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENT_TRADE_POLLS)]
+        max_concurrent_trade_polls: usize,
         #[arg(long, default_value_t = 20.0)]
         http_timeout: f64,
         #[arg(long, default_value_t = 180.0)]
@@ -128,6 +131,7 @@ async fn main() -> Result<()> {
             settlement_lookback_secs,
             max_markets,
             max_trade_polls_per_cycle,
+            max_concurrent_trade_polls,
             http_timeout,
             stale_after_secs,
             trade_finalization_lag_secs,
@@ -143,6 +147,7 @@ async fn main() -> Result<()> {
                 settlement_lookback_secs,
                 max_markets,
                 max_trade_polls_per_cycle,
+                max_concurrent_trade_polls,
                 http_timeout: positive_duration(http_timeout, "HTTP timeout")?,
                 stale_after: positive_duration(stale_after_secs, "stale interval")?,
                 trade_finalization_lag_secs,
@@ -218,6 +223,7 @@ mod tests {
         let Command::CollectReference {
             max_markets,
             max_trade_polls_per_cycle,
+            max_concurrent_trade_polls,
             ..
         } = command
         else {
@@ -227,6 +233,10 @@ mod tests {
         assert_eq!(
             max_trade_polls_per_cycle,
             ReferenceConfig::default().max_trade_polls_per_cycle
+        );
+        assert_eq!(
+            max_concurrent_trade_polls,
+            ReferenceConfig::default().max_concurrent_trade_polls
         );
     }
 }

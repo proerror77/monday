@@ -3,6 +3,7 @@
 use crate::polymarket_upload::ensure_canonical_directory;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use futures::{stream, StreamExt};
 use rand::random;
 use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -27,6 +28,7 @@ const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 192;
+pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
 const TARGET_MARKET_WINDOWS_SECS: [usize; 2] = [300, 900];
 const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
@@ -66,6 +68,7 @@ pub struct ReferenceConfig {
     pub settlement_lookback_secs: i64,
     pub max_markets: usize,
     pub max_trade_polls_per_cycle: usize,
+    pub max_concurrent_trade_polls: usize,
     pub http_timeout: Duration,
     pub stale_after: Duration,
     pub trade_finalization_lag_secs: i64,
@@ -86,6 +89,7 @@ impl Default for ReferenceConfig {
             settlement_lookback_secs: 86_400,
             max_markets: DEFAULT_MAX_MARKETS_PER_LANE,
             max_trade_polls_per_cycle: DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
+            max_concurrent_trade_polls: DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
             http_timeout: Duration::from_secs(20),
             stale_after: Duration::from_secs(180),
             trade_finalization_lag_secs: 1_800,
@@ -103,12 +107,16 @@ impl ReferenceConfig {
             || self.settlement_lookback_secs <= 0
             || self.max_markets == 0
             || self.max_trade_polls_per_cycle == 0
+            || self.max_concurrent_trade_polls == 0
             || self.http_timeout.is_zero()
             || self.stale_after.is_zero()
             || self.trade_finalization_lag_secs <= 0
             || self.trade_finalization_stable_polls == 0
         {
             bail!("reference collector limits must be positive");
+        }
+        if self.max_concurrent_trade_polls > self.max_trade_polls_per_cycle {
+            bail!("concurrent trade polls cannot exceed the per-cycle trade poll budget");
         }
         if self.settlement_lookback_secs < MIN_SETTLEMENT_LOOKBACK_SECS {
             bail!("settlement lookback must cover at least {MIN_SETTLEMENT_LOOKBACK_SECS} seconds");
@@ -1459,6 +1467,28 @@ impl ReferenceCollector {
                 .collect(),
             self.config.max_trade_polls_per_cycle,
         );
+        let fetcher = &*self;
+        let per_market_delay = self.config.per_market_delay;
+        let trade_fetches = stream::iter(trade_poll_plan.selected.iter().filter_map(|market_id| {
+            let condition_id = targets
+                .get(market_id)?
+                .0
+                .get("conditionId")?
+                .as_str()?
+                .to_owned();
+            Some((market_id.clone(), condition_id))
+        }))
+        .map(move |(market_id, condition_id)| async move {
+            let result = fetcher.fetch_trades(&condition_id).await;
+            if !per_market_delay.is_zero() {
+                tokio::time::sleep(per_market_delay).await;
+            }
+            (market_id, result)
+        })
+        .buffer_unordered(self.config.max_concurrent_trade_polls)
+        .collect::<Vec<_>>()
+        .await;
+        let mut trade_fetches = trade_fetches.into_iter().collect::<BTreeMap<_, _>>();
 
         for (market_id, (market, target)) in &targets {
             let condition_id = market
@@ -1513,7 +1543,10 @@ impl ReferenceCollector {
                 && trade_poll_plan.selected.contains(market_id)
             {
                 trade_polls += 1;
-                match self.fetch_trades(&condition_id).await {
+                let trade_fetch = trade_fetches.remove(market_id).ok_or_else(|| {
+                    anyhow!("selected trade market {market_id} has no scheduled fetch")
+                })?;
+                match trade_fetch {
                     Ok((trades, truncated, non_object_rows)) => {
                         successful_trade_polls += 1;
                         let (new_updates, mut malformed) = trade_updates(
@@ -1574,9 +1607,6 @@ impl ReferenceCollector {
                         tracked.trade_last_error = Some(error.to_string());
                     }
                 }
-                if !self.config.per_market_delay.is_zero() {
-                    tokio::time::sleep(self.config.per_market_delay).await;
-                }
             }
             if let Some(settlement) = settlement {
                 if !tracked.settled {
@@ -1585,6 +1615,12 @@ impl ReferenceCollector {
                 }
             }
             next_state.markets.insert(market_id.clone(), tracked);
+        }
+        if !trade_fetches.is_empty() {
+            bail!(
+                "{} scheduled trade fetches were not applied",
+                trade_fetches.len()
+            );
         }
 
         let mut overdue_unresolved_markets = Vec::new();
@@ -1658,6 +1694,7 @@ impl ReferenceCollector {
             "record_types": record_types,
             "api_errors": errors,
             "trade_poll_budget": self.config.max_trade_polls_per_cycle,
+            "trade_poll_concurrency": self.config.max_concurrent_trade_polls,
             "eligible_trade_markets": trade_poll_plan.eligible,
             "priority_trade_markets": trade_poll_plan.priority,
             "selected_trade_markets": trade_poll_plan.selected.len(),
@@ -1999,6 +2036,10 @@ mod tests {
             default.max_trade_polls_per_cycle,
             DEFAULT_MAX_TRADE_POLLS_PER_CYCLE
         );
+        assert_eq!(
+            default.max_concurrent_trade_polls,
+            DEFAULT_MAX_CONCURRENT_TRADE_POLLS
+        );
         default.validate().unwrap();
 
         let exact_capacity = ReferenceConfig {
@@ -2026,6 +2067,19 @@ mod tests {
             ..ReferenceConfig::default()
         };
         assert!(zero_trade_budget.validate().is_err());
+
+        let zero_concurrency = ReferenceConfig {
+            max_concurrent_trade_polls: 0,
+            ..ReferenceConfig::default()
+        };
+        assert!(zero_concurrency.validate().is_err());
+
+        let concurrency_above_budget = ReferenceConfig {
+            max_trade_polls_per_cycle: 3,
+            max_concurrent_trade_polls: 4,
+            ..ReferenceConfig::default()
+        };
+        assert!(concurrency_above_budget.validate().is_err());
     }
 
     #[test]

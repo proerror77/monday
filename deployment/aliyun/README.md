@@ -91,7 +91,9 @@ The collector discovers the full 24-hour settlement lane on every cycle, but bou
 Data API trade requests to 192 markets per cycle. Markets in the active/finalization
 window and failed retries are always selected first; the remaining historical lane
 rotates by oldest successful poll so cold-start backfill cannot prevent health from
-advancing. `priority_trade_backlog` must be zero for the shadow gate to accept a
+advancing. Up to four trade requests run concurrently; the existing 100ms per-request
+delay remains in place, so slow I/O overlaps without creating an unbounded request
+fan-out. `priority_trade_backlog` must be zero for the shadow gate to accept a
 health sample, while `deferred_trade_markets` makes bounded historical backfill
 explicit rather than silently claiming full-cycle trade coverage.
 `cycle_started_at` preserves the API snapshot boundary, while `updated_at` and
