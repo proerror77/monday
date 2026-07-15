@@ -27,6 +27,9 @@ const TRADE_ID_VERSION: &str = "v2";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
+const HTTP_GET_ATTEMPTS: usize = 3;
+const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const HTTP_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
@@ -59,6 +62,45 @@ impl std::error::Error for DataCompletenessError {}
 
 fn completeness_error(message: impl Into<String>) -> anyhow::Error {
     DataCompletenessError(message.into()).into()
+}
+
+fn retryable_http_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn retryable_http_error(error: &reqwest::Error) -> bool {
+    error.is_timeout()
+        || error.is_connect()
+        || error.is_request()
+        || error.is_body()
+        || error.is_decode()
+}
+
+fn http_retry_delay(
+    retry_after: Option<&str>,
+    attempt: usize,
+    now: DateTime<Utc>,
+) -> Option<Duration> {
+    let Some(retry_after) = retry_after else {
+        return Some(
+            HTTP_RETRY_BASE_DELAY
+                .saturating_mul(1_u32 << attempt.min(3))
+                .min(HTTP_RETRY_MAX_DELAY),
+        );
+    };
+    let retry_after = retry_after.trim();
+    let delay = if let Ok(seconds) = retry_after.parse::<u64>() {
+        Duration::from_secs(seconds)
+    } else {
+        let retry_at = DateTime::parse_from_rfc2822(retry_after)
+            .ok()?
+            .with_timezone(&Utc);
+        retry_at
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+    };
+    (delay <= HTTP_RETRY_MAX_DELAY).then_some(delay)
 }
 
 #[derive(Debug, Clone)]
@@ -1174,6 +1216,8 @@ struct ReferenceCollector {
     writer: TapeWriter,
     http: reqwest::Client,
     trade_request_started_at: tokio::sync::Mutex<Option<Instant>>,
+    #[cfg(test)]
+    trade_request_attempts_started_at: std::sync::Mutex<Vec<Instant>>,
     last_success: Instant,
 }
 
@@ -1232,6 +1276,8 @@ impl ReferenceCollector {
             writer,
             http,
             trade_request_started_at: tokio::sync::Mutex::new(None),
+            #[cfg(test)]
+            trade_request_attempts_started_at: std::sync::Mutex::new(Vec::new()),
             last_success: Instant::now(),
         };
         collector.recover_state_from_active_tape()?;
@@ -1303,15 +1349,78 @@ impl ReferenceCollector {
     }
 
     async fn get_json(&self, url: &str, params: &[(String, String)]) -> Result<Value> {
-        Ok(self
-            .http
-            .get(url)
-            .query(params)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        self.get_json_with_request_spacing(url, params, false).await
+    }
+
+    async fn get_json_rate_limited(&self, url: &str, params: &[(String, String)]) -> Result<Value> {
+        self.get_json_with_request_spacing(url, params, true).await
+    }
+
+    async fn get_json_with_request_spacing(
+        &self,
+        url: &str,
+        params: &[(String, String)],
+        rate_limited: bool,
+    ) -> Result<Value> {
+        for attempt in 0..HTTP_GET_ATTEMPTS {
+            if rate_limited {
+                self.wait_for_trade_request_slot().await;
+            }
+            let response = match self.http.get(url).query(params).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if attempt + 1 == HTTP_GET_ATTEMPTS || !retryable_http_error(&error) {
+                        return Err(error.into());
+                    }
+                    tokio::time::sleep(
+                        http_retry_delay(None, attempt, Utc::now())
+                            .expect("retry delay without Retry-After must be bounded"),
+                    )
+                    .await;
+                    continue;
+                }
+            };
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .cloned();
+            if !status.is_success() {
+                let error = match response.error_for_status() {
+                    Ok(_) => unreachable!("non-success response passed error_for_status"),
+                    Err(error) => error,
+                };
+                if attempt + 1 == HTTP_GET_ATTEMPTS || !retryable_http_status(status) {
+                    return Err(error.into());
+                }
+                let retry_after = retry_after
+                    .as_ref()
+                    .map(|value| value.to_str())
+                    .transpose()
+                    .context("server returned a non-text Retry-After header")?;
+                let Some(delay) = http_retry_delay(retry_after, attempt, Utc::now()) else {
+                    return Err(error).context(
+                        "server Retry-After cannot be honored within the bounded retry budget",
+                    );
+                };
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            match response.json().await {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    if attempt + 1 == HTTP_GET_ATTEMPTS || !retryable_http_error(&error) {
+                        return Err(error.into());
+                    }
+                    tokio::time::sleep(
+                        http_retry_delay(None, attempt, Utc::now())
+                            .expect("retry delay without Retry-After must be bounded"),
+                    )
+                    .await;
+                }
+            }
+        }
+        unreachable!("HTTP_GET_ATTEMPTS is non-zero")
     }
 
     async fn wait_for_trade_request_slot(&self) {
@@ -1326,6 +1435,11 @@ impl ReferenceCollector {
             }
         }
         *last_started = Some(Instant::now());
+        #[cfg(test)]
+        self.trade_request_attempts_started_at
+            .lock()
+            .expect("trade request attempt history mutex poisoned")
+            .push(Instant::now());
     }
 
     async fn discover_markets(&self, now: DateTime<Utc>) -> Result<Vec<Value>> {
@@ -1359,9 +1473,8 @@ impl ReferenceCollector {
         let mut truncated = false;
         let mut non_object_rows = 0_u64;
         for offset in [0_u64, 10_000] {
-            self.wait_for_trade_request_slot().await;
             let payload = self
-                .get_json(
+                .get_json_rate_limited(
                     DATA_TRADES_URL,
                     &[
                         ("market".to_owned(), condition_id.to_owned()),
@@ -1928,6 +2041,264 @@ mod tests {
             "outcomeIndex": 0,
             "sourceOnlyField": {"preserved": true},
         })
+    }
+
+    #[tokio::test]
+    async fn transient_http_failure_is_retried_before_health_error() {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = first.read(&mut request).unwrap();
+            first
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut second, _)) => {
+                        second.set_nonblocking(false).unwrap();
+                        let _ = second.read(&mut request).unwrap();
+                        second
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                            )
+                            .unwrap();
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                }
+            }
+            false
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            http_timeout: Duration::from_secs(1),
+            ..ReferenceConfig::default()
+        };
+        let collector = ReferenceCollector::new(config).unwrap();
+        let result = collector
+            .get_json(&format!("http://{address}/market"), &[])
+            .await;
+        let retried = server.join().unwrap();
+
+        assert!(retried, "collector did not retry the transient response");
+        assert_eq!(result.unwrap(), json!({"ok": true}));
+    }
+
+    #[tokio::test]
+    async fn concurrent_trade_retries_preserve_global_request_spacing() {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut accepted = 0;
+            while accepted < 4 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut request = [0_u8; 2048];
+                        let _ = stream.read(&mut request).unwrap();
+                        accepted += 1;
+                        let response = if accepted <= 2 {
+                            b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".as_slice()
+                        } else {
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".as_slice()
+                        };
+                        stream.write_all(response).unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                }
+            }
+            accepted
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            http_timeout: Duration::from_secs(1),
+            per_market_delay: Duration::from_millis(200),
+            ..ReferenceConfig::default()
+        };
+        let collector = ReferenceCollector::new(config).unwrap();
+        let url = format!("http://{address}/trades");
+        let (left, right) = tokio::join!(
+            collector.get_json_rate_limited(&url, &[]),
+            collector.get_json_rate_limited(&url, &[])
+        );
+        let accepted = server.join().unwrap();
+        let started_at = collector
+            .trade_request_attempts_started_at
+            .lock()
+            .unwrap()
+            .clone();
+
+        assert_eq!(left.unwrap(), json!({"ok": true}));
+        assert_eq!(right.unwrap(), json!({"ok": true}));
+        assert_eq!(accepted, 4);
+        assert_eq!(started_at.len(), 4);
+        assert!(started_at
+            .windows(2)
+            .all(|times| { times[1].duration_since(times[0]) >= Duration::from_millis(150) }));
+    }
+
+    #[test]
+    fn http_retry_policy_is_bounded_and_fail_closed() {
+        let now = fixed_time("2015-10-21T07:27:59Z");
+        assert!(retryable_http_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(retryable_http_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!retryable_http_status(reqwest::StatusCode::BAD_REQUEST));
+        assert_eq!(
+            http_retry_delay(None, 0, now),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            http_retry_delay(None, 1, now),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            http_retry_delay(Some("2"), 0, now),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(http_retry_delay(Some("60"), 0, now), None);
+        assert_eq!(
+            http_retry_delay(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 0, now),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            http_retry_delay(Some("Wed, 21 Oct 2015 07:29:00 GMT"), 0, now),
+            None
+        );
+        assert_eq!(http_retry_delay(Some("not-a-delay"), 0, now), None);
+    }
+
+    #[tokio::test]
+    async fn unhonorable_retry_after_fails_without_an_early_retry() {
+        use std::io::Read as _;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut request = [0_u8; 2048];
+                        let _ = stream.read(&mut request).unwrap();
+                        server_attempts.fetch_add(1, Ordering::SeqCst);
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            )
+                            .unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                }
+            }
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            http_timeout: Duration::from_secs(1),
+            ..ReferenceConfig::default()
+        };
+        let collector = ReferenceCollector::new(config).unwrap();
+        let result = collector
+            .get_json(&format!("http://{address}/market"), &[])
+            .await;
+        server.join().unwrap();
+
+        assert!(result.is_err(), "unhonorable Retry-After must fail closed");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_http_retries_still_fail_closed() {
+        use std::io::Read as _;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_attempts = Arc::clone(&attempts);
+        let server_stop = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut request = [0_u8; 2048];
+                        let _ = stream.read(&mut request).unwrap();
+                        server_attempts.fetch_add(1, Ordering::SeqCst);
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                            )
+                            .unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                }
+            }
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            http_timeout: Duration::from_secs(1),
+            ..ReferenceConfig::default()
+        };
+        let collector = ReferenceCollector::new(config).unwrap();
+        let result = collector
+            .get_json(&format!("http://{address}/market"), &[])
+            .await;
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+
+        assert!(result.is_err(), "exhausted retries must remain an error");
+        assert_eq!(attempts.load(Ordering::SeqCst), HTTP_GET_ATTEMPTS);
     }
 
     #[test]
