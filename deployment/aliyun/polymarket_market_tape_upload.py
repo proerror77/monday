@@ -25,6 +25,9 @@ ALLOWED_KINDS = {
     "event_discovered",
     "event_expired",
     "reference_price",
+    "market_metadata",
+    "polymarket_trade",
+    "market_settlement",
 }
 
 
@@ -107,6 +110,13 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
     max_bid_levels = 0
     max_ask_levels = 0
     contextless_quotes = 0
+    market_ids: set[str] = set()
+    condition_ids: set[str] = set()
+    record_ids: set[str] = set()
+    record_id_versions: set[str] = set()
+    duplicate_record_ids = 0
+    source_field_presence: dict[str, Counter[str]] = defaultdict(Counter)
+    source_field_non_null: dict[str, Counter[str]] = defaultdict(Counter)
 
     with path.open("rb") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
@@ -157,6 +167,73 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
                     if isinstance(event_token, str) and event_token:
                         known_event_tokens.add(event_token)
 
+            market_id = update.get("market_id")
+            if isinstance(market_id, str) and market_id:
+                market_ids.add(market_id)
+            condition_id = update.get("condition_id")
+            if isinstance(condition_id, str) and condition_id:
+                condition_ids.add(condition_id)
+            record_id = update.get("record_id")
+            if isinstance(record_id, str) and record_id:
+                if record_id in record_ids:
+                    duplicate_record_ids += 1
+                record_ids.add(record_id)
+            if kind == "polymarket_trade":
+                version = update.get("record_id_version")
+                record_id_versions.add(
+                    version if isinstance(version, str) and version else "v1_legacy"
+                )
+
+            raw_field = {
+                "market_metadata": "market",
+                "polymarket_trade": "trade",
+                "market_settlement": "market",
+            }.get(kind)
+            if raw_field is not None:
+                raw_payload = update.get(raw_field)
+                if not isinstance(raw_payload, dict):
+                    raise ValueError(f"line {line_number}: {kind}.{raw_field} must be an object")
+                for field, value in raw_payload.items():
+                    source_field_presence[kind][field] += 1
+                    if value is not None:
+                        source_field_non_null[kind][field] += 1
+
+            if kind == "market_metadata":
+                for required in ("market_id", "condition_id", "symbol", "retrieved_at"):
+                    if not update.get(required):
+                        raise ValueError(f"line {line_number}: market_metadata requires {required}")
+            elif kind == "polymarket_trade":
+                for required in (
+                    "record_id",
+                    "condition_id",
+                    "token_id",
+                    "symbol",
+                    "side",
+                    "trade_ts",
+                    "transaction_hash",
+                ):
+                    if update.get(required) in (None, ""):
+                        raise ValueError(f"line {line_number}: polymarket_trade requires {required}")
+                if update.get("side") not in {"BUY", "SELL"}:
+                    raise ValueError(f"line {line_number}: polymarket_trade side must be BUY or SELL")
+                decimal_or_none(update.get("size"), "size", line_number)
+                price = decimal_or_none(update.get("price"), "price", line_number)
+                if price is None or not Decimal("0") <= price <= Decimal("1"):
+                    raise ValueError(f"line {line_number}: polymarket_trade price must be within [0, 1]")
+                parse_timestamp(update.get("trade_ts"), "trade_ts", line_number)
+            elif kind == "market_settlement":
+                for required in (
+                    "market_id",
+                    "condition_id",
+                    "symbol",
+                    "winning_token_id",
+                    "winning_outcome",
+                    "resolution_source",
+                    "retrieved_at",
+                ):
+                    if update.get(required) in (None, ""):
+                        raise ValueError(f"line {line_number}: market_settlement requires {required}")
+
             if kind == "quote":
                 if not isinstance(token_id, str) or token_id not in known_event_tokens:
                     contextless_quotes += 1
@@ -170,7 +247,9 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
                 ask_levels = update.get("ask_levels") or []
                 if not isinstance(bid_levels, list) or not isinstance(ask_levels, list):
                     raise ValueError(f"line {line_number}: quote levels must be arrays")
-                if len(bid_levels) > quote_depth_levels or len(ask_levels) > quote_depth_levels:
+                if quote_depth_levels and (
+                    len(bid_levels) > quote_depth_levels or len(ask_levels) > quote_depth_levels
+                ):
                     raise ValueError(f"line {line_number}: quote exceeds configured depth")
                 max_bid_levels = max(max_bid_levels, len(bid_levels))
                 max_ask_levels = max(max_ask_levels, len(ask_levels))
@@ -223,17 +302,39 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
 
     partition = parse_timestamp(first_recorded_at, "recorded_at", 1)
     event_context_complete = contextless_quotes == 0
+    has_quotes = event_types.get("quote", 0) > 0
+    has_reference_records = any(
+        event_types.get(kind, 0) > 0
+        for kind in ("market_metadata", "polymarket_trade", "market_settlement")
+    )
+    depth_complete = has_quotes and quote_depth_levels == 0
+    temporal_updates_complete = has_quotes and quote_sample_ms == 0
+    replay_scope = (
+        "complete_reference_hour_segment"
+        if has_reference_records and not has_quotes
+        else (
+            (
+                (
+                    "complete_full_depth_normalized_hour_segment"
+                    if temporal_updates_complete
+                    else "complete_full_depth_sampled_normalized_hour_segment"
+                )
+                if depth_complete
+                else "complete_sampled_normalized_hour_segment"
+            )
+            if event_context_complete
+            else "sampled_normalized_hour_segment_requires_prior_event_context"
+        )
+    )
     return {
-        "schema": "monday.polymarket.market_updates.v1",
+        "schema": "monday.polymarket.raw.v1",
+        "canonical": True,
         "venue": "polymarket",
         "dataset": dataset,
         "format": "ndjson.zst",
-        "replay_scope": (
-            "complete_sampled_normalized_hour_segment"
-            if event_context_complete
-            else "sampled_normalized_hour_segment_requires_prior_event_context"
-        ),
-        "venue_depth_complete": False,
+        "replay_scope": replay_scope,
+        "venue_depth_complete": depth_complete,
+        "temporal_updates_complete": temporal_updates_complete,
         "segment_complete": True,
         "source_session_closed": True,
         "event_context_complete": event_context_complete,
@@ -249,6 +350,9 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
         "hour": partition.strftime("%H"),
         "symbols": sorted(symbols),
         "token_count": len(token_ids),
+        "market_count": len(market_ids),
+        "condition_count": len(condition_ids),
+        "record_id_versions": sorted(record_id_versions),
         "recording_policy": {
             "quote_sample_ms": quote_sample_ms,
             "quote_depth_levels": quote_depth_levels,
@@ -260,6 +364,14 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
         "field_non_null": {
             kind: dict(sorted(fields.items())) for kind, fields in sorted(non_null_fields.items())
         },
+        "source_field_presence": {
+            kind: dict(sorted(fields.items()))
+            for kind, fields in sorted(source_field_presence.items())
+        },
+        "source_field_non_null": {
+            kind: dict(sorted(fields.items()))
+            for kind, fields in sorted(source_field_non_null.items())
+        },
         "quality": {
             "crossed_quotes": crossed_quotes,
             "one_sided_quotes": one_sided_quotes,
@@ -269,6 +381,7 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
             "max_bid_levels": max_bid_levels,
             "max_ask_levels": max_ask_levels,
             "contextless_quotes": contextless_quotes,
+            "duplicate_record_ids": duplicate_record_ids,
         },
         "source_file": path.name,
         "source_bytes": before.st_size,
@@ -522,8 +635,13 @@ def parse_args() -> argparse.Namespace:
         default=Path("/data/monday/spool/polymarket"),
     )
     parser.add_argument("--dataset", default="crypto_expiry")
-    parser.add_argument("--quote-depth-levels", type=int, default=1)
-    parser.add_argument("--quote-sample-ms", type=int, default=1000)
+    parser.add_argument(
+        "--quote-depth-levels",
+        type=int,
+        default=0,
+        help="maximum persisted levels per side; 0 means unbounded",
+    )
+    parser.add_argument("--quote-sample-ms", type=int, default=0)
     parser.add_argument("--bucket", default=os.getenv("OSS_BUCKET", "monday-lob-apne1-1045353359"))
     parser.add_argument(
         "--endpoint",

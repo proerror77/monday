@@ -15,17 +15,25 @@ systemctl status polymarket-market-tape.service
 journalctl -u polymarket-market-tape.service -f
 ```
 
+Install the runtime config as group-readable by the unprivileged service account:
+
+```bash
+sudo install -m 0640 -g hftcollector deployment/aliyun/polymarket-market-tape.toml \
+  /etc/monday/polymarket-market-tape.toml
+```
+
 The initial scope is BTC, ETH, SOL, XRP, DOGE, HYPE, and BNB 5-minute/15-minute
 markets only. NBA, World Cup, general event, and weather catalogs remain disabled
 until this lane is stable and explicitly expanded.
 
 The service records normalized `MarketUpdate` NDJSON under
 `/data/monday/spool/polymarket/`. It has no credential environment file and cannot
-emit trading intents. To keep this research collector bounded, the tape stores only
-Polymarket quotes/lifecycle events plus reference prices, samples each token at most
-once per second, retains the top bid/ask level, and drops orphaned or post-expiry
-quotes from the persisted tape. Sampling affects the recording only; the runtime
-still receives every live quote for active event tokens. Quotes timestamped after
+emit trading intents. The primary tape stores Polymarket quotes/lifecycle events plus
+reference prices, records one full visible CLOB book per token per second, retains
+every bid and ask level in each snapshot, and drops orphaned or post-expiry quotes.
+The manifest separates `venue_depth_complete` from `temporal_updates_complete` so a
+full-depth sampled snapshot cannot be mistaken for a raw exchange-diff tape.
+Quotes timestamped after
 their event end are rejected before executor or strategy evaluation, so a late quote
 from an expired 5-minute/15-minute market cannot trigger a trade in the next event.
 The recorder rotates the active tape in-process every hour, without disconnecting
@@ -47,6 +55,33 @@ closed tapes. Failed uploads retain the closed source tape for retry and surface
 `/data/monday/spool/polymarket/upload-status.json`.
 Each manifest reports `event_context_complete`; legacy segments lacking a prior
 token discovery are explicitly marked as requiring the previous event context.
+New manifests also set `canonical=true` and list `record_id_versions`. Raw readers
+must ignore any artifact with an adjacent `<data>.SUPERSEDED.json` marker; the marker
+names the canonical replacement and quarantine copy. This is the fail-closed path
+when the collector role can write but cannot delete an invalid historical object.
+
+The companion `polymarket-reference-collector.service` polls the official Gamma and
+Data APIs every 30 seconds. It writes complete Gamma market payloads (including
+volume, tick size, minimum order size, fee fields, token/outcome mappings, and status),
+all public taker and maker trade prints, and closed-market settlement payloads to
+`/data/monday/spool/polymarket-reference/`. Its independent uploader publishes the
+same hash-bound artifact triplet under
+`lake/raw/venue=polymarket/dataset=crypto_expiry_reference/`. Stable trade IDs and a
+persisted overlap state prevent duplicate trade prints across polls and restarts.
+An in-place v1-to-v2 migration locally isolates the old active tape, reopens completed
+markets, and emits a complete v2 overlap; the canonicalizer builds a v2 union before
+historical v1 artifacts receive supersession markers. After settlement,
+trade polling continues for at least 30 minutes after the latest observed change and
+requires three additional stable polls before a market is marked complete. Malformed
+trade rows are isolated and counted by reason in `health.json` instead of blocking
+valid rows.
+Each append batch rolls back to its starting offset if write or fsync fails, so a retry
+cannot duplicate a durable prefix or leave a partial record behind.
+Neither companion unit contains private keys or an execution command.
+The Python companion is a transitional parity lane: the existing Rust
+`collect-pm-trades` command requires PostgreSQL and cannot yet emit the stateless raw
+OSS contract used by this data-only ECS. Replace it only after a Rust shadow service
+produces byte/field, deduplication, settlement, rotation, and OSS-readback parity.
 
 Install the uploader beside the existing tape service:
 
@@ -61,6 +96,20 @@ sudo install -m 0644 deployment/aliyun/polymarket-market-tape-upload.timer \
   /etc/systemd/system/polymarket-market-tape-upload.timer
 sudo systemctl daemon-reload
 sudo systemctl enable --now polymarket-market-tape-upload.timer
+```
+
+Install the companion reference lane:
+
+```bash
+sudo install -m 0755 deployment/aliyun/polymarket_reference_collector.py \
+  /opt/monday/bin/polymarket_reference_collector.py
+sudo install -m 0644 deployment/aliyun/polymarket-reference-{collector,upload}.service \
+  /etc/systemd/system/
+sudo install -m 0644 deployment/aliyun/polymarket-reference-upload.timer \
+  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-reference-collector.service \
+  polymarket-reference-upload.timer
 ```
 
 Each service opens bounded WebSocket shards, records every diff, fetches a REST

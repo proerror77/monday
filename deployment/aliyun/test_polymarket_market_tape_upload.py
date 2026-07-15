@@ -128,6 +128,73 @@ class TapeValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires price and size"):
             UPLOADER.scan_tape(path, "crypto_expiry", 1, 1000)
 
+    def test_zero_depth_limit_accepts_full_visible_book(self):
+        rows = self.sample_rows()
+        rows[1]["update"]["bid_levels"].append({"price": "0.48", "size": "12"})
+        rows[1]["update"]["ask_levels"].append({"price": "0.52", "size": "13"})
+        path = self.write_tape(rows)
+
+        manifest = UPLOADER.scan_tape(path, "crypto_expiry", 0, 1000)
+
+        self.assertTrue(manifest["venue_depth_complete"])
+        self.assertFalse(manifest["temporal_updates_complete"])
+        self.assertEqual(manifest["quality"]["max_bid_levels"], 2)
+        self.assertEqual(manifest["recording_policy"]["quote_depth_levels"], 0)
+
+    def test_reference_tape_validates_raw_fields_and_trade_quality(self):
+        rows = [
+            record(
+                0,
+                "2026-07-15T01:00:00Z",
+                {
+                    "kind": "market_metadata",
+                    "market_id": "market-1",
+                    "condition_id": "0xcondition",
+                    "symbol": "BTCUSDT",
+                    "market_window_secs": 300,
+                    "retrieved_at": "2026-07-15T01:00:00Z",
+                    "market": {
+                        "volume": 100,
+                        "orderPriceMinTickSize": 0.01,
+                        "orderMinSize": 5,
+                        "makerBaseFee": 1000,
+                        "takerBaseFee": 1000,
+                    },
+                },
+            ),
+            record(
+                1,
+                "2026-07-15T01:00:01Z",
+                {
+                    "kind": "polymarket_trade",
+                    "record_id": "trade-1",
+                    "record_id_version": "v2",
+                    "market_id": "market-1",
+                    "condition_id": "0xcondition",
+                    "token_id": "token-1",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "size": 10,
+                    "price": 0.51,
+                    "trade_ts": "2026-07-15T01:00:00Z",
+                    "transaction_hash": "0xtx",
+                    "trade": {"asset": "token-1", "price": 0.51, "size": 10},
+                },
+            ),
+        ]
+        path = self.write_tape(rows)
+
+        manifest = UPLOADER.scan_tape(path, "crypto_expiry_reference", 0, 0)
+
+        self.assertEqual(manifest["market_count"], 1)
+        self.assertEqual(manifest["condition_count"], 1)
+        self.assertTrue(manifest["canonical"])
+        self.assertEqual(manifest["record_id_versions"], ["v2"])
+        self.assertEqual(manifest["quality"]["duplicate_record_ids"], 0)
+        self.assertEqual(
+            manifest["source_field_non_null"]["market_metadata"]["makerBaseFee"], 1
+        )
+
     def test_scan_tape_marks_quotes_without_event_context_as_non_self_contained(self):
         path = self.write_tape([self.sample_rows()[1]])
         row = json.loads(path.read_text())
