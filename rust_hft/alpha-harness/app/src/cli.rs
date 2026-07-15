@@ -84,7 +84,7 @@ enum DataCommand {
 #[derive(Debug, Subcommand)]
 enum CandidateCommand {
     List(MissionStatusArgs),
-    RegisterOnnx(RegisterOnnxArgs),
+    RegisterOnnx(Box<RegisterOnnxArgs>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -531,7 +531,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Candidate { command } => match command {
             CandidateCommand::List(args) => governance::candidate_list(args),
-            CandidateCommand::RegisterOnnx(args) => governance::register_onnx_candidate(args),
+            CandidateCommand::RegisterOnnx(args) => governance::register_onnx_candidate(*args),
         },
         Command::Evaluate(args) => governance::evaluate(args),
         Command::Promote(args) => governance::promote(args),
