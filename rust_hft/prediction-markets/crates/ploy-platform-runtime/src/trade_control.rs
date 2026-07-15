@@ -212,10 +212,10 @@ pub fn replace_order(
 #[cfg(test)]
 mod tests {
     use super::{cancel_order, replace_order};
+    use crate::test_support::StaticExecutionGateway;
     use ploy_connectivity::{
         CancellationOutcome, CancellationRequest, ExecutionError, ExecutionOutcome,
-        ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest,
-        StaticExecutionGateway, TrackedOrder,
+        ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest, TrackedOrder,
     };
     use ploy_operator_contracts::{
         DeploymentState, DesiredState, ObservedState, OrderReplaceRequest,

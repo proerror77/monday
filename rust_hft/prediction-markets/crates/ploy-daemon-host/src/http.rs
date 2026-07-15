@@ -2636,11 +2636,11 @@ mod tests {
         ADMIN_SESSION_COOKIE_NAME,
     };
     use crate::events::EventBroker;
+    use crate::test_support::StaticExecutionGateway;
     use chrono::{Duration, Utc};
     use ploy_connectivity::{
         CancellationOutcome, CancellationRequest, ExecutionError, ExecutionOutcome,
-        ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest,
-        StaticExecutionGateway, TrackedOrder,
+        ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest, TrackedOrder,
     };
     use ploy_operator_contracts::AuditLogEntry;
     use ploy_operator_contracts::{OrderReplaceRequest, PaperIntentRequest};

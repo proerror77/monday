@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use syn::{Attribute, Item, ItemImpl, Type};
 
 const RETIRED_SOURCE_PATHS: &[&str] = &[
     ".dockerignore",
@@ -63,49 +64,6 @@ const RETIRED_SOURCE_PATHS: &[&str] = &[
     "src/supervisor",
     "src/tui",
     "src/validation.rs",
-];
-
-const ALLOWED_GATEWAY_IMPLEMENTATIONS: &[(&str, &str)] = &[
-    (
-        "crates/ploy-connectivity/src/lib.rs",
-        "DisabledLiveExecutionGateway",
-    ),
-    (
-        "crates/ploy-connectivity/src/lib.rs",
-        "StaticExecutionGateway",
-    ),
-    (
-        "crates/ploy-daemon-host/src/http.rs",
-        "BenchmarkSubmitGateway",
-    ),
-    (
-        "crates/ploy-daemon-host/src/http.rs",
-        "BlockingSubmitGateway",
-    ),
-    (
-        "crates/ploy-daemon-host/src/runtime.rs",
-        "CountingAckGateway",
-    ),
-    (
-        "crates/ploy-daemon-host/src/runtime.rs",
-        "PendingPersistGateway",
-    ),
-    (
-        "crates/ploy-daemon-host/src/runtime.rs",
-        "FlakyReconcileGateway",
-    ),
-    (
-        "crates/ploy-platform-runtime/src/trade_control.rs",
-        "CountingControlGateway",
-    ),
-    (
-        "crates/ploy-platform-runtime/src/trade_submit.rs",
-        "CountingGateway",
-    ),
-    (
-        "crates/ploy-platform-runtime/src/trade_submit.rs",
-        "TransportGateway",
-    ),
 ];
 
 const RETIRED_TEST_TARGETS: &[&str] = &[
@@ -341,29 +299,79 @@ fn collect_forbidden_language_paths(root: &Path, paths: &mut Vec<String>) {
     }
 }
 
-fn gateway_implementation_names(body: &str) -> Vec<String> {
-    let tokens = body.split_whitespace().collect::<Vec<_>>();
-    tokens
-        .windows(3)
-        .filter_map(|window| {
-            let trait_name = window[0]
-                .trim_matches(|value: char| !value.is_ascii_alphanumeric() && value != '_')
-                .rsplit("::")
-                .next()
-                .unwrap_or_default();
-            (trait_name == "LiveExecutionGateway" && window[1] == "for").then(|| {
-                window[2]
-                    .trim_matches(|value: char| !value.is_ascii_alphanumeric() && value != '_')
-                    .to_string()
-            })
-        })
-        .collect()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayImplementation {
+    source: String,
+    target: String,
+    test_only: bool,
 }
 
-fn collect_authenticated_execution_surfaces(
+fn has_exact_cfg_test(attributes: &[Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && attribute
+                .parse_args::<syn::Ident>()
+                .is_ok_and(|condition| condition == "test")
+    })
+}
+
+fn gateway_target(implementation: &ItemImpl) -> Option<String> {
+    let (_, trait_path, _) = implementation.trait_.as_ref()?;
+    if trait_path
+        .segments
+        .last()
+        .is_none_or(|segment| segment.ident != "LiveExecutionGateway")
+    {
+        return None;
+    }
+
+    match implementation.self_ty.as_ref() {
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        _ => Some("<non-named-type>".to_string()),
+    }
+}
+
+fn collect_gateway_items(
+    source: &str,
+    items: &[Item],
+    inside_cfg_test: bool,
+    implementations: &mut Vec<GatewayImplementation>,
+) {
+    for item in items {
+        match item {
+            Item::Impl(implementation) => {
+                if let Some(target) = gateway_target(implementation) {
+                    implementations.push(GatewayImplementation {
+                        source: source.to_string(),
+                        target,
+                        test_only: inside_cfg_test || has_exact_cfg_test(&implementation.attrs),
+                    });
+                }
+            }
+            Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    collect_gateway_items(
+                        source,
+                        items,
+                        inside_cfg_test || has_exact_cfg_test(&module.attrs),
+                        implementations,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_gateway_implementations(
     workspace_root: &Path,
     root: &Path,
-    findings: &mut Vec<String>,
+    implementations: &mut Vec<GatewayImplementation>,
+    parse_failures: &mut Vec<String>,
 ) {
     for entry in fs::read_dir(root).expect("read active source directory") {
         let path = entry.expect("active source entry").path();
@@ -371,7 +379,36 @@ fn collect_authenticated_execution_surfaces(
             if is_non_execution_surface_directory(&path) {
                 continue;
             }
-            collect_authenticated_execution_surfaces(workspace_root, &path, findings);
+            collect_gateway_implementations(workspace_root, &path, implementations, parse_failures);
+            continue;
+        }
+
+        if path == workspace_root.join("tests/workspace_runtime_retirement.rs")
+            || path.extension().and_then(|value| value.to_str()) != Some("rs")
+        {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(workspace_root)
+            .expect("source must be inside prediction-market workspace")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let body = fs::read_to_string(&path).expect("read Rust source");
+        match syn::parse_file(&body) {
+            Ok(file) => collect_gateway_items(&relative, &file.items, false, implementations),
+            Err(error) => parse_failures.push(format!("{relative}: {error}")),
+        }
+    }
+}
+
+fn collect_authenticated_execution_surfaces(root: &Path, findings: &mut Vec<String>) {
+    for entry in fs::read_dir(root).expect("read active source directory") {
+        let path = entry.expect("active source entry").path();
+        if path.is_dir() {
+            if is_non_execution_surface_directory(&path) {
+                continue;
+            }
+            collect_authenticated_execution_surfaces(&path, findings);
             continue;
         }
 
@@ -397,24 +434,6 @@ fn collect_authenticated_execution_surfaces(
         for pattern in forbidden {
             if body.contains(&pattern) {
                 findings.push(format!("{} contains {pattern}", path.display()));
-            }
-        }
-
-        let relative_path = path
-            .strip_prefix(workspace_root)
-            .expect("active source must be inside prediction-market workspace")
-            .to_string_lossy();
-        for implementation in gateway_implementation_names(&body) {
-            if !ALLOWED_GATEWAY_IMPLEMENTATIONS
-                .iter()
-                .any(|(allowed_path, allowed_type)| {
-                    relative_path == *allowed_path && implementation == *allowed_type
-                })
-            {
-                findings.push(format!(
-                    "{} adds unapproved LiveExecutionGateway implementation {implementation}",
-                    path.display()
-                ));
             }
         }
     }
@@ -444,7 +463,7 @@ fn python_command_detector_covers_suffixless_wrappers_and_inline_invocations() {
 }
 
 #[test]
-fn authenticated_execution_guard_covers_root_frontend_and_renamed_gateways() {
+fn authenticated_execution_guard_covers_root_frontend_and_rust_syntax() {
     for active_path in [
         "Cargo.toml",
         "Dockerfile.runner",
@@ -456,15 +475,35 @@ fn authenticated_execution_guard_covers_root_frontend_and_renamed_gateways() {
         );
     }
 
-    let renamed = gateway_implementation_names(
-        "impl ploy_connectivity::LiveExecutionGateway for VenueAuthenticatedClient {",
-    );
-    assert_eq!(renamed, vec!["VenueAuthenticatedClient"]);
-    assert!(
-        !ALLOWED_GATEWAY_IMPLEMENTATIONS
-            .iter()
-            .any(|(_, allowed_type)| renamed.iter().any(|name| name == allowed_type)),
-        "a renamed production gateway must not enter through the compatibility workspace"
+    let syntax = syn::parse_file(
+        r#"
+            impl
+                ploy_connectivity::LiveExecutionGateway
+                for VenueAuthenticatedClient {}
+
+            #[cfg(test)]
+            mod tests {
+                impl LiveExecutionGateway for DeterministicFake {}
+            }
+        "#,
+    )
+    .expect("parse gateway fixture");
+    let mut implementations = Vec::new();
+    collect_gateway_items("fixture.rs", &syntax.items, false, &mut implementations);
+    assert_eq!(
+        implementations,
+        vec![
+            GatewayImplementation {
+                source: "fixture.rs".to_string(),
+                target: "VenueAuthenticatedClient".to_string(),
+                test_only: false,
+            },
+            GatewayImplementation {
+                source: "fixture.rs".to_string(),
+                target: "DeterministicFake".to_string(),
+                test_only: true,
+            },
+        ]
     );
 }
 
@@ -749,11 +788,46 @@ fn compatibility_connectivity_has_no_concrete_polymarket_execution_adapter() {
 fn active_compatibility_source_has_no_authenticated_venue_execution_surface() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut findings = Vec::new();
-    collect_authenticated_execution_surfaces(workspace_root, workspace_root, &mut findings);
+    collect_authenticated_execution_surfaces(workspace_root, &mut findings);
     assert!(
         findings.is_empty(),
         "authenticated venue execution escaped the canonical Monday Adapter:\n{}",
         findings.join("\n")
+    );
+
+    let mut implementations = Vec::new();
+    let mut parse_failures = Vec::new();
+    collect_gateway_implementations(
+        workspace_root,
+        workspace_root,
+        &mut implementations,
+        &mut parse_failures,
+    );
+    assert!(
+        parse_failures.is_empty(),
+        "gateway boundary could not parse active Rust source:\n{}",
+        parse_failures.join("\n")
+    );
+
+    let production = implementations
+        .iter()
+        .filter(|implementation| !implementation.test_only)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        production,
+        vec![&GatewayImplementation {
+            source: "crates/ploy-connectivity/src/lib.rs".to_string(),
+            target: "DisabledLiveExecutionGateway".to_string(),
+            test_only: false,
+        }],
+        "the fail-closed gateway must be the only production-compiled LiveExecutionGateway; all fakes must be inside exact #[cfg(test)] modules"
+    );
+    assert!(
+        implementations
+            .iter()
+            .filter(|implementation| { implementation.target != "DisabledLiveExecutionGateway" })
+            .all(|implementation| implementation.test_only),
+        "every LiveExecutionGateway fake must be compiled only under exact #[cfg(test)]"
     );
 }
 

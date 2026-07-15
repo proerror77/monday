@@ -1,7 +1,6 @@
 use ployctl::{client::ControlPlaneClient, deployments, system, trading};
 
-const MONDAY_ACCOUNT_INSPECTION_AUTHORITY: &str =
-    "prediction-market account inspection moved to Monday's canonical execution runtime";
+const USAGE: &str = "usage: ployctl system status | ployctl system metrics | ployctl system alerts | ployctl system audit | ployctl trading status | ployctl trading inspect <deployment-id> | ployctl trading cancel <deployment-id> <order-id> | ployctl trading replace <deployment-id> <order-id> <quantity> <limit-price|-> | ployctl deployments list | ployctl deployments inspect <deployment-id> | ployctl deployments apply <manifest.json> | ployctl deployments pause <deployment-id> | ployctl deployments resume <deployment-id> | ployctl deployments stop <deployment-id> | ployctl deployments drain <deployment-id> | ployctl deployments enable <deployment-id> | ployctl deployments disable <deployment-id> | ployctl deployments archive <deployment-id>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -10,7 +9,6 @@ enum Command {
     SystemAlerts,
     SystemAudit,
     TradingStatus,
-    TradingAccountInspectionRetired,
     TradingInspect(String),
     TradingCancel(String, String),
     TradingReplace(
@@ -49,14 +47,6 @@ impl Command {
             [_bin, trading, status] if trading == "trading" && status == "status" => {
                 Ok(Self::TradingStatus)
             }
-            [_bin, trading, principal] if trading == "trading" && principal == "principal" => {
-                Ok(Self::TradingAccountInspectionRetired)
-            }
-            [_bin, trading, readiness, _required_pusd]
-                if trading == "trading" && readiness == "readiness" =>
-            {
-                Ok(Self::TradingAccountInspectionRetired)
-            }
             [_bin, trading, inspect, deployment_id]
                 if trading == "trading" && inspect == "inspect" =>
             {
@@ -65,10 +55,7 @@ impl Command {
             [_bin, trading, cancel, deployment_id, order_id]
                 if trading == "trading" && cancel == "cancel" =>
             {
-                Ok(Self::TradingCancel(
-                    deployment_id.clone(),
-                    order_id.clone(),
-                ))
+                Ok(Self::TradingCancel(deployment_id.clone(), order_id.clone()))
             }
             [_bin, trading, replace, deployment_id, order_id, quantity, limit_price]
                 if trading == "trading" && replace == "replace" =>
@@ -140,7 +127,7 @@ impl Command {
             {
                 Ok(Self::DeploymentsArchive(deployment_id.clone()))
             }
-            _ => Err("usage: ployctl system status | ployctl system metrics | ployctl system alerts | ployctl system audit | ployctl trading status | ployctl trading principal | ployctl trading readiness <required-pusd> | ployctl trading inspect <deployment-id> | ployctl trading cancel <deployment-id> <order-id> | ployctl trading replace <deployment-id> <order-id> <quantity> <limit-price|-> | ployctl deployments list | ployctl deployments inspect <deployment-id> | ployctl deployments apply <manifest.json> | ployctl deployments pause <deployment-id> | ployctl deployments resume <deployment-id> | ployctl deployments stop <deployment-id> | ployctl deployments drain <deployment-id> | ployctl deployments enable <deployment-id> | ployctl deployments disable <deployment-id> | ployctl deployments archive <deployment-id>".to_string()),
+            _ => Err(USAGE.to_string()),
         }
     }
 }
@@ -166,9 +153,6 @@ fn execute(command: Command, client: &ControlPlaneClient) -> Result<String, Stri
         Command::SystemAlerts => system::render_system_alerts(client),
         Command::SystemAudit => system::render_audit_log(client),
         Command::TradingStatus => trading::render_trading_state(client),
-        Command::TradingAccountInspectionRetired => {
-            Err(MONDAY_ACCOUNT_INSPECTION_AUTHORITY.to_string())
-        }
         Command::TradingInspect(deployment_id) => {
             trading::render_one_trading_state(client, &deployment_id)
         }
@@ -225,7 +209,7 @@ fn execute(command: Command, client: &ControlPlaneClient) -> Result<String, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{execute, Command, MONDAY_ACCOUNT_INSPECTION_AUTHORITY};
+    use super::{execute, Command};
     use ployctl::client::ControlPlaneClient;
     use std::fs;
     use std::path::PathBuf;
@@ -268,13 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn routes_polymarket_account_readiness_to_retired_boundary() {
-        let command = Command::parse(&["ployctl", "trading", "readiness", "5"].map(str::to_string))
-            .expect("command");
-        assert_eq!(command, Command::TradingAccountInspectionRetired);
-    }
-
-    #[test]
     fn parses_trading_status_command() {
         let command =
             Command::parse(&["ployctl", "trading", "status"].map(str::to_string)).expect("command");
@@ -282,19 +259,16 @@ mod tests {
     }
 
     #[test]
-    fn routes_trading_principal_to_retired_boundary() {
-        let command = Command::parse(&["ployctl", "trading", "principal"].map(str::to_string))
-            .expect("command");
-        assert_eq!(command, Command::TradingAccountInspectionRetired);
-    }
-
-    #[test]
-    fn compatibility_account_commands_fail_closed() {
-        let client = ployctl::client::ControlPlaneClient::default();
-        assert_eq!(
-            execute(Command::TradingAccountInspectionRetired, &client),
-            Err(MONDAY_ACCOUNT_INSPECTION_AUTHORITY.to_string())
-        );
+    fn retired_account_commands_are_not_parsed_or_advertised() {
+        for args in [
+            ["ployctl", "trading", "principal"].as_slice(),
+            ["ployctl", "trading", "readiness", "5"].as_slice(),
+        ] {
+            let args = args.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let error = Command::parse(&args).expect_err("retired account command must not parse");
+            assert!(!error.contains("trading principal"));
+            assert!(!error.contains("trading readiness"));
+        }
     }
 
     #[test]

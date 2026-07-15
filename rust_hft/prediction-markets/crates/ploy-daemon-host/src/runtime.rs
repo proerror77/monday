@@ -1375,10 +1375,11 @@ pub fn run_shared_forever(
 mod tests {
     use super::{seed_empty_live_ledgers, PloyDaemon, ReconcileStatus};
     use crate::config::PlatformConfig;
+    use crate::test_support::StaticExecutionGateway;
     use ploy_connectivity::{
         CancellationOutcome, CancellationRequest, ExecutionError, ExecutionOutcome,
         ExecutionRequest, LiveExecutionGateway, ReplaceOutcome, ReplaceRequest,
-        StaticExecutionGateway, MONDAY_LIVE_EXECUTION_DISABLED,
+        MONDAY_LIVE_EXECUTION_DISABLED,
     };
     use ploy_operator_contracts::{
         DeploymentApplyRequest, DeploymentControlRequest, DeploymentRuntimeMode, DeploymentState,

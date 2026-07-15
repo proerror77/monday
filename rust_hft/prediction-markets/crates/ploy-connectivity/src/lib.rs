@@ -2,8 +2,9 @@
 //!
 //! Real venue connectivity belongs to Monday's data-pipeline and execution
 //! Adapters. This compatibility crate deliberately exposes only a fail-closed
-//! gateway plus deterministic test fakes for the imported paper/control-plane
-//! runtime. It contains no credentials, wallet code, network client, or venue SDK.
+//! gateway for the imported paper/control-plane runtime. It contains no
+//! credentials, wallet code, network client, venue SDK, or production-compiled
+//! test gateway.
 
 use ploy_trading::{FillRecord, TradeSide};
 use rust_decimal::Decimal;
@@ -113,8 +114,8 @@ pub enum ExecutionError {
 /// Compatibility interface used by the imported paper/control-plane runtime.
 ///
 /// Production construction always installs [`DisabledLiveExecutionGateway`].
-/// Test code may inject [`StaticExecutionGateway`] to verify state transitions.
-/// Concrete venue Adapters must never be implemented in this crate.
+/// Test code defines its fakes inside exact `#[cfg(test)]` modules. Concrete
+/// venue Adapters must never be implemented in this crate.
 pub trait LiveExecutionGateway: Send + Sync + std::fmt::Debug {
     fn probe(&self) -> Result<(), ExecutionError>;
 
@@ -176,135 +177,6 @@ impl LiveExecutionGateway for DisabledLiveExecutionGateway {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct StaticExecutionGateway {
-    probe_result: Result<(), ExecutionError>,
-    result: Result<ExecutionOutcome, ExecutionError>,
-    cancel_result: Result<CancellationOutcome, ExecutionError>,
-    replace_result: Result<ReplaceOutcome, ExecutionError>,
-    reconcile_result: Result<ReconcileBatch, ExecutionError>,
-}
-
-impl StaticExecutionGateway {
-    #[must_use]
-    pub fn acknowledged(venue_order_id: impl Into<String>) -> Self {
-        let venue_order_id = venue_order_id.into();
-        Self {
-            probe_result: Ok(()),
-            result: Ok(ExecutionOutcome::Acknowledged {
-                venue_order_id: venue_order_id.clone(),
-            }),
-            cancel_result: Ok(CancellationOutcome::Canceled),
-            replace_result: Ok(ReplaceOutcome::Replaced {
-                venue_order_id: format!("{venue_order_id}-replaced"),
-            }),
-            reconcile_result: Ok(ReconcileBatch::default()),
-        }
-    }
-
-    #[must_use]
-    pub fn rejected(reason: impl Into<String>) -> Self {
-        let reason = reason.into();
-        Self {
-            probe_result: Ok(()),
-            result: Ok(ExecutionOutcome::Rejected {
-                reason: reason.clone(),
-            }),
-            cancel_result: Ok(CancellationOutcome::Canceled),
-            replace_result: Ok(ReplaceOutcome::Rejected { reason }),
-            reconcile_result: Ok(ReconcileBatch::default()),
-        }
-    }
-
-    #[must_use]
-    pub fn failed(error: ExecutionError) -> Self {
-        Self {
-            probe_result: Ok(()),
-            result: Err(error.clone()),
-            cancel_result: Ok(CancellationOutcome::Canceled),
-            replace_result: Err(error),
-            reconcile_result: Ok(ReconcileBatch::default()),
-        }
-    }
-
-    #[must_use]
-    pub fn with_cancel_result(
-        mut self,
-        result: Result<CancellationOutcome, ExecutionError>,
-    ) -> Self {
-        self.cancel_result = result;
-        self
-    }
-
-    #[must_use]
-    pub fn with_probe_result(mut self, result: Result<(), ExecutionError>) -> Self {
-        self.probe_result = result;
-        self
-    }
-
-    #[must_use]
-    pub fn with_replace_result(mut self, result: Result<ReplaceOutcome, ExecutionError>) -> Self {
-        self.replace_result = result;
-        self
-    }
-
-    #[must_use]
-    pub fn with_reconciled_fills(mut self, fills: Vec<FillRecord>) -> Self {
-        self.reconcile_result = Ok(ReconcileBatch::fills_only(fills));
-        self
-    }
-
-    #[must_use]
-    pub fn with_reconciled_updates(mut self, updates: ReconcileBatch) -> Self {
-        self.reconcile_result = Ok(updates);
-        self
-    }
-
-    #[must_use]
-    pub fn with_reconcile_result(
-        mut self,
-        result: Result<Vec<FillRecord>, ExecutionError>,
-    ) -> Self {
-        self.reconcile_result = result.map(ReconcileBatch::fills_only);
-        self
-    }
-}
-
-impl LiveExecutionGateway for StaticExecutionGateway {
-    fn probe(&self) -> Result<(), ExecutionError> {
-        self.probe_result.clone()
-    }
-
-    fn submit(&self, _request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError> {
-        self.result.clone()
-    }
-
-    fn cancel(
-        &self,
-        _request: &CancellationRequest,
-    ) -> Result<CancellationOutcome, ExecutionError> {
-        self.cancel_result.clone()
-    }
-
-    fn replace(&self, _request: &ReplaceRequest) -> Result<ReplaceOutcome, ExecutionError> {
-        self.replace_result.clone()
-    }
-
-    fn reconcile_fills(
-        &self,
-        _tracked_orders: &[TrackedOrder],
-    ) -> Result<Vec<FillRecord>, ExecutionError> {
-        self.reconcile_result.clone().map(|batch| batch.fills)
-    }
-
-    fn reconcile_updates(
-        &self,
-        _tracked_orders: &[TrackedOrder],
-    ) -> Result<ReconcileBatch, ExecutionError> {
-        self.reconcile_result.clone()
-    }
-}
-
 #[must_use]
 pub fn crate_marker() -> &'static str {
     CRATE_MARKER
@@ -314,8 +186,8 @@ pub fn crate_marker() -> &'static str {
 mod tests {
     use super::{
         CancellationRequest, DisabledLiveExecutionGateway, ExecutionError, ExecutionRequest,
-        LiveExecutionGateway, OrderExecutionType, ReplaceRequest, StaticExecutionGateway,
-        TrackedOrder, MONDAY_LIVE_EXECUTION_DISABLED,
+        LiveExecutionGateway, OrderExecutionType, ReplaceRequest, TrackedOrder,
+        MONDAY_LIVE_EXECUTION_DISABLED,
     };
     use ploy_trading::TradeSide;
     use rust_decimal_macros::dec;
@@ -330,18 +202,6 @@ mod tests {
             order_type: OrderExecutionType::GTC,
             aggressive_ticks: 0,
         }
-    }
-
-    #[test]
-    fn static_gateway_returns_acknowledged_outcome() {
-        let gateway = StaticExecutionGateway::acknowledged("venue-order-1");
-        let outcome = gateway.submit(&execution_request()).expect("ack outcome");
-        assert_eq!(
-            outcome,
-            super::ExecutionOutcome::Acknowledged {
-                venue_order_id: "venue-order-1".to_string()
-            }
-        );
     }
 
     #[test]

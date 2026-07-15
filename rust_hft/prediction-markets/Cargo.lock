@@ -5495,6 +5495,7 @@ dependencies = [
  "ploy-operator-contracts",
  "ploy-platform",
  "rust_decimal",
+ "syn 2.0.117",
 ]
 
 [[package]]

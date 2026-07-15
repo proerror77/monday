@@ -17,6 +17,8 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Add and validate dedicated PLOY CI at the Monday repository root.
 - [x] Pass repository secret scanning and focused Rust/TypeScript validation.
 - [x] Complete standards/spec review and address findings.
+- [x] Enforce the compatibility live-gateway boundary from parsed Rust syntax and keep every execution fake inside exact `#[cfg(test)]` modules.
+- [x] Remove retired `ployctl trading principal/readiness` parsing and usage until a canonical Monday read-only preflight exists.
 - [ ] Merge the Monday migration PR.
 - [ ] Redirect and archive the former PLOY repository.
 

@@ -120,7 +120,8 @@ pub fn reconcile_live_fills(
 #[cfg(test)]
 mod tests {
     use super::reconcile_live_fills;
-    use ploy_connectivity::{OrderObservation, ReconcileBatch, StaticExecutionGateway};
+    use crate::test_support::StaticExecutionGateway;
+    use ploy_connectivity::{OrderObservation, ReconcileBatch};
     use ploy_operator_contracts::{DeploymentState, DesiredState, ObservedState};
     use ploy_platform::DeploymentRecord;
     use ploy_trading::{
