@@ -285,6 +285,22 @@ cutover requires exactly one immutable passing run. A short test override is
 available only for script testing; it writes `passed=false` and never creates
 `PASSED.sha256`, so it cannot authorize cutover.
 
+For a one-time upgrade from the pre-release layout, where the running Rust
+binary is still a regular file instead of a digest-addressed symlink, use
+`host-rust-lob-adopt-production-release.sh` through Cloud Assistant before the
+cutover. Pin both the running binary digest and the already gated candidate
+digest. The helper never starts, stops, restarts, enables, or disables a unit.
+It verifies fresh full-catalog production health and stable PIDs/restart counts,
+copies the byte-identical running binary and current rollback assets into an
+adopted release, installs an inactive/non-installable rollback-compatibility
+upload unit, atomically replaces the regular path with the identical release
+symlink, and writes immutable adoption evidence. Any failure restores the
+original regular binary and the upload unit's original absent state. This helper
+is intentionally not part of the candidate deployment bundle, so using it does
+not mutate or invalidate an already completed shadow gate. It is not a general
+manual-symlink escape hatch and refuses partial, drifted, unhealthy, or already
+modern release layouts.
+
 ### 3. Cut over or roll back
 
 After the production gate succeeds, invoke the cutover with the same immutable
