@@ -199,6 +199,9 @@ grep -Fq 'binance-lob-archiver@usdm.service' "$CUTOVER"
 grep -Fq 'legacy collector unit must be disabled before cutover' "$CUTOVER"
 grep -Fq 'release_staging=$(mktemp -d "$release_root/.${artifact_sha256}.new.XXXXXX")' \
   "$INSTALL_RELEASE"
+grep -Fq 'COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@]}"' \
+  "$INSTALL_RELEASE"
+grep -Fq 'install -d -m 0755 /opt/monday/releases' "$INSTALL_RELEASE"
 grep -Fq 'chmod 0755 "$release_staging"' "$INSTALL_RELEASE"
 grep -Fq 'release directory must be traversable with mode 0755' "$INSTALL_RELEASE"
 grep -Fq 'runuser -u hftcollector -- "$release_binary" --self-test' "$INSTALL_RELEASE"
