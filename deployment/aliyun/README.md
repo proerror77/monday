@@ -100,6 +100,11 @@ may remain in flight, and each processing chunk retains at most four market resp
 so slow I/O overlaps without creating an unbounded request or memory fan-out. An
 absolute 180-second cycle deadline cancels stalled network work and fails closed;
 health evidence over that duration is rejected by the shadow gate.
+The shadow gate allows a separate 60-second initial-health grace after that
+deadline so a cycle completing at the boundary can finish durable health
+publication before the first sample. This does not relax the 180-second health
+policy: a real timeout still exits or restarts the candidate and fails the
+identity checks.
 `cycle_started_at` preserves the API snapshot boundary, while `updated_at` and
 `last_success_at` are stamped only after tape and state durability completes;
 `cycle_duration_ms` makes the 90-second gate freshness budget directly auditable.

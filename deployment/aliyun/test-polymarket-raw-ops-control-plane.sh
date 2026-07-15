@@ -377,6 +377,9 @@ done
 
 grep -Fq 'readonly REQUIRED_DURATION_SECONDS=3600' "$GATE"
 grep -Fq 'readonly PARITY_TAIL_SECONDS=300' "$GATE"
+grep -Fq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$GATE"
+grep -Fq 'readonly INITIAL_HEALTH_GRACE_SECONDS=60' "$GATE"
+grep -Fq 'readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))' "$GATE"
 grep -Fq 'verify-shadow-parity' "$GATE"
 [[ ! -e "$SCRIPT_DIR/verify-polymarket-shadow-parity.py" ]]
 if grep -Fq 'python3 "$PARITY_VERIFIER"' "$GATE"; then
