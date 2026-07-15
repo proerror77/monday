@@ -351,6 +351,7 @@ for mutation in \
   'del(.last_success_at)' \
   'del(.cycle_started_at)' \
   '.cycle_duration_ms = -1' \
+  '.cycle_duration_ms = 180001' \
   '.trade_poll_concurrency = 0' \
   '.trade_poll_concurrency = 5' \
   '.trade_poll_concurrency = 193' \

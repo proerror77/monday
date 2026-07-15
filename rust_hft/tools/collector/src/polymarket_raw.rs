@@ -26,6 +26,7 @@ const USER_AGENT: &str = "monday-polymarket-reference-collector/2.0";
 const TRADE_ID_VERSION: &str = "v2";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
+const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 192;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
@@ -1829,6 +1830,17 @@ impl ReferenceCollector {
         }
         Ok(health)
     }
+
+    async fn collect_once_bounded(&mut self) -> Result<Value> {
+        tokio::time::timeout(MAX_CYCLE_DURATION, self.collect_once())
+            .await
+            .map_err(|_| {
+                completeness_error(format!(
+                    "collector cycle exceeded the absolute {}ms deadline",
+                    MAX_CYCLE_DURATION.as_millis()
+                ))
+            })?
+    }
 }
 
 pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
@@ -1838,14 +1850,14 @@ pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
     if once {
         println!(
             "{}",
-            serde_json::to_string(&collector.collect_once().await?)?
+            serde_json::to_string(&collector.collect_once_bounded().await?)?
         );
         collector.writer.close()?;
         return Ok(());
     }
     loop {
         let started = Instant::now();
-        match collector.collect_once().await {
+        match collector.collect_once_bounded().await {
             Ok(health) => println!("{}", serde_json::to_string(&health)?),
             Err(error) => {
                 eprintln!("Polymarket reference poll failed: {error:#}");

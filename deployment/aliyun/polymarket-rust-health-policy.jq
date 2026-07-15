@@ -2,6 +2,7 @@
 and (.last_success_at | type == "string" and length > 0)
 and (.cycle_started_at | type == "string" and length > 0)
 and (.cycle_duration_ms | type == "number" and floor == . and . >= 0)
+and (.cycle_duration_ms <= 180000)
 and (.target_markets | type == "number" and floor == . and . > 0)
 and (.trade_poll_budget | type == "number" and floor == . and . > 0)
 and (.trade_poll_concurrency | type == "number" and floor == . and . > 0)
