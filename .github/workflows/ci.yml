@@ -121,6 +121,12 @@ jobs:
             ':(exclude,glob)**/docs/reviews/**'
             ':(exclude,glob)**/docs/superpowers/**'
             ':(exclude,glob)**/tasks/research_evidence/**'
+            # These root-only migration controls must identify and snapshot the
+            # already-installed legacy runtime for parity and fail-closed rollback.
+            # They contain no legacy application source and are exact-file exceptions.
+            ':(exclude,glob)deployment/aliyun/polymarket-raw-ops-shadow-gate.sh'
+            ':(exclude,glob)deployment/aliyun/polymarket-raw-ops-cutover.sh'
+            ':(exclude,glob)deployment/aliyun/test-polymarket-raw-ops-control-plane.sh'
           )
           reject_python_text \
             "Python runtime or package-manager command" \
