@@ -10,7 +10,7 @@ use alpha_domain::{
 pub use alpha_domain::{
     FormulaEvaluatorConfig, MultipleTestingAdjustment, WALK_FORWARD_EVALUATOR_VERSION,
 };
-use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
+use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
 
 const BPS: f64 = 10_000.0;
 
@@ -163,6 +163,7 @@ impl FormulaEvaluator {
         dataset: &PreparedDataset,
     ) -> Result<CandidateEvaluation, String> {
         let ast = formula(proposal)?;
+        validate_live_formula(ast).map_err(|error| error.to_string())?;
         evaluate_sealed_holdout(dataset, |rows| {
             let signals = evaluate_ast(ast, rows)?;
             self.evaluate_ranges(
@@ -682,7 +683,10 @@ mod tests {
             .map(|index| ResearchRow {
                 available_time: start + Duration::minutes(index as i64),
                 signal: if index % 2 == 0 { 1.0 } else { -1.0 },
-                features: std::collections::BTreeMap::new(),
+                features: std::collections::BTreeMap::from([(
+                    "book_imbalance".to_string(),
+                    if index % 2 == 0 { 1.0 } else { -1.0 },
+                )]),
                 label: if index % 2 == 0 { 0.01 } else { -0.01 },
                 fee_bps,
                 funding_bps: 0.0,
@@ -722,7 +726,7 @@ mod tests {
     fn causal_signal_formula_passes_walk_forward_and_holdout() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "book_imbalance".to_string(),
         )));
         let dataset = dataset(0.0);
         assert!(
@@ -852,6 +856,27 @@ mod tests {
     }
 
     #[test]
+    fn sealed_evaluation_rejects_a_formula_that_live_cannot_construct() {
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+        let proposal = proposal(
+            FactorAst::call(
+                FactorOperator::Rank,
+                vec![FactorAst::Terminal(FactorTerminal::Field(
+                    "mid_price".to_string(),
+                ))],
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            evaluator
+                .evaluate_sealed(&proposal, &dataset(0.0))
+                .unwrap_err(),
+            "unsupported live operator: rank"
+        );
+    }
+
+    #[test]
     fn registered_point_in_time_feature_can_drive_a_formula() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
@@ -902,7 +927,10 @@ mod tests {
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Constant(
             "0".to_string(),
         )));
-        let result = evaluator.evaluate_sealed(&proposal, &dataset(0.0)).unwrap();
+        let input = dataset(0.0);
+        let result = evaluator
+            .evaluate(&proposal, &input.engine_context())
+            .unwrap();
 
         assert!(!result.passed);
         assert_eq!(result.metrics.trade_count, 0);
@@ -919,6 +947,10 @@ mod tests {
             .failure_reasons
             .iter()
             .any(|reason| reason.contains("time-series IC")));
+        assert_eq!(
+            evaluator.evaluate_sealed(&proposal, &input).unwrap_err(),
+            "formula must reference a snapshot or bar field"
+        );
     }
 
     #[test]
@@ -929,7 +961,7 @@ mod tests {
         };
         let evaluator = FormulaEvaluator::new(config.clone()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "book_imbalance".to_string(),
         )));
         let result = evaluator.evaluate_sealed(&proposal, &dataset(0.0)).unwrap();
 
@@ -955,7 +987,7 @@ mod tests {
         let dataset = prepare_dataset(input, &protocol(0.0, 3), "sealed-drawdown").unwrap();
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "book_imbalance".to_string(),
         )));
         let result = evaluator.evaluate_sealed(&proposal, &dataset).unwrap();
 

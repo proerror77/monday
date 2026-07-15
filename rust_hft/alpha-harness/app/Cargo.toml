@@ -15,6 +15,7 @@ clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 hft-collector = { path = "../../tools/collector", features = ["collector-binance"] }
+hft-factor-dsl = { path = "../../research-core/factor-dsl" }
 hft-research-manifest = { path = "../../research-core/manifest" }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }

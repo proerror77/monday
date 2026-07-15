@@ -513,6 +513,7 @@ fn validate_text(value: &str, name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hft_factor_dsl::{validate_live_formula, LiveFormulaCapabilityError};
 
     #[test]
     fn hypothesis_ast_rejects_unbounded_operator() {
@@ -531,6 +532,38 @@ mod tests {
             },
         };
         assert!(hypothesis_ast(&artifact).is_err());
+    }
+
+    #[test]
+    fn llm_candidate_grammar_obeys_the_shared_live_capability_contract() {
+        let artifact = |operator: &str, window| HypothesisArtifact {
+            hypothesis: "test".to_string(),
+            field: "book_imbalance".to_string(),
+            operator: operator.to_string(),
+            window,
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            prompt_hash: "hash".to_string(),
+            token_usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        };
+
+        assert!(
+            validate_live_formula(&hypothesis_ast(&artifact("identity", None)).unwrap()).is_ok()
+        );
+        assert!(matches!(
+            validate_live_formula(&hypothesis_ast(&artifact("rank", None)).unwrap()),
+            Err(LiveFormulaCapabilityError::UnsupportedOperator(operator))
+                if operator == "rank"
+        ));
+        assert!(matches!(
+            validate_live_formula(&hypothesis_ast(&artifact("mean", Some(20))).unwrap()),
+            Err(LiveFormulaCapabilityError::UnsupportedOperator(operator))
+                if operator == "mean"
+        ));
     }
 
     #[test]

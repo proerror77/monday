@@ -588,6 +588,7 @@ mod tests {
                 let return_rate = if (index / 3) % 2 == 0 { 0.01 } else { -0.01 };
                 *close *= 1.0 + return_rate;
                 let close = *close;
+                let open = close / (1.0 + return_rate);
                 let event_time = start + Duration::minutes(i64::from(index));
                 let available_time = event_time + Duration::minutes(1);
                 Some(OhlcvTraceRow {
@@ -601,9 +602,9 @@ mod tests {
                     quality_flags: vec![],
                     symbol: "BTCUSDT".to_string(),
                     interval: CandleInterval::OneMinute,
-                    open: close * 0.9995,
-                    high: close * 1.001,
-                    low: close * 0.999,
+                    open,
+                    high: open.max(close) * 1.001,
+                    low: open.min(close) * 0.999,
                     close,
                     volume: 1.0,
                 })
@@ -1009,7 +1010,7 @@ mod tests {
             created_at: now,
         };
         let candidate: CandidateArtifact = serde_json::from_value(serde_json::json!({
-            "Formula": {"Terminal": {"Field": "signal"}}
+            "Formula": {"Terminal": {"Field": "mid_price"}}
         }))
         .unwrap();
         let evaluation = canonical_evaluation(
@@ -1253,7 +1254,7 @@ mod tests {
             .create_mission(&mission_fixture(now, mission_id))
             .unwrap();
         let candidate: CandidateArtifact = serde_json::from_value(serde_json::json!({
-            "Formula": {"Terminal": {"Field": "signal"}}
+            "Formula": {"Terminal": {"Field": "mid_price"}}
         }))
         .unwrap();
         store
@@ -1524,7 +1525,7 @@ mod tests {
         research_mission.dataset_manifest_id =
             serde_json::from_value(serde_json::json!(manifest.manifest_id)).unwrap();
         let candidate: CandidateArtifact = serde_json::from_value(serde_json::json!({
-            "Formula": {"Terminal": {"Field": "signal"}}
+            "Formula": {"Terminal": {"Field": "bar_return"}}
         }))
         .unwrap();
         let dataset_args = DatasetArgs {

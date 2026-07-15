@@ -16,6 +16,7 @@ use alpha_engine::{
 };
 use alpha_store::{AlphaStore, StoreError};
 use anyhow::{bail, Context};
+use hft_factor_dsl::{validate_live_formula, FactorAst, FactorTerminal};
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +159,7 @@ fn build_engine(
         );
     }
     let fields = fields.into_iter().collect::<Vec<_>>();
+    validate_live_feature_fields(&fields)?;
     let primary = fields[0].clone();
     let secondary = fields.get(1).cloned().unwrap_or_else(|| primary.clone());
     let engine: Box<dyn ProposalEngine> = match args.engine {
@@ -195,4 +197,17 @@ fn build_engine(
         }
     };
     Ok(engine)
+}
+
+pub(crate) fn validate_live_feature_fields(fields: &[String]) -> anyhow::Result<()> {
+    for field in fields {
+        let field = field.trim();
+        validate_live_formula(&FactorAst::Terminal(FactorTerminal::Field(
+            field.to_string(),
+        )))
+        .map_err(|error| {
+            anyhow::anyhow!("feature field {field} is not live executable: {error}")
+        })?;
+    }
+    Ok(())
 }

@@ -2899,7 +2899,7 @@ mod tests {
         include_mission_binding: bool,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "mid_price".to_string(),
         )));
         let mut candidate_iteration = iteration();
         candidate_iteration.engine = engine;
@@ -2982,7 +2982,7 @@ mod tests {
             evaluation_metrics_hash.clone(),
             evaluation_hash.clone(),
             StrategyBundleArtifact::Formula {
-                ast: FactorAst::Terminal(FactorTerminal::Field("signal".to_string())),
+                ast: FactorAst::Terminal(FactorTerminal::Field("mid_price".to_string())),
             },
             now,
         )
@@ -3370,7 +3370,7 @@ mod tests {
         let mission = mission();
         store.create_mission(&mission).unwrap();
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "mid_price".to_string(),
         )));
         let mut iteration = iteration();
         iteration.evaluation_artifact_id = Some("evaluation-1".to_string());
@@ -3501,7 +3501,7 @@ mod tests {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "mid_price".to_string(),
         )));
         store
             .append_iteration(&iteration(), Some(("candidate-1", &candidate)), None)
@@ -3548,7 +3548,7 @@ mod tests {
             evaluation_metrics_hash.clone(),
             evaluation_hash.clone(),
             StrategyBundleArtifact::Formula {
-                ast: FactorAst::Terminal(FactorTerminal::Field("signal".to_string())),
+                ast: FactorAst::Terminal(FactorTerminal::Field("mid_price".to_string())),
             },
             now,
         )
@@ -4292,7 +4292,7 @@ mod tests {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "mid_price".to_string(),
         )));
         store
             .append_iteration(&iteration(), Some(("candidate-1", &candidate)), None)

@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use hft_factor_dsl::FactorAst;
+use hft_factor_dsl::{validate_live_formula, FactorAst, LiveFormulaCapabilityError};
 use hft_research_manifest::{ArtifactRef, ManifestId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,6 +76,8 @@ pub enum DomainError {
     InvalidPolicyScore,
     #[error("candidate artifact is research-only and cannot be promoted")]
     ResearchOnlyArtifact,
+    #[error("formula is not live executable: {0}")]
+    UnsupportedLiveFormula(#[from] LiveFormulaCapabilityError),
     #[error("strategy bundle is invalid")]
     InvalidStrategyBundle,
     #[error("strategy bundle hash does not match its canonical payload")]
@@ -1543,8 +1545,7 @@ impl CandidateArtifact {
     ) -> Result<StrategyBundleArtifact, DomainError> {
         match self {
             Self::Formula(ast) => {
-                ast.validate()
-                    .map_err(|_| DomainError::InvalidStrategyBundle)?;
+                validate_live_formula(ast)?;
                 Ok(StrategyBundleArtifact::Formula { ast: ast.clone() })
             }
             Self::OnnxModel(model) => {
@@ -1572,9 +1573,7 @@ pub enum StrategyBundleArtifact {
 impl StrategyBundleArtifact {
     pub fn validate(&self) -> Result<(), DomainError> {
         match self {
-            Self::Formula { ast } => ast
-                .validate()
-                .map_err(|_| DomainError::InvalidStrategyBundle),
+            Self::Formula { ast } => validate_live_formula(ast).map(|_| ()).map_err(Into::into),
             Self::Onnx { model } => model.validate(),
         }
     }
@@ -3000,7 +2999,7 @@ mod tests {
             "b".repeat(64),
             StrategyBundleArtifact::Formula {
                 ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
-                    "signal".to_string(),
+                    "mid_price".to_string(),
                 )),
             },
             Utc::now(),
@@ -3052,7 +3051,9 @@ mod tests {
     #[test]
     fn strategy_bundle_hash_is_stable_across_storage_metadata() {
         let artifact = StrategyBundleArtifact::Formula {
-            ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field("signal".to_string())),
+            ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                "mid_price".to_string(),
+            )),
         };
         let first = StrategyBundle::new(
             "bundle-1".to_string(),
@@ -3177,6 +3178,29 @@ mod tests {
         assert!(matches!(
             onnx.to_governed_strategy_bundle_artifact(),
             Ok(StrategyBundleArtifact::Onnx { .. })
+        ));
+    }
+
+    #[test]
+    fn formula_candidate_must_be_live_executable_before_bundle_creation() {
+        let artifact = CandidateArtifact::Formula(
+            FactorAst::call(
+                hft_factor_dsl::FactorOperator::Mean,
+                vec![
+                    FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                        "mid_price".to_string(),
+                    )),
+                    FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Constant("20".to_string())),
+                ],
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            artifact.to_governed_strategy_bundle_artifact(),
+            Err(DomainError::UnsupportedLiveFormula(
+                hft_factor_dsl::LiveFormulaCapabilityError::UnsupportedOperator(operator)
+            )) if operator == "mean"
         ));
     }
 

@@ -26,6 +26,7 @@ use alpha_store::{
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hft_factor_dsl::validate_live_formula;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -391,7 +392,10 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
 
 fn sealed_evaluator_version(artifact: &CandidateArtifact) -> anyhow::Result<&'static str> {
     match artifact {
-        CandidateArtifact::Formula(_) => Ok(SEALED_HOLDOUT_EVALUATOR_VERSION),
+        CandidateArtifact::Formula(ast) => {
+            validate_live_formula(ast).map_err(anyhow::Error::new)?;
+            Ok(SEALED_HOLDOUT_EVALUATOR_VERSION)
+        }
         CandidateArtifact::OnnxModel(_) => Ok(ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION),
         _ => bail!("candidate artifact has no governed sealed evaluator"),
     }
@@ -1141,7 +1145,7 @@ mod tests {
             "evaluation_metrics_hash": "3".repeat(64),
             "sealed_evaluation_hash": "4".repeat(64),
             "artifact": {
-                "Formula": {"ast": {"Terminal": {"Field": "signal"}}}
+                "Formula": {"ast": {"Terminal": {"Field": "mid_price"}}}
             },
             "bundle_hash": "",
             "created_at": now,
@@ -1426,6 +1430,29 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(&output).unwrap().count(), 2);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn sealed_and_promotion_entrypoint_rejects_non_live_formula() {
+        let ast = hft_factor_dsl::FactorAst::call(
+            hft_factor_dsl::FactorOperator::Mean,
+            vec![
+                hft_factor_dsl::FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                    "mid_price".to_string(),
+                )),
+                hft_factor_dsl::FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Constant(
+                    "20".to_string(),
+                )),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            sealed_evaluator_version(&CandidateArtifact::Formula(ast))
+                .unwrap_err()
+                .to_string(),
+            "unsupported live operator: mean"
+        );
     }
 
     #[test]

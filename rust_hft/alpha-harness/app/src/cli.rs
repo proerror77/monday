@@ -315,7 +315,7 @@ pub struct RunMissionArgs {
     pub engine: EngineChoice,
     #[arg(long, default_value_t = 7)]
     pub seed: u64,
-    #[arg(long, value_delimiter = ',', default_value = "signal")]
+    #[arg(long, value_delimiter = ',', default_value = "bar_return")]
     pub feature_fields: Vec<String>,
     #[arg(long)]
     pub offline_trace: Option<PathBuf>,
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn parses_bounded_loop_run_without_execution_authority() {
-        assert!(Cli::try_parse_from([
+        let cli = Cli::try_parse_from([
             "alpha-harness",
             "loop",
             "run",
@@ -797,7 +797,14 @@ mod tests {
             "--max-research-missions",
             "2",
         ])
-        .is_ok());
+        .unwrap();
+        let Command::Loop {
+            command: LoopCommand::Run(args),
+        } = cli.command
+        else {
+            panic!("expected loop run command")
+        };
+        assert_eq!(args.mission.feature_fields, ["bar_return"]);
     }
 
     #[test]

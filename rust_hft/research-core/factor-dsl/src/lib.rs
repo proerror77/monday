@@ -8,7 +8,7 @@ use thiserror::Error;
 pub const MAX_FACTOR_AST_DEPTH: usize = 64;
 pub const MAX_FACTOR_AST_NODES: usize = 10_000;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum FactorDslError {
     #[error("operator arity mismatch for {operator}: expected {expected}, got {actual}")]
     ArityMismatch {
@@ -20,6 +20,33 @@ pub enum FactorDslError {
     AstTooDeep { max_depth: usize },
     #[error("factor AST exceeds the maximum size of {max_nodes} nodes")]
     AstTooLarge { max_nodes: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveEventDomain {
+    Snapshot,
+    Bar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveFormulaCapability {
+    pub event_domain: LiveEventDomain,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum LiveFormulaCapabilityError {
+    #[error("invalid factor AST: {0}")]
+    InvalidAst(#[from] FactorDslError),
+    #[error("unsupported live operator: {0}")]
+    UnsupportedOperator(String),
+    #[error("unsupported live field: {0}")]
+    UnsupportedField(String),
+    #[error("formula mixes snapshot and bar fields")]
+    MixedEventDomains,
+    #[error("formula must reference a snapshot or bar field")]
+    MissingEventDomain,
+    #[error("formula constant is not a finite f64: {0}")]
+    InvalidConstant(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +166,72 @@ impl FactorAst {
     }
 }
 
+pub fn validate_live_formula(
+    ast: &FactorAst,
+) -> Result<LiveFormulaCapability, LiveFormulaCapabilityError> {
+    ast.validate()?;
+    let mut event_domain = None;
+    validate_live_node(ast, &mut event_domain)?;
+    Ok(LiveFormulaCapability {
+        event_domain: event_domain.ok_or(LiveFormulaCapabilityError::MissingEventDomain)?,
+    })
+}
+
+fn validate_live_node(
+    ast: &FactorAst,
+    event_domain: &mut Option<LiveEventDomain>,
+) -> Result<(), LiveFormulaCapabilityError> {
+    match ast {
+        FactorAst::Terminal(FactorTerminal::Constant(value)) => {
+            let parsed = value
+                .parse::<f64>()
+                .map_err(|_| LiveFormulaCapabilityError::InvalidConstant(value.clone()))?;
+            if !parsed.is_finite() {
+                return Err(LiveFormulaCapabilityError::InvalidConstant(value.clone()));
+            }
+        }
+        FactorAst::Terminal(FactorTerminal::Field(field)) => {
+            let current = match field.as_str() {
+                "best_bid" | "best_ask" | "mid_price" | "spread" | "spread_bps" | "bid_size"
+                | "ask_size" | "book_imbalance" => LiveEventDomain::Snapshot,
+                "open" | "high" | "low" | "close" | "volume" | "trade_count" | "bar_return" => {
+                    LiveEventDomain::Bar
+                }
+                _ => return Err(LiveFormulaCapabilityError::UnsupportedField(field.clone())),
+            };
+            match *event_domain {
+                Some(existing) if existing != current => {
+                    return Err(LiveFormulaCapabilityError::MixedEventDomains)
+                }
+                None => *event_domain = Some(current),
+                _ => {}
+            }
+        }
+        FactorAst::Call { operator, args } => {
+            if !matches!(
+                operator,
+                FactorOperator::Add
+                    | FactorOperator::Sub
+                    | FactorOperator::Mul
+                    | FactorOperator::Div
+                    | FactorOperator::Abs
+                    | FactorOperator::Log
+                    | FactorOperator::GreaterThan
+                    | FactorOperator::LessThan
+                    | FactorOperator::IfElse
+            ) {
+                return Err(LiveFormulaCapabilityError::UnsupportedOperator(
+                    operator.symbol().to_string(),
+                ));
+            }
+            for arg in args {
+                validate_live_node(arg, event_domain)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl fmt::Display for FactorAst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -251,5 +344,57 @@ mod tests {
         let right = FactorAst::Terminal(FactorTerminal::Field("cvd_slope_5m".to_string()));
         let ast = FactorAst::call(FactorOperator::Mul, vec![left, right]).unwrap();
         assert_eq!(ast.to_string(), "(oi_delta_5m * cvd_slope_5m)");
+    }
+
+    #[test]
+    fn live_capability_accepts_only_runtime_fields_and_stateless_operators() {
+        let ast = FactorAst::call(
+            FactorOperator::Sub,
+            vec![
+                FactorAst::Terminal(FactorTerminal::Field("best_ask".to_string())),
+                FactorAst::Terminal(FactorTerminal::Field("best_bid".to_string())),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_live_formula(&ast).unwrap(),
+            LiveFormulaCapability {
+                event_domain: LiveEventDomain::Snapshot,
+            }
+        );
+    }
+
+    #[test]
+    fn live_capability_rejects_research_only_operators_and_features() {
+        for operator in [
+            FactorOperator::Rank,
+            FactorOperator::Delta,
+            FactorOperator::Mean,
+            FactorOperator::Std,
+            FactorOperator::ZScore,
+        ] {
+            let mut args = vec![FactorAst::Terminal(FactorTerminal::Field(
+                "mid_price".to_string(),
+            ))];
+            if operator.arity() == 2 {
+                args.push(FactorAst::Terminal(FactorTerminal::Constant(
+                    "5".to_string(),
+                )));
+            }
+            let ast = FactorAst::call(operator.clone(), args).unwrap();
+            assert_eq!(
+                validate_live_formula(&ast).unwrap_err(),
+                LiveFormulaCapabilityError::UnsupportedOperator(operator.symbol().to_string())
+            );
+        }
+
+        for field in ["book_imbalance_top5", "ofi_top5", "signal"] {
+            let ast = FactorAst::Terminal(FactorTerminal::Field(field.to_string()));
+            assert_eq!(
+                validate_live_formula(&ast).unwrap_err(),
+                LiveFormulaCapabilityError::UnsupportedField(field.to_string())
+            );
+        }
     }
 }

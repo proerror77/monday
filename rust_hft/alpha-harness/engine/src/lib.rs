@@ -23,6 +23,8 @@ use chrono::Utc;
 #[cfg(feature = "kernel")]
 use evaluation::PreparedDataset;
 use evaluation::{EngineContext, ProposalContext};
+#[cfg(feature = "kernel")]
+use hft_factor_dsl::validate_live_formula;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "kernel")]
 use thiserror::Error;
@@ -369,16 +371,35 @@ where
                         .map_err(|error| EngineError::Evaluation(error.to_string()))?;
                     let is_novel = seen_artifacts.insert(fingerprint);
                     let evaluated = if !is_novel {
-                        Err("proposal duplicated an existing candidate artifact".to_string())
+                        Err((
+                            "duplicate_candidate",
+                            "proposal duplicated an existing candidate artifact".to_string(),
+                        ))
                     } else if within_budget {
-                        self.evaluator
-                            .evaluate(&proposal, &evaluation_context)
-                            .and_then(|result| {
-                                result.validate().map_err(|error| error.to_string())?;
-                                Ok(result)
-                            })
+                        let live_capability = match &proposal.artifact {
+                            CandidateArtifact::Formula(ast) => validate_live_formula(ast)
+                                .map(|_| ())
+                                .map_err(|error| error.to_string()),
+                            _ => Ok(()),
+                        };
+                        match live_capability {
+                            Err(error) => Err(("live_capability_reject", error)),
+                            Ok(()) => self
+                                .evaluator
+                                .evaluate(&proposal, &evaluation_context)
+                                .map_err(|error| ("evaluation_error", error))
+                                .and_then(|result| {
+                                    result
+                                        .validate()
+                                        .map_err(|error| ("evaluation_error", error.to_string()))?;
+                                    Ok(result)
+                                }),
+                        }
                     } else {
-                        Err("proposal exceeded remaining search budget".to_string())
+                        Err((
+                            "evaluation_error",
+                            "proposal exceeded remaining search budget".to_string(),
+                        ))
                     };
                     match evaluated {
                         Ok(result) => {
@@ -418,7 +439,7 @@ where
                                 Some(evaluation),
                             )
                         }
-                        Err(error) => {
+                        Err((failure_class, error)) => {
                             self.proposal_engine.abandon(&proposal);
                             let candidate_id = is_novel.then(|| proposal.candidate_id.clone());
                             let candidate =
@@ -434,11 +455,7 @@ where
                                     evaluation_artifact_id: None,
                                     budget_usage: usage.clone(),
                                     verdict: IterationVerdict::Crash,
-                                    failure_class: Some(if is_novel {
-                                        "evaluation_error".to_string()
-                                    } else {
-                                        "duplicate_candidate".to_string()
-                                    }),
+                                    failure_class: Some(failure_class.to_string()),
                                     failure_explanation: Some(error),
                                     created_at,
                                 },
@@ -666,15 +683,23 @@ mod tests {
         BayesianOptimizerEngine, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
         OfflineTrace,
     };
-    use crate::evaluation::{prepare_dataset, ResearchRow};
+    use crate::evaluation::{prepare_dataset, ResearchRow, WalkForwardConfig};
     use alpha_domain::{
-        EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
-        MissionCompletionPolicy, ResearchMission, SearchBudget, ValidatorMode,
+        DomainError, EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1,
+        EvaluationWalkForwardV1, MissionCompletionPolicy, ResearchMission, SearchBudget,
+        ValidatorMode,
     };
     use chrono::Duration;
+    use hft_core::Symbol;
+    use hft_factor_dsl::{
+        validate_live_formula, FactorAst, FactorOperator, FactorTerminal,
+        LiveFormulaCapabilityError,
+    };
     use hft_research_manifest::ManifestId;
+    use rust_decimal::Decimal;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use strategy_formula::{FormulaStrategy, FormulaStrategyConfig};
 
     struct CountingEngine {
         calls: Arc<AtomicUsize>,
@@ -772,6 +797,46 @@ mod tests {
         }
     }
 
+    struct FixedFormulaEngine {
+        ast: FactorAst,
+    }
+
+    impl ProposalEngine for FixedFormulaEngine {
+        fn kind(&self) -> EngineKind {
+            EngineKind::ManualSeed
+        }
+
+        fn propose(
+            &mut self,
+            mission_id: &str,
+            iteration_index: usize,
+            _context: &ProposalContext<'_>,
+            _remaining: &RemainingBudget,
+        ) -> Result<EngineProposal, String> {
+            Ok(EngineProposal {
+                candidate_id: format!("{mission_id}-candidate-{iteration_index}"),
+                hypothesis: "fixed formula".to_string(),
+                artifact: CandidateArtifact::Formula(self.ast.clone()),
+                expansions: 1,
+                tokens: 0,
+                elapsed_ms: 1,
+            })
+        }
+    }
+
+    struct CountingPassingEvaluator(Arc<AtomicUsize>);
+
+    impl CandidateEvaluator for CountingPassingEvaluator {
+        fn evaluate(
+            &self,
+            proposal: &EngineProposal,
+            context: &EngineContext<'_>,
+        ) -> Result<CandidateEvaluation, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            PassingEvaluator.evaluate(proposal, context)
+        }
+    }
+
     fn mission() -> ResearchMission {
         let now = Utc::now();
         ResearchMission {
@@ -841,6 +906,40 @@ mod tests {
             )
             .unwrap(),
             "holdout-1",
+        )
+        .unwrap()
+    }
+
+    fn live_contract_dataset() -> PreparedDataset {
+        let start = Utc::now();
+        let rows = (0..500)
+            .map(|index| {
+                let signal = if index % 2 == 0 { 1.0 } else { -1.0 };
+                ResearchRow {
+                    available_time: start + Duration::seconds(index),
+                    signal,
+                    features: std::collections::BTreeMap::from([(
+                        "book_imbalance".to_string(),
+                        signal,
+                    )]),
+                    label: signal * 0.01,
+                    fee_bps: 0.0,
+                    funding_bps: 0.0,
+                    latency_bps: 0.0,
+                }
+            })
+            .collect();
+        prepare_dataset(
+            rows,
+            &WalkForwardConfig {
+                initial_train_rows: 200,
+                validation_rows: 64,
+                fold_count: 3,
+                purge_rows: 1,
+                embargo_rows: 1,
+                sealed_holdout_rows: 64,
+            },
+            "live-contract-holdout",
         )
         .unwrap()
     }
@@ -1123,6 +1222,45 @@ mod tests {
     }
 
     #[test]
+    fn live_capability_rejection_happens_before_evaluation_or_keep() {
+        let evaluator_calls = Arc::new(AtomicUsize::new(0));
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        let mut mission = mission();
+        mission.search_budget.max_candidates = 1;
+        mission.completion_policy.min_kept_candidates = 1;
+        store.create_mission(&mission).unwrap();
+        let ast = FactorAst::call(
+            FactorOperator::Rank,
+            vec![FactorAst::Terminal(FactorTerminal::Field(
+                "mid_price".to_string(),
+            ))],
+        )
+        .unwrap();
+
+        let outcome = AutoResearchKernel::new(
+            &mut store,
+            FixedFormulaEngine { ast },
+            CountingPassingEvaluator(evaluator_calls.clone()),
+        )
+        .run("mission-1", &dataset(), RunControl::default())
+        .unwrap();
+
+        assert_eq!(outcome.status, MissionStatus::BudgetExhausted);
+        assert_eq!(evaluator_calls.load(Ordering::SeqCst), 0);
+        let lineage = store.mission_lineage("mission-1").unwrap();
+        assert_eq!(lineage.evaluations.len(), 0);
+        assert_eq!(lineage.iterations[0].verdict, IterationVerdict::Crash);
+        assert_eq!(
+            lineage.iterations[0].failure_class.as_deref(),
+            Some("live_capability_reject")
+        );
+        assert_eq!(
+            lineage.iterations[0].failure_explanation.as_deref(),
+            Some("unsupported live operator: rank")
+        );
+    }
+
+    #[test]
     fn resume_rejects_engine_kind_change_before_mission_state_transition() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
@@ -1186,7 +1324,7 @@ mod tests {
         store.create_mission(&mission).unwrap();
         {
             let engine =
-                GeneticProgrammingEngine::new(7, vec!["signal".to_string()], 8, 5).unwrap();
+                GeneticProgrammingEngine::new(7, vec!["book_imbalance".to_string()], 8, 5).unwrap();
             AutoResearchKernel::new(&mut store, engine, PassingEvaluator)
                 .run(
                     "mission-1",
@@ -1199,7 +1337,7 @@ mod tests {
         }
         {
             let engine =
-                GeneticProgrammingEngine::new(7, vec!["signal".to_string()], 8, 5).unwrap();
+                GeneticProgrammingEngine::new(7, vec!["book_imbalance".to_string()], 8, 5).unwrap();
             AutoResearchKernel::new(&mut store, engine, PassingEvaluator)
                 .run("mission-1", &dataset(), RunControl::default())
                 .unwrap();
@@ -1276,6 +1414,121 @@ mod tests {
             OfflineRlEngine::train("oi", "policy-1", &traces, 3, 0.2, 0.9, 20).unwrap()
         )
         .is_empty());
+    }
+
+    #[test]
+    fn deterministic_search_engines_obey_the_evaluation_to_live_contract() {
+        fn check<P: ProposalEngine>(engine: P, expected_live: bool) {
+            let dataset = live_contract_dataset();
+            let mut store = AlphaStore::open_in_memory().unwrap();
+            let mut mission = mission();
+            mission.search_budget.max_candidates = 1;
+            mission.search_budget.max_expansions = 256;
+            mission.completion_policy.min_kept_candidates = 1;
+            store.create_mission(&mission).unwrap();
+            let evaluator = crate::formula_evaluator::FormulaEvaluator::new(
+                alpha_domain::FormulaEvaluatorConfig::default(),
+            )
+            .unwrap();
+            AutoResearchKernel::new(&mut store, engine, evaluator)
+                .run("mission-1", &dataset, RunControl::default())
+                .unwrap();
+
+            let lineage = store.mission_lineage("mission-1").unwrap();
+            let iteration = &lineage.iterations[0];
+            let candidate = &lineage.candidates[0];
+            let CandidateArtifact::Formula(ast) = &candidate.artifact else {
+                panic!("search engine did not produce a formula")
+            };
+            let proposal = EngineProposal {
+                candidate_id: candidate.candidate_id.clone(),
+                hypothesis: iteration.hypothesis.clone(),
+                artifact: candidate.artifact.clone(),
+                expansions: 0,
+                tokens: 0,
+                elapsed_ms: 0,
+            };
+            let sealed = crate::formula_evaluator::FormulaEvaluator::new(
+                alpha_domain::FormulaEvaluatorConfig::default(),
+            )
+            .unwrap()
+            .evaluate_sealed(&proposal, &dataset);
+            let promotion_artifact = candidate.artifact.to_governed_strategy_bundle_artifact();
+            let strategy = FormulaStrategy::new(FormulaStrategyConfig {
+                name: "live-contract".to_string(),
+                symbol: Symbol::from("BTCUSDT"),
+                ast: ast.clone(),
+                max_order_notional: Decimal::ONE,
+                signal_threshold: 0.0,
+            });
+
+            if expected_live {
+                assert_eq!(iteration.verdict, IterationVerdict::Keep);
+                assert!(validate_live_formula(ast).is_ok());
+                assert!(sealed.unwrap().passed);
+                assert!(promotion_artifact.is_ok());
+                assert!(strategy.is_ok());
+            } else {
+                assert_eq!(iteration.verdict, IterationVerdict::Crash);
+                assert_eq!(
+                    iteration.failure_class.as_deref(),
+                    Some("live_capability_reject")
+                );
+                assert!(matches!(
+                    validate_live_formula(ast),
+                    Err(LiveFormulaCapabilityError::UnsupportedOperator(_))
+                ));
+                assert!(sealed.is_err());
+                assert!(matches!(
+                    promotion_artifact,
+                    Err(DomainError::UnsupportedLiveFormula(
+                        LiveFormulaCapabilityError::UnsupportedOperator(_)
+                    ))
+                ));
+                assert!(strategy.is_err());
+            }
+        }
+
+        check(
+            GeneticProgrammingEngine::new(3, vec!["book_imbalance".to_string()], 4, 4).unwrap(),
+            true,
+        );
+        check(
+            MctsEngine::new(4, "book_imbalance", "book_imbalance", 1.4, 3).unwrap(),
+            true,
+        );
+        check(
+            BayesianOptimizerEngine::new("book_imbalance", 5.0, 60.0, 12, 1e-6, 10.0, 0.01)
+                .unwrap(),
+            false,
+        );
+        let traces = vec![
+            OfflineTrace {
+                state: "negative".to_string(),
+                action: "rank".to_string(),
+                reward: 1.0,
+                next_state: "negative".to_string(),
+                terminal: false,
+            },
+            OfflineTrace {
+                state: "negative".to_string(),
+                action: "mean".to_string(),
+                reward: -1.0,
+                next_state: "flat".to_string(),
+                terminal: true,
+            },
+            OfflineTrace {
+                state: "flat".to_string(),
+                action: "rank".to_string(),
+                reward: 0.2,
+                next_state: "negative".to_string(),
+                terminal: false,
+            },
+        ];
+        check(
+            OfflineRlEngine::train("book_imbalance", "policy-1", &traces, 3, 0.2, 0.9, 20).unwrap(),
+            false,
+        );
     }
 
     #[test]

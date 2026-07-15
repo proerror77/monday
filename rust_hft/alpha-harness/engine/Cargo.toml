@@ -22,4 +22,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 alpha-store = { path = "../store", features = ["test-support"] }
+hft-core = { path = "../../market-core/core" }
 hft-research-manifest = { path = "../../research-core/manifest" }
+hft-strategy-formula = { path = "../../strategy-framework/strategies/formula" }
+rust_decimal = { workspace = true }
