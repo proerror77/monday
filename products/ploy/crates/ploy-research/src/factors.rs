@@ -2504,6 +2504,13 @@ pub fn observations_to_frame(rows: &[FactorObservation]) -> PolarsResult<DataFra
         "event_id" => rows.iter().map(|row| row.event_id.as_str()).collect::<Vec<_>>(),
         "symbol" => rows.iter().map(|row| row.symbol.as_str()).collect::<Vec<_>>(),
         "tick_ts" => rows.iter().map(|row| row.tick_ts.timestamp_millis()).collect::<Vec<_>>(),
+        "source_available_at_spot_ms" => rows.iter().map(|row| row.source_availability.spot.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_lob_ms" => rows.iter().map(|row| row.source_availability.lob.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_aggregate_trade_ms" => rows.iter().map(|row| row.source_availability.aggregate_trade.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_polymarket_up_quote_ms" => rows.iter().map(|row| row.source_availability.polymarket_up_quote.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_polymarket_down_quote_ms" => rows.iter().map(|row| row.source_availability.polymarket_down_quote.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_chainlink_reference_ms" => rows.iter().map(|row| row.source_availability.chainlink_reference.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_chainlink_open_ms" => rows.iter().map(|row| row.source_availability.chainlink_open.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
         "event_window_secs" => rows.iter().map(|row| row.event_window_secs).collect::<Vec<_>>(),
         "time_remaining_secs" => rows.iter().map(|row| row.time_remaining_secs).collect::<Vec<_>>(),
         "signed_distance_to_beat" => rows.iter().map(|row| row.signed_distance_to_beat).collect::<Vec<_>>(),
@@ -3027,11 +3034,19 @@ mod tests {
         GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS, GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION,
         PM_BOOK_SAMPLED_QUERY,
     };
+    #[cfg(feature = "polars-export")]
+    use super::{export_observations_parquet, FactorSourceAvailability};
     use chrono::{TimeZone, Utc};
     use ploy_market_contracts::MarketUpdate;
+    #[cfg(feature = "polars-export")]
+    use polars::io::parquet::read::ParquetReader;
+    #[cfg(feature = "polars-export")]
+    use polars::prelude::SerReader;
     use rust_decimal::Decimal;
     #[cfg(feature = "db")]
     use serde_json::json;
+    #[cfg(feature = "polars-export")]
+    use std::fs::File;
     use std::sync::Arc;
 
     fn chainlink_tick(ts_secs: i64, price: i64) -> MarketUpdate {
@@ -3293,6 +3308,92 @@ mod tests {
 
         assert_eq!(decoded.event_window_secs, 0);
         assert_eq!(decoded.source_availability, Default::default());
+    }
+
+    #[cfg(feature = "polars-export")]
+    #[test]
+    fn snapshot_json_and_parquet_preserve_source_availability_provenance() {
+        let available_at = |offset_ms: i64| {
+            Utc.timestamp_millis_opt(1_700_000_000_000 + offset_ms)
+                .single()
+                .expect("valid source availability timestamp")
+        };
+        let mut governed = test_factor_observation("evt-1", "BTCUSDT", 100, 1.0, None);
+        governed.source_availability = FactorSourceAvailability {
+            spot: Some(available_at(1)),
+            lob: Some(available_at(2)),
+            aggregate_trade: Some(available_at(3)),
+            polymarket_up_quote: Some(available_at(4)),
+            polymarket_down_quote: Some(available_at(5)),
+            chainlink_reference: Some(available_at(6)),
+            chainlink_open: Some(available_at(7)),
+        };
+        let observations = vec![
+            governed,
+            test_factor_observation("evt-2", "BTCUSDT", 101, 0.0, None),
+        ];
+
+        let json = serde_json::to_vec(&observations).expect("serialize snapshot observations JSON");
+        let json_rows: Vec<FactorObservation> =
+            serde_json::from_slice(&json).expect("deserialize snapshot observations JSON");
+        let temp_dir = tempfile::tempdir().expect("create snapshot export directory");
+        let parquet_path = temp_dir.path().join("observations.parquet");
+        export_observations_parquet(&observations, &parquet_path)
+            .expect("export snapshot observations Parquet");
+        let parquet = ParquetReader::new(
+            File::open(&parquet_path).expect("open snapshot observations Parquet"),
+        )
+        .finish()
+        .expect("read snapshot observations Parquet");
+
+        let expected_columns = [
+            (
+                "source_available_at_spot_ms",
+                json_rows[0].source_availability.spot,
+            ),
+            (
+                "source_available_at_lob_ms",
+                json_rows[0].source_availability.lob,
+            ),
+            (
+                "source_available_at_aggregate_trade_ms",
+                json_rows[0].source_availability.aggregate_trade,
+            ),
+            (
+                "source_available_at_polymarket_up_quote_ms",
+                json_rows[0].source_availability.polymarket_up_quote,
+            ),
+            (
+                "source_available_at_polymarket_down_quote_ms",
+                json_rows[0].source_availability.polymarket_down_quote,
+            ),
+            (
+                "source_available_at_chainlink_reference_ms",
+                json_rows[0].source_availability.chainlink_reference,
+            ),
+            (
+                "source_available_at_chainlink_open_ms",
+                json_rows[0].source_availability.chainlink_open,
+            ),
+        ];
+
+        for (column_name, json_timestamp) in expected_columns {
+            let parquet_timestamps = parquet
+                .column(column_name)
+                .unwrap_or_else(|_| panic!("missing governed provenance column {column_name}"))
+                .i64()
+                .unwrap_or_else(|_| panic!("provenance column {column_name} must be Int64"));
+            assert_eq!(
+                parquet_timestamps.get(0),
+                json_timestamp.map(|timestamp| timestamp.timestamp_millis()),
+                "JSON and Parquet provenance must match for {column_name}"
+            );
+            assert_eq!(
+                parquet_timestamps.get(1),
+                None,
+                "missing provenance must remain null for {column_name}"
+            );
+        }
     }
 
     #[test]
