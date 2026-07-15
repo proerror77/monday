@@ -1083,27 +1083,47 @@ fn market_updates_from_price_change(
     change: &PriceChange,
     books: &mut HashMap<String, ClobBookState>,
     last_timestamp: &mut HashMap<String, i64>,
-) -> Vec<MarketUpdate> {
+) -> Result<Vec<MarketUpdate>, String> {
     let Some(ts) = DateTime::from_timestamp_millis(change.timestamp) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    change
-        .price_changes
-        .iter()
-        .filter_map(|entry| {
-            let token_id = entry.asset_id.to_string();
-            if last_timestamp
-                .get(&token_id)
-                .is_some_and(|last| change.timestamp < *last)
-            {
-                return None;
-            }
-            let state = books.entry(token_id.clone()).or_default();
-            state.apply(entry);
-            last_timestamp.insert(token_id.clone(), change.timestamp);
-            Some(state.quote(token_id, ts, Some(entry)))
+    let mut updated_tokens = Vec::new();
+    let mut last_entries = HashMap::new();
+
+    for entry in &change.price_changes {
+        let token_id = entry.asset_id.to_string();
+        if last_timestamp
+            .get(&token_id)
+            .is_some_and(|last| change.timestamp < *last)
+        {
+            continue;
+        }
+        books.entry(token_id.clone()).or_default().apply(entry);
+        last_timestamp.insert(token_id.clone(), change.timestamp);
+        if last_entries.insert(token_id.clone(), entry).is_none() {
+            updated_tokens.push(token_id);
+        }
+    }
+
+    let updates = updated_tokens
+        .into_iter()
+        .map(|token_id| {
+            books[&token_id].quote(token_id.clone(), ts, last_entries.get(&token_id).copied())
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if updates.iter().any(|update| {
+        matches!(
+            update,
+            MarketUpdate::Quote {
+                bid: Some(bid),
+                ask: Some(ask),
+                ..
+            } if bid > ask
+        )
+    }) {
+        return Err("Polymarket price-change batch produced a crossed book".to_string());
+    }
+    Ok(updates)
 }
 
 fn send_empty_polymarket_quotes(tx: &broadcast::Sender<MarketUpdate>, token_ids: &[U256]) -> bool {
@@ -1151,7 +1171,7 @@ fn forward_clob_ws_payload(
             }
             WsMessage::PriceChange(change) => {
                 for update in
-                    market_updates_from_price_change(&change, books_by_token, last_timestamp)
+                    market_updates_from_price_change(&change, books_by_token, last_timestamp)?
                 {
                     if tx.send(update).is_err() {
                         return Ok(false);
@@ -1909,6 +1929,21 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
+    fn seeded_clob_books() -> std::collections::HashMap<String, ClobBookState> {
+        let book = serde_json::from_value(json!({
+            "asset_id": "7",
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600100",
+            "bids": [{"price": "0.40", "size": "7"}],
+            "asks": [{"price": "0.60", "size": "9"}],
+            "hash": null
+        }))
+        .expect("valid CLOB book update");
+        let mut state = ClobBookState::default();
+        market_update_from_clob_book(&book, &mut state).expect("initial snapshot");
+        std::collections::HashMap::from([("7".to_string(), state)])
+    }
+
     #[test]
     fn dry_run_rtds_market_data_uses_relaxed_ws_heartbeat_settings() {
         let config = rtds_market_data_ws_config();
@@ -1989,7 +2024,8 @@ mod tests {
             &change,
             &mut std::collections::HashMap::new(),
             &mut std::collections::HashMap::new(),
-        );
+        )
+        .expect("valid price change");
         assert_eq!(updates.len(), 1);
         let MarketUpdate::Quote {
             token_id,
@@ -2079,7 +2115,8 @@ mod tests {
             &change,
             &mut books,
             &mut std::collections::HashMap::new(),
-        );
+        )
+        .expect("valid cancellation");
 
         assert!(matches!(
             updates.as_slice(),
@@ -2095,6 +2132,73 @@ mod tests {
                     size: dec!(20),
                 }]
         ));
+    }
+
+    #[test]
+    fn clob_price_change_batch_publishes_only_the_final_book_state() {
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [
+                {
+                    "asset_id": "7", "price": "0.61", "size": "10", "side": "BUY",
+                    "hash": null, "best_bid": "0.61", "best_ask": "0.62"
+                },
+                {
+                    "asset_id": "7", "price": "0.60", "size": "0", "side": "SELL",
+                    "hash": null, "best_bid": "0.61", "best_ask": "0.62"
+                },
+                {
+                    "asset_id": "7", "price": "0.62", "size": "5", "side": "SELL",
+                    "hash": null, "best_bid": "0.61", "best_ask": "0.62"
+                }
+            ]
+        }))
+        .expect("valid batched price change");
+
+        let mut books = seeded_clob_books();
+        let updates = market_updates_from_price_change(
+            &change,
+            &mut books,
+            &mut std::collections::HashMap::new(),
+        )
+        .expect("valid batched price change");
+
+        assert!(matches!(
+            updates.as_slice(),
+            [MarketUpdate::Quote {
+                bid: Some(bid),
+                ask: Some(ask),
+                bid_levels,
+                ask_levels,
+                ..
+            }] if *bid == dec!(0.61)
+                && *ask == dec!(0.62)
+                && bid_levels.first().is_some_and(|level| level.price == dec!(0.61))
+                && ask_levels.first().is_some_and(|level| level.price == dec!(0.62))
+        ));
+    }
+
+    #[test]
+    fn clob_crossed_final_batch_requires_a_fresh_snapshot() {
+        let change = serde_json::from_value(json!({
+            "market": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "timestamp": "1712205600200",
+            "price_changes": [{
+                "asset_id": "7", "price": "0.61", "size": "10", "side": "BUY",
+                "hash": null, "best_bid": "0.61", "best_ask": "0.60"
+            }]
+        }))
+        .expect("valid crossed price change");
+
+        let mut books = seeded_clob_books();
+
+        assert!(market_updates_from_price_change(
+            &change,
+            &mut books,
+            &mut std::collections::HashMap::new(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -2144,15 +2248,23 @@ mod tests {
         let mut books = std::collections::HashMap::from([("7".to_string(), state)]);
         let mut timestamps = std::collections::HashMap::from([("7".to_string(), book.timestamp)]);
         assert_eq!(
-            market_updates_from_price_change(&newer, &mut books, &mut timestamps).len(),
+            market_updates_from_price_change(&newer, &mut books, &mut timestamps)
+                .expect("valid newer price change")
+                .len(),
             1
         );
         assert_eq!(
-            market_updates_from_price_change(&same_millisecond, &mut books, &mut timestamps,).len(),
+            market_updates_from_price_change(&same_millisecond, &mut books, &mut timestamps,)
+                .expect("valid same-millisecond price change")
+                .len(),
             1,
             "distinct deltas sharing a wire millisecond must not be dropped"
         );
-        assert!(market_updates_from_price_change(&stale, &mut books, &mut timestamps).is_empty());
+        assert!(
+            market_updates_from_price_change(&stale, &mut books, &mut timestamps)
+                .expect("stale price change is ignored")
+                .is_empty()
+        );
 
         let quote = books["7"].quote(
             "7".to_string(),
