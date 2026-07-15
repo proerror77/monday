@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Propose the next typed LLM-prior mutation batch via a real model call.
+"""Propose the next governed typed-prior candidate batch via a real model call.
 
 This is the Priority 3 "genuine LLM-driven Expansion" script referenced in
 tasks/todo.md. It is deliberately separate from
@@ -18,28 +18,27 @@ already degrades when `--alpha-search-llm-prior-json` is omitted) unless
 `PLOY_RESEARCH_LLM_API_KEY` is set in the environment — so this script is a
 no-op everywhere until that secret is explicitly configured.
 
-The model is asked to produce entries shaped exactly like
-`LlmMutationSpec` (crates/ploy-research/src/autofactor.rs:238-255) inside a
-`next-llm-prior.json` file compatible with the existing
-`--alpha-search-llm-prior-json` flag, so no downstream Rust code needs to
-change: `compile_llm_mutation` already validates and compiles whatever
-lands there today. The proposal is never trusted blindly — it goes through
-the same JSON-schema-shaped validation as a hand-written prior file before
-being written out.
+The first turn requires a versioned prediction mission. The model may return
+only authorities named by that mission: typed `LlmMutationSpec` entries for
+AutoFactor diagnostics and/or typed non-negative probability blends for the
+event-disjoint prediction evaluator. The proposal is never trusted blindly;
+schema, mission scope, target, horizon, symbol, provenance, and budget checks
+all run before a `next-llm-prior.json` is written.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 from pathlib import Path
 from typing import Any, Protocol
 
 try:
     from alpha_search_closed_loop_agent import (
         ALLOWED_MUTATIONS,
-        DIMENSION_TO_MUTATION,
         DEFAULT_TARGET,
         load_artifact,
         selected_nodes,
@@ -47,7 +46,6 @@ try:
 except ModuleNotFoundError:
     from scripts.alpha_search_closed_loop_agent import (
         ALLOWED_MUTATIONS,
-        DIMENSION_TO_MUTATION,
         DEFAULT_TARGET,
         load_artifact,
         selected_nodes,
@@ -68,6 +66,29 @@ OPTIONAL_MUTATION_FIELDS = {
     "window",
 }
 ALL_MUTATION_FIELDS = REQUIRED_MUTATION_FIELDS | OPTIONAL_MUTATION_FIELDS
+
+REQUIRED_PROBABILITY_BLEND_FIELDS = {
+    "name",
+    "hypothesis",
+    "market_midpoint_weight",
+    "distance_lob_vol_weight",
+    "event_surface_weight",
+    "existing_model_weight",
+}
+PROBABILITY_COMPONENTS = (
+    "market_midpoint",
+    "distance_lob_vol",
+    "event_surface",
+    "existing_model",
+)
+FORMULA_MUTABLE_SCOPES = {"factor_ast", "factor_formula"}
+PROBABILITY_BLEND_MUTABLE_SCOPE = "probability_blend_weights"
+MISSION_SCHEMA_VERSION = "prediction_research_mission.v1"
+SAFE_CANDIDATE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+TARGET_HORIZONS = {
+    "full_depth_settlement_executable_pnl": "5m",
+    "tradeable_full_depth_settlement_pnl": "5m",
+}
 
 MAX_SCHEMA_RETRIES = 2
 
@@ -109,7 +130,7 @@ class UnconfiguredLlmClient:
 # request, generated from the same field sets used by validate_response() so
 # the model is asked for exactly what will be accepted — not a hand-copied
 # third description of the same shape.
-def _mutation_json_schema() -> dict[str, Any]:
+def _proposal_json_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
@@ -124,6 +145,7 @@ def _mutation_json_schema() -> dict[str, Any]:
                             "enum": sorted(ALLOWED_MUTATIONS),
                         },
                         "name": {"type": "string"},
+                        "hypothesis": {"type": "string"},
                         "feature": {"type": "string"},
                         "denominator_feature": {"type": "string"},
                         "constant": {"type": "number"},
@@ -134,9 +156,24 @@ def _mutation_json_schema() -> dict[str, Any]:
                     "required": sorted(REQUIRED_MUTATION_FIELDS),
                     "additionalProperties": False,
                 },
-            }
+            },
+            "probability_blends": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "market_midpoint_weight": {"type": "number", "minimum": 0},
+                        "distance_lob_vol_weight": {"type": "number", "minimum": 0},
+                        "event_surface_weight": {"type": "number", "minimum": 0},
+                        "existing_model_weight": {"type": "number", "minimum": 0},
+                    },
+                    "required": sorted(REQUIRED_PROBABILITY_BLEND_FIELDS),
+                    "additionalProperties": False,
+                },
+            },
         },
-        "required": ["mutations"],
+        "required": ["mutations", "probability_blends"],
         "additionalProperties": False,
     }
 
@@ -151,7 +188,7 @@ class AnthropicLlmClient:
     Priority 3's architecture-decision note).
 
     Uses tool-calling to force a structured response matching
-    _mutation_json_schema() — the model cannot return free text that would
+    _proposal_json_schema() — the model cannot return free text that would
     need fragile parsing; the SDK/API either returns a well-formed tool
     call or the request fails outright.
     """
@@ -191,7 +228,7 @@ class AnthropicLlmClient:
                             "Propose bounded factor-formula mutations for the "
                             "alpha search loop."
                         ),
-                        "input_schema": _mutation_json_schema(),
+                        "input_schema": _proposal_json_schema(),
                     }
                 ],
                 "tool_choice": {"type": "tool", "name": self.TOOL_NAME},
@@ -250,7 +287,7 @@ class OpenAiLlmClient:
                     "format": {
                         "type": "json_schema",
                         "name": "propose_mutations",
-                        "schema": _mutation_json_schema(),
+                        "schema": _proposal_json_schema(),
                         "strict": True,
                     }
                 },
@@ -286,7 +323,7 @@ def _extract_openai_output_text(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def client_from_env(env: dict[str, str]) -> LlmClient:
+def client_from_env(env: dict[str, str], timeout_secs: float = 60.0) -> LlmClient:
     """Build a real client from environment variables, or fail soft.
 
     Returns UnconfiguredLlmClient (which raises on use, caught by main()'s
@@ -300,9 +337,13 @@ def client_from_env(env: dict[str, str]) -> LlmClient:
     provider = env.get("PLOY_RESEARCH_LLM_PROVIDER", "anthropic").strip().lower()
     model = env.get("PLOY_RESEARCH_LLM_MODEL", "").strip()
     if provider == "anthropic":
-        return AnthropicLlmClient(api_key, model=model or "claude-sonnet-5")
+        return AnthropicLlmClient(
+            api_key, model=model or "claude-sonnet-5", timeout_secs=timeout_secs
+        )
     if provider == "openai":
-        return OpenAiLlmClient(api_key, model=model or "gpt-5.5")
+        return OpenAiLlmClient(
+            api_key, model=model or "gpt-5.5", timeout_secs=timeout_secs
+        )
     raise RuntimeError(
         f"PLOY_RESEARCH_LLM_PROVIDER={provider!r} is not supported; use "
         "'anthropic' or 'openai'"
@@ -310,7 +351,130 @@ def client_from_env(env: dict[str, str]) -> LlmClient:
 
 
 class SchemaValidationError(ValueError):
-    """Raised when a model response does not match the mutation schema."""
+    """Raised when a model response does not match the typed proposal schema."""
+
+
+class MissionValidationError(ValueError):
+    """Raised when a prediction-research mission expands or omits authority."""
+
+
+def _mission_text(payload: dict[str, Any], field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise MissionValidationError(f"mission.{field} must be a non-empty string")
+    return value.strip()
+
+
+def _mission_provenance(payload: dict[str, Any], field: str) -> str:
+    value = _mission_text(payload, field)
+    if value.startswith("REPLACE_WITH_"):
+        raise MissionValidationError(
+            f"mission.{field} placeholder must be replaced with recorded provenance"
+        )
+    return value
+
+
+def validate_mission(payload: Any, expected_target: str) -> dict[str, Any]:
+    """Validate and reduce the cross-workspace prediction mission protocol.
+
+    PLOY and alpha-harness remain separate runtimes.  This JSON brief is the
+    narrow shared seam: it grants proposal authority, but never evaluator or
+    execution authority.  Returning a new object also prevents unrelated
+    mission fields from flowing into the model prompt.
+    """
+    if not isinstance(payload, dict):
+        raise MissionValidationError("mission must be a JSON object")
+    if payload.get("schema_version") != MISSION_SCHEMA_VERSION:
+        raise MissionValidationError(
+            f"mission.schema_version must be {MISSION_SCHEMA_VERSION!r}"
+        )
+    if payload.get("lane") != "prediction_market":
+        raise MissionValidationError("mission.lane must be 'prediction_market'")
+
+    target = _mission_text(payload, "target")
+    if target != expected_target:
+        raise MissionValidationError(
+            f"mission.target {target!r} does not match run target {expected_target!r}"
+        )
+
+    symbols = payload.get("symbols")
+    if (
+        not isinstance(symbols, list)
+        or len(symbols) != 1
+        or not isinstance(symbols[0], str)
+        or not symbols[0].strip()
+    ):
+        raise MissionValidationError(
+            "mission.symbols must contain exactly one non-empty symbol; "
+            "BTC and SOL require separate missions"
+        )
+
+    mutable_scope = payload.get("mutable_scope")
+    if not isinstance(mutable_scope, list) or any(
+        not isinstance(item, str) or not item.strip() for item in mutable_scope
+    ):
+        raise MissionValidationError(
+            "mission.mutable_scope must be a non-empty string list"
+        )
+    normalized_scope = sorted({item.strip() for item in mutable_scope})
+    allowed_scope = FORMULA_MUTABLE_SCOPES | {PROBABILITY_BLEND_MUTABLE_SCOPE}
+    if not set(normalized_scope).intersection(allowed_scope):
+        raise MissionValidationError(
+            "mission.mutable_scope grants neither factor-formula nor "
+            "probability-blend authority"
+        )
+
+    budget = payload.get("search_budget")
+    if not isinstance(budget, dict):
+        raise MissionValidationError("mission.search_budget must be an object")
+    normalized_budget: dict[str, int] = {}
+    for field in ("max_candidates", "max_llm_calls", "max_seconds"):
+        value = budget.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise MissionValidationError(
+                f"mission.search_budget.{field} must be a positive integer"
+            )
+        normalized_budget[field] = value
+
+    horizon = _mission_text(payload, "horizon")
+    expected_horizon = TARGET_HORIZONS.get(expected_target)
+    if expected_horizon is not None and horizon != expected_horizon:
+        raise MissionValidationError(
+            f"mission.horizon {horizon!r} does not match target horizon "
+            f"{expected_horizon!r}"
+        )
+
+    return {
+        "schema_version": MISSION_SCHEMA_VERSION,
+        "mission_id": _mission_text(payload, "mission_id"),
+        "lane": "prediction_market",
+        "objective": _mission_text(payload, "objective"),
+        "hypothesis_scope": _mission_text(payload, "hypothesis_scope"),
+        "mutable_scope": normalized_scope,
+        "data_snapshot_id": _mission_provenance(payload, "data_snapshot_id"),
+        "target": target,
+        "symbols": [symbols[0].strip().upper()],
+        "horizon": horizon,
+        "prompt_snapshot_id": _mission_provenance(payload, "prompt_snapshot_id"),
+        "search_policy_snapshot_id": _mission_provenance(
+            payload, "search_policy_snapshot_id"
+        ),
+        "search_budget": normalized_budget,
+    }
+
+
+def resolve_mission(
+    run: dict[str, Any], explicit_mission: Any, expected_target: str
+) -> dict[str, Any]:
+    candidate = explicit_mission
+    if candidate is None:
+        prior = run.get("input_prior")
+        candidate = prior.get("mission") if isinstance(prior, dict) else None
+    if candidate is None:
+        raise MissionValidationError(
+            "a governed --mission-json is required for the first LLM turn"
+        )
+    return validate_mission(candidate, expected_target)
 
 
 def allowed_mutations_description() -> str:
@@ -340,7 +504,41 @@ def weak_dimensions_summary(plan: dict[str, Any]) -> list[dict[str, Any]]:
                 "factor_name": node.get("factor_name"),
                 "selected_dimension": node.get("selected_dimension"),
                 "proposed_mutation": node.get("proposed_mutation"),
-                "reward": node.get("reward"),
+            }
+        )
+    return out
+
+
+def qualitative_prediction_feedback(payload: Any) -> list[dict[str, Any]]:
+    """Expose bounded verdicts to the model, never labels, metrics, or gates."""
+    if not isinstance(payload, dict):
+        return []
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return []
+    out = []
+    for candidate in candidates[-8:]:
+        if not isinstance(candidate, dict):
+            continue
+        model = candidate.get("model")
+        hypothesis = candidate.get("hypothesis")
+        verdict = candidate.get("verdict")
+        reasons = candidate.get("reason_codes")
+        if not isinstance(model, str) or verdict not in {"keep", "discard"}:
+            continue
+        out.append(
+            {
+                "model": model,
+                "hypothesis": hypothesis.strip()[:500]
+                if isinstance(hypothesis, str) and hypothesis.strip()
+                else "<not-recorded>",
+                "verdict": verdict,
+                "reason_codes": [
+                    reason
+                    for reason in reasons if isinstance(reason, str)
+                ][:8]
+                if isinstance(reasons, list)
+                else [],
             }
         )
     return out
@@ -391,28 +589,45 @@ def alpha_zoo_summary(alpha_zoo_snapshot: Any) -> list[dict[str, Any]]:
 
 def build_prompt(
     run: dict[str, Any],
+    mission: dict[str, Any],
     alpha_zoo_snapshot: Any = None,
     avoided_subtrees: Any = None,
     mutation_limit: int = 6,
 ) -> str:
-    """Build the prompt describing weak dimensions and known-crowded shapes.
+    """Build the governed prompt and bounded qualitative feedback context.
 
-    Inputs are the run's own historical artifacts, not external user data,
-    so prompt-injection risk is low but not assumed zero: factor names and
-    human-written `notes` strings do flow through here. This function only
-    embeds structured, already-validated JSON artifact fields (never raw
-    free-text notes), which keeps the untrusted-content surface small.
+    The mission objective and hypothesis scope are reviewed research inputs,
+    not authority-bearing instructions. The response still passes independent
+    schema and mutable-scope checks. Raw labels, metrics, and gate thresholds
+    are intentionally absent.
     """
+    weak_dimensions = weak_dimensions_summary(run.get("plan") or {})
+    available_base_factors = sorted(
+        {
+            str(item.get("factor_name") or "").strip()
+            for item in weak_dimensions
+            if str(item.get("factor_name") or "").strip()
+        }
+    )
     payload = {
         "task": (
-            "Propose up to "
-            f"{mutation_limit} bounded factor-formula mutations for the alpha "
-            "search loop. Each proposal must pick exactly one mutation_type "
-            "from the allowed list and reference an existing base_factor."
+            f"Propose up to {mutation_limit} typed candidates for this governed "
+            "prediction-market mission. Change only fields named by mutable_scope. "
+            "Factor mutations must reference an available_base_factor. Probability "
+            "blends must state one falsifiable hypothesis, may only assign finite "
+            "non-negative weights to registered components, and must have a positive "
+            "total weight. Do not change labels, "
+            "evaluation gates, costs, settlement rules, or execution settings."
         ),
         "target": run.get("target"),
+        "mission": mission,
         "allowed_mutation_types": allowed_mutations_description(),
-        "weak_dimensions": weak_dimensions_summary(run.get("plan") or {}),
+        "available_base_factors": available_base_factors,
+        "registered_probability_components": list(PROBABILITY_COMPONENTS),
+        "weak_dimensions": weak_dimensions,
+        "prior_candidate_outcomes": qualitative_prediction_feedback(
+            run.get("prediction_feedback")
+        ),
         "crowded_structural_shapes_within_batch": crowded_signatures_summary(
             avoided_subtrees
         ),
@@ -430,14 +645,29 @@ def build_prompt(
                     "hi": "number, optional",
                     "window": "integer, optional",
                 }
-            ]
+            ],
+            "probability_blends": [
+                {
+                    "name": "safe short identifier, required",
+                    "hypothesis": "one falsifiable sentence, required",
+                    "market_midpoint_weight": "non-negative number, required",
+                    "distance_lob_vol_weight": "non-negative number, required",
+                    "event_surface_weight": "non-negative number, required",
+                    "existing_model_weight": "non-negative number, required",
+                }
+            ],
         },
     }
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
-def validate_response(response: Any) -> list[dict[str, Any]]:
-    """Validate a model response against the mutation schema.
+def validate_response(
+    response: Any,
+    *,
+    allowed_base_factors: set[str] | None = None,
+    mutable_scope: set[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Validate a model response against mission-authorized typed schemas.
 
     Raises SchemaValidationError with a specific reason on any violation.
     This is the fail-closed boundary: a response that doesn't match is
@@ -445,11 +675,33 @@ def validate_response(response: Any) -> list[dict[str, Any]]:
     """
     if not isinstance(response, dict):
         raise SchemaValidationError("response must be a JSON object")
+    unknown_top_level = sorted(set(response) - {"mutations", "probability_blends"})
+    if unknown_top_level:
+        raise SchemaValidationError(
+            "response has unknown fields: " + ", ".join(unknown_top_level)
+        )
     mutations = response.get("mutations")
     if not isinstance(mutations, list):
         raise SchemaValidationError("response.mutations must be a list")
+    probability_blends = response.get("probability_blends", [])
+    if not isinstance(probability_blends, list):
+        raise SchemaValidationError("response.probability_blends must be a list")
 
-    validated: list[dict[str, Any]] = []
+    granted_scope = (
+        mutable_scope
+        if mutable_scope is not None
+        else FORMULA_MUTABLE_SCOPES | {PROBABILITY_BLEND_MUTABLE_SCOPE}
+    )
+    if mutations and not granted_scope.intersection(FORMULA_MUTABLE_SCOPES):
+        raise SchemaValidationError(
+            "mission mutable_scope does not authorize factor-formula mutations"
+        )
+    if probability_blends and PROBABILITY_BLEND_MUTABLE_SCOPE not in granted_scope:
+        raise SchemaValidationError(
+            "mission mutable_scope does not authorize probability-blend weights"
+        )
+
+    validated_mutations: list[dict[str, Any]] = []
     for index, item in enumerate(mutations):
         if not isinstance(item, dict):
             raise SchemaValidationError(f"mutations[{index}] must be an object")
@@ -468,6 +720,13 @@ def validate_response(response: Any) -> list[dict[str, Any]]:
             raise SchemaValidationError(
                 f"mutations[{index}].base_factor must be a non-empty string"
             )
+        if (
+            allowed_base_factors is not None
+            and base_factor not in allowed_base_factors
+        ):
+            raise SchemaValidationError(
+                f"mutations[{index}].base_factor must reference an existing base factor"
+            )
         mutation_type = item.get("mutation_type")
         if mutation_type not in ALLOWED_MUTATIONS:
             raise SchemaValidationError(
@@ -478,6 +737,7 @@ def validate_response(response: Any) -> list[dict[str, Any]]:
             if numeric_field in item and (
                 isinstance(item[numeric_field], bool)
                 or not isinstance(item[numeric_field], (int, float))
+                or not math.isfinite(item[numeric_field])
             ):
                 raise SchemaValidationError(
                     f"mutations[{index}].{numeric_field} must be numeric"
@@ -491,18 +751,80 @@ def validate_response(response: Any) -> list[dict[str, Any]]:
                 raise SchemaValidationError(
                     f"mutations[{index}].{string_field} must be a string"
                 )
-        validated.append(item)
-    return validated
+        validated_mutations.append(item)
+
+    validated_blends: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(probability_blends):
+        if not isinstance(item, dict):
+            raise SchemaValidationError(
+                f"probability_blends[{index}] must be an object"
+            )
+        unknown = sorted(set(item) - REQUIRED_PROBABILITY_BLEND_FIELDS)
+        if unknown:
+            raise SchemaValidationError(
+                f"probability_blends[{index}] has unknown fields: {', '.join(unknown)}"
+            )
+        missing = sorted(REQUIRED_PROBABILITY_BLEND_FIELDS - set(item))
+        if missing:
+            raise SchemaValidationError(
+                f"probability_blends[{index}] missing required fields: "
+                + ", ".join(missing)
+            )
+        name = item.get("name")
+        if not isinstance(name, str) or SAFE_CANDIDATE_NAME.fullmatch(name) is None:
+            raise SchemaValidationError(
+                f"probability_blends[{index}].name must match "
+                "[A-Za-z0-9_-]{1,80}"
+            )
+        if name in seen_names:
+            raise SchemaValidationError(
+                f"probability_blends[{index}].name is duplicated"
+            )
+        seen_names.add(name)
+        hypothesis = item.get("hypothesis")
+        if (
+            not isinstance(hypothesis, str)
+            or not hypothesis.strip()
+            or len(hypothesis) > 500
+        ):
+            raise SchemaValidationError(
+                f"probability_blends[{index}].hypothesis must be a non-empty "
+                "string of at most 500 characters"
+            )
+        total_weight = 0.0
+        for field in REQUIRED_PROBABILITY_BLEND_FIELDS - {"name", "hypothesis"}:
+            value = item.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0.0
+            ):
+                raise SchemaValidationError(
+                    f"probability_blends[{index}].{field} must be finite and non-negative"
+                )
+            total_weight += float(value)
+        if total_weight <= 0.0:
+            raise SchemaValidationError(
+                f"probability_blends[{index}] must have positive total weight"
+            )
+        validated_blends.append(item)
+    return {
+        "mutations": validated_mutations,
+        "probability_blends": validated_blends,
+    }
 
 
-def propose_mutations(
+def propose_candidates(
     client: LlmClient,
     run: dict[str, Any],
+    mission: dict[str, Any],
     alpha_zoo_snapshot: Any = None,
     avoided_subtrees: Any = None,
     mutation_limit: int = 6,
     max_retries: int = MAX_SCHEMA_RETRIES,
-) -> list[dict[str, Any]]:
+) -> dict[str, list[dict[str, Any]]]:
     """Call the client and validate its response, retrying on schema failure.
 
     Fails soft by design at the caller level (see main()): if every retry is
@@ -513,18 +835,38 @@ def propose_mutations(
     """
     prompt = build_prompt(
         run,
+        mission,
         alpha_zoo_snapshot=alpha_zoo_snapshot,
         avoided_subtrees=avoided_subtrees,
         mutation_limit=mutation_limit,
     )
+    allowed_base_factors = {
+        str(item.get("factor_name") or "").strip()
+        for item in weak_dimensions_summary(run.get("plan") or {})
+        if str(item.get("factor_name") or "").strip()
+    }
+    mutable_scope = set(mission["mutable_scope"])
     last_error: SchemaValidationError | None = None
-    for attempt in range(max_retries + 1):
+    retry_limit = min(
+        max(0, max_retries), mission["search_budget"]["max_llm_calls"] - 1
+    )
+    for attempt in range(retry_limit + 1):
         response = client.propose(prompt)
         try:
-            return validate_response(response)[:mutation_limit]
+            validated = validate_response(
+                response,
+                allowed_base_factors=allowed_base_factors,
+                mutable_scope=mutable_scope,
+            )
+            probability_blends = validated["probability_blends"][:mutation_limit]
+            mutation_slots = max(0, mutation_limit - len(probability_blends))
+            return {
+                "mutations": validated["mutations"][:mutation_slots],
+                "probability_blends": probability_blends,
+            }
         except SchemaValidationError as err:
             last_error = err
-            if attempt < max_retries:
+            if attempt < retry_limit:
                 prompt = (
                     f"{prompt}\n\nYour previous response was rejected: {err}. "
                     "Return a corrected JSON object matching response_schema exactly."
@@ -533,29 +875,45 @@ def propose_mutations(
     raise last_error
 
 
-def build_prior_from_mutations(
-    target: str, mutations: list[dict[str, Any]]
+def build_prior(
+    target: str,
+    mission: dict[str, Any],
+    proposal: dict[str, list[dict[str, Any]]],
+    source_prior: Any = None,
 ) -> dict[str, Any]:
-    """Build a next-llm-prior.json payload shaped like build_prior()'s output.
+    """Build a provenance-bound next-llm-prior.json payload.
 
-    Deliberately matches the schema alpha_search_closed_loop_agent.py's
-    build_prior() already produces (schema_version/kind/source/target/
-    mutations) so factor_walk_forward_v2.rs's read_llm_prior() and the
-    hosted workflow's prior-forwarding logic need no changes to accept
-    LLM-sourced mutations alongside deterministic ones.
+    Existing mutation and avoidance fields stay compatible with the closed-loop
+    agent, while mission provenance and probability blends remain explicit for
+    the prediction evaluator.
     """
+    source_prior = source_prior if isinstance(source_prior, dict) else {}
     return {
         "schema_version": 1,
         "kind": "typed_llm_prior_draft",
         "source": "alpha_search_llm_propose",
         "target": target,
-        "mutations": mutations,
-        "runtime_avoid_factors": [],
+        "mission_id": mission["mission_id"],
+        "data_snapshot_id": mission["data_snapshot_id"],
+        "prompt_snapshot_id": mission["prompt_snapshot_id"],
+        "search_policy_snapshot_id": mission["search_policy_snapshot_id"],
+        "mission": mission,
+        "symbols": mission["symbols"],
+        "horizon": mission["horizon"],
+        "mutations": proposal["mutations"],
+        "probability_blends": proposal["probability_blends"],
+        "runtime_avoid_factors": source_prior.get("runtime_avoid_factors", []),
+        "structural_avoid_signatures": source_prior.get(
+            "structural_avoid_signatures", []
+        ),
     }
 
 
 def write_usage_artifact(
-    client: LlmClient, output_prior_path: Path, mutation_count: int
+    client: LlmClient,
+    output_prior_path: Path,
+    mutation_count: int,
+    probability_blend_count: int,
 ) -> None:
     usage = getattr(client, "last_usage", None)
     if usage is None:
@@ -565,6 +923,7 @@ def write_usage_artifact(
         "client": client.__class__.__name__,
         "model": getattr(client, "_model", None),
         "mutation_count": mutation_count,
+        "probability_blend_count": probability_blend_count,
         "usage": usage,
     }
     usage_path = output_prior_path.with_name("llm-expansion-usage.json")
@@ -581,11 +940,18 @@ def main(env: dict[str, str] | None = None) -> None:
     parser.add_argument("--output-prior-json", required=True)
     parser.add_argument("--mutation-limit", type=int, default=6)
     parser.add_argument("--alpha-zoo-snapshot-json")
+    parser.add_argument("--mission-json")
     args = parser.parse_args()
 
     output_path = Path(args.output_prior_json)
     try:
         run = load_artifact(Path(args.artifact_dir), args.target)
+        explicit_mission = None
+        if args.mission_json:
+            explicit_mission = json.loads(
+                Path(args.mission_json).read_text(encoding="utf-8")
+            )
+        mission = resolve_mission(run, explicit_mission, args.target)
         alpha_zoo_snapshot = None
         if args.alpha_zoo_snapshot_json:
             zoo_path = Path(args.alpha_zoo_snapshot_json)
@@ -600,28 +966,54 @@ def main(env: dict[str, str] | None = None) -> None:
                 avoided_subtrees_path.read_text(encoding="utf-8")
             )
 
-        client = client_from_env(env if env is not None else dict(os.environ))
-        mutations = propose_mutations(
+        provider_timeout = min(
+            60.0,
+            max(
+                1.0,
+                mission["search_budget"]["max_seconds"]
+                / mission["search_budget"]["max_llm_calls"],
+            ),
+        )
+        client = client_from_env(
+            env if env is not None else dict(os.environ),
+            timeout_secs=provider_timeout,
+        )
+        candidate_limit = min(
+            max(1, args.mutation_limit), mission["search_budget"]["max_candidates"]
+        )
+        proposal = propose_candidates(
             client,
             run,
+            mission,
             alpha_zoo_snapshot=alpha_zoo_snapshot,
             avoided_subtrees=avoided_subtrees,
-            mutation_limit=max(1, args.mutation_limit),
+            mutation_limit=candidate_limit,
         )
     except Exception as err:  # noqa: BLE001 - fail soft, never block the search path
         print(f"alpha_search_llm_propose: no LLM prior produced ({err})")
         return
 
-    write_usage_artifact(client, output_path, len(mutations))
+    mutations = proposal["mutations"]
+    probability_blends = proposal["probability_blends"]
+    write_usage_artifact(
+        client,
+        output_path,
+        len(mutations),
+        len(probability_blends),
+    )
 
-    if not mutations:
-        print("alpha_search_llm_propose: no LLM prior produced (empty mutation set)")
+    if not mutations and not probability_blends:
+        print("alpha_search_llm_propose: no LLM prior produced (empty candidate set)")
         return
 
-    prior = build_prior_from_mutations(args.target, mutations)
+    prior = build_prior(args.target, mission, proposal, run.get("input_prior"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(prior, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"alpha_search_llm_propose: wrote {len(mutations)} mutation(s) to {output_path}")
+    print(
+        "alpha_search_llm_propose: wrote "
+        f"{len(mutations)} mutation(s) and {len(probability_blends)} "
+        f"probability blend(s) to {output_path}"
+    )
 
 
 if __name__ == "__main__":

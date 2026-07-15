@@ -220,14 +220,38 @@ pub struct NamedFactorExpr {
     pub parent_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmPriorSpec {
     #[serde(default)]
+    pub mission_id: Option<String>,
+    #[serde(default)]
+    pub data_snapshot_id: Option<String>,
+    #[serde(default)]
+    pub prompt_snapshot_id: Option<String>,
+    #[serde(default)]
+    pub search_policy_snapshot_id: Option<String>,
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub horizon: Option<String>,
+    #[serde(default)]
     pub mutations: Vec<LlmMutationSpec>,
+    #[serde(default)]
+    pub probability_blends: Vec<LlmProbabilityBlendSpec>,
     #[serde(default)]
     pub runtime_avoid_factors: Vec<RuntimeAvoidFactorSpec>,
     #[serde(default)]
     pub structural_avoid_signatures: Vec<StructuralAvoidSignatureSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmProbabilityBlendSpec {
+    pub name: String,
+    pub hypothesis: String,
+    pub market_midpoint_weight: f64,
+    pub distance_lob_vol_weight: f64,
+    pub event_surface_weight: f64,
+    pub existing_model_weight: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3775,6 +3799,7 @@ mod tests {
                 hi: None,
                 window: None,
             }],
+            ..Default::default()
         };
 
         let reports = mine_domain_autofactors_from_v2_with_guidance(
@@ -3826,6 +3851,7 @@ mod tests {
                 hi: None,
                 window: None,
             }],
+            ..Default::default()
         };
 
         let reports = mine_domain_autofactors_from_v2_with_guidance(

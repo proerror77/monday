@@ -22,7 +22,14 @@ Monday intentionally keeps two evaluation frameworks because the labels, samplin
 
 The lanes share repository governance, evidence provenance requirements, and the Monday execution-authority boundary. They do not share labels, fold construction, evaluator thresholds, or a Cargo graph. In particular, IC/ICIR may be diagnostic for a prediction-market feature, but it is not a prediction-market promotion gate; prediction rows must not be routed through the derivatives `FormulaEvaluator`.
 
-LLM proposal paths remain lane-specific as well. `alpha-harness` has a bounded, lab-only Formula proposer for derivatives missions. PLOY accepts a typed `LlmPriorSpec` that must compile through the prediction-market factor grammar before deterministic search and evaluation; PLOY's evaluator does not invoke an LLM or accept free-form trading instructions.
+LLM proposal paths remain lane-specific as well. `alpha-harness` has a bounded,
+lab-only Formula proposer for derivatives missions. PLOY uses the versioned
+`prediction_research_mission.v1` JSON brief and its existing `LlmPriorSpec`; it
+does not import the alpha-harness Rust domain or loop runtime. Formula mutations
+still compile through AutoFactor as IC/ICIR diagnostics. Typed probability-blend
+candidates instead enter PLOY's event-disjoint Brier/log-loss/calibration
+evaluator and return candidate-specific deterministic feedback. The evaluator
+never invokes an LLM or accepts free-form trading instructions.
 
 ## Source and provenance
 

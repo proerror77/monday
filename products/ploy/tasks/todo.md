@@ -34,6 +34,8 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [x] Remove unused Monday research-store/search crates while preserving active DSL, manifest, and harness contracts.
 - [x] Pass governed mission context and bounded prior verdicts into LLM proposals, with code-enforced mutable scope.
 - [x] Gate prediction OOS evidence with Brier score, log loss, calibration error, settlement PnL, and event-level capacity.
+- [x] Route typed probability-blend candidates into the prediction evaluator and emit candidate-specific loop feedback.
+- [x] Add separate governed BTC and SOL five-minute mission templates; reject mixed-symbol missions and unresolved provenance.
 
 ## Safety
 

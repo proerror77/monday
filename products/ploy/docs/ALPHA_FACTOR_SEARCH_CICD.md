@@ -525,25 +525,44 @@ parity, dry-run, or live approval gates.
 
 ## Real LLM Expansion
 
-The hosted artifact workflow can optionally replace the deterministic
-closed-loop prior with a real model-proposed typed prior. This is off by
-default. Enable it only on an explicit `workflow_dispatch` run by setting:
+The optional LLM turn is mission-driven and remains off by default. Its first
+turn requires a reviewed `prediction_research_mission.v1` JSON; later turns may
+recover the same mission from the previous typed prior. BTC and SOL must use
+separate mission files so a candidate cannot silently broaden its symbol
+population. Start from one of the checked-in examples, replace both provenance
+placeholders, and run:
 
-```json
-{
-  "enable_llm_expansion": true,
-  "llm_expansion_provider": "anthropic",
-  "llm_expansion_model": ""
-}
+```bash
+python3 scripts/alpha_search_llm_propose.py \
+  /tmp/downloaded-alpha-search-artifact \
+  --target full_depth_settlement_executable_pnl \
+  --mission-json config/research_missions/polymarket-btc-5m.json \
+  --output-prior-json /tmp/next-llm-prior.json
 ```
 
-The workflow also requires the repository secret
-`PLOY_RESEARCH_LLM_API_KEY`. If the flag is false, the secret is missing, the
-model call fails, optional artifact JSON is corrupt, or the model returns no
-mutations, the step exits successfully and leaves the deterministic
-`next-llm-prior.json` unchanged. A successful model response is still only a
-typed prior draft: Rust must compile it through the existing allowed
-`LlmMutationSpec` mutation types before any candidate is evaluated.
+The call requires `PLOY_RESEARCH_LLM_API_KEY`; provider and model remain
+selectable through the existing environment variables. Missing mission
+authority, unresolved provenance placeholders, a target/horizon mismatch, a
+provider failure, or an invalid response fails soft and leaves the deterministic
+prior unchanged.
+
+The model sees the mission objective, hypothesis scope, registered probability
+components, available base-factor names, and at most eight qualitative
+`keep`/`discard` outcomes. It does not receive raw labels, evaluator thresholds,
+or numeric evaluation metrics. Output is limited by `mutable_scope`:
+
+- `factor_formula` / `factor_ast` allows an existing typed `LlmMutationSpec`,
+  which remains an IC/ICIR diagnostic in AutoFactor.
+- `probability_blend_weights` allows a named non-negative logit blend over the
+  four registered probability components. These candidates enter the real
+  event-disjoint probability evaluator as `q_llm_<name>` and are scored with
+  Brier score, log loss, calibration error, executable settlement PnL, and
+  capacity evidence.
+
+After evaluation, `prediction-research-feedback.json` records candidate metrics
+and deterministic reason codes. Only the candidate name, verdict, and reason
+codes are returned to the next LLM turn. This closes the proposal/evaluation/
+feedback loop without giving the model evaluator or execution authority.
 
 When the provider returns usage data, the script writes
 `llm-expansion-usage.json` next to `next-llm-prior.json` in the alpha-search

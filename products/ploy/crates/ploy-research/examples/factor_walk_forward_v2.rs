@@ -8,7 +8,8 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use ploy_research::{
     autofactor_matrix_from_v2, build_factor_observations_v2_with_deribit_and_pm_books,
     build_factor_stability_report, build_full_depth_execution_matrix,
-    build_settlement_probability_promotion_gate_report, format_autofactor_reports,
+    build_prediction_research_feedback, build_settlement_probability_promotion_gate_report,
+    build_settlement_probability_report_with_prior, format_autofactor_reports,
     format_factor_combo_v1_report, format_factor_stability_report,
     format_factor_walk_forward_v2_report, format_fillability_review_v1_report,
     format_full_depth_execution_matrix_report, format_liquidity_gate_v1_report,
@@ -23,6 +24,7 @@ use ploy_research::{
     walk_forward_factor_combo_v1_with_deribit_and_pm_books,
     walk_forward_factors_v2_with_deribit_and_pm_books,
     walk_forward_meta_label_v1_with_deribit_and_pm_books,
+    walk_forward_settlement_probability_report_with_prior,
     write_alpha_search_artifacts_with_state_and_runtime_feedback, AlphaSearchRuntimeFeedback,
     AlphaZooSnapshot, AutoFactorOptions, AutoFactorV2Target, FactorComboV1Options,
     FactorObservation, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
@@ -652,8 +654,13 @@ async fn main() {
         &all_pm_book_snapshots,
         &options.review,
     );
-    let settlement_probability_report = ploy_research::build_settlement_probability_report(
+    let llm_prior = alpha_search_llm_prior_json.as_deref().map(read_llm_prior);
+    if let Some(path) = alpha_search_llm_prior_json.as_deref() {
+        eprintln!("alpha search typed LLM prior loaded from {path}");
+    }
+    let settlement_probability_report = build_settlement_probability_report_with_prior(
         &autofactor_rows,
+        llm_prior.as_ref(),
         SettlementProbabilityReportOptions {
             min_bucket_observations: options.review.min_observations.max(20),
             ..Default::default()
@@ -664,10 +671,11 @@ async fn main() {
         format_settlement_probability_report(&settlement_probability_report)
     );
     let settlement_probability_walk_forward_report =
-        ploy_research::walk_forward_settlement_probability_report(
+        walk_forward_settlement_probability_report_with_prior(
             &autofactor_rows,
             start,
             end,
+            llm_prior.as_ref(),
             SettlementProbabilityWalkForwardOptions {
                 walk_forward: options.clone(),
                 probability: SettlementProbabilityReportOptions {
@@ -729,6 +737,39 @@ async fn main() {
         "{}",
         format_settlement_probability_promotion_gate_report(&promotion_gate_report)
     );
+    if let (Some(output_root), Some(prior)) =
+        (alpha_search_output_dir.as_deref(), llm_prior.as_ref())
+    {
+        if let Some(feedback) = build_prediction_research_feedback(
+            prior,
+            &settlement_probability_walk_forward_report,
+            promotion_gate_report.options.min_positive_window_ratio,
+        ) {
+            let output_dir = std::path::Path::new(output_root)
+                .join(AutoFactorV2Target::FullDepthSettlementExecutablePnl.as_str());
+            std::fs::create_dir_all(&output_dir).unwrap_or_else(|err| {
+                panic!(
+                    "create prediction research feedback directory {} failed: {err}",
+                    output_dir.display()
+                )
+            });
+            let output_path = output_dir.join("prediction-research-feedback.json");
+            let json = serde_json::to_string_pretty(&feedback)
+                .expect("serialize prediction research feedback");
+            std::fs::write(&output_path, format!("{json}\n")).unwrap_or_else(|err| {
+                panic!(
+                    "write prediction research feedback {} failed: {err}",
+                    output_path.display()
+                )
+            });
+            eprintln!(
+                "prediction research feedback written mission_id={} candidates={} path={}",
+                feedback.mission_id,
+                feedback.candidates.len(),
+                output_path.display()
+            );
+        }
+    }
     let autofactor_options = AutoFactorOptions {
         min_observations: options.review.min_observations.max(50),
         min_window_observations: options.review.min_observations.max(20),
@@ -748,10 +789,6 @@ async fn main() {
         .as_deref()
         .map(alpha_search_plan_factor_names)
         .unwrap_or_default();
-    let llm_prior = alpha_search_llm_prior_json.as_deref().map(read_llm_prior);
-    if let Some(path) = alpha_search_llm_prior_json.as_deref() {
-        eprintln!("alpha search typed LLM prior loaded from {path}");
-    }
     let mcts_state = alpha_search_state_json.as_deref().map(|path| {
         read_mcts_search_state(path)
             .unwrap_or_else(|err| panic!("read alpha search MCTS state JSON {path} failed: {err}"))

@@ -130,6 +130,10 @@ def load_artifact(path: Path, target: str) -> dict[str, Any]:
         "registry_preview": optional_json(alpha_root / "factor-registry-preview.json") or {},
         "chain": chain,
         "search_space": optional_json(alpha_root / "search-space.json") or {},
+        "prediction_feedback": optional_json(
+            alpha_root / "prediction-research-feedback.json"
+        )
+        or {},
         "candidate_strategy_replay": candidate_strategy_replay or {},
         "input_prior": optional_json(
             path / "alpha-search-chain" / "input-alpha-search-plan" / "next-llm-prior.json"

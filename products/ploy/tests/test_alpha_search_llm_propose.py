@@ -13,12 +13,43 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def mission(
+    *,
+    target: str = "full_depth_settlement_executable_pnl",
+    symbol: str = "BTC",
+    mutable_scope: list[str] | None = None,
+) -> dict:
+    return {
+        "schema_version": "prediction_research_mission.v1",
+        "mission_id": f"polymarket-{symbol.lower()}-5m-v1",
+        "lane": "prediction_market",
+        "objective": f"Predict the official five-minute {symbol} settlement probability.",
+        "hypothesis_scope": "CEX microstructure may lead prediction-market repricing.",
+        "mutable_scope": mutable_scope
+        if mutable_scope is not None
+        else ["factor_formula", "probability_blend_weights"],
+        "data_snapshot_id": f"sha256:{symbol.lower()}-dataset",
+        "target": target,
+        "symbols": [symbol],
+        "horizon": "5m",
+        "prompt_snapshot_id": f"sha256:{symbol.lower()}-prompt",
+        "search_policy_snapshot_id": "prediction-blend-policy-v1",
+        "search_budget": {
+            "max_candidates": 6,
+            "max_llm_calls": 2,
+            "max_seconds": 600,
+        },
+    }
+
+
 def artifact(
     root: Path,
     *,
     target: str = "full_depth_settlement_executable_pnl",
     selected_nodes: list[dict] | None = None,
     avoided_subtrees: list[dict] | None = None,
+    prediction_feedback: dict | None = None,
+    input_prior: dict | None = None,
 ) -> Path:
     factor_root = root / "factor-walk-forward-v2"
     alpha_root = factor_root / "alpha-search" / target
@@ -64,6 +95,16 @@ def artifact(
     )
     if avoided_subtrees is not None:
         write_json(alpha_root / "avoided-subtrees.json", avoided_subtrees)
+    if prediction_feedback is not None:
+        write_json(alpha_root / "prediction-research-feedback.json", prediction_feedback)
+    if input_prior is not None:
+        write_json(
+            root
+            / "alpha-search-chain"
+            / "input-alpha-search-plan"
+            / "next-llm-prior.json",
+            input_prior,
+        )
     write_json(
         root / "alpha-search-chain" / "chain-decision.json",
         {"current_run_id": "1000000001"},
@@ -90,7 +131,7 @@ class BuildPromptTests(unittest.TestCase):
             from scripts.alpha_search_closed_loop_agent import DEFAULT_TARGET, load_artifact
 
             run = load_artifact(path, DEFAULT_TARGET)
-            prompt = propose.build_prompt(run)
+            prompt = propose.build_prompt(run, mission())
 
         payload = json.loads(prompt)
         listed = set(payload["allowed_mutation_types"].split(", "))
@@ -112,12 +153,13 @@ class BuildPromptTests(unittest.TestCase):
             from scripts.alpha_search_closed_loop_agent import DEFAULT_TARGET, load_artifact
 
             run = load_artifact(path, DEFAULT_TARGET)
-            prompt = propose.build_prompt(run)
+            prompt = propose.build_prompt(run, mission())
 
         payload = json.loads(prompt)
         self.assertEqual(len(payload["weak_dimensions"]), 1)
         self.assertEqual(payload["weak_dimensions"][0]["factor_name"], "auto_settlement_x")
         self.assertEqual(payload["weak_dimensions"][0]["selected_dimension"], "overfit_risk")
+        self.assertNotIn("reward", payload["weak_dimensions"][0])
 
     def test_prompt_includes_crowded_structural_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -129,7 +171,7 @@ class BuildPromptTests(unittest.TestCase):
                 {"root_gene": "SafeDiv", "count": 4, "action": "penalize", "reason": "x"},
                 {"root_gene": "Add", "count": 1, "action": "keep", "reason": "y"},
             ]
-            prompt = propose.build_prompt(run, avoided_subtrees=avoided)
+            prompt = propose.build_prompt(run, mission(), avoided_subtrees=avoided)
 
         payload = json.loads(prompt)
         shapes = payload["crowded_structural_shapes_within_batch"]
@@ -147,7 +189,7 @@ class BuildPromptTests(unittest.TestCase):
                 "target": "full_depth_settlement_executable_pnl",
                 "entries": [{"root_gene": "Mul", "count": 12}],
             }
-            prompt = propose.build_prompt(run, alpha_zoo_snapshot=zoo)
+            prompt = propose.build_prompt(run, mission(), alpha_zoo_snapshot=zoo)
 
         payload = json.loads(prompt)
         entries = payload["crowded_root_genes_across_all_history"]
@@ -159,10 +201,83 @@ class BuildPromptTests(unittest.TestCase):
             from scripts.alpha_search_closed_loop_agent import DEFAULT_TARGET, load_artifact
 
             run = load_artifact(path, DEFAULT_TARGET)
-            prompt = propose.build_prompt(run)
+            prompt = propose.build_prompt(run, mission())
 
         payload = json.loads(prompt)
         self.assertEqual(payload["crowded_root_genes_across_all_history"], [])
+
+    def test_prompt_carries_governed_mission_and_only_qualitative_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = artifact(
+                Path(tmp),
+                prediction_feedback={
+                    "mission_id": "polymarket-btc-5m-v1",
+                    "candidates": [
+                        {
+                            "model": "q_llm_microstructure",
+                            "hypothesis": "CEX flow improves calibration.",
+                            "verdict": "discard",
+                            "reason_codes": ["calibration_gate_failed"],
+                            "metrics": {"avg_test_brier_score": 0.42},
+                        }
+                    ],
+                },
+            )
+            from scripts.alpha_search_closed_loop_agent import DEFAULT_TARGET, load_artifact
+
+            run = load_artifact(path, DEFAULT_TARGET)
+            prompt = propose.build_prompt(run, mission())
+
+        payload = json.loads(prompt)
+        self.assertEqual(payload["mission"]["symbols"], ["BTC"])
+        self.assertEqual(payload["mission"]["horizon"], "5m")
+        self.assertIn("CEX microstructure", payload["mission"]["hypothesis_scope"])
+        self.assertEqual(
+            payload["prior_candidate_outcomes"],
+            [
+                {
+                    "model": "q_llm_microstructure",
+                    "hypothesis": "CEX flow improves calibration.",
+                    "verdict": "discard",
+                    "reason_codes": ["calibration_gate_failed"],
+                }
+            ],
+        )
+        self.assertNotIn("0.42", prompt)
+
+
+class MissionValidationTests(unittest.TestCase):
+    def test_rejects_cross_target_mission(self) -> None:
+        with self.assertRaises(propose.MissionValidationError):
+            propose.validate_mission(mission(target="reprice_pnl_10s"), "full_depth_settlement_executable_pnl")
+
+    def test_rejects_multi_symbol_mission(self) -> None:
+        payload = mission()
+        payload["symbols"] = ["BTC", "SOL"]
+        with self.assertRaises(propose.MissionValidationError):
+            propose.validate_mission(payload, "full_depth_settlement_executable_pnl")
+
+    def test_rejects_mission_without_mutable_authority(self) -> None:
+        with self.assertRaises(propose.MissionValidationError):
+            propose.validate_mission(
+                mission(mutable_scope=["validator_thresholds"]),
+                "full_depth_settlement_executable_pnl",
+            )
+
+    def test_rejects_wrong_horizon_and_unresolved_provenance(self) -> None:
+        wrong_horizon = mission()
+        wrong_horizon["horizon"] = "15m"
+        with self.assertRaises(propose.MissionValidationError):
+            propose.validate_mission(
+                wrong_horizon, "full_depth_settlement_executable_pnl"
+            )
+
+        unresolved = mission()
+        unresolved["data_snapshot_id"] = "REPLACE_WITH_DATASET"
+        with self.assertRaises(propose.MissionValidationError):
+            propose.validate_mission(
+                unresolved, "full_depth_settlement_executable_pnl"
+            )
 
 
 class ValidateResponseTests(unittest.TestCase):
@@ -174,11 +289,84 @@ class ValidateResponseTests(unittest.TestCase):
                     "mutation_type": "add_capacity_gate",
                     "feature": "entry_capacity_score",
                 }
-            ]
+            ],
+            "probability_blends": [
+                {
+                    "name": "microstructure",
+                    "hypothesis": "CEX-informed components improve calibration.",
+                    "market_midpoint_weight": 0.4,
+                    "distance_lob_vol_weight": 0.3,
+                    "event_surface_weight": 0.2,
+                    "existing_model_weight": 0.1,
+                }
+            ],
         }
-        validated = propose.validate_response(response)
-        self.assertEqual(len(validated), 1)
-        self.assertEqual(validated[0]["base_factor"], "auto_settlement_x")
+        validated = propose.validate_response(
+            response,
+            allowed_base_factors={"auto_settlement_x"},
+            mutable_scope={"factor_formula", "probability_blend_weights"},
+        )
+        self.assertEqual(len(validated["mutations"]), 1)
+        self.assertEqual(validated["mutations"][0]["base_factor"], "auto_settlement_x")
+        self.assertEqual(validated["probability_blends"][0]["name"], "microstructure")
+
+    def test_rejects_unknown_base_factor(self) -> None:
+        response = {
+            "mutations": [
+                {"base_factor": "invented", "mutation_type": "add_capacity_gate"}
+            ],
+            "probability_blends": [],
+        }
+        with self.assertRaises(propose.SchemaValidationError) as ctx:
+            propose.validate_response(
+                response,
+                allowed_base_factors={"auto_settlement_x"},
+                mutable_scope={"factor_formula"},
+            )
+        self.assertIn("existing base factor", str(ctx.exception))
+
+    def test_rejects_probability_blend_without_mission_authority(self) -> None:
+        response = {
+            "mutations": [],
+            "probability_blends": [
+                {
+                    "name": "unauthorized",
+                    "hypothesis": "This proposal lacks mission authority.",
+                    "market_midpoint_weight": 1.0,
+                    "distance_lob_vol_weight": 0.0,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0,
+                }
+            ],
+        }
+        with self.assertRaises(propose.SchemaValidationError):
+            propose.validate_response(
+                response,
+                allowed_base_factors=set(),
+                mutable_scope={"factor_formula"},
+            )
+
+    def test_rejects_negative_or_all_zero_probability_weights(self) -> None:
+        for weights in ((-0.1, 0.3, 0.3, 0.5), (0.0, 0.0, 0.0, 0.0)):
+            response = {
+                "mutations": [],
+                "probability_blends": [
+                    {
+                        "name": "invalid",
+                        "hypothesis": "Invalid weights must fail closed.",
+                        "market_midpoint_weight": weights[0],
+                        "distance_lob_vol_weight": weights[1],
+                        "event_surface_weight": weights[2],
+                        "existing_model_weight": weights[3],
+                    }
+                ],
+            }
+            with self.assertRaises(propose.SchemaValidationError):
+                propose.validate_response(
+                    response,
+                    allowed_base_factors=set(),
+                    mutable_scope={"probability_blend_weights"},
+                )
 
     def test_rejects_non_dict_response(self) -> None:
         with self.assertRaises(propose.SchemaValidationError):
@@ -294,9 +482,9 @@ class ProposeMutationsTests(unittest.TestCase):
                     }
                 ]
             )
-            mutations = propose.propose_mutations(client, run)
+            proposal = propose.propose_candidates(client, run, mission())
 
-        self.assertEqual(len(mutations), 1)
+        self.assertEqual(len(proposal["mutations"]), 1)
         self.assertEqual(len(client.calls), 1)
 
     def test_retries_on_schema_failure_then_succeeds(self) -> None:
@@ -304,20 +492,24 @@ class ProposeMutationsTests(unittest.TestCase):
             run = self._run(tmp)
             client = FakeClient(
                 [
-                    {"mutations": [{"mutation_type": "add_capacity_gate"}]},  # missing base_factor
+                    {
+                        "mutations": [{"mutation_type": "add_capacity_gate"}],
+                        "probability_blends": [],
+                    },  # missing base_factor
                     {
                         "mutations": [
                             {
                                 "base_factor": "auto_settlement_full_depth_settlement_edge",
                                 "mutation_type": "add_capacity_gate",
                             }
-                        ]
+                        ],
+                        "probability_blends": [],
                     },
                 ]
             )
-            mutations = propose.propose_mutations(client, run, max_retries=2)
+            proposal = propose.propose_candidates(client, run, mission(), max_retries=2)
 
-        self.assertEqual(len(mutations), 1)
+        self.assertEqual(len(proposal["mutations"]), 1)
         self.assertEqual(len(client.calls), 2)
         # The retry prompt must mention the rejection reason so the model can self-correct.
         self.assertIn("was rejected", client.calls[1])
@@ -327,14 +519,14 @@ class ProposeMutationsTests(unittest.TestCase):
             run = self._run(tmp)
             client = FakeClient(
                 [
-                    {"mutations": "not-a-list"},
-                    {"mutations": "still-not-a-list"},
-                    {"mutations": "nope"},
+                    {"mutations": "not-a-list", "probability_blends": []},
+                    {"mutations": "still-not-a-list", "probability_blends": []},
+                    {"mutations": "nope", "probability_blends": []},
                 ]
             )
             with self.assertRaises(propose.SchemaValidationError):
-                propose.propose_mutations(client, run, max_retries=2)
-        self.assertEqual(len(client.calls), 3)
+                propose.propose_candidates(client, run, mission(), max_retries=2)
+        self.assertEqual(len(client.calls), 2)
 
     def test_mutation_limit_truncates_results(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -346,10 +538,14 @@ class ProposeMutationsTests(unittest.TestCase):
                 }
                 for _ in range(5)
             ]
-            client = FakeClient([{"mutations": many_mutations}])
-            mutations = propose.propose_mutations(client, run, mutation_limit=2)
+            client = FakeClient(
+                [{"mutations": many_mutations, "probability_blends": []}]
+            )
+            proposal = propose.propose_candidates(
+                client, run, mission(), mutation_limit=2
+            )
 
-        self.assertEqual(len(mutations), 2)
+        self.assertEqual(len(proposal["mutations"]), 2)
 
 
 class UnconfiguredLlmClientTests(unittest.TestCase):
@@ -368,6 +564,11 @@ def _fake_response(json_payload: dict, status_ok: bool = True) -> mock.Mock:
     return response
 
 
+def _fake_requests_module(response: mock.Mock) -> tuple[mock.Mock, mock.Mock]:
+    post = mock.Mock(return_value=response)
+    return mock.Mock(post=post), post
+
+
 class AnthropicLlmClientTests(unittest.TestCase):
     def test_propose_extracts_tool_use_input(self) -> None:
         client = propose.AnthropicLlmClient("test-key")
@@ -384,7 +585,8 @@ class AnthropicLlmClientTests(unittest.TestCase):
                 "usage": {"input_tokens": 10, "output_tokens": 5},
             }
         )
-        with mock.patch("requests.post", return_value=fake_response) as post:
+        requests_module, post = _fake_requests_module(fake_response)
+        with mock.patch.dict("sys.modules", {"requests": requests_module}):
             result = client.propose("a prompt")
 
         self.assertEqual(result, tool_input)
@@ -397,14 +599,16 @@ class AnthropicLlmClientTests(unittest.TestCase):
     def test_propose_raises_when_no_tool_use_block(self) -> None:
         client = propose.AnthropicLlmClient("test-key")
         fake_response = _fake_response({"content": [{"type": "text", "text": "not a tool call"}]})
-        with mock.patch("requests.post", return_value=fake_response):
+        requests_module, _ = _fake_requests_module(fake_response)
+        with mock.patch.dict("sys.modules", {"requests": requests_module}):
             with self.assertRaises(RuntimeError):
                 client.propose("a prompt")
 
     def test_propose_propagates_http_errors(self) -> None:
         client = propose.AnthropicLlmClient("test-key")
         fake_response = _fake_response({}, status_ok=False)
-        with mock.patch("requests.post", return_value=fake_response):
+        requests_module, _ = _fake_requests_module(fake_response)
+        with mock.patch.dict("sys.modules", {"requests": requests_module}):
             with self.assertRaises(RuntimeError):
                 client.propose("a prompt")
 
@@ -429,7 +633,8 @@ class OpenAiLlmClientTests(unittest.TestCase):
                 "usage": {"input_tokens": 12, "output_tokens": 6},
             }
         )
-        with mock.patch("requests.post", return_value=fake_response) as post:
+        requests_module, post = _fake_requests_module(fake_response)
+        with mock.patch.dict("sys.modules", {"requests": requests_module}):
             result = client.propose("a prompt")
 
         self.assertEqual(result, mutations_payload)
@@ -441,7 +646,8 @@ class OpenAiLlmClientTests(unittest.TestCase):
     def test_propose_raises_when_output_text_missing(self) -> None:
         client = propose.OpenAiLlmClient("test-key")
         fake_response = _fake_response({"output": []})
-        with mock.patch("requests.post", return_value=fake_response):
+        requests_module, _ = _fake_requests_module(fake_response)
+        with mock.patch.dict("sys.modules", {"requests": requests_module}):
             with self.assertRaises(RuntimeError):
                 client.propose("a prompt")
 
@@ -450,7 +656,8 @@ class OpenAiLlmClientTests(unittest.TestCase):
         fake_response = _fake_response(
             {"output": [{"content": [{"type": "output_text", "text": "[1, 2, 3]"}]}]}
         )
-        with mock.patch("requests.post", return_value=fake_response):
+        requests_module, _ = _fake_requests_module(fake_response)
+        with mock.patch.dict("sys.modules", {"requests": requests_module}):
             with self.assertRaises(RuntimeError):
                 client.propose("a prompt")
 
@@ -492,19 +699,42 @@ class ClientFromEnvTests(unittest.TestCase):
         )
         self.assertEqual(client._model, "gpt-5.5-mini")
 
+    def test_honors_mission_derived_provider_timeout(self) -> None:
+        client = propose.client_from_env(
+            {"PLOY_RESEARCH_LLM_API_KEY": "key"}, timeout_secs=12.5
+        )
+        self.assertEqual(client._timeout_secs, 12.5)
+
 
 class BuildPriorFromMutationsTests(unittest.TestCase):
     def test_matches_closed_loop_agent_prior_shape(self) -> None:
         mutations = [
             {"base_factor": "auto_settlement_x", "mutation_type": "add_capacity_gate"}
         ]
-        prior = propose.build_prior_from_mutations("full_depth_settlement_executable_pnl", mutations)
+        probability_blends = [
+            {
+                "name": "microstructure",
+                "hypothesis": "CEX-informed components improve calibration.",
+                "market_midpoint_weight": 0.4,
+                "distance_lob_vol_weight": 0.3,
+                "event_surface_weight": 0.2,
+                "existing_model_weight": 0.1,
+            }
+        ]
+        prior = propose.build_prior(
+            "full_depth_settlement_executable_pnl",
+            mission(),
+            {"mutations": mutations, "probability_blends": probability_blends},
+        )
 
         self.assertEqual(prior["schema_version"], 1)
         self.assertEqual(prior["kind"], "typed_llm_prior_draft")
         self.assertEqual(prior["source"], "alpha_search_llm_propose")
         self.assertEqual(prior["target"], "full_depth_settlement_executable_pnl")
         self.assertEqual(prior["mutations"], mutations)
+        self.assertEqual(prior["probability_blends"], probability_blends)
+        self.assertEqual(prior["mission_id"], "polymarket-btc-5m-v1")
+        self.assertEqual(prior["mission"]["prompt_snapshot_id"], "sha256:btc-prompt")
         self.assertEqual(prior["runtime_avoid_factors"], [])
 
 
@@ -513,6 +743,8 @@ class MainIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = artifact(Path(tmp))
             output_path = Path(tmp) / "next-llm-prior.json"
+            mission_path = Path(tmp) / "mission.json"
+            write_json(mission_path, mission())
             client = FakeClient(
                 [
                     {
@@ -522,7 +754,17 @@ class MainIntegrationTests(unittest.TestCase):
                                 "mutation_type": "add_capacity_gate",
                                 "feature": "entry_capacity_score",
                             }
-                        ]
+                        ],
+                        "probability_blends": [
+                            {
+                                "name": "microstructure",
+                                "hypothesis": "CEX-informed components improve calibration.",
+                                "market_midpoint_weight": 0.4,
+                                "distance_lob_vol_weight": 0.3,
+                                "event_surface_weight": 0.2,
+                                "existing_model_weight": 0.1,
+                            }
+                        ],
                     }
                 ]
             )
@@ -535,13 +777,15 @@ class MainIntegrationTests(unittest.TestCase):
                 str(path),
                 "--output-prior-json",
                 str(output_path),
+                "--mission-json",
+                str(mission_path),
             ]
             try:
                 with mock.patch.object(
                     propose, "client_from_env", return_value=client
                 ), mock.patch.object(
-                    propose, "propose_mutations", wraps=propose.propose_mutations
-                ) as propose_mutations:
+                    propose, "propose_candidates", wraps=propose.propose_candidates
+                ) as propose_candidates:
                     propose.main()
             finally:
                 sys.argv = argv
@@ -550,7 +794,9 @@ class MainIntegrationTests(unittest.TestCase):
             prior = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(prior["source"], "alpha_search_llm_propose")
             self.assertEqual(len(prior["mutations"]), 1)
-            self.assertEqual(propose_mutations.call_count, 1)
+            self.assertEqual(len(prior["probability_blends"]), 1)
+            self.assertEqual(prior["mission_id"], "polymarket-btc-5m-v1")
+            self.assertEqual(propose_candidates.call_count, 1)
             usage_path = output_path.with_name("llm-expansion-usage.json")
             usage = json.loads(usage_path.read_text(encoding="utf-8"))
             self.assertEqual(usage["source"], "alpha_search_llm_propose")
@@ -562,7 +808,35 @@ class MainIntegrationTests(unittest.TestCase):
             path = artifact(Path(tmp))
             output_path = Path(tmp) / "next-llm-prior.json"
             output_path.write_text("existing deterministic prior", encoding="utf-8")
-            client = FakeClient([{"mutations": []}])
+            mission_path = Path(tmp) / "mission.json"
+            write_json(mission_path, mission())
+            client = FakeClient([{"mutations": [], "probability_blends": []}])
+            import sys
+
+            argv = sys.argv
+            sys.argv = [
+                "alpha_search_llm_propose.py",
+                str(path),
+                "--output-prior-json",
+                str(output_path),
+                "--mission-json",
+                str(mission_path),
+            ]
+            try:
+                with mock.patch.object(propose, "client_from_env", return_value=client):
+                    propose.main()
+            finally:
+                sys.argv = argv
+
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8"), "existing deterministic prior"
+            )
+
+    def test_main_does_not_call_model_without_explicit_or_carried_mission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = artifact(Path(tmp))
+            output_path = Path(tmp) / "next-llm-prior.json"
+            client = FakeClient([{"mutations": [], "probability_blends": []}])
             import sys
 
             argv = sys.argv
@@ -578,15 +852,61 @@ class MainIntegrationTests(unittest.TestCase):
             finally:
                 sys.argv = argv
 
-            self.assertEqual(
-                output_path.read_text(encoding="utf-8"), "existing deterministic prior"
+        self.assertEqual(client.calls, [])
+        self.assertFalse(output_path.exists())
+
+    def test_main_continues_with_mission_carried_by_input_prior(self) -> None:
+        carried = {
+            "mission": mission(),
+            "mission_id": "polymarket-btc-5m-v1",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = artifact(Path(tmp), input_prior=carried)
+            output_path = Path(tmp) / "next-llm-prior.json"
+            client = FakeClient(
+                [
+                    {
+                        "mutations": [],
+                        "probability_blends": [
+                            {
+                                "name": "continuation",
+                                "hypothesis": "The retained components improve OOS calibration.",
+                                "market_midpoint_weight": 0.5,
+                                "distance_lob_vol_weight": 0.5,
+                                "event_surface_weight": 0.0,
+                                "existing_model_weight": 0.0,
+                            }
+                        ],
+                    }
+                ]
             )
+            import sys
+
+            argv = sys.argv
+            sys.argv = [
+                "alpha_search_llm_propose.py",
+                str(path),
+                "--output-prior-json",
+                str(output_path),
+            ]
+            try:
+                with mock.patch.object(propose, "client_from_env", return_value=client):
+                    propose.main()
+            finally:
+                sys.argv = argv
+
+            prior = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(prior["mission_id"], "polymarket-btc-5m-v1")
+        self.assertEqual(len(prior["probability_blends"]), 1)
 
     def test_main_fails_soft_on_corrupt_optional_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = artifact(Path(tmp))
             output_path = Path(tmp) / "next-llm-prior.json"
             zoo_path = Path(tmp) / "alpha-zoo-snapshot.json"
+            mission_path = Path(tmp) / "mission.json"
+            write_json(mission_path, mission())
             zoo_path.write_text("{not json", encoding="utf-8")
             import sys
 
@@ -598,6 +918,8 @@ class MainIntegrationTests(unittest.TestCase):
                 str(output_path),
                 "--alpha-zoo-snapshot-json",
                 str(zoo_path),
+                "--mission-json",
+                str(mission_path),
             ]
             try:
                 propose.main(env={"PLOY_RESEARCH_LLM_API_KEY": ""})
@@ -612,6 +934,8 @@ class MainIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = artifact(Path(tmp))
             output_path = Path(tmp) / "next-llm-prior.json"
+            mission_path = Path(tmp) / "mission.json"
+            write_json(mission_path, mission())
             import sys
 
             argv = sys.argv
@@ -620,6 +944,8 @@ class MainIntegrationTests(unittest.TestCase):
                 str(path),
                 "--output-prior-json",
                 str(output_path),
+                "--mission-json",
+                str(mission_path),
             ]
             try:
                 propose.main()

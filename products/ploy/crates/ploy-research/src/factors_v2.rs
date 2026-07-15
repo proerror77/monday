@@ -4,6 +4,7 @@ use chrono::{DateTime, Duration, Utc};
 use ploy_operator_contracts::Regime;
 use serde::{Deserialize, Serialize};
 
+use crate::autofactor::{LlmPriorSpec, LlmProbabilityBlendSpec};
 use crate::factors::{pearson_ic, spearman_ic, FactorObservation, ResearchPmBookSnapshot};
 
 const DEFAULT_STAKE_USD: f64 = 15.0;
@@ -551,6 +552,25 @@ pub struct SettlementProbabilityWalkForwardReport {
     pub options: SettlementProbabilityWalkForwardOptions,
     pub windows: Vec<SettlementProbabilityWalkForwardWindow>,
     pub aggregates: Vec<SettlementProbabilityWalkForwardAggregate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PredictionResearchCandidateFeedback {
+    pub model: String,
+    pub hypothesis: String,
+    pub verdict: String,
+    pub reason_codes: Vec<String>,
+    pub metrics: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PredictionResearchFeedback {
+    pub schema_version: String,
+    pub mission_id: String,
+    pub data_snapshot_id: Option<String>,
+    pub prompt_snapshot_id: Option<String>,
+    pub search_policy_snapshot_id: Option<String>,
+    pub candidates: Vec<PredictionResearchCandidateFeedback>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2670,13 +2690,22 @@ pub fn build_settlement_probability_report(
     rows: &[FactorObservationV2],
     options: SettlementProbabilityReportOptions,
 ) -> SettlementProbabilityReport {
+    build_settlement_probability_report_with_prior(rows, None, options)
+}
+
+pub fn build_settlement_probability_report_with_prior(
+    rows: &[FactorObservationV2],
+    prior: Option<&LlmPriorSpec>,
+    options: SettlementProbabilityReportOptions,
+) -> SettlementProbabilityReport {
     let rows = rows.iter().collect::<Vec<_>>();
-    build_settlement_probability_report_with_surface(&rows, &rows, options)
+    build_settlement_probability_report_with_surface(&rows, &rows, prior, options)
 }
 
 fn build_settlement_probability_report_with_surface<'a>(
     evaluation_rows: &[&'a FactorObservationV2],
     surface_rows: &[&'a FactorObservationV2],
+    prior: Option<&LlmPriorSpec>,
     options: SettlementProbabilityReportOptions,
 ) -> SettlementProbabilityReport {
     let options = normalize_settlement_probability_report_options(options);
@@ -2689,7 +2718,8 @@ fn build_settlement_probability_report_with_surface<'a>(
         options.event_surface_shrinkage_observations,
     );
 
-    let mut by_model: BTreeMap<&'static str, Vec<SettlementProbabilitySample>> = BTreeMap::new();
+    let typed_blends = validated_probability_blends(prior);
+    let mut by_model: BTreeMap<String, Vec<SettlementProbabilitySample>> = BTreeMap::new();
     for (row, win, pnl) in eligible_rows {
         for (model, q) in settlement_probability_models(row) {
             push_settlement_probability_sample(&mut by_model, model, row, win, pnl, q);
@@ -2714,6 +2744,20 @@ fn build_settlement_probability_report_with_surface<'a>(
                 pnl,
                 q,
             );
+        }
+        if prior.is_none_or(|prior| prediction_prior_matches_row(prior, row)) {
+            for (model, blend) in &typed_blends {
+                if let Some(q) = settlement_probability_weighted_blend(row, event_q, blend) {
+                    push_settlement_probability_sample(
+                        &mut by_model,
+                        model.as_str(),
+                        row,
+                        win,
+                        pnl,
+                        q,
+                    );
+                }
+            }
         }
     }
 
@@ -2755,7 +2799,7 @@ fn settlement_probability_eligible_rows<'a>(
 }
 
 fn settlement_probability_report_from_model_samples(
-    by_model: BTreeMap<&'static str, Vec<SettlementProbabilitySample>>,
+    by_model: BTreeMap<String, Vec<SettlementProbabilitySample>>,
     options: SettlementProbabilityReportOptions,
 ) -> SettlementProbabilityReport {
     let mut baselines = Vec::new();
@@ -2768,15 +2812,15 @@ fn settlement_probability_report_from_model_samples(
             continue;
         }
         let model_calibration =
-            build_probability_calibration_rows(model, &samples, options.bucket_count);
+            build_probability_calibration_rows(&model, &samples, options.bucket_count);
         let model_edge_buckets = build_probability_edge_bucket_rows(
-            model,
+            &model,
             &samples,
             options.bucket_count,
             options.min_bucket_observations,
         );
         baselines.push(build_probability_baseline_row(
-            model,
+            &model,
             &samples,
             &model_calibration,
             &model_edge_buckets,
@@ -2788,12 +2832,12 @@ fn settlement_probability_report_from_model_samples(
                 .filter(|row| row.count >= options.min_bucket_observations),
         );
         anti_overfit.extend(build_probability_anti_overfit_rows(
-            model,
+            &model,
             &samples,
             options.top_edge_quantile,
         ));
         symbol_holdouts.extend(build_probability_symbol_holdout_rows(
-            model,
+            &model,
             &samples,
             options.top_edge_quantile,
             options.min_bucket_observations,
@@ -2821,6 +2865,16 @@ pub fn walk_forward_settlement_probability_report(
     rows: &[FactorObservationV2],
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    options: SettlementProbabilityWalkForwardOptions,
+) -> SettlementProbabilityWalkForwardReport {
+    walk_forward_settlement_probability_report_with_prior(rows, start, end, None, options)
+}
+
+pub fn walk_forward_settlement_probability_report_with_prior(
+    rows: &[FactorObservationV2],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    prior: Option<&LlmPriorSpec>,
     options: SettlementProbabilityWalkForwardOptions,
 ) -> SettlementProbabilityWalkForwardReport {
     let mut rows = rows.to_vec();
@@ -2854,11 +2908,13 @@ pub fn walk_forward_settlement_probability_report(
             let train_report = build_settlement_probability_report_with_surface(
                 &train_rows,
                 &train_rows,
+                prior,
                 probability_options.clone(),
             );
             let test_report = build_settlement_probability_report_with_surface(
                 &test_rows,
                 &train_rows,
+                prior,
                 probability_options.clone(),
             );
             windows.extend(settlement_probability_walk_forward_windows(
@@ -3388,6 +3444,86 @@ fn best_walk_forward_oos_model(
                         .total_cmp(&b.avg_test_top_edge_avg_full_depth_settlement_pnl)
                 })
         })
+}
+
+pub fn build_prediction_research_feedback(
+    prior: &LlmPriorSpec,
+    report: &SettlementProbabilityWalkForwardReport,
+    min_positive_window_ratio: f64,
+) -> Option<PredictionResearchFeedback> {
+    let mission_id = prior.mission_id.as_deref()?.trim();
+    if mission_id.is_empty() {
+        return None;
+    }
+    let allowed_models = validated_probability_blends(Some(prior))
+        .into_iter()
+        .map(|(model, blend)| (model, blend.hypothesis.trim().to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let min_ratio = min_positive_window_ratio.clamp(0.0, 1.0);
+    let candidates = report
+        .aggregates
+        .iter()
+        .filter(|aggregate| allowed_models.contains_key(&aggregate.model))
+        .map(|aggregate| {
+            let mut reason_codes = Vec::new();
+            if aggregate.windows == 0 {
+                reason_codes.push("no_oos_windows".to_string());
+            }
+            if aggregate.positive_window_ratio < min_ratio {
+                reason_codes.push("insufficient_positive_windows".to_string());
+            }
+            if aggregate.pass_window_ratio < min_ratio {
+                reason_codes.push("insufficient_passing_windows".to_string());
+            }
+            if !aggregate.avg_test_brier_score.is_finite()
+                || aggregate.avg_test_brier_score > report.options.max_test_brier_score
+            {
+                reason_codes.push("brier_gate_failed".to_string());
+            }
+            if !aggregate.avg_test_log_loss.is_finite()
+                || aggregate.avg_test_log_loss > report.options.max_test_log_loss
+            {
+                reason_codes.push("log_loss_gate_failed".to_string());
+            }
+            if !aggregate.avg_test_expected_calibration_error.is_finite()
+                || aggregate.avg_test_expected_calibration_error
+                    > report.options.max_test_expected_calibration_error
+            {
+                reason_codes.push("calibration_gate_failed".to_string());
+            }
+            if aggregate.min_test_top_edge_avg_full_depth_settlement_pnl <= 0.0 {
+                reason_codes.push("nonpositive_oos_settlement_pnl".to_string());
+            }
+            PredictionResearchCandidateFeedback {
+                model: aggregate.model.clone(),
+                hypothesis: allowed_models[&aggregate.model].clone(),
+                verdict: if reason_codes.is_empty() {
+                    "keep".to_string()
+                } else {
+                    "discard".to_string()
+                },
+                reason_codes,
+                metrics: serde_json::json!({
+                    "windows": aggregate.windows,
+                    "positive_window_ratio": aggregate.positive_window_ratio,
+                    "pass_window_ratio": aggregate.pass_window_ratio,
+                    "avg_test_brier_score": aggregate.avg_test_brier_score,
+                    "avg_test_log_loss": aggregate.avg_test_log_loss,
+                    "avg_test_expected_calibration_error": aggregate.avg_test_expected_calibration_error,
+                    "avg_test_top_edge_avg_full_depth_settlement_pnl": aggregate.avg_test_top_edge_avg_full_depth_settlement_pnl,
+                    "min_test_top_edge_avg_full_depth_settlement_pnl": aggregate.min_test_top_edge_avg_full_depth_settlement_pnl,
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(PredictionResearchFeedback {
+        schema_version: "prediction_research_feedback.v1".to_string(),
+        mission_id: mission_id.to_string(),
+        data_snapshot_id: prior.data_snapshot_id.clone(),
+        prompt_snapshot_id: prior.prompt_snapshot_id.clone(),
+        search_policy_snapshot_id: prior.search_policy_snapshot_id.clone(),
+        candidates,
+    })
 }
 
 pub fn format_settlement_probability_report(report: &SettlementProbabilityReport) -> String {
@@ -7784,8 +7920,8 @@ struct SettlementProbabilitySample {
 }
 
 fn push_settlement_probability_sample(
-    by_model: &mut BTreeMap<&'static str, Vec<SettlementProbabilitySample>>,
-    model: &'static str,
+    by_model: &mut BTreeMap<String, Vec<SettlementProbabilitySample>>,
+    model: &str,
     row: &FactorObservationV2,
     win: f64,
     pnl: f64,
@@ -7794,7 +7930,7 @@ fn push_settlement_probability_sample(
     let q = clamp_probability(q);
     let entry_price = row.entry_sweep_avg_price_15u;
     by_model
-        .entry(model)
+        .entry(model.to_string())
         .or_default()
         .push(SettlementProbabilitySample {
             symbol: row.symbol.clone(),
@@ -7987,21 +8123,124 @@ fn settlement_probability_final_blend(
     row: &FactorObservationV2,
     event_surface_q: Option<f64>,
 ) -> Option<f64> {
+    settlement_probability_weighted_components(row, event_surface_q, 0.45, 0.35, 0.20, 0.0)
+}
+
+fn validated_probability_blends(
+    prior: Option<&LlmPriorSpec>,
+) -> Vec<(String, &LlmProbabilityBlendSpec)> {
+    let mut by_name = BTreeMap::new();
+    let Some(prior) = prior else {
+        return Vec::new();
+    };
+    for blend in &prior.probability_blends {
+        if blend.name.is_empty()
+            || blend.name.len() > 80
+            || blend.hypothesis.trim().is_empty()
+            || blend.hypothesis.len() > 500
+            || !blend
+                .name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            || !probability_blend_weights_valid(blend)
+        {
+            continue;
+        }
+        by_name
+            .entry(format!("q_llm_{}", blend.name))
+            .or_insert(blend);
+    }
+    by_name.into_iter().collect()
+}
+
+fn prediction_prior_matches_row(prior: &LlmPriorSpec, row: &FactorObservationV2) -> bool {
+    if prior.symbols.is_empty() {
+        return true;
+    }
+    let row_symbol = prediction_underlying_symbol(&row.symbol);
+    prior
+        .symbols
+        .iter()
+        .any(|symbol| prediction_underlying_symbol(symbol) == row_symbol)
+}
+
+fn prediction_underlying_symbol(raw: &str) -> String {
+    let normalized = raw.trim().to_ascii_uppercase().replace(['/', '-', '_'], "");
+    for quote in ["USDT", "USDC", "USD"] {
+        if let Some(base) = normalized.strip_suffix(quote) {
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    normalized
+}
+
+fn probability_blend_weights_valid(blend: &LlmProbabilityBlendSpec) -> bool {
+    let weights = [
+        blend.market_midpoint_weight,
+        blend.distance_lob_vol_weight,
+        blend.event_surface_weight,
+        blend.existing_model_weight,
+    ];
+    weights
+        .iter()
+        .all(|weight| weight.is_finite() && *weight >= 0.0)
+        && weights.iter().sum::<f64>() > EPS
+}
+
+fn settlement_probability_weighted_blend(
+    row: &FactorObservationV2,
+    event_surface_q: Option<f64>,
+    blend: &LlmProbabilityBlendSpec,
+) -> Option<f64> {
+    if !probability_blend_weights_valid(blend) {
+        return None;
+    }
+    settlement_probability_weighted_components(
+        row,
+        event_surface_q,
+        blend.market_midpoint_weight,
+        blend.distance_lob_vol_weight,
+        blend.event_surface_weight,
+        blend.existing_model_weight,
+    )
+}
+
+fn settlement_probability_weighted_components(
+    row: &FactorObservationV2,
+    event_surface_q: Option<f64>,
+    market_midpoint_weight: f64,
+    distance_lob_vol_weight: f64,
+    event_surface_weight: f64,
+    existing_model_weight: f64,
+) -> Option<f64> {
     let mut logit_sum = 0.0;
     let mut total_weight = 0.0;
     add_probability_component(
         &mut logit_sum,
         &mut total_weight,
         settlement_market_midpoint_probability(row),
-        0.45,
+        market_midpoint_weight,
     );
     add_probability_component(
         &mut logit_sum,
         &mut total_weight,
         settlement_distance_lob_vol_probability(row),
-        0.35,
+        distance_lob_vol_weight,
     );
-    add_probability_component(&mut logit_sum, &mut total_weight, event_surface_q, 0.20);
+    add_probability_component(
+        &mut logit_sum,
+        &mut total_weight,
+        event_surface_q,
+        event_surface_weight,
+    );
+    add_probability_component(
+        &mut logit_sum,
+        &mut total_weight,
+        valid_probability(row.side_model_prob).then_some(row.side_model_prob),
+        existing_model_weight,
+    );
     if total_weight <= EPS {
         None
     } else {
@@ -10307,6 +10546,177 @@ mod tests {
     }
 
     #[test]
+    fn typed_prior_probability_blend_enters_probability_evaluator() {
+        let options = FactorReviewOptions::default();
+        let mut source_rows = (0..8)
+            .map(|idx| {
+                let mut obs = base_obs();
+                obs.event_id = format!("prior-blend-{idx}");
+                obs.tick_ts = Utc::now() + Duration::hours(idx);
+                obs.settlement_up = if idx % 2 == 0 { 1.0 } else { 0.0 };
+                obs.pm_up_bid = 0.35 + idx as f64 * 0.02;
+                obs.pm_up_ask = obs.pm_up_bid + 0.02;
+                obs.distance_over_sigma = if idx % 2 == 0 { 0.8 } else { -0.6 };
+                obs
+            })
+            .collect::<Vec<_>>();
+        let mut sol = source_rows[0].clone();
+        sol.event_id = "prior-blend-sol".to_string();
+        sol.symbol = "SOLUSDT".to_string();
+        sol.tick_ts += Duration::minutes(30);
+        source_rows.push(sol);
+        let mut rows = build_factor_observations_v2(&source_rows, &options);
+        rows.retain(|row| row.side == ReviewSide::Up);
+        for row in &mut rows {
+            row.label_full_depth_entry_fillable = true;
+            row.entry_sweep_avg_price_15u = row.entry_ask;
+            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
+            row.label_full_depth_executable_pnl_15u = row
+                .label_settlement_win
+                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
+        }
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "mission_id": "polymarket-btc-5m-v1",
+            "prompt_snapshot_id": "sha256:prompt",
+            "symbols": ["BTC"],
+            "horizon": "5m",
+            "probability_blends": [{
+                "name": "microstructure",
+                "hypothesis": "CEX-informed components improve BTC calibration.",
+                "market_midpoint_weight": 0.4,
+                "distance_lob_vol_weight": 0.4,
+                "event_surface_weight": 0.2,
+                "existing_model_weight": 0.0
+            }]
+        }))
+        .expect("typed prior");
+
+        let report = build_settlement_probability_report_with_prior(
+            &rows,
+            Some(&prior),
+            SettlementProbabilityReportOptions {
+                bucket_count: 2,
+                min_bucket_observations: 1,
+                top_edge_quantile: 0.5,
+                event_surface_min_bucket_observations: 1,
+                event_surface_shrinkage_observations: 1,
+            },
+        );
+
+        let candidate = report
+            .baselines
+            .iter()
+            .find(|row| row.model == "q_llm_microstructure")
+            .expect("prior blend should be evaluated as probability");
+        assert!(candidate.brier_score.is_finite());
+        assert!(candidate.log_loss.is_finite());
+        assert!(candidate.expected_calibration_error.is_finite());
+        assert_eq!(candidate.n, 8, "SOL rows must stay outside the BTC mission");
+    }
+
+    #[test]
+    fn invalid_typed_probability_blends_fail_closed() {
+        let options = FactorReviewOptions::default();
+        let mut rows = build_factor_observations_v2(&[base_obs()], &options);
+        for row in &mut rows {
+            row.label_full_depth_entry_fillable = true;
+            row.entry_sweep_avg_price_15u = row.entry_ask;
+            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
+            row.label_full_depth_executable_pnl_15u = row
+                .label_settlement_win
+                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
+        }
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "probability_blends": [
+                {
+                    "name": "negative",
+                    "hypothesis": "Negative weights must be rejected.",
+                    "market_midpoint_weight": -1.0,
+                    "distance_lob_vol_weight": 1.0,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0
+                },
+                {
+                    "name": "all_zero",
+                    "hypothesis": "Zero total weight must be rejected.",
+                    "market_midpoint_weight": 0.0,
+                    "distance_lob_vol_weight": 0.0,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0
+                }
+            ]
+        }))
+        .expect("typed prior");
+
+        let report = build_settlement_probability_report_with_prior(
+            &rows,
+            Some(&prior),
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(!report
+            .baselines
+            .iter()
+            .any(|row| row.model.starts_with("q_llm_")));
+    }
+
+    #[test]
+    fn prediction_feedback_is_candidate_specific_and_machine_readable() {
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "mission_id": "polymarket-sol-5m-v1",
+            "data_snapshot_id": "sha256:sol-data",
+            "prompt_snapshot_id": "sha256:sol-prompt",
+            "search_policy_snapshot_id": "prediction-probability-blend-v1",
+            "probability_blends": [{
+                "name": "sol_flow",
+                "hypothesis": "SOL flow components improve OOS calibration.",
+                "market_midpoint_weight": 0.5,
+                "distance_lob_vol_weight": 0.3,
+                "event_surface_weight": 0.2,
+                "existing_model_weight": 0.0
+            }]
+        }))
+        .expect("typed prior");
+        let report = SettlementProbabilityWalkForwardReport {
+            options: SettlementProbabilityWalkForwardOptions::default(),
+            windows: Vec::new(),
+            aggregates: vec![SettlementProbabilityWalkForwardAggregate {
+                model: "q_llm_sol_flow".to_string(),
+                windows: 3,
+                positive_window_ratio: 1.0,
+                pass_window_ratio: 0.0,
+                avg_test_brier_score: 0.40,
+                avg_test_log_loss: 0.80,
+                avg_test_expected_calibration_error: 0.20,
+                avg_test_top_edge_avg_full_depth_settlement_pnl: -1.0,
+                min_test_top_edge_avg_full_depth_settlement_pnl: -2.0,
+            }],
+        };
+
+        let feedback =
+            build_prediction_research_feedback(&prior, &report, 0.6).expect("mission feedback");
+
+        assert_eq!(feedback.mission_id, "polymarket-sol-5m-v1");
+        assert_eq!(
+            feedback.data_snapshot_id.as_deref(),
+            Some("sha256:sol-data")
+        );
+        assert_eq!(feedback.candidates.len(), 1);
+        assert!(feedback.candidates[0].hypothesis.contains("SOL flow"));
+        assert_eq!(feedback.candidates[0].verdict, "discard");
+        assert!(feedback.candidates[0]
+            .reason_codes
+            .contains(&"calibration_gate_failed".to_string()));
+        assert_eq!(
+            feedback.candidates[0].metrics["avg_test_brier_score"],
+            serde_json::json!(0.40)
+        );
+    }
+
+    #[test]
     fn settlement_probability_walk_forward_uses_train_surface_for_test_window() {
         let start = Utc::now();
         let source_rows = (0..8)
@@ -10334,10 +10744,23 @@ mod tests {
                 .map(|win| win * row.entry_sweep_shares_15u - 15.0);
         }
 
-        let report = walk_forward_settlement_probability_report(
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "mission_id": "polymarket-btc-5m-v1",
+            "probability_blends": [{
+                "name": "walk_forward",
+                "hypothesis": "The blend improves event-disjoint OOS calibration.",
+                "market_midpoint_weight": 0.4,
+                "distance_lob_vol_weight": 0.4,
+                "event_surface_weight": 0.2,
+                "existing_model_weight": 0.0
+            }]
+        }))
+        .expect("typed prior");
+        let report = walk_forward_settlement_probability_report_with_prior(
             &rows,
             start,
             start + Duration::days(4),
+            Some(&prior),
             SettlementProbabilityWalkForwardOptions {
                 walk_forward: FactorWalkForwardOptions {
                     review: FactorReviewOptions {
@@ -10367,6 +10790,10 @@ mod tests {
             .aggregates
             .iter()
             .any(|row| row.model == "q_final_logit_blend"));
+        assert!(report
+            .aggregates
+            .iter()
+            .any(|row| row.model == "q_llm_walk_forward"));
         let text = format_settlement_probability_walk_forward_report(&report);
         assert!(text.contains("Settlement Probability Walk-Forward Report"));
         assert!(text.contains("EventVolSurface and q_final use only the train window"));
