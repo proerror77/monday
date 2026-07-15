@@ -82,6 +82,8 @@ pub struct RuntimeSection {
     pub record_market_updates_max_records: Option<u64>,
     /// Optional hard cap for a bounded canonical `MarketUpdate` recording.
     pub record_market_updates_max_bytes: Option<u64>,
+    /// Optional interval for rotating the active tape without restarting the feed.
+    pub record_market_updates_rotate_seconds: Option<u64>,
     /// Optional allow-list of update kinds to persist. Empty records all kinds.
     #[serde(default)]
     pub record_market_updates_include_kinds: Vec<RecordingKind>,
@@ -423,6 +425,7 @@ impl FullConfig {
     pub fn record_market_updates_policy(&self) -> RecordingPolicy {
         RecordingPolicy {
             limits: self.record_market_updates_limits(),
+            rotate_seconds: self.runtime.record_market_updates_rotate_seconds,
             include_kinds: self.runtime.record_market_updates_include_kinds.clone(),
             quote_sample_ms: self.runtime.record_market_updates_quote_sample_ms,
             quote_depth_levels: self.runtime.record_market_updates_quote_depth_levels,
@@ -669,6 +672,7 @@ max_updates = 10000
 record_market_updates_to = "tmp/sample.ndjson"
 record_market_updates_max_records = 1000
 record_market_updates_max_bytes = 1048576
+record_market_updates_rotate_seconds = 3600
 record_market_updates_include_kinds = ["quote", "event_discovered", "event_expired", "reference_price"]
 record_market_updates_quote_sample_ms = 500
 record_market_updates_quote_depth_levels = 5
@@ -722,6 +726,10 @@ max_sweep_price_delta = 0.003
             Some(1_048_576)
         );
         assert_eq!(
+            config.runtime.record_market_updates_rotate_seconds,
+            Some(3600)
+        );
+        assert_eq!(
             config.record_market_updates_limits(),
             RecordingLimits {
                 max_records: Some(1000),
@@ -735,6 +743,7 @@ max_sweep_price_delta = 0.003
                     max_records: Some(1000),
                     max_bytes: Some(1_048_576),
                 },
+                rotate_seconds: Some(3600),
                 include_kinds: vec![
                     RecordingKind::Quote,
                     RecordingKind::EventDiscovered,
@@ -1330,6 +1339,7 @@ taker_fee_rate = 0.07
             "record_market_updates_to",
             "record_market_updates_max_records",
             "record_market_updates_max_bytes",
+            "record_market_updates_rotate_seconds",
         ] {
             dryrun_runtime.remove(recording_key);
         }

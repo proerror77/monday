@@ -28,16 +28,25 @@ quotes from the persisted tape. Sampling affects the recording only; the runtime
 still receives every live quote for active event tokens. Quotes timestamped after
 their event end are rejected before executor or strategy evaluation, so a late quote
 from an expired 5-minute/15-minute market cannot trigger a trade in the next event.
-The runner restarts every six hours; the recorder rotates an existing tape before
-opening the next session.
+The recorder rotates the active tape in-process every hour, without disconnecting
+the feed. The runner's independent six-hour restart remains as a bounded lifecycle
+refresh. This keeps the local-only recovery-point window to about one hour while
+avoiding unsafe copy/truncate operations and hourly WebSocket reconnect gaps. A
+new tape is seeded with the active `event_discovered` records before quotes, so
+token-to-event context remains independently replayable.
 
 Closed Polymarket sessions are validated, compressed, and uploaded every five
 minutes by `polymarket-market-tape-upload.timer`. The uploader ignores the active
 `market-updates.ndjson`, requires contiguous sequence numbers and monotonic record
 timestamps, then writes `.ndjson.zst`, `manifest.json`, and `_SUCCESS` under
-`lake/raw/venue=polymarket/dataset=crypto_expiry/`. Failed uploads retain the
-closed source tape for retry and surface the failure in
+`lake/raw/venue=polymarket/dataset=crypto_expiry/`. Sessions crossing UTC-hour
+boundaries are split into hour partitions. Before deleting a closed source tape,
+the uploader reads all three OSS objects back and verifies the compressed byte
+count, SHA-256, manifest, and success marker. A bad tape does not block later
+closed tapes. Failed uploads retain the closed source tape for retry and surface the failure in
 `/data/monday/spool/polymarket/upload-status.json`.
+Each manifest reports `event_context_complete`; legacy segments lacking a prior
+token discovery are explicitly marked as requiring the previous event context.
 
 Install the uploader beside the existing tape service:
 

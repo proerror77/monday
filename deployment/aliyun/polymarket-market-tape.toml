@@ -5,6 +5,7 @@ prediction_family = "crypto_expiry"
 venue = "polymarket"
 market_data_source = "external_direct"
 record_market_updates_to = "/data/monday/spool/polymarket/market-updates.ndjson"
+record_market_updates_rotate_seconds = 3600
 record_market_updates_include_kinds = ["quote", "event_discovered", "event_expired", "reference_price"]
 record_market_updates_quote_sample_ms = 1000
 record_market_updates_quote_depth_levels = 1

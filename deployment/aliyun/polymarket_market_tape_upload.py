@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -52,13 +53,13 @@ def parse_timestamp(value: Any, field: str, line_number: int) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def decimal_or_none(value: Any) -> Decimal | None:
+def decimal_or_none(value: Any, field: str, line_number: int) -> Decimal | None:
     if value is None:
         return None
     try:
         return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError(f"line {line_number}: {field} must be numeric") from error
 
 
 def sha256_file(path: Path) -> str:
@@ -90,12 +91,14 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
     non_null_fields: dict[str, Counter[str]] = defaultdict(Counter)
     symbols: set[str] = set()
     token_ids: set[str] = set()
+    known_event_tokens: set[str] = set()
+    contextless_quote_tokens: set[str] = set()
     first_recorded_at: str | None = None
     last_recorded_at: str | None = None
     previous_recorded_at: datetime | None = None
     first_sequence: int | None = None
     last_sequence: int | None = None
-    expected_sequence = 0
+    expected_sequence: int | None = None
     crossed_quotes = 0
     one_sided_quotes = 0
     empty_quotes = 0
@@ -103,6 +106,7 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
     negative_sizes = 0
     max_bid_levels = 0
     max_ask_levels = 0
+    contextless_quotes = 0
 
     with path.open("rb") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
@@ -116,6 +120,10 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
                 raise ValueError(f"line {line_number}: record must be an object")
 
             sequence = record.get("sequence")
+            if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+                raise ValueError(f"line {line_number}: sequence must be a non-negative integer")
+            if expected_sequence is None:
+                expected_sequence = sequence
             if sequence != expected_sequence:
                 raise ValueError(
                     f"line {line_number}: sequence gap expected={expected_sequence} actual={sequence}"
@@ -143,12 +151,21 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
             token_id = update.get("token_id")
             if isinstance(token_id, str) and token_id:
                 token_ids.add(token_id)
+            if kind == "event_discovered":
+                for token_field in ("up_token", "down_token"):
+                    event_token = update.get(token_field)
+                    if isinstance(event_token, str) and event_token:
+                        known_event_tokens.add(event_token)
 
             if kind == "quote":
-                bid = decimal_or_none(update.get("bid"))
-                ask = decimal_or_none(update.get("ask"))
-                bid_size = decimal_or_none(update.get("bid_size"))
-                ask_size = decimal_or_none(update.get("ask_size"))
+                if not isinstance(token_id, str) or token_id not in known_event_tokens:
+                    contextless_quotes += 1
+                    if isinstance(token_id, str):
+                        contextless_quote_tokens.add(token_id)
+                bid = decimal_or_none(update.get("bid"), "bid", line_number)
+                ask = decimal_or_none(update.get("ask"), "ask", line_number)
+                bid_size = decimal_or_none(update.get("bid_size"), "bid_size", line_number)
+                ask_size = decimal_or_none(update.get("ask_size"), "ask_size", line_number)
                 bid_levels = update.get("bid_levels") or []
                 ask_levels = update.get("ask_levels") or []
                 if not isinstance(bid_levels, list) or not isinstance(ask_levels, list):
@@ -157,6 +174,26 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
                     raise ValueError(f"line {line_number}: quote exceeds configured depth")
                 max_bid_levels = max(max_bid_levels, len(bid_levels))
                 max_ask_levels = max(max_ask_levels, len(ask_levels))
+                for side, levels in (("bid_levels", bid_levels), ("ask_levels", ask_levels)):
+                    for level_index, level in enumerate(levels):
+                        if not isinstance(level, dict):
+                            raise ValueError(
+                                f"line {line_number}: {side}[{level_index}] must be an object"
+                            )
+                        level_price = decimal_or_none(
+                            level.get("price"), f"{side}[{level_index}].price", line_number
+                        )
+                        level_size = decimal_or_none(
+                            level.get("size"), f"{side}[{level_index}].size", line_number
+                        )
+                        if level_price is None or level_size is None:
+                            raise ValueError(
+                                f"line {line_number}: {side}[{level_index}] requires price and size"
+                            )
+                        if not Decimal("0") <= level_price <= Decimal("1"):
+                            out_of_range_prices += 1
+                        if level_size < 0:
+                            negative_sizes += 1
                 if bid is None and ask is None:
                     empty_quotes += 1
                 elif bid is None or ask is None:
@@ -175,25 +212,33 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
             last_recorded_at = recorded_at_text
             first_sequence = sequence if first_sequence is None else first_sequence
             last_sequence = sequence
-            expected_sequence += 1
+            expected_sequence = sequence + 1
             previous_recorded_at = recorded_at
 
     after = path.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise ValueError("tape changed while being validated; refusing to archive an active file")
-    if expected_sequence == 0 or first_recorded_at is None or last_recorded_at is None:
+    if first_sequence is None or first_recorded_at is None or last_recorded_at is None:
         raise ValueError("tape is empty")
 
     partition = parse_timestamp(first_recorded_at, "recorded_at", 1)
+    event_context_complete = contextless_quotes == 0
     return {
         "schema": "monday.polymarket.market_updates.v1",
         "venue": "polymarket",
         "dataset": dataset,
         "format": "ndjson.zst",
-        "replay_scope": "complete_sampled_normalized_session",
+        "replay_scope": (
+            "complete_sampled_normalized_hour_segment"
+            if event_context_complete
+            else "sampled_normalized_hour_segment_requires_prior_event_context"
+        ),
         "venue_depth_complete": False,
-        "session_complete": True,
-        "events": expected_sequence,
+        "segment_complete": True,
+        "source_session_closed": True,
+        "event_context_complete": event_context_complete,
+        "contextless_quote_tokens": sorted(contextless_quote_tokens),
+        "events": last_sequence - first_sequence + 1,
         "event_types": dict(sorted(event_types.items())),
         "start_sequence": first_sequence,
         "end_sequence": last_sequence,
@@ -223,10 +268,54 @@ def scan_tape(path: Path, dataset: str, quote_depth_levels: int, quote_sample_ms
             "negative_sizes": negative_sizes,
             "max_bid_levels": max_bid_levels,
             "max_ask_levels": max_ask_levels,
+            "contextless_quotes": contextless_quotes,
         },
         "source_file": path.name,
         "source_bytes": before.st_size,
     }
+
+
+def split_tape_by_utc_hour(source: Path) -> list[Path]:
+    """Copy a validated closed tape into deterministic UTC-hour chunks."""
+    staging_dir = source.parent / ".upload-staging" / source.name
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    for temporary in staging_dir.glob("*.tmp"):
+        temporary.unlink()
+
+    chunks: list[Path] = []
+    output = None
+    output_path: Path | None = None
+    current_hour: str | None = None
+    try:
+        with source.open("rb") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                record = json.loads(raw_line)
+                recorded_at = parse_timestamp(record.get("recorded_at"), "recorded_at", line_number)
+                hour = recorded_at.strftime("%Y%m%dT%H")
+                if hour != current_hour:
+                    if output is not None and output_path is not None:
+                        output.flush()
+                        os.fsync(output.fileno())
+                        output.close()
+                        final_path = output_path.with_suffix("")
+                        os.replace(output_path, final_path)
+                        chunks.append(final_path)
+                    output_path = staging_dir / f"{source.stem}.{hour}.ndjson.tmp"
+                    output = output_path.open("wb")
+                    current_hour = hour
+                output.write(raw_line)
+        if output is not None and output_path is not None:
+            output.flush()
+            os.fsync(output.fileno())
+            output.close()
+            output = None
+            final_path = output_path.with_suffix("")
+            os.replace(output_path, final_path)
+            chunks.append(final_path)
+    finally:
+        if output is not None:
+            output.close()
+    return chunks
 
 
 def prepare_artifacts(
@@ -291,9 +380,98 @@ def upload_artifacts(
             check=True,
             timeout=timeout,
         )
+    verify_remote_artifacts(artifacts, bucket, endpoint, region, profile, timeout)
     for path in (artifacts.source, artifacts.data, artifacts.manifest, artifacts.success):
         path.unlink()
     return f"oss://{bucket}/{artifacts.object_prefix}/{artifacts.data.name}"
+
+
+def verify_remote_artifacts(
+    artifacts: Artifacts,
+    bucket: str,
+    endpoint: str,
+    region: str,
+    profile: str,
+    timeout: int,
+) -> None:
+    """Read all three objects back before deleting the local closed tape."""
+    expected_manifest = json.loads(artifacts.manifest.read_text(encoding="utf-8"))
+    with tempfile.TemporaryDirectory(prefix=".oss-verify-", dir=artifacts.source.parent) as directory:
+        verify_dir = Path(directory)
+        downloaded: dict[str, Path] = {}
+        for source in (artifacts.data, artifacts.manifest, artifacts.success):
+            destination = verify_dir / source.name
+            remote = f"oss://{bucket}/{artifacts.object_prefix}/{source.name}"
+            subprocess.run(
+                [
+                    "aliyun",
+                    "ossutil",
+                    "cp",
+                    remote,
+                    str(destination),
+                    "--profile",
+                    profile,
+                    "--endpoint",
+                    endpoint,
+                    "--region",
+                    region,
+                    "--force",
+                ],
+                check=True,
+                timeout=timeout,
+            )
+            downloaded[source.name] = destination
+
+        remote_data = downloaded[artifacts.data.name]
+        if remote_data.stat().st_size != expected_manifest["bytes"]:
+            raise ValueError("remote data size does not match manifest")
+        if sha256_file(remote_data) != expected_manifest["sha256"]:
+            raise ValueError("remote data sha256 does not match manifest")
+        if downloaded[artifacts.manifest.name].read_bytes() != artifacts.manifest.read_bytes():
+            raise ValueError("remote manifest does not match local manifest")
+        if downloaded[artifacts.success.name].read_text(encoding="utf-8").strip() != expected_manifest[
+            "sha256"
+        ]:
+            raise ValueError("remote _SUCCESS does not match manifest")
+
+
+def archive_source(source: Path, args: argparse.Namespace) -> list[str]:
+    """Validate one closed session, upload UTC-hour chunks, then delete it."""
+    source_manifest = scan_tape(
+        source, args.dataset, args.quote_depth_levels, args.quote_sample_ms
+    )
+    if source_manifest["start_sequence"] != 0:
+        raise ValueError(
+            f"closed source tape must start at sequence 0; actual={source_manifest['start_sequence']}"
+        )
+    uploaded: list[str] = []
+    chunks = split_tape_by_utc_hour(source)
+    for chunk in chunks:
+        artifacts, _ = prepare_artifacts(
+            chunk,
+            args.dataset,
+            args.quote_depth_levels,
+            args.quote_sample_ms,
+            args.zstd_timeout,
+        )
+        uploaded.append(
+            upload_artifacts(
+                artifacts,
+                args.bucket,
+                args.endpoint,
+                args.region,
+                args.profile,
+                args.oss_timeout,
+            )
+        )
+    source.unlink()
+    staging_dir = source.parent / ".upload-staging" / source.name
+    try:
+        staging_dir.rmdir()
+        staging_dir.parent.rmdir()
+    except OSError:
+        pass
+    return uploaded
 
 
 def read_status(path: Path) -> dict[str, Any]:
@@ -309,51 +487,31 @@ def run(args: argparse.Namespace) -> int:
     spool_dir.mkdir(parents=True, exist_ok=True)
     status_path = spool_dir / "upload-status.json"
     status = read_status(status_path)
-    try:
-        for source in discover_rotated_tapes(spool_dir):
-            artifacts, _ = prepare_artifacts(
-                source,
-                args.dataset,
-                args.quote_depth_levels,
-                args.quote_sample_ms,
-                args.zstd_timeout,
-            )
-            uploaded = upload_artifacts(
-                artifacts,
-                args.bucket,
-                args.endpoint,
-                args.region,
-                args.profile,
-                args.oss_timeout,
-            )
+    failures: list[dict[str, str]] = []
+    for source in discover_rotated_tapes(spool_dir):
+        try:
+            uploaded = archive_source(source, args)
             status.update(
                 {
                     "last_success_at": utc_now(),
-                    "last_uploaded_object": uploaded,
-                    "last_error_at": None,
-                    "last_error": None,
+                    "last_uploaded_object": uploaded[-1],
                 }
             )
-        status.update(
-            {
-                "updated_at": utc_now(),
-                "pending_segments": len(discover_rotated_tapes(spool_dir)),
-            }
-        )
-        atomic_json(status_path, status)
-        return 0
-    except Exception as error:
-        status.update(
-            {
-                "updated_at": utc_now(),
-                "pending_segments": len(discover_rotated_tapes(spool_dir)),
-                "last_error_at": utc_now(),
-                "last_error": str(error),
-            }
-        )
-        atomic_json(status_path, status)
-        print(f"Polymarket tape upload failed: {error}", flush=True)
-        return 1
+        except Exception as error:
+            failures.append({"source": source.name, "error": str(error)})
+            print(f"Polymarket tape upload failed for {source.name}: {error}", flush=True)
+
+    status.update(
+        {
+            "updated_at": utc_now(),
+            "pending_segments": len(discover_rotated_tapes(spool_dir)),
+            "failed_segments": failures,
+            "last_error_at": utc_now() if failures else None,
+            "last_error": failures[-1]["error"] if failures else None,
+        }
+    )
+    atomic_json(status_path, status)
+    return 1 if failures else 0
 
 
 def parse_args() -> argparse.Namespace:
