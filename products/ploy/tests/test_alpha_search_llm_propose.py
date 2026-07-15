@@ -159,6 +159,8 @@ class BuildPromptTests(unittest.TestCase):
         )
         self.assertIn("hypothesis", blend_schema["properties"])
         self.assertIn("hypothesis", blend_schema["required"])
+        self.assertIn("chainlink_digital_weight", blend_schema["properties"])
+        self.assertIn("chainlink_digital_weight", blend_schema["required"])
 
     def test_prompt_lists_allowed_mutations_from_shared_constant(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -195,6 +197,25 @@ class BuildPromptTests(unittest.TestCase):
         self.assertEqual(payload["weak_dimensions"][0]["factor_name"], "auto_settlement_x")
         self.assertEqual(payload["weak_dimensions"][0]["selected_dimension"], "overfit_risk")
         self.assertNotIn("reward", payload["weak_dimensions"][0])
+
+    def test_prompt_explains_binary_option_component_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = artifact(Path(tmp))
+            from scripts.alpha_search_closed_loop_agent import DEFAULT_TARGET, load_artifact
+
+            run = load_artifact(path, DEFAULT_TARGET)
+            prompt = propose.build_prompt(run, mission())
+
+        payload = json.loads(prompt)
+        components = {
+            component["name"]: component
+            for component in payload["registered_probability_components"]
+        }
+        self.assertIn("chainlink_digital", components)
+        self.assertIn("Chainlink", components["chainlink_digital"]["inputs"])
+        self.assertIn("cash-or-nothing", components["chainlink_digital"]["theory"])
+        self.assertIn("CEX", components["existing_model"]["inputs"])
+        self.assertIn("log-moneyness", components["existing_model"]["theory"])
 
     def test_prompt_includes_crowded_structural_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,6 +284,7 @@ class BuildPromptTests(unittest.TestCase):
                                 "name": "microstructure",
                                 "hypothesis": "CEX flow improves calibration.",
                                 "market_midpoint_weight": 0.4,
+                                "chainlink_digital_weight": 0.0,
                                 "distance_lob_vol_weight": 0.3,
                                 "event_surface_weight": 0.2,
                                 "existing_model_weight": 0.1,
@@ -292,6 +314,7 @@ class BuildPromptTests(unittest.TestCase):
                     "probability_blend": {
                         "name": "microstructure",
                         "market_midpoint_weight": 0.4,
+                        "chainlink_digital_weight": 0.0,
                         "distance_lob_vol_weight": 0.3,
                         "event_surface_weight": 0.2,
                         "existing_model_weight": 0.1,
@@ -406,6 +429,7 @@ class ValidateResponseTests(unittest.TestCase):
                     "name": "microstructure",
                     "hypothesis": "CEX-informed components improve calibration.",
                     "market_midpoint_weight": 0.4,
+                    "chainlink_digital_weight": 0.0,
                     "distance_lob_vol_weight": 0.3,
                     "event_surface_weight": 0.2,
                     "existing_model_weight": 0.1,
@@ -448,6 +472,7 @@ class ValidateResponseTests(unittest.TestCase):
                     "name": "unauthorized",
                     "hypothesis": "This proposal lacks mission authority.",
                     "market_midpoint_weight": 1.0,
+                    "chainlink_digital_weight": 0.0,
                     "distance_lob_vol_weight": 0.0,
                     "event_surface_weight": 0.0,
                     "existing_model_weight": 0.0,
@@ -474,6 +499,7 @@ class ValidateResponseTests(unittest.TestCase):
                         "name": "invalid",
                         "hypothesis": "Invalid weights must fail closed.",
                         "market_midpoint_weight": weights[0],
+                        "chainlink_digital_weight": 0.0,
                         "distance_lob_vol_weight": weights[1],
                         "event_surface_weight": weights[2],
                         "existing_model_weight": weights[3],
@@ -851,6 +877,7 @@ class BuildPriorFromMutationsTests(unittest.TestCase):
                 "name": "microstructure",
                 "hypothesis": "CEX-informed components improve calibration.",
                 "market_midpoint_weight": 0.4,
+                "chainlink_digital_weight": 0.0,
                 "distance_lob_vol_weight": 0.3,
                 "event_surface_weight": 0.2,
                 "existing_model_weight": 0.1,
@@ -899,6 +926,7 @@ class MainIntegrationTests(unittest.TestCase):
                                 "name": "microstructure",
                                 "hypothesis": "CEX-informed components improve calibration.",
                                 "market_midpoint_weight": 0.4,
+                                "chainlink_digital_weight": 0.0,
                                 "distance_lob_vol_weight": 0.3,
                                 "event_surface_weight": 0.2,
                                 "existing_model_weight": 0.1,
@@ -1011,6 +1039,7 @@ class MainIntegrationTests(unittest.TestCase):
                                 "name": "continuation",
                                 "hypothesis": "The retained components improve OOS calibration.",
                                 "market_midpoint_weight": 0.5,
+                                "chainlink_digital_weight": 0.0,
                                 "distance_lob_vol_weight": 0.5,
                                 "event_surface_weight": 0.0,
                                 "existing_model_weight": 0.0,

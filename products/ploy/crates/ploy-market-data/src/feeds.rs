@@ -1482,6 +1482,7 @@ pub fn spawn_chainlink_feed(
                     // Convert Unix millis to DateTime<Utc>
                     let ts = DateTime::from_timestamp_millis(chainlink_price.timestamp)
                         .unwrap_or_else(Utc::now);
+                    let received_at = Utc::now();
 
                     upsert_reference_price(
                         &reference_prices,
@@ -1494,7 +1495,7 @@ pub fn spawn_chainlink_feed(
                             value: chainlink_price.value,
                             full_accuracy_value: None,
                             source_timestamp: ts,
-                            received_at: Utc::now(),
+                            received_at,
                             is_carried_forward: false,
                         },
                     )
@@ -1509,6 +1510,7 @@ pub fn spawn_chainlink_feed(
                         price: chainlink_price.value,
                         full_accuracy_value: None,
                         is_carried_forward: false,
+                        received_at: Some(received_at),
                         ts,
                     };
 
@@ -1526,6 +1528,7 @@ pub fn spawn_chainlink_feed(
                             &chainlink_price.symbol,
                             chainlink_price.value,
                             ts,
+                            received_at,
                         )
                         .await;
                     }
@@ -1792,16 +1795,18 @@ async fn persist_chainlink_price(
     symbol: &str,
     price: Decimal,
     source_timestamp: DateTime<Utc>,
+    received_at: DateTime<Utc>,
 ) {
     let result = sqlx::query(
         r#"
         INSERT INTO chainlink_price_ticks (symbol, price, source_timestamp, received_at)
-        VALUES ($1, $2, $3, NOW())
+        VALUES ($1, $2, $3, $4)
         "#,
     )
     .bind(symbol)
     .bind(price)
     .bind(source_timestamp)
+    .bind(received_at)
     .execute(pool)
     .await;
 
@@ -1848,6 +1853,7 @@ fn reference_price_update(snapshot: &ReferencePriceSnapshot) -> MarketUpdate {
         price: snapshot.value,
         full_accuracy_value: snapshot.full_accuracy_value.as_deref().map(Arc::from),
         is_carried_forward: snapshot.is_carried_forward,
+        received_at: Some(snapshot.received_at),
         ts: snapshot.source_timestamp,
     }
 }

@@ -13,6 +13,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(any(feature = "db", test))]
+use crate::factors::normalized_underlying_symbol;
 use crate::{DeribitFeatureSnapshot, FactorObservation, ResearchPmBookSnapshot};
 
 pub const RESEARCH_SNAPSHOT_SCHEMA_VERSION: &str = "research_snapshot_v1";
@@ -420,6 +422,17 @@ pub struct ResearchSnapshotBuildOptions {
     pub data_audit_report: Option<String>,
     pub include_deribit: bool,
     pub pm_book_archive_dir: Option<PathBuf>,
+}
+
+#[cfg(any(feature = "db", test))]
+fn chainlink_reference_symbols(symbols: &[String]) -> Vec<String> {
+    symbols
+        .iter()
+        .filter_map(|symbol| {
+            let underlying = normalized_underlying_symbol(symbol).to_ascii_lowercase();
+            (!underlying.is_empty()).then(|| format!("{underlying}/usd"))
+        })
+        .collect()
 }
 
 fn research_snapshot_quality_flags(
@@ -853,6 +866,8 @@ pub async fn build_research_snapshot_from_database(
         history_start,
         options.end,
         &HistoricalLoadOptions {
+            include_reference_prices: true,
+            reference_symbols: chainlink_reference_symbols(&options.symbols),
             require_official_settlement: options.require_official_settlement,
             include_l2: false,
             spot_sample_secs: historical_sample_secs,
@@ -1055,7 +1070,7 @@ pub async fn build_research_snapshot_from_database(
                     snapshot_sampled: true,
                     sample_secs: Some(i64::from(historical_sample_secs)),
                     row_count: Some(all_updates.len()),
-                    notes: "DB MarketUpdate tape loaded with sampler settings; suitable for factor search, not tick-complete replay.".to_string(),
+                    notes: "DB MarketUpdate tape includes point-in-time Chainlink reference prices and sampled CEX/PM updates; suitable for factor search, not tick-complete replay.".to_string(),
                 },
                 ResearchSnapshotSourceSurface {
                     name: "binance_lob_ticks".to_string(),
@@ -1462,6 +1477,18 @@ fn write_quality_markdown(path: &Path, manifest: &ResearchSnapshotManifest) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_market_symbols_to_chainlink_reference_symbols() {
+        assert_eq!(
+            chainlink_reference_symbols(&[
+                "BTCUSDT".to_string(),
+                "SOL/USD".to_string(),
+                "eth-usdc".to_string(),
+            ]),
+            ["btc/usd", "sol/usd", "eth/usd"]
+        );
+    }
 
     #[test]
     fn write_and_load_empty_snapshot_roundtrips_manifest() {

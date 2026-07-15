@@ -97,6 +97,7 @@ class FakeClient:
                     "name": name,
                     "hypothesis": f"{name} improves held-out calibration and executable PnL.",
                     "market_midpoint_weight": 1.0,
+                    "chainlink_digital_weight": 0.0,
                     "distance_lob_vol_weight": 1.0,
                     "event_surface_weight": 1.0,
                     "existing_model_weight": 1.0,

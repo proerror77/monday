@@ -72,15 +72,50 @@ REQUIRED_PROBABILITY_BLEND_FIELDS = {
     "name",
     "hypothesis",
     "market_midpoint_weight",
+    "chainlink_digital_weight",
     "distance_lob_vol_weight",
     "event_surface_weight",
     "existing_model_weight",
 }
-PROBABILITY_COMPONENTS = (
-    "market_midpoint",
-    "distance_lob_vol",
-    "event_surface",
-    "existing_model",
+PROBABILITY_COMPONENT_DESCRIPTIONS = (
+    {
+        "name": "market_midpoint",
+        "inputs": "Polymarket executable bid and ask midpoint",
+        "theory": "prediction-market consensus prior before independent evidence",
+    },
+    {
+        "name": "chainlink_digital",
+        "inputs": (
+            "fresh Chainlink current price, arrival-timestamped pre-open Chainlink "
+            "reference used to reconstruct the price-to-beat, remaining time, and "
+            "horizon volatility"
+        ),
+        "theory": (
+            "cash-or-nothing endpoint probability that the Chainlink settlement "
+            "price finishes above the point-in-time opening reference"
+        ),
+    },
+    {
+        "name": "distance_lob_vol",
+        "inputs": (
+            "CEX spot distance to price-to-beat, order-book imbalance, and "
+            "realized volatility"
+        ),
+        "theory": "microstructure-conditioned endpoint probability proxy",
+    },
+    {
+        "name": "event_surface",
+        "inputs": "train-only asset, time-to-expiry, and distance buckets",
+        "theory": "empirical endpoint frequency surface estimated without test labels",
+    },
+    {
+        "name": "existing_model",
+        "inputs": "CEX spot, contract price-to-beat metadata, remaining time, and horizon volatility",
+        "theory": "CEX log-moneyness scaled by horizon volatility endpoint proxy",
+    },
+)
+PROBABILITY_COMPONENTS = tuple(
+    component["name"] for component in PROBABILITY_COMPONENT_DESCRIPTIONS
 )
 FORMULA_MUTABLE_SCOPES = {"factor_ast", "factor_formula"}
 PROBABILITY_BLEND_MUTABLE_SCOPE = "probability_blend_weights"
@@ -165,6 +200,7 @@ def _proposal_json_schema() -> dict[str, Any]:
                         "name": {"type": "string"},
                         "hypothesis": {"type": "string"},
                         "market_midpoint_weight": {"type": "number", "minimum": 0},
+                        "chainlink_digital_weight": {"type": "number", "minimum": 0},
                         "distance_lob_vol_weight": {"type": "number", "minimum": 0},
                         "event_surface_weight": {"type": "number", "minimum": 0},
                         "existing_model_weight": {"type": "number", "minimum": 0},
@@ -694,7 +730,9 @@ def build_prompt(
         "mission": mission,
         "allowed_mutation_types": allowed_mutations_description(),
         "available_base_factors": available_base_factors,
-        "registered_probability_components": list(PROBABILITY_COMPONENTS),
+        "registered_probability_components": list(
+            PROBABILITY_COMPONENT_DESCRIPTIONS
+        ),
         "weak_dimensions": weak_dimensions,
         "prior_candidate_outcomes": qualitative_prediction_feedback(
             run.get("prediction_feedback"), mission
@@ -723,6 +761,7 @@ def build_prompt(
                     "name": "safe short identifier, required",
                     "hypothesis": "one falsifiable sentence, required",
                     "market_midpoint_weight": "non-negative number, required",
+                    "chainlink_digital_weight": "non-negative number, required",
                     "distance_lob_vol_weight": "non-negative number, required",
                     "event_surface_weight": "non-negative number, required",
                     "existing_model_weight": "non-negative number, required",

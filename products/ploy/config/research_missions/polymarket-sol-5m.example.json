@@ -3,7 +3,7 @@
   "mission_id": "polymarket-sol-5m-v1",
   "lane": "prediction_market",
   "objective": "Estimate official settlement probabilities for SOL five-minute Polymarket events before each entry cutoff.",
-  "hypothesis_scope": "Generate falsifiable SOL microstructure probability theories and test whether the registered market midpoint, distance-plus-LOB-volatility estimate, event surface, and existing model contain complementary pre-settlement information.",
+  "hypothesis_scope": "Generate falsifiable SOL cash-or-nothing endpoint-probability theories. Test whether fresh Chainlink price versus an arrival-timestamped pre-open Chainlink reference, remaining time, and horizon volatility add settlement-source information beyond the Polymarket midpoint, CEX distance-plus-LOB-volatility estimate, event surface, and CEX log-moneyness model.",
   "mutable_scope": [
     "probability_blend_weights"
   ],
@@ -13,8 +13,8 @@
     "SOL"
   ],
   "horizon": "5m",
-  "prompt_snapshot_id": "sha256:fc85bbbdeba2da844e2878e57b7dab4be01895db6f4e7736e942c8cff7635c51",
-  "search_policy_snapshot_id": "sha256:c236dffe69f59f6a1843b56ac305b2e01b961665ba8c42ec2ef9f3ae1e53130f",
+  "prompt_snapshot_id": "sha256:96cd4873dce8c2194d12373885d7f0a58d48d5c85eb3b5ce3ddba1a9fe525bd1",
+  "search_policy_snapshot_id": "sha256:b228d16c45aced2dd7fe9e0ae93c132f2679d16cd07508c0a002e259bfdba5fe",
   "search_budget": {
     "max_candidates": 6,
     "max_llm_calls": 2,

@@ -29,6 +29,7 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 
 ## Research framework cleanup
 
+- [x] Adapt the prediction Loop to binary/digital-option factors by exposing a point-in-time Chainlink endpoint-probability component without duplicating the existing CEX model.
 - [x] Split every prediction walk-forward lane by event end so unresolved events cannot cross train/test boundaries.
 - [x] Run `ploy-research` library tests in the active root CI workflow.
 - [x] Remove unused Monday research-store/search crates while preserving active DSL, manifest, and harness contracts.

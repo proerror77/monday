@@ -131,6 +131,11 @@ pub struct FactorObservation {
         default = "nan_f64",
         deserialize_with = "deserialize_nullable_f64_as_nan"
     )]
+    pub chainlink_prob_up: f64,
+    #[serde(
+        default = "nan_f64",
+        deserialize_with = "deserialize_nullable_f64_as_nan"
+    )]
     pub model_edge_up: f64,
     #[serde(
         default = "nan_f64",
@@ -270,6 +275,7 @@ pub struct EventFactorSummary {
     pub vol_gap: f64,
     pub distance_over_sigma: f64,
     pub model_prob_up: f64,
+    pub chainlink_prob_up: f64,
     pub model_edge_up: f64,
     pub reward_risk_up: f64,
     pub reward_risk_down: f64,
@@ -399,6 +405,8 @@ struct EventState {
     end_time: Option<DateTime<Utc>>,
     window_secs: Option<i64>,
     price_to_beat: Option<f64>,
+    chainlink_open_candidate: Option<(DateTime<Utc>, f64)>,
+    chainlink_price_to_beat: Option<f64>,
     resolved_up_won: Option<bool>,
     up_token: String,
     down_token: String,
@@ -1122,6 +1130,7 @@ pub fn build_factor_observations_with_lob_sampled(
     let mut buf_10s: HashMap<String, DriftBuffer> = HashMap::new();
     let mut drift_state: HashMap<String, DriftState> = HashMap::new();
     let mut spot: HashMap<String, (DateTime<Utc>, f64)> = HashMap::new();
+    let mut chainlink: HashMap<String, (DateTime<Utc>, DateTime<Utc>, f64)> = HashMap::new();
     let mut vol: HashMap<String, VolatilityState> = HashMap::new();
     let mut retbuf: HashMap<String, ReturnBuffer> = HashMap::new();
     let mut events: HashMap<String, EventState> = HashMap::new();
@@ -1143,7 +1152,7 @@ pub fn build_factor_observations_with_lob_sampled(
     }
 
     let mut ordered_updates: Vec<&MarketUpdate> = updates.iter().collect();
-    ordered_updates.sort_by_key(|update| update_sort_ts(update));
+    ordered_updates.sort_by_key(|update| (update_sort_ts(update), update_sort_priority(update)));
 
     for update in ordered_updates {
         match update {
@@ -1175,6 +1184,8 @@ pub fn build_factor_observations_with_lob_sampled(
                         end_time: Some(*end_time),
                         window_secs: Some(*window_secs as i64),
                         price_to_beat: price_to_beat.and_then(|value| value.to_f64()),
+                        chainlink_open_candidate: None,
+                        chainlink_price_to_beat: None,
                         resolved_up_won,
                         up_token: up_token.to_string(),
                         down_token: down_token.to_string(),
@@ -1243,6 +1254,65 @@ pub fn build_factor_observations_with_lob_sampled(
                         obi_10: *obi,
                     },
                 );
+            }
+            MarketUpdate::ReferencePrice {
+                symbol,
+                source,
+                price,
+                is_carried_forward,
+                ts,
+                received_at,
+                ..
+            } => {
+                if !*is_carried_forward && source.eq_ignore_ascii_case("chainlink") {
+                    if let (Some(price), Some(available_at)) =
+                        (price.to_f64().filter(|price| *price > 0.0), *received_at)
+                    {
+                        let underlying = normalized_underlying_symbol(symbol);
+                        chainlink.insert(underlying.clone(), (*ts, available_at, price));
+
+                        let max_open_offset_secs = max_quote_age_secs.max(0) as f64;
+                        let matching_event_ids = events_by_symbol
+                            .iter()
+                            .filter(|(event_symbol, _)| {
+                                normalized_underlying_symbol(event_symbol) == underlying
+                            })
+                            .flat_map(|(_, event_ids)| event_ids.iter().cloned())
+                            .collect::<Vec<_>>();
+                        for event_id in matching_event_ids {
+                            let Some(event) = events.get_mut(&event_id) else {
+                                continue;
+                            };
+                            if event.chainlink_price_to_beat.is_some() {
+                                continue;
+                            }
+                            let Some(start_time) = event.start_time else {
+                                continue;
+                            };
+                            if *ts < start_time {
+                                let lead_secs =
+                                    (start_time - *ts).num_milliseconds() as f64 / 1000.0;
+                                if lead_secs <= max_open_offset_secs
+                                    && event
+                                        .chainlink_open_candidate
+                                        .is_none_or(|(candidate_ts, _)| *ts > candidate_ts)
+                                {
+                                    event.chainlink_open_candidate = Some((*ts, price));
+                                }
+                            } else {
+                                let delay_secs =
+                                    (*ts - start_time).num_milliseconds() as f64 / 1000.0;
+                                if delay_secs <= max_open_offset_secs {
+                                    // Freeze the last fresh pre-open tick once the first
+                                    // post-start tick makes the opening window observable.
+                                    event.chainlink_price_to_beat = event
+                                        .chainlink_open_candidate
+                                        .map(|(_, candidate_price)| candidate_price);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             MarketUpdate::SpotPrice { symbol, price, ts } => {
                 let Some(spot_price) = price.to_f64() else {
@@ -1372,7 +1442,13 @@ pub fn build_factor_observations_with_lob_sampled(
                     let Some(event) = events.get(event_id) else {
                         continue;
                     };
-                    let Some(price_to_beat) = event.price_to_beat else {
+                    let chainlink_price_to_beat = event.chainlink_price_to_beat.or_else(|| {
+                        event
+                            .chainlink_open_candidate
+                            .map(|(_, candidate_price)| candidate_price)
+                    });
+                    let Some(price_to_beat) = event.price_to_beat.or(chainlink_price_to_beat)
+                    else {
                         continue;
                     };
                     let Some(end_time) = event.end_time else {
@@ -1543,6 +1619,30 @@ pub fn build_factor_observations_with_lob_sampled(
 
                     let model_prob_up =
                         estimate_probability(price_to_beat, spot_price, sigma_horizon);
+                    let chainlink_prob_up = chainlink_price_to_beat
+                        .and_then(|chainlink_price_to_beat| {
+                            chainlink.get(&normalized_underlying_symbol(&sym)).and_then(
+                                |(source_ts, available_at, reference_price)| {
+                                    let source_lag_secs =
+                                        (*ts - *source_ts).num_milliseconds() as f64 / 1000.0;
+                                    let availability_lag_secs =
+                                        (*ts - *available_at).num_milliseconds() as f64 / 1000.0;
+                                    let max_age_secs = max_quote_age_secs.max(0) as f64;
+                                    (source_lag_secs >= 0.0
+                                        && source_lag_secs <= max_age_secs
+                                        && availability_lag_secs >= 0.0
+                                        && availability_lag_secs <= max_age_secs)
+                                        .then(|| {
+                                            estimate_probability(
+                                                chainlink_price_to_beat,
+                                                *reference_price,
+                                                sigma_horizon,
+                                            )
+                                        })
+                                },
+                            )
+                        })
+                        .unwrap_or(f64::NAN);
                     let model_edge_up = if up_ask.is_finite() {
                         model_prob_up - up_ask - crypto_fee_cost(up_ask)
                     } else {
@@ -1579,6 +1679,7 @@ pub fn build_factor_observations_with_lob_sampled(
                         vol_gap,
                         distance_over_sigma,
                         model_prob_up,
+                        chainlink_prob_up,
                         model_edge_up,
                         reward_risk_up,
                         reward_risk_down,
@@ -1730,6 +1831,7 @@ pub fn build_event_summaries(rows: &[FactorObservation]) -> Vec<EventFactorSumma
                 vol_gap: mean(rows.iter().map(|row| row.vol_gap)),
                 distance_over_sigma: mean(rows.iter().map(|row| row.distance_over_sigma)),
                 model_prob_up: mean(rows.iter().map(|row| row.model_prob_up)),
+                chainlink_prob_up: mean(rows.iter().map(|row| row.chainlink_prob_up)),
                 model_edge_up: mean(rows.iter().map(|row| row.model_edge_up)),
                 reward_risk_up: mean(rows.iter().map(|row| row.reward_risk_up)),
                 reward_risk_down: mean(rows.iter().map(|row| row.reward_risk_down)),
@@ -1979,6 +2081,7 @@ pub fn observations_to_frame(rows: &[FactorObservation]) -> PolarsResult<DataFra
         "vol_gap" => rows.iter().map(|row| row.vol_gap).collect::<Vec<_>>(),
         "distance_over_sigma" => rows.iter().map(|row| row.distance_over_sigma).collect::<Vec<_>>(),
         "model_prob_up" => rows.iter().map(|row| row.model_prob_up).collect::<Vec<_>>(),
+        "chainlink_prob_up" => rows.iter().map(|row| row.chainlink_prob_up).collect::<Vec<_>>(),
         "model_edge_up" => rows.iter().map(|row| row.model_edge_up).collect::<Vec<_>>(),
         "reward_risk_up" => rows.iter().map(|row| row.reward_risk_up).collect::<Vec<_>>(),
         "reward_risk_down" => rows.iter().map(|row| row.reward_risk_down).collect::<Vec<_>>(),
@@ -2031,6 +2134,7 @@ fn row_factor_accessors() -> Vec<(&'static str, fn(&FactorObservation) -> f64)> 
         ("vol_gap", |row| row.vol_gap),
         ("distance_over_sigma", |row| row.distance_over_sigma),
         ("model_prob_up", |row| row.model_prob_up),
+        ("chainlink_prob_up", |row| row.chainlink_prob_up),
         ("model_edge_up", |row| row.model_edge_up),
         ("reward_risk_up", |row| row.reward_risk_up),
         ("reward_risk_down", |row| row.reward_risk_down),
@@ -2090,6 +2194,7 @@ fn event_factor_accessors() -> Vec<(&'static str, fn(&EventFactorSummary) -> f64
         ("vol_gap", |row| row.vol_gap),
         ("distance_over_sigma", |row| row.distance_over_sigma),
         ("model_prob_up", |row| row.model_prob_up),
+        ("chainlink_prob_up", |row| row.chainlink_prob_up),
         ("model_edge_up", |row| row.model_edge_up),
         ("reward_risk_up", |row| row.reward_risk_up),
         ("reward_risk_down", |row| row.reward_risk_down),
@@ -2159,6 +2264,18 @@ fn estimate_probability(s0: f64, st: f64, sigma_horizon: f64) -> f64 {
     }
     let z = (st / s0).ln() / sigma_horizon;
     normal_cdf(z)
+}
+
+pub(crate) fn normalized_underlying_symbol(raw: &str) -> String {
+    let normalized = raw.trim().to_ascii_uppercase().replace(['/', '-', '_'], "");
+    for quote in ["USDT", "USDC", "USD"] {
+        if let Some(base) = normalized.strip_suffix(quote) {
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    normalized
 }
 
 fn quote_mid(bid: f64, ask: f64) -> f64 {
@@ -2381,8 +2498,10 @@ fn update_sort_ts(update: &MarketUpdate) -> DateTime<Utc> {
         | MarketUpdate::SportsState { ts, .. }
         | MarketUpdate::SportsPregame { ts, .. }
         | MarketUpdate::SportsLive { ts, .. }
-        | MarketUpdate::ReferencePrice { ts, .. }
         | MarketUpdate::Kline { ts, .. } => *ts,
+        MarketUpdate::ReferencePrice {
+            ts, received_at, ..
+        } => received_at.unwrap_or(*ts),
         MarketUpdate::EventDiscovered {
             end_time,
             window_secs,
@@ -2391,6 +2510,14 @@ fn update_sort_ts(update: &MarketUpdate) -> DateTime<Utc> {
             *end_time - chrono::Duration::seconds(*window_secs as i64) - chrono::Duration::hours(1)
         }
         MarketUpdate::EventExpired { end_time, .. } => *end_time,
+    }
+}
+
+fn update_sort_priority(update: &MarketUpdate) -> u8 {
+    if matches!(update, MarketUpdate::ReferencePrice { .. }) {
+        0
+    } else {
+        1
     }
 }
 
@@ -2455,8 +2582,8 @@ pub fn export_observations_parquet(
 mod tests {
     use super::{
         attach_future_pm_labels, build_factor_observations_with_lob,
-        build_task_grain_derived_artifacts_for_event_ids, pearson_ic, spearman_ic,
-        FactorObservation, LabelField, PM_BOOK_SAMPLED_QUERY,
+        build_task_grain_derived_artifacts_for_event_ids, estimate_probability, pearson_ic,
+        spearman_ic, FactorObservation, LabelField, PM_BOOK_SAMPLED_QUERY,
     };
     use chrono::{TimeZone, Utc};
     use ploy_market_contracts::MarketUpdate;
@@ -2514,6 +2641,7 @@ mod tests {
             vol_gap: 0.0,
             distance_over_sigma: 0.0,
             model_prob_up: 0.5,
+            chainlink_prob_up: f64::NAN,
             model_edge_up: 0.0,
             reward_risk_up: 1.0,
             reward_risk_down: 1.0,
@@ -2655,6 +2783,30 @@ mod tests {
                 price_to_beat: Some(Decimal::new(100, 0)),
                 resolved_up_won: None,
             },
+            // Legacy reference evidence without an arrival time must not seed
+            // the new point-in-time component.
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: None,
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+            },
+            // A post-start tick alone is current-price evidence, not opening-strike
+            // provenance, so it must not make the component available either.
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(10001, 2),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(709, 0).unwrap()),
+                ts: Utc.timestamp_opt(708, 0).unwrap(),
+            },
             MarketUpdate::Quote {
                 token_id: Arc::from("up"),
                 bid: Some(Decimal::new(45, 2)),
@@ -2698,6 +2850,157 @@ mod tests {
         assert_eq!(rows[0].tick_ts, Utc.timestamp_opt(710, 0).unwrap());
         assert_eq!(rows[0].event_window_secs, 300);
         assert!(rows[0].tick_ts >= start);
+        assert!(rows[0].chainlink_prob_up.is_nan());
+    }
+
+    #[test]
+    fn factor_observations_use_only_fresh_chainlink_binary_probability() {
+        let end = Utc.timestamp_opt(1000, 0).unwrap();
+        let updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("evt"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: Some(Decimal::new(90, 0)),
+                resolved_up_won: None,
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+            },
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(45, 2)),
+                ask: Some(Decimal::new(46, 2)),
+                bid_size: Some(Decimal::new(100, 0)),
+                ask_size: Some(Decimal::new(100, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: Utc.timestamp_opt(709, 0).unwrap(),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(102, 0),
+                ts: Utc.timestamp_opt(710, 0).unwrap(),
+            },
+            // Intentionally follows SpotPrice in input order. The availability-time
+            // tie-break must process the reference before the observation.
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(10001, 2),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(708, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(710, 0).unwrap()),
+            },
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(47, 2)),
+                ask: Some(Decimal::new(48, 2)),
+                bid_size: Some(Decimal::new(100, 0)),
+                ask_size: Some(Decimal::new(100, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: Utc.timestamp_opt(749, 0).unwrap(),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(103, 0),
+                ts: Utc.timestamp_opt(750, 0).unwrap(),
+            },
+            MarketUpdate::EventExpired {
+                event_id: Arc::from("evt"),
+                end_time: end,
+                resolved_up_won: Some(true),
+            },
+        ];
+
+        let rows = build_factor_observations_with_lob(&updates, &[], 30);
+
+        assert_eq!(rows.len(), 2);
+        let expected = estimate_probability(100.0, 100.01, rows[0].sigma_horizon);
+        assert!((rows[0].chainlink_prob_up - expected).abs() < 1e-9);
+        assert!(rows[0].model_prob_up > rows[0].chainlink_prob_up);
+        assert!(rows[1].chainlink_prob_up.is_nan());
+    }
+
+    #[test]
+    fn factor_observations_do_not_see_delayed_chainlink_before_it_was_received() {
+        let end = Utc.timestamp_opt(1000, 0).unwrap();
+        let updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("evt"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: Some(Decimal::new(100, 0)),
+                resolved_up_won: None,
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+            },
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(45, 2)),
+                ask: Some(Decimal::new(46, 2)),
+                bid_size: Some(Decimal::new(100, 0)),
+                ask_size: Some(Decimal::new(100, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: Utc.timestamp_opt(709, 0).unwrap(),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(101, 0),
+                ts: Utc.timestamp_opt(710, 0).unwrap(),
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(10001, 2),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                ts: Utc.timestamp_opt(708, 0).unwrap(),
+                received_at: Some(Utc.timestamp_opt(715, 0).unwrap()),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(101, 0),
+                ts: Utc.timestamp_opt(716, 0).unwrap(),
+            },
+            MarketUpdate::EventExpired {
+                event_id: Arc::from("evt"),
+                end_time: end,
+                resolved_up_won: Some(true),
+            },
+        ];
+
+        let rows = build_factor_observations_with_lob(&updates, &[], 30);
+
+        assert_eq!(rows.len(), 2);
+        assert!((rows[0].chainlink_prob_up - 0.5).abs() < 1e-9);
+        assert!(rows[1].chainlink_prob_up > rows[0].chainlink_prob_up);
     }
 
     #[test]
@@ -2927,6 +3230,7 @@ mod tests {
                     vol_gap: -0.8,
                     distance_over_sigma: 0.0,
                     model_prob_up: 0.5,
+                    chainlink_prob_up: f64::NAN,
                     model_edge_up: 0.0,
                     reward_risk_up: 1.0,
                     reward_risk_down: 0.5,
@@ -2985,6 +3289,7 @@ mod tests {
                     vol_gap: -0.7,
                     distance_over_sigma: 0.0,
                     model_prob_up: 0.5,
+                    chainlink_prob_up: f64::NAN,
                     model_edge_up: 0.0,
                     reward_risk_up: 4.0,
                     reward_risk_down: 0.1,
@@ -3043,6 +3348,7 @@ mod tests {
                     vol_gap: -0.6,
                     distance_over_sigma: 0.0,
                     model_prob_up: 0.5,
+                    chainlink_prob_up: f64::NAN,
                     model_edge_up: 0.0,
                     reward_risk_up: 0.6,
                     reward_risk_down: 1.5,

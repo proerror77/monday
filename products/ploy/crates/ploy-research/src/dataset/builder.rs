@@ -468,6 +468,7 @@ mod tests {
             vol_gap: 0.0,
             distance_over_sigma: 0.0,
             model_prob_up: 0.5,
+            chainlink_prob_up: f64::NAN,
             model_edge_up: 0.0,
             reward_risk_up: 1.0,
             reward_risk_down: 1.0,

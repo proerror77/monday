@@ -138,6 +138,71 @@ const BINANCE_LOB_SAMPLED_QUERY: &str = r#"
         ORDER BY lob.event_time
         "#;
 
+const REFERENCE_PRICE_TICKS_QUERY: &str = r#"
+        WITH reference_ticks AS (
+            SELECT
+                lower(symbol) AS symbol,
+                lower(source) AS source,
+                asset_class,
+                price,
+                full_accuracy_value,
+                price_time,
+                received_at,
+                is_carried_forward,
+                0 AS source_rank,
+                id AS row_id
+            FROM reference_price_ticks
+            WHERE lower(symbol) = ANY($1)
+              AND received_at >= $2
+              AND received_at <= $3
+
+            UNION ALL
+
+            SELECT
+                lower(symbol) AS symbol,
+                'chainlink'::text AS source,
+                'crypto'::text AS asset_class,
+                price,
+                NULL::text AS full_accuracy_value,
+                source_timestamp AS price_time,
+                received_at,
+                false AS is_carried_forward,
+                1 AS source_rank,
+                id AS row_id
+            FROM chainlink_price_ticks
+            WHERE lower(symbol) = ANY($1)
+              AND received_at >= $2
+              AND received_at <= $3
+        ), ranked AS (
+            SELECT
+                symbol,
+                source,
+                asset_class,
+                price,
+                full_accuracy_value,
+                price_time,
+                received_at,
+                is_carried_forward,
+                row_number() OVER (
+                    PARTITION BY symbol, source, price_time, price
+                    ORDER BY received_at ASC, source_rank ASC, row_id ASC
+                ) AS duplicate_rank
+            FROM reference_ticks
+        )
+        SELECT
+            symbol,
+            source,
+            asset_class,
+            price,
+            full_accuracy_value,
+            price_time,
+            received_at,
+            is_carried_forward
+        FROM ranked
+        WHERE duplicate_rank = 1
+        ORDER BY received_at, price_time, symbol, source, price
+        "#;
+
 /// Historical research backtests only trust canonical historical PM quote captures.
 ///
 /// Older `ploy_runner_live` rows were synthetic midpoint quotes; newer rows carry
@@ -151,7 +216,7 @@ const TRUSTED_PM_RESEARCH_QUOTE_SOURCES: &[&str] = &[
     "ploy_runner_live",
 ];
 
-/// One persisted reference-price tick from `reference_price_ticks`.
+/// One persisted reference-price tick from the canonical or legacy capture.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ReferencePriceTick {
     pub symbol: String,
@@ -413,41 +478,24 @@ async fn load_agg_trades(
     Ok(())
 }
 
-/// Load reference-price ticks from the additive `reference_price_ticks` table.
+/// Load canonical reference ticks plus the legacy Chainlink capture.
 pub async fn load_reference_price_ticks(
     pool: &PgPool,
     symbols: &[String],
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<Vec<ReferencePriceTick>, sqlx::Error> {
-    sqlx::query_as(
-        r#"
-        SELECT
-            symbol,
-            source,
-            asset_class,
-            price,
-            full_accuracy_value,
-            price_time,
-            received_at,
-            is_carried_forward
-        FROM reference_price_ticks
-        WHERE symbol = ANY($1)
-          AND price_time >= $2
-          AND price_time <= $3
-        ORDER BY price_time
-        "#,
-    )
-    .bind(
-        &symbols
-            .iter()
-            .map(|symbol| symbol.trim().to_lowercase())
-            .collect::<Vec<_>>(),
-    )
-    .bind(from)
-    .bind(to)
-    .fetch_all(pool)
-    .await
+    sqlx::query_as(REFERENCE_PRICE_TICKS_QUERY)
+        .bind(
+            &symbols
+                .iter()
+                .map(|symbol| symbol.trim().to_lowercase())
+                .collect::<Vec<_>>(),
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_all(pool)
+        .await
 }
 
 /// Load reference-price ticks as canonical `MarketUpdate` values.
@@ -462,7 +510,7 @@ pub async fn load_reference_price_updates(
     info!(
         count = rows.len(),
         symbols = ?symbols,
-        "Loaded reference prices from reference_price_ticks"
+        "Loaded reference prices from canonical and legacy captures"
     );
 
     Ok(rows
@@ -474,6 +522,7 @@ pub async fn load_reference_price_updates(
             price: row.price,
             full_accuracy_value: row.full_accuracy_value.map(Arc::from),
             is_carried_forward: row.is_carried_forward,
+            received_at: Some(row.received_at),
             ts: row.price_time,
         })
         .collect())
@@ -1178,7 +1227,7 @@ mod tests {
         book_levels_from_json, build_event_updates, l2_updates_from_book, near_depth,
         official_settlement_coverage, EventMetadataRow, MarketUpdate,
         BINANCE_AGG_TRADE_SAMPLED_QUERY, BINANCE_LOB_SAMPLED_QUERY, BINANCE_PRICE_SAMPLED_QUERY,
-        SYNC_RECORDS_SPOT_SAMPLED_QUERY,
+        REFERENCE_PRICE_TICKS_QUERY, SYNC_RECORDS_SPOT_SAMPLED_QUERY,
     };
 
     #[test]
@@ -1246,6 +1295,19 @@ mod tests {
         assert!(BINANCE_AGG_TRADE_SAMPLED_QUERY.contains("ORDER BY trade_time ASC"));
         assert!(BINANCE_LOB_SAMPLED_QUERY.contains("event_time >= buckets.bucket_start"));
         assert!(BINANCE_LOB_SAMPLED_QUERY.contains("ORDER BY event_time DESC"));
+    }
+
+    #[test]
+    fn reference_price_query_preserves_source_and_arrival_time() {
+        let query = REFERENCE_PRICE_TICKS_QUERY
+            .split_whitespace()
+            .collect::<String>();
+
+        assert!(query.contains("source_timestampASprice_time"));
+        assert_eq!(query.matches("received_at>=$2").count(), 2);
+        assert!(query.contains("PARTITIONBYsymbol,source,price_time,price"));
+        assert!(query.contains("ORDERBYreceived_atASC,source_rankASC,row_idASC"));
+        assert!(query.ends_with("ORDERBYreceived_at,price_time,symbol,source,price"));
     }
 
     #[test]

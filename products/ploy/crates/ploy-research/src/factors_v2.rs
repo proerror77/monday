@@ -5,7 +5,10 @@ use ploy_operator_contracts::Regime;
 use serde::{Deserialize, Serialize};
 
 use crate::autofactor::{LlmPriorSpec, LlmProbabilityBlendSpec};
-use crate::factors::{pearson_ic, spearman_ic, FactorObservation, ResearchPmBookSnapshot};
+use crate::factors::{
+    normalized_underlying_symbol, pearson_ic, spearman_ic, FactorObservation,
+    ResearchPmBookSnapshot,
+};
 
 const DEFAULT_STAKE_USD: f64 = 15.0;
 const DEFAULT_TOP_QUANTILE: f64 = 0.2;
@@ -129,6 +132,8 @@ pub struct FactorObservationV2 {
     pub side: ReviewSide,
 
     pub side_model_prob: f64,
+    #[serde(default = "nan_f64")]
+    pub side_chainlink_prob: f64,
     pub side_fair_prob: f64,
     pub side_model_edge: f64,
     pub side_distance_over_sigma: f64,
@@ -2729,10 +2734,25 @@ fn build_settlement_probability_report_with_surface<'a>(
         options.event_surface_shrinkage_observations,
     );
 
-    let typed_blends = validated_probability_blends(prior);
+    let raw_chainlink_support_complete = eligible_rows
+        .iter()
+        .all(|(row, ..)| valid_probability(row.side_chainlink_prob));
+    let typed_chainlink_support_complete = eligible_rows
+        .iter()
+        .filter(|(row, ..)| prior.is_none_or(|prior| prediction_prior_matches_row(prior, row)))
+        .all(|(row, ..)| valid_probability(row.side_chainlink_prob));
+    let typed_blends = validated_probability_blends(prior)
+        .into_iter()
+        .filter(|(_, blend)| {
+            blend.chainlink_digital_weight <= EPS || typed_chainlink_support_complete
+        })
+        .collect::<Vec<_>>();
     let mut by_model: BTreeMap<String, Vec<SettlementProbabilitySample>> = BTreeMap::new();
     for (row, win, pnl, conservative_pnl) in eligible_rows {
         for (model, q) in settlement_probability_models(row) {
+            if model == "q_chainlink_digital" && !raw_chainlink_support_complete {
+                continue;
+            }
             push_settlement_probability_sample(
                 &mut by_model,
                 model,
@@ -8186,10 +8206,13 @@ fn event_surface_distance_bucket(distance_z: f64) -> &'static str {
 }
 
 fn settlement_probability_models(row: &FactorObservationV2) -> Vec<(&'static str, f64)> {
-    let mut models = Vec::with_capacity(8);
+    let mut models = Vec::with_capacity(9);
     models.push(("q_naive_50_50", 0.5));
     if let Some(q) = settlement_market_midpoint_probability(row) {
         models.push(("q_market_midpoint", q));
+    }
+    if valid_probability(row.side_chainlink_prob) {
+        models.push(("q_chainlink_digital", row.side_chainlink_prob));
     }
     if row.side_distance_over_sigma.is_finite() {
         let base_z = row.side_distance_over_sigma;
@@ -8222,7 +8245,7 @@ fn settlement_probability_final_blend(
     row: &FactorObservationV2,
     event_surface_q: Option<f64>,
 ) -> Option<f64> {
-    settlement_probability_weighted_components(row, event_surface_q, 0.45, 0.35, 0.20, 0.0)
+    settlement_probability_weighted_components(row, event_surface_q, 0.45, 0.0, 0.35, 0.20, 0.0)
 }
 
 fn validated_probability_blends(
@@ -8294,28 +8317,17 @@ fn prediction_prior_matches_row(prior: &LlmPriorSpec, row: &FactorObservationV2)
     if prior.symbols.is_empty() {
         return true;
     }
-    let row_symbol = prediction_underlying_symbol(&row.symbol);
+    let row_symbol = normalized_underlying_symbol(&row.symbol);
     prior
         .symbols
         .iter()
-        .any(|symbol| prediction_underlying_symbol(symbol) == row_symbol)
-}
-
-fn prediction_underlying_symbol(raw: &str) -> String {
-    let normalized = raw.trim().to_ascii_uppercase().replace(['/', '-', '_'], "");
-    for quote in ["USDT", "USDC", "USD"] {
-        if let Some(base) = normalized.strip_suffix(quote) {
-            if !base.is_empty() {
-                return base.to_string();
-            }
-        }
-    }
-    normalized
+        .any(|symbol| normalized_underlying_symbol(symbol) == row_symbol)
 }
 
 fn probability_blend_weights_valid(blend: &LlmProbabilityBlendSpec) -> bool {
     let weights = [
         blend.market_midpoint_weight,
+        blend.chainlink_digital_weight,
         blend.distance_lob_vol_weight,
         blend.event_surface_weight,
         blend.existing_model_weight,
@@ -8348,10 +8360,14 @@ fn settlement_probability_weighted_blend(
     if !probability_blend_weights_valid(blend) {
         return None;
     }
+    if blend.chainlink_digital_weight > EPS && !valid_probability(row.side_chainlink_prob) {
+        return None;
+    }
     settlement_probability_weighted_components(
         row,
         event_surface_q,
         blend.market_midpoint_weight,
+        blend.chainlink_digital_weight,
         blend.distance_lob_vol_weight,
         blend.event_surface_weight,
         blend.existing_model_weight,
@@ -8362,6 +8378,7 @@ fn settlement_probability_weighted_components(
     row: &FactorObservationV2,
     event_surface_q: Option<f64>,
     market_midpoint_weight: f64,
+    chainlink_digital_weight: f64,
     distance_lob_vol_weight: f64,
     event_surface_weight: f64,
     existing_model_weight: f64,
@@ -8373,6 +8390,12 @@ fn settlement_probability_weighted_components(
         &mut total_weight,
         settlement_market_midpoint_probability(row),
         market_midpoint_weight,
+    );
+    add_probability_component(
+        &mut logit_sum,
+        &mut total_weight,
+        valid_probability(row.side_chainlink_prob).then_some(row.side_chainlink_prob),
+        chainlink_digital_weight,
     );
     add_probability_component(
         &mut logit_sum,
@@ -9084,6 +9107,11 @@ fn side_row(
             )
         }
     };
+    let side_chainlink_prob = match side {
+        ReviewSide::Up => row.chainlink_prob_up,
+        ReviewSide::Down if row.chainlink_prob_up.is_finite() => 1.0 - row.chainlink_prob_up,
+        ReviewSide::Down => f64::NAN,
+    };
 
     let entry_shares = if valid_price(entry_ask) {
         stake_usd / entry_ask
@@ -9271,6 +9299,7 @@ fn side_row(
         regime: Regime::from_secs(row.time_remaining_secs),
         side,
         side_model_prob,
+        side_chainlink_prob,
         side_fair_prob,
         side_model_edge,
         side_distance_over_sigma,
@@ -10333,6 +10362,7 @@ mod tests {
             vol_gap: 0.0,
             distance_over_sigma: 1.0,
             model_prob_up: 0.7,
+            chainlink_prob_up: f64::NAN,
             model_edge_up: 0.2,
             reward_risk_up: 1.0,
             reward_risk_down: 1.0,
@@ -10799,6 +10829,7 @@ mod tests {
                 "name": "microstructure",
                 "hypothesis": "CEX-informed components improve BTC calibration.",
                 "market_midpoint_weight": 0.4,
+                "chainlink_digital_weight": 0.0,
                 "distance_lob_vol_weight": 0.4,
                 "event_surface_weight": 0.2,
                 "existing_model_weight": 0.0
@@ -10830,6 +10861,98 @@ mod tests {
     }
 
     #[test]
+    fn chainlink_only_typed_blend_preserves_binary_complements() {
+        let mut observation = base_obs();
+        observation.chainlink_prob_up = 0.73;
+        let rows = build_factor_observations_v2(&[observation], &FactorReviewOptions::default());
+        let blend = crate::autofactor::LlmProbabilityBlendSpec {
+            name: "chainlink_only".to_string(),
+            hypothesis: "Fresh Chainlink endpoint probability is the sole component.".to_string(),
+            market_midpoint_weight: 0.0,
+            chainlink_digital_weight: 1.0,
+            distance_lob_vol_weight: 0.0,
+            event_surface_weight: 0.0,
+            existing_model_weight: 0.0,
+        };
+
+        for (side, expected) in [(ReviewSide::Up, 0.73), (ReviewSide::Down, 0.27)] {
+            let row = rows
+                .iter()
+                .find(|row| row.side == side)
+                .expect("both binary sides");
+            let probability = settlement_probability_weighted_blend(row, None, &blend)
+                .expect("valid Chainlink-only blend");
+            assert!((probability - expected).abs() < 1e-12);
+        }
+
+        let mut missing_chainlink = rows[0].clone();
+        missing_chainlink.side_chainlink_prob = f64::NAN;
+        assert!(settlement_probability_weighted_blend(&missing_chainlink, None, &blend).is_none());
+
+        let prior = crate::autofactor::LlmPriorSpec {
+            target: Some("full_depth_settlement_executable_pnl".to_string()),
+            mission_id: Some("polymarket-btc-5m-v1".to_string()),
+            data_snapshot_id: Some("sha256:data".to_string()),
+            prompt_snapshot_id: Some("sha256:prompt".to_string()),
+            search_policy_snapshot_id: Some("sha256:policy".to_string()),
+            symbols: vec!["BTC".to_string()],
+            horizon: Some("5m".to_string()),
+            probability_blends: vec![blend.clone()],
+            ..Default::default()
+        };
+        let mut eligible_rows = rows.clone();
+        make_settlement_probability_eligible(&mut eligible_rows);
+        let report = build_settlement_probability_report_with_prior(
+            &eligible_rows,
+            Some(&prior),
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                top_edge_quantile: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(report
+            .baselines
+            .iter()
+            .any(|row| row.model == "q_llm_chainlink_only"));
+        assert!(report
+            .baselines
+            .iter()
+            .any(|row| row.model == "q_chainlink_digital"));
+
+        eligible_rows[0].side_chainlink_prob = f64::NAN;
+        let incomplete = build_settlement_probability_report_with_prior(
+            &eligible_rows,
+            Some(&prior),
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                top_edge_quantile: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(incomplete
+            .baselines
+            .iter()
+            .all(|row| row.model != "q_llm_chainlink_only"));
+        assert!(incomplete
+            .baselines
+            .iter()
+            .all(|row| row.model != "q_chainlink_digital"));
+
+        let legacy: crate::autofactor::LlmProbabilityBlendSpec =
+            serde_json::from_value(serde_json::json!({
+                "name": "legacy",
+                "hypothesis": "An old prior keeps its original blend.",
+                "market_midpoint_weight": 1.0,
+                "distance_lob_vol_weight": 0.0,
+                "event_surface_weight": 0.0,
+                "existing_model_weight": 0.0
+            }))
+            .expect("legacy blend");
+        assert_eq!(legacy.chainlink_digital_weight, 0.0);
+    }
+
+    #[test]
     fn invalid_typed_probability_blends_fail_closed() {
         let options = FactorReviewOptions::default();
         let mut rows = build_factor_observations_v2(&[base_obs()], &options);
@@ -10847,6 +10970,7 @@ mod tests {
                     "name": "negative",
                     "hypothesis": "Negative weights must be rejected.",
                     "market_midpoint_weight": -1.0,
+                    "chainlink_digital_weight": 0.0,
                     "distance_lob_vol_weight": 1.0,
                     "event_surface_weight": 0.0,
                     "existing_model_weight": 0.0
@@ -10855,6 +10979,7 @@ mod tests {
                     "name": "all_zero",
                     "hypothesis": "Zero total weight must be rejected.",
                     "market_midpoint_weight": 0.0,
+                    "chainlink_digital_weight": 0.0,
                     "distance_lob_vol_weight": 0.0,
                     "event_surface_weight": 0.0,
                     "existing_model_weight": 0.0
@@ -10863,6 +10988,7 @@ mod tests {
                     "name": "overflow",
                     "hypothesis": "Overflowing total weight must be rejected.",
                     "market_midpoint_weight": 1e308,
+                    "chainlink_digital_weight": 0.0,
                     "distance_lob_vol_weight": 1e308,
                     "event_surface_weight": 0.0,
                     "existing_model_weight": 0.0
@@ -10900,6 +11026,7 @@ mod tests {
                 "name": "mixed",
                 "hypothesis": "A mixed-symbol candidate must not be evaluated.",
                 "market_midpoint_weight": 1.0,
+                "chainlink_digital_weight": 0.0,
                 "distance_lob_vol_weight": 0.0,
                 "event_surface_weight": 0.0,
                 "existing_model_weight": 0.0
@@ -10939,6 +11066,7 @@ mod tests {
             "name": "otherwise_valid",
             "hypothesis": "The blend itself is valid.",
             "market_midpoint_weight": 1.0,
+            "chainlink_digital_weight": 0.0,
             "distance_lob_vol_weight": 0.0,
             "event_surface_weight": 0.0,
             "existing_model_weight": 0.0
@@ -10967,6 +11095,7 @@ mod tests {
                     "name": "sol_flow",
                     "hypothesis": "SOL flow components improve OOS calibration.",
                     "market_midpoint_weight": 0.5,
+                    "chainlink_digital_weight": 0.0,
                     "distance_lob_vol_weight": 0.3,
                     "event_surface_weight": 0.2,
                     "existing_model_weight": 0.0
@@ -10975,6 +11104,7 @@ mod tests {
                     "name": "no_oos",
                     "hypothesis": "This candidate still requires OOS evidence.",
                     "market_midpoint_weight": 1.0,
+                    "chainlink_digital_weight": 0.0,
                     "distance_lob_vol_weight": 0.0,
                     "event_surface_weight": 0.0,
                     "existing_model_weight": 0.0
@@ -11082,6 +11212,7 @@ mod tests {
                 "name": "walk_forward",
                 "hypothesis": "The blend improves event-disjoint OOS calibration.",
                 "market_midpoint_weight": 0.4,
+                "chainlink_digital_weight": 0.0,
                 "distance_lob_vol_weight": 0.4,
                 "event_surface_weight": 0.2,
                 "existing_model_weight": 0.0

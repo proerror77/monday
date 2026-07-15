@@ -252,6 +252,8 @@ pub struct LlmProbabilityBlendSpec {
     pub name: String,
     pub hypothesis: String,
     pub market_midpoint_weight: f64,
+    #[serde(default)]
+    pub chainlink_digital_weight: f64,
     pub distance_lob_vol_weight: f64,
     pub event_surface_weight: f64,
     pub existing_model_weight: f64,
@@ -3121,6 +3123,7 @@ mod tests {
             regime: Regime::Middle,
             side: ReviewSide::Up,
             side_model_prob: (0.50 + score * 0.01).clamp(0.01, 0.99),
+            side_chainlink_prob: f64::NAN,
             side_fair_prob: (0.50 + score * 0.01).clamp(0.01, 0.99),
             side_model_edge: score * 0.01,
             side_distance_over_sigma: 0.25,
