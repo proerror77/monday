@@ -27,9 +27,7 @@ Do not bother the user with preflight checks progress ("I'm not going to ..."). 
 ### 2. Project Type Detection
 - Check for project indicators:
   - Node.js: `test -f package.json && echo "Node.js project detected"`
-  - Python: `test -f requirements.txt || test -f pyproject.toml && echo "Python project detected"`
   - Rust: `test -f Cargo.toml && echo "Rust project detected"`
-  - Go: `test -f go.mod && echo "Go project detected"`
 - Run: `git status 2>/dev/null` to confirm this is a git repository
 - If not a git repo, ask: "⚠️ Not a git repository. Continue anyway? (yes/no)"
 
@@ -53,12 +51,12 @@ Do not bother the user with preflight checks progress ("I'm not going to ..."). 
 Gather information in this order:
 
 **Project Detection:**
-- Run: `find . -maxdepth 2 -name 'package.json' -o -name 'requirements.txt' -o -name 'Cargo.toml' -o -name 'go.mod' 2>/dev/null`
+- Run: `find . -maxdepth 2 \( -name 'package.json' -o -name 'Cargo.toml' \) 2>/dev/null`
 - Run: `git remote -v 2>/dev/null` to get repository information
 - Run: `git branch --show-current 2>/dev/null` to get current branch
 
 **Codebase Analysis:**
-- Run: `find . -type f -name '*.js' -o -name '*.py' -o -name '*.rs' -o -name '*.go' 2>/dev/null | head -20`
+- Run: `find . -type f \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.rs' \) 2>/dev/null | head -20`
 - Run: `ls -la` to see root directory structure
 - Read README.md if it exists
 

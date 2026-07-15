@@ -9,13 +9,14 @@ description = "Market-data collection, discovery, and scanning infrastructure fo
 
 [features]
 default = []
+audit = ["dep:sqlx"]
 live = [
+    "audit",
     "dep:crc32fast",
     "dep:futures",
     "dep:polymarket-client-sdk",
     "dep:reqwest",
     "dep:secrecy",
-    "dep:sqlx",
     "dep:tokio-tungstenite",
 ]
 
@@ -38,6 +39,13 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+anyhow = "1"
 chrono.workspace = true
 rust_decimal_macros.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
+
+[[example]]
+name = "market_data_gap_audit"
+path = "examples/market_data_gap_audit.rs"
+required-features = ["audit"]

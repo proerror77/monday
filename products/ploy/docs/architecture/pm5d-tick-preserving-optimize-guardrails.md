@@ -6,8 +6,9 @@ Status: superseded by snapshot-only optimization in
 `docs/runbooks/strategy-research-cicd.md`
 
 This document is retained as historical context for the removed
-`optimize_backtest` live-Parquet path. Current optimizer runs consume retained
-complete sampled research snapshot artifacts through `.github/workflows/optimize.yml`.
+`optimize_backtest` live-Parquet path. The former nested optimization workflow was
+also removed; current PLOY validation is owned by the Monday repository-root
+`.github/workflows/ploy-ci.yml` and does not restore that optimizer lane.
 
 ## Context
 

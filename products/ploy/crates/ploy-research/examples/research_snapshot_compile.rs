@@ -8,9 +8,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use ploy_market_data::diagnostics::PredictionMarketDataAuditReport;
+use ploy_research::research_snapshot::ResearchSnapshotInputArtifact;
 use ploy_research::{
     build_research_snapshot_from_database, write_research_snapshot, ResearchSnapshotBuildOptions,
 };
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
@@ -52,10 +55,54 @@ fn parse_timestamp(raw: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| panic!("invalid timestamp: {raw}"))
 }
 
+fn validated_data_audit(
+    report_path: Option<String>,
+    supplied_status: Option<String>,
+    symbols: &[String],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> anyhow::Result<(Option<String>, Option<String>, Option<String>)> {
+    let Some(report_path) = report_path else {
+        anyhow::bail!(
+            "--data-audit-report is required; prediction snapshots cannot be compiled without typed audit evidence"
+        );
+    };
+    let bytes = std::fs::read(&report_path)
+        .map_err(|error| anyhow::anyhow!("read data audit report {report_path}: {error}"))?;
+    let report: PredictionMarketDataAuditReport = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("parse typed data audit report {report_path}: {error}"))?;
+    report
+        .validate_for_prediction_snapshot(symbols, start, end)
+        .map_err(|error| anyhow::anyhow!("validate data audit report {report_path}: {error}"))?;
+    let report_status = report.data_audit_status.as_str().to_string();
+    if supplied_status
+        .as_deref()
+        .is_some_and(|status| status != report_status)
+    {
+        anyhow::bail!("--data-audit-status does not match typed report status {report_status}");
+    }
+    let report_hash = format!("sha256:{:x}", Sha256::digest(&bytes));
+    Ok((Some(report_status), Some(report_path), Some(report_hash)))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let db_url = flag_value(&args, "--db-url").expect("--db-url required");
+    if args
+        .iter()
+        .any(|arg| arg == "--db-url" || arg.starts_with("--db-url="))
+    {
+        anyhow::bail!(
+            "--db-url is forbidden because it exposes credentials; use PLOY_DATABASE__URL or DATABASE_URL"
+        );
+    }
+    let db_url = std::env::var("PLOY_DATABASE__URL")
+        .ok()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("database URL is required via PLOY_DATABASE__URL or DATABASE_URL")
+        })?;
     let output_dir =
         PathBuf::from(flag_value(&args, "--output-dir").expect("--output-dir required"));
     let start = flag_value(&args, "--start-ts")
@@ -88,8 +135,13 @@ async fn main() -> anyhow::Result<()> {
     let optimizer_data_dir =
         flag_value(&args, "--optimizer-data-dir").expect("--optimizer-data-dir required");
     let data_requirements = parse_csv(flag_value(&args, "--data-requirements"), "all");
-    let data_audit_status = flag_value(&args, "--data-audit-status");
-    let data_audit_report = flag_value(&args, "--data-audit-report");
+    let (data_audit_status, data_audit_report, data_audit_report_hash) = validated_data_audit(
+        flag_value(&args, "--data-audit-report"),
+        flag_value(&args, "--data-audit-status"),
+        &symbols,
+        start,
+        end,
+    )?;
     let include_deribit = !flag_present(&args, "--skip-deribit");
     let pm_book_archive_dir = flag_value(&args, "--pm-book-archive-dir")
         .or_else(|| std::env::var("PLOY_CLOB_BOOK_ARCHIVE_DIR").ok())
@@ -119,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&db_url)
         .await?;
 
-    let snapshot = build_research_snapshot_from_database(
+    let mut snapshot = build_research_snapshot_from_database(
         &pool,
         ResearchSnapshotBuildOptions {
             symbols,
@@ -135,12 +187,25 @@ async fn main() -> anyhow::Result<()> {
             git_sha: std::env::var("GITHUB_SHA").ok(),
             data_requirements,
             data_audit_status,
-            data_audit_report,
+            data_audit_report: data_audit_report.clone(),
             include_deribit,
             pm_book_archive_dir,
         },
     )
     .await?;
+    if let (Some(path), Some(content_hash)) =
+        (data_audit_report.as_ref(), data_audit_report_hash.as_ref())
+    {
+        snapshot
+            .manifest
+            .input_artifacts
+            .push(ResearchSnapshotInputArtifact {
+                name: "prediction_market_data_audit".to_string(),
+                path: path.clone(),
+                content_hash: Some(content_hash.clone()),
+                row_count: None,
+            });
+    }
     let manifest = write_research_snapshot(&output_dir, snapshot)?;
 
     eprintln!("research snapshot written: {}", output_dir.display());
@@ -162,4 +227,29 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validated_data_audit;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn prediction_snapshot_requires_typed_audit_evidence() {
+        let start = Utc
+            .with_ymd_and_hms(2026, 7, 1, 0, 0, 0)
+            .single()
+            .expect("valid start");
+        let end = Utc
+            .with_ymd_and_hms(2026, 7, 2, 0, 0, 0)
+            .single()
+            .expect("valid end");
+
+        let error = validated_data_audit(None, None, &["BTCUSDT".to_string()], start, end)
+            .expect_err("missing typed audit must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("--data-audit-report is required"));
+    }
 }

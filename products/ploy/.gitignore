@@ -1,13 +1,16 @@
 # Rust
 /target/
 
+# Local Python artifacts can still be produced by editors and third-party
+# tooling; the product CI rejects them if they are ever tracked.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
 # Node
 node_modules/
-
-# Python
-__pycache__/
-*.pyc
-.venv/
 
 # IDE
 .idea/

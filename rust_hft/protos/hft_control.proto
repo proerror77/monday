@@ -9,7 +9,7 @@ option go_package = "hft/control";
 
 // HFT 控制服務
 service HftControl {
-  // 加載新模型
+  // Compatibility endpoint; runtime always rejects direct loads and accepts only signed StrategyBundle handoffs.
   rpc LoadModel(LoadModelRequest) returns (Ack);
 
   // 暫停交易
@@ -55,7 +55,7 @@ message LoadModelRequest {
   string url = 1;           // 模型 URL (file:// 或 http://)
   string sha256 = 2;        // 模型校驗碼
   string version = 3;       // 模型版本
-  string model_type = 4;    // 模型類型 (onnx, pt, etc.)
+  string model_type = 4;    // Compatibility artifact family (ONNX only); direct loading is denied.
 }
 
 // 緊急停止請求

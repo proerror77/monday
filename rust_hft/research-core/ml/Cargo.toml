@@ -1,0 +1,23 @@
+[package]
+name = "hft-research-ml"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust, point-in-time ML training for continuous contracts"
+
+[dependencies]
+burn.workspace = true
+burn-ndarray.workspace = true
+burn-store.workspace = true
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "train-contract-model"
+path = "src/bin/train_contract_model.rs"

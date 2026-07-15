@@ -91,7 +91,7 @@ Failed:
 
 ```bash
 # Kill any hanging test processes
-pkill -f "jest|mocha|pytest" 2>/dev/null || true
+pkill -f "jest|mocha" 2>/dev/null || true
 ```
 
 ## Error Handling

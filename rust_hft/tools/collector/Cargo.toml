@@ -6,7 +6,7 @@ description = "多交易所數據收集器：WebSocket → ClickHouse"
 
 [dependencies]
 # 核心異步運行時
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "process"] }
 
 # WebSocket + HTTP 客戶端（統一使用 rustls）
 tokio-tungstenite = { workspace = true }

@@ -8,6 +8,15 @@ commit. Hashes are SHA-256 values at migration closeout.
 The import is therefore an **adapted snapshot**, not a byte-identical checkout and
 not a history-preserving subtree merge.
 
+## Post-import retirements
+
+The Rust-only consolidation removed `products/ploy/.github/workflows/` after the
+initial import. The four workflow rows below retain their upstream hashes only as
+provenance; an em dash in the Monday path/hash columns means the path is absent
+from the current tree. Current PLOY CI lives only at the Monday repository root in
+`.github/workflows/ploy-ci.yml`. The same retirement notation is used for former
+Python operational helpers and the OpenClaw feed-ingestion implementation.
+
 ## Adapted tracked paths
 
 Paths not listed in this table and not covered by the omission section were imported
@@ -16,10 +25,10 @@ byte-for-byte from the source archive.
 | Source path | Monday path | Source SHA-256 | Monday SHA-256 | Adaptation |
 | --- | --- | --- | --- | --- |
 | .env.production | .env.production.example | `f71e4bb79550bd93eab1ba1a904b580186f25e6b71ef1db2c6eaf8c16fc15b71` | `f71e4bb79550bd93eab1ba1a904b580186f25e6b71ef1db2c6eaf8c16fc15b71` | renamed to a non-secret example file; bytes unchanged |
-| .github/workflows/healthcheck-tango-1-1.yml | .github/workflows/healthcheck-tango-1-1.yml | `7e0e267431f1d02bdc494030ccc097b9d31d73ff12fba20cd0305e83f73f6be7` | `9f760831287a31d65093a18573efff776ce58ca9c53e53e1a38053ef4eba1e54` | removed hard-coded database credentials |
-| .github/workflows/recorded-replay-parity.yml | .github/workflows/recorded-replay-parity.yml | `7d2cc0fd162e04556bd6cb618a8be93509ddb72866f5cea855e42c04f49fe406` | `565a01a854e1e5ad075de1f4443a75a63fcc22d5741bf5123ce9708f0edf9a12` | removed hard-coded database credentials |
-| .github/workflows/runtime-candidate-replay.yml | .github/workflows/runtime-candidate-replay.yml | `231350c4c29a414481317ff13f7e6b5d9fe848f9e477524f1ef7906f560fc4b1` | `7641280d1a278b3bf3ffff6c0ef272d608c250d911e916cb872f16edb04fdf15` | removed hard-coded database credentials |
-| .github/workflows/test.yml | .github/workflows/test.yml | `8b14628cdf5a2c294c330780c81c4d547051c97203e936767a896b1410c1a358` | `76c524ba7a68c3152694fb27b9f5cccbc822f912ca3832f12df7685c3a154481` | removed hard-coded database credentials |
+| .github/workflows/healthcheck-tango-1-1.yml | — (retired) | `7e0e267431f1d02bdc494030ccc097b9d31d73ff12fba20cd0305e83f73f6be7` | — | imported with credentials removed, then deleted in the Rust-only consolidation |
+| .github/workflows/recorded-replay-parity.yml | — (retired) | `7d2cc0fd162e04556bd6cb618a8be93509ddb72866f5cea855e42c04f49fe406` | — | imported with credentials removed, then deleted in the Rust-only consolidation |
+| .github/workflows/runtime-candidate-replay.yml | — (retired) | `231350c4c29a414481317ff13f7e6b5d9fe848f9e477524f1ef7906f560fc4b1` | — | imported with credentials removed, then deleted in the Rust-only consolidation |
+| .github/workflows/test.yml | — (retired) | `8b14628cdf5a2c294c330780c81c4d547051c97203e936767a896b1410c1a358` | — | imported with credentials removed, then deleted in the Rust-only consolidation |
 | AGENTS.md | AGENTS.md | `d5bcff09a1a644a07159667ba778b65fe589abe4787a07e58f64bae8a46ba5fa` | `a0bde5f7e76a7b76a8a35d567ca9415192c77abd660bdd76472d2b54524d1cc6` | replaced with Monday product authority and development instructions |
 | CHANGELOG.md | CHANGELOG.md | `81c2716392ba9f305635c354c9ea15b4528d5492577f295c79d235699132d573` | `48f2c6f4d65aa1c97497af7dac406d0173789a7f4b860541cdfba8c836ce5714` | normalized terminal blank lines during import |
 | Cargo.toml | Cargo.toml | `2b42d583d9eeeab1be37065139d60f7b77802f5fb56cb0529ebd37bd7972a9ec` | `a40a1c0013d96774d3ea24907c54754242b982ada780e15fc41d33633ec64433` | updated repository metadata to Monday |
@@ -76,8 +85,8 @@ byte-for-byte from the source archive.
 | docs/superpowers/specs/2026-04-16-trailing-exit-design.md | docs/superpowers/specs/2026-04-16-trailing-exit-design.md | `dcbf6a20312dd69de728c4a722a357ee4256dc1b5fa7f92818c85ce2d9e28607` | `540821e00b9a75b5d0120f9476d9e6691d0d2d2b9501f55aab7ee7a2e4508e17` | normalized trailing whitespace during import |
 | examples/openclaw/README.md | examples/openclaw/README.md | `1d2a06b1b0d470fc78a9645a60e6e577c72a7481290c6bf74446ff3ec8c0238a` | `ec0e8ceba458104ca78ea7eb1540464b8c9b7881858cd62067313413661c24a7` | replaced remote trading guide with read-only research instructions |
 | examples/openclaw/skill-ploy-rpc/SKILL.md | examples/openclaw/skill-ploy-rpc/SKILL.md | `bdeddb7a8bfc9153e4c7606cf3f8549f9b74e41e8c00229d28a9f6bd1f7b2083` | `d5f8c3f3d3a7b400cf9f7cc50c062da65d424b1a5745cfd054f12faa51430c4a` | converted remote-control skill to read-only allowlisted research and documented the safe feed-parser dependency |
-| examples/openclaw/skill-ploy-rpc/bin/ingest_feeds | examples/openclaw/skill-ploy-rpc/bin/ingest_feeds | `1cba35b8e1725117f4ea4162bdc4cb1725f5e450d3ff1131952499f2c91dec40` | `1fdc61493ee6733e44bb8d4ea130c5e485b9267820d813c4f0650b4ff00227c4` | normalized terminal blank lines during import |
-| examples/openclaw/skill-ploy-rpc/bin/ingest_feeds.py | examples/openclaw/skill-ploy-rpc/bin/ingest_feeds.py | `0bbfa7b57355494336d634885d0f18f484aacf9c19d254fa0c9445a36dcaa23f` | `abde74a21d609b2b1744d1a414b8accf14f15319b57f382cc6d5222bbd830cab` | switched RSS/Atom parsing to defusedxml and bounded feed size |
+| examples/openclaw/skill-ploy-rpc/bin/ingest_feeds | — (retired) | `1cba35b8e1725117f4ea4162bdc4cb1725f5e450d3ff1131952499f2c91dec40` | — | imported, then deleted in the Rust-only consolidation |
+| examples/openclaw/skill-ploy-rpc/bin/ingest_feeds.py | — (retired) | `0bbfa7b57355494336d634885d0f18f484aacf9c19d254fa0c9445a36dcaa23f` | — | imported with bounded parsing, then deleted in the Rust-only consolidation |
 | examples/openclaw/skill-ploy-rpc/bin/ployctl | examples/openclaw/skill-ploy-rpc/bin/ployctl | `5457a410048f97ad9db1fb637479478f08ead9abb46c90c899000e44c2f8a185` | `20601bde06a9d094447f987419268c255acf09341b0e547cb4b17520d333f559` | restricted remote control wrapper to status and logs |
 | examples/openclaw/skill-ploy-rpc/bin/ployrpc | examples/openclaw/skill-ploy-rpc/bin/ployrpc | `c1fdfe96dd8ba94e75d69a61fd815b74f2c60019090b7e304be7a4caaae53971` | `1e9d5208b26f1acd9c9cd03f3e0d578579e168bb93e40ef2870370f2fb81be1b` | added fail-closed read-only RPC allowlist before SSH |
 | examples/openclaw/skill-ploy-rpc/config/feeds.example.json | examples/openclaw/skill-ploy-rpc/config/feeds.example.json | `56b2847e8d28d52bb37198d96c36fc2e45ec4f10d5831e4f0e8d9a01d1a01106` | `759c6cada858805c204d8101f14b822fa6eec4caf14d0f224fc2a12afc241ce3` | normalized terminal blank lines during import |
@@ -96,13 +105,13 @@ byte-for-byte from the source archive.
 | ploy-openclaw/workspace/skills/risk-monitor/SKILL.md | docs/archive/standalone-source-2026-07-13/ploy-openclaw/workspace/skills/risk-monitor/SKILL.md | `67b32a4a914a79feac154dcfadcb1fa4dcf8e176554fd6a807506cbe5f9b131b` | `67b32a4a914a79feac154dcfadcb1fa4dcf8e176554fd6a807506cbe5f9b131b` | relocated write-capable standalone OpenClaw package to archive; bytes unchanged |
 | migrations/015_pm_token_settlements.sql | migrations/015_pm_token_settlements.sql | `c10856d0ae5c9fc6ccae50f978b3049fb34a767579e1a82c5b48b76c7fb2a4d0` | `db9680add01adcd7bc132a0f6cc4b6f52f3b7d5aa11bc043dfe03d1f562dfb16` | normalized terminal blank lines during import |
 | models/crypto/lob_logistic_compat.json | models/crypto/lob_logistic_compat.json | `c9d767961e0455a71f7069659af0b47ef007b1c0573d9e6bffe7d7295008ef3f` | `2d405a0eafcd5ef5b58c12846468d2a81233a852ed12886dc0f7965c3a018f83` | normalized terminal blank lines during import |
-| scripts/audit_market_data_gaps.py | scripts/audit_market_data_gaps.py | `c25c0c4207b5a7142f6af1e6f0a269474ad6938fb4f20f4fec586f173df90138` | `cca65ae4d035bb080e6128c52d4f1a585ab579a5e2b1f8063933f5a31ef5c714` | moved PostgreSQL credentials out of subprocess arguments and sends SQL over stdin |
-| scripts/deribit_atm_greeks_collector.py | scripts/deribit_atm_greeks_collector.py | `e28d0128fb0e37bff174ed1864b380a006b66a12117701c941a198fbae9acb91` | `f667c33030ea89211f6c01e58691060aa8d6ab140143c75c2f93c02b16ef6923` | fixed the psql executable and moved connection credentials out of subprocess arguments |
+| scripts/audit_market_data_gaps.py | — (retired) | `c25c0c4207b5a7142f6af1e6f0a269474ad6938fb4f20f4fec586f173df90138` | — | imported with safer credential handling, then replaced by the typed Rust audit |
+| scripts/deribit_atm_greeks_collector.py | — (retired) | `e28d0128fb0e37bff174ed1864b380a006b66a12117701c941a198fbae9acb91` | — | imported with safer credential handling, then deleted in the Rust-only consolidation |
 | scripts/pm_bursts_watch.sh | scripts/pm_bursts_watch.sh | `c98c22fb2768ce84e1cdd99d76c140e2e9ac7662e44e6bfe7529c38fe44b2eb1` | `ae46a90f55f29d6f83455fc6e4552c60d1b139d2bb4d6c21ecdc429d435c2069` | normalized terminal blank lines during import |
 | scripts/pm_trade_alerts_watch.sh | scripts/pm_trade_alerts_watch.sh | `937ada7b40120b3cc7d57513ae50d3991f52c07df16df2a3beb61cbf2409edc7` | `80bf5f27a23defde26b080b8c4fbfa1f8d3f3b2f9e35ac8292580da3743d2041` | normalized terminal blank lines during import |
 | scripts/pm_trades_watch.sh | scripts/pm_trades_watch.sh | `9bf4a5a1484073e3f4969728f737f670d063815a1d99bd86b738893b12cff17c` | `50c9920ea3c5e475e76ea02547827f733c51e8bada3aa3ab05c82e515e18cb31` | normalized terminal blank lines during import |
-| scripts/report_market_data_health.py | scripts/report_market_data_health.py | `9593f5ca5d2e65e0c753d8ad7a995502394360735f3751545bb1489edccbf287` | `4775fec7bcaf1b68dbe1a54554755027f3360230f100484e40afbebd02f5088b` | moved PostgreSQL credentials out of subprocess arguments and sends SQL over stdin |
-| scripts/report_strategy.py | scripts/report_strategy.py | `688f118ad6656940b59f831cc3921e27839cfea2aa88379a558e11f13cde0a6d` | `9579153c6d9d935c9816104c4e1b21aa4bc2729ff1f3227f5d0d3ff0f1295b71` | retired direct SSH reporting and moved PostgreSQL credentials out of subprocess arguments |
+| scripts/report_market_data_health.py | — (retired) | `9593f5ca5d2e65e0c753d8ad7a995502394360735f3751545bb1489edccbf287` | — | imported with safer credential handling, then deleted in the Rust-only consolidation |
+| scripts/report_strategy.py | — (retired) | `688f118ad6656940b59f831cc3921e27839cfea2aa88379a558e11f13cde0a6d` | — | imported with direct SSH disabled, then deleted in the Rust-only consolidation |
 | scripts/verify_price_to_beat.sh | scripts/verify_price_to_beat.sh | `c899ca221940cafe4abd53a362e3d2f2d38861373bf4b04570e0b29985b643f6` | `dcc25b900458d62d69f0dff78516adee045932e382493657de485e1d1e632d2c` | removed hard-coded database password and require explicit input |
 | tasks/lessons.md | tasks/lessons.md | `c5e80412b2ada63cb01568c7305158ee822781fa21e68a027433b1b908c5fdde` | `829c58d001cc39880cbed9293645d35cac986794728f48b68f9d6798c1f4b89e` | marked former host and remote-recovery rules historical and non-operational |
 | tasks/research_evidence/TEMPLATE.md | tasks/research_evidence/TEMPLATE.md | `e3589c82597e1d41bf4bd9febe5426b868ad11af3b940ab5f0f2c2fbc7f0d59b` | `c18267c2975def1ad1511bea2a0b4db7266c368fb442cd11244dfaa5a7c29b24` | normalized trailing whitespace during import |

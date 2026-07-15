@@ -2,9 +2,13 @@
 .github
 .worktrees
 **/target
-**/__pycache__
-**/.venv
-**/.pytest_cache
+
+# Never send local Python caches or virtual environments to a Rust image build.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.venv/
+**/venv/
 
 # Local credentials and key material
 **/.env

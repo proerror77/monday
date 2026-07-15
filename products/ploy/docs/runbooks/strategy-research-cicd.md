@@ -55,7 +55,7 @@ when the mismatch is understood and tracked as a follow-up issue.
 | Purpose | Workflow | Default role |
 | --- | --- | --- |
 | PR validation | `.github/workflows/test.yml` | Required Rust-first Platform CI gate for code, contracts, frontend, integration, dependency audit, and workflow lint |
-| Legacy Python compatibility | `.github/workflows/legacy-python-tools.yml` | Isolated, path-scoped checks for remaining Python helper scripts; not part of the Rust-first required CI contract |
+| Retired compatibility lane | removed | Missing capability stays fail-closed until implemented in a governed Rust crate |
 | Research snapshot | `.github/workflows/research-snapshot.yml` | Compile reusable research evidence from remote data |
 | Factor diagnostics | `.github/workflows/factor-review-v2-hosted-artifact.yml` | GitHub-hosted factor review from a retained complete sampled research snapshot artifact |
 | Walk-forward diagnostics | `.github/workflows/factor-walk-forward-v2-hosted-artifact.yml` | GitHub-hosted walk-forward from a retained complete sampled research snapshot artifact |

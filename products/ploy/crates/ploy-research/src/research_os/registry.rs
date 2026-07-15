@@ -172,7 +172,7 @@ mod tests {
         let raw = r#"{
             "candidate_replay_id": "candidate_replay:abc",
             "run_id": "123",
-            "source_workflow": "runtime-candidate-replay.yml",
+            "source_workflow": "local-rust-research-harness",
             "workflow_run_id": null,
             "workflow_run_url": null,
             "artifact_name": null,
@@ -203,5 +203,6 @@ mod tests {
         assert_eq!(parsed.decision_contract_json, serde_json::json!({}));
         assert_eq!(parsed.blocking_risk_flags_json, serde_json::json!([]));
         assert_eq!(parsed.candidate_replay_id, "candidate_replay:abc");
+        assert_eq!(parsed.source_workflow, "local-rust-research-harness");
     }
 }

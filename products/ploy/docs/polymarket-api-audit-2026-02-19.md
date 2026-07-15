@@ -1,5 +1,9 @@
 # Polymarket API Audit (2026-02-19)
 
+> **Historical audit snapshot.** Paths and helper commands below describe the
+> standalone PLOY tree at the audit date. They are not current Monday operator
+> entrypoints; use the Rust workspace and root PLOY CI contracts instead.
+
 Scope: verify that this project is using Polymarket APIs according to official docs and SDK behavior.
 
 Local static check command:

@@ -6,7 +6,6 @@ pub mod cex_collectors;
 pub mod collector;
 #[cfg(feature = "live")]
 pub mod deribit_collectors;
-#[cfg(feature = "live")]
 pub mod diagnostics;
 #[cfg(feature = "live")]
 pub mod discovery;

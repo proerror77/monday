@@ -19,4 +19,7 @@ This directory is the PLOY product workspace inside the Monday monorepo.
 
 ## Legacy material
 
-The nested `.github`, `deployment`, and `infra` directories are retained for historical contracts and source compatibility. They are not active Monday workflows or approved deployment entrypoints. Do not copy them to the repository-root `.github/workflows` without an explicit architecture and security review.
+The `deployment` and `infra` directories are historical contracts, not active
+Monday deployment entrypoints. PLOY has no nested workflow authority and no
+Python compatibility lane. Do not restore either without an explicit architecture
+and security review.

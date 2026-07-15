@@ -36,7 +36,6 @@ pub fn create_strategy_instances_from_config(
         StrategyType::MarketMaking => {
             Err(StrategyFactoryError::FeatureDisabled("strategy-market-making").into())
         }
-        StrategyType::Dl => create_dl_strategy(config),
         StrategyType::Formula => create_formula_strategies(config),
         StrategyType::Onnx => create_onnx_strategy(config),
     }
@@ -183,66 +182,6 @@ fn create_lob_flow_grid_strategies(
     #[cfg(not(feature = "strategy-lob-flow-grid"))]
     {
         Err(StrategyFactoryError::FeatureDisabled("strategy-lob-flow-grid").into())
-    }
-}
-
-fn create_dl_strategy(_config: &StrategyConfig) -> HftResult<Vec<Box<dyn StrategyTrait>>> {
-    #[cfg(feature = "strategy-dl")]
-    {
-        use strategy_dl as sdl;
-
-        let mut cfg = sdl::DlStrategyConfig {
-            name: _config.name.clone(),
-            symbols: _config.symbols.clone(),
-            ..Default::default()
-        };
-
-        if let StrategyParams::Dl {
-            model_path,
-            device,
-            top_n,
-            window_size,
-            trigger_threshold,
-            output_threshold,
-            queue_capacity,
-            timeout_ms,
-            max_error_rate,
-            degradation_mode,
-        } = &_config.params
-        {
-            cfg.model.model_path = std::path::PathBuf::from(model_path);
-            cfg.model.device = device.clone();
-            cfg.features.top_n = *top_n;
-            cfg.features.window_size = *window_size;
-            cfg.inference.queue_capacity = *queue_capacity;
-            cfg.inference.timeout_ms = *timeout_ms;
-            cfg.inference.trigger_threshold = *trigger_threshold;
-            cfg.inference.output_threshold = *output_threshold;
-            cfg.risk.max_error_rate = *max_error_rate;
-            cfg.risk.degradation_mode = degradation_mode.clone();
-        } else {
-            warn!("DL 策略缺少特定參數，使用預設");
-        }
-
-        let strat = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle.block_on(sdl::DlStrategy::new(cfg.clone())),
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("建立臨時 runtime 失敗");
-                rt.block_on(sdl::DlStrategy::new(cfg.clone()))
-            }
-        };
-
-        match strat {
-            Ok(strategy) => Ok(vec![Box::new(strategy) as Box<dyn StrategyTrait>]),
-            Err(err) => Err(StrategyFactoryError::BuildFailure(err.to_string()).into()),
-        }
-    }
-    #[cfg(not(feature = "strategy-dl"))]
-    {
-        Err(StrategyFactoryError::FeatureDisabled("strategy-dl").into())
     }
 }
 

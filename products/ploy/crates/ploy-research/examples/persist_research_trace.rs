@@ -629,6 +629,7 @@ fn full_depth_execution_surface_row(
 ) -> Result<FullDepthExecutionSurfaceRow> {
     let artifact_json: Value = read_json(path)?;
     let artifact_sha256 = file_sha256(path)?;
+    let source_workflow = required_full_depth_source_workflow(&artifact_json, path)?;
     let schema_version =
         string_field(&artifact_json, "schema_version").unwrap_or_else(|| "".to_string());
     let surface = string_field(&artifact_json, "surface").unwrap_or_default();
@@ -697,8 +698,7 @@ fn full_depth_execution_surface_row(
         )
         .unwrap_or_else(|| format!("full_depth_execution_surface:{}", &artifact_sha256[..32])),
         run_id: plan.run_id.clone(),
-        source_workflow: string_field(&artifact_json, "source_workflow")
-            .unwrap_or_else(|| "collect-full-depth-execution-surface.yml".to_string()),
+        source_workflow,
         workflow_run_id: string_field(&artifact_json, "workflow_run_id"),
         workflow_run_url: string_field(&artifact_json, "workflow_run_url"),
         artifact_name: string_field(&artifact_json, "artifact_name"),
@@ -724,6 +724,15 @@ fn full_depth_execution_surface_row(
 
 fn full_depth_surface_valid(blockers: &[String]) -> bool {
     blockers.is_empty()
+}
+
+fn required_full_depth_source_workflow(artifact: &Value, path: &Path) -> Result<String> {
+    string_field(artifact, "source_workflow").with_context(|| {
+        format!(
+            "{} missing source_workflow; full-depth producer authority must be explicit",
+            path.display()
+        )
+    })
 }
 
 fn canonical_candidate_replay_evidence_stage(
@@ -1832,6 +1841,42 @@ mod tests {
         assert!(
             err.to_string().contains("contradicts basis"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn full_depth_surface_requires_explicit_source_workflow() {
+        let artifact = json!({
+            "schema_version": "full_depth_execution_surface.v1",
+            "surface": "polymarket_full_depth",
+            "source": "local-rust-collector",
+            "start_ts": "2026-07-15T00:00:00Z",
+            "end_ts": "2026-07-15T00:05:00Z",
+            "checked_hours": 1,
+            "existing_hours": 1,
+            "exported_hours": 0,
+            "row_count": 1,
+            "full_fidelity": true,
+            "incomplete": false
+        });
+        let path = Path::new("full-depth-without-authority.json");
+        let error = required_full_depth_source_workflow(&artifact, path)
+            .expect_err("missing producer authority must fail closed");
+
+        assert!(
+            error.to_string().contains("missing source_workflow"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn full_depth_surface_accepts_explicit_local_rust_authority() {
+        let artifact = json!({"source_workflow": "local-rust-full-depth-collector"});
+
+        assert_eq!(
+            required_full_depth_source_workflow(&artifact, Path::new("artifact.json"))
+                .expect("explicit local authority"),
+            "local-rust-full-depth-collector"
         );
     }
 

@@ -49,7 +49,7 @@ Focus on what failed:
 
 Always clean up after tests:
 ```bash
-pkill -f "jest|mocha|pytest" 2>/dev/null || true
+pkill -f "jest|mocha" 2>/dev/null || true
 ```
 
 ## Important Notes

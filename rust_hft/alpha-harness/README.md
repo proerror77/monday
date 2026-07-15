@@ -125,7 +125,14 @@ cargo run -p alpha-harness -- deployment sign \
 
 The deployment signing key file contains exactly 32 bytes as hex and is never stored in DuckDB or passed to the runtime. Live-small signing requires a persisted `human_live_small` approval whose `scope_hash` matches venue, instruments, and live-small intent. Runtime-owned `policy.json` must independently carry the referenced approval id, class, promotion subject, scope hash, signer, validity window, and revocation state; an envelope signer cannot self-assert an approval id. The runtime still refuses live-small activation until universal order/slippage enforcement and real-venue reconciliation/reduce-only acceptance tests pass.
 
-ONNX candidates enter through `candidate register-onnx`. The command verifies a bundle-relative model, checksum, byte length, static LOB tensor schema, preprocessing version, registered PIT feature matrix, and Rust walk-forward results before persisting one immutable candidate iteration. Sealed evaluation reruns the same model through Rust. ONNX promotion requires `--bundle-out` and `--model-root`; it materializes the exact verified model beside the content-addressed bundle. Python may train/export the model, but cannot create promotion evidence or load it into the runtime directly.
+Native contract models are trained by `hft-research-ml` with Burn. The trainer
+requires point-in-time rows, an exact feature order, a content-addressed dataset
+manifest, a fixed split identifier, purge/embargo metadata, and a deterministic
+seed. It writes a Burnpack artifact plus a typed manifest and is lab-only:
+training never creates promotion evidence. ONNX remains a read-only compatibility
+ingress for already governed artifacts; `candidate register-onnx` still verifies
+the bundle-relative checksum, byte length, tensor schema, preprocessing version,
+registered PIT feature matrix, and Rust walk-forward results.
 
 For paper/shadow runtime intake, first obtain current hashes:
 

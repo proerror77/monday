@@ -53,7 +53,7 @@ Always provide [specific deliverables] when working in this domain.
 
 #### 1. Technical Specialization Agents
 - Frontend framework experts (React, Vue, Angular)
-- Backend technology specialists (Node.js, Python, Go)
+- Backend technology specialists (Rust services and TypeScript operator tooling)
 - Database experts (SQL, NoSQL, Graph databases)
 - DevOps and infrastructure specialists
 

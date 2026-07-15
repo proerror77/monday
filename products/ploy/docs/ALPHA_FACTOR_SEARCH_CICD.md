@@ -1,5 +1,11 @@
 # Alpha Factor Search CI/CD Contract
 
+> **Superseded by the Rust-only cutover.** Script and nested-workflow commands
+> below are retained as research-history context and are not executable Monday
+> entrypoints. Current authority is `crates/ploy-research`,
+> `crates/ploy-market-data`, the root PLOY CI workflow, and
+> `docs/architecture/RUST_ONLY_RESEARCH.md` at the Monday repository root.
+
 This document defines Ploy's CI/CD method for mining alpha factors with a
 two-layer search architecture:
 
@@ -34,7 +40,7 @@ For Ploy, these are architecture inputs, not permission to skip repo gates.
 The useful pattern is LLM-guided symbolic priors plus machine-checked
 exploration and CI evidence.
 
-## Current State
+## Historical State at Retirement
 
 The repo now has the core alpha-search factory, not only the downstream
 promotion half:

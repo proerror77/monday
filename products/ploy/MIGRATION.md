@@ -23,7 +23,8 @@ the path and SHA-256 manifest covering renamed, changed, replaced, and omitted m
 - Polymarket and Predict account tools: planning and read checks remain available;
   approval, execution, redemption, and reconciliation writes reject unconditionally
 - Write-capable standalone `ploy-openclaw`: relocated under the historical archive
-- Legacy PLOY deploy workflows: retained only as nested, inactive source material
+- Legacy nested PLOY workflows: removed; the only current PLOY workflow is the
+  repository-root `.github/workflows/ploy-ci.yml`
 - Legacy secrets/environments: not copied
 
 ## Former repository configuration inventory

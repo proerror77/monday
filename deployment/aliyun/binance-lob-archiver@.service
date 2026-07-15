@@ -1,25 +1,34 @@
 [Unit]
-Description=Binance LOB archiver (%i)
+Description=Rust Binance LOB archiver (%i)
 After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
 
 [Service]
 Type=simple
 User=hftcollector
 Group=hftcollector
-StateDirectory=hft-collector
+Environment=RUST_LOG=info
+Environment=HOME=/var/lib/hft-collector
 EnvironmentFile=/etc/monday/binance-lob-archiver-%i.env
-ExecStart=/opt/monday/venv/bin/python /opt/monday/binance_lob_archiver.py
+ExecStartPre=/opt/monday/bin/binance-lob-archiver --self-test
+ExecStart=/opt/monday/bin/binance-lob-archiver
 Restart=always
 RestartSec=5
 RuntimeMaxSec=21600
-TimeoutStopSec=180
+TimeoutStopSec=360
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/data/monday/spool
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+StateDirectory=hft-collector
+ReadWritePaths=/data/monday/spool/binance-lob
 CPUQuota=80%
 MemoryHigh=2500M
 MemoryMax=3200M

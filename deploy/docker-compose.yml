@@ -185,29 +185,6 @@ services:
       - dev
     restart: unless-stopped
 
-  # ============================================
-  # 模型訓練服務 (定時運行)
-  # ============================================
-
-  trainer:
-    build:
-      context: ../ml_trainer
-      dockerfile: ../deploy/Dockerfile.trainer
-    container_name: hft-trainer
-    command: ["python", "train.py"]
-    volumes:
-      - ../ml_trainer:/app:ro
-      - ../models:/models:rw
-    environment:
-      CLICKHOUSE_HOST: clickhouse
-      CLICKHOUSE_PORT: 8123
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-    profiles:
-      - training
-    restart: "no"
-
 volumes:
   clickhouse_data:
   redis_data:

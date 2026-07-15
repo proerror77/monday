@@ -9,6 +9,8 @@ const RETIRED_SOURCE_PATHS: &[&str] = &[
     "docker-compose.prod.yml",
     "docker-compose.yml",
     "nginx.conf",
+    "scripts/check_event_dataset_scope.sh",
+    "scripts/check_event_dataset_verification_lane.sh",
     "start.sh",
     "stop.sh",
     "tools/polymarket-account-ops",
@@ -69,6 +71,212 @@ const RETIRED_TEST_TARGETS: &[&str] = &[
     "tests/strategy_evaluations_and_deployment_gate.rs",
     "tests/workflow_migrations.rs",
 ];
+
+fn is_non_runtime_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some(
+            ".git"
+                | "node_modules"
+                | "target"
+                | "archive"
+                | "plans"
+                | "reviews"
+                | "superpowers"
+                | "research_evidence"
+                | "__pycache__"
+                | ".pytest_cache"
+                | ".venv"
+                | "venv"
+        )
+    )
+}
+
+fn is_forbidden_python_artifact(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    if matches!(
+        extension.as_deref(),
+        Some("py" | "pyw" | "ipynb" | "pyc" | "pyo" | "pyd")
+    ) {
+        return true;
+    }
+
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let lower_name = file_name.to_ascii_lowercase();
+    matches!(
+        lower_name.as_str(),
+        "pyproject.toml" | "pipfile" | "poetry.lock" | "pytest.ini" | "tox.ini" | "setup.py"
+    ) || (lower_name.starts_with("requirements") && lower_name.ends_with(".txt"))
+}
+
+fn is_python_command_name(token: &str) -> bool {
+    let command = token.trim_matches(|value: char| {
+        matches!(value, '"' | '\'' | '`' | '[' | ']' | '{' | '}' | ',' | ':')
+    });
+    let command = command.rsplit('/').next().unwrap_or(command);
+    if matches!(
+        command,
+        "python"
+            | "pip"
+            | "pipx"
+            | "pytest"
+            | "poetry"
+            | "pdm"
+            | "rye"
+            | "conda"
+            | "mamba"
+            | "hatch"
+            | "tox"
+            | "virtualenv"
+            | "uv"
+    ) {
+        return true;
+    }
+
+    ["python", "pip"].iter().any(|prefix| {
+        command.strip_prefix(prefix).is_some_and(|version| {
+            !version.is_empty()
+                && version.split('.').all(|part| {
+                    !part.is_empty() && part.chars().all(|value| value.is_ascii_digit())
+                })
+        })
+    })
+}
+
+fn line_invokes_python(line: &str) -> bool {
+    line.contains("actions/setup-python@")
+        || line.contains("astral-sh/setup-uv@")
+        || line
+            .split(|value: char| {
+                value.is_whitespace() || matches!(value, ';' | '&' | '|' | '(' | ')' | '/')
+            })
+            .any(is_python_command_name)
+}
+
+fn is_python_runtime_crate(name: &str) -> bool {
+    matches!(
+        name,
+        "cpython" | "rust-cpython" | "python3-sys" | "rustpython"
+    ) || name.starts_with("pyo3")
+        || name.starts_with("rustpython-")
+}
+
+fn declares_python_runtime_crate(line: &str) -> bool {
+    let trimmed = line.trim();
+    if let Some(name) = trimmed
+        .strip_prefix("name = \"")
+        .and_then(|name| name.strip_suffix('"'))
+    {
+        return is_python_runtime_crate(name);
+    }
+    trimmed
+        .split_once('=')
+        .is_some_and(|(name, _)| is_python_runtime_crate(name.trim()))
+}
+
+fn should_scan_inline_commands(path: &Path) -> bool {
+    let extension = path.extension().and_then(|value| value.to_str());
+    extension.is_none()
+        || matches!(
+            extension,
+            Some(
+                "sh" | "bash"
+                    | "zsh"
+                    | "yml"
+                    | "yaml"
+                    | "toml"
+                    | "service"
+                    | "timer"
+                    | "socket"
+                    | "conf"
+            )
+        )
+}
+
+fn collect_forbidden_language_paths(root: &Path, paths: &mut Vec<String>) {
+    for entry in fs::read_dir(root).expect("read workspace directory") {
+        let path = entry.expect("workspace entry").path();
+        if path.is_dir() {
+            if is_non_runtime_directory(&path) {
+                continue;
+            }
+            collect_forbidden_language_paths(&path, paths);
+            continue;
+        }
+
+        if is_forbidden_python_artifact(&path) {
+            paths.push(path.display().to_string());
+            continue;
+        }
+
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if matches!(
+            path.file_name().and_then(|value| value.to_str()),
+            Some("Cargo.toml" | "Cargo.lock")
+        ) && body.lines().any(declares_python_runtime_crate)
+        {
+            paths.push(format!("{} (Python runtime Rust crate)", path.display()));
+            continue;
+        }
+        let first_line = body.lines().next().unwrap_or_default();
+        if first_line.starts_with("#!") && line_invokes_python(first_line) {
+            paths.push(format!("{} (Python shebang)", path.display()));
+        } else if should_scan_inline_commands(&path)
+            && body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .any(line_invokes_python)
+        {
+            paths.push(format!("{} (inline Python command)", path.display()));
+        }
+    }
+}
+
+#[test]
+fn python_command_detector_covers_suffixless_wrappers_and_inline_invocations() {
+    let interpreter = ["py", "thon"].concat();
+    assert!(line_invokes_python(&format!(
+        "#!/usr/bin/env {interpreter}3"
+    )));
+    assert!(line_invokes_python(&format!(
+        "#!/usr/bin/{interpreter}3.12 -u"
+    )));
+    assert!(line_invokes_python(&format!(
+        "run: {interpreter} -m package"
+    )));
+    assert!(line_invokes_python(&format!(
+        "exec /usr/bin/{interpreter}3 worker"
+    )));
+    assert!(line_invokes_python("uses: actions/setup-python@v5"));
+    assert!(line_invokes_python("run: pip install package"));
+    assert!(line_invokes_python("run: uv sync"));
+    assert!(declares_python_runtime_crate("pyo3 = \"0.24\""));
+    assert!(declares_python_runtime_crate("name = \"pyo3-ffi\""));
+    assert!(!line_invokes_python("PYTHONPATH=/opt/rust-only"));
+}
+
+#[test]
+fn workspace_is_rust_only_outside_the_frontend() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut forbidden = Vec::new();
+    collect_forbidden_language_paths(repo_root, &mut forbidden);
+    assert!(
+        forbidden.is_empty(),
+        "non-Rust research/runtime language surface remains:\n{}",
+        forbidden.join("\n")
+    );
+    assert!(
+        !repo_root.join(".github/workflows").exists(),
+        "nested historical workflows must not be restored"
+    );
+}
 
 #[test]
 fn workspace_root_keeps_only_the_shim_surface() {

@@ -8,10 +8,10 @@ the standalone host/workflow inventory at source SHA
 | --- | --- | --- |
 | `crates/ploy-market-data` | maintained PLOY market-data/product code | PLOY product workspace |
 | `crates/ploy-feed-loaders` | maintained historical loaders | PLOY research/backtest |
-| `scripts/*` collectors and repairs | compatibility or offline tools | explicit task review only |
+| Rust binaries and crate examples | maintained diagnostics and bounded repair tools | explicit task review only |
 | `migrations/*` | retained PLOY schema history | database-backed CI and reviewed migrations |
 | root `.github/workflows/ploy-ci.yml` | active PLOY validation | Monday repository |
-| nested `products/ploy/.github/workflows/*` | historical, inactive | no deployment authority |
+| nested workflow surface | retired | no deployment authority |
 | former `/opt/ploy` and Tango/trade hosts | historical topology | no Monday authority |
 
 ## Guardrails
@@ -19,8 +19,8 @@ the standalone host/workflow inventory at source SHA
 - Production data acquisition and host deployment stay under Monday's governed
   collector/runtime ownership.
 - Do not dispatch nested workflows or revive former host mutation from this inventory.
-- Do not treat compatibility Python collectors as a production source of truth without
-  explicit parity, freshness, and ownership evidence.
+- Do not restore a compatibility collector. Missing capability remains fail-closed
+  until a Rust implementation has freshness, completeness, and ownership evidence.
 - Research artifacts do not authorize live execution or promotion.
 
 Detailed standalone classifications are preserved by the source SHA and the verified

@@ -6,6 +6,10 @@ target
 *.tmp
 node_modules
 __pycache__
+*.py[cod]
+.pytest_cache
+.venv
+venv
 *.log
 clickhouse
 *.tar.gz

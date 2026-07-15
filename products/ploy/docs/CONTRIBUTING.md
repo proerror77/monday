@@ -54,5 +54,5 @@ tests run in the root Monday workflow `.github/workflows/ploy-ci.yml`.
 ## Pull requests
 
 Open PLOY changes against `proerror77/monday`. The root PLOY CI workflow owns the
-current Rust, frontend, schema, audit, and integration lanes. Nested workflows
-under `products/ploy/.github/workflows` are historical source material only.
+current Rust, frontend, schema, audit, and integration lanes. The former nested
+workflow surface is retired and must not be recreated.

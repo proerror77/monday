@@ -271,7 +271,7 @@ mod tests {
         build_event_root_dataset, standard_event_root_dataset_artifacts, DatasetBuildError,
         EventRootDatasetBuildRequest,
     };
-    use crate::dataset::{DatasetSourceWindow, DatasetSplit, EventMetadataChronologyInput};
+    use crate::dataset::{DatasetSourceWindow, EventMetadataChronologyInput};
     use crate::factors::FactorObservation;
     use chrono::{Duration, TimeZone, Utc};
     use std::collections::HashSet;

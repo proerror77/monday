@@ -104,7 +104,6 @@ pub enum StrategyType {
     Trend,
     Arbitrage,
     MarketMaking,
-    Dl,
     Imbalance,
     LobFlowGrid,
 }
@@ -123,12 +122,6 @@ pub enum StrategyParams {
         obi_threshold: f64,
         lot: Decimal,
         top_levels: usize,
-    },
-    Dl {
-        model_path: String,
-        device: String,
-        top_n: usize,
-        queue_capacity: usize,
     },
     LobFlowGrid {
         #[serde(flatten)]

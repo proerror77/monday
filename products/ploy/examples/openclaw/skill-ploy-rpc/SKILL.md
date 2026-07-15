@@ -31,12 +31,5 @@ remote runtime and cannot submit, cancel, or replace orders.
 ./bin/ployrpc event_edge.scan '{"title":"Example event"}'
 ```
 
-Feed ingestion remains local and non-executing:
-
-```bash
-python3 -m pip install -r ./requirements.txt
-./bin/ingest_feeds ./config/feeds.json
-```
-
 All unlisted RPC methods fail closed before SSH. Treat the output as research evidence,
 not as permission to trade or mutate a host.

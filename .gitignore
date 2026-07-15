@@ -1,20 +1,14 @@
 # System files
 .DS_Store
-*.pyc
-__pycache__/
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-.venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.pytest_cache/
 .cache/
+
+# Python caches and virtual environments are local artifacts. Rust-only CI
+# independently rejects any tracked Python runtime or packaging surface.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
 
 # Rust specific
 /target/
@@ -126,10 +120,6 @@ hft_ui_nextjs/**/*.log
 *.rdb
 *.tmp
 *.cache
-
-# Python venv
-**/.venv/
-**/__pycache__/
 
 # Rust target
 **/target/

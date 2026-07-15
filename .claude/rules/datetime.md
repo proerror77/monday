@@ -101,10 +101,7 @@ If you need to ensure compatibility across different systems:
 # Try primary method first
 date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
 # Fallback for systems without -u flag
-date +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || \
-# Last resort: use Python if available
-python3 -c "from datetime import datetime; print(datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))" 2>/dev/null || \
-python -c "from datetime import datetime; print(datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))" 2>/dev/null
+date +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null
 ```
 
 ## Rule Priority

@@ -12,6 +12,14 @@ target/
 *~
 *.tmp
 
+# Ignore Python artifacts produced by editors or third-party tooling. Python is
+# not part of the Rust runtime image.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.venv/
+**/venv/
+
 # Ignore IDE files
 .vscode/
 .idea/
@@ -50,11 +58,6 @@ clickhouse_credentials.txt
 # Ignore macOS files
 .DS_Store
 
-# Ignore Python cache
-__pycache__/
-*.pyc
-*.pyo
-
 # Ignore node modules (if any)
 node_modules/
 
@@ -64,7 +67,3 @@ node_modules/
 # Ignore ops folder except Dockerfile
 ops/*
 !ops/hft-live.Dockerfile
-
-# Ignore other workspaces
-../ml_workspace/
-../ops_workspace/

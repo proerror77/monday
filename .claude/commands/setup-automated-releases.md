@@ -7,16 +7,14 @@ Setup automated release workflows
 Set up automated releases following industry best practices:
 
 1. **Analyze Repository Structure**
-   - Detect project type (Node.js, Python, Go, etc.)
+   - Detect Monday's Rust workspace or TypeScript frontend package
    - Check for existing CI/CD workflows
    - Identify current versioning approach
    - Review existing release processes
 
 2. **Create Version Tracking**
    - For Node.js: Use package.json version field
-   - For Python: Use __version__ in __init__.py or pyproject.toml
-   - For Go: Use version in go.mod
-   - For others: Create version.txt file
+   - For Rust: Use the package version in Cargo.toml
    - Ensure version follows semantic versioning (MAJOR.MINOR.PATCH)
 
 3. **Set Up Conventional Commits**

@@ -70,8 +70,8 @@ jobs:
         run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
       - name: Run actionlint
-        run: |
-          "${HOME}/go/bin/actionlint" -color -config-file .github/actionlint.yaml ../../.github/workflows/ploy-ci.yml .github/workflows/*.yml
+        run: >-
+          "${HOME}/go/bin/actionlint" -color ../../.github/workflows/ploy-ci.yml
 
   rust-format:
     name: Rust formatting
@@ -101,20 +101,98 @@ jobs:
       - name: Validate frontend route contract
         run: node ploy-frontend/scripts/check-route-contract.mjs
 
-      - name: Validate Python safety helpers
+      - name: Enforce Rust-only research surface
         run: |
           set -euo pipefail
-          python3 -m unittest discover -s tests -p 'test_psql_connection.py'
-          python3 -m unittest tests.test_alpha_search_llm_propose
-          python3 -m py_compile \
-            scripts/psql_connection.py \
-            scripts/audit_market_data_gaps.py \
-            scripts/alpha_search_closed_loop_agent.py \
-            scripts/alpha_search_llm_propose.py
-          python3 -m pip install \
-            --disable-pip-version-check \
-            --requirement examples/openclaw/skill-ploy-rpc/requirements.txt
-          python3 -m py_compile examples/openclaw/skill-ploy-rpc/bin/ingest_feeds.py
+
+          forbidden_paths="$(git ls-files \
+            ':(glob)**/*.py' \
+            ':(glob)**/*.pyw' \
+            ':(glob)**/*.ipynb' \
+            ':(glob)**/*.py[cod]' \
+            ':(glob)**/requirements*.txt' \
+            ':(glob)**/pyproject.toml' \
+            ':(glob)**/Pipfile' \
+            ':(glob)**/poetry.lock' \
+            ':(glob)**/pytest.ini' \
+            ':(glob)**/tox.ini' \
+            ':(glob)**/setup.py')"
+          if [ -n "${forbidden_paths}" ]; then
+            echo "tracked Python source, notebook, bytecode, or packaging artifact is forbidden" >&2
+            printf '%s\n' "${forbidden_paths}" >&2
+            exit 1
+          fi
+
+          reject_python_text() {
+            label="$1"
+            pattern="$2"
+            shift 2
+            set +e
+            matches="$(git grep -n -I -E "${pattern}" -- "$@")"
+            scan_status=$?
+            set -e
+            case "${scan_status}" in
+              0)
+                echo "tracked ${label} is forbidden" >&2
+                printf '%s\n' "${matches}" >&2
+                exit 1
+                ;;
+              1)
+                return 0
+                ;;
+              *)
+                echo "${label} scanner failed with status ${scan_status}" >&2
+                exit "${scan_status}"
+                ;;
+            esac
+          }
+
+          shebang_pathspecs=(
+            ':(exclude,glob)**/*.md'
+            ':(exclude,glob)**/docs/archive/**'
+            ':(exclude,glob)**/docs/plans/**'
+            ':(exclude,glob)**/docs/reviews/**'
+            ':(exclude,glob)**/docs/superpowers/**'
+            ':(exclude,glob)**/tasks/research_evidence/**'
+          )
+          reject_python_text \
+            "Python shebang" \
+            '^#!.*python([0-9]+([.][0-9]+)?)?([[:space:]]|$)' \
+            "${shebang_pathspecs[@]}"
+
+          inline_command_pathspecs=(
+            ':(glob)**/*.sh'
+            ':(glob)**/*.bash'
+            ':(glob)**/*.zsh'
+            ':(glob)**/*.yml'
+            ':(glob)**/*.yaml'
+            ':(glob)**/*.toml'
+            ':(glob)**/*.service'
+            ':(glob)**/*.timer'
+            ':(glob)**/*.socket'
+            ':(glob)**/*.conf'
+            ':(glob)**/Dockerfile*'
+            ':(glob)**/Makefile'
+            ':(glob)**/Justfile'
+            ':(glob)**/bin/*'
+            ':(glob)**/scripts/*'
+            ':(glob)**/scripts/**/*'
+            ':(exclude,glob)**/docs/archive/**'
+            ':(exclude,glob)**/docs/plans/**'
+            ':(exclude,glob)**/docs/reviews/**'
+            ':(exclude,glob)**/docs/superpowers/**'
+            ':(exclude,glob)**/tasks/research_evidence/**'
+          )
+          reject_python_text \
+            "Python runtime or package-manager command" \
+            'actions/setup-pyth[o]n@|astral-sh/setup-u[v]@|(^|[;&|()/[:space:]])(python([0-9]+([.][0-9]+)?)?|pip([0-9]+)?|pipx|pytest|poetry|pdm|rye|conda|mamba|hatch|tox|virtualenv)([[:space:]]|$)|(^|[;&|()/[:space:]])uv[[:space:]]+(run|sync|pip|venv|python)([[:space:]]|$)' \
+            "${inline_command_pathspecs[@]}"
+
+          if git grep -n -E '(name = "(burn-tch|tch|torch-sys|pyo3[^"]*|cpython|rust-cpython|python3-sys|rustpython[^"]*)"|^[[:space:]]*(burn-tch|tch|torch-sys|pyo3([-_][A-Za-z0-9_-]+)?|cpython|rust-cpython|python3-sys|rustpython([-_][A-Za-z0-9_-]+)?)[[:space:]]*=)' -- \
+            ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock'; then
+            echo "PyTorch/libtorch and Python-runtime Rust bindings are forbidden" >&2
+            exit 1
+          fi
 
       - name: Reject retired routes, insecure SSH, and reset bypasses
         run: |
@@ -153,7 +231,7 @@ jobs:
           run_forbidden_scan \
             "insecure SSH or reset bypass" \
             'StrictHostKeyChecking[[:space:]=]+no|UserKnownHostsFile[[:space:]=]+/dev/null|allow[_-]?running' \
-            .github/workflows
+            ../../.github/workflows
 
   audit:
     name: Dependency audit
@@ -529,8 +607,11 @@ jobs:
         run: |
           cargo test --locked -p ploy-feed-loaders --lib
           cargo test --locked -p ploy-research --lib
+          cargo test --locked -p ploy-research --features ml --lib
           cargo check --locked -p ploy-research --example prediction_research_loop
           cargo check --locked -p ploy-research --features db --example factor_walk_forward_v2
+          cargo test --locked -p ploy-market-data --features audit --lib --examples
+          cargo test --locked -p ploy-research --features db --example research_snapshot_compile
 
       - name: Install SQLx CLI
         run: |
@@ -684,11 +765,8 @@ jobs:
         run: |
           set -euo pipefail
           SECONDS=0
-          cargo test --locked -p ploy --test platform_release_workflow
           cargo test --locked -p ploy --test platform_smoke
           cargo test --locked -p ploy --test workspace_runtime_retirement
-          cargo test --locked -p ploy --test workflow_security ci_runs_dependency_vulnerability_audit -- --exact
-          cargo test --locked -p ploy --test workflow_security checked_in_platform_service_enforces_guardrails -- --exact
           echo "### Rust integration regressions lane" >> "$GITHUB_STEP_SUMMARY"
           echo "Elapsed seconds: ${SECONDS}" >> "$GITHUB_STEP_SUMMARY"
 

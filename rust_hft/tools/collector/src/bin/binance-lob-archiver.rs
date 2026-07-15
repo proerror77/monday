@@ -2,16 +2,14 @@ use anyhow::Context;
 use clap::Parser;
 use futures::StreamExt;
 use hft_collector::lob_archiver::{
-    checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
-    recover_parts, segment_partition, send_or_shutdown, write_health, write_success_marker,
-    write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget, QueueHealth, Segment,
-    SegmentConfig, SendOutcome, RAW_SCHEMA,
+    checkpoint_event, files_with_suffix, read_upload_status, recover_parts, segment_partition,
+    send_or_shutdown, write_health, write_success_marker, write_upload_status, DepthDiff, Market,
+    OrderBookState, PendingBudget, QueueHealth, Segment, SegmentConfig, SendOutcome, RAW_SCHEMA,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -45,6 +43,7 @@ struct Config {
     max_pending_diffs: usize,
     stall_timeout: Duration,
     sync_timeout: Duration,
+    task_cancel_timeout: Duration,
     process_watchdog_timeout: Duration,
     snapshot_retry_attempts: usize,
     rest_base: String,
@@ -101,6 +100,10 @@ impl Config {
             max_pending_diffs: env_parse("MAX_PENDING_DIFFS_TOTAL", 250_000_usize)?.max(1),
             stall_timeout: Duration::from_secs(env_parse("STALL_TIMEOUT_SECONDS", 60_u64)?),
             sync_timeout: Duration::from_secs(env_parse("SYNC_TIMEOUT_SECONDS", 120_u64)?),
+            task_cancel_timeout: Duration::from_secs(env_parse(
+                "TASK_CANCEL_TIMEOUT_SECONDS",
+                10_u64,
+            )?),
             process_watchdog_timeout: Duration::from_secs(env_parse(
                 "PROCESS_WATCHDOG_SECONDS",
                 180_u64,
@@ -514,10 +517,8 @@ async fn run_session(
     let _ = session_stop_tx.send(true);
     let final_queue_health = QueueHealth::from_sender(&sender);
     drop(sender);
-    while let Some(joined) = tasks.join_next().await {
-        if let Ok(Ok(TaskExit::Stopped(Some(event)))) = joined {
-            archive_only(&mut segment, &session_id, event)?;
-        }
+    for event in stop_session_tasks(&mut tasks, config.task_cancel_timeout).await {
+        archive_only(&mut segment, &session_id, event)?;
     }
     while let Ok(event) = receiver.try_recv() {
         archive_only(&mut segment, &session_id, event)?;
@@ -543,6 +544,31 @@ async fn run_session(
     } else {
         Ok(())
     }
+}
+
+async fn stop_session_tasks(
+    tasks: &mut JoinSet<anyhow::Result<TaskExit>>,
+    timeout: Duration,
+) -> Vec<Event> {
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut trailing_events = Vec::new();
+    while !tasks.is_empty() {
+        tokio::select! {
+            joined = tasks.join_next() => {
+                if let Some(Ok(Ok(TaskExit::Stopped(Some(event))))) = joined {
+                    trailing_events.push(event);
+                }
+            }
+            _ = &mut deadline => {
+                warn!(?timeout, remaining_tasks = tasks.len(), "session tasks exceeded shutdown grace; aborting");
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                break;
+            }
+        }
+    }
+    trailing_events
 }
 
 fn sync_timed_out(
@@ -1017,15 +1043,19 @@ fn parse_symbol_catalog(market: Market, payload: &Value) -> anyhow::Result<Symbo
 
 async fn upload_loop(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) {
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
         let mut status = read_upload_status(&config.spool_dir);
-        match upload_pending(&config).await {
-            Ok(uploaded) => {
+        match upload_pending(&config, &mut shutdown).await {
+            Ok(Some(uploaded)) => {
                 if uploaded > 0 {
                     status.last_success_at = Some(chrono::Utc::now().to_rfc3339());
                 }
                 status.last_error_at = None;
                 status.last_error = None;
             }
+            Ok(None) => return,
             Err(error) => {
                 let now = chrono::Utc::now().to_rfc3339();
                 status.last_error_at = Some(now);
@@ -1047,28 +1077,36 @@ async fn upload_loop(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-async fn upload_pending(config: &Config) -> anyhow::Result<usize> {
-    let config = config.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut failures = 0_usize;
-        let mut uploaded = 0_usize;
-        for manifest in files_with_suffix(&config.spool_dir, ".manifest.json")? {
-            if let Err(error) = upload_one(&config, &manifest) {
+async fn upload_pending(
+    config: &Config,
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<Option<usize>> {
+    let mut failures = 0_usize;
+    let mut uploaded = 0_usize;
+    for manifest in files_with_suffix(&config.spool_dir, ".manifest.json")? {
+        if *shutdown.borrow() {
+            return Ok(None);
+        }
+        match upload_one(config, &manifest, shutdown).await {
+            Ok(true) => uploaded += 1,
+            Ok(false) => return Ok(None),
+            Err(error) => {
                 failures += 1;
                 error!(manifest = %manifest.display(), error = %error, "OSS upload retained for retry");
-            } else {
-                uploaded += 1;
             }
         }
-        if failures > 0 {
-            anyhow::bail!("{failures} pending OSS uploads failed");
-        }
-        anyhow::Ok(uploaded)
-    })
-    .await?
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} pending OSS uploads failed");
+    }
+    Ok(Some(uploaded))
 }
 
-fn upload_one(config: &Config, manifest: &Path) -> anyhow::Result<()> {
+async fn upload_one(
+    config: &Config,
+    manifest: &Path,
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<bool> {
     let metadata: Value = serde_json::from_reader(std::fs::File::open(manifest)?)?;
     let data = manifest.with_file_name(
         metadata["file"]
@@ -1092,7 +1130,7 @@ fn upload_one(config: &Config, manifest: &Path) -> anyhow::Result<()> {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        let mut command = Command::new("aliyun");
+        let mut command = tokio::process::Command::new("aliyun");
         command
             .args(["ossutil", "cp"])
             .arg(source)
@@ -1106,7 +1144,11 @@ fn upload_one(config: &Config, manifest: &Path) -> anyhow::Result<()> {
                 &config.oss_region,
                 "--force",
             ]);
-        let status = command_status_with_timeout(&mut command, config.oss_copy_timeout)?;
+        let Some(status) =
+            command_status_or_shutdown(&mut command, config.oss_copy_timeout, shutdown).await?
+        else {
+            return Ok(false);
+        };
         if !status.success() {
             anyhow::bail!(
                 "aliyun ossutil failed for {} with {status}",
@@ -1117,7 +1159,36 @@ fn upload_one(config: &Config, manifest: &Path) -> anyhow::Result<()> {
     std::fs::remove_file(data)?;
     std::fs::remove_file(manifest)?;
     std::fs::remove_file(success)?;
-    Ok(())
+    Ok(true)
+}
+
+async fn command_status_or_shutdown(
+    command: &mut tokio::process::Command,
+    timeout: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> anyhow::Result<Option<std::process::ExitStatus>> {
+    if *shutdown.borrow() {
+        return Ok(None);
+    }
+    command.kill_on_drop(true);
+    let status = command.status();
+    tokio::pin!(status);
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(None);
+                }
+            }
+            result = &mut status => return Ok(Some(result?)),
+            _ = &mut deadline => {
+                anyhow::bail!("child process timed out after {}s", timeout.as_secs());
+            }
+        }
+    }
 }
 
 async fn wait_for_signal(shutdown: watch::Sender<bool>) {
@@ -1206,6 +1277,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::process::Command;
 
     fn test_config(rest_base: String) -> Config {
         Config {
@@ -1224,6 +1296,7 @@ mod tests {
             max_pending_diffs: 100,
             stall_timeout: Duration::from_secs(60),
             sync_timeout: Duration::from_secs(120),
+            task_cancel_timeout: Duration::from_secs(1),
             process_watchdog_timeout: Duration::from_secs(180),
             snapshot_retry_attempts: 3,
             rest_base,
@@ -1234,6 +1307,40 @@ mod tests {
             zstd_timeout: Duration::from_secs(30),
             oss_copy_timeout: Duration::from_secs(30),
         }
+    }
+
+    #[tokio::test]
+    async fn session_task_shutdown_aborts_a_stuck_task_at_deadline() {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(std::future::pending::<anyhow::Result<TaskExit>>());
+        let events = tokio::time::timeout(
+            Duration::from_secs(1),
+            stop_session_tasks(&mut tasks, Duration::from_millis(20)),
+        )
+        .await
+        .expect("stuck session task must be aborted");
+        assert!(events.is_empty());
+        assert!(tasks.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_command_stops_immediately_on_shutdown() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 60"]);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            command_status_or_shutdown(&mut command, Duration::from_secs(60), &mut shutdown_rx)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send(true).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("shutdown must cancel the upload child")
+            .unwrap()
+            .unwrap();
+        assert!(result.is_none());
     }
 
     #[test]

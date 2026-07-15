@@ -9,9 +9,13 @@ RPC method before opening SSH.
 
 ## Supported use
 
-- ingest RSS/Atom sources with `bin/ingest_feeds`;
 - query explicitly allowlisted market, order-book, position, and system methods;
 - collect research evidence for a later typed Monday handoff.
+
+RSS/Atom ingestion is currently unavailable: the former helper was removed by the
+Rust-only consolidation. A future replacement must be a reviewed typed Rust
+collector; the retained `ployctl` and `ployrpc` wrappers do not provide ingestion
+or fall back to another runtime.
 
 Required environment:
 

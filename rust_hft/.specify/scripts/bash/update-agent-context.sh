@@ -242,9 +242,6 @@ get_commands_for_language() {
     local lang="$1"
     
     case "$lang" in
-        *"Python"*)
-            echo "cd src && pytest && ruff check ."
-            ;;
         *"Rust"*)
             echo "cargo test && cargo clippy"
             ;;

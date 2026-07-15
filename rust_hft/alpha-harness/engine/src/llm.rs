@@ -519,7 +519,7 @@ mod tests {
         let artifact = HypothesisArtifact {
             hypothesis: "test".to_string(),
             field: "oi".to_string(),
-            operator: "python".to_string(),
+            operator: "eval".to_string(),
             window: None,
             provider: "test".to_string(),
             model: "test".to_string(),

@@ -42,8 +42,10 @@ A silent WebSocket shard fails after
 `STALL_TIMEOUT_SECONDS`. Receiver cleanup is bounded to five seconds so a stuck
 WebSocket close handshake cannot block reconnection. A separate process watchdog
 exits after 180 seconds without any market-data frame, allowing systemd to recover
-even if the asyncio loop deadlocks. Low disk space emits a warning but does not
-pause collection. Successfully uploaded segments are deleted
+even if the runtime stalls. On shutdown, session tasks have a 10-second grace
+period and an in-flight OSS child is killed immediately; systemd reserves up to
+360 seconds for that drain plus the bounded 300-second final compression. Low disk
+space emits a warning but does not pause collection. Successfully uploaded segments are deleted
 from the local spool immediately. Pending segments are retained when OSS upload
 fails so the collector never creates a silent data hole merely to reclaim space.
 The shared pending-diff budget still bounds initialization bursts. Services restart
@@ -86,20 +88,22 @@ ClickHouse is optional for always-on shared analytics, dashboards, and derived
 realtime features. It is not required for the first backtest pipeline and should
 not duplicate the complete raw OSS tape.
 
-## Rust collector shadow rollout
+## Rust Binance collector
 
-The Rust replacement runs beside the Python collector first. Its service name,
-spool directory, and OSS dataset are deliberately separate, so installing or
-starting it neither stops the Python services nor overwrites their objects:
+The repository has one Binance LOB archiver implementation: the Rust
+`binance-lob-archiver` binary. Two systemd templates serve different rollout
+roles; they do not represent two implementations:
 
-| Market | Service | Local spool | OSS dataset |
+| Role | Market scope | Local spool | OSS dataset |
 | --- | --- | --- | --- |
-| Spot | `binance-lob-archiver-rust@spot` | `/data/monday/spool/binance-lob-rust-shadow/spot` | `spot_all_rust_shadow` |
-| USD-M | `binance-lob-archiver-rust@usdm` | `/data/monday/spool/binance-lob-rust-shadow/usdm` | `usdm_perpetual_all_rust_shadow` |
+| Rust shadow canary | `BTCUSDT` | `/data/monday/spool/binance-lob-rust-shadow/<market>` | `spot_all_rust_shadow` / `usdm_perpetual_all_rust_shadow` |
+| Canonical continuity contract | `ALL` | `/data/monday/spool/binance-lob/<market>` | `spot_all` / `usdm_perpetual_all` |
 
-Both shadow examples start with `BTCUSDT` only. Keep that bounded scope through
-two successful segment rotations and uploads; switch `SYMBOLS=ALL` only after
-health, replay continuity, and resource use pass the shadow gate.
+The canonical Rust configuration intentionally preserves the existing symbol,
+spool, and dataset-prefix contract. A repository change does not activate or
+replace a remote unit. Run the bounded shadow canary first; do not overwrite the
+canonical unit until two segment rotations/uploads, replay continuity, consumer
+readback, and host resource gates pass.
 
 Build and verify the binary from `rust_hft/`:
 
@@ -109,10 +113,34 @@ cargo build --release --locked --no-default-features \
 target/release/binance-lob-archiver --self-test
 ```
 
-Install the binary and the Rust-only service templates without changing the
-running Python units:
+Install the binary and bounded Rust shadow templates during an explicitly
+reviewed host deployment:
 
 ```bash
+(
+set -euo pipefail
+
+# Host dependencies are part of the deployment contract. This block targets the
+# current Linux x86_64 ECS image; use the arm64 values documented below on aarch64.
+command -v zstd >/dev/null || {
+  sudo apt-get update
+  sudo apt-get install -y zstd
+}
+zstd --version
+
+ALIYUN_CLI_VERSION=3.4.6
+ALIYUN_CLI_ARCH=amd64
+ALIYUN_CLI_SHA256=9f7c993bd1b16c530f219bc1976bf78057879db4b1bae857b2952676eb7466f6
+test "$(uname -m)" = x86_64
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "${tmp_dir}"' EXIT
+archive="aliyun-cli-linux-${ALIYUN_CLI_VERSION}-${ALIYUN_CLI_ARCH}.tgz"
+curl -fsSLo "${tmp_dir}/${archive}" "https://aliyuncli.alicdn.com/${archive}"
+echo "${ALIYUN_CLI_SHA256}  ${tmp_dir}/${archive}" | sha256sum -c -
+tar -xzf "${tmp_dir}/${archive}" -C "${tmp_dir}" aliyun
+sudo install -m 0755 "${tmp_dir}/aliyun" /usr/local/bin/aliyun
+aliyun version | grep -F "${ALIYUN_CLI_VERSION}"
+
 sudo install -D -m 0755 target/release/binance-lob-archiver \
   /opt/monday/bin/binance-lob-archiver
 sudo install -d -m 0750 -o hftcollector -g hftcollector \
@@ -123,16 +151,37 @@ sudo install -m 0640 ../deployment/aliyun/binance-lob-archiver-rust-spot.env \
   /etc/monday/binance-lob-archiver-rust-spot.env
 sudo install -m 0640 ../deployment/aliyun/binance-lob-archiver-rust-usdm.env \
   /etc/monday/binance-lob-archiver-rust-usdm.env
+sha256sum target/release/binance-lob-archiver \
+  /opt/monday/bin/binance-lob-archiver \
+  /usr/local/bin/aliyun
+cmp target/release/binance-lob-archiver /opt/monday/bin/binance-lob-archiver
+sudo -u hftcollector env HOME=/var/lib/hft-collector \
+  /opt/monday/bin/binance-lob-archiver --self-test
 sudo systemctl daemon-reload
+)
 ```
 
-Starting shadow collection is a separate, explicit operation:
+For an arm64 host, use archive architecture `arm64` and SHA-256
+`042833125a21dcafb6279811db4e4e772049404421ae60b565a3123147959092`.
+The deployment must stop if the architecture, checksum, CLI version, `zstd`
+readback, binary comparison, or self-test does not match. The first successful
+shadow upload is the RAM-role/OSS write proof; installation alone is not that
+proof.
+
+Starting the shadow is a separate, explicit operation after readback of the
+installed binary hash, environment, and storage mount:
 
 ```bash
 sudo systemctl start binance-lob-archiver-rust@spot.service
 sudo systemctl start binance-lob-archiver-rust@usdm.service
 jq . /data/monday/spool/binance-lob-rust-shadow/{spot,usdm}/health.json
 ```
+
+Only after those gates pass may an operator install
+`binance-lob-archiver@.service` and its non-`rust-` environment files over the
+canonical paths. Before the reviewed restart, read back that `SYMBOLS=ALL`, the
+original dataset prefixes, and the original spool paths are unchanged. This
+repository change neither performs nor proves that remote cutover.
 
 The container image is built from the Rust workspace root and includes pinned
 Alibaba Cloud CLI checksums plus `zstd`:

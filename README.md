@@ -32,11 +32,12 @@ The repository provides the durable goal loop and CLI. Time-based or event-based
 | OpenAI-compatible hypothesis/failure critic | `lab-only` | Optional `ALPHA_LLM_*` calls; outputs remain evidence/proposals |
 | PLOY typed probability-blend LoopRun | `governed-research` | BTC/SOL five-minute event lane only; Rust schema, budget, event-disjoint evaluator, and content-addressed ledger; no order authority |
 | Purged walk-forward and one-time sealed holdout v3 | `governed` | Typed predictive/trading metrics and config hashes are recomputed before promotion |
-| ONNX loading | `runtime-compatibility` | No governed ONNX producer until point-in-time training lineage and model evaluation exist |
+| Native Rust contract-model training | `governed-lab` | Burn 0.20.1, point-in-time rows, immutable dataset binding, deterministic seed, Burnpack artifact; never self-promotes |
+| ONNX loading | `runtime-compatibility` | Read-only compatibility for already governed artifacts; native training uses Burnpack |
 | Signed Formula Paper/Shadow handoff | `implemented` | Ed25519 verification, runtime-owned approval evidence, policy binding, durable nonce and audit records |
 | Runtime attribution and follow-up learning | `implemented` | Signed deployment/strategy-scoped events; validator-gated lab policy adoption |
 | Live-small runtime activation | `disabled` | Human eligibility evidence does not bypass the runtime fail-closed gate |
-| Python ML workspace | `legacy-prototype` | Not production control-plane or execution authority; migrate only with Rust parity evidence |
+| Repository language boundary | `rust-only` | No tracked Python source, PyTorch, libtorch, `tch`, synthetic trainer fallback, or Python CI/deployment path |
 | PLOY product workspace | `integrated-product` | `products/ploy` owns prediction-market product, operator UI, sidecar, and research capabilities; Monday risk, OMS, and execution remain authoritative |
 | Real alpha profitability | `not claimed` | Requires real point-in-time data, valid evaluation, and venue soak evidence |
 
@@ -67,6 +68,7 @@ Run from `rust_hft/` unless noted:
 
 ```bash
 cargo test --locked -p hft-collector -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness
+cargo test --locked -p hft-research-ml
 cargo clippy --locked -p alpha-domain -p alpha-store -p alpha-engine -p alpha-harness --all-targets --no-deps -- -D warnings
 cargo clippy --locked -p hft-collector --all-targets --features collector-binance --no-deps -- -D warnings
 cargo test --locked -p hft-live --features dl-strategy
@@ -95,6 +97,7 @@ Ordinary changes should use package-scoped checks. Run a release graph, containe
 - [Current implementation plan](docs/superpowers/plans/2026-07-11-loop-engineer-production-hardening.md)
 - [Design document status](docs/superpowers/README.md)
 - [PLOY integration boundary](docs/architecture/PLOY_INTEGRATION.md)
+- [Rust-only research and model boundary](docs/architecture/RUST_ONLY_RESEARCH.md)
 - [PLOY product workspace](products/ploy/README.md)
 
 DuckDB is the local research control-plane source of truth. Raw and large derived market data belongs in content-addressed trace/Parquet artifacts; ClickHouse is optional analytics storage, not control-plane authority.

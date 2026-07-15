@@ -43,7 +43,7 @@ ast-grep --pattern '$PATTERN' --lang $LANGUAGE $PATH
 
 ## Supported Languages
 
-- javascript, typescript, ruby, python, go, rust, java, c, cpp, html, css, yaml, json, and more
+- Rust, JavaScript, TypeScript, HTML, CSS, YAML, and JSON
 
 ## Integration Workflow
 

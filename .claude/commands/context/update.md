@@ -39,7 +39,7 @@ Gather information about what has changed:
 
 **Dependency Changes:**
 - Node.js: `git diff HEAD~5..HEAD package.json 2>/dev/null`
-- Python: `git diff HEAD~5..HEAD requirements.txt 2>/dev/null`
+- Rust: `git diff HEAD~5..HEAD -- '*/Cargo.toml' '*/Cargo.lock' 2>/dev/null`
 - Check if new dependencies were added or versions changed
 
 ### 3. Get Current DateTime

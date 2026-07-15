@@ -30,11 +30,11 @@ Supported examples:
 ./bin/ployrpc pm.get_order_book '{"token_id":"123"}'
 ```
 
-RSS/Atom ingestion remains local and non-executing:
-
-```bash
-./bin/ingest_feeds ./config/feeds.json
-```
+The former RSS/Atom feed-ingestion helper was removed in the Rust-only
+consolidation. This compatibility example currently provides no feed-ingestion
+command. Restoring that capability requires a typed Rust collector with source,
+clock, freshness, and evidence contracts; `ployctl` and `ployrpc` do not silently
+fall back to another runtime.
 
 ## Current development direction
 

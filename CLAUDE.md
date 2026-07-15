@@ -15,7 +15,9 @@ Read [README.md](README.md), [rust_hft/ARCHITECTURE.md](rust_hft/ARCHITECTURE.md
 ## Engineering Rules
 
 - Prefer Rust for durable production paths.
-- Preserve Python only where explicit parity evidence is missing.
+- Repository research, data, training, evaluation, and runtime code is Rust-only.
+  Do not add Python or PyTorch/libtorch bindings; missing capability fails closed
+  until a governed Rust implementation exists.
 - Never silently replace real data with fixtures.
 - Keep dataset, candidate, evaluation, approval, policy, feedback, and deployment evidence content-addressed or append-only.
 - Keep private signing keys and LLM credentials out of DuckDB and logs.

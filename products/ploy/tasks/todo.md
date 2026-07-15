@@ -29,6 +29,8 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 
 ## Research framework cleanup
 
+- [x] Complete the repository-wide Rust-only cutover: remove tracked Python and PyTorch/libtorch paths, add native Burn training for both research lanes, and pass focused Rust validation.
+
 - [x] Adapt the prediction Loop to binary/digital-option factors by exposing a point-in-time Chainlink endpoint-probability component without duplicating the existing CEX model.
 - [x] Split every prediction walk-forward lane by event end so unresolved events cannot cross train/test boundaries.
 - [x] Run `ploy-research` library tests in the active root CI workflow.
@@ -38,7 +40,7 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [x] Route typed probability-blend candidates into the prediction evaluator and emit candidate-specific loop feedback.
 - [x] Add separate governed BTC and SOL five-minute mission templates; reject mixed-symbol missions and unresolved provenance.
 - [x] Add a resumable PLOY prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
-- [x] Move the authoritative prediction LoopRun from Python into `ploy-research` Rust; retain Python only as a non-authoritative manual proposal helper.
+- [x] Move the authoritative prediction LoopRun into `ploy-research` Rust and retire the non-authoritative compatibility proposal helper.
 - [x] Require explicit, non-empty Chainlink reference plus Binance spot/aggTrade/L2 snapshot surfaces, replayed by `received_at`, before a BTC/SOL LoopRun starts.
 - [x] Retire the legacy Binance-to-`price_to_beat` backfill path so Binance cannot override Chainlink reference-price authority or Polymarket official resolution.
 - [x] Enforce mission, symbol, horizon, and exact snapshot provenance again at the Rust evaluator boundary.

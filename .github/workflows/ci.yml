@@ -33,6 +33,100 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Enforce Rust-only research and runtime source
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          forbidden_paths="$(git ls-files \
+            ':(glob)**/*.py' \
+            ':(glob)**/*.pyw' \
+            ':(glob)**/*.ipynb' \
+            ':(glob)**/*.py[cod]' \
+            ':(glob)**/requirements*.txt' \
+            ':(glob)**/pyproject.toml' \
+            ':(glob)**/Pipfile' \
+            ':(glob)**/poetry.lock' \
+            ':(glob)**/pytest.ini' \
+            ':(glob)**/tox.ini' \
+            ':(glob)**/setup.py')"
+          if [ -n "${forbidden_paths}" ]; then
+            echo "tracked Python source, notebook, bytecode, or packaging artifact is forbidden" >&2
+            printf '%s\n' "${forbidden_paths}" >&2
+            exit 1
+          fi
+
+          reject_python_text() {
+            label="$1"
+            pattern="$2"
+            shift 2
+            set +e
+            matches="$(git grep -n -I -E "${pattern}" -- "$@")"
+            scan_status=$?
+            set -e
+            case "${scan_status}" in
+              0)
+                echo "tracked ${label} is forbidden" >&2
+                printf '%s\n' "${matches}" >&2
+                exit 1
+                ;;
+              1)
+                return 0
+                ;;
+              *)
+                echo "${label} scanner failed with status ${scan_status}" >&2
+                exit "${scan_status}"
+                ;;
+            esac
+          }
+
+          shebang_pathspecs=(
+            ':(exclude,glob)**/*.md'
+            ':(exclude,glob)**/docs/archive/**'
+            ':(exclude,glob)**/docs/plans/**'
+            ':(exclude,glob)**/docs/reviews/**'
+            ':(exclude,glob)**/docs/superpowers/**'
+            ':(exclude,glob)**/tasks/research_evidence/**'
+          )
+          reject_python_text \
+            "Python shebang" \
+            '^#!.*python([0-9]+([.][0-9]+)?)?([[:space:]]|$)' \
+            "${shebang_pathspecs[@]}"
+
+          inline_command_pathspecs=(
+            ':(glob)**/*.sh'
+            ':(glob)**/*.bash'
+            ':(glob)**/*.zsh'
+            ':(glob)**/*.yml'
+            ':(glob)**/*.yaml'
+            ':(glob)**/*.toml'
+            ':(glob)**/*.service'
+            ':(glob)**/*.timer'
+            ':(glob)**/*.socket'
+            ':(glob)**/*.conf'
+            ':(glob)**/Dockerfile*'
+            ':(glob)**/Makefile'
+            ':(glob)**/Justfile'
+            ':(glob)**/bin/*'
+            ':(glob)**/scripts/*'
+            ':(glob)**/scripts/**/*'
+            ':(exclude,glob)**/docs/archive/**'
+            ':(exclude,glob)**/docs/plans/**'
+            ':(exclude,glob)**/docs/reviews/**'
+            ':(exclude,glob)**/docs/superpowers/**'
+            ':(exclude,glob)**/tasks/research_evidence/**'
+          )
+          reject_python_text \
+            "Python runtime or package-manager command" \
+            'actions/setup-pyth[o]n@|astral-sh/setup-u[v]@|(^|[;&|()/[:space:]])(python([0-9]+([.][0-9]+)?)?|pip([0-9]+)?|pipx|pytest|poetry|pdm|rye|conda|mamba|hatch|tox|virtualenv)([[:space:]]|$)|(^|[;&|()/[:space:]])uv[[:space:]]+(run|sync|pip|venv|python)([[:space:]]|$)' \
+            "${inline_command_pathspecs[@]}"
+
+          if git grep -n -E '(name = "(burn-tch|tch|torch-sys|pyo3[^"]*|cpython|rust-cpython|python3-sys|rustpython[^"]*)"|^[[:space:]]*(burn-tch|tch|torch-sys|pyo3([-_][A-Za-z0-9_-]+)?|cpython|rust-cpython|python3-sys|rustpython([-_][A-Za-z0-9_-]+)?)[[:space:]]*=)' -- \
+            ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock'; then
+            echo "PyTorch/libtorch and Python-runtime Rust bindings are forbidden" >&2
+            exit 1
+          fi
+
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,6 +162,7 @@ jobs:
           cargo fmt --check --package alpha-onnx-evaluator
           cargo fmt --check --package alpha-harness
           cargo fmt --check --package hft-harnessctl
+          cargo fmt --check --package hft-research-ml
 
       - name: Clippy Loop Engineer packages
         run: |
@@ -78,13 +173,14 @@ jobs:
             -p alpha-onnx-evaluator \
             -p alpha-harness \
             -p hft-harnessctl \
+            -p hft-research-ml \
             --all-targets \
             --locked \
             -- \
             -D warnings
 
       - name: Test Loop Engineer packages
-        run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-onnx-evaluator -p alpha-harness -p hft-harnessctl --locked
+        run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-onnx-evaluator -p alpha-harness -p hft-harnessctl -p hft-research-ml --locked
 
       - name: Verify signed runtime handoff
         run: |
@@ -218,38 +314,6 @@ jobs:
 
       - name: Test Binance MD fast lane
         run: cargo test -p hft-engine --locked binance_md
-
-  python_lint:
-    name: Python Lint (ml_workspace)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ml_workspace
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install linters
-        run: |
-          python -m pip install --upgrade pip
-          pip install ruff black
-
-      - name: Ruff
-        run: ruff check .
-        continue-on-error: true
-
-      - name: Black
-        run: black --check --diff .
-        continue-on-error: true
-
-      - name: Syntax check
-        run: python -m compileall .
 
   node_install:
     name: Node Install (root)

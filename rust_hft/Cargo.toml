@@ -74,13 +74,13 @@ members = [
     "infra-services/core/secrets",
     "infra-services/core/venue",
     "infra-services/core/ipc",
-    "infra-services/core/model-manager",
     "infra-services/core/grpc-server",
     "infra-services/testing",
 
     # Research Core
     "research-core/factor-dsl",
     "research-core/manifest",
+    "research-core/ml",
 
     # Bounded Loop Engineer research plane
     "alpha-harness/domain",
@@ -194,6 +194,9 @@ rust_decimal = { version = "1.33", features = ["serde"] }
 # CLI and examples
 clap = { version = "4.0", features = ["derive"] }
 metrics-exporter-prometheus = "0.17"
+burn = { version = "0.20.1", default-features = false, features = ["ndarray", "autodiff", "std"] }
+burn-ndarray = "0.20.1"
+burn-store = { version = "0.20.1", default-features = false, features = ["std", "burnpack"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

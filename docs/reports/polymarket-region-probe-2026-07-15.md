@@ -82,7 +82,7 @@ geoblock, and HTTP latency collection were deliberately orchestrated with Alibab
   `5aea388d8ae8a83364dcb481a2715a3da2467034e4f81d3024fd1162f4d10db0`.
 
 The Polymarket quote and execution hot paths are Rust. The wider Monday repository also contains
-supporting Python, TypeScript, and shell tooling, so it would be inaccurate to call every repository
+supporting Rust, TypeScript, and shell tooling, so it would be inaccurate to call every repository
 file Rust.
 
 ## Release and cleanup proof

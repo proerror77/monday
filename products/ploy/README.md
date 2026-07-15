@@ -5,15 +5,14 @@ PLOY is maintained inside the [Monday repository](https://github.com/proerror77/
 prediction-market product, research, agent sidecar, and operator code can evolve
 without joining Monday's `rust_hft` Cargo graph.
 
-The durable runtime is Rust and TypeScript is limited to `ploy-frontend`. Imported
-Python research/compatibility utilities remain only behind explicit parity gates;
-the root CI checks them for source compatibility but does not deploy the nested
-historical PLOY workflows.
+The durable runtime, research plane, data diagnostics, training, evaluation, and
+operator utilities are Rust. TypeScript is limited to `ploy-frontend`. There is
+no Python compatibility lane and no nested historical workflow authority.
 
-The authoritative prediction-research LoopRun is implemented in Rust in
-`crates/ploy-research` and exposed by the `prediction_research_loop` example.
-Python helpers are compatibility or one-shot analysis tools; they do not own
-LoopRun state, evidence, evaluation, promotion, or execution authority.
+The authoritative prediction-research LoopRun and binary-probability model are
+implemented in `crates/ploy-research`. The LoopRun owns bounded proposal evidence;
+the Burn model owns only event-disjoint supervised training and out-of-sample
+probability metrics. Neither owns promotion or execution authority.
 
 ## Execution boundary
 
@@ -29,12 +28,10 @@ reconciliation, cancellation, replacement, and order execution.
   order, cancellation, and reconciliation operations belong to `rust_hft`.
 - The standard `new-ploy-runner --features full` build does not enable the legacy
   `live-execution` feature.
-- Workflows under `products/ploy/.github/workflows` are historical source material.
-  GitHub does not execute them from this nested location.
+- The only PLOY CI authority is the root `.github/workflows/ploy-ci.yml` workflow.
 
 Live configuration examples and legacy deployment assets are retained only for
-compatibility and historical analysis. They are not approved Monday deployment
-entrypoints.
+historical analysis. They are not approved Monday deployment entrypoints.
 
 ## Supported development scope
 
@@ -79,6 +76,23 @@ cargo +1.91 check --locked -p new-ploy-runner --features full
 
 Use package-scoped checks for ordinary development. Workspace-wide and database-backed
 matrices belong to migration closeout or the root PLOY CI workflow.
+
+The prediction snapshot must consume a typed Rust data audit; a hand-written
+status is rejected:
+
+```bash
+PLOY_DATABASE__URL="${PLOY_DATABASE__URL:?required}" \
+  cargo run -p ploy-market-data --features audit \
+  --example market_data_gap_audit -- \
+  --start-ts 2026-07-01T00:00:00Z \
+  --end-ts 2026-07-02T00:00:00Z \
+  --symbols BTCUSDT,SOLUSDT \
+  --output /tmp/prediction-data-audit.json
+```
+
+The report separately proves Binance spot/aggTrade/L2, Chainlink, Polymarket
+full depth, and official settlement coverage. Query failures are unavailable
+evidence, not zero missing rows.
 
 The full runner remains non-executing in Monday:
 

@@ -51,8 +51,8 @@ lab-only Formula proposer for derivatives missions. PLOY uses the versioned
 does not import the alpha-harness Rust domain or loop runtime. Instead, PLOY has
 its own bounded Rust prediction-research LoopRun in `crates/ploy-research`, with
 `prediction_research_loop` as its CLI example, because an event settlement loop
-cannot reuse the derivatives return/IC state machine. No Python script is an
-authoritative prediction LoopRun or promotion surface. Standalone formula
+cannot reuse the derivatives return/IC state machine. No compatibility script is
+an authoritative prediction LoopRun or promotion surface. Standalone formula
 mutations may carry a falsifiable hypothesis and compile through AutoFactor as
 IC/ICIR diagnostics, but the prediction LoopRun accepts only typed
 probability-blend candidates. Those candidates enter PLOY's
@@ -111,24 +111,24 @@ The complete path and SHA-256 record is in
   into that archive. The only active OpenClaw example is read-only and rejects
   unlisted RPC methods and remote-control mutations before SSH.
 
-The original `.github`, `deployment`, and `infra` trees remain under `products/ploy` for source compatibility and historical evidence. GitHub does not execute nested workflows. They are not Monday deployment entrypoints.
+The imported nested `.github` workflow tree was retired during the Rust-only
+cutover. The remaining `deployment` and `infra` trees are historical evidence,
+not Monday deployment entrypoints.
 
 ## Language boundary
 
 - Durable Monday market data, account, order, reconciliation, sidecar, report,
   backtest, and monitoring paths are Rust. TypeScript is limited to the operator
   frontend.
-- Python remains only where behavior has not yet earned Rust parity: the legacy ML
-  workspace, the Python LOB archiver during Rust shadow comparison, and imported
-  PLOY research/compatibility utilities. Root CI may compile or fixture-test those
-  files, but they do not own prediction LoopRun state, evaluator evidence, or
-  promotion decisions, and root CI does not make the nested PLOY deployment
-  workflows active.
+- Training and inference use native Rust libraries. Continuous-contract models
+  use the `hft-research-ml` Burn trainer and immutable Burnpack bundles;
+  prediction-market probability models use PLOY's event-disjoint Burn trainer.
+  PyTorch/libtorch bindings and tracked Python source are forbidden by root CI.
 - Shell remains for host bootstrap, CI command composition, and package installation;
   no shell script owns trading decisions, risk, OMS, or exchange mutations.
 - The Rust sidecar is built and tested but has no approved deployment package. Its
   missing evidence adapters fail closed and require a separate parity and deployment
-  review rather than falling back to Python or user-global tools.
+  review rather than falling back to ungoverned tools.
 
 ## Historical local-only documents
 
@@ -139,10 +139,8 @@ Seven documents from local PLOY commit `5de411bbe8889284b47fe9932821af077d2962fc
 - Monday's existing Rust workspace stays rooted at `rust_hft` and keeps its own toolchain and CI.
 - PLOY stays rooted at `products/ploy`, uses Rust `1.91` and Node `22`, and has a dedicated root workflow at `.github/workflows/ploy-ci.yml`.
 - PLOY-only changes do not run Monday's Rust or Docker build matrices; repository-wide security checks still scan the full diff.
-- Semgrep excludes the nested historical PLOY workflow and infrastructure
-  directories because those files are preserved evidence rather than executable
-  Monday delivery paths. Root workflows and active source remain scanned, and
-  tracked-secret detection still covers the complete repository tree.
+- Root workflows and active source remain scanned, and tracked-secret detection
+  covers the complete repository tree. There is no nested PLOY workflow surface.
 - The active PLOY runtime entrypoints are `new-ployd`, `ploy-agent-sidecar`, `new-ploy-runner`, `ployctl`, and `ploytui`. The root `ploy` crate is a compatibility shim.
 - `PloyDaemon::boot` installs `DisabledLiveExecutionGateway`; production code
   cannot inject the private Polymarket gateway, and the standard runner `full`

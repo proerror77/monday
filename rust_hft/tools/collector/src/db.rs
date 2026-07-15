@@ -448,7 +448,9 @@ mod tests {
             .conn
             .lock()
             .expect("lock")
-            .query_row("SELECT count(*) FROM binance_orderbook", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM binance_orderbook", [], |row| {
+                row.get(0)
+            })
             .expect("count");
         assert_eq!(count, 1);
 

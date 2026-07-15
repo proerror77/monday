@@ -431,7 +431,6 @@ fn map_strategy_type(strategy_type: shared::StrategyType) -> StrategyType {
         shared::StrategyType::Trend => StrategyType::Trend,
         shared::StrategyType::Arbitrage => StrategyType::Arbitrage,
         shared::StrategyType::MarketMaking => StrategyType::MarketMaking,
-        shared::StrategyType::Dl => StrategyType::Dl,
         shared::StrategyType::Imbalance => StrategyType::Imbalance,
         shared::StrategyType::LobFlowGrid => StrategyType::LobFlowGrid,
     }
@@ -535,26 +534,6 @@ pub(super) fn convert_strategy_params(
             obi_threshold,
             lot,
             top_levels,
-        }),
-        (
-            shared::StrategyType::Dl,
-            shared::StrategyParams::Dl {
-                model_path,
-                device,
-                top_n,
-                queue_capacity,
-            },
-        ) => Ok(StrategyParams::Dl {
-            model_path,
-            device,
-            top_n,
-            window_size: None,
-            trigger_threshold: 0.0,
-            output_threshold: 0.0,
-            queue_capacity,
-            timeout_ms: 0,
-            max_error_rate: 0.0,
-            degradation_mode: "disabled".to_string(),
         }),
         (shared::StrategyType::LobFlowGrid, shared::StrategyParams::LobFlowGrid { config }) => {
             let lob_params: LobFlowGridParams = serde_yaml::to_value(config)

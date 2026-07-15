@@ -12,7 +12,7 @@ rules.
 
 - Prefer `rtk read <file>` instead of raw `cat`, `head`, or `tail`.
 - Use `rtk git status`, `rtk git diff`, `rtk git log`, and `rtk git push`.
-- Use `rtk cargo ...`, `rtk pytest`, `rtk test npm test`, and other supported
+- Use `rtk cargo ...`, `rtk test npm test`, and other supported
   `rtk` wrappers when they apply.
 - If no `rtk` wrapper exists for the command you need, use the plain command.
 
@@ -121,10 +121,8 @@ rules.
   required.
 - On trading hosts, do not build Rust source on-host. Build in CI and deploy
   release artifacts only.
-- Historical only: `.github/workflows/deploy-tango-1-1.yml`,
-  `.github/workflows/deploy-trade.yml`, `.github/workflows/approve-live-trade.yml`,
-  and `.github/workflows/release-platform.yml` are nested standalone contracts,
-  not active Monday workflows or deployment authority.
+- Historical nested deployment workflows were retired. Do not recreate a PLOY-local
+  workflow authority; the Monday-root workflow is canonical.
 - Live services should keep these systemd guardrails:
   - `Restart=always`
   - `RestartSec=5`
