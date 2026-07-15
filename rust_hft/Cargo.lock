@@ -3512,6 +3512,7 @@ dependencies = [
  "clickhouse 0.12.2",
  "duckdb",
  "flate2",
+ "fs4",
  "futures",
  "hex",
  "hft-engine",

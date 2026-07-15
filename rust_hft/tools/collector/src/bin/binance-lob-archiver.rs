@@ -26,6 +26,9 @@ use tracing::{error, info, warn};
 struct Args {
     #[arg(long)]
     self_test: bool,
+
+    #[arg(long, conflicts_with = "self_test")]
+    upload_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +57,74 @@ struct Config {
     aliyun_profile: String,
     zstd_timeout: Duration,
     oss_copy_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct UploadConfig {
+    spool_dir: PathBuf,
+    oss_bucket: String,
+    oss_endpoint: String,
+    oss_region: String,
+    aliyun_profile: String,
+    oss_copy_timeout: Duration,
+}
+
+const UPLOADED_CLEANUP_SCHEMA: &str = "monday.binance_lob.uploaded_cleanup.v1";
+const UPLOADED_CLEANUP_SUFFIX: &str = ".uploaded-cleanup.json";
+const UPLOADED_CLEANUP_TMP_SUFFIX: &str = ".uploaded-cleanup.json.tmp";
+const SPOOL_LOCK_FILE: &str = ".binance-lob-archiver.lock";
+
+#[derive(Debug)]
+struct SpoolLock {
+    _file: std::fs::File,
+}
+
+impl SpoolLock {
+    fn acquire(spool_dir: &Path) -> anyhow::Result<Self> {
+        let path = spool_dir.join(SPOOL_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open spool lock {}", path.display()))?;
+        if let Err(error) = fs4::FileExt::try_lock(&file) {
+            let error = std::io::Error::from(error);
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!("spool is already locked: {}", spool_dir.display());
+            }
+            return Err(error)
+                .with_context(|| format!("failed to lock spool {}", spool_dir.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+impl UploadConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            spool_dir: PathBuf::from(env_string("SPOOL_DIR", "/data/monday/spool/binance-lob")),
+            oss_bucket: env_string("OSS_BUCKET", "monday-lob-apne1-1045353359"),
+            oss_endpoint: env_string("OSS_ENDPOINT", "oss-ap-northeast-1-internal.aliyuncs.com"),
+            oss_region: env_string("OSS_REGION", "ap-northeast-1"),
+            aliyun_profile: env_string("ALIYUN_PROFILE", "ecs-role"),
+            oss_copy_timeout: Duration::from_secs(env_parse("OSS_COPY_TIMEOUT_SECONDS", 300_u64)?),
+        })
+    }
+}
+
+impl From<&Config> for UploadConfig {
+    fn from(config: &Config) -> Self {
+        Self {
+            spool_dir: config.spool_dir.clone(),
+            oss_bucket: config.oss_bucket.clone(),
+            oss_endpoint: config.oss_endpoint.clone(),
+            oss_region: config.oss_region.clone(),
+            aliyun_profile: config.aliyun_profile.clone(),
+            oss_copy_timeout: config.oss_copy_timeout,
+        }
+    }
 }
 
 impl Config {
@@ -315,12 +386,18 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    if Args::parse().self_test {
+    let args = Args::parse();
+    if args.self_test {
         return self_test();
     }
+    if args.upload_only {
+        return upload_only(&UploadConfig::from_env()?).await;
+    }
 
+    let spool_dir = PathBuf::from(env_string("SPOOL_DIR", "/data/monday/spool/binance-lob"));
+    std::fs::create_dir_all(&spool_dir)?;
+    let _spool_lock = SpoolLock::acquire(&spool_dir)?;
     let config = Arc::new(Config::from_env().await?);
-    std::fs::create_dir_all(&config.spool_dir)?;
     let recovered = recover_parts(&config.segment_config())?;
     if !recovered.is_empty() {
         info!(segments = recovered.len(), "recovered interrupted segments");
@@ -1016,25 +1093,10 @@ fn parse_symbol_catalog(market: Market, payload: &Value) -> anyhow::Result<Symbo
 }
 
 async fn upload_loop(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) {
+    let upload_config = UploadConfig::from(config.as_ref());
     loop {
-        let mut status = read_upload_status(&config.spool_dir);
-        match upload_pending(&config).await {
-            Ok(uploaded) => {
-                if uploaded > 0 {
-                    status.last_success_at = Some(chrono::Utc::now().to_rfc3339());
-                }
-                status.last_error_at = None;
-                status.last_error = None;
-            }
-            Err(error) => {
-                let now = chrono::Utc::now().to_rfc3339();
-                status.last_error_at = Some(now);
-                status.last_error = Some(error.to_string().chars().take(500).collect());
-                warn!(error = %error, "pending OSS upload failed; files retained");
-            }
-        }
-        if let Err(error) = write_upload_status(&config.spool_dir, &status) {
-            error!(error = %error, "failed to persist OSS upload status");
+        if let Err(error) = upload_pending_with_status(&upload_config).await {
+            warn!(error = %error, "pending OSS upload failed; files retained");
         }
         tokio::select! {
             changed = shutdown.changed() => {
@@ -1047,9 +1109,80 @@ async fn upload_loop(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-async fn upload_pending(config: &Config) -> anyhow::Result<usize> {
+async fn upload_only(config: &UploadConfig) -> anyhow::Result<()> {
+    if !config.spool_dir.is_dir() {
+        anyhow::bail!(
+            "SPOOL_DIR is not a directory: {}",
+            config.spool_dir.display()
+        );
+    }
+    let _spool_lock = SpoolLock::acquire(&config.spool_dir)?;
+    let mut incomplete = Vec::new();
+    for suffix in [".jsonl.part", ".zst.tmp", ".part.corrupt"] {
+        incomplete.extend(files_with_suffix(&config.spool_dir, suffix)?);
+    }
+    if !incomplete.is_empty() {
+        anyhow::bail!(
+            "upload-only drain blocked by {} incomplete segment artifacts; recover them with the collector release that created them",
+            incomplete.len()
+        );
+    }
+    let uploaded = upload_pending_with_status(config).await?;
+    let pending = files_with_suffix(&config.spool_dir, ".manifest.json")?.len();
+    if pending > 0 {
+        anyhow::bail!("upload-only drain incomplete: {pending} manifests remain");
+    }
+    let mut residual = Vec::new();
+    for suffix in [
+        ".jsonl.part",
+        ".zst.tmp",
+        ".part.corrupt",
+        ".jsonl.zst",
+        "._SUCCESS",
+        UPLOADED_CLEANUP_SUFFIX,
+        UPLOADED_CLEANUP_TMP_SUFFIX,
+    ] {
+        residual.extend(files_with_suffix(&config.spool_dir, suffix)?);
+    }
+    if !residual.is_empty() {
+        anyhow::bail!(
+            "upload-only drain incomplete: {} local segment artifacts remain",
+            residual.len()
+        );
+    }
+    println!("upload-only: uploaded={uploaded} pending=0");
+    Ok(())
+}
+
+async fn upload_pending_with_status(config: &UploadConfig) -> anyhow::Result<usize> {
+    let mut status = read_upload_status(&config.spool_dir);
+    let result = upload_pending(config).await;
+    match &result {
+        Ok(uploaded) => {
+            if *uploaded > 0 {
+                status.last_success_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            status.last_error_at = None;
+            status.last_error = None;
+        }
+        Err(error) => {
+            status.last_error_at = Some(chrono::Utc::now().to_rfc3339());
+            status.last_error = Some(error.to_string().chars().take(500).collect());
+            status.failure_count = status.failure_count.saturating_add(1);
+        }
+    }
+    write_upload_status(&config.spool_dir, &status)
+        .context("failed to persist OSS upload status")?;
+    result
+}
+
+async fn upload_pending(config: &UploadConfig) -> anyhow::Result<usize> {
     let config = config.clone();
     tokio::task::spawn_blocking(move || {
+        let recovered = recover_uploaded_cleanups(&config.spool_dir)?;
+        if recovered > 0 {
+            info!(recovered, "completed interrupted local upload cleanup");
+        }
         let mut failures = 0_usize;
         let mut uploaded = 0_usize;
         for manifest in files_with_suffix(&config.spool_dir, ".manifest.json")? {
@@ -1068,7 +1201,104 @@ async fn upload_pending(config: &Config) -> anyhow::Result<usize> {
     .await?
 }
 
-fn upload_one(config: &Config, manifest: &Path) -> anyhow::Result<()> {
+fn write_uploaded_cleanup_marker(
+    data: &Path,
+    manifest: &Path,
+    success: &Path,
+) -> anyhow::Result<PathBuf> {
+    let parent = manifest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("manifest has no parent: {}", manifest.display()))?;
+    if data.parent() != Some(parent) || success.parent() != Some(parent) {
+        anyhow::bail!("uploaded cleanup artifacts must share one directory");
+    }
+    let manifest_name = local_file_name(manifest)?;
+    let marker = manifest.with_file_name(format!("{manifest_name}{UPLOADED_CLEANUP_SUFFIX}"));
+    let temporary = marker.with_file_name(format!("{}.tmp", local_file_name(&marker)?));
+    let mut bytes = serde_json::to_vec(&json!({
+        "schema": UPLOADED_CLEANUP_SCHEMA,
+        "data": local_file_name(data)?,
+        "manifest": manifest_name,
+        "success": local_file_name(success)?,
+    }))?;
+    bytes.push(b'\n');
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    std::io::Write::write_all(&mut output, &bytes)?;
+    output.sync_all()?;
+    std::fs::rename(&temporary, &marker)?;
+    sync_parent_directory(&marker)?;
+    Ok(marker)
+}
+
+fn recover_uploaded_cleanups(spool_dir: &Path) -> anyhow::Result<usize> {
+    let markers = files_with_suffix(spool_dir, UPLOADED_CLEANUP_SUFFIX)?;
+    for marker in &markers {
+        cleanup_uploaded_marker(marker)?;
+    }
+    Ok(markers.len())
+}
+
+fn cleanup_uploaded_marker(marker: &Path) -> anyhow::Result<()> {
+    let metadata: Value = serde_json::from_reader(std::fs::File::open(marker)?)
+        .with_context(|| format!("invalid uploaded cleanup marker {}", marker.display()))?;
+    if metadata["schema"] != UPLOADED_CLEANUP_SCHEMA {
+        anyhow::bail!(
+            "invalid uploaded cleanup marker schema: {}",
+            marker.display()
+        );
+    }
+    for field in ["data", "manifest", "success"] {
+        let path = cleanup_artifact_path(marker, &metadata, field)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to clean uploaded artifact {}", path.display())
+                });
+            }
+        }
+    }
+    sync_parent_directory(marker)?;
+    std::fs::remove_file(marker)?;
+    sync_parent_directory(marker)
+}
+
+fn cleanup_artifact_path(marker: &Path, metadata: &Value, field: &str) -> anyhow::Result<PathBuf> {
+    let name = metadata[field]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("uploaded cleanup marker missing {field}"))?;
+    if Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name) {
+        anyhow::bail!("uploaded cleanup marker contains invalid {field} file name");
+    }
+    let path = marker
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cleanup marker has no parent: {}", marker.display()))?
+        .join(name);
+    if path == marker {
+        anyhow::bail!("uploaded cleanup marker cannot reference itself");
+    }
+    Ok(path)
+}
+
+fn local_file_name(path: &Path) -> anyhow::Result<&str> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("path has no UTF-8 file name: {}", path.display()))
+}
+
+fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn upload_one(config: &UploadConfig, manifest: &Path) -> anyhow::Result<()> {
     let metadata: Value = serde_json::from_reader(std::fs::File::open(manifest)?)?;
     let data = manifest.with_file_name(
         metadata["file"]
@@ -1114,10 +1344,8 @@ fn upload_one(config: &Config, manifest: &Path) -> anyhow::Result<()> {
             );
         }
     }
-    std::fs::remove_file(data)?;
-    std::fs::remove_file(manifest)?;
-    std::fs::remove_file(success)?;
-    Ok(())
+    let marker = write_uploaded_cleanup_marker(&data, manifest, &success)?;
+    cleanup_uploaded_marker(&marker)
 }
 
 async fn wait_for_signal(shutdown: watch::Sender<bool>) {
@@ -1206,6 +1434,247 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn upload_only_cli_is_explicit_and_exclusive() {
+        let args = Args::try_parse_from(["binance-lob-archiver", "--upload-only"]).unwrap();
+        assert!(args.upload_only);
+        assert!(!args.self_test);
+        assert!(
+            Args::try_parse_from(["binance-lob-archiver", "--upload-only", "--self-test",])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_only_rejects_a_missing_spool() {
+        let spool_dir =
+            env::temp_dir().join(format!("monday-upload-only-missing-{}", now_ns().unwrap()));
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error.to_string().contains("SPOOL_DIR is not a directory"));
+        assert!(!spool_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn upload_only_accepts_an_empty_spool_without_network_access() {
+        let spool_dir =
+            env::temp_dir().join(format!("monday-upload-only-empty-{}", now_ns().unwrap()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        upload_only(&config).await.unwrap();
+        assert!(spool_dir.join("upload-status.json").is_file());
+        assert!(spool_dir.join(SPOOL_LOCK_FILE).is_file());
+        assert!(files_with_suffix(&spool_dir, ".manifest.json")
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_only_fails_while_spool_lock_is_held_and_succeeds_after_release() {
+        let spool_dir = env::temp_dir().join(format!("monday-spool-lock-{}", now_ns().unwrap()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let first = SpoolLock::acquire(&spool_dir).unwrap();
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error.to_string().contains("spool is already locked"));
+        assert!(!spool_dir.join("upload-status.json").exists());
+
+        drop(first);
+        upload_only(&config).await.unwrap();
+        assert!(spool_dir.join(SPOOL_LOCK_FILE).is_file());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_only_rejects_an_interrupted_segment() {
+        for suffix in ["jsonl.part", "jsonl.zst.tmp", "jsonl.part.corrupt"] {
+            let spool_dir = env::temp_dir().join(format!(
+                "monday-upload-only-interrupted-{suffix}-{}",
+                now_ns().unwrap()
+            ));
+            std::fs::create_dir_all(&spool_dir).unwrap();
+            let artifact = spool_dir.join(format!("part-1700000000000000000.{suffix}"));
+            std::fs::write(&artifact, b"unfinished").unwrap();
+            let config = UploadConfig {
+                spool_dir: spool_dir.clone(),
+                oss_bucket: "unused".into(),
+                oss_endpoint: "unused".into(),
+                oss_region: "ap-northeast-1".into(),
+                aliyun_profile: "unused".into(),
+                oss_copy_timeout: Duration::from_secs(1),
+            };
+
+            let error = upload_only(&config).await.unwrap_err();
+            assert!(error.to_string().contains("incomplete segment artifacts"));
+            assert!(artifact.is_file());
+            std::fs::remove_dir_all(spool_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_only_rejects_an_orphaned_compressed_segment() {
+        let spool_dir =
+            env::temp_dir().join(format!("monday-upload-only-zst-{}", now_ns().unwrap()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("part-1700000000000000000.jsonl.zst"),
+            b"orphaned",
+        )
+        .unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error.to_string().contains("local segment artifacts remain"));
+        assert!(spool_dir
+            .join("part-1700000000000000000.jsonl.zst")
+            .is_file());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[test]
+    fn uploaded_cleanup_recovery_is_idempotent_after_every_interruption_point() {
+        for removed in 0..=3 {
+            let spool_dir = env::temp_dir().join(format!(
+                "monday-upload-cleanup-{removed}-{}",
+                now_ns().unwrap()
+            ));
+            std::fs::create_dir_all(&spool_dir).unwrap();
+            let data = spool_dir.join("part-1700000000000000000.jsonl.zst");
+            let manifest = spool_dir.join("part-1700000000000000000.jsonl.zst.manifest.json");
+            let success = spool_dir.join("part-1700000000000000000.jsonl.zst._SUCCESS");
+            for path in [&data, &manifest, &success] {
+                std::fs::write(path, b"artifact").unwrap();
+            }
+            let marker = write_uploaded_cleanup_marker(&data, &manifest, &success).unwrap();
+
+            for path in [&data, &manifest, &success].into_iter().take(removed) {
+                std::fs::remove_file(path).unwrap();
+            }
+
+            assert_eq!(recover_uploaded_cleanups(&spool_dir).unwrap(), 1);
+            for path in [&data, &manifest, &success, &marker] {
+                assert!(!path.exists(), "{} was not cleaned", path.display());
+            }
+            assert_eq!(recover_uploaded_cleanups(&spool_dir).unwrap(), 0);
+            std::fs::remove_dir_all(spool_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn uploaded_cleanup_marker_is_removed_last() {
+        let spool_dir =
+            env::temp_dir().join(format!("monday-upload-cleanup-last-{}", now_ns().unwrap()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let data = spool_dir.join("part-1700000000000000000.jsonl.zst");
+        let manifest = spool_dir.join("part-1700000000000000000.jsonl.zst.manifest.json");
+        let success = spool_dir.join("part-1700000000000000000.jsonl.zst._SUCCESS");
+        for path in [&data, &manifest, &success] {
+            std::fs::write(path, b"artifact").unwrap();
+        }
+        let marker = write_uploaded_cleanup_marker(&data, &manifest, &success).unwrap();
+        std::fs::remove_file(&success).unwrap();
+        std::fs::create_dir(&success).unwrap();
+
+        recover_uploaded_cleanups(&spool_dir).unwrap_err();
+        assert!(marker.is_file());
+
+        std::fs::remove_dir(&success).unwrap();
+        assert_eq!(recover_uploaded_cleanups(&spool_dir).unwrap(), 1);
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_pending_recovers_cleanup_before_reading_manifests() {
+        let spool_dir = env::temp_dir().join(format!(
+            "monday-upload-cleanup-before-manifests-{}",
+            now_ns().unwrap()
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let data = spool_dir.join("part-1700000000000000000.jsonl.zst");
+        let manifest = spool_dir.join("part-1700000000000000000.jsonl.zst.manifest.json");
+        let success = spool_dir.join("part-1700000000000000000.jsonl.zst._SUCCESS");
+        for path in [&data, &manifest, &success] {
+            std::fs::write(path, b"not valid manifest JSON").unwrap();
+        }
+        let marker = write_uploaded_cleanup_marker(&data, &manifest, &success).unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        assert_eq!(upload_pending(&config).await.unwrap(), 0);
+        assert!(!marker.exists());
+        assert!(files_with_suffix(&spool_dir, ".manifest.json")
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_only_rejects_a_residual_cleanup_marker() {
+        let spool_dir = env::temp_dir().join(format!(
+            "monday-upload-cleanup-residual-{}",
+            now_ns().unwrap()
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let marker = spool_dir.join(format!(
+            "part-1700000000000000000.jsonl.zst.manifest.json{UPLOADED_CLEANUP_SUFFIX}"
+        ));
+        std::fs::write(&marker, b"{}\n").unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid uploaded cleanup marker schema"));
+        assert!(marker.is_file());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
 
     fn test_config(rest_base: String) -> Config {
         Config {

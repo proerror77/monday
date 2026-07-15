@@ -27,6 +27,7 @@ hex = { workspace = true }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+fs4 = { workspace = true }
 rust_decimal = { version = "1", features = ["serde"] }
 ordered-float = "4"
 tracing = "0.1"

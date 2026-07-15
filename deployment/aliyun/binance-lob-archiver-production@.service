@@ -1,5 +1,5 @@
 [Unit]
-Description=Rust Binance LOB archiver shadow (%i)
+Description=Rust Binance LOB archiver production (%i)
 After=network-online.target
 Wants=network-online.target
 RequiresMountsFor=/data
@@ -11,9 +11,9 @@ User=hftcollector
 Group=hftcollector
 Environment=RUST_LOG=info
 Environment=HOME=/var/lib/hft-collector
-EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env
-ExecStartPre=/opt/monday/bin/binance-lob-archiver-shadow --self-test
-ExecStart=/opt/monday/bin/binance-lob-archiver-shadow
+EnvironmentFile=/etc/monday/binance-lob-archiver-production-%i.env
+ExecStartPre=/opt/monday/bin/binance-lob-archiver --self-test
+ExecStart=/opt/monday/bin/binance-lob-archiver
 Restart=always
 RestartSec=5
 RuntimeMaxSec=21600
@@ -28,7 +28,7 @@ ProtectControlGroups=true
 LockPersonality=true
 RestrictSUIDSGID=true
 StateDirectory=hft-collector
-ReadWritePaths=/data/monday/spool/binance-lob-rust-shadow
+ReadWritePaths=/data/monday/spool/binance-lob
 CPUQuota=80%
 MemoryHigh=2500M
 MemoryMax=3200M
