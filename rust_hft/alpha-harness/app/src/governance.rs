@@ -15,7 +15,7 @@ use alpha_domain::{
     ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 use alpha_engine::{
-    evaluation::{prepare_dataset, WalkForwardConfig},
+    evaluation::prepare_dataset,
     formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
     CandidateEvaluation, EngineProposal,
 };
@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -53,6 +53,17 @@ pub(crate) fn validated_walk_forward_candidates(
 fn validated_walk_forward_candidates_in_lineage(
     lineage: &MissionLineage,
 ) -> anyhow::Result<Vec<String>> {
+    Ok(validated_walk_forward_evidence_in_lineage(lineage)?
+        .into_iter()
+        .map(|(candidate_id, _)| candidate_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+fn validated_walk_forward_evidence_in_lineage(
+    lineage: &MissionLineage,
+) -> anyhow::Result<Vec<(String, String)>> {
     let expected_config = FormulaEvaluator::for_mission(&lineage.mission)
         .map_err(anyhow::Error::msg)?
         .config_evidence()
@@ -111,7 +122,13 @@ fn validated_walk_forward_candidates_in_lineage(
             .map_err(anyhow::Error::new)
             .with_context(|| format!("walk-forward evaluation {evaluation_id} is invalid"))?;
         if evaluation.passed && evaluation.evaluator_config == expected_config {
-            candidates.push(candidate_id.to_string());
+            let (_, protocol_hash) = evaluation
+                .protocol_binding()
+                .map_err(anyhow::Error::new)
+                .with_context(|| {
+                    format!("walk-forward evaluation {evaluation_id} has no bound protocol")
+                })?;
+            candidates.push((candidate_id.to_string(), protocol_hash.to_string()));
         }
     }
     candidates.sort();
@@ -140,20 +157,14 @@ pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
     if mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
         bail!("mission dataset id does not match the supplied manifest");
     }
+    let protocol = args.dataset.validation.evaluation_protocol()?;
     let dataset = prepare_dataset(
         manifest.load_rows(
             args.dataset.validation.fee_bps,
             args.dataset.validation.funding_bps,
             args.dataset.validation.latency_bps,
         )?,
-        &WalkForwardConfig {
-            initial_train_rows: args.dataset.validation.initial_train_rows,
-            validation_rows: args.dataset.validation.validation_rows,
-            fold_count: args.dataset.validation.fold_count,
-            purge_rows: args.dataset.validation.purge_rows,
-            embargo_rows: args.dataset.validation.embargo_rows,
-            sealed_holdout_rows: args.dataset.validation.sealed_holdout_rows,
-        },
+        &protocol,
         format!("sealed:{}", manifest.manifest_id()),
     )?;
     let evaluation = OnnxEvaluator::for_mission(&mission)
@@ -219,11 +230,15 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
 pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRevision> {
     let mut store = AlphaStore::open(&args.db)?;
     let lineage = store.mission_lineage(&args.mission_id)?;
-    if !validated_walk_forward_candidates_in_lineage(&lineage)?
+    let requested_protocol = args.dataset.validation.evaluation_protocol()?;
+    let requested_protocol_hash = requested_protocol.content_hash()?;
+    if !validated_walk_forward_evidence_in_lineage(&lineage)?
         .iter()
-        .any(|candidate_id| candidate_id == &args.candidate_id)
+        .any(|(candidate_id, protocol_hash)| {
+            candidate_id == &args.candidate_id && protocol_hash == &requested_protocol_hash
+        })
     {
-        bail!("candidate lacks canonical v3 walk-forward evidence");
+        bail!("candidate lacks canonical walk-forward evidence for this evaluation protocol");
     }
     let candidate = lineage
         .candidates
@@ -287,8 +302,18 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
                 != Some(lineage.mission.dataset_manifest_id.as_str())
             || existing_evaluation.evaluator_version != expected_sealed_version
             || existing_evaluation.evaluator_config != expected_config
+            || existing
+                .payload
+                .get("evaluation_protocol_hash")
+                .and_then(serde_json::Value::as_str)
+                != Some(requested_protocol_hash.as_str())
+            || existing_evaluation
+                .protocol_binding()
+                .map(|(_, hash)| hash)
+                .ok()
+                != Some(requested_protocol_hash.as_str())
         {
-            bail!("existing sealed evaluation is not canonical v3 evidence for this candidate");
+            bail!("existing sealed evaluation is not canonical evidence for this protocol");
         }
         return Ok(existing);
     }
@@ -305,14 +330,7 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
     )?;
     let dataset = prepare_dataset(
         rows,
-        &WalkForwardConfig {
-            initial_train_rows: args.dataset.validation.initial_train_rows,
-            validation_rows: args.dataset.validation.validation_rows,
-            fold_count: args.dataset.validation.fold_count,
-            purge_rows: args.dataset.validation.purge_rows,
-            embargo_rows: args.dataset.validation.embargo_rows,
-            sealed_holdout_rows: args.dataset.validation.sealed_holdout_rows,
-        },
+        &requested_protocol,
         format!("sealed:{}", manifest.manifest_id()),
     )?;
     let proposal = EngineProposal {
@@ -350,6 +368,7 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
             "mission_id": args.mission_id,
             "candidate_content_hash": candidate.content_hash,
             "dataset_manifest_id": manifest.manifest_id(),
+            "evaluation_protocol_hash": requested_protocol_hash,
             "evaluation": evaluation,
         }),
         created_at: Utc::now(),
@@ -416,12 +435,19 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         .iter()
         .find(|candidate| candidate.candidate_id == args.candidate_id)
         .context("candidate does not belong to mission")?;
-    if !validated_walk_forward_candidates_in_lineage(&lineage)?
+    let walk_forward_protocol_hashes = validated_walk_forward_evidence_in_lineage(&lineage)?
+        .into_iter()
+        .filter_map(|(candidate_id, protocol_hash)| {
+            (candidate_id == args.candidate_id).then_some(protocol_hash)
+        })
+        .collect::<BTreeSet<_>>();
+    let Some(walk_forward_protocol_hash) = walk_forward_protocol_hashes
         .iter()
-        .any(|candidate_id| candidate_id == &args.candidate_id)
-    {
-        bail!("candidate lacks canonical v3 walk-forward evidence");
-    }
+        .next()
+        .filter(|_| walk_forward_protocol_hashes.len() == 1)
+    else {
+        bail!("candidate lacks a unique canonical walk-forward protocol binding");
+    };
     let expected_sealed_version = sealed_evaluator_version(&candidate.artifact)?;
     let sealed_id = sealed_evaluation_revision_id(&args.candidate_id, expected_sealed_version);
     let sealed = store.get_registry_revision(&sealed_id)?;
@@ -438,7 +464,17 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
     if !evaluation.passed {
         bail!("candidate failed sealed holdout and cannot be promoted");
     }
+    let (_, sealed_protocol_hash) = evaluation
+        .protocol_binding()
+        .map_err(anyhow::Error::new)
+        .context("sealed evaluation has no valid protocol binding")?;
+    let evaluation_protocol_hash = sealed_protocol_hash.to_string();
     if sealed.asset_id != candidate.candidate_id
+        || sealed
+            .payload
+            .get("mission_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(args.mission_id.as_str())
         || sealed
             .payload
             .get("candidate_content_hash")
@@ -449,6 +485,12 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
             .get("dataset_manifest_id")
             .and_then(serde_json::Value::as_str)
             != Some(lineage.mission.dataset_manifest_id.as_str())
+        || sealed
+            .payload
+            .get("evaluation_protocol_hash")
+            .and_then(serde_json::Value::as_str)
+            != Some(sealed_protocol_hash)
+        || sealed_protocol_hash != walk_forward_protocol_hash.as_str()
     {
         bail!("sealed evaluation binding does not match candidate and mission");
     }
@@ -481,6 +523,7 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         candidate.content_hash.clone(),
         lineage.mission.dataset_manifest_id.clone(),
         evaluation.evaluator_version.clone(),
+        evaluation_protocol_hash.clone(),
         evaluator_config_hash.clone(),
         evaluation_metrics_hash.clone(),
         sealed_evaluation_hash.clone(),
@@ -494,6 +537,7 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         candidate_content_hash: candidate.content_hash.clone(),
         dataset_manifest_id: lineage.mission.dataset_manifest_id.clone(),
         evaluator_version: evaluation.evaluator_version,
+        evaluation_protocol_hash,
         evaluator_config_hash,
         evaluation_metrics_hash,
         sealed_evaluation_id: sealed_id,
@@ -762,13 +806,37 @@ fn read_trusted_attribution_keys(
 mod tests {
     use super::*;
     use alpha_domain::{
-        sign_runtime_attribution_event, AllowedIntentType, MissionCompletionPolicy,
-        ResearchMission, SearchBudget, TensorElementType, TensorSpec, ValidatorMode,
-        LOB_ONNX_PREPROCESSING_VERSION,
+        sign_runtime_attribution_event, AllowedIntentType, EvaluationCostsV1,
+        EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
+        MissionCompletionPolicy, ResearchMission, SearchBudget, TensorElementType, TensorSpec,
+        ValidatorMode, LOB_ONNX_PREPROCESSING_VERSION,
     };
     use alpha_engine::evaluation::ResearchRow;
     use alpha_store::{StoredCandidate, StoredEvaluation};
     use chrono::Duration;
+
+    fn evaluation_protocol() -> EvaluationProtocolV1 {
+        EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 1,
+                validation_rows: 32,
+                fold_count: 2,
+                purge_rows: 0,
+                embargo_rows: 0,
+                sealed_holdout_rows: 1,
+            },
+            EvaluationCostsV1 {
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                latency_bps: 0.0,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: 1_000,
+            },
+        )
+        .unwrap()
+    }
 
     fn live_small_envelope() -> DeploymentEnvelope {
         let now = Utc::now();
@@ -806,6 +874,7 @@ mod tests {
             "candidate_content_hash": "1".repeat(64),
             "dataset_manifest_id": "dataset-1",
             "evaluator_version": SEALED_HOLDOUT_EVALUATOR_VERSION,
+            "evaluation_protocol_hash": "5".repeat(64),
             "evaluator_config_hash": "2".repeat(64),
             "evaluation_metrics_hash": "3".repeat(64),
             "sealed_evaluation_hash": "4".repeat(64),
@@ -824,6 +893,7 @@ mod tests {
             candidate_content_hash: bundle.candidate_content_hash.clone(),
             dataset_manifest_id: bundle.dataset_manifest_id.clone(),
             evaluator_version: bundle.evaluator_version.clone(),
+            evaluation_protocol_hash: bundle.evaluation_protocol_hash.clone(),
             evaluator_config_hash: bundle.evaluator_config_hash.clone(),
             evaluation_metrics_hash: bundle.evaluation_metrics_hash.clone(),
             sealed_evaluation_id: sealed_evaluation_revision_id(
@@ -942,7 +1012,13 @@ mod tests {
         let signals = rows.iter().map(|row| row.signal).collect::<Vec<_>>();
         let evaluation = FormulaEvaluator::for_mission(&mission)
             .unwrap()
-            .evaluate_onnx_signals(&rows, &signals, [0..32, 32..64], false)
+            .evaluate_onnx_signals(
+                &rows,
+                &signals,
+                [0..32, 32..64],
+                false,
+                &evaluation_protocol(),
+            )
             .unwrap();
         assert!(evaluation.passed);
         let created_at = Utc::now();

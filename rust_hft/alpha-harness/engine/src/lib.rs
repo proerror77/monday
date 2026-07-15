@@ -632,8 +632,11 @@ mod tests {
         BayesianOptimizerEngine, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
         OfflineTrace,
     };
-    use crate::evaluation::{prepare_dataset, ResearchRow, WalkForwardConfig};
-    use alpha_domain::{MissionCompletionPolicy, ResearchMission, SearchBudget, ValidatorMode};
+    use crate::evaluation::{prepare_dataset, ResearchRow};
+    use alpha_domain::{
+        EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
+        MissionCompletionPolicy, ResearchMission, SearchBudget, ValidatorMode,
+    };
     use chrono::Duration;
     use hft_research_manifest::ManifestId;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -698,6 +701,13 @@ mod tests {
                 failure_reasons: vec![],
                 evaluator_version: "fixture-v1".to_string(),
                 evaluator_config: serde_json::json!({"fixture": true}),
+                evaluation_protocol: Some(context.protocol().clone()),
+                evaluation_protocol_hash: Some(
+                    context
+                        .protocol()
+                        .content_hash()
+                        .map_err(|error| error.to_string())?,
+                ),
                 metrics: EvaluationMetrics {
                     predictive: PredictiveMetrics::from_folds(vec![FoldPredictiveMetrics {
                         fold_index: 1,
@@ -772,14 +782,26 @@ mod tests {
             .collect();
         prepare_dataset(
             rows,
-            &WalkForwardConfig {
-                initial_train_rows: 20,
-                validation_rows: 5,
-                fold_count: 3,
-                purge_rows: 2,
-                embargo_rows: 1,
-                sealed_holdout_rows: 10,
-            },
+            &EvaluationProtocolV1::new(
+                EvaluationWalkForwardV1 {
+                    initial_train_rows: 20,
+                    validation_rows: 5,
+                    fold_count: 3,
+                    purge_rows: 2,
+                    embargo_rows: 1,
+                    sealed_holdout_rows: 10,
+                },
+                EvaluationCostsV1 {
+                    fee_bps: 1.0,
+                    funding_bps: 0.1,
+                    latency_bps: 0.2,
+                },
+                EvaluationLabelSpecV1 {
+                    horizon_buckets: 1,
+                    observation_frequency_millis: 1_000,
+                },
+            )
+            .unwrap(),
             "holdout-1",
         )
         .unwrap()

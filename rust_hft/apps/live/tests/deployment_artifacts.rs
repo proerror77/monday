@@ -107,6 +107,7 @@ fn formula_bundle() -> StrategyBundle {
         "candidate_content_hash": "1".repeat(64),
         "dataset_manifest_id": "dataset-1",
         "evaluator_version": SEALED_HOLDOUT_EVALUATOR_VERSION,
+        "evaluation_protocol_hash": "5".repeat(64),
         "evaluator_config_hash": "3".repeat(64),
         "evaluation_metrics_hash": "4".repeat(64),
         "sealed_evaluation_hash": "2".repeat(64),

@@ -16,6 +16,7 @@ pub const WALK_FORWARD_EVALUATOR_VERSION: &str = "purged-walk-forward-v3";
 pub const ONNX_WALK_FORWARD_EVALUATOR_VERSION: &str = "onnx-purged-walk-forward-v2";
 pub const ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION: &str = "onnx-sealed-holdout-v2";
 pub const LOB_ONNX_PREPROCESSING_VERSION: &str = "lob-relative-price-log-size-v1";
+pub const EVALUATION_PROTOCOL_VERSION_V1: &str = "evaluation-protocol-v1";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -85,6 +86,118 @@ pub enum DomainError {
     InvalidEvaluationEvidence,
     #[error("formula evaluator configuration is invalid")]
     InvalidEvaluatorConfiguration,
+    #[error("evaluation protocol is invalid")]
+    InvalidEvaluationProtocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationWalkForwardV1 {
+    pub initial_train_rows: usize,
+    pub validation_rows: usize,
+    pub fold_count: usize,
+    pub purge_rows: usize,
+    pub embargo_rows: usize,
+    pub sealed_holdout_rows: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationCostsV1 {
+    pub fee_bps: f64,
+    pub funding_bps: f64,
+    pub latency_bps: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationLabelSpecV1 {
+    pub horizon_buckets: usize,
+    pub observation_frequency_millis: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IcirDefinitionV1 {
+    FoldMeanOverPopulationStddevWithEpsilonFloorV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharpeDefinitionV1 {
+    MeanFoldPerObservationPopulationStddevUnannualizedWithEpsilonFloorV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationMetricDefinitionsV1 {
+    pub icir: IcirDefinitionV1,
+    pub sharpe: SharpeDefinitionV1,
+}
+
+impl Default for EvaluationMetricDefinitionsV1 {
+    fn default() -> Self {
+        Self {
+            icir: IcirDefinitionV1::FoldMeanOverPopulationStddevWithEpsilonFloorV1,
+            sharpe:
+                SharpeDefinitionV1::MeanFoldPerObservationPopulationStddevUnannualizedWithEpsilonFloorV1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationProtocolV1 {
+    pub version: String,
+    pub walk_forward: EvaluationWalkForwardV1,
+    pub costs: EvaluationCostsV1,
+    pub labels: EvaluationLabelSpecV1,
+    pub metrics: EvaluationMetricDefinitionsV1,
+}
+
+impl EvaluationProtocolV1 {
+    pub fn new(
+        walk_forward: EvaluationWalkForwardV1,
+        costs: EvaluationCostsV1,
+        labels: EvaluationLabelSpecV1,
+    ) -> Result<Self, DomainError> {
+        let protocol = Self {
+            version: EVALUATION_PROTOCOL_VERSION_V1.to_string(),
+            walk_forward,
+            costs,
+            labels,
+            metrics: EvaluationMetricDefinitionsV1::default(),
+        };
+        protocol.validate()?;
+        Ok(protocol)
+    }
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.version != EVALUATION_PROTOCOL_VERSION_V1
+            || self.walk_forward.initial_train_rows == 0
+            || self.walk_forward.validation_rows == 0
+            || self.walk_forward.fold_count == 0
+            || self.walk_forward.sealed_holdout_rows == 0
+            || self.labels.horizon_buckets == 0
+            || self.labels.observation_frequency_millis == 0
+            || [
+                self.costs.fee_bps,
+                self.costs.funding_bps,
+                self.costs.latency_bps,
+            ]
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+            || self.metrics != EvaluationMetricDefinitionsV1::default()
+        {
+            return Err(DomainError::InvalidEvaluationProtocol);
+        }
+        Ok(())
+    }
+
+    pub fn content_hash(&self) -> Result<String, DomainError> {
+        self.validate()?;
+        canonical_json_hash(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +488,10 @@ pub struct CandidateEvaluation {
     pub failure_reasons: Vec<String>,
     pub evaluator_version: String,
     pub evaluator_config: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_protocol: Option<EvaluationProtocolV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_protocol_hash: Option<String>,
     pub metrics: EvaluationMetrics,
 }
 
@@ -440,7 +557,8 @@ impl CandidateEvaluation {
             .map(|fold| fold.net_sharpe)
             .sum::<f64>()
             / self.metrics.folds.len().max(1) as f64;
-        if self.evaluator_version.trim().is_empty()
+        if self.protocol_binding().is_err()
+            || self.evaluator_version.trim().is_empty()
             || !self.evaluator_config.is_object()
             || self.metrics.row_count == 0
             || self.metrics.folds.is_empty()
@@ -491,6 +609,22 @@ impl CandidateEvaluation {
             }
         }
         Ok(())
+    }
+
+    pub fn protocol_binding(&self) -> Result<(&EvaluationProtocolV1, &str), DomainError> {
+        let protocol = self
+            .evaluation_protocol
+            .as_ref()
+            .ok_or(DomainError::InvalidEvaluationEvidence)?;
+        let protocol_hash = self
+            .evaluation_protocol_hash
+            .as_deref()
+            .ok_or(DomainError::InvalidEvaluationEvidence)?;
+        validate_sha256(protocol_hash).map_err(|_| DomainError::InvalidEvaluationEvidence)?;
+        if protocol.content_hash()? != protocol_hash {
+            return Err(DomainError::InvalidEvaluationEvidence);
+        }
+        Ok((protocol, protocol_hash))
     }
 
     pub fn formula_config(&self) -> Result<FormulaEvaluatorConfig, DomainError> {
@@ -1344,6 +1478,8 @@ pub struct StrategyBundle {
     pub candidate_content_hash: String,
     pub dataset_manifest_id: ManifestId,
     pub evaluator_version: String,
+    #[serde(default)]
+    pub evaluation_protocol_hash: String,
     pub evaluator_config_hash: String,
     pub evaluation_metrics_hash: String,
     pub sealed_evaluation_hash: String,
@@ -1360,6 +1496,7 @@ impl StrategyBundle {
         candidate_content_hash: String,
         dataset_manifest_id: ManifestId,
         evaluator_version: String,
+        evaluation_protocol_hash: String,
         evaluator_config_hash: String,
         evaluation_metrics_hash: String,
         sealed_evaluation_hash: String,
@@ -1372,6 +1509,7 @@ impl StrategyBundle {
             candidate_content_hash,
             dataset_manifest_id,
             evaluator_version,
+            evaluation_protocol_hash,
             evaluator_config_hash,
             evaluation_metrics_hash,
             sealed_evaluation_hash,
@@ -1398,6 +1536,7 @@ impl StrategyBundle {
         require_text("bundle candidate_id", &self.candidate_id)?;
         require_text("evaluator_version", &self.evaluator_version)?;
         validate_sha256(&self.candidate_content_hash)?;
+        validate_sha256(&self.evaluation_protocol_hash)?;
         validate_sha256(&self.evaluator_config_hash)?;
         validate_sha256(&self.evaluation_metrics_hash)?;
         validate_sha256(&self.sealed_evaluation_hash)?;
@@ -1413,6 +1552,7 @@ impl StrategyBundle {
             candidate_content_hash: &'a str,
             dataset_manifest_id: &'a ManifestId,
             evaluator_version: &'a str,
+            evaluation_protocol_hash: &'a str,
             evaluator_config_hash: &'a str,
             evaluation_metrics_hash: &'a str,
             sealed_evaluation_hash: &'a str,
@@ -1422,6 +1562,7 @@ impl StrategyBundle {
             candidate_content_hash: &self.candidate_content_hash,
             dataset_manifest_id: &self.dataset_manifest_id,
             evaluator_version: &self.evaluator_version,
+            evaluation_protocol_hash: &self.evaluation_protocol_hash,
             evaluator_config_hash: &self.evaluator_config_hash,
             evaluation_metrics_hash: &self.evaluation_metrics_hash,
             sealed_evaluation_hash: &self.sealed_evaluation_hash,
@@ -1438,6 +1579,8 @@ pub struct PromotionRecord {
     pub candidate_content_hash: String,
     pub dataset_manifest_id: ManifestId,
     pub evaluator_version: String,
+    #[serde(default)]
+    pub evaluation_protocol_hash: String,
     pub evaluator_config_hash: String,
     pub evaluation_metrics_hash: String,
     pub sealed_evaluation_id: String,
@@ -1463,6 +1606,7 @@ impl PromotionRecord {
             require_text(name, value)?;
         }
         validate_sha256(&self.candidate_content_hash)?;
+        validate_sha256(&self.evaluation_protocol_hash)?;
         validate_sha256(&self.evaluator_config_hash)?;
         validate_sha256(&self.evaluation_metrics_hash)?;
         validate_sha256(&self.sealed_evaluation_hash)?;
@@ -1471,6 +1615,7 @@ impl PromotionRecord {
             || self.candidate_content_hash != bundle.candidate_content_hash
             || self.dataset_manifest_id != bundle.dataset_manifest_id
             || self.evaluator_version != bundle.evaluator_version
+            || self.evaluation_protocol_hash != bundle.evaluation_protocol_hash
             || self.evaluator_config_hash != bundle.evaluator_config_hash
             || self.evaluation_metrics_hash != bundle.evaluation_metrics_hash
             || self.sealed_evaluation_hash != bundle.sealed_evaluation_hash
@@ -2315,9 +2460,49 @@ mod tests {
         );
     }
 
+    fn evaluation_protocol() -> EvaluationProtocolV1 {
+        EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 200,
+                validation_rows: 64,
+                fold_count: 3,
+                purge_rows: 1,
+                embargo_rows: 1,
+                sealed_holdout_rows: 64,
+            },
+            EvaluationCostsV1 {
+                fee_bps: 1.0,
+                funding_bps: 0.0,
+                latency_bps: 0.5,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 5,
+                observation_frequency_millis: 1_000,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn evaluation_protocol_hash_binds_fee_cost() {
+        let protocol = evaluation_protocol();
+        let original_hash = protocol.content_hash().unwrap();
+        assert_eq!(protocol.content_hash().unwrap(), original_hash);
+        let mut changed = protocol;
+        changed.costs.fee_bps = 2.0;
+
+        assert_ne!(changed.content_hash().unwrap(), original_hash);
+
+        let mut unknown_field = serde_json::to_value(changed).unwrap();
+        unknown_field["unversioned_override"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<EvaluationProtocolV1>(unknown_field).is_err());
+    }
+
     #[test]
     fn evaluation_evidence_recomputes_policy_and_adjusted_score() {
         let config = FormulaEvaluatorConfig::for_trials(10).unwrap();
+        let evaluation_protocol = evaluation_protocol();
+        let evaluation_protocol_hash = evaluation_protocol.content_hash().unwrap();
         let raw_score = 5.0;
         let adjusted_score = config.adjusted_score(raw_score).unwrap();
         let mut evaluation = CandidateEvaluation {
@@ -2326,6 +2511,8 @@ mod tests {
             failure_reasons: vec![],
             evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
             evaluator_config: serde_json::to_value(&config).unwrap(),
+            evaluation_protocol: Some(evaluation_protocol),
+            evaluation_protocol_hash: Some(evaluation_protocol_hash),
             metrics: EvaluationMetrics {
                 predictive: PredictiveMetrics::from_folds(vec![FoldPredictiveMetrics {
                     fold_index: 1,
@@ -2354,6 +2541,34 @@ mod tests {
             },
         };
         assert!(evaluation.validate().is_ok());
+
+        let mut legacy_protocol_value = serde_json::to_value(&evaluation).unwrap();
+        legacy_protocol_value
+            .as_object_mut()
+            .unwrap()
+            .remove("evaluation_protocol");
+        legacy_protocol_value
+            .as_object_mut()
+            .unwrap()
+            .remove("evaluation_protocol_hash");
+        let legacy_protocol: CandidateEvaluation =
+            serde_json::from_value(legacy_protocol_value).unwrap();
+        assert_eq!(
+            legacy_protocol.validate(),
+            Err(DomainError::InvalidEvaluationEvidence)
+        );
+
+        let mut tampered_protocol = evaluation.clone();
+        tampered_protocol
+            .evaluation_protocol
+            .as_mut()
+            .unwrap()
+            .costs
+            .fee_bps = 2.0;
+        assert_eq!(
+            tampered_protocol.validate(),
+            Err(DomainError::InvalidEvaluationEvidence)
+        );
 
         let mut legacy_value = serde_json::to_value(&evaluation).unwrap();
         legacy_value["evaluator_version"] = serde_json::json!("purged-walk-forward-v2");
@@ -2454,6 +2669,7 @@ mod tests {
             "a".repeat(64),
             ManifestId::new("dataset-1").unwrap(),
             SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            "e".repeat(64),
             "c".repeat(64),
             "d".repeat(64),
             "b".repeat(64),
@@ -2472,6 +2688,30 @@ mod tests {
             bundle.validate(),
             Err(DomainError::StrategyBundleHashMismatch)
         );
+
+        let mut protocol_tampered = StrategyBundle::new(
+            "bundle-1".to_string(),
+            "candidate-1".to_string(),
+            "a".repeat(64),
+            ManifestId::new("dataset-1").unwrap(),
+            SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            "e".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            "b".repeat(64),
+            StrategyBundleArtifact::Formula {
+                ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                    "signal".to_string(),
+                )),
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        protocol_tampered.evaluation_protocol_hash = "f".repeat(64);
+        assert_eq!(
+            protocol_tampered.validate(),
+            Err(DomainError::StrategyBundleHashMismatch)
+        );
     }
 
     #[test]
@@ -2485,6 +2725,7 @@ mod tests {
             "a".repeat(64),
             ManifestId::new("dataset-1").unwrap(),
             SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            "e".repeat(64),
             "c".repeat(64),
             "d".repeat(64),
             "b".repeat(64),
@@ -2498,6 +2739,7 @@ mod tests {
             "a".repeat(64),
             ManifestId::new("dataset-1").unwrap(),
             SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            "e".repeat(64),
             "c".repeat(64),
             "d".repeat(64),
             "b".repeat(64),

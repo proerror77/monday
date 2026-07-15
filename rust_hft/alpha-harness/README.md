@@ -36,7 +36,9 @@ cargo run -p alpha-harness -- mission run \
   --db var/alpha.duckdb \
   --mission-id mission-1 \
   --engine gp \
-  --dataset-manifest var/datasets/dataset-....manifest.json
+  --dataset-manifest var/datasets/dataset-....manifest.json \
+  --label-horizon-buckets 1 \
+  --observation-frequency-millis 60000
 
 cargo run -p alpha-harness -- mission status \
   --db var/alpha.duckdb --mission-id mission-1
@@ -69,6 +71,8 @@ cargo run -p alpha-harness -- loop run \
   --mission-id mission-1 \
   --engine mcts \
   --dataset-manifest var/datasets/dataset-....manifest.json \
+  --label-horizon-buckets 1 \
+  --observation-frequency-millis 60000 \
   --target-stage shadow-healthy \
   --max-research-missions 2
 
@@ -86,7 +90,9 @@ cargo run -p alpha-harness -- evaluate \
   --db var/alpha.duckdb \
   --mission-id mission-1 \
   --candidate-id candidate-1 \
-  --dataset-manifest var/datasets/dataset-....manifest.json
+  --dataset-manifest var/datasets/dataset-....manifest.json \
+  --label-horizon-buckets 1 \
+  --observation-frequency-millis 60000
 
 cargo run -p alpha-harness -- mission learn \
   --db var/alpha.duckdb \
@@ -94,9 +100,9 @@ cargo run -p alpha-harness -- mission learn \
   --repeated-failure-threshold 3
 ```
 
-Only a canonical Formula v3 walk-forward Keep candidate can access the sealed holdout. Candidate generators receive label-free proposal metadata; only the evaluator can read labels. Before position mapping, the evaluator persists per-fold time-series IC, RankIC, ICIR, RankICIR, and positive-IC ratio. After mapping, it persists rows, trades, post-cost edge, drawdown, per-observation net Sharpe, raw score, and adjusted score. The Sharpe value is deliberately not annualized because dataset frequency is not yet part of the evaluation contract.
+Only a canonical Formula v3 walk-forward Keep candidate can access the sealed holdout. Candidate generators receive label-free proposal metadata; only the evaluator can read labels. Before position mapping, the evaluator persists per-fold time-series IC, RankIC, ICIR, RankICIR, and positive-IC ratio. After mapping, it persists rows, trades, post-cost edge, drawdown, per-observation net Sharpe, raw score, and adjusted score. The versioned evaluation protocol binds the split, costs, label horizon, observation frequency, fold-IC population-deviation ICIR, and unannualized per-observation population-deviation Sharpe definitions. Sharpe remains unannualized by explicit protocol definition.
 
-Mission `validator_spec` may override `min_time_series_ic`, `min_time_series_rank_ic`, `min_time_series_icir`, `min_time_series_rank_icir`, and `min_positive_ic_ratio`. It may also pre-register a larger multiple-testing family through `multiple_testing_trials`, but cannot declare fewer trials than its candidate budget. Config and metric hashes are bound into versioned sealed evidence, promotion, and bundle hashes. Repeated failures generate one idempotent follow-up mission and learning directive. Add `--llm-critic` for a bounded real failure explanation.
+Mission `validator_spec` may override `min_time_series_ic`, `min_time_series_rank_ic`, `min_time_series_icir`, `min_time_series_rank_icir`, and `min_positive_ic_ratio`. It may also pre-register a larger multiple-testing family through `multiple_testing_trials`, but cannot declare fewer trials than its candidate budget. The evaluation protocol, config, and metric hashes are bound into versioned sealed evidence, promotion, and bundle hashes. Old evidence remains readable but cannot be promoted without a valid protocol binding. Repeated failures generate one idempotent follow-up mission and learning directive. Add `--llm-critic` for a bounded real failure explanation.
 
 Runtime feedback and search policy revisions enter through typed JSON:
 

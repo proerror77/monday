@@ -823,20 +823,20 @@ impl AlphaStore {
         )
     }
 
-    fn has_canonical_walk_forward_evidence(
+    fn canonical_walk_forward_protocol_hash(
         &self,
         mission: &ResearchMission,
         candidate_id: &str,
         candidate_iteration: &ResearchIteration,
         candidate_artifact: &CandidateArtifact,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Option<String>, StoreError> {
         let expected_version = match candidate_artifact {
             CandidateArtifact::Formula(_) => WALK_FORWARD_EVALUATOR_VERSION,
             CandidateArtifact::OnnxModel(_) => ONNX_WALK_FORWARD_EVALUATOR_VERSION,
-            _ => return Ok(false),
+            _ => return Ok(None),
         };
         let Some(evaluation_id) = candidate_iteration.evaluation_artifact_id.as_deref() else {
-            return Ok(false);
+            return Ok(None);
         };
         let stored = match read_json_row::<EvaluationRecord>(
             &self.connection,
@@ -844,18 +844,19 @@ impl AlphaStore {
             evaluation_id,
         ) {
             Ok(stored) => stored,
-            Err(StoreError::NotFound) => return Ok(false),
+            Err(StoreError::NotFound) => return Ok(None),
             Err(error) => return Err(error),
         };
         let Ok(evaluation) = serde_json::from_value::<CandidateEvaluation>(stored.payload.clone())
         else {
-            return Ok(false);
+            return Ok(None);
         };
         if evaluation.validate().is_err() {
-            return Ok(false);
+            return Ok(None);
         }
+        let (_, protocol_hash) = evaluation.protocol_binding().map_err(domain_error)?;
         let expected_config = FormulaEvaluatorConfig::for_mission(mission).map_err(domain_error)?;
-        Ok(candidate_iteration.mission_id == mission.mission_id
+        Ok((candidate_iteration.mission_id == mission.mission_id
             && candidate_iteration.candidate_artifact_id.as_deref() == Some(candidate_id)
             && candidate_iteration.verdict == IterationVerdict::Keep
             && stored.mission_id == mission.mission_id
@@ -864,6 +865,7 @@ impl AlphaStore {
             && evaluation.passed
             && evaluation.evaluator_version == expected_version
             && evaluation.formula_config().map_err(domain_error)? == expected_config)
+            .then(|| protocol_hash.to_string()))
     }
 
     pub fn promote_candidate(
@@ -916,16 +918,17 @@ impl AlphaStore {
                 "promotion dataset does not match mission".to_string(),
             ));
         }
-        if !self.has_canonical_walk_forward_evidence(
+        let Some(walk_forward_protocol_hash) = self.canonical_walk_forward_protocol_hash(
             &mission,
             &bundle.candidate_id,
             &candidate_iteration,
             &candidate_artifact,
-        )? {
+        )?
+        else {
             return Err(StoreError::Domain(
                 "promotion candidate lacks canonical walk-forward evidence".to_string(),
             ));
-        }
+        };
         let expected_sealed_evaluation_id =
             sealed_evaluation_revision_id(&bundle.candidate_id, &bundle.evaluator_version);
         if promotion.sealed_evaluation_id != expected_sealed_evaluation_id {
@@ -941,6 +944,8 @@ impl AlphaStore {
         let typed_evaluation: CandidateEvaluation =
             serde_json::from_value(sealed_evaluation.clone()).map_err(serialization_error)?;
         typed_evaluation.validate().map_err(domain_error)?;
+        let (_, sealed_protocol_hash) =
+            typed_evaluation.protocol_binding().map_err(domain_error)?;
         let expected_evaluator_config =
             FormulaEvaluatorConfig::for_mission(&mission).map_err(domain_error)?;
         let evaluator_matches_artifact = match &candidate_artifact {
@@ -975,6 +980,10 @@ impl AlphaStore {
         let stored_evaluator_version = sealed_evaluation
             .get("evaluator_version")
             .and_then(serde_json::Value::as_str);
+        let stored_protocol_hash = sealed
+            .payload
+            .get("evaluation_protocol_hash")
+            .and_then(serde_json::Value::as_str);
         let stored_evaluator_config = sealed_evaluation
             .get("evaluator_config")
             .ok_or_else(|| StoreError::Domain("sealed evaluator config is missing".into()))?;
@@ -986,6 +995,15 @@ impl AlphaStore {
         let evaluation_metrics_hash =
             canonical_json_hash(stored_evaluation_metrics).map_err(domain_error)?;
         let evaluation_hash = canonical_json_hash(sealed_evaluation).map_err(domain_error)?;
+        if stored_protocol_hash != Some(sealed_protocol_hash)
+            || sealed_protocol_hash != walk_forward_protocol_hash.as_str()
+            || sealed_protocol_hash != bundle.evaluation_protocol_hash.as_str()
+        {
+            return Err(StoreError::Domain(
+                "promotion evaluation protocol does not match walk-forward and sealed evidence"
+                    .to_string(),
+            ));
+        }
         if sealed.registry_kind != "sealed_evaluation"
             || sealed.asset_id != bundle.candidate_id
             || stored_mission_id != Some(promotion.mission_id.as_str())
@@ -1366,7 +1384,10 @@ impl AlphaStore {
             }
             let evaluation: CandidateEvaluation =
                 serde_json::from_value(evaluation_value.clone()).map_err(serialization_error)?;
-            evaluation.validate().map_err(domain_error)?;
+            if evaluation.validate().is_err() {
+                continue;
+            }
+            let (_, sealed_protocol_hash) = evaluation.protocol_binding().map_err(domain_error)?;
             if !evaluation.passed
                 || evaluation.formula_config().map_err(domain_error)?
                     != FormulaEvaluatorConfig::for_mission(&mission).map_err(domain_error)?
@@ -1411,15 +1432,21 @@ impl AlphaStore {
                 "SELECT payload_json, content_hash FROM iterations WHERE iteration_id = ?",
                 &candidate_iteration_id,
             )?;
+            let walk_forward_protocol_hash = self.canonical_walk_forward_protocol_hash(
+                &mission,
+                &revision.asset_id,
+                &candidate_iteration,
+                &candidate_artifact,
+            )?;
             if candidate_iteration.engine == EngineKind::OfflineReinforcementLearning
                 || candidate_iteration.candidate_artifact_id.as_deref()
                     != Some(revision.asset_id.as_str())
-                || !self.has_canonical_walk_forward_evidence(
-                    &mission,
-                    &revision.asset_id,
-                    &candidate_iteration,
-                    &candidate_artifact,
-                )?
+                || walk_forward_protocol_hash.as_deref() != Some(sealed_protocol_hash)
+                || revision
+                    .payload
+                    .get("evaluation_protocol_hash")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(sealed_protocol_hash)
             {
                 continue;
             }
@@ -2387,7 +2414,8 @@ mod tests {
     use super::*;
     use alpha_domain::{
         canonical_json_hash, sign_envelope, AllowedIntentType, ApprovalClass, AttributionKind,
-        AttributionMode, AttributionOutcome, DeploymentEnvelope, EngineKind, IterationVerdict,
+        AttributionMode, AttributionOutcome, DeploymentEnvelope, EngineKind, EvaluationCostsV1,
+        EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1, IterationVerdict,
         LoopCompletionPolicy, LoopRunStatus, LoopTargetStage, MissionCompletionPolicy,
         MissionStatus, PromotionRecord, RuntimeAttributionEvent, SearchBudget,
         SearchPolicyRevision, StrategyBundle, StrategyBundleArtifact, ValidatorMode,
@@ -2452,7 +2480,34 @@ mod tests {
         iteration
     }
 
-    fn evaluation_fixture(evaluator_version: &str, fold_count: usize) -> serde_json::Value {
+    fn evaluation_protocol() -> EvaluationProtocolV1 {
+        EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 200,
+                validation_rows: 30,
+                fold_count: 2,
+                purge_rows: 1,
+                embargo_rows: 1,
+                sealed_holdout_rows: 30,
+            },
+            EvaluationCostsV1 {
+                fee_bps: 1.0,
+                funding_bps: 0.0,
+                latency_bps: 0.5,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 5,
+                observation_frequency_millis: 1_000,
+            },
+        )
+        .unwrap()
+    }
+
+    fn evaluation_fixture_with_protocol(
+        evaluator_version: &str,
+        fold_count: usize,
+        protocol: &EvaluationProtocolV1,
+    ) -> serde_json::Value {
         let config = FormulaEvaluatorConfig::for_trials(3).unwrap();
         let raw_score = 4.0;
         let adjusted_score = config.adjusted_score(raw_score).unwrap();
@@ -2481,12 +2536,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let icir = (fold_count > 1).then_some(0.1 / f64::EPSILON);
+        let protocol_hash = protocol.content_hash().unwrap();
         serde_json::json!({
             "passed": true,
             "score": adjusted_score,
             "failure_reasons": [],
             "evaluator_version": evaluator_version,
             "evaluator_config": config,
+            "evaluation_protocol": protocol,
+            "evaluation_protocol_hash": protocol_hash,
             "metrics": {
                 "predictive": {
                     "row_count": fold_count * 30,
@@ -2510,6 +2568,10 @@ mod tests {
         })
     }
 
+    fn evaluation_fixture(evaluator_version: &str, fold_count: usize) -> serde_json::Value {
+        evaluation_fixture_with_protocol(evaluator_version, fold_count, &evaluation_protocol())
+    }
+
     fn sealed_evaluation() -> serde_json::Value {
         evaluation_fixture(SEALED_HOLDOUT_EVALUATOR_VERSION, 1)
     }
@@ -2530,7 +2592,7 @@ mod tests {
         now: DateTime<Utc>,
         engine: EngineKind,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
-        try_persist_formula_promotion_with_evidence(store, now, engine, true, None)
+        try_persist_formula_promotion_with_evidence(store, now, engine, true, None, None)
     }
 
     fn try_persist_formula_promotion_with_evidence(
@@ -2539,17 +2601,23 @@ mod tests {
         engine: EngineKind,
         include_walk_forward: bool,
         sealed_revision_id: Option<&str>,
+        sealed_protocol: Option<EvaluationProtocolV1>,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
             "signal".to_string(),
         )));
         let mut candidate_iteration = iteration();
         candidate_iteration.engine = engine;
+        let walk_forward_protocol = evaluation_protocol();
         let walk_forward = include_walk_forward.then(|| EvaluationRecord {
             evaluation_id: "evaluation-1".to_string(),
             mission_id: "mission-1".to_string(),
             candidate_id: "candidate-1".to_string(),
-            payload: walk_forward_evaluation(),
+            payload: evaluation_fixture_with_protocol(
+                WALK_FORWARD_EVALUATOR_VERSION,
+                2,
+                &walk_forward_protocol,
+            ),
             created_at: now,
         });
         candidate_iteration.evaluation_artifact_id = walk_forward
@@ -2565,7 +2633,14 @@ mod tests {
         let candidate_hash = store.mission_lineage("mission-1").unwrap().candidates[0]
             .content_hash
             .clone();
-        let evaluation = sealed_evaluation();
+        let sealed_protocol = sealed_protocol.unwrap_or_else(evaluation_protocol);
+        let evaluation =
+            evaluation_fixture_with_protocol(SEALED_HOLDOUT_EVALUATOR_VERSION, 1, &sealed_protocol);
+        let evaluation_protocol_hash = evaluation
+            .get("evaluation_protocol_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
         let sealed = RegistryRevision {
             revision_id: sealed_revision_id.map(str::to_owned).unwrap_or_else(|| {
                 format!(
@@ -2580,6 +2655,7 @@ mod tests {
                 "mission_id": "mission-1",
                 "candidate_content_hash": candidate_hash,
                 "dataset_manifest_id": "dataset-1",
+                "evaluation_protocol_hash": evaluation_protocol_hash,
                 "evaluation": evaluation,
             }),
             created_at: now,
@@ -2598,6 +2674,7 @@ mod tests {
             candidate_hash.clone(),
             ManifestId::new("dataset-1").unwrap(),
             SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            evaluation_protocol_hash.clone(),
             evaluator_config_hash.clone(),
             evaluation_metrics_hash.clone(),
             evaluation_hash.clone(),
@@ -2614,6 +2691,7 @@ mod tests {
             candidate_content_hash: candidate_hash,
             dataset_manifest_id: ManifestId::new("dataset-1").unwrap(),
             evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            evaluation_protocol_hash,
             evaluator_config_hash,
             evaluation_metrics_hash,
             sealed_evaluation_id: sealed.revision_id,
@@ -2742,6 +2820,7 @@ mod tests {
             EngineKind::ManualSeed,
             false,
             None,
+            None,
         )
         .unwrap_err();
 
@@ -2750,6 +2829,71 @@ mod tests {
             store.get_strategy_bundle("bundle:candidate-1"),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn promotion_rejects_any_sealed_protocol_drift_without_partial_bundle() {
+        let base = evaluation_protocol();
+        let mut variants = Vec::new();
+
+        let mut changed = base.clone();
+        changed.costs.fee_bps += 1.0;
+        variants.push(("fee", changed));
+        let mut changed = base.clone();
+        changed.costs.funding_bps += 1.0;
+        variants.push(("funding", changed));
+        let mut changed = base.clone();
+        changed.costs.latency_bps += 1.0;
+        variants.push(("latency", changed));
+        let mut changed = base.clone();
+        changed.walk_forward.initial_train_rows += 1;
+        variants.push(("initial_train", changed));
+        let mut changed = base.clone();
+        changed.walk_forward.validation_rows += 1;
+        variants.push(("validation", changed));
+        let mut changed = base.clone();
+        changed.walk_forward.fold_count += 1;
+        variants.push(("fold_count", changed));
+        let mut changed = base.clone();
+        changed.walk_forward.purge_rows += 1;
+        variants.push(("purge", changed));
+        let mut changed = base.clone();
+        changed.walk_forward.embargo_rows += 1;
+        variants.push(("embargo", changed));
+        let mut changed = base.clone();
+        changed.walk_forward.sealed_holdout_rows += 1;
+        variants.push(("sealed_holdout", changed));
+        let mut changed = base.clone();
+        changed.labels.horizon_buckets += 1;
+        variants.push(("label_horizon", changed));
+        let mut changed = base;
+        changed.labels.observation_frequency_millis += 1;
+        variants.push(("label_frequency", changed));
+
+        for (field, sealed_protocol) in variants {
+            let mut store = AlphaStore::open_in_memory().unwrap();
+            store.create_mission(&mission()).unwrap();
+
+            let error = try_persist_formula_promotion_with_evidence(
+                &mut store,
+                Utc::now(),
+                EngineKind::ManualSeed,
+                true,
+                None,
+                Some(sealed_protocol),
+            )
+            .expect_err(field);
+
+            assert!(error.to_string().contains("protocol"), "{field}: {error}");
+            assert!(matches!(
+                store.get_strategy_bundle("bundle:candidate-1"),
+                Err(StoreError::NotFound)
+            ));
+            assert!(matches!(
+                store.get_promotion("promotion-1"),
+                Err(StoreError::NotFound)
+            ));
+        }
     }
 
     #[test]
@@ -2763,6 +2907,7 @@ mod tests {
             EngineKind::ManualSeed,
             true,
             Some("legacy-sealed-evaluation:candidate-1"),
+            None,
         )
         .unwrap_err();
 
@@ -2813,9 +2958,10 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!store
-            .has_canonical_walk_forward_evidence(&mission, "candidate-1", &iteration, &candidate,)
-            .unwrap());
+        assert!(store
+            .canonical_walk_forward_protocol_hash(&mission, "candidate-1", &iteration, &candidate,)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2926,6 +3072,11 @@ mod tests {
             .unwrap();
         let now = Utc::now();
         let evaluation = sealed_evaluation();
+        let evaluation_protocol_hash = evaluation
+            .get("evaluation_protocol_hash")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
         store
             .put_registry_revision(&RegistryRevision {
                 revision_id: format!(
@@ -2939,6 +3090,7 @@ mod tests {
                     "mission_id": "mission-1",
                     "candidate_content_hash": "c".repeat(64),
                     "dataset_manifest_id": "dataset-1",
+                    "evaluation_protocol_hash": evaluation_protocol_hash,
                     "evaluation": evaluation,
                 }),
                 created_at: now,
@@ -2955,6 +3107,7 @@ mod tests {
             "c".repeat(64),
             ManifestId::new("dataset-1").unwrap(),
             SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            evaluation_protocol_hash.clone(),
             evaluator_config_hash.clone(),
             evaluation_metrics_hash.clone(),
             evaluation_hash.clone(),
@@ -2971,6 +3124,7 @@ mod tests {
             candidate_content_hash: "c".repeat(64),
             dataset_manifest_id: ManifestId::new("dataset-1").unwrap(),
             evaluator_version: SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            evaluation_protocol_hash,
             evaluator_config_hash,
             evaluation_metrics_hash,
             sealed_evaluation_id: format!(

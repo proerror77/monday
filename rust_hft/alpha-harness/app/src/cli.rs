@@ -1,4 +1,7 @@
 use crate::{data_mission, governance, loop_control, mission, mission_runner};
+use alpha_domain::{
+    EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
+};
 use alpha_store::AlphaStore;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -163,6 +166,34 @@ pub struct ValidationArgs {
     pub funding_bps: f64,
     #[arg(long, default_value_t = 0.5)]
     pub latency_bps: f64,
+    #[arg(long)]
+    pub label_horizon_buckets: usize,
+    #[arg(long)]
+    pub observation_frequency_millis: u64,
+}
+
+impl ValidationArgs {
+    pub fn evaluation_protocol(&self) -> Result<EvaluationProtocolV1, alpha_domain::DomainError> {
+        EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: self.initial_train_rows,
+                validation_rows: self.validation_rows,
+                fold_count: self.fold_count,
+                purge_rows: self.purge_rows,
+                embargo_rows: self.embargo_rows,
+                sealed_holdout_rows: self.sealed_holdout_rows,
+            },
+            EvaluationCostsV1 {
+                fee_bps: self.fee_bps,
+                funding_bps: self.funding_bps,
+                latency_bps: self.latency_bps,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: self.label_horizon_buckets,
+                observation_frequency_millis: self.observation_frequency_millis,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -533,6 +564,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validation_args_build_an_explicit_label_and_metric_protocol() {
+        let args = ValidationArgs {
+            initial_train_rows: 200,
+            validation_rows: 64,
+            fold_count: 3,
+            purge_rows: 1,
+            embargo_rows: 1,
+            sealed_holdout_rows: 64,
+            fee_bps: 1.0,
+            funding_bps: 0.0,
+            latency_bps: 0.5,
+            label_horizon_buckets: 5,
+            observation_frequency_millis: 1_000,
+        };
+
+        let protocol = args.evaluation_protocol().unwrap();
+
+        assert_eq!(protocol.labels.horizon_buckets, 5);
+        assert_eq!(protocol.labels.observation_frequency_millis, 1_000);
+        assert_eq!(
+            protocol.metrics,
+            alpha_domain::EvaluationMetricDefinitionsV1::default()
+        );
+    }
+
+    #[test]
     fn parses_mission_and_data_control_plane_commands() {
         assert!(Cli::try_parse_from([
             "alpha-harness",
@@ -580,6 +637,10 @@ mod tests {
             "mcts",
             "--feature-fields",
             "book_imbalance_top5,ofi_top5",
+            "--label-horizon-buckets",
+            "5",
+            "--observation-frequency-millis",
+            "1000",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
@@ -620,6 +681,10 @@ mod tests {
             "loop-1",
             "--target-stage",
             "shadow-healthy",
+            "--label-horizon-buckets",
+            "1",
+            "--observation-frequency-millis",
+            "60000",
             "--max-research-missions",
             "2",
         ])
@@ -644,6 +709,10 @@ mod tests {
             "loop-1",
             "--target-stage",
             "live-small-eligible",
+            "--label-horizon-buckets",
+            "1",
+            "--observation-frequency-millis",
+            "60000",
         ])
         .is_ok());
     }

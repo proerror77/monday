@@ -1,4 +1,4 @@
-use alpha_domain::ResearchMission;
+use alpha_domain::{EvaluationProtocolV1, ResearchMission};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops::Range};
@@ -18,6 +18,8 @@ pub enum EvaluationError {
     NonFiniteValue,
     #[error("dataset feature schema is empty, inconsistent, or contains an invalid field")]
     InvalidFeatureSchema,
+    #[error("dataset costs do not match the bound evaluation protocol")]
+    ProtocolMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,16 +32,6 @@ pub struct ResearchRow {
     pub fee_bps: f64,
     pub funding_bps: f64,
     pub latency_bps: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WalkForwardConfig {
-    pub initial_train_rows: usize,
-    pub validation_rows: usize,
-    pub fold_count: usize,
-    pub purge_rows: usize,
-    pub embargo_rows: usize,
-    pub sealed_holdout_rows: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +52,7 @@ pub struct EngineContext<'a> {
     rows: &'a [ResearchRow],
     folds: &'a [WalkForwardFold],
     sealed_holdout_id: &'a str,
+    protocol: &'a EvaluationProtocolV1,
 }
 
 impl<'a> EngineContext<'a> {
@@ -73,6 +66,10 @@ impl<'a> EngineContext<'a> {
 
     pub fn sealed_holdout_id(&self) -> &str {
         self.sealed_holdout_id
+    }
+
+    pub fn protocol(&self) -> &EvaluationProtocolV1 {
+        self.protocol
     }
 }
 
@@ -127,6 +124,7 @@ pub struct PreparedDataset {
     feature_names: Vec<String>,
     plan: WalkForwardPlan,
     sealed_holdout_id: String,
+    protocol: EvaluationProtocolV1,
 }
 
 impl PreparedDataset {
@@ -161,6 +159,7 @@ impl PreparedDataset {
             rows: &self.rows[..self.plan.sealed_holdout.start],
             folds: &self.plan.folds,
             sealed_holdout_id: &self.sealed_holdout_id,
+            protocol: &self.protocol,
         }
     }
 
@@ -171,13 +170,21 @@ impl PreparedDataset {
     pub fn feature_names(&self) -> &[String] {
         &self.feature_names
     }
+
+    pub fn protocol(&self) -> &EvaluationProtocolV1 {
+        &self.protocol
+    }
 }
 
 pub fn prepare_dataset(
     rows: Vec<ResearchRow>,
-    config: &WalkForwardConfig,
+    protocol: &EvaluationProtocolV1,
     sealed_holdout_id: impl Into<String>,
 ) -> Result<PreparedDataset, EvaluationError> {
+    protocol
+        .validate()
+        .map_err(|_| EvaluationError::InvalidConfiguration)?;
+    let config = &protocol.walk_forward;
     if config.initial_train_rows == 0
         || config.validation_rows == 0
         || config.fold_count == 0
@@ -198,6 +205,13 @@ pub fn prepare_dataset(
             || row.features.values().any(|value| !value.is_finite())
     }) {
         return Err(EvaluationError::NonFiniteValue);
+    }
+    if rows.iter().any(|row| {
+        row.fee_bps.to_bits() != protocol.costs.fee_bps.to_bits()
+            || row.funding_bps.to_bits() != protocol.costs.funding_bps.to_bits()
+            || row.latency_bps.to_bits() != protocol.costs.latency_bps.to_bits()
+    }) {
+        return Err(EvaluationError::ProtocolMismatch);
     }
     let feature_names = rows
         .first()
@@ -254,6 +268,7 @@ pub fn prepare_dataset(
             sealed_holdout: holdout_start..holdout_start + config.sealed_holdout_rows,
         },
         sealed_holdout_id: sealed_holdout_id.into(),
+        protocol: protocol.clone(),
     })
 }
 
@@ -267,6 +282,7 @@ pub fn evaluate_sealed_holdout<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alpha_domain::{EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationWalkForwardV1};
     use chrono::Duration;
 
     fn rows(count: usize) -> Vec<ResearchRow> {
@@ -284,20 +300,32 @@ mod tests {
             .collect()
     }
 
-    fn config() -> WalkForwardConfig {
-        WalkForwardConfig {
-            initial_train_rows: 20,
-            validation_rows: 5,
-            fold_count: 3,
-            purge_rows: 2,
-            embargo_rows: 1,
-            sealed_holdout_rows: 10,
-        }
+    fn protocol() -> EvaluationProtocolV1 {
+        EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 20,
+                validation_rows: 5,
+                fold_count: 3,
+                purge_rows: 2,
+                embargo_rows: 1,
+                sealed_holdout_rows: 10,
+            },
+            EvaluationCostsV1 {
+                fee_bps: 1.0,
+                funding_bps: 0.1,
+                latency_bps: 0.2,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: 1_000,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
     fn walk_forward_builds_purged_embargoed_folds() {
-        let dataset = prepare_dataset(rows(50), &config(), "holdout-1").unwrap();
+        let dataset = prepare_dataset(rows(50), &protocol(), "holdout-1").unwrap();
         assert_eq!(dataset.plan().folds.len(), 3);
         assert_eq!(dataset.plan().folds[0].train, 0..20);
         assert_eq!(dataset.plan().folds[0].purge, 20..22);
@@ -308,7 +336,7 @@ mod tests {
 
     #[test]
     fn engine_context_cannot_read_sealed_holdout_rows() {
-        let dataset = prepare_dataset(rows(50), &config(), "holdout-1").unwrap();
+        let dataset = prepare_dataset(rows(50), &protocol(), "holdout-1").unwrap();
         let context = dataset.engine_context();
         assert_eq!(context.rows().len(), 40);
         assert_eq!(evaluate_sealed_holdout(&dataset, |rows| rows.len()), 10);
@@ -316,7 +344,7 @@ mod tests {
 
     #[test]
     fn proposal_context_exposes_only_label_free_metadata() {
-        let dataset = prepare_dataset(rows(50), &config(), "holdout-1").unwrap();
+        let dataset = prepare_dataset(rows(50), &protocol(), "holdout-1").unwrap();
         let context = dataset.proposal_context();
 
         assert_eq!(context.row_count(), 40);
@@ -330,7 +358,7 @@ mod tests {
         let mut rows = rows(50);
         rows.swap(1, 2);
         assert_eq!(
-            prepare_dataset(rows, &config(), "holdout-1").unwrap_err(),
+            prepare_dataset(rows, &protocol(), "holdout-1").unwrap_err(),
             EvaluationError::NonMonotonicAvailability
         );
     }
@@ -340,7 +368,7 @@ mod tests {
         let mut rows = rows(50);
         rows[2].available_time = rows[1].available_time;
         assert_eq!(
-            prepare_dataset(rows, &config(), "holdout-1").unwrap_err(),
+            prepare_dataset(rows, &protocol(), "holdout-1").unwrap_err(),
             EvaluationError::NonMonotonicAvailability
         );
     }
@@ -351,8 +379,19 @@ mod tests {
         rows[0].features.insert("lob_imbalance".to_string(), 0.1);
 
         assert_eq!(
-            prepare_dataset(rows, &config(), "holdout-1").unwrap_err(),
+            prepare_dataset(rows, &protocol(), "holdout-1").unwrap_err(),
             EvaluationError::InvalidFeatureSchema
+        );
+    }
+
+    #[test]
+    fn dataset_rejects_costs_that_do_not_match_the_bound_protocol() {
+        let mut rows = rows(50);
+        rows[0].fee_bps = 2.0;
+
+        assert_eq!(
+            prepare_dataset(rows, &protocol(), "holdout-1").unwrap_err(),
+            EvaluationError::ProtocolMismatch
         );
     }
 }

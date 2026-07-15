@@ -547,12 +547,13 @@ mod tests {
     use alpha_domain::{
         deployment_scope_hash, sign_runtime_attribution_event, AllowedIntentType, ApprovalClass,
         AttributionKind, AttributionOutcome, CandidateArtifact, DeploymentEnvelope, EngineKind,
+        EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
         IterationVerdict, LiveSmallEligibilityEvidence, MissionTerminalReason, ResearchIteration,
         ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage,
         SEALED_HOLDOUT_EVALUATOR_VERSION,
     };
     use alpha_engine::{
-        evaluation::{prepare_dataset, WalkForwardConfig},
+        evaluation::prepare_dataset,
         formula_evaluator::{FormulaEvaluator, WALK_FORWARD_EVALUATOR_VERSION},
         CandidateEvaluation, CandidateEvaluator, EngineProposal, EvaluationMetrics,
         FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
@@ -859,6 +860,8 @@ mod tests {
                         fee_bps: 1.0,
                         funding_bps: 0.0,
                         latency_bps: 0.5,
+                        label_horizon_buckets: 1,
+                        observation_frequency_millis: 60_000,
                     },
                 },
             },
@@ -900,12 +903,35 @@ mod tests {
                 })
                 .collect(),
         );
+        let protocol = EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 1,
+                validation_rows: 30,
+                fold_count: 2,
+                purge_rows: 0,
+                embargo_rows: 0,
+                sealed_holdout_rows: 30,
+            },
+            EvaluationCostsV1 {
+                fee_bps: 1.0,
+                funding_bps: 0.0,
+                latency_bps: 0.5,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: 60_000,
+            },
+        )
+        .unwrap();
+        let protocol_hash = protocol.content_hash().unwrap();
         CandidateEvaluation {
             passed: true,
             score: 2.0,
             failure_reasons: vec![],
             evaluator_version: version.to_string(),
             evaluator_config: evaluator.config_evidence().unwrap(),
+            evaluation_protocol: Some(protocol),
+            evaluation_protocol_hash: Some(protocol_hash),
             metrics: EvaluationMetrics {
                 predictive,
                 row_count: 30 * fold_count,
@@ -994,6 +1020,12 @@ mod tests {
             .find(|candidate| candidate.candidate_id == candidate_id)
             .unwrap()
             .content_hash;
+        let evaluation = canonical_evaluation(SEALED_HOLDOUT_EVALUATOR_VERSION, 1);
+        let evaluation_protocol_hash = evaluation
+            .evaluation_protocol_hash
+            .as_deref()
+            .unwrap()
+            .to_string();
         store
             .put_registry_revision(&RegistryRevision {
                 revision_id: governance::sealed_evaluation_revision_id(
@@ -1007,10 +1039,8 @@ mod tests {
                     "mission_id": mission_id,
                     "candidate_content_hash": candidate_hash,
                     "dataset_manifest_id": "dataset-loop",
-                    "evaluation": canonical_evaluation(
-                        SEALED_HOLDOUT_EVALUATOR_VERSION,
-                        1,
-                    )
+                    "evaluation_protocol_hash": evaluation_protocol_hash,
+                    "evaluation": evaluation,
                 }),
                 created_at: Utc::now(),
             })
@@ -1458,19 +1488,14 @@ mod tests {
                 fee_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.0,
+                label_horizon_buckets: 1,
+                observation_frequency_millis: 60_000,
             },
         };
         let research_rows = data_mission::load_research_rows(&manifest, 0.0, 0.0, 0.0).unwrap();
         let prepared = prepare_dataset(
             research_rows,
-            &WalkForwardConfig {
-                initial_train_rows: dataset_args.validation.initial_train_rows,
-                validation_rows: dataset_args.validation.validation_rows,
-                fold_count: dataset_args.validation.fold_count,
-                purge_rows: dataset_args.validation.purge_rows,
-                embargo_rows: dataset_args.validation.embargo_rows,
-                sealed_holdout_rows: dataset_args.validation.sealed_holdout_rows,
-            },
+            &dataset_args.validation.evaluation_protocol().unwrap(),
             format!("sealed:{}", manifest.manifest_id),
         )
         .unwrap();
@@ -1552,6 +1577,14 @@ mod tests {
             dataset: dataset_args.clone(),
         })
         .unwrap();
+        governance::evaluate(EvaluateArgs {
+            db: db.clone(),
+            mission_id: mission_id.to_string(),
+            candidate_id: candidate_id.to_string(),
+            model_root: None,
+            dataset: dataset_args.clone(),
+        })
+        .expect("the same evaluation protocol must reuse sealed evidence idempotently");
         governance::promote(PromoteArgs {
             db: db.clone(),
             mission_id: mission_id.to_string(),
@@ -1584,6 +1617,19 @@ mod tests {
             let evaluation = sealed.payload.get("evaluation").unwrap();
             let typed: CandidateEvaluation = serde_json::from_value(evaluation.clone()).unwrap();
             typed.validate().unwrap();
+            let (_, protocol_hash) = typed.protocol_binding().unwrap();
+            assert_eq!(
+                sealed
+                    .payload
+                    .get("evaluation_protocol_hash")
+                    .and_then(serde_json::Value::as_str),
+                Some(protocol_hash)
+            );
+            assert_eq!(bundle.evaluation_protocol_hash, protocol_hash);
+            assert_eq!(
+                promotion.record.evaluation_protocol_hash,
+                bundle.evaluation_protocol_hash
+            );
             assert_eq!(
                 bundle.evaluator_config_hash,
                 alpha_domain::canonical_json_hash(evaluation.get("evaluator_config").unwrap())
