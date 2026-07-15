@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Fail-closed compatibility execution interface for Monday prediction markets"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 ploy-trading.workspace = true
 rust_decimal.workspace = true

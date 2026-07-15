@@ -20,5 +20,6 @@ ploy-trading.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+ploy-connectivity = { workspace = true, features = ["test-support"] }
 rust_decimal.workspace = true
 rust_decimal_macros.workspace = true

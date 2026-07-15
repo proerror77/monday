@@ -28,6 +28,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+ploy-connectivity = { workspace = true, features = ["test-support"] }
 ploy-market-contracts.workspace = true
 ploy-strategy-bundles.workspace = true
 rust_decimal.workspace = true

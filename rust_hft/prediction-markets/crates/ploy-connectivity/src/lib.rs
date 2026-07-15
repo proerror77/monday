@@ -10,6 +10,19 @@ use ploy_trading::{FillRecord, TradeSide};
 use rust_decimal::Decimal;
 use thiserror::Error;
 
+mod execution_seal {
+    /// Compiler-enforced authority boundary for compatibility execution.
+    ///
+    /// The normal production build implements this trait only for the disabled
+    /// gateway. Workspace unit-test crates may opt into a dev-only blanket
+    /// implementation through `test-support`; production dependencies are
+    /// forbidden from enabling that feature by the workspace retirement guard.
+    pub trait ProductionExecutionSeal {}
+
+    #[cfg(feature = "test-support")]
+    impl<T> ProductionExecutionSeal for T where T: Send + Sync + std::fmt::Debug {}
+}
+
 pub const CRATE_MARKER: &str = "ploy-connectivity";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -116,7 +129,9 @@ pub enum ExecutionError {
 /// Production construction always installs [`DisabledLiveExecutionGateway`].
 /// Test code defines its fakes inside exact `#[cfg(test)]` modules. Concrete
 /// venue Adapters must never be implemented in this crate.
-pub trait LiveExecutionGateway: Send + Sync + std::fmt::Debug {
+pub trait LiveExecutionGateway:
+    execution_seal::ProductionExecutionSeal + Send + Sync + std::fmt::Debug
+{
     fn probe(&self) -> Result<(), ExecutionError>;
 
     fn submit(&self, request: &ExecutionRequest) -> Result<ExecutionOutcome, ExecutionError>;
@@ -148,6 +163,9 @@ fn monday_live_execution_disabled_error() -> ExecutionError {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DisabledLiveExecutionGateway;
+
+#[cfg(not(feature = "test-support"))]
+impl execution_seal::ProductionExecutionSeal for DisabledLiveExecutionGateway {}
 
 impl LiveExecutionGateway for DisabledLiveExecutionGateway {
     fn probe(&self) -> Result<(), ExecutionError> {
