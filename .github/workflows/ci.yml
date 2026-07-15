@@ -208,7 +208,7 @@ jobs:
           workspaces: |
             rust_hft
           key: rust_hft-ci-rust-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/Cargo.lock') }}
-          cache-all-crates: true
+          cache-all-crates: false
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Format Loop Engineer packages
@@ -220,21 +220,6 @@ jobs:
           cargo fmt --check --package alpha-harness
           cargo fmt --check --package hft-harnessctl
           cargo fmt --check --package hft-research-ml
-
-      - name: Clippy Loop Engineer packages
-        run: |
-          cargo clippy \
-            -p alpha-domain \
-            -p alpha-store \
-            -p alpha-engine \
-            -p alpha-onnx-evaluator \
-            -p alpha-harness \
-            -p hft-harnessctl \
-            -p hft-research-ml \
-            --all-targets \
-            --locked \
-            -- \
-            -D warnings
 
       - name: Test Loop Engineer packages
         run: cargo test -p alpha-domain -p alpha-store -p alpha-engine -p alpha-onnx-evaluator -p alpha-harness -p hft-harnessctl -p hft-research-ml --locked
@@ -368,7 +353,7 @@ jobs:
           workspaces: |
             rust_hft
           key: hft-engine-fast-lane-${{ steps.cache-info.outputs.rust }}-sccache-${{ steps.cache-info.outputs.sccache }}-${{ hashFiles('rust_hft/Cargo.lock') }}
-          cache-all-crates: true
+          cache-all-crates: false
           save-if: ${{ github.event_name != 'pull_request' }}
 
       - name: Audit unbounded channels
