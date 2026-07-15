@@ -28,6 +28,62 @@ use crate::{DeribitFeatureSnapshot, FactorObservation, ResearchPmBookSnapshot};
 
 pub const RESEARCH_SNAPSHOT_SCHEMA_VERSION: &str = "research_snapshot_v1";
 
+#[cfg(any(feature = "db", test))]
+const OFFICIAL_OUTCOME_AVAILABILITY_SQL: &str = r#"
+    WITH governed_tokens AS (
+        SELECT
+            m.market_slug,
+            trim(both '"' from token.value::text) AS token_id,
+            CASE token.ordinality WHEN 1 THEN 'UP' ELSE 'DOWN' END AS side
+        FROM pm_market_metadata m
+        CROSS JOIN LATERAL jsonb_array_elements(
+            (m.raw_market->'markets'->0->>'clobTokenIds')::jsonb
+        ) WITH ORDINALITY AS token(value, ordinality)
+        WHERE m.market_slug = ANY($1)
+          AND token.ordinality <= 2
+    ), current_resolution AS (
+        SELECT
+            g.market_slug,
+            g.token_id,
+            g.side,
+            s.settled_price,
+            s.resolved_at,
+            s.fetched_at
+        FROM pm_token_settlements s
+        JOIN governed_tokens g
+          ON g.market_slug = s.market_slug
+         AND g.token_id = s.token_id
+        WHERE s.resolved = TRUE
+    )
+    SELECT
+        market_slug,
+        CASE
+            WHEN MAX(settled_price) FILTER (WHERE side = 'UP') = 1
+             AND MAX(settled_price) FILTER (WHERE side = 'DOWN') = 0
+                THEN TRUE
+            WHEN MAX(settled_price) FILTER (WHERE side = 'UP') = 0
+             AND MAX(settled_price) FILTER (WHERE side = 'DOWN') = 1
+                THEN FALSE
+            ELSE NULL
+        END AS official_outcome_up,
+        MAX(GREATEST(COALESCE(resolved_at, fetched_at), fetched_at))
+            AS official_outcome_available_at
+    FROM current_resolution
+    GROUP BY market_slug
+    HAVING COUNT(DISTINCT token_id) = 2
+       AND COUNT(DISTINCT side) = 2
+       AND COUNT(*) FILTER (WHERE settled_price IN (0, 1)) = 2
+       AND MIN(settled_price) = 0
+       AND MAX(settled_price) = 1
+"#;
+
+#[cfg(any(feature = "db", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OfficialOutcomeAvailability {
+    outcome_up: bool,
+    available_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchSnapshotArtifacts {
     pub observations_json: String,
@@ -293,6 +349,73 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
     })
 }
 
+/// Recompute the governed snapshot digests from the exact in-memory rows before
+/// a caller uses them for evaluation or model training.
+///
+/// This closes the gap between a previously verified on-disk artifact and a
+/// mutable [`ResearchSnapshot`] value. When Parquet export is enabled, the
+/// verifier deterministically regenerates the derived Parquet bytes through
+/// the same serializer used by the governed writer.
+#[cfg(feature = "ml")]
+pub(crate) fn verify_research_snapshot_integrity(snapshot: &ResearchSnapshot) -> Result<()> {
+    #[cfg(feature = "polars-export")]
+    let observations_parquet = snapshot
+        .manifest
+        .artifacts
+        .observations_parquet
+        .as_ref()
+        .map(|_| serialize_observations_parquet(&snapshot.observations))
+        .transpose()?;
+    #[cfg(not(feature = "polars-export"))]
+    let observations_parquet = {
+        anyhow::ensure!(
+            snapshot.manifest.artifacts.observations_parquet.is_none(),
+            "reverifying an observations_parquet artifact requires the polars-export feature"
+        );
+        None
+    };
+    let artifact_bytes = ResearchSnapshotArtifactBytes {
+        observations_json: serialize_json(&snapshot.observations, "snapshot observations")?,
+        deribit_snapshots_json: serialize_json(
+            &snapshot.deribit_snapshots,
+            "snapshot Deribit rows",
+        )?,
+        pm_book_snapshots_json: serialize_json(
+            &snapshot.pm_book_snapshots,
+            "snapshot PM book rows",
+        )?,
+        observations_parquet,
+    };
+    let recorded_contract_hash = snapshot
+        .manifest
+        .snapshot_contract_hash
+        .as_deref()
+        .context("research snapshot manifest is missing snapshot_contract_hash")?;
+    let computed_contract_hash =
+        compute_snapshot_contract_hash(&snapshot.manifest, &artifact_bytes)
+            .context("recompute in-memory research snapshot evaluator contract hash")?;
+    anyhow::ensure!(
+        recorded_contract_hash == computed_contract_hash,
+        "research snapshot evaluator contract hash mismatch: manifest={} computed={}",
+        recorded_contract_hash,
+        computed_contract_hash
+    );
+    let recorded_hash = snapshot
+        .manifest
+        .snapshot_hash
+        .as_deref()
+        .context("research snapshot manifest is missing snapshot_hash")?;
+    let computed_hash = compute_snapshot_hash(&snapshot.manifest, &artifact_bytes)
+        .context("recompute in-memory research snapshot content hash")?;
+    anyhow::ensure!(
+        recorded_hash == computed_hash,
+        "research snapshot content hash mismatch: manifest={} computed={}",
+        recorded_hash,
+        computed_hash
+    );
+    Ok(())
+}
+
 pub fn write_research_snapshot(
     snapshot_dir: impl AsRef<Path>,
     mut snapshot: ResearchSnapshot,
@@ -349,17 +472,7 @@ pub fn write_research_snapshot(
         serialize_json(&snapshot.pm_book_snapshots, "snapshot PM book rows")?;
 
     #[cfg(feature = "polars-export")]
-    let observations_parquet = {
-        use polars::io::parquet::write::ParquetWriter;
-
-        let mut frame = crate::observations_to_frame(&snapshot.observations)
-            .context("build snapshot observations parquet frame")?;
-        let mut cursor = Cursor::new(Vec::new());
-        ParquetWriter::new(&mut cursor)
-            .finish(&mut frame)
-            .context("serialize snapshot observations parquet")?;
-        Some(cursor.into_inner())
-    };
+    let observations_parquet = Some(serialize_observations_parquet(&snapshot.observations)?);
     #[cfg(not(feature = "polars-export"))]
     let observations_parquet = None;
 
@@ -1098,6 +1211,63 @@ async fn load_pm_book_token_windows(
 }
 
 #[cfg(feature = "db")]
+async fn load_official_outcome_availability(
+    pool: &sqlx::PgPool,
+    event_ids: &[String],
+) -> Result<HashMap<String, OfficialOutcomeAvailability>, sqlx::Error> {
+    if event_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows =
+        sqlx::query_as::<_, (String, bool, DateTime<Utc>)>(OFFICIAL_OUTCOME_AVAILABILITY_SQL)
+            .bind(event_ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(event_id, outcome_up, available_at)| {
+            (
+                event_id,
+                OfficialOutcomeAvailability {
+                    outcome_up,
+                    available_at,
+                },
+            )
+        })
+        .collect())
+}
+
+#[cfg(any(feature = "db", test))]
+fn bind_official_outcome_availability(
+    evidence: &mut [crate::ChainlinkOracleSettlementEvidence],
+    observations: &HashMap<String, OfficialOutcomeAvailability>,
+) -> Result<()> {
+    for event in evidence {
+        let observed = observations.get(&event.event_id).with_context(|| {
+            format!(
+                "official resolution value and availability are missing for event {}",
+                event.event_id
+            )
+        })?;
+        let expected_outcome = event.official_outcome_up.with_context(|| {
+            format!(
+                "governed settlement evidence is missing the official outcome for event {}",
+                event.event_id
+            )
+        })?;
+        anyhow::ensure!(
+            expected_outcome == observed.outcome_up,
+            "official outcome changed while compiling snapshot for event {}: initial={} current={}",
+            event.event_id,
+            expected_outcome,
+            observed.outcome_up
+        );
+        event.official_outcome_available_at = Some(observed.available_at);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "db")]
 fn archive_token_window_values_sql(windows: &[PmBookTokenWindow]) -> String {
     windows
         .iter()
@@ -1498,7 +1668,26 @@ pub async fn build_research_snapshot_from_database(
         options.max_quote_age_secs,
         options.observation_sample_secs,
     );
-    let chainlink_oracle_settlement_evidence = factor_build.oracle_settlement_evidence;
+    let mut chainlink_oracle_settlement_evidence = factor_build.oracle_settlement_evidence;
+    let settlement_event_ids = chainlink_oracle_settlement_evidence
+        .iter()
+        .map(|evidence| evidence.event_id.clone())
+        .collect::<Vec<_>>();
+    let settlement_started = Instant::now();
+    let official_outcome_availability =
+        load_official_outcome_availability(pool, &settlement_event_ids)
+            .await
+            .context("load official outcome availability clocks")?;
+    bind_official_outcome_availability(
+        &mut chainlink_oracle_settlement_evidence,
+        &official_outcome_availability,
+    )
+    .context("bind official outcome values to availability clocks")?;
+    phase_timings.push(ResearchSnapshotPhaseTiming {
+        phase: "official_outcome_availability".to_string(),
+        elapsed_ms: settlement_started.elapsed().as_millis(),
+        rows: Some(official_outcome_availability.len()),
+    });
     let chainlink_oracle_settlement_audit = (factor_build.oracle_settlement_audit.expected_events
         > 0)
     .then_some(factor_build.oracle_settlement_audit);
@@ -1619,8 +1808,8 @@ pub async fn build_research_snapshot_from_database(
                     raw_full_fidelity: true,
                     snapshot_sampled: false,
                     sample_secs: None,
-                    row_count: None,
-                    notes: "Official settlement labels are required when require_official_settlement=true.".to_string(),
+                    row_count: Some(official_outcome_availability.len()),
+                    notes: "Official settlement labels are required when require_official_settlement=true; availability is the latest current-value fetched/resolved clock across both outcome tokens.".to_string(),
                 },
                 ResearchSnapshotSourceSurface {
                     name: "deribit_feature_snapshots".to_string(),
@@ -1955,6 +2144,19 @@ fn parse_snapshot_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], artifact: &st
 
 fn serialize_json<T: Serialize>(value: &T, label: &str) -> Result<Vec<u8>> {
     serde_json::to_vec_pretty(value).with_context(|| format!("serialize {label}"))
+}
+
+#[cfg(feature = "polars-export")]
+fn serialize_observations_parquet(observations: &[FactorObservation]) -> Result<Vec<u8>> {
+    use polars::io::parquet::write::ParquetWriter;
+
+    let mut frame = crate::observations_to_frame(observations)
+        .context("build snapshot observations parquet frame")?;
+    let mut cursor = Cursor::new(Vec::new());
+    ParquetWriter::new(&mut cursor)
+        .finish(&mut frame)
+        .context("serialize snapshot observations parquet")?;
+    Ok(cursor.into_inner())
 }
 
 #[cfg(test)]
@@ -2320,6 +2522,70 @@ fn render_quality_markdown(manifest: &ResearchSnapshotManifest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_resolution_availability_query_tracks_current_two_token_value() {
+        let normalized = OFFICIAL_OUTCOME_AVAILABILITY_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(normalized.contains("WITH governed_tokens AS"));
+        assert!(normalized.contains("JOIN governed_tokens"));
+        assert!(normalized.contains("AS official_outcome_up"));
+        assert!(normalized.contains("settled_price"));
+        assert!(normalized.contains("MAX(GREATEST(COALESCE(resolved_at, fetched_at), fetched_at))"));
+        assert!(normalized.contains("resolved = TRUE"));
+        assert!(normalized.contains("GROUP BY market_slug"));
+        assert!(normalized.contains("HAVING COUNT(DISTINCT token_id) = 2"));
+        assert!(normalized.contains("COUNT(DISTINCT side) = 2"));
+        assert!(normalized.contains("COUNT(*) FILTER (WHERE settled_price IN (0, 1)) = 2"));
+    }
+
+    #[test]
+    fn official_resolution_clock_is_bound_to_the_same_outcome_value() {
+        let end_time = Utc::now();
+        let evidence = crate::ChainlinkOracleSettlementEvidence {
+            event_id: "event-1".to_string(),
+            symbol: "BTC".to_string(),
+            policy_version: "test".to_string(),
+            start_time: end_time - chrono::Duration::minutes(5),
+            end_time,
+            open: None,
+            close: None,
+            chainlink_outcome_up: Some(true),
+            official_outcome_up: Some(true),
+            official_outcome_available_at: None,
+            reasons: vec![],
+        };
+        let available_at = end_time + chrono::Duration::seconds(1);
+        let matching = HashMap::from([(
+            "event-1".to_string(),
+            OfficialOutcomeAvailability {
+                outcome_up: true,
+                available_at,
+            },
+        )]);
+        let mut matching_evidence = vec![evidence.clone()];
+        bind_official_outcome_availability(&mut matching_evidence, &matching)
+            .expect("matching value and clock must bind atomically");
+        assert_eq!(
+            matching_evidence[0].official_outcome_available_at,
+            Some(available_at)
+        );
+
+        let corrected = HashMap::from([(
+            "event-1".to_string(),
+            OfficialOutcomeAvailability {
+                outcome_up: false,
+                available_at,
+            },
+        )]);
+        let error = bind_official_outcome_availability(&mut [evidence], &corrected)
+            .expect_err("a correction between reads must fail closed");
+        assert!(error
+            .to_string()
+            .contains("official outcome changed while compiling snapshot"));
+    }
 
     #[test]
     fn governed_chainlink_event_sets_must_match_bidirectionally() {

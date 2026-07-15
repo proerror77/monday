@@ -60,8 +60,9 @@ pub use factors::{
     normalized_underlying_symbol, AggregatedFactorMetric, ChainlinkOracleAuditFailure,
     ChainlinkOracleBoundaryEvidence, ChainlinkOracleFailureReason, ChainlinkOracleSettlementAudit,
     ChainlinkOracleSettlementEvidence, EventFactorSummary, FactorMetric, FactorObservation,
-    FactorObservationBuild, ResearchLobSnapshot, ResearchPmBookLevel, ResearchPmBookSnapshot,
-    GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS, GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION,
+    FactorObservationBuild, FactorSourceAvailability, ResearchLobSnapshot, ResearchPmBookLevel,
+    ResearchPmBookSnapshot, GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS,
+    GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION,
 };
 #[cfg(feature = "polars-export")]
 pub use factors::{export_observations_parquet, observations_to_frame};

@@ -34,6 +34,7 @@ mod tests {
             settlement_up: 0.0,
             event_id: "e".into(),
             symbol: "BTC".into(),
+            source_availability: Default::default(),
             tick_ts: Utc::now(),
             event_window_secs: 300,
             signed_distance_to_beat: 0.0,

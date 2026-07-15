@@ -53,6 +53,7 @@ mod tests {
             event_id: "e".into(),
             symbol: "BTC".into(),
             tick_ts: Utc::now(),
+            source_availability: Default::default(),
             event_window_secs: 300,
             distance_over_sigma: 0.0,
             signed_distance_to_beat: 0.0,

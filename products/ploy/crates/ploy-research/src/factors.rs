@@ -93,11 +93,29 @@ const PM_BOOK_SAMPLED_QUERY: &str = r#"
         ORDER BY received_at
         "#;
 
+/// Point-in-time receipt clocks for the source families used to derive one
+/// observation. `None` means the source provenance is unavailable; governed
+/// ML consumers must fail closed for features that depend on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactorSourceAvailability {
+    pub spot: Option<DateTime<Utc>>,
+    pub lob: Option<DateTime<Utc>>,
+    pub aggregate_trade: Option<DateTime<Utc>>,
+    pub polymarket_up_quote: Option<DateTime<Utc>>,
+    pub polymarket_down_quote: Option<DateTime<Utc>>,
+    pub chainlink_reference: Option<DateTime<Utc>>,
+    /// Event-static opening boundary. It must be known by decision time, but
+    /// does not expire under the rolling feature-age limit.
+    pub chainlink_open: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FactorObservation {
     pub event_id: String,
     pub symbol: String,
     pub tick_ts: DateTime<Utc>,
+    #[serde(default)]
+    pub source_availability: FactorSourceAvailability,
     #[serde(default)]
     pub event_window_secs: i64,
     pub time_remaining_secs: i64,
@@ -450,7 +468,7 @@ pub struct ChainlinkOracleBoundaryEvidence {
 }
 
 impl ChainlinkOracleBoundaryEvidence {
-    fn available_at(self) -> DateTime<Utc> {
+    pub fn available_at(self) -> DateTime<Utc> {
         self.received_at.max(self.confirmation_received_at)
     }
 }
@@ -475,6 +493,11 @@ pub struct ChainlinkOracleSettlementEvidence {
     pub close: Option<ChainlinkOracleBoundaryEvidence>,
     pub chainlink_outcome_up: Option<bool>,
     pub official_outcome_up: Option<bool>,
+    /// Earliest observed time at which the official venue resolution was
+    /// available to the research system. Historical snapshots without this
+    /// provenance cannot safely use the label for chronological training.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_outcome_available_at: Option<DateTime<Utc>>,
     pub reasons: Vec<ChainlinkOracleFailureReason>,
 }
 
@@ -485,6 +508,19 @@ impl ChainlinkOracleSettlementEvidence {
             && self.close.is_some()
             && self.chainlink_outcome_up.is_some()
             && self.official_outcome_up.is_some()
+    }
+
+    /// Earliest safe chronological cutoff for using this event label.
+    pub fn label_available_at(&self) -> Option<DateTime<Utc>> {
+        let close_available_at = self
+            .close
+            .map(ChainlinkOracleBoundaryEvidence::available_at)?;
+        let official_available_at = self.official_outcome_available_at?;
+        Some(
+            self.end_time
+                .max(close_available_at)
+                .max(official_available_at),
+        )
     }
 }
 
@@ -690,6 +726,7 @@ fn governed_chainlink_settlement_outcomes(
                 close,
                 chainlink_outcome_up,
                 official_outcome_up,
+                official_outcome_available_at: None,
                 reasons,
             }
         })
@@ -698,6 +735,7 @@ fn governed_chainlink_settlement_outcomes(
 
 #[derive(Clone, Default)]
 struct LobState {
+    available_at: Option<DateTime<Utc>>,
     obi: f64,
     spread_bps: f64,
     mid_price: f64,
@@ -1460,6 +1498,7 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
     let mut lob_by_symbol: HashMap<String, Vec<&ResearchLobSnapshot>> = HashMap::new();
     let mut lob_flow: HashMap<String, LobFlowAccumulator> = HashMap::new();
     let mut trade_flow: HashMap<String, TradeFlowAccumulator> = HashMap::new();
+    let mut latest_aggregate_trade: HashMap<String, DateTime<Utc>> = HashMap::new();
     let mut candle_flow: HashMap<String, CandleFlowAccumulator> = HashMap::new();
     let mut last_observation_bucket: HashMap<String, i64> = HashMap::new();
     let mut rows = Vec::new();
@@ -1562,9 +1601,11 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                 symbol,
                 obi,
                 spread_bps,
+                ts,
                 ..
             } => {
                 let state = lob.entry(symbol.to_string()).or_default();
+                state.available_at = Some(*ts);
                 state.obi = *obi;
                 state.spread_bps = *spread_bps as f64;
                 state.obi_10 = *obi;
@@ -1575,11 +1616,13 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                 spread_bps,
                 bid_depth_near,
                 ask_depth_near,
+                ts,
                 ..
             } => {
                 lob.insert(
                     symbol.to_string(),
                     LobState {
+                        available_at: Some(*ts),
                         obi: *obi,
                         spread_bps: *spread_bps as f64,
                         mid_price: f64::NAN,
@@ -1756,6 +1799,7 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                         lob.insert(
                             sym.clone(),
                             LobState {
+                                available_at: Some(snapshot.ts),
                                 obi: snapshot.obi,
                                 spread_bps: snapshot.spread_bps,
                                 mid_price: snapshot.mid_price,
@@ -1835,7 +1879,14 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                         }
                     }
 
-                    let (mut up_bid, mut up_ask, up_lag, mut up_bid_sz, mut up_ask_sz) = quotes
+                    let (
+                        mut up_bid,
+                        mut up_ask,
+                        up_lag,
+                        mut up_bid_sz,
+                        mut up_ask_sz,
+                        up_quote_available_at,
+                    ) = quotes
                         .get(&event.up_token)
                         .map(|(quote_ts, bid, ask, bid_sz, ask_sz)| {
                             (
@@ -1844,22 +1895,30 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                                 (*ts - *quote_ts).num_seconds() as f64,
                                 *bid_sz,
                                 *ask_sz,
+                                Some(*quote_ts),
                             )
                         })
-                        .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN));
-                    let (mut down_bid, mut down_ask, down_lag, mut down_bid_sz, mut down_ask_sz) =
-                        quotes
-                            .get(&event.down_token)
-                            .map(|(quote_ts, bid, ask, bid_sz, ask_sz)| {
-                                (
-                                    *bid,
-                                    *ask,
-                                    (*ts - *quote_ts).num_seconds() as f64,
-                                    *bid_sz,
-                                    *ask_sz,
-                                )
-                            })
-                            .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN));
+                        .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, None));
+                    let (
+                        mut down_bid,
+                        mut down_ask,
+                        down_lag,
+                        mut down_bid_sz,
+                        mut down_ask_sz,
+                        down_quote_available_at,
+                    ) = quotes
+                        .get(&event.down_token)
+                        .map(|(quote_ts, bid, ask, bid_sz, ask_sz)| {
+                            (
+                                *bid,
+                                *ask,
+                                (*ts - *quote_ts).num_seconds() as f64,
+                                *bid_sz,
+                                *ask_sz,
+                                Some(*quote_ts),
+                            )
+                        })
+                        .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, None));
 
                     let up_quote_fresh =
                         up_lag.is_finite() && up_lag >= 0.0 && up_lag <= max_quote_age_secs as f64;
@@ -2027,6 +2086,17 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                         event_id: event.event_id.clone(),
                         symbol: sym.clone(),
                         tick_ts: *ts,
+                        source_availability: FactorSourceAvailability {
+                            spot: Some(*ts),
+                            lob: lob_state.available_at,
+                            aggregate_trade: latest_aggregate_trade.get(&sym).copied(),
+                            polymarket_up_quote: up_quote_available_at,
+                            polymarket_down_quote: down_quote_available_at,
+                            chainlink_reference: chainlink
+                                .get(&normalized_underlying_symbol(&sym))
+                                .map(|(_, available_at, _)| *available_at),
+                            chainlink_open: event.chainlink_price_to_beat_available_at,
+                        },
                         event_window_secs: event.window_secs.unwrap_or_default(),
                         time_remaining_secs: time_remaining,
                         signed_distance_to_beat: signed_distance,
@@ -2105,6 +2175,7 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                 ..
             } => {
                 if let Some(qty) = quantity.to_f64() {
+                    latest_aggregate_trade.insert(symbol.to_string(), *ts);
                     // buyer_maker=false → buyer aggressor (bullish); true → seller aggressor
                     let signed_qty = if *is_buyer_maker { -qty } else { qty };
                     trade_flow
@@ -3076,6 +3147,7 @@ mod tests {
             tick_ts: chrono::DateTime::from_timestamp(tick_ts_secs, 0)
                 .unwrap()
                 .with_timezone(&Utc),
+            source_availability: Default::default(),
             event_window_secs: 300,
             time_remaining_secs: 60,
             signed_distance_to_beat: 0.0,
@@ -3212,11 +3284,15 @@ mod tests {
         json.as_object_mut()
             .expect("observation object")
             .remove("event_window_secs");
+        json.as_object_mut()
+            .expect("observation object")
+            .remove("source_availability");
 
         let decoded: FactorObservation =
             serde_json::from_value(json).expect("deserialize legacy observation");
 
         assert_eq!(decoded.event_window_secs, 0);
+        assert_eq!(decoded.source_availability, Default::default());
     }
 
     #[test]
@@ -3996,6 +4072,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts2,
+                    source_availability: Default::default(),
                     event_window_secs: 300,
                     time_remaining_secs: 10,
                     signed_distance_to_beat: 0.0,
@@ -4055,6 +4132,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts0,
+                    source_availability: Default::default(),
                     event_window_secs: 300,
                     time_remaining_secs: 90,
                     signed_distance_to_beat: 0.0,
@@ -4114,6 +4192,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts1,
+                    source_availability: Default::default(),
                     event_window_secs: 300,
                     time_remaining_secs: 50,
                     signed_distance_to_beat: 0.0,

@@ -29,7 +29,7 @@ use crate::{
         validate_prediction_snapshot_sources, PredictionResearchMission,
         PREDICTION_EVENT_WINDOW_SECS,
     },
-    research_snapshot::ResearchSnapshot,
+    research_snapshot::{verify_research_snapshot_integrity, ResearchSnapshot},
     FactorObservation,
 };
 
@@ -45,11 +45,62 @@ const MAX_BURNPACK_METADATA_BYTES: usize = 1_048_576;
 const BURNPACK_HEADER_BYTES: usize = 10;
 const BURNPACK_MAGIC: u32 = 0x4255_524e;
 const BURNPACK_FORMAT_VERSION: u16 = 1;
-const MAX_FEATURES: usize = 4_096;
+const MAX_FEATURES: usize = 64;
+const MAX_BINARY_EPOCHS: usize = 1_000;
+const MAX_SELECTORS_PER_PARTITION: usize = 250_000;
+const MAX_TOTAL_SELECTORS: usize = 400_000;
+const MAX_FEATURE_CELLS: usize = 8_000_000;
+const MAX_TOTAL_WORK: usize = 2_000_000_000;
+const MAX_SNAPSHOT_OBSERVATIONS: usize = 1_000_000;
+const MAX_SNAPSHOT_DERIBIT_ROWS: usize = 2_000_000;
+const MAX_SNAPSHOT_BOOK_ROWS: usize = 2_000_000;
+const MAX_TOTAL_SNAPSHOT_ROWS: usize = 4_000_000;
+const MAX_SNAPSHOT_COVERAGE_WORK: usize = 4_000_000;
 const MIN_STANDARD_DEVIATION: f64 = 1.0e-12;
 
 type InferenceBackend = NdArray<f32>;
 type TrainingBackend = Autodiff<InferenceBackend>;
+
+fn validate_snapshot_row_budget(
+    observations: usize,
+    deribit_rows: usize,
+    book_rows: usize,
+) -> Result<(), String> {
+    let total_rows = observations
+        .checked_add(deribit_rows)
+        .and_then(|rows| rows.checked_add(book_rows))
+        .ok_or_else(|| "snapshot row count arithmetic overflow".to_string())?;
+    let coverage_work = observations
+        .checked_mul(2)
+        .and_then(|lookups| lookups.checked_add(book_rows))
+        .ok_or_else(|| "snapshot coverage work arithmetic overflow".to_string())?;
+    if observations > MAX_SNAPSHOT_OBSERVATIONS {
+        return Err(format!(
+            "snapshot observation row count exceeds the governed limit of {MAX_SNAPSHOT_OBSERVATIONS}"
+        ));
+    }
+    if deribit_rows > MAX_SNAPSHOT_DERIBIT_ROWS {
+        return Err(format!(
+            "snapshot Deribit row count exceeds the governed limit of {MAX_SNAPSHOT_DERIBIT_ROWS}"
+        ));
+    }
+    if book_rows > MAX_SNAPSHOT_BOOK_ROWS {
+        return Err(format!(
+            "snapshot Polymarket book row count exceeds the governed limit of {MAX_SNAPSHOT_BOOK_ROWS}"
+        ));
+    }
+    if total_rows > MAX_TOTAL_SNAPSHOT_ROWS {
+        return Err(format!(
+            "total snapshot row count exceeds the governed limit of {MAX_TOTAL_SNAPSHOT_ROWS}"
+        ));
+    }
+    if coverage_work > MAX_SNAPSHOT_COVERAGE_WORK {
+        return Err(format!(
+            "snapshot coverage work exceeds the governed limit of {MAX_SNAPSHOT_COVERAGE_WORK} indexed row operations"
+        ));
+    }
+    Ok(())
+}
 
 fn validate_binary_snapshot_coverage(
     snapshot: &ResearchSnapshot,
@@ -71,6 +122,11 @@ fn validate_binary_snapshot_coverage(
             "snapshot manifest row counts do not match governed evaluator artifacts".to_string(),
         );
     }
+    validate_snapshot_row_budget(
+        snapshot.observations.len(),
+        snapshot.deribit_snapshots.len(),
+        snapshot.pm_book_snapshots.len(),
+    )?;
 
     let observation_events = snapshot
         .observations
@@ -84,6 +140,7 @@ fn validate_binary_snapshot_coverage(
         .map(|evidence| (evidence.event_id.as_str(), evidence))
         .collect::<BTreeMap<_, _>>();
     let mut book_tokens = BTreeMap::<(&str, &str), &str>::new();
+    let mut valid_book_times = BTreeMap::<(&str, &str), Vec<_>>::new();
     for book in &snapshot.pm_book_snapshots {
         if !observation_events.contains(book.event_id.as_str()) {
             return Err(format!(
@@ -117,26 +174,34 @@ fn validate_binary_snapshot_coverage(
                 book.event_id
             ));
         }
+        if !book.bids.is_empty()
+            && !book.asks.is_empty()
+            && book.bids.iter().chain(&book.asks).all(|level| {
+                level.price.is_finite()
+                    && level.price > 0.0
+                    && level.price < 1.0
+                    && level.size.is_finite()
+                    && level.size > 0.0
+            })
+        {
+            valid_book_times.entry(key).or_default().push(book.ts);
+        }
+    }
+    for timestamps in valid_book_times.values_mut() {
+        timestamps.sort_unstable();
     }
 
     let max_book_age_secs = snapshot.manifest.max_quote_age_secs.max(0) as f64;
     let has_fresh_book = |row: &FactorObservation, side: &str| {
-        snapshot.pm_book_snapshots.iter().any(|book| {
-            let age_secs = (row.tick_ts - book.ts).num_milliseconds() as f64 / 1_000.0;
-            book.event_id == row.event_id
-                && book.side.eq_ignore_ascii_case(side)
-                && age_secs >= 0.0
-                && age_secs <= max_book_age_secs
-                && !book.bids.is_empty()
-                && !book.asks.is_empty()
-                && book.bids.iter().chain(&book.asks).all(|level| {
-                    level.price.is_finite()
-                        && level.price > 0.0
-                        && level.price < 1.0
-                        && level.size.is_finite()
-                        && level.size > 0.0
-                })
-        })
+        let Some(timestamps) = valid_book_times.get(&(row.event_id.as_str(), side)) else {
+            return false;
+        };
+        let upper = timestamps.partition_point(|timestamp| timestamp <= &row.tick_ts);
+        let Some(timestamp) = upper.checked_sub(1).and_then(|index| timestamps.get(index)) else {
+            return false;
+        };
+        let age_secs = (row.tick_ts - *timestamp).num_milliseconds() as f64 / 1_000.0;
+        age_secs >= 0.0 && age_secs <= max_book_age_secs
     };
 
     let mut labels = BTreeMap::<&str, f64>::new();
@@ -170,6 +235,12 @@ fn validate_binary_snapshot_coverage(
                     row.event_id
                 )
             })?;
+        if evidence.label_available_at().is_none() {
+            return Err(format!(
+                "snapshot event {} lacks official label availability provenance",
+                row.event_id
+            ));
+        }
         if (evidence.end_time - row.tick_ts).num_seconds() != row.time_remaining_secs {
             return Err(format!(
                 "snapshot event {} decision-time settlement boundary disagrees with governed Chainlink evidence",
@@ -295,6 +366,8 @@ impl BinaryDatasetContract {
         mission: &PredictionResearchMission,
         feature_names: Vec<String>,
     ) -> Result<Self> {
+        verify_research_snapshot_integrity(snapshot)
+            .context("verify immutable prediction snapshot artifacts")?;
         validate_prediction_mission(mission, &current_prediction_policy_snapshot_id())
             .map_err(anyhow::Error::msg)
             .context("validate prediction mission contract")?;
@@ -364,8 +437,8 @@ impl BinaryDatasetContract {
             "mission_sha256 must use sha256:<64 lowercase hex>"
         );
         ensure!(
-            is_prefixed_sha256(&self.snapshot_hash),
-            "snapshot_hash must use sha256:<64 lowercase hex>"
+            is_snapshot_hash(&self.snapshot_hash),
+            "snapshot_hash must use the governed 16-character lowercase snapshot digest"
         );
         ensure!(
             is_prefixed_sha256(&self.snapshot_contract_hash),
@@ -454,7 +527,8 @@ pub struct EventDisjointBinarySplit {
 struct MaterializedBinarySample {
     event_id: String,
     decision_at_ms: i64,
-    settlement_at_ms: i64,
+    event_end_at_ms: i64,
+    label_available_at_ms: i64,
     features: Vec<f32>,
     outcome: bool,
 }
@@ -492,8 +566,8 @@ impl BinaryTrainingConfig {
     fn validate(&self) -> Result<()> {
         ensure!(self.epochs > 0, "epochs must be greater than zero");
         ensure!(
-            self.epochs <= 1_000_000,
-            "epochs exceeds the research safety bound"
+            self.epochs <= MAX_BINARY_EPOCHS,
+            "epochs exceeds the governed research limit of {MAX_BINARY_EPOCHS}"
         );
         ensure!(
             self.learning_rate.is_finite() && self.learning_rate > 0.0,
@@ -781,29 +855,40 @@ impl BinaryProbabilityModel {
         &self.manifest
     }
 
-    /// Produce probabilities for research evaluation after verifying the exact
-    /// ordered feature schema used by the caller.
+    /// Produce probabilities only from exact decision rows in the immutable,
+    /// governed snapshot bound to this model's dataset contract.
     pub fn predict_probabilities(
         &self,
-        expected_feature_schema_sha256: &str,
-        feature_names: &[String],
-        feature_rows: &[Vec<f32>],
+        snapshot: &ResearchSnapshot,
+        mission: &PredictionResearchMission,
+        selectors: &[BinaryDecisionRow],
     ) -> Result<Vec<f64>> {
-        ensure!(!feature_rows.is_empty(), "prediction batch is empty");
+        ensure!(!selectors.is_empty(), "prediction batch is empty");
+        validate_selector_partition("prediction", selectors)?;
+        validate_prediction_budget(
+            selectors.len(),
+            self.manifest.dataset_contract.feature_names.len(),
+        )?;
+        self.manifest
+            .dataset_contract
+            .validate_mission_binding(mission)?;
+        let expected_contract = BinaryDatasetContract::from_prediction_snapshot(
+            snapshot,
+            mission,
+            self.manifest.dataset_contract.feature_names.clone(),
+        )?;
         ensure!(
-            expected_feature_schema_sha256 == self.manifest.dataset_contract.feature_schema_sha256,
-            "prediction feature schema SHA-256 does not match the model"
+            self.manifest.dataset_contract == expected_contract,
+            "prediction snapshot contract does not match the trained model"
         );
-        ensure!(
-            feature_names == self.manifest.dataset_contract.feature_names.as_slice(),
-            "prediction feature schema does not match the trained ordered schema"
-        );
-        ensure!(
-            feature_schema_sha256(feature_names)?
-                == self.manifest.dataset_contract.feature_schema_sha256,
-            "prediction feature schema SHA-256 does not match the model"
-        );
-        predict_probabilities(&self.model, &self.manifest.normalizer, feature_rows)
+        let governed_rows = governed_observation_index(snapshot)?;
+        let feature_rows = materialize_governed_feature_rows(
+            "prediction",
+            selectors,
+            &self.manifest.dataset_contract,
+            &governed_rows,
+        )?;
+        predict_feature_rows(&self.model, &self.manifest.normalizer, &feature_rows)
     }
 
     /// Persist a Burnpack plus typed JSON manifest in a new directory.
@@ -947,8 +1032,18 @@ pub fn train_event_disjoint_binary(
     config: BinaryTrainingConfig,
 ) -> Result<BinaryProbabilityModel> {
     config.validate()?;
+    validate_total_selector_budget(split)?;
+    validate_selector_partition("train", &split.train)?;
+    validate_selector_partition("validation", &split.validation)?;
     split.contract.validate()?;
     split.contract.validate_mission_binding(mission)?;
+    let input_dim = split.contract.feature_names.len();
+    validate_training_budget(
+        split.train.len(),
+        split.validation.len(),
+        input_dim,
+        config.epochs,
+    )?;
     let expected_contract = BinaryDatasetContract::from_prediction_snapshot(
         snapshot,
         mission,
@@ -958,7 +1053,6 @@ pub fn train_event_disjoint_binary(
         split.contract == expected_contract,
         "binary dataset contract does not match the validated prediction snapshot"
     );
-    let input_dim = split.contract.feature_names.len();
     let materialized = materialize_split(split, snapshot)?;
     validate_split(&materialized, input_dim)?;
 
@@ -1001,7 +1095,7 @@ pub fn train_event_disjoint_binary(
         .iter()
         .map(|sample| sample.features.clone())
         .collect::<Vec<_>>();
-    let validation_probabilities = predict_probabilities(&model, &normalizer, &validation_rows)?;
+    let validation_probabilities = predict_feature_rows(&model, &normalizer, &validation_rows)?;
     let validation_metrics = compute_metrics(
         &materialized.validation,
         &validation_probabilities,
@@ -1032,6 +1126,84 @@ pub fn train_event_disjoint_binary(
     Ok(BinaryProbabilityModel { model, manifest })
 }
 
+fn validate_total_selector_budget(split: &EventDisjointBinarySplit) -> Result<()> {
+    let total = split
+        .train
+        .len()
+        .checked_add(split.validation.len())
+        .context("total selector count overflow")?;
+    ensure!(
+        total <= MAX_TOTAL_SELECTORS,
+        "total selector count exceeds the governed limit of {MAX_TOTAL_SELECTORS}"
+    );
+    Ok(())
+}
+
+fn checked_feature_cells(rows: usize, features: usize, scope: &str) -> Result<usize> {
+    rows.checked_mul(features)
+        .with_context(|| format!("{scope} feature cell count overflow"))
+}
+
+fn validate_training_budget(
+    train_rows: usize,
+    validation_rows: usize,
+    features: usize,
+    epochs: usize,
+) -> Result<()> {
+    let total_rows = train_rows
+        .checked_add(validation_rows)
+        .context("total training row count overflow")?;
+    let total_cells = checked_feature_cells(total_rows, features, "total")?;
+    ensure!(
+        total_cells <= MAX_FEATURE_CELLS,
+        "feature cell count exceeds the governed limit of {MAX_FEATURE_CELLS}"
+    );
+
+    let train_cells = checked_feature_cells(train_rows, features, "training")?;
+    let optimization_work = train_cells
+        .checked_mul(epochs)
+        .context("training epoch work overflow")?;
+    let validation_cells = checked_feature_cells(validation_rows, features, "validation")?;
+    let total_work = optimization_work
+        .checked_add(validation_cells)
+        .context("total training work overflow")?;
+    ensure!(
+        total_work <= MAX_TOTAL_WORK,
+        "total training work exceeds the governed limit of {MAX_TOTAL_WORK} feature-cell steps"
+    );
+    Ok(())
+}
+
+fn validate_prediction_budget(rows: usize, features: usize) -> Result<()> {
+    let cells = checked_feature_cells(rows, features, "prediction")?;
+    ensure!(
+        cells <= MAX_FEATURE_CELLS,
+        "prediction feature cell count exceeds the governed limit of {MAX_FEATURE_CELLS}"
+    );
+    Ok(())
+}
+
+fn validate_selector_partition(partition: &str, selectors: &[BinaryDecisionRow]) -> Result<()> {
+    ensure!(
+        selectors.len() <= MAX_SELECTORS_PER_PARTITION,
+        "{partition} selector count exceeds the governed limit of {MAX_SELECTORS_PER_PARTITION}"
+    );
+    let mut unique = HashSet::with_capacity(selectors.len());
+    for (index, selector) in selectors.iter().enumerate() {
+        ensure!(
+            !selector.event_id.trim().is_empty() && selector.event_id.trim() == selector.event_id,
+            "{partition} selector {index} has an invalid event_id"
+        );
+        ensure!(
+            unique.insert((selector.event_id.as_str(), selector.decision_at_ms)),
+            "{partition} contains duplicate decision selector {:?} at {}",
+            selector.event_id,
+            selector.decision_at_ms
+        );
+    }
+    Ok(())
+}
+
 fn validate_feature_names(feature_names: &[String]) -> Result<()> {
     ensure!(!feature_names.is_empty(), "feature schema is empty");
     ensure!(
@@ -1058,6 +1230,47 @@ fn validate_feature_names(feature_names: &[String]) -> Result<()> {
 }
 
 type RegisteredFeatureAccessor = fn(&FactorObservation) -> f64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeatureSource {
+    Spot,
+    Lob,
+    AggregateTrade,
+    PolymarketUpQuote,
+    PolymarketDownQuote,
+    ChainlinkReference,
+    ChainlinkOpen,
+}
+
+impl FeatureSource {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Spot => "spot",
+            Self::Lob => "lob",
+            Self::AggregateTrade => "aggregate_trade",
+            Self::PolymarketUpQuote => "polymarket_up_quote",
+            Self::PolymarketDownQuote => "polymarket_down_quote",
+            Self::ChainlinkReference => "chainlink_reference",
+            Self::ChainlinkOpen => "chainlink_open",
+        }
+    }
+
+    fn available_at(self, row: &FactorObservation) -> Option<chrono::DateTime<chrono::Utc>> {
+        match self {
+            Self::Spot => row.source_availability.spot,
+            Self::Lob => row.source_availability.lob,
+            Self::AggregateTrade => row.source_availability.aggregate_trade,
+            Self::PolymarketUpQuote => row.source_availability.polymarket_up_quote,
+            Self::PolymarketDownQuote => row.source_availability.polymarket_down_quote,
+            Self::ChainlinkReference => row.source_availability.chainlink_reference,
+            Self::ChainlinkOpen => row.source_availability.chainlink_open,
+        }
+    }
+
+    fn is_event_static(self) -> bool {
+        self == Self::ChainlinkOpen
+    }
+}
 
 /// Closed registry of decision-time fields that the binary trainer is allowed
 /// to project from a governed snapshot. Settlement and `future_*` fields are
@@ -1118,9 +1331,100 @@ fn registered_feature_accessor(name: &str) -> Option<RegisteredFeatureAccessor> 
     }
 }
 
-fn extract_registered_feature(row: &FactorObservation, name: &str) -> Result<f32> {
+fn registered_feature_sources(name: &str) -> Option<&'static [FeatureSource]> {
+    use FeatureSource::{
+        AggregateTrade, ChainlinkOpen, ChainlinkReference, Lob, PolymarketDownQuote,
+        PolymarketUpQuote, Spot,
+    };
+    match name {
+        "time_remaining_secs" => Some(&[]),
+        "signed_distance_to_beat"
+        | "abs_distance_to_beat"
+        | "distance_over_sigma"
+        | "model_prob_up" => Some(&[Spot, ChainlinkOpen]),
+        "drift_10s" | "drift_30s" | "flip_age_secs" | "post_flip_drift" | "sigma_horizon" => {
+            Some(&[Spot])
+        }
+        "fair_prob_up" | "fair_prob_up_clean" | "prob_disagreement" | "reward_risk_up"
+        | "reward_risk_down" | "pm_lag_secs" => Some(&[PolymarketUpQuote, PolymarketDownQuote]),
+        "implied_sigma_horizon" | "vol_gap" | "model_edge_up" => {
+            Some(&[Spot, ChainlinkOpen, PolymarketUpQuote, PolymarketDownQuote])
+        }
+        "chainlink_prob_up" => Some(&[Spot, ChainlinkOpen, ChainlinkReference]),
+        "obi"
+        | "spread_bps"
+        | "microprice_offset_bps"
+        | "bid_depth_near"
+        | "ask_depth_near"
+        | "depth_ratio"
+        | "depth_imbalance"
+        | "depth_far_ratio"
+        | "depth_acceleration"
+        | "obi_10"
+        | "cum_obi_delta_5m"
+        | "cum_depth_delta_5m"
+        | "cum_mprice_drift_5m" => Some(&[Lob]),
+        "pm_up_bid" | "pm_up_ask" | "pm_up_bid_size" | "pm_up_ask_size" => {
+            Some(&[PolymarketUpQuote])
+        }
+        "pm_down_bid" | "pm_down_ask" | "pm_down_bid_size" | "pm_down_ask_size" => {
+            Some(&[PolymarketDownQuote])
+        }
+        "cum_trade_imbalance_5m" => Some(&[AggregateTrade]),
+        "cex_bar_return_30s"
+        | "cex_bar_return_60s"
+        | "cex_bar_volume_ratio_30s"
+        | "cex_bar_volume_trend_3"
+        | "cex_signed_volume_ratio_30s"
+        | "cex_consecutive_up_bars"
+        | "cex_consecutive_down_bars"
+        | "cex_breakout_volume_score" => Some(&[Spot, AggregateTrade]),
+        _ => None,
+    }
+}
+
+fn validate_feature_freshness(
+    row: &FactorObservation,
+    name: &str,
+    max_feature_age_ms: i64,
+) -> Result<()> {
+    let sources = registered_feature_sources(name)
+        .with_context(|| format!("feature {name:?} has no registered source clock"))?;
+    for source in sources {
+        let source_name = source.name();
+        let available_at = source.available_at(row).with_context(|| {
+            format!(
+                "snapshot feature {name:?} is missing {source_name} availability for event {:?} at {}",
+                row.event_id, row.tick_ts
+            )
+        })?;
+        ensure!(
+            available_at <= row.tick_ts,
+            "snapshot feature {name:?} uses future {source_name} availability for event {:?} at {}",
+            row.event_id,
+            row.tick_ts
+        );
+        if !source.is_event_static() {
+            let age_ms = (row.tick_ts - available_at).num_milliseconds();
+            ensure!(
+                age_ms <= max_feature_age_ms,
+                "snapshot feature {name:?} {source_name} source is stale by {age_ms}ms for event {:?} at {} (max {max_feature_age_ms}ms)",
+                row.event_id,
+                row.tick_ts
+            );
+        }
+    }
+    Ok(())
+}
+
+fn extract_registered_feature(
+    row: &FactorObservation,
+    name: &str,
+    max_feature_age_ms: i64,
+) -> Result<f32> {
     let accessor = registered_feature_accessor(name)
         .with_context(|| format!("feature {name:?} is not registered for binary research"))?;
+    validate_feature_freshness(row, name, max_feature_age_ms)?;
     let value = accessor(row);
     ensure!(
         value.is_finite(),
@@ -1152,7 +1456,7 @@ fn validate_split(split: &MaterializedBinarySplit<'_>, input_dim: usize) -> Resu
     let latest_training_settlement = split
         .train
         .iter()
-        .map(|sample| sample.settlement_at_ms)
+        .map(|sample| sample.label_available_at_ms)
         .max()
         .expect("non-empty training partition was checked above");
     let earliest_validation_decision = split
@@ -1179,7 +1483,7 @@ fn validate_partition<'a>(
     input_dim: usize,
 ) -> Result<HashSet<&'a str>> {
     let mut events = HashSet::new();
-    let mut event_contracts: HashMap<&str, (i64, bool)> = HashMap::new();
+    let mut event_contracts: HashMap<&str, (i64, i64, bool)> = HashMap::new();
     for (row, sample) in samples.iter().enumerate() {
         ensure!(
             !sample.event_id.trim().is_empty(),
@@ -1199,28 +1503,38 @@ fn validate_partition<'a>(
             "{partition} row {row} contains a non-finite feature"
         );
         ensure!(
-            sample.decision_at_ms < sample.settlement_at_ms,
+            sample.decision_at_ms < sample.event_end_at_ms,
             "settlement cutoff violation in {partition} row {row}: decision is not before settlement"
         );
         let event_id = sample.event_id.as_str();
-        if let Some((settlement_at_ms, outcome)) = event_contracts.get(event_id) {
+        if let Some((event_end_at_ms, label_available_at_ms, outcome)) =
+            event_contracts.get(event_id)
+        {
             ensure!(
-                *settlement_at_ms == sample.settlement_at_ms && *outcome == sample.outcome,
+                *event_end_at_ms == sample.event_end_at_ms
+                    && *label_available_at_ms == sample.label_available_at_ms
+                    && *outcome == sample.outcome,
                 "inconsistent settlement contract for event {event_id:?} in {partition}"
             );
         } else {
-            event_contracts.insert(event_id, (sample.settlement_at_ms, sample.outcome));
+            event_contracts.insert(
+                event_id,
+                (
+                    sample.event_end_at_ms,
+                    sample.label_available_at_ms,
+                    sample.outcome,
+                ),
+            );
         }
         events.insert(event_id);
     }
     Ok(events)
 }
 
-fn materialize_split<'a>(
-    split: &'a EventDisjointBinarySplit,
-    snapshot: &ResearchSnapshot,
-) -> Result<MaterializedBinarySplit<'a>> {
-    let mut governed_rows = HashMap::<(&str, i64), &FactorObservation>::new();
+type GovernedObservationIndex<'a> = HashMap<(&'a str, i64), &'a FactorObservation>;
+
+fn governed_observation_index(snapshot: &ResearchSnapshot) -> Result<GovernedObservationIndex<'_>> {
+    let mut governed_rows = HashMap::with_capacity(snapshot.observations.len());
     for row in &snapshot.observations {
         let decision_at_ms = row.tick_ts.timestamp_millis();
         ensure!(
@@ -1231,6 +1545,55 @@ fn materialize_split<'a>(
             row.event_id
         );
     }
+    Ok(governed_rows)
+}
+
+fn materialize_governed_feature_row(
+    partition: &str,
+    index: usize,
+    selector: &BinaryDecisionRow,
+    contract: &BinaryDatasetContract,
+    governed_rows: &GovernedObservationIndex<'_>,
+) -> Result<Vec<f32>> {
+    ensure!(
+        !selector.event_id.trim().is_empty() && selector.event_id.trim() == selector.event_id,
+        "{partition} row {index} has an invalid event_id"
+    );
+    let snapshot_row = governed_rows
+        .get(&(selector.event_id.as_str(), selector.decision_at_ms))
+        .copied()
+        .with_context(|| {
+            format!(
+                "{partition} row {index} is not an exact decision row in the bound prediction snapshot"
+            )
+        })?;
+    contract
+        .feature_names
+        .iter()
+        .map(|name| extract_registered_feature(snapshot_row, name, contract.max_feature_age_ms))
+        .collect()
+}
+
+fn materialize_governed_feature_rows(
+    partition: &str,
+    selectors: &[BinaryDecisionRow],
+    contract: &BinaryDatasetContract,
+    governed_rows: &GovernedObservationIndex<'_>,
+) -> Result<Vec<Vec<f32>>> {
+    selectors
+        .iter()
+        .enumerate()
+        .map(|(index, selector)| {
+            materialize_governed_feature_row(partition, index, selector, contract, governed_rows)
+        })
+        .collect()
+}
+
+fn materialize_split<'a>(
+    split: &'a EventDisjointBinarySplit,
+    snapshot: &ResearchSnapshot,
+) -> Result<MaterializedBinarySplit<'a>> {
+    let governed_rows = governed_observation_index(snapshot)?;
     let governed_events = snapshot
         .manifest
         .chainlink_oracle_settlement_evidence
@@ -1238,54 +1601,48 @@ fn materialize_split<'a>(
         .map(|evidence| (evidence.event_id.as_str(), evidence))
         .collect::<HashMap<_, _>>();
 
-    let materialize_partition = |partition: &str,
-                                 selectors: &[BinaryDecisionRow]|
-     -> Result<Vec<_>> {
-        selectors
+    let materialize_partition =
+        |partition: &str, selectors: &[BinaryDecisionRow]| -> Result<Vec<_>> {
+            selectors
                 .iter()
                 .enumerate()
                 .map(|(index, selector)| {
-                    ensure!(
-                        !selector.event_id.trim().is_empty()
-                            && selector.event_id.trim() == selector.event_id,
-                        "{partition} row {index} has an invalid event_id"
-                    );
-                    let snapshot_row = governed_rows
-                        .get(&(selector.event_id.as_str(), selector.decision_at_ms))
-                        .copied()
-                        .with_context(|| {
-                            format!(
-                                "{partition} row {index} is not an exact decision row in the bound prediction snapshot"
-                            )
-                        })?;
+                    let features = materialize_governed_feature_row(
+                        partition,
+                        index,
+                        selector,
+                        &split.contract,
+                        &governed_rows,
+                    )?;
                     let settlement_evidence = governed_events
                         .get(selector.event_id.as_str())
                         .copied()
                         .with_context(|| {
-                            format!(
-                                "{partition} row {index} has no governed settlement evidence"
-                            )
+                            format!("{partition} row {index} has no governed settlement evidence")
                         })?;
-                    let settlement_at_ms = settlement_evidence.end_time.timestamp_millis();
+                    let event_end_at_ms = settlement_evidence.end_time.timestamp_millis();
+                    let label_available_at_ms = settlement_evidence
+                        .label_available_at()
+                        .with_context(|| {
+                            format!(
+                            "{partition} row {index} lacks official label availability provenance"
+                        )
+                        })?
+                        .timestamp_millis();
                     let outcome = settlement_evidence
                         .official_outcome_up
                         .context("governed settlement evidence is missing official outcome")?;
-                    let features = split
-                        .contract
-                        .feature_names
-                        .iter()
-                        .map(|name| extract_registered_feature(snapshot_row, name))
-                        .collect::<Result<Vec<_>>>()?;
                     Ok(MaterializedBinarySample {
                         event_id: selector.event_id.clone(),
                         decision_at_ms: selector.decision_at_ms,
-                        settlement_at_ms,
+                        event_end_at_ms,
+                        label_available_at_ms,
                         features,
                         outcome,
                     })
                 })
                 .collect()
-    };
+        };
 
     Ok(MaterializedBinarySplit {
         contract: &split.contract,
@@ -1298,20 +1655,30 @@ fn normalized_flattened_features(
     samples: &[MaterializedBinarySample],
     normalizer: &FeatureNormalizer,
 ) -> Result<Vec<f32>> {
-    let mut flattened = Vec::with_capacity(samples.len() * normalizer.means.len());
+    let capacity = checked_feature_cells(samples.len(), normalizer.means.len(), "normalized")?;
+    ensure!(
+        capacity <= MAX_FEATURE_CELLS,
+        "feature cell count exceeds the governed limit of {MAX_FEATURE_CELLS}"
+    );
+    let mut flattened = Vec::with_capacity(capacity);
     for sample in samples {
         flattened.extend(normalizer.transform(&sample.features)?);
     }
     Ok(flattened)
 }
 
-fn predict_probabilities(
+fn predict_feature_rows(
     model: &BurnBinaryLinear<InferenceBackend>,
     normalizer: &FeatureNormalizer,
     feature_rows: &[Vec<f32>],
 ) -> Result<Vec<f64>> {
     ensure!(!feature_rows.is_empty(), "prediction batch is empty");
-    let mut flattened = Vec::with_capacity(feature_rows.len() * normalizer.means.len());
+    let capacity = checked_feature_cells(feature_rows.len(), normalizer.means.len(), "prediction")?;
+    ensure!(
+        capacity <= MAX_FEATURE_CELLS,
+        "prediction feature cell count exceeds the governed limit of {MAX_FEATURE_CELLS}"
+    );
+    let mut flattened = Vec::with_capacity(capacity);
     for features in feature_rows {
         flattened.extend(normalizer.transform(features)?);
     }
@@ -1491,6 +1858,13 @@ fn is_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn is_snapshot_hash(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn is_prefixed_sha256(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(is_sha256)
 }
@@ -1506,10 +1880,11 @@ mod tests {
             REQUIRED_POLYMARKET_SOURCE_SURFACE,
         },
         research_snapshot::{
-            ResearchSnapshotArtifacts, ResearchSnapshotInputArtifact, ResearchSnapshotPhaseTiming,
+            load_research_snapshot, write_research_snapshot, ResearchSnapshotArtifacts,
+            ResearchSnapshotInputArtifact, ResearchSnapshotPhaseTiming,
             ResearchSnapshotPmBookSource, ResearchSnapshotRowCounts, ResearchSnapshotSourceSurface,
         },
-        FactorObservation, ResearchPmBookLevel, ResearchPmBookSnapshot,
+        FactorObservation, FactorSourceAvailability, ResearchPmBookLevel, ResearchPmBookSnapshot,
     };
     use chrono::{Duration, TimeZone, Utc};
 
@@ -1587,6 +1962,15 @@ mod tests {
             event_id: sample.event_id.clone(),
             symbol: "BTCUSDT".to_owned(),
             tick_ts,
+            source_availability: FactorSourceAvailability {
+                spot: Some(tick_ts),
+                lob: Some(tick_ts),
+                aggregate_trade: Some(tick_ts),
+                polymarket_up_quote: Some(tick_ts),
+                polymarket_down_quote: Some(tick_ts),
+                chainlink_reference: Some(tick_ts),
+                chainlink_open: Some(tick_ts - Duration::minutes(5)),
+            },
             event_window_secs: PREDICTION_EVENT_WINDOW_SECS,
             time_remaining_secs: (sample.settlement_at_ms - sample.decision_at_ms) / 1_000,
             signed_distance_to_beat: 0.0,
@@ -1708,6 +2092,7 @@ mod tests {
                     }),
                     chainlink_outcome_up: Some(sample.outcome),
                     official_outcome_up: Some(sample.outcome),
+                    official_outcome_available_at: Some(end_time),
                     reasons: Vec::new(),
                 }
             })
@@ -1719,8 +2104,8 @@ mod tests {
         ResearchSnapshot {
             manifest: crate::ResearchSnapshotManifest {
                 schema_version: crate::RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_owned(),
-                snapshot_hash: Some(format!("sha256:{}", "3".repeat(64))),
-                snapshot_contract_hash: Some(format!("sha256:{}", "1".repeat(64))),
+                snapshot_hash: None,
+                snapshot_contract_hash: None,
                 generated_at,
                 git_sha: None,
                 symbols: vec!["BTCUSDT".to_owned()],
@@ -1809,8 +2194,11 @@ mod tests {
             .map(|index| sample("validation", index, index % 2 == 0))
             .collect::<Vec<_>>();
         let all_samples = train.iter().chain(&validation).cloned().collect::<Vec<_>>();
-        let mission = mission();
-        let snapshot = snapshot(&all_samples);
+        let mut mission = mission();
+        let temp = tempfile::tempdir().unwrap();
+        let written = write_research_snapshot(temp.path(), snapshot(&all_samples)).unwrap();
+        mission.data_snapshot_id = written.snapshot_contract_hash.unwrap();
+        let snapshot = load_research_snapshot(temp.path()).unwrap();
         let contract =
             BinaryDatasetContract::from_prediction_snapshot(&snapshot, &mission, feature_names())
                 .expect("valid governed test contract");
@@ -1825,13 +2213,25 @@ mod tests {
         }
     }
 
-    fn validation_rows(context: &TestContext) -> Vec<Vec<f32>> {
-        materialize_split(&context.split, &context.snapshot)
-            .expect("valid governed test split")
-            .validation
-            .into_iter()
-            .map(|sample| sample.features)
-            .collect()
+    fn reseal_snapshot(
+        snapshot: ResearchSnapshot,
+        mut mission: PredictionResearchMission,
+    ) -> (ResearchSnapshot, PredictionResearchMission) {
+        let temp = tempfile::tempdir().unwrap();
+        let written = write_research_snapshot(temp.path(), snapshot).unwrap();
+        mission.data_snapshot_id = written.snapshot_contract_hash.unwrap();
+        (load_research_snapshot(temp.path()).unwrap(), mission)
+    }
+
+    fn reseal_context(mut context: TestContext) -> TestContext {
+        (context.snapshot, context.mission) = reseal_snapshot(context.snapshot, context.mission);
+        context.split.contract = BinaryDatasetContract::from_prediction_snapshot(
+            &context.snapshot,
+            &context.mission,
+            feature_names(),
+        )
+        .expect("resealed context must have a valid governed contract");
+        context
     }
 
     fn test_config() -> BinaryTrainingConfig {
@@ -1841,6 +2241,29 @@ mod tests {
             learning_rate: 0.05,
             log_loss_epsilon: 1.0e-7,
         }
+    }
+
+    #[test]
+    fn accepts_snapshot_written_and_loaded_by_governed_snapshot_api() {
+        let train = (0..12)
+            .map(|index| sample("train", index, index % 2 == 0))
+            .collect::<Vec<_>>();
+        let validation = (15..21)
+            .map(|index| sample("validation", index, index % 2 == 0))
+            .collect::<Vec<_>>();
+        let all_samples = train.iter().chain(&validation).cloned().collect::<Vec<_>>();
+        let temp = tempfile::tempdir().unwrap();
+        let written = write_research_snapshot(temp.path(), snapshot(&all_samples)).unwrap();
+        let loaded = load_research_snapshot(temp.path()).unwrap();
+        let mut mission = mission();
+        mission.data_snapshot_id = written.snapshot_contract_hash.clone().unwrap();
+
+        assert!(written
+            .snapshot_hash
+            .as_deref()
+            .is_some_and(|hash| hash.len() == 16));
+        BinaryDatasetContract::from_prediction_snapshot(&loaded, &mission, feature_names())
+            .expect("a snapshot emitted by the governed writer must enter the Burn lane");
     }
 
     #[test]
@@ -1859,20 +2282,46 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_non_finite_and_invalid_settlement_snapshot_rows() {
+    fn rejects_duplicate_selector_in_either_partition() {
+        for partition in ["train", "validation"] {
+            let mut context = context();
+            match partition {
+                "train" => context.split.train.push(context.split.train[0].clone()),
+                "validation" => context
+                    .split
+                    .validation
+                    .push(context.split.validation[0].clone()),
+                _ => unreachable!(),
+            }
+
+            let error = train_event_disjoint_binary(
+                &context.snapshot,
+                &context.mission,
+                &context.split,
+                test_config(),
+            )
+            .expect_err("an exact selector duplicate must fail closed");
+            assert!(error.to_string().contains("duplicate decision selector"));
+        }
+    }
+
+    #[test]
+    fn rejects_missing_source_and_non_finite_snapshot_rows() {
         let mut missing_lob = context();
-        missing_lob.snapshot.observations[0].obi = f64::NAN;
+        missing_lob.snapshot.observations[0].source_availability.lob = None;
+        let missing_lob = reseal_context(missing_lob);
         let error = train_event_disjoint_binary(
             &missing_lob.snapshot,
             &missing_lob.mission,
             &missing_lob.split,
             test_config(),
         )
-        .expect_err("missing L2 context must fail");
-        assert!(format!("{error:#}").contains("finite Binance L2 context"));
+        .expect_err("missing L2 availability must fail");
+        assert!(format!("{error:#}").contains("missing lob availability"));
 
         let mut non_finite = context();
-        non_finite.snapshot.observations[0].cex_bar_return_30s = f64::NAN;
+        non_finite.snapshot.observations[0].cex_bar_return_30s = f64::MAX;
+        let non_finite = reseal_context(non_finite);
         let error = train_event_disjoint_binary(
             &non_finite.snapshot,
             &non_finite.mission,
@@ -1881,17 +2330,6 @@ mod tests {
         )
         .expect_err("non-finite registered feature must fail");
         assert!(error.to_string().contains("snapshot feature"));
-
-        let mut settlement = context();
-        settlement.snapshot.observations[0].time_remaining_secs += 1;
-        let error = train_event_disjoint_binary(
-            &settlement.snapshot,
-            &settlement.mission,
-            &settlement.split,
-            test_config(),
-        )
-        .expect_err("observation boundary that disagrees with governed evidence must fail");
-        assert!(format!("{error:#}").contains("disagrees with governed Chainlink evidence"));
     }
 
     #[test]
@@ -1960,6 +2398,7 @@ mod tests {
                     .manifest
                     .chainlink_oracle_settlement_evidence,
             ));
+        let context = reseal_context(context);
 
         let error = train_event_disjoint_binary(
             &context.snapshot,
@@ -1969,6 +2408,108 @@ mod tests {
         )
         .expect_err("future training label must not validate past decisions");
         assert!(error.to_string().contains("OOS cutoff violation"));
+    }
+
+    #[test]
+    fn rejects_training_label_available_after_validation_begins() {
+        let train = (0..12)
+            .map(|index| sample("train", index, index % 2 == 0))
+            .collect::<Vec<_>>();
+        let validation = (15..21)
+            .map(|index| sample("validation", index, index % 2 == 0))
+            .collect::<Vec<_>>();
+        let validation_start = validation[0].decision_at_ms;
+        let all_samples = train.iter().chain(&validation).cloned().collect::<Vec<_>>();
+        let mut raw_snapshot = snapshot(&all_samples);
+        let last_train_event = &train.last().unwrap().event_id;
+        let evidence = raw_snapshot
+            .manifest
+            .chainlink_oracle_settlement_evidence
+            .iter_mut()
+            .find(|evidence| &evidence.event_id == last_train_event)
+            .unwrap();
+        evidence.official_outcome_available_at = Some(
+            Utc.timestamp_millis_opt(validation_start + 1_000)
+                .single()
+                .unwrap(),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let written = write_research_snapshot(temp.path(), raw_snapshot).unwrap();
+        let loaded = load_research_snapshot(temp.path()).unwrap();
+        let mut mission = mission();
+        mission.data_snapshot_id = written.snapshot_contract_hash.unwrap();
+        let contract =
+            BinaryDatasetContract::from_prediction_snapshot(&loaded, &mission, feature_names())
+                .unwrap();
+        let split = EventDisjointBinarySplit {
+            contract,
+            train: train.iter().map(selector).collect(),
+            validation: validation.iter().map(selector).collect(),
+        };
+
+        let error = train_event_disjoint_binary(&loaded, &mission, &split, test_config())
+            .expect_err("labels unavailable at validation start must not enter training");
+        assert!(error.to_string().contains("OOS cutoff violation"));
+    }
+
+    #[test]
+    fn feature_materialization_enforces_source_availability_and_age() {
+        let sample = sample("availability", 0, true);
+        let mut row = observation(&sample);
+
+        row.source_availability.lob = None;
+        let missing = extract_registered_feature(&row, "obi", 30_000)
+            .expect_err("missing source availability must fail closed");
+        assert!(missing.to_string().contains("missing lob availability"));
+
+        let mut row = observation(&sample);
+        row.source_availability.lob = Some(row.tick_ts + Duration::milliseconds(1));
+        let future = extract_registered_feature(&row, "obi", 30_000)
+            .expect_err("future source availability must fail closed");
+        assert!(future.to_string().contains("future lob availability"));
+
+        let mut row = observation(&sample);
+        row.source_availability.aggregate_trade = Some(row.tick_ts - Duration::seconds(31));
+        let stale = extract_registered_feature(&row, "cex_bar_return_30s", 30_000)
+            .expect_err("stale source availability must fail closed");
+        assert!(stale
+            .to_string()
+            .contains("aggregate_trade source is stale"));
+
+        let mut row = observation(&sample);
+        row.source_availability.chainlink_reference = Some(row.tick_ts - Duration::seconds(31));
+        let combination = extract_registered_feature(&row, "chainlink_prob_up", 30_000)
+            .expect_err("one stale dependency in a combined feature must fail closed");
+        assert!(combination
+            .to_string()
+            .contains("chainlink_reference source is stale"));
+
+        extract_registered_feature(&row, "signed_distance_to_beat", 30_000)
+            .expect("event-static Chainlink open may predate the rolling freshness window");
+    }
+
+    #[test]
+    fn rejects_snapshot_without_official_label_availability() {
+        let train = (0..12)
+            .map(|index| sample("train", index, index % 2 == 0))
+            .collect::<Vec<_>>();
+        let validation = (15..21)
+            .map(|index| sample("validation", index, index % 2 == 0))
+            .collect::<Vec<_>>();
+        let all_samples = train.iter().chain(&validation).cloned().collect::<Vec<_>>();
+        let mut raw_snapshot = snapshot(&all_samples);
+        raw_snapshot.manifest.chainlink_oracle_settlement_evidence[0]
+            .official_outcome_available_at = None;
+        let temp = tempfile::tempdir().unwrap();
+        let written = write_research_snapshot(temp.path(), raw_snapshot).unwrap();
+        let loaded = load_research_snapshot(temp.path()).unwrap();
+        let mut mission = mission();
+        mission.data_snapshot_id = written.snapshot_contract_hash.unwrap();
+
+        let error =
+            BinaryDatasetContract::from_prediction_snapshot(&loaded, &mission, feature_names())
+                .expect_err("missing official label availability must fail closed");
+        assert!(format!("{error:#}").contains("official label availability"));
     }
 
     #[test]
@@ -1989,6 +2530,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_snapshot_mutated_after_contract_creation() {
+        let mut context = context();
+        context.snapshot.observations[0].cex_bar_return_30s += 7.0;
+
+        let error = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            test_config(),
+        )
+        .expect_err("training must reverify the immutable snapshot contract");
+        assert!(format!("{error:#}").contains("evaluator contract hash mismatch"));
+    }
+
+    #[test]
     fn rejects_snapshot_without_isolated_symbol_or_official_authority() {
         let mut wrong_symbol = context();
         wrong_symbol.snapshot.manifest.symbols = vec!["SOLUSDT".to_owned()];
@@ -2002,24 +2558,26 @@ mod tests {
         {
             evidence.symbol = "SOL".to_owned();
         }
-        let error = train_event_disjoint_binary(
-            &wrong_symbol.snapshot,
-            &wrong_symbol.mission,
-            &wrong_symbol.split,
-            test_config(),
+        let (wrong_symbol_snapshot, wrong_symbol_mission) =
+            reseal_snapshot(wrong_symbol.snapshot, wrong_symbol.mission);
+        let error = BinaryDatasetContract::from_prediction_snapshot(
+            &wrong_symbol_snapshot,
+            &wrong_symbol_mission,
+            feature_names(),
         )
-        .expect_err("cross-symbol snapshot must fail");
+        .expect_err("cross-symbol snapshot must fail at contract creation");
         assert!(format!("{error:#}").contains("not isolated mission underlying"));
 
         let mut unofficial = context();
         unofficial.snapshot.manifest.require_official_settlement = false;
-        let error = train_event_disjoint_binary(
-            &unofficial.snapshot,
-            &unofficial.mission,
-            &unofficial.split,
-            test_config(),
+        let (unofficial_snapshot, unofficial_mission) =
+            reseal_snapshot(unofficial.snapshot, unofficial.mission);
+        let error = BinaryDatasetContract::from_prediction_snapshot(
+            &unofficial_snapshot,
+            &unofficial_mission,
+            feature_names(),
         )
-        .expect_err("unofficial labels must fail");
+        .expect_err("unofficial labels must fail at contract creation");
         assert!(format!("{error:#}").contains("official settlement labels"));
     }
 
@@ -2040,14 +2598,19 @@ mod tests {
             test_config(),
         )
         .unwrap();
-        let rows = validation_rows(&context);
-        let schema_hash = &context.split.contract.feature_schema_sha256;
-        let names = &context.split.contract.feature_names;
         let probabilities_a = model_a
-            .predict_probabilities(schema_hash, names, &rows)
+            .predict_probabilities(
+                &context.snapshot,
+                &context.mission,
+                &context.split.validation,
+            )
             .unwrap();
         let probabilities_b = model_b
-            .predict_probabilities(schema_hash, names, &rows)
+            .predict_probabilities(
+                &context.snapshot,
+                &context.mission,
+                &context.split.validation,
+            )
             .unwrap();
 
         assert_eq!(probabilities_a, probabilities_b);
@@ -2065,6 +2628,97 @@ mod tests {
     }
 
     #[test]
+    fn rejects_epoch_budget_above_governed_limit() {
+        let context = context();
+        let mut config = test_config();
+        config.epochs = 1_001;
+
+        let error = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            config,
+        )
+        .expect_err("epoch count above the governed bound must fail before training");
+        assert!(error.to_string().contains("epochs exceeds"));
+    }
+
+    #[test]
+    fn rejects_selector_partition_above_governed_limit() {
+        let mut context = context();
+        context.split.train = vec![context.split.train[0].clone(); MAX_SELECTORS_PER_PARTITION + 1];
+
+        let error = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            test_config(),
+        )
+        .expect_err("selector count above the governed bound must fail before allocation");
+        assert!(error.to_string().contains("train selector count exceeds"));
+    }
+
+    #[test]
+    fn rejects_total_selector_budget_above_governed_limit() {
+        let mut context = context();
+        let partition_size = MAX_TOTAL_SELECTORS / 2 + 1;
+        context.split.train = vec![context.split.train[0].clone(); partition_size];
+        context.split.validation = vec![context.split.validation[0].clone(); partition_size];
+
+        let error = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            test_config(),
+        )
+        .expect_err("combined selector count above the governed bound must fail first");
+        assert!(error.to_string().contains("total selector count exceeds"));
+    }
+
+    #[test]
+    fn training_budget_uses_checked_governed_arithmetic() {
+        let overflow = validate_training_budget(usize::MAX, 1, 2, 1)
+            .expect_err("row arithmetic overflow must fail closed");
+        assert!(format!("{overflow:#}").contains("overflow"));
+
+        let cells = validate_training_budget(MAX_FEATURE_CELLS + 1, 0, 1, 1)
+            .expect_err("feature matrix above the governed bound must fail closed");
+        assert!(cells.to_string().contains("feature cell count exceeds"));
+
+        let work = validate_training_budget(100_001, 1, 20, MAX_BINARY_EPOCHS)
+            .expect_err("training work above the governed bound must fail closed");
+        assert!(work.to_string().contains("total training work exceeds"));
+
+        let too_many_features = (0..=MAX_FEATURES)
+            .map(|index| format!("feature_{index}"))
+            .collect::<Vec<_>>();
+        let feature_count = validate_feature_names(&too_many_features)
+            .expect_err("feature count above the governed bound must fail first");
+        assert!(feature_count.to_string().contains("feature schema exceeds"));
+
+        let prediction = validate_prediction_budget(MAX_FEATURE_CELLS + 1, 1)
+            .expect_err("prediction cell count must fail before materialization");
+        assert!(prediction
+            .to_string()
+            .contains("prediction feature cell count exceeds"));
+    }
+
+    #[test]
+    fn snapshot_coverage_budget_uses_checked_governed_arithmetic() {
+        let overflow = validate_snapshot_row_budget(usize::MAX, 1, 1)
+            .expect_err("snapshot row arithmetic overflow must fail closed");
+        assert!(overflow.contains("overflow"));
+
+        let observations = validate_snapshot_row_budget(MAX_SNAPSHOT_OBSERVATIONS + 1, 0, 0)
+            .expect_err("unselected observations must still be bounded");
+        assert!(observations.contains("observation row count exceeds"));
+
+        let books = validate_snapshot_row_budget(0, 0, MAX_SNAPSHOT_BOOK_ROWS + 1)
+            .expect_err("unselected book rows must still be bounded");
+        assert!(books.contains("Polymarket book row count exceeds"));
+    }
+
+    #[test]
     fn normalizer_is_fit_from_train_partition_only() {
         let mut context = context();
         let validation_ids = context
@@ -2078,6 +2732,7 @@ mod tests {
                 observation.cex_bar_return_30s += 10_000.0;
             }
         }
+        let context = reseal_context(context);
         let materialized = materialize_split(&context.split, &context.snapshot).unwrap();
         let expected_train_mean = materialized
             .train
@@ -2097,7 +2752,7 @@ mod tests {
     }
 
     #[test]
-    fn prediction_requires_the_ordered_feature_schema_hash() {
+    fn prediction_requires_the_bound_snapshot_and_exact_selector() {
         let context = context();
         let model = train_event_disjoint_binary(
             &context.snapshot,
@@ -2106,30 +2761,26 @@ mod tests {
             test_config(),
         )
         .unwrap();
-        let rows = validation_rows(&context);
-        let mut reversed = context.split.contract.feature_names.clone();
-        reversed.reverse();
-        let reversed_hash = feature_schema_sha256(&reversed).unwrap();
-
+        let unknown = vec![BinaryDecisionRow {
+            event_id: "unbound-event".to_owned(),
+            decision_at_ms: context.split.validation[0].decision_at_ms,
+        }];
         let error = model
-            .predict_probabilities(&reversed_hash, &reversed, &rows)
-            .expect_err("wrong feature schema hash must fail");
-        assert!(error.to_string().contains("schema SHA-256"));
+            .predict_probabilities(&context.snapshot, &context.mission, &unknown)
+            .expect_err("selector outside the governed snapshot must fail");
+        assert!(error.to_string().contains("not an exact decision row"));
 
+        let mut mutated = context.snapshot.clone();
+        mutated.observations[0].obi += 0.25;
         let error = model
-            .predict_probabilities(
-                &context.split.contract.feature_schema_sha256,
-                &reversed,
-                &rows,
-            )
-            .expect_err("wrong feature order must fail");
-        assert!(error.to_string().contains("trained ordered schema"));
+            .predict_probabilities(&mutated, &context.mission, &context.split.validation)
+            .expect_err("snapshot mutation must fail immutable-contract verification");
+        assert!(format!("{error:#}").contains("evaluator contract hash mismatch"));
     }
 
     #[test]
     fn burnpack_and_typed_manifest_round_trip_predictions() {
         let context = context();
-        let rows = validation_rows(&context);
         let mut model = train_event_disjoint_binary(
             &context.snapshot,
             &context.mission,
@@ -2139,9 +2790,9 @@ mod tests {
         .unwrap();
         let before = model
             .predict_probabilities(
-                &context.split.contract.feature_schema_sha256,
-                &context.split.contract.feature_names,
-                &rows,
+                &context.snapshot,
+                &context.mission,
+                &context.split.validation,
             )
             .unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -2162,9 +2813,9 @@ mod tests {
             BinaryProbabilityModel::load_bundle(&bundle, &digest, &context.mission).unwrap();
         let after = loaded
             .predict_probabilities(
-                &context.split.contract.feature_schema_sha256,
-                &context.split.contract.feature_names,
-                &rows,
+                &context.snapshot,
+                &context.mission,
+                &context.split.validation,
             )
             .unwrap();
         assert_eq!(before, after);
