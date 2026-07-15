@@ -1,10 +1,14 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 use ploy_operator_contracts::Regime;
 use serde::{Deserialize, Serialize};
 
-use crate::factors::{pearson_ic, spearman_ic, FactorObservation, ResearchPmBookSnapshot};
+use crate::autofactor::{LlmPriorSpec, LlmProbabilityBlendSpec};
+use crate::factors::{
+    normalized_underlying_symbol, pearson_ic, spearman_ic, FactorObservation,
+    ResearchPmBookSnapshot,
+};
 
 const DEFAULT_STAKE_USD: f64 = 15.0;
 const DEFAULT_TOP_QUANTILE: f64 = 0.2;
@@ -12,6 +16,13 @@ const CONSERVATIVE_VISIBLE_DEPTH_HAIRCUT: f64 = 0.5;
 const CONSERVATIVE_MAX_SWEEP_LEVELS: usize = 3;
 const PM_BOOK_MAX_AGE_SECS: i64 = 30;
 const EPS: f64 = 1e-9;
+pub const PREDICTION_MAX_TEST_BRIER_SCORE: f64 = 0.25;
+pub const PREDICTION_MAX_TEST_LOG_LOSS: f64 = std::f64::consts::LN_2;
+pub const PREDICTION_MAX_TEST_EXPECTED_CALIBRATION_ERROR: f64 = 0.05;
+pub const PREDICTION_MIN_POSITIVE_WINDOW_RATIO: f64 = 0.60;
+pub const PREDICTION_MIN_CONSERVATIVE_COVERAGE_RATE: f64 = 1.0;
+pub const PREDICTION_MIN_PAIRED_SCORING_OBSERVATIONS: usize = 20;
+pub const PREDICTION_MIN_PAIRED_SCORING_COVERAGE_RATE: f64 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FactorFamily {
@@ -128,6 +139,8 @@ pub struct FactorObservationV2 {
     pub side: ReviewSide,
 
     pub side_model_prob: f64,
+    #[serde(default = "nan_f64")]
+    pub side_chainlink_prob: f64,
     pub side_fair_prob: f64,
     pub side_model_edge: f64,
     pub side_distance_over_sigma: f64,
@@ -398,6 +411,11 @@ impl Default for SettlementProbabilityReportOptions {
 pub struct SettlementProbabilityWalkForwardOptions {
     pub walk_forward: FactorWalkForwardOptions,
     pub probability: SettlementProbabilityReportOptions,
+    pub max_test_brier_score: f64,
+    pub max_test_log_loss: f64,
+    pub max_test_expected_calibration_error: f64,
+    pub min_paired_scoring_observations: usize,
+    pub min_paired_scoring_coverage_rate: f64,
 }
 
 impl Default for SettlementProbabilityWalkForwardOptions {
@@ -405,6 +423,11 @@ impl Default for SettlementProbabilityWalkForwardOptions {
         Self {
             walk_forward: FactorWalkForwardOptions::default(),
             probability: SettlementProbabilityReportOptions::default(),
+            max_test_brier_score: PREDICTION_MAX_TEST_BRIER_SCORE,
+            max_test_log_loss: PREDICTION_MAX_TEST_LOG_LOSS,
+            max_test_expected_calibration_error: PREDICTION_MAX_TEST_EXPECTED_CALIBRATION_ERROR,
+            min_paired_scoring_observations: PREDICTION_MIN_PAIRED_SCORING_OBSERVATIONS,
+            min_paired_scoring_coverage_rate: PREDICTION_MIN_PAIRED_SCORING_COVERAGE_RATE,
         }
     }
 }
@@ -412,7 +435,15 @@ impl Default for SettlementProbabilityWalkForwardOptions {
 #[derive(Debug, Clone, Serialize)]
 pub struct SettlementProbabilityBaselineRow {
     pub model: String,
+    /// Number of model-specific decisions used for edge and PnL metrics.
     pub n: usize,
+    /// Number of observations in the paired universe used for probability scores.
+    pub scoring_n: usize,
+    /// Size of the complete scoreable population before model intersection.
+    pub scoring_population_n: usize,
+    /// Paired scoring observations divided by the complete scoreable population.
+    pub scoring_coverage_rate: f64,
+    pub entry_edge_threshold: f64,
     pub avg_predicted_q: f64,
     pub actual_win_rate: f64,
     pub brier_score: f64,
@@ -421,6 +452,7 @@ pub struct SettlementProbabilityBaselineRow {
     pub avg_edge: f64,
     pub avg_full_depth_settlement_pnl: f64,
     pub avg_conservative_settlement_pnl: f64,
+    pub conservative_coverage_rate: f64,
     pub profit_factor: f64,
     pub edge_bucket_monotonic_non_decreasing: bool,
     pub top_edge_count: usize,
@@ -428,6 +460,7 @@ pub struct SettlementProbabilityBaselineRow {
     pub top_edge_win_rate: f64,
     pub top_edge_avg_full_depth_settlement_pnl: f64,
     pub top_edge_avg_conservative_settlement_pnl: f64,
+    pub top_edge_conservative_coverage_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -514,27 +547,43 @@ pub struct SettlementProbabilityWalkForwardWindow {
     pub test_end: DateTime<Utc>,
     pub train_n: usize,
     pub test_n: usize,
+    pub train_scoring_n: usize,
+    pub test_scoring_n: usize,
+    pub train_scoring_population_n: usize,
+    pub test_scoring_population_n: usize,
+    pub train_scoring_coverage_rate: f64,
+    pub test_scoring_coverage_rate: f64,
     pub train_brier_score: f64,
     pub test_brier_score: f64,
+    pub train_log_loss: f64,
+    pub test_log_loss: f64,
     pub train_expected_calibration_error: f64,
     pub test_expected_calibration_error: f64,
     pub train_top_edge_avg_full_depth_settlement_pnl: f64,
     pub test_top_edge_avg_full_depth_settlement_pnl: f64,
     pub test_top_edge_avg_conservative_settlement_pnl: f64,
+    pub train_top_edge_conservative_coverage_rate: f64,
+    pub test_top_edge_conservative_coverage_rate: f64,
     pub test_edge_bucket_monotonic_non_decreasing: bool,
     pub pass: bool,
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SettlementProbabilityWalkForwardAggregate {
     pub model: String,
     pub windows: usize,
+    pub complete_windows: usize,
     pub positive_window_ratio: f64,
     pub pass_window_ratio: f64,
     pub avg_test_brier_score: f64,
+    pub avg_test_log_loss: f64,
     pub avg_test_expected_calibration_error: f64,
     pub avg_test_top_edge_avg_full_depth_settlement_pnl: f64,
     pub min_test_top_edge_avg_full_depth_settlement_pnl: f64,
+    pub avg_test_top_edge_avg_conservative_settlement_pnl: f64,
+    pub min_test_top_edge_avg_conservative_settlement_pnl: f64,
+    pub min_top_edge_conservative_coverage_rate: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -542,6 +591,128 @@ pub struct SettlementProbabilityWalkForwardReport {
     pub options: SettlementProbabilityWalkForwardOptions,
     pub windows: Vec<SettlementProbabilityWalkForwardWindow>,
     pub aggregates: Vec<SettlementProbabilityWalkForwardAggregate>,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettlementProbabilityWalkForwardError {
+    InvalidTimeRange {
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    },
+    InsufficientTimeRange {
+        available_seconds: i64,
+        required_seconds: i64,
+    },
+    OverlappingTestWindows {
+        step_seconds: i64,
+        test_seconds: i64,
+    },
+    InvalidOptions {
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for SettlementProbabilityWalkForwardError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidTimeRange { start, end } => {
+                write!(formatter, "invalid walk-forward time range: start={start} end={end}")
+            }
+            Self::InsufficientTimeRange {
+                available_seconds,
+                required_seconds,
+            } => write!(
+                formatter,
+                "insufficient walk-forward time range: available_seconds={available_seconds} required_seconds={required_seconds}"
+            ),
+            Self::OverlappingTestWindows {
+                step_seconds,
+                test_seconds,
+            } => write!(
+                formatter,
+                "walk-forward test windows overlap: step_seconds={step_seconds} test_seconds={test_seconds}"
+            ),
+            Self::InvalidOptions { reason } => {
+                write!(formatter, "invalid walk-forward options: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SettlementProbabilityWalkForwardError {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionResearchGatePolicy {
+    pub min_positive_window_ratio: f64,
+    pub max_test_brier_score: f64,
+    pub max_test_log_loss: f64,
+    pub max_test_expected_calibration_error: f64,
+    pub min_test_top_edge_full_depth_settlement_pnl: f64,
+    pub min_test_top_edge_conservative_settlement_pnl: f64,
+    pub min_top_edge_conservative_coverage_rate: f64,
+    pub incremental_comparison_epsilon: f64,
+}
+
+impl PredictionResearchGatePolicy {
+    pub fn governed() -> Self {
+        Self {
+            min_positive_window_ratio: PREDICTION_MIN_POSITIVE_WINDOW_RATIO,
+            max_test_brier_score: PREDICTION_MAX_TEST_BRIER_SCORE,
+            max_test_log_loss: PREDICTION_MAX_TEST_LOG_LOSS,
+            max_test_expected_calibration_error: PREDICTION_MAX_TEST_EXPECTED_CALIBRATION_ERROR,
+            min_test_top_edge_full_depth_settlement_pnl: 0.0,
+            min_test_top_edge_conservative_settlement_pnl: 0.0,
+            min_top_edge_conservative_coverage_rate: PREDICTION_MIN_CONSERVATIVE_COVERAGE_RATE,
+            incremental_comparison_epsilon: EPS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionResearchCandidateMetrics {
+    pub windows: usize,
+    pub positive_window_ratio: Option<f64>,
+    pub pass_window_ratio: Option<f64>,
+    pub avg_test_brier_score: Option<f64>,
+    pub avg_test_log_loss: Option<f64>,
+    pub avg_test_expected_calibration_error: Option<f64>,
+    pub avg_test_top_edge_avg_full_depth_settlement_pnl: Option<f64>,
+    pub min_test_top_edge_avg_full_depth_settlement_pnl: Option<f64>,
+    pub avg_test_top_edge_avg_conservative_settlement_pnl: Option<f64>,
+    pub min_test_top_edge_avg_conservative_settlement_pnl: Option<f64>,
+    pub min_top_edge_conservative_coverage_rate: Option<f64>,
+    pub best_baseline_brier_score: Option<f64>,
+    pub best_baseline_log_loss: Option<f64>,
+    pub best_baseline_avg_conservative_settlement_pnl: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionResearchCandidateFeedback {
+    pub model: String,
+    pub hypothesis: String,
+    pub probability_blend: LlmProbabilityBlendSpec,
+    pub verdict: String,
+    pub reason_codes: Vec<String>,
+    pub metrics: PredictionResearchCandidateMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionResearchFeedback {
+    pub schema_version: String,
+    pub mission_id: String,
+    pub target: String,
+    pub symbols: Vec<String>,
+    pub horizon: String,
+    pub data_snapshot_id: String,
+    pub prompt_snapshot_id: String,
+    pub search_policy_snapshot_id: String,
+    pub gate_policy: PredictionResearchGatePolicy,
+    pub candidates: Vec<PredictionResearchCandidateFeedback>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -591,7 +762,7 @@ impl Default for SettlementProbabilityPromotionGateOptions {
             stake_usd: DEFAULT_STAKE_USD,
             min_entry_fill_rate: 0.30,
             max_expected_calibration_error: 0.05,
-            min_positive_window_ratio: 0.60,
+            min_positive_window_ratio: PREDICTION_MIN_POSITIVE_WINDOW_RATIO,
             require_deribit: false,
             include_deribit: false,
             data_audit_status: None,
@@ -2200,6 +2371,7 @@ fn walk_forward_factor_rows(
             factor_name_matches_filter(descriptor.name, &options.factor_name_filter)
         })
         .collect();
+    let event_ends = inferred_event_ends(v2_rows);
 
     let mut windows = Vec::new();
     let mut train_start = start;
@@ -2208,14 +2380,14 @@ fn walk_forward_factor_rows(
         let train_end = train_start + train_duration;
         let test_start = train_end;
         let test_end = test_start + test_duration;
-        let train_rows: Vec<&FactorObservationV2> =
-            walk_forward_time_slice(&v2_rows, train_start, train_end)
-                .iter()
-                .collect();
-        let test_rows: Vec<&FactorObservationV2> =
-            walk_forward_time_slice(&v2_rows, test_start, test_end)
-                .iter()
-                .collect();
+        let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
+            v2_rows,
+            &event_ends,
+            train_start,
+            train_end,
+            test_start,
+            test_end,
+        );
 
         if train_rows.len() >= options.review.min_observations
             && test_rows.len() >= options.review.min_observations
@@ -2660,12 +2832,36 @@ pub fn build_settlement_probability_report(
     rows: &[FactorObservationV2],
     options: SettlementProbabilityReportOptions,
 ) -> SettlementProbabilityReport {
-    build_settlement_probability_report_with_surface(rows, rows, options)
+    build_settlement_probability_report_with_prior(rows, None, options)
 }
 
-fn build_settlement_probability_report_with_surface(
-    evaluation_rows: &[FactorObservationV2],
-    surface_rows: &[FactorObservationV2],
+pub fn build_settlement_probability_report_with_prior(
+    rows: &[FactorObservationV2],
+    prior: Option<&LlmPriorSpec>,
+    options: SettlementProbabilityReportOptions,
+) -> SettlementProbabilityReport {
+    let rows = rows.iter().collect::<Vec<_>>();
+    build_settlement_probability_report_with_surface(
+        &rows,
+        &rows,
+        prior,
+        ProbabilityDecisionSelection::AllRows,
+        options,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProbabilityDecisionSelection<'a> {
+    AllRows,
+    LearnThresholds,
+    FixedThresholds(&'a BTreeMap<String, f64>),
+}
+
+fn build_settlement_probability_report_with_surface<'a>(
+    evaluation_rows: &[&'a FactorObservationV2],
+    surface_rows: &[&'a FactorObservationV2],
+    prior: Option<&LlmPriorSpec>,
+    decision_selection: ProbabilityDecisionSelection<'_>,
     options: SettlementProbabilityReportOptions,
 ) -> SettlementProbabilityReport {
     let options = normalize_settlement_probability_report_options(options);
@@ -2678,10 +2874,38 @@ fn build_settlement_probability_report_with_surface(
         options.event_surface_shrinkage_observations,
     );
 
-    let mut by_model: BTreeMap<&'static str, Vec<SettlementProbabilitySample>> = BTreeMap::new();
-    for (row, win, pnl) in eligible_rows {
+    let raw_chainlink_support_complete = eligible_rows
+        .iter()
+        .all(|(row, ..)| valid_probability(row.side_chainlink_prob));
+    let typed_blends = validated_probability_blends(prior)
+        .into_iter()
+        .filter(|(_, blend)| {
+            eligible_rows
+                .iter()
+                .filter(|(row, ..)| {
+                    prior.is_none_or(|prior| prediction_prior_matches_row(prior, row))
+                })
+                .all(|(row, ..)| {
+                    settlement_probability_weighted_blend(row, event_surface.predict(row), blend)
+                        .is_some()
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut by_model: BTreeMap<String, Vec<SettlementProbabilitySample>> = BTreeMap::new();
+    for (row, win, pnl, conservative_pnl) in eligible_rows {
         for (model, q) in settlement_probability_models(row) {
-            push_settlement_probability_sample(&mut by_model, model, row, win, pnl, q);
+            if model == "q_chainlink_digital" && !raw_chainlink_support_complete {
+                continue;
+            }
+            push_settlement_probability_sample(
+                &mut by_model,
+                model,
+                row,
+                win,
+                pnl,
+                conservative_pnl,
+                q,
+            );
         }
         let event_q = event_surface.predict(row);
         if let Some(q) = event_q {
@@ -2691,6 +2915,7 @@ fn build_settlement_probability_report_with_surface(
                 row,
                 win,
                 pnl,
+                conservative_pnl,
                 q,
             );
         }
@@ -2701,12 +2926,28 @@ fn build_settlement_probability_report_with_surface(
                 row,
                 win,
                 pnl,
+                conservative_pnl,
                 q,
             );
         }
+        if prior.is_none_or(|prior| prediction_prior_matches_row(prior, row)) {
+            for (model, blend) in &typed_blends {
+                if let Some(q) = settlement_probability_weighted_blend(row, event_q, blend) {
+                    push_settlement_probability_sample(
+                        &mut by_model,
+                        model.as_str(),
+                        row,
+                        win,
+                        pnl,
+                        conservative_pnl,
+                        q,
+                    );
+                }
+            }
+        }
     }
 
-    settlement_probability_report_from_model_samples(by_model, options)
+    settlement_probability_report_from_model_samples(by_model, decision_selection, options)
 }
 
 fn normalize_settlement_probability_report_options(
@@ -2721,11 +2962,11 @@ fn normalize_settlement_probability_report_options(
     }
 }
 
-fn settlement_probability_eligible_rows(
-    rows: &[FactorObservationV2],
-) -> Vec<(&FactorObservationV2, f64, f64)> {
+fn settlement_probability_eligible_rows<'a>(
+    rows: &[&'a FactorObservationV2],
+) -> Vec<(&'a FactorObservationV2, f64, f64, Option<f64>)> {
     let mut eligible_rows = Vec::new();
-    for row in rows {
+    for &row in rows {
         let Some(win) = row.label_settlement_win.filter(|win| win.is_finite()) else {
             continue;
         };
@@ -2738,38 +2979,71 @@ fn settlement_probability_eligible_rows(
         if !row.label_full_depth_entry_fillable || !valid_price(row.entry_sweep_avg_price_15u) {
             continue;
         }
-        eligible_rows.push((row, win, pnl));
+        let conservative_pnl = row
+            .label_conservative_entry_fillable
+            .then_some(row.label_conservative_executable_pnl_15u)
+            .flatten()
+            .filter(|pnl| pnl.is_finite());
+        eligible_rows.push((row, win, pnl, conservative_pnl));
     }
     eligible_rows
 }
 
 fn settlement_probability_report_from_model_samples(
-    by_model: BTreeMap<&'static str, Vec<SettlementProbabilitySample>>,
+    by_model: BTreeMap<String, Vec<SettlementProbabilitySample>>,
+    decision_selection: ProbabilityDecisionSelection<'_>,
     options: SettlementProbabilityReportOptions,
 ) -> SettlementProbabilityReport {
+    let paired_scoring_keys = paired_probability_scoring_keys(&by_model);
+    let scoring_population_n = by_model
+        .values()
+        .flatten()
+        .map(probability_scoring_key)
+        .collect::<BTreeSet<_>>()
+        .len();
     let mut baselines = Vec::new();
     let mut calibration = Vec::new();
     let mut edge_buckets = Vec::new();
     let mut anti_overfit = Vec::new();
     let mut symbol_holdouts = Vec::new();
     for (model, samples) in by_model {
-        if samples.len() < options.min_bucket_observations {
+        let scoring_samples = samples
+            .iter()
+            .filter(|sample| paired_scoring_keys.contains(&probability_scoring_key(sample)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some((decision_samples, entry_edge_threshold, top_edge_quantile)) =
+            selected_probability_samples(
+                &model,
+                samples,
+                decision_selection,
+                options.top_edge_quantile,
+            )
+        else {
+            continue;
+        };
+        if decision_samples.len() < options.min_bucket_observations
+            || scoring_samples.len() < options.min_bucket_observations
+        {
             continue;
         }
         let model_calibration =
-            build_probability_calibration_rows(model, &samples, options.bucket_count);
+            build_probability_calibration_rows(&model, &scoring_samples, options.bucket_count);
         let model_edge_buckets = build_probability_edge_bucket_rows(
-            model,
-            &samples,
+            &model,
+            &decision_samples,
             options.bucket_count,
             options.min_bucket_observations,
         );
         baselines.push(build_probability_baseline_row(
-            model,
-            &samples,
+            &model,
+            &decision_samples,
+            &scoring_samples,
+            scoring_population_n,
             &model_calibration,
             &model_edge_buckets,
-            options.top_edge_quantile,
+            top_edge_quantile,
+            entry_edge_threshold,
         ));
         calibration.extend(
             model_calibration
@@ -2777,14 +3051,14 @@ fn settlement_probability_report_from_model_samples(
                 .filter(|row| row.count >= options.min_bucket_observations),
         );
         anti_overfit.extend(build_probability_anti_overfit_rows(
-            model,
-            &samples,
-            options.top_edge_quantile,
+            &model,
+            &decision_samples,
+            top_edge_quantile,
         ));
         symbol_holdouts.extend(build_probability_symbol_holdout_rows(
-            model,
-            &samples,
-            options.top_edge_quantile,
+            &model,
+            &decision_samples,
+            top_edge_quantile,
             options.min_bucket_observations,
         ));
         edge_buckets.extend(model_edge_buckets);
@@ -2806,19 +3080,147 @@ fn settlement_probability_report_from_model_samples(
     }
 }
 
+type ProbabilityScoringKey = (String, String, DateTime<Utc>, String);
+
+fn probability_scoring_key(sample: &SettlementProbabilitySample) -> ProbabilityScoringKey {
+    (
+        sample.symbol.clone(),
+        sample.event_id.clone(),
+        sample.tick_ts,
+        sample.side.as_str().to_string(),
+    )
+}
+
+fn paired_probability_scoring_keys(
+    by_model: &BTreeMap<String, Vec<SettlementProbabilitySample>>,
+) -> BTreeSet<ProbabilityScoringKey> {
+    let mut model_samples = by_model.values();
+    let Some(first) = model_samples.next() else {
+        return BTreeSet::new();
+    };
+    let mut paired = first
+        .iter()
+        .map(probability_scoring_key)
+        .collect::<BTreeSet<_>>();
+    for samples in model_samples {
+        let available = samples
+            .iter()
+            .map(probability_scoring_key)
+            .collect::<BTreeSet<_>>();
+        paired.retain(|key| available.contains(key));
+    }
+    paired
+}
+
+fn selected_probability_samples(
+    model: &str,
+    samples: Vec<SettlementProbabilitySample>,
+    selection: ProbabilityDecisionSelection<'_>,
+    top_edge_quantile: f64,
+) -> Option<(Vec<SettlementProbabilitySample>, f64, f64)> {
+    match selection {
+        ProbabilityDecisionSelection::AllRows => {
+            let threshold = top_edge_threshold(&samples, top_edge_quantile)?;
+            Some((samples, threshold, top_edge_quantile))
+        }
+        ProbabilityDecisionSelection::LearnThresholds => {
+            let threshold = training_entry_edge_threshold(&samples, top_edge_quantile)?;
+            Some((first_event_decisions(&samples, threshold), threshold, 1.0))
+        }
+        ProbabilityDecisionSelection::FixedThresholds(thresholds) => {
+            let threshold = *thresholds.get(model)?;
+            Some((first_event_decisions(&samples, threshold), threshold, 1.0))
+        }
+    }
+}
+
 pub fn walk_forward_settlement_probability_report(
     rows: &[FactorObservationV2],
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     options: SettlementProbabilityWalkForwardOptions,
 ) -> SettlementProbabilityWalkForwardReport {
+    walk_forward_settlement_probability_report_with_prior(rows, start, end, None, options)
+}
+
+pub fn try_walk_forward_settlement_probability_report(
+    rows: &[FactorObservationV2],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    options: SettlementProbabilityWalkForwardOptions,
+) -> Result<SettlementProbabilityWalkForwardReport, SettlementProbabilityWalkForwardError> {
+    try_walk_forward_settlement_probability_report_with_prior(rows, start, end, None, options)
+}
+
+const BUILTIN_SETTLEMENT_PROBABILITY_CANDIDATE_MODELS: [&str; 10] = [
+    "q_market_midpoint",
+    "q_chainlink_digital",
+    "q_base_distance_phi",
+    "q_distance_lob_drift_phi",
+    "q_distance_vol_adjusted_phi",
+    "q_distance_lob_vol_phi",
+    "q_existing_fair_prob",
+    "q_existing_model_prob",
+    "q_event_surface_empirical",
+    "q_final_logit_blend",
+];
+
+fn expected_settlement_probability_candidate_models(
+    prior: Option<&LlmPriorSpec>,
+) -> BTreeSet<String> {
+    let mut models = BUILTIN_SETTLEMENT_PROBABILITY_CANDIDATE_MODELS
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    models.extend(
+        validated_probability_blends(prior)
+            .into_iter()
+            .map(|(model, _)| model),
+    );
+    models
+}
+
+pub fn walk_forward_settlement_probability_report_with_prior(
+    rows: &[FactorObservationV2],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    prior: Option<&LlmPriorSpec>,
+    options: SettlementProbabilityWalkForwardOptions,
+) -> SettlementProbabilityWalkForwardReport {
+    let fallback_options = options.clone();
+    try_walk_forward_settlement_probability_report_with_prior(rows, start, end, prior, options)
+        .unwrap_or_else(|error| SettlementProbabilityWalkForwardReport {
+            options: fallback_options,
+            windows: Vec::new(),
+            aggregates: Vec::new(),
+            failure_reason: Some(error.to_string()),
+        })
+}
+
+pub fn try_walk_forward_settlement_probability_report_with_prior(
+    rows: &[FactorObservationV2],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    prior: Option<&LlmPriorSpec>,
+    options: SettlementProbabilityWalkForwardOptions,
+) -> Result<SettlementProbabilityWalkForwardReport, SettlementProbabilityWalkForwardError> {
     let mut rows = rows.to_vec();
     rows.sort_by_key(|row| row.tick_ts);
     let train_duration = options.walk_forward.train_duration();
     let test_duration = options.walk_forward.test_duration();
     let step_duration = options.walk_forward.step_duration();
+    validate_settlement_probability_walk_forward_options(
+        start,
+        end,
+        train_duration,
+        test_duration,
+        step_duration,
+        &options,
+    )?;
     let probability_options =
         normalize_settlement_probability_report_options(options.probability.clone());
+    let event_ends = inferred_event_ends(&rows);
+    let expected_candidate_models = expected_settlement_probability_candidate_models(prior);
 
     let mut windows = Vec::new();
     let mut train_start = start;
@@ -2827,27 +3229,72 @@ pub fn walk_forward_settlement_probability_report(
         let train_end = train_start + train_duration;
         let test_start = train_end;
         let test_end = test_start + test_duration;
-        let train_rows = walk_forward_time_slice(&rows, train_start, train_end);
-        let test_rows = walk_forward_time_slice(&rows, test_start, test_end);
+        let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
+            &rows,
+            &event_ends,
+            train_start,
+            train_end,
+            test_start,
+            test_end,
+        );
 
         if train_rows.len() >= options.walk_forward.review.min_observations
             && test_rows.len() >= options.walk_forward.review.min_observations
         {
-            let train_report =
-                build_settlement_probability_report(train_rows, probability_options.clone());
+            let train_report = build_settlement_probability_report_with_surface(
+                &train_rows,
+                &train_rows,
+                prior,
+                ProbabilityDecisionSelection::LearnThresholds,
+                probability_options.clone(),
+            );
+            let train_thresholds = train_report
+                .baselines
+                .iter()
+                .map(|row| (row.model.clone(), row.entry_edge_threshold))
+                .collect::<BTreeMap<_, _>>();
             let test_report = build_settlement_probability_report_with_surface(
-                test_rows,
-                train_rows,
+                &test_rows,
+                &train_rows,
+                prior,
+                ProbabilityDecisionSelection::FixedThresholds(&train_thresholds),
                 probability_options.clone(),
             );
             windows.extend(settlement_probability_walk_forward_windows(
-                window_index,
-                train_start,
-                train_end,
-                test_start,
-                test_end,
+                ProbabilityWalkForwardWindowBounds {
+                    window_index,
+                    train_start,
+                    train_end,
+                    test_start,
+                    test_end,
+                },
                 &train_report,
                 &test_report,
+                &expected_candidate_models,
+                &options,
+            ));
+        } else {
+            let empty_report = SettlementProbabilityReport {
+                options: probability_options.clone(),
+                baselines: Vec::new(),
+                calibration: Vec::new(),
+                edge_buckets: Vec::new(),
+                anti_overfit: Vec::new(),
+                symbol_holdouts: Vec::new(),
+                ablations: Vec::new(),
+            };
+            windows.extend(settlement_probability_walk_forward_windows(
+                ProbabilityWalkForwardWindowBounds {
+                    window_index,
+                    train_start,
+                    train_end,
+                    test_start,
+                    test_end,
+                },
+                &empty_report,
+                &empty_report,
+                &expected_candidate_models,
+                &options,
             ));
         }
 
@@ -2855,58 +3302,220 @@ pub fn walk_forward_settlement_probability_report(
         train_start += step_duration;
     }
     let aggregates = aggregate_settlement_probability_walk_forward_windows(&windows);
-    SettlementProbabilityWalkForwardReport {
+    Ok(SettlementProbabilityWalkForwardReport {
         options,
         windows,
         aggregates,
-    }
+        failure_reason: None,
+    })
 }
 
-fn settlement_probability_walk_forward_windows(
+fn validate_settlement_probability_walk_forward_options(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    train_duration: Duration,
+    test_duration: Duration,
+    step_duration: Duration,
+    options: &SettlementProbabilityWalkForwardOptions,
+) -> Result<(), SettlementProbabilityWalkForwardError> {
+    if start >= end {
+        return Err(SettlementProbabilityWalkForwardError::InvalidTimeRange { start, end });
+    }
+    if step_duration < test_duration {
+        return Err(
+            SettlementProbabilityWalkForwardError::OverlappingTestWindows {
+                step_seconds: step_duration.num_seconds(),
+                test_seconds: test_duration.num_seconds(),
+            },
+        );
+    }
+    let available_seconds = (end - start).num_seconds();
+    let required_seconds = (train_duration + test_duration).num_seconds();
+    if available_seconds < required_seconds {
+        return Err(
+            SettlementProbabilityWalkForwardError::InsufficientTimeRange {
+                available_seconds,
+                required_seconds,
+            },
+        );
+    }
+    if options.min_paired_scoring_observations == 0 {
+        return Err(SettlementProbabilityWalkForwardError::InvalidOptions {
+            reason: "min_paired_scoring_observations must be at least 1".to_string(),
+        });
+    }
+    if !options.min_paired_scoring_coverage_rate.is_finite()
+        || !(0.0..=1.0).contains(&options.min_paired_scoring_coverage_rate)
+        || options.min_paired_scoring_coverage_rate <= 0.0
+    {
+        return Err(SettlementProbabilityWalkForwardError::InvalidOptions {
+            reason: "min_paired_scoring_coverage_rate must be finite and within (0, 1]".to_string(),
+        });
+    }
+    let probability_gates = [
+        options.max_test_brier_score,
+        options.max_test_log_loss,
+        options.max_test_expected_calibration_error,
+    ];
+    if probability_gates
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(SettlementProbabilityWalkForwardError::InvalidOptions {
+            reason: "probability quality gates must be finite and non-negative".to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProbabilityWalkForwardWindowBounds {
     window_index: usize,
     train_start: DateTime<Utc>,
     train_end: DateTime<Utc>,
     test_start: DateTime<Utc>,
     test_end: DateTime<Utc>,
+}
+
+fn settlement_probability_walk_forward_windows(
+    bounds: ProbabilityWalkForwardWindowBounds,
     train_report: &SettlementProbabilityReport,
     test_report: &SettlementProbabilityReport,
+    expected_candidate_models: &BTreeSet<String>,
+    options: &SettlementProbabilityWalkForwardOptions,
 ) -> Vec<SettlementProbabilityWalkForwardWindow> {
     let train_by_model: BTreeMap<&str, &SettlementProbabilityBaselineRow> = train_report
         .baselines
         .iter()
         .map(|row| (row.model.as_str(), row))
         .collect();
-    let mut windows = Vec::new();
-    for test in &test_report.baselines {
-        let Some(train) = train_by_model.get(test.model.as_str()) else {
+    let test_by_model: BTreeMap<&str, &SettlementProbabilityBaselineRow> = test_report
+        .baselines
+        .iter()
+        .map(|row| (row.model.as_str(), row))
+        .collect();
+    let mut windows = Vec::with_capacity(expected_candidate_models.len());
+    for model in expected_candidate_models {
+        let train = train_by_model.get(model.as_str()).copied();
+        let test = test_by_model.get(model.as_str()).copied();
+        if let (Some(train), Some(test)) = (train, test) {
+            let failure_reason = paired_scoring_failure_reason(train, test, options);
+            let paired_scoring_complete = failure_reason.is_none();
+            windows.push(SettlementProbabilityWalkForwardWindow {
+                window_index: bounds.window_index,
+                model: model.clone(),
+                train_start: bounds.train_start,
+                train_end: bounds.train_end,
+                test_start: bounds.test_start,
+                test_end: bounds.test_end,
+                train_n: train.n,
+                test_n: test.n,
+                train_scoring_n: train.scoring_n,
+                test_scoring_n: test.scoring_n,
+                train_scoring_population_n: train.scoring_population_n,
+                test_scoring_population_n: test.scoring_population_n,
+                train_scoring_coverage_rate: train.scoring_coverage_rate,
+                test_scoring_coverage_rate: test.scoring_coverage_rate,
+                train_brier_score: train.brier_score,
+                test_brier_score: test.brier_score,
+                train_log_loss: train.log_loss,
+                test_log_loss: test.log_loss,
+                train_expected_calibration_error: train.expected_calibration_error,
+                test_expected_calibration_error: test.expected_calibration_error,
+                train_top_edge_avg_full_depth_settlement_pnl: train
+                    .top_edge_avg_full_depth_settlement_pnl,
+                test_top_edge_avg_full_depth_settlement_pnl: test
+                    .top_edge_avg_full_depth_settlement_pnl,
+                test_top_edge_avg_conservative_settlement_pnl: test
+                    .top_edge_avg_conservative_settlement_pnl,
+                train_top_edge_conservative_coverage_rate: train
+                    .top_edge_conservative_coverage_rate,
+                test_top_edge_conservative_coverage_rate: test.top_edge_conservative_coverage_rate,
+                test_edge_bucket_monotonic_non_decreasing: test
+                    .edge_bucket_monotonic_non_decreasing,
+                pass: paired_scoring_complete
+                    && test.top_edge_avg_full_depth_settlement_pnl > 0.0
+                    && test.top_edge_avg_conservative_settlement_pnl > 0.0
+                    && train.top_edge_conservative_coverage_rate >= 1.0
+                    && test.top_edge_conservative_coverage_rate >= 1.0
+                    && test.brier_score.is_finite()
+                    && test.brier_score <= options.max_test_brier_score
+                    && test.log_loss.is_finite()
+                    && test.log_loss <= options.max_test_log_loss
+                    && test.expected_calibration_error.is_finite()
+                    && test.expected_calibration_error
+                        <= options.max_test_expected_calibration_error,
+                failure_reason,
+            });
             continue;
+        }
+        let failure_reason = match (train.is_some(), test.is_some()) {
+            (false, false) => "missing_train_and_test_model_evidence",
+            (false, true) => "missing_train_model_evidence",
+            (true, false) => "missing_test_model_evidence",
+            (true, true) => unreachable!("complete model evidence handled above"),
         };
         windows.push(SettlementProbabilityWalkForwardWindow {
-            window_index,
-            model: test.model.clone(),
-            train_start,
-            train_end,
-            test_start,
-            test_end,
-            train_n: train.n,
-            test_n: test.n,
-            train_brier_score: train.brier_score,
-            test_brier_score: test.brier_score,
-            train_expected_calibration_error: train.expected_calibration_error,
-            test_expected_calibration_error: test.expected_calibration_error,
+            window_index: bounds.window_index,
+            model: model.clone(),
+            train_start: bounds.train_start,
+            train_end: bounds.train_end,
+            test_start: bounds.test_start,
+            test_end: bounds.test_end,
+            train_n: train.map_or(0, |row| row.n),
+            test_n: test.map_or(0, |row| row.n),
+            train_scoring_n: train.map_or(0, |row| row.scoring_n),
+            test_scoring_n: test.map_or(0, |row| row.scoring_n),
+            train_scoring_population_n: train.map_or(0, |row| row.scoring_population_n),
+            test_scoring_population_n: test.map_or(0, |row| row.scoring_population_n),
+            train_scoring_coverage_rate: train.map_or(0.0, |row| row.scoring_coverage_rate),
+            test_scoring_coverage_rate: test.map_or(0.0, |row| row.scoring_coverage_rate),
+            train_brier_score: train.map_or(f64::NAN, |row| row.brier_score),
+            test_brier_score: test.map_or(f64::NAN, |row| row.brier_score),
+            train_log_loss: train.map_or(f64::NAN, |row| row.log_loss),
+            test_log_loss: test.map_or(f64::NAN, |row| row.log_loss),
+            train_expected_calibration_error: train
+                .map_or(f64::NAN, |row| row.expected_calibration_error),
+            test_expected_calibration_error: test
+                .map_or(f64::NAN, |row| row.expected_calibration_error),
             train_top_edge_avg_full_depth_settlement_pnl: train
-                .top_edge_avg_full_depth_settlement_pnl,
-            test_top_edge_avg_full_depth_settlement_pnl: test
-                .top_edge_avg_full_depth_settlement_pnl,
-            test_top_edge_avg_conservative_settlement_pnl: test
-                .top_edge_avg_conservative_settlement_pnl,
-            test_edge_bucket_monotonic_non_decreasing: test.edge_bucket_monotonic_non_decreasing,
-            pass: test.top_edge_avg_full_depth_settlement_pnl > 0.0
-                && test.expected_calibration_error.is_finite()
-                && test.brier_score.is_finite(),
+                .map_or(0.0, |row| row.top_edge_avg_full_depth_settlement_pnl),
+            test_top_edge_avg_full_depth_settlement_pnl: 0.0,
+            test_top_edge_avg_conservative_settlement_pnl: 0.0,
+            train_top_edge_conservative_coverage_rate: train
+                .map_or(0.0, |row| row.top_edge_conservative_coverage_rate),
+            test_top_edge_conservative_coverage_rate: 0.0,
+            test_edge_bucket_monotonic_non_decreasing: false,
+            pass: false,
+            failure_reason: Some(failure_reason.to_string()),
         });
     }
     windows
+}
+
+fn paired_scoring_failure_reason(
+    train: &SettlementProbabilityBaselineRow,
+    test: &SettlementProbabilityBaselineRow,
+    options: &SettlementProbabilityWalkForwardOptions,
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    for (phase, row) in [("train", train), ("test", test)] {
+        if row.scoring_n < options.min_paired_scoring_observations {
+            reasons.push(format!(
+                "{phase}_insufficient_paired_scoring_observations:actual={} required={}",
+                row.scoring_n, options.min_paired_scoring_observations
+            ));
+        }
+        if !row.scoring_coverage_rate.is_finite()
+            || row.scoring_coverage_rate + EPS < options.min_paired_scoring_coverage_rate
+        {
+            reasons.push(format!(
+                "{phase}_insufficient_paired_scoring_coverage:actual={:.6} required={:.6}",
+                row.scoring_coverage_rate, options.min_paired_scoring_coverage_rate
+            ));
+        }
+    }
+    (!reasons.is_empty()).then(|| reasons.join(";"))
 }
 
 fn aggregate_settlement_probability_walk_forward_windows(
@@ -2923,6 +3532,10 @@ fn aggregate_settlement_probability_walk_forward_windows(
         .into_iter()
         .map(|(model, rows)| {
             let windows = rows.len();
+            let complete_windows = rows
+                .iter()
+                .filter(|row| settlement_probability_window_evidence_complete(row))
+                .count();
             let positive = rows
                 .iter()
                 .filter(|row| row.test_top_edge_avg_full_depth_settlement_pnl > 0.0)
@@ -2931,9 +3544,11 @@ fn aggregate_settlement_probability_walk_forward_windows(
             SettlementProbabilityWalkForwardAggregate {
                 model: model.to_string(),
                 windows,
+                complete_windows,
                 positive_window_ratio: ratio(positive, windows),
                 pass_window_ratio: ratio(passed, windows),
                 avg_test_brier_score: mean(rows.iter().map(|row| row.test_brier_score)),
+                avg_test_log_loss: mean(rows.iter().map(|row| row.test_log_loss)),
                 avg_test_expected_calibration_error: mean(
                     rows.iter().map(|row| row.test_expected_calibration_error),
                 ),
@@ -2945,6 +3560,21 @@ fn aggregate_settlement_probability_walk_forward_windows(
                     .iter()
                     .map(|row| row.test_top_edge_avg_full_depth_settlement_pnl)
                     .fold(f64::INFINITY, f64::min),
+                avg_test_top_edge_avg_conservative_settlement_pnl: mean(
+                    rows.iter()
+                        .map(|row| row.test_top_edge_avg_conservative_settlement_pnl),
+                ),
+                min_test_top_edge_avg_conservative_settlement_pnl: rows
+                    .iter()
+                    .map(|row| row.test_top_edge_avg_conservative_settlement_pnl)
+                    .fold(f64::INFINITY, f64::min),
+                min_top_edge_conservative_coverage_rate: rows
+                    .iter()
+                    .map(|row| {
+                        row.train_top_edge_conservative_coverage_rate
+                            .min(row.test_top_edge_conservative_coverage_rate)
+                    })
+                    .fold(f64::INFINITY, f64::min),
             }
         })
         .collect::<Vec<_>>();
@@ -2954,6 +3584,37 @@ fn aggregate_settlement_probability_walk_forward_windows(
             .then_with(|| b.positive_window_ratio.total_cmp(&a.positive_window_ratio))
     });
     aggregates
+}
+
+fn settlement_probability_window_evidence_complete(
+    row: &SettlementProbabilityWalkForwardWindow,
+) -> bool {
+    row.failure_reason.is_none()
+        && row.train_n > 0
+        && row.test_n > 0
+        && row.train_scoring_n > 0
+        && row.test_scoring_n > 0
+        && row.train_scoring_population_n >= row.train_scoring_n
+        && row.test_scoring_population_n >= row.test_scoring_n
+        && row.train_scoring_coverage_rate.is_finite()
+        && row.test_scoring_coverage_rate.is_finite()
+        && (0.0..=1.0).contains(&row.train_scoring_coverage_rate)
+        && (0.0..=1.0).contains(&row.test_scoring_coverage_rate)
+        && [
+            row.train_brier_score,
+            row.test_brier_score,
+            row.train_log_loss,
+            row.test_log_loss,
+            row.train_expected_calibration_error,
+            row.test_expected_calibration_error,
+            row.train_top_edge_avg_full_depth_settlement_pnl,
+            row.test_top_edge_avg_full_depth_settlement_pnl,
+            row.test_top_edge_avg_conservative_settlement_pnl,
+            row.train_top_edge_conservative_coverage_rate,
+            row.test_top_edge_conservative_coverage_rate,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
 }
 
 pub fn build_settlement_probability_promotion_gate_report(
@@ -3127,23 +3788,64 @@ pub fn build_settlement_probability_promotion_gate_report(
     });
 
     let oos_model = best_walk_forward_oos_model(walk_forward, options.min_positive_window_ratio);
+    let oos_candidate = walk_forward
+        .aggregates
+        .iter()
+        .filter(|row| is_settlement_probability_candidate_model(&row.model))
+        .filter(|row| row.windows > 0)
+        .max_by(|a, b| {
+            a.pass_window_ratio
+                .total_cmp(&b.pass_window_ratio)
+                .then_with(|| {
+                    a.avg_test_top_edge_avg_full_depth_settlement_pnl
+                        .total_cmp(&b.avg_test_top_edge_avg_full_depth_settlement_pnl)
+                })
+        });
     gates.push(SettlementProbabilityPromotionGateRow {
         gate: "walk_forward_oos".to_string(),
         passed: oos_model.is_some(),
         evidence: oos_model.map_or_else(
             || {
-                format!(
-                    "no non-naive model has non-empty OOS windows with positive_window_ratio >= {:.2}",
-                    options.min_positive_window_ratio
+                oos_candidate.map_or_else(
+                    || "no non-naive model has non-empty OOS windows".to_string(),
+                    |row| {
+                        format!(
+                            "rejected model={} windows={} complete_windows={} positive_window_ratio={:.4} pass_window_ratio={:.4} min_ratio={:.4} avg_test_brier={:.6} max_brier={:.6} avg_test_log_loss={:.6} max_log_loss={:.6} avg_test_ece={:.6} max_ece={:.6} min_test_top_edge_pnl={:.4} min_test_top_edge_conservative_pnl={:.4}",
+                            row.model,
+                            row.windows,
+                            row.complete_windows,
+                            row.positive_window_ratio,
+                            row.pass_window_ratio,
+                            options.min_positive_window_ratio,
+                            row.avg_test_brier_score,
+                            walk_forward.options.max_test_brier_score,
+                            row.avg_test_log_loss,
+                            walk_forward.options.max_test_log_loss,
+                            row.avg_test_expected_calibration_error,
+                            walk_forward.options.max_test_expected_calibration_error,
+                            row.min_test_top_edge_avg_full_depth_settlement_pnl,
+                            row.min_test_top_edge_avg_conservative_settlement_pnl,
+                        )
+                    },
                 )
             },
             |row| {
                 format!(
-                    "model={} windows={} positive_window_ratio={:.4} min_test_top_edge_pnl={:.4}",
+                    "model={} windows={} complete_windows={} positive_window_ratio={:.4} pass_window_ratio={:.4} min_ratio={:.4} avg_test_brier={:.6} max_brier={:.6} avg_test_log_loss={:.6} max_log_loss={:.6} avg_test_ece={:.6} max_ece={:.6} min_test_top_edge_pnl={:.4} min_test_top_edge_conservative_pnl={:.4}",
                     row.model,
                     row.windows,
+                    row.complete_windows,
                     row.positive_window_ratio,
-                    row.min_test_top_edge_avg_full_depth_settlement_pnl
+                    row.pass_window_ratio,
+                    options.min_positive_window_ratio,
+                    row.avg_test_brier_score,
+                    walk_forward.options.max_test_brier_score,
+                    row.avg_test_log_loss,
+                    walk_forward.options.max_test_log_loss,
+                    row.avg_test_expected_calibration_error,
+                    walk_forward.options.max_test_expected_calibration_error,
+                    row.min_test_top_edge_avg_full_depth_settlement_pnl,
+                    row.min_test_top_edge_avg_conservative_settlement_pnl
                 )
             },
         ),
@@ -3228,6 +3930,7 @@ fn best_conservative_edge_model(
         .baselines
         .iter()
         .filter(|row| is_settlement_probability_candidate_model(&row.model))
+        .filter(|row| row.top_edge_conservative_coverage_rate >= 1.0)
         .filter(|row| row.top_edge_avg_conservative_settlement_pnl > 0.0)
         .max_by(|a, b| {
             a.top_edge_avg_conservative_settlement_pnl
@@ -3290,16 +3993,372 @@ fn best_walk_forward_oos_model(
         .iter()
         .filter(|row| is_settlement_probability_candidate_model(&row.model))
         .filter(|row| row.windows > 0)
+        .filter(|row| row.complete_windows == row.windows)
         .filter(|row| row.positive_window_ratio >= min_positive_window_ratio)
+        .filter(|row| row.pass_window_ratio >= min_positive_window_ratio)
+        .filter(|row| {
+            row.avg_test_brier_score.is_finite()
+                && row.avg_test_brier_score <= report.options.max_test_brier_score
+        })
+        .filter(|row| {
+            row.avg_test_log_loss.is_finite()
+                && row.avg_test_log_loss <= report.options.max_test_log_loss
+        })
+        .filter(|row| {
+            row.avg_test_expected_calibration_error.is_finite()
+                && row.avg_test_expected_calibration_error
+                    <= report.options.max_test_expected_calibration_error
+        })
         .filter(|row| row.min_test_top_edge_avg_full_depth_settlement_pnl > 0.0)
+        .filter(|row| row.min_test_top_edge_avg_conservative_settlement_pnl > 0.0)
+        .filter(|row| row.min_top_edge_conservative_coverage_rate >= 1.0)
         .max_by(|a, b| {
-            a.positive_window_ratio
-                .total_cmp(&b.positive_window_ratio)
+            a.pass_window_ratio
+                .total_cmp(&b.pass_window_ratio)
                 .then_with(|| {
                     a.avg_test_top_edge_avg_full_depth_settlement_pnl
                         .total_cmp(&b.avg_test_top_edge_avg_full_depth_settlement_pnl)
                 })
         })
+}
+
+fn validate_prediction_research_gate_policy(
+    policy: &PredictionResearchGatePolicy,
+) -> Result<(), String> {
+    let policy_values = [
+        policy.min_positive_window_ratio,
+        policy.max_test_brier_score,
+        policy.max_test_log_loss,
+        policy.max_test_expected_calibration_error,
+        policy.min_test_top_edge_full_depth_settlement_pnl,
+        policy.min_test_top_edge_conservative_settlement_pnl,
+        policy.min_top_edge_conservative_coverage_rate,
+        policy.incremental_comparison_epsilon,
+    ];
+    if policy_values.iter().any(|value| !value.is_finite())
+        || !(0.0..=1.0).contains(&policy.min_positive_window_ratio)
+        || !(0.0..=1.0).contains(&policy.min_top_edge_conservative_coverage_rate)
+        || policy.max_test_brier_score < 0.0
+        || policy.max_test_log_loss < 0.0
+        || policy.max_test_expected_calibration_error < 0.0
+        || policy.incremental_comparison_epsilon < 0.0
+    {
+        return Err("prediction feedback gate policy is invalid".to_string());
+    }
+    Ok(())
+}
+
+pub fn recompute_prediction_research_outcome(
+    metrics: &PredictionResearchCandidateMetrics,
+    policy: &PredictionResearchGatePolicy,
+) -> Result<(String, Vec<String>), String> {
+    validate_prediction_research_gate_policy(policy)?;
+    if metrics.windows == 0 {
+        return Ok(("discard".to_string(), vec!["no_oos_windows".to_string()]));
+    }
+
+    let mut reason_codes = Vec::new();
+    if [
+        metrics.positive_window_ratio,
+        metrics.pass_window_ratio,
+        metrics.avg_test_brier_score,
+        metrics.avg_test_log_loss,
+        metrics.avg_test_expected_calibration_error,
+        metrics.avg_test_top_edge_avg_full_depth_settlement_pnl,
+        metrics.min_test_top_edge_avg_full_depth_settlement_pnl,
+        metrics.avg_test_top_edge_avg_conservative_settlement_pnl,
+        metrics.min_test_top_edge_avg_conservative_settlement_pnl,
+        metrics.min_top_edge_conservative_coverage_rate,
+    ]
+    .iter()
+    .any(Option::is_none)
+    {
+        reason_codes.push("incomplete_oos_window_coverage".to_string());
+    }
+    if metrics
+        .positive_window_ratio
+        .is_none_or(|value| !value.is_finite() || value < policy.min_positive_window_ratio)
+    {
+        reason_codes.push("insufficient_positive_windows".to_string());
+    }
+    if metrics
+        .pass_window_ratio
+        .is_none_or(|value| !value.is_finite() || value < policy.min_positive_window_ratio)
+    {
+        reason_codes.push("insufficient_passing_windows".to_string());
+    }
+    if metrics
+        .avg_test_brier_score
+        .is_none_or(|value| !value.is_finite() || value > policy.max_test_brier_score)
+    {
+        reason_codes.push("brier_gate_failed".to_string());
+    }
+    if metrics
+        .avg_test_log_loss
+        .is_none_or(|value| !value.is_finite() || value > policy.max_test_log_loss)
+    {
+        reason_codes.push("log_loss_gate_failed".to_string());
+    }
+    if metrics
+        .avg_test_expected_calibration_error
+        .is_none_or(|value| {
+            !value.is_finite() || value > policy.max_test_expected_calibration_error
+        })
+    {
+        reason_codes.push("calibration_gate_failed".to_string());
+    }
+    if metrics
+        .min_test_top_edge_avg_full_depth_settlement_pnl
+        .is_none_or(|value| {
+            !value.is_finite() || value <= policy.min_test_top_edge_full_depth_settlement_pnl
+        })
+    {
+        reason_codes.push("nonpositive_oos_settlement_pnl".to_string());
+    }
+    if metrics
+        .min_test_top_edge_avg_conservative_settlement_pnl
+        .is_none_or(|value| {
+            !value.is_finite() || value <= policy.min_test_top_edge_conservative_settlement_pnl
+        })
+    {
+        reason_codes.push("nonpositive_oos_conservative_capacity_pnl".to_string());
+    }
+    if metrics
+        .min_top_edge_conservative_coverage_rate
+        .is_none_or(|value| {
+            !value.is_finite() || value < policy.min_top_edge_conservative_coverage_rate
+        })
+    {
+        reason_codes.push("incomplete_oos_top_edge_conservative_capacity_coverage".to_string());
+    }
+
+    match (
+        metrics.best_baseline_brier_score,
+        metrics.best_baseline_log_loss,
+        metrics.best_baseline_avg_conservative_settlement_pnl,
+    ) {
+        (Some(baseline_brier), Some(baseline_log_loss), Some(baseline_pnl))
+            if baseline_brier.is_finite()
+                && baseline_log_loss.is_finite()
+                && baseline_pnl.is_finite() =>
+        {
+            if metrics.avg_test_brier_score.is_none_or(|value| {
+                !value.is_finite()
+                    || value >= baseline_brier - policy.incremental_comparison_epsilon
+            }) {
+                reason_codes.push("no_incremental_brier_vs_baseline".to_string());
+            }
+            if metrics.avg_test_log_loss.is_none_or(|value| {
+                !value.is_finite()
+                    || value >= baseline_log_loss - policy.incremental_comparison_epsilon
+            }) {
+                reason_codes.push("no_incremental_log_loss_vs_baseline".to_string());
+            }
+            if metrics
+                .avg_test_top_edge_avg_conservative_settlement_pnl
+                .is_none_or(|value| {
+                    !value.is_finite()
+                        || value <= baseline_pnl + policy.incremental_comparison_epsilon
+                })
+            {
+                reason_codes.push("no_incremental_conservative_pnl_vs_baseline".to_string());
+            }
+        }
+        _ => reason_codes.push("missing_baseline_comparison".to_string()),
+    }
+    let verdict = if reason_codes.is_empty() {
+        // This evaluator is reused adaptively by the proposal loop. Passing its
+        // gates is therefore only a search result; final keep requires a
+        // separate sealed snapshot that the loop has never observed.
+        "search_pass"
+    } else {
+        "discard"
+    };
+    Ok((verdict.to_string(), reason_codes))
+}
+
+fn finite_metric(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
+pub fn build_prediction_research_feedback(
+    prior: &LlmPriorSpec,
+    report: &SettlementProbabilityWalkForwardReport,
+    min_positive_window_ratio: f64,
+) -> Option<PredictionResearchFeedback> {
+    try_build_prediction_research_feedback(prior, report, min_positive_window_ratio)
+        .ok()
+        .flatten()
+}
+
+pub fn try_build_prediction_research_feedback(
+    prior: &LlmPriorSpec,
+    report: &SettlementProbabilityWalkForwardReport,
+    min_positive_window_ratio: f64,
+) -> Result<Option<PredictionResearchFeedback>, String> {
+    validate_prediction_research_prior(prior).map_err(str::to_string)?;
+    if !min_positive_window_ratio.is_finite() || !(0.0..=1.0).contains(&min_positive_window_ratio) {
+        return Err("min_positive_window_ratio must be finite and within [0, 1]".to_string());
+    }
+    if let Some(reason) = report.failure_reason.as_deref() {
+        return Err(format!("walk-forward report is invalid: {reason}"));
+    }
+    let mission_id = prior
+        .mission_id
+        .as_deref()
+        .ok_or_else(|| "validated prediction prior is missing mission_id".to_string())?
+        .trim();
+    if mission_id.is_empty() {
+        return Ok(None);
+    }
+    let allowed_models = validated_probability_blends(Some(prior))
+        .into_iter()
+        .map(|(model, blend)| (model, blend.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let aggregates = report
+        .aggregates
+        .iter()
+        .map(|aggregate| (aggregate.model.as_str(), aggregate))
+        .collect::<BTreeMap<_, _>>();
+    let baseline_aggregates = report
+        .aggregates
+        .iter()
+        .filter(|aggregate| {
+            aggregate.windows > 0
+                && aggregate.complete_windows == aggregate.windows
+                && !aggregate.model.starts_with("q_llm_")
+                && aggregate.model != "q_naive_50_50"
+        })
+        .collect::<Vec<_>>();
+    let best_baseline_brier = finite_min(
+        baseline_aggregates
+            .iter()
+            .map(|aggregate| aggregate.avg_test_brier_score),
+    );
+    let best_baseline_log_loss = finite_min(
+        baseline_aggregates
+            .iter()
+            .map(|aggregate| aggregate.avg_test_log_loss),
+    );
+    let best_baseline_conservative_pnl = finite_max(
+        baseline_aggregates
+            .iter()
+            .map(|aggregate| aggregate.avg_test_top_edge_avg_conservative_settlement_pnl),
+    );
+    let gate_policy = PredictionResearchGatePolicy {
+        min_positive_window_ratio,
+        max_test_brier_score: report.options.max_test_brier_score,
+        max_test_log_loss: report.options.max_test_log_loss,
+        max_test_expected_calibration_error: report.options.max_test_expected_calibration_error,
+        ..PredictionResearchGatePolicy::governed()
+    };
+    validate_prediction_research_gate_policy(&gate_policy)?;
+    let candidates = allowed_models
+        .into_iter()
+        .map(
+            |(model, probability_blend)| -> Result<PredictionResearchCandidateFeedback, String> {
+                let hypothesis = probability_blend.hypothesis.trim().to_string();
+                let Some(aggregate) = aggregates.get(model.as_str()).copied() else {
+                    let metrics = PredictionResearchCandidateMetrics {
+                        windows: 0,
+                        positive_window_ratio: None,
+                        pass_window_ratio: None,
+                        avg_test_brier_score: None,
+                        avg_test_log_loss: None,
+                        avg_test_expected_calibration_error: None,
+                        avg_test_top_edge_avg_full_depth_settlement_pnl: None,
+                        min_test_top_edge_avg_full_depth_settlement_pnl: None,
+                        avg_test_top_edge_avg_conservative_settlement_pnl: None,
+                        min_test_top_edge_avg_conservative_settlement_pnl: None,
+                        min_top_edge_conservative_coverage_rate: None,
+                        best_baseline_brier_score: finite_metric(best_baseline_brier),
+                        best_baseline_log_loss: finite_metric(best_baseline_log_loss),
+                        best_baseline_avg_conservative_settlement_pnl: finite_metric(
+                            best_baseline_conservative_pnl,
+                        ),
+                    };
+                    let (verdict, reason_codes) =
+                        recompute_prediction_research_outcome(&metrics, &gate_policy)?;
+                    return Ok(PredictionResearchCandidateFeedback {
+                        model,
+                        hypothesis,
+                        probability_blend,
+                        verdict,
+                        reason_codes,
+                        metrics,
+                    });
+                };
+                let complete_coverage =
+                    aggregate.windows > 0 && aggregate.complete_windows == aggregate.windows;
+                let metric = |value| complete_coverage.then_some(value).and_then(finite_metric);
+                let metrics = PredictionResearchCandidateMetrics {
+                    windows: aggregate.windows,
+                    positive_window_ratio: metric(aggregate.positive_window_ratio),
+                    pass_window_ratio: metric(aggregate.pass_window_ratio),
+                    avg_test_brier_score: metric(aggregate.avg_test_brier_score),
+                    avg_test_log_loss: metric(aggregate.avg_test_log_loss),
+                    avg_test_expected_calibration_error: metric(
+                        aggregate.avg_test_expected_calibration_error,
+                    ),
+                    avg_test_top_edge_avg_full_depth_settlement_pnl: metric(
+                        aggregate.avg_test_top_edge_avg_full_depth_settlement_pnl,
+                    ),
+                    min_test_top_edge_avg_full_depth_settlement_pnl: metric(
+                        aggregate.min_test_top_edge_avg_full_depth_settlement_pnl,
+                    ),
+                    avg_test_top_edge_avg_conservative_settlement_pnl: metric(
+                        aggregate.avg_test_top_edge_avg_conservative_settlement_pnl,
+                    ),
+                    min_test_top_edge_avg_conservative_settlement_pnl: metric(
+                        aggregate.min_test_top_edge_avg_conservative_settlement_pnl,
+                    ),
+                    min_top_edge_conservative_coverage_rate: metric(
+                        aggregate.min_top_edge_conservative_coverage_rate,
+                    ),
+                    best_baseline_brier_score: finite_metric(best_baseline_brier),
+                    best_baseline_log_loss: finite_metric(best_baseline_log_loss),
+                    best_baseline_avg_conservative_settlement_pnl: finite_metric(
+                        best_baseline_conservative_pnl,
+                    ),
+                };
+                let (verdict, reason_codes) =
+                    recompute_prediction_research_outcome(&metrics, &gate_policy)?;
+                Ok(PredictionResearchCandidateFeedback {
+                    model,
+                    hypothesis,
+                    probability_blend,
+                    verdict,
+                    reason_codes,
+                    metrics,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(PredictionResearchFeedback {
+        schema_version: "prediction_research_feedback.v3".to_string(),
+        mission_id: mission_id.to_string(),
+        target: prior
+            .target
+            .clone()
+            .ok_or_else(|| "validated prediction prior is missing target".to_string())?,
+        symbols: prior.symbols.clone(),
+        horizon: prior
+            .horizon
+            .clone()
+            .ok_or_else(|| "validated prediction prior is missing horizon".to_string())?,
+        data_snapshot_id: prior
+            .data_snapshot_id
+            .clone()
+            .ok_or_else(|| "validated prediction prior is missing data_snapshot_id".to_string())?,
+        prompt_snapshot_id: prior.prompt_snapshot_id.clone().ok_or_else(|| {
+            "validated prediction prior is missing prompt_snapshot_id".to_string()
+        })?,
+        search_policy_snapshot_id: prior.search_policy_snapshot_id.clone().ok_or_else(|| {
+            "validated prediction prior is missing search_policy_snapshot_id".to_string()
+        })?,
+        gate_policy,
+        candidates,
+    }))
 }
 
 pub fn format_settlement_probability_report(report: &SettlementProbabilityReport) -> String {
@@ -3313,14 +4372,18 @@ pub fn format_settlement_probability_report(report: &SettlementProbabilityReport
         report.options.event_surface_min_bucket_observations,
         report.options.event_surface_shrinkage_observations,
     ));
-    out.push_str("Population is full-depth entry-fillable candidate rows with settled labels. Edge is q_side - full_depth_entry_sweep_avg_price; PnL is full-depth settlement PnL after crypto fee. Conservative PnL uses 50% visible depth and max 3 CLOB levels.\n");
+    out.push_str("Population is full-depth entry-fillable candidate rows with settled labels. Edge is q_side - full_depth_entry_sweep_avg_price; PnL is full-depth settlement PnL after crypto fee. Conservative PnL uses 50% visible depth and max 3 CLOB levels; uncovered rows remain in the denominator with zero conservative PnL, and promoted top-edge selections require 100% conservative coverage.\n");
     out.push_str("\n--- Baseline Comparison ---\n");
-    out.push_str("model,n,avg_q,actual_win,brier,log_loss,ece,avg_edge,avg_full_depth_settlement_pnl,avg_conservative_settlement_pnl,profit_factor,edge_bucket_monotonic,top_edge_count,top_edge_avg_edge,top_edge_win,top_edge_avg_full_depth_settlement_pnl,top_edge_avg_conservative_settlement_pnl\n");
+    out.push_str("model,decision_n,scoring_n,scoring_population_n,scoring_coverage_rate,entry_edge_threshold,avg_q,actual_win,brier,log_loss,ece,avg_edge,avg_full_depth_settlement_pnl,avg_conservative_settlement_pnl,conservative_coverage_rate,profit_factor,edge_bucket_monotonic,top_edge_count,top_edge_avg_edge,top_edge_win,top_edge_avg_full_depth_settlement_pnl,top_edge_avg_conservative_settlement_pnl,top_edge_conservative_coverage_rate\n");
     for row in &report.baselines {
         out.push_str(&format!(
-            "{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{},{},{:.4},{:.4},{:.4},{:.4}\n",
+            "{},{},{},{},{:.6},{:.6},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
             row.model,
             row.n,
+            row.scoring_n,
+            row.scoring_population_n,
+            row.scoring_coverage_rate,
+            row.entry_edge_threshold,
             row.avg_predicted_q,
             row.actual_win_rate,
             row.brier_score,
@@ -3329,6 +4392,7 @@ pub fn format_settlement_probability_report(report: &SettlementProbabilityReport
             row.avg_edge,
             row.avg_full_depth_settlement_pnl,
             row.avg_conservative_settlement_pnl,
+            row.conservative_coverage_rate,
             row.profit_factor,
             row.edge_bucket_monotonic_non_decreasing,
             row.top_edge_count,
@@ -3336,6 +4400,7 @@ pub fn format_settlement_probability_report(report: &SettlementProbabilityReport
             row.top_edge_win_rate,
             row.top_edge_avg_full_depth_settlement_pnl,
             row.top_edge_avg_conservative_settlement_pnl,
+            row.top_edge_conservative_coverage_rate,
         ));
     }
     out.push_str("\n--- Calibration Buckets ---\n");
@@ -3425,35 +4490,48 @@ pub fn format_settlement_probability_walk_forward_report(
     let mut out = String::new();
     out.push_str("=== Settlement Probability Walk-Forward Report ===\n");
     out.push_str(&format!(
-        "train_window={} test_window={} step={} min_obs={} probability_min_bucket_obs={} top_edge_quantile={:.2}\n",
+        "train_window={} test_window={} step={} min_obs={} probability_min_bucket_obs={} min_paired_scoring_obs={} min_paired_scoring_coverage={:.4} top_edge_quantile={:.2} max_test_brier={:.4} max_test_log_loss={:.6} max_test_ece={:.4}\n",
         report.options.walk_forward.train_window_label(),
         report.options.walk_forward.test_window_label(),
         report.options.walk_forward.step_label(),
         report.options.walk_forward.review.min_observations,
         report.options.probability.min_bucket_observations,
+        report.options.min_paired_scoring_observations,
+        report.options.min_paired_scoring_coverage_rate,
         report.options.probability.top_edge_quantile,
+        report.options.max_test_brier_score,
+        report.options.max_test_log_loss,
+        report.options.max_test_expected_calibration_error,
     ));
-    out.push_str("Test windows evaluate formula probabilities on future rows; EventVolSurface and q_final use only the train window as empirical prior.\n");
+    if let Some(reason) = report.failure_reason.as_deref() {
+        out.push_str(&format!("failure_reason={reason}\n"));
+    }
+    out.push_str("Test windows evaluate formula probabilities on future rows; EventVolSurface and q_final use only the train window as empirical prior. Brier, log loss, and ECE use one paired scoring universe across every model available in the window. Entry edge thresholds are learned from train-event maxima; PnL uses each model's first chronological threshold trigger per event. Every built-in non-naive and typed candidate has one record per scheduled window; missing evidence is an explicit failure.\n");
     out.push_str("\n--- Aggregate ---\n");
-    out.push_str("model,windows,positive_window_ratio,pass_window_ratio,avg_test_brier,avg_test_ece,avg_test_top_edge_full_depth_pnl,min_test_top_edge_full_depth_pnl\n");
+    out.push_str("model,windows,complete_windows,positive_window_ratio,pass_window_ratio,avg_test_brier,avg_test_log_loss,avg_test_ece,avg_test_top_edge_full_depth_pnl,min_test_top_edge_full_depth_pnl,avg_test_top_edge_conservative_pnl,min_test_top_edge_conservative_pnl,min_top_edge_conservative_coverage_rate\n");
     for row in &report.aggregates {
         out.push_str(&format!(
-            "{},{},{:.4},{:.4},{:.6},{:.6},{:.4},{:.4}\n",
+            "{},{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
             row.model,
             row.windows,
+            row.complete_windows,
             row.positive_window_ratio,
             row.pass_window_ratio,
             row.avg_test_brier_score,
+            row.avg_test_log_loss,
             row.avg_test_expected_calibration_error,
             row.avg_test_top_edge_avg_full_depth_settlement_pnl,
             row.min_test_top_edge_avg_full_depth_settlement_pnl,
+            row.avg_test_top_edge_avg_conservative_settlement_pnl,
+            row.min_test_top_edge_avg_conservative_settlement_pnl,
+            row.min_top_edge_conservative_coverage_rate,
         ));
     }
     out.push_str("\n--- Windows ---\n");
-    out.push_str("window,model,train_start,train_end,test_start,test_end,train_n,test_n,train_brier,test_brier,train_ece,test_ece,train_top_edge_full_depth_pnl,test_top_edge_full_depth_pnl,test_top_edge_conservative_pnl,test_edge_monotonic,pass\n");
+    out.push_str("window,model,train_start,train_end,test_start,test_end,train_decision_n,test_decision_n,train_scoring_n,test_scoring_n,train_scoring_population_n,test_scoring_population_n,train_scoring_coverage_rate,test_scoring_coverage_rate,train_brier,test_brier,train_log_loss,test_log_loss,train_ece,test_ece,train_top_edge_full_depth_pnl,test_top_edge_full_depth_pnl,test_top_edge_conservative_pnl,train_top_edge_conservative_coverage_rate,test_top_edge_conservative_coverage_rate,test_edge_monotonic,pass,failure_reason\n");
     for row in &report.windows {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{}\n",
             row.window_index,
             row.model,
             row.train_start,
@@ -3462,15 +4540,26 @@ pub fn format_settlement_probability_walk_forward_report(
             row.test_end,
             row.train_n,
             row.test_n,
+            row.train_scoring_n,
+            row.test_scoring_n,
+            row.train_scoring_population_n,
+            row.test_scoring_population_n,
+            row.train_scoring_coverage_rate,
+            row.test_scoring_coverage_rate,
             row.train_brier_score,
             row.test_brier_score,
+            row.train_log_loss,
+            row.test_log_loss,
             row.train_expected_calibration_error,
             row.test_expected_calibration_error,
             row.train_top_edge_avg_full_depth_settlement_pnl,
             row.test_top_edge_avg_full_depth_settlement_pnl,
             row.test_top_edge_avg_conservative_settlement_pnl,
+            row.train_top_edge_conservative_coverage_rate,
+            row.test_top_edge_conservative_coverage_rate,
             row.test_edge_bucket_monotonic_non_decreasing,
             row.pass,
+            row.failure_reason.as_deref().unwrap_or(""),
         ));
     }
     out
@@ -3558,7 +4647,7 @@ fn walk_forward_factor_combo_v1_rows(
         })
         .collect();
 
-    walk_forward_factor_combo_from_v2_rows(source_rows, &v2_rows, &descriptors, start, end, options)
+    walk_forward_factor_combo_from_v2_rows(source_rows, v2_rows, &descriptors, start, end, options)
 }
 
 fn walk_forward_factor_combo_from_v2_rows(
@@ -3574,20 +4663,21 @@ fn walk_forward_factor_combo_from_v2_rows(
     let train_duration = options.walk_forward.train_duration();
     let test_duration = options.walk_forward.test_duration();
     let step_duration = options.walk_forward.step_duration();
+    let event_ends = inferred_event_ends(v2_rows);
     let mut train_start = start;
     let mut window_index = 0usize;
     while train_start + train_duration + test_duration <= end + Duration::seconds(1) {
         let train_end = train_start + train_duration;
         let test_start = train_end;
         let test_end = test_start + test_duration;
-        let train_rows: Vec<&FactorObservationV2> =
-            walk_forward_time_slice(&v2_rows, train_start, train_end)
-                .iter()
-                .collect();
-        let test_rows: Vec<&FactorObservationV2> =
-            walk_forward_time_slice(&v2_rows, test_start, test_end)
-                .iter()
-                .collect();
+        let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
+            v2_rows,
+            &event_ends,
+            train_start,
+            train_end,
+            test_start,
+            test_end,
+        );
 
         if train_rows.len() >= options.walk_forward.review.min_observations
             && test_rows.len() >= options.walk_forward.review.min_observations
@@ -3595,7 +4685,7 @@ fn walk_forward_factor_combo_from_v2_rows(
             if let Some(window) = fit_combo_v1_window(
                 &train_rows,
                 &test_rows,
-                &descriptors,
+                descriptors,
                 &options,
                 window_index,
                 train_start,
@@ -3648,7 +4738,7 @@ fn build_fillability_review_v1_report(
     v2_rows: &[FactorObservationV2],
     options: FillabilityReviewOptions,
 ) -> FillabilityReviewReport {
-    let health = build_data_health_report(source_rows, &v2_rows);
+    let health = build_data_health_report(source_rows, v2_rows);
     let mut rows = Vec::new();
     for spec in fillability_bucket_specs() {
         let mut buckets: BTreeMap<String, Vec<&FactorObservationV2>> = BTreeMap::new();
@@ -3884,8 +4974,8 @@ fn build_trade_formation_v1_report(
     options: TradeFormationReviewOptions,
 ) -> TradeFormationReviewReport {
     v2_rows.sort_by_key(|row| row.tick_ts);
-    let health = build_data_health_report(source_rows, &v2_rows);
-    let gate = build_liquidity_gate_v1_report(source_rows, &v2_rows, options.gate.clone());
+    let health = build_data_health_report(source_rows, v2_rows);
+    let gate = build_liquidity_gate_v1_report(source_rows, v2_rows, options.gate.clone());
     let gated = v2_rows
         .iter()
         .filter(|row| liquidity_gate_v1_accepts(row, &options.gate))
@@ -3977,12 +5067,13 @@ fn walk_forward_meta_label_v1_rows(
     options: MetaLabelWalkForwardOptions,
 ) -> MetaLabelWalkForwardReport {
     v2_rows.sort_by_key(|row| row.tick_ts);
-    let health = build_data_health_report(source_rows, &v2_rows);
-    let gate = build_liquidity_gate_v1_report(source_rows, &v2_rows, options.gate.clone());
+    let health = build_data_health_report(source_rows, v2_rows);
+    let gate = build_liquidity_gate_v1_report(source_rows, v2_rows, options.gate.clone());
     let mut windows = Vec::new();
     let train_duration = Duration::days(options.train_window_days.max(1));
     let test_duration = Duration::days(options.test_window_days.max(1));
     let step_duration = Duration::days(options.step_days.max(1));
+    let event_ends = inferred_event_ends(v2_rows);
     let mut train_start = start;
     let mut window_index = 0usize;
 
@@ -3990,14 +5081,20 @@ fn walk_forward_meta_label_v1_rows(
         let train_end = train_start + train_duration;
         let test_start = train_end;
         let test_end = test_start + test_duration;
-        let train_slice = walk_forward_time_slice(&v2_rows, train_start, train_end);
-        let test_slice = walk_forward_time_slice(&v2_rows, test_start, test_end);
+        let (train_slice, test_slice) = event_disjoint_walk_forward_slices(
+            v2_rows,
+            &event_ends,
+            train_start,
+            train_end,
+            test_start,
+            test_end,
+        );
         let train_gated = train_slice
-            .iter()
+            .into_iter()
             .filter(|row| liquidity_gate_v1_accepts(row, &options.gate))
             .collect::<Vec<_>>();
         let test_gated = test_slice
-            .iter()
+            .into_iter()
             .filter(|row| liquidity_gate_v1_accepts(row, &options.gate))
             .collect::<Vec<_>>();
 
@@ -6878,6 +7975,64 @@ fn walk_forward_time_slice(
     &rows[lo..hi]
 }
 
+type EventEndIndex<'a> = HashMap<&'a str, Option<DateTime<Utc>>>;
+
+fn inferred_event_ends(rows: &[FactorObservationV2]) -> EventEndIndex<'_> {
+    let mut event_ends = HashMap::new();
+    for row in rows {
+        let inferred = inferred_event_end(row);
+        match event_ends.entry(row.event_id.as_str()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(inferred);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let aggregated = match (entry.get().as_ref(), inferred) {
+                    (Some(current), Some(next)) => Some((*current).max(next)),
+                    _ => None,
+                };
+                entry.insert(aggregated);
+            }
+        }
+    }
+    event_ends
+}
+
+fn event_disjoint_walk_forward_slices<'a>(
+    rows: &'a [FactorObservationV2],
+    event_ends: &EventEndIndex<'_>,
+    train_start: DateTime<Utc>,
+    train_end: DateTime<Utc>,
+    test_start: DateTime<Utc>,
+    test_end: DateTime<Utc>,
+) -> (Vec<&'a FactorObservationV2>, Vec<&'a FactorObservationV2>) {
+    let train = walk_forward_time_slice(rows, train_start, train_end);
+    let test = walk_forward_time_slice(rows, test_start, test_end);
+    let ends_in = |row: &&FactorObservationV2, start, end| {
+        event_ends
+            .get(row.event_id.as_str())
+            .and_then(Option::as_ref)
+            .is_some_and(|event_end| *event_end >= start && *event_end < end)
+    };
+
+    (
+        train
+            .iter()
+            .filter(|row| ends_in(row, train_start, train_end))
+            .collect(),
+        test.iter()
+            .filter(|row| ends_in(row, test_start, test_end))
+            .collect(),
+    )
+}
+
+fn inferred_event_end(row: &FactorObservationV2) -> Option<DateTime<Utc>> {
+    if row.time_remaining_secs < 0 {
+        return None;
+    }
+    Duration::try_seconds(row.time_remaining_secs)
+        .and_then(|remaining| row.tick_ts.checked_add_signed(remaining))
+}
+
 fn evaluate_factor_threshold(
     rows: &[&FactorObservationV2],
     descriptor: FactorV2Descriptor,
@@ -7614,36 +8769,45 @@ fn side_market_values(row: &FactorObservation, side: ReviewSide) -> (f64, f64, f
 
 #[derive(Clone)]
 struct SettlementProbabilitySample {
+    event_id: String,
     symbol: String,
+    tick_ts: DateTime<Utc>,
+    side: ReviewSide,
     q: f64,
     win: f64,
     entry_price: f64,
     edge: f64,
     pnl: f64,
-    conservative_pnl: Option<f64>,
+    conservative_pnl: f64,
+    conservative_covered: bool,
 }
 
 fn push_settlement_probability_sample(
-    by_model: &mut BTreeMap<&'static str, Vec<SettlementProbabilitySample>>,
-    model: &'static str,
+    by_model: &mut BTreeMap<String, Vec<SettlementProbabilitySample>>,
+    model: &str,
     row: &FactorObservationV2,
     win: f64,
     pnl: f64,
+    conservative_pnl: Option<f64>,
     q: f64,
 ) {
     let q = clamp_probability(q);
     let entry_price = row.entry_sweep_avg_price_15u;
     by_model
-        .entry(model)
+        .entry(model.to_string())
         .or_default()
         .push(SettlementProbabilitySample {
+            event_id: row.event_id.clone(),
             symbol: row.symbol.clone(),
+            tick_ts: row.tick_ts,
+            side: row.side,
             q,
             win,
             entry_price,
             edge: q - entry_price,
             pnl,
-            conservative_pnl: row.label_conservative_executable_pnl_15u,
+            conservative_pnl: conservative_pnl.unwrap_or(0.0),
+            conservative_covered: conservative_pnl.is_some(),
         });
 }
 
@@ -7702,7 +8866,7 @@ struct EventVolSurface {
 
 impl EventVolSurface {
     fn fit(
-        rows: &[(&FactorObservationV2, f64, f64)],
+        rows: &[(&FactorObservationV2, f64, f64, Option<f64>)],
         min_bucket_observations: usize,
         shrinkage_observations: usize,
     ) -> Self {
@@ -7713,7 +8877,7 @@ impl EventVolSurface {
             buckets: HashMap::new(),
             events: HashMap::new(),
         };
-        for (row, win, _) in rows {
+        for (row, win, _, _) in rows {
             if !win.is_finite() {
                 continue;
             }
@@ -7791,10 +8955,13 @@ fn event_surface_distance_bucket(distance_z: f64) -> &'static str {
 }
 
 fn settlement_probability_models(row: &FactorObservationV2) -> Vec<(&'static str, f64)> {
-    let mut models = Vec::with_capacity(8);
+    let mut models = Vec::with_capacity(9);
     models.push(("q_naive_50_50", 0.5));
     if let Some(q) = settlement_market_midpoint_probability(row) {
         models.push(("q_market_midpoint", q));
+    }
+    if valid_probability(row.side_chainlink_prob) {
+        models.push(("q_chainlink_digital", row.side_chainlink_prob));
     }
     if row.side_distance_over_sigma.is_finite() {
         let base_z = row.side_distance_over_sigma;
@@ -7827,21 +8994,184 @@ fn settlement_probability_final_blend(
     row: &FactorObservationV2,
     event_surface_q: Option<f64>,
 ) -> Option<f64> {
+    settlement_probability_weighted_components(row, event_surface_q, 0.45, 0.0, 0.35, 0.20, 0.0)
+}
+
+fn validated_probability_blends(
+    prior: Option<&LlmPriorSpec>,
+) -> Vec<(String, &LlmProbabilityBlendSpec)> {
+    let mut by_name = BTreeMap::new();
+    let Some(prior) = prior.filter(|prior| validate_prediction_research_prior(prior).is_ok())
+    else {
+        return Vec::new();
+    };
+    for blend in &prior.probability_blends {
+        by_name
+            .entry(format!("q_llm_{}", blend.name))
+            .or_insert(blend);
+    }
+    by_name.into_iter().collect()
+}
+
+pub fn validate_prediction_research_prior(prior: &LlmPriorSpec) -> Result<(), &'static str> {
+    if prior.target.as_deref() != Some("full_depth_settlement_executable_pnl") {
+        return Err("target must be full_depth_settlement_executable_pnl");
+    }
+    if !prior
+        .mission_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty() && !value.trim().starts_with("REPLACE_WITH_"))
+    {
+        return Err("mission_id is required");
+    }
+    for (value, message) in [
+        (
+            prior.data_snapshot_id.as_deref(),
+            "data_snapshot_id must be a lowercase sha256 digest",
+        ),
+        (
+            prior.prompt_snapshot_id.as_deref(),
+            "prompt_snapshot_id must be a lowercase sha256 digest",
+        ),
+        (
+            prior.search_policy_snapshot_id.as_deref(),
+            "search_policy_snapshot_id must be a lowercase sha256 digest",
+        ),
+    ] {
+        if !value.is_some_and(valid_sha256_snapshot_id) {
+            return Err(message);
+        }
+    }
+    if !matches!(prior.symbols.as_slice(), [symbol] if matches!(symbol.as_str(), "BTC" | "SOL")) {
+        return Err("exactly one canonical BTC or SOL symbol is required");
+    }
+    if prior.horizon.as_deref() != Some("5m") {
+        return Err("horizon must be 5m");
+    }
+    if !prior.mutations.is_empty() {
+        return Err("prediction prior may not contain factor mutations");
+    }
+    if prior.probability_blends.is_empty() {
+        return Err("prediction prior must contain at least one probability blend");
+    }
+    let mut names = BTreeSet::new();
+    for blend in &prior.probability_blends {
+        if !probability_blend_schema_valid(blend) {
+            return Err("probability blend is invalid");
+        }
+        if !names.insert(blend.name.as_str()) {
+            return Err("probability blend names must be unique");
+        }
+    }
+    Ok(())
+}
+
+fn valid_sha256_snapshot_id(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn prediction_prior_matches_row(prior: &LlmPriorSpec, row: &FactorObservationV2) -> bool {
+    if prior.symbols.is_empty() {
+        return true;
+    }
+    let row_symbol = normalized_underlying_symbol(&row.symbol);
+    prior
+        .symbols
+        .iter()
+        .any(|symbol| normalized_underlying_symbol(symbol) == row_symbol)
+}
+
+fn probability_blend_weights_valid(blend: &LlmProbabilityBlendSpec) -> bool {
+    let weights = [
+        blend.market_midpoint_weight,
+        blend.chainlink_digital_weight,
+        blend.distance_lob_vol_weight,
+        blend.event_surface_weight,
+        blend.existing_model_weight,
+    ];
+    let total = weights.iter().sum::<f64>();
+    weights
+        .iter()
+        .all(|weight| weight.is_finite() && *weight >= 0.0)
+        && total.is_finite()
+        && total > EPS
+}
+
+fn probability_blend_schema_valid(blend: &LlmProbabilityBlendSpec) -> bool {
+    !blend.name.is_empty()
+        && blend.name.len() <= 80
+        && !blend.hypothesis.trim().is_empty()
+        && blend.hypothesis.chars().count() <= 500
+        && blend
+            .name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        && probability_blend_weights_valid(blend)
+}
+
+fn settlement_probability_weighted_blend(
+    row: &FactorObservationV2,
+    event_surface_q: Option<f64>,
+    blend: &LlmProbabilityBlendSpec,
+) -> Option<f64> {
+    if !probability_blend_weights_valid(blend) {
+        return None;
+    }
+    settlement_probability_weighted_components(
+        row,
+        event_surface_q,
+        blend.market_midpoint_weight,
+        blend.chainlink_digital_weight,
+        blend.distance_lob_vol_weight,
+        blend.event_surface_weight,
+        blend.existing_model_weight,
+    )
+}
+
+fn settlement_probability_weighted_components(
+    row: &FactorObservationV2,
+    event_surface_q: Option<f64>,
+    market_midpoint_weight: f64,
+    chainlink_digital_weight: f64,
+    distance_lob_vol_weight: f64,
+    event_surface_weight: f64,
+    existing_model_weight: f64,
+) -> Option<f64> {
+    let components = [
+        (
+            settlement_market_midpoint_probability(row),
+            market_midpoint_weight,
+        ),
+        (
+            valid_probability(row.side_chainlink_prob).then_some(row.side_chainlink_prob),
+            chainlink_digital_weight,
+        ),
+        (
+            settlement_distance_lob_vol_probability(row),
+            distance_lob_vol_weight,
+        ),
+        (event_surface_q, event_surface_weight),
+        (
+            valid_probability(row.side_model_prob).then_some(row.side_model_prob),
+            existing_model_weight,
+        ),
+    ];
+    if components
+        .iter()
+        .any(|(q, weight)| *weight > 0.0 && !q.is_some_and(valid_probability))
+    {
+        return None;
+    }
     let mut logit_sum = 0.0;
     let mut total_weight = 0.0;
-    add_probability_component(
-        &mut logit_sum,
-        &mut total_weight,
-        settlement_market_midpoint_probability(row),
-        0.45,
-    );
-    add_probability_component(
-        &mut logit_sum,
-        &mut total_weight,
-        settlement_distance_lob_vol_probability(row),
-        0.35,
-    );
-    add_probability_component(&mut logit_sum, &mut total_weight, event_surface_q, 0.20);
+    for (q, weight) in components {
+        add_probability_component(&mut logit_sum, &mut total_weight, q, weight);
+    }
     if total_weight <= EPS {
         None
     } else {
@@ -7970,42 +9300,128 @@ fn add_finite_component(score: &mut f64, weight: &mut f64, value: f64, component
     }
 }
 
+fn top_edge_threshold(
+    samples: &[SettlementProbabilitySample],
+    top_edge_quantile: f64,
+) -> Option<f64> {
+    edge_quantile_threshold(samples.iter().map(|sample| sample.edge), top_edge_quantile)
+}
+
+fn edge_quantile_threshold(
+    edges: impl IntoIterator<Item = f64>,
+    top_edge_quantile: f64,
+) -> Option<f64> {
+    let mut edges = edges
+        .into_iter()
+        .filter(|edge| edge.is_finite())
+        .collect::<Vec<_>>();
+    edges.sort_by(|a, b| b.total_cmp(a));
+    let top_n = ((edges.len() as f64) * top_edge_quantile.clamp(0.01, 1.0))
+        .ceil()
+        .max(1.0) as usize;
+    edges.get(top_n.saturating_sub(1)).copied()
+}
+
+fn training_entry_edge_threshold(
+    samples: &[SettlementProbabilitySample],
+    top_edge_quantile: f64,
+) -> Option<f64> {
+    let mut max_edge_by_event = BTreeMap::<(&str, &str), f64>::new();
+    for sample in samples.iter().filter(|sample| sample.edge.is_finite()) {
+        max_edge_by_event
+            .entry((sample.symbol.as_str(), sample.event_id.as_str()))
+            .and_modify(|edge| *edge = edge.max(sample.edge))
+            .or_insert(sample.edge);
+    }
+    edge_quantile_threshold(max_edge_by_event.into_values(), top_edge_quantile)
+}
+
+fn first_event_decisions(
+    samples: &[SettlementProbabilitySample],
+    entry_edge_threshold: f64,
+) -> Vec<SettlementProbabilitySample> {
+    let mut ordered = samples
+        .iter()
+        .filter(|sample| sample.edge.is_finite() && sample.edge >= entry_edge_threshold)
+        .cloned()
+        .collect::<Vec<_>>();
+    ordered.sort_by(|a, b| {
+        a.tick_ts
+            .cmp(&b.tick_ts)
+            .then_with(|| b.edge.total_cmp(&a.edge))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+            .then_with(|| a.event_id.cmp(&b.event_id))
+    });
+    let mut seen = BTreeSet::new();
+    ordered
+        .into_iter()
+        .filter(|sample| seen.insert((sample.symbol.clone(), sample.event_id.clone())))
+        .collect()
+}
+
 fn build_probability_baseline_row(
     model: &str,
-    samples: &[SettlementProbabilitySample],
+    decision_samples: &[SettlementProbabilitySample],
+    scoring_samples: &[SettlementProbabilitySample],
+    scoring_population_n: usize,
     calibration: &[SettlementProbabilityCalibrationRow],
     edge_buckets: &[SettlementProbabilityEdgeBucketRow],
     top_edge_quantile: f64,
+    entry_edge_threshold: f64,
 ) -> SettlementProbabilityBaselineRow {
-    let n = samples.len();
+    let n = decision_samples.len();
+    let scoring_n = scoring_samples.len();
     let top_n = ((n as f64) * top_edge_quantile).ceil().max(1.0) as usize;
-    let mut by_edge = samples.to_vec();
+    let mut by_edge = decision_samples.to_vec();
     by_edge.sort_by(|a, b| b.edge.total_cmp(&a.edge));
     let top = by_edge.into_iter().take(top_n).collect::<Vec<_>>();
     SettlementProbabilityBaselineRow {
         model: model.to_string(),
         n,
-        avg_predicted_q: mean(samples.iter().map(|sample| sample.q)),
-        actual_win_rate: mean(samples.iter().map(|sample| sample.win)),
-        brier_score: mean(samples.iter().map(|sample| (sample.q - sample.win).powi(2))),
-        log_loss: mean(samples.iter().map(|sample| {
+        scoring_n,
+        scoring_population_n,
+        scoring_coverage_rate: ratio(scoring_n, scoring_population_n),
+        entry_edge_threshold,
+        avg_predicted_q: mean(scoring_samples.iter().map(|sample| sample.q)),
+        actual_win_rate: mean(scoring_samples.iter().map(|sample| sample.win)),
+        brier_score: mean(
+            scoring_samples
+                .iter()
+                .map(|sample| (sample.q - sample.win).powi(2)),
+        ),
+        log_loss: mean(scoring_samples.iter().map(|sample| {
             let q = clamp_probability(sample.q);
             -(sample.win * q.ln() + (1.0 - sample.win) * (1.0 - q).ln())
         })),
-        expected_calibration_error: expected_calibration_error(calibration, n),
-        avg_edge: mean(samples.iter().map(|sample| sample.edge)),
-        avg_full_depth_settlement_pnl: mean(samples.iter().map(|sample| sample.pnl)),
+        expected_calibration_error: expected_calibration_error(calibration, scoring_n),
+        avg_edge: mean(decision_samples.iter().map(|sample| sample.edge)),
+        avg_full_depth_settlement_pnl: mean(decision_samples.iter().map(|sample| sample.pnl)),
         avg_conservative_settlement_pnl: mean(
-            samples.iter().filter_map(|sample| sample.conservative_pnl),
+            decision_samples
+                .iter()
+                .map(|sample| sample.conservative_pnl),
         ),
-        profit_factor: profit_factor(samples.iter().map(|sample| sample.pnl)),
+        conservative_coverage_rate: ratio(
+            decision_samples
+                .iter()
+                .filter(|sample| sample.conservative_covered)
+                .count(),
+            n,
+        ),
+        profit_factor: profit_factor(decision_samples.iter().map(|sample| sample.pnl)),
         edge_bucket_monotonic_non_decreasing: edge_bucket_monotonic(edge_buckets),
         top_edge_count: top.len(),
         top_edge_avg_edge: mean(top.iter().map(|sample| sample.edge)),
         top_edge_win_rate: mean(top.iter().map(|sample| sample.win)),
         top_edge_avg_full_depth_settlement_pnl: mean(top.iter().map(|sample| sample.pnl)),
         top_edge_avg_conservative_settlement_pnl: mean(
-            top.iter().filter_map(|sample| sample.conservative_pnl),
+            top.iter().map(|sample| sample.conservative_pnl),
+        ),
+        top_edge_conservative_coverage_rate: ratio(
+            top.iter()
+                .filter(|sample| sample.conservative_covered)
+                .count(),
+            top.len(),
         ),
     }
 }
@@ -8037,9 +9453,7 @@ fn build_probability_calibration_rows(
                 avg_edge: mean(bucket_samples.iter().map(|sample| sample.edge)),
                 avg_full_depth_settlement_pnl: mean(bucket_samples.iter().map(|sample| sample.pnl)),
                 avg_conservative_settlement_pnl: mean(
-                    bucket_samples
-                        .iter()
-                        .filter_map(|sample| sample.conservative_pnl),
+                    bucket_samples.iter().map(|sample| sample.conservative_pnl),
                 ),
             }
         })
@@ -8078,15 +9492,11 @@ fn build_probability_edge_bucket_rows(
             ),
             avg_full_depth_settlement_pnl: mean(bucket_samples.iter().map(|sample| sample.pnl)),
             avg_conservative_settlement_pnl: mean(
-                bucket_samples
-                    .iter()
-                    .filter_map(|sample| sample.conservative_pnl),
+                bucket_samples.iter().map(|sample| sample.conservative_pnl),
             ),
             profit_factor: profit_factor(bucket_samples.iter().map(|sample| sample.pnl)),
             conservative_profit_factor: profit_factor(
-                bucket_samples
-                    .iter()
-                    .filter_map(|sample| sample.conservative_pnl),
+                bucket_samples.iter().map(|sample| sample.conservative_pnl),
             ),
         });
     }
@@ -8346,7 +9756,7 @@ fn build_settlement_probability_ablation_rows(
         };
         for candidate in baselines {
             if candidate.model == reference.model
-                || candidate.n != reference.n
+                || candidate.scoring_n != reference.scoring_n
                 || !is_ablation_candidate(&candidate.model, reference_model)
             {
                 continue;
@@ -8354,7 +9764,7 @@ fn build_settlement_probability_ablation_rows(
             rows.push(SettlementProbabilityAblationRow {
                 model: candidate.model.clone(),
                 reference_model: reference.model.clone(),
-                n: candidate.n,
+                n: candidate.scoring_n,
                 delta_brier_score: candidate.brier_score - reference.brier_score,
                 delta_log_loss: candidate.log_loss - reference.log_loss,
                 delta_expected_calibration_error: candidate.expected_calibration_error
@@ -8528,6 +9938,11 @@ fn side_row(
                 1.0 - row.settlement_up,
             )
         }
+    };
+    let side_chainlink_prob = match side {
+        ReviewSide::Up => row.chainlink_prob_up,
+        ReviewSide::Down if row.chainlink_prob_up.is_finite() => 1.0 - row.chainlink_prob_up,
+        ReviewSide::Down => f64::NAN,
     };
 
     let entry_shares = if valid_price(entry_ask) {
@@ -8716,6 +10131,7 @@ fn side_row(
         regime: Regime::from_secs(row.time_remaining_secs),
         side,
         side_model_prob,
+        side_chainlink_prob,
         side_fair_prob,
         side_model_edge,
         side_distance_over_sigma,
@@ -9757,11 +11173,540 @@ mod tests {
         assert!(!anti_overfit_pass(0.18, 0.16, 2.12, 2.05));
     }
 
+    fn probability_sample(
+        event_id: &str,
+        tick_ts: DateTime<Utc>,
+        edge: f64,
+        pnl: f64,
+    ) -> SettlementProbabilitySample {
+        SettlementProbabilitySample {
+            event_id: event_id.to_string(),
+            symbol: "BTCUSDT".to_string(),
+            tick_ts,
+            side: ReviewSide::Up,
+            q: 0.5 + edge,
+            win: 1.0,
+            entry_price: 0.5,
+            edge,
+            pnl,
+            conservative_pnl: pnl,
+            conservative_covered: true,
+        }
+    }
+
+    #[test]
+    fn oos_probability_decisions_use_train_threshold_and_first_event_trigger() {
+        let start = Utc::now();
+        let train = vec![
+            probability_sample("train-a", start, 0.09, 1.0),
+            probability_sample("train-a", start + Duration::seconds(1), 0.01, 1.0),
+            probability_sample("train-b", start, 0.08, 1.0),
+            probability_sample("train-c", start, 0.02, 1.0),
+        ];
+        let threshold = training_entry_edge_threshold(&train, 0.5).expect("train threshold");
+        assert!((threshold - 0.08).abs() < 1e-12);
+
+        let test = vec![
+            probability_sample("test-a", start, 0.081, 1.0),
+            probability_sample("test-a", start + Duration::seconds(1), 0.099, 99.0),
+            probability_sample("test-b", start, 0.085, 22.0),
+            probability_sample("test-b", start, 0.09, 2.0),
+            probability_sample("test-c", start, 0.079, 3.0),
+        ];
+        let thresholds = BTreeMap::from([("q_test".to_string(), threshold)]);
+        let report = settlement_probability_report_from_model_samples(
+            BTreeMap::from([("q_test".to_string(), test)]),
+            ProbabilityDecisionSelection::FixedThresholds(&thresholds),
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+        let baseline = report.baselines.first().expect("OOS baseline");
+        assert_eq!(baseline.n, 2);
+        assert_eq!(baseline.top_edge_count, 2);
+        assert!((baseline.avg_full_depth_settlement_pnl - 1.5).abs() < 1e-12);
+        assert!((baseline.entry_edge_threshold - threshold).abs() < 1e-12);
+    }
+
+    #[test]
+    fn oos_probability_quality_scores_use_a_paired_universe_but_pnl_uses_model_triggers() {
+        let start = Utc::now();
+        let model_a = vec![
+            probability_sample("paired-a", start, 0.40, 1.0),
+            probability_sample("paired-b", start + Duration::seconds(1), 0.10, 1.0),
+            probability_sample("unpaired-c", start + Duration::seconds(2), 0.01, 100.0),
+        ];
+        let model_b = vec![
+            probability_sample("paired-a", start, 0.30, 10.0),
+            probability_sample("paired-b", start + Duration::seconds(1), 0.20, 20.0),
+        ];
+        let thresholds = BTreeMap::from([
+            ("q_model_a".to_string(), 0.05),
+            ("q_model_b".to_string(), 0.25),
+        ]);
+        let report = settlement_probability_report_from_model_samples(
+            BTreeMap::from([
+                ("q_model_a".to_string(), model_a),
+                ("q_model_b".to_string(), model_b),
+            ]),
+            ProbabilityDecisionSelection::FixedThresholds(&thresholds),
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+        let a = report
+            .baselines
+            .iter()
+            .find(|row| row.model == "q_model_a")
+            .expect("model A baseline");
+        let b = report
+            .baselines
+            .iter()
+            .find(|row| row.model == "q_model_b")
+            .expect("model B baseline");
+
+        assert_eq!((a.scoring_n, b.scoring_n), (2, 2));
+        assert_eq!((a.scoring_population_n, b.scoring_population_n), (3, 3));
+        assert!((a.scoring_coverage_rate - (2.0 / 3.0)).abs() < 1e-12);
+        assert!((b.scoring_coverage_rate - (2.0 / 3.0)).abs() < 1e-12);
+        assert_eq!((a.n, b.n), (2, 1));
+        assert!((a.brier_score - 0.085).abs() < 1e-12);
+        assert!((b.brier_score - 0.065).abs() < 1e-12);
+        assert!((a.avg_full_depth_settlement_pnl - 1.0).abs() < 1e-12);
+        assert!((b.avg_full_depth_settlement_pnl - 10.0).abs() < 1e-12);
+
+        let expected = BTreeSet::from(["q_model_a".to_string(), "q_model_b".to_string()]);
+        let bounds = ProbabilityWalkForwardWindowBounds {
+            window_index: 0,
+            train_start: start,
+            train_end: start + Duration::hours(1),
+            test_start: start + Duration::hours(1),
+            test_end: start + Duration::hours(2),
+        };
+        let coverage_options = SettlementProbabilityWalkForwardOptions {
+            min_paired_scoring_observations: 1,
+            min_paired_scoring_coverage_rate: 1.0,
+            ..Default::default()
+        };
+        let coverage_failed = settlement_probability_walk_forward_windows(
+            bounds,
+            &report,
+            &report,
+            &expected,
+            &coverage_options,
+        );
+        assert!(coverage_failed.iter().all(|row| {
+            !row.pass
+                && !settlement_probability_window_evidence_complete(row)
+                && row
+                    .failure_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("insufficient_paired_scoring_coverage"))
+        }));
+
+        let observation_options = SettlementProbabilityWalkForwardOptions {
+            min_paired_scoring_observations: 3,
+            min_paired_scoring_coverage_rate: 0.5,
+            ..Default::default()
+        };
+        let observations_failed = settlement_probability_walk_forward_windows(
+            bounds,
+            &report,
+            &report,
+            &expected,
+            &observation_options,
+        );
+        assert!(observations_failed.iter().all(|row| {
+            !row.pass
+                && !settlement_probability_window_evidence_complete(row)
+                && row.failure_reason.as_deref().is_some_and(|reason| {
+                    reason.contains("insufficient_paired_scoring_observations")
+                })
+        }));
+    }
+
+    fn probability_model_report(model: &str) -> SettlementProbabilityReport {
+        settlement_probability_report_from_model_samples(
+            BTreeMap::from([(
+                model.to_string(),
+                vec![probability_sample("event", Utc::now(), 0.49, 1.0)],
+            )]),
+            ProbabilityDecisionSelection::AllRows,
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn probability_test_prior(name: &str) -> LlmPriorSpec {
+        LlmPriorSpec {
+            target: Some("full_depth_settlement_executable_pnl".to_string()),
+            mission_id: Some("polymarket-btc-5m-test".to_string()),
+            data_snapshot_id: Some(format!("sha256:{}", "a".repeat(64))),
+            prompt_snapshot_id: Some(format!("sha256:{}", "b".repeat(64))),
+            search_policy_snapshot_id: Some(format!("sha256:{}", "c".repeat(64))),
+            symbols: vec!["BTC".to_string()],
+            horizon: Some("5m".to_string()),
+            probability_blends: vec![LlmProbabilityBlendSpec {
+                name: name.to_string(),
+                hypothesis: "A complete OOS matrix must fail closed.".to_string(),
+                market_midpoint_weight: 1.0,
+                chainlink_digital_weight: 0.0,
+                distance_lob_vol_weight: 0.0,
+                event_surface_weight: 0.0,
+                existing_model_weight: 0.0,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn missing_candidate_window_is_explicit_and_cannot_search_pass() {
+        let model = "q_llm_complete_matrix";
+        let expected = BTreeSet::from([model.to_string()]);
+        let options = SettlementProbabilityWalkForwardOptions {
+            min_paired_scoring_observations: 1,
+            probability: SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let train = probability_model_report(model);
+        let test = probability_model_report(model);
+        let empty = SettlementProbabilityReport {
+            options: options.probability.clone(),
+            baselines: Vec::new(),
+            calibration: Vec::new(),
+            edge_buckets: Vec::new(),
+            anti_overfit: Vec::new(),
+            symbol_holdouts: Vec::new(),
+            ablations: Vec::new(),
+        };
+        let start = Utc::now();
+        let bounds = |window_index| ProbabilityWalkForwardWindowBounds {
+            window_index,
+            train_start: start + Duration::days(window_index as i64),
+            train_end: start + Duration::days(window_index as i64 + 1),
+            test_start: start + Duration::days(window_index as i64 + 1),
+            test_end: start + Duration::days(window_index as i64 + 2),
+        };
+        let mut windows = settlement_probability_walk_forward_windows(
+            bounds(0),
+            &train,
+            &test,
+            &expected,
+            &options,
+        );
+        windows.extend(settlement_probability_walk_forward_windows(
+            bounds(1),
+            &train,
+            &empty,
+            &expected,
+            &options,
+        ));
+
+        assert_eq!(windows.len(), 2);
+        let missing = &windows[1];
+        assert_eq!(missing.model, model);
+        assert_eq!(missing.test_n, 0);
+        assert_eq!(
+            missing.failure_reason.as_deref(),
+            Some("missing_test_model_evidence")
+        );
+        assert!(!missing.pass);
+
+        let aggregate = aggregate_settlement_probability_walk_forward_windows(&windows)
+            .pop()
+            .expect("candidate aggregate");
+        assert_eq!(aggregate.windows, 2);
+        assert_eq!(aggregate.complete_windows, 1);
+        assert_eq!(aggregate.pass_window_ratio, 0.5);
+        assert_eq!(
+            aggregate.min_test_top_edge_avg_full_depth_settlement_pnl,
+            0.0
+        );
+        assert_eq!(aggregate.min_top_edge_conservative_coverage_rate, 0.0);
+        let baseline = SettlementProbabilityWalkForwardAggregate {
+            model: "q_market_midpoint".to_string(),
+            windows: 2,
+            complete_windows: 2,
+            positive_window_ratio: 1.0,
+            pass_window_ratio: 1.0,
+            avg_test_brier_score: 0.2,
+            avg_test_log_loss: 0.6,
+            avg_test_expected_calibration_error: 0.04,
+            avg_test_top_edge_avg_full_depth_settlement_pnl: 0.5,
+            min_test_top_edge_avg_full_depth_settlement_pnl: 0.1,
+            avg_test_top_edge_avg_conservative_settlement_pnl: 0.5,
+            min_test_top_edge_avg_conservative_settlement_pnl: 0.1,
+            min_top_edge_conservative_coverage_rate: 1.0,
+        };
+        let feedback = build_prediction_research_feedback(
+            &probability_test_prior("complete_matrix"),
+            &SettlementProbabilityWalkForwardReport {
+                options,
+                windows,
+                aggregates: vec![baseline, aggregate],
+                failure_reason: None,
+            },
+            0.6,
+        )
+        .expect("candidate feedback");
+        let candidate = &feedback.candidates[0];
+        assert_eq!(candidate.verdict, "discard");
+        assert!(candidate.metrics.avg_test_brier_score.is_none());
+        assert!(candidate
+            .reason_codes
+            .contains(&"incomplete_oos_window_coverage".to_string()));
+        assert!(candidate
+            .reason_codes
+            .contains(&"brier_gate_failed".to_string()));
+    }
+
+    #[test]
+    fn insufficient_raw_window_still_emits_candidate_failure() {
+        let start = Utc::now();
+        let prior = probability_test_prior("raw_sample_gap");
+        let report = walk_forward_settlement_probability_report_with_prior(
+            &[],
+            start,
+            start + Duration::days(3),
+            Some(&prior),
+            SettlementProbabilityWalkForwardOptions::default(),
+        );
+
+        let expected_models = expected_settlement_probability_candidate_models(Some(&prior));
+        assert_eq!(report.windows.len(), expected_models.len());
+        let candidate = report
+            .windows
+            .iter()
+            .find(|row| row.model == "q_llm_raw_sample_gap")
+            .expect("typed candidate placeholder");
+        assert_eq!(candidate.train_n, 0);
+        assert_eq!(candidate.test_n, 0);
+        assert_eq!(
+            candidate.failure_reason.as_deref(),
+            Some("missing_train_and_test_model_evidence")
+        );
+        assert!(!candidate.pass);
+        let candidate_aggregate = report
+            .aggregates
+            .iter()
+            .find(|row| row.model == candidate.model)
+            .expect("typed candidate aggregate");
+        assert_eq!(candidate_aggregate.windows, 1);
+        assert_eq!(candidate_aggregate.complete_windows, 0);
+        assert_eq!(
+            candidate_aggregate.min_test_top_edge_avg_full_depth_settlement_pnl,
+            0.0
+        );
+    }
+
+    #[test]
+    fn walk_forward_emits_every_expected_model_for_every_non_overlapping_test_window() {
+        let start = Utc::now();
+        let prior = probability_test_prior("complete_cardinality");
+        let expected_models = expected_settlement_probability_candidate_models(Some(&prior));
+        let report = walk_forward_settlement_probability_report_with_prior(
+            &[],
+            start,
+            start + Duration::hours(4),
+            Some(&prior),
+            SettlementProbabilityWalkForwardOptions {
+                min_paired_scoring_observations: 1,
+                walk_forward: FactorWalkForwardOptions {
+                    train_window_hours: Some(1),
+                    test_window_hours: Some(1),
+                    step_hours: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(report.windows.len(), 3 * expected_models.len());
+        for window_index in 0..3 {
+            let models = report
+                .windows
+                .iter()
+                .filter(|row| row.window_index == window_index)
+                .map(|row| row.model.as_str())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(models.len(), expected_models.len());
+            assert!(expected_models
+                .iter()
+                .all(|model| models.contains(model.as_str())));
+        }
+        let candidate_windows = report
+            .windows
+            .iter()
+            .filter(|row| row.model == "q_llm_complete_cardinality")
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_windows.len(), 3);
+        assert!(candidate_windows
+            .windows(2)
+            .all(|pair| pair[0].test_end == pair[1].test_start));
+        assert!(candidate_windows.iter().all(|row| {
+            row.failure_reason.as_deref() == Some("missing_train_and_test_model_evidence")
+        }));
+        assert!(report.aggregates.iter().all(|row| row.windows == 3));
+        assert!(report
+            .aggregates
+            .iter()
+            .all(|row| row.complete_windows == 0));
+        assert!(best_walk_forward_oos_model(&report, 0.0).is_none());
+        let feedback =
+            build_prediction_research_feedback(&prior, &report, 0.0).expect("failure feedback");
+        let candidate = feedback
+            .candidates
+            .iter()
+            .find(|row| row.model == "q_llm_complete_cardinality")
+            .expect("typed failure feedback");
+        assert_eq!(candidate.verdict, "discard");
+        assert!(candidate.metrics.best_baseline_brier_score.is_none());
+        assert!(candidate
+            .reason_codes
+            .contains(&"missing_baseline_comparison".to_string()));
+
+        let formatted = format_settlement_probability_walk_forward_report(&report);
+        assert!(formatted.contains("complete_windows"));
+        assert!(formatted.contains("failure_reason"));
+        assert!(formatted.contains("missing_train_and_test_model_evidence"));
+    }
+
+    #[test]
+    fn missing_builtin_model_is_a_failed_placeholder_while_supported_models_remain_complete() {
+        let start = Utc::now();
+        let mut train = base_obs();
+        train.event_id = "builtin-train".to_string();
+        train.tick_ts = start + Duration::minutes(10);
+        train.time_remaining_secs = 600;
+        train.chainlink_prob_up = f64::NAN;
+        let mut test = train.clone();
+        test.event_id = "builtin-test".to_string();
+        test.tick_ts = start + Duration::hours(1) + Duration::minutes(10);
+        let mut rows = build_factor_observations_v2(
+            &[train, test],
+            &FactorReviewOptions {
+                min_observations: 1,
+                ..Default::default()
+            },
+        );
+        make_settlement_probability_eligible(&mut rows);
+
+        let report = walk_forward_settlement_probability_report(
+            &rows,
+            start,
+            start + Duration::hours(2),
+            SettlementProbabilityWalkForwardOptions {
+                min_paired_scoring_observations: 1,
+                walk_forward: FactorWalkForwardOptions {
+                    review: FactorReviewOptions {
+                        min_observations: 1,
+                        ..Default::default()
+                    },
+                    train_window_hours: Some(1),
+                    test_window_hours: Some(1),
+                    step_hours: Some(1),
+                    ..Default::default()
+                },
+                probability: SettlementProbabilityReportOptions {
+                    min_bucket_observations: 1,
+                    event_surface_min_bucket_observations: 1,
+                    event_surface_shrinkage_observations: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let market = report
+            .windows
+            .iter()
+            .find(|row| row.model == "q_market_midpoint")
+            .expect("market midpoint matrix row");
+        assert!(market.failure_reason.is_none());
+        assert!(settlement_probability_window_evidence_complete(market));
+        let chainlink = report
+            .windows
+            .iter()
+            .find(|row| row.model == "q_chainlink_digital")
+            .expect("Chainlink matrix row");
+        assert_eq!(
+            chainlink.failure_reason.as_deref(),
+            Some("missing_train_and_test_model_evidence")
+        );
+        assert!(!settlement_probability_window_evidence_complete(chainlink));
+        let chainlink_aggregate = report
+            .aggregates
+            .iter()
+            .find(|row| row.model == "q_chainlink_digital")
+            .expect("Chainlink aggregate");
+        assert_eq!(
+            (
+                chainlink_aggregate.windows,
+                chainlink_aggregate.complete_windows
+            ),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn settlement_probability_walk_forward_rejects_invalid_windows_without_panicking() {
+        let start = Utc::now();
+        let options = SettlementProbabilityWalkForwardOptions {
+            walk_forward: FactorWalkForwardOptions {
+                test_window_hours: Some(2),
+                step_hours: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let error = try_walk_forward_settlement_probability_report(
+            &[],
+            start,
+            start + Duration::hours(6),
+            options.clone(),
+        )
+        .expect_err("overlapping windows must fail");
+        assert!(matches!(
+            error,
+            SettlementProbabilityWalkForwardError::OverlappingTestWindows { .. }
+        ));
+
+        let fail_closed = walk_forward_settlement_probability_report(
+            &[],
+            start,
+            start + Duration::hours(6),
+            options,
+        );
+        assert!(fail_closed.windows.is_empty());
+        assert!(fail_closed
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("overlap")));
+
+        assert!(matches!(
+            try_walk_forward_settlement_probability_report(
+                &[],
+                start,
+                start,
+                SettlementProbabilityWalkForwardOptions::default(),
+            ),
+            Err(SettlementProbabilityWalkForwardError::InvalidTimeRange { .. })
+        ));
+    }
+
     fn base_obs() -> FactorObservation {
         FactorObservation {
             event_id: "evt".into(),
             symbol: "BTCUSDT".into(),
             tick_ts: Utc::now(),
+            event_window_secs: 300,
             time_remaining_secs: 220,
             signed_distance_to_beat: 0.01,
             abs_distance_to_beat: 0.01,
@@ -9777,6 +11722,7 @@ mod tests {
             vol_gap: 0.0,
             distance_over_sigma: 1.0,
             model_prob_up: 0.7,
+            chainlink_prob_up: f64::NAN,
             model_edge_up: 0.2,
             reward_risk_up: 1.0,
             reward_risk_down: 1.0,
@@ -9814,6 +11760,20 @@ mod tests {
             cex_consecutive_up_bars: 2.0,
             cex_consecutive_down_bars: 0.0,
             cex_breakout_volume_score: 1.2,
+        }
+    }
+
+    fn make_settlement_probability_eligible(rows: &mut [FactorObservationV2]) {
+        for row in rows {
+            row.label_full_depth_entry_fillable = true;
+            row.label_conservative_entry_fillable = true;
+            row.entry_sweep_avg_price_15u = row.entry_ask;
+            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
+            let pnl = row
+                .label_settlement_win
+                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
+            row.label_full_depth_executable_pnl_15u = pnl;
+            row.label_conservative_executable_pnl_15u = pnl;
         }
     }
 
@@ -9954,14 +11914,7 @@ mod tests {
     fn settlement_probability_report_uses_full_depth_entry_population() {
         let options = FactorReviewOptions::default();
         let mut rows = build_factor_observations_v2(&[base_obs()], &options);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
         let base_rows = rows.clone();
         rows.extend(base_rows.iter().cloned());
         rows.extend(base_rows.iter().cloned());
@@ -10017,7 +11970,7 @@ mod tests {
         let text = format_settlement_probability_report(&report);
         assert!(text.contains("Settlement Probability Report"));
         assert!(text.contains("q_base_distance_phi"));
-        assert!(text.contains("q_final_logit_blend"));
+        assert!(!text.contains("q_final_logit_blend"));
         assert!(text.contains("full_depth_settlement_pnl"));
         assert!(text.contains("Anti-Overfit Diagnostics"));
         assert!(text.contains("Symbol Holdout Diagnostics"));
@@ -10043,14 +11996,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut rows = build_factor_observations_v2(&source_rows, &options);
         rows.retain(|row| row.side == ReviewSide::Up);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
 
         let report = build_settlement_probability_report(
             &rows,
@@ -10096,14 +12042,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut rows = build_factor_observations_v2(&source_rows, &options);
         rows.retain(|row| row.side == ReviewSide::Up);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
 
         let event_surface = EventVolSurface::fit(
             &rows
@@ -10113,6 +12052,7 @@ mod tests {
                         row,
                         row.label_settlement_win.unwrap(),
                         row.label_full_depth_executable_pnl_15u.unwrap(),
+                        row.label_conservative_executable_pnl_15u,
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -10147,6 +12087,664 @@ mod tests {
     }
 
     #[test]
+    fn settlement_probability_requires_complete_conservative_capacity_labels() {
+        let source_rows = (0..4)
+            .map(|idx| {
+                let mut obs = base_obs();
+                obs.event_id = format!("conservative-{idx}");
+                obs.tick_ts += Duration::seconds(idx);
+                obs
+            })
+            .collect::<Vec<_>>();
+        let mut rows = build_factor_observations_v2(
+            &source_rows,
+            &FactorReviewOptions {
+                min_observations: 1,
+                ..Default::default()
+            },
+        );
+        rows.retain(|row| row.side == ReviewSide::Up);
+        make_settlement_probability_eligible(&mut rows);
+        rows[1].label_conservative_executable_pnl_15u = None;
+        rows[2].label_conservative_executable_pnl_15u = Some(f64::NAN);
+        rows[3].label_conservative_entry_fillable = false;
+
+        let report = build_settlement_probability_report(
+            &rows,
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                top_edge_quantile: 1.0,
+                event_surface_min_bucket_observations: 1,
+                event_surface_shrinkage_observations: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(!report.baselines.is_empty());
+        assert!(report.baselines.iter().all(|row| row.n == 4));
+        assert!(report
+            .baselines
+            .iter()
+            .all(|row| row.avg_conservative_settlement_pnl.is_finite()));
+        assert!(report
+            .baselines
+            .iter()
+            .all(|row| (row.conservative_coverage_rate - 0.25).abs() < 1e-9));
+        assert!(report
+            .baselines
+            .iter()
+            .all(|row| (row.top_edge_conservative_coverage_rate - 0.25).abs() < 1e-9));
+        assert!(best_conservative_edge_model(&report).is_none());
+
+        for row in &mut rows {
+            row.label_conservative_executable_pnl_15u = None;
+        }
+        let uncovered = build_settlement_probability_report(
+            &rows,
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                top_edge_quantile: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(uncovered.baselines.iter().all(|row| row.n == 4));
+        assert!(uncovered.baselines.iter().all(|row| {
+            row.conservative_coverage_rate == 0.0 && row.avg_conservative_settlement_pnl == 0.0
+        }));
+        assert!(best_conservative_edge_model(&uncovered).is_none());
+    }
+
+    #[test]
+    fn typed_prior_probability_blend_enters_probability_evaluator() {
+        let options = FactorReviewOptions::default();
+        let mut source_rows = (0..8)
+            .map(|idx| {
+                let mut obs = base_obs();
+                obs.event_id = format!("prior-blend-{idx}");
+                obs.tick_ts = Utc::now() + Duration::hours(idx);
+                obs.settlement_up = if idx % 2 == 0 { 1.0 } else { 0.0 };
+                obs.pm_up_bid = 0.35 + idx as f64 * 0.02;
+                obs.pm_up_ask = obs.pm_up_bid + 0.02;
+                obs.distance_over_sigma = if idx % 2 == 0 { 0.8 } else { -0.6 };
+                obs
+            })
+            .collect::<Vec<_>>();
+        let mut sol = source_rows[0].clone();
+        sol.event_id = "prior-blend-sol".to_string();
+        sol.symbol = "SOLUSDT".to_string();
+        sol.tick_ts += Duration::minutes(30);
+        source_rows.push(sol);
+        let mut rows = build_factor_observations_v2(&source_rows, &options);
+        rows.retain(|row| row.side == ReviewSide::Up);
+        make_settlement_probability_eligible(&mut rows);
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "polymarket-btc-5m-v1",
+            "data_snapshot_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "prompt_snapshot_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "search_policy_snapshot_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "symbols": ["BTC"],
+            "horizon": "5m",
+            "probability_blends": [{
+                "name": "microstructure",
+                "hypothesis": "CEX-informed components improve BTC calibration.",
+                "market_midpoint_weight": 0.4,
+                "chainlink_digital_weight": 0.0,
+                "distance_lob_vol_weight": 0.4,
+                "event_surface_weight": 0.2,
+                "existing_model_weight": 0.0
+            }]
+        }))
+        .expect("typed prior");
+
+        let report = build_settlement_probability_report_with_prior(
+            &rows,
+            Some(&prior),
+            SettlementProbabilityReportOptions {
+                bucket_count: 2,
+                min_bucket_observations: 1,
+                top_edge_quantile: 0.5,
+                event_surface_min_bucket_observations: 1,
+                event_surface_shrinkage_observations: 1,
+            },
+        );
+
+        let candidate = report
+            .baselines
+            .iter()
+            .find(|row| row.model == "q_llm_microstructure")
+            .expect("prior blend should be evaluated as probability");
+        assert!(candidate.brier_score.is_finite());
+        assert!(candidate.log_loss.is_finite());
+        assert!(candidate.expected_calibration_error.is_finite());
+        assert_eq!(candidate.n, 8, "SOL rows must stay outside the BTC mission");
+    }
+
+    #[test]
+    fn chainlink_only_typed_blend_preserves_binary_complements() {
+        let mut observation = base_obs();
+        observation.chainlink_prob_up = 0.73;
+        let rows = build_factor_observations_v2(&[observation], &FactorReviewOptions::default());
+        let blend = crate::autofactor::LlmProbabilityBlendSpec {
+            name: "chainlink_only".to_string(),
+            hypothesis: "Fresh Chainlink endpoint probability is the sole component.".to_string(),
+            market_midpoint_weight: 0.0,
+            chainlink_digital_weight: 1.0,
+            distance_lob_vol_weight: 0.0,
+            event_surface_weight: 0.0,
+            existing_model_weight: 0.0,
+        };
+
+        for (side, expected) in [(ReviewSide::Up, 0.73), (ReviewSide::Down, 0.27)] {
+            let row = rows
+                .iter()
+                .find(|row| row.side == side)
+                .expect("both binary sides");
+            let probability = settlement_probability_weighted_blend(row, None, &blend)
+                .expect("valid Chainlink-only blend");
+            assert!((probability - expected).abs() < 1e-12);
+        }
+
+        let mut missing_chainlink = rows[0].clone();
+        missing_chainlink.side_chainlink_prob = f64::NAN;
+        assert!(settlement_probability_weighted_blend(&missing_chainlink, None, &blend).is_none());
+
+        let prior = crate::autofactor::LlmPriorSpec {
+            target: Some("full_depth_settlement_executable_pnl".to_string()),
+            mission_id: Some("polymarket-btc-5m-v1".to_string()),
+            data_snapshot_id: Some(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            prompt_snapshot_id: Some(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            ),
+            search_policy_snapshot_id: Some(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            ),
+            symbols: vec!["BTC".to_string()],
+            horizon: Some("5m".to_string()),
+            probability_blends: vec![blend.clone()],
+            ..Default::default()
+        };
+        let mut eligible_rows = rows.clone();
+        make_settlement_probability_eligible(&mut eligible_rows);
+        let report = build_settlement_probability_report_with_prior(
+            &eligible_rows,
+            Some(&prior),
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                top_edge_quantile: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(report
+            .baselines
+            .iter()
+            .any(|row| row.model == "q_llm_chainlink_only"));
+        assert!(report
+            .baselines
+            .iter()
+            .any(|row| row.model == "q_chainlink_digital"));
+
+        eligible_rows[0].side_chainlink_prob = f64::NAN;
+        let incomplete = build_settlement_probability_report_with_prior(
+            &eligible_rows,
+            Some(&prior),
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                top_edge_quantile: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(incomplete
+            .baselines
+            .iter()
+            .all(|row| row.model != "q_llm_chainlink_only"));
+        assert!(incomplete
+            .baselines
+            .iter()
+            .all(|row| row.model != "q_chainlink_digital"));
+
+        let legacy: crate::autofactor::LlmProbabilityBlendSpec =
+            serde_json::from_value(serde_json::json!({
+                "name": "legacy",
+                "hypothesis": "An old prior keeps its original blend.",
+                "market_midpoint_weight": 1.0,
+                "distance_lob_vol_weight": 0.0,
+                "event_surface_weight": 0.0,
+                "existing_model_weight": 0.0
+            }))
+            .expect("legacy blend");
+        assert_eq!(legacy.chainlink_digital_weight, 0.0);
+    }
+
+    #[test]
+    fn typed_probability_blend_requires_complete_nonzero_components() {
+        let mut second = base_obs();
+        second.event_id = "typed-completeness-2".to_string();
+        second.tick_ts += Duration::seconds(1);
+        let mut rows =
+            build_factor_observations_v2(&[base_obs(), second], &FactorReviewOptions::default());
+        rows.retain(|row| row.side == ReviewSide::Up);
+        make_settlement_probability_eligible(&mut rows);
+        let blend = LlmProbabilityBlendSpec {
+            name: "existing_only".to_string(),
+            hypothesis: "Every eligible event must carry the weighted model probability."
+                .to_string(),
+            market_midpoint_weight: 0.0,
+            chainlink_digital_weight: 0.0,
+            distance_lob_vol_weight: 0.0,
+            event_surface_weight: 0.0,
+            existing_model_weight: 1.0,
+        };
+        rows[1].side_model_prob = f64::NAN;
+        assert!(settlement_probability_weighted_blend(&rows[1], None, &blend).is_none());
+
+        let prior = LlmPriorSpec {
+            target: Some("full_depth_settlement_executable_pnl".to_string()),
+            mission_id: Some("polymarket-btc-5m-completeness".to_string()),
+            data_snapshot_id: Some(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            prompt_snapshot_id: Some(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            ),
+            search_policy_snapshot_id: Some(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            ),
+            symbols: vec!["BTC".to_string()],
+            horizon: Some("5m".to_string()),
+            probability_blends: vec![blend],
+            ..Default::default()
+        };
+        let report = build_settlement_probability_report_with_prior(
+            &rows,
+            Some(&prior),
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+        assert!(report
+            .baselines
+            .iter()
+            .all(|row| row.model != "q_llm_existing_only"));
+    }
+
+    #[test]
+    fn invalid_typed_probability_blends_fail_closed() {
+        let options = FactorReviewOptions::default();
+        let mut rows = build_factor_observations_v2(&[base_obs()], &options);
+        make_settlement_probability_eligible(&mut rows);
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "polymarket-btc-5m-invalid",
+            "data_snapshot_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "prompt_snapshot_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "search_policy_snapshot_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "symbols": ["BTC"],
+            "horizon": "5m",
+            "probability_blends": [
+                {
+                    "name": "negative",
+                    "hypothesis": "Negative weights must be rejected.",
+                    "market_midpoint_weight": -1.0,
+                    "chainlink_digital_weight": 0.0,
+                    "distance_lob_vol_weight": 1.0,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0
+                },
+                {
+                    "name": "all_zero",
+                    "hypothesis": "Zero total weight must be rejected.",
+                    "market_midpoint_weight": 0.0,
+                    "chainlink_digital_weight": 0.0,
+                    "distance_lob_vol_weight": 0.0,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0
+                },
+                {
+                    "name": "overflow",
+                    "hypothesis": "Overflowing total weight must be rejected.",
+                    "market_midpoint_weight": 1e308,
+                    "chainlink_digital_weight": 0.0,
+                    "distance_lob_vol_weight": 1e308,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0
+                }
+            ]
+        }))
+        .expect("typed prior");
+
+        let report = build_settlement_probability_report_with_prior(
+            &rows,
+            Some(&prior),
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(!report
+            .baselines
+            .iter()
+            .any(|row| row.model.starts_with("q_llm_")));
+    }
+
+    #[test]
+    fn multi_symbol_probability_prior_fails_closed() {
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "mixed-symbol-mission",
+            "data_snapshot_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "prompt_snapshot_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "search_policy_snapshot_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "symbols": ["BTC", "SOL"],
+            "horizon": "5m",
+            "probability_blends": [{
+                "name": "mixed",
+                "hypothesis": "A mixed-symbol candidate must not be evaluated.",
+                "market_midpoint_weight": 1.0,
+                "chainlink_digital_weight": 0.0,
+                "distance_lob_vol_weight": 0.0,
+                "event_surface_weight": 0.0,
+                "existing_model_weight": 0.0
+            }]
+        }))
+        .expect("typed prior");
+
+        assert!(validate_prediction_research_prior(&prior).is_err());
+        assert!(validated_probability_blends(Some(&prior)).is_empty());
+    }
+
+    #[test]
+    fn prediction_prior_requires_canonical_symbol_and_snapshot_digests() {
+        let mut prior = LlmPriorSpec {
+            target: Some("full_depth_settlement_executable_pnl".to_string()),
+            mission_id: Some("polymarket-btc-5m-boundary".to_string()),
+            data_snapshot_id: Some(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            prompt_snapshot_id: Some(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            ),
+            search_policy_snapshot_id: Some(
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            ),
+            symbols: vec!["BTC".to_string()],
+            horizon: Some("5m".to_string()),
+            probability_blends: vec![LlmProbabilityBlendSpec {
+                name: "boundary".to_string(),
+                hypothesis: "The trust boundary accepts only frozen mission evidence.".to_string(),
+                market_midpoint_weight: 1.0,
+                chainlink_digital_weight: 0.0,
+                distance_lob_vol_weight: 0.0,
+                event_surface_weight: 0.0,
+                existing_model_weight: 0.0,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(validate_prediction_research_prior(&prior), Ok(()));
+
+        prior.symbols = vec!["ETH".to_string()];
+        assert_eq!(
+            validate_prediction_research_prior(&prior),
+            Err("exactly one canonical BTC or SOL symbol is required")
+        );
+        prior.symbols = vec!["SOL".to_string()];
+        prior.data_snapshot_id = Some("sha256:short".to_string());
+        assert_eq!(
+            validate_prediction_research_prior(&prior),
+            Err("data_snapshot_id must be a lowercase sha256 digest")
+        );
+        prior.data_snapshot_id = Some(
+            "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        );
+        assert_eq!(
+            validate_prediction_research_prior(&prior),
+            Err("data_snapshot_id must be a lowercase sha256 digest")
+        );
+    }
+
+    #[test]
+    fn prediction_prior_rejects_formula_mutations_and_empty_blends() {
+        let base = serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "blend-only-mission",
+            "data_snapshot_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "prompt_snapshot_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "search_policy_snapshot_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "symbols": ["BTC"],
+            "horizon": "5m"
+        });
+        let empty: crate::autofactor::LlmPriorSpec =
+            serde_json::from_value(base.clone()).expect("empty typed prior");
+        assert_eq!(
+            validate_prediction_research_prior(&empty),
+            Err("prediction prior must contain at least one probability blend")
+        );
+
+        let mut formula = base;
+        formula["mutations"] = serde_json::json!([{
+            "base_factor": "auto_settlement_model_full_depth_settlement_edge",
+            "mutation_type": "add_capacity_gate",
+            "hypothesis": "A formula mutation must not cross into the blend-only loop."
+        }]);
+        formula["probability_blends"] = serde_json::json!([{
+            "name": "otherwise_valid",
+            "hypothesis": "The blend itself is valid.",
+            "market_midpoint_weight": 1.0,
+            "chainlink_digital_weight": 0.0,
+            "distance_lob_vol_weight": 0.0,
+            "event_surface_weight": 0.0,
+            "existing_model_weight": 0.0
+        }]);
+        let formula: crate::autofactor::LlmPriorSpec =
+            serde_json::from_value(formula).expect("formula typed prior");
+        assert_eq!(
+            validate_prediction_research_prior(&formula),
+            Err("prediction prior may not contain factor mutations")
+        );
+        assert!(validated_probability_blends(Some(&formula)).is_empty());
+    }
+
+    #[test]
+    fn prediction_feedback_rejects_non_finite_or_invalid_gate_policy_without_panicking() {
+        let prior = probability_test_prior("invalid_gate");
+        let report = SettlementProbabilityWalkForwardReport {
+            options: SettlementProbabilityWalkForwardOptions::default(),
+            windows: Vec::new(),
+            aggregates: Vec::new(),
+            failure_reason: None,
+        };
+
+        assert_eq!(
+            try_build_prediction_research_feedback(&prior, &report, f64::NAN),
+            Err("min_positive_window_ratio must be finite and within [0, 1]".to_string())
+        );
+        assert!(build_prediction_research_feedback(&prior, &report, f64::NAN).is_none());
+
+        let mut invalid_report = report;
+        invalid_report.options.max_test_brier_score = -1.0;
+        assert_eq!(
+            try_build_prediction_research_feedback(&prior, &invalid_report, 0.6),
+            Err("prediction feedback gate policy is invalid".to_string())
+        );
+        assert!(build_prediction_research_feedback(&prior, &invalid_report, 0.6).is_none());
+    }
+
+    #[test]
+    fn prediction_feedback_is_candidate_specific_and_machine_readable() {
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "polymarket-sol-5m-v1",
+            "data_snapshot_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "prompt_snapshot_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "search_policy_snapshot_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "symbols": ["SOL"],
+            "horizon": "5m",
+            "probability_blends": [
+                {
+                    "name": "sol_flow",
+                    "hypothesis": "SOL flow components improve OOS calibration.",
+                    "market_midpoint_weight": 0.5,
+                    "chainlink_digital_weight": 0.0,
+                    "distance_lob_vol_weight": 0.3,
+                    "event_surface_weight": 0.2,
+                    "existing_model_weight": 0.0
+                },
+                {
+                    "name": "no_oos",
+                    "hypothesis": "This candidate still requires OOS evidence.",
+                    "market_midpoint_weight": 1.0,
+                    "chainlink_digital_weight": 0.0,
+                    "distance_lob_vol_weight": 0.0,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0
+                }
+            ]
+        }))
+        .expect("typed prior");
+        let report = SettlementProbabilityWalkForwardReport {
+            options: SettlementProbabilityWalkForwardOptions::default(),
+            windows: Vec::new(),
+            aggregates: vec![SettlementProbabilityWalkForwardAggregate {
+                model: "q_llm_sol_flow".to_string(),
+                windows: 3,
+                complete_windows: 3,
+                positive_window_ratio: 1.0,
+                pass_window_ratio: 0.0,
+                avg_test_brier_score: 0.40,
+                avg_test_log_loss: 0.80,
+                avg_test_expected_calibration_error: 0.20,
+                avg_test_top_edge_avg_full_depth_settlement_pnl: -1.0,
+                min_test_top_edge_avg_full_depth_settlement_pnl: -2.0,
+                avg_test_top_edge_avg_conservative_settlement_pnl: -1.5,
+                min_test_top_edge_avg_conservative_settlement_pnl: -2.5,
+                min_top_edge_conservative_coverage_rate: 1.0,
+            }],
+            failure_reason: None,
+        };
+
+        let feedback =
+            build_prediction_research_feedback(&prior, &report, 0.6).expect("mission feedback");
+
+        assert_eq!(feedback.mission_id, "polymarket-sol-5m-v1");
+        assert_eq!(feedback.target, "full_depth_settlement_executable_pnl");
+        assert_eq!(feedback.symbols, ["SOL"]);
+        assert_eq!(feedback.horizon, "5m");
+        assert_eq!(
+            feedback.data_snapshot_id,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(feedback.candidates.len(), 2);
+        let sol_feedback = feedback
+            .candidates
+            .iter()
+            .find(|candidate| candidate.model == "q_llm_sol_flow")
+            .expect("SOL feedback");
+        assert!(sol_feedback.hypothesis.contains("SOL flow"));
+        assert_eq!(sol_feedback.probability_blend.name, "sol_flow");
+        assert_eq!(sol_feedback.verdict, "discard");
+        assert!(sol_feedback
+            .reason_codes
+            .contains(&"calibration_gate_failed".to_string()));
+        assert!(sol_feedback
+            .reason_codes
+            .contains(&"nonpositive_oos_conservative_capacity_pnl".to_string()));
+        assert_eq!(sol_feedback.metrics.avg_test_brier_score, Some(0.40));
+        let no_oos = feedback
+            .candidates
+            .iter()
+            .find(|candidate| candidate.model == "q_llm_no_oos")
+            .expect("no-OOS feedback");
+        assert_eq!(no_oos.verdict, "discard");
+        assert_eq!(no_oos.reason_codes, ["no_oos_windows"]);
+
+        let mut incomplete = report.clone();
+        incomplete.aggregates[0].min_top_edge_conservative_coverage_rate = 0.5;
+        let incomplete_feedback = build_prediction_research_feedback(&prior, &incomplete, 0.6)
+            .expect("incomplete capacity feedback");
+        assert!(incomplete_feedback
+            .candidates
+            .iter()
+            .find(|candidate| candidate.model == "q_llm_sol_flow")
+            .expect("SOL feedback")
+            .reason_codes
+            .contains(&"incomplete_oos_top_edge_conservative_capacity_coverage".to_string()));
+    }
+
+    #[test]
+    fn prediction_feedback_requires_incremental_value_over_existing_baselines() {
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "polymarket-btc-5m-v1",
+            "data_snapshot_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "prompt_snapshot_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "search_policy_snapshot_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "symbols": ["BTC"],
+            "horizon": "5m",
+            "probability_blends": [{
+                "name": "binance_incremental",
+                "hypothesis": "Binance flow adds incremental OOS value.",
+                "market_midpoint_weight": 0.5,
+                "chainlink_digital_weight": 0.2,
+                "distance_lob_vol_weight": 0.3,
+                "event_surface_weight": 0.0,
+                "existing_model_weight": 0.0
+            }]
+        }))
+        .expect("typed prior");
+        let aggregate = |model: &str, brier: f64, log_loss: f64, conservative_pnl: f64| {
+            SettlementProbabilityWalkForwardAggregate {
+                model: model.to_string(),
+                windows: 3,
+                complete_windows: 3,
+                positive_window_ratio: 1.0,
+                pass_window_ratio: 1.0,
+                avg_test_brier_score: brier,
+                avg_test_log_loss: log_loss,
+                avg_test_expected_calibration_error: 0.05,
+                avg_test_top_edge_avg_full_depth_settlement_pnl: conservative_pnl + 0.5,
+                min_test_top_edge_avg_full_depth_settlement_pnl: 0.5,
+                avg_test_top_edge_avg_conservative_settlement_pnl: conservative_pnl,
+                min_test_top_edge_avg_conservative_settlement_pnl: 0.25,
+                min_top_edge_conservative_coverage_rate: 1.0,
+            }
+        };
+        let mut report = SettlementProbabilityWalkForwardReport {
+            options: SettlementProbabilityWalkForwardOptions::default(),
+            windows: Vec::new(),
+            aggregates: vec![
+                aggregate("q_market_midpoint", 0.18, 0.45, 1.6),
+                aggregate("q_llm_binance_incremental", 0.20, 0.50, 1.5),
+            ],
+            failure_reason: None,
+        };
+        let worse = build_prediction_research_feedback(&prior, &report, 0.6)
+            .expect("worse candidate feedback");
+        assert_eq!(worse.candidates[0].verdict, "discard");
+        assert!(worse.candidates[0]
+            .reason_codes
+            .contains(&"no_incremental_brier_vs_baseline".to_string()));
+
+        report.aggregates[1] = aggregate("q_llm_binance_incremental", 0.16, 0.40, 2.0);
+        let better = build_prediction_research_feedback(&prior, &report, 0.6)
+            .expect("better candidate feedback");
+        assert_eq!(better.candidates[0].verdict, "search_pass");
+        assert!(better.candidates[0].reason_codes.is_empty());
+    }
+
+    #[test]
     fn settlement_probability_walk_forward_uses_train_surface_for_test_window() {
         let start = Utc::now();
         let source_rows = (0..8)
@@ -10165,19 +12763,32 @@ mod tests {
             .collect::<Vec<_>>();
         let mut rows = build_factor_observations_v2(&source_rows, &FactorReviewOptions::default());
         rows.retain(|row| row.side == ReviewSide::Up);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
 
-        let report = walk_forward_settlement_probability_report(
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "polymarket-btc-5m-v1",
+            "data_snapshot_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "prompt_snapshot_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "search_policy_snapshot_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "symbols": ["BTC"],
+            "horizon": "5m",
+            "probability_blends": [{
+                "name": "walk_forward",
+                "hypothesis": "The blend improves event-disjoint OOS calibration.",
+                "market_midpoint_weight": 0.4,
+                "chainlink_digital_weight": 0.0,
+                "distance_lob_vol_weight": 0.4,
+                "event_surface_weight": 0.2,
+                "existing_model_weight": 0.0
+            }]
+        }))
+        .expect("typed prior");
+        let report = walk_forward_settlement_probability_report_with_prior(
             &rows,
             start,
             start + Duration::days(4),
+            Some(&prior),
             SettlementProbabilityWalkForwardOptions {
                 walk_forward: FactorWalkForwardOptions {
                     review: FactorReviewOptions {
@@ -10195,6 +12806,7 @@ mod tests {
                     event_surface_shrinkage_observations: 1,
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -10206,9 +12818,88 @@ mod tests {
             .aggregates
             .iter()
             .any(|row| row.model == "q_final_logit_blend"));
+        assert!(report
+            .aggregates
+            .iter()
+            .any(|row| row.model == "q_llm_walk_forward"));
         let text = format_settlement_probability_walk_forward_report(&report);
         assert!(text.contains("Settlement Probability Walk-Forward Report"));
         assert!(text.contains("EventVolSurface and q_final use only the train window"));
+    }
+
+    #[test]
+    fn settlement_probability_walk_forward_assigns_crossing_event_to_its_end_window() {
+        let start = Utc::now();
+        let boundary = start + Duration::hours(12);
+        let mut source_rows = Vec::new();
+        for (event_id, tick_ts) in [
+            ("train-only", start + Duration::hours(1)),
+            ("crossing", boundary - Duration::minutes(1)),
+            ("crossing", boundary + Duration::minutes(1)),
+            ("test-only", boundary + Duration::hours(1)),
+        ] {
+            let mut row = base_obs();
+            row.event_id = event_id.to_string();
+            row.tick_ts = tick_ts;
+            source_rows.push(row);
+        }
+        let mut rows = build_factor_observations_v2(
+            &source_rows,
+            &FactorReviewOptions {
+                min_observations: 1,
+                ..Default::default()
+            },
+        );
+        rows.retain(|row| row.side == ReviewSide::Up);
+        rows.sort_by_key(|row| row.tick_ts);
+
+        let (train, test) = event_disjoint_walk_forward_slices(
+            &rows,
+            &inferred_event_ends(&rows),
+            start,
+            boundary,
+            boundary,
+            boundary + Duration::hours(12),
+        );
+
+        assert_eq!(
+            train
+                .iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["train-only"]
+        );
+        assert_eq!(
+            test.iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["crossing", "test-only"]
+        );
+    }
+
+    #[test]
+    fn walk_forward_excludes_unsettled_train_event_without_test_ticks() {
+        let start = Utc::now();
+        let boundary = start + Duration::hours(12);
+        let mut source = base_obs();
+        source.event_id = "unsettled".to_string();
+        source.tick_ts = boundary - Duration::minutes(1);
+        source.time_remaining_secs = 120;
+        let mut rows = build_factor_observations_v2(&[source], &FactorReviewOptions::default());
+        rows.retain(|row| row.side == ReviewSide::Up);
+        rows.sort_by_key(|row| row.tick_ts);
+
+        let (train, test) = event_disjoint_walk_forward_slices(
+            &rows,
+            &inferred_event_ends(&rows),
+            start,
+            boundary,
+            boundary,
+            boundary + Duration::hours(12),
+        );
+
+        assert!(train.is_empty());
+        assert!(test.is_empty());
     }
 
     #[test]
@@ -10230,14 +12921,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut rows = build_factor_observations_v2(&source_rows, &FactorReviewOptions::default());
         rows.retain(|row| row.side == ReviewSide::Up);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
 
         let report = walk_forward_settlement_probability_report(
             &rows,
@@ -10260,6 +12944,7 @@ mod tests {
                     event_surface_shrinkage_observations: 1,
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -10276,12 +12961,53 @@ mod tests {
     }
 
     #[test]
+    fn settlement_probability_oos_requires_all_probability_quality_gates() {
+        let mut report = SettlementProbabilityWalkForwardReport {
+            options: SettlementProbabilityWalkForwardOptions::default(),
+            windows: Vec::new(),
+            aggregates: vec![SettlementProbabilityWalkForwardAggregate {
+                model: "q_final_logit_blend".to_string(),
+                windows: 3,
+                complete_windows: 3,
+                positive_window_ratio: 1.0,
+                pass_window_ratio: 1.0,
+                avg_test_brier_score: 0.1,
+                avg_test_log_loss: 0.2,
+                avg_test_expected_calibration_error: 0.01,
+                avg_test_top_edge_avg_full_depth_settlement_pnl: 2.0,
+                min_test_top_edge_avg_full_depth_settlement_pnl: 1.0,
+                avg_test_top_edge_avg_conservative_settlement_pnl: 1.5,
+                min_test_top_edge_avg_conservative_settlement_pnl: 0.5,
+                min_top_edge_conservative_coverage_rate: 1.0,
+            }],
+            failure_reason: None,
+        };
+
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_some());
+        report.aggregates[0].avg_test_brier_score = 0.3;
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
+        report.aggregates[0].avg_test_brier_score = 0.1;
+        report.aggregates[0].avg_test_log_loss = 0.8;
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
+        report.aggregates[0].avg_test_log_loss = 0.2;
+        report.aggregates[0].avg_test_expected_calibration_error = 0.1;
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
+        report.aggregates[0].avg_test_expected_calibration_error = 0.01;
+        report.aggregates[0].min_top_edge_conservative_coverage_rate = 0.99;
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
+    }
+
+    #[test]
     fn settlement_probability_promotion_gate_tracks_pending_post_dryrun_replay_parity() {
         let probability = SettlementProbabilityReport {
             options: SettlementProbabilityReportOptions::default(),
             baselines: vec![SettlementProbabilityBaselineRow {
                 model: "q_final_logit_blend".to_string(),
                 n: 100,
+                scoring_n: 100,
+                scoring_population_n: 100,
+                scoring_coverage_rate: 1.0,
+                entry_edge_threshold: 0.05,
                 avg_predicted_q: 0.7,
                 actual_win_rate: 0.7,
                 brier_score: 0.1,
@@ -10290,6 +13016,7 @@ mod tests {
                 avg_edge: 0.05,
                 avg_full_depth_settlement_pnl: 1.0,
                 avg_conservative_settlement_pnl: 0.8,
+                conservative_coverage_rate: 1.0,
                 profit_factor: 1.2,
                 edge_bucket_monotonic_non_decreasing: true,
                 top_edge_count: 20,
@@ -10297,6 +13024,7 @@ mod tests {
                 top_edge_win_rate: 0.8,
                 top_edge_avg_full_depth_settlement_pnl: 2.0,
                 top_edge_avg_conservative_settlement_pnl: 1.5,
+                top_edge_conservative_coverage_rate: 1.0,
             }],
             calibration: Vec::new(),
             edge_buckets: Vec::new(),
@@ -10338,13 +13066,19 @@ mod tests {
             aggregates: vec![SettlementProbabilityWalkForwardAggregate {
                 model: "q_final_logit_blend".to_string(),
                 windows: 3,
+                complete_windows: 3,
                 positive_window_ratio: 1.0,
                 pass_window_ratio: 1.0,
                 avg_test_brier_score: 0.1,
+                avg_test_log_loss: 0.2,
                 avg_test_expected_calibration_error: 0.01,
                 avg_test_top_edge_avg_full_depth_settlement_pnl: 2.0,
                 min_test_top_edge_avg_full_depth_settlement_pnl: 1.0,
+                avg_test_top_edge_avg_conservative_settlement_pnl: 1.5,
+                min_test_top_edge_avg_conservative_settlement_pnl: 0.5,
+                min_top_edge_conservative_coverage_rate: 1.0,
             }],
+            failure_reason: None,
         };
         let execution = FullDepthExecutionMatrixReport {
             options: FullDepthExecutionMatrixOptions::default(),
@@ -10392,12 +13126,35 @@ mod tests {
             },
         );
         assert!(pending_parity.ready_for_dry_run_handoff);
+        assert!(pending_parity.gates.iter().any(|gate| {
+            gate.gate == "walk_forward_oos" && gate.evidence.contains("complete_windows=3")
+        }));
         assert!(pending_parity
             .gates
             .iter()
             .any(|gate| gate.gate == "recorded_replay_parity"
                 && !gate.passed
                 && gate.evidence.contains("post-dry-run gate pending")));
+
+        let mut incomplete_walk_forward = walk_forward.clone();
+        incomplete_walk_forward.aggregates[0].complete_windows = 2;
+        let rejected_oos = build_settlement_probability_promotion_gate_report(
+            &probability,
+            &incomplete_walk_forward,
+            &execution,
+            &execution,
+            SettlementProbabilityPromotionGateOptions {
+                include_deribit: false,
+                data_audit_status: Some("ok".to_string()),
+                replay_parity_ready: true,
+                ..Default::default()
+            },
+        );
+        assert!(rejected_oos.gates.iter().any(|gate| {
+            gate.gate == "walk_forward_oos"
+                && !gate.passed
+                && gate.evidence.contains("windows=3 complete_windows=2")
+        }));
 
         let ready = build_settlement_probability_promotion_gate_report(
             &probability,
@@ -10484,6 +13241,7 @@ mod tests {
             options: SettlementProbabilityWalkForwardOptions::default(),
             windows: Vec::new(),
             aggregates: Vec::new(),
+            failure_reason: None,
         };
         let execution = FullDepthExecutionMatrixReport {
             options: FullDepthExecutionMatrixOptions::default(),

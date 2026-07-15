@@ -81,8 +81,10 @@ to continue research, not a reason to deploy.
 
 Reports must name the data surfaces used and the surfaces missing:
 
-- Binance spot or trade ticks: external price movement.
-- Binance L2 / LOB: depth, pressure, and short-term execution context.
+- Chainlink opening and close observations: contract reference and official
+  settlement truth for governed PM5D crypto events.
+- Binance spot or trade ticks: external predictive movement and repricing input.
+- Binance L2 / LOB: external depth, pressure, and short-term repricing context.
 - Polymarket quote ticks: top-of-book PM market state.
 - Polymarket full CLOB depth: executable sweep, capacity, and conservative
   fillability.
@@ -90,6 +92,11 @@ Reports must name the data surfaces used and the surfaces missing:
   accounting.
 - Dry-run/runtime fills: observed execution behavior, not a substitute for
   official settlement labels.
+
+Binance is never the PM5D opening reference, settlement oracle, or executable
+venue. Polymarket CLOB data is never a substitute for Chainlink settlement
+truth, and Chainlink observations are never a substitute for CLOB price, fees,
+depth, or fillability.
 
 FactorEvolve data surfaces use these fail-closed categories:
 

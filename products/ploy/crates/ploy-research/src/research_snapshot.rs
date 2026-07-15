@@ -1,15 +1,29 @@
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::{self, File};
+#[cfg(feature = "db")]
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "polars-export")]
+use std::io::Cursor;
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "db")]
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "db")]
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike, Utc};
+#[cfg(feature = "db")]
+use chrono::Timelike;
+use chrono::{DateTime, Utc};
+use rustix::fd::OwnedFd;
+use rustix::fs::{AtFlags, Mode, OFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+#[cfg(any(feature = "db", test))]
+use crate::factors::normalized_underlying_symbol;
 use crate::{DeribitFeatureSnapshot, FactorObservation, ResearchPmBookSnapshot};
 
 pub const RESEARCH_SNAPSHOT_SCHEMA_VERSION: &str = "research_snapshot_v1";
@@ -93,6 +107,8 @@ pub struct ResearchSnapshotPmBookSource {
 pub struct ResearchSnapshotManifest {
     pub schema_version: String,
     pub snapshot_hash: Option<String>,
+    #[serde(default)]
+    pub snapshot_contract_hash: Option<String>,
     pub generated_at: DateTime<Utc>,
     pub git_sha: Option<String>,
     pub symbols: Vec<String>,
@@ -106,6 +122,20 @@ pub struct ResearchSnapshotManifest {
     pub max_quote_age_secs: i64,
     pub stake_usd: f64,
     pub require_official_settlement: bool,
+    /// Content-addressed coverage/mismatch audit for every governed 300-second
+    /// Chainlink settlement event represented by this snapshot. `None` is
+    /// valid only for snapshots that contain no governed five-minute events;
+    /// prediction-loop preflight requires this evidence.
+    #[serde(default)]
+    pub chainlink_oracle_settlement_audit: Option<crate::factors::ChainlinkOracleSettlementAudit>,
+    /// Governed event-level proof behind `chainlink_oracle_settlement_audit`.
+    /// The evaluator contract hash binds this complete collection together
+    /// with the observation artifact so prediction preflight can verify every
+    /// five-minute label against its exact oracle boundaries and official
+    /// payout instead of trusting aggregate counters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chainlink_oracle_settlement_evidence:
+        Vec<crate::factors::ChainlinkOracleSettlementEvidence>,
     pub immutable_input: bool,
     pub source_kind: String,
     pub optimizer_data_dir: Option<String>,
@@ -154,10 +184,37 @@ pub struct ResearchSnapshotRequest<'a> {
     pub require_official_settlement: bool,
 }
 
+#[derive(Debug)]
+struct ResearchSnapshotArtifactBytes {
+    observations_json: Vec<u8>,
+    deribit_snapshots_json: Vec<u8>,
+    pm_book_snapshots_json: Vec<u8>,
+    observations_parquet: Option<Vec<u8>>,
+}
+
+impl ResearchSnapshotArtifactBytes {
+    fn read(snapshot_root: &SnapshotRoot, artifacts: &ResearchSnapshotArtifacts) -> Result<Self> {
+        Ok(Self {
+            observations_json: snapshot_root.read_file(&artifacts.observations_json)?,
+            deribit_snapshots_json: snapshot_root.read_file(&artifacts.deribit_snapshots_json)?,
+            pm_book_snapshots_json: snapshot_root.read_file(&artifacts.pm_book_snapshots_json)?,
+            observations_parquet: artifacts
+                .observations_parquet
+                .as_deref()
+                .map(|artifact| snapshot_root.read_file(artifact))
+                .transpose()?,
+        })
+    }
+}
+
 pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<ResearchSnapshot> {
     let snapshot_dir = snapshot_dir.as_ref();
+    let snapshot_root = SnapshotRoot::open(snapshot_dir)?;
+    let manifest_bytes = snapshot_root
+        .read_file("manifest.json")
+        .context("read research snapshot manifest")?;
     let manifest: ResearchSnapshotManifest =
-        read_json(snapshot_dir.join("manifest.json")).context("read research snapshot manifest")?;
+        serde_json::from_slice(&manifest_bytes).context("parse research snapshot manifest")?;
 
     if manifest.schema_version != RESEARCH_SNAPSHOT_SCHEMA_VERSION {
         anyhow::bail!(
@@ -166,15 +223,67 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
             RESEARCH_SNAPSHOT_SCHEMA_VERSION
         );
     }
+    let artifact_bytes = ResearchSnapshotArtifactBytes::read(&snapshot_root, &manifest.artifacts)
+        .context("read governed research snapshot artifacts")?;
+    if let Some(recorded_contract_hash) = manifest.snapshot_contract_hash.as_deref() {
+        let contract_hex = recorded_contract_hash
+            .strip_prefix("sha256:")
+            .filter(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .context("research snapshot contract hash must use sha256:<64hex>")?;
+        debug_assert_eq!(contract_hex.len(), 64);
+        let computed_contract_hash = compute_snapshot_contract_hash(&manifest, &artifact_bytes)
+            .context("verify research snapshot evaluator contract hash")?;
+        if recorded_contract_hash != computed_contract_hash {
+            anyhow::bail!(
+                "research snapshot evaluator contract hash mismatch: manifest={} computed={}",
+                recorded_contract_hash,
+                computed_contract_hash
+            );
+        }
+    }
+    let recorded_hash = manifest
+        .snapshot_hash
+        .as_deref()
+        .filter(|hash| !hash.is_empty())
+        .context("research snapshot manifest is missing snapshot_hash")?;
+    let computed_hash = compute_snapshot_hash(&manifest, &artifact_bytes)
+        .context("verify research snapshot content hash")?;
+    if recorded_hash != computed_hash {
+        anyhow::bail!(
+            "research snapshot content hash mismatch: manifest={} computed={}",
+            recorded_hash,
+            computed_hash
+        );
+    }
 
-    let observations = read_json(snapshot_dir.join(&manifest.artifacts.observations_json))
-        .context("read snapshot observations")?;
-    let deribit_snapshots =
-        read_json(snapshot_dir.join(&manifest.artifacts.deribit_snapshots_json))
-            .context("read snapshot Deribit rows")?;
-    let pm_book_snapshots =
-        read_json(snapshot_dir.join(&manifest.artifacts.pm_book_snapshots_json))
-            .context("read snapshot PM book rows")?;
+    let observations: Vec<FactorObservation> = parse_snapshot_json(
+        &artifact_bytes.observations_json,
+        &manifest.artifacts.observations_json,
+    )
+    .context("read snapshot observations")?;
+    let deribit_snapshots = parse_snapshot_json(
+        &artifact_bytes.deribit_snapshots_json,
+        &manifest.artifacts.deribit_snapshots_json,
+    )
+    .context("read snapshot Deribit rows")?;
+    let pm_book_snapshots = parse_snapshot_json(
+        &artifact_bytes.pm_book_snapshots_json,
+        &manifest.artifacts.pm_book_snapshots_json,
+    )
+    .context("read snapshot PM book rows")?;
+
+    if manifest.chainlink_oracle_settlement_audit.is_some()
+        || !manifest.chainlink_oracle_settlement_evidence.is_empty()
+        || observations.iter().any(|row| row.event_window_secs == 300)
+    {
+        validate_governed_chainlink_5m_settlement_evidence(&manifest, &observations)
+            .context("validate governed Chainlink five-minute snapshot evidence")?;
+    }
 
     Ok(ResearchSnapshot {
         manifest,
@@ -191,10 +300,41 @@ pub fn write_research_snapshot(
     if snapshot.manifest.optimizer_data_dir.is_none() {
         anyhow::bail!("research snapshot manifest requires optimizer_data_dir");
     }
+    if snapshot
+        .observations
+        .iter()
+        .any(|row| row.event_window_secs == 300)
+        || snapshot
+            .manifest
+            .chainlink_oracle_settlement_audit
+            .is_some()
+        || !snapshot
+            .manifest
+            .chainlink_oracle_settlement_evidence
+            .is_empty()
+    {
+        validate_governed_chainlink_5m_settlement_evidence(
+            &snapshot.manifest,
+            &snapshot.observations,
+        )
+        .context("refuse to write snapshot with invalid governed Chainlink evidence")?;
+    }
 
     let snapshot_dir = snapshot_dir.as_ref();
-    fs::create_dir_all(snapshot_dir)
-        .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
+    #[cfg(feature = "polars-export")]
+    {
+        snapshot
+            .manifest
+            .artifacts
+            .observations_parquet
+            .get_or_insert_with(|| "observations.parquet".to_string());
+    }
+    validate_snapshot_output_paths(&snapshot.manifest.artifacts)
+        .context("validate governed research snapshot output paths")?;
+    #[cfg(not(feature = "polars-export"))]
+    if snapshot.manifest.artifacts.observations_parquet.is_some() {
+        anyhow::bail!("writing observations_parquet requires the polars-export feature");
+    }
 
     snapshot.manifest.row_counts = ResearchSnapshotRowCounts {
         observations: snapshot.observations.len(),
@@ -202,42 +342,77 @@ pub fn write_research_snapshot(
         pm_book_snapshots: snapshot.pm_book_snapshots.len(),
     };
 
-    write_json(
-        snapshot_dir.join(&snapshot.manifest.artifacts.observations_json),
-        &snapshot.observations,
-    )?;
-    write_json(
-        snapshot_dir.join(&snapshot.manifest.artifacts.deribit_snapshots_json),
-        &snapshot.deribit_snapshots,
-    )?;
-    write_json(
-        snapshot_dir.join(&snapshot.manifest.artifacts.pm_book_snapshots_json),
-        &snapshot.pm_book_snapshots,
-    )?;
+    let observations_json = serialize_json(&snapshot.observations, "snapshot observations")?;
+    let deribit_snapshots_json =
+        serialize_json(&snapshot.deribit_snapshots, "snapshot Deribit rows")?;
+    let pm_book_snapshots_json =
+        serialize_json(&snapshot.pm_book_snapshots, "snapshot PM book rows")?;
 
     #[cfg(feature = "polars-export")]
-    {
-        let parquet_name = "observations.parquet";
-        crate::export_observations_parquet(
-            &snapshot.observations,
-            &snapshot_dir.join(parquet_name),
-        )
-        .context("write snapshot observations parquet")?;
-        snapshot.manifest.artifacts.observations_parquet = Some(parquet_name.to_string());
+    let observations_parquet = {
+        use polars::io::parquet::write::ParquetWriter;
+
+        let mut frame = crate::observations_to_frame(&snapshot.observations)
+            .context("build snapshot observations parquet frame")?;
+        let mut cursor = Cursor::new(Vec::new());
+        ParquetWriter::new(&mut cursor)
+            .finish(&mut frame)
+            .context("serialize snapshot observations parquet")?;
+        Some(cursor.into_inner())
+    };
+    #[cfg(not(feature = "polars-export"))]
+    let observations_parquet = None;
+
+    let artifact_bytes = ResearchSnapshotArtifactBytes {
+        observations_json,
+        deribit_snapshots_json,
+        pm_book_snapshots_json,
+        observations_parquet,
+    };
+
+    fs::create_dir_all(snapshot_dir)
+        .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
+    let snapshot_root = SnapshotRoot::open(snapshot_dir)?;
+    snapshot_root.write_atomic(
+        &snapshot.manifest.artifacts.observations_json,
+        &artifact_bytes.observations_json,
+    )?;
+    snapshot_root.write_atomic(
+        &snapshot.manifest.artifacts.deribit_snapshots_json,
+        &artifact_bytes.deribit_snapshots_json,
+    )?;
+    snapshot_root.write_atomic(
+        &snapshot.manifest.artifacts.pm_book_snapshots_json,
+        &artifact_bytes.pm_book_snapshots_json,
+    )?;
+    if let (Some(path), Some(bytes)) = (
+        snapshot.manifest.artifacts.observations_parquet.as_deref(),
+        artifact_bytes.observations_parquet.as_deref(),
+    ) {
+        snapshot_root.write_atomic(path, bytes)?;
     }
 
     snapshot.manifest.snapshot_hash =
-        Some(compute_snapshot_hash(snapshot_dir, &snapshot.manifest)?);
-
-    write_json(
-        snapshot_dir.join(&snapshot.manifest.artifacts.query_timings_json),
-        &snapshot.manifest.phase_timings,
-    )?;
-    write_quality_markdown(
-        &snapshot_dir.join(&snapshot.manifest.artifacts.quality_markdown),
+        Some(compute_snapshot_hash(&snapshot.manifest, &artifact_bytes)?);
+    snapshot.manifest.snapshot_contract_hash = Some(compute_snapshot_contract_hash(
         &snapshot.manifest,
+        &artifact_bytes,
+    )?);
+
+    let query_timings_json =
+        serialize_json(&snapshot.manifest.phase_timings, "snapshot query timings")?;
+    let quality_markdown = render_quality_markdown(&snapshot.manifest).into_bytes();
+    let manifest_json = serialize_json(&snapshot.manifest, "snapshot manifest")?;
+    snapshot_root.write_atomic(
+        &snapshot.manifest.artifacts.query_timings_json,
+        &query_timings_json,
     )?;
-    write_json(snapshot_dir.join("manifest.json"), &snapshot.manifest)?;
+    snapshot_root.write_atomic(
+        &snapshot.manifest.artifacts.quality_markdown,
+        &quality_markdown,
+    )?;
+    // The manifest is the commit record for the snapshot and must be published last.
+    snapshot_root.write_atomic("manifest.json", &manifest_json)?;
 
     Ok(snapshot.manifest)
 }
@@ -254,6 +429,308 @@ pub fn validate_snapshot_request_coverage(
     request: ResearchSnapshotRequest<'_>,
 ) -> Result<()> {
     validate_snapshot_request_with_window_mode(manifest, request, false)
+}
+
+/// Validate the event-level Chainlink settlement evidence required by the
+/// governed five-minute prediction lane. This is deliberately separate from
+/// quote-cadence validation: the oracle boundary policy is fixed by its own
+/// version and tolerance and cannot inherit a caller's quote-freshness value.
+pub fn validate_governed_chainlink_5m_settlement_audit(
+    manifest: &ResearchSnapshotManifest,
+) -> Result<()> {
+    let audit = manifest
+        .chainlink_oracle_settlement_audit
+        .as_ref()
+        .context("snapshot is missing governed Chainlink five-minute settlement audit")?;
+    validate_chainlink_5m_settlement_audit(audit)?;
+    validate_chainlink_5m_settlement_manifest_evidence(manifest, audit)
+}
+
+/// Validate the complete governed event evidence and bind every five-minute
+/// observation label to the matching Chainlink boundaries and official payout.
+/// This is the prediction compiler/preflight boundary; aggregate counts alone
+/// are never sufficient here.
+pub fn validate_governed_chainlink_5m_settlement_evidence(
+    manifest: &ResearchSnapshotManifest,
+    observations: &[FactorObservation],
+) -> Result<()> {
+    validate_governed_chainlink_5m_settlement_audit(manifest)?;
+
+    let evidence_event_ids = manifest
+        .chainlink_oracle_settlement_evidence
+        .iter()
+        .map(|evidence| evidence.event_id.as_str())
+        .collect::<HashSet<_>>();
+    let observation_event_ids = observations
+        .iter()
+        .filter(|row| row.event_window_secs == 300)
+        .map(|row| row.event_id.as_str())
+        .collect::<HashSet<_>>();
+    validate_governed_chainlink_event_set(&evidence_event_ids, &observation_event_ids)?;
+
+    let evidence_by_event = manifest
+        .chainlink_oracle_settlement_evidence
+        .iter()
+        .map(|evidence| (evidence.event_id.as_str(), evidence))
+        .collect::<HashMap<_, _>>();
+    for observation in observations
+        .iter()
+        .filter(|row| row.event_window_secs == 300)
+    {
+        let evidence = evidence_by_event
+            .get(observation.event_id.as_str())
+            .with_context(|| {
+                format!(
+                    "governed five-minute observation event {} is missing exact Chainlink settlement evidence",
+                    observation.event_id
+                )
+            })?;
+        if crate::factors::normalized_underlying_symbol(&observation.symbol)
+            != crate::factors::normalized_underlying_symbol(&evidence.symbol)
+        {
+            anyhow::bail!(
+                "governed five-minute observation event {} symbol {} does not match oracle evidence symbol {}",
+                observation.event_id,
+                observation.symbol,
+                evidence.symbol
+            );
+        }
+        if observation.tick_ts < evidence.start_time || observation.tick_ts > evidence.end_time {
+            anyhow::bail!(
+                "governed five-minute observation event {} tick {} is outside oracle evidence window {}..{}",
+                observation.event_id,
+                observation.tick_ts,
+                evidence.start_time,
+                evidence.end_time
+            );
+        }
+        let observed_outcome = if observation.settlement_up == 1.0 {
+            true
+        } else if observation.settlement_up == 0.0 {
+            false
+        } else {
+            anyhow::bail!(
+                "governed five-minute observation event {} has non-binary settlement_up {}",
+                observation.event_id,
+                observation.settlement_up
+            );
+        };
+        let official_outcome = evidence
+            .official_outcome_up
+            .context("complete Chainlink settlement evidence is missing official outcome")?;
+        if observed_outcome != official_outcome {
+            anyhow::bail!(
+                "governed five-minute observation event {} settlement_up {} does not match official outcome {}",
+                observation.event_id,
+                observation.settlement_up,
+                u8::from(official_outcome)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_governed_chainlink_event_set(
+    evidence_event_ids: &HashSet<&str>,
+    observation_event_ids: &HashSet<&str>,
+) -> Result<()> {
+    let mut evidence_without_observations = evidence_event_ids
+        .difference(observation_event_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut observations_without_evidence = observation_event_ids
+        .difference(evidence_event_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    evidence_without_observations.sort_unstable();
+    observations_without_evidence.sort_unstable();
+
+    if !evidence_without_observations.is_empty() || !observations_without_evidence.is_empty() {
+        anyhow::bail!(
+            "governed Chainlink evidence and five-minute observation event sets do not match: evidence_without_observations={evidence_without_observations:?} observations_without_evidence={observations_without_evidence:?}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_chainlink_5m_settlement_manifest_evidence(
+    manifest: &ResearchSnapshotManifest,
+    audit: &crate::factors::ChainlinkOracleSettlementAudit,
+) -> Result<()> {
+    let evidence = &manifest.chainlink_oracle_settlement_evidence;
+    if evidence.is_empty() {
+        anyhow::bail!("snapshot is missing governed Chainlink five-minute settlement evidence");
+    }
+    let recomputed = crate::factors::ChainlinkOracleSettlementAudit::from_evidence(evidence);
+    if &recomputed != audit {
+        anyhow::bail!(
+            "governed Chainlink five-minute settlement audit does not match event evidence: recorded={audit:?} recomputed={recomputed:?}"
+        );
+    }
+
+    let snapshot_symbols = manifest
+        .symbols
+        .iter()
+        .map(|symbol| crate::factors::normalized_underlying_symbol(symbol))
+        .collect::<HashSet<_>>();
+    let mut event_ids = HashSet::with_capacity(evidence.len());
+    for event in evidence {
+        if event.event_id.trim().is_empty() || !event_ids.insert(event.event_id.as_str()) {
+            anyhow::bail!(
+                "governed Chainlink five-minute settlement evidence has empty or duplicate event_id {:?}",
+                event.event_id
+            );
+        }
+        if event.policy_version != crate::factors::GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION {
+            anyhow::bail!(
+                "Chainlink settlement evidence event {} policy {} does not match governed {}",
+                event.event_id,
+                event.policy_version,
+                crate::factors::GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION
+            );
+        }
+        if event.end_time - event.start_time != chrono::Duration::seconds(300) {
+            anyhow::bail!(
+                "Chainlink settlement evidence event {} window {}..{} is not exactly 300 seconds",
+                event.event_id,
+                event.start_time,
+                event.end_time
+            );
+        }
+        if !snapshot_symbols.contains(&crate::factors::normalized_underlying_symbol(&event.symbol))
+        {
+            anyhow::bail!(
+                "Chainlink settlement evidence event {} symbol {} is outside snapshot symbols {:?}",
+                event.event_id,
+                event.symbol,
+                manifest.symbols
+            );
+        }
+        if !event.reasons.is_empty() {
+            anyhow::bail!(
+                "Chainlink settlement evidence event {} contains failure reasons {:?}",
+                event.event_id,
+                event.reasons
+            );
+        }
+        let open = event.open.as_ref().with_context(|| {
+            format!(
+                "Chainlink settlement event {} is missing open",
+                event.event_id
+            )
+        })?;
+        let close = event.close.as_ref().with_context(|| {
+            format!(
+                "Chainlink settlement event {} is missing close",
+                event.event_id
+            )
+        })?;
+        validate_chainlink_boundary_evidence(&event.event_id, "open", event.start_time, open)?;
+        validate_chainlink_boundary_evidence(&event.event_id, "close", event.end_time, close)?;
+
+        let computed_outcome = close.price >= open.price;
+        if event.chainlink_outcome_up != Some(computed_outcome) {
+            anyhow::bail!(
+                "Chainlink settlement evidence event {} outcome {:?} does not match boundary prices open={} close={}",
+                event.event_id,
+                event.chainlink_outcome_up,
+                open.price,
+                close.price
+            );
+        }
+        if event.official_outcome_up != Some(computed_outcome) {
+            anyhow::bail!(
+                "Chainlink settlement evidence event {} official outcome {:?} does not corroborate Chainlink outcome {}",
+                event.event_id,
+                event.official_outcome_up,
+                computed_outcome
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_chainlink_boundary_evidence(
+    event_id: &str,
+    boundary_name: &str,
+    expected_boundary: DateTime<Utc>,
+    boundary: &crate::factors::ChainlinkOracleBoundaryEvidence,
+) -> Result<()> {
+    let max_age =
+        chrono::Duration::seconds(crate::factors::GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS);
+    if boundary.boundary_ts != expected_boundary {
+        anyhow::bail!(
+            "Chainlink settlement event {event_id} {boundary_name} boundary_ts {} does not match expected {}",
+            boundary.boundary_ts,
+            expected_boundary
+        );
+    }
+    if !boundary.price.is_finite() || boundary.price <= 0.0 {
+        anyhow::bail!(
+            "Chainlink settlement event {event_id} {boundary_name} boundary price {} is invalid",
+            boundary.price
+        );
+    }
+    if boundary.source_ts > expected_boundary
+        || expected_boundary - boundary.source_ts > max_age
+        || boundary.received_at < boundary.source_ts
+        || boundary.received_at > expected_boundary + max_age
+    {
+        anyhow::bail!(
+            "Chainlink settlement event {event_id} {boundary_name} selected tick violates the governed source/arrival boundary tolerance"
+        );
+    }
+    if boundary.confirmation_source_ts < expected_boundary
+        || boundary.confirmation_source_ts - expected_boundary > max_age
+        || boundary.confirmation_received_at < boundary.confirmation_source_ts
+        || boundary.confirmation_received_at > expected_boundary + max_age
+    {
+        anyhow::bail!(
+            "Chainlink settlement event {event_id} {boundary_name} confirmation tick violates the governed source/arrival boundary tolerance"
+        );
+    }
+    Ok(())
+}
+
+fn validate_chainlink_5m_settlement_audit(
+    audit: &crate::factors::ChainlinkOracleSettlementAudit,
+) -> Result<()> {
+    if audit.policy_version != crate::factors::GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION {
+        anyhow::bail!(
+            "Chainlink settlement policy {} does not match governed {}",
+            audit.policy_version,
+            crate::factors::GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION
+        );
+    }
+    if audit.max_boundary_age_secs != crate::factors::GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS {
+        anyhow::bail!(
+            "Chainlink settlement boundary tolerance {} does not match governed {} seconds",
+            audit.max_boundary_age_secs,
+            crate::factors::GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS
+        );
+    }
+    if audit.expected_events == 0 {
+        anyhow::bail!("governed Chainlink five-minute settlement audit has no expected events");
+    }
+    if audit.has_failures() {
+        let failures = audit
+            .failures
+            .iter()
+            .map(|failure| format!("{}:{:?}", failure.event_id, failure.reasons))
+            .collect::<Vec<_>>()
+            .join(",");
+        anyhow::bail!(
+            "governed Chainlink five-minute settlement audit failed: expected={} accepted={} missing_open={} missing_close={} missing_official={} payout_mismatch={} reasons=[{}]",
+            audit.expected_events,
+            audit.accepted_events,
+            audit.missing_open_events,
+            audit.missing_close_events,
+            audit.missing_official_events,
+            audit.payout_mismatch_events,
+            failures
+        );
+    }
+    Ok(())
 }
 
 fn validate_snapshot_request_with_window_mode(
@@ -344,6 +821,10 @@ fn validate_snapshot_request_with_window_mode(
             request.require_official_settlement
         );
     }
+    if manifest.chainlink_oracle_settlement_audit.is_some() {
+        validate_governed_chainlink_5m_settlement_audit(manifest)
+            .context("snapshot contains invalid governed Chainlink settlement evidence")?;
+    }
     if !manifest.immutable_input {
         anyhow::bail!("snapshot manifest is not marked immutable_input=true");
     }
@@ -378,8 +859,23 @@ pub struct ResearchSnapshotBuildOptions {
     pub pm_book_archive_dir: Option<PathBuf>,
 }
 
+#[cfg(any(feature = "db", test))]
+fn chainlink_reference_symbols(symbols: &[String]) -> Vec<String> {
+    symbols
+        .iter()
+        .filter_map(|symbol| {
+            let underlying = normalized_underlying_symbol(symbol).to_ascii_lowercase();
+            (!underlying.is_empty()).then(|| format!("{underlying}/usd"))
+        })
+        .collect()
+}
+
 fn research_snapshot_quality_flags(
     observation_count: usize,
+    chainlink_reference_tick_count: usize,
+    binance_price_tick_count: usize,
+    binance_agg_trade_tick_count: usize,
+    binance_lob_snapshot_count: usize,
     deribit_snapshot_count: usize,
     pm_book_snapshot_count: usize,
     include_deribit: bool,
@@ -390,6 +886,18 @@ fn research_snapshot_quality_flags(
     let mut quality_flags = Vec::new();
     if observation_count == 0 {
         quality_flags.push("no_factor_observations".to_string());
+    }
+    if chainlink_reference_tick_count == 0 {
+        quality_flags.push("no_chainlink_reference_ticks".to_string());
+    }
+    if binance_price_tick_count == 0 {
+        quality_flags.push("no_binance_price_ticks".to_string());
+    }
+    if binance_agg_trade_tick_count == 0 {
+        quality_flags.push("no_binance_agg_trade_ticks".to_string());
+    }
+    if binance_lob_snapshot_count == 0 {
+        quality_flags.push("no_binance_lob_snapshots".to_string());
     }
     if include_deribit && deribit_snapshot_count == 0 {
         quality_flags.push("no_deribit_snapshots".to_string());
@@ -794,8 +1302,9 @@ pub async fn build_research_snapshot_from_database(
     use ploy_market_contracts::MarketUpdate;
 
     use crate::{
-        build_factor_observations_with_lob_sampled, load_deribit_feature_snapshots_with_timings,
-        load_research_lob_snapshots_sampled, load_research_pm_book_snapshots_sampled,
+        build_factor_observations_with_lob_sampled_and_oracle_evidence,
+        load_deribit_feature_snapshots_with_timings, load_research_lob_snapshots_sampled,
+        load_research_pm_book_snapshots_sampled,
     };
 
     let mut phase_timings = Vec::new();
@@ -809,6 +1318,8 @@ pub async fn build_research_snapshot_from_database(
         history_start,
         options.end,
         &HistoricalLoadOptions {
+            include_reference_prices: true,
+            reference_symbols: chainlink_reference_symbols(&options.symbols),
             require_official_settlement: options.require_official_settlement,
             include_l2: false,
             spot_sample_secs: historical_sample_secs,
@@ -823,6 +1334,28 @@ pub async fn build_research_snapshot_from_database(
         elapsed_ms: started.elapsed().as_millis(),
         rows: Some(all_updates.len()),
     });
+    let binance_price_tick_rows = all_updates
+        .iter()
+        .filter(|update| matches!(update, MarketUpdate::SpotPrice { .. }))
+        .count();
+    let binance_agg_trade_tick_rows = all_updates
+        .iter()
+        .filter(|update| matches!(update, MarketUpdate::AggTrade { .. }))
+        .count();
+    let chainlink_reference_tick_rows = all_updates
+        .iter()
+        .filter(|update| {
+            matches!(
+                update,
+                MarketUpdate::ReferencePrice {
+                    source,
+                    is_carried_forward: false,
+                    received_at: Some(_),
+                    ..
+                } if source.eq_ignore_ascii_case("chainlink")
+            )
+        })
+        .count();
 
     let started = Instant::now();
     let all_lob_snapshots = load_research_lob_snapshots_sampled(
@@ -959,12 +1492,22 @@ pub async fn build_research_snapshot_from_database(
     let lob_slice = slice_by_time(&all_lob_snapshots, history_start, options.end, |snapshot| {
         snapshot.ts
     });
-    let observations = build_factor_observations_with_lob_sampled(
+    let factor_build = build_factor_observations_with_lob_sampled_and_oracle_evidence(
         updates_slice,
         lob_slice,
         options.max_quote_age_secs,
         options.observation_sample_secs,
     );
+    let chainlink_oracle_settlement_evidence = factor_build.oracle_settlement_evidence;
+    let chainlink_oracle_settlement_audit = (factor_build.oracle_settlement_audit.expected_events
+        > 0)
+    .then_some(factor_build.oracle_settlement_audit);
+    if let Some(audit) = chainlink_oracle_settlement_audit.as_ref() {
+        validate_chainlink_5m_settlement_audit(audit).context(
+            "refuse to compile research snapshot with incomplete or mismatched governed five-minute settlement evidence",
+        )?;
+    }
+    let observations = factor_build.observations;
     phase_timings.push(ResearchSnapshotPhaseTiming {
         phase: "factor_observations".to_string(),
         elapsed_ms: started.elapsed().as_millis(),
@@ -973,6 +1516,10 @@ pub async fn build_research_snapshot_from_database(
 
     let quality_flags = research_snapshot_quality_flags(
         observations.len(),
+        chainlink_reference_tick_rows,
+        binance_price_tick_rows,
+        binance_agg_trade_tick_rows,
+        all_lob_snapshots.len(),
         deribit_snapshots.len(),
         all_pm_book_snapshots.len(),
         options.include_deribit,
@@ -986,6 +1533,7 @@ pub async fn build_research_snapshot_from_database(
         manifest: ResearchSnapshotManifest {
             schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
             snapshot_hash: None,
+            snapshot_contract_hash: None,
             generated_at: Utc::now(),
             git_sha: options.git_sha,
             symbols: options.symbols,
@@ -998,10 +1546,42 @@ pub async fn build_research_snapshot_from_database(
             max_quote_age_secs: options.max_quote_age_secs,
             stake_usd: options.stake_usd,
             require_official_settlement: options.require_official_settlement,
+            chainlink_oracle_settlement_audit,
+            chainlink_oracle_settlement_evidence,
             immutable_input: true,
             source_kind: "tango_postgres_compiled_snapshot".to_string(),
             optimizer_data_dir: options.optimizer_data_dir,
             source_surfaces: vec![
+                ResearchSnapshotSourceSurface {
+                    name: "chainlink_reference_ticks".to_string(),
+                    role: "opening_reference_and_settlement_authority".to_string(),
+                    gate_category: "required_for_prediction".to_string(),
+                    raw_full_fidelity: false,
+                    snapshot_sampled: true,
+                    sample_secs: Some(i64::from(historical_sample_secs)),
+                    row_count: Some(chainlink_reference_tick_rows),
+                    notes: "Arrival-timestamped Chainlink reference prices define the governed opening reference and settlement-source probability; Binance never replaces this authority.".to_string(),
+                },
+                ResearchSnapshotSourceSurface {
+                    name: "binance_price_ticks".to_string(),
+                    role: "cex_reference_price".to_string(),
+                    gate_category: "required_for_prediction".to_string(),
+                    raw_full_fidelity: false,
+                    snapshot_sampled: true,
+                    sample_secs: Some(i64::from(historical_sample_secs)),
+                    row_count: Some(binance_price_tick_rows),
+                    notes: "Binance spot ticks sampled by source time and replayed at received_at so unavailable prices cannot enter earlier observations.".to_string(),
+                },
+                ResearchSnapshotSourceSurface {
+                    name: "binance_agg_trade_ticks".to_string(),
+                    role: "cex_trade_flow".to_string(),
+                    gate_category: "required_for_prediction".to_string(),
+                    raw_full_fidelity: false,
+                    snapshot_sampled: true,
+                    sample_secs: Some(5),
+                    row_count: Some(binance_agg_trade_tick_rows),
+                    notes: "Binance aggTrade flow sampled to one source tick per 5-second bucket and replayed at received_at.".to_string(),
+                },
                 ResearchSnapshotSourceSurface {
                     name: "historical_market_updates".to_string(),
                     role: "prediction_context".to_string(),
@@ -1010,7 +1590,7 @@ pub async fn build_research_snapshot_from_database(
                     snapshot_sampled: true,
                     sample_secs: Some(i64::from(historical_sample_secs)),
                     row_count: Some(all_updates.len()),
-                    notes: "DB MarketUpdate tape loaded with sampler settings; suitable for factor search, not tick-complete replay.".to_string(),
+                    notes: "Combined DB MarketUpdate tape includes point-in-time Chainlink reference prices and sampled PM updates; suitable for factor search, not tick-complete replay.".to_string(),
                 },
                 ResearchSnapshotSourceSurface {
                     name: "binance_lob_ticks".to_string(),
@@ -1020,7 +1600,7 @@ pub async fn build_research_snapshot_from_database(
                     snapshot_sampled: true,
                     sample_secs: Some(i64::from(options.lob_sample_secs.max(1))),
                     row_count: Some(all_lob_snapshots.len()),
-                    notes: "Partial-depth CEX LOB snapshots; not a sequence-correct local book for queue-position evidence.".to_string(),
+                    notes: "Binance partial-depth LOB snapshots sampled by source time and replayed at received_at; not a sequence-correct local book for queue-position evidence.".to_string(),
                 },
                 ResearchSnapshotSourceSurface {
                     name: "clob_orderbook_snapshots".to_string(),
@@ -1107,20 +1687,285 @@ where
     &items[lo..hi]
 }
 
+#[cfg(feature = "db")]
 fn read_json<T: for<'de> Deserialize<'de>>(path: PathBuf) -> Result<T> {
     let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
     serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("parse {}", path.display()))
 }
 
+static SNAPSHOT_TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// An opened, canonical research-snapshot root. All governed I/O is resolved
+/// relative to this descriptor so later path replacement cannot redirect it.
+#[derive(Debug)]
+struct SnapshotRoot {
+    fd: OwnedFd,
+    canonical_path: PathBuf,
+}
+
+impl SnapshotRoot {
+    fn open(snapshot_dir: &Path) -> Result<Self> {
+        let canonical_path = fs::canonicalize(snapshot_dir).with_context(|| {
+            format!(
+                "canonicalize research snapshot root {}",
+                snapshot_dir.display()
+            )
+        })?;
+        let fd = rustix::fs::open(
+            &canonical_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| {
+            format!(
+                "open canonical research snapshot root without following symlinks {}",
+                canonical_path.display()
+            )
+        })?;
+        Ok(Self { fd, canonical_path })
+    }
+
+    fn read_file(&self, artifact: &str) -> Result<Vec<u8>> {
+        let (parent, file_name) = self.open_parent(artifact, false)?;
+        let fd = rustix::fs::openat(
+            &parent,
+            &file_name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| {
+            format!(
+                "open research snapshot artifact with no-follow traversal {:?} under {}",
+                artifact,
+                self.canonical_path.display()
+            )
+        })?;
+        let mut file = File::from(fd);
+        if !file
+            .metadata()
+            .with_context(|| format!("inspect open snapshot artifact {artifact:?}"))?
+            .is_file()
+        {
+            anyhow::bail!("research snapshot artifact must be a regular file: {artifact:?}");
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("single-read research snapshot artifact {artifact:?}"))?;
+        Ok(bytes)
+    }
+
+    fn write_atomic(&self, artifact: &str, bytes: &[u8]) -> Result<()> {
+        let (parent, file_name) = self.open_parent(artifact, true)?;
+        let (temporary_name, temporary_fd) = (0..128)
+            .find_map(|_| {
+                let sequence = SNAPSHOT_TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let candidate =
+                    format!(".research-snapshot.tmp.{}.{}", std::process::id(), sequence);
+                match rustix::fs::openat(
+                    &parent,
+                    candidate.as_str(),
+                    OFlags::WRONLY
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::RUSR | Mode::WUSR,
+                ) {
+                    Ok(fd) => Some(Ok((candidate, fd))),
+                    Err(error) if error == rustix::io::Errno::EXIST => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "create atomic snapshot temporary file for {artifact:?} under {}",
+                    self.canonical_path.display()
+                )
+            })?
+            .context("exhausted unique snapshot temporary file names")?;
+
+        let mut renamed = false;
+        let result = (|| -> Result<()> {
+            let mut temporary_file = File::from(temporary_fd);
+            temporary_file
+                .write_all(bytes)
+                .with_context(|| format!("write atomic snapshot temporary for {artifact:?}"))?;
+            temporary_file
+                .sync_all()
+                .with_context(|| format!("sync atomic snapshot temporary for {artifact:?}"))?;
+            drop(temporary_file);
+
+            rustix::fs::renameat(&parent, temporary_name.as_str(), &parent, &file_name)
+                .with_context(|| format!("atomically publish snapshot artifact {artifact:?}"))?;
+            renamed = true;
+            rustix::fs::fsync(&parent)
+                .with_context(|| format!("sync snapshot artifact directory for {artifact:?}"))?;
+            Ok(())
+        })();
+
+        if result.is_err() && !renamed {
+            let _ = rustix::fs::unlinkat(&parent, temporary_name.as_str(), AtFlags::empty());
+        }
+        result
+    }
+
+    fn open_parent(&self, artifact: &str, create_directories: bool) -> Result<(OwnedFd, OsString)> {
+        self.open_parent_with_sync(artifact, create_directories, |parent, _component_name| {
+            rustix::fs::fsync(parent).context("fsync snapshot directory parent descriptor")
+        })
+    }
+
+    fn open_parent_with_sync<F>(
+        &self,
+        artifact: &str,
+        create_directories: bool,
+        mut sync_created_parent: F,
+    ) -> Result<(OwnedFd, OsString)>
+    where
+        F: FnMut(&OwnedFd, &std::ffi::OsStr) -> Result<()>,
+    {
+        let mut components = validate_relative_snapshot_path(artifact)?;
+        let file_name = components
+            .pop()
+            .context("validated snapshot artifact path must have a file name")?;
+        let mut parent = rustix::io::dup(&self.fd).context("duplicate snapshot root descriptor")?;
+        for component in components {
+            let component_name = component.as_os_str();
+            let directory = match rustix::fs::openat(
+                &parent,
+                component_name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(directory) => directory,
+                Err(error) if create_directories && error == rustix::io::Errno::NOENT => {
+                    match rustix::fs::mkdirat(&parent, component_name, Mode::RWXU) {
+                        Ok(()) => {}
+                        Err(error) if error == rustix::io::Errno::EXIST => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "create snapshot artifact directory {:?} with dir-FD anchoring",
+                                    component_name
+                                )
+                            })
+                        }
+                    }
+                    sync_created_parent(&parent, component_name).with_context(|| {
+                        format!(
+                            "sync parent directory after creating nested snapshot directory {:?}",
+                            component_name
+                        )
+                    })?;
+                    rustix::fs::openat(
+                        &parent,
+                        component_name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "open newly-created snapshot directory {:?} without following symlinks",
+                            component_name
+                        )
+                    })?
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "open snapshot directory {:?} with no-follow dir-FD traversal",
+                            component_name
+                        )
+                    })
+                }
+            };
+            parent = directory;
+        }
+        Ok((parent, file_name))
+    }
+}
+
+fn validate_relative_snapshot_path(artifact: &str) -> Result<Vec<OsString>> {
+    let relative = Path::new(artifact);
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        anyhow::bail!("unsafe research snapshot artifact path {artifact:?}");
+    }
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            anyhow::bail!("unsafe research snapshot artifact path {artifact:?}");
+        };
+        components.push(component.to_os_string());
+    }
+    if components.is_empty() {
+        anyhow::bail!("unsafe research snapshot artifact path {artifact:?}");
+    }
+    Ok(components)
+}
+
+fn validate_snapshot_output_paths(artifacts: &ResearchSnapshotArtifacts) -> Result<()> {
+    let mut paths = vec![
+        ("observations_json", artifacts.observations_json.as_str()),
+        (
+            "deribit_snapshots_json",
+            artifacts.deribit_snapshots_json.as_str(),
+        ),
+        (
+            "pm_book_snapshots_json",
+            artifacts.pm_book_snapshots_json.as_str(),
+        ),
+        ("quality_markdown", artifacts.quality_markdown.as_str()),
+        ("query_timings_json", artifacts.query_timings_json.as_str()),
+        ("manifest", "manifest.json"),
+    ];
+    if let Some(parquet) = artifacts.observations_parquet.as_deref() {
+        paths.push(("observations_parquet", parquet));
+    }
+
+    let mut normalized_paths = HashSet::new();
+    for (name, path) in paths {
+        validate_relative_snapshot_path(path)
+            .with_context(|| format!("validate snapshot output {name}"))?;
+        let path = PathBuf::from(path);
+        if !normalized_paths.insert(path.clone()) {
+            anyhow::bail!(
+                "duplicate governed research snapshot output path: {}",
+                path.display()
+            );
+        }
+        if normalized_paths
+            .iter()
+            .any(|other| other != &path && (other.starts_with(&path) || path.starts_with(other)))
+        {
+            anyhow::bail!(
+                "governed research snapshot output paths must not contain one another: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_snapshot_json<T: for<'de> Deserialize<'de>>(bytes: &[u8], artifact: &str) -> Result<T> {
+    serde_json::from_slice(bytes)
+        .with_context(|| format!("parse research snapshot artifact {artifact}"))
+}
+
+fn serialize_json<T: Serialize>(value: &T, label: &str) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(value).with_context(|| format!("serialize {label}"))
+}
+
+#[cfg(test)]
 fn write_json<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
     let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
     serde_json::to_writer_pretty(file, value).with_context(|| format!("write {}", path.display()))
 }
 
 fn compute_snapshot_hash(
-    snapshot_dir: &Path,
     manifest: &ResearchSnapshotManifest,
+    artifact_bytes: &ResearchSnapshotArtifactBytes,
 ) -> Result<String> {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -1147,6 +1992,20 @@ fn compute_snapshot_hash(
             .as_bytes(),
     );
     update(&mut hash, manifest.data_requirements.join(",").as_bytes());
+    update(
+        &mut hash,
+        serde_json::to_string(&manifest.chainlink_oracle_settlement_audit)
+            .context("serialize Chainlink settlement audit for snapshot hash")?
+            .as_bytes(),
+    );
+    if !manifest.chainlink_oracle_settlement_evidence.is_empty() {
+        update(
+            &mut hash,
+            serde_json::to_string(&manifest.chainlink_oracle_settlement_evidence)
+                .context("serialize Chainlink settlement evidence for snapshot hash")?
+                .as_bytes(),
+        );
+    }
     update(
         &mut hash,
         serde_json::to_string(&manifest.source_surfaces)
@@ -1202,26 +2061,87 @@ fn compute_snapshot_hash(
             .unwrap_or("")
             .as_bytes(),
     );
-    for artifact in [
-        &manifest.artifacts.observations_json,
-        &manifest.artifacts.deribit_snapshots_json,
-        &manifest.artifacts.pm_book_snapshots_json,
+    for (artifact, bytes) in [
+        (
+            &manifest.artifacts.observations_json,
+            artifact_bytes.observations_json.as_slice(),
+        ),
+        (
+            &manifest.artifacts.deribit_snapshots_json,
+            artifact_bytes.deribit_snapshots_json.as_slice(),
+        ),
+        (
+            &manifest.artifacts.pm_book_snapshots_json,
+            artifact_bytes.pm_book_snapshots_json.as_slice(),
+        ),
     ] {
         update(&mut hash, artifact.as_bytes());
-        let bytes = fs::read(snapshot_dir.join(artifact))
-            .with_context(|| format!("read snapshot artifact {artifact} for hashing"))?;
-        update(&mut hash, &bytes);
+        update(&mut hash, bytes);
     }
     Ok(format!("{hash:016x}"))
 }
 
-fn write_quality_markdown(path: &Path, manifest: &ResearchSnapshotManifest) -> Result<()> {
+fn compute_snapshot_contract_hash(
+    manifest: &ResearchSnapshotManifest,
+    artifact_bytes: &ResearchSnapshotArtifactBytes,
+) -> Result<String> {
+    fn update_framed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut contract_manifest = manifest.clone();
+    contract_manifest.snapshot_hash = None;
+    contract_manifest.snapshot_contract_hash = None;
+
+    let manifest_bytes = serde_json::to_vec(&contract_manifest)
+        .context("serialize manifest for research snapshot evaluator contract hash")?;
+    let mut hasher = Sha256::new();
+    update_framed(&mut hasher, b"ploy.research_snapshot.evaluator_contract.v1");
+    update_framed(&mut hasher, &manifest_bytes);
+
+    for (artifact, bytes) in [
+        (
+            manifest.artifacts.observations_json.as_str(),
+            artifact_bytes.observations_json.as_slice(),
+        ),
+        (
+            manifest.artifacts.deribit_snapshots_json.as_str(),
+            artifact_bytes.deribit_snapshots_json.as_slice(),
+        ),
+        (
+            manifest.artifacts.pm_book_snapshots_json.as_str(),
+            artifact_bytes.pm_book_snapshots_json.as_slice(),
+        ),
+    ] {
+        update_framed(&mut hasher, artifact.as_bytes());
+        update_framed(&mut hasher, bytes);
+    }
+    if let (Some(artifact), Some(bytes)) = (
+        manifest.artifacts.observations_parquet.as_deref(),
+        artifact_bytes.observations_parquet.as_deref(),
+    ) {
+        update_framed(&mut hasher, artifact.as_bytes());
+        update_framed(&mut hasher, bytes);
+    }
+
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn render_quality_markdown(manifest: &ResearchSnapshotManifest) -> String {
     let mut body = String::new();
     body.push_str("# Research Snapshot Quality\n\n");
     body.push_str(&format!("- Schema: `{}`\n", manifest.schema_version));
     body.push_str(&format!(
         "- Snapshot hash: `{}`\n",
         manifest.snapshot_hash.as_deref().unwrap_or("<missing>")
+    ));
+    body.push_str(&format!(
+        "- Snapshot contract hash: `{}`\n",
+        manifest
+            .snapshot_contract_hash
+            .as_deref()
+            .unwrap_or("<legacy-unavailable>")
     ));
     body.push_str(&format!("- Generated at: `{}`\n", manifest.generated_at));
     body.push_str(&format!(
@@ -1348,6 +2268,34 @@ fn write_quality_markdown(path: &Path, manifest: &ResearchSnapshotManifest) -> R
         "- Official settlement required: `{}`\n",
         manifest.require_official_settlement
     ));
+    body.push_str("\n## Governed Chainlink 5m Settlement Audit\n\n");
+    if let Some(audit) = manifest.chainlink_oracle_settlement_audit.as_ref() {
+        body.push_str(&format!(
+            "- Policy: `{}`; max_boundary_age_secs=`{}`\n",
+            audit.policy_version, audit.max_boundary_age_secs
+        ));
+        body.push_str(&format!(
+            "- Coverage: expected={}, accepted={}, missing_open={}, missing_close={}, missing_official={}, payout_mismatch={}\n",
+            audit.expected_events,
+            audit.accepted_events,
+            audit.missing_open_events,
+            audit.missing_close_events,
+            audit.missing_official_events,
+            audit.payout_mismatch_events
+        ));
+        if audit.failures.is_empty() {
+            body.push_str("- Failures: `<none>`\n");
+        } else {
+            for failure in &audit.failures {
+                body.push_str(&format!(
+                    "- Failure event=`{}` reasons=`{:?}`\n",
+                    failure.event_id, failure.reasons
+                ));
+            }
+        }
+    } else {
+        body.push_str("- `<not-recorded>`\n");
+    }
     body.push_str("\n## Phase Timings\n\n");
     for timing in &manifest.phase_timings {
         body.push_str(&format!(
@@ -1366,12 +2314,297 @@ fn write_quality_markdown(path: &Path, manifest: &ResearchSnapshotManifest) -> R
             body.push_str(&format!("- `{flag}`\n"));
         }
     }
-    fs::write(path, body).with_context(|| format!("write {}", path.display()))
+    body
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn governed_chainlink_event_sets_must_match_bidirectionally() {
+        let evidence_event_ids = HashSet::from(["event-1", "event-2"]);
+        let complete_observation_event_ids = HashSet::from(["event-1", "event-2"]);
+        validate_governed_chainlink_event_set(&evidence_event_ids, &complete_observation_event_ids)
+            .expect("exact governed event coverage");
+
+        let missing_observation_event_ids = HashSet::from(["event-1"]);
+        let missing_observation = validate_governed_chainlink_event_set(
+            &evidence_event_ids,
+            &missing_observation_event_ids,
+        )
+        .expect_err("evidence without an observation must fail closed");
+        let missing_observation = format!("{missing_observation:#}");
+        assert!(missing_observation.contains("evidence_without_observations=[\"event-2\"]"));
+        assert!(missing_observation.contains("observations_without_evidence=[]"));
+
+        let unknown_observation_event_ids = HashSet::from(["event-1", "event-2", "event-3"]);
+        let unknown_observation = validate_governed_chainlink_event_set(
+            &evidence_event_ids,
+            &unknown_observation_event_ids,
+        )
+        .expect_err("observation without evidence must fail closed");
+        let unknown_observation = format!("{unknown_observation:#}");
+        assert!(unknown_observation.contains("evidence_without_observations=[]"));
+        assert!(unknown_observation.contains("observations_without_evidence=[\"event-3\"]"));
+    }
+
+    #[test]
+    fn maps_market_symbols_to_chainlink_reference_symbols() {
+        assert_eq!(
+            chainlink_reference_symbols(&[
+                "BTCUSDT".to_string(),
+                "SOL/USD".to_string(),
+                "eth-usdc".to_string(),
+            ]),
+            ["btc/usd", "sol/usd", "eth/usd"]
+        );
+    }
+
+    #[test]
+    fn snapshot_artifact_bytes_are_read_once_and_paths_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "ploy-research-snapshot-bytes-test-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create snapshot test root");
+        let artifacts = ResearchSnapshotArtifacts::default();
+        for artifact in [
+            &artifacts.observations_json,
+            &artifacts.deribit_snapshots_json,
+            &artifacts.pm_book_snapshots_json,
+        ] {
+            fs::write(root.join(artifact), "[]").expect("write snapshot artifact");
+        }
+        let snapshot_root = SnapshotRoot::open(&root).expect("open snapshot test root");
+        let captured = ResearchSnapshotArtifactBytes::read(&snapshot_root, &artifacts)
+            .expect("capture snapshot artifacts once");
+
+        fs::write(root.join(&artifacts.observations_json), "not-json")
+            .expect("replace artifact after capture");
+        let observations: Vec<FactorObservation> =
+            parse_snapshot_json(&captured.observations_json, &artifacts.observations_json)
+                .expect("parse the exact captured bytes");
+        assert!(observations.is_empty());
+
+        let mut traversal = artifacts.clone();
+        traversal.observations_json = "../outside.json".to_string();
+        assert!(
+            ResearchSnapshotArtifactBytes::read(&snapshot_root, &traversal)
+                .expect_err("parent traversal must fail")
+                .to_string()
+                .contains("unsafe research snapshot artifact path")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = root.with_extension("outside.json");
+            fs::write(&outside, "[]").expect("write outside artifact");
+            symlink(&outside, root.join("linked.json")).expect("link outside artifact");
+            let mut linked = artifacts.clone();
+            linked.observations_json = "linked.json".to_string();
+            assert!(ResearchSnapshotArtifactBytes::read(&snapshot_root, &linked)
+                .expect_err("symlinked artifact must fail")
+                .to_string()
+                .contains("no-follow"));
+            fs::remove_file(outside).expect("remove outside artifact");
+        }
+
+        fs::remove_dir_all(root).expect("remove snapshot test root");
+    }
+
+    #[test]
+    fn snapshot_root_descriptor_survives_root_path_replacement() {
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let root = std::env::temp_dir().join(format!("ploy-snapshot-root-race-{suffix}"));
+        let moved = std::env::temp_dir().join(format!("ploy-snapshot-root-moved-{suffix}"));
+        fs::create_dir_all(&root).expect("create original snapshot root");
+        fs::write(root.join("artifact.json"), b"original").expect("write original artifact");
+        let snapshot_root = SnapshotRoot::open(&root).expect("open original snapshot root FD");
+
+        fs::rename(&root, &moved).expect("move original root after FD capture");
+        fs::create_dir_all(&root).expect("create attacker replacement root");
+        fs::write(root.join("artifact.json"), b"replacement").expect("write replacement artifact");
+
+        assert_eq!(
+            snapshot_root
+                .read_file("artifact.json")
+                .expect("read remains anchored to original root"),
+            b"original"
+        );
+        snapshot_root
+            .write_atomic("anchored.json", b"anchored")
+            .expect("write remains anchored to original root");
+        assert_eq!(
+            fs::read(moved.join("anchored.json")).expect("read anchored write"),
+            b"anchored"
+        );
+        assert!(!root.join("anchored.json").exists());
+
+        fs::remove_dir_all(root).expect("remove replacement root");
+        fs::remove_dir_all(moved).expect("remove moved root");
+    }
+
+    #[test]
+    fn nested_snapshot_directories_sync_each_parent_and_fail_closed_on_sync_error() {
+        let root = std::env::temp_dir().join(format!(
+            "ploy-snapshot-directory-sync-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).expect("create snapshot root");
+        let snapshot_root = SnapshotRoot::open(&root).expect("open snapshot root");
+
+        let mut synced_components = Vec::new();
+        let (parent, file_name) = snapshot_root
+            .open_parent_with_sync(
+                "level-one/level-two/artifact.json",
+                true,
+                |_parent, component_name| {
+                    synced_components.push(component_name.to_os_string());
+                    Ok(())
+                },
+            )
+            .expect("create every nested directory with a parent sync barrier");
+        drop(parent);
+        assert_eq!(file_name, std::ffi::OsStr::new("artifact.json"));
+        assert_eq!(
+            synced_components,
+            [OsString::from("level-one"), OsString::from("level-two")]
+        );
+
+        let sync_error = snapshot_root
+            .open_parent_with_sync(
+                "sync-failure/child/artifact.json",
+                true,
+                |_parent, component_name| {
+                    if component_name == std::ffi::OsStr::new("child") {
+                        anyhow::bail!("injected directory fsync failure");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("a parent directory sync failure must abort traversal");
+        let sync_error = format!("{sync_error:#}");
+        assert!(sync_error
+            .contains("sync parent directory after creating nested snapshot directory \"child\""));
+        assert!(sync_error.contains("injected directory fsync failure"));
+        assert!(!root.join("sync-failure/child/artifact.json").exists());
+
+        snapshot_root
+            .write_atomic("durable/level/artifact.json", b"durable")
+            .expect("publish through real parent fsync barriers");
+        drop(snapshot_root);
+        let reopened = SnapshotRoot::open(&root).expect("reopen snapshot root after publication");
+        assert_eq!(
+            reopened
+                .read_file("durable/level/artifact.json")
+                .expect("read nested artifact through a fresh root descriptor"),
+            b"durable"
+        );
+        drop(reopened);
+
+        fs::remove_dir_all(root).expect("remove snapshot root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_snapshot_write_replaces_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let root = std::env::temp_dir().join(format!("ploy-snapshot-write-link-{suffix}"));
+        let outside = std::env::temp_dir().join(format!("ploy-snapshot-outside-{suffix}.json"));
+        fs::create_dir_all(&root).expect("create snapshot root");
+        fs::write(&outside, b"outside-sentinel").expect("write outside sentinel");
+        symlink(&outside, root.join("artifact.json")).expect("create hostile artifact symlink");
+
+        let snapshot_root = SnapshotRoot::open(&root).expect("open snapshot root");
+        snapshot_root
+            .write_atomic("artifact.json", b"governed")
+            .expect("atomic write replaces directory entry, not symlink target");
+
+        assert_eq!(
+            fs::read(&outside).expect("read outside sentinel"),
+            b"outside-sentinel"
+        );
+        assert_eq!(
+            fs::read(root.join("artifact.json")).expect("read governed artifact"),
+            b"governed"
+        );
+        assert!(!fs::symlink_metadata(root.join("artifact.json"))
+            .expect("inspect governed artifact")
+            .file_type()
+            .is_symlink());
+
+        fs::remove_dir_all(root).expect("remove snapshot root");
+        fs::remove_file(outside).expect("remove outside sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_write_rejects_symlinked_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let root = std::env::temp_dir().join(format!("ploy-snapshot-parent-link-{suffix}"));
+        let outside = std::env::temp_dir().join(format!("ploy-snapshot-parent-outside-{suffix}"));
+        fs::create_dir_all(&root).expect("create snapshot root");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        symlink(&outside, root.join("nested")).expect("create hostile parent symlink");
+
+        let snapshot_root = SnapshotRoot::open(&root).expect("open snapshot root");
+        let error = snapshot_root
+            .write_atomic("nested/artifact.json", b"must-not-escape")
+            .expect_err("symlinked parent must fail closed");
+        assert!(error.to_string().contains("no-follow"));
+        assert!(!outside.join("artifact.json").exists());
+
+        fs::remove_dir_all(root).expect("remove snapshot root");
+        fs::remove_dir_all(outside).expect("remove outside directory");
+    }
+
+    #[test]
+    fn snapshot_output_paths_are_all_validated_before_writing() {
+        let mut artifacts = ResearchSnapshotArtifacts::default();
+        artifacts.observations_json = "../outside.json".to_string();
+        let traversal =
+            validate_snapshot_output_paths(&artifacts).expect_err("parent traversal must fail");
+        assert!(format!("{traversal:#}").contains("unsafe research snapshot artifact path"));
+
+        artifacts.observations_json = "/tmp/outside.json".to_string();
+        let absolute =
+            validate_snapshot_output_paths(&artifacts).expect_err("absolute path must fail");
+        assert!(format!("{absolute:#}").contains("unsafe research snapshot artifact path"));
+
+        artifacts.observations_json = "observations.json".to_string();
+        artifacts.observations_parquet = Some("../outside.parquet".to_string());
+        let optional = validate_snapshot_output_paths(&artifacts)
+            .expect_err("optional parquet traversal must fail");
+        assert!(format!("{optional:#}").contains("unsafe research snapshot artifact path"));
+
+        artifacts.observations_parquet = None;
+        artifacts.observations_json = artifacts.quality_markdown.clone();
+        assert!(validate_snapshot_output_paths(&artifacts)
+            .expect_err("duplicate governed outputs must fail")
+            .to_string()
+            .contains("duplicate governed research snapshot output path"));
+    }
 
     #[test]
     fn write_and_load_empty_snapshot_roundtrips_manifest() {
@@ -1388,6 +2621,7 @@ mod tests {
             manifest: ResearchSnapshotManifest {
                 schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
                 snapshot_hash: None,
+                snapshot_contract_hash: None,
                 generated_at: Utc::now(),
                 git_sha: Some("test-sha".to_string()),
                 symbols: vec!["BTCUSDT".to_string()],
@@ -1400,6 +2634,8 @@ mod tests {
                 max_quote_age_secs: 30,
                 stake_usd: 15.0,
                 require_official_settlement: true,
+                chainlink_oracle_settlement_audit: None,
+                chainlink_oracle_settlement_evidence: vec![],
                 immutable_input: true,
                 source_kind: "unit_test".to_string(),
                 optimizer_data_dir: Some("/tmp/immutable-parquet".to_string()),
@@ -1442,6 +2678,13 @@ mod tests {
         let loaded = load_research_snapshot(&root).expect("load snapshot");
         assert_eq!(written.schema_version, RESEARCH_SNAPSHOT_SCHEMA_VERSION);
         assert!(written.snapshot_hash.is_some());
+        let contract_hex = written
+            .snapshot_contract_hash
+            .as_deref()
+            .and_then(|hash| hash.strip_prefix("sha256:"))
+            .expect("SHA-256 contract hash");
+        assert_eq!(contract_hex.len(), 64);
+        assert!(contract_hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(loaded.manifest.git_sha.as_deref(), Some("test-sha"));
         assert_eq!(loaded.manifest.source_surfaces.len(), 1);
         assert!(loaded.manifest.source_surfaces[0].snapshot_sampled);
@@ -1497,10 +2740,60 @@ mod tests {
         assert!(exact_subset_result.is_err());
         assert_eq!(loaded.manifest.row_counts.observations, 0);
         let quality = std::fs::read_to_string(root.join("quality.md")).expect("read quality");
+        assert!(quality.contains("Snapshot contract hash: `sha256:"));
         assert!(quality.contains("## Source Surfaces"));
         assert!(quality.contains("gate_category=`required_for_prediction`"));
         assert!(quality.contains("snapshot_sampled=`true`"));
         assert!(quality.contains("## Input Artifacts"));
+        assert!(quality.contains("## Governed Chainlink 5m Settlement Audit"));
+        assert!(quality.contains("- `<not-recorded>`"));
+
+        let mut legacy_manifest = serde_json::to_value(&loaded.manifest).expect("legacy manifest");
+        legacy_manifest
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("snapshot_contract_hash");
+        write_json(root.join("manifest.json"), &legacy_manifest).expect("write legacy manifest");
+        load_research_snapshot(&root).expect("legacy snapshot without contract hash must load");
+
+        let mut semantic_tamper = loaded.manifest.clone();
+        semantic_tamper.max_quote_age_secs += 1;
+        write_json(root.join("manifest.json"), &semantic_tamper)
+            .expect("tamper snapshot manifest semantics");
+        let tampered_manifest =
+            load_research_snapshot(&root).expect_err("semantic tamper must fail");
+        assert!(tampered_manifest
+            .to_string()
+            .contains("evaluator contract hash mismatch"));
+
+        write_json(root.join("manifest.json"), &loaded.manifest)
+            .expect("restore snapshot manifest");
+        let mut oracle_audit_tamper = loaded.manifest.clone();
+        oracle_audit_tamper.chainlink_oracle_settlement_audit =
+            Some(crate::factors::ChainlinkOracleSettlementAudit {
+                expected_events: 1,
+                accepted_events: 1,
+                ..Default::default()
+            });
+        write_json(root.join("manifest.json"), &oracle_audit_tamper)
+            .expect("tamper snapshot oracle audit");
+        let tampered_audit =
+            load_research_snapshot(&root).expect_err("oracle audit tamper must fail");
+        assert!(tampered_audit
+            .to_string()
+            .contains("evaluator contract hash mismatch"));
+
+        write_json(root.join("manifest.json"), &loaded.manifest)
+            .expect("restore snapshot manifest after oracle audit tamper");
+        std::fs::write(
+            root.join(&loaded.manifest.artifacts.observations_json),
+            "[]\n",
+        )
+        .expect("tamper snapshot observations");
+        let tampered = load_research_snapshot(&root).expect_err("tampered snapshot must fail");
+        assert!(tampered
+            .to_string()
+            .contains("evaluator contract hash mismatch"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1512,6 +2805,7 @@ mod tests {
         let manifest = ResearchSnapshotManifest {
             schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
             snapshot_hash: Some("hash".to_string()),
+            snapshot_contract_hash: None,
             generated_at: Utc::now(),
             git_sha: Some("test-sha".to_string()),
             symbols: vec!["BTCUSDT".to_string()],
@@ -1524,6 +2818,8 @@ mod tests {
             max_quote_age_secs: 120,
             stake_usd: 15.0,
             require_official_settlement: true,
+            chainlink_oracle_settlement_audit: None,
+            chainlink_oracle_settlement_evidence: vec![],
             immutable_input: true,
             source_kind: "unit_test".to_string(),
             optimizer_data_dir: Some("/tmp/immutable-parquet".to_string()),
@@ -1584,6 +2880,10 @@ mod tests {
     fn quality_flags_sparse_pm_book_sampling_against_quote_age() {
         let flags = research_snapshot_quality_flags(
             100,
+            10,
+            10,
+            10,
+            10,
             0,
             10,
             false,
@@ -1601,6 +2901,10 @@ mod tests {
     fn quality_flags_accepts_pm_book_sampling_within_quote_age() {
         let flags = research_snapshot_quality_flags(
             100,
+            10,
+            10,
+            10,
+            10,
             0,
             10,
             false,
@@ -1616,6 +2920,10 @@ mod tests {
     fn quality_flags_archive_manifest_without_sampled_rows() {
         let flags = research_snapshot_quality_flags(
             100,
+            10,
+            10,
+            10,
+            10,
             0,
             0,
             false,
@@ -1630,6 +2938,46 @@ mod tests {
 
         assert!(flags.contains(&"no_pm_book_snapshots".to_string()));
         assert!(flags.contains(&"pm_book_archive_manifest_rows_but_no_sampled_rows".to_string()));
+    }
+
+    #[test]
+    fn quality_flags_identify_empty_required_binance_surfaces() {
+        let flags = research_snapshot_quality_flags(
+            100,
+            10,
+            0,
+            0,
+            0,
+            0,
+            10,
+            false,
+            30,
+            30,
+            &ResearchSnapshotPmBookSource::default(),
+        );
+
+        assert!(flags.contains(&"no_binance_price_ticks".to_string()));
+        assert!(flags.contains(&"no_binance_agg_trade_ticks".to_string()));
+        assert!(flags.contains(&"no_binance_lob_snapshots".to_string()));
+    }
+
+    #[test]
+    fn quality_flags_identify_missing_chainlink_settlement_reference() {
+        let flags = research_snapshot_quality_flags(
+            100,
+            0,
+            10,
+            10,
+            10,
+            0,
+            10,
+            false,
+            30,
+            30,
+            &ResearchSnapshotPmBookSource::default(),
+        );
+
+        assert!(flags.contains(&"no_chainlink_reference_ticks".to_string()));
     }
 
     #[cfg(feature = "db")]

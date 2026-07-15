@@ -133,6 +133,10 @@ pub enum MarketUpdate {
         price: Decimal,
         full_accuracy_value: Option<Arc<str>>,
         is_carried_forward: bool,
+        /// Time this process or upstream capture received the tick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        received_at: Option<DateTime<Utc>>,
+        /// Source timestamp supplied by the reference-price provider.
         ts: DateTime<Utc>,
     },
 
@@ -191,8 +195,10 @@ impl MarketUpdate {
             | MarketUpdate::SportsState { ts, .. }
             | MarketUpdate::SportsPregame { ts, .. }
             | MarketUpdate::SportsLive { ts, .. }
-            | MarketUpdate::ReferencePrice { ts, .. }
             | MarketUpdate::Kline { ts, .. } => *ts,
+            MarketUpdate::ReferencePrice {
+                received_at, ts, ..
+            } => received_at.unwrap_or(*ts),
             MarketUpdate::EventDiscovered {
                 end_time,
                 window_secs,
@@ -232,7 +238,7 @@ fn hex_to_decimal_string(hex: &str) -> Option<String> {
     let mut digits = vec![0_u8];
 
     for ch in hex.chars() {
-        let value = ch.to_digit(16)? as u32;
+        let value = ch.to_digit(16)?;
         let mut carry = value;
 
         for digit in &mut digits {
@@ -420,5 +426,46 @@ mod tests {
             market_update_sort_ts(&update),
             end_time - chrono::Duration::seconds(300) - chrono::Duration::hours(1)
         );
+    }
+
+    #[test]
+    fn legacy_reference_price_without_received_at_still_deserializes() {
+        let json = r#"{
+            "kind":"reference_price",
+            "symbol":"btc/usd",
+            "source":"chainlink",
+            "asset_class":"crypto",
+            "price":"100000",
+            "full_accuracy_value":null,
+            "is_carried_forward":false,
+            "ts":"2026-04-21T00:00:00Z"
+        }"#;
+
+        let update: MarketUpdate = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            update,
+            MarketUpdate::ReferencePrice {
+                received_at: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reference_price_sort_ts_uses_received_at() {
+        let source_ts = ts();
+        let received_at = source_ts + chrono::Duration::seconds(3);
+        let update = MarketUpdate::ReferencePrice {
+            symbol: Arc::from("btc/usd"),
+            source: Arc::from("chainlink"),
+            asset_class: Arc::from("crypto"),
+            price: Decimal::new(100_000, 0),
+            full_accuracy_value: None,
+            is_carried_forward: false,
+            received_at: Some(received_at),
+            ts: source_ts,
+        };
+
+        assert_eq!(market_update_sort_ts(&update), received_at);
     }
 }

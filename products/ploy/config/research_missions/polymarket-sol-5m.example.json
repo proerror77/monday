@@ -1,0 +1,23 @@
+{
+  "schema_version": "prediction_research_mission.v1",
+  "mission_id": "polymarket-sol-5m-v1",
+  "lane": "prediction_market",
+  "objective": "Estimate Chainlink-defined settlement probabilities for SOL five-minute Polymarket events before each entry cutoff, using Polymarket CLOB depth for executable evaluation.",
+  "hypothesis_scope": "Generate falsifiable SOL cash-or-nothing endpoint-probability theories. Treat the point-in-time Chainlink opening reference and official Chainlink close as contract truth. Test whether arrival-timestamped Binance spot log-moneyness, drift, aggTrade flow, L2 imbalance, and horizon volatility add predictive or repricing information beyond the Polymarket midpoint, Chainlink digital probability, and event surface. Binance must never define the opening reference, settlement label, or Polymarket execution price.",
+  "mutable_scope": [
+    "probability_blend_weights"
+  ],
+  "data_snapshot_id": "REPLACE_WITH_CONTENT_ADDRESSED_SOL_DATA_SNAPSHOT_ID",
+  "target": "full_depth_settlement_executable_pnl",
+  "symbols": [
+    "SOL"
+  ],
+  "horizon": "5m",
+  "prompt_snapshot_id": "sha256:4adfd79f90d6a0be5de2d8b0ba7fd91007a2ecdede225bdd821710a8af1edc57",
+  "search_policy_snapshot_id": "sha256:93c37ea85f1a779f5375fe0e27c2697474f1a8cec589abb41dc70b7f1fc14a99",
+  "search_budget": {
+    "max_candidates": 6,
+    "max_llm_calls": 2,
+    "max_seconds": 900
+  }
+}

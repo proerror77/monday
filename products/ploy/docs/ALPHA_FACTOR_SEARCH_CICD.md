@@ -523,29 +523,116 @@ prior draft using only the existing allowed mutation types. It still cannot
 guarantee profitability and cannot bypass walk-forward, promotion, replay
 parity, dry-run, or live approval gates.
 
-## Real LLM Expansion
+## Rust Prediction LoopRun and Optional LLM Expansion
 
-The hosted artifact workflow can optionally replace the deterministic
-closed-loop prior with a real model-proposed typed prior. This is off by
-default. Enable it only on an explicit `workflow_dispatch` run by setting:
+The optional LLM turn is mission-driven and remains off by default. Its first
+turn requires a reviewed `prediction_research_mission.v1` JSON; later turns may
+recover the same mission from the previous typed prior. BTC and SOL must use
+separate mission files so a candidate cannot silently broaden its symbol
+population. Start from one of the checked-in examples. Set `data_snapshot_id`
+to the immutable snapshot manifest's `snapshot_contract_hash`, then verify the
+brief and implementation IDs before running one manual proposal:
 
-```json
-{
-  "enable_llm_expansion": true,
-  "llm_expansion_provider": "anthropic",
-  "llm_expansion_model": ""
-}
+```bash
+cargo run -p ploy-research --example prediction_research_loop -- \
+  --print-brief-snapshot-id \
+  config/research_missions/polymarket-btc-5m.json
+cargo run -p ploy-research --example prediction_research_loop -- \
+  --print-policy-snapshot-id
 ```
 
-The workflow also requires the repository secret
-`PLOY_RESEARCH_LLM_API_KEY`. If the flag is false, the secret is missing, the
-model call fails, optional artifact JSON is corrupt, or the model returns no
-mutations, the step exits successfully and leaves the deterministic
-`next-llm-prior.json` unchanged. A successful model response is still only a
-typed prior draft: Rust must compile it through the existing allowed
-`LlmMutationSpec` mutation types before any candidate is evaluated.
+The printed values must equal `prompt_snapshot_id` and
+`search_policy_snapshot_id`. A brief or implementation change requires a new
+mission revision; do not rewrite an existing run's identity.
 
-When the provider returns usage data, the script writes
+Then run:
+
+```bash
+python3 scripts/alpha_search_llm_propose.py \
+  /tmp/downloaded-alpha-search-artifact \
+  --target full_depth_settlement_executable_pnl \
+  --mission-json config/research_missions/polymarket-btc-5m.json \
+  --output-prior-json /tmp/next-llm-prior.json
+```
+
+That Python command is a standalone compatibility helper for a manually
+reviewed proposal. It does not own LoopRun state, evaluation, promotion, or
+execution authority. The governed BTC/SOL loop below is Rust-only.
+
+The mission LoopRun driver is the normal BTC/SOL research entrypoint once the
+immutable research snapshot exists:
+
+```bash
+cargo run -p ploy-research --example prediction_research_loop -- \
+  config/research_missions/polymarket-btc-5m.json \
+  /var/lib/ploy/research-snapshots/btc-5m \
+  /var/lib/ploy/research-runs/btc-5m-loop-001
+```
+
+The driver runs a deterministic baseline, proposes a typed batch, invokes the
+same Rust evaluator, ingests candidate feedback, and repeats until a candidate
+earns a provisional search pass, a budget is exhausted, or an explicit failure
+pauses the run. A provisional result is not promotion evidence: adaptive turns
+have already observed earlier outcomes from this search snapshot, so a separate
+sealed snapshot must pass before any final keep or handoff decision. Rerun the
+same command only after a `paused` result. `provisional`, `budget_exhausted`,
+and `failed` are immutable terminal ledgers; extending one of those requires a
+new reviewed mission revision and a new output directory. Evaluator failures
+reuse the already persisted prior without another LLM call. Every LLM attempt
+is retained in a durable call-state ledger, including schema rejection, provider
+failure, and a response missing after process interruption. Attempt statuses are
+updated through atomic state checkpoints, while prompt and response payloads are
+content-addressed. Only a response already bound by committed LoopRun state may
+be replayed; an unbound orphan response or evaluator artifact is never adopted
+during recovery.
+
+The output directory is exclusively locked while the LoopRun owns it. Reusing
+it for SOL, another mission revision, another snapshot, or another policy
+implementation is rejected. The prediction LoopRun requires `mutable_scope` to
+contain only `probability_blend_weights`; formula/IC diagnostics remain a
+separate standalone research lane.
+
+Governed five-minute missions enforce `event_window_secs=300` at both the Rust
+LoopRun and evaluator boundaries. They require observations whose persisted
+`event_window_secs` is exactly `300`, plus a verified
+`snapshot_contract_hash` that binds the complete evaluator manifest and input
+artifacts. Legacy snapshots default that field to zero and do not have the
+strong contract hash, so they must be regenerated before this LoopRun can use
+them. Rebuilding the snapshot does not imply recollecting an already retained
+raw source, but it does require producing a new immutable evaluator artifact.
+
+The Rust client requires `PLOY_RESEARCH_LLM_BASE_URL` and
+`PLOY_RESEARCH_LLM_MODEL`. `PLOY_RESEARCH_LLM_API_KEY` is optional for a
+loopback Grok Builder and should be set for an authenticated remote HTTPS
+endpoint; `PLOY_RESEARCH_LLM_PROVIDER` labels the durable call record. Missing
+mission authority, unresolved provenance placeholders, and target/horizon
+mismatches fail closed before the LoopRun starts. A provider failure is recorded
+after the call budget is durably reserved and pauses the run. An invalid proposal
+response is retained as an `invalid` call attempt, consumes that reserved call,
+and is not evaluated as a candidate; the loop may continue within its remaining
+budget.
+
+The model sees the mission objective, hypothesis scope, registered probability
+components, and at most eight qualitative
+`search_pass`/`discard` outcomes. It does not receive raw labels, evaluator thresholds,
+or numeric evaluation metrics. Output is limited by `mutable_scope`:
+
+- `probability_blend_weights` allows a named non-negative logit blend over the
+  five registered probability components: Polymarket midpoint, Chainlink
+  digital probability, Binance distance/LOB/volatility, event surface, and the
+  existing Binance log-moneyness model. These candidates enter the real
+  event-disjoint probability evaluator as `q_llm_<name>` and are scored with
+  Brier score, log loss, calibration error, executable settlement PnL, and
+  conservative-depth capacity evidence.
+
+After evaluation, `prediction-research-feedback-<sha256>.json` records the
+candidate definition, metrics, and deterministic reason codes. Only the
+candidate definition, hypothesis, provisional verdict, and reason codes are
+returned to the next LLM turn; evaluator metrics and thresholds are withheld.
+This closes the proposal/evaluation/feedback loop without giving the model
+evaluator, sealed-holdout, promotion, or execution authority.
+
+When the standalone Python compatibility helper receives provider usage, it writes
 `llm-expansion-usage.json` next to `next-llm-prior.json` in the alpha-search
 artifact directory. Treat that as per-run token accounting, not promotion
 evidence.

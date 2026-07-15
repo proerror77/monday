@@ -7,9 +7,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use ploy_research::{
-    build_research_snapshot_from_database, write_research_snapshot, ResearchSnapshotBuildOptions,
+    build_research_snapshot_from_database, validate_governed_chainlink_5m_settlement_evidence,
+    write_research_snapshot, ResearchSnapshotBuildOptions,
 };
 use sqlx::postgres::PgPoolOptions;
 
@@ -141,6 +143,26 @@ async fn main() -> anyhow::Result<()> {
         },
     )
     .await?;
+    if require_official_settlement {
+        let expected_events = snapshot
+            .manifest
+            .chainlink_oracle_settlement_audit
+            .as_ref()
+            .map(|audit| audit.expected_events)
+            .unwrap_or_default();
+        if expected_events == 0 {
+            anyhow::bail!(
+                "refuse to publish prediction Chainlink five-minute snapshot with no expected events"
+            );
+        }
+        validate_governed_chainlink_5m_settlement_evidence(
+            &snapshot.manifest,
+            &snapshot.observations,
+        )
+        .context(
+            "refuse to publish prediction Chainlink five-minute snapshot without complete non-zero event evidence",
+        )?;
+    }
     let manifest = write_research_snapshot(&output_dir, snapshot)?;
 
     eprintln!("research snapshot written: {}", output_dir.display());
