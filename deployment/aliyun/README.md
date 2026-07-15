@@ -55,8 +55,10 @@ token-to-event context remains independently replayable.
 Closed Polymarket sessions are validated, compressed, and uploaded every five
 minutes by `polymarket-market-tape-upload.timer`. The uploader ignores the active
 `market-updates.ndjson`, requires contiguous sequence numbers and monotonic record
-timestamps, then writes `.ndjson.zst`, `manifest.json`, and `_SUCCESS` under
-`lake/raw/venue=polymarket/dataset=crypto_expiry/`. Sessions crossing UTC-hour
+timestamps, then writes `.ndjson.zst`, `manifest.json`, and `_SUCCESS` under the
+immutable `lake/raw/venue=polymarket/dataset=crypto_expiry/date=.../hour=.../sha256=<data-sha>/`
+prefix. Uploads are no-clobber, and an existing triplet must match byte for byte before
+it is treated as a successful retry. Sessions crossing UTC-hour
 boundaries are split into hour partitions. Before deleting a closed source tape,
 the uploader reads all three OSS objects back and verifies the compressed byte
 count, SHA-256, manifest, and success marker. A bad tape does not block later
@@ -74,52 +76,111 @@ Data APIs every 30 seconds. It writes complete Gamma market payloads (including
 volume, tick size, minimum order size, fee fields, token/outcome mappings, and status),
 all public taker and maker trade prints, and closed-market settlement payloads to
 `/data/monday/spool/polymarket-reference/`. Its independent uploader publishes the
-same hash-bound artifact triplet under
+same content-addressed artifact triplet under
 `lake/raw/venue=polymarket/dataset=crypto_expiry_reference/`. Stable trade IDs and a
 persisted overlap state prevent duplicate trade prints across polls and restarts.
 An in-place v1-to-v2 migration locally isolates the old active tape, reopens completed
-markets, and emits a complete v2 overlap; the canonicalizer builds a v2 union before
-historical v1 artifacts receive supersession markers. After settlement,
+markets, and emits a complete v2 overlap. Historical v1 objects remain readable only
+under their explicit supersession markers; there is no long-lived canonicalizer
+process. After settlement,
 trade polling continues for at least 30 minutes after the latest observed change and
 requires three additional stable polls before a market is marked complete. Malformed
 trade rows are isolated and counted by reason in `health.json` instead of blocking
 valid rows.
 Each append batch rolls back to its starting offset if write or fsync fails, so a retry
-cannot duplicate a durable prefix or leave a partial record behind.
+cannot duplicate a durable prefix, suppress a required hourly metadata seed, or leave
+a partial record behind. A durable per-hour seed marker also forces Rust metadata when
+cutover inherits a current-hour Python tape. Discovery is fail-closed unless every
+configured asset is present; `health.json.missing_target_symbols` must remain empty.
 Neither companion unit contains private keys or an execution command.
-The Python companion is a transitional parity lane: the existing Rust
-`collect-pm-trades` command requires PostgreSQL and cannot yet emit the stateless raw
-OSS contract used by this data-only ECS. Replace it only after a Rust shadow service
-produces byte/field, deduplication, settlement, rotation, and OSS-readback parity.
+After cutover, both companion units use the same `polymarket-raw-ops` Rust binary. Its
+`collect-reference` subcommand owns metadata/trade/settlement collection and its
+`upload` subcommand owns validation, compression, OSS upload, and remote readback.
+The former Python collector and uploader remain installed, but inactive, until the
+rollback retention window closes. The one-off canonicalizer is not a runtime service.
 
-Install the uploader beside the existing tape service:
-
-```bash
-sudo install -m 0755 deployment/aliyun/polymarket_market_tape_upload.py \
-  /opt/monday/bin/polymarket_market_tape_upload.py
-sudo install -m 0640 deployment/aliyun/polymarket-market-tape-upload.env \
-  /etc/monday/polymarket-market-tape-upload.env
-sudo install -m 0644 deployment/aliyun/polymarket-market-tape-upload.service \
-  /etc/systemd/system/polymarket-market-tape-upload.service
-sudo install -m 0644 deployment/aliyun/polymarket-market-tape-upload.timer \
-  /etc/systemd/system/polymarket-market-tape-upload.timer
-sudo systemctl daemon-reload
-sudo systemctl enable --now polymarket-market-tape-upload.timer
-```
-
-Install the companion reference lane:
+Obtain `polymarket-raw-ops` and its SHA-256 from the immutable collector build
+artifact and verify the digest from the extracted artifact directory. Do not install
+it over the active runtime or replace any production unit manually:
 
 ```bash
-sudo install -m 0755 deployment/aliyun/polymarket_reference_collector.py \
-  /opt/monday/bin/polymarket_reference_collector.py
-sudo install -m 0644 deployment/aliyun/polymarket-reference-{collector,upload}.service \
-  /etc/systemd/system/
-sudo install -m 0644 deployment/aliyun/polymarket-reference-upload.timer \
-  /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now polymarket-reference-collector.service \
-  polymarket-reference-upload.timer
+sha256sum -c polymarket-raw-ops.sha256
+candidate_sha=$(awk '{print $1}' polymarket-raw-ops.sha256)
+source_revision=$(git rev-parse HEAD)
 ```
+
+Install the control bundle without changing the active Python units:
+
+```bash
+sudo install -d -m 0755 /opt/monday/control/polymarket-raw-ops
+sudo install -m 0755 \
+  deployment/aliyun/polymarket-raw-ops-{shadow-gate,cutover}.sh \
+  /opt/monday/control/polymarket-raw-ops/
+sudo install -m 0644 \
+  deployment/aliyun/polymarket-legacy-health-policy.jq \
+  deployment/aliyun/polymarket-rust-health-policy.jq \
+  deployment/aliyun/polymarket-shadow-gate-policy.jq \
+  deployment/aliyun/polymarket-reference-collector-shadow@.service \
+  deployment/aliyun/polymarket-reference-{collector,upload}.service \
+  deployment/aliyun/polymarket-reference-upload.timer \
+  deployment/aliyun/polymarket-market-tape-upload.{service,timer} \
+  /opt/monday/control/polymarket-raw-ops/
+```
+
+Run the isolated Rust shadow while the active unit is still the Python collector.
+The gate cannot produce production-eligible evidence before 3600 continuous seconds
+plus a verified five-minute comparison tail inside one UTC hour. Both lanes are bounded
+to the same successful-poll cutoff (with a safety lag), so new Python rows written after
+the Rust shadow stops cannot create a false mismatch. Every invocation gets a unique
+run spool beneath the candidate digest, so a failed or expired gate can be rerun without
+reusing prior tape data.
+Evidence binds both the candidate binary digest and the exact control-bundle digest;
+cutover refuses either identity if the bundle changes after shadowing. Control assets
+and evidence must remain root-owned and non-writable by the service account, and a
+gate older than 24 hours must be rerun.
+The gate also writes a content-addressed, root-owned snapshot of the six non-secret
+OSS uploader settings beside the candidate binary. Cutover renders both Rust upload
+units against that immutable snapshot, so a later edit to the live legacy env file
+cannot change the destination represented by the gate evidence.
+It fails unless the seven assets have field and stable metadata-contract value parity,
+identical non-duplicated in-window trade IDs, settlement parity, an hourly rotation,
+fresh fail-closed health, and exact candidate process identity. The candidate must also
+upload and read back both a closed reference segment and a deterministic market-tape
+fixture under the isolated `crypto_expiry_reference_rust_shadow` and
+`crypto_expiry_market_rust_shadow` datasets. Parity comparison itself runs through the
+candidate's Rust `verify-shadow-parity` subcommand; the control bundle contains no
+separate Python verifier:
+
+```bash
+gate_json=$(sudo /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-shadow-gate.sh \
+  ./polymarket-raw-ops "$candidate_sha" "$source_revision")
+```
+
+Only the cutover command may replace the active unit. It verifies the immutable gate,
+snapshots the installed Python units and scripts, drains with the Python uploader,
+stops the Python collector, installs the content-addressed Rust release, and performs
+an explicit `systemctl restart`. Before enabling either upload timer it verifies the
+new MainPID, `/proc/<pid>/exe` digest, command line, fresh fail-closed health, journal,
+and both one-shot upload services. Any failed step automatically restores and restarts
+the snapshotted Python runtime:
+
+```bash
+cutover_json=$(sudo /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-cutover.sh \
+  cutover "$candidate_sha" "$gate_json")
+```
+
+Keep the returned cutover evidence directory for the rollback window. A later manual
+rollback uses the same checksum-verified snapshot and confirms the Python PID and
+command line after restart:
+
+```bash
+cutover_dir=$(dirname "$cutover_json")
+sudo /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-cutover.sh \
+  rollback "$cutover_dir"
+```
+
+Never use `enable --now` as a substitute for this path: it does not prove that an
+already-active Python process was replaced by the gated Rust artifact.
 
 Each service opens bounded WebSocket shards, records every diff, fetches a REST
 Top-100 snapshot, validates sequence continuity, writes replay checkpoints, compresses

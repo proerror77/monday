@@ -11,7 +11,8 @@ User=hftcollector
 Group=hftcollector
 Environment=HOME=/var/lib/hft-collector
 EnvironmentFile=/etc/monday/polymarket-market-tape-upload.env
-ExecStart=/usr/bin/python3 /opt/monday/bin/polymarket_market_tape_upload.py --quote-depth-levels 0 --quote-sample-ms 1000
+ExecStart=/opt/monday/bin/polymarket-raw-ops upload --quote-depth-levels 0 --quote-sample-ms 1000
+TimeoutStartSec=0
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

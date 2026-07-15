@@ -2,6 +2,9 @@
 
 pub mod feature_matrix;
 pub mod lob_archiver;
+pub mod polymarket_parity;
+pub mod polymarket_raw;
+pub mod polymarket_upload;
 pub mod source_catalog;
 
 pub use feature_matrix::{

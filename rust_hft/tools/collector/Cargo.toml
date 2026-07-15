@@ -79,6 +79,10 @@ path = "src/main.rs"
 name = "binance-lob-archiver"
 path = "src/bin/binance-lob-archiver.rs"
 
+[[bin]]
+name = "polymarket-raw-ops"
+path = "src/bin/polymarket-raw-ops.rs"
+
 [lib]
 name = "hft_collector"
 path = "src/lib.rs"
