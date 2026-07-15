@@ -145,16 +145,57 @@ installing anything:
 set -euo pipefail
 artifact_dir=$(pwd -P)
 
-sha256sum -c polymarket-raw-ops.sha256
-candidate_sha=$(awk '{print $1}' polymarket-raw-ops.sha256)
-[[ $(wc -l < source-revision.txt) -eq 1 ]]
-grep -Eq '^[0-9a-f]{40}$' source-revision.txt
-source_revision=$(<source-revision.txt)
+manifest_sha=$(sha256sum polymarket-raw-ops-release.json | awk '{print $1}')
+[[ $(wc -l < polymarket-raw-ops-release.json.sha256) -eq 1 ]]
+[[ $(<polymarket-raw-ops-release.json.sha256) \
+  == "$manifest_sha  polymarket-raw-ops-release.json" ]]
+printf '%s  %s\n' "$manifest_sha" polymarket-raw-ops-release.json \
+  | sha256sum --check --strict
+jq -e -s '
+  length == 1 and (.[0] |
+    .schema == "monday.polymarket_raw_ops_release.v1"
+    and (keys | sort) == (["candidate","control_archive","control_manifest",
+      "schema","source_revision"] | sort)
+    and (.source_revision | test("^[0-9a-f]{40,64}$"))
+    and .candidate.file == "polymarket-raw-ops"
+    and (.candidate | keys | sort) == ["file","sha256"]
+    and (.candidate.sha256 | test("^[0-9a-f]{64}$"))
+    and .control_manifest.file == "polymarket-raw-ops-control-assets.sha256"
+    and (.control_manifest | keys | sort) == ["file","sha256"]
+    and (.control_manifest.sha256 | test("^[0-9a-f]{64}$"))
+    and .control_archive.file == "polymarket-raw-ops-control.tar.gz"
+    and (.control_archive | keys | sort) == ["file","sha256"]
+    and (.control_archive.sha256 | test("^[0-9a-f]{64}$"))
+  )
+' polymarket-raw-ops-release.json >/dev/null
+candidate_sha=$(jq -er -s '.[0].candidate.sha256' polymarket-raw-ops-release.json)
+source_revision=$(jq -er -s '.[0].source_revision' polymarket-raw-ops-release.json)
+deployment_bundle_sha=$(jq -er -s '.[0].control_manifest.sha256' \
+  polymarket-raw-ops-release.json)
+control_archive_sha=$(jq -er -s '.[0].control_archive.sha256' \
+  polymarket-raw-ops-release.json)
 
-sha256sum -c polymarket-raw-ops-control.tar.gz.sha256
+actual_candidate_sha=$(sha256sum polymarket-raw-ops | awk '{print $1}')
+[[ $actual_candidate_sha == "$candidate_sha" ]]
+[[ $(wc -l < polymarket-raw-ops.sha256) -eq 1 ]]
+[[ $(<polymarket-raw-ops.sha256) == "$candidate_sha  polymarket-raw-ops" ]]
+printf '%s  %s\n' "$candidate_sha" polymarket-raw-ops \
+  | sha256sum --check --strict
+[[ $(wc -l < source-revision.txt) -eq 1 ]]
+grep -Eq '^[0-9a-f]{40,64}$' source-revision.txt
+[[ $(<source-revision.txt) == "$source_revision" ]]
+
+actual_control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz \
+  | awk '{print $1}')
+[[ $actual_control_archive_sha == "$control_archive_sha" ]]
+[[ $(wc -l < polymarket-raw-ops-control.tar.gz.sha256) -eq 1 ]]
+[[ $(<polymarket-raw-ops-control.tar.gz.sha256) \
+  == "$control_archive_sha  polymarket-raw-ops-control.tar.gz" ]]
+printf '%s  %s\n' "$control_archive_sha" polymarket-raw-ops-control.tar.gz \
+  | sha256sum --check --strict
 [[ $(wc -l < deployment-bundle.sha256) -eq 1 ]]
 grep -Eq '^[0-9a-f]{64}$' deployment-bundle.sha256
-deployment_bundle_sha=$(<deployment-bundle.sha256)
+[[ $(<deployment-bundle.sha256) == "$deployment_bundle_sha" ]]
 manifest_sha=$(sha256sum polymarket-raw-ops-control-assets.sha256 | awk '{print $1}')
 [[ $manifest_sha == "$deployment_bundle_sha" ]]
 
@@ -188,7 +229,14 @@ through the release workflow. Never combine a candidate binary with control asse
 from another revision or replace a production unit manually:
 
 ```bash
-sudo install -m 0644 \
+sudo install -d -o root -g root -m 0755 /run/monday
+sudo flock -n /run/monday/polymarket-raw-ops.lock \
+  bash -s -- "$control_dir" "$artifact_dir" <<'ROOT_INSTALL'
+set -euo pipefail
+control_dir=$1
+artifact_dir=$2
+install -d -o root -g root -m 0755 /opt/monday/control/polymarket-raw-ops
+install -o root -g root -m 0644 \
   "$control_dir"/polymarket-{legacy,rust}-health-policy.jq \
   "$control_dir"/polymarket-shadow-gate-policy.jq \
   "$control_dir"/polymarket-reference-collector-shadow@.service \
@@ -196,9 +244,17 @@ sudo install -m 0644 \
   "$control_dir"/polymarket-reference-upload.timer \
   "$control_dir"/polymarket-market-tape-upload.{service,timer} \
   /opt/monday/control/polymarket-raw-ops/
-sudo install -m 0755 \
+install -o root -g root -m 0755 \
   "$control_dir"/polymarket-raw-ops-{shadow-gate,cutover}.sh \
   /opt/monday/control/polymarket-raw-ops/
+install -o root -g root -m 0444 \
+  "$artifact_dir/polymarket-raw-ops-release.json" \
+  /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-release.json
+sync -f /opt/monday/control/polymarket-raw-ops
+ROOT_INSTALL
+
+sudo /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-shadow-gate.sh \
+  "$artifact_dir/polymarket-raw-ops" "$candidate_sha" "$source_revision"
 ```
 
 The Rust shadow unit must complete its configured observation window and publish

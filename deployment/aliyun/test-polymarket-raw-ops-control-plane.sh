@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Static contract greps intentionally use literal shell expressions.
 # Extracted production snippets invoke test doubles and variables indirectly.
-# shellcheck disable=SC1090,SC2016,SC2034,SC2329
+# shellcheck disable=SC1090,SC2016,SC2034,SC2317,SC2329
 set -euo pipefail
 
 export LC_ALL=C
@@ -17,7 +17,13 @@ readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 readonly README="$SCRIPT_DIR/README.md"
 
-for command in cargo chmod cp grep jq mkdir mktemp mv rm sed sha256sum shellcheck \
+if command -v gsha256sum >/dev/null 2>&1; then
+  sha256sum() {
+    command gsha256sum "$@"
+  }
+fi
+
+for command in cargo chmod cp grep jq ln mkdir mktemp mv rm sed sha256sum shellcheck \
   sync wc; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'missing control-plane test dependency: %s\n' "$command" >&2
@@ -73,6 +79,186 @@ if verify_gate_marker "$marker_dir"; then
   printf 'gate-marker verifier accepted a multi-entry marker\n' >&2
   exit 1
 fi
+
+# Exercise the installed immutable release manifest parser. The manifest is the
+# sole binding for source, candidate, control-manifest, and control-archive IDs.
+(
+release_manifest_verifier="$tmp_dir/verify-release-manifest.sh"
+sed -n \
+  -e '/^verify_release_manifest() {$/,/^}$/p' \
+  -e '/^verify_release_binding() {$/,/^}$/p' "$GATE" \
+  >"$release_manifest_verifier"
+readonly RELEASE_MANIFEST_SCHEMA=monday.polymarket_raw_ops_release.v1
+secure_control_file() {
+  [[ -f $1 && ! -L $1 ]]
+}
+# shellcheck source=/dev/null
+source "$release_manifest_verifier"
+release_manifest_dir="$tmp_dir/release-manifest"
+mkdir "$release_manifest_dir"
+release_manifest="$release_manifest_dir/polymarket-raw-ops-release.json"
+candidate_file="$release_manifest_dir/polymarket-raw-ops"
+printf 'verified candidate\n' >"$candidate_file"
+candidate_sha=$(sha256sum "$candidate_file" | awk '{print $1}')
+source_revision=$(printf 'b%.0s' {1..40})
+bundle_fixture_sha=$(printf 'c%.0s' {1..64})
+control_archive_sha=$(printf 'd%.0s' {1..64})
+jq -S -n \
+  --arg candidate "$candidate_sha" \
+  --arg source "$source_revision" \
+  --arg control_manifest "$bundle_fixture_sha" \
+  --arg control_archive "$control_archive_sha" \
+  '{schema:"monday.polymarket_raw_ops_release.v1",source_revision:$source,
+    candidate:{file:"polymarket-raw-ops",sha256:$candidate},
+    control_manifest:{file:"polymarket-raw-ops-control-assets.sha256",
+      sha256:$control_manifest},
+    control_archive:{file:"polymarket-raw-ops-control.tar.gz",
+      sha256:$control_archive}}' >"$release_manifest"
+release_manifest_sha=$(sha256sum "$release_manifest" | awk '{print $1}')
+bundle_sha256() {
+  printf '%s\n' "$bundle_fixture_sha"
+}
+verify_release_manifest "$release_manifest" || {
+  printf 'release manifest verifier rejected a valid identity binding\n' >&2
+  exit 1
+}
+verify_release_binding "$release_manifest" "$release_manifest_sha" \
+  "$candidate_sha" "$source_revision" "$bundle_fixture_sha" \
+  "$control_archive_sha" "$candidate_file" || {
+  printf 'release binding rejected a valid immutable release\n' >&2
+  exit 1
+}
+if verify_release_binding "$release_manifest" "$(printf '0%.0s' {1..64})" \
+  "$candidate_sha" "$source_revision" "$bundle_fixture_sha" \
+  "$control_archive_sha" "$candidate_file"; then
+  printf 'release binding accepted a different manifest identity\n' >&2
+  exit 1
+fi
+if verify_release_binding "$release_manifest" "$release_manifest_sha" \
+  "$(printf '0%.0s' {1..64})" "$source_revision" "$bundle_fixture_sha" \
+  "$control_archive_sha" "$candidate_file"; then
+  printf 'release binding accepted a different candidate identity\n' >&2
+  exit 1
+fi
+printf 'tampered candidate\n' >>"$candidate_file"
+if verify_release_binding "$release_manifest" "$release_manifest_sha" \
+  "$candidate_sha" "$source_revision" "$bundle_fixture_sha" \
+  "$control_archive_sha" "$candidate_file" >/dev/null 2>&1; then
+  printf 'release binding accepted modified candidate bytes\n' >&2
+  exit 1
+fi
+printf 'verified candidate\n' >"$candidate_file"
+bundle_fixture_sha=$(printf 'e%.0s' {1..64})
+if verify_release_binding "$release_manifest" "$release_manifest_sha" \
+  "$candidate_sha" "$source_revision" "$(printf 'c%.0s' {1..64})" \
+  "$control_archive_sha" "$candidate_file"; then
+  printf 'release binding accepted a modified installed control bundle\n' >&2
+  exit 1
+fi
+bundle_fixture_sha=$(printf 'c%.0s' {1..64})
+jq '.extra = true' "$release_manifest" >"$release_manifest_dir/extra.json"
+if verify_release_manifest "$release_manifest_dir/extra.json"; then
+  printf 'release manifest verifier accepted an extra identity field\n' >&2
+  exit 1
+fi
+jq '.candidate.file = "other-binary"' "$release_manifest" \
+  >"$release_manifest_dir/wrong-file.json"
+if verify_release_manifest "$release_manifest_dir/wrong-file.json"; then
+  printf 'release manifest verifier accepted a different candidate filename\n' >&2
+  exit 1
+fi
+printf '{}\n%s\n' "$(<"$release_manifest")" \
+  >"$release_manifest_dir/multiple.json"
+if verify_release_manifest "$release_manifest_dir/multiple.json" 2>/dev/null; then
+  printf 'release manifest verifier accepted multiple JSON values\n' >&2
+  exit 1
+fi
+)
+
+# Both controls must carry the same root-chain contract. Run it with deterministic
+# stat/direct-directory doubles so these macOS-hosted tests cover Linux ownership
+# semantics without requiring local root-owned fixtures.
+root_chain_contract="$tmp_dir/root-chain-contract.sh"
+gate_root_chain_contract=$(sed -n \
+  -e '/^valid_absolute_path() {$/,/^}$/p' \
+  -e '/^secure_root_directory() {$/,/^}$/p' \
+  -e '/^secure_root_chain() {$/,/^}$/p' \
+  -e '/^secure_root_chain_or_absent() {$/,/^}$/p' \
+  -e '/^secure_collector_directory() {$/,/^}$/p' "$GATE")
+cutover_root_chain_contract=$(sed -n \
+  -e '/^valid_absolute_path() {$/,/^}$/p' \
+  -e '/^secure_root_directory() {$/,/^}$/p' \
+  -e '/^secure_root_chain() {$/,/^}$/p' \
+  -e '/^secure_root_chain_or_absent() {$/,/^}$/p' \
+  -e '/^secure_collector_directory() {$/,/^}$/p' "$CUTOVER")
+[[ -n $gate_root_chain_contract \
+  && $gate_root_chain_contract == "$cutover_root_chain_contract" ]] || {
+  printf 'shadow and cutover trusted-directory contracts differ\n' >&2
+  exit 1
+}
+printf '%s\n' "$gate_root_chain_contract" >"$root_chain_contract"
+(
+  mock_root_uid=0
+  mock_root_mode=755
+  mock_leaf_mode=750
+  mock_leaf_owner=hftcollector
+  mock_leaf_group=hftcollector
+  direct_directory() {
+    return 0
+  }
+  stat() {
+    [[ $1 == -c && $3 == -- && $# -eq 4 ]] || return 64
+    case "$2" in
+      %u) printf '%s\n' "$mock_root_uid" ;;
+      %a)
+        if [[ $4 == /trusted/spool ]]; then
+          printf '%s\n' "$mock_leaf_mode"
+        else
+          printf '%s\n' "$mock_root_mode"
+        fi
+        ;;
+      %U) printf '%s\n' "$mock_leaf_owner" ;;
+      %G) printf '%s\n' "$mock_leaf_group" ;;
+      *) return 65 ;;
+    esac
+  }
+  # shellcheck source=/dev/null
+  source "$root_chain_contract"
+  secure_root_chain /trusted/leaf || exit 1
+  secure_collector_directory /trusted/spool || exit 1
+  mock_root_mode=775
+  if secure_root_chain /trusted/leaf; then
+    printf 'root-chain contract accepted a writable ancestor\n' >&2
+    exit 1
+  fi
+  mock_root_mode=755
+  mock_root_uid=1000
+  if secure_root_chain /trusted/leaf; then
+    printf 'root-chain contract accepted a non-root ancestor\n' >&2
+    exit 1
+  fi
+  mock_root_uid=0
+  mock_leaf_mode=770
+  if secure_collector_directory /trusted/spool; then
+    printf 'collector-directory contract accepted writable leaf permissions\n' >&2
+    exit 1
+  fi
+  if secure_root_chain /trusted/../leaf; then
+    printf 'root-chain contract accepted a parent traversal\n' >&2
+    exit 1
+  fi
+  if secure_root_chain_or_absent /trusted/missing/../leaf; then
+    printf 'absent root-chain contract accepted a parent traversal\n' >&2
+    exit 1
+  fi
+  dangling_parent="$tmp_dir/root-chain-dangling"
+  mkdir "$dangling_parent"
+  ln -s missing "$dangling_parent/link"
+  if secure_root_chain_or_absent "$dangling_parent/link/child"; then
+    printf 'root-chain contract accepted a dangling intermediate symlink\n' >&2
+    exit 1
+  fi
+)
 
 # Exercise the journal cursor/restart detector with deterministic journal JSON.
 # Both release scripts must carry the exact same implementation so one behavior
@@ -204,7 +390,7 @@ fi
 # The marker must be a unique, exact checksum of cutover.json and a rerun must
 # fail closed rather than replacing existing evidence.
 cutover_marker_publisher="$tmp_dir/publish-cutover-marker.sh"
-sed -n '/^success_marker="\$evidence_dir\/PASSED.sha256"$/,/^sync "\$success_marker"$/p' \
+sed -n '/^success_marker="\$evidence_dir\/PASSED.sha256"$/,/^sync -f "\$evidence_dir"$/p' \
   "$CUTOVER" >"$cutover_marker_publisher"
 [[ -s $cutover_marker_publisher ]] || {
   printf 'cutover success-marker publisher is missing\n' >&2
@@ -212,6 +398,9 @@ sed -n '/^success_marker="\$evidence_dir\/PASSED.sha256"$/,/^sync "\$success_mar
 }
 publish_cutover_marker() (
   evidence_dir=$1
+  secure_root_chain() {
+    [[ -d $1 && ! -L $1 ]]
+  }
   die() {
     printf 'marker publication failed: %s\n' "$*" >&2
     exit 1
@@ -287,6 +476,9 @@ exercise_failed_cutover_cleanup() (
   secure_regular_file() {
     [[ -f $1 && ! -L $1 ]]
   }
+  secure_root_chain() {
+    [[ -d $1 && ! -L $1 ]]
+  }
   die() {
     printf 'rollback evidence transition failed: %s\n' "$*" >&2
     exit 1
@@ -350,6 +542,26 @@ set -e
   sha256sum --check --strict PASSED.rollback-pending.sha256 >/dev/null
 )
 
+automatic_finalize_conflict_dir="$tmp_dir/cutover-automatic-finalize-conflict"
+mkdir "$automatic_finalize_conflict_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
+  >"$automatic_finalize_conflict_dir/cutover.json"
+publish_cutover_marker "$automatic_finalize_conflict_dir"
+printf 'preserve existing forensic marker\n' \
+  >"$automatic_finalize_conflict_dir/PASSED.invalid.sha256"
+set +e
+exercise_failed_cutover_cleanup "$automatic_finalize_conflict_dir" 0 >/dev/null 2>&1
+automatic_finalize_conflict_status=$?
+set -e
+[[ $automatic_finalize_conflict_status -ne 0 \
+  && ! -e $automatic_finalize_conflict_dir/PASSED.sha256 \
+  && -f $automatic_finalize_conflict_dir/PASSED.rollback-pending.sha256 \
+  && $(<"$automatic_finalize_conflict_dir/PASSED.invalid.sha256") \
+    == 'preserve existing forensic marker' ]] || {
+  printf 'rollback finalization overwrote conflicting forensic evidence\n' >&2
+  exit 1
+}
+
 # Execute the manual rollback transition itself. A failed restoration must
 # leave rollback-pending evidence, and a retry must finalize it before exit 0.
 manual_rollback_contract="$tmp_dir/manual-rollback-contract.sh"
@@ -371,6 +583,9 @@ exercise_manual_rollback() (
   }
   secure_regular_file() {
     [[ -f $1 && ! -L $1 ]]
+  }
+  secure_root_chain() {
+    [[ -d $1 && ! -L $1 ]]
   }
   die() {
     printf 'manual rollback evidence transition failed: %s\n' "$*" >&2
@@ -541,6 +756,8 @@ candidate=$(printf 'a%.0s' {1..64})
 source_revision=$(printf 'b%.0s' {1..40})
 bundle=$(printf 'c%.0s' {1..64})
 oss_config=$(printf 'd%.0s' {1..64})
+release_manifest_sha=$(printf '1%.0s' {1..64})
+control_archive_sha=$(printf '2%.0s' {1..64})
 legacy_invocation_id=$(printf 'e%.0s' {1..32})
 shadow_invocation_id=$(printf 'f%.0s' {1..32})
 legacy_cmdline=dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a
@@ -549,6 +766,8 @@ jq \
   --arg source "$source_revision" \
   --arg bundle "$bundle" \
   --arg oss_config "$oss_config" \
+  --arg release_manifest_sha "$release_manifest_sha" \
+  --arg control_archive_sha "$control_archive_sha" \
   --arg legacy_invocation_id "$legacy_invocation_id" \
   --arg shadow_invocation_id "$shadow_invocation_id" \
   --arg legacy_cmdline "$legacy_cmdline" \
@@ -557,6 +776,8 @@ jq \
     candidate_sha256:$candidate,
     deployment_bundle_sha256:$bundle,
     deployment_source_revision:$source,
+    release_manifest_sha256:$release_manifest_sha,
+    control_archive_sha256:$control_archive_sha,
     oss_config_sha256:$oss_config,
     duration_seconds:3900,
     parity_window_started_at_unix:100,
@@ -633,6 +854,18 @@ fi
 jq 'del(.oss_config_sha256)' "$tmp_dir/gate.json" >"$tmp_dir/unbound-oss-config.json"
 if jq -e -f "$POLICY" "$tmp_dir/unbound-oss-config.json" >/dev/null; then
   printf 'gate policy accepted evidence without an OSS configuration identity\n' >&2
+  exit 1
+fi
+jq 'del(.release_manifest_sha256)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/unbound-release-manifest.json"
+if jq -e -f "$POLICY" "$tmp_dir/unbound-release-manifest.json" >/dev/null; then
+  printf 'gate policy accepted evidence without a release manifest identity\n' >&2
+  exit 1
+fi
+jq 'del(.control_archive_sha256)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/unbound-control-archive.json"
+if jq -e -f "$POLICY" "$tmp_dir/unbound-control-archive.json" >/dev/null; then
+  printf 'gate policy accepted evidence without a control archive identity\n' >&2
   exit 1
 fi
 jq '.legacy_runtime.restarts = -1' "$tmp_dir/gate.json" >"$tmp_dir/negative-restarts.json"
@@ -945,6 +1178,10 @@ shadow_stopped_equality_line=$(grep -n '^\[\[ \$stopped_shadow_restarts == 0 \]\
 }
 
 cutover_sync_line=$(grep -n '^sync "$evidence_dir/cutover.json"$' "$CUTOVER" | cut -d: -f1)
+cutover_rollback_sync_line=$(grep -n '^sync -f "$rollback_dir"$' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_release_sync_line=$(grep -n '^sync -f "$candidate_binary"$' "$CUTOVER" \
+  | cut -d: -f1)
 cutover_final_runtime_line=$(grep -n \
   '^verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id"' \
   "$CUTOVER" \
@@ -958,17 +1195,44 @@ cutover_marker_hash_line=$(grep -n '^  sha256sum cutover.json >' "$CUTOVER" | cu
 cutover_marker_move_line=$(grep -n '^mv -Tf "$success_marker_tmp" "$success_marker"$' \
   "$CUTOVER" | cut -d: -f1)
 cutover_marker_sync_line=$(grep -n '^sync "$success_marker"$' "$CUTOVER" | cut -d: -f1)
+cutover_marker_dir_sync_line=$(grep -n '^sync -f "$evidence_dir"$' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
 cutover_success_line=$(grep -n '^cutover_succeeded=true$' "$CUTOVER" | cut -d: -f1)
 cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -f1)
-((cutover_sync_line < cutover_final_runtime_line \
+((cutover_sync_line < cutover_rollback_sync_line \
+  && cutover_rollback_sync_line < cutover_release_sync_line \
+  && cutover_release_sync_line < cutover_final_runtime_line \
   && cutover_final_runtime_line < cutover_final_upload_line \
   && cutover_final_upload_line < cutover_final_oss_line \
   && cutover_final_oss_line < cutover_marker_hash_line \
   && cutover_marker_hash_line < cutover_marker_move_line \
   && cutover_marker_move_line < cutover_marker_sync_line \
-  && cutover_marker_sync_line < cutover_success_line \
+  && cutover_marker_sync_line < cutover_marker_dir_sync_line \
+  && cutover_marker_dir_sync_line < cutover_success_line \
   && cutover_success_line < cutover_trap_off_line)) || {
   printf 'cutover publishes success before final verification or durable marker sync\n' >&2
+  exit 1
+}
+
+snapshot_manifest_line=$(grep -n \
+  '^    sha256sum state.json systemd/\* bin/\* config/\* control/\* >manifest.sha256$' \
+  "$CUTOVER" | cut -d: -f1)
+snapshot_sync_line=$(grep -n '^  sync -f "$rollback_dir"$' "$CUTOVER" | head -1 \
+  | cut -d: -f1)
+((snapshot_manifest_line < snapshot_sync_line)) || {
+  printf 'rollback snapshot is not synchronized after its checksum manifest\n' >&2
+  exit 1
+}
+
+rollback_pending_move_line=$(grep -n '^    mv -Tf "$marker" "$pending"' "$CUTOVER" \
+  | cut -d: -f1)
+rollback_pending_file_sync_line=$(grep -n '^    sync "$pending"' "$CUTOVER" \
+  | cut -d: -f1)
+rollback_pending_dir_sync_line=$(grep -n '^    sync -f "$evidence_dir"' "$CUTOVER" \
+  | head -1 | cut -d: -f1)
+((rollback_pending_move_line < rollback_pending_file_sync_line \
+  && rollback_pending_file_sync_line < rollback_pending_dir_sync_line)) || {
+  printf 'rollback can start before PASSED invalidation is durably synchronized\n' >&2
   exit 1
 }
 
@@ -1036,16 +1300,80 @@ cutover_assets=$(extract_bundle_assets "$CUTOVER")
   printf 'ACR artifact and release-control bundle asset lists differ\n' >&2
   exit 1
 }
-grep -Fq "printf '%s\\n' '\${{ github.sha }}' > source-revision.txt" "$WORKFLOW"
-grep -Fq 'sha256sum -c polymarket-raw-ops-control.tar.gz.sha256' "$README"
+grep -Fq '@${{ steps.build.outputs.digest }}' "$WORKFLOW"
+if grep -F 'IMAGE:' "$WORKFLOW" | grep -Fq ':${{ github.sha }}'; then
+  printf 'workflow still extracts the collector from a mutable SHA tag\n' >&2
+  exit 1
+fi
+grep -Fq 'monday.polymarket_raw_ops_release.v1' "$WORKFLOW"
+grep -Fq '> polymarket-raw-ops-release.json' "$WORKFLOW"
+grep -Fq "jq -er '.source_revision' polymarket-raw-ops-release.json" "$WORKFLOW"
+grep -Fq "jq -er '.control_manifest.sha256' polymarket-raw-ops-release.json" "$WORKFLOW"
+grep -Fq "jq -er '.control_archive.sha256' polymarket-raw-ops-release.json" "$WORKFLOW"
+workflow_candidate_line=$(grep -n '^            candidate_sha=' "$WORKFLOW" | cut -d: -f1)
+workflow_manifest_line=$(grep -n '^              > polymarket-raw-ops-release.json$' "$WORKFLOW" \
+  | cut -d: -f1)
+workflow_sidecar_line=$(grep -n '^              > source-revision.txt$' "$WORKFLOW" \
+  | cut -d: -f1)
+((workflow_candidate_line < workflow_manifest_line \
+  && workflow_manifest_line < workflow_sidecar_line)) || {
+  printf 'workflow publishes release sidecars before the immutable manifest exists\n' >&2
+  exit 1
+}
+grep -Fq 'actual_candidate_sha=$(sha256sum polymarket-raw-ops' "$README"
+grep -Fq 'actual_control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz' \
+  "$README"
+grep -Fq 'sha256sum --check --strict' "$README"
 grep -Fq 'sha256sum polymarket-raw-ops-control-assets.sha256' "$README"
 grep -Fq 'sha256sum -c "$artifact_dir/polymarket-raw-ops-control-assets.sha256"' "$README"
 grep -Fq '"${control_assets[@]}" | LC_ALL=C sort' "$README"
 grep -Fq 'tar -tzf polymarket-raw-ops-control.tar.gz | LC_ALL=C sort' "$README"
 grep -Fq '"$control_dir"/polymarket-reference-{collector,upload}.service' "$README"
+grep -Fq 'flock -n /run/monday/polymarket-raw-ops.lock' "$README"
+grep -Fq 'sync -f /opt/monday/control/polymarket-raw-ops' "$README"
 if grep -Fq 'deployment/aliyun/polymarket-reference-collector.service' "$README"; then
   printf 'README installs the production unit from a mutable checkout\n' >&2
   exit 1
 fi
+
+grep -Fq 'candidate CLI digest differs from the verified release manifest' "$GATE"
+grep -Fq 'source CLI revision differs from the verified release manifest' "$GATE"
+gate_final_binding_line=$(grep -n '^  verify_release_binding "\$RELEASE_MANIFEST"' "$GATE" \
+  | tail -1 | cut -d: -f1)
+gate_marker_line=$(grep -n '^  marker="\$evidence_dir/PASSED.sha256"$' "$GATE" \
+  | cut -d: -f1)
+gate_marker_sync_line=$(grep -n '^  sync "\$marker"$' "$GATE" | cut -d: -f1)
+gate_marker_dir_sync_line=$(grep -n '^  sync -f "\$evidence_dir"$' "$GATE" \
+  | tail -1 | cut -d: -f1)
+((gate_final_binding_line < gate_marker_line \
+  && gate_marker_line < gate_marker_sync_line \
+  && gate_marker_sync_line < gate_marker_dir_sync_line)) || {
+  printf 'gate publishes success before revalidating the immutable release binding\n' >&2
+  exit 1
+}
+cutover_binding_line=$(grep -n '^verify_release_binding "\$RELEASE_MANIFEST"' "$CUTOVER" \
+  | head -1 | cut -d: -f1)
+cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" | cut -d: -f1)
+((cutover_binding_line < cutover_transition_line)) || {
+  printf 'cutover mutates runtime before revalidating the immutable release binding\n' >&2
+  exit 1
+}
+cutover_final_binding_line=$(grep -n '^verify_release_binding "\$RELEASE_MANIFEST"' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_success_marker_line=$(grep -n '^success_marker="\$evidence_dir/PASSED.sha256"$' \
+  "$CUTOVER" | cut -d: -f1)
+((cutover_final_binding_line < cutover_success_marker_line)) || {
+  printf 'cutover publishes success without final immutable release revalidation\n' >&2
+  exit 1
+}
+
+gate_upload_env_chain_line=$(grep -n '^  "\$RELEASE_ROOT" /etc/monday ' "$GATE" \
+  | head -1 | cut -d: -f1)
+gate_upload_env_read_line=$(grep -n '^secure_control_file "\$UPLOAD_ENV"$' "$GATE" \
+  | cut -d: -f1)
+((gate_upload_env_chain_line < gate_upload_env_read_line)) || {
+  printf 'gate reads the upload environment before validating its trusted parent chain\n' >&2
+  exit 1
+}
 
 printf 'Polymarket raw-ops control-plane tests passed\n'

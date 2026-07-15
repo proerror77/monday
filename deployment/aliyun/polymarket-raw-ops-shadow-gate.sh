@@ -22,9 +22,11 @@ readonly UPLOAD_ENV=/etc/monday/polymarket-market-tape-upload.env
 readonly RELEASE_ROOT=/opt/monday/releases/polymarket-raw-ops
 readonly SHADOW_ROOT=/data/monday/spool/polymarket-reference-rust-shadow
 readonly EVIDENCE_ROOT=/data/monday/evidence/polymarket-shadow-gates
-readonly LOCK_FILE=/run/lock/monday-polymarket-raw-ops.lock
+readonly LOCK_FILE=/run/monday/polymarket-raw-ops.lock
+readonly RELEASE_MANIFEST_SCHEMA=monday.polymarket_raw_ops_release.v1
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 readonly SCRIPT_DIR
+readonly RELEASE_MANIFEST="$SCRIPT_DIR/polymarket-raw-ops-release.json"
 readonly SERVICE_TEMPLATE="$SCRIPT_DIR/polymarket-reference-collector-shadow@.service"
 readonly GATE_POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
@@ -67,14 +69,70 @@ direct_directory() {
   [[ -d $path && ! -L $path && $(readlink -f -- "$path") == "$path" ]]
 }
 
-direct_directory_or_absent() {
+secure_root_directory() {
+  local path=$1 owner mode
+  direct_directory "$path" || return 1
+  owner=$(stat -c %u -- "$path") || return 1
+  mode=$(stat -c %a -- "$path") || return 1
+  [[ $owner == 0 ]] && (( (8#$mode & 0022) == 0 ))
+}
+
+valid_absolute_path() {
   local path=$1
-  [[ ! -e $path && ! -L $path ]] || direct_directory "$path"
+  [[ $path == /* && $path != *//* && $path != */./* && $path != */../* \
+    && $path != */. && $path != */.. ]]
+}
+
+secure_root_chain() {
+  local path=$1 remainder component current=
+  valid_absolute_path "$path" || return 1
+  if [[ $path == / ]]; then
+    secure_root_directory /
+    return
+  fi
+  remainder=${path#/}
+  while [[ -n $remainder ]]; do
+    component=${remainder%%/*}
+    [[ -n $component ]] || return 1
+    current="$current/$component"
+    secure_root_directory "$current" || return 1
+    [[ $remainder == "$component" ]] && break
+    remainder=${remainder#*/}
+  done
+}
+
+secure_root_chain_or_absent() {
+  local path=$1 ancestor=$1 parent
+  valid_absolute_path "$path" || return 1
+  [[ ! -L $path ]] || return 1
+  if [[ -e $path ]]; then
+    secure_root_chain "$path"
+    return
+  fi
+  while [[ ! -e $ancestor && ! -L $ancestor ]]; do
+    parent=${ancestor%/*}
+    [[ -n $parent ]] || parent=/
+    [[ $parent != "$ancestor" ]] || return 1
+    ancestor=$parent
+  done
+  [[ ! -L $ancestor ]] || return 1
+  secure_root_chain "$ancestor"
+}
+
+secure_collector_directory() {
+  local path=$1 owner group mode parent
+  direct_directory "$path" || return 1
+  owner=$(stat -c %U -- "$path") || return 1
+  group=$(stat -c %G -- "$path") || return 1
+  mode=$(stat -c %a -- "$path") || return 1
+  [[ $owner == hftcollector && $group == hftcollector && $mode == 750 ]] || return 1
+  parent=${path%/*}
+  secure_root_chain "$parent"
 }
 
 secure_release_directory() {
   local path=$1 owner mode
-  direct_directory "$path" || return 1
+  secure_root_chain "$path" || return 1
   owner=$(stat -c %u -- "$path") || return 1
   mode=$(stat -c %a -- "$path") || return 1
   [[ $owner == 0 && $mode == 755 ]]
@@ -87,6 +145,50 @@ secure_control_file() {
   mode=$(stat -c %a -- "$path")
   [[ $owner == 0 ]] || die "control-plane file is not root-owned: $path"
   (( (8#$mode & 022) == 0 )) || die "control-plane file is group/world writable: $path"
+}
+
+verify_release_manifest() {
+  local manifest=$1
+  secure_control_file "$manifest" || return 1
+  jq -e -s --arg schema "$RELEASE_MANIFEST_SCHEMA" '
+    length == 1 and (.[0] |
+      .schema == $schema
+      and (keys | sort) == (["candidate","control_archive","control_manifest",
+        "schema","source_revision"] | sort)
+      and (.source_revision | type == "string" and test("^[a-f0-9]{40,64}$"))
+      and .candidate.file == "polymarket-raw-ops"
+      and (.candidate | keys | sort) == ["file","sha256"]
+      and (.candidate.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and .control_manifest.file == "polymarket-raw-ops-control-assets.sha256"
+      and (.control_manifest | keys | sort) == ["file","sha256"]
+      and (.control_manifest.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and .control_archive.file == "polymarket-raw-ops-control.tar.gz"
+      and (.control_archive | keys | sort) == ["file","sha256"]
+      and (.control_archive.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    )
+  ' "$manifest" >/dev/null
+}
+
+verify_release_binding() {
+  local manifest=$1 expected_manifest_sha=$2 expected_candidate_sha=$3
+  local expected_source_revision=$4 expected_bundle_sha=$5 expected_archive_sha=$6
+  local candidate=$7
+  verify_release_manifest "$manifest" || return 1
+  [[ $(sha256sum "$manifest" | awk '{print $1}') == "$expected_manifest_sha" ]] \
+    || return 1
+  [[ $(jq -er -s '.[0].candidate.sha256' "$manifest") \
+    == "$expected_candidate_sha" ]] \
+    || return 1
+  [[ $(jq -er -s '.[0].source_revision' "$manifest") \
+    == "$expected_source_revision" ]] \
+    || return 1
+  [[ $(jq -er -s '.[0].control_manifest.sha256' "$manifest") \
+    == "$expected_bundle_sha" ]] || return 1
+  [[ $(jq -er -s '.[0].control_archive.sha256' "$manifest") \
+    == "$expected_archive_sha" ]] || return 1
+  [[ $(bundle_sha256) == "$expected_bundle_sha" ]] || return 1
+  printf '%s  %s\n' "$expected_candidate_sha" "$candidate" \
+    | sha256sum --check --strict >/dev/null
 }
 
 effective_exec_argv() {
@@ -247,15 +349,38 @@ verify_shadow_identity() {
 }
 
 for command in awk chown chmod date flock grep install journalctl jq mkdir mktemp mountpoint mv \
-  readlink rm runuser sed sha256sum sleep stat sync systemctl tr; do
+  readlink rm runuser sed sha256sum sleep stat sync systemctl tr wc; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
 
+mountpoint -q /data || die '/data must be a mount point'
+for path in "$SCRIPT_DIR" /opt/monday /opt/monday/bin /opt/monday/releases \
+  "$RELEASE_ROOT" /etc/monday /etc/systemd/system /data /data/monday \
+  /data/monday/spool "$SHADOW_ROOT" /data/monday/evidence "$EVIDENCE_ROOT" \
+  /run/monday; do
+  secure_root_chain_or_absent "$path" \
+    || die "trusted path chain is not root-owned and non-writable: $path"
+done
+secure_collector_directory "$LEGACY_SPOOL" \
+  || die 'legacy spool is not an exact hftcollector-owned 0750 directory'
+
 candidate_source=$1
-candidate_sha=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
-source_revision=$(printf '%s' "$3" | tr '[:upper:]' '[:lower:]')
+candidate_sha_cli=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+source_revision_cli=$(printf '%s' "$3" | tr '[:upper:]' '[:lower:]')
+verify_release_manifest "$RELEASE_MANIFEST" || die 'installed release manifest is invalid'
+candidate_sha=$(jq -er '.candidate.sha256' "$RELEASE_MANIFEST")
+source_revision=$(jq -er '.source_revision' "$RELEASE_MANIFEST")
+manifest_deployment_bundle_sha=$(jq -er '.control_manifest.sha256' "$RELEASE_MANIFEST")
+control_archive_sha=$(jq -er '.control_archive.sha256' "$RELEASE_MANIFEST")
+release_manifest_sha=$(sha256sum "$RELEASE_MANIFEST" | awk '{print $1}')
+[[ $candidate_sha_cli == "$candidate_sha" ]] \
+  || die 'candidate CLI digest differs from the verified release manifest'
+[[ $source_revision_cli == "$source_revision" ]] \
+  || die 'source CLI revision differs from the verified release manifest'
 [[ $candidate_sha =~ ^[a-f0-9]{64}$ ]] || die 'candidate SHA-256 is invalid'
 [[ $source_revision =~ ^[a-f0-9]{40,64}$ ]] || die 'source revision is invalid'
+[[ $control_archive_sha =~ ^[a-f0-9]{64}$ ]] \
+  || die 'control archive identity is invalid'
 [[ -f $candidate_source && ! -L $candidate_source && -x $candidate_source ]] \
   || die 'candidate must be a direct executable regular file'
 printf '%s  %s\n' "$candidate_sha" "$candidate_source" \
@@ -266,16 +391,16 @@ for asset in "${BUNDLE_ASSETS[@]}"; do
 done
 secure_control_file "$UPLOAD_ENV"
 deployment_bundle_sha=$(bundle_sha256)
+[[ $deployment_bundle_sha == "$manifest_deployment_bundle_sha" ]] \
+  || die 'installed control bundle differs from the verified release manifest'
+verify_release_binding "$RELEASE_MANIFEST" "$release_manifest_sha" \
+  "$candidate_sha" "$source_revision" "$deployment_bundle_sha" \
+  "$control_archive_sha" "$candidate_source" \
+  || die 'release manifest does not bind the candidate and installed control bundle'
 load_oss_config_snapshot
-mountpoint -q /data || die '/data must be a mount point'
 
-for path in /opt/monday /opt/monday/releases "$RELEASE_ROOT" \
-  /data/monday /data/monday/spool "$SHADOW_ROOT" \
-  /data/monday/evidence "$EVIDENCE_ROOT"; do
-  direct_directory_or_absent "$path" || die "fixed path is indirect or a symlink: $path"
-done
-
-install -d -m 0755 "$(dirname "$LOCK_FILE")"
+install -d -m 0755 /run/monday
+secure_root_chain /run/monday || die 'runtime control directory is not trusted'
 exec 9>"$LOCK_FILE"
 flock -n 9 || die 'another Polymarket release operation is running'
 
@@ -319,6 +444,7 @@ if [[ -e $release_dir || -L $release_dir ]]; then
     | sha256sum --check --strict >/dev/null || die 'existing release identity mismatch'
 else
   install -d -m 0755 "$RELEASE_ROOT"
+  secure_root_chain "$RELEASE_ROOT" || die 'release root is not trusted after creation'
   staging=$(mktemp -d "$RELEASE_ROOT/.${candidate_sha}.new.XXXXXX")
   install -m 0755 "$candidate_source" "$staging/polymarket-raw-ops"
   printf '%s  %s\n' "$candidate_sha" "$staging/polymarket-raw-ops" \
@@ -348,12 +474,17 @@ shadow_unit="polymarket-reference-collector-shadow@${candidate_sha}.service"
   || die 'refusing to reuse a market upload shadow spool run'
 install -d -m 0755 /data/monday /data/monday/spool "$SHADOW_ROOT" "$shadow_parent"
 for path in /data/monday /data/monday/spool "$SHADOW_ROOT" "$shadow_parent"; do
-  direct_directory "$path" || die "created shadow path is indirect: $path"
+  secure_root_chain "$path" || die "created shadow path is not trusted: $path"
 done
 install -d -m 0750 -o hftcollector -g hftcollector "$shadow_spool"
 install -d -m 0750 -o hftcollector -g hftcollector "$market_shadow_spool"
+secure_collector_directory "$shadow_spool" \
+  || die 'reference shadow spool identity or permissions are unsafe'
+secure_collector_directory "$market_shadow_spool" \
+  || die 'market shadow spool identity or permissions are unsafe'
 
 install -d -m 0755 /run/monday
+secure_root_chain /run/monday || die 'runtime environment directory is not trusted'
 shadow_env_file="/run/monday/polymarket-reference-shadow-${candidate_sha}.env"
 # A killed gate can leave its isolated unit/env behind. The global release lock
 # proves there is no live gate owner, so stop only that shadow instance and
@@ -508,10 +639,11 @@ stopped_shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_u
 evidence_parent="$EVIDENCE_ROOT/$candidate_sha"
 install -d -m 0755 /data/monday/evidence "$EVIDENCE_ROOT" "$evidence_parent"
 for path in /data/monday/evidence "$EVIDENCE_ROOT" "$evidence_parent"; do
-  direct_directory "$path" || die "evidence path is indirect: $path"
+  secure_root_chain "$path" || die "evidence path is not trusted: $path"
 done
 evidence_dir="$evidence_parent/$run_id"
 mkdir -m 0750 "$evidence_dir" || die 'evidence run already exists'
+secure_root_chain "$evidence_dir" || die 'evidence run directory is not trusted'
 parity_json="$evidence_dir/parity.json"
 "$release_binary" verify-shadow-parity \
   --legacy-spool "$LEGACY_SPOOL" \
@@ -607,6 +739,8 @@ jq \
   --arg candidate_sha256 "$candidate_sha" \
   --arg deployment_bundle_sha256 "$deployment_bundle_sha" \
   --arg deployment_source_revision "$source_revision" \
+  --arg release_manifest_sha256 "$release_manifest_sha" \
+  --arg control_archive_sha256 "$control_archive_sha" \
   --arg oss_config_sha256 "$oss_config_sha" \
   --arg started_at "$started_at" \
   --arg completed_at "$completed_at" \
@@ -639,6 +773,8 @@ jq \
     candidate_sha256:$candidate_sha256,
     deployment_bundle_sha256:$deployment_bundle_sha256,
     deployment_source_revision:$deployment_source_revision,
+    release_manifest_sha256:$release_manifest_sha256,
+    control_archive_sha256:$control_archive_sha256,
     oss_config_sha256:$oss_config_sha256,
     started_at:$started_at,
     completed_at:$completed_at,
@@ -674,6 +810,12 @@ mv "$gate_tmp" "$gate_json"
 sync "$gate_json"
 
 if [[ $production_eligible == true ]]; then
+  secure_root_chain "$evidence_dir" \
+    || die 'evidence directory trust changed before marker publication'
+  verify_release_binding "$RELEASE_MANIFEST" "$release_manifest_sha" \
+    "$candidate_sha" "$source_revision" "$deployment_bundle_sha" \
+    "$control_archive_sha" "$release_binary" \
+    || die 'release manifest, candidate, or installed control bundle changed during gate'
   verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
     || die 'legacy collector identity changed before the gate marker was published'
   verify_current_oss_config
@@ -685,6 +827,8 @@ if [[ $production_eligible == true ]]; then
     sha256sum gate.json >".${marker##*/}.tmp"
     mv ".${marker##*/}.tmp" "${marker##*/}"
   )
+  sync "$marker"
+  sync -f "$evidence_dir"
 fi
 
 printf '%s\n' "$gate_json"

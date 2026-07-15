@@ -6,6 +6,8 @@ def nonnegative_integer: type == "number" and floor == . and . >= 0;
 and (.candidate_sha256 | sha256)
 and (.deployment_bundle_sha256 | sha256)
 and (.deployment_source_revision | type == "string" and test("^[a-f0-9]{40,64}$"))
+and (.release_manifest_sha256 | sha256)
+and (.control_archive_sha256 | sha256)
 and (.oss_config_sha256 | sha256)
 and (.duration_seconds | positive_integer and . >= 3900)
 and (.parity_window_started_at_unix | positive_integer)

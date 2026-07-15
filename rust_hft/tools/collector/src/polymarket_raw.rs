@@ -70,10 +70,8 @@ impl CycleWatchdog {
                     .wait_timeout_while(completed, timeout, |completed| !*completed)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if wait.timed_out() && !*completed {
-                    eprintln!(
-                        "Polymarket reference cycle exceeded the hard {}ms wall-clock deadline",
-                        timeout.as_millis()
-                    );
+                    // A hard watchdog must not wait on stderr's global lock or
+                    // a backpressured log sink. systemd records exit status 124.
                     std::process::exit(HARD_CYCLE_WATCHDOG_EXIT_CODE);
                 }
             })?;
@@ -2042,6 +2040,8 @@ mod tests {
     use super::*;
 
     const HARD_WATCHDOG_TEST_ENV: &str = "MONDAY_TEST_POLYMARKET_HARD_WATCHDOG";
+    const HARD_WATCHDOG_HOLD_STDERR_TEST_ENV: &str =
+        "MONDAY_TEST_POLYMARKET_HARD_WATCHDOG_HOLD_STDERR";
 
     struct TestDir {
         _temp: tempfile::TempDir,
@@ -2075,6 +2075,19 @@ mod tests {
         if std::env::var_os(HARD_WATCHDOG_TEST_ENV).is_none() {
             return;
         }
+        let _stderr_lock_holder = if std::env::var_os(HARD_WATCHDOG_HOLD_STDERR_TEST_ENV).is_some()
+        {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _stderr = std::io::stderr().lock();
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(10));
+            });
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            Some(holder)
+        } else {
+            None
+        };
         let _watchdog = CycleWatchdog::arm(Duration::from_millis(100)).unwrap();
         std::thread::sleep(Duration::from_secs(10));
     }
@@ -2095,7 +2108,27 @@ mod tests {
             started.elapsed() < Duration::from_secs(3),
             "hard watchdog did not terminate the child promptly"
         );
-        assert!(String::from_utf8_lossy(&output.stderr).contains("hard 100ms wall-clock deadline"));
+    }
+
+    #[test]
+    fn hard_cycle_watchdog_exits_124_while_stderr_is_locked() {
+        let started = Instant::now();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("hard_cycle_watchdog_child")
+            .env(HARD_WATCHDOG_TEST_ENV, "1")
+            .env(HARD_WATCHDOG_HOLD_STDERR_TEST_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        assert_eq!(status.code(), Some(HARD_CYCLE_WATCHDOG_EXIT_CODE));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "hard watchdog blocked on the process-wide stderr lock"
+        );
     }
 
     #[test]

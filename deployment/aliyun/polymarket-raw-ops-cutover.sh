@@ -9,12 +9,14 @@ readonly SCRIPT_DIR
 readonly POLICY="$SCRIPT_DIR/polymarket-shadow-gate-policy.jq"
 readonly LEGACY_HEALTH_POLICY="$SCRIPT_DIR/polymarket-legacy-health-policy.jq"
 readonly RUST_HEALTH_POLICY="$SCRIPT_DIR/polymarket-rust-health-policy.jq"
+readonly RELEASE_MANIFEST_SCHEMA=monday.polymarket_raw_ops_release.v1
+readonly RELEASE_MANIFEST="$SCRIPT_DIR/polymarket-raw-ops-release.json"
 readonly RELEASE_ROOT=/opt/monday/releases/polymarket-raw-ops
 readonly ACTIVE_BINARY=/opt/monday/bin/polymarket-raw-ops
 readonly EVIDENCE_ROOT=/data/monday/evidence/polymarket-cutovers
 readonly GATE_EVIDENCE_ROOT=/data/monday/evidence/polymarket-shadow-gates
 readonly MAX_GATE_AGE_SECONDS=86400
-readonly LOCK_FILE=/run/lock/monday-polymarket-raw-ops.lock
+readonly LOCK_FILE=/run/monday/polymarket-raw-ops.lock
 readonly COLLECTOR_UNIT=polymarket-reference-collector.service
 readonly REFERENCE_UPLOAD_UNIT=polymarket-reference-upload.service
 readonly REFERENCE_UPLOAD_TIMER=polymarket-reference-upload.timer
@@ -80,14 +82,70 @@ direct_directory() {
   [[ -d $path && ! -L $path && $(readlink -f -- "$path") == "$path" ]]
 }
 
-direct_directory_or_absent() {
+secure_root_directory() {
+  local path=$1 owner mode
+  direct_directory "$path" || return 1
+  owner=$(stat -c %u -- "$path") || return 1
+  mode=$(stat -c %a -- "$path") || return 1
+  [[ $owner == 0 ]] && (( (8#$mode & 0022) == 0 ))
+}
+
+valid_absolute_path() {
   local path=$1
-  [[ ! -e $path && ! -L $path ]] || direct_directory "$path"
+  [[ $path == /* && $path != *//* && $path != */./* && $path != */../* \
+    && $path != */. && $path != */.. ]]
+}
+
+secure_root_chain() {
+  local path=$1 remainder component current=
+  valid_absolute_path "$path" || return 1
+  if [[ $path == / ]]; then
+    secure_root_directory /
+    return
+  fi
+  remainder=${path#/}
+  while [[ -n $remainder ]]; do
+    component=${remainder%%/*}
+    [[ -n $component ]] || return 1
+    current="$current/$component"
+    secure_root_directory "$current" || return 1
+    [[ $remainder == "$component" ]] && break
+    remainder=${remainder#*/}
+  done
+}
+
+secure_root_chain_or_absent() {
+  local path=$1 ancestor=$1 parent
+  valid_absolute_path "$path" || return 1
+  [[ ! -L $path ]] || return 1
+  if [[ -e $path ]]; then
+    secure_root_chain "$path"
+    return
+  fi
+  while [[ ! -e $ancestor && ! -L $ancestor ]]; do
+    parent=${ancestor%/*}
+    [[ -n $parent ]] || parent=/
+    [[ $parent != "$ancestor" ]] || return 1
+    ancestor=$parent
+  done
+  [[ ! -L $ancestor ]] || return 1
+  secure_root_chain "$ancestor"
+}
+
+secure_collector_directory() {
+  local path=$1 owner group mode parent
+  direct_directory "$path" || return 1
+  owner=$(stat -c %U -- "$path") || return 1
+  group=$(stat -c %G -- "$path") || return 1
+  mode=$(stat -c %a -- "$path") || return 1
+  [[ $owner == hftcollector && $group == hftcollector && $mode == 750 ]] || return 1
+  parent=${path%/*}
+  secure_root_chain "$parent"
 }
 
 secure_release_directory() {
   local path=$1 owner mode
-  direct_directory "$path" || return 1
+  secure_root_chain "$path" || return 1
   owner=$(stat -c %u -- "$path") || return 1
   mode=$(stat -c %a -- "$path") || return 1
   [[ $owner == 0 && $mode == 755 ]]
@@ -101,6 +159,48 @@ secure_regular_file() {
   [[ $owner == 0 ]] || die "required file is not root-owned: $path"
   (( (8#$mode & 022) == 0 )) \
     || die "required file is group/world writable: $path"
+}
+
+verify_release_manifest() {
+  local manifest=$1
+  secure_regular_file "$manifest" || return 1
+  jq -e -s --arg schema "$RELEASE_MANIFEST_SCHEMA" '
+    length == 1 and (.[0] |
+      .schema == $schema
+      and (keys | sort) == (["candidate","control_archive","control_manifest",
+        "schema","source_revision"] | sort)
+      and (.source_revision | type == "string" and test("^[a-f0-9]{40,64}$"))
+      and .candidate.file == "polymarket-raw-ops"
+      and (.candidate | keys | sort) == ["file","sha256"]
+      and (.candidate.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and .control_manifest.file == "polymarket-raw-ops-control-assets.sha256"
+      and (.control_manifest | keys | sort) == ["file","sha256"]
+      and (.control_manifest.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+      and .control_archive.file == "polymarket-raw-ops-control.tar.gz"
+      and (.control_archive | keys | sort) == ["file","sha256"]
+      and (.control_archive.sha256 | type == "string" and test("^[a-f0-9]{64}$"))
+    )
+  ' "$manifest" >/dev/null
+}
+
+verify_release_binding() {
+  local manifest=$1 expected_manifest_sha=$2 expected_candidate_sha=$3
+  local expected_source_revision=$4 expected_bundle_sha=$5 expected_archive_sha=$6
+  local candidate=$7
+  verify_release_manifest "$manifest" || return 1
+  [[ $(sha256sum "$manifest" | awk '{print $1}') == "$expected_manifest_sha" ]] \
+    || return 1
+  [[ $(jq -er -s '.[0].candidate.sha256' "$manifest") \
+    == "$expected_candidate_sha" ]] || return 1
+  [[ $(jq -er -s '.[0].source_revision' "$manifest") \
+    == "$expected_source_revision" ]] || return 1
+  [[ $(jq -er -s '.[0].control_manifest.sha256' "$manifest") \
+    == "$expected_bundle_sha" ]] || return 1
+  [[ $(jq -er -s '.[0].control_archive.sha256' "$manifest") \
+    == "$expected_archive_sha" ]] || return 1
+  [[ $(bundle_sha256) == "$expected_bundle_sha" ]] || return 1
+  printf '%s  %s\n' "$expected_candidate_sha" "$candidate" \
+    | sha256sum --check --strict >/dev/null
 }
 
 verify_gate_marker() {
@@ -138,6 +238,7 @@ prepare_rollback_evidence() {
   local marker=$evidence_dir/PASSED.sha256
   local pending=$evidence_dir/PASSED.rollback-pending.sha256
   local cutover=$evidence_dir/cutover.json
+  secure_root_chain "$evidence_dir" || return 1
   if [[ -e $marker || -L $marker ]]; then
     secure_regular_file "$marker"
     secure_regular_file "$cutover"
@@ -147,6 +248,7 @@ prepare_rollback_evidence() {
       || die 'rollback-pending marker path already exists'
     mv -Tf "$marker" "$pending" || return 1
     sync "$pending" || return 1
+    sync -f "$evidence_dir" || return 1
   elif [[ -e $pending || -L $pending ]]; then
     secure_regular_file "$pending"
     secure_regular_file "$cutover"
@@ -158,12 +260,17 @@ prepare_rollback_evidence() {
 finalize_rollback_evidence() {
   local evidence_dir=$1 label=$2
   local pending=$evidence_dir/PASSED.rollback-pending.sha256
+  local final=$evidence_dir/PASSED.$label.sha256
+  [[ $label == invalid || $label == rolled-back ]] || return 1
+  secure_root_chain "$evidence_dir" || return 1
   if [[ -e $pending || -L $pending ]]; then
     verify_named_marker "$evidence_dir" cutover.json PASSED.rollback-pending.sha256 \
       || return 1
-    mv -Tf "$pending" "$evidence_dir/PASSED.$label.sha256" || return 1
+    [[ ! -e $final && ! -L $final ]] || return 1
+    mv -Tf "$pending" "$final" || return 1
+    sync "$final" || return 1
   fi
-  sync "$evidence_dir"
+  sync -f "$evidence_dir"
 }
 
 effective_exec_argv() {
@@ -393,6 +500,8 @@ snapshot_legacy() {
   local state_json=$rollback_dir/state.json asset enabled active
   install -d -m 0750 "$rollback_dir/systemd" "$rollback_dir/bin" \
     "$rollback_dir/config" "$rollback_dir/control"
+  secure_root_chain "$rollback_dir" \
+    || die 'rollback snapshot directory chain is not trusted'
   for asset in "${UNIT_ASSETS[@]}"; do
     secure_regular_file "/etc/systemd/system/$asset"
     install -m 0644 "/etc/systemd/system/$asset" "$rollback_dir/systemd/$asset"
@@ -422,6 +531,7 @@ snapshot_legacy() {
     cd "$rollback_dir"
     sha256sum state.json systemd/* bin/* config/* control/* >manifest.sha256
   )
+  sync -f "$rollback_dir"
 }
 
 restore_legacy() (
@@ -430,8 +540,8 @@ restore_legacy() (
   local rollback_dir=$evidence_dir/rollback active_target actual_manifest_sha asset
   local expected_manifest_sha started_epoch rollback_pid current_pid restarts
   local rollback_health_policy=$rollback_dir/control/polymarket-legacy-health-policy.jq
-  direct_directory "$evidence_dir" || die 'rollback evidence directory is indirect'
-  direct_directory "$rollback_dir" || die 'rollback payload directory is indirect'
+  secure_root_chain "$evidence_dir" || die 'rollback evidence directory is not trusted'
+  secure_root_chain "$rollback_dir" || die 'rollback payload directory is not trusted'
   secure_regular_file "$rollback_dir/manifest.sha256"
   (
     cd "$rollback_dir"
@@ -544,12 +654,17 @@ case "$mode" in
     ;;
 esac
 mountpoint -q /data || die '/data must be a mount point'
-for path in /opt/monday /opt/monday/bin /opt/monday/releases "$RELEASE_ROOT" \
-  /data/monday /data/monday/spool /data/monday/spool/polymarket-reference \
-  /data/monday/evidence "$EVIDENCE_ROOT" "$GATE_EVIDENCE_ROOT"; do
-  direct_directory_or_absent "$path" || die "fixed path is indirect or a symlink: $path"
+for path in "$SCRIPT_DIR" /etc/monday /etc/systemd/system /opt/monday \
+  /opt/monday/bin /opt/monday/releases "$RELEASE_ROOT" /data /data/monday \
+  /data/monday/spool /data/monday/evidence "$EVIDENCE_ROOT" \
+  "$GATE_EVIDENCE_ROOT" /run/monday; do
+  secure_root_chain_or_absent "$path" \
+    || die "trusted path chain is not root-owned and non-writable: $path"
 done
-install -d -m 0755 "$(dirname "$LOCK_FILE")"
+secure_collector_directory /data/monday/spool/polymarket-reference \
+  || die 'production spool is not an exact hftcollector-owned 0750 directory'
+install -d -m 0755 /run/monday
+secure_root_chain /run/monday || die 'runtime control directory is not trusted'
 exec 9>"$LOCK_FILE"
 flock -n 9 || die 'another Polymarket release operation is running'
 
@@ -558,6 +673,8 @@ if [[ $mode == rollback ]]; then
   rollback_evidence=$(readlink -f -- "$2")
   [[ $rollback_evidence == "$EVIDENCE_ROOT"/* ]] \
     || die 'rollback evidence is outside the fixed cutover evidence root'
+  secure_root_chain "$rollback_evidence" \
+    || die 'manual rollback evidence directory is not trusted'
   prepare_rollback_evidence "$rollback_evidence" \
     || die 'could not invalidate cutover success before manual rollback'
   restore_legacy "$rollback_evidence" >/dev/null
@@ -586,7 +703,7 @@ gate_json=$(readlink -f -- "$3")
   || die 'gate evidence is outside the fixed shadow evidence root'
 secure_regular_file "$gate_json"
 gate_dir=$(dirname "$gate_json")
-direct_directory "$gate_dir" || die 'gate evidence directory is indirect'
+secure_root_chain "$gate_dir" || die 'gate evidence directory is not trusted'
 secure_regular_file "$gate_dir/PASSED.sha256"
 verify_gate_marker "$gate_dir" \
   || die 'shadow gate marker is not the exact single gate.json checksum'
@@ -595,6 +712,15 @@ jq -e -f "$POLICY" "$gate_json" >/dev/null || die 'shadow gate is not production
   || die 'gate belongs to a different candidate'
 [[ $(jq -r '.deployment_bundle_sha256' "$gate_json") == "$deployment_bundle_sha" ]] \
   || die 'control-plane bundle changed after the shadow gate'
+gate_release_manifest_sha=$(jq -er \
+  '.release_manifest_sha256 | select(type == "string" and test("^[a-f0-9]{64}$"))' \
+  "$gate_json") || die 'shadow gate is missing the release manifest identity'
+gate_control_archive_sha=$(jq -er \
+  '.control_archive_sha256 | select(type == "string" and test("^[a-f0-9]{64}$"))' \
+  "$gate_json") || die 'shadow gate is missing the control archive identity'
+gate_source_revision=$(jq -er \
+  '.deployment_source_revision | select(type == "string" and test("^[a-f0-9]{40,64}$"))' \
+  "$gate_json") || die 'shadow gate is missing the source revision identity'
 gate_oss_config_sha=$(jq -er '.oss_config_sha256 | select(type == "string")' "$gate_json") \
   || die 'shadow gate is missing the OSS configuration identity'
 [[ $gate_oss_config_sha == "$current_oss_config_sha" ]] \
@@ -616,6 +742,10 @@ secure_regular_file "$candidate_binary"
 [[ -x $candidate_binary ]] || die 'candidate release is not executable'
 printf '%s  %s\n' "$candidate_sha" "$candidate_binary" \
   | sha256sum --check --strict >/dev/null || die 'candidate release checksum mismatch'
+verify_release_binding "$RELEASE_MANIFEST" "$gate_release_manifest_sha" \
+  "$candidate_sha" "$gate_source_revision" "$deployment_bundle_sha" \
+  "$gate_control_archive_sha" "$candidate_binary" \
+  || die 'release manifest no longer binds the gated candidate and control bundle'
 pinned_upload_env="$RELEASE_ROOT/$candidate_sha/polymarket-upload-env-$gate_oss_config_sha.env"
 secure_regular_file "$pinned_upload_env"
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
@@ -644,9 +774,11 @@ verify_legacy_health "$legacy_health_not_before" \
   || die 'cutover requires current fail-closed legacy health'
 
 install -d -m 0755 /data/monday /data/monday/evidence "$EVIDENCE_ROOT"
+secure_root_chain "$EVIDENCE_ROOT" || die 'cutover evidence root is not trusted'
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-${candidate_sha:0:12}-$$"
 evidence_dir="$EVIDENCE_ROOT/$run_id"
 mkdir -m 0750 "$evidence_dir" || die 'cutover evidence directory already exists'
+secure_root_chain "$evidence_dir" || die 'cutover evidence directory is not trusted'
 rollback_dir="$evidence_dir/rollback"
 snapshot_legacy "$rollback_dir"
 
@@ -820,6 +952,9 @@ jq -n \
   --arg schema monday.polymarket_cutover.v1 \
   --arg candidate_sha256 "$candidate_sha" \
   --arg deployment_bundle_sha256 "$deployment_bundle_sha" \
+  --arg deployment_source_revision "$gate_source_revision" \
+  --arg release_manifest_sha256 "$gate_release_manifest_sha" \
+  --arg control_archive_sha256 "$gate_control_archive_sha" \
   --arg oss_config_sha256 "$gate_oss_config_sha" \
   --arg gate_json_sha256 "$(sha256sum "$gate_json" | awk '{print $1}')" \
   --arg completed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -830,6 +965,9 @@ jq -n \
   --argjson main_pid "$main_pid" \
   '{schema:$schema,candidate_sha256:$candidate_sha256,
     deployment_bundle_sha256:$deployment_bundle_sha256,
+    deployment_source_revision:$deployment_source_revision,
+    release_manifest_sha256:$release_manifest_sha256,
+    control_archive_sha256:$control_archive_sha256,
     oss_config_sha256:$oss_config_sha256,
     gate_json_sha256:$gate_json_sha256,completed_at:$completed_at,
     collector:{main_pid:$main_pid,restarts:0,invocation_id:$rust_invocation_id,
@@ -847,23 +985,32 @@ verify_upload_units "$pinned_upload_env" \
   || die 'pinned OSS configuration changed while cutover evidence was being prepared'
 mv "$evidence_dir/cutover.json.tmp" "$evidence_dir/cutover.json"
 sync "$evidence_dir/cutover.json"
+sync -f "$rollback_dir"
+sync -f "$candidate_binary"
 verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed before cutover completion'
 verify_upload_units "$pinned_upload_env" \
   || die 'Rust upload unit identity changed before cutover completion'
 [[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
   || die 'pinned OSS configuration changed before cutover completion'
+verify_release_binding "$RELEASE_MANIFEST" "$gate_release_manifest_sha" \
+  "$candidate_sha" "$gate_source_revision" "$deployment_bundle_sha" \
+  "$gate_control_archive_sha" "$candidate_binary" \
+  || die 'release manifest or installed control bundle changed before cutover completion'
 success_marker="$evidence_dir/PASSED.sha256"
 success_marker_tmp="$evidence_dir/.PASSED.sha256.tmp"
 [[ ! -e $success_marker && ! -L $success_marker \
   && ! -e $success_marker_tmp && ! -L $success_marker_tmp ]] \
   || die 'cutover success marker path already exists'
+secure_root_chain "$evidence_dir" \
+  || die 'cutover evidence directory trust changed before success publication'
 (
   cd "$evidence_dir"
   sha256sum cutover.json >"${success_marker_tmp##*/}"
 )
 mv -Tf "$success_marker_tmp" "$success_marker"
 sync "$success_marker"
+sync -f "$evidence_dir"
 
 cutover_succeeded=true
 trap - EXIT

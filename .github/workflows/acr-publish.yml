@@ -57,7 +57,7 @@ jobs:
       - name: Extract collector binaries for bare-metal ECS
         if: matrix.repository == 'binance-lob-archiver'
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ github.sha }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
         run: |
           mkdir -p artifact
           docker pull "$IMAGE"
@@ -93,11 +93,34 @@ jobs:
           )
           (
             cd artifact
-            sha256sum polymarket-raw-ops-control-assets.sha256 \
-              | awk '{print $1}' > deployment-bundle.sha256
-            sha256sum polymarket-raw-ops-control.tar.gz \
+            candidate_sha=$(awk 'NR == 1 {print $1}' polymarket-raw-ops.sha256)
+            control_manifest_sha=$(sha256sum polymarket-raw-ops-control-assets.sha256 \
+              | awk '{print $1}')
+            control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz \
+              | awk '{print $1}')
+            jq -S -n \
+              --arg source_revision '${{ github.sha }}' \
+              --arg candidate_sha256 "$candidate_sha" \
+              --arg control_manifest_sha256 "$control_manifest_sha" \
+              --arg control_archive_sha256 "$control_archive_sha" \
+              '{schema:"monday.polymarket_raw_ops_release.v1",
+                source_revision:$source_revision,
+                candidate:{file:"polymarket-raw-ops",sha256:$candidate_sha256},
+                control_manifest:{file:"polymarket-raw-ops-control-assets.sha256",
+                  sha256:$control_manifest_sha256},
+                control_archive:{file:"polymarket-raw-ops-control.tar.gz",
+                  sha256:$control_archive_sha256}}' \
+              > polymarket-raw-ops-release.json
+            sha256sum polymarket-raw-ops-release.json \
+              > polymarket-raw-ops-release.json.sha256
+            jq -er '.source_revision' polymarket-raw-ops-release.json \
+              > source-revision.txt
+            jq -er '.control_manifest.sha256' polymarket-raw-ops-release.json \
+              > deployment-bundle.sha256
+            printf '%s  %s\n' \
+              "$(jq -er '.control_archive.sha256' polymarket-raw-ops-release.json)" \
+              polymarket-raw-ops-control.tar.gz \
               > polymarket-raw-ops-control.tar.gz.sha256
-            printf '%s\n' '${{ github.sha }}' > source-revision.txt
           )
 
       - name: Upload collector binary artifact bundle
