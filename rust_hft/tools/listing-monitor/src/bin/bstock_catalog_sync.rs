@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -35,14 +36,15 @@ struct Filter {
     values: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct GeneratedCatalog {
     generated_at: String,
     source: String,
+    instruments_sha256: String,
     instruments: Vec<GeneratedInstrument>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct GeneratedInstrument {
     symbol: String,
     venue: String,
@@ -64,7 +66,11 @@ struct GeneratedInstrument {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let symbols = parse_symbol_filter(&args);
+    let symbols = parse_symbol_filter(&args).ok_or_else(|| {
+        anyhow::anyhow!(
+            "bStock catalog sync requires --symbols=SYMBOL,... because exchangeInfo has no reliable asset-class field"
+        )
+    })?;
     let exchange_info = if let Some(path) = parse_arg_value(&args, "--input=") {
         serde_json::from_str(&fs::read_to_string(path)?)?
     } else {
@@ -76,22 +82,45 @@ async fn main() -> Result<()> {
         .into_iter()
         .filter(|symbol| symbol.status == "TRADING")
         .filter(|symbol| symbol.quote_asset == "USDT")
-        .filter(|symbol| {
-            symbols
-                .as_ref()
-                .map(|selected| selected.contains(&symbol.symbol))
-                .unwrap_or_else(|| looks_like_bstock(&symbol.base_asset))
-        })
+        .filter(|symbol| symbols.contains(&symbol.symbol))
         .map(to_generated_instrument)
         .collect();
 
-    let catalog = GeneratedCatalog {
+    let mut catalog = GeneratedCatalog {
         generated_at: chrono::Utc::now().to_rfc3339(),
         source: EXCHANGE_INFO_API.to_string(),
+        instruments_sha256: String::new(),
         instruments,
     };
+    catalog.instruments_sha256 = instruments_digest(&catalog.instruments)?;
+
+    if let Some(path) = parse_arg_value(&args, "--verify-against=") {
+        let bytes = fs::read(path)?;
+        let pinned_sha256 = fs::read_to_string(format!("{path}.sha256"))?;
+        listing_monitor::integrity::verify_sha256_hex(&bytes, &pinned_sha256)
+            .map_err(anyhow::Error::msg)?;
+        let checked_in: GeneratedCatalog = serde_yaml::from_slice(&bytes)?;
+        verify_catalog(&checked_in)?;
+        if checked_in.instruments_sha256 != catalog.instruments_sha256 {
+            anyhow::bail!("bStock catalog is stale; regenerate {path}");
+        }
+        return Ok(());
+    }
 
     println!("{}", serde_yaml::to_string(&catalog)?);
+    Ok(())
+}
+
+fn instruments_digest(instruments: &[GeneratedInstrument]) -> Result<String> {
+    let canonical = serde_yaml::to_string(instruments)?;
+    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+fn verify_catalog(catalog: &GeneratedCatalog) -> Result<()> {
+    let expected = instruments_digest(&catalog.instruments)?;
+    if catalog.instruments_sha256 != expected {
+        anyhow::bail!("bStock catalog instruments_sha256 does not match its contents");
+    }
     Ok(())
 }
 
@@ -122,12 +151,6 @@ async fn fetch_exchange_info() -> Result<ExchangeInfo> {
         .error_for_status()?
         .json()
         .await?)
-}
-
-fn looks_like_bstock(base_asset: &str) -> bool {
-    // Binance's first bStocks use a trailing B ticker pattern: CRCLB, NVDAB, TSLAB.
-    // ponytail: heuristic only; replace with an official asset-class field if Binance exposes one.
-    base_asset.len() > 2 && base_asset.ends_with('B')
 }
 
 fn to_generated_instrument(symbol: SymbolInfo) -> GeneratedInstrument {
@@ -175,10 +198,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bstock_heuristic_matches_current_symbol_pattern() {
-        assert!(looks_like_bstock("TSLAB"));
-        assert!(looks_like_bstock("NVDAB"));
-        assert!(!looks_like_bstock("BTC"));
-        assert!(!looks_like_bstock("B"));
+    fn checked_in_catalog_covers_the_quotes_only_bstock_universe() {
+        let bytes = include_bytes!("../../../../config/generated/binance_bstocks_instruments.yaml");
+        listing_monitor::integrity::verify_sha256_hex(
+            bytes,
+            include_str!("../../../../config/generated/binance_bstocks_instruments.yaml.sha256"),
+        )
+        .expect("checked-in bStock catalog raw bytes must match its SHA-256 sidecar");
+        let catalog: GeneratedCatalog =
+            serde_yaml::from_slice(bytes).expect("checked-in bStock catalog must be valid YAML");
+        verify_catalog(&catalog).expect("checked-in bStock catalog digest must match contents");
+
+        let symbols: BTreeSet<_> = catalog
+            .instruments
+            .iter()
+            .map(|instrument| instrument.symbol.as_str())
+            .collect();
+        let quotes_only_config: serde_yaml::Value = serde_yaml::from_str(include_str!(
+            "../../../../config/dev/binance_bstocks_quotes_only.yaml"
+        ))
+        .expect("checked-in bStock quotes-only config must be valid YAML");
+        let configured_symbols: BTreeSet<_> = quotes_only_config["venues"][0]["symbol_catalog"]
+            .as_sequence()
+            .expect("bStock quotes-only config must declare a symbol catalog")
+            .iter()
+            .map(|symbol| {
+                symbol
+                    .as_str()
+                    .expect("bStock symbol must be a string")
+                    .split_once('@')
+                    .expect("bStock symbol must include its venue")
+                    .0
+            })
+            .collect();
+        assert_eq!(symbols, configured_symbols);
+        assert!(catalog.instruments.iter().all(|instrument| {
+            instrument.venue == "BINANCE_TOKENIZED_SECURITIES"
+                && instrument.asset_class == "TokenizedSecurity"
+                && instrument.product_type == "TokenizedSecuritySpot"
+                && instrument.regulatory_profile == "AdgmTokenizedSecurity"
+                && instrument.status == "TRADING"
+        }));
     }
 }

@@ -16,6 +16,10 @@ path = "src/bin/spot.rs"
 name = "binance-bstock-catalog-sync"
 path = "src/bin/bstock_catalog_sync.rs"
 
+[[bin]]
+name = "binance-web3-tokenized-catalog-sync"
+path = "src/bin/binance_web3_tokenized_catalog_sync.rs"
+
 [dependencies]
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
@@ -26,3 +30,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = { workspace = true }
+futures = { workspace = true }
