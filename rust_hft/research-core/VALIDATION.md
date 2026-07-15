@@ -11,8 +11,6 @@ cargo test -p alpha-engine --locked
 cargo test -p alpha-harness --locked
 cargo test -p hft-research-manifest --locked
 cargo test -p hft-factor-dsl --locked
-cargo test -p hft-search-protocol --locked
-cargo test -p hft-factor-bank --locked
 cargo test -p hft-live --no-default-features --test deployment_envelope --locked
 cargo check -p hft-collector --locked
 ```

@@ -291,7 +291,7 @@ where
             .collect::<Result<std::collections::BTreeSet<_>, _>>()
             .map_err(|error| EngineError::Evaluation(error.to_string()))?;
         let mut new_iterations = 0;
-        let proposal_context = dataset.proposal_context();
+        let proposal_context = dataset.proposal_context_for_mission(&mission);
         let evaluation_context = dataset.engine_context();
 
         if kept >= mission.completion_policy.min_kept_candidates {
@@ -658,6 +658,15 @@ mod tests {
         ) -> Result<EngineProposal, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(context.row_count(), 40);
+            assert_eq!(context.objective(), Some("find one candidate"));
+            assert_eq!(context.hypothesis_scope(), Some("fixture"));
+            assert_eq!(
+                context
+                    .mutable_scope()
+                    .and_then(|scope| scope.first())
+                    .map(String::as_str),
+                Some("candidate")
+            );
             assert!(remaining.candidates > 0);
             if self.crash {
                 return Err("fixture crash".to_string());

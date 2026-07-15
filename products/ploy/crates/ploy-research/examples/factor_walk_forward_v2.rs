@@ -674,6 +674,7 @@ async fn main() {
                     min_bucket_observations: options.review.min_observations.max(20),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
     println!(

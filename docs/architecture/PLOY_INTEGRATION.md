@@ -11,6 +11,19 @@ Monday remains the repository and production authority. In particular:
 - PLOY must not bypass Monday by submitting orders from its sidecar or legacy standalone deployment paths.
 - Live trading remains disabled. This migration does not deploy, resume, approve, or mutate any trading host.
 
+## Research framework boundary
+
+Monday intentionally keeps two evaluation frameworks because the labels, sampling units, and promotion evidence are different:
+
+| Research lane | Sampling unit and target | Primary evaluation | Owner |
+| --- | --- | --- | --- |
+| Derivatives / continuous contracts | Point-in-time time-series rows predicting future return | Purged walk-forward IC, RankIC, ICIR, post-cost return, turnover, and drawdown | `rust_hft/alpha-harness` |
+| Prediction markets | Event observations predicting an official binary settlement | Event-disjoint walk-forward Brier score, log loss, calibration error, full-depth settlement PnL, and capacity | `products/ploy/crates/ploy-research` |
+
+The lanes share repository governance, evidence provenance requirements, and the Monday execution-authority boundary. They do not share labels, fold construction, evaluator thresholds, or a Cargo graph. In particular, IC/ICIR may be diagnostic for a prediction-market feature, but it is not a prediction-market promotion gate; prediction rows must not be routed through the derivatives `FormulaEvaluator`.
+
+LLM proposal paths remain lane-specific as well. `alpha-harness` has a bounded, lab-only Formula proposer for derivatives missions. PLOY accepts a typed `LlmPriorSpec` that must compile through the prediction-market factor grammar before deterministic search and evaluation; PLOY's evaluator does not invoke an LLM or accept free-form trading instructions.
+
 ## Source and provenance
 
 - Source repository: `https://github.com/proerror77/ploy`

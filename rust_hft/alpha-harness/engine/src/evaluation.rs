@@ -1,3 +1,4 @@
+use alpha_domain::ResearchMission;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops::Range};
@@ -80,6 +81,10 @@ pub struct ProposalContext<'a> {
     fold_count: usize,
     sealed_holdout_id: &'a str,
     latest_signal: Option<f64>,
+    objective: Option<&'a str>,
+    hypothesis_scope: Option<&'a str>,
+    mutable_scope: Option<&'a [String]>,
+    prompt_snapshot_id: Option<&'a str>,
 }
 
 impl ProposalContext<'_> {
@@ -97,6 +102,22 @@ impl ProposalContext<'_> {
 
     pub fn latest_signal(&self) -> Option<f64> {
         self.latest_signal
+    }
+
+    pub fn objective(&self) -> Option<&str> {
+        self.objective
+    }
+
+    pub fn hypothesis_scope(&self) -> Option<&str> {
+        self.hypothesis_scope
+    }
+
+    pub fn mutable_scope(&self) -> Option<&[String]> {
+        self.mutable_scope
+    }
+
+    pub fn prompt_snapshot_id(&self) -> Option<&str> {
+        self.prompt_snapshot_id
     }
 }
 
@@ -116,7 +137,23 @@ impl PreparedDataset {
             fold_count: self.plan.folds.len(),
             sealed_holdout_id: &self.sealed_holdout_id,
             latest_signal: research_rows.last().map(|row| row.signal),
+            objective: None,
+            hypothesis_scope: None,
+            mutable_scope: None,
+            prompt_snapshot_id: None,
         }
+    }
+
+    pub fn proposal_context_for_mission<'a>(
+        &'a self,
+        mission: &'a ResearchMission,
+    ) -> ProposalContext<'a> {
+        let mut context = self.proposal_context();
+        context.objective = Some(&mission.objective);
+        context.hypothesis_scope = Some(&mission.hypothesis_scope);
+        context.mutable_scope = Some(&mission.mutable_scope);
+        context.prompt_snapshot_id = mission.prompt_snapshot_id.as_deref();
+        context
     }
 
     pub fn engine_context(&self) -> EngineContext<'_> {

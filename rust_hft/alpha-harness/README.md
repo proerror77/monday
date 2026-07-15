@@ -56,6 +56,8 @@ ALPHA_LLM_PROVIDER  # optional
 
 Credentials are process inputs and are never persisted.
 
+For an LLM mission, `objective` and `hypothesis_scope` are the governed research brief; put the curated, source-grounded material synthesis in those fields. `prompt_snapshot_id` records the content-addressed source snapshot but is not an implicit retrieval mechanism. The proposer receives that brief, the registered feature names, the mutable scope, and at most eight prior candidate `keep`/`discard` outcomes. It receives no row labels, raw evaluation metrics, or validator thresholds, and code rejects Formula output unless `mutable_scope` explicitly includes `factor_ast` or `factor_formula`.
+
 ## Bounded LoopRun
 
 Run or resume a durable staged goal with the same command:

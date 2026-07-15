@@ -3455,16 +3455,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hft-artifact-store"
-version = "0.1.0"
-dependencies = [
- "hft-research-manifest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "hft-backtest"
 version = "0.1.0"
 dependencies = [
@@ -4154,57 +4144,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "hft-experiment-store"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hft-research-manifest",
- "hft-search-protocol",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "hft-factor-bank"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hft-factor-dsl",
- "hft-research-manifest",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "hft-factor-dsl"
 version = "0.1.0"
 dependencies = [
  "hft-research-manifest",
  "serde",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "hft-factor-store"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hft-factor-bank",
- "hft-factor-dsl",
- "hft-research-manifest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "hft-factorctl"
-version = "0.1.0"
-dependencies = [
- "clap",
- "hft-factor-bank",
- "hft-factor-store",
 ]
 
 [[package]]
@@ -4589,17 +4534,6 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "hft-search-protocol"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hft-factor-dsl",
- "hft-research-manifest",
- "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]

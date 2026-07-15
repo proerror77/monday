@@ -27,6 +27,14 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [x] Build and install the Linux runner artifact.
 - [x] Enable the BTC/ETH/SOL/XRP 5-minute/15-minute service and verify event rollover, token-mapped quotes, and zero intents/fills.
 
+## Research framework cleanup
+
+- [x] Split every prediction walk-forward lane by event end so unresolved events cannot cross train/test boundaries.
+- [x] Run `ploy-research` library tests in the active root CI workflow.
+- [x] Remove unused Monday research-store/search crates while preserving active DSL, manifest, and harness contracts.
+- [x] Pass governed mission context and bounded prior verdicts into LLM proposals, with code-enforced mutable scope.
+- [x] Gate prediction OOS evidence with Brier score, log loss, calibration error, settlement PnL, and event-level capacity.
+
 ## Safety
 
 - Live trading stays disabled.

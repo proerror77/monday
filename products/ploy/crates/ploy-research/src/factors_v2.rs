@@ -398,6 +398,9 @@ impl Default for SettlementProbabilityReportOptions {
 pub struct SettlementProbabilityWalkForwardOptions {
     pub walk_forward: FactorWalkForwardOptions,
     pub probability: SettlementProbabilityReportOptions,
+    pub max_test_brier_score: f64,
+    pub max_test_log_loss: f64,
+    pub max_test_expected_calibration_error: f64,
 }
 
 impl Default for SettlementProbabilityWalkForwardOptions {
@@ -405,6 +408,9 @@ impl Default for SettlementProbabilityWalkForwardOptions {
         Self {
             walk_forward: FactorWalkForwardOptions::default(),
             probability: SettlementProbabilityReportOptions::default(),
+            max_test_brier_score: 0.25,
+            max_test_log_loss: std::f64::consts::LN_2,
+            max_test_expected_calibration_error: 0.05,
         }
     }
 }
@@ -516,6 +522,8 @@ pub struct SettlementProbabilityWalkForwardWindow {
     pub test_n: usize,
     pub train_brier_score: f64,
     pub test_brier_score: f64,
+    pub train_log_loss: f64,
+    pub test_log_loss: f64,
     pub train_expected_calibration_error: f64,
     pub test_expected_calibration_error: f64,
     pub train_top_edge_avg_full_depth_settlement_pnl: f64,
@@ -532,6 +540,7 @@ pub struct SettlementProbabilityWalkForwardAggregate {
     pub positive_window_ratio: f64,
     pub pass_window_ratio: f64,
     pub avg_test_brier_score: f64,
+    pub avg_test_log_loss: f64,
     pub avg_test_expected_calibration_error: f64,
     pub avg_test_top_edge_avg_full_depth_settlement_pnl: f64,
     pub min_test_top_edge_avg_full_depth_settlement_pnl: f64,
@@ -2200,6 +2209,7 @@ fn walk_forward_factor_rows(
             factor_name_matches_filter(descriptor.name, &options.factor_name_filter)
         })
         .collect();
+    let event_ends = inferred_event_ends(v2_rows);
 
     let mut windows = Vec::new();
     let mut train_start = start;
@@ -2208,14 +2218,14 @@ fn walk_forward_factor_rows(
         let train_end = train_start + train_duration;
         let test_start = train_end;
         let test_end = test_start + test_duration;
-        let train_rows: Vec<&FactorObservationV2> =
-            walk_forward_time_slice(&v2_rows, train_start, train_end)
-                .iter()
-                .collect();
-        let test_rows: Vec<&FactorObservationV2> =
-            walk_forward_time_slice(&v2_rows, test_start, test_end)
-                .iter()
-                .collect();
+        let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
+            v2_rows,
+            &event_ends,
+            train_start,
+            train_end,
+            test_start,
+            test_end,
+        );
 
         if train_rows.len() >= options.review.min_observations
             && test_rows.len() >= options.review.min_observations
@@ -2660,12 +2670,13 @@ pub fn build_settlement_probability_report(
     rows: &[FactorObservationV2],
     options: SettlementProbabilityReportOptions,
 ) -> SettlementProbabilityReport {
-    build_settlement_probability_report_with_surface(rows, rows, options)
+    let rows = rows.iter().collect::<Vec<_>>();
+    build_settlement_probability_report_with_surface(&rows, &rows, options)
 }
 
-fn build_settlement_probability_report_with_surface(
-    evaluation_rows: &[FactorObservationV2],
-    surface_rows: &[FactorObservationV2],
+fn build_settlement_probability_report_with_surface<'a>(
+    evaluation_rows: &[&'a FactorObservationV2],
+    surface_rows: &[&'a FactorObservationV2],
     options: SettlementProbabilityReportOptions,
 ) -> SettlementProbabilityReport {
     let options = normalize_settlement_probability_report_options(options);
@@ -2721,11 +2732,11 @@ fn normalize_settlement_probability_report_options(
     }
 }
 
-fn settlement_probability_eligible_rows(
-    rows: &[FactorObservationV2],
-) -> Vec<(&FactorObservationV2, f64, f64)> {
+fn settlement_probability_eligible_rows<'a>(
+    rows: &[&'a FactorObservationV2],
+) -> Vec<(&'a FactorObservationV2, f64, f64)> {
     let mut eligible_rows = Vec::new();
-    for row in rows {
+    for &row in rows {
         let Some(win) = row.label_settlement_win.filter(|win| win.is_finite()) else {
             continue;
         };
@@ -2819,6 +2830,7 @@ pub fn walk_forward_settlement_probability_report(
     let step_duration = options.walk_forward.step_duration();
     let probability_options =
         normalize_settlement_probability_report_options(options.probability.clone());
+    let event_ends = inferred_event_ends(&rows);
 
     let mut windows = Vec::new();
     let mut train_start = start;
@@ -2827,27 +2839,39 @@ pub fn walk_forward_settlement_probability_report(
         let train_end = train_start + train_duration;
         let test_start = train_end;
         let test_end = test_start + test_duration;
-        let train_rows = walk_forward_time_slice(&rows, train_start, train_end);
-        let test_rows = walk_forward_time_slice(&rows, test_start, test_end);
+        let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
+            &rows,
+            &event_ends,
+            train_start,
+            train_end,
+            test_start,
+            test_end,
+        );
 
         if train_rows.len() >= options.walk_forward.review.min_observations
             && test_rows.len() >= options.walk_forward.review.min_observations
         {
-            let train_report =
-                build_settlement_probability_report(train_rows, probability_options.clone());
+            let train_report = build_settlement_probability_report_with_surface(
+                &train_rows,
+                &train_rows,
+                probability_options.clone(),
+            );
             let test_report = build_settlement_probability_report_with_surface(
-                test_rows,
-                train_rows,
+                &test_rows,
+                &train_rows,
                 probability_options.clone(),
             );
             windows.extend(settlement_probability_walk_forward_windows(
-                window_index,
-                train_start,
-                train_end,
-                test_start,
-                test_end,
+                ProbabilityWalkForwardWindowBounds {
+                    window_index,
+                    train_start,
+                    train_end,
+                    test_start,
+                    test_end,
+                },
                 &train_report,
                 &test_report,
+                &options,
             ));
         }
 
@@ -2862,14 +2886,20 @@ pub fn walk_forward_settlement_probability_report(
     }
 }
 
-fn settlement_probability_walk_forward_windows(
+#[derive(Debug, Clone, Copy)]
+struct ProbabilityWalkForwardWindowBounds {
     window_index: usize,
     train_start: DateTime<Utc>,
     train_end: DateTime<Utc>,
     test_start: DateTime<Utc>,
     test_end: DateTime<Utc>,
+}
+
+fn settlement_probability_walk_forward_windows(
+    bounds: ProbabilityWalkForwardWindowBounds,
     train_report: &SettlementProbabilityReport,
     test_report: &SettlementProbabilityReport,
+    options: &SettlementProbabilityWalkForwardOptions,
 ) -> Vec<SettlementProbabilityWalkForwardWindow> {
     let train_by_model: BTreeMap<&str, &SettlementProbabilityBaselineRow> = train_report
         .baselines
@@ -2882,16 +2912,18 @@ fn settlement_probability_walk_forward_windows(
             continue;
         };
         windows.push(SettlementProbabilityWalkForwardWindow {
-            window_index,
+            window_index: bounds.window_index,
             model: test.model.clone(),
-            train_start,
-            train_end,
-            test_start,
-            test_end,
+            train_start: bounds.train_start,
+            train_end: bounds.train_end,
+            test_start: bounds.test_start,
+            test_end: bounds.test_end,
             train_n: train.n,
             test_n: test.n,
             train_brier_score: train.brier_score,
             test_brier_score: test.brier_score,
+            train_log_loss: train.log_loss,
+            test_log_loss: test.log_loss,
             train_expected_calibration_error: train.expected_calibration_error,
             test_expected_calibration_error: test.expected_calibration_error,
             train_top_edge_avg_full_depth_settlement_pnl: train
@@ -2902,8 +2934,12 @@ fn settlement_probability_walk_forward_windows(
                 .top_edge_avg_conservative_settlement_pnl,
             test_edge_bucket_monotonic_non_decreasing: test.edge_bucket_monotonic_non_decreasing,
             pass: test.top_edge_avg_full_depth_settlement_pnl > 0.0
+                && test.brier_score.is_finite()
+                && test.brier_score <= options.max_test_brier_score
+                && test.log_loss.is_finite()
+                && test.log_loss <= options.max_test_log_loss
                 && test.expected_calibration_error.is_finite()
-                && test.brier_score.is_finite(),
+                && test.expected_calibration_error <= options.max_test_expected_calibration_error,
         });
     }
     windows
@@ -2934,6 +2970,7 @@ fn aggregate_settlement_probability_walk_forward_windows(
                 positive_window_ratio: ratio(positive, windows),
                 pass_window_ratio: ratio(passed, windows),
                 avg_test_brier_score: mean(rows.iter().map(|row| row.test_brier_score)),
+                avg_test_log_loss: mean(rows.iter().map(|row| row.test_log_loss)),
                 avg_test_expected_calibration_error: mean(
                     rows.iter().map(|row| row.test_expected_calibration_error),
                 ),
@@ -3127,22 +3164,59 @@ pub fn build_settlement_probability_promotion_gate_report(
     });
 
     let oos_model = best_walk_forward_oos_model(walk_forward, options.min_positive_window_ratio);
+    let oos_candidate = walk_forward
+        .aggregates
+        .iter()
+        .filter(|row| is_settlement_probability_candidate_model(&row.model))
+        .filter(|row| row.windows > 0)
+        .max_by(|a, b| {
+            a.pass_window_ratio
+                .total_cmp(&b.pass_window_ratio)
+                .then_with(|| {
+                    a.avg_test_top_edge_avg_full_depth_settlement_pnl
+                        .total_cmp(&b.avg_test_top_edge_avg_full_depth_settlement_pnl)
+                })
+        });
     gates.push(SettlementProbabilityPromotionGateRow {
         gate: "walk_forward_oos".to_string(),
         passed: oos_model.is_some(),
         evidence: oos_model.map_or_else(
             || {
-                format!(
-                    "no non-naive model has non-empty OOS windows with positive_window_ratio >= {:.2}",
-                    options.min_positive_window_ratio
+                oos_candidate.map_or_else(
+                    || "no non-naive model has non-empty OOS windows".to_string(),
+                    |row| {
+                        format!(
+                            "rejected model={} windows={} positive_window_ratio={:.4} pass_window_ratio={:.4} min_ratio={:.4} avg_test_brier={:.6} max_brier={:.6} avg_test_log_loss={:.6} max_log_loss={:.6} avg_test_ece={:.6} max_ece={:.6} min_test_top_edge_pnl={:.4}",
+                            row.model,
+                            row.windows,
+                            row.positive_window_ratio,
+                            row.pass_window_ratio,
+                            options.min_positive_window_ratio,
+                            row.avg_test_brier_score,
+                            walk_forward.options.max_test_brier_score,
+                            row.avg_test_log_loss,
+                            walk_forward.options.max_test_log_loss,
+                            row.avg_test_expected_calibration_error,
+                            walk_forward.options.max_test_expected_calibration_error,
+                            row.min_test_top_edge_avg_full_depth_settlement_pnl,
+                        )
+                    },
                 )
             },
             |row| {
                 format!(
-                    "model={} windows={} positive_window_ratio={:.4} min_test_top_edge_pnl={:.4}",
+                    "model={} windows={} positive_window_ratio={:.4} pass_window_ratio={:.4} min_ratio={:.4} avg_test_brier={:.6} max_brier={:.6} avg_test_log_loss={:.6} max_log_loss={:.6} avg_test_ece={:.6} max_ece={:.6} min_test_top_edge_pnl={:.4}",
                     row.model,
                     row.windows,
                     row.positive_window_ratio,
+                    row.pass_window_ratio,
+                    options.min_positive_window_ratio,
+                    row.avg_test_brier_score,
+                    walk_forward.options.max_test_brier_score,
+                    row.avg_test_log_loss,
+                    walk_forward.options.max_test_log_loss,
+                    row.avg_test_expected_calibration_error,
+                    walk_forward.options.max_test_expected_calibration_error,
                     row.min_test_top_edge_avg_full_depth_settlement_pnl
                 )
             },
@@ -3291,10 +3365,24 @@ fn best_walk_forward_oos_model(
         .filter(|row| is_settlement_probability_candidate_model(&row.model))
         .filter(|row| row.windows > 0)
         .filter(|row| row.positive_window_ratio >= min_positive_window_ratio)
+        .filter(|row| row.pass_window_ratio >= min_positive_window_ratio)
+        .filter(|row| {
+            row.avg_test_brier_score.is_finite()
+                && row.avg_test_brier_score <= report.options.max_test_brier_score
+        })
+        .filter(|row| {
+            row.avg_test_log_loss.is_finite()
+                && row.avg_test_log_loss <= report.options.max_test_log_loss
+        })
+        .filter(|row| {
+            row.avg_test_expected_calibration_error.is_finite()
+                && row.avg_test_expected_calibration_error
+                    <= report.options.max_test_expected_calibration_error
+        })
         .filter(|row| row.min_test_top_edge_avg_full_depth_settlement_pnl > 0.0)
         .max_by(|a, b| {
-            a.positive_window_ratio
-                .total_cmp(&b.positive_window_ratio)
+            a.pass_window_ratio
+                .total_cmp(&b.pass_window_ratio)
                 .then_with(|| {
                     a.avg_test_top_edge_avg_full_depth_settlement_pnl
                         .total_cmp(&b.avg_test_top_edge_avg_full_depth_settlement_pnl)
@@ -3425,35 +3513,39 @@ pub fn format_settlement_probability_walk_forward_report(
     let mut out = String::new();
     out.push_str("=== Settlement Probability Walk-Forward Report ===\n");
     out.push_str(&format!(
-        "train_window={} test_window={} step={} min_obs={} probability_min_bucket_obs={} top_edge_quantile={:.2}\n",
+        "train_window={} test_window={} step={} min_obs={} probability_min_bucket_obs={} top_edge_quantile={:.2} max_test_brier={:.4} max_test_log_loss={:.6} max_test_ece={:.4}\n",
         report.options.walk_forward.train_window_label(),
         report.options.walk_forward.test_window_label(),
         report.options.walk_forward.step_label(),
         report.options.walk_forward.review.min_observations,
         report.options.probability.min_bucket_observations,
         report.options.probability.top_edge_quantile,
+        report.options.max_test_brier_score,
+        report.options.max_test_log_loss,
+        report.options.max_test_expected_calibration_error,
     ));
     out.push_str("Test windows evaluate formula probabilities on future rows; EventVolSurface and q_final use only the train window as empirical prior.\n");
     out.push_str("\n--- Aggregate ---\n");
-    out.push_str("model,windows,positive_window_ratio,pass_window_ratio,avg_test_brier,avg_test_ece,avg_test_top_edge_full_depth_pnl,min_test_top_edge_full_depth_pnl\n");
+    out.push_str("model,windows,positive_window_ratio,pass_window_ratio,avg_test_brier,avg_test_log_loss,avg_test_ece,avg_test_top_edge_full_depth_pnl,min_test_top_edge_full_depth_pnl\n");
     for row in &report.aggregates {
         out.push_str(&format!(
-            "{},{},{:.4},{:.4},{:.6},{:.6},{:.4},{:.4}\n",
+            "{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4}\n",
             row.model,
             row.windows,
             row.positive_window_ratio,
             row.pass_window_ratio,
             row.avg_test_brier_score,
+            row.avg_test_log_loss,
             row.avg_test_expected_calibration_error,
             row.avg_test_top_edge_avg_full_depth_settlement_pnl,
             row.min_test_top_edge_avg_full_depth_settlement_pnl,
         ));
     }
     out.push_str("\n--- Windows ---\n");
-    out.push_str("window,model,train_start,train_end,test_start,test_end,train_n,test_n,train_brier,test_brier,train_ece,test_ece,train_top_edge_full_depth_pnl,test_top_edge_full_depth_pnl,test_top_edge_conservative_pnl,test_edge_monotonic,pass\n");
+    out.push_str("window,model,train_start,train_end,test_start,test_end,train_n,test_n,train_brier,test_brier,train_log_loss,test_log_loss,train_ece,test_ece,train_top_edge_full_depth_pnl,test_top_edge_full_depth_pnl,test_top_edge_conservative_pnl,test_edge_monotonic,pass\n");
     for row in &report.windows {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{},{}\n",
+            "{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{},{}\n",
             row.window_index,
             row.model,
             row.train_start,
@@ -3464,6 +3556,8 @@ pub fn format_settlement_probability_walk_forward_report(
             row.test_n,
             row.train_brier_score,
             row.test_brier_score,
+            row.train_log_loss,
+            row.test_log_loss,
             row.train_expected_calibration_error,
             row.test_expected_calibration_error,
             row.train_top_edge_avg_full_depth_settlement_pnl,
@@ -3558,7 +3652,7 @@ fn walk_forward_factor_combo_v1_rows(
         })
         .collect();
 
-    walk_forward_factor_combo_from_v2_rows(source_rows, &v2_rows, &descriptors, start, end, options)
+    walk_forward_factor_combo_from_v2_rows(source_rows, v2_rows, &descriptors, start, end, options)
 }
 
 fn walk_forward_factor_combo_from_v2_rows(
@@ -3574,20 +3668,21 @@ fn walk_forward_factor_combo_from_v2_rows(
     let train_duration = options.walk_forward.train_duration();
     let test_duration = options.walk_forward.test_duration();
     let step_duration = options.walk_forward.step_duration();
+    let event_ends = inferred_event_ends(v2_rows);
     let mut train_start = start;
     let mut window_index = 0usize;
     while train_start + train_duration + test_duration <= end + Duration::seconds(1) {
         let train_end = train_start + train_duration;
         let test_start = train_end;
         let test_end = test_start + test_duration;
-        let train_rows: Vec<&FactorObservationV2> =
-            walk_forward_time_slice(&v2_rows, train_start, train_end)
-                .iter()
-                .collect();
-        let test_rows: Vec<&FactorObservationV2> =
-            walk_forward_time_slice(&v2_rows, test_start, test_end)
-                .iter()
-                .collect();
+        let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
+            v2_rows,
+            &event_ends,
+            train_start,
+            train_end,
+            test_start,
+            test_end,
+        );
 
         if train_rows.len() >= options.walk_forward.review.min_observations
             && test_rows.len() >= options.walk_forward.review.min_observations
@@ -3595,7 +3690,7 @@ fn walk_forward_factor_combo_from_v2_rows(
             if let Some(window) = fit_combo_v1_window(
                 &train_rows,
                 &test_rows,
-                &descriptors,
+                descriptors,
                 &options,
                 window_index,
                 train_start,
@@ -3648,7 +3743,7 @@ fn build_fillability_review_v1_report(
     v2_rows: &[FactorObservationV2],
     options: FillabilityReviewOptions,
 ) -> FillabilityReviewReport {
-    let health = build_data_health_report(source_rows, &v2_rows);
+    let health = build_data_health_report(source_rows, v2_rows);
     let mut rows = Vec::new();
     for spec in fillability_bucket_specs() {
         let mut buckets: BTreeMap<String, Vec<&FactorObservationV2>> = BTreeMap::new();
@@ -3884,8 +3979,8 @@ fn build_trade_formation_v1_report(
     options: TradeFormationReviewOptions,
 ) -> TradeFormationReviewReport {
     v2_rows.sort_by_key(|row| row.tick_ts);
-    let health = build_data_health_report(source_rows, &v2_rows);
-    let gate = build_liquidity_gate_v1_report(source_rows, &v2_rows, options.gate.clone());
+    let health = build_data_health_report(source_rows, v2_rows);
+    let gate = build_liquidity_gate_v1_report(source_rows, v2_rows, options.gate.clone());
     let gated = v2_rows
         .iter()
         .filter(|row| liquidity_gate_v1_accepts(row, &options.gate))
@@ -3977,12 +4072,13 @@ fn walk_forward_meta_label_v1_rows(
     options: MetaLabelWalkForwardOptions,
 ) -> MetaLabelWalkForwardReport {
     v2_rows.sort_by_key(|row| row.tick_ts);
-    let health = build_data_health_report(source_rows, &v2_rows);
-    let gate = build_liquidity_gate_v1_report(source_rows, &v2_rows, options.gate.clone());
+    let health = build_data_health_report(source_rows, v2_rows);
+    let gate = build_liquidity_gate_v1_report(source_rows, v2_rows, options.gate.clone());
     let mut windows = Vec::new();
     let train_duration = Duration::days(options.train_window_days.max(1));
     let test_duration = Duration::days(options.test_window_days.max(1));
     let step_duration = Duration::days(options.step_days.max(1));
+    let event_ends = inferred_event_ends(v2_rows);
     let mut train_start = start;
     let mut window_index = 0usize;
 
@@ -3990,14 +4086,20 @@ fn walk_forward_meta_label_v1_rows(
         let train_end = train_start + train_duration;
         let test_start = train_end;
         let test_end = test_start + test_duration;
-        let train_slice = walk_forward_time_slice(&v2_rows, train_start, train_end);
-        let test_slice = walk_forward_time_slice(&v2_rows, test_start, test_end);
+        let (train_slice, test_slice) = event_disjoint_walk_forward_slices(
+            v2_rows,
+            &event_ends,
+            train_start,
+            train_end,
+            test_start,
+            test_end,
+        );
         let train_gated = train_slice
-            .iter()
+            .into_iter()
             .filter(|row| liquidity_gate_v1_accepts(row, &options.gate))
             .collect::<Vec<_>>();
         let test_gated = test_slice
-            .iter()
+            .into_iter()
             .filter(|row| liquidity_gate_v1_accepts(row, &options.gate))
             .collect::<Vec<_>>();
 
@@ -6876,6 +6978,64 @@ fn walk_forward_time_slice(
     let lo = rows.partition_point(|row| row.tick_ts < start);
     let hi = rows.partition_point(|row| row.tick_ts < end);
     &rows[lo..hi]
+}
+
+type EventEndIndex<'a> = HashMap<&'a str, Option<DateTime<Utc>>>;
+
+fn inferred_event_ends(rows: &[FactorObservationV2]) -> EventEndIndex<'_> {
+    let mut event_ends = HashMap::new();
+    for row in rows {
+        let inferred = inferred_event_end(row);
+        match event_ends.entry(row.event_id.as_str()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(inferred);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let aggregated = match (entry.get().as_ref(), inferred) {
+                    (Some(current), Some(next)) => Some((*current).max(next)),
+                    _ => None,
+                };
+                entry.insert(aggregated);
+            }
+        }
+    }
+    event_ends
+}
+
+fn event_disjoint_walk_forward_slices<'a>(
+    rows: &'a [FactorObservationV2],
+    event_ends: &EventEndIndex<'_>,
+    train_start: DateTime<Utc>,
+    train_end: DateTime<Utc>,
+    test_start: DateTime<Utc>,
+    test_end: DateTime<Utc>,
+) -> (Vec<&'a FactorObservationV2>, Vec<&'a FactorObservationV2>) {
+    let train = walk_forward_time_slice(rows, train_start, train_end);
+    let test = walk_forward_time_slice(rows, test_start, test_end);
+    let ends_in = |row: &&FactorObservationV2, start, end| {
+        event_ends
+            .get(row.event_id.as_str())
+            .and_then(Option::as_ref)
+            .is_some_and(|event_end| *event_end >= start && *event_end < end)
+    };
+
+    (
+        train
+            .iter()
+            .filter(|row| ends_in(row, train_start, train_end))
+            .collect(),
+        test.iter()
+            .filter(|row| ends_in(row, test_start, test_end))
+            .collect(),
+    )
+}
+
+fn inferred_event_end(row: &FactorObservationV2) -> Option<DateTime<Utc>> {
+    if row.time_remaining_secs < 0 {
+        return None;
+    }
+    Duration::try_seconds(row.time_remaining_secs)
+        .and_then(|remaining| row.tick_ts.checked_add_signed(remaining))
 }
 
 fn evaluate_factor_threshold(
@@ -10195,6 +10355,7 @@ mod tests {
                     event_surface_shrinkage_observations: 1,
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -10209,6 +10370,81 @@ mod tests {
         let text = format_settlement_probability_walk_forward_report(&report);
         assert!(text.contains("Settlement Probability Walk-Forward Report"));
         assert!(text.contains("EventVolSurface and q_final use only the train window"));
+    }
+
+    #[test]
+    fn settlement_probability_walk_forward_assigns_crossing_event_to_its_end_window() {
+        let start = Utc::now();
+        let boundary = start + Duration::hours(12);
+        let mut source_rows = Vec::new();
+        for (event_id, tick_ts) in [
+            ("train-only", start + Duration::hours(1)),
+            ("crossing", boundary - Duration::minutes(1)),
+            ("crossing", boundary + Duration::minutes(1)),
+            ("test-only", boundary + Duration::hours(1)),
+        ] {
+            let mut row = base_obs();
+            row.event_id = event_id.to_string();
+            row.tick_ts = tick_ts;
+            source_rows.push(row);
+        }
+        let mut rows = build_factor_observations_v2(
+            &source_rows,
+            &FactorReviewOptions {
+                min_observations: 1,
+                ..Default::default()
+            },
+        );
+        rows.retain(|row| row.side == ReviewSide::Up);
+        rows.sort_by_key(|row| row.tick_ts);
+
+        let (train, test) = event_disjoint_walk_forward_slices(
+            &rows,
+            &inferred_event_ends(&rows),
+            start,
+            boundary,
+            boundary,
+            boundary + Duration::hours(12),
+        );
+
+        assert_eq!(
+            train
+                .iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["train-only"]
+        );
+        assert_eq!(
+            test.iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["crossing", "test-only"]
+        );
+    }
+
+    #[test]
+    fn walk_forward_excludes_unsettled_train_event_without_test_ticks() {
+        let start = Utc::now();
+        let boundary = start + Duration::hours(12);
+        let mut source = base_obs();
+        source.event_id = "unsettled".to_string();
+        source.tick_ts = boundary - Duration::minutes(1);
+        source.time_remaining_secs = 120;
+        let mut rows = build_factor_observations_v2(&[source], &FactorReviewOptions::default());
+        rows.retain(|row| row.side == ReviewSide::Up);
+        rows.sort_by_key(|row| row.tick_ts);
+
+        let (train, test) = event_disjoint_walk_forward_slices(
+            &rows,
+            &inferred_event_ends(&rows),
+            start,
+            boundary,
+            boundary,
+            boundary + Duration::hours(12),
+        );
+
+        assert!(train.is_empty());
+        assert!(test.is_empty());
     }
 
     #[test]
@@ -10260,6 +10496,7 @@ mod tests {
                     event_surface_shrinkage_observations: 1,
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
 
@@ -10273,6 +10510,35 @@ mod tests {
             .any(|row| { row.model == "q_final_logit_blend" && row.windows >= 1 }));
         let text = format_settlement_probability_walk_forward_report(&report);
         assert!(text.contains("train_window=12h test_window=12h step=12h"));
+    }
+
+    #[test]
+    fn settlement_probability_oos_requires_all_probability_quality_gates() {
+        let mut report = SettlementProbabilityWalkForwardReport {
+            options: SettlementProbabilityWalkForwardOptions::default(),
+            windows: Vec::new(),
+            aggregates: vec![SettlementProbabilityWalkForwardAggregate {
+                model: "q_final_logit_blend".to_string(),
+                windows: 3,
+                positive_window_ratio: 1.0,
+                pass_window_ratio: 1.0,
+                avg_test_brier_score: 0.1,
+                avg_test_log_loss: 0.2,
+                avg_test_expected_calibration_error: 0.01,
+                avg_test_top_edge_avg_full_depth_settlement_pnl: 2.0,
+                min_test_top_edge_avg_full_depth_settlement_pnl: 1.0,
+            }],
+        };
+
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_some());
+        report.aggregates[0].avg_test_brier_score = 0.3;
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
+        report.aggregates[0].avg_test_brier_score = 0.1;
+        report.aggregates[0].avg_test_log_loss = 0.8;
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
+        report.aggregates[0].avg_test_log_loss = 0.2;
+        report.aggregates[0].avg_test_expected_calibration_error = 0.1;
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
     }
 
     #[test]
@@ -10341,6 +10607,7 @@ mod tests {
                 positive_window_ratio: 1.0,
                 pass_window_ratio: 1.0,
                 avg_test_brier_score: 0.1,
+                avg_test_log_loss: 0.2,
                 avg_test_expected_calibration_error: 0.01,
                 avg_test_top_edge_avg_full_depth_settlement_pnl: 2.0,
                 min_test_top_edge_avg_full_depth_settlement_pnl: 1.0,

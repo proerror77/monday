@@ -68,10 +68,7 @@ members = [
     "execution-gateway/adapters/adapter-polymarket",
 
     # Infra Services
-    "infra-services/core/artifact-store",
     "infra-services/core/clickhouse",
-    "infra-services/core/experiment-store",
-    "infra-services/core/factor-store",
     "infra-services/core/redis",
     "infra-services/core/metrics",
     "infra-services/core/secrets",
@@ -83,9 +80,7 @@ members = [
 
     # Research Core
     "research-core/factor-dsl",
-    "research-core/factor-bank",
     "research-core/manifest",
-    "research-core/search-protocol",
 
     # Bounded Loop Engineer research plane
     "alpha-harness/domain",
@@ -112,7 +107,6 @@ members = [
     "tools/infer-cli",
     "tools/hyperliquid-demo",
     "tools/ws_test",
-    "tools/factorctl",
     "tools/harnessctl",
     "tools/listing-monitor",
 

@@ -16,7 +16,7 @@ Never add execution-adapter dependencies or order commands to `alpha-harness`. L
 - `alpha-harness`: Agent-facing structured CLI.
 - `hft-live`: signed runtime handoff and execution runtime.
 - `hft-collector`: connector-owned data acquisition.
-- `hft-factor-dsl`, `hft-factor-bank`, `hft-research-manifest`, and `hft-search-protocol` remain shared contracts with active consumers.
+- `hft-factor-dsl` and `hft-research-manifest` remain shared contracts with active consumers.
 
 ## Validation Lanes
 
