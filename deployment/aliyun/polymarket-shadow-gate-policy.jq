@@ -1,10 +1,13 @@
 def sha256: type == "string" and test("^[a-f0-9]{64}$");
 def positive_integer: type == "number" and floor == . and . > 0;
+def nonnegative_integer: type == "number" and floor == . and . >= 0;
 
 .schema == "monday.polymarket_shadow_gate.v1"
 and (.candidate_sha256 | sha256)
 and (.deployment_bundle_sha256 | sha256)
 and (.deployment_source_revision | type == "string" and test("^[a-f0-9]{40,64}$"))
+and (.release_manifest_sha256 | sha256)
+and (.control_archive_sha256 | sha256)
 and (.oss_config_sha256 | sha256)
 and (.duration_seconds | positive_integer and . >= 3900)
 and (.parity_window_started_at_unix | positive_integer)
@@ -19,7 +22,8 @@ and .legacy_runtime.cmdline_sha256 == "dffeb118d105e9312898460249f514eb982c20433
 and .legacy_runtime.fragment_path == "/etc/systemd/system/polymarket-reference-collector.service"
 and .legacy_runtime.drop_in_paths == []
 and (.legacy_runtime.main_pid | positive_integer)
-and .legacy_runtime.restarts == 0
+and (.legacy_runtime.restarts | nonnegative_integer)
+and (.legacy_runtime.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
 and (
   .shadow_runtime.exec_start == (
     "/opt/monday/releases/polymarket-raw-ops/" + .candidate_sha256
@@ -37,6 +41,7 @@ and .shadow_runtime.fragment_path == "/etc/systemd/system/polymarket-reference-c
 and .shadow_runtime.drop_in_paths == []
 and (.shadow_runtime.main_pid | positive_integer)
 and .shadow_runtime.restarts == 0
+and (.shadow_runtime.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
 and .checks.byte_parity == true
 and .checks.metadata_parity == true
 and .checks.field_parity == true

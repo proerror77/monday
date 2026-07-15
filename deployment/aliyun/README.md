@@ -98,12 +98,19 @@ request, including a second pagination request for the same market, passes throu
 shared start-time pacer with at least 100ms between request starts. Up to four requests
 may remain in flight, and each processing chunk retains at most four market responses,
 so slow I/O overlaps without creating an unbounded request or memory fan-out. An
-absolute 180-second cycle deadline cancels stalled network work and fails closed;
-health evidence over that duration is rejected by the shadow gate.
-The 112-request budget and the collector units' 384MiB/512MiB memory high/max
-limits are a measured pair: a clean Tokyo cold start covered all 112 priority
-markets in 45.091 seconds with zero priority backlog. The health policy pins the
-budget so a later default drift cannot silently invalidate that evidence.
+absolute 180-second cycle deadline cancels stalled network work and fails closed.
+A separate OS-thread watchdog enforces the same wall-clock deadline across synchronous
+tape fsync and atomic state publication, where a cooperative Tokio timeout cannot
+preempt non-yielding work. Health evidence over that duration is rejected by the
+shadow gate.
+The 112-request budget and the collector units' 512MiB/768MiB memory high/max
+limits are a measured pair. A Tokyo cold-start probe covered all 112 priority
+markets in 31.425 seconds with zero priority backlog, while the retired 384MiB
+high watermark put the same full-catalog workload under sustained cgroup reclaim
+and prevented health publication. The health policy pins the budget so a later
+default drift cannot silently invalidate that evidence. The host, cgroup pressure,
+invocation IDs, and control probes are recorded in
+`docs/reports/polymarket-shadow-memory-calibration-2026-07-16.md`.
 The shadow gate allows a separate 60-second initial-health grace after that
 deadline so a cycle completing at the boundary can finish durable health
 publication before the first sample. This does not relax the 180-second health
@@ -124,30 +131,130 @@ Neither companion unit contains private keys or an execution command.
 Both companion units use the same `polymarket-raw-ops` Rust binary. Its
 `collect-reference` subcommand owns metadata/trade/settlement collection and its
 `upload` subcommand owns validation, compression, OSS upload, and remote readback.
-The retired compatibility collector, uploader, parity scripts, and rollback lane are
-not part of the active deployment and must not be restored.
+Retired Python collectors and uploaders are rollback inputs only and are never
+reintroduced as application code. The root-only shadow-gate and cutover controls
+remain part of the release bundle until the Python-to-Rust migration and its rollback
+retention window are complete; they do not collect data or execute trades.
 
 Obtain `polymarket-raw-ops` and its SHA-256 from the immutable collector build
-artifact and verify the digest from the extracted artifact directory:
+artifact. Verify the binary, source revision, control archive, control manifest,
+and deployment-bundle digest from the extracted artifact directory before
+installing anything:
 
 ```bash
-sha256sum -c polymarket-raw-ops.sha256
-candidate_sha=$(awk '{print $1}' polymarket-raw-ops.sha256)
-source_revision=$(git rev-parse HEAD)
+set -euo pipefail
+artifact_dir=$(pwd -P)
+
+manifest_sha=$(sha256sum polymarket-raw-ops-release.json | awk '{print $1}')
+[[ $(wc -l < polymarket-raw-ops-release.json.sha256) -eq 1 ]]
+[[ $(<polymarket-raw-ops-release.json.sha256) \
+  == "$manifest_sha  polymarket-raw-ops-release.json" ]]
+printf '%s  %s\n' "$manifest_sha" polymarket-raw-ops-release.json \
+  | sha256sum --check --strict
+jq -e -s '
+  length == 1 and (.[0] |
+    .schema == "monday.polymarket_raw_ops_release.v1"
+    and (keys | sort) == (["candidate","control_archive","control_manifest",
+      "schema","source_revision"] | sort)
+    and (.source_revision | test("^[0-9a-f]{40,64}$"))
+    and .candidate.file == "polymarket-raw-ops"
+    and (.candidate | keys | sort) == ["file","sha256"]
+    and (.candidate.sha256 | test("^[0-9a-f]{64}$"))
+    and .control_manifest.file == "polymarket-raw-ops-control-assets.sha256"
+    and (.control_manifest | keys | sort) == ["file","sha256"]
+    and (.control_manifest.sha256 | test("^[0-9a-f]{64}$"))
+    and .control_archive.file == "polymarket-raw-ops-control.tar.gz"
+    and (.control_archive | keys | sort) == ["file","sha256"]
+    and (.control_archive.sha256 | test("^[0-9a-f]{64}$"))
+  )
+' polymarket-raw-ops-release.json >/dev/null
+candidate_sha=$(jq -er -s '.[0].candidate.sha256' polymarket-raw-ops-release.json)
+source_revision=$(jq -er -s '.[0].source_revision' polymarket-raw-ops-release.json)
+deployment_bundle_sha=$(jq -er -s '.[0].control_manifest.sha256' \
+  polymarket-raw-ops-release.json)
+control_archive_sha=$(jq -er -s '.[0].control_archive.sha256' \
+  polymarket-raw-ops-release.json)
+
+actual_candidate_sha=$(sha256sum polymarket-raw-ops | awk '{print $1}')
+[[ $actual_candidate_sha == "$candidate_sha" ]]
+[[ $(wc -l < polymarket-raw-ops.sha256) -eq 1 ]]
+[[ $(<polymarket-raw-ops.sha256) == "$candidate_sha  polymarket-raw-ops" ]]
+printf '%s  %s\n' "$candidate_sha" polymarket-raw-ops \
+  | sha256sum --check --strict
+[[ $(wc -l < source-revision.txt) -eq 1 ]]
+grep -Eq '^[0-9a-f]{40,64}$' source-revision.txt
+[[ $(<source-revision.txt) == "$source_revision" ]]
+
+actual_control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz \
+  | awk '{print $1}')
+[[ $actual_control_archive_sha == "$control_archive_sha" ]]
+[[ $(wc -l < polymarket-raw-ops-control.tar.gz.sha256) -eq 1 ]]
+[[ $(<polymarket-raw-ops-control.tar.gz.sha256) \
+  == "$control_archive_sha  polymarket-raw-ops-control.tar.gz" ]]
+printf '%s  %s\n' "$control_archive_sha" polymarket-raw-ops-control.tar.gz \
+  | sha256sum --check --strict
+[[ $(wc -l < deployment-bundle.sha256) -eq 1 ]]
+grep -Eq '^[0-9a-f]{64}$' deployment-bundle.sha256
+[[ $(<deployment-bundle.sha256) == "$deployment_bundle_sha" ]]
+manifest_sha=$(sha256sum polymarket-raw-ops-control-assets.sha256 | awk '{print $1}')
+[[ $manifest_sha == "$deployment_bundle_sha" ]]
+
+control_assets=(
+  polymarket-raw-ops-shadow-gate.sh
+  polymarket-raw-ops-cutover.sh
+  polymarket-shadow-gate-policy.jq
+  polymarket-legacy-health-policy.jq
+  polymarket-rust-health-policy.jq
+  polymarket-reference-collector-shadow@.service
+  polymarket-reference-collector.service
+  polymarket-reference-upload.service
+  polymarket-reference-upload.timer
+  polymarket-market-tape-upload.service
+  polymarket-market-tape-upload.timer
+)
+control_dir=$(mktemp -d)
+trap 'rm -rf -- "$control_dir"' EXIT
+diff -u <(printf '%s\n' "${control_assets[@]}" | LC_ALL=C sort) \
+  <(tar -tzf polymarket-raw-ops-control.tar.gz | LC_ALL=C sort)
+tar --no-same-owner --no-same-permissions \
+  -xzf polymarket-raw-ops-control.tar.gz -C "$control_dir"
+(
+  cd "$control_dir"
+  sha256sum -c "$artifact_dir/polymarket-raw-ops-control-assets.sha256"
+)
 ```
 
-Install the Rust services and their immutable configuration through the release
-workflow. Do not copy historical control scripts into `/opt/monday/control` or
-replace a production unit manually:
+Install the binary and the exact control bundle from the same reviewed revision
+through the release workflow. Never combine a candidate binary with control assets
+from another revision or replace a production unit manually:
 
 ```bash
-sudo install -m 0644 \
-  deployment/aliyun/polymarket-rust-health-policy.jq \
-  deployment/aliyun/polymarket-reference-collector-shadow@.service \
-  deployment/aliyun/polymarket-reference-{collector,upload}.service \
-  deployment/aliyun/polymarket-reference-upload.timer \
-  deployment/aliyun/polymarket-market-tape-upload.{service,timer} \
+sudo install -d -o root -g root -m 0755 /run/monday
+sudo flock -n /run/monday/polymarket-raw-ops.lock \
+  bash -s -- "$control_dir" "$artifact_dir" <<'ROOT_INSTALL'
+set -euo pipefail
+control_dir=$1
+artifact_dir=$2
+install -d -o root -g root -m 0755 /opt/monday/control/polymarket-raw-ops
+install -o root -g root -m 0644 \
+  "$control_dir"/polymarket-{legacy,rust}-health-policy.jq \
+  "$control_dir"/polymarket-shadow-gate-policy.jq \
+  "$control_dir"/polymarket-reference-collector-shadow@.service \
+  "$control_dir"/polymarket-reference-{collector,upload}.service \
+  "$control_dir"/polymarket-reference-upload.timer \
+  "$control_dir"/polymarket-market-tape-upload.{service,timer} \
   /opt/monday/control/polymarket-raw-ops/
+install -o root -g root -m 0755 \
+  "$control_dir"/polymarket-raw-ops-{shadow-gate,cutover}.sh \
+  /opt/monday/control/polymarket-raw-ops/
+install -o root -g root -m 0444 \
+  "$artifact_dir/polymarket-raw-ops-release.json" \
+  /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-release.json
+sync -f /opt/monday/control/polymarket-raw-ops
+ROOT_INSTALL
+
+sudo /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-shadow-gate.sh \
+  "$artifact_dir/polymarket-raw-ops" "$candidate_sha" "$source_revision"
 ```
 
 The Rust shadow unit must complete its configured observation window and publish
@@ -156,6 +263,32 @@ the candidate binary digest, source revision, symbol set, settled market payload
 and upload readback. Any stale health, missing symbol, sequence gap, or identity
 mismatch blocks promotion. Live execution remains disabled; this lane only collects
 and archives public market data.
+The gate freezes the legacy writer's PID and current systemd restart counter at
+start and requires both to remain unchanged. A nonzero historical counter from the
+unit's scheduled six-hour `RuntimeMaxSec` refresh is valid evidence; any increment
+during shadow or before cutover fails the migration. After the legacy writer is
+stopped, cutover explicitly resets the inherited counter and requires the new Rust
+process to remain at zero for post-start verification.
+PID and `NRestarts` are not sufficient across the final stop boundary, so the gate
+also freezes each unit's systemd `InvocationID`. Immediately before stopping the
+shadow or legacy writer, the control captures a synced journal cursor; after the
+stop it scans only records after that cursor, rejects evidence of a new invocation
+or restart, and rechecks the frozen restart counter. This closes the race between
+the final live identity check and `systemctl stop`.
+
+A cutover is successful only when its evidence directory contains `cutover.json`
+and an adjacent, single-line `PASSED.sha256` that verifies exactly that JSON with
+`sha256sum --check --strict`. Either file by itself is provisional and must not be
+treated as promotion evidence. Any failed transition or automatic or requested
+rollback invalidates that success pair; the retained failed/rollback artifacts are
+for forensic review only and cannot authorize Rust production. Before rollback can
+change any service, the marker is atomically renamed to
+`PASSED.rollback-pending.sha256` and synced. A failed or interrupted restore therefore
+leaves an explicit pending marker rather than stale Rust-production authorization;
+successful automatic recovery finalizes it as `PASSED.invalid.sha256`, while a
+requested rollback finalizes it as `PASSED.rolled-back.sha256`. Each renamed marker
+continues to verify the unchanged `cutover.json`; none can substitute for the exact
+canonical `PASSED.sha256` required to authorize Rust production.
 
 Each service opens bounded WebSocket shards, records every diff, fetches a REST
 Top-100 snapshot, validates sequence continuity, writes replay checkpoints, compresses
