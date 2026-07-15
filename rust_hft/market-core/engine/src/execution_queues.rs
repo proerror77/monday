@@ -9,7 +9,7 @@ use crate::dataflow::ring_buffer::{spsc_ring_buffer, SpscConsumer, SpscProducer}
 use hft_core::Timestamp;
 use ports::{ExecutionEvent, OrderIntent, OrderIntentEnvelope, OrderIntentRejectReason};
 use std::sync::Arc;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
 
 /// 执行队列配置
@@ -43,6 +43,8 @@ pub struct EngineQueues {
     stats: QueueStats,
     intent_notify: Arc<Notify>,
     event_space_notify: Arc<Notify>,
+    applied_stream_tx: mpsc::UnboundedSender<u64>,
+    applied_stream_notify: Arc<Notify>,
 }
 
 /// 执行 Worker 端的队列接口
@@ -57,6 +59,8 @@ pub struct WorkerQueues {
     engine_notify: Option<Arc<Notify>>,
     intent_notify: Arc<Notify>,
     event_space_notify: Arc<Notify>,
+    applied_stream_rx: mpsc::UnboundedReceiver<u64>,
+    applied_stream_notify: Arc<Notify>,
 }
 
 /// 队列统计
@@ -73,6 +77,7 @@ pub struct QueueStats {
     pub intent_stale_count: u64,
     pub intent_max_latency_count: u64,
     pub intent_order_notional_count: u64,
+    pub intent_order_quantity_count: u64,
 }
 
 /// 帶生命週期 envelope 的意圖提交失敗原因。
@@ -93,6 +98,8 @@ pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, W
     let (event_producer, event_consumer) = spsc_ring_buffer(config.event_queue_capacity);
     let intent_notify = Arc::new(Notify::new());
     let event_space_notify = Arc::new(Notify::new());
+    let applied_stream_notify = Arc::new(Notify::new());
+    let (applied_stream_tx, applied_stream_rx) = mpsc::unbounded_channel();
 
     let engine_queues = EngineQueues {
         intent_producer,
@@ -101,6 +108,8 @@ pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, W
         stats: QueueStats::default(),
         intent_notify: Arc::clone(&intent_notify),
         event_space_notify: Arc::clone(&event_space_notify),
+        applied_stream_tx,
+        applied_stream_notify: Arc::clone(&applied_stream_notify),
     };
 
     let worker_queues = WorkerQueues {
@@ -111,6 +120,8 @@ pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, W
         engine_notify: None,
         intent_notify,
         event_space_notify,
+        applied_stream_rx,
+        applied_stream_notify,
     };
 
     (engine_queues, worker_queues)
@@ -194,6 +205,10 @@ impl EngineQueues {
                     | OrderIntentRejectReason::MaxOrderNotionalExceeded { .. } => {
                         self.stats.intent_order_notional_count += 1;
                     }
+                    OrderIntentRejectReason::InvalidMaxOrderQuantity { .. }
+                    | OrderIntentRejectReason::MaxOrderQuantityExceeded { .. } => {
+                        self.stats.intent_order_quantity_count += 1;
+                    }
                 }
                 Err(LifecycleIntentSubmitError::LifecycleRejected {
                     envelope: Box::new(envelope),
@@ -248,6 +263,19 @@ impl EngineQueues {
     pub fn event_queue_capacity(&self) -> usize {
         self.config.event_queue_capacity
     }
+
+    /// A stream synchronization marker is acknowledged only after the engine has applied it and
+    /// every earlier FIFO execution report to OMS, portfolio, and risk state.
+    pub fn acknowledge_applied_execution_stream(&self, stream_id: u64) {
+        if self.applied_stream_tx.send(stream_id).is_ok() {
+            self.applied_stream_notify.notify_one();
+        } else {
+            warn!(
+                stream_id,
+                "execution worker dropped before stream-application acknowledgement"
+            );
+        }
+    }
 }
 
 impl WorkerQueues {
@@ -292,6 +320,14 @@ impl WorkerQueues {
 
     pub fn intent_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.intent_notify)
+    }
+
+    pub fn applied_stream_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.applied_stream_notify)
+    }
+
+    pub fn try_receive_applied_execution_stream(&mut self) -> Option<u64> {
+        self.applied_stream_rx.try_recv().ok()
     }
 
     /// 发送执行回报到引擎 (非阻塞)

@@ -27,15 +27,38 @@ token ID as `Symbol`. A condition ID, Gamma slug, or display label is not an exe
 - Formula strategies emit a real `PredictionMarket` intent when their authoritative source book is
   Polymarket. A Polymarket-specific `VenueSpec` keeps the generic risk path active while leaving
   dynamic tick/minimum-size enforcement to the adapter's just-in-time CLOB market query.
-- A verified deployment's maximum order notional and slippage are copied into every intent
-  envelope. The engine and worker enforce notional again at the final boundary, and the adapter
+- A verified deployment's maximum order quantity, capital-derived order notional ceiling, and
+  slippage are copied into every intent envelope. The engine and worker enforce both independent
+  size ceilings, while the adapter requires them again at the final prepared-order boundary and
   consumes slippage for both immediate and limit order paths.
 - Fully paginated open-order and recent-fill inspection, collateral balance, and Data API position
   snapshots.
-- Authenticated user order/trade events. Startup REST catch-up is buffered until the execution
-  worker subscribes, so a fast fill cannot disappear between client connection and stream
-  attachment. A private-stream gap emits `ReconciliationRequired`, disables new intents, and
-  requires account-wide REST order/trade reconciliation before recovery.
+- Authenticated user order/trade events. Private confirmed fills and startup/gap-recovery REST
+  catch-up events use a bounded, single-consumer reliable outbox. Every required batch slot is
+  reserved and every batch is staged before fill-dedupe or order state commits; the now-infallible
+  sends happen immediately after that in-memory commit. Outbox saturation therefore leaves all
+  accounting state untouched. Large catch-ups are chunked without splitting a matching
+  `Fill`/`FeeCharged` pair. The worker pulls one adapter event at a time and only its next poll
+  acknowledges the prior downstream write, so cancellation or SPSC backpressure replays exactly
+  the current unacknowledged event without rewinding an already delivered fill. The engine also
+  keeps a bounded 200,000-event Fill/Fee idempotency window before OMS, portfolio, risk, metrics,
+  and broadcasts as defense in depth. Stream attachment emits a generation-tagged barrier and appends a matching
+  synchronized-state marker behind any catch-up backlog. Older ready events or markers from a
+  replaced stream cannot clear or overwrite the latest generation, and a worker that hits its event batch limit defers new
+  intents until another drain pass. The worker remains closed after the tail marker until the
+  engine acknowledges that every earlier report has been applied to OMS, portfolio, and risk; it
+  then rejects every pre-watermark queued intent before reopening. Active gap recovery publishes
+  the same generation pair around each REST catch-up and retries a transient worker-side snapshot
+  failure without requiring restart. Intake therefore cannot reopen while older fill/fee events
+  are merely in transit. This prevents a fast fill from disappearing between client connection,
+  task cancellation, and stream attachment. Private-health fault epochs, recovery epochs, and
+  their event publication share one transition guard, so an older recovery cannot publish ready
+  after a newer fault or replacement stream. A private order/trade that may contain fill state
+  queues `ReconciliationRequired` before its first async processing step, disables new intents,
+  and requires account-wide REST order/trade reconciliation before recovery. The adapter's own
+  placement gate remains closed until the matching engine-applied generation acknowledgement.
+  Any failure that occurs before the venue POST is typed as definitely not submitted; only a
+  transport failure at the POST boundary can enter sticky unknown-outcome handling.
 - A pristine startup that discovers exchange-only orders enters a sticky operator-recovery mode.
   Authenticated REST inspection and cancellation remain available even if the private socket is
   unavailable, while placement and replacement remain disabled. The latch clears only after strict
@@ -51,8 +74,12 @@ token ID as `Symbol`. A condition ID, Gamma slug, or display label is not an exe
   tombstone's remaining quantity; an overfill forces reconciliation. Fill IDs use a 100,000-entry
   FIFO dedupe window. REST recovery examines account-wide orders and trades; an empty local
   tracking map cannot be treated as a clean account.
-- Confirmed taker fills emit an idempotent `FeeCharged` event using the venue fee-rate field;
-  maker fills remain fee-free. The fee is reflected in Monday cash and realized PnL.
+- Confirmed taker fills emit an idempotent `FeeCharged` event from the V2 market `fd` schedule using
+  `rate × (price × (1 - price))^exponent`. An absent `fd` follows official V2 semantics and is
+  treated as zero fee. Metadata request/identity errors, invalid negative rates, and positive
+  non-taker-only schedules fail closed; maker fills remain fee-free. The fee is reflected in Monday
+  cash and realized PnL. The private stream never waits on fee metadata: a cache miss disables new
+  intake until strict REST recovery observes the same final trade and backfills its market schedule.
 - A pristine, single-client Polymarket runtime can bootstrap cash and positions from a complete
   authoritative snapshot. Any exchange-open order, incomplete snapshot, non-Polymarket client, or
   existing local OMS/portfolio state prevents bootstrap.

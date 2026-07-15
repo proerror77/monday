@@ -292,6 +292,10 @@ fn accepted_paper_shadow_handoff_reaches_both_runtime_adapters() {
     assert_eq!(config.engine.intent_max_slippage_bps, Some(5));
     assert_eq!(
         config.engine.intent_max_order_notional,
+        Some(rust_decimal::Decimal::from(500))
+    );
+    assert_eq!(
+        config.engine.intent_max_order_quantity,
         Some(rust_decimal::Decimal::from(100))
     );
     assert_eq!(config.strategies[0].name, bundle.bundle_id);
@@ -867,6 +871,7 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
         assert!(error.contains("finite integer in 1..=10000"));
         assert_eq!(config.engine.intent_max_slippage_bps, None);
         assert_eq!(config.engine.intent_max_order_notional, None);
+        assert_eq!(config.engine.intent_max_order_quantity, None);
     }
 
     for value in [1.0, 10_000.0] {
@@ -893,6 +898,10 @@ fn deployment_slippage_requires_a_finite_integer_bps() {
         assert_eq!(config.engine.intent_max_slippage_bps, Some(value as i32));
         assert_eq!(
             config.engine.intent_max_order_notional,
+            Some(rust_decimal::Decimal::from(500))
+        );
+        assert_eq!(
+            config.engine.intent_max_order_quantity,
             Some(rust_decimal::Decimal::from(100))
         );
     }

@@ -933,7 +933,9 @@ impl ExecutionClient for BybitExecutionClient {
             let s = tokio_stream::wrappers::BroadcastStream::new(rx).map(|result| match result {
                 Ok(event) => Ok(event),
                 Err(error) => Ok(ExecutionEvent::ReconciliationRequired {
-                    reason: format!("Bybit private execution stream lagged: {error}"),
+                    reason: format!(
+                        "Bybit private execution stream lagged and has no in-process watermark recovery; restart is required: {error}"
+                    ),
                     timestamp: hft_core::now_micros(),
                 }),
             });

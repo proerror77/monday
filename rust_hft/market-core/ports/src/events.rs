@@ -312,6 +312,9 @@ pub struct OrderIntentLifecycle {
     /// Signed deployment ceiling consumed again at the final execution boundary.
     #[serde(default)]
     pub max_order_notional: Option<rust_decimal::Decimal>,
+    /// Signed deployment quantity ceiling consumed again at the final execution boundary.
+    #[serde(default)]
+    pub max_order_quantity: Option<rust_decimal::Decimal>,
     #[serde(default)]
     pub reduce_only: bool,
 }
@@ -326,6 +329,7 @@ impl Default for OrderIntentLifecycle {
             max_latency_us: None,
             max_slippage_bps: None,
             max_order_notional: None,
+            max_order_quantity: None,
             reduce_only: false,
         }
     }
@@ -445,7 +449,7 @@ impl OrderIntentEnvelope {
         latest_book_seq: Option<u64>,
     ) -> Result<(), OrderIntentRejectReason> {
         self.lifecycle.validate_pre_risk(now, latest_book_seq)?;
-        self.validate_order_notional()
+        self.validate_order_limits()
     }
 
     pub fn validate_pre_execution(
@@ -455,10 +459,25 @@ impl OrderIntentEnvelope {
     ) -> Result<(), OrderIntentRejectReason> {
         self.lifecycle
             .validate_pre_execution(now, latest_book_seq)?;
-        self.validate_order_notional()
+        self.validate_order_limits()
     }
 
-    fn validate_order_notional(&self) -> Result<(), OrderIntentRejectReason> {
+    fn validate_order_limits(&self) -> Result<(), OrderIntentRejectReason> {
+        if let Some(max_order_quantity) = self.lifecycle.max_order_quantity {
+            if max_order_quantity <= rust_decimal::Decimal::ZERO {
+                return Err(OrderIntentRejectReason::InvalidMaxOrderQuantity {
+                    max_order_quantity,
+                });
+            }
+            let order_quantity = self.intent.quantity.0;
+            if order_quantity > max_order_quantity {
+                return Err(OrderIntentRejectReason::MaxOrderQuantityExceeded {
+                    order_quantity,
+                    max_order_quantity,
+                });
+            }
+        }
+
         let Some(max_order_notional) = self.lifecycle.max_order_notional else {
             return Ok(());
         };
@@ -507,6 +526,13 @@ pub enum OrderIntentRejectReason {
     MaxOrderNotionalExceeded {
         order_notional: rust_decimal::Decimal,
         max_order_notional: rust_decimal::Decimal,
+    },
+    InvalidMaxOrderQuantity {
+        max_order_quantity: rust_decimal::Decimal,
+    },
+    MaxOrderQuantityExceeded {
+        order_quantity: rust_decimal::Decimal,
+        max_order_quantity: rust_decimal::Decimal,
     },
 }
 
@@ -588,8 +614,26 @@ pub enum ExecutionEvent {
         connected: bool,
         timestamp: Timestamp,
     },
-    /// The transport is still connected, but one or more private events were missed.
-    /// Order intake must remain disabled until an authoritative reconciliation succeeds.
+    /// A newly attached execution-report consumer must stay fail-closed until it reaches the
+    /// matching `ExecutionStreamSynchronized` marker. Older ready events already in the adapter
+    /// backlog cannot clear this barrier. `stream_id` must be non-zero, unique for the lifetime of
+    /// the process, and strictly increase for each later generation (process-global monotonic is
+    /// sufficient). The worker uses `0` as its unseen sentinel and this ordering prevents an old
+    /// consumer backlog from overwriting a newer replacement-stream barrier.
+    ExecutionStreamBarrier {
+        stream_id: u64,
+        timestamp: Timestamp,
+    },
+    /// Tail marker appended after the adapter's pre-existing report backlog for one stream attach.
+    ExecutionStreamSynchronized {
+        stream_id: u64,
+        connected: bool,
+        timestamp: Timestamp,
+    },
+    /// The transport may still be connected, but one or more private events were missed. Order
+    /// intake becomes fail-closed immediately. An adapter that supports in-process recovery must
+    /// follow this with a newer monotonic Barrier/Synchronized generation; otherwise recovery is
+    /// explicitly restart-required and the worker remains closed.
     ReconciliationRequired {
         reason: String,
         timestamp: Timestamp,
@@ -717,6 +761,33 @@ mod tests {
             Err(OrderIntentRejectReason::MaxOrderNotionalExceeded {
                 order_notional: rust_decimal::Decimal::from(110),
                 max_order_notional: rust_decimal::Decimal::from(100),
+            })
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_order_above_signed_quantity_ceiling() {
+        let mut lifecycle = lifecycle(1_000, 2_000);
+        lifecycle.max_order_quantity = Some(rust_decimal::Decimal::from(10));
+        let envelope = OrderIntentEnvelope::new(
+            OrderIntent::crypto_spot(
+                Symbol::new("BTCUSDT"),
+                Side::Buy,
+                Quantity(rust_decimal::Decimal::from(11)),
+                OrderType::Limit,
+                Some(Price(rust_decimal::Decimal::from(5))),
+                TimeInForce::IOC,
+                "quantity-bounded".to_string(),
+                Some(VenueId::BINANCE_SPOT),
+            ),
+            lifecycle,
+        );
+
+        assert_eq!(
+            envelope.validate_pre_execution(1_100, None),
+            Err(OrderIntentRejectReason::MaxOrderQuantityExceeded {
+                order_quantity: rust_decimal::Decimal::from(11),
+                max_order_quantity: rust_decimal::Decimal::from(10),
             })
         );
     }

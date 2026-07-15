@@ -29,6 +29,7 @@ Classification:
 
 | File | Usage | Classification | Rationale / next action |
 | --- | --- | --- | --- |
+| `market-core/engine/src/execution_queues.rs` | engine-applied execution-stream generation acknowledgements | control-plane acceptable | One `u64` acknowledgement per stream attach or recovery generation, never per order/fill. Execution reports remain on the bounded SPSC ring; the low-rate ack prevents reopening before OMS/portfolio/risk application. |
 | `market-core/engine/src/execution_worker.rs` | `UnboundedReceiver<ControlCommand>` and `unbounded_channel()` for worker control handles | control-plane acceptable | Low-rate worker control path, not order intent or execution feedback. Keep separate from hot path; do not carry market data or reports here. |
 | `market-core/engine/src/execution_control.rs` | sends emergency, pause, resume, cancel, and reconciliation commands to execution workers | control-plane acceptable | Human/ops lifecycle commands only. Market data, order intents, acks, fills, and private reports use separate bounded queues. |
 | `market-core/runtime/src/system_builder.rs` | stores execution-worker control senders | control-plane acceptable | Sender registry for worker lifecycle/control. Acceptable while it remains command-only. |

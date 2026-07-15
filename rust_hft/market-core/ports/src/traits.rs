@@ -111,6 +111,11 @@ pub trait ExecutionClient: Send + Sync {
         false
     }
 
+    /// Confirms that the engine has applied a generation-tagged synchronization marker and every
+    /// earlier execution report to OMS, portfolio, and risk state. Live adapters may keep their
+    /// placement gate closed until this acknowledgement arrives.
+    fn acknowledge_execution_stream_applied(&self, _stream_id: u64) {}
+
     /// 獲取未結訂單列表 (用於對賬)
     async fn list_open_orders(&self) -> HftResult<Vec<OpenOrder>>;
 
@@ -766,6 +771,9 @@ pub struct PortfolioState {
     pub market_prices: std::collections::HashMap<Symbol, Price>,
     /// 已處理的成交ID（去重），恢復後避免重覆累計
     pub processed_fill_ids: std::collections::HashMap<OrderId, std::collections::HashSet<String>>,
+    /// Engine accounting replay horizon, ordered oldest to newest. Hash-based portfolio fill sets
+    /// cannot reconstruct recency once the bounded engine deduper reaches capacity.
+    pub recent_accounting_event_ids: Vec<(OrderId, String)>,
 }
 
 /// Portfolio 管理器 trait - 提供帳戶會計能力
