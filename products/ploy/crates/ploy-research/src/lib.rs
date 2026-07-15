@@ -171,6 +171,12 @@ pub use factors_v2::{
 };
 #[cfg(feature = "rl")]
 pub use model::rl::{BinaryEventEnv, DqnAgent, Environment, ReplayBuffer};
+#[cfg(feature = "ml")]
+pub use model::supervised::{
+    train_event_disjoint_binary, BinaryArtifactScope, BinaryBundleDigest, BinaryDatasetContract,
+    BinaryDecisionRow, BinaryModelManifest, BinaryOosMetrics, BinaryProbabilityModel,
+    BinarySettlementAuthority, BinaryTrainingConfig, EventDisjointBinarySplit, FeatureNormalizer,
+};
 #[cfg(any(feature = "ml", feature = "rl"))]
 pub use model::{RlAgent, StrategyModel, Transition};
 pub use ploy_operator_contracts::Regime;
