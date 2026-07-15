@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use syn::visit::{self, Visit};
 use syn::{Attribute, Item, ItemImpl, Type};
 
 const RETIRED_SOURCE_PATHS: &[&str] = &[
@@ -315,12 +317,65 @@ fn has_exact_cfg_test(attributes: &[Attribute]) -> bool {
     })
 }
 
-fn gateway_target(implementation: &ItemImpl) -> Option<String> {
+fn collect_gateway_alias_renames(items: &[Item], renames: &mut Vec<(String, String)>) {
+    fn collect_use_tree(tree: &syn::UseTree, renames: &mut Vec<(String, String)>) {
+        match tree {
+            syn::UseTree::Rename(rename) => {
+                renames.push((rename.ident.to_string(), rename.rename.to_string()));
+            }
+            syn::UseTree::Path(path) => collect_use_tree(&path.tree, renames),
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    collect_use_tree(item, renames);
+                }
+            }
+            syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+        }
+    }
+
+    struct AliasVisitor<'a> {
+        renames: &'a mut Vec<(String, String)>,
+    }
+
+    impl<'ast> Visit<'ast> for AliasVisitor<'_> {
+        fn visit_item_use(&mut self, item_use: &'ast syn::ItemUse) {
+            collect_use_tree(&item_use.tree, self.renames);
+            visit::visit_item_use(self, item_use);
+        }
+    }
+
+    let mut visitor = AliasVisitor { renames };
+    for item in items {
+        visitor.visit_item(item);
+    }
+}
+
+fn gateway_trait_aliases(items: &[Item]) -> BTreeSet<String> {
+    let mut renames = Vec::new();
+    collect_gateway_alias_renames(items, &mut renames);
+    let mut aliases = BTreeSet::from(["LiveExecutionGateway".to_string()]);
+    loop {
+        let before = aliases.len();
+        for (source, alias) in &renames {
+            if aliases.contains(source) {
+                aliases.insert(alias.clone());
+            }
+        }
+        if aliases.len() == before {
+            return aliases;
+        }
+    }
+}
+
+fn gateway_target(
+    implementation: &ItemImpl,
+    gateway_trait_aliases: &BTreeSet<String>,
+) -> Option<String> {
     let (_, trait_path, _) = implementation.trait_.as_ref()?;
     if trait_path
         .segments
         .last()
-        .is_none_or(|segment| segment.ident != "LiveExecutionGateway")
+        .is_none_or(|segment| !gateway_trait_aliases.contains(&segment.ident.to_string()))
     {
         return None;
     }
@@ -335,35 +390,74 @@ fn gateway_target(implementation: &ItemImpl) -> Option<String> {
     }
 }
 
+fn macro_mentions_gateway(syntax: &syn::Macro, gateway_trait_aliases: &BTreeSet<String>) -> bool {
+    syntax.path.segments.iter().any(|segment| {
+        let identifier = segment.ident.to_string();
+        gateway_trait_aliases.contains(&identifier)
+            || identifier.to_ascii_lowercase().contains("gateway")
+    }) || syntax
+        .tokens
+        .to_string()
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|token| gateway_trait_aliases.contains(token))
+}
+
 fn collect_gateway_items(
     source: &str,
     items: &[Item],
     inside_cfg_test: bool,
     implementations: &mut Vec<GatewayImplementation>,
 ) {
+    let aliases = gateway_trait_aliases(items);
+    let mut visitor = GatewayImplementationVisitor {
+        source,
+        inside_cfg_test,
+        gateway_trait_aliases: &aliases,
+        implementations,
+    };
     for item in items {
-        match item {
-            Item::Impl(implementation) => {
-                if let Some(target) = gateway_target(implementation) {
-                    implementations.push(GatewayImplementation {
-                        source: source.to_string(),
-                        target,
-                        test_only: inside_cfg_test || has_exact_cfg_test(&implementation.attrs),
-                    });
-                }
-            }
-            Item::Mod(module) => {
-                if let Some((_, items)) = &module.content {
-                    collect_gateway_items(
-                        source,
-                        items,
-                        inside_cfg_test || has_exact_cfg_test(&module.attrs),
-                        implementations,
-                    );
-                }
-            }
-            _ => {}
+        visitor.visit_item(item);
+    }
+}
+
+struct GatewayImplementationVisitor<'a> {
+    source: &'a str,
+    inside_cfg_test: bool,
+    gateway_trait_aliases: &'a BTreeSet<String>,
+    implementations: &'a mut Vec<GatewayImplementation>,
+}
+
+impl<'ast> Visit<'ast> for GatewayImplementationVisitor<'_> {
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        let prior = self.inside_cfg_test;
+        self.inside_cfg_test = prior || has_exact_cfg_test(&module.attrs);
+        visit::visit_item_mod(self, module);
+        self.inside_cfg_test = prior;
+    }
+
+    fn visit_item_impl(&mut self, implementation: &'ast ItemImpl) {
+        if let Some(target) = gateway_target(implementation, self.gateway_trait_aliases) {
+            self.implementations.push(GatewayImplementation {
+                source: self.source.to_string(),
+                target,
+                test_only: self.inside_cfg_test || has_exact_cfg_test(&implementation.attrs),
+            });
         }
+        visit::visit_item_impl(self, implementation);
+    }
+
+    fn visit_macro(&mut self, syntax: &'ast syn::Macro) {
+        if macro_mentions_gateway(syntax, self.gateway_trait_aliases) {
+            let finding = GatewayImplementation {
+                source: self.source.to_string(),
+                target: "<unexpanded LiveExecutionGateway macro>".to_string(),
+                test_only: self.inside_cfg_test,
+            };
+            if !self.implementations.contains(&finding) {
+                self.implementations.push(finding);
+            }
+        }
+        visit::visit_macro(self, syntax);
     }
 }
 
@@ -477,9 +571,24 @@ fn authenticated_execution_guard_covers_root_frontend_and_rust_syntax() {
 
     let syntax = syn::parse_file(
         r#"
+            use ploy_connectivity::LiveExecutionGateway as VenueGateway;
+
             impl
                 ploy_connectivity::LiveExecutionGateway
                 for VenueAuthenticatedClient {}
+
+            impl VenueGateway for AliasedVenueAuthenticatedClient {}
+
+            const _: () = {
+                impl LiveExecutionGateway for BlockScopedVenueAuthenticatedClient {}
+            };
+
+            macro_rules! implement_gateway {
+                ($target:ty) => {
+                    impl LiveExecutionGateway for $target {}
+                };
+            }
+            implement_gateway!(MacroGeneratedVenueAuthenticatedClient);
 
             #[cfg(test)]
             mod tests {
@@ -500,10 +609,51 @@ fn authenticated_execution_guard_covers_root_frontend_and_rust_syntax() {
             },
             GatewayImplementation {
                 source: "fixture.rs".to_string(),
+                target: "AliasedVenueAuthenticatedClient".to_string(),
+                test_only: false,
+            },
+            GatewayImplementation {
+                source: "fixture.rs".to_string(),
+                target: "BlockScopedVenueAuthenticatedClient".to_string(),
+                test_only: false,
+            },
+            GatewayImplementation {
+                source: "fixture.rs".to_string(),
+                target: "<unexpanded LiveExecutionGateway macro>".to_string(),
+                test_only: false,
+            },
+            GatewayImplementation {
+                source: "fixture.rs".to_string(),
                 target: "DeterministicFake".to_string(),
                 test_only: true,
             },
         ]
+    );
+}
+
+#[test]
+fn gateway_guard_fails_closed_on_unexpanded_production_macro() {
+    let syntax = syn::parse_file(
+        r#"
+            install_live_execution_gateway!(MacroGeneratedVenueAuthenticatedClient);
+        "#,
+    )
+    .expect("parse unexpanded production gateway macro fixture");
+    let mut implementations = Vec::new();
+    collect_gateway_items(
+        "macro-fixture.rs",
+        &syntax.items,
+        false,
+        &mut implementations,
+    );
+
+    assert_eq!(
+        implementations,
+        vec![GatewayImplementation {
+            source: "macro-fixture.rs".to_string(),
+            target: "<unexpanded LiveExecutionGateway macro>".to_string(),
+            test_only: false,
+        }]
     );
 }
 

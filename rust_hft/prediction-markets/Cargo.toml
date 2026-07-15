@@ -102,7 +102,7 @@ ploy-deployments.workspace = true
 ploy-operator-contracts.workspace = true
 ploy-platform.workspace = true
 rust_decimal.workspace = true
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", features = ["full", "visit"] }
 
 [profile.release]
 lto = "thin"
