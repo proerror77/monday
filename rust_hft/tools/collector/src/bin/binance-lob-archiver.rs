@@ -1663,8 +1663,8 @@ mod tests {
     async fn upload_only_rejects_a_symlink_spool_lock_without_touching_its_target() {
         use std::os::unix::fs::symlink;
 
-        let spool_dir =
-            env::temp_dir().join(format!("monday-spool-lock-symlink-{}", now_ns().unwrap()));
+        let temp_dir = tempfile::tempdir().unwrap();
+        let spool_dir = temp_dir.path().join("spool");
         std::fs::create_dir_all(&spool_dir).unwrap();
         let victim = spool_dir.join("victim");
         std::fs::write(&victim, b"keep-me").unwrap();
