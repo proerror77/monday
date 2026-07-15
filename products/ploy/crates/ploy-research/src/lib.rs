@@ -168,7 +168,7 @@ pub use model::rl::{BinaryEventEnv, DqnAgent, Environment, ReplayBuffer};
 #[cfg(feature = "ml")]
 pub use model::supervised::{
     train_event_disjoint_binary, BinaryArtifactScope, BinaryBundleDigest, BinaryDatasetContract,
-    BinaryEventSample, BinaryModelManifest, BinaryOosMetrics, BinaryProbabilityModel,
+    BinaryDecisionRow, BinaryModelManifest, BinaryOosMetrics, BinaryProbabilityModel,
     BinarySettlementAuthority, BinaryTrainingConfig, EventDisjointBinarySplit, FeatureNormalizer,
 };
 #[cfg(any(feature = "ml", feature = "rl"))]

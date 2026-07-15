@@ -29,6 +29,8 @@ reconciliation, cancellation, replacement, and order execution.
 - The standard `new-ploy-runner --features full` build does not enable the legacy
   `live-execution` feature.
 - The only PLOY CI authority is the root `.github/workflows/ploy-ci.yml` workflow.
+- `scripts/install-platform-service.sh` is a fail-closed compatibility tombstone;
+  it cannot install or enable the former standalone service.
 
 Live configuration examples and legacy deployment assets are retained only for
 historical analysis. They are not approved Monday deployment entrypoints.

@@ -5,6 +5,10 @@
 
 **Note**: This template is filled in by the `/speckit.plan` command. See `.specify/templates/commands/plan.md` for the execution workflow.
 
+**Runtime boundary**: Generated plans MUST use Rust and Cargo only. Do not
+introduce a second language runtime, foreign package manager, or foreign test
+runner.
+
 ## Summary
 
 [Extract from feature spec: primary requirement + technical approach from research]
@@ -17,12 +21,12 @@
   the iteration process.
 -->
 
-**Language/Version**: [e.g., Python 3.11, Swift 5.9, Rust 1.75 or NEEDS CLARIFICATION]  
-**Primary Dependencies**: [e.g., FastAPI, UIKit, LLVM or NEEDS CLARIFICATION]  
-**Storage**: [if applicable, e.g., PostgreSQL, CoreData, files or N/A]  
-**Testing**: [e.g., pytest, XCTest, cargo test or NEEDS CLARIFICATION]  
-**Target Platform**: [e.g., Linux server, iOS 15+, WASM or NEEDS CLARIFICATION]
-**Project Type**: [single/web/mobile - determines source structure]  
+**Language/Version**: [Rust toolchain/MSRV from `rust-toolchain.toml` and workspace policy, or NEEDS CLARIFICATION]
+**Primary Dependencies**: [Cargo crates and enabled features, or NEEDS CLARIFICATION]
+**Storage**: [if applicable, e.g., PostgreSQL via a Rust crate, append-only files, or N/A]
+**Testing**: [`cargo test --locked` plus the narrow package/feature lane, or NEEDS CLARIFICATION]
+**Target Platform**: [e.g., Linux server, WASM, supported target triple, or NEEDS CLARIFICATION]
+**Project Type**: [Cargo workspace package: library, binary, service, or tool]
 **Performance Goals**: [domain-specific, e.g., 1000 req/s, 10k lines/sec, 60 fps or NEEDS CLARIFICATION]  
 **Constraints**: [domain-specific, e.g., <200ms p95, <100MB memory, offline-capable or NEEDS CLARIFICATION]  
 **Scale/Scope**: [domain-specific, e.g., 10k users, 1M LOC, 50 screens or NEEDS CLARIFICATION]
@@ -56,39 +60,31 @@ specs/[###-feature]/
 -->
 
 ```
-# [REMOVE IF UNUSED] Option 1: Single project (DEFAULT)
-src/
-├── models/
-├── services/
-├── cli/
-└── lib/
-
-tests/
-├── contract/
-├── integration/
-└── unit/
-
-# [REMOVE IF UNUSED] Option 2: Web application (when "frontend" + "backend" detected)
-backend/
+# [REMOVE IF UNUSED] Option 1: Extend an existing Cargo package (DEFAULT)
+[package]/
+├── Cargo.toml
 ├── src/
-│   ├── models/
-│   ├── services/
-│   └── api/
+│   ├── lib.rs
+│   ├── [domain].rs
+│   └── bin/
+│       └── [tool].rs
 └── tests/
+    ├── [contract].rs
+    └── [integration].rs
 
-frontend/
+# [REMOVE IF UNUSED] Option 2: Add a Cargo workspace package
+[workspace-domain]/[package]/
+├── Cargo.toml
 ├── src/
-│   ├── components/
-│   ├── pages/
-│   └── services/
-└── tests/
+│   ├── lib.rs
+│   └── [modules].rs
+├── tests/
+│   └── [behavior].rs
+└── benches/
+    └── [benchmark].rs
 
-# [REMOVE IF UNUSED] Option 3: Mobile + API (when "iOS/Android" detected)
-api/
-└── [same as backend above]
-
-ios/ or android/
-└── [platform-specific structure: feature modules, UI flows, platform tests]
+Cargo.toml              # Register the package only when a new member is required
+Cargo.lock              # Update with locked Cargo resolution
 ```
 
 **Structure Decision**: [Document the selected structure and reference the real
@@ -100,5 +96,5 @@ directories captured above]
 
 | Violation | Why Needed | Simpler Alternative Rejected Because |
 |-----------|------------|-------------------------------------|
-| [e.g., 4th project] | [current need] | [why 3 projects insufficient] |
+| [e.g., new workspace package] | [current need] | [why an existing package is insufficient] |
 | [e.g., Repository pattern] | [specific problem] | [why direct DB access insufficient] |

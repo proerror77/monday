@@ -60,8 +60,13 @@ jobs:
             label="$1"
             pattern="$2"
             shift 2
+            grep_args=(-n -I -E)
+            if [ "${1:-}" = "--ignore-case" ]; then
+              grep_args+=(-i)
+              shift
+            fi
             set +e
-            matches="$(git grep -n -I -E "${pattern}" -- "$@")"
+            matches="$(git grep "${grep_args[@]}" "${pattern}" -- "$@")"
             scan_status=$?
             set -e
             case "${scan_status}" in
@@ -120,6 +125,16 @@ jobs:
             "Python runtime or package-manager command" \
             'actions/setup-pyth[o]n@|astral-sh/setup-u[v]@|(^|[;&|()/[:space:]])(python([0-9]+([.][0-9]+)?)?|pip([0-9]+)?|pipx|pytest|poetry|pdm|rye|conda|mamba|hatch|tox|virtualenv)([[:space:]]|$)|(^|[;&|()/[:space:]])uv[[:space:]]+(run|sync|pip|venv|python)([[:space:]]|$)' \
             "${inline_command_pathspecs[@]}"
+
+          rust_template_pathspecs=(
+            ':(glob)rust_hft/.specify/templates/*.md'
+            ':(glob)rust_hft/.specify/templates/**/*.md'
+          )
+          reject_python_text \
+            "Python scaffolding in active Rust templates" \
+            'actions/setup-pyth[o]n@|astral-sh/setup-u[v]@|(^|[^[:alnum:]_])(python([0-9]+([.][0-9]+)?)?|pip([0-9]+)?|pipx|pytest|poetry|pdm|rye|conda|mamba|hatch|tox|virtualenv|pyproject[.]toml|requirements[^/[:space:]]*[.]txt|setup[.]py|[^/[:space:]`"]+[.]py)([^[:alnum:]_]|$)|(^|[;&|()/[:space:]])uv[[:space:]]+(run|sync|pip|venv|python)([[:space:]]|$)' \
+            --ignore-case \
+            "${rust_template_pathspecs[@]}"
 
           if git grep -n -E '(name = "(burn-tch|tch|torch-sys|pyo3[^"]*|cpython|rust-cpython|python3-sys|rustpython[^"]*)"|^[[:space:]]*(burn-tch|tch|torch-sys|pyo3([-_][A-Za-z0-9_-]+)?|cpython|rust-cpython|python3-sys|rustpython([-_][A-Za-z0-9_-]+)?)[[:space:]]*=)' -- \
             ':(glob)**/Cargo.toml' ':(glob)**/Cargo.lock'; then

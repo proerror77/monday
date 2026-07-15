@@ -42,9 +42,12 @@ A silent WebSocket shard fails after
 `STALL_TIMEOUT_SECONDS`. Receiver cleanup is bounded to five seconds so a stuck
 WebSocket close handshake cannot block reconnection. A separate process watchdog
 exits after 180 seconds without any market-data frame, allowing systemd to recover
-even if the runtime stalls. On shutdown, session tasks have a 10-second grace
-period and an in-flight OSS child is killed immediately; systemd reserves up to
-360 seconds for that drain plus the bounded 300-second final compression. Low disk
+even if the runtime stalls. It stays armed across session reconnects, but a global
+shutdown disarms it before shutdown becomes visible to session tasks, so the
+bounded final compression cannot be mistaken for a data stall. On shutdown,
+session tasks have a 10-second grace period and an in-flight OSS child is killed
+immediately; systemd reserves up to 360 seconds for that drain plus the bounded
+300-second final compression. Low disk
 space emits a warning but does not pause collection. Successfully uploaded segments are deleted
 from the local spool immediately. Pending segments are retained when OSS upload
 fails so the collector never creates a silent data hole merely to reclaim space.

@@ -30,6 +30,7 @@ use crate::{
         PREDICTION_EVENT_WINDOW_SECS,
     },
     research_snapshot::ResearchSnapshot,
+    FactorObservation,
 };
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -210,33 +211,46 @@ impl BinaryDatasetContract {
     }
 }
 
-/// One labelled decision-time observation for a binary event.
+/// Selector for one decision-time row in the governed research snapshot.
 ///
-/// Source and local-receipt clocks are parallel to `features`, preserving the
-/// governed feature order and allowing every input to be checked independently.
+/// This deliberately contains no feature values, clocks, settlement timestamp,
+/// or outcome. The trainer materializes all of those fields from the immutable,
+/// content-addressed snapshot so callers cannot smuggle labels into features or
+/// claim fictitious point-in-time availability.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct BinaryEventSample {
+pub struct BinaryDecisionRow {
     pub event_id: String,
     pub decision_at_ms: i64,
-    pub settlement_at_ms: i64,
-    pub label_observed_at_ms: i64,
-    pub features: Vec<f32>,
-    pub feature_source_at_ms: Vec<i64>,
-    pub feature_received_at_ms: Vec<i64>,
-    pub outcome: bool,
 }
 
-/// Caller-supplied, already separated train and validation partitions.
+/// Caller-selected, already separated train and validation decision rows.
 ///
 /// The trainer validates that no `event_id` occurs in both partitions. It does
-/// not silently re-split rows, which avoids overlapping event-window leakage.
+/// not silently re-split rows, and it derives every value from the bound
+/// snapshot, which avoids overlapping event-window and caller-input leakage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EventDisjointBinarySplit {
     pub contract: BinaryDatasetContract,
-    pub train: Vec<BinaryEventSample>,
-    pub validation: Vec<BinaryEventSample>,
+    pub train: Vec<BinaryDecisionRow>,
+    pub validation: Vec<BinaryDecisionRow>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct MaterializedBinarySample {
+    event_id: String,
+    decision_at_ms: i64,
+    settlement_at_ms: i64,
+    features: Vec<f32>,
+    outcome: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MaterializedBinarySplit<'a> {
+    contract: &'a BinaryDatasetContract,
+    train: Vec<MaterializedBinarySample>,
+    validation: Vec<MaterializedBinarySample>,
 }
 
 /// Deterministic full-batch training configuration.
@@ -291,7 +305,7 @@ pub struct FeatureNormalizer {
 }
 
 impl FeatureNormalizer {
-    fn fit(samples: &[BinaryEventSample], input_dim: usize) -> Self {
+    fn fit(samples: &[MaterializedBinarySample], input_dim: usize) -> Self {
         let count = samples.len() as f64;
         let mut means = vec![0.0; input_dim];
         for sample in samples {
@@ -711,7 +725,8 @@ impl BinaryProbabilityModel {
 }
 
 /// Train a deterministic Burn binary probability model and evaluate it once on
-/// the caller-provided event-disjoint validation partition.
+/// the caller-selected event-disjoint validation partition. Feature values and
+/// labels are always materialized from the bound governed snapshot.
 pub fn train_event_disjoint_binary(
     snapshot: &ResearchSnapshot,
     mission: &PredictionResearchMission,
@@ -731,13 +746,13 @@ pub fn train_event_disjoint_binary(
         "binary dataset contract does not match the validated prediction snapshot"
     );
     let input_dim = split.contract.feature_names.len();
-    validate_split(split, input_dim)?;
-    validate_samples_against_snapshot(split, snapshot)?;
+    let materialized = materialize_split(split, snapshot)?;
+    validate_split(&materialized, input_dim)?;
 
-    let normalizer = FeatureNormalizer::fit(&split.train, input_dim);
+    let normalizer = FeatureNormalizer::fit(&materialized.train, input_dim);
     normalizer.validate(input_dim)?;
-    let train_features = normalized_flattened_features(&split.train, &normalizer)?;
-    let train_labels = split
+    let train_features = normalized_flattened_features(&materialized.train, &normalizer)?;
+    let train_labels = materialized
         .train
         .iter()
         .map(|sample| i64::from(sample.outcome))
@@ -747,11 +762,11 @@ pub fn train_event_disjoint_binary(
     TrainingBackend::seed(&device, config.seed);
     let mut model = BurnBinaryLinear::<TrainingBackend>::from_seed(input_dim, config.seed, &device);
     let features = Tensor::<TrainingBackend, 2>::from_data(
-        TensorData::new(train_features, [split.train.len(), input_dim]),
+        TensorData::new(train_features, [materialized.train.len(), input_dim]),
         &device,
     );
     let labels = Tensor::<TrainingBackend, 2, Int>::from_data(
-        TensorData::new(train_labels, [split.train.len(), 1]),
+        TensorData::new(train_labels, [materialized.train.len(), 1]),
         &device,
     );
     let loss = BinaryCrossEntropyLossConfig::new()
@@ -768,14 +783,14 @@ pub fn train_event_disjoint_binary(
     }
 
     let model = model.valid();
-    let validation_rows = split
+    let validation_rows = materialized
         .validation
         .iter()
         .map(|sample| sample.features.clone())
         .collect::<Vec<_>>();
     let validation_probabilities = predict_probabilities(&model, &normalizer, &validation_rows)?;
     let validation_metrics = compute_metrics(
-        &split.validation,
+        &materialized.validation,
         &validation_probabilities,
         config.log_loss_epsilon,
     )?;
@@ -791,10 +806,10 @@ pub fn train_event_disjoint_binary(
         normalizer,
         training: config,
         dataset_sha256: sha256_bytes(
-            &serde_json::to_vec(split).context("serialize governed binary split")?,
+            &serde_json::to_vec(&materialized).context("serialize governed binary split")?,
         ),
-        train_sample_count: split.train.len(),
-        train_event_count: event_count(&split.train),
+        train_sample_count: materialized.train.len(),
+        train_event_count: event_count(&materialized.train),
         validation_metrics,
         model_file: MODEL_FILE.to_owned(),
         model_sha256: None,
@@ -821,26 +836,110 @@ fn validate_feature_names(feature_names: &[String]) -> Result<()> {
             unique.insert(name.as_str()),
             "duplicate feature name: {name}"
         );
+        ensure!(
+            registered_feature_accessor(name).is_some(),
+            "feature {name:?} is not a registered point-in-time binary feature"
+        );
     }
     Ok(())
 }
 
-fn validate_split(split: &EventDisjointBinarySplit, input_dim: usize) -> Result<()> {
+type RegisteredFeatureAccessor = fn(&FactorObservation) -> f64;
+
+/// Closed registry of decision-time fields that the binary trainer is allowed
+/// to project from a governed snapshot. Settlement and `future_*` fields are
+/// intentionally absent.
+fn registered_feature_accessor(name: &str) -> Option<RegisteredFeatureAccessor> {
+    match name {
+        "time_remaining_secs" => Some(|row| row.time_remaining_secs as f64),
+        "signed_distance_to_beat" => Some(|row| row.signed_distance_to_beat),
+        "abs_distance_to_beat" => Some(|row| row.abs_distance_to_beat),
+        "drift_10s" => Some(|row| row.drift_10s),
+        "drift_30s" => Some(|row| row.drift_30s),
+        "flip_age_secs" => Some(|row| row.flip_age_secs),
+        "post_flip_drift" => Some(|row| row.post_flip_drift),
+        "sigma_horizon" => Some(|row| row.sigma_horizon),
+        "fair_prob_up" => Some(|row| row.fair_prob_up),
+        "fair_prob_up_clean" => Some(|row| row.fair_prob_up_clean),
+        "prob_disagreement" => Some(|row| row.prob_disagreement),
+        "implied_sigma_horizon" => Some(|row| row.implied_sigma_horizon),
+        "vol_gap" => Some(|row| row.vol_gap),
+        "distance_over_sigma" => Some(|row| row.distance_over_sigma),
+        "model_prob_up" => Some(|row| row.model_prob_up),
+        "chainlink_prob_up" => Some(|row| row.chainlink_prob_up),
+        "model_edge_up" => Some(|row| row.model_edge_up),
+        "reward_risk_up" => Some(|row| row.reward_risk_up),
+        "reward_risk_down" => Some(|row| row.reward_risk_down),
+        "obi" => Some(|row| row.obi),
+        "spread_bps" => Some(|row| row.spread_bps),
+        "microprice_offset_bps" => Some(|row| row.microprice_offset_bps),
+        "bid_depth_near" => Some(|row| row.bid_depth_near),
+        "ask_depth_near" => Some(|row| row.ask_depth_near),
+        "depth_ratio" => Some(|row| row.depth_ratio),
+        "depth_imbalance" => Some(|row| row.depth_imbalance),
+        "depth_far_ratio" => Some(|row| row.depth_far_ratio),
+        "depth_acceleration" => Some(|row| row.depth_acceleration),
+        "obi_10" => Some(|row| row.obi_10),
+        "pm_up_bid" => Some(|row| row.pm_up_bid),
+        "pm_up_ask" => Some(|row| row.pm_up_ask),
+        "pm_up_bid_size" => Some(|row| row.pm_up_bid_size),
+        "pm_up_ask_size" => Some(|row| row.pm_up_ask_size),
+        "pm_down_bid" => Some(|row| row.pm_down_bid),
+        "pm_down_ask" => Some(|row| row.pm_down_ask),
+        "pm_down_bid_size" => Some(|row| row.pm_down_bid_size),
+        "pm_down_ask_size" => Some(|row| row.pm_down_ask_size),
+        "pm_lag_secs" => Some(|row| row.pm_lag_secs),
+        "cum_obi_delta_5m" => Some(|row| row.cum_obi_delta_5m),
+        "cum_depth_delta_5m" => Some(|row| row.cum_depth_delta_5m),
+        "cum_mprice_drift_5m" => Some(|row| row.cum_mprice_drift_5m),
+        "cum_trade_imbalance_5m" => Some(|row| row.cum_trade_imbalance_5m),
+        "cex_bar_return_30s" => Some(|row| row.cex_bar_return_30s),
+        "cex_bar_return_60s" => Some(|row| row.cex_bar_return_60s),
+        "cex_bar_volume_ratio_30s" => Some(|row| row.cex_bar_volume_ratio_30s),
+        "cex_bar_volume_trend_3" => Some(|row| row.cex_bar_volume_trend_3),
+        "cex_signed_volume_ratio_30s" => Some(|row| row.cex_signed_volume_ratio_30s),
+        "cex_consecutive_up_bars" => Some(|row| row.cex_consecutive_up_bars),
+        "cex_consecutive_down_bars" => Some(|row| row.cex_consecutive_down_bars),
+        "cex_breakout_volume_score" => Some(|row| row.cex_breakout_volume_score),
+        _ => None,
+    }
+}
+
+fn extract_registered_feature(row: &FactorObservation, name: &str) -> Result<f32> {
+    let accessor = registered_feature_accessor(name)
+        .with_context(|| format!("feature {name:?} is not registered for binary research"))?;
+    let value = accessor(row);
+    ensure!(
+        value.is_finite(),
+        "snapshot feature {name:?} is non-finite for event {:?} at {}",
+        row.event_id,
+        row.tick_ts
+    );
+    let value = value as f32;
+    ensure!(
+        value.is_finite(),
+        "snapshot feature {name:?} exceeds f32 range for event {:?} at {}",
+        row.event_id,
+        row.tick_ts
+    );
+    Ok(value)
+}
+
+fn validate_split(split: &MaterializedBinarySplit<'_>, input_dim: usize) -> Result<()> {
     ensure!(!split.train.is_empty(), "training partition is empty");
     ensure!(
         !split.validation.is_empty(),
         "validation partition is empty"
     );
-    let train_events = validate_partition("train", &split.train, input_dim, &split.contract)?;
-    let validation_events =
-        validate_partition("validation", &split.validation, input_dim, &split.contract)?;
+    let train_events = validate_partition("train", &split.train, input_dim)?;
+    let validation_events = validate_partition("validation", &split.validation, input_dim)?;
     if let Some(overlap) = train_events.intersection(&validation_events).next() {
         bail!("event-disjoint split violation: event {overlap:?} appears in train and validation");
     }
-    let latest_training_label = split
+    let latest_training_settlement = split
         .train
         .iter()
-        .map(|sample| sample.label_observed_at_ms)
+        .map(|sample| sample.settlement_at_ms)
         .max()
         .expect("non-empty training partition was checked above");
     let earliest_validation_decision = split
@@ -850,8 +949,8 @@ fn validate_split(split: &EventDisjointBinarySplit, input_dim: usize) -> Result<
         .min()
         .expect("non-empty validation partition was checked above");
     ensure!(
-        latest_training_label <= earliest_validation_decision,
-        "OOS cutoff violation: a training label was observed after validation decisions began"
+        latest_training_settlement <= earliest_validation_decision,
+        "OOS cutoff violation: a training event settles after validation decisions begin"
     );
     ensure!(
         split.train.iter().any(|sample| sample.outcome)
@@ -863,9 +962,8 @@ fn validate_split(split: &EventDisjointBinarySplit, input_dim: usize) -> Result<
 
 fn validate_partition<'a>(
     partition: &str,
-    samples: &'a [BinaryEventSample],
+    samples: &'a [MaterializedBinarySample],
     input_dim: usize,
-    contract: &BinaryDatasetContract,
 ) -> Result<HashSet<&'a str>> {
     let mut events = HashSet::new();
     let mut event_contracts: HashMap<&str, (i64, bool)> = HashMap::new();
@@ -888,41 +986,9 @@ fn validate_partition<'a>(
             "{partition} row {row} contains a non-finite feature"
         );
         ensure!(
-            sample.feature_source_at_ms.len() == input_dim
-                && sample.feature_received_at_ms.len() == input_dim,
-            "{partition} row {row} dual-clock width does not match feature schema"
-        );
-        for feature_index in 0..input_dim {
-            let source_at_ms = sample.feature_source_at_ms[feature_index];
-            let received_at_ms = sample.feature_received_at_ms[feature_index];
-            ensure!(
-                source_at_ms <= sample.decision_at_ms
-                    && received_at_ms <= sample.decision_at_ms,
-                "PIT violation in {partition} row {row} feature {feature_index}: source or receipt clock is after decision time"
-            );
-            let source_age_ms = sample
-                .decision_at_ms
-                .checked_sub(source_at_ms)
-                .context("feature source age overflow")?;
-            let receipt_age_ms = sample
-                .decision_at_ms
-                .checked_sub(received_at_ms)
-                .context("feature receipt age overflow")?;
-            ensure!(
-                source_age_ms <= contract.max_feature_age_ms
-                    && receipt_age_ms <= contract.max_feature_age_ms,
-                "freshness violation in {partition} row {row} feature {feature_index}"
-            );
-        }
-        ensure!(
             sample.decision_at_ms < sample.settlement_at_ms,
             "settlement cutoff violation in {partition} row {row}: decision is not before settlement"
         );
-        ensure!(
-            sample.label_observed_at_ms >= sample.settlement_at_ms,
-            "settlement label violation in {partition} row {row}: outcome was observed before settlement"
-        );
-
         let event_id = sample.event_id.as_str();
         if let Some((settlement_at_ms, outcome)) = event_contracts.get(event_id) {
             ensure!(
@@ -937,54 +1003,85 @@ fn validate_partition<'a>(
     Ok(events)
 }
 
-fn validate_samples_against_snapshot(
-    split: &EventDisjointBinarySplit,
+fn materialize_split<'a>(
+    split: &'a EventDisjointBinarySplit,
     snapshot: &ResearchSnapshot,
-) -> Result<()> {
-    let mut governed_rows = HashMap::<(&str, i64), (bool, i64)>::new();
+) -> Result<MaterializedBinarySplit<'a>> {
+    let mut governed_rows = HashMap::<(&str, i64), &FactorObservation>::new();
     for row in &snapshot.observations {
         let decision_at_ms = row.tick_ts.timestamp_millis();
-        let settlement_at_ms = decision_at_ms
-            .checked_add(
-                row.time_remaining_secs
-                    .checked_mul(1_000)
-                    .context("snapshot settlement offset overflow")?,
-            )
-            .context("snapshot settlement timestamp overflow")?;
-        let outcome = match row.settlement_up {
-            0.0 => false,
-            1.0 => true,
-            _ => bail!("snapshot event {} has a non-binary label", row.event_id),
-        };
-        governed_rows.insert(
-            (row.event_id.as_str(), decision_at_ms),
-            (outcome, settlement_at_ms),
+        ensure!(
+            governed_rows
+                .insert((row.event_id.as_str(), decision_at_ms), row)
+                .is_none(),
+            "bound prediction snapshot contains duplicate decision row {:?} at {decision_at_ms}",
+            row.event_id
         );
     }
 
-    for (partition, samples) in [
-        ("train", split.train.as_slice()),
-        ("validation", split.validation.as_slice()),
-    ] {
-        for (row, sample) in samples.iter().enumerate() {
-            let Some((outcome, settlement_at_ms)) =
-                governed_rows.get(&(sample.event_id.as_str(), sample.decision_at_ms))
-            else {
-                bail!(
-                    "{partition} row {row} is not an exact decision row in the bound prediction snapshot"
-                );
-            };
-            ensure!(
-                sample.outcome == *outcome && sample.settlement_at_ms == *settlement_at_ms,
-                "{partition} row {row} label or settlement cutoff differs from the bound prediction snapshot"
-            );
-        }
-    }
-    Ok(())
+    let materialize_partition = |partition: &str,
+                                 selectors: &[BinaryDecisionRow]|
+     -> Result<Vec<_>> {
+        selectors
+                .iter()
+                .enumerate()
+                .map(|(index, selector)| {
+                    ensure!(
+                        !selector.event_id.trim().is_empty()
+                            && selector.event_id.trim() == selector.event_id,
+                        "{partition} row {index} has an invalid event_id"
+                    );
+                    let snapshot_row = governed_rows
+                        .get(&(selector.event_id.as_str(), selector.decision_at_ms))
+                        .copied()
+                        .with_context(|| {
+                            format!(
+                                "{partition} row {index} is not an exact decision row in the bound prediction snapshot"
+                            )
+                        })?;
+                    let settlement_at_ms = selector
+                        .decision_at_ms
+                        .checked_add(
+                            snapshot_row
+                                .time_remaining_secs
+                                .checked_mul(1_000)
+                                .context("snapshot settlement offset overflow")?,
+                        )
+                        .context("snapshot settlement timestamp overflow")?;
+                    let outcome = match snapshot_row.settlement_up {
+                        0.0 => false,
+                        1.0 => true,
+                        _ => bail!(
+                            "snapshot event {} has a non-binary label",
+                            snapshot_row.event_id
+                        ),
+                    };
+                    let features = split
+                        .contract
+                        .feature_names
+                        .iter()
+                        .map(|name| extract_registered_feature(snapshot_row, name))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(MaterializedBinarySample {
+                        event_id: selector.event_id.clone(),
+                        decision_at_ms: selector.decision_at_ms,
+                        settlement_at_ms,
+                        features,
+                        outcome,
+                    })
+                })
+                .collect()
+    };
+
+    Ok(MaterializedBinarySplit {
+        contract: &split.contract,
+        train: materialize_partition("train", &split.train)?,
+        validation: materialize_partition("validation", &split.validation)?,
+    })
 }
 
 fn normalized_flattened_features(
-    samples: &[BinaryEventSample],
+    samples: &[MaterializedBinarySample],
     normalizer: &FeatureNormalizer,
 ) -> Result<Vec<f32>> {
     let mut flattened = Vec::with_capacity(samples.len() * normalizer.means.len());
@@ -1032,7 +1129,7 @@ fn predict_probabilities(
 }
 
 fn compute_metrics(
-    samples: &[BinaryEventSample],
+    samples: &[MaterializedBinarySample],
     probabilities: &[f64],
     epsilon: f64,
 ) -> Result<BinaryOosMetrics> {
@@ -1066,7 +1163,7 @@ fn compute_metrics(
     })
 }
 
-fn event_count(samples: &[BinaryEventSample]) -> usize {
+fn event_count(samples: &[MaterializedBinarySample]) -> usize {
     samples
         .iter()
         .map(|sample| sample.event_id.as_str())
@@ -1208,28 +1305,38 @@ mod tests {
         split: EventDisjointBinarySplit,
     }
 
-    fn sample(partition: &str, index: usize, outcome: bool) -> BinaryEventSample {
+    #[derive(Clone)]
+    struct TestDecision {
+        event_id: String,
+        decision_at_ms: i64,
+        settlement_at_ms: i64,
+        features: [f64; 2],
+        outcome: bool,
+    }
+
+    fn sample(partition: &str, index: usize, outcome: bool) -> TestDecision {
         let base = 1_700_000_000_000_i64 + index as i64 * 60_000;
         let direction = if outcome { 1.0 } else { -1.0 };
         let decision_at_ms = base + 1_000;
         let settlement_at_ms = base + 50_000;
-        BinaryEventSample {
+        TestDecision {
             event_id: format!("{partition}-event-{index}"),
             decision_at_ms,
             settlement_at_ms,
-            label_observed_at_ms: settlement_at_ms + 100,
-            features: vec![direction + index as f32 * 0.001, direction * 0.5],
-            feature_source_at_ms: vec![decision_at_ms - 200, decision_at_ms - 150],
-            feature_received_at_ms: vec![decision_at_ms - 100, decision_at_ms - 50],
+            features: [direction + index as f64 * 0.001, direction * 0.5],
             outcome,
         }
     }
 
+    fn selector(sample: &TestDecision) -> BinaryDecisionRow {
+        BinaryDecisionRow {
+            event_id: sample.event_id.clone(),
+            decision_at_ms: sample.decision_at_ms,
+        }
+    }
+
     fn feature_names() -> Vec<String> {
-        vec![
-            "binance_return_5m".to_owned(),
-            "pm_book_imbalance".to_owned(),
-        ]
+        vec!["cex_bar_return_30s".to_owned(), "obi".to_owned()]
     }
 
     fn mission() -> PredictionResearchMission {
@@ -1257,7 +1364,7 @@ mod tests {
         mission
     }
 
-    fn observation(sample: &BinaryEventSample) -> FactorObservation {
+    fn observation(sample: &TestDecision) -> FactorObservation {
         let tick_ts = Utc
             .timestamp_millis_opt(sample.decision_at_ms)
             .single()
@@ -1292,7 +1399,7 @@ mod tests {
             model_edge_up: 0.0,
             reward_risk_up: 1.0,
             reward_risk_down: 1.0,
-            obi: 0.0,
+            obi: sample.features[1],
             spread_bps: 1.0,
             microprice_offset_bps: 0.0,
             bid_depth_near: 10.0,
@@ -1318,7 +1425,7 @@ mod tests {
             cum_depth_delta_5m: 0.0,
             cum_mprice_drift_5m: 0.0,
             cum_trade_imbalance_5m: 0.0,
-            cex_bar_return_30s: 0.0,
+            cex_bar_return_30s: sample.features[0],
             cex_bar_return_60s: 0.0,
             cex_bar_volume_ratio_30s: 0.0,
             cex_bar_volume_trend_3: 0.0,
@@ -1329,7 +1436,7 @@ mod tests {
         }
     }
 
-    fn books(sample: &BinaryEventSample) -> Vec<ResearchPmBookSnapshot> {
+    fn books(sample: &TestDecision) -> Vec<ResearchPmBookSnapshot> {
         let tick_ts = Utc
             .timestamp_millis_opt(sample.decision_at_ms)
             .single()
@@ -1353,7 +1460,7 @@ mod tests {
             .collect()
     }
 
-    fn snapshot(samples: &[BinaryEventSample]) -> ResearchSnapshot {
+    fn snapshot(samples: &[TestDecision]) -> ResearchSnapshot {
         let generated_at = Utc
             .timestamp_millis_opt(samples[0].decision_at_ms)
             .single()
@@ -1464,17 +1571,18 @@ mod tests {
             snapshot,
             split: EventDisjointBinarySplit {
                 contract,
-                train,
-                validation,
+                train: train.iter().map(selector).collect(),
+                validation: validation.iter().map(selector).collect(),
             },
         }
     }
 
-    fn validation_rows(split: &EventDisjointBinarySplit) -> Vec<Vec<f32>> {
-        split
+    fn validation_rows(context: &TestContext) -> Vec<Vec<f32>> {
+        materialize_split(&context.split, &context.snapshot)
+            .expect("valid governed test split")
             .validation
-            .iter()
-            .map(|sample| sample.features.clone())
+            .into_iter()
+            .map(|sample| sample.features)
             .collect()
     }
 
@@ -1503,17 +1611,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_pit_and_settlement_cutoff_violations() {
-        let mut pit = context();
-        pit.split.train[0].feature_received_at_ms[0] = pit.split.train[0].decision_at_ms + 1;
-        let error =
-            train_event_disjoint_binary(&pit.snapshot, &pit.mission, &pit.split, test_config())
-                .expect_err("future feature must fail");
-        assert!(error.to_string().contains("PIT violation"));
-
+    fn rejects_stale_non_finite_and_invalid_settlement_snapshot_rows() {
         let mut stale = context();
-        stale.split.train[0].feature_source_at_ms[0] =
-            stale.split.train[0].decision_at_ms - stale.split.contract.max_feature_age_ms - 1;
+        stale.snapshot.observations[0].binance_lob_fresh = false;
         let error = train_event_disjoint_binary(
             &stale.snapshot,
             &stale.mission,
@@ -1521,10 +1621,21 @@ mod tests {
             test_config(),
         )
         .expect_err("stale feature must fail");
-        assert!(error.to_string().contains("freshness violation"));
+        assert!(format!("{error:#}").contains("fresh Binance L2 context"));
+
+        let mut non_finite = context();
+        non_finite.snapshot.observations[0].cex_bar_return_30s = f64::NAN;
+        let error = train_event_disjoint_binary(
+            &non_finite.snapshot,
+            &non_finite.mission,
+            &non_finite.split,
+            test_config(),
+        )
+        .expect_err("non-finite registered feature must fail");
+        assert!(error.to_string().contains("snapshot feature"));
 
         let mut settlement = context();
-        settlement.split.train[0].settlement_at_ms = settlement.split.train[0].decision_at_ms;
+        settlement.snapshot.observations[0].time_remaining_secs = 0;
         let error = train_event_disjoint_binary(
             &settlement.snapshot,
             &settlement.mission,
@@ -1533,24 +1644,42 @@ mod tests {
         )
         .expect_err("decision at settlement must fail");
         assert!(error.to_string().contains("settlement cutoff violation"));
-
-        let mut label = context();
-        label.split.train[0].label_observed_at_ms = label.split.train[0].settlement_at_ms - 1;
-        let error = train_event_disjoint_binary(
-            &label.snapshot,
-            &label.mission,
-            &label.split,
-            test_config(),
-        )
-        .expect_err("pre-settlement label must fail");
-        assert!(error.to_string().contains("settlement label violation"));
     }
 
     #[test]
-    fn rejects_training_labels_observed_after_validation_begins() {
+    fn rejects_unregistered_label_features_and_caller_supplied_values() {
+        let context = context();
+        for forbidden in ["settlement_up", "future_up_ask_change_30s", "unknown"] {
+            let error = BinaryDatasetContract::from_prediction_snapshot(
+                &context.snapshot,
+                &context.mission,
+                vec![forbidden.to_owned()],
+            )
+            .expect_err("labels and unknown fields must not enter the feature registry");
+            assert!(error.to_string().contains("not a registered point-in-time"));
+        }
+
+        let selector = serde_json::json!({
+            "event_id": context.split.train[0].event_id,
+            "decision_at_ms": context.split.train[0].decision_at_ms,
+            "features": [1.0],
+            "outcome": true
+        });
+        assert!(serde_json::from_value::<BinaryDecisionRow>(selector).is_err());
+    }
+
+    #[test]
+    fn rejects_training_events_settling_after_validation_begins() {
         let mut context = context();
-        context.split.train[0].label_observed_at_ms =
-            context.split.validation[0].decision_at_ms + 1;
+        let validation_start = context.split.validation[0].decision_at_ms;
+        let train_selector = context.split.train.last().unwrap();
+        let row = context
+            .snapshot
+            .observations
+            .iter_mut()
+            .find(|row| row.event_id == train_selector.event_id)
+            .unwrap();
+        row.time_remaining_secs = (validation_start - train_selector.decision_at_ms) / 1_000 + 1;
 
         let error = train_event_disjoint_binary(
             &context.snapshot,
@@ -1621,7 +1750,7 @@ mod tests {
             test_config(),
         )
         .unwrap();
-        let rows = validation_rows(&context.split);
+        let rows = validation_rows(&context);
         let schema_hash = &context.split.contract.feature_schema_sha256;
         let names = &context.split.contract.feature_names;
         let probabilities_a = model_a
@@ -1648,16 +1777,24 @@ mod tests {
     #[test]
     fn normalizer_is_fit_from_train_partition_only() {
         let mut context = context();
-        for validation in &mut context.split.validation {
-            validation.features[0] += 10_000.0;
-        }
-        let expected_train_mean = context
+        let validation_ids = context
             .split
+            .validation
+            .iter()
+            .map(|row| row.event_id.as_str())
+            .collect::<HashSet<_>>();
+        for observation in &mut context.snapshot.observations {
+            if validation_ids.contains(observation.event_id.as_str()) {
+                observation.cex_bar_return_30s += 10_000.0;
+            }
+        }
+        let materialized = materialize_split(&context.split, &context.snapshot).unwrap();
+        let expected_train_mean = materialized
             .train
             .iter()
             .map(|sample| f64::from(sample.features[0]))
             .sum::<f64>()
-            / context.split.train.len() as f64;
+            / materialized.train.len() as f64;
 
         let model = train_event_disjoint_binary(
             &context.snapshot,
@@ -1679,7 +1816,7 @@ mod tests {
             test_config(),
         )
         .unwrap();
-        let rows = validation_rows(&context.split);
+        let rows = validation_rows(&context);
         let mut reversed = context.split.contract.feature_names.clone();
         reversed.reverse();
         let reversed_hash = feature_schema_sha256(&reversed).unwrap();
@@ -1702,7 +1839,7 @@ mod tests {
     #[test]
     fn burnpack_and_typed_manifest_round_trip_predictions() {
         let context = context();
-        let rows = validation_rows(&context.split);
+        let rows = validation_rows(&context);
         let mut model = train_event_disjoint_binary(
             &context.snapshot,
             &context.mission,

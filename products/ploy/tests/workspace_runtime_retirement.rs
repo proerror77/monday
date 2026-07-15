@@ -300,6 +300,28 @@ fn workspace_root_keeps_only_the_shim_surface() {
 }
 
 #[test]
+fn standalone_platform_installer_is_a_fail_closed_tombstone() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let installer = repo_root.join("scripts/install-platform-service.sh");
+    let body = fs::read_to_string(&installer).expect("read retired platform installer");
+
+    let output = Command::new("bash")
+        .arg(&installer)
+        .output()
+        .expect("run retired platform installer");
+
+    assert_eq!(output.status.code(), Some(78));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("standalone PLOY platform installer is retired and disabled in Monday"));
+    for forbidden in ["sudo", "systemctl", "useradd", "/opt/ploy"] {
+        assert!(
+            !body.contains(forbidden),
+            "retired platform installer still contains host mutation command: {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn openclaw_compatibility_example_rejects_remote_mutations() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let rpc = repo_root.join("examples/openclaw/skill-ploy-rpc/bin/ployrpc");

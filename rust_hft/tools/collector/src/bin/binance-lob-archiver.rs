@@ -257,15 +257,19 @@ struct ProcessWatchdogInner {
 }
 
 impl ProcessWatchdog {
-    fn start(timeout: Duration) -> anyhow::Result<Self> {
-        let watchdog = Self {
+    fn new_state() -> Self {
+        Self {
             inner: Arc::new(ProcessWatchdogInner {
                 started: Instant::now(),
                 last_data_ms: AtomicU64::new(0),
                 armed: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
             }),
-        };
+        }
+    }
+
+    fn start(timeout: Duration) -> anyhow::Result<Self> {
+        let watchdog = Self::new_state();
         let monitor = watchdog.clone();
         thread::Builder::new()
             .name("binance-lob-process-watchdog".into())
@@ -273,13 +277,11 @@ impl ProcessWatchdog {
                 let interval = timeout
                     .div_f64(4.0)
                     .clamp(Duration::from_secs(1), Duration::from_secs(10));
-                while !monitor.inner.shutdown.load(Ordering::Relaxed) {
+                while !monitor.inner.shutdown.load(Ordering::Acquire) {
                     thread::sleep(interval);
                     let now_ms = monitor.elapsed_ms();
-                    let last_ms = monitor.inner.last_data_ms.load(Ordering::Relaxed);
-                    if monitor.inner.armed.load(Ordering::Relaxed)
-                        && process_watchdog_expired(last_ms, now_ms, timeout)
-                    {
+                    if monitor.should_exit_at(now_ms, timeout) {
+                        let last_ms = monitor.inner.last_data_ms.load(Ordering::Relaxed);
                         error!(
                             silent_ms = now_ms.saturating_sub(last_ms),
                             "process watchdog exiting after market-data stall"
@@ -289,7 +291,7 @@ impl ProcessWatchdog {
                 }
             })?;
         watchdog.mark_data();
-        watchdog.inner.armed.store(true, Ordering::Relaxed);
+        watchdog.inner.armed.store(true, Ordering::Release);
         Ok(watchdog)
     }
 
@@ -299,8 +301,23 @@ impl ProcessWatchdog {
             .store(self.elapsed_ms(), Ordering::Relaxed);
     }
 
+    fn disarm(&self) {
+        self.inner.armed.store(false, Ordering::Release);
+    }
+
     fn stop(&self) {
-        self.inner.shutdown.store(true, Ordering::Relaxed);
+        self.disarm();
+        self.inner.shutdown.store(true, Ordering::Release);
+    }
+
+    fn should_exit_at(&self, now_ms: u64, timeout: Duration) -> bool {
+        !self.inner.shutdown.load(Ordering::Acquire)
+            && self.inner.armed.load(Ordering::Acquire)
+            && process_watchdog_expired(
+                self.inner.last_data_ms.load(Ordering::Relaxed),
+                now_ms,
+                timeout,
+            )
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -310,6 +327,14 @@ impl ProcessWatchdog {
 
 fn process_watchdog_expired(last_data_ms: u64, now_ms: u64, timeout: Duration) -> bool {
     now_ms.saturating_sub(last_data_ms) > timeout.as_millis() as u64
+}
+
+fn publish_global_shutdown(shutdown: &watch::Sender<bool>, watchdog: &ProcessWatchdog) {
+    // Publish shutdown only after the watchdog is disarmed. Receivers may spend
+    // up to ZSTD_TIMEOUT_SECONDS closing their final segment, which is expected
+    // progress and must not be mistaken for a market-data stall.
+    watchdog.disarm();
+    let _ = shutdown.send(true);
 }
 
 #[tokio::main]
@@ -331,7 +356,7 @@ async fn main() -> anyhow::Result<()> {
     let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let upload_task = tokio::spawn(upload_loop(config.clone(), shutdown_rx.clone()));
-    let shutdown_signal = tokio::spawn(wait_for_signal(shutdown_tx.clone()));
+    let shutdown_signal = tokio::spawn(wait_for_signal(shutdown_tx.clone(), watchdog.clone()));
 
     let mut backoff = 1_u64;
     while !*shutdown_rx.borrow() {
@@ -345,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    let _ = shutdown_tx.send(true);
+    publish_global_shutdown(&shutdown_tx, &watchdog);
     watchdog.stop();
     upload_task.await?;
     shutdown_signal.abort();
@@ -405,8 +430,13 @@ async fn run_session(
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
-                changed?;
-                break;
+                if changed.is_err() || *shutdown.borrow() {
+                    // Defensive in case a future shutdown publisher bypasses
+                    // publish_global_shutdown: disarm before task drain and
+                    // final segment compression begin.
+                    watchdog.disarm();
+                    break;
+                }
             }
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 match joined {
@@ -1191,7 +1221,7 @@ async fn command_status_or_shutdown(
     }
 }
 
-async fn wait_for_signal(shutdown: watch::Sender<bool>) {
+async fn wait_for_signal(shutdown: watch::Sender<bool>, watchdog: ProcessWatchdog) {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -1204,7 +1234,7 @@ async fn wait_for_signal(shutdown: watch::Sender<bool>) {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
-    let _ = shutdown.send(true);
+    publish_global_shutdown(&shutdown, &watchdog);
 }
 
 fn env_string(name: &str, default: &str) -> String {
@@ -1560,6 +1590,23 @@ mod tests {
             181_001,
             Duration::from_secs(180)
         ));
+    }
+
+    #[test]
+    fn global_shutdown_is_published_only_after_process_watchdog_is_disarmed() {
+        let watchdog = ProcessWatchdog::new_state();
+        watchdog.inner.last_data_ms.store(1_000, Ordering::Relaxed);
+        watchdog.inner.armed.store(true, Ordering::Release);
+        let timeout = Duration::from_secs(180);
+
+        // The same watchdog remains armed across ordinary session reconnects.
+        assert!(watchdog.should_exit_at(181_001, timeout));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        publish_global_shutdown(&shutdown_tx, &watchdog);
+
+        assert!(*shutdown_rx.borrow());
+        assert!(!watchdog.should_exit_at(301_001, timeout));
     }
 
     #[test]
