@@ -70,7 +70,7 @@ never mutate risk, OMS, credentials, deployment, or live execution.
 | Removed surface | Rust authority |
 | --- | --- |
 | Generic model trainer and experimental ML workspace | `rust_hft/research-core/ml` plus `rust_hft/alpha-harness` |
-| PLOY binary TCN training helper | `products/ploy/crates/ploy-research` native Burn probability model |
+| PLOY binary TCN training helper | `rust_hft/prediction-markets/crates/ploy-research` native Burn probability model |
 | PLOY market-data gap script | `ploy-market-data --example market_data_gap_audit` typed audit report |
 | Binance LOB archiver service | `hft-collector --bin binance-lob-archiver` |
 | Bitget latency summary script | `hft-data-adapter-bitget --bin latency-report` |

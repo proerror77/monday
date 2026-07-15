@@ -1,0 +1,24 @@
+# Historical standalone runtime image for backtest jobs.
+# Provenance only; this is not a Monday deployment entrypoint.
+# Binaries are built by CI and copied in at build time
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/ploy/bin /opt/ploy/config/strategies
+
+# Binaries copied by CI pipeline
+COPY target/x86_64-unknown-linux-gnu/release/examples/run_backtest /opt/ploy/bin/run_backtest
+RUN chmod +x /opt/ploy/bin/run_backtest
+
+WORKDIR /opt/ploy
+
+ENV RUST_LOG=info,ploy=debug,sqlx=warn
+ENV RUST_BACKTRACE=1
+
+# Job containers use CMD to specify which binary to run
+ENTRYPOINT ["/bin/sh", "-c"]

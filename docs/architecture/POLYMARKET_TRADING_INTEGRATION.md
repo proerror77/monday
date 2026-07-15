@@ -4,8 +4,8 @@
 
 Monday is the only live-trading authority. Strategies emit lifecycle-qualified intents; Monday's
 risk manager, OMS, execution worker, reconciliation loop, cancellation controls, and emergency
-mode remain on the path for every Polymarket order. The imported PLOY workspace supplies protocol
-reference code only and cannot place orders for Monday.
+mode remain on the path for every Polymarket order. The imported prediction-market compatibility
+module supplies protocol reference code only and cannot place orders for Monday.
 
 The venue uses the official `polymarket_client_sdk_v2` 0.6.0 client. Monday models each outcome as
 `AssetClass::PredictionMarket` / `ProductType::PredictionMarket`, with the decimal CLOB outcome
