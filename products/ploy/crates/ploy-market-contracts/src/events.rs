@@ -238,7 +238,7 @@ fn hex_to_decimal_string(hex: &str) -> Option<String> {
     let mut digits = vec![0_u8];
 
     for ch in hex.chars() {
-        let value = ch.to_digit(16)? as u32;
+        let value = ch.to_digit(16)?;
         let mut carry = value;
 
         for digit in &mut digits {

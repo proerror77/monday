@@ -14,6 +14,11 @@ implemented in `crates/ploy-research`. The LoopRun owns bounded proposal evidenc
 the Burn model owns only event-disjoint supervised training and out-of-sample
 probability metrics. Neither owns promotion or execution authority.
 
+The authoritative prediction-research LoopRun is implemented in Rust in
+`crates/ploy-research` and exposed by the `prediction_research_loop` example.
+Python helpers are compatibility or one-shot analysis tools; they do not own
+LoopRun state, evidence, evaluation, promotion, or execution authority.
+
 ## Execution boundary
 
 Monday's `rust_hft` runtime is the only production authority for risk, OMS,

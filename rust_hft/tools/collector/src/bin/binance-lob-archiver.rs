@@ -2,15 +2,18 @@ use anyhow::Context;
 use clap::Parser;
 use futures::StreamExt;
 use hft_collector::lob_archiver::{
-    checkpoint_event, files_with_suffix, read_upload_status, recover_parts, segment_partition,
-    send_or_shutdown, write_health, write_success_marker, write_upload_status, DepthDiff, Market,
-    OrderBookState, PendingBudget, QueueHealth, Segment, SegmentConfig, SendOutcome, RAW_SCHEMA,
+    checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
+    recover_parts, segment_partition, send_or_shutdown, write_health, write_success_marker,
+    write_upload_status, DepthDiff, Market, OrderBookState, PendingBudget, QueueHealth, Segment,
+    SegmentConfig, SendOutcome, RAW_SCHEMA,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,6 +27,9 @@ use tracing::{error, info, warn};
 struct Args {
     #[arg(long)]
     self_test: bool,
+
+    #[arg(long, conflicts_with = "self_test")]
+    upload_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -43,7 +49,6 @@ struct Config {
     max_pending_diffs: usize,
     stall_timeout: Duration,
     sync_timeout: Duration,
-    task_cancel_timeout: Duration,
     process_watchdog_timeout: Duration,
     snapshot_retry_attempts: usize,
     rest_base: String,
@@ -53,6 +58,81 @@ struct Config {
     aliyun_profile: String,
     zstd_timeout: Duration,
     oss_copy_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct UploadConfig {
+    spool_dir: PathBuf,
+    oss_bucket: String,
+    oss_endpoint: String,
+    oss_region: String,
+    aliyun_profile: String,
+    oss_copy_timeout: Duration,
+}
+
+const UPLOADED_CLEANUP_SCHEMA: &str = "monday.binance_lob.uploaded_cleanup.v1";
+const UPLOADED_CLEANUP_SUFFIX: &str = ".uploaded-cleanup.json";
+const UPLOADED_CLEANUP_TMP_SUFFIX: &str = ".uploaded-cleanup.json.tmp";
+const SPOOL_LOCK_FILE: &str = ".binance-lob-archiver.lock";
+
+#[derive(Debug)]
+struct SpoolLock {
+    _file: std::fs::File,
+}
+
+impl SpoolLock {
+    fn acquire(spool_dir: &Path) -> anyhow::Result<Self> {
+        let path = spool_dir.join(SPOOL_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .with_context(|| format!("failed to open spool lock {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to inspect spool lock {}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            anyhow::bail!("spool lock is not a regular file: {}", path.display());
+        }
+        if let Err(error) = fs4::FileExt::try_lock(&file) {
+            let error = std::io::Error::from(error);
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!("spool is already locked: {}", spool_dir.display());
+            }
+            return Err(error)
+                .with_context(|| format!("failed to lock spool {}", spool_dir.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+impl UploadConfig {
+    fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            spool_dir: PathBuf::from(env_string("SPOOL_DIR", "/data/monday/spool/binance-lob")),
+            oss_bucket: env_string("OSS_BUCKET", "monday-lob-apne1-1045353359"),
+            oss_endpoint: env_string("OSS_ENDPOINT", "oss-ap-northeast-1-internal.aliyuncs.com"),
+            oss_region: env_string("OSS_REGION", "ap-northeast-1"),
+            aliyun_profile: env_string("ALIYUN_PROFILE", "ecs-role"),
+            oss_copy_timeout: Duration::from_secs(env_parse("OSS_COPY_TIMEOUT_SECONDS", 300_u64)?),
+        })
+    }
+}
+
+impl From<&Config> for UploadConfig {
+    fn from(config: &Config) -> Self {
+        Self {
+            spool_dir: config.spool_dir.clone(),
+            oss_bucket: config.oss_bucket.clone(),
+            oss_endpoint: config.oss_endpoint.clone(),
+            oss_region: config.oss_region.clone(),
+            aliyun_profile: config.aliyun_profile.clone(),
+            oss_copy_timeout: config.oss_copy_timeout,
+        }
+    }
 }
 
 impl Config {
@@ -100,10 +180,6 @@ impl Config {
             max_pending_diffs: env_parse("MAX_PENDING_DIFFS_TOTAL", 250_000_usize)?.max(1),
             stall_timeout: Duration::from_secs(env_parse("STALL_TIMEOUT_SECONDS", 60_u64)?),
             sync_timeout: Duration::from_secs(env_parse("SYNC_TIMEOUT_SECONDS", 120_u64)?),
-            task_cancel_timeout: Duration::from_secs(env_parse(
-                "TASK_CANCEL_TIMEOUT_SECONDS",
-                10_u64,
-            )?),
             process_watchdog_timeout: Duration::from_secs(env_parse(
                 "PROCESS_WATCHDOG_SECONDS",
                 180_u64,
@@ -252,8 +328,16 @@ struct ProcessWatchdog {
 struct ProcessWatchdogInner {
     started: Instant,
     last_data_ms: AtomicU64,
-    armed: AtomicBool,
-    shutdown: AtomicBool,
+    state: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum ProcessWatchdogState {
+    Disarmed = 0,
+    Armed = 1,
+    Firing = 2,
+    Stopped = 3,
 }
 
 impl ProcessWatchdog {
@@ -262,8 +346,7 @@ impl ProcessWatchdog {
             inner: Arc::new(ProcessWatchdogInner {
                 started: Instant::now(),
                 last_data_ms: AtomicU64::new(0),
-                armed: AtomicBool::new(false),
-                shutdown: AtomicBool::new(false),
+                state: AtomicU8::new(ProcessWatchdogState::Disarmed as u8),
             }),
         }
     }
@@ -277,10 +360,10 @@ impl ProcessWatchdog {
                 let interval = timeout
                     .div_f64(4.0)
                     .clamp(Duration::from_secs(1), Duration::from_secs(10));
-                while !monitor.inner.shutdown.load(Ordering::Acquire) {
+                while monitor.state() != ProcessWatchdogState::Stopped {
                     thread::sleep(interval);
                     let now_ms = monitor.elapsed_ms();
-                    if monitor.should_exit_at(now_ms, timeout) {
+                    if monitor.try_begin_exit_at(now_ms, timeout) {
                         let last_ms = monitor.inner.last_data_ms.load(Ordering::Relaxed);
                         error!(
                             silent_ms = now_ms.saturating_sub(last_ms),
@@ -291,7 +374,7 @@ impl ProcessWatchdog {
                 }
             })?;
         watchdog.mark_data();
-        watchdog.inner.armed.store(true, Ordering::Release);
+        anyhow::ensure!(watchdog.arm(), "process watchdog failed to arm");
         Ok(watchdog)
     }
 
@@ -301,23 +384,93 @@ impl ProcessWatchdog {
             .store(self.elapsed_ms(), Ordering::Relaxed);
     }
 
-    fn disarm(&self) {
-        self.inner.armed.store(false, Ordering::Release);
+    fn arm(&self) -> bool {
+        self.inner
+            .state
+            .compare_exchange(
+                ProcessWatchdogState::Disarmed as u8,
+                ProcessWatchdogState::Armed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn disarm(&self) -> bool {
+        loop {
+            match self.state() {
+                ProcessWatchdogState::Armed => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            ProcessWatchdogState::Armed as u8,
+                            ProcessWatchdogState::Disarmed as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                ProcessWatchdogState::Disarmed | ProcessWatchdogState::Stopped => return true,
+                ProcessWatchdogState::Firing => return false,
+            }
+        }
     }
 
     fn stop(&self) {
-        self.disarm();
-        self.inner.shutdown.store(true, Ordering::Release);
+        loop {
+            let current = self.state();
+            match current {
+                ProcessWatchdogState::Stopped | ProcessWatchdogState::Firing => return,
+                ProcessWatchdogState::Disarmed | ProcessWatchdogState::Armed => {
+                    if self
+                        .inner
+                        .state
+                        .compare_exchange(
+                            current as u8,
+                            ProcessWatchdogState::Stopped as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
-    fn should_exit_at(&self, now_ms: u64, timeout: Duration) -> bool {
-        !self.inner.shutdown.load(Ordering::Acquire)
-            && self.inner.armed.load(Ordering::Acquire)
-            && process_watchdog_expired(
-                self.inner.last_data_ms.load(Ordering::Relaxed),
-                now_ms,
-                timeout,
+    fn try_begin_exit_at(&self, now_ms: u64, timeout: Duration) -> bool {
+        if !process_watchdog_expired(
+            self.inner.last_data_ms.load(Ordering::Relaxed),
+            now_ms,
+            timeout,
+        ) {
+            return false;
+        }
+        self.inner
+            .state
+            .compare_exchange(
+                ProcessWatchdogState::Armed as u8,
+                ProcessWatchdogState::Firing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             )
+            .is_ok()
+    }
+
+    fn state(&self) -> ProcessWatchdogState {
+        match self.inner.state.load(Ordering::Acquire) {
+            0 => ProcessWatchdogState::Disarmed,
+            1 => ProcessWatchdogState::Armed,
+            2 => ProcessWatchdogState::Firing,
+            3 => ProcessWatchdogState::Stopped,
+            state => unreachable!("invalid process watchdog state {state}"),
+        }
     }
 
     fn elapsed_ms(&self) -> u64 {
@@ -329,12 +482,15 @@ fn process_watchdog_expired(last_data_ms: u64, now_ms: u64, timeout: Duration) -
     now_ms.saturating_sub(last_data_ms) > timeout.as_millis() as u64
 }
 
-fn publish_global_shutdown(shutdown: &watch::Sender<bool>, watchdog: &ProcessWatchdog) {
+fn publish_global_shutdown(shutdown: &watch::Sender<bool>, watchdog: &ProcessWatchdog) -> bool {
     // Publish shutdown only after the watchdog is disarmed. Receivers may spend
     // up to ZSTD_TIMEOUT_SECONDS closing their final segment, which is expected
     // progress and must not be mistaken for a market-data stall.
-    watchdog.disarm();
+    if !watchdog.disarm() {
+        return false;
+    }
     let _ = shutdown.send(true);
+    true
 }
 
 #[tokio::main]
@@ -343,12 +499,18 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    if Args::parse().self_test {
+    let args = Args::parse();
+    if args.self_test {
         return self_test();
     }
+    if args.upload_only {
+        return upload_only(&UploadConfig::from_env()?).await;
+    }
 
+    let spool_dir = PathBuf::from(env_string("SPOOL_DIR", "/data/monday/spool/binance-lob"));
+    std::fs::create_dir_all(&spool_dir)?;
+    let _spool_lock = SpoolLock::acquire(&spool_dir)?;
     let config = Arc::new(Config::from_env().await?);
-    std::fs::create_dir_all(&config.spool_dir)?;
     let recovered = recover_parts(&config.segment_config())?;
     if !recovered.is_empty() {
         info!(segments = recovered.len(), "recovered interrupted segments");
@@ -547,8 +709,10 @@ async fn run_session(
     let _ = session_stop_tx.send(true);
     let final_queue_health = QueueHealth::from_sender(&sender);
     drop(sender);
-    for event in stop_session_tasks(&mut tasks, config.task_cancel_timeout).await {
-        archive_only(&mut segment, &session_id, event)?;
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(Ok(TaskExit::Stopped(Some(event)))) = joined {
+            archive_only(&mut segment, &session_id, event)?;
+        }
     }
     while let Ok(event) = receiver.try_recv() {
         archive_only(&mut segment, &session_id, event)?;
@@ -574,31 +738,6 @@ async fn run_session(
     } else {
         Ok(())
     }
-}
-
-async fn stop_session_tasks(
-    tasks: &mut JoinSet<anyhow::Result<TaskExit>>,
-    timeout: Duration,
-) -> Vec<Event> {
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    let mut trailing_events = Vec::new();
-    while !tasks.is_empty() {
-        tokio::select! {
-            joined = tasks.join_next() => {
-                if let Some(Ok(Ok(TaskExit::Stopped(Some(event))))) = joined {
-                    trailing_events.push(event);
-                }
-            }
-            _ = &mut deadline => {
-                warn!(?timeout, remaining_tasks = tasks.len(), "session tasks exceeded shutdown grace; aborting");
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                break;
-            }
-        }
-    }
-    trailing_events
 }
 
 fn sync_timed_out(
@@ -1016,11 +1155,21 @@ fn snapshot_retry_delay(retry_after: Option<&str>, attempt: usize) -> Duration {
 }
 
 async fn discover_symbols(market: Market, rest_base: &str) -> anyhow::Result<SymbolCatalog> {
+    discover_symbols_with_timeout(market, rest_base, Duration::from_secs(15)).await
+}
+
+async fn discover_symbols_with_timeout(
+    market: Market,
+    rest_base: &str,
+    timeout: Duration,
+) -> anyhow::Result<SymbolCatalog> {
     let path = match market {
         Market::Spot => "/api/v3/exchangeInfo",
         Market::Usdm => "/fapi/v1/exchangeInfo",
     };
-    let payload: Value = reqwest::Client::new()
+    let payload: Value = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()?
         .get(format!("{rest_base}{path}"))
         .send()
         .await?
@@ -1072,29 +1221,10 @@ fn parse_symbol_catalog(market: Market, payload: &Value) -> anyhow::Result<Symbo
 }
 
 async fn upload_loop(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) {
+    let upload_config = UploadConfig::from(config.as_ref());
     loop {
-        if *shutdown.borrow() {
-            return;
-        }
-        let mut status = read_upload_status(&config.spool_dir);
-        match upload_pending(&config, &mut shutdown).await {
-            Ok(Some(uploaded)) => {
-                if uploaded > 0 {
-                    status.last_success_at = Some(chrono::Utc::now().to_rfc3339());
-                }
-                status.last_error_at = None;
-                status.last_error = None;
-            }
-            Ok(None) => return,
-            Err(error) => {
-                let now = chrono::Utc::now().to_rfc3339();
-                status.last_error_at = Some(now);
-                status.last_error = Some(error.to_string().chars().take(500).collect());
-                warn!(error = %error, "pending OSS upload failed; files retained");
-            }
-        }
-        if let Err(error) = write_upload_status(&config.spool_dir, &status) {
-            error!(error = %error, "failed to persist OSS upload status");
+        if let Err(error) = upload_pending_with_status(&upload_config).await {
+            warn!(error = %error, "pending OSS upload failed; files retained");
         }
         tokio::select! {
             changed = shutdown.changed() => {
@@ -1107,36 +1237,326 @@ async fn upload_loop(config: Arc<Config>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
-async fn upload_pending(
-    config: &Config,
-    shutdown: &mut watch::Receiver<bool>,
-) -> anyhow::Result<Option<usize>> {
-    let mut failures = 0_usize;
-    let mut uploaded = 0_usize;
-    for manifest in files_with_suffix(&config.spool_dir, ".manifest.json")? {
-        if *shutdown.borrow() {
-            return Ok(None);
+async fn upload_only(config: &UploadConfig) -> anyhow::Result<()> {
+    if !config.spool_dir.is_dir() {
+        anyhow::bail!(
+            "SPOOL_DIR is not a directory: {}",
+            config.spool_dir.display()
+        );
+    }
+    let _spool_lock = SpoolLock::acquire(&config.spool_dir)?;
+    let mut incomplete = Vec::new();
+    for suffix in [".jsonl.part", ".zst.tmp", ".part.corrupt"] {
+        incomplete.extend(files_with_suffix(&config.spool_dir, suffix)?);
+    }
+    if !incomplete.is_empty() {
+        anyhow::bail!(
+            "upload-only drain blocked by {} incomplete segment artifacts; recover them with the collector release that created them",
+            incomplete.len()
+        );
+    }
+    let uploaded = upload_pending_with_status(config).await?;
+    let pending = files_with_suffix(&config.spool_dir, ".manifest.json")?.len();
+    if pending > 0 {
+        anyhow::bail!("upload-only drain incomplete: {pending} manifests remain");
+    }
+    let mut residual = Vec::new();
+    for suffix in [
+        ".jsonl.part",
+        ".zst.tmp",
+        ".part.corrupt",
+        ".jsonl.zst",
+        "._SUCCESS",
+        UPLOADED_CLEANUP_SUFFIX,
+        UPLOADED_CLEANUP_TMP_SUFFIX,
+    ] {
+        residual.extend(files_with_suffix(&config.spool_dir, suffix)?);
+    }
+    if !residual.is_empty() {
+        anyhow::bail!(
+            "upload-only drain incomplete: {} local segment artifacts remain",
+            residual.len()
+        );
+    }
+    println!("upload-only: uploaded={uploaded} pending=0");
+    Ok(())
+}
+
+async fn upload_pending_with_status(config: &UploadConfig) -> anyhow::Result<usize> {
+    let mut status = read_upload_status(&config.spool_dir);
+    let result = upload_pending(config).await;
+    match &result {
+        Ok(uploaded) => {
+            if *uploaded > 0 {
+                status.last_success_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+            status.last_error_at = None;
+            status.last_error = None;
         }
-        match upload_one(config, &manifest, shutdown).await {
-            Ok(true) => uploaded += 1,
-            Ok(false) => return Ok(None),
-            Err(error) => {
+        Err(error) => {
+            status.last_error_at = Some(chrono::Utc::now().to_rfc3339());
+            status.last_error = Some(error.to_string().chars().take(500).collect());
+            status.failure_count = status.failure_count.saturating_add(1);
+        }
+    }
+    write_upload_status(&config.spool_dir, &status)
+        .context("failed to persist OSS upload status")?;
+    result
+}
+
+async fn upload_pending(config: &UploadConfig) -> anyhow::Result<usize> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let recovered = recover_uploaded_cleanups(&config.spool_dir)?;
+        if recovered > 0 {
+            info!(recovered, "completed interrupted local upload cleanup");
+        }
+        let mut failures = 0_usize;
+        let mut uploaded = 0_usize;
+        for manifest in files_with_suffix(&config.spool_dir, ".manifest.json")? {
+            if let Err(error) = upload_one(&config, &manifest) {
                 failures += 1;
                 error!(manifest = %manifest.display(), error = %error, "OSS upload retained for retry");
+            } else {
+                uploaded += 1;
+            }
+        }
+        if failures > 0 {
+            anyhow::bail!("{failures} pending OSS uploads failed");
+        }
+        anyhow::Ok(uploaded)
+    })
+    .await?
+}
+
+fn write_uploaded_cleanup_marker(
+    data: &Path,
+    manifest: &Path,
+    success: &Path,
+) -> anyhow::Result<PathBuf> {
+    let parent = manifest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("manifest has no parent: {}", manifest.display()))?;
+    if data.parent() != Some(parent) || success.parent() != Some(parent) {
+        anyhow::bail!("uploaded cleanup artifacts must share one directory");
+    }
+    let manifest_name = local_file_name(manifest)?;
+    let marker = manifest.with_file_name(format!("{manifest_name}{UPLOADED_CLEANUP_SUFFIX}"));
+    let temporary = marker.with_file_name(format!("{}.tmp", local_file_name(&marker)?));
+    match std::fs::symlink_metadata(&marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!(
+            "uploaded cleanup marker already exists: {}",
+            marker.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", marker.display()))
+        }
+    }
+    let mut bytes = serde_json::to_vec(&json!({
+        "schema": UPLOADED_CLEANUP_SCHEMA,
+        "data": local_file_name(data)?,
+        "manifest": manifest_name,
+        "success": local_file_name(success)?,
+    }))?;
+    bytes.push(b'\n');
+    let mut output = create_cleanup_temporary(&temporary)?;
+    std::io::Write::write_all(&mut output, &bytes)?;
+    output.sync_all()?;
+    std::fs::rename(&temporary, &marker)?;
+    sync_parent_directory(&marker)?;
+    Ok(marker)
+}
+
+fn create_cleanup_temporary(path: &Path) -> anyhow::Result<std::fs::File> {
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(file) => return Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                let metadata = std::fs::symlink_metadata(path).with_context(|| {
+                    format!("failed to inspect stale cleanup temp {}", path.display())
+                })?;
+                if !metadata.file_type().is_file() {
+                    anyhow::bail!("refusing non-regular cleanup temp path: {}", path.display());
+                }
+                std::fs::remove_file(path).with_context(|| {
+                    format!("failed to remove stale cleanup temp {}", path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to create cleanup temp {}", path.display()));
             }
         }
     }
-    if failures > 0 {
-        anyhow::bail!("{failures} pending OSS uploads failed");
-    }
-    Ok(Some(uploaded))
+    unreachable!("cleanup temp creation retries are bounded")
 }
 
-async fn upload_one(
-    config: &Config,
-    manifest: &Path,
-    shutdown: &mut watch::Receiver<bool>,
-) -> anyhow::Result<bool> {
+fn recover_uploaded_cleanups(spool_dir: &Path) -> anyhow::Result<usize> {
+    let markers = files_with_suffix(spool_dir, UPLOADED_CLEANUP_SUFFIX)?;
+    for marker in &markers {
+        cleanup_uploaded_marker(marker)?;
+    }
+    Ok(markers.len())
+}
+
+fn cleanup_uploaded_marker(marker: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(marker) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => anyhow::bail!(
+            "refusing non-regular uploaded cleanup marker: {}",
+            marker.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect uploaded cleanup marker {}",
+                    marker.display()
+                )
+            });
+        }
+    }
+    let marker_file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(marker)
+        .with_context(|| {
+            format!(
+                "failed to open uploaded cleanup marker {}",
+                marker.display()
+            )
+        })?;
+    if !marker_file
+        .metadata()
+        .with_context(|| {
+            format!(
+                "failed to inspect uploaded cleanup marker {}",
+                marker.display()
+            )
+        })?
+        .file_type()
+        .is_file()
+    {
+        anyhow::bail!(
+            "uploaded cleanup marker is not a regular file: {}",
+            marker.display()
+        );
+    }
+    let metadata: Value = serde_json::from_reader(marker_file)
+        .with_context(|| format!("invalid uploaded cleanup marker {}", marker.display()))?;
+    if metadata["schema"] != UPLOADED_CLEANUP_SCHEMA {
+        anyhow::bail!(
+            "invalid uploaded cleanup marker schema: {}",
+            marker.display()
+        );
+    }
+    let paths = cleanup_artifact_paths(marker, &metadata)?;
+    match std::fs::symlink_metadata(marker) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => anyhow::bail!(
+            "refusing non-regular uploaded cleanup marker: {}",
+            marker.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect uploaded cleanup marker {}",
+                    marker.display()
+                )
+            });
+        }
+    }
+    for path in &paths {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                anyhow::bail!("refusing non-regular uploaded artifact: {}", path.display())
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect uploaded artifact {}", path.display())
+                });
+            }
+        }
+    }
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to clean uploaded artifact {}", path.display())
+                });
+            }
+        }
+    }
+    sync_parent_directory(marker)?;
+    std::fs::remove_file(marker)?;
+    sync_parent_directory(marker)
+}
+
+fn cleanup_artifact_paths(marker: &Path, metadata: &Value) -> anyhow::Result<[PathBuf; 3]> {
+    let marker_name = local_file_name(marker)?;
+    let manifest_name = marker_name
+        .strip_suffix(UPLOADED_CLEANUP_SUFFIX)
+        .ok_or_else(|| anyhow::anyhow!("invalid uploaded cleanup marker name: {marker_name}"))?;
+    let data_name = manifest_name
+        .strip_suffix(".manifest.json")
+        .ok_or_else(|| {
+            anyhow::anyhow!("cleanup marker is not bound to a manifest: {marker_name}")
+        })?;
+    let _segment_id = data_name
+        .strip_prefix("part-")
+        .and_then(|value| value.strip_suffix(".jsonl.zst"))
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("cleanup marker has an invalid segment name: {marker_name}")
+        })?;
+    let success_name = format!("{data_name}._SUCCESS");
+    let expected = [
+        ("data", data_name),
+        ("manifest", manifest_name),
+        ("success", success_name.as_str()),
+    ];
+    for (field, expected_name) in expected {
+        let actual = metadata[field]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("uploaded cleanup marker missing {field}"))?;
+        if actual != expected_name {
+            anyhow::bail!(
+                "uploaded cleanup marker {field} does not match its segment: expected {expected_name}, got {actual}"
+            );
+        }
+    }
+    let parent = marker
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cleanup marker has no parent: {}", marker.display()))?;
+    Ok([
+        parent.join(data_name),
+        parent.join(manifest_name),
+        parent.join(success_name),
+    ])
+}
+
+fn local_file_name(path: &Path) -> anyhow::Result<&str> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("path has no UTF-8 file name: {}", path.display()))
+}
+
+fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn upload_one(config: &UploadConfig, manifest: &Path) -> anyhow::Result<()> {
     let metadata: Value = serde_json::from_reader(std::fs::File::open(manifest)?)?;
     let data = manifest.with_file_name(
         metadata["file"]
@@ -1160,7 +1580,7 @@ async fn upload_one(
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        let mut command = tokio::process::Command::new("aliyun");
+        let mut command = Command::new("aliyun");
         command
             .args(["ossutil", "cp"])
             .arg(source)
@@ -1174,11 +1594,7 @@ async fn upload_one(
                 &config.oss_region,
                 "--force",
             ]);
-        let Some(status) =
-            command_status_or_shutdown(&mut command, config.oss_copy_timeout, shutdown).await?
-        else {
-            return Ok(false);
-        };
+        let status = command_status_with_timeout(&mut command, config.oss_copy_timeout)?;
         if !status.success() {
             anyhow::bail!(
                 "aliyun ossutil failed for {} with {status}",
@@ -1186,39 +1602,8 @@ async fn upload_one(
             );
         }
     }
-    std::fs::remove_file(data)?;
-    std::fs::remove_file(manifest)?;
-    std::fs::remove_file(success)?;
-    Ok(true)
-}
-
-async fn command_status_or_shutdown(
-    command: &mut tokio::process::Command,
-    timeout: Duration,
-    shutdown: &mut watch::Receiver<bool>,
-) -> anyhow::Result<Option<std::process::ExitStatus>> {
-    if *shutdown.borrow() {
-        return Ok(None);
-    }
-    command.kill_on_drop(true);
-    let status = command.status();
-    tokio::pin!(status);
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            biased;
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(None);
-                }
-            }
-            result = &mut status => return Ok(Some(result?)),
-            _ = &mut deadline => {
-                anyhow::bail!("child process timed out after {}s", timeout.as_secs());
-            }
-        }
-    }
+    let marker = write_uploaded_cleanup_marker(&data, manifest, &success)?;
+    cleanup_uploaded_marker(&marker)
 }
 
 async fn wait_for_signal(shutdown: watch::Sender<bool>, watchdog: ProcessWatchdog) {
@@ -1307,7 +1692,389 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::process::Command;
+    use std::sync::Barrier;
+
+    #[test]
+    fn upload_only_cli_is_explicit_and_exclusive() {
+        let args = Args::try_parse_from(["binance-lob-archiver", "--upload-only"]).unwrap();
+        assert!(args.upload_only);
+        assert!(!args.self_test);
+        assert!(
+            Args::try_parse_from(["binance-lob-archiver", "--upload-only", "--self-test",])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_only_rejects_a_missing_spool() {
+        let spool_dir =
+            env::temp_dir().join(format!("monday-upload-only-missing-{}", now_ns().unwrap()));
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error.to_string().contains("SPOOL_DIR is not a directory"));
+        assert!(!spool_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn upload_only_accepts_an_empty_spool_without_network_access() {
+        let spool_dir =
+            env::temp_dir().join(format!("monday-upload-only-empty-{}", now_ns().unwrap()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        upload_only(&config).await.unwrap();
+        assert!(spool_dir.join("upload-status.json").is_file());
+        assert!(spool_dir.join(SPOOL_LOCK_FILE).is_file());
+        assert!(files_with_suffix(&spool_dir, ".manifest.json")
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_only_fails_while_spool_lock_is_held_and_succeeds_after_release() {
+        let spool_dir = env::temp_dir().join(format!("monday-spool-lock-{}", now_ns().unwrap()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let first = SpoolLock::acquire(&spool_dir).unwrap();
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error.to_string().contains("spool is already locked"));
+        assert!(!spool_dir.join("upload-status.json").exists());
+
+        drop(first);
+        upload_only(&config).await.unwrap();
+        assert!(spool_dir.join(SPOOL_LOCK_FILE).is_file());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_only_rejects_a_symlink_spool_lock_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let spool_dir = temp_dir.path().join("spool");
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let victim = spool_dir.join("victim");
+        std::fs::write(&victim, b"keep-me").unwrap();
+        let lock_path = spool_dir.join(SPOOL_LOCK_FILE);
+        symlink(&victim, &lock_path).unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error.to_string().contains("failed to open spool lock"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep-me");
+        assert!(std::fs::symlink_metadata(&lock_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!spool_dir.join("upload-status.json").exists());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_only_rejects_an_interrupted_segment() {
+        for suffix in ["jsonl.part", "jsonl.zst.tmp", "jsonl.part.corrupt"] {
+            let spool_dir = env::temp_dir().join(format!(
+                "monday-upload-only-interrupted-{suffix}-{}",
+                now_ns().unwrap()
+            ));
+            std::fs::create_dir_all(&spool_dir).unwrap();
+            let artifact = spool_dir.join(format!("part-1700000000000000000.{suffix}"));
+            std::fs::write(&artifact, b"unfinished").unwrap();
+            let config = UploadConfig {
+                spool_dir: spool_dir.clone(),
+                oss_bucket: "unused".into(),
+                oss_endpoint: "unused".into(),
+                oss_region: "ap-northeast-1".into(),
+                aliyun_profile: "unused".into(),
+                oss_copy_timeout: Duration::from_secs(1),
+            };
+
+            let error = upload_only(&config).await.unwrap_err();
+            assert!(error.to_string().contains("incomplete segment artifacts"));
+            assert!(artifact.is_file());
+            std::fs::remove_dir_all(spool_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_only_rejects_an_orphaned_compressed_segment() {
+        let spool_dir =
+            env::temp_dir().join(format!("monday-upload-only-zst-{}", now_ns().unwrap()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("part-1700000000000000000.jsonl.zst"),
+            b"orphaned",
+        )
+        .unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error.to_string().contains("local segment artifacts remain"));
+        assert!(spool_dir
+            .join("part-1700000000000000000.jsonl.zst")
+            .is_file());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[test]
+    fn uploaded_cleanup_recovery_is_idempotent_after_every_interruption_point() {
+        for removed in 0..=3 {
+            let spool_dir = env::temp_dir().join(format!(
+                "monday-upload-cleanup-{removed}-{}",
+                now_ns().unwrap()
+            ));
+            std::fs::create_dir_all(&spool_dir).unwrap();
+            let data = spool_dir.join("part-1700000000000000000.jsonl.zst");
+            let manifest = spool_dir.join("part-1700000000000000000.jsonl.zst.manifest.json");
+            let success = spool_dir.join("part-1700000000000000000.jsonl.zst._SUCCESS");
+            for path in [&data, &manifest, &success] {
+                std::fs::write(path, b"artifact").unwrap();
+            }
+            let marker = write_uploaded_cleanup_marker(&data, &manifest, &success).unwrap();
+
+            for path in [&data, &manifest, &success].into_iter().take(removed) {
+                std::fs::remove_file(path).unwrap();
+            }
+
+            assert_eq!(recover_uploaded_cleanups(&spool_dir).unwrap(), 1);
+            for path in [&data, &manifest, &success, &marker] {
+                assert!(!path.exists(), "{} was not cleaned", path.display());
+            }
+            assert_eq!(recover_uploaded_cleanups(&spool_dir).unwrap(), 0);
+            std::fs::remove_dir_all(spool_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn uploaded_cleanup_marker_replaces_only_a_stale_regular_temp() {
+        let spool_dir = env::temp_dir().join(format!(
+            "monday-upload-cleanup-stale-temp-{}",
+            now_ns().unwrap()
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let data = spool_dir.join("part-1700000000000000000.jsonl.zst");
+        let manifest = spool_dir.join("part-1700000000000000000.jsonl.zst.manifest.json");
+        let success = spool_dir.join("part-1700000000000000000.jsonl.zst._SUCCESS");
+        for path in [&data, &manifest, &success] {
+            std::fs::write(path, b"artifact").unwrap();
+        }
+        let temporary = spool_dir.join(format!(
+            "{}{}.tmp",
+            local_file_name(&manifest).unwrap(),
+            UPLOADED_CLEANUP_SUFFIX
+        ));
+        std::fs::write(&temporary, b"stale").unwrap();
+
+        let marker = write_uploaded_cleanup_marker(&data, &manifest, &success).unwrap();
+        assert!(marker.is_file());
+        assert!(!temporary.exists());
+        cleanup_uploaded_marker(&marker).unwrap();
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uploaded_cleanup_marker_refuses_a_symlink_temp_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let spool_dir = env::temp_dir().join(format!(
+            "monday-upload-cleanup-symlink-temp-{}",
+            now_ns().unwrap()
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let data = spool_dir.join("part-1700000000000000000.jsonl.zst");
+        let manifest = spool_dir.join("part-1700000000000000000.jsonl.zst.manifest.json");
+        let success = spool_dir.join("part-1700000000000000000.jsonl.zst._SUCCESS");
+        for path in [&data, &manifest, &success] {
+            std::fs::write(path, b"artifact").unwrap();
+        }
+        let victim = spool_dir.join("victim");
+        std::fs::write(&victim, b"keep-me").unwrap();
+        let temporary = spool_dir.join(format!(
+            "{}{}.tmp",
+            local_file_name(&manifest).unwrap(),
+            UPLOADED_CLEANUP_SUFFIX
+        ));
+        symlink(&victim, &temporary).unwrap();
+
+        let error = write_uploaded_cleanup_marker(&data, &manifest, &success).unwrap_err();
+        assert!(error.to_string().contains("non-regular cleanup temp path"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep-me");
+        assert!(std::fs::symlink_metadata(&temporary)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[test]
+    fn uploaded_cleanup_marker_cannot_delete_a_sibling_segment() {
+        let spool_dir = env::temp_dir().join(format!(
+            "monday-upload-cleanup-cross-segment-{}",
+            now_ns().unwrap()
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let data = spool_dir.join("part-1700000000000000000.jsonl.zst");
+        let manifest = spool_dir.join("part-1700000000000000000.jsonl.zst.manifest.json");
+        let success = spool_dir.join("part-1700000000000000000.jsonl.zst._SUCCESS");
+        let sibling_data = spool_dir.join("part-1700000000000000001.jsonl.zst");
+        let sibling_manifest = spool_dir.join("part-1700000000000000001.jsonl.zst.manifest.json");
+        let sibling_success = spool_dir.join("part-1700000000000000001.jsonl.zst._SUCCESS");
+        for path in [
+            &data,
+            &manifest,
+            &success,
+            &sibling_data,
+            &sibling_manifest,
+            &sibling_success,
+        ] {
+            std::fs::write(path, b"artifact").unwrap();
+        }
+        let marker = write_uploaded_cleanup_marker(&data, &manifest, &success).unwrap();
+        let mut metadata: Value =
+            serde_json::from_reader(std::fs::File::open(&marker).unwrap()).unwrap();
+        metadata["manifest"] = json!(local_file_name(&sibling_manifest).unwrap());
+        std::fs::write(&marker, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let error = cleanup_uploaded_marker(&marker).unwrap_err();
+        assert!(error.to_string().contains("does not match its segment"));
+        for path in [
+            &data,
+            &manifest,
+            &success,
+            &sibling_data,
+            &sibling_manifest,
+            &sibling_success,
+            &marker,
+        ] {
+            assert!(path.exists(), "{} was removed", path.display());
+        }
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[test]
+    fn uploaded_cleanup_marker_is_removed_last() {
+        let spool_dir =
+            env::temp_dir().join(format!("monday-upload-cleanup-last-{}", now_ns().unwrap()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let data = spool_dir.join("part-1700000000000000000.jsonl.zst");
+        let manifest = spool_dir.join("part-1700000000000000000.jsonl.zst.manifest.json");
+        let success = spool_dir.join("part-1700000000000000000.jsonl.zst._SUCCESS");
+        for path in [&data, &manifest, &success] {
+            std::fs::write(path, b"artifact").unwrap();
+        }
+        let marker = write_uploaded_cleanup_marker(&data, &manifest, &success).unwrap();
+        std::fs::remove_file(&success).unwrap();
+        std::fs::create_dir(&success).unwrap();
+
+        recover_uploaded_cleanups(&spool_dir).unwrap_err();
+        assert!(marker.is_file());
+        assert!(data.is_file());
+        assert!(manifest.is_file());
+        assert!(success.is_dir());
+
+        std::fs::remove_dir(&success).unwrap();
+        assert_eq!(recover_uploaded_cleanups(&spool_dir).unwrap(), 1);
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_pending_recovers_cleanup_before_reading_manifests() {
+        let spool_dir = env::temp_dir().join(format!(
+            "monday-upload-cleanup-before-manifests-{}",
+            now_ns().unwrap()
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let data = spool_dir.join("part-1700000000000000000.jsonl.zst");
+        let manifest = spool_dir.join("part-1700000000000000000.jsonl.zst.manifest.json");
+        let success = spool_dir.join("part-1700000000000000000.jsonl.zst._SUCCESS");
+        for path in [&data, &manifest, &success] {
+            std::fs::write(path, b"not valid manifest JSON").unwrap();
+        }
+        let marker = write_uploaded_cleanup_marker(&data, &manifest, &success).unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        assert_eq!(upload_pending(&config).await.unwrap(), 0);
+        assert!(!marker.exists());
+        assert!(files_with_suffix(&spool_dir, ".manifest.json")
+            .unwrap()
+            .is_empty());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_only_rejects_a_residual_cleanup_marker() {
+        let spool_dir = env::temp_dir().join(format!(
+            "monday-upload-cleanup-residual-{}",
+            now_ns().unwrap()
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let marker = spool_dir.join(format!(
+            "part-1700000000000000000.jsonl.zst.manifest.json{UPLOADED_CLEANUP_SUFFIX}"
+        ));
+        std::fs::write(&marker, b"{}\n").unwrap();
+        let config = UploadConfig {
+            spool_dir: spool_dir.clone(),
+            oss_bucket: "unused".into(),
+            oss_endpoint: "unused".into(),
+            oss_region: "ap-northeast-1".into(),
+            aliyun_profile: "unused".into(),
+            oss_copy_timeout: Duration::from_secs(1),
+        };
+
+        let error = upload_only(&config).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid uploaded cleanup marker schema"));
+        assert!(marker.is_file());
+        std::fs::remove_dir_all(spool_dir).unwrap();
+    }
 
     fn test_config(rest_base: String) -> Config {
         Config {
@@ -1326,7 +2093,6 @@ mod tests {
             max_pending_diffs: 100,
             stall_timeout: Duration::from_secs(60),
             sync_timeout: Duration::from_secs(120),
-            task_cancel_timeout: Duration::from_secs(1),
             process_watchdog_timeout: Duration::from_secs(180),
             snapshot_retry_attempts: 3,
             rest_base,
@@ -1337,40 +2103,6 @@ mod tests {
             zstd_timeout: Duration::from_secs(30),
             oss_copy_timeout: Duration::from_secs(30),
         }
-    }
-
-    #[tokio::test]
-    async fn session_task_shutdown_aborts_a_stuck_task_at_deadline() {
-        let mut tasks = JoinSet::new();
-        tasks.spawn(std::future::pending::<anyhow::Result<TaskExit>>());
-        let events = tokio::time::timeout(
-            Duration::from_secs(1),
-            stop_session_tasks(&mut tasks, Duration::from_millis(20)),
-        )
-        .await
-        .expect("stuck session task must be aborted");
-        assert!(events.is_empty());
-        assert!(tasks.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn upload_command_stops_immediately_on_shutdown() {
-        let mut command = tokio::process::Command::new("sh");
-        command.args(["-c", "sleep 60"]);
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let task = tokio::spawn(async move {
-            command_status_or_shutdown(&mut command, Duration::from_secs(60), &mut shutdown_rx)
-                .await
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        shutdown_tx.send(true).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("shutdown must cancel the upload child")
-            .unwrap()
-            .unwrap();
-        assert!(result.is_none());
     }
 
     #[test]
@@ -1397,6 +2129,34 @@ mod tests {
         let manifest = config.segment_config();
         assert_eq!(manifest.security_token_symbols, ["SECURITYUSDT"]);
         assert_eq!(manifest.excluded_symbols, ["BLOCKEDUSDT"]);
+    }
+
+    #[tokio::test]
+    async fn symbol_discovery_times_out_when_exchange_info_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let started = Instant::now();
+        let error = discover_symbols_with_timeout(
+            Market::Spot,
+            &format!("http://{address}"),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+        }));
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -1592,21 +2352,100 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn global_shutdown_is_published_only_after_process_watchdog_is_disarmed() {
+    fn armed_watchdog() -> ProcessWatchdog {
         let watchdog = ProcessWatchdog::new_state();
         watchdog.inner.last_data_ms.store(1_000, Ordering::Relaxed);
-        watchdog.inner.armed.store(true, Ordering::Release);
-        let timeout = Duration::from_secs(180);
+        assert!(watchdog.arm());
+        watchdog
+    }
 
-        // The same watchdog remains armed across ordinary session reconnects.
-        assert!(watchdog.should_exit_at(181_001, timeout));
+    #[tokio::test]
+    async fn global_shutdown_receiver_observes_a_disarmed_watchdog() {
+        let watchdog = armed_watchdog();
+        let observed_watchdog = watchdog.clone();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let receiver = tokio::spawn(async move {
+            shutdown_rx
+                .changed()
+                .await
+                .expect("observe global shutdown");
+            assert!(*shutdown_rx.borrow());
+            assert_eq!(observed_watchdog.state(), ProcessWatchdogState::Disarmed);
+            assert!(!observed_watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
+        });
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        publish_global_shutdown(&shutdown_tx, &watchdog);
+        assert!(publish_global_shutdown(&shutdown_tx, &watchdog));
+        receiver.await.expect("join shutdown observer");
+    }
 
-        assert!(*shutdown_rx.borrow());
-        assert!(!watchdog.should_exit_at(301_001, timeout));
+    #[test]
+    fn shutdown_disarm_and_watchdog_firing_are_one_atomic_race() {
+        for _ in 0..32 {
+            let watchdog = armed_watchdog();
+            let publisher_watchdog = watchdog.clone();
+            let firing_watchdog = watchdog.clone();
+            let barrier = Arc::new(Barrier::new(3));
+            let publisher_barrier = barrier.clone();
+            let firing_barrier = barrier.clone();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            let publisher = thread::spawn(move || {
+                publisher_barrier.wait();
+                publish_global_shutdown(&shutdown_tx, &publisher_watchdog)
+            });
+            let firing = thread::spawn(move || {
+                firing_barrier.wait();
+                firing_watchdog.try_begin_exit_at(181_001, Duration::from_secs(180))
+            });
+            barrier.wait();
+
+            let published = publisher.join().expect("join shutdown publisher");
+            let claimed_exit = firing.join().expect("join watchdog firing claimant");
+            assert_ne!(published, claimed_exit);
+            assert_eq!(*shutdown_rx.borrow(), published);
+            assert_eq!(
+                watchdog.state(),
+                if published {
+                    ProcessWatchdogState::Disarmed
+                } else {
+                    ProcessWatchdogState::Firing
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_session_task_failure_keeps_watchdog_armed_for_reconnect() {
+        let watchdog = armed_watchdog();
+        let spool_dir = env::temp_dir().join(format!(
+            "monday-watchdog-reconnect-test-{}",
+            now_ns().unwrap()
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+        let mut config = test_config("http://[::1".into());
+        // The newline makes the websocket URL invalid while the malformed REST
+        // base makes the snapshot task fail too. Both failures happen only
+        // after run_session has created its segment and spawned its producers.
+        config.symbols = vec!["BAD\nSYMBOL".into()];
+        config.spool_dir = spool_dir.clone();
+        config.snapshot_retry_attempts = 1;
+        let config = Arc::new(config);
+
+        for attempt in 1..=2 {
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_session(config.clone(), shutdown_rx, watchdog.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("session attempt {attempt} did not fail promptly"))
+            .expect_err("invalid producers must return to the reconnect loop");
+            assert!(!error.to_string().is_empty());
+            assert_eq!(watchdog.state(), ProcessWatchdogState::Armed);
+        }
+
+        std::fs::remove_dir_all(spool_dir).unwrap();
+        assert!(watchdog.try_begin_exit_at(181_001, Duration::from_secs(180)));
     }
 
     #[test]

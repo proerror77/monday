@@ -1,0 +1,27 @@
+{
+  "schema": "monday.polymarket.supersession.v1",
+  "created_at": "2026-07-15T03:56:04Z",
+  "reason": "v1_trade_identity_collision_and_overlapping_v2_backfill",
+  "canonical": false,
+  "superseded_by": "oss://monday-lob-apne1-1045353359/lake/raw/venue=polymarket/dataset=crypto_expiry_reference/date=2026-07-15/hour=03/market-updates.canonical-v2-union-20260715T035200.20260715T03.ndjson.zst",
+  "coverage": {
+    "input_rows": 28345,
+    "canonical_output_rows": 23335,
+    "canonical_v2_trades": 21868,
+    "duplicate_trades_removed": 5010
+  },
+  "objects": [
+    {
+      "source": "oss://monday-lob-apne1-1045353359/lake/raw/venue=polymarket/dataset=crypto_expiry_reference/date=2026-07-15/hour=03/market-updates.20260715T032240417688104.20260715T03.ndjson.zst",
+      "quarantine_copy": "oss://monday-lob-apne1-1045353359/lake/quarantine/venue=polymarket/dataset=crypto_expiry_reference/reason=v1_trade_id_superseded/date=2026-07-15/hour=03/market-updates.20260715T032240417688104.20260715T03.ndjson.zst"
+    },
+    {
+      "source": "oss://monday-lob-apne1-1045353359/lake/raw/venue=polymarket/dataset=crypto_expiry_reference/date=2026-07-15/hour=03/market-updates.20260715T033437163978530.20260715T03.ndjson.zst",
+      "quarantine_copy": "oss://monday-lob-apne1-1045353359/lake/quarantine/venue=polymarket/dataset=crypto_expiry_reference/reason=v1_trade_id_superseded/date=2026-07-15/hour=03/market-updates.20260715T033437163978530.20260715T03.ndjson.zst"
+    },
+    {
+      "source": "oss://monday-lob-apne1-1045353359/lake/raw/venue=polymarket/dataset=crypto_expiry_reference/date=2026-07-15/hour=03/market-updates.20260715T033536673162539.20260715T03.ndjson.zst",
+      "quarantine_copy": "oss://monday-lob-apne1-1045353359/lake/quarantine/venue=polymarket/dataset=crypto_expiry_reference/reason=canonical_v2_union/date=2026-07-15/hour=03/market-updates.20260715T033536673162539.20260715T03.ndjson.zst"
+    }
+  ]
+}

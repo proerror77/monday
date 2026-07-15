@@ -27,6 +27,8 @@ hex = { workspace = true }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+fs4 = { workspace = true }
+libc = "0.2"
 rust_decimal = { version = "1", features = ["serde"] }
 ordered-float = "4"
 tracing = "0.1"
@@ -66,6 +68,9 @@ collector-okx = []
 collector-asterdex = []
 duckdb = ["dep:duckdb"]
 
+[dev-dependencies]
+tempfile = "3.10"
+
 [[bin]]
 name = "hft-collector"
 path = "src/main.rs"
@@ -73,6 +78,10 @@ path = "src/main.rs"
 [[bin]]
 name = "binance-lob-archiver"
 path = "src/bin/binance-lob-archiver.rs"
+
+[[bin]]
+name = "polymarket-raw-ops"
+path = "src/bin/polymarket-raw-ops.rs"
 
 [lib]
 name = "hft_collector"

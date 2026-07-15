@@ -484,6 +484,18 @@ fn monday_polymarket_data_service_is_read_only_and_fail_closed() {
     let service =
         fs::read_to_string(monday_root.join("deployment/aliyun/polymarket-market-tape.service"))
             .expect("read Polymarket market-data service");
+    let reference_service = fs::read_to_string(
+        monday_root.join("deployment/aliyun/polymarket-reference-collector.service"),
+    )
+    .expect("read Polymarket reference service");
+    let market_upload_service = fs::read_to_string(
+        monday_root.join("deployment/aliyun/polymarket-market-tape-upload.service"),
+    )
+    .expect("read Polymarket market tape upload service");
+    let reference_upload_service = fs::read_to_string(
+        monday_root.join("deployment/aliyun/polymarket-reference-upload.service"),
+    )
+    .expect("read Polymarket reference upload service");
 
     for required in [
         "mode = \"dryrun\"",
@@ -492,7 +504,6 @@ fn monday_polymarket_data_service_is_read_only_and_fail_closed() {
         "record_market_updates_to = \"/data/monday/spool/polymarket/market-updates.ndjson\"",
         "record_market_updates_include_kinds = [\"quote\", \"event_discovered\", \"event_expired\", \"reference_price\"]",
         "record_market_updates_quote_sample_ms = 1000",
-        "record_market_updates_quote_depth_levels = 1",
         "record_market_updates_event_scoped_quotes = true",
         "symbols = [\"BTCUSDT\", \"ETHUSDT\", \"SOLUSDT\", \"XRPUSDT\", \"DOGEUSDT\", \"HYPEUSDT\", \"BNBUSDT\"]",
     ] {
@@ -509,5 +520,52 @@ fn monday_polymarket_data_service_is_read_only_and_fail_closed() {
     }
     for forbidden in ["live-execution", "PRIVATE_KEY", "EnvironmentFile="] {
         assert!(!service.contains(forbidden), "service contains {forbidden}");
+        assert!(
+            !reference_service.contains(forbidden),
+            "reference service contains {forbidden}"
+        );
+    }
+    for forbidden in ["record_market_updates_quote_depth_levels"] {
+        assert!(
+            !config.contains(forbidden),
+            "full-depth collector config contains {forbidden}"
+        );
+    }
+    for required in [
+        "User=hftcollector",
+        "/opt/monday/bin/polymarket-raw-ops collect-reference",
+        "NoNewPrivileges=true",
+        "ProtectSystem=strict",
+        "ReadWritePaths=/data/monday/spool/polymarket-reference",
+    ] {
+        assert!(
+            reference_service.contains(required),
+            "reference service missing {required}"
+        );
+    }
+    for (name, upload_service) in [
+        ("market", &market_upload_service),
+        ("reference", &reference_upload_service),
+    ] {
+        assert!(
+            upload_service.contains("/opt/monday/bin/polymarket-raw-ops upload"),
+            "{name} uploader must use the Rust raw-ops binary"
+        );
+        for forbidden in ["python3", ".py", "PRIVATE_KEY", "live-execution"] {
+            assert!(
+                !upload_service.contains(forbidden),
+                "{name} uploader contains forbidden runtime surface {forbidden}"
+            );
+        }
+    }
+    for retired in [
+        "polymarket_reference_collector.py",
+        "polymarket_market_tape_upload.py",
+        "polymarket_reference_canonicalize.py",
+    ] {
+        assert!(
+            !monday_root.join("deployment/aliyun").join(retired).exists(),
+            "retired Python runtime still exists: {retired}"
+        );
     }
 }

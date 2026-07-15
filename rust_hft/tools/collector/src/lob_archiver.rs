@@ -1,4 +1,5 @@
 use engine::binance_md::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
+use rand::random;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -721,14 +722,27 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
 
 pub fn files_with_suffix(root: &Path, suffix: &str) -> anyhow::Result<Vec<PathBuf>> {
     fn visit(path: &Path, suffix: &str, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-        if !path.exists() {
-            return Ok(());
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("refusing symlink while scanning spool: {}", path.display());
+        }
+        if !metadata.is_dir() {
+            anyhow::bail!("spool scan root is not a directory: {}", path.display());
         }
         for entry in fs::read_dir(path)? {
-            let path = entry?.path();
-            if path.is_dir() {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                anyhow::bail!("refusing symlink while scanning spool: {}", path.display());
+            }
+            if file_type.is_dir() {
                 visit(&path, suffix, files)?;
-            } else if path.to_string_lossy().ends_with(suffix) {
+            } else if file_type.is_file() && path.to_string_lossy().ends_with(suffix) {
                 files.push(path);
             }
         }
@@ -799,6 +813,7 @@ pub fn write_health(
             "disk_warning": disk_free_gb.is_some_and(|free| free < disk_warning_threshold_gb),
             "disk_warning_threshold_gb": disk_warning_threshold_gb,
             "upload_warning": upload.last_error_at.is_some(),
+            "upload_failure_count": upload.failure_count,
             "last_upload_success_at": upload.last_success_at,
             "last_upload_error_at": upload.last_error_at,
             "last_upload_error": upload.last_error,
@@ -815,6 +830,8 @@ pub struct UploadStatus {
     pub last_success_at: Option<String>,
     pub last_error_at: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub failure_count: u64,
 }
 
 pub fn read_upload_status(spool_dir: &Path) -> UploadStatus {
@@ -944,20 +961,39 @@ fn atomic_write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let temporary = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default()
-    ));
-    let mut output = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temporary)?;
-    output.write_all(bytes)?;
-    output.sync_all()?;
-    fs::rename(temporary, path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("atomic target has no parent"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let (temporary, mut output) = (0..32)
+        .find_map(|_| {
+            let temporary = parent.join(format!(".{file_name}.{:016x}.tmp", random::<u64>()));
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+            {
+                Ok(output) => Some(Ok((temporary, output))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("could not allocate exclusive atomic-write temporary"))?;
+    let write_result = (|| -> anyhow::Result<()> {
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        drop(output);
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result?;
     sync_parent(path)
 }
 
@@ -1109,6 +1145,7 @@ mod tests {
                 last_success_at: None,
                 last_error_at: Some("2026-07-14T16:00:00Z".into()),
                 last_error: Some("oss down".into()),
+                failure_count: 7,
             },
         )
         .unwrap();
@@ -1131,12 +1168,47 @@ mod tests {
         let health: Value =
             serde_json::from_reader(File::open(root.join("health.json")).unwrap()).unwrap();
         assert_eq!(health["upload_warning"], true);
+        assert_eq!(health["upload_failure_count"], 7);
         assert_eq!(health["last_upload_error"], "oss down");
         assert_eq!(health["snapshot_ready_count"], 0);
         assert_eq!(health["bridged_count"], 0);
         assert_eq!(health["snapshot_only_symbols"], json!([]));
         assert_eq!(health["all_symbols_bridged"], false);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spool_scan_rejects_root_directory_and_file_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("monday-scan-root-{}", now_ns().unwrap()));
+        let outside =
+            std::env::temp_dir().join(format!("monday-scan-outside-{}", now_ns().unwrap()));
+        let root_link =
+            std::env::temp_dir().join(format!("monday-scan-root-link-{}", now_ns().unwrap()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("outside.manifest.json");
+        fs::write(&outside_file, b"do-not-delete\n").unwrap();
+
+        symlink(&outside, &root_link).unwrap();
+        let error = files_with_suffix(&root_link, ".manifest.json").unwrap_err();
+        assert!(error.to_string().contains("refusing symlink"));
+        fs::remove_file(&root_link).unwrap();
+
+        symlink(&outside, root.join("escape")).unwrap();
+        let error = files_with_suffix(&root, ".manifest.json").unwrap_err();
+        assert!(error.to_string().contains("refusing symlink"));
+        fs::remove_file(root.join("escape")).unwrap();
+
+        symlink(&outside_file, root.join("linked.manifest.json")).unwrap();
+        let error = files_with_suffix(&root, ".manifest.json").unwrap_err();
+        assert!(error.to_string().contains("refusing symlink"));
+        assert_eq!(fs::read(&outside_file).unwrap(), b"do-not-delete\n");
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
@@ -1188,5 +1260,26 @@ mod tests {
             format!("{}\n", artifacts.sha256)
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn success_marker_atomic_write_does_not_follow_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::Builder::new()
+            .prefix("monday-marker-test-")
+            .tempdir()
+            .unwrap();
+        let root = root.path();
+        let data = root.join("segment.ndjson.zst");
+        fs::write(&data, b"compressed").unwrap();
+        let victim = root.join("victim");
+        fs::write(&victim, b"do-not-touch\n").unwrap();
+        symlink(&victim, root.join("segment.ndjson.zst._SUCCESS.tmp")).unwrap();
+
+        let marker = write_success_marker(&data, "abcd").unwrap();
+        assert_eq!(fs::read_to_string(marker).unwrap(), "abcd\n");
+        assert_eq!(fs::read(&victim).unwrap(), b"do-not-touch\n");
     }
 }

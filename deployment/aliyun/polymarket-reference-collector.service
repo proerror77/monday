@@ -1,0 +1,34 @@
+[Unit]
+Description=Monday Polymarket metadata, trade, and settlement tape
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=simple
+User=hftcollector
+Group=hftcollector
+ExecStart=/opt/monday/bin/polymarket-raw-ops collect-reference
+Restart=always
+RestartSec=5
+RuntimeMaxSec=21600
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadWritePaths=/data/monday/spool/polymarket-reference
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0027
+CPUQuota=20%
+MemoryHigh=384M
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

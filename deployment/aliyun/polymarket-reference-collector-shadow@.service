@@ -1,0 +1,32 @@
+[Unit]
+Description=Monday Polymarket Rust reference shadow for artifact %i
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=exec
+User=hftcollector
+Group=hftcollector
+EnvironmentFile=/run/monday/polymarket-reference-shadow-%i.env
+ExecStart=/opt/monday/releases/polymarket-raw-ops/%i/polymarket-raw-ops collect-reference --spool-dir ${MONDAY_POLYMARKET_SHADOW_SPOOL}
+Restart=on-failure
+RestartSec=5
+RuntimeMaxSec=7500
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadWritePaths=/data/monday/spool/polymarket-reference-rust-shadow/%i
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0027
+CPUQuota=20%
+MemoryHigh=384M
+MemoryMax=512M
