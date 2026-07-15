@@ -41,6 +41,8 @@ entrypoints.
 The active PLOY scope inside Monday is:
 
 - research, replay, backtesting, and evidence generation;
+- governed native Rust probability-model training via the
+  [Burn binary research lane](docs/BURN_BINARY_RESEARCH.md);
 - prediction-market data and product contracts;
 - paper-mode control-plane and operator flows;
 - frontend and sidecar development;

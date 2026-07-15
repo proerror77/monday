@@ -220,7 +220,7 @@ pub fn build_prediction_prompt(
     .expect("prediction prompt is serializable")
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 18] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 19] {
     [
         ("Cargo.lock", include_bytes!("../../../Cargo.lock")),
         ("Cargo.toml", include_bytes!("../../../Cargo.toml")),
@@ -241,6 +241,10 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 18] {
             include_bytes!("factors_v2.rs"),
         ),
         ("crates/ploy-research/src/lib.rs", include_bytes!("lib.rs")),
+        (
+            "crates/ploy-research/src/model/supervised/burn_binary.rs",
+            include_bytes!("model/supervised/burn_binary.rs"),
+        ),
         (
             "crates/ploy-research/src/prediction_loop.rs",
             include_bytes!("prediction_loop.rs"),
@@ -2352,6 +2356,7 @@ mod tests {
                 }),
                 chainlink_outcome_up: Some(true),
                 official_outcome_up: Some(true),
+                official_outcome_available_at: Some(event_end),
                 reasons: Vec::new(),
             }],
             immutable_input: true,
@@ -2419,6 +2424,7 @@ mod tests {
             event_id: "event-1".to_string(),
             symbol: "BTCUSDT".to_string(),
             tick_ts,
+            source_availability: Default::default(),
             event_window_secs: 300,
             time_remaining_secs: 60,
             signed_distance_to_beat: 0.0,

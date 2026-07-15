@@ -93,11 +93,29 @@ const PM_BOOK_SAMPLED_QUERY: &str = r#"
         ORDER BY received_at
         "#;
 
+/// Point-in-time receipt clocks for the source families used to derive one
+/// observation. `None` means the source provenance is unavailable; governed
+/// ML consumers must fail closed for features that depend on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactorSourceAvailability {
+    pub spot: Option<DateTime<Utc>>,
+    pub lob: Option<DateTime<Utc>>,
+    pub aggregate_trade: Option<DateTime<Utc>>,
+    pub polymarket_up_quote: Option<DateTime<Utc>>,
+    pub polymarket_down_quote: Option<DateTime<Utc>>,
+    pub chainlink_reference: Option<DateTime<Utc>>,
+    /// Event-static opening boundary. It must be known by decision time, but
+    /// does not expire under the rolling feature-age limit.
+    pub chainlink_open: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FactorObservation {
     pub event_id: String,
     pub symbol: String,
     pub tick_ts: DateTime<Utc>,
+    #[serde(default)]
+    pub source_availability: FactorSourceAvailability,
     #[serde(default)]
     pub event_window_secs: i64,
     pub time_remaining_secs: i64,
@@ -450,7 +468,7 @@ pub struct ChainlinkOracleBoundaryEvidence {
 }
 
 impl ChainlinkOracleBoundaryEvidence {
-    fn available_at(self) -> DateTime<Utc> {
+    pub fn available_at(self) -> DateTime<Utc> {
         self.received_at.max(self.confirmation_received_at)
     }
 }
@@ -475,6 +493,11 @@ pub struct ChainlinkOracleSettlementEvidence {
     pub close: Option<ChainlinkOracleBoundaryEvidence>,
     pub chainlink_outcome_up: Option<bool>,
     pub official_outcome_up: Option<bool>,
+    /// Earliest observed time at which the official venue resolution was
+    /// available to the research system. Historical snapshots without this
+    /// provenance cannot safely use the label for chronological training.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_outcome_available_at: Option<DateTime<Utc>>,
     pub reasons: Vec<ChainlinkOracleFailureReason>,
 }
 
@@ -485,6 +508,19 @@ impl ChainlinkOracleSettlementEvidence {
             && self.close.is_some()
             && self.chainlink_outcome_up.is_some()
             && self.official_outcome_up.is_some()
+    }
+
+    /// Earliest safe chronological cutoff for using this event label.
+    pub fn label_available_at(&self) -> Option<DateTime<Utc>> {
+        let close_available_at = self
+            .close
+            .map(ChainlinkOracleBoundaryEvidence::available_at)?;
+        let official_available_at = self.official_outcome_available_at?;
+        Some(
+            self.end_time
+                .max(close_available_at)
+                .max(official_available_at),
+        )
     }
 }
 
@@ -690,6 +726,7 @@ fn governed_chainlink_settlement_outcomes(
                 close,
                 chainlink_outcome_up,
                 official_outcome_up,
+                official_outcome_available_at: None,
                 reasons,
             }
         })
@@ -698,6 +735,7 @@ fn governed_chainlink_settlement_outcomes(
 
 #[derive(Clone, Default)]
 struct LobState {
+    available_at: Option<DateTime<Utc>>,
     obi: f64,
     spread_bps: f64,
     mid_price: f64,
@@ -1460,6 +1498,7 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
     let mut lob_by_symbol: HashMap<String, Vec<&ResearchLobSnapshot>> = HashMap::new();
     let mut lob_flow: HashMap<String, LobFlowAccumulator> = HashMap::new();
     let mut trade_flow: HashMap<String, TradeFlowAccumulator> = HashMap::new();
+    let mut latest_aggregate_trade: HashMap<String, DateTime<Utc>> = HashMap::new();
     let mut candle_flow: HashMap<String, CandleFlowAccumulator> = HashMap::new();
     let mut last_observation_bucket: HashMap<String, i64> = HashMap::new();
     let mut rows = Vec::new();
@@ -1562,9 +1601,11 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                 symbol,
                 obi,
                 spread_bps,
+                ts,
                 ..
             } => {
                 let state = lob.entry(symbol.to_string()).or_default();
+                state.available_at = Some(*ts);
                 state.obi = *obi;
                 state.spread_bps = *spread_bps as f64;
                 state.obi_10 = *obi;
@@ -1575,11 +1616,13 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                 spread_bps,
                 bid_depth_near,
                 ask_depth_near,
+                ts,
                 ..
             } => {
                 lob.insert(
                     symbol.to_string(),
                     LobState {
+                        available_at: Some(*ts),
                         obi: *obi,
                         spread_bps: *spread_bps as f64,
                         mid_price: f64::NAN,
@@ -1756,6 +1799,7 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                         lob.insert(
                             sym.clone(),
                             LobState {
+                                available_at: Some(snapshot.ts),
                                 obi: snapshot.obi,
                                 spread_bps: snapshot.spread_bps,
                                 mid_price: snapshot.mid_price,
@@ -1835,7 +1879,14 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                         }
                     }
 
-                    let (mut up_bid, mut up_ask, up_lag, mut up_bid_sz, mut up_ask_sz) = quotes
+                    let (
+                        mut up_bid,
+                        mut up_ask,
+                        up_lag,
+                        mut up_bid_sz,
+                        mut up_ask_sz,
+                        up_quote_available_at,
+                    ) = quotes
                         .get(&event.up_token)
                         .map(|(quote_ts, bid, ask, bid_sz, ask_sz)| {
                             (
@@ -1844,22 +1895,30 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                                 (*ts - *quote_ts).num_seconds() as f64,
                                 *bid_sz,
                                 *ask_sz,
+                                Some(*quote_ts),
                             )
                         })
-                        .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN));
-                    let (mut down_bid, mut down_ask, down_lag, mut down_bid_sz, mut down_ask_sz) =
-                        quotes
-                            .get(&event.down_token)
-                            .map(|(quote_ts, bid, ask, bid_sz, ask_sz)| {
-                                (
-                                    *bid,
-                                    *ask,
-                                    (*ts - *quote_ts).num_seconds() as f64,
-                                    *bid_sz,
-                                    *ask_sz,
-                                )
-                            })
-                            .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN));
+                        .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, None));
+                    let (
+                        mut down_bid,
+                        mut down_ask,
+                        down_lag,
+                        mut down_bid_sz,
+                        mut down_ask_sz,
+                        down_quote_available_at,
+                    ) = quotes
+                        .get(&event.down_token)
+                        .map(|(quote_ts, bid, ask, bid_sz, ask_sz)| {
+                            (
+                                *bid,
+                                *ask,
+                                (*ts - *quote_ts).num_seconds() as f64,
+                                *bid_sz,
+                                *ask_sz,
+                                Some(*quote_ts),
+                            )
+                        })
+                        .unwrap_or((f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, None));
 
                     let up_quote_fresh =
                         up_lag.is_finite() && up_lag >= 0.0 && up_lag <= max_quote_age_secs as f64;
@@ -2027,6 +2086,17 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                         event_id: event.event_id.clone(),
                         symbol: sym.clone(),
                         tick_ts: *ts,
+                        source_availability: FactorSourceAvailability {
+                            spot: Some(*ts),
+                            lob: lob_state.available_at,
+                            aggregate_trade: latest_aggregate_trade.get(&sym).copied(),
+                            polymarket_up_quote: up_quote_available_at,
+                            polymarket_down_quote: down_quote_available_at,
+                            chainlink_reference: chainlink
+                                .get(&normalized_underlying_symbol(&sym))
+                                .map(|(_, available_at, _)| *available_at),
+                            chainlink_open: event.chainlink_price_to_beat_available_at,
+                        },
                         event_window_secs: event.window_secs.unwrap_or_default(),
                         time_remaining_secs: time_remaining,
                         signed_distance_to_beat: signed_distance,
@@ -2105,6 +2175,7 @@ pub fn build_factor_observations_with_lob_sampled_and_oracle_evidence(
                 ..
             } => {
                 if let Some(qty) = quantity.to_f64() {
+                    latest_aggregate_trade.insert(symbol.to_string(), *ts);
                     // buyer_maker=false → buyer aggressor (bullish); true → seller aggressor
                     let signed_qty = if *is_buyer_maker { -qty } else { qty };
                     trade_flow
@@ -2433,6 +2504,13 @@ pub fn observations_to_frame(rows: &[FactorObservation]) -> PolarsResult<DataFra
         "event_id" => rows.iter().map(|row| row.event_id.as_str()).collect::<Vec<_>>(),
         "symbol" => rows.iter().map(|row| row.symbol.as_str()).collect::<Vec<_>>(),
         "tick_ts" => rows.iter().map(|row| row.tick_ts.timestamp_millis()).collect::<Vec<_>>(),
+        "source_available_at_spot_ms" => rows.iter().map(|row| row.source_availability.spot.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_lob_ms" => rows.iter().map(|row| row.source_availability.lob.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_aggregate_trade_ms" => rows.iter().map(|row| row.source_availability.aggregate_trade.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_polymarket_up_quote_ms" => rows.iter().map(|row| row.source_availability.polymarket_up_quote.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_polymarket_down_quote_ms" => rows.iter().map(|row| row.source_availability.polymarket_down_quote.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_chainlink_reference_ms" => rows.iter().map(|row| row.source_availability.chainlink_reference.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "source_available_at_chainlink_open_ms" => rows.iter().map(|row| row.source_availability.chainlink_open.as_ref().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
         "event_window_secs" => rows.iter().map(|row| row.event_window_secs).collect::<Vec<_>>(),
         "time_remaining_secs" => rows.iter().map(|row| row.time_remaining_secs).collect::<Vec<_>>(),
         "signed_distance_to_beat" => rows.iter().map(|row| row.signed_distance_to_beat).collect::<Vec<_>>(),
@@ -2956,11 +3034,19 @@ mod tests {
         GOVERNED_CHAINLINK_BOUNDARY_MAX_AGE_SECS, GOVERNED_CHAINLINK_BOUNDARY_POLICY_VERSION,
         PM_BOOK_SAMPLED_QUERY,
     };
+    #[cfg(feature = "polars-export")]
+    use super::{export_observations_parquet, FactorSourceAvailability};
     use chrono::{TimeZone, Utc};
     use ploy_market_contracts::MarketUpdate;
+    #[cfg(feature = "polars-export")]
+    use polars::io::parquet::read::ParquetReader;
+    #[cfg(feature = "polars-export")]
+    use polars::prelude::SerReader;
     use rust_decimal::Decimal;
     #[cfg(feature = "db")]
     use serde_json::json;
+    #[cfg(feature = "polars-export")]
+    use std::fs::File;
     use std::sync::Arc;
 
     fn chainlink_tick(ts_secs: i64, price: i64) -> MarketUpdate {
@@ -3076,6 +3162,7 @@ mod tests {
             tick_ts: chrono::DateTime::from_timestamp(tick_ts_secs, 0)
                 .unwrap()
                 .with_timezone(&Utc),
+            source_availability: Default::default(),
             event_window_secs: 300,
             time_remaining_secs: 60,
             signed_distance_to_beat: 0.0,
@@ -3212,11 +3299,101 @@ mod tests {
         json.as_object_mut()
             .expect("observation object")
             .remove("event_window_secs");
+        json.as_object_mut()
+            .expect("observation object")
+            .remove("source_availability");
 
         let decoded: FactorObservation =
             serde_json::from_value(json).expect("deserialize legacy observation");
 
         assert_eq!(decoded.event_window_secs, 0);
+        assert_eq!(decoded.source_availability, Default::default());
+    }
+
+    #[cfg(feature = "polars-export")]
+    #[test]
+    fn snapshot_json_and_parquet_preserve_source_availability_provenance() {
+        let available_at = |offset_ms: i64| {
+            Utc.timestamp_millis_opt(1_700_000_000_000 + offset_ms)
+                .single()
+                .expect("valid source availability timestamp")
+        };
+        let mut governed = test_factor_observation("evt-1", "BTCUSDT", 100, 1.0, None);
+        governed.source_availability = FactorSourceAvailability {
+            spot: Some(available_at(1)),
+            lob: Some(available_at(2)),
+            aggregate_trade: Some(available_at(3)),
+            polymarket_up_quote: Some(available_at(4)),
+            polymarket_down_quote: Some(available_at(5)),
+            chainlink_reference: Some(available_at(6)),
+            chainlink_open: Some(available_at(7)),
+        };
+        let observations = vec![
+            governed,
+            test_factor_observation("evt-2", "BTCUSDT", 101, 0.0, None),
+        ];
+
+        let json = serde_json::to_vec(&observations).expect("serialize snapshot observations JSON");
+        let json_rows: Vec<FactorObservation> =
+            serde_json::from_slice(&json).expect("deserialize snapshot observations JSON");
+        let temp_dir = tempfile::tempdir().expect("create snapshot export directory");
+        let parquet_path = temp_dir.path().join("observations.parquet");
+        export_observations_parquet(&observations, &parquet_path)
+            .expect("export snapshot observations Parquet");
+        let parquet = ParquetReader::new(
+            File::open(&parquet_path).expect("open snapshot observations Parquet"),
+        )
+        .finish()
+        .expect("read snapshot observations Parquet");
+
+        let expected_columns = [
+            (
+                "source_available_at_spot_ms",
+                json_rows[0].source_availability.spot,
+            ),
+            (
+                "source_available_at_lob_ms",
+                json_rows[0].source_availability.lob,
+            ),
+            (
+                "source_available_at_aggregate_trade_ms",
+                json_rows[0].source_availability.aggregate_trade,
+            ),
+            (
+                "source_available_at_polymarket_up_quote_ms",
+                json_rows[0].source_availability.polymarket_up_quote,
+            ),
+            (
+                "source_available_at_polymarket_down_quote_ms",
+                json_rows[0].source_availability.polymarket_down_quote,
+            ),
+            (
+                "source_available_at_chainlink_reference_ms",
+                json_rows[0].source_availability.chainlink_reference,
+            ),
+            (
+                "source_available_at_chainlink_open_ms",
+                json_rows[0].source_availability.chainlink_open,
+            ),
+        ];
+
+        for (column_name, json_timestamp) in expected_columns {
+            let parquet_timestamps = parquet
+                .column(column_name)
+                .unwrap_or_else(|_| panic!("missing governed provenance column {column_name}"))
+                .i64()
+                .unwrap_or_else(|_| panic!("provenance column {column_name} must be Int64"));
+            assert_eq!(
+                parquet_timestamps.get(0),
+                json_timestamp.map(|timestamp| timestamp.timestamp_millis()),
+                "JSON and Parquet provenance must match for {column_name}"
+            );
+            assert_eq!(
+                parquet_timestamps.get(1),
+                None,
+                "missing provenance must remain null for {column_name}"
+            );
+        }
     }
 
     #[test]
@@ -3996,6 +4173,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts2,
+                    source_availability: Default::default(),
                     event_window_secs: 300,
                     time_remaining_secs: 10,
                     signed_distance_to_beat: 0.0,
@@ -4055,6 +4233,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts0,
+                    source_availability: Default::default(),
                     event_window_secs: 300,
                     time_remaining_secs: 90,
                     signed_distance_to_beat: 0.0,
@@ -4114,6 +4293,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts1,
+                    source_availability: Default::default(),
                     event_window_secs: 300,
                     time_remaining_secs: 50,
                     signed_distance_to_beat: 0.0,

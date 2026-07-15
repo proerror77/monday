@@ -978,6 +978,7 @@ mod tests {
             event_id: event_id.to_string(),
             symbol: symbol.to_string(),
             tick_ts: event_start + Duration::seconds(row_idx * 30),
+            source_availability: Default::default(),
             event_window_secs: 300,
             time_remaining_secs: 300 - row_idx * 30,
             signed_distance_to_beat: 0.0,

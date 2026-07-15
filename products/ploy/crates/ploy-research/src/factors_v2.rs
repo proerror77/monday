@@ -11706,6 +11706,7 @@ mod tests {
             event_id: "evt".into(),
             symbol: "BTCUSDT".into(),
             tick_ts: Utc::now(),
+            source_availability: Default::default(),
             event_window_secs: 300,
             time_remaining_secs: 220,
             signed_distance_to_beat: 0.01,
