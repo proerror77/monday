@@ -246,7 +246,7 @@ pub struct LlmPriorSpec {
     pub structural_avoid_signatures: Vec<StructuralAvoidSignatureSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmProbabilityBlendSpec {
     pub name: String,
@@ -3122,6 +3122,7 @@ mod tests {
             time_remaining_secs: 120,
             regime: Regime::Middle,
             side: ReviewSide::Up,
+            pm_token_id: "up-token".to_string(),
             side_model_prob: (0.50 + score * 0.01).clamp(0.01, 0.99),
             side_chainlink_prob: f64::NAN,
             side_fair_prob: (0.50 + score * 0.01).clamp(0.01, 0.99),

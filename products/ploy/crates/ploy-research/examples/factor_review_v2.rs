@@ -140,6 +140,7 @@ async fn main() {
         top_quantile: flag_value(&args, "--top-quantile")
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(0.2),
+        max_quote_age_secs,
     };
 
     eprintln!(

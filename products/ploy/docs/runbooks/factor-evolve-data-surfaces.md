@@ -21,12 +21,13 @@ diagnostic search toward executable replay or dry-run handoff.
 
 | Surface | Current status | Taxonomy | Promotion rule |
 | --- | --- | --- | --- |
-| Binance aggTrade / spot ticks | Present | `required_for_prediction` | Required for crypto event movement features. |
-| Binance partial LOB snapshots | Present | `required_for_prediction` | Diagnostic only; not queue or passive-fill proof. |
+| Chainlink opening reference and expiry-price feed | Present for PM5D evidence | `required_for_prediction` | Contract price-source truth for the threshold and expiry comparison; cannot be replaced by Binance. |
+| Binance aggTrade / spot ticks | Present | `required_for_prediction` | External predictor/repricing input only; the governed snapshot preserves spot arrival time and side-aggregates aggTrade flow in five-second source-time buckets. Never settlement or execution truth. |
+| Binance partial LOB snapshots | Present | `required_for_prediction` | External predictor/repricing diagnostic only; not settlement, queue, or passive-fill proof. |
 | Binance futures local book | Contract added; collector replay not first-class | `required_for_prediction` | `missing_blocks_promotion` for hypotheses that depend on sequence-correct depth imbalance. |
 | Polymarket quote ticks | Present | `required_for_execution` | Required for top-of-book state and quote freshness. |
 | Polymarket full CLOB snapshots | Present and archived | `required_for_execution` | `missing_blocks_promotion` for executable-price or capacity claims. |
-| Official settlement | Present for PM5D evidence | `required_for_prediction` | `missing_blocks_promotion` for settlement-probability strategies. |
+| Polymarket official resolution (`pm_token_settlements`) | Present for PM5D evidence | `required_for_prediction` | Final binary label; `missing_blocks_promotion` for settlement-probability strategies. |
 | Dry-run/runtime fills | Present as runtime evidence | `required_for_execution` after dry-run | Required for recorded replay/dry-run parity, not a substitute for settlement labels. |
 | Binance futures OI | Not first-class | `optional_context` | Blocks only hypotheses that explicitly depend on open-interest pressure. |
 | Binance futures funding | Not first-class | `optional_context` | Blocks only funding/basis carry hypotheses. |
@@ -48,6 +49,9 @@ diagnostic search toward executable replay or dry-run handoff.
 5. Runtime dry-run fills prove observed execution behavior only after a
    candidate exists. They do not replace historical executable replay or
    official settlement labels.
+6. Binance data cannot populate or backfill the Chainlink opening reference or
+   settlement label. Polymarket CLOB quotes and full depth are the only research
+   surfaces for executable price, fees, fillability, and capacity.
 
 ## Research Issue Checklist
 

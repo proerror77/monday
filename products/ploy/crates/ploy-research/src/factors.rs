@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
-use ploy_market_contracts::MarketUpdate;
+use ploy_market_contracts::{BinanceSourceClock, BinanceSourceKind, MarketUpdate};
 #[cfg(feature = "polars-export")]
 use polars::prelude::*;
 use rust_decimal::prelude::ToPrimitive;
@@ -13,6 +13,22 @@ use sqlx::PgPool;
 
 const EWMA_LAMBDA: f64 = 0.94;
 const RETURN_BUFFER_WINDOW_SECS: f64 = 300.0;
+
+#[cfg(any(feature = "db", test))]
+fn accept_monotonic_source_time(
+    latest_by_symbol: &mut HashMap<String, DateTime<Utc>>,
+    symbol: &str,
+    source_time: DateTime<Utc>,
+) -> bool {
+    if latest_by_symbol
+        .get(symbol)
+        .is_some_and(|latest| source_time < *latest)
+    {
+        return false;
+    }
+    latest_by_symbol.insert(symbol.to_string(), source_time);
+    true
+}
 
 fn nan_f64() -> f64 {
     f64::NAN
@@ -86,6 +102,18 @@ pub struct FactorObservation {
     pub event_id: String,
     pub symbol: String,
     pub tick_ts: DateTime<Utc>,
+    #[serde(default)]
+    pub up_token_id: String,
+    #[serde(default)]
+    pub down_token_id: String,
+    #[serde(default)]
+    pub chainlink_reference_fresh: bool,
+    #[serde(default)]
+    pub binance_spot_fresh: bool,
+    #[serde(default)]
+    pub binance_lob_fresh: bool,
+    #[serde(default)]
+    pub binance_agg_trade_fresh: bool,
     #[serde(default)]
     pub event_window_secs: i64,
     pub time_remaining_secs: i64,
@@ -367,6 +395,8 @@ pub struct AggregatedFactorMetric {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchLobSnapshot {
     pub symbol: String,
+    #[serde(default)]
+    pub source_ts: Option<DateTime<Utc>>,
     pub ts: DateTime<Utc>,
     pub obi: f64,
     pub obi_10: f64,
@@ -594,7 +624,7 @@ impl LobFlowAccumulator {
 
 /// Rolling accumulator for signed trade flow over a time window.
 struct TradeFlowAccumulator {
-    entries: VecDeque<(DateTime<Utc>, f64)>, // (ts, signed_qty)
+    entries: VecDeque<(DateTime<Utc>, DateTime<Utc>, f64)>, // (arrival, source, signed_qty)
     window_secs: f64,
 }
 
@@ -606,11 +636,11 @@ impl TradeFlowAccumulator {
         }
     }
 
-    fn push(&mut self, ts: DateTime<Utc>, signed_qty: f64) {
-        self.entries.push_back((ts, signed_qty));
+    fn push(&mut self, received_at: DateTime<Utc>, source_ts: DateTime<Utc>, signed_qty: f64) {
+        self.entries.push_back((received_at, source_ts, signed_qty));
         while self.entries.len() > 1 {
             let oldest = self.entries.front().unwrap().0;
-            if (ts - oldest).num_milliseconds() as f64 / 1000.0 > self.window_secs {
+            if (received_at - oldest).num_milliseconds() as f64 / 1000.0 > self.window_secs {
                 self.entries.pop_front();
             } else {
                 break;
@@ -619,7 +649,11 @@ impl TradeFlowAccumulator {
     }
 
     fn cum_imbalance(&self) -> f64 {
-        self.entries.iter().map(|e| e.1).sum()
+        self.entries.iter().map(|e| e.2).sum()
+    }
+
+    fn last_clocks(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.entries.back().map(|entry| (entry.1, entry.0))
     }
 }
 
@@ -845,7 +879,7 @@ pub async fn load_research_lob_snapshots(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<ResearchLobSnapshot>, sqlx::Error> {
-    load_research_lob_snapshots_sampled(pool, symbols, start, end, 5).await
+    load_research_lob_snapshots_sampled(pool, symbols, start, end, 5, 30).await
 }
 
 /// Loads LOB snapshots from `binance_lob_ticks`, keeping one tick per symbol per
@@ -864,9 +898,12 @@ pub async fn load_research_lob_snapshots_sampled(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     sample_every_secs: i32,
+    max_source_delay_secs: i64,
 ) -> Result<Vec<ResearchLobSnapshot>, sqlx::Error> {
     let sample_every_secs = sample_every_secs.max(1);
+    let max_source_delay_secs = max_source_delay_secs.max(0);
     let rows: Vec<(
+        DateTime<Utc>,
         DateTime<Utc>,
         String,
         rust_decimal::Decimal,
@@ -889,6 +926,7 @@ pub async fn load_research_lob_snapshots_sampled(
             ) AS bucket_start
         )
         SELECT
+            lob.received_at,
             lob.event_time,
             lob.symbol,
             COALESCE(lob.obi_5, 0) AS obi_5,
@@ -902,6 +940,7 @@ pub async fn load_research_lob_snapshots_sampled(
         FROM buckets
         JOIN LATERAL (
             SELECT
+                received_at,
                 event_time,
                 symbol,
                 obi_5,
@@ -916,17 +955,20 @@ pub async fn load_research_lob_snapshots_sampled(
             WHERE symbol = buckets.symbol
               AND event_time >= buckets.bucket_start
               AND event_time < buckets.bucket_start + ($4::text || ' seconds')::interval
-              AND event_time <= $3
+              AND received_at <= $3
+              AND received_at >= event_time
+              AND received_at - event_time <= ($5::text || ' seconds')::interval
             ORDER BY event_time DESC
             LIMIT 1
         ) AS lob ON true
-        ORDER BY lob.event_time
+        ORDER BY lob.received_at
         "#,
     )
     .bind(symbols)
     .bind(start)
     .bind(end)
     .bind(sample_every_secs)
+    .bind(max_source_delay_secs)
     .fetch_all(pool)
     .await?;
 
@@ -936,38 +978,53 @@ pub async fn load_research_lob_snapshots_sampled(
         sample_every_secs
     );
 
-    Ok(rows
-        .into_iter()
-        .map(
-            |(ts, symbol, obi_5, obi_10, spread_bps, best_bid, best_ask, mid_price, bids, asks)| {
-                let mid_price = mid_price.to_f64().unwrap_or(f64::NAN);
-                let (bid_depth_near, ask_depth_near) = depth_band(&bids, &asks, mid_price, 0.001);
-                let (bid_depth_far, ask_depth_far) = depth_band(&bids, &asks, mid_price, 0.005);
-                // Inner band: much tighter than near, so depth_acceleration
-                // (inner_ratio - near_ratio) has variance even when the book
-                // is very tight (e.g. BTC where all 20 levels sit within 0.007% of mid).
-                let (bid_depth_inner, ask_depth_inner) =
-                    depth_band(&bids, &asks, mid_price, 0.00003);
+    let mut latest_source_time = HashMap::<String, DateTime<Utc>>::new();
+    let mut snapshots = Vec::with_capacity(rows.len());
+    for (
+        received_at,
+        event_time,
+        symbol,
+        obi_5,
+        obi_10,
+        spread_bps,
+        best_bid,
+        best_ask,
+        mid_price,
+        bids,
+        asks,
+    ) in rows
+    {
+        if !accept_monotonic_source_time(&mut latest_source_time, &symbol, event_time) {
+            continue;
+        }
 
-                ResearchLobSnapshot {
-                    symbol,
-                    ts,
-                    obi: obi_5.to_f64().unwrap_or(0.0),
-                    obi_10: obi_10.to_f64().unwrap_or(0.0),
-                    spread_bps: spread_bps.to_f64().unwrap_or(0.0),
-                    best_bid: best_bid.to_f64().unwrap_or(f64::NAN),
-                    best_ask: best_ask.to_f64().unwrap_or(f64::NAN),
-                    mid_price,
-                    bid_depth_near,
-                    ask_depth_near,
-                    bid_depth_far,
-                    ask_depth_far,
-                    bid_depth_inner,
-                    ask_depth_inner,
-                }
-            },
-        )
-        .collect())
+        let mid_price = mid_price.to_f64().unwrap_or(f64::NAN);
+        let (bid_depth_near, ask_depth_near) = depth_band(&bids, &asks, mid_price, 0.001);
+        let (bid_depth_far, ask_depth_far) = depth_band(&bids, &asks, mid_price, 0.005);
+        // Inner band: much tighter than near, so depth_acceleration
+        // (inner_ratio - near_ratio) has variance even when the book
+        // is very tight (e.g. BTC where all 20 levels sit within 0.007% of mid).
+        let (bid_depth_inner, ask_depth_inner) = depth_band(&bids, &asks, mid_price, 0.00003);
+
+        snapshots.push(ResearchLobSnapshot {
+            symbol,
+            source_ts: Some(event_time),
+            ts: received_at,
+            obi: obi_5.to_f64().unwrap_or(0.0),
+            obi_10: obi_10.to_f64().unwrap_or(0.0),
+            spread_bps: spread_bps.to_f64().unwrap_or(0.0),
+            best_bid: best_bid.to_f64().unwrap_or(f64::NAN),
+            best_ask: best_ask.to_f64().unwrap_or(f64::NAN),
+            mid_price,
+            bid_depth_near,
+            ask_depth_near,
+            bid_depth_far,
+            ask_depth_far,
+            bid_depth_inner,
+            ask_depth_inner,
+        });
+    }
+    Ok(snapshots)
 }
 
 #[cfg(feature = "db")]
@@ -1085,6 +1142,19 @@ fn json_f64(value: &Value) -> Option<f64> {
     }
 }
 
+fn dual_clock_fresh(
+    decision_ts: DateTime<Utc>,
+    source_ts: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+    max_age_secs: i64,
+) -> bool {
+    let max_age_ms = max_age_secs.max(0).saturating_mul(1_000);
+    source_ts <= received_at
+        && received_at <= decision_ts
+        && (decision_ts - source_ts).num_milliseconds() <= max_age_ms
+        && (decision_ts - received_at).num_milliseconds() <= max_age_ms
+}
+
 pub fn build_factor_observations(
     updates: &[MarketUpdate],
     max_quote_age_secs: i64,
@@ -1097,7 +1167,13 @@ pub fn build_factor_observations_with_lob(
     lob_snapshots: &[ResearchLobSnapshot],
     max_quote_age_secs: i64,
 ) -> Vec<FactorObservation> {
-    build_factor_observations_with_lob_sampled(updates, lob_snapshots, max_quote_age_secs, 0)
+    build_factor_observations_with_lob_sampled_and_source_clocks(
+        updates,
+        lob_snapshots,
+        &[],
+        max_quote_age_secs,
+        0,
+    )
 }
 
 pub fn build_factor_observations_with_lob_sampled(
@@ -1106,7 +1182,46 @@ pub fn build_factor_observations_with_lob_sampled(
     max_quote_age_secs: i64,
     observation_sample_secs: i64,
 ) -> Vec<FactorObservation> {
+    build_factor_observations_with_lob_sampled_and_source_clocks(
+        updates,
+        lob_snapshots,
+        &[],
+        max_quote_age_secs,
+        observation_sample_secs,
+    )
+}
+
+pub fn build_factor_observations_with_lob_sampled_and_source_clocks(
+    updates: &[MarketUpdate],
+    lob_snapshots: &[ResearchLobSnapshot],
+    binance_source_clocks: &[BinanceSourceClock],
+    max_quote_age_secs: i64,
+    observation_sample_secs: i64,
+) -> Vec<FactorObservation> {
     let observation_sample_secs = observation_sample_secs.max(0);
+    let mut spot_source_clocks = HashMap::new();
+    let mut agg_trade_source_clocks = HashMap::new();
+    let mut lob_source_clocks = HashMap::new();
+    for clock in binance_source_clocks {
+        match clock.kind {
+            BinanceSourceKind::Spot => {
+                spot_source_clocks
+                    .insert((clock.symbol.clone(), clock.received_at), clock.source_ts);
+            }
+            BinanceSourceKind::AggTrade => {
+                if let Some(sequence_id) = clock.sequence_id {
+                    agg_trade_source_clocks.insert(
+                        (clock.symbol.clone(), clock.received_at, sequence_id),
+                        clock.source_ts,
+                    );
+                }
+            }
+            BinanceSourceKind::L2 => {
+                lob_source_clocks
+                    .insert((clock.symbol.clone(), clock.received_at), clock.source_ts);
+            }
+        }
+    }
     let mut final_outcomes: HashMap<String, bool> = HashMap::new();
     for update in updates {
         match update {
@@ -1129,7 +1244,7 @@ pub fn build_factor_observations_with_lob_sampled(
     let mut buf_30s: HashMap<String, DriftBuffer> = HashMap::new();
     let mut buf_10s: HashMap<String, DriftBuffer> = HashMap::new();
     let mut drift_state: HashMap<String, DriftState> = HashMap::new();
-    let mut spot: HashMap<String, (DateTime<Utc>, f64)> = HashMap::new();
+    let mut spot: HashMap<String, (DateTime<Utc>, DateTime<Utc>, f64)> = HashMap::new();
     let mut chainlink: HashMap<String, (DateTime<Utc>, DateTime<Utc>, f64)> = HashMap::new();
     let mut vol: HashMap<String, VolatilityState> = HashMap::new();
     let mut retbuf: HashMap<String, ReturnBuffer> = HashMap::new();
@@ -1137,6 +1252,7 @@ pub fn build_factor_observations_with_lob_sampled(
     let mut events_by_symbol: HashMap<String, Vec<String>> = HashMap::new();
     let mut quotes: HashMap<String, (DateTime<Utc>, f64, f64, f64, f64)> = HashMap::new();
     let mut lob: HashMap<String, LobState> = HashMap::new();
+    let mut lob_depth_clocks: HashMap<String, (DateTime<Utc>, DateTime<Utc>)> = HashMap::new();
     let mut lob_by_symbol: HashMap<String, Vec<&ResearchLobSnapshot>> = HashMap::new();
     let mut lob_flow: HashMap<String, LobFlowAccumulator> = HashMap::new();
     let mut trade_flow: HashMap<String, TradeFlowAccumulator> = HashMap::new();
@@ -1235,10 +1351,16 @@ pub fn build_factor_observations_with_lob_sampled(
                 spread_bps,
                 bid_depth_near,
                 ask_depth_near,
-                ..
+                ts,
             } => {
+                let symbol = symbol.to_string();
+                let source_ts = lob_source_clocks
+                    .get(&(symbol.clone(), *ts))
+                    .copied()
+                    .unwrap_or(*ts);
+                lob_depth_clocks.insert(symbol.clone(), (source_ts, *ts));
                 lob.insert(
-                    symbol.to_string(),
+                    symbol,
                     LobState {
                         obi: *obi,
                         spread_bps: *spread_bps as f64,
@@ -1323,6 +1445,10 @@ pub fn build_factor_observations_with_lob_sampled(
                 }
 
                 let sym = symbol.to_string();
+                let spot_source_ts = spot_source_clocks
+                    .get(&(sym.clone(), *ts))
+                    .copied()
+                    .unwrap_or(*ts);
                 buf_30s
                     .entry(sym.clone())
                     .or_insert_with(|| DriftBuffer::new(30.0))
@@ -1351,7 +1477,7 @@ pub fn build_factor_observations_with_lob_sampled(
                 dstate.prev_drift_30s = drift_30s;
                 dstate.post_flip_drift = drift_30s.abs();
 
-                if let Some((prev_ts, prev_price)) = spot.get(&sym).copied() {
+                if let Some((prev_ts, _, prev_price)) = spot.get(&sym).copied() {
                     let dt_secs = (*ts - prev_ts).num_milliseconds() as f64 / 1000.0;
                     if dt_secs > 0.0 && prev_price > 0.0 {
                         let log_return = (spot_price / prev_price).ln();
@@ -1371,7 +1497,7 @@ pub fn build_factor_observations_with_lob_sampled(
                             .push(log_return, dt_secs, spot_price);
                     }
                 }
-                spot.insert(sym.clone(), (*ts, spot_price));
+                spot.insert(sym.clone(), (*ts, spot_source_ts, spot_price));
                 candle_flow
                     .entry(sym.clone())
                     .or_insert_with(|| CandleFlowAccumulator::new(30, 16))
@@ -1424,6 +1550,10 @@ pub fn build_factor_observations_with_lob_sampled(
                                 obi_10: snapshot.obi_10,
                             },
                         );
+                        lob_depth_clocks.insert(
+                            sym.clone(),
+                            (snapshot.source_ts.unwrap_or(snapshot.ts), snapshot.ts),
+                        );
                     }
                 }
 
@@ -1447,8 +1577,16 @@ pub fn build_factor_observations_with_lob_sampled(
                             .chainlink_open_candidate
                             .map(|(_, candidate_price)| candidate_price)
                     });
-                    let Some(price_to_beat) = event.price_to_beat.or(chainlink_price_to_beat)
-                    else {
+                    // Five-minute settlement research fails closed without a
+                    // point-in-time Chainlink opening reference. Historical
+                    // event metadata may have been populated from Binance and
+                    // is permitted only for other legacy horizons.
+                    let price_to_beat = if event.window_secs == Some(300) {
+                        chainlink_price_to_beat
+                    } else {
+                        chainlink_price_to_beat.or(event.price_to_beat)
+                    };
+                    let Some(price_to_beat) = price_to_beat else {
                         continue;
                     };
                     let Some(end_time) = event.end_time else {
@@ -1658,11 +1796,32 @@ pub fn build_factor_observations_with_lob_sampled(
                         .get(&sym)
                         .map(CandleFlowAccumulator::features)
                         .unwrap_or_default();
+                    let binance_spot_fresh =
+                        dual_clock_fresh(*ts, spot_source_ts, *ts, max_quote_age_secs);
+                    let binance_lob_fresh =
+                        lob_depth_clocks
+                            .get(&sym)
+                            .is_some_and(|(source_ts, received_at)| {
+                                dual_clock_fresh(*ts, *source_ts, *received_at, max_quote_age_secs)
+                            });
+                    let binance_agg_trade_fresh = trade_flow
+                        .get(&sym)
+                        .and_then(TradeFlowAccumulator::last_clocks)
+                        .is_some_and(|(source_ts, received_at)| {
+                            dual_clock_fresh(*ts, source_ts, received_at, max_quote_age_secs)
+                        });
 
                     rows.push(FactorObservation {
                         event_id: event.event_id.clone(),
                         symbol: sym.clone(),
                         tick_ts: *ts,
+                        up_token_id: event.up_token.clone(),
+                        down_token_id: event.down_token.clone(),
+                        chainlink_reference_fresh: chainlink_prob_up.is_finite()
+                            && (0.0..=1.0).contains(&chainlink_prob_up),
+                        binance_spot_fresh,
+                        binance_lob_fresh,
+                        binance_agg_trade_fresh,
                         event_window_secs: event.window_secs.unwrap_or_default(),
                         time_remaining_secs: time_remaining,
                         signed_distance_to_beat: signed_distance,
@@ -1734,22 +1893,27 @@ pub fn build_factor_observations_with_lob_sampled(
             }
             MarketUpdate::AggTrade {
                 symbol,
+                agg_trade_id,
                 price,
                 quantity,
                 is_buyer_maker,
                 ts,
-                ..
             } => {
                 if let Some(qty) = quantity.to_f64() {
                     // buyer_maker=false → buyer aggressor (bullish); true → seller aggressor
                     let signed_qty = if *is_buyer_maker { -qty } else { qty };
+                    let symbol = symbol.to_string();
+                    let source_ts = agg_trade_source_clocks
+                        .get(&(symbol.clone(), *ts, *agg_trade_id))
+                        .copied()
+                        .unwrap_or(*ts);
                     trade_flow
-                        .entry(symbol.to_string())
+                        .entry(symbol.clone())
                         .or_insert_with(|| TradeFlowAccumulator::new(300.0))
-                        .push(*ts, signed_qty);
+                        .push(*ts, source_ts, signed_qty);
                     if let Some(price) = price.to_f64() {
                         candle_flow
-                            .entry(symbol.to_string())
+                            .entry(symbol)
                             .or_insert_with(|| CandleFlowAccumulator::new(30, 16))
                             .push_trade(*ts, price, qty, signed_qty);
                     }
@@ -2266,7 +2430,11 @@ fn estimate_probability(s0: f64, st: f64, sigma_horizon: f64) -> f64 {
     normal_cdf(z)
 }
 
-pub(crate) fn normalized_underlying_symbol(raw: &str) -> String {
+/// Normalize a venue symbol (for example `BTCUSDT`) to its base underlying.
+///
+/// Prediction research uses this single boundary helper when binding Binance
+/// context, Chainlink reference ticks, and Polymarket event symbols.
+pub fn normalized_underlying_symbol(raw: &str) -> String {
     let normalized = raw.trim().to_ascii_uppercase().replace(['/', '-', '_'], "");
     for quote in ["USDT", "USDC", "USD"] {
         if let Some(base) = normalized.strip_suffix(quote) {
@@ -2581,16 +2749,18 @@ pub fn export_observations_parquet(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_future_pm_labels, build_factor_observations_with_lob,
-        build_task_grain_derived_artifacts_for_event_ids, estimate_probability, pearson_ic,
-        spearman_ic, FactorObservation, LabelField, PM_BOOK_SAMPLED_QUERY,
+        accept_monotonic_source_time, attach_future_pm_labels, build_factor_observations_with_lob,
+        build_factor_observations_with_lob_sampled_and_source_clocks,
+        build_task_grain_derived_artifacts_for_event_ids, dual_clock_fresh, estimate_probability,
+        pearson_ic, spearman_ic, FactorObservation, LabelField, ResearchLobSnapshot,
+        PM_BOOK_SAMPLED_QUERY,
     };
-    use chrono::{TimeZone, Utc};
-    use ploy_market_contracts::MarketUpdate;
+    use chrono::{Duration, TimeZone, Utc};
+    use ploy_market_contracts::{BinanceSourceClock, BinanceSourceKind, MarketUpdate};
     use rust_decimal::Decimal;
     #[cfg(feature = "db")]
     use serde_json::json;
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     #[test]
     fn pm_book_sampler_uses_token_window_index_lookup() {
@@ -2612,6 +2782,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn binance_research_lob_replay_uses_arrival_time_without_losing_source_index() {
+        let source = include_str!("factors.rs");
+        let query = source
+            .split_once("pub async fn load_research_lob_snapshots_sampled")
+            .expect("research LOB loader")
+            .1
+            .split_once("pub async fn load_research_pm_book_snapshots_sampled")
+            .expect("research PM book loader")
+            .0;
+
+        assert!(query.contains("event_time >= buckets.bucket_start"));
+        assert!(query.contains("received_at <= $3"));
+        assert!(query.contains("received_at >= event_time"));
+        assert!(query.contains("received_at - event_time <= ($5::text || ' seconds')::interval"));
+        assert!(query.contains("lob.event_time"));
+        assert!(query.contains("ORDER BY lob.received_at"));
+    }
+
+    #[test]
+    fn binance_research_lob_replay_drops_bounded_out_of_order_source_rows() {
+        let base = Utc::now();
+        let mut latest = HashMap::new();
+
+        assert!(accept_monotonic_source_time(
+            &mut latest,
+            "BTCUSDT",
+            base + Duration::seconds(10)
+        ));
+        assert!(!accept_monotonic_source_time(&mut latest, "BTCUSDT", base));
+        assert!(accept_monotonic_source_time(
+            &mut latest,
+            "BTCUSDT",
+            base + Duration::seconds(10)
+        ));
+    }
+
     fn test_factor_observation(
         event_id: &str,
         symbol: &str,
@@ -2625,6 +2832,12 @@ mod tests {
             tick_ts: chrono::DateTime::from_timestamp(tick_ts_secs, 0)
                 .unwrap()
                 .with_timezone(&Utc),
+            up_token_id: String::new(),
+            down_token_id: String::new(),
+            chainlink_reference_fresh: false,
+            binance_spot_fresh: false,
+            binance_lob_fresh: false,
+            binance_agg_trade_fresh: false,
             event_window_secs: 300,
             time_remaining_secs: 60,
             signed_distance_to_beat: 0.0,
@@ -2795,6 +3008,18 @@ mod tests {
                 received_at: None,
                 ts: Utc.timestamp_opt(699, 0).unwrap(),
             },
+            // The governed 5m row still needs an arrival-timestamped
+            // pre-open Chainlink reference.
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+            },
             // A post-start tick alone is current-price evidence, not opening-strike
             // provenance, so it must not make the component available either.
             MarketUpdate::ReferencePrice {
@@ -2850,7 +3075,27 @@ mod tests {
         assert_eq!(rows[0].tick_ts, Utc.timestamp_opt(710, 0).unwrap());
         assert_eq!(rows[0].event_window_secs, 300);
         assert!(rows[0].tick_ts >= start);
-        assert!(rows[0].chainlink_prob_up.is_nan());
+        assert!(rows[0].chainlink_prob_up.is_finite());
+
+        let missing_chainlink_open = updates
+            .iter()
+            .filter(|update| {
+                !matches!(
+                    update,
+                    MarketUpdate::ReferencePrice {
+                        received_at: Some(_),
+                        ts,
+                        ..
+                    } if *ts < start
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let rows = build_factor_observations_with_lob(&missing_chainlink_open, &[], 30);
+        assert!(
+            rows.is_empty(),
+            "governed 5m rows must not fall back to a legacy metadata threshold"
+        );
     }
 
     #[test]
@@ -2930,7 +3175,9 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         let expected = estimate_probability(100.0, 100.01, rows[0].sigma_horizon);
+        let expected_model = estimate_probability(100.0, 102.0, rows[0].sigma_horizon);
         assert!((rows[0].chainlink_prob_up - expected).abs() < 1e-9);
+        assert!((rows[0].model_prob_up - expected_model).abs() < 1e-9);
         assert!(rows[0].model_prob_up > rows[0].chainlink_prob_up);
         assert!(rows[1].chainlink_prob_up.is_nan());
     }
@@ -3017,6 +3264,16 @@ mod tests {
                 price_to_beat: Some(Decimal::new(100, 0)),
                 resolved_up_won: None,
             },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
+            },
             MarketUpdate::Quote {
                 token_id: Arc::from("up"),
                 bid: Some(Decimal::new(45, 2)),
@@ -3070,6 +3327,16 @@ mod tests {
                 window_secs: 300,
                 price_to_beat: Some(Decimal::new(100, 0)),
                 resolved_up_won: None,
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(699, 0).unwrap()),
+                ts: Utc.timestamp_opt(699, 0).unwrap(),
             },
             MarketUpdate::Quote {
                 token_id: Arc::from("up"),
@@ -3135,6 +3402,24 @@ mod tests {
                 ask_levels: vec![],
                 ts: Utc.timestamp_opt(778, 0).unwrap(),
             },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(103, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(778, 0).unwrap()),
+                ts: Utc.timestamp_opt(778, 0).unwrap(),
+            },
+            MarketUpdate::L2Depth {
+                symbol: Arc::from("BTCUSDT"),
+                obi: 0.1,
+                spread_bps: 1,
+                bid_depth_near: 10.0,
+                ask_depth_near: 9.0,
+                ts: Utc.timestamp_opt(778, 0).unwrap(),
+            },
             MarketUpdate::SpotPrice {
                 symbol: Arc::from("BTCUSDT"),
                 price: Decimal::new(103, 0),
@@ -3169,6 +3454,126 @@ mod tests {
         assert!(last.cex_consecutive_up_bars >= 3.0);
         assert_eq!(last.cex_consecutive_down_bars, 0.0);
         assert!(last.cex_breakout_volume_score > 0.0);
+        assert_eq!(last.up_token_id, "up");
+        assert_eq!(last.down_token_id, "down");
+        assert!(last.chainlink_reference_fresh);
+        assert!(last.binance_spot_fresh);
+        assert!(last.binance_lob_fresh);
+        assert!(last.binance_agg_trade_fresh);
+    }
+
+    #[test]
+    fn dual_clock_fresh_requires_source_and_arrival_to_be_within_the_limit() {
+        let source = Utc.timestamp_opt(0, 0).unwrap();
+        let received_at = Utc.timestamp_opt(30, 0).unwrap();
+        let decision = Utc.timestamp_opt(60, 0).unwrap();
+
+        assert!(!dual_clock_fresh(decision, source, received_at, 30));
+        assert!(dual_clock_fresh(decision, received_at, received_at, 30));
+        assert!(!dual_clock_fresh(decision, decision, received_at, 30));
+    }
+
+    #[test]
+    fn factor_freshness_rejects_old_binance_source_despite_fresh_arrival() {
+        let source = Utc.timestamp_opt(0, 0).unwrap();
+        let received_at = Utc.timestamp_opt(30, 0).unwrap();
+        let decision = Utc.timestamp_opt(60, 0).unwrap();
+        let end = Utc.timestamp_opt(300, 0).unwrap();
+        let updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("evt"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 300,
+                price_to_beat: None,
+                resolved_up_won: None,
+            },
+            MarketUpdate::ReferencePrice {
+                symbol: Arc::from("btc/usd"),
+                source: Arc::from("chainlink"),
+                asset_class: Arc::from("crypto"),
+                price: Decimal::new(100, 0),
+                full_accuracy_value: None,
+                is_carried_forward: false,
+                received_at: Some(Utc.timestamp_opt(-1, 0).unwrap()),
+                ts: Utc.timestamp_opt(-1, 0).unwrap(),
+            },
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(49, 2)),
+                ask: Some(Decimal::new(51, 2)),
+                bid_size: Some(Decimal::new(10, 0)),
+                ask_size: Some(Decimal::new(10, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: received_at,
+            },
+            MarketUpdate::AggTrade {
+                symbol: Arc::from("BTCUSDT"),
+                agg_trade_id: 7,
+                price: Decimal::new(100, 0),
+                quantity: Decimal::new(1, 0),
+                is_buyer_maker: false,
+                ts: received_at,
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(101, 0),
+                ts: decision,
+            },
+            MarketUpdate::EventExpired {
+                event_id: Arc::from("evt"),
+                end_time: end,
+                resolved_up_won: Some(true),
+            },
+        ];
+        let lob_snapshots = vec![ResearchLobSnapshot {
+            symbol: "BTCUSDT".to_string(),
+            source_ts: Some(source),
+            ts: received_at,
+            obi: 0.1,
+            obi_10: 0.1,
+            spread_bps: 1.0,
+            best_bid: 100.0,
+            best_ask: 101.0,
+            mid_price: 100.5,
+            bid_depth_near: 10.0,
+            ask_depth_near: 9.0,
+            bid_depth_far: 20.0,
+            ask_depth_far: 18.0,
+            bid_depth_inner: 5.0,
+            ask_depth_inner: 4.0,
+        }];
+        let clocks = vec![
+            BinanceSourceClock {
+                kind: BinanceSourceKind::Spot,
+                symbol: "BTCUSDT".to_string(),
+                source_ts: received_at,
+                received_at: decision,
+                sequence_id: None,
+            },
+            BinanceSourceClock {
+                kind: BinanceSourceKind::AggTrade,
+                symbol: "BTCUSDT".to_string(),
+                source_ts: source,
+                received_at,
+                sequence_id: Some(7),
+            },
+        ];
+
+        let rows = build_factor_observations_with_lob_sampled_and_source_clocks(
+            &updates,
+            &lob_snapshots,
+            &clocks,
+            30,
+            0,
+        );
+        let row = rows.last().expect("observation row");
+        assert!(row.binance_spot_fresh);
+        assert!(!row.binance_lob_fresh);
+        assert!(!row.binance_agg_trade_fresh);
     }
 
     #[test]
@@ -3214,6 +3619,12 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts2,
+                    up_token_id: String::new(),
+                    down_token_id: String::new(),
+                    chainlink_reference_fresh: false,
+                    binance_spot_fresh: false,
+                    binance_lob_fresh: false,
+                    binance_agg_trade_fresh: false,
                     event_window_secs: 300,
                     time_remaining_secs: 10,
                     signed_distance_to_beat: 0.0,
@@ -3273,6 +3684,12 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts0,
+                    up_token_id: String::new(),
+                    down_token_id: String::new(),
+                    chainlink_reference_fresh: false,
+                    binance_spot_fresh: false,
+                    binance_lob_fresh: false,
+                    binance_agg_trade_fresh: false,
                     event_window_secs: 300,
                     time_remaining_secs: 90,
                     signed_distance_to_beat: 0.0,
@@ -3332,6 +3749,12 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts1,
+                    up_token_id: String::new(),
+                    down_token_id: String::new(),
+                    chainlink_reference_fresh: false,
+                    binance_spot_fresh: false,
+                    binance_lob_fresh: false,
+                    binance_agg_trade_fresh: false,
                     event_window_secs: 300,
                     time_remaining_secs: 50,
                     signed_distance_to_beat: 0.0,

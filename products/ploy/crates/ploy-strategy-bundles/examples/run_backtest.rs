@@ -455,6 +455,7 @@ fn main() {
                 include_l2: true,
                 lob_sample_secs: 30,
                 spot_sample_secs: 1,
+                max_source_delay_secs: 30,
             };
             (strategy_variant, config.strategy, sim, rt, backtest_options)
         } else {

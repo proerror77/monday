@@ -523,7 +523,7 @@ prior draft using only the existing allowed mutation types. It still cannot
 guarantee profitability and cannot bypass walk-forward, promotion, replay
 parity, dry-run, or live approval gates.
 
-## Real LLM Expansion
+## Rust Prediction LoopRun and Optional LLM Expansion
 
 The optional LLM turn is mission-driven and remains off by default. Its first
 turn requires a reviewed `prediction_research_mission.v1` JSON; later turns may
@@ -534,10 +534,11 @@ to the immutable snapshot manifest's `snapshot_contract_hash`, then verify the
 brief and implementation IDs before running one manual proposal:
 
 ```bash
-python3 scripts/prediction_research_loop.py \
+cargo run -p ploy-research --example prediction_research_loop -- \
   --print-brief-snapshot-id \
   config/research_missions/polymarket-btc-5m.json
-python3 scripts/prediction_research_loop.py --print-policy-snapshot-id
+cargo run -p ploy-research --example prediction_research_loop -- \
+  --print-policy-snapshot-id
 ```
 
 The printed values must equal `prompt_snapshot_id` and
@@ -554,11 +555,15 @@ python3 scripts/alpha_search_llm_propose.py \
   --output-prior-json /tmp/next-llm-prior.json
 ```
 
+That Python command is a standalone compatibility helper for a manually
+reviewed proposal. It does not own LoopRun state, evaluation, promotion, or
+execution authority. The governed BTC/SOL loop below is Rust-only.
+
 The mission LoopRun driver is the normal BTC/SOL research entrypoint once the
 immutable research snapshot exists:
 
 ```bash
-python3 scripts/prediction_research_loop.py \
+cargo run -p ploy-research --example prediction_research_loop -- \
   config/research_missions/polymarket-btc-5m.json \
   /var/lib/ploy/research-snapshots/btc-5m \
   /var/lib/ploy/research-runs/btc-5m-loop-001
@@ -567,14 +572,14 @@ python3 scripts/prediction_research_loop.py \
 The driver runs a deterministic baseline, proposes a typed batch, invokes the
 same Rust evaluator, ingests candidate feedback, and repeats until a candidate
 is kept, a budget is exhausted, or an explicit failure pauses the run. Rerun
-the same command only after a `paused` result. `completed`, `stopped`, and
-`failed` are immutable terminal ledgers; continuing one of those requires a new
+the same command only after a `paused` result. `kept`, `budget_exhausted`, and
+`failed` are immutable terminal ledgers; extending one of those requires a new
 reviewed mission revision and a new output directory. Evaluator failures reuse
 the already persisted prior without another LLM call. Every LLM attempt is
 retained in an append-only call ledger, including schema rejection, provider
-failure, a response missing after process interruption, and a response that
-arrived after the time budget. A durably persisted response is replayed after a
-crash before any new provider call or call-budget check.
+failure, and a response missing after process interruption. A durably persisted
+response is replayed after a crash before any new provider call or call-budget
+check.
 
 The output directory is exclusively locked while the LoopRun owns it. Reusing
 it for SOL, another mission revision, another snapshot, or another policy
@@ -582,8 +587,8 @@ implementation is rejected. The prediction LoopRun requires `mutable_scope` to
 contain only `probability_blend_weights`; formula/IC diagnostics remain a
 separate standalone research lane.
 
-Governed five-minute missions pass `--event-window-secs 300` at both the Python
-driver and Rust evaluator boundaries. They require observations whose persisted
+Governed five-minute missions enforce `event_window_secs=300` at both the Rust
+LoopRun and evaluator boundaries. They require observations whose persisted
 `event_window_secs` is exactly `300`, plus a verified
 `snapshot_contract_hash` that binds the complete evaluator manifest and input
 artifacts. Legacy snapshots default that field to zero and do not have the
@@ -591,22 +596,23 @@ strong contract hash, so they must be regenerated before this LoopRun can use
 them. Rebuilding the snapshot does not imply recollecting an already retained
 raw source, but it does require producing a new immutable evaluator artifact.
 
-The call requires `PLOY_RESEARCH_LLM_API_KEY`; provider and model remain
-selectable through the existing environment variables. Missing mission
+The Rust client requires `PLOY_RESEARCH_LLM_BASE_URL` and
+`PLOY_RESEARCH_LLM_MODEL`. `PLOY_RESEARCH_LLM_API_KEY` is optional for a
+loopback Grok Builder and should be set for an authenticated remote HTTPS
+endpoint; `PLOY_RESEARCH_LLM_PROVIDER` labels the durable call record. Missing mission
 authority, unresolved provenance placeholders, a target/horizon mismatch, a
 provider failure, or an invalid response fails soft and leaves the deterministic
 prior unchanged.
 
 The model sees the mission objective, hypothesis scope, registered probability
-components, available base-factor names, and at most eight qualitative
+components, and at most eight qualitative
 `keep`/`discard` outcomes. It does not receive raw labels, evaluator thresholds,
 or numeric evaluation metrics. Output is limited by `mutable_scope`:
 
-- `factor_formula` / `factor_ast` allows an existing typed `LlmMutationSpec`
-  with a falsifiable hypothesis, which remains an IC/ICIR diagnostic in
-  AutoFactor.
 - `probability_blend_weights` allows a named non-negative logit blend over the
-  four registered probability components. These candidates enter the real
+  five registered probability components: Polymarket midpoint, Chainlink
+  digital probability, Binance distance/LOB/volatility, event surface, and the
+  existing Binance log-moneyness model. These candidates enter the real
   event-disjoint probability evaluator as `q_llm_<name>` and are scored with
   Brier score, log loss, calibration error, executable settlement PnL, and
   conservative-depth capacity evidence.
@@ -618,7 +624,7 @@ next LLM turn; evaluator metrics and thresholds are withheld. This closes the
 proposal/evaluation/feedback loop without giving the model evaluator or
 execution authority.
 
-When the provider returns usage data, the script writes
+When the standalone Python compatibility helper receives provider usage, it writes
 `llm-expansion-usage.json` next to `next-llm-prior.json` in the alpha-search
 artifact directory. Treat that as per-run token accounting, not promotion
 evidence.

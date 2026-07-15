@@ -22,12 +22,37 @@ Monday intentionally keeps two evaluation frameworks because the labels, samplin
 
 The lanes share repository governance, evidence provenance requirements, and the Monday execution-authority boundary. They do not share labels, fold construction, evaluator thresholds, or a Cargo graph. In particular, IC/ICIR may be diagnostic for a prediction-market feature, but it is not a prediction-market promotion gate; prediction rows must not be routed through the derivatives `FormulaEvaluator`.
 
+The prediction-market lane also keeps data authority explicit:
+
+- Chainlink provides the point-in-time opening reference and the contract's
+  expiry-price semantics. Polymarket's official resolved outcome, materialized
+  in `pm_token_settlements`, is the binary evaluation label.
+- Binance spot, aggTrade, and L2 data are external predictive and repricing
+  inputs only. They must never replace the opening reference, settlement oracle,
+  or Polymarket execution price.
+- Polymarket CLOB quotes and full depth provide market-implied probability,
+  executable entry price, fees, fillability, and capacity evidence.
+
+The governed snapshot keeps Binance availability semantics separate from source
+time. Spot and L2 are bucket-selected by exchange time but replayed at
+`received_at`; aggTrade rows are aggregated inside each five-second source-time
+bucket by aggressor side, preserving buy/sell gross flow, and replayed only at
+the latest contributing `received_at`. Rows with reversed clocks, excessive
+source-to-arrival delay, or per-symbol source-time rollback are rejected, and
+every prediction-evaluator observation must retain fresh spot, aggTrade, and L2
+authority flags. At each decision timestamp, both `decision - source_ts` and
+`decision - received_at` must fit the mission age bound; a fresh arrival cannot
+mask an old exchange observation. The retained raw feed remains the audit
+source; the aggregate is the bounded research view.
+
 LLM proposal paths remain lane-specific as well. `alpha-harness` has a bounded,
 lab-only Formula proposer for derivatives missions. PLOY uses the versioned
 `prediction_research_mission.v1` JSON brief and its existing `LlmPriorSpec`; it
 does not import the alpha-harness Rust domain or loop runtime. Instead, PLOY has
-its own bounded prediction-research LoopRun driver because an event settlement
-loop cannot reuse the derivatives return/IC state machine. Standalone formula
+its own bounded Rust prediction-research LoopRun in `crates/ploy-research`, with
+`prediction_research_loop` as its CLI example, because an event settlement loop
+cannot reuse the derivatives return/IC state machine. No Python script is an
+authoritative prediction LoopRun or promotion surface. Standalone formula
 mutations may carry a falsifiable hypothesis and compile through AutoFactor as
 IC/ICIR diagnostics, but the prediction LoopRun accepts only typed
 probability-blend candidates. Those candidates enter PLOY's
@@ -96,7 +121,9 @@ The original `.github`, `deployment`, and `infra` trees remain under `products/p
 - Python remains only where behavior has not yet earned Rust parity: the legacy ML
   workspace, the Python LOB archiver during Rust shadow comparison, and imported
   PLOY research/compatibility utilities. Root CI may compile or fixture-test those
-  files, but it does not make the nested PLOY deployment workflows active.
+  files, but they do not own prediction LoopRun state, evaluator evidence, or
+  promotion decisions, and root CI does not make the nested PLOY deployment
+  workflows active.
 - Shell remains for host bootstrap, CI command composition, and package installation;
   no shell script owns trading decisions, risk, OMS, or exchange mutations.
 - The Rust sidecar is built and tested but has no approved deployment package. Its

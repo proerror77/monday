@@ -80,6 +80,7 @@ async fn run_backtest(
         include_l2: true,
         lob_sample_secs: 30,
         spot_sample_secs: 1,
+        max_source_delay_secs: 30,
     };
 
     let updates =

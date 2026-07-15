@@ -13,6 +13,9 @@ pub mod factors_v2;
 #[cfg(any(feature = "ml", feature = "rl"))]
 pub mod model;
 pub mod orderbook;
+pub mod prediction_llm;
+pub mod prediction_loop;
+mod prediction_loop_fs;
 pub mod replay;
 pub mod research_os;
 pub mod research_snapshot;
@@ -52,9 +55,10 @@ pub use event_ml::{
 };
 pub use factors::{
     aggregate_factor_metrics, build_event_summaries, build_factor_observations,
-    build_factor_observations_with_lob, build_factor_observations_with_lob_sampled, factor_metrics,
-    AggregatedFactorMetric, EventFactorSummary, FactorMetric, FactorObservation,
-    ResearchLobSnapshot, ResearchPmBookLevel, ResearchPmBookSnapshot,
+    build_factor_observations_with_lob, build_factor_observations_with_lob_sampled,
+    build_factor_observations_with_lob_sampled_and_source_clocks, factor_metrics,
+    normalized_underlying_symbol, AggregatedFactorMetric, EventFactorSummary, FactorMetric,
+    FactorObservation, ResearchLobSnapshot, ResearchPmBookLevel, ResearchPmBookSnapshot,
 };
 #[cfg(feature = "polars-export")]
 pub use factors::{export_observations_parquet, observations_to_frame};

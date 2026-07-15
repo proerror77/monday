@@ -5,6 +5,7 @@
 //! scores executable PnL after PM CLOB fillability.
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
 use ploy_research::{
     autofactor_matrix_from_v2, build_factor_observations_v2_with_deribit_and_pm_books,
     build_factor_stability_report, build_full_depth_execution_matrix,
@@ -70,6 +71,34 @@ fn validate_prediction_snapshot_contract_id(
         return Err(format!(
             "prediction research prior data_snapshot_id {prior_snapshot_id} does not match loaded snapshot_contract_hash {snapshot_contract_hash}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_expected_prediction_policy(
+    expected: Option<&str>,
+    governed_prior: Option<&LlmPriorSpec>,
+) -> Result<(), String> {
+    let expected = match (expected, governed_prior.is_some()) {
+        (Some(expected), _) => expected,
+        (None, true) => {
+            return Err(
+                "governed prediction evaluation requires --expected-search-policy-snapshot-id"
+                    .to_string(),
+            )
+        }
+        (None, false) => return Ok(()),
+    };
+    let current = current_prediction_policy_snapshot_id();
+    if expected != current {
+        return Err(format!(
+            "expected prediction policy {expected} does not match current evaluator policy {current}"
+        ));
+    }
+    if governed_prior
+        .is_some_and(|prior| prior.search_policy_snapshot_id.as_deref() != Some(expected))
+    {
+        return Err("governed prior policy differs from current evaluator policy".to_string());
     }
     Ok(())
 }
@@ -191,7 +220,11 @@ fn replay_parity_evidence(path: &str) -> (bool, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{replay_parity_evidence, validate_prediction_snapshot_contract_id};
+    use super::{
+        replay_parity_evidence, validate_expected_prediction_policy,
+        validate_prediction_snapshot_contract_id,
+    };
+    use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
     use std::fs;
 
     fn write_parity_fixture(name: &str, payload: &str) -> String {
@@ -202,6 +235,17 @@ mod tests {
         ));
         fs::write(&path, payload).expect("write parity fixture");
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn governed_prediction_policy_must_match_the_current_evaluator() {
+        let current = current_prediction_policy_snapshot_id();
+        validate_expected_prediction_policy(Some(&current), None).expect("current baseline policy");
+        assert!(
+            validate_expected_prediction_policy(Some("sha256:stale"), None)
+                .expect_err("stale controller policy must fail")
+                .contains("does not match")
+        );
     }
 
     #[test]
@@ -450,6 +494,7 @@ async fn main() {
         top_quantile: flag_value(&args, "--top-quantile")
             .and_then(|raw| raw.parse().ok())
             .unwrap_or(0.2),
+        max_quote_age_secs,
     };
     let options = FactorWalkForwardOptions {
         review,
@@ -502,10 +547,16 @@ async fn main() {
     let alpha_search_output_dir = flag_value(&args, "--alpha-search-output-dir");
     let alpha_search_plan_json = flag_value(&args, "--alpha-search-plan-json");
     let alpha_search_llm_prior_json = flag_value(&args, "--alpha-search-llm-prior-json");
+    let expected_prediction_policy = flag_value(&args, "--expected-search-policy-snapshot-id");
     let llm_prior = alpha_search_llm_prior_json.as_deref().map(read_llm_prior);
     let governed_prediction_prior = llm_prior
         .as_ref()
         .filter(|prior| prior.mission_id.is_some() || !prior.probability_blends.is_empty());
+    validate_expected_prediction_policy(
+        expected_prediction_policy.as_deref(),
+        governed_prediction_prior,
+    )
+    .unwrap_or_else(|reason| panic!("prediction evaluator policy mismatch: {reason}"));
     if let Some(prior) = governed_prediction_prior {
         validate_prediction_research_prior(prior)
             .unwrap_or_else(|reason| panic!("prediction research prior is not governed: {reason}"));
@@ -717,6 +768,7 @@ async fn main() {
         &all_pm_book_snapshots,
         FullDepthExecutionMatrixOptions {
             min_bucket_observations: options.review.min_observations.max(20),
+            max_quote_age_secs,
             ..Default::default()
         },
     );
@@ -731,6 +783,7 @@ async fn main() {
             visible_depth_haircut: 0.5,
             max_levels: Some(3),
             min_bucket_observations: options.review.min_observations.max(20),
+            max_quote_age_secs,
             ..Default::default()
         },
     );

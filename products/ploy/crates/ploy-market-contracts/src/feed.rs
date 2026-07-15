@@ -1,6 +1,27 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::MarketUpdate;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinanceSourceKind {
+    Spot,
+    AggTrade,
+    L2,
+}
+
+/// Exchange/source time paired with the time a historical row became visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinanceSourceClock {
+    pub kind: BinanceSourceKind,
+    pub symbol: String,
+    pub source_ts: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_id: Option<u64>,
+}
 
 /// Additive historical-loader flags for non-crypto datasets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +43,8 @@ pub struct HistoricalLoadOptions {
     /// Factor review jobs use coarser observation buckets and should not load
     /// every `sync_records` tick into memory. Defaults to 1 second.
     pub spot_sample_secs: u32,
+    /// Reject captured CEX rows whose arrival lags exchange time by more than N seconds.
+    pub max_source_delay_secs: u32,
 }
 
 impl Default for HistoricalLoadOptions {
@@ -34,6 +57,7 @@ impl Default for HistoricalLoadOptions {
             include_l2: true,
             lob_sample_secs: 30,
             spot_sample_secs: 1,
+            max_source_delay_secs: 30,
         }
     }
 }

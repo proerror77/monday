@@ -96,6 +96,7 @@ pub struct FactorReviewOptions {
     pub stake_usd: f64,
     pub min_observations: usize,
     pub top_quantile: f64,
+    pub max_quote_age_secs: i64,
 }
 
 impl Default for FactorReviewOptions {
@@ -104,6 +105,7 @@ impl Default for FactorReviewOptions {
             stake_usd: DEFAULT_STAKE_USD,
             min_observations: 20,
             top_quantile: DEFAULT_TOP_QUANTILE,
+            max_quote_age_secs: PM_BOOK_MAX_AGE_SECS,
         }
     }
 }
@@ -130,6 +132,8 @@ pub struct FactorObservationV2 {
     pub time_remaining_secs: i64,
     pub regime: Regime,
     pub side: ReviewSide,
+    #[serde(default)]
+    pub pm_token_id: String,
 
     pub side_model_prob: f64,
     #[serde(default = "nan_f64")]
@@ -329,6 +333,7 @@ pub struct FullDepthExecutionMatrixOptions {
     pub visible_depth_haircut: f64,
     pub max_levels: Option<usize>,
     pub min_bucket_observations: usize,
+    pub max_quote_age_secs: i64,
 }
 
 impl Default for FullDepthExecutionMatrixOptions {
@@ -338,6 +343,7 @@ impl Default for FullDepthExecutionMatrixOptions {
             visible_depth_haircut: 1.0,
             max_levels: None,
             min_bucket_observations: 20,
+            max_quote_age_secs: PM_BOOK_MAX_AGE_SECS,
         }
     }
 }
@@ -566,7 +572,7 @@ pub struct SettlementProbabilityWalkForwardReport {
     pub aggregates: Vec<SettlementProbabilityWalkForwardAggregate>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PredictionResearchCandidateFeedback {
     pub model: String,
     pub hypothesis: String,
@@ -576,7 +582,7 @@ pub struct PredictionResearchCandidateFeedback {
     pub metrics: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PredictionResearchFeedback {
     pub schema_version: String,
     pub mission_id: String,
@@ -1424,12 +1430,31 @@ pub fn build_factor_observations_v2_with_deribit_and_pm_books(
     let book_index = build_pm_book_index(pm_books);
     let mut out = Vec::with_capacity(rows.len() * 2);
     for row in rows {
-        let up_book = latest_pm_book(&book_index, &row.event_id, ReviewSide::Up, row.tick_ts);
-        let down_book = latest_pm_book(&book_index, &row.event_id, ReviewSide::Down, row.tick_ts);
+        let up_book = latest_pm_book(
+            &book_index,
+            &row.event_id,
+            &row.up_token_id,
+            ReviewSide::Up,
+            row.tick_ts,
+            options.max_quote_age_secs,
+        );
+        let down_book = latest_pm_book(
+            &book_index,
+            &row.event_id,
+            &row.down_token_id,
+            ReviewSide::Down,
+            row.tick_ts,
+            options.max_quote_age_secs,
+        );
         out.push(side_row(row, ReviewSide::Up, stake_usd, up_book));
         out.push(side_row(row, ReviewSide::Down, stake_usd, down_book));
     }
-    enrich_rolling_features(&mut out, deribit, Some(&book_index));
+    enrich_rolling_features(
+        &mut out,
+        deribit,
+        Some(&book_index),
+        options.max_quote_age_secs,
+    );
     out
 }
 
@@ -3539,6 +3564,30 @@ pub fn build_prediction_research_feedback(
         .iter()
         .map(|aggregate| (aggregate.model.as_str(), aggregate))
         .collect::<BTreeMap<_, _>>();
+    let baseline_aggregates = report
+        .aggregates
+        .iter()
+        .filter(|aggregate| {
+            aggregate.windows > 0
+                && !aggregate.model.starts_with("q_llm_")
+                && aggregate.model != "q_naive_50_50"
+        })
+        .collect::<Vec<_>>();
+    let best_baseline_brier = finite_min(
+        baseline_aggregates
+            .iter()
+            .map(|aggregate| aggregate.avg_test_brier_score),
+    );
+    let best_baseline_log_loss = finite_min(
+        baseline_aggregates
+            .iter()
+            .map(|aggregate| aggregate.avg_test_log_loss),
+    );
+    let best_baseline_conservative_pnl = finite_max(
+        baseline_aggregates
+            .iter()
+            .map(|aggregate| aggregate.avg_test_top_edge_avg_conservative_settlement_pnl),
+    );
     let min_ratio = min_positive_window_ratio.clamp(0.0, 1.0);
     let candidates = allowed_models
         .into_iter()
@@ -3587,6 +3636,25 @@ pub fn build_prediction_research_feedback(
                 reason_codes
                     .push("incomplete_oos_top_edge_conservative_capacity_coverage".to_string());
             }
+            if !best_baseline_brier.is_finite()
+                || !best_baseline_log_loss.is_finite()
+                || !best_baseline_conservative_pnl.is_finite()
+            {
+                reason_codes.push("missing_baseline_comparison".to_string());
+            } else {
+                if aggregate.avg_test_brier_score >= best_baseline_brier - 1e-9 {
+                    reason_codes.push("no_incremental_brier_vs_baseline".to_string());
+                }
+                if aggregate.avg_test_log_loss >= best_baseline_log_loss - 1e-9 {
+                    reason_codes.push("no_incremental_log_loss_vs_baseline".to_string());
+                }
+                if aggregate.avg_test_top_edge_avg_conservative_settlement_pnl
+                    <= best_baseline_conservative_pnl + 1e-9
+                {
+                    reason_codes
+                        .push("no_incremental_conservative_pnl_vs_baseline".to_string());
+                }
+            }
             PredictionResearchCandidateFeedback {
                 model,
                 hypothesis,
@@ -3609,6 +3677,9 @@ pub fn build_prediction_research_feedback(
                     "avg_test_top_edge_avg_conservative_settlement_pnl": aggregate.avg_test_top_edge_avg_conservative_settlement_pnl,
                     "min_test_top_edge_avg_conservative_settlement_pnl": aggregate.min_test_top_edge_avg_conservative_settlement_pnl,
                     "min_top_edge_conservative_coverage_rate": aggregate.min_top_edge_conservative_coverage_rate,
+                    "best_baseline_brier_score": best_baseline_brier.is_finite().then_some(best_baseline_brier),
+                    "best_baseline_log_loss": best_baseline_log_loss.is_finite().then_some(best_baseline_log_loss),
+                    "best_baseline_avg_conservative_settlement_pnl": best_baseline_conservative_pnl.is_finite().then_some(best_baseline_conservative_pnl),
                 }),
             }
         })
@@ -7489,7 +7560,7 @@ fn review_one_factor(
     })
 }
 
-type PmBookIndex<'a> = HashMap<(String, String), Vec<&'a ResearchPmBookSnapshot>>;
+type PmBookIndex<'a> = HashMap<(String, String, String), Vec<&'a ResearchPmBookSnapshot>>;
 
 #[derive(Debug, Clone, Copy)]
 struct SweepFill {
@@ -7522,7 +7593,11 @@ fn build_pm_book_index(pm_books: &[ResearchPmBookSnapshot]) -> PmBookIndex<'_> {
     let mut index: PmBookIndex<'_> = HashMap::new();
     for book in pm_books {
         index
-            .entry((book.event_id.clone(), book.side.to_ascii_uppercase()))
+            .entry((
+                book.event_id.clone(),
+                book.side.to_ascii_uppercase(),
+                book.token_id.clone(),
+            ))
             .or_default()
             .push(book);
     }
@@ -7535,15 +7610,29 @@ fn build_pm_book_index(pm_books: &[ResearchPmBookSnapshot]) -> PmBookIndex<'_> {
 fn latest_pm_book<'a>(
     index: &'a PmBookIndex<'a>,
     event_id: &str,
+    token_id: &str,
     side: ReviewSide,
     tick_ts: DateTime<Utc>,
+    max_age_secs: i64,
 ) -> Option<&'a ResearchPmBookSnapshot> {
-    let key = (event_id.to_string(), book_side_key(side).to_string());
+    let key = (
+        event_id.to_string(),
+        book_side_key(side).to_string(),
+        token_id.to_string(),
+    );
     let books = index.get(&key)?;
     let pos = books.partition_point(|book| book.ts <= tick_ts);
     let book = *books.get(pos.checked_sub(1)?)?;
-    let age_secs = (tick_ts - book.ts).num_seconds();
-    (age_secs >= 0 && age_secs <= PM_BOOK_MAX_AGE_SECS).then_some(book)
+    let age_millis = (tick_ts - book.ts).num_milliseconds();
+    let max_age_millis = max_age_secs.max(0).saturating_mul(1_000);
+    (age_millis >= 0 && age_millis <= max_age_millis).then_some(book)
+}
+
+fn side_token_id(row: &FactorObservation, side: ReviewSide) -> &str {
+    match side {
+        ReviewSide::Up => &row.up_token_id,
+        ReviewSide::Down => &row.down_token_id,
+    }
 }
 
 fn book_side_key(side: ReviewSide) -> &'static str {
@@ -7729,7 +7818,14 @@ pub fn build_full_depth_execution_matrix(
             } else {
                 f64::NAN
             };
-            let current_book = latest_pm_book(&book_index, &source.event_id, side, source.tick_ts);
+            let current_book = latest_pm_book(
+                &book_index,
+                &source.event_id,
+                side_token_id(source, side),
+                side,
+                source.tick_ts,
+                options.max_quote_age_secs,
+            );
             let quote_age_secs = current_book
                 .map(|book| (source.tick_ts - book.ts).num_milliseconds() as f64 / 1000.0)
                 .unwrap_or(f64::NAN);
@@ -7872,17 +7968,24 @@ fn build_full_depth_execution_sample(
             continue;
         };
         let (_, future_bid, _) = side_market_values(future, side);
-        let exit_sweep = latest_pm_book(book_index, &future.event_id, side, future.tick_ts)
-            .map(|book| {
-                sweep_sell_shares_with_config(
-                    &book.bids,
-                    future_bid,
-                    entry_sweep.shares,
-                    options.visible_depth_haircut,
-                    options.max_levels,
-                )
-            })
-            .unwrap_or_default();
+        let exit_sweep = latest_pm_book(
+            book_index,
+            &future.event_id,
+            side_token_id(future, side),
+            side,
+            future.tick_ts,
+            options.max_quote_age_secs,
+        )
+        .map(|book| {
+            sweep_sell_shares_with_config(
+                &book.bids,
+                future_bid,
+                entry_sweep.shares,
+                options.visible_depth_haircut,
+                options.max_levels,
+            )
+        })
+        .unwrap_or_default();
         let reprice_pnl = exit_sweep.fillable.then_some(
             exit_sweep.shares * exit_sweep.avg_price - stake_usd - entry_fee - exit_sweep.fee_usd,
         );
@@ -8344,7 +8447,7 @@ fn probability_blend_schema_valid(blend: &LlmProbabilityBlendSpec) -> bool {
     !blend.name.is_empty()
         && blend.name.len() <= 80
         && !blend.hypothesis.trim().is_empty()
-        && blend.hypothesis.len() <= 500
+        && blend.hypothesis.chars().count() <= 500
         && blend
             .name
             .chars()
@@ -9298,6 +9401,7 @@ fn side_row(
         time_remaining_secs: row.time_remaining_secs,
         regime: Regime::from_secs(row.time_remaining_secs),
         side,
+        pm_token_id: side_token_id(row, side).to_string(),
         side_model_prob,
         side_chainlink_prob,
         side_fair_prob,
@@ -9435,6 +9539,7 @@ fn enrich_rolling_features(
     rows: &mut [FactorObservationV2],
     deribit: &[DeribitFeatureSnapshot],
     pm_book_index: Option<&PmBookIndex<'_>>,
+    max_quote_age_secs: i64,
 ) {
     rows.sort_by_key(|row| {
         (
@@ -9528,7 +9633,14 @@ fn enrich_rolling_features(
                 ) {
                     let future = rows[future_idx].clone();
                     let future_book = pm_book_index.and_then(|index| {
-                        latest_pm_book(index, &future.event_id, future.side, future.tick_ts)
+                        latest_pm_book(
+                            index,
+                            &future.event_id,
+                            &future.pm_token_id,
+                            future.side,
+                            future.tick_ts,
+                            max_quote_age_secs,
+                        )
                     });
                     set_future_exit_labels(rows, idx, &future, future_book, horizon_secs);
                 }
@@ -10346,6 +10458,12 @@ mod tests {
             event_id: "evt".into(),
             symbol: "BTCUSDT".into(),
             tick_ts: Utc::now(),
+            up_token_id: "up-token".into(),
+            down_token_id: "down-token".into(),
+            chainlink_reference_fresh: false,
+            binance_spot_fresh: false,
+            binance_lob_fresh: false,
+            binance_agg_trade_fresh: false,
             event_window_secs: 300,
             time_remaining_secs: 220,
             signed_distance_to_beat: 0.01,
@@ -11180,6 +11298,65 @@ mod tests {
     }
 
     #[test]
+    fn prediction_feedback_requires_incremental_value_over_existing_baselines() {
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "polymarket-btc-5m-v1",
+            "data_snapshot_id": "sha256:btc-data",
+            "prompt_snapshot_id": "sha256:btc-prompt",
+            "search_policy_snapshot_id": "prediction-probability-blend-v1",
+            "symbols": ["BTC"],
+            "horizon": "5m",
+            "probability_blends": [{
+                "name": "binance_incremental",
+                "hypothesis": "Binance flow adds incremental OOS value.",
+                "market_midpoint_weight": 0.5,
+                "chainlink_digital_weight": 0.2,
+                "distance_lob_vol_weight": 0.3,
+                "event_surface_weight": 0.0,
+                "existing_model_weight": 0.0
+            }]
+        }))
+        .expect("typed prior");
+        let aggregate = |model: &str, brier: f64, log_loss: f64, conservative_pnl: f64| {
+            SettlementProbabilityWalkForwardAggregate {
+                model: model.to_string(),
+                windows: 3,
+                positive_window_ratio: 1.0,
+                pass_window_ratio: 1.0,
+                avg_test_brier_score: brier,
+                avg_test_log_loss: log_loss,
+                avg_test_expected_calibration_error: 0.05,
+                avg_test_top_edge_avg_full_depth_settlement_pnl: conservative_pnl + 0.5,
+                min_test_top_edge_avg_full_depth_settlement_pnl: 0.5,
+                avg_test_top_edge_avg_conservative_settlement_pnl: conservative_pnl,
+                min_test_top_edge_avg_conservative_settlement_pnl: 0.25,
+                min_top_edge_conservative_coverage_rate: 1.0,
+            }
+        };
+        let mut report = SettlementProbabilityWalkForwardReport {
+            options: SettlementProbabilityWalkForwardOptions::default(),
+            windows: Vec::new(),
+            aggregates: vec![
+                aggregate("q_market_midpoint", 0.18, 0.45, 1.6),
+                aggregate("q_llm_binance_incremental", 0.20, 0.50, 1.5),
+            ],
+        };
+        let worse = build_prediction_research_feedback(&prior, &report, 0.6)
+            .expect("worse candidate feedback");
+        assert_eq!(worse.candidates[0].verdict, "discard");
+        assert!(worse.candidates[0]
+            .reason_codes
+            .contains(&"no_incremental_brier_vs_baseline".to_string()));
+
+        report.aggregates[1] = aggregate("q_llm_binance_incremental", 0.16, 0.40, 2.0);
+        let better = build_prediction_research_feedback(&prior, &report, 0.6)
+            .expect("better candidate feedback");
+        assert_eq!(better.candidates[0].verdict, "keep");
+        assert!(better.candidates[0].reason_codes.is_empty());
+    }
+
+    #[test]
     fn settlement_probability_walk_forward_uses_train_surface_for_test_window() {
         let start = Utc::now();
         let source_rows = (0..8)
@@ -11738,6 +11915,88 @@ mod tests {
     }
 
     #[test]
+    fn full_depth_lookup_ignores_newer_wrong_token_for_the_same_side() {
+        let mut obs = base_obs();
+        obs.pm_up_ask_size = 1.0;
+        let correct_book = ResearchPmBookSnapshot {
+            event_id: obs.event_id.clone(),
+            token_id: obs.up_token_id.clone(),
+            side: "UP".into(),
+            ts: obs.tick_ts - chrono::Duration::seconds(1),
+            bids: vec![crate::factors::ResearchPmBookLevel {
+                price: 0.49,
+                size: 40.0,
+            }],
+            asks: vec![crate::factors::ResearchPmBookLevel {
+                price: 0.50,
+                size: 40.0,
+            }],
+        };
+        let mut wrong_token_book = correct_book.clone();
+        wrong_token_book.token_id = "wrong-token".into();
+        wrong_token_book.ts = obs.tick_ts;
+        wrong_token_book.asks[0].size = 1.0;
+
+        let rows = build_factor_observations_v2_with_deribit_and_pm_books(
+            &[obs],
+            &[],
+            &[correct_book, wrong_token_book],
+            &FactorReviewOptions::default(),
+        );
+        let up = rows.iter().find(|row| row.side == ReviewSide::Up).unwrap();
+
+        assert_eq!(up.pm_token_id, "up-token");
+        assert!(up.label_full_depth_entry_fillable);
+    }
+
+    #[test]
+    fn full_depth_lookup_enforces_quote_age_to_the_millisecond() {
+        let obs = base_obs();
+        let mut book = ResearchPmBookSnapshot {
+            event_id: obs.event_id.clone(),
+            token_id: obs.up_token_id.clone(),
+            side: "UP".into(),
+            ts: obs.tick_ts - chrono::Duration::milliseconds(5_000),
+            bids: vec![crate::factors::ResearchPmBookLevel {
+                price: 0.49,
+                size: 40.0,
+            }],
+            asks: vec![crate::factors::ResearchPmBookLevel {
+                price: 0.50,
+                size: 40.0,
+            }],
+        };
+        let options = FactorReviewOptions {
+            max_quote_age_secs: 5,
+            ..Default::default()
+        };
+        let boundary = build_factor_observations_v2_with_deribit_and_pm_books(
+            &[obs.clone()],
+            &[],
+            &[book.clone()],
+            &options,
+        );
+        assert!(
+            boundary
+                .iter()
+                .find(|row| row.side == ReviewSide::Up)
+                .unwrap()
+                .label_full_depth_entry_fillable
+        );
+
+        book.ts -= chrono::Duration::milliseconds(1);
+        let stale =
+            build_factor_observations_v2_with_deribit_and_pm_books(&[obs], &[], &[book], &options);
+        assert!(
+            !stale
+                .iter()
+                .find(|row| row.side == ReviewSide::Up)
+                .unwrap()
+                .label_full_depth_entry_fillable
+        );
+    }
+
+    #[test]
     fn full_depth_sweep_charges_probability_fee_per_level() {
         let levels = vec![
             crate::factors::ResearchPmBookLevel {
@@ -11983,6 +12242,7 @@ mod tests {
                         stake_usd: 15.0,
                         min_observations: 10,
                         top_quantile: 0.2,
+                        max_quote_age_secs: PM_BOOK_MAX_AGE_SECS,
                     },
                     train_window_days: 2,
                     test_window_days: 1,
@@ -12046,6 +12306,7 @@ mod tests {
                     stake_usd: 15.0,
                     min_observations: 10,
                     top_quantile: 0.2,
+                    max_quote_age_secs: PM_BOOK_MAX_AGE_SECS,
                 },
                 min_path_observations: 10,
                 top_n: 10,
@@ -12114,6 +12375,7 @@ mod tests {
                     stake_usd: 15.0,
                     min_observations: 10,
                     top_quantile: 0.2,
+                    max_quote_age_secs: PM_BOOK_MAX_AGE_SECS,
                 },
                 train_window_days: 2,
                 test_window_days: 1,
@@ -12156,6 +12418,7 @@ mod tests {
                     stake_usd: 15.0,
                     min_observations: 10,
                     top_quantile: 0.2,
+                    max_quote_age_secs: PM_BOOK_MAX_AGE_SECS,
                 },
                 train_window_days: 2,
                 test_window_days: 1,
@@ -12601,6 +12864,7 @@ mod tests {
                     stake_usd: 15.0,
                     min_observations: 10,
                     top_quantile: 0.2,
+                    max_quote_age_secs: PM_BOOK_MAX_AGE_SECS,
                 },
                 train_window_days: 2,
                 test_window_days: 1,
@@ -12804,6 +13068,7 @@ mod tests {
                         stake_usd: 15.0,
                         min_observations: 10,
                         top_quantile: 0.2,
+                        max_quote_age_secs: PM_BOOK_MAX_AGE_SECS,
                     },
                     train_window_days: 2,
                     test_window_days: 1,

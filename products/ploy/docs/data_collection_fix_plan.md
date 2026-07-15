@@ -12,6 +12,12 @@
 > `docs/COLLECTOR_RUNBOOK.md`. Current research evidence must flow through
 > `docs/runbooks/strategy-research-cicd.md`.
 
+> **Superseded data authority:** any historical Binance-to-`price_to_beat`
+> backfill described below is forbidden for governed research. Chainlink owns
+> the opening reference and expiry-price semantics; Polymarket official
+> resolution owns the binary label. Binance is predictor/repricing context only.
+> The executable backfill script has been removed.
+
 ## 问题诊断（2026-04-01）
 
 ### 用户需求

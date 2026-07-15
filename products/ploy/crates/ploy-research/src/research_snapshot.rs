@@ -435,18 +435,52 @@ fn chainlink_reference_symbols(symbols: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn research_snapshot_quality_flags(
+#[derive(Debug, Clone, Copy)]
+#[cfg(any(feature = "db", test))]
+struct ResearchSnapshotQualityInputs<'a> {
     observation_count: usize,
+    chainlink_reference_tick_count: usize,
+    binance_price_tick_count: usize,
+    binance_agg_trade_tick_count: usize,
+    binance_lob_snapshot_count: usize,
     deribit_snapshot_count: usize,
     pm_book_snapshot_count: usize,
     include_deribit: bool,
     pm_book_sample_secs: i32,
     max_quote_age_secs: i64,
-    pm_book_source: &ResearchSnapshotPmBookSource,
-) -> Vec<String> {
+    pm_book_source: &'a ResearchSnapshotPmBookSource,
+}
+
+#[cfg(any(feature = "db", test))]
+fn research_snapshot_quality_flags(input: ResearchSnapshotQualityInputs<'_>) -> Vec<String> {
+    let ResearchSnapshotQualityInputs {
+        observation_count,
+        chainlink_reference_tick_count,
+        binance_price_tick_count,
+        binance_agg_trade_tick_count,
+        binance_lob_snapshot_count,
+        deribit_snapshot_count,
+        pm_book_snapshot_count,
+        include_deribit,
+        pm_book_sample_secs,
+        max_quote_age_secs,
+        pm_book_source,
+    } = input;
     let mut quality_flags = Vec::new();
     if observation_count == 0 {
         quality_flags.push("no_factor_observations".to_string());
+    }
+    if chainlink_reference_tick_count == 0 {
+        quality_flags.push("no_chainlink_reference_ticks".to_string());
+    }
+    if binance_price_tick_count == 0 {
+        quality_flags.push("no_binance_price_ticks".to_string());
+    }
+    if binance_agg_trade_tick_count == 0 {
+        quality_flags.push("no_binance_agg_trade_ticks".to_string());
+    }
+    if binance_lob_snapshot_count == 0 {
+        quality_flags.push("no_binance_lob_snapshots".to_string());
     }
     if include_deribit && deribit_snapshot_count == 0 {
         quality_flags.push("no_deribit_snapshots".to_string());
@@ -847,12 +881,15 @@ pub async fn build_research_snapshot_from_database(
     pool: &sqlx::PgPool,
     options: ResearchSnapshotBuildOptions,
 ) -> Result<ResearchSnapshot> {
-    use ploy_feed_loaders::{load_from_database_with_options, HistoricalLoadOptions};
+    use ploy_feed_loaders::{
+        load_from_database_with_options_and_source_clocks, HistoricalLoadOptions,
+    };
     use ploy_market_contracts::MarketUpdate;
 
     use crate::{
-        build_factor_observations_with_lob_sampled, load_deribit_feature_snapshots_with_timings,
-        load_research_lob_snapshots_sampled, load_research_pm_book_snapshots_sampled,
+        build_factor_observations_with_lob_sampled_and_source_clocks,
+        load_deribit_feature_snapshots_with_timings, load_research_lob_snapshots_sampled,
+        load_research_pm_book_snapshots_sampled,
     };
 
     let mut phase_timings = Vec::new();
@@ -860,7 +897,7 @@ pub async fn build_research_snapshot_from_database(
     let historical_sample_secs = u32::try_from(options.lob_sample_secs.max(1)).unwrap_or(1);
 
     let started = Instant::now();
-    let all_updates = load_from_database_with_options(
+    let historical_batch = load_from_database_with_options_and_source_clocks(
         pool,
         &options.symbols,
         history_start,
@@ -872,16 +909,42 @@ pub async fn build_research_snapshot_from_database(
             include_l2: false,
             spot_sample_secs: historical_sample_secs,
             lob_sample_secs: historical_sample_secs,
+            max_source_delay_secs: u32::try_from(options.max_quote_age_secs.max(0))
+                .unwrap_or(u32::MAX),
             ..Default::default()
         },
     )
     .await
     .context("load historical market updates")?;
+    let all_updates = historical_batch.updates;
+    let binance_source_clocks = historical_batch.binance_source_clocks;
     phase_timings.push(ResearchSnapshotPhaseTiming {
         phase: "historical_updates".to_string(),
         elapsed_ms: started.elapsed().as_millis(),
         rows: Some(all_updates.len()),
     });
+    let binance_price_tick_rows = all_updates
+        .iter()
+        .filter(|update| matches!(update, MarketUpdate::SpotPrice { .. }))
+        .count();
+    let binance_agg_trade_tick_rows = all_updates
+        .iter()
+        .filter(|update| matches!(update, MarketUpdate::AggTrade { .. }))
+        .count();
+    let chainlink_reference_tick_rows = all_updates
+        .iter()
+        .filter(|update| {
+            matches!(
+                update,
+                MarketUpdate::ReferencePrice {
+                    source,
+                    is_carried_forward: false,
+                    received_at: Some(_),
+                    ..
+                } if source.eq_ignore_ascii_case("chainlink")
+            )
+        })
+        .count();
 
     let started = Instant::now();
     let all_lob_snapshots = load_research_lob_snapshots_sampled(
@@ -890,6 +953,7 @@ pub async fn build_research_snapshot_from_database(
         history_start,
         options.end,
         options.lob_sample_secs,
+        options.max_quote_age_secs,
     )
     .await
     .context("load CEX LOB snapshots")?;
@@ -1018,9 +1082,10 @@ pub async fn build_research_snapshot_from_database(
     let lob_slice = slice_by_time(&all_lob_snapshots, history_start, options.end, |snapshot| {
         snapshot.ts
     });
-    let observations = build_factor_observations_with_lob_sampled(
+    let observations = build_factor_observations_with_lob_sampled_and_source_clocks(
         updates_slice,
         lob_slice,
+        &binance_source_clocks,
         options.max_quote_age_secs,
         options.observation_sample_secs,
     );
@@ -1030,15 +1095,19 @@ pub async fn build_research_snapshot_from_database(
         rows: Some(observations.len()),
     });
 
-    let quality_flags = research_snapshot_quality_flags(
-        observations.len(),
-        deribit_snapshots.len(),
-        all_pm_book_snapshots.len(),
-        options.include_deribit,
+    let quality_flags = research_snapshot_quality_flags(ResearchSnapshotQualityInputs {
+        observation_count: observations.len(),
+        chainlink_reference_tick_count: chainlink_reference_tick_rows,
+        binance_price_tick_count: binance_price_tick_rows,
+        binance_agg_trade_tick_count: binance_agg_trade_tick_rows,
+        binance_lob_snapshot_count: all_lob_snapshots.len(),
+        deribit_snapshot_count: deribit_snapshots.len(),
+        pm_book_snapshot_count: all_pm_book_snapshots.len(),
+        include_deribit: options.include_deribit,
         pm_book_sample_secs,
-        options.max_quote_age_secs,
-        &pm_book_source,
-    );
+        max_quote_age_secs: options.max_quote_age_secs,
+        pm_book_source: &pm_book_source,
+    });
     let symbols_csv = options.symbols.join(",");
 
     Ok(ResearchSnapshot {
@@ -1063,6 +1132,36 @@ pub async fn build_research_snapshot_from_database(
             optimizer_data_dir: options.optimizer_data_dir,
             source_surfaces: vec![
                 ResearchSnapshotSourceSurface {
+                    name: "chainlink_reference_ticks".to_string(),
+                    role: "opening_reference_and_expiry_price_source".to_string(),
+                    gate_category: "required_for_prediction".to_string(),
+                    raw_full_fidelity: false,
+                    snapshot_sampled: true,
+                    sample_secs: Some(i64::from(historical_sample_secs)),
+                    row_count: Some(chainlink_reference_tick_rows),
+                    notes: "Arrival-timestamped Chainlink prices define the governed opening reference and expiry-price semantics; Polymarket official resolution remains the binary label, and Binance never replaces either authority.".to_string(),
+                },
+                ResearchSnapshotSourceSurface {
+                    name: "binance_price_ticks".to_string(),
+                    role: "cex_reference_price".to_string(),
+                    gate_category: "required_for_prediction".to_string(),
+                    raw_full_fidelity: false,
+                    snapshot_sampled: true,
+                    sample_secs: Some(i64::from(historical_sample_secs)),
+                    row_count: Some(binance_price_tick_rows),
+                    notes: "Binance spot ticks sampled by source time and replayed at received_at so unavailable prices cannot enter earlier observations.".to_string(),
+                },
+                ResearchSnapshotSourceSurface {
+                    name: "binance_agg_trade_ticks".to_string(),
+                    role: "cex_trade_flow".to_string(),
+                    gate_category: "required_for_prediction".to_string(),
+                    raw_full_fidelity: false,
+                    snapshot_sampled: true,
+                    sample_secs: Some(5),
+                    row_count: Some(binance_agg_trade_tick_rows),
+                    notes: "Binance aggTrade flow aggregated by source-time 5-second bucket and aggressor side, then replayed at received_at.".to_string(),
+                },
+                ResearchSnapshotSourceSurface {
                     name: "historical_market_updates".to_string(),
                     role: "prediction_context".to_string(),
                     gate_category: "required_for_prediction".to_string(),
@@ -1070,7 +1169,7 @@ pub async fn build_research_snapshot_from_database(
                     snapshot_sampled: true,
                     sample_secs: Some(i64::from(historical_sample_secs)),
                     row_count: Some(all_updates.len()),
-                    notes: "DB MarketUpdate tape includes point-in-time Chainlink reference prices and sampled CEX/PM updates; suitable for factor search, not tick-complete replay.".to_string(),
+                    notes: "Combined DB MarketUpdate tape includes point-in-time Chainlink reference prices and sampled PM updates; suitable for factor search, not tick-complete replay.".to_string(),
                 },
                 ResearchSnapshotSourceSurface {
                     name: "binance_lob_ticks".to_string(),
@@ -1080,7 +1179,7 @@ pub async fn build_research_snapshot_from_database(
                     snapshot_sampled: true,
                     sample_secs: Some(i64::from(options.lob_sample_secs.max(1))),
                     row_count: Some(all_lob_snapshots.len()),
-                    notes: "Partial-depth CEX LOB snapshots; not a sequence-correct local book for queue-position evidence.".to_string(),
+                    notes: "Binance partial-depth LOB snapshots sampled by source time and replayed at received_at; not a sequence-correct local book for queue-position evidence.".to_string(),
                 },
                 ResearchSnapshotSourceSurface {
                     name: "clob_orderbook_snapshots".to_string(),
@@ -1095,12 +1194,12 @@ pub async fn build_research_snapshot_from_database(
                 ResearchSnapshotSourceSurface {
                     name: "pm_token_settlements".to_string(),
                     role: "settlement_labels".to_string(),
-                    gate_category: "required_for_execution".to_string(),
+                    gate_category: "required_for_prediction".to_string(),
                     raw_full_fidelity: true,
                     snapshot_sampled: false,
                     sample_secs: None,
                     row_count: None,
-                    notes: "Official settlement labels are required when require_official_settlement=true.".to_string(),
+                    notes: "Official binary outcome labels are required for prediction evaluation when require_official_settlement=true; they are not execution evidence.".to_string(),
                 },
                 ResearchSnapshotSourceSurface {
                     name: "deribit_feature_snapshots".to_string(),
@@ -1739,15 +1838,20 @@ mod tests {
 
     #[test]
     fn quality_flags_sparse_pm_book_sampling_against_quote_age() {
-        let flags = research_snapshot_quality_flags(
-            100,
-            0,
-            10,
-            false,
-            300,
-            30,
-            &ResearchSnapshotPmBookSource::default(),
-        );
+        let pm_book_source = ResearchSnapshotPmBookSource::default();
+        let flags = research_snapshot_quality_flags(ResearchSnapshotQualityInputs {
+            observation_count: 100,
+            chainlink_reference_tick_count: 10,
+            binance_price_tick_count: 10,
+            binance_agg_trade_tick_count: 10,
+            binance_lob_snapshot_count: 10,
+            deribit_snapshot_count: 0,
+            pm_book_snapshot_count: 10,
+            include_deribit: false,
+            pm_book_sample_secs: 300,
+            max_quote_age_secs: 30,
+            pm_book_source: &pm_book_source,
+        });
 
         assert!(flags.contains(&"pm_book_sample_secs_gt_max_quote_age:300>30".to_string()));
         assert!(!flags.contains(&"no_factor_observations".to_string()));
@@ -1756,37 +1860,89 @@ mod tests {
 
     #[test]
     fn quality_flags_accepts_pm_book_sampling_within_quote_age() {
-        let flags = research_snapshot_quality_flags(
-            100,
-            0,
-            10,
-            false,
-            30,
-            30,
-            &ResearchSnapshotPmBookSource::default(),
-        );
+        let pm_book_source = ResearchSnapshotPmBookSource::default();
+        let flags = research_snapshot_quality_flags(ResearchSnapshotQualityInputs {
+            observation_count: 100,
+            chainlink_reference_tick_count: 10,
+            binance_price_tick_count: 10,
+            binance_agg_trade_tick_count: 10,
+            binance_lob_snapshot_count: 10,
+            deribit_snapshot_count: 0,
+            pm_book_snapshot_count: 10,
+            include_deribit: false,
+            pm_book_sample_secs: 30,
+            max_quote_age_secs: 30,
+            pm_book_source: &pm_book_source,
+        });
 
         assert!(flags.is_empty());
     }
 
     #[test]
     fn quality_flags_archive_manifest_without_sampled_rows() {
-        let flags = research_snapshot_quality_flags(
-            100,
-            0,
-            0,
-            false,
-            30,
-            30,
-            &ResearchSnapshotPmBookSource {
-                archive_manifest_rows: 1000,
-                archive_status: "archive_loaded".to_string(),
-                ..Default::default()
-            },
-        );
+        let pm_book_source = ResearchSnapshotPmBookSource {
+            archive_manifest_rows: 1000,
+            archive_status: "archive_loaded".to_string(),
+            ..Default::default()
+        };
+        let flags = research_snapshot_quality_flags(ResearchSnapshotQualityInputs {
+            observation_count: 100,
+            chainlink_reference_tick_count: 10,
+            binance_price_tick_count: 10,
+            binance_agg_trade_tick_count: 10,
+            binance_lob_snapshot_count: 10,
+            deribit_snapshot_count: 0,
+            pm_book_snapshot_count: 0,
+            include_deribit: false,
+            pm_book_sample_secs: 30,
+            max_quote_age_secs: 30,
+            pm_book_source: &pm_book_source,
+        });
 
         assert!(flags.contains(&"no_pm_book_snapshots".to_string()));
         assert!(flags.contains(&"pm_book_archive_manifest_rows_but_no_sampled_rows".to_string()));
+    }
+
+    #[test]
+    fn quality_flags_identify_empty_required_binance_surfaces() {
+        let pm_book_source = ResearchSnapshotPmBookSource::default();
+        let flags = research_snapshot_quality_flags(ResearchSnapshotQualityInputs {
+            observation_count: 100,
+            chainlink_reference_tick_count: 10,
+            binance_price_tick_count: 0,
+            binance_agg_trade_tick_count: 0,
+            binance_lob_snapshot_count: 0,
+            deribit_snapshot_count: 0,
+            pm_book_snapshot_count: 10,
+            include_deribit: false,
+            pm_book_sample_secs: 30,
+            max_quote_age_secs: 30,
+            pm_book_source: &pm_book_source,
+        });
+
+        assert!(flags.contains(&"no_binance_price_ticks".to_string()));
+        assert!(flags.contains(&"no_binance_agg_trade_ticks".to_string()));
+        assert!(flags.contains(&"no_binance_lob_snapshots".to_string()));
+    }
+
+    #[test]
+    fn quality_flags_identify_missing_chainlink_settlement_reference() {
+        let pm_book_source = ResearchSnapshotPmBookSource::default();
+        let flags = research_snapshot_quality_flags(ResearchSnapshotQualityInputs {
+            observation_count: 100,
+            chainlink_reference_tick_count: 0,
+            binance_price_tick_count: 10,
+            binance_agg_trade_tick_count: 10,
+            binance_lob_snapshot_count: 10,
+            deribit_snapshot_count: 0,
+            pm_book_snapshot_count: 10,
+            include_deribit: false,
+            pm_book_sample_secs: 30,
+            max_quote_age_secs: 30,
+            pm_book_source: &pm_book_source,
+        });
+
+        assert!(flags.contains(&"no_chainlink_reference_ticks".to_string()));
     }
 
     #[cfg(feature = "db")]

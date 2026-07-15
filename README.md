@@ -11,7 +11,7 @@ This repository is locally production-gated for governed research plus signed **
 The implemented loop is goal-based and evidence-driven:
 
 1. A `LoopRun` declares a target stage, bounded mission budget, and explicit completion policy.
-2. Durable `LoopRun` execution uses MCTS or Bayesian engines with exact engine-state checkpoints. GP, offline RL, and LLM remain explicit standalone Lab missions.
+2. Continuous-contract Formula `LoopRun` execution uses MCTS or Bayesian engines with exact engine-state checkpoints. GP, offline RL, and free-form LLM formula search remain standalone Lab missions. PLOY's separate binary-settlement lane may run its bounded, typed probability-blend LLM loop under the event-disjoint Rust evaluator; it has no promotion or execution authority outside that lane.
 3. The versioned evaluator applies point-in-time data, purged walk-forward folds, costs, drawdown limits, minimum evidence, and a pre-registered multiple-testing haircut.
 4. Failures remain queryable and may create one bounded follow-up mission with a validator-gated learning directive.
 5. Promotion binds candidate, dataset, evaluator config/metrics, sealed result, approval, and bundle hashes.
@@ -30,6 +30,7 @@ The repository provides the durable goal loop and CLI. Time-based or event-based
 | Formula search with GP, MCTS, and Bayesian optimization | `governed` | Eligible for evaluator v3 and Formula-only promotion |
 | Offline Q-learning | `lab-only` | Search-policy experiment; blocked from holdout, promotion, allocation, and runtime authority |
 | OpenAI-compatible hypothesis/failure critic | `lab-only` | Optional `ALPHA_LLM_*` calls; outputs remain evidence/proposals |
+| PLOY typed probability-blend LoopRun | `governed-research` | BTC/SOL five-minute event lane only; Rust schema, budget, event-disjoint evaluator, and content-addressed ledger; no order authority |
 | Purged walk-forward and one-time sealed holdout v3 | `governed` | Typed predictive/trading metrics and config hashes are recomputed before promotion |
 | ONNX loading | `runtime-compatibility` | No governed ONNX producer until point-in-time training lineage and model evaluation exist |
 | Signed Formula Paper/Shadow handoff | `implemented` | Ed25519 verification, runtime-owned approval evidence, policy binding, durable nonce and audit records |

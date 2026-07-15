@@ -18,6 +18,7 @@ strategy-runtime = []
 
 [dependencies]
 rand.workspace = true
+reqwest.workspace = true
 chrono.workspace = true
 polars = { workspace = true, optional = true }
 ploy-market-contracts.workspace = true
@@ -34,6 +35,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing.workspace = true
 uuid.workspace = true
 anyhow = "1"
+fs2 = "0.4"
+libc.workspace = true
 burn = { version = "0.17", default-features = false, features = ["ndarray", "autodiff", "std"], optional = true }
 burn-ndarray = { version = "0.17", optional = true }
 optimizer.workspace = true
@@ -87,6 +90,10 @@ required-features = ["db"]
 name = "factor_walk_forward_v2"
 path = "examples/factor_walk_forward_v2.rs"
 required-features = ["db"]
+
+[[example]]
+name = "prediction_research_loop"
+path = "examples/prediction_research_loop.rs"
 
 [[example]]
 name = "research_snapshot_compile"

@@ -1678,6 +1678,7 @@ fn main() -> Result<()> {
         stake_usd,
         min_observations: min_trades_override.unwrap_or(20),
         top_quantile: 0.2,
+        max_quote_age_secs: snapshot.manifest.max_quote_age_secs,
     };
     let mut v2_rows = build_factor_observations_v2_with_deribit_and_pm_books(
         &snapshot.observations,
@@ -2225,6 +2226,7 @@ mod tests {
             time_remaining_secs: 120,
             regime: Regime::Middle,
             side: ReviewSide::Up,
+            pm_token_id: "up-token".to_string(),
             side_model_prob,
             side_chainlink_prob: f64::NAN,
             side_fair_prob: side_model_prob,
