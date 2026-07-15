@@ -60,3 +60,30 @@ The Rust collector also uses an independent 180-second OS-thread watchdog so
 non-yielding fsync or atomic state publication cannot evade the cooperative Tokio
 timeout. The health policy remains capped at 180 seconds; no acceptance threshold was
 relaxed.
+
+The production compatibility unit has a six-hour `RuntimeMaxSec` and `Restart=always`.
+Consequently, a healthy long-lived legacy process can have a nonzero cumulative
+systemd `NRestarts`. The production gate records the PID and restart counter at its
+start and rejects any change during shadow or before cutover; it does not erase or
+misclassify an earlier scheduled lifecycle refresh. The counter is reset only after
+the legacy writer is stopped, so the promoted Rust process is still verified from a
+zero restart baseline.
+
+Runtime continuity is bound to the systemd `InvocationID` as well as the frozen PID
+and `NRestarts` value. Immediately before stopping either the Rust shadow or the
+legacy writer, the control syncs the journal and captures a cursor. It then scans
+only post-cursor records, rejects a restart or new invocation, and re-reads the
+restart counter after stop. This supplies evidence across the narrow interval that
+PID and counter sampling alone cannot cover.
+
+The later production cutover is complete only if `cutover.json` has an adjacent
+single-line `PASSED.sha256` that verifies the exact JSON checksum. A JSON file
+without that marker is not success evidence. A failed transition or any automatic
+or requested rollback invalidates the pair; the remaining artifacts document the
+failure or rollback but cannot authorize the Rust collector as current production.
+The valid marker is atomically renamed and synced as rollback-pending before any
+service mutation. If restoration fails or is interrupted, that pending state remains
+fail-closed. A completed automatic recovery renames the marker to
+`PASSED.invalid.sha256`; a completed requested rollback uses
+`PASSED.rolled-back.sha256`. Both continue to verify the unchanged `cutover.json`,
+but neither is the canonical `PASSED.sha256` required for Rust-production authority.

@@ -104,8 +104,31 @@ proc_cmdline() {
   tr '\0' ' ' <"/proc/$pid/cmdline"
 }
 
+journal_cursor() {
+  local unit=$1 cursor
+  journalctl --sync || return 1
+  cursor=$(journalctl --unit "$unit" --lines=0 --show-cursor --no-pager \
+    | sed -n 's/^-- cursor: //p') || return 1
+  [[ -n $cursor ]] || return 1
+  printf '%s\n' "$cursor"
+}
+
+verify_no_restart_after_cursor() {
+  local unit=$1 cursor=$2 expected_invocation_id=$3
+  journalctl --sync || return 1
+  journalctl --unit "$unit" --after-cursor "$cursor" --output=json --no-pager \
+    | jq -s -e --arg expected "$expected_invocation_id" '
+      all(.[];
+        ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
+        and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
+        and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
+      )
+    ' >/dev/null || return 1
+}
+
 verify_legacy_identity() {
-  local expected_pid=$1 pid restarts fragment drop_ins exec_argv cmdline
+  local expected_pid=$1 expected_restarts=$2 expected_invocation_id=$3
+  local pid restarts invocation_id fragment drop_ins exec_argv cmdline
   systemctl is-active --quiet "$LEGACY_UNIT" || return 1
   fragment=$(systemctl show --property=FragmentPath --value "$LEGACY_UNIT") || return 1
   [[ $fragment == "$LEGACY_FRAGMENT" ]] || return 1
@@ -116,7 +139,9 @@ verify_legacy_identity() {
   pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT") || return 1
   [[ $pid == "$expected_pid" ]] || return 1
   restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT") || return 1
-  [[ $restarts == 0 ]] || return 1
+  [[ $restarts == "$expected_restarts" ]] || return 1
+  invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT") || return 1
+  [[ $invocation_id == "$expected_invocation_id" ]] || return 1
   cmdline=$(proc_cmdline "$pid") || return 1
   [[ $cmdline == "$LEGACY_EXEC " ]]
 }
@@ -191,7 +216,8 @@ install_pinned_upload_env() {
 }
 
 verify_shadow_identity() {
-  local expected_pid=$1 pid restarts fragment drop_ins exec_argv cmdline
+  local expected_pid=$1 expected_invocation_id=$2
+  local pid restarts invocation_id fragment drop_ins exec_argv cmdline
   local expected_exec_raw expected_exec_expanded
   systemctl is-active --quiet "$shadow_unit" || return 1
   fragment=$(systemctl show --property=FragmentPath --value "$shadow_unit") || return 1
@@ -207,6 +233,8 @@ verify_shadow_identity() {
   [[ $pid == "$expected_pid" ]] || return 1
   restarts=$(systemctl show --property=NRestarts --value "$shadow_unit") || return 1
   [[ $restarts == 0 ]] || return 1
+  invocation_id=$(systemctl show --property=InvocationID --value "$shadow_unit") || return 1
+  [[ $invocation_id == "$expected_invocation_id" ]] || return 1
   [[ $(readlink -f "/proc/$pid/exe") == "$release_binary" ]] || return 1
   cmdline=$(proc_cmdline "$pid") || return 1
   [[ $cmdline == "$release_binary collect-reference --spool-dir $shadow_spool " ]]
@@ -218,7 +246,7 @@ verify_shadow_identity() {
   exit 2
 }
 
-for command in awk chown chmod date flock grep install jq mkdir mktemp mountpoint mv \
+for command in awk chown chmod date flock grep install journalctl jq mkdir mktemp mountpoint mv \
   readlink rm runuser sed sha256sum sleep stat sync systemctl tr; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
@@ -253,8 +281,14 @@ flock -n 9 || die 'another Polymarket release operation is running'
 
 legacy_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT")
 [[ $legacy_pid =~ ^[1-9][0-9]*$ ]] || die 'active Python collector has no verifiable MainPID'
-verify_legacy_identity "$legacy_pid" \
-  || die 'active reference collector identity is not exact and restart-free'
+legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
+[[ $legacy_restarts =~ ^[0-9]+$ ]] \
+  || die 'active legacy collector has no verifiable restart counter'
+legacy_invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT")
+[[ $legacy_invocation_id =~ ^[a-f0-9]{32}$ ]] \
+  || die 'active legacy collector has no verifiable systemd invocation ID'
+verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
+  || die 'active reference collector identity or restart counter is not exact'
 
 gate_seconds=${MONDAY_POLYMARKET_GATE_SECONDS:-$MINIMUM_GATE_SECONDS}
 [[ $gate_seconds =~ ^[1-9][0-9]*$ ]] || die 'gate duration must be a positive integer'
@@ -343,6 +377,9 @@ started_at_unix=$(date -u +%s)
 started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 start_uptime=$SECONDS
 systemctl start "$shadow_unit"
+shadow_invocation_id=$(systemctl show --property=InvocationID --value "$shadow_unit")
+[[ $shadow_invocation_id =~ ^[a-f0-9]{32}$ ]] \
+  || die 'Rust shadow has no verifiable systemd invocation ID'
 
 last_health=
 last_health_change=$start_uptime
@@ -355,7 +392,7 @@ parity_window_started_at=
 while :; do
   now_uptime=$SECONDS
   elapsed=$((now_uptime - start_uptime))
-  verify_legacy_identity "$legacy_pid" \
+  verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
     || die 'legacy collector PID, restart count, or effective unit identity changed during gate'
   shadow_pid=$(systemctl show --property=MainPID --value "$shadow_unit")
   [[ $shadow_pid =~ ^[1-9][0-9]*$ ]] || die 'Rust shadow has no MainPID'
@@ -364,7 +401,7 @@ while :; do
   else
     [[ $shadow_pid == "$initial_shadow_pid" ]] || die 'Rust shadow MainPID changed during gate'
   fi
-  verify_shadow_identity "$initial_shadow_pid" \
+  verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id" \
     || die 'Rust shadow systemd identity, PID, or command line changed during gate'
   if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]; then
     health="$shadow_spool/health.json"
@@ -444,9 +481,9 @@ shadow_pid=$(systemctl show --property=MainPID --value "$shadow_unit")
 shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_unit")
 [[ $shadow_restarts == 0 && $shadow_pid == "$initial_shadow_pid" ]] \
   || die 'Rust shadow did not remain a single continuous process'
-verify_shadow_identity "$initial_shadow_pid" \
+verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id" \
   || die 'final Rust shadow systemd identity differs from the gated candidate'
-verify_legacy_identity "$legacy_pid" \
+verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
   || die 'legacy collector identity changed before parity evidence was captured'
 shadow_exec_argv=$(effective_exec_argv "$shadow_unit") \
   || die 'could not capture the effective Rust shadow ExecStart'
@@ -457,7 +494,16 @@ shadow_fragment_path=$(systemctl show --property=FragmentPath --value "$shadow_u
 shadow_drop_ins=$(systemctl show --property=DropInPaths --value "$shadow_unit")
 shadow_drop_ins_json=$(jq -cn --arg value "$shadow_drop_ins" \
   '$value | split(" ") | map(select(length > 0))')
+shadow_stop_cursor=$(journal_cursor "$shadow_unit") \
+  || die 'could not capture the Rust shadow journal cursor before stop'
+verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id" \
+  || die 'Rust shadow identity changed immediately before stop'
 systemctl stop "$shadow_unit"
+verify_no_restart_after_cursor "$shadow_unit" "$shadow_stop_cursor" "$shadow_invocation_id" \
+  || die 'Rust shadow journal recorded a restart during final stop'
+stopped_shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_unit")
+[[ $stopped_shadow_restarts == 0 ]] \
+  || die 'Rust shadow restarted between final verification and stop'
 
 evidence_parent="$EVIDENCE_ROOT/$candidate_sha"
 install -d -m 0755 /data/monday/evidence "$EVIDENCE_ROOT" "$evidence_parent"
@@ -539,7 +585,7 @@ market_canonical_uploaded_segments=$(jq -er \
   <<<"$market_upload_json") \
   || die 'market-tape shadow uploader did not verify a canonical closed segment'
 
-verify_legacy_identity "$legacy_pid" \
+verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
   || die 'legacy collector identity changed while parity or OSS readback was running'
 verify_current_oss_config
 legacy_exec_argv=$(effective_exec_argv "$LEGACY_UNIT") \
@@ -552,8 +598,6 @@ legacy_fragment_path=$(systemctl show --property=FragmentPath --value "$LEGACY_U
 legacy_drop_ins=$(systemctl show --property=DropInPaths --value "$LEGACY_UNIT")
 legacy_drop_ins_json=$(jq -cn --arg value "$legacy_drop_ins" \
   '$value | split(" ") | map(select(length > 0))')
-legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
-
 completed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 production_eligible=true
 [[ $test_only == false ]] || production_eligible=false
@@ -569,12 +613,14 @@ jq \
   --arg legacy_exec "$legacy_exec_argv" \
   --arg legacy_cmdline "$legacy_cmdline_argv" \
   --arg legacy_cmdline_sha256 "$legacy_cmdline_sha" \
+  --arg legacy_invocation_id "$legacy_invocation_id" \
   --arg legacy_fragment_path "$legacy_fragment_path" \
   --argjson legacy_drop_in_paths "$legacy_drop_ins_json" \
   --argjson legacy_pid "$legacy_pid" \
   --argjson legacy_restarts "$legacy_restarts" \
   --arg shadow_exec "$shadow_exec_argv" \
   --arg shadow_cmdline "$shadow_cmdline_argv" \
+  --arg shadow_invocation_id "$shadow_invocation_id" \
   --arg shadow_fragment_path "$shadow_fragment_path" \
   --argjson shadow_drop_in_paths "$shadow_drop_ins_json" \
   --argjson shadow_pid "$shadow_pid" \
@@ -604,10 +650,12 @@ jq \
     legacy_runtime:{exec_start:$legacy_exec,cmdline:$legacy_cmdline,
       cmdline_sha256:$legacy_cmdline_sha256,
       fragment_path:$legacy_fragment_path,drop_in_paths:$legacy_drop_in_paths,
-      main_pid:$legacy_pid,restarts:$legacy_restarts},
+      main_pid:$legacy_pid,restarts:$legacy_restarts,
+      invocation_id:$legacy_invocation_id},
     shadow_runtime:{exec_start:$shadow_exec,cmdline:$shadow_cmdline,
       fragment_path:$shadow_fragment_path,drop_in_paths:$shadow_drop_in_paths,
-      main_pid:$shadow_pid,restarts:$shadow_restarts},
+      main_pid:$shadow_pid,restarts:$shadow_restarts,
+      invocation_id:$shadow_invocation_id},
     checks:(.checks + {
       health_freshness:true,
       candidate_identity:true,
@@ -626,7 +674,7 @@ mv "$gate_tmp" "$gate_json"
 sync "$gate_json"
 
 if [[ $production_eligible == true ]]; then
-  verify_legacy_identity "$legacy_pid" \
+  verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
     || die 'legacy collector identity changed before the gate marker was published'
   verify_current_oss_config
   jq -e -f "$GATE_POLICY" "$gate_json" >/dev/null \

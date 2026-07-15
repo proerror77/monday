@@ -207,6 +207,32 @@ the candidate binary digest, source revision, symbol set, settled market payload
 and upload readback. Any stale health, missing symbol, sequence gap, or identity
 mismatch blocks promotion. Live execution remains disabled; this lane only collects
 and archives public market data.
+The gate freezes the legacy writer's PID and current systemd restart counter at
+start and requires both to remain unchanged. A nonzero historical counter from the
+unit's scheduled six-hour `RuntimeMaxSec` refresh is valid evidence; any increment
+during shadow or before cutover fails the migration. After the legacy writer is
+stopped, cutover explicitly resets the inherited counter and requires the new Rust
+process to remain at zero for post-start verification.
+PID and `NRestarts` are not sufficient across the final stop boundary, so the gate
+also freezes each unit's systemd `InvocationID`. Immediately before stopping the
+shadow or legacy writer, the control captures a synced journal cursor; after the
+stop it scans only records after that cursor, rejects evidence of a new invocation
+or restart, and rechecks the frozen restart counter. This closes the race between
+the final live identity check and `systemctl stop`.
+
+A cutover is successful only when its evidence directory contains `cutover.json`
+and an adjacent, single-line `PASSED.sha256` that verifies exactly that JSON with
+`sha256sum --check --strict`. Either file by itself is provisional and must not be
+treated as promotion evidence. Any failed transition or automatic or requested
+rollback invalidates that success pair; the retained failed/rollback artifacts are
+for forensic review only and cannot authorize Rust production. Before rollback can
+change any service, the marker is atomically renamed to
+`PASSED.rollback-pending.sha256` and synced. A failed or interrupted restore therefore
+leaves an explicit pending marker rather than stale Rust-production authorization;
+successful automatic recovery finalizes it as `PASSED.invalid.sha256`, while a
+requested rollback finalizes it as `PASSED.rolled-back.sha256`. Each renamed marker
+continues to verify the unchanged `cutover.json`; none can substitute for the exact
+canonical `PASSED.sha256` required to authorize Rust production.
 
 Each service opens bounded WebSocket shards, records every diff, fetches a REST
 Top-100 snapshot, validates sequence continuity, writes replay checkpoints, compresses

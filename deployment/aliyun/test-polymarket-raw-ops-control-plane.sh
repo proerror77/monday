@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Static contract greps intentionally use literal shell expressions.
-# shellcheck disable=SC1090,SC2016
+# Extracted production snippets invoke test doubles and variables indirectly.
+# shellcheck disable=SC1090,SC2016,SC2034,SC2329
 set -euo pipefail
 
 export LC_ALL=C
@@ -16,7 +17,8 @@ readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 readonly README="$SCRIPT_DIR/README.md"
 
-for command in cargo chmod cp grep jq mkdir mktemp mv rm sed sha256sum shellcheck; do
+for command in cargo chmod cp grep jq mkdir mktemp mv rm sed sha256sum shellcheck \
+  sync wc; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'missing control-plane test dependency: %s\n' "$command" >&2
     exit 2
@@ -71,6 +73,361 @@ if verify_gate_marker "$marker_dir"; then
   printf 'gate-marker verifier accepted a multi-entry marker\n' >&2
   exit 1
 fi
+
+# Exercise the journal cursor/restart detector with deterministic journal JSON.
+# Both release scripts must carry the exact same implementation so one behavior
+# test covers the code that guards both the shadow stop and production cutover.
+cutover_journal_contract=$(sed -n \
+  -e '/^journal_cursor() {$/,/^}$/p' \
+  -e '/^verify_no_restart_after_cursor() {$/,/^}$/p' "$CUTOVER")
+gate_journal_contract=$(sed -n \
+  -e '/^journal_cursor() {$/,/^}$/p' \
+  -e '/^verify_no_restart_after_cursor() {$/,/^}$/p' "$GATE")
+[[ -n $cutover_journal_contract \
+  && $cutover_journal_contract == "$gate_journal_contract" ]] || {
+  printf 'shadow and cutover journal restart guards are missing or differ\n' >&2
+  exit 1
+}
+journal_contract="$tmp_dir/journal-contract.sh"
+printf '%s\n' "$cutover_journal_contract" >"$journal_contract"
+# shellcheck source=/dev/null
+source "$journal_contract"
+
+journal_test_unit=polymarket-contract-test.service
+journal_cursor_fixture='s=contract-cursor'
+journal_fixture=
+journal_failure_mode=none
+journalctl() {
+  local arguments="$*"
+  if [[ $arguments == '--sync' ]]; then
+    [[ $journal_failure_mode != sync ]] || return 70
+    return 0
+  fi
+  if [[ $arguments == \
+    "--unit $journal_test_unit --lines=0 --show-cursor --no-pager" ]]; then
+    [[ $journal_failure_mode != cursor ]] || return 71
+    printf '%s\n' "-- cursor: $journal_cursor_fixture"
+    return 0
+  fi
+  if [[ $arguments == \
+    "--unit $journal_test_unit --after-cursor $journal_cursor_fixture --output=json --no-pager" ]]; then
+    [[ $journal_failure_mode != after-cursor ]] || return 72
+    [[ -z $journal_fixture ]] || printf '%s\n' "$journal_fixture"
+    return 0
+  fi
+  return 64
+}
+
+captured_cursor=$(journal_cursor "$journal_test_unit")
+[[ $captured_cursor == "$journal_cursor_fixture" ]] || {
+  printf 'journal cursor helper did not return the exact synchronized cursor\n' >&2
+  exit 1
+}
+journal_cursor_fixture=
+if journal_cursor "$journal_test_unit" >/dev/null; then
+  printf 'journal cursor helper accepted an empty cursor\n' >&2
+  exit 1
+fi
+journal_cursor_fixture='s=contract-cursor'
+journal_failure_mode=sync
+if journal_cursor "$journal_test_unit" >/dev/null; then
+  printf 'journal cursor helper ignored journal synchronization failure\n' >&2
+  exit 1
+fi
+journal_failure_mode=cursor
+if journal_cursor "$journal_test_unit" >/dev/null; then
+  printf 'journal cursor helper ignored cursor query failure\n' >&2
+  exit 1
+fi
+journal_failure_mode=none
+
+expected_invocation_id=$(printf '1%.0s' {1..32})
+other_invocation_id=$(printf '2%.0s' {1..32})
+journal_fixture=$(jq -cn '{MESSAGE_ID:"unrelated"}')
+verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id" || {
+    printf 'journal restart guard rejected an unrelated event\n' >&2
+    exit 1
+  }
+journal_fixture=$(jq -cn --arg invocation "$expected_invocation_id" \
+  '{MESSAGE_ID:"39f53479d3a045ac8e11786248231fbf",INVOCATION_ID:$invocation,
+    _SYSTEMD_INVOCATION_ID:$invocation}')
+verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id" || {
+    printf 'journal restart guard rejected the expected invocation\n' >&2
+    exit 1
+  }
+journal_fixture=$(jq -cn --arg invocation "$expected_invocation_id" \
+  '{MESSAGE_ID:"5eb03494b6584870a536b337290809b3",INVOCATION_ID:$invocation}')
+if verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id"; then
+  printf 'journal restart guard accepted an automatic restart event\n' >&2
+  exit 1
+fi
+journal_fixture=$(jq -cn --arg invocation "$other_invocation_id" \
+  '{MESSAGE_ID:"be02cf6855d2428ba40df7e9d022f03d",INVOCATION_ID:$invocation}')
+if verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id"; then
+  printf 'journal restart guard accepted UNIT_FAILED from a different invocation ID\n' >&2
+  exit 1
+fi
+journal_fixture=$(jq -cn --arg invocation "$other_invocation_id" \
+  '{MESSAGE_ID:"unrelated",_SYSTEMD_INVOCATION_ID:$invocation}')
+if verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id"; then
+  printf 'journal restart guard accepted a different systemd invocation ID\n' >&2
+  exit 1
+fi
+journal_fixture=
+journal_failure_mode=sync
+if verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id"; then
+  printf 'journal restart guard ignored journal synchronization failure\n' >&2
+  exit 1
+fi
+journal_failure_mode=after-cursor
+if verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id"; then
+  printf 'journal restart guard ignored journal query failure\n' >&2
+  exit 1
+fi
+journal_failure_mode=none
+journal_fixture='{not-json}'
+if verify_no_restart_after_cursor \
+  "$journal_test_unit" "$journal_cursor_fixture" "$expected_invocation_id" \
+  2>/dev/null; then
+  printf 'journal restart guard accepted malformed journal JSON\n' >&2
+  exit 1
+fi
+
+# Execute the production success-marker statements against temporary evidence.
+# The marker must be a unique, exact checksum of cutover.json and a rerun must
+# fail closed rather than replacing existing evidence.
+cutover_marker_publisher="$tmp_dir/publish-cutover-marker.sh"
+sed -n '/^success_marker="\$evidence_dir\/PASSED.sha256"$/,/^sync "\$success_marker"$/p' \
+  "$CUTOVER" >"$cutover_marker_publisher"
+[[ -s $cutover_marker_publisher ]] || {
+  printf 'cutover success-marker publisher is missing\n' >&2
+  exit 1
+}
+publish_cutover_marker() (
+  evidence_dir=$1
+  die() {
+    printf 'marker publication failed: %s\n' "$*" >&2
+    exit 1
+  }
+  mv() {
+    if [[ ${1:-} == -Tf && $# -eq 3 ]]; then
+      command mv -f "$2" "$3"
+    else
+      command mv "$@"
+    fi
+  }
+  # shellcheck source=/dev/null
+  source "$cutover_marker_publisher"
+)
+
+cutover_success_dir="$tmp_dir/cutover-success"
+mkdir "$cutover_success_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
+  >"$cutover_success_dir/cutover.json"
+publish_cutover_marker "$cutover_success_dir"
+[[ $(wc -l <"$cutover_success_dir/PASSED.sha256") -eq 1 ]] || {
+  printf 'cutover success marker is not exactly one line\n' >&2
+  exit 1
+}
+expected_cutover_marker=$(cd "$cutover_success_dir" && sha256sum cutover.json)
+[[ $(<"$cutover_success_dir/PASSED.sha256") == "$expected_cutover_marker" ]] || {
+  printf 'cutover success marker does not bind the exact cutover.json\n' >&2
+  exit 1
+}
+(
+  cd "$cutover_success_dir"
+  sha256sum --check --strict PASSED.sha256 >/dev/null
+)
+if publish_cutover_marker "$cutover_success_dir" 2>/dev/null; then
+  printf 'cutover marker publisher overwrote existing success evidence\n' >&2
+  exit 1
+fi
+
+# Exercise the production rollback-evidence helpers and EXIT trap. Rollback
+# must durably revoke PASSED before restore can mutate runtime state, then give
+# the preserved evidence its final invalid/rolled-back name.
+rollback_evidence_helpers="$tmp_dir/rollback-evidence-helpers.sh"
+sed -n \
+  -e '/^verify_named_marker() {$/,/^}$/p' \
+  -e '/^prepare_rollback_evidence() {$/,/^}$/p' \
+  -e '/^finalize_rollback_evidence() {$/,/^}$/p' \
+  "$CUTOVER" >"$rollback_evidence_helpers"
+[[ -s $rollback_evidence_helpers ]] || {
+  printf 'rollback evidence helpers are missing\n' >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+source "$rollback_evidence_helpers"
+
+cutover_failure_cleanup="$tmp_dir/cutover-failure-cleanup.sh"
+sed -n '/^on_exit() {$/,/^}$/p' "$CUTOVER" >"$cutover_failure_cleanup"
+[[ -s $cutover_failure_cleanup ]] || {
+  printf 'cutover automatic failure cleanup is missing\n' >&2
+  exit 1
+}
+exercise_failed_cutover_cleanup() (
+  set +e
+  evidence_dir=$1
+  restore_result=$2
+  cutover_succeeded=false
+  transition_started=true
+  restore_legacy() {
+    [[ ! -e $evidence_dir/PASSED.sha256 \
+      && -f $evidence_dir/PASSED.rollback-pending.sha256 ]] || return 90
+    printf '%s\n' pending >"$evidence_dir/restore-observed-pending"
+    return "$restore_result"
+  }
+  secure_regular_file() {
+    [[ -f $1 && ! -L $1 ]]
+  }
+  die() {
+    printf 'rollback evidence transition failed: %s\n' "$*" >&2
+    exit 1
+  }
+  mv() {
+    if [[ ${1:-} == -Tf && $# -eq 3 ]]; then
+      command mv -f "$2" "$3"
+    else
+      command mv "$@"
+    fi
+  }
+  # shellcheck source=/dev/null
+  source "$cutover_failure_cleanup"
+  false
+  on_exit
+)
+
+automatic_failure_dir="$tmp_dir/cutover-automatic-failure"
+mkdir "$automatic_failure_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
+  >"$automatic_failure_dir/cutover.json"
+publish_cutover_marker "$automatic_failure_dir"
+set +e
+exercise_failed_cutover_cleanup "$automatic_failure_dir" 0 >/dev/null 2>&1
+automatic_failure_status=$?
+set -e
+[[ $automatic_failure_status -ne 0 \
+  && ! -e $automatic_failure_dir/PASSED.sha256 \
+  && ! -e $automatic_failure_dir/PASSED.rollback-pending.sha256 \
+  && -f $automatic_failure_dir/cutover.json \
+  && -f $automatic_failure_dir/PASSED.invalid.sha256 \
+  && -f $automatic_failure_dir/restore-observed-pending ]] || {
+  printf 'automatic rollback left success-looking cutover evidence\n' >&2
+  exit 1
+}
+(
+  cd "$automatic_failure_dir"
+  sha256sum --check --strict PASSED.invalid.sha256 >/dev/null
+)
+
+automatic_restore_failure_dir="$tmp_dir/cutover-automatic-restore-failure"
+mkdir "$automatic_restore_failure_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
+  >"$automatic_restore_failure_dir/cutover.json"
+publish_cutover_marker "$automatic_restore_failure_dir"
+set +e
+exercise_failed_cutover_cleanup "$automatic_restore_failure_dir" 1 >/dev/null 2>&1
+automatic_restore_failure_status=$?
+set -e
+[[ $automatic_restore_failure_status -ne 0 \
+  && ! -e $automatic_restore_failure_dir/PASSED.sha256 \
+  && -f $automatic_restore_failure_dir/PASSED.rollback-pending.sha256 \
+  && -f $automatic_restore_failure_dir/cutover.json \
+  && ! -e $automatic_restore_failure_dir/PASSED.invalid.sha256 \
+  && -f $automatic_restore_failure_dir/restore-observed-pending ]] || {
+  printf 'failed automatic restore left ambiguous cutover evidence\n' >&2
+  exit 1
+}
+(
+  cd "$automatic_restore_failure_dir"
+  sha256sum --check --strict PASSED.rollback-pending.sha256 >/dev/null
+)
+
+# Execute the manual rollback transition itself. A failed restoration must
+# leave rollback-pending evidence, and a retry must finalize it before exit 0.
+manual_rollback_contract="$tmp_dir/manual-rollback-contract.sh"
+sed -n '/^  prepare_rollback_evidence "\$rollback_evidence"/,/^  exit 0$/p' \
+  "$CUTOVER" >"$manual_rollback_contract"
+[[ -s $manual_rollback_contract ]] || {
+  printf 'manual rollback evidence transition is missing\n' >&2
+  exit 1
+}
+exercise_manual_rollback() (
+  set -euo pipefail
+  rollback_evidence=$1
+  restore_result=$2
+  restore_legacy() {
+    [[ ! -e $rollback_evidence/PASSED.sha256 \
+      && -f $rollback_evidence/PASSED.rollback-pending.sha256 ]] || return 90
+    printf '%s\n' pending >"$rollback_evidence/restore-observed-pending"
+    return "$restore_result"
+  }
+  secure_regular_file() {
+    [[ -f $1 && ! -L $1 ]]
+  }
+  die() {
+    printf 'manual rollback evidence transition failed: %s\n' "$*" >&2
+    exit 1
+  }
+  mv() {
+    if [[ ${1:-} == -Tf && $# -eq 3 ]]; then
+      command mv -f "$2" "$3"
+    else
+      command mv "$@"
+    fi
+  }
+  # shellcheck source=/dev/null
+  source "$manual_rollback_contract"
+)
+
+manual_failure_dir="$tmp_dir/manual-rollback-failure"
+mkdir "$manual_failure_dir"
+printf '%s\n' '{"schema":"monday.polymarket_cutover.v1"}' \
+  >"$manual_failure_dir/cutover.json"
+publish_cutover_marker "$manual_failure_dir"
+set +e
+exercise_manual_rollback "$manual_failure_dir" 1 >/dev/null 2>&1
+manual_failure_status=$?
+set -e
+[[ $manual_failure_status -ne 0 \
+  && ! -e $manual_failure_dir/PASSED.sha256 \
+  && -f $manual_failure_dir/PASSED.rollback-pending.sha256 \
+  && -f $manual_failure_dir/cutover.json \
+  && -f $manual_failure_dir/restore-observed-pending \
+  && ! -e $manual_failure_dir/PASSED.rolled-back.sha256 \
+  && ! -e $manual_failure_dir/cutover.rolled-back.json ]] || {
+  printf 'failed manual restoration did not leave rollback-pending evidence\n' >&2
+  exit 1
+}
+(
+  cd "$manual_failure_dir"
+  sha256sum --check --strict PASSED.rollback-pending.sha256 >/dev/null
+)
+
+set +e
+exercise_manual_rollback "$manual_failure_dir" 0 >/dev/null 2>&1
+manual_success_status=$?
+set -e
+[[ $manual_success_status -eq 0 \
+  && ! -e $manual_failure_dir/PASSED.sha256 \
+  && ! -e $manual_failure_dir/PASSED.rollback-pending.sha256 \
+  && -f $manual_failure_dir/cutover.json \
+  && -f $manual_failure_dir/PASSED.rolled-back.sha256 \
+  && ! -e $manual_failure_dir/cutover.rolled-back.json ]] || {
+  printf 'successful manual rollback retained success-looking evidence\n' >&2
+  exit 1
+}
+(
+  cd "$manual_failure_dir"
+  sha256sum --check --strict PASSED.rolled-back.sha256 >/dev/null
+)
 
 legacy="$tmp_dir/legacy"
 rust="$tmp_dir/rust"
@@ -184,12 +541,16 @@ candidate=$(printf 'a%.0s' {1..64})
 source_revision=$(printf 'b%.0s' {1..40})
 bundle=$(printf 'c%.0s' {1..64})
 oss_config=$(printf 'd%.0s' {1..64})
+legacy_invocation_id=$(printf 'e%.0s' {1..32})
+shadow_invocation_id=$(printf 'f%.0s' {1..32})
 legacy_cmdline=dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a
 jq \
   --arg candidate "$candidate" \
   --arg source "$source_revision" \
   --arg bundle "$bundle" \
   --arg oss_config "$oss_config" \
+  --arg legacy_invocation_id "$legacy_invocation_id" \
+  --arg shadow_invocation_id "$shadow_invocation_id" \
   --arg legacy_cmdline "$legacy_cmdline" \
   '. + {
     schema:"monday.polymarket_shadow_gate.v1",
@@ -208,7 +569,8 @@ jq \
       cmdline:"/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py",
       cmdline_sha256:$legacy_cmdline,
       fragment_path:"/etc/systemd/system/polymarket-reference-collector.service",
-      drop_in_paths:[],main_pid:10,restarts:0
+      drop_in_paths:[],main_pid:10,restarts:1,
+      invocation_id:$legacy_invocation_id
     },
     shadow_runtime:{
       exec_start:("/opt/monday/releases/polymarket-raw-ops/" + $candidate
@@ -217,7 +579,8 @@ jq \
         + "/polymarket-raw-ops collect-reference --spool-dir "
         + "/data/monday/spool/polymarket-reference-rust-shadow/" + $candidate + "/run-1"),
       fragment_path:"/etc/systemd/system/polymarket-reference-collector-shadow@.service",
-      drop_in_paths:[],main_pid:11,restarts:0
+      drop_in_paths:[],main_pid:11,restarts:0,
+      invocation_id:$shadow_invocation_id
     },
     checks:(.checks + {health_freshness:true,candidate_identity:true,
       oss_readback_parity:true,market_oss_readback_parity:true}),
@@ -272,9 +635,38 @@ if jq -e -f "$POLICY" "$tmp_dir/unbound-oss-config.json" >/dev/null; then
   printf 'gate policy accepted evidence without an OSS configuration identity\n' >&2
   exit 1
 fi
-jq '.legacy_runtime.restarts = 1' "$tmp_dir/gate.json" >"$tmp_dir/restarted-legacy.json"
-if jq -e -f "$POLICY" "$tmp_dir/restarted-legacy.json" >/dev/null; then
-  printf 'gate policy accepted a restarted legacy collector\n' >&2
+jq '.legacy_runtime.restarts = -1' "$tmp_dir/gate.json" >"$tmp_dir/negative-restarts.json"
+if jq -e -f "$POLICY" "$tmp_dir/negative-restarts.json" >/dev/null; then
+  printf 'gate policy accepted a negative legacy restart counter\n' >&2
+  exit 1
+fi
+jq '.legacy_runtime.restarts = 1.5' "$tmp_dir/gate.json" >"$tmp_dir/fractional-restarts.json"
+if jq -e -f "$POLICY" "$tmp_dir/fractional-restarts.json" >/dev/null; then
+  printf 'gate policy accepted a fractional legacy restart counter\n' >&2
+  exit 1
+fi
+jq 'del(.legacy_runtime.invocation_id)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/missing-legacy-invocation.json"
+if jq -e -f "$POLICY" "$tmp_dir/missing-legacy-invocation.json" >/dev/null; then
+  printf 'gate policy accepted evidence without a legacy invocation ID\n' >&2
+  exit 1
+fi
+jq '.legacy_runtime.invocation_id = ("E" * 32)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/invalid-legacy-invocation.json"
+if jq -e -f "$POLICY" "$tmp_dir/invalid-legacy-invocation.json" >/dev/null; then
+  printf 'gate policy accepted a malformed legacy invocation ID\n' >&2
+  exit 1
+fi
+jq 'del(.shadow_runtime.invocation_id)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/missing-shadow-invocation.json"
+if jq -e -f "$POLICY" "$tmp_dir/missing-shadow-invocation.json" >/dev/null; then
+  printf 'gate policy accepted evidence without a shadow invocation ID\n' >&2
+  exit 1
+fi
+jq '.shadow_runtime.invocation_id = ("f" * 31)' "$tmp_dir/gate.json" \
+  >"$tmp_dir/invalid-shadow-invocation.json"
+if jq -e -f "$POLICY" "$tmp_dir/invalid-shadow-invocation.json" >/dev/null; then
+  printf 'gate policy accepted a malformed shadow invocation ID\n' >&2
   exit 1
 fi
 jq '.legacy_runtime.drop_in_paths = ["/etc/systemd/system/polymarket-reference-collector.service.d/override.conf"]' \
@@ -412,6 +804,9 @@ grep -Fq 'readlink -f "/proc/$pid/exe"' "$CUTOVER"
 grep -Fq 'FragmentPath' "$CUTOVER"
 grep -Fq 'DropInPaths' "$CUTOVER"
 grep -Fq 'NRestarts' "$CUTOVER"
+[[ $(grep -Fc '[[ $invocation_id == "$expected_invocation_id" ]]' "$GATE") -eq 2 ]]
+[[ $(grep -Fc '[[ $invocation_id == "$expected_invocation_id" ]]' "$CUTOVER") -eq 2 ]]
+grep -Fq 'invocation_id:$rust_invocation_id' "$CUTOVER"
 grep -Fq 'verify_shadow_identity' "$GATE"
 grep -Fq 'health_advanced=true' "$CUTOVER"
 grep -Fq 'updated_epoch >= started_epoch' "$CUTOVER"
@@ -453,12 +848,62 @@ release_move_line=$(grep -n '^  mv "$staging" "$release_dir"$' "$GATE" \
 }
 
 cutover_stop_line=$(grep -n '^systemctl stop "$COLLECTOR_UNIT"$' "$CUTOVER" | cut -d: -f1)
+legacy_drain_line=$(grep -n '^verify_oneshot_success "$REFERENCE_UPLOAD_UNIT"' "$CUTOVER" \
+  | head -1 | cut -d: -f1)
+legacy_cursor_line=$(grep -n '^legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT")' \
+  "$CUTOVER" | cut -d: -f1)
+legacy_final_runtime_line=$(grep -n \
+  '^verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id"' \
+  "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+legacy_final_health_line=$(grep -n '^verify_legacy_health "$pre_stop_health_not_before"' \
+  "$CUTOVER" | cut -d: -f1)
+legacy_final_oss_line=$(grep -n \
+  'OSS configuration changed during the legacy uploader drain' "$CUTOVER" \
+  | cut -d: -f1)
+legacy_journal_guard_line=$(grep -n '^verify_no_restart_after_cursor' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+legacy_stopped_counter_line=$(grep -n '^stopped_legacy_restarts=' "$CUTOVER" \
+  | cut -d: -f1)
+legacy_stopped_equality_line=$(grep -n \
+  '^\[\[ \$stopped_legacy_restarts == "\$gate_legacy_restarts" \]\]' "$CUTOVER" \
+  | cut -d: -f1)
 cutover_clear_line=$(grep -n '^clear_health_before_restart "$evidence_dir" pre-cutover$' \
   "$CUTOVER" | cut -d: -f1)
+cutover_reset_line=$(grep -n '^systemctl reset-failed "$COLLECTOR_UNIT"$' "$CUTOVER" \
+  | cut -d: -f1)
 cutover_restart_line=$(grep -n '^systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
   | cut -d: -f1)
-((cutover_stop_line < cutover_clear_line && cutover_clear_line < cutover_restart_line)) || {
-  printf 'cutover no longer follows stop -> clear stale health -> explicit restart\n' >&2
+((legacy_drain_line < legacy_cursor_line \
+  && legacy_cursor_line < legacy_final_health_line \
+  && legacy_final_health_line < legacy_final_oss_line \
+  && legacy_final_oss_line < legacy_final_runtime_line \
+  && legacy_final_runtime_line < cutover_stop_line \
+  && cutover_stop_line < legacy_journal_guard_line \
+  && legacy_journal_guard_line < legacy_stopped_counter_line \
+  && cutover_stop_line < legacy_stopped_counter_line \
+  && legacy_stopped_counter_line < legacy_stopped_equality_line \
+  && legacy_stopped_equality_line < cutover_clear_line \
+  && cutover_clear_line < cutover_reset_line \
+  && cutover_reset_line < cutover_restart_line)) || {
+  printf 'cutover no longer proves restart-free legacy stop before reset/restart\n' >&2
+  exit 1
+}
+rollback_reload_line=$(grep -n '^  systemctl daemon-reload$' "$CUTOVER" | cut -d: -f1)
+rollback_reset_line=$(grep -n '^  systemctl reset-failed "$COLLECTOR_UNIT"$' "$CUTOVER" \
+  | cut -d: -f1)
+rollback_restart_line=$(grep -n '^  systemctl restart "$COLLECTOR_UNIT"$' "$CUTOVER" \
+  | cut -d: -f1)
+((rollback_reload_line < rollback_reset_line && rollback_reset_line < rollback_restart_line)) \
+  || {
+    printf 'rollback does not reset the inherited restart counter before verification\n' >&2
+    exit 1
+  }
+rollback_state_line=$(grep -n '^  verify_saved_unit_state' "$CUTOVER" | cut -d: -f1)
+rollback_final_runtime_line=$(grep -n '^  verify_fresh_legacy_runtime' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+((rollback_state_line < rollback_final_runtime_line)) || {
+  printf 'rollback lacks a final runtime check after restoring unit state\n' >&2
   exit 1
 }
 rollback_branch_line=$(grep -n '^if \[\[ \$mode == rollback \]\]; then$' "$CUTOVER" \
@@ -470,6 +915,95 @@ cutover_policy_line=$(grep -n '^secure_regular_file "$POLICY"$' "$CUTOVER" \
   exit 1
 }
 grep -Fq 'shadow_restarts=$(systemctl show --property=NRestarts' "$GATE"
+grep -Fq 'legacy_restarts=$(systemctl show --property=NRestarts' "$GATE"
+grep -Fq \
+  'verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id"' \
+  "$GATE"
+grep -Fq \
+  'verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id"' \
+  "$CUTOVER"
+
+shadow_cursor_line=$(grep -n '^shadow_stop_cursor=$(journal_cursor "$shadow_unit")' "$GATE" \
+  | cut -d: -f1)
+shadow_final_runtime_line=$(grep -n \
+  '^verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id"' "$GATE" \
+  | tail -1 | cut -d: -f1)
+shadow_stop_line=$(grep -n '^systemctl stop "$shadow_unit"$' "$GATE" | tail -1 | cut -d: -f1)
+shadow_journal_guard_line=$(grep -n \
+  '^verify_no_restart_after_cursor "$shadow_unit" "$shadow_stop_cursor" "$shadow_invocation_id"' \
+  "$GATE" | cut -d: -f1)
+shadow_stopped_counter_line=$(grep -n '^stopped_shadow_restarts=' "$GATE" | cut -d: -f1)
+shadow_stopped_equality_line=$(grep -n '^\[\[ \$stopped_shadow_restarts == 0 \]\]' \
+  "$GATE" | cut -d: -f1)
+((shadow_cursor_line < shadow_final_runtime_line \
+  && shadow_final_runtime_line < shadow_stop_line \
+  && shadow_stop_line < shadow_journal_guard_line \
+  && shadow_journal_guard_line < shadow_stopped_counter_line \
+  && shadow_stopped_counter_line < shadow_stopped_equality_line)) || {
+  printf 'shadow lacks exact invocation, journal, and restart-counter stop guards\n' >&2
+  exit 1
+}
+
+cutover_sync_line=$(grep -n '^sync "$evidence_dir/cutover.json"$' "$CUTOVER" | cut -d: -f1)
+cutover_final_runtime_line=$(grep -n \
+  '^verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id"' \
+  "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_final_upload_line=$(grep -n '^verify_upload_units "$pinned_upload_env"' "$CUTOVER" \
+  | tail -1 | cut -d: -f1)
+cutover_final_oss_line=$(grep -n \
+  'pinned OSS configuration changed before cutover completion' "$CUTOVER" \
+  | cut -d: -f1)
+cutover_marker_hash_line=$(grep -n '^  sha256sum cutover.json >' "$CUTOVER" | cut -d: -f1)
+cutover_marker_move_line=$(grep -n '^mv -Tf "$success_marker_tmp" "$success_marker"$' \
+  "$CUTOVER" | cut -d: -f1)
+cutover_marker_sync_line=$(grep -n '^sync "$success_marker"$' "$CUTOVER" | cut -d: -f1)
+cutover_success_line=$(grep -n '^cutover_succeeded=true$' "$CUTOVER" | cut -d: -f1)
+cutover_trap_off_line=$(grep -n '^trap - EXIT$' "$CUTOVER" | tail -1 | cut -d: -f1)
+((cutover_sync_line < cutover_final_runtime_line \
+  && cutover_final_runtime_line < cutover_final_upload_line \
+  && cutover_final_upload_line < cutover_final_oss_line \
+  && cutover_final_oss_line < cutover_marker_hash_line \
+  && cutover_marker_hash_line < cutover_marker_move_line \
+  && cutover_marker_move_line < cutover_marker_sync_line \
+  && cutover_marker_sync_line < cutover_success_line \
+  && cutover_success_line < cutover_trap_off_line)) || {
+  printf 'cutover publishes success before final verification or durable marker sync\n' >&2
+  exit 1
+}
+
+automatic_prepare_line=$(grep -n \
+  '^    prepare_rollback_evidence "$evidence_dir" || {' "$CUTOVER" | cut -d: -f1)
+automatic_restore_line=$(grep -n '^    restore_legacy "$evidence_dir" >/dev/null$' "$CUTOVER" \
+  | cut -d: -f1)
+automatic_finalize_line=$(grep -n \
+  '^      finalize_rollback_evidence "$evidence_dir" invalid || status=1$' "$CUTOVER" \
+  | cut -d: -f1)
+automatic_failure_exit_line=$(grep -n '^  exit "$status"$' "$CUTOVER" | cut -d: -f1)
+((automatic_prepare_line < automatic_restore_line \
+  && automatic_restore_line < automatic_finalize_line \
+  && automatic_finalize_line < automatic_failure_exit_line)) || {
+  printf 'automatic rollback does not revoke success before restore and finalize evidence\n' >&2
+  exit 1
+}
+
+manual_prepare_line=$(grep -n \
+  'prepare_rollback_evidence "$rollback_evidence"' "$CUTOVER" | tail -1 | cut -d: -f1)
+manual_restore_line=$(grep -n '^  restore_legacy "$rollback_evidence" >/dev/null$' "$CUTOVER" \
+  | cut -d: -f1)
+manual_finalize_line=$(grep -n \
+  '^  finalize_rollback_evidence "$rollback_evidence" rolled-back' "$CUTOVER" \
+  | cut -d: -f1)
+manual_print_line=$(grep -n '^  printf '\''%s\\n'\'' "$rollback_evidence"$' "$CUTOVER" \
+  | cut -d: -f1)
+manual_exit_line=$(grep -n '^  exit 0$' "$CUTOVER" | head -1 | cut -d: -f1)
+((manual_prepare_line < manual_restore_line \
+  && manual_restore_line < manual_finalize_line \
+  && manual_finalize_line < manual_print_line \
+  && manual_print_line < manual_exit_line)) || {
+  printf 'manual rollback does not revoke success before restore and finalize evidence\n' >&2
+  exit 1
+}
 
 market_upload_line=$(grep -n '^market_upload_json=' "$GATE" | cut -d: -f1)
 legacy_final_line=$(grep -n 'verify_legacy_identity "$legacy_pid"' "$GATE" \

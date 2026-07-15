@@ -118,6 +118,54 @@ verify_gate_marker() {
   )
 }
 
+verify_named_marker() {
+  local evidence_dir=$1 json_name=$2 marker_name=$3 expected actual line_count
+  [[ -f $evidence_dir/$json_name && ! -L $evidence_dir/$json_name ]] || return 1
+  [[ -f $evidence_dir/$marker_name && ! -L $evidence_dir/$marker_name ]] || return 1
+  line_count=$(wc -l <"$evidence_dir/$marker_name") || return 1
+  [[ $line_count -eq 1 ]] || return 1
+  expected=$(cd "$evidence_dir" && sha256sum "$json_name") || return 1
+  actual=$(<"$evidence_dir/$marker_name") || return 1
+  [[ $actual == "$expected" ]] || return 1
+  (
+    cd "$evidence_dir"
+    sha256sum --check --strict "$marker_name" >/dev/null
+  )
+}
+
+prepare_rollback_evidence() {
+  local evidence_dir=$1
+  local marker=$evidence_dir/PASSED.sha256
+  local pending=$evidence_dir/PASSED.rollback-pending.sha256
+  local cutover=$evidence_dir/cutover.json
+  if [[ -e $marker || -L $marker ]]; then
+    secure_regular_file "$marker"
+    secure_regular_file "$cutover"
+    verify_named_marker "$evidence_dir" cutover.json PASSED.sha256 \
+      || die 'cutover success marker does not verify the exact cutover evidence'
+    [[ ! -e $pending && ! -L $pending ]] \
+      || die 'rollback-pending marker path already exists'
+    mv -Tf "$marker" "$pending" || return 1
+    sync "$pending" || return 1
+  elif [[ -e $pending || -L $pending ]]; then
+    secure_regular_file "$pending"
+    secure_regular_file "$cutover"
+    verify_named_marker "$evidence_dir" cutover.json PASSED.rollback-pending.sha256 \
+      || die 'rollback-pending marker does not verify the exact cutover evidence'
+  fi
+}
+
+finalize_rollback_evidence() {
+  local evidence_dir=$1 label=$2
+  local pending=$evidence_dir/PASSED.rollback-pending.sha256
+  if [[ -e $pending || -L $pending ]]; then
+    verify_named_marker "$evidence_dir" cutover.json PASSED.rollback-pending.sha256 \
+      || return 1
+    mv -Tf "$pending" "$evidence_dir/PASSED.$label.sha256" || return 1
+  fi
+  sync "$evidence_dir"
+}
+
 effective_exec_argv() {
   local unit=$1 raw argv
   raw=$(systemctl show --property=ExecStart --value "$unit") || return 1
@@ -131,6 +179,28 @@ proc_cmdline() {
   local pid=$1
   [[ $pid =~ ^[1-9][0-9]*$ && -r /proc/$pid/cmdline ]] || return 1
   tr '\0' ' ' <"/proc/$pid/cmdline"
+}
+
+journal_cursor() {
+  local unit=$1 cursor
+  journalctl --sync || return 1
+  cursor=$(journalctl --unit "$unit" --lines=0 --show-cursor --no-pager \
+    | sed -n 's/^-- cursor: //p') || return 1
+  [[ -n $cursor ]] || return 1
+  printf '%s\n' "$cursor"
+}
+
+verify_no_restart_after_cursor() {
+  local unit=$1 cursor=$2 expected_invocation_id=$3
+  journalctl --sync || return 1
+  journalctl --unit "$unit" --after-cursor "$cursor" --output=json --no-pager \
+    | jq -s -e --arg expected "$expected_invocation_id" '
+      all(.[];
+        ((.MESSAGE_ID // "") != "5eb03494b6584870a536b337290809b3")
+        and ((.INVOCATION_ID // "") | length == 0 or . == $expected)
+        and ((._SYSTEMD_INVOCATION_ID // "") | length == 0 or . == $expected)
+      )
+    ' >/dev/null || return 1
 }
 
 verify_effective_unit() {
@@ -233,13 +303,16 @@ verify_saved_unit_state() {
 }
 
 verify_legacy_runtime() {
-  local expected_pid=$1 pid cmdline restarts
+  local expected_pid=$1 expected_restarts=$2 expected_invocation_id=$3
+  local pid cmdline restarts invocation_id
   unit_active "$COLLECTOR_UNIT" || return 1
   verify_effective_unit "$COLLECTOR_UNIT" "$COLLECTOR_FRAGMENT" "$LEGACY_EXEC" || return 1
   pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
   [[ $pid == "$expected_pid" ]] || return 1
   restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") || return 1
-  [[ $restarts == 0 ]] || return 1
+  [[ $restarts == "$expected_restarts" ]] || return 1
+  invocation_id=$(systemctl show --property=InvocationID --value "$COLLECTOR_UNIT") || return 1
+  [[ $invocation_id == "$expected_invocation_id" ]] || return 1
   cmdline=$(proc_cmdline "$pid") || return 1
   [[ $cmdline == "$LEGACY_EXEC " ]]
 }
@@ -262,8 +335,10 @@ verify_legacy_health() {
 }
 
 verify_fresh_legacy_runtime() {
-  local started_epoch=$1 expected_pid=$2 health_policy=${3:-$LEGACY_HEALTH_POLICY}
-  verify_legacy_runtime "$expected_pid" || return 1
+  local started_epoch=$1 expected_pid=$2 expected_restarts=$3 expected_invocation_id=$4
+  local health_policy=${5:-$LEGACY_HEALTH_POLICY}
+  verify_legacy_runtime "$expected_pid" "$expected_restarts" "$expected_invocation_id" \
+    || return 1
   verify_legacy_health "$started_epoch" "$health_policy"
 }
 
@@ -297,14 +372,16 @@ verify_rust_health_file() {
 }
 
 verify_rust_runtime() {
-  local expected_binary=$1 started_epoch=$2 expected_pid=$3
-  local pid cmdline restarts
+  local expected_binary=$1 started_epoch=$2 expected_pid=$3 expected_invocation_id=$4
+  local pid cmdline restarts invocation_id
   unit_active "$COLLECTOR_UNIT" || return 1
   verify_effective_unit "$COLLECTOR_UNIT" "$COLLECTOR_FRAGMENT" "$RUST_EXEC" || return 1
   pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
   [[ $pid == "$expected_pid" ]] || return 1
   restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") || return 1
   [[ $restarts == 0 ]] || return 1
+  invocation_id=$(systemctl show --property=InvocationID --value "$COLLECTOR_UNIT") || return 1
+  [[ $invocation_id == "$expected_invocation_id" ]] || return 1
   [[ $(readlink -f "/proc/$pid/exe") == "$expected_binary" ]] || return 1
   cmdline=$(proc_cmdline "$pid") || return 1
   [[ $cmdline == "$RUST_EXEC " ]] || return 1
@@ -388,9 +465,13 @@ restore_legacy() (
     rm -f "$ACTIVE_BINARY"
   fi
   systemctl daemon-reload
+  systemctl reset-failed "$COLLECTOR_UNIT"
+  [[ $(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") == 0 ]] \
+    || die 'legacy restart counter did not reset before rollback verification'
   started_epoch=$(date -u +%s)
   systemctl restart "$COLLECTOR_UNIT"
   rollback_pid=
+  rollback_invocation_id=
   for _ in $(seq 1 36); do
     restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT")
     [[ $restarts == 0 ]] || die 'Python collector restarted while rollback was being verified'
@@ -398,17 +479,21 @@ restore_legacy() (
     if [[ $current_pid =~ ^[1-9][0-9]*$ ]]; then
       if [[ -z $rollback_pid ]]; then
         rollback_pid=$current_pid
+        rollback_invocation_id=$(systemctl show --property=InvocationID --value "$COLLECTOR_UNIT")
+        [[ $rollback_invocation_id =~ ^[a-f0-9]{32}$ ]] \
+          || die 'rollback collector has no verifiable systemd invocation ID'
       else
         [[ $current_pid == "$rollback_pid" ]] \
           || die 'Python collector PID changed while rollback was being verified'
       fi
-      verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" \
-        "$rollback_health_policy" && break
+      verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
+        "$rollback_invocation_id" "$rollback_health_policy" && break
     fi
     sleep 5
   done
   [[ -n $rollback_pid ]] || die 'Python collector never produced a verifiable MainPID'
-  verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" "$rollback_health_policy" \
+  verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
+    "$rollback_invocation_id" "$rollback_health_policy" \
     || die 'Python collector identity or health did not recover during rollback'
 
   for asset in "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"; do
@@ -423,10 +508,14 @@ restore_legacy() (
       systemctl start "$asset"
     fi
   done
-  verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" "$rollback_health_policy" \
+  verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
+    "$rollback_invocation_id" "$rollback_health_policy" \
     || die 'rollback did not preserve Python runtime identity and health'
   verify_saved_unit_state "$rollback_dir/state.json" \
     || die 'rollback did not restore the saved collector/timer state'
+  verify_fresh_legacy_runtime "$started_epoch" "$rollback_pid" 0 \
+    "$rollback_invocation_id" "$rollback_health_policy" \
+    || die 'legacy runtime changed before rollback completion'
   printf '%s\n' "$evidence_dir"
 )
 
@@ -469,7 +558,12 @@ if [[ $mode == rollback ]]; then
   rollback_evidence=$(readlink -f -- "$2")
   [[ $rollback_evidence == "$EVIDENCE_ROOT"/* ]] \
     || die 'rollback evidence is outside the fixed cutover evidence root'
-  restore_legacy "$rollback_evidence"
+  prepare_rollback_evidence "$rollback_evidence" \
+    || die 'could not invalidate cutover success before manual rollback'
+  restore_legacy "$rollback_evidence" >/dev/null
+  finalize_rollback_evidence "$rollback_evidence" rolled-back \
+    || die 'could not finalize rolled-back cutover evidence'
+  printf '%s\n' "$rollback_evidence"
   exit 0
 fi
 
@@ -535,10 +629,16 @@ legacy_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
   || die 'cutover requires a verifiable active Python reference collector PID'
 gate_legacy_pid=$(jq -er '.legacy_runtime.main_pid | select(type == "number" and floor == . and . > 0)' \
   "$gate_json") || die 'shadow gate has no valid legacy MainPID'
+gate_legacy_restarts=$(jq -er \
+  '.legacy_runtime.restarts | select(type == "number" and floor == . and . >= 0)' \
+  "$gate_json") || die 'shadow gate has no valid legacy restart counter'
+gate_legacy_invocation_id=$(jq -er \
+  '.legacy_runtime.invocation_id | select(type == "string" and test("^[a-f0-9]{32}$"))' \
+  "$gate_json") || die 'shadow gate has no valid legacy systemd invocation ID'
 [[ $legacy_pid == "$gate_legacy_pid" ]] \
   || die 'legacy collector MainPID changed after the shadow gate'
-verify_legacy_runtime "$legacy_pid" \
-  || die 'cutover requires the exact restart-free Python reference collector'
+verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id" \
+  || die 'legacy collector identity or restart counter changed after the shadow gate'
 legacy_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
 verify_legacy_health "$legacy_health_not_before" \
   || die 'cutover requires current fail-closed legacy health'
@@ -557,6 +657,10 @@ on_exit() {
   if [[ $cutover_succeeded == false && $transition_started == true ]]; then
     printf 'cutover failed; restoring snapshotted Python runtime\n' >&2
     trap - EXIT
+    prepare_rollback_evidence "$evidence_dir" || {
+      printf 'refusing automatic rollback because success evidence could not be invalidated\n' >&2
+      exit 1
+    }
     set +e
     restore_legacy "$evidence_dir" >/dev/null
     restore_status=$?
@@ -564,6 +668,8 @@ on_exit() {
     if ((restore_status != 0)); then
       printf 'automatic rollback failed; collector and upload timers require operator recovery\n' >&2
       status=1
+    else
+      finalize_rollback_evidence "$evidence_dir" invalid || status=1
     fi
   fi
   exit "$status"
@@ -588,8 +694,23 @@ grep -Fxq "EnvironmentFile=$pinned_upload_env" \
 systemctl start "$REFERENCE_UPLOAD_UNIT"
 verify_oneshot_success "$REFERENCE_UPLOAD_UNIT" \
   || die 'legacy reference uploader drain did not complete successfully'
+legacy_stop_cursor=$(journal_cursor "$COLLECTOR_UNIT") \
+  || die 'could not capture the legacy collector journal cursor before stop'
+pre_stop_health_not_before=$(($(date -u +%s) - MAX_HEALTH_SILENCE_SECONDS))
+verify_legacy_health "$pre_stop_health_not_before" \
+  || die 'legacy collector health is not current after uploader drain'
+[[ $(oss_config_sha256) == "$gate_oss_config_sha" ]] \
+  || die 'OSS configuration changed during the legacy uploader drain'
+verify_legacy_runtime "$legacy_pid" "$gate_legacy_restarts" "$gate_legacy_invocation_id" \
+  || die 'legacy collector identity or restart counter changed during uploader drain'
 
 systemctl stop "$COLLECTOR_UNIT"
+verify_no_restart_after_cursor \
+  "$COLLECTOR_UNIT" "$legacy_stop_cursor" "$gate_legacy_invocation_id" \
+  || die 'legacy collector journal recorded a restart during final stop'
+stopped_legacy_restarts=$(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT")
+[[ $stopped_legacy_restarts == "$gate_legacy_restarts" ]] \
+  || die 'legacy collector restarted between final verification and stop'
 clear_health_before_restart "$evidence_dir" pre-cutover
 install -d -m 0755 /opt/monday/bin
 temporary_link="${ACTIVE_BINARY}.new.$$"
@@ -609,9 +730,13 @@ systemctl daemon-reload
 verify_upload_units "$pinned_upload_env" \
   || die 'Rust upload unit or timer identity differs from the gated configuration'
 
+systemctl reset-failed "$COLLECTOR_UNIT"
+[[ $(systemctl show --property=NRestarts --value "$COLLECTOR_UNIT") == 0 ]] \
+  || die 'collector restart counter did not reset before Rust verification'
 started_epoch=$(date -u +%s)
 systemctl restart "$COLLECTOR_UNIT"
 rust_pid=
+rust_invocation_id=
 first_health_updated_at=
 health_advanced=false
 for _ in $(seq 1 36); do
@@ -621,11 +746,15 @@ for _ in $(seq 1 36); do
   if [[ $current_pid =~ ^[1-9][0-9]*$ ]]; then
     if [[ -z $rust_pid ]]; then
       rust_pid=$current_pid
+      rust_invocation_id=$(systemctl show --property=InvocationID --value "$COLLECTOR_UNIT")
+      [[ $rust_invocation_id =~ ^[a-f0-9]{32}$ ]] \
+        || die 'Rust collector has no verifiable systemd invocation ID'
     else
       [[ $current_pid == "$rust_pid" ]] \
         || die 'Rust collector PID changed during cutover verification'
     fi
-    if verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid"; then
+    if verify_rust_runtime \
+      "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id"; then
       current_health_updated_at=$(jq -er '.updated_at' "$HEALTH")
       if [[ -z $first_health_updated_at ]]; then
         first_health_updated_at=$current_health_updated_at
@@ -640,7 +769,7 @@ done
 [[ -n $rust_pid ]] || die 'Rust collector never produced a verifiable MainPID'
 [[ $health_advanced == true ]] \
   || die 'Rust collector health did not advance across two clean polls'
-verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" \
+verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector failed post-restart identity or health checks'
 
 # Both one-shot services must execute successfully before their timers are re-enabled.
@@ -660,7 +789,7 @@ verify_oneshot_success "$MARKET_UPLOAD_UNIT" \
   || die 'Rust market uploader did not complete successfully'
 systemctl enable "$COLLECTOR_UNIT" "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
 systemctl start "$REFERENCE_UPLOAD_TIMER" "$MARKET_UPLOAD_TIMER"
-verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" \
+verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed while enabling upload timers'
 verify_upload_units "$pinned_upload_env" \
   || die 'Rust upload unit or timer identity changed while enabling timers'
@@ -677,7 +806,7 @@ fi
 
 main_pid=$(systemctl show --property=MainPID --value "$COLLECTOR_UNIT")
 [[ $main_pid == "$rust_pid" ]] || die 'Rust collector PID changed before evidence publication'
-verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" \
+verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity or health changed before evidence publication'
 health_file="$evidence_dir/post-start-health.json"
 install -m 0640 "$HEALTH" "$health_file"
@@ -697,18 +826,20 @@ jq -n \
   --arg health_sha256 "$health_sha" \
   --arg journal_sha256 "$journal_sha" \
   --arg rollback_manifest_sha256 "$rollback_sha" \
+  --arg rust_invocation_id "$rust_invocation_id" \
   --argjson main_pid "$main_pid" \
   '{schema:$schema,candidate_sha256:$candidate_sha256,
     deployment_bundle_sha256:$deployment_bundle_sha256,
     oss_config_sha256:$oss_config_sha256,
     gate_json_sha256:$gate_json_sha256,completed_at:$completed_at,
-    collector:{main_pid:$main_pid,restarts:0,health_sha256:$health_sha256,
+    collector:{main_pid:$main_pid,restarts:0,invocation_id:$rust_invocation_id,
+      health_sha256:$health_sha256,
       journal_sha256:$journal_sha256},
     rollback_manifest_sha256:$rollback_manifest_sha256,
     explicit_restart:true,post_start_identity_verified:true,
     upload_services_verified:true,rollback_ready:true}' \
   >"$evidence_dir/cutover.json.tmp"
-verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" \
+verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
   || die 'Rust collector identity changed while cutover evidence was being prepared'
 verify_upload_units "$pinned_upload_env" \
   || die 'Rust upload unit identity changed while cutover evidence was being prepared'
@@ -716,6 +847,23 @@ verify_upload_units "$pinned_upload_env" \
   || die 'pinned OSS configuration changed while cutover evidence was being prepared'
 mv "$evidence_dir/cutover.json.tmp" "$evidence_dir/cutover.json"
 sync "$evidence_dir/cutover.json"
+verify_rust_runtime "$candidate_binary" "$started_epoch" "$rust_pid" "$rust_invocation_id" \
+  || die 'Rust collector identity changed before cutover completion'
+verify_upload_units "$pinned_upload_env" \
+  || die 'Rust upload unit identity changed before cutover completion'
+[[ $(oss_config_sha256 "$pinned_upload_env") == "$gate_oss_config_sha" ]] \
+  || die 'pinned OSS configuration changed before cutover completion'
+success_marker="$evidence_dir/PASSED.sha256"
+success_marker_tmp="$evidence_dir/.PASSED.sha256.tmp"
+[[ ! -e $success_marker && ! -L $success_marker \
+  && ! -e $success_marker_tmp && ! -L $success_marker_tmp ]] \
+  || die 'cutover success marker path already exists'
+(
+  cd "$evidence_dir"
+  sha256sum cutover.json >"${success_marker_tmp##*/}"
+)
+mv -Tf "$success_marker_tmp" "$success_marker"
+sync "$success_marker"
 
 cutover_succeeded=true
 trap - EXIT
