@@ -3,6 +3,7 @@
 use crate::polymarket_upload::ensure_canonical_directory;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use futures::{stream, StreamExt};
 use rand::random;
 use rust_decimal::Decimal;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -25,8 +26,11 @@ const USER_AGENT: &str = "monday-polymarket-reference-collector/2.0";
 const TRADE_ID_VERSION: &str = "v2";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
+const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 192;
+pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
+const MIN_TRADE_REQUEST_SPACING: Duration = Duration::from_millis(100);
 const TARGET_MARKET_WINDOWS_SECS: [usize; 2] = [300, 900];
 const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
@@ -66,6 +70,7 @@ pub struct ReferenceConfig {
     pub settlement_lookback_secs: i64,
     pub max_markets: usize,
     pub max_trade_polls_per_cycle: usize,
+    pub max_concurrent_trade_polls: usize,
     pub http_timeout: Duration,
     pub stale_after: Duration,
     pub trade_finalization_lag_secs: i64,
@@ -86,11 +91,12 @@ impl Default for ReferenceConfig {
             settlement_lookback_secs: 86_400,
             max_markets: DEFAULT_MAX_MARKETS_PER_LANE,
             max_trade_polls_per_cycle: DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
+            max_concurrent_trade_polls: DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
             http_timeout: Duration::from_secs(20),
             stale_after: Duration::from_secs(180),
             trade_finalization_lag_secs: 1_800,
             trade_finalization_stable_polls: 3,
-            per_market_delay: Duration::from_millis(100),
+            per_market_delay: MIN_TRADE_REQUEST_SPACING,
         }
     }
 }
@@ -103,12 +109,27 @@ impl ReferenceConfig {
             || self.settlement_lookback_secs <= 0
             || self.max_markets == 0
             || self.max_trade_polls_per_cycle == 0
+            || self.max_concurrent_trade_polls == 0
             || self.http_timeout.is_zero()
             || self.stale_after.is_zero()
             || self.trade_finalization_lag_secs <= 0
             || self.trade_finalization_stable_polls == 0
         {
             bail!("reference collector limits must be positive");
+        }
+        if self.max_concurrent_trade_polls > DEFAULT_MAX_CONCURRENT_TRADE_POLLS {
+            bail!(
+                "concurrent trade polls cannot exceed the hard limit of {DEFAULT_MAX_CONCURRENT_TRADE_POLLS}"
+            );
+        }
+        if self.max_concurrent_trade_polls > self.max_trade_polls_per_cycle {
+            bail!("concurrent trade polls cannot exceed the per-cycle trade poll budget");
+        }
+        if self.per_market_delay < MIN_TRADE_REQUEST_SPACING {
+            bail!(
+                "trade request spacing must be at least {}ms",
+                MIN_TRADE_REQUEST_SPACING.as_millis()
+            );
         }
         if self.settlement_lookback_secs < MIN_SETTLEMENT_LOOKBACK_SECS {
             bail!("settlement lookback must cover at least {MIN_SETTLEMENT_LOOKBACK_SECS} seconds");
@@ -256,6 +277,30 @@ fn plan_trade_polls(candidates: Vec<TradePollCandidate>, max_trade_polls: usize)
         deferred: eligible.saturating_sub(selected_count),
         priority_deferred: priority_count.saturating_sub(max_trade_polls),
     }
+}
+
+fn target_processing_chunks<'a>(
+    target_ids: impl IntoIterator<Item = &'a String>,
+    selected: &BTreeSet<String>,
+    max_selected_per_chunk: usize,
+) -> Vec<Vec<&'a String>> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut selected_in_current = 0_usize;
+    for market_id in target_ids {
+        current.push(market_id);
+        if selected.contains(market_id) {
+            selected_in_current += 1;
+        }
+        if selected_in_current == max_selected_per_chunk {
+            chunks.push(std::mem::take(&mut current));
+            selected_in_current = 0;
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn utc_now() -> DateTime<Utc> {
@@ -1128,6 +1173,7 @@ struct ReferenceCollector {
     state: CollectorState,
     writer: TapeWriter,
     http: reqwest::Client,
+    trade_request_started_at: tokio::sync::Mutex<Option<Instant>>,
     last_success: Instant,
 }
 
@@ -1185,6 +1231,7 @@ impl ReferenceCollector {
             state,
             writer,
             http,
+            trade_request_started_at: tokio::sync::Mutex::new(None),
             last_success: Instant::now(),
         };
         collector.recover_state_from_active_tape()?;
@@ -1267,6 +1314,20 @@ impl ReferenceCollector {
             .await?)
     }
 
+    async fn wait_for_trade_request_slot(&self) {
+        let mut last_started = self.trade_request_started_at.lock().await;
+        if let Some(previous) = *last_started {
+            let remaining = self
+                .config
+                .per_market_delay
+                .saturating_sub(previous.elapsed());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+        }
+        *last_started = Some(Instant::now());
+    }
+
     async fn discover_markets(&self, now: DateTime<Utc>) -> Result<Vec<Value>> {
         let mut discovery = GammaDiscovery::default();
         for lane in [GammaLane::Open, GammaLane::Closed] {
@@ -1298,6 +1359,7 @@ impl ReferenceCollector {
         let mut truncated = false;
         let mut non_object_rows = 0_u64;
         for offset in [0_u64, 10_000] {
+            self.wait_for_trade_request_slot().await;
             let payload = self
                 .get_json(
                     DATA_TRADES_URL,
@@ -1459,132 +1521,169 @@ impl ReferenceCollector {
                 .collect(),
             self.config.max_trade_polls_per_cycle,
         );
-
-        for (market_id, (market, target)) in &targets {
-            let condition_id = market
-                .get("conditionId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let mut tracked = next_state.markets.remove(market_id).unwrap_or_default();
-            tracked.condition_id = Some(condition_id.clone());
-            tracked.symbol = Some(target.symbol.clone());
-            tracked.market_window_secs = target.window_secs;
-            if let Some(end_time) = market.get("endDate").and_then(Value::as_str) {
-                tracked.end_time = Some(end_time.to_owned());
-            }
-
-            if let Some(metadata) = market_metadata_update(
-                market_id,
-                market,
-                target,
-                &retrieved_at,
-                force_hour_context,
-                &mut tracked,
-            )? {
-                updates.push(metadata);
-            }
-
-            let settlement = match settlement_from_market(
-                market,
-                &target.symbol,
-                target.window_secs,
-                &retrieved_at,
-            ) {
-                Ok(settlement) => settlement,
-                Err(error) => {
-                    let detail = error.to_string();
-                    errors.push(format!("settlement {market_id}: {detail}"));
-                    invalid_settlement_markets.push(market_id.clone());
-                    tracked
-                        .settlement_failure_since
-                        .get_or_insert_with(|| retrieved_at.clone());
-                    tracked.settlement_last_error = Some(detail);
-                    None
+        let target_chunks = target_processing_chunks(
+            targets.keys(),
+            &trade_poll_plan.selected,
+            self.config.max_concurrent_trade_polls,
+        );
+        for target_chunk in target_chunks {
+            let fetcher = &*self;
+            let trade_fetches = stream::iter(target_chunk.iter().filter_map(|market_id| {
+                if !trade_poll_plan.selected.contains(*market_id) {
+                    return None;
                 }
-            };
-            if settlement.is_some() {
-                tracked.settlement_failure_since = None;
-                tracked.settlement_last_error = None;
-            }
-            let was_settled = tracked.settled;
-            if !condition_id.is_empty()
-                && !tracked.trade_complete
-                && trade_poll_plan.selected.contains(market_id)
-            {
-                trade_polls += 1;
-                match self.fetch_trades(&condition_id).await {
-                    Ok((trades, truncated, non_object_rows)) => {
-                        successful_trade_polls += 1;
-                        let (new_updates, mut malformed) = trade_updates(
-                            &self.config,
-                            &mut next_state,
-                            market_id,
-                            &condition_id,
-                            &target.symbol,
-                            target.window_secs,
-                            &trades,
-                            now,
-                        );
-                        if non_object_rows > 0 {
-                            *malformed.entry("non_object_trade".to_owned()).or_default() +=
-                                non_object_rows;
-                            non_object_trade_markets.push(condition_id.clone());
+                let condition_id = targets
+                    .get(*market_id)?
+                    .0
+                    .get("conditionId")?
+                    .as_str()?
+                    .to_owned();
+                Some(((*market_id).clone(), condition_id))
+            }))
+            .map(move |(market_id, condition_id)| async move {
+                (market_id, fetcher.fetch_trades(&condition_id).await)
+            })
+            .buffer_unordered(self.config.max_concurrent_trade_polls)
+            .collect::<Vec<_>>()
+            .await;
+            let mut trade_fetches = trade_fetches.into_iter().collect::<BTreeMap<_, _>>();
+
+            for market_id in target_chunk {
+                let (market, target) = targets
+                    .get(market_id)
+                    .ok_or_else(|| anyhow!("target market {market_id} disappeared"))?;
+                let condition_id = market
+                    .get("conditionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let mut tracked = next_state.markets.remove(market_id).unwrap_or_default();
+                tracked.condition_id = Some(condition_id.clone());
+                tracked.symbol = Some(target.symbol.clone());
+                tracked.market_window_secs = target.window_secs;
+                if let Some(end_time) = market.get("endDate").and_then(Value::as_str) {
+                    tracked.end_time = Some(end_time.to_owned());
+                }
+
+                if let Some(metadata) = market_metadata_update(
+                    market_id,
+                    market,
+                    target,
+                    &retrieved_at,
+                    force_hour_context,
+                    &mut tracked,
+                )? {
+                    updates.push(metadata);
+                }
+
+                let settlement = match settlement_from_market(
+                    market,
+                    &target.symbol,
+                    target.window_secs,
+                    &retrieved_at,
+                ) {
+                    Ok(settlement) => settlement,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        errors.push(format!("settlement {market_id}: {detail}"));
+                        invalid_settlement_markets.push(market_id.clone());
+                        tracked
+                            .settlement_failure_since
+                            .get_or_insert_with(|| retrieved_at.clone());
+                        tracked.settlement_last_error = Some(detail);
+                        None
+                    }
+                };
+                if settlement.is_some() {
+                    tracked.settlement_failure_since = None;
+                    tracked.settlement_last_error = None;
+                }
+                let was_settled = tracked.settled;
+                if !condition_id.is_empty()
+                    && !tracked.trade_complete
+                    && trade_poll_plan.selected.contains(market_id)
+                {
+                    trade_polls += 1;
+                    let trade_fetch = trade_fetches.remove(market_id).ok_or_else(|| {
+                        anyhow!("selected trade market {market_id} has no scheduled fetch")
+                    })?;
+                    match trade_fetch {
+                        Ok((trades, truncated, non_object_rows)) => {
+                            successful_trade_polls += 1;
+                            let (new_updates, mut malformed) = trade_updates(
+                                &self.config,
+                                &mut next_state,
+                                market_id,
+                                &condition_id,
+                                &target.symbol,
+                                target.window_secs,
+                                &trades,
+                                now,
+                            );
+                            if non_object_rows > 0 {
+                                *malformed.entry("non_object_trade".to_owned()).or_default() +=
+                                    non_object_rows;
+                                non_object_trade_markets.push(condition_id.clone());
+                            }
+                            let new_trade_count = new_updates.len();
+                            updates.extend(new_updates);
+                            for (reason, count) in &malformed {
+                                *malformed_trade_reasons.entry(reason.clone()).or_default() +=
+                                    count;
+                            }
+                            tracked.last_trade_success_at = Some(retrieved_at.clone());
+                            if malformed.is_empty() {
+                                tracked.trade_failure_since = None;
+                                tracked.trade_last_error = None;
+                            } else {
+                                let detail = format!("malformed trade rows: {malformed:?}");
+                                errors.push(format!("trades {condition_id}: {detail}"));
+                                tracked
+                                    .trade_failure_since
+                                    .get_or_insert_with(|| retrieved_at.clone());
+                                tracked.trade_last_error = Some(detail);
+                            }
+                            if truncated {
+                                truncated_markets.push(condition_id.clone());
+                            }
+                            if settlement.is_some()
+                                && advance_trade_finalization(
+                                    &mut tracked,
+                                    now,
+                                    &retrieved_at,
+                                    new_trade_count,
+                                    truncated || !malformed.is_empty(),
+                                    was_settled,
+                                    self.config.trade_finalization_lag_secs,
+                                    self.config.trade_finalization_stable_polls,
+                                )
+                            {
+                                tracked.trade_complete = true;
+                            }
                         }
-                        let new_trade_count = new_updates.len();
-                        updates.extend(new_updates);
-                        for (reason, count) in &malformed {
-                            *malformed_trade_reasons.entry(reason.clone()).or_default() += count;
-                        }
-                        tracked.last_trade_success_at = Some(retrieved_at.clone());
-                        if malformed.is_empty() {
-                            tracked.trade_failure_since = None;
-                            tracked.trade_last_error = None;
-                        } else {
-                            let detail = format!("malformed trade rows: {malformed:?}");
-                            errors.push(format!("trades {condition_id}: {detail}"));
+                        Err(error) => {
+                            errors.push(format!("trades {condition_id}: {error}"));
                             tracked
                                 .trade_failure_since
                                 .get_or_insert_with(|| retrieved_at.clone());
-                            tracked.trade_last_error = Some(detail);
-                        }
-                        if truncated {
-                            truncated_markets.push(condition_id.clone());
-                        }
-                        if settlement.is_some()
-                            && advance_trade_finalization(
-                                &mut tracked,
-                                now,
-                                &retrieved_at,
-                                new_trade_count,
-                                truncated || !malformed.is_empty(),
-                                was_settled,
-                                self.config.trade_finalization_lag_secs,
-                                self.config.trade_finalization_stable_polls,
-                            )
-                        {
-                            tracked.trade_complete = true;
+                            tracked.trade_last_error = Some(error.to_string());
                         }
                     }
-                    Err(error) => {
-                        errors.push(format!("trades {condition_id}: {error}"));
-                        tracked
-                            .trade_failure_since
-                            .get_or_insert_with(|| retrieved_at.clone());
-                        tracked.trade_last_error = Some(error.to_string());
+                }
+                if let Some(settlement) = settlement {
+                    if !tracked.settled {
+                        updates.push(settlement);
+                        tracked.settled = true;
                     }
                 }
-                if !self.config.per_market_delay.is_zero() {
-                    tokio::time::sleep(self.config.per_market_delay).await;
-                }
+                next_state.markets.insert(market_id.clone(), tracked);
             }
-            if let Some(settlement) = settlement {
-                if !tracked.settled {
-                    updates.push(settlement);
-                    tracked.settled = true;
-                }
+            if !trade_fetches.is_empty() {
+                bail!(
+                    "{} scheduled trade fetches were not applied",
+                    trade_fetches.len()
+                );
             }
-            next_state.markets.insert(market_id.clone(), tracked);
         }
 
         let mut overdue_unresolved_markets = Vec::new();
@@ -1658,6 +1757,8 @@ impl ReferenceCollector {
             "record_types": record_types,
             "api_errors": errors,
             "trade_poll_budget": self.config.max_trade_polls_per_cycle,
+            "trade_poll_concurrency": self.config.max_concurrent_trade_polls,
+            "trade_request_spacing_ms": u64::try_from(self.config.per_market_delay.as_millis()).unwrap_or(u64::MAX),
             "eligible_trade_markets": trade_poll_plan.eligible,
             "priority_trade_markets": trade_poll_plan.priority,
             "selected_trade_markets": trade_poll_plan.selected.len(),
@@ -1729,6 +1830,17 @@ impl ReferenceCollector {
         }
         Ok(health)
     }
+
+    async fn collect_once_bounded(&mut self) -> Result<Value> {
+        tokio::time::timeout(MAX_CYCLE_DURATION, self.collect_once())
+            .await
+            .map_err(|_| {
+                completeness_error(format!(
+                    "collector cycle exceeded the absolute {}ms deadline",
+                    MAX_CYCLE_DURATION.as_millis()
+                ))
+            })?
+    }
 }
 
 pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
@@ -1738,14 +1850,14 @@ pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
     if once {
         println!(
             "{}",
-            serde_json::to_string(&collector.collect_once().await?)?
+            serde_json::to_string(&collector.collect_once_bounded().await?)?
         );
         collector.writer.close()?;
         return Ok(());
     }
     loop {
         let started = Instant::now();
-        match collector.collect_once().await {
+        match collector.collect_once_bounded().await {
             Ok(health) => println!("{}", serde_json::to_string(&health)?),
             Err(error) => {
                 eprintln!("Polymarket reference poll failed: {error:#}");
@@ -1999,6 +2111,10 @@ mod tests {
             default.max_trade_polls_per_cycle,
             DEFAULT_MAX_TRADE_POLLS_PER_CYCLE
         );
+        assert_eq!(
+            default.max_concurrent_trade_polls,
+            DEFAULT_MAX_CONCURRENT_TRADE_POLLS
+        );
         default.validate().unwrap();
 
         let exact_capacity = ReferenceConfig {
@@ -2026,6 +2142,33 @@ mod tests {
             ..ReferenceConfig::default()
         };
         assert!(zero_trade_budget.validate().is_err());
+
+        let zero_concurrency = ReferenceConfig {
+            max_concurrent_trade_polls: 0,
+            ..ReferenceConfig::default()
+        };
+        assert!(zero_concurrency.validate().is_err());
+
+        let concurrency_above_budget = ReferenceConfig {
+            max_trade_polls_per_cycle: 3,
+            max_concurrent_trade_polls: 4,
+            ..ReferenceConfig::default()
+        };
+        assert!(concurrency_above_budget.validate().is_err());
+
+        let concurrency_above_hard_limit = ReferenceConfig {
+            max_concurrent_trade_polls: DEFAULT_MAX_CONCURRENT_TRADE_POLLS + 1,
+            ..ReferenceConfig::default()
+        };
+        let error = concurrency_above_hard_limit.validate().unwrap_err();
+        assert!(error.to_string().contains("hard limit"));
+
+        let insufficient_request_spacing = ReferenceConfig {
+            per_market_delay: MIN_TRADE_REQUEST_SPACING - Duration::from_millis(1),
+            ..ReferenceConfig::default()
+        };
+        let error = insufficient_request_spacing.validate().unwrap_err();
+        assert!(error.to_string().contains("request spacing"));
     }
 
     #[test]
@@ -2097,6 +2240,46 @@ mod tests {
         let plan = plan_trade_polls(candidates, 2);
         assert_eq!(plan.priority_deferred, 1);
         assert_eq!(plan.deferred, 1);
+    }
+
+    #[test]
+    fn target_chunks_preserve_order_and_bound_retained_selected_results() {
+        let target_ids = ["a", "b", "c", "d", "e", "f", "g", "h", "i"].map(str::to_owned);
+        let selected = BTreeSet::from([
+            "b".to_owned(),
+            "c".to_owned(),
+            "e".to_owned(),
+            "g".to_owned(),
+            "h".to_owned(),
+        ]);
+        let chunks = target_processing_chunks(target_ids.iter(), &selected, 2);
+        assert_eq!(
+            chunks
+                .iter()
+                .flatten()
+                .map(|market_id| market_id.as_str())
+                .collect::<Vec<_>>(),
+            target_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert!(chunks.iter().all(|chunk| {
+            chunk
+                .iter()
+                .filter(|market_id| selected.contains(**market_id))
+                .count()
+                <= 2
+        }));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .filter(|market_id| selected.contains(**market_id))
+                        .count()
+                })
+                .collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
     }
 
     #[test]

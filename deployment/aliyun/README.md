@@ -93,7 +93,13 @@ window and failed retries are always selected first; the remaining historical la
 rotates by oldest successful poll so cold-start backfill cannot prevent health from
 advancing. `priority_trade_backlog` must be zero for the shadow gate to accept a
 health sample, while `deferred_trade_markets` makes bounded historical backfill
-explicit rather than silently claiming full-cycle trade coverage.
+explicit rather than silently claiming full-cycle trade coverage. Every Data API
+request, including a second pagination request for the same market, passes through a
+shared start-time pacer with at least 100ms between request starts. Up to four requests
+may remain in flight, and each processing chunk retains at most four market responses,
+so slow I/O overlaps without creating an unbounded request or memory fan-out. An
+absolute 180-second cycle deadline cancels stalled network work and fails closed;
+health evidence over that duration is rejected by the shadow gate.
 `cycle_started_at` preserves the API snapshot boundary, while `updated_at` and
 `last_success_at` are stamped only after tape and state durability completes;
 `cycle_duration_ms` makes the 90-second gate freshness budget directly auditable.
