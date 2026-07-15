@@ -351,6 +351,7 @@ for mutation in \
   '.selected_trade_markets = 13' \
   '.deferred_trade_markets = 1' \
   '.eligible_trade_markets = 13' \
+  '.successful_trade_polls = 0' \
   '.successful_trade_polls = 15' \
   '.missing_target_symbols = ["BTCUSDT"]' \
   '.api_errors = ["Gamma unavailable"]' \

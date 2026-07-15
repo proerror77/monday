@@ -14,7 +14,7 @@ and (.selected_trade_markets == ([.eligible_trade_markets, .trade_poll_budget] |
 and (.deferred_trade_markets == (.eligible_trade_markets - .selected_trade_markets))
 and (.priority_trade_backlog == ([.priority_trade_markets - .trade_poll_budget, 0] | max))
 and (.selected_trade_markets == .trade_polls)
-and (.successful_trade_polls <= .trade_polls)
+and (.successful_trade_polls == .trade_polls)
 and (.priority_trade_backlog == 0)
 and .missing_target_symbols == []
 and .api_errors == []
