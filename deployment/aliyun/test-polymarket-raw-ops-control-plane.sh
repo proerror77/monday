@@ -338,7 +338,7 @@ jq -n '{
   updated_at:"2026-07-15T00:00:01Z",last_success_at:"2026-07-15T00:00:01Z",
   cycle_started_at:"2026-07-15T00:00:00Z",cycle_duration_ms:1000,
   target_markets:14,missing_target_symbols:[],api_errors:[],malformed_trade_rows:0,
-  trade_poll_budget:192,trade_poll_concurrency:4,trade_request_spacing_ms:100,
+  trade_poll_budget:112,trade_poll_concurrency:4,trade_request_spacing_ms:100,
   eligible_trade_markets:14,priority_trade_markets:8,
   selected_trade_markets:14,deferred_trade_markets:0,priority_trade_backlog:0,
   trade_polls:14,successful_trade_polls:14,
@@ -352,6 +352,8 @@ for mutation in \
   'del(.cycle_started_at)' \
   '.cycle_duration_ms = -1' \
   '.cycle_duration_ms = 180001' \
+  '.trade_poll_budget = 111' \
+  '.trade_poll_budget = 113' \
   '.trade_poll_concurrency = 0' \
   '.trade_poll_concurrency = 5' \
   '.trade_poll_concurrency = 193' \
@@ -377,6 +379,9 @@ done
 
 grep -Fq 'readonly REQUIRED_DURATION_SECONDS=3600' "$GATE"
 grep -Fq 'readonly PARITY_TAIL_SECONDS=300' "$GATE"
+grep -Fq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$GATE"
+grep -Fq 'readonly INITIAL_HEALTH_GRACE_SECONDS=60' "$GATE"
+grep -Fq 'readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))' "$GATE"
 grep -Fq 'verify-shadow-parity' "$GATE"
 [[ ! -e "$SCRIPT_DIR/verify-polymarket-shadow-parity.py" ]]
 if grep -Fq 'python3 "$PARITY_VERIFIER"' "$GATE"; then
@@ -427,6 +432,10 @@ grep -Fq 'control-plane bundle changed after the shadow gate' "$CUTOVER"
 grep -Fq 'shadow gate evidence is stale or from the future' "$CUTOVER"
 grep -Fq 'secure_release_directory "$release_dir"' "$GATE"
 grep -Fq 'secure_release_directory "$candidate_release_dir"' "$CUTOVER"
+grep -Fxq 'MemoryHigh=384M' "$SCRIPT_DIR/polymarket-reference-collector-shadow@.service"
+grep -Fxq 'MemoryMax=512M' "$SCRIPT_DIR/polymarket-reference-collector-shadow@.service"
+grep -Fxq 'MemoryHigh=384M' "$SCRIPT_DIR/polymarket-reference-collector.service"
+grep -Fxq 'MemoryMax=512M' "$SCRIPT_DIR/polymarket-reference-collector.service"
 grep -Fxq 'TimeoutStartSec=0' "$SCRIPT_DIR/polymarket-reference-upload.service"
 grep -Fxq 'TimeoutStartSec=0' "$SCRIPT_DIR/polymarket-market-tape-upload.service"
 
