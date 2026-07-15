@@ -13,6 +13,7 @@ readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GR
 readonly MAX_HEALTH_SILENCE_SECONDS=90
 readonly SAMPLE_SECONDS=30
 readonly PARITY_CUTOFF_LAG_SECONDS=60
+readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900
 readonly LEGACY_UNIT=polymarket-reference-collector.service
 readonly LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py'
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
@@ -55,6 +56,26 @@ usage() {
     'Usage: polymarket-raw-ops-shadow-gate.sh <candidate-binary> <sha256> <source-revision>' \
     '' \
     'A production-eligible gate observes for 3600 seconds plus a 300-second current-hour parity tail.'
+}
+
+valid_parity_window() {
+  local started_at=$1 ended_at=$2
+  [[ $started_at =~ ^(0|[1-9][0-9]*)$ && $ended_at =~ ^(0|[1-9][0-9]*)$ ]] \
+    && ((started_at < ended_at))
+}
+
+bounded_parity_window_start() {
+  local gate_started_at=$1 common_cutoff=$2 allow_short=$3 lookback_seconds=$4
+  local parity_started_at settlement_safe_started_at
+  parity_started_at=$((common_cutoff - common_cutoff % 3600))
+  settlement_safe_started_at=$((gate_started_at + lookback_seconds))
+  ((parity_started_at >= settlement_safe_started_at)) \
+    || parity_started_at=$settlement_safe_started_at
+  if [[ $allow_short == true ]] && ((parity_started_at >= common_cutoff)); then
+    ((common_cutoff > 0)) || return 1
+    parity_started_at=$((common_cutoff - 1))
+  fi
+  printf '%s\n' "$parity_started_at"
 }
 
 bundle_sha256() {
@@ -577,15 +598,20 @@ while :; do
     if [[ $test_only == false ]]; then
       common_cutoff=$((common_cutoff - PARITY_CUTOFF_LAG_SECONDS))
     fi
-    parity_window_started_at=$((common_cutoff - common_cutoff % 3600))
-    ((parity_window_started_at >= started_at_unix)) \
-      || parity_window_started_at=$started_at_unix
+    parity_window_started_at=$(bounded_parity_window_start \
+      "$started_at_unix" "$common_cutoff" "$test_only" \
+      "$SETTLEMENT_EVENT_LOOKBACK_SECONDS") \
+      || die 'could not derive a bounded parity window start'
   fi
 
   if ((elapsed >= gate_seconds)) && [[ -n $common_cutoff ]]; then
-    if [[ $test_only == true ]] \
-      || ((common_cutoff - parity_window_started_at >= PARITY_TAIL_SECONDS)); then
-      break
+    if valid_parity_window "$parity_window_started_at" "$common_cutoff"; then
+      if [[ $test_only == true ]] \
+        || ((common_cutoff - parity_window_started_at >= PARITY_TAIL_SECONDS)); then
+        break
+      fi
+    elif [[ $test_only == true ]]; then
+      die 'short test gate could not derive an ordered parity window'
     fi
   fi
 
@@ -600,6 +626,8 @@ done
 observed_duration_seconds=$elapsed
 [[ -n $common_cutoff && -n $parity_window_started_at ]] \
   || die 'no common successful collection cutoff was observed'
+valid_parity_window "$parity_window_started_at" "$common_cutoff" \
+  || die 'settlement-safe parity start is not before the common cutoff'
 if [[ $test_only == false ]]; then
   ((observed_duration_seconds >= MINIMUM_GATE_SECONDS)) \
     || die 'production shadow duration is shorter than required'

@@ -41,6 +41,31 @@ tmp_dir=$(mktemp -d)
 tmp_dir=$(cd -- "$tmp_dir" && pwd -P)
 trap 'rm -rf "$tmp_dir"' EXIT
 
+# A short test gate must not continue after the settlement-safe clamp places
+# the start at or beyond the common cutoff.
+parity_window_verifier="$tmp_dir/valid-parity-window.sh"
+sed -n '/^valid_parity_window() {$/,/^}$/p' "$GATE" >"$parity_window_verifier"
+sed -n '/^bounded_parity_window_start() {$/,/^}$/p' "$GATE" \
+  >>"$parity_window_verifier"
+# shellcheck source=/dev/null
+source "$parity_window_verifier"
+valid_parity_window 100 1000 || {
+  printf 'parity-window verifier rejected an ordered window\n' >&2
+  exit 1
+}
+if valid_parity_window 1900 1800 || valid_parity_window 1800 1800; then
+  printf 'parity-window verifier accepted a clamped start at/after cutoff\n' >&2
+  exit 1
+fi
+[[ $(bounded_parity_window_start 100 1000 true 900) == 999 ]] || {
+  printf 'short test gate did not cap parity start below the cutoff\n' >&2
+  exit 1
+}
+[[ $(bounded_parity_window_start 100 1900 false 900) == 1000 ]] || {
+  printf 'production gate did not preserve its settlement-safe start\n' >&2
+  exit 1
+}
+
 # Exercise the production marker verifier itself. A marker is valid only when
 # it contains the one content-addressed gate.json entry; sha256sum otherwise
 # accepts an unrelated entry or a valid gate entry followed by extra entries.
@@ -665,25 +690,37 @@ append_row() {
 }
 
 for symbol in BTCUSDT ETHUSDT SOLUSDT XRPUSDT DOGEUSDT HYPEUSDT BNBUSDT; do
-  append_row "$(jq -cn --arg symbol "$symbol" \
+  case $symbol in
+    BTCUSDT) market_name=Bitcoin ;;
+    ETHUSDT) market_name=Ethereum ;;
+    SOLUSDT) market_name=Solana ;;
+    XRPUSDT) market_name=XRP ;;
+    DOGEUSDT) market_name=Dogecoin ;;
+    HYPEUSDT) market_name=Hyperliquid ;;
+    BNBUSDT) market_name='Binance Coin' ;;
+    *) printf 'unsupported fixture symbol: %s\n' "$symbol" >&2; exit 1 ;;
+  esac
+  append_row "$(jq -cn --arg symbol "$symbol" --arg market_name "$market_name" \
     '{kind:"market_metadata",market_id:("market-" + $symbol),
       condition_id:("condition-" + $symbol),symbol:$symbol,market_window_secs:300,
       source:"gamma_api",retrieved_at:"1970-01-01T00:03:20Z",
       market:{id:("market-" + $symbol),conditionId:("condition-" + $symbol),
-        question:($symbol + " Up or Down"),slug:("market-" + $symbol),
+        question:($market_name + " Up or Down"),slug:("market-" + $symbol),
         startDate:"1970-01-01T00:00:00Z",endDate:"1970-01-01T00:05:00Z",
         outcomes:["Up","Down"],clobTokenIds:[("up-" + $symbol),("down-" + $symbol)],
         orderPriceMinTickSize:0.01,orderMinSize:5,feesEnabled:true}}')"
 done
 
-trade=$(jq -cn \
-  '{kind:"polymarket_trade",record_id:"trade-1",record_id_version:"v2",
-    market_id:"market-BTCUSDT",condition_id:"condition-BTCUSDT",token_id:"token-1",
+trade_id=$(printf '%s' '0x1|condition-BTCUSDT|up-BTCUSDT|BUY|200|0x2|1|0.5|0' \
+  | sha256sum | awk '{print $1}')
+trade=$(jq -cn --arg record_id "$trade_id" \
+  '{kind:"polymarket_trade",record_id:$record_id,record_id_version:"v2",
+    market_id:"market-BTCUSDT",condition_id:"condition-BTCUSDT",token_id:"up-BTCUSDT",
     symbol:"BTCUSDT",market_window_secs:300,side:"BUY",size:"1",price:"0.5",
     trade_ts:"1970-01-01T00:03:20Z",trade_ts_unix:200,
     transaction_hash:"0x1",proxy_wallet:"0x2",outcome:"Up",outcome_index:0,
     source:"polymarket_data_api",received_at:"1970-01-01T00:03:20Z",
-    trade:{transactionHash:"0x1",conditionId:"condition-BTCUSDT",asset:"token-1",
+    trade:{transactionHash:"0x1",conditionId:"condition-BTCUSDT",asset:"up-BTCUSDT",
       side:"BUY",timestamp:200,proxyWallet:"0x2",size:"1",price:"0.5",
       outcomeIndex:0,outcome:"Up"}}')
 append_row "$trade"
@@ -691,10 +728,12 @@ append_row "$trade"
 append_row "$(jq -cn \
   '{kind:"market_settlement",market_id:"market-BTCUSDT",
     condition_id:"condition-BTCUSDT",symbol:"BTCUSDT",market_window_secs:300,
-    winning_token_id:"token-1",winning_outcome:"Up",resolved_up_won:true,
+    winning_token_id:"up-BTCUSDT",winning_outcome:"Up",resolved_up_won:true,
     resolution_source:"gamma_api_closed_market",retrieved_at:"1970-01-01T00:03:20Z",
-    market:{id:"market-BTCUSDT",conditionId:"condition-BTCUSDT",closed:true,
-      outcomes:["Up","Down"],clobTokenIds:["token-1","token-2"],
+    market:{id:"market-BTCUSDT",conditionId:"condition-BTCUSDT",
+      question:"BTCUSDT Up or Down",startDate:"1970-01-01T00:00:00Z",
+      endDate:"1970-01-01T00:05:00Z",closed:true,
+      outcomes:["Up","Down"],clobTokenIds:["up-BTCUSDT","down-BTCUSDT"],
       outcomePrices:["1","0"]}}')"
 
 # A delayed historical trade recorded only after the common cutoff must not make
@@ -707,16 +746,20 @@ late_trade=$(jq -c \
     | .post_cutoff_only = true
     | .trade.postCutoffOnly = true' <<<"$trade")
 jq -cn --argjson sequence "$sequence" --argjson update "$late_trade" \
-  '{sequence:$sequence,recorded_at:"1970-01-01T00:05:01Z",update:$update}' \
+  '{sequence:$sequence,recorded_at:"1970-01-01T00:16:41Z",update:$update}' \
   >>"$legacy_tape"
 
 parity="$tmp_dir/parity.json"
 "$VERIFY" verify-shadow-parity \
   --legacy-spool "$legacy" --rust-spool "$rust" --started-at-unix 100 \
-  --ended-at-unix 300 \
+  --ended-at-unix 1000 \
   --output "$parity"
 jq -e '.passed == true and .checks.metadata_parity == true
-  and ([.checks[]] | all)' "$parity" >/dev/null
+  and ([.checks[]] | all)
+  and (.metrics.normalized_trade_sha256 | test("^[a-f0-9]{64}$"))
+  and (.metrics.normalized_metadata_sha256 | test("^[a-f0-9]{64}$"))
+  and (.metrics.normalized_settlement_sha256 | test("^[a-f0-9]{64}$"))' \
+  "$parity" >/dev/null
 
 rust_bad="$tmp_dir/rust-bad"
 cp -R "$rust" "$rust_bad"
@@ -725,7 +768,7 @@ jq -cn --argjson update "$trade" \
   >"$rust_bad/market-updates.ndjson"
 if "$VERIFY" verify-shadow-parity \
   --legacy-spool "$legacy" --rust-spool "$rust_bad" --started-at-unix 100 \
-  --ended-at-unix 300 \
+  --ended-at-unix 1000 \
   --output "$tmp_dir/bad-parity.json" 2>/dev/null; then
   printf 'parity verifier accepted a duplicate Rust trade ID\n' >&2
   exit 1
@@ -745,7 +788,7 @@ mv "$rust_bad_metadata/market-updates.rewritten" \
   "$rust_bad_metadata/market-updates.19700101T000400000000.ndjson"
 if "$VERIFY" verify-shadow-parity \
   --legacy-spool "$legacy" --rust-spool "$rust_bad_metadata" \
-  --started-at-unix 100 --ended-at-unix 300 \
+  --started-at-unix 100 --ended-at-unix 1000 \
   --output "$tmp_dir/bad-metadata-parity.json" 2>/dev/null; then
   printf 'parity verifier accepted contradictory metadata values\n' >&2
   exit 1
@@ -782,7 +825,7 @@ jq \
     oss_config_sha256:$oss_config,
     duration_seconds:3900,
     parity_window_started_at_unix:100,
-    parity_window_ended_at_unix:400,
+    parity_window_ended_at_unix:1000,
     completed_at:"2026-07-15T00:00:00Z",
     shadow_run_id:"run-1",
     production_eligible:true,
@@ -812,6 +855,57 @@ jq \
     })
   } | .passed = true' "$parity" >"$tmp_dir/gate.json"
 jq -e -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+jq 'del(.metrics.normalized_settlement_sha256)' \
+  "$tmp_dir/gate.json" >"$tmp_dir/missing-settlement-digest.json"
+if jq -e -f "$POLICY" "$tmp_dir/missing-settlement-digest.json" >/dev/null; then
+  printf 'gate policy accepted evidence without a normalized settlement digest\n' >&2
+  exit 1
+fi
+jq '.metrics.normalized_settlement_sha256 = "not-a-digest"' \
+  "$tmp_dir/gate.json" >"$tmp_dir/invalid-settlement-digest.json"
+if jq -e -f "$POLICY" "$tmp_dir/invalid-settlement-digest.json" >/dev/null; then
+  printf 'gate policy accepted an invalid normalized settlement digest\n' >&2
+  exit 1
+fi
+jq '.metrics.rust_only_metadata_ids = ["future-market"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/rust-metadata-superset.json"
+jq -e -f "$POLICY" "$tmp_dir/rust-metadata-superset.json" >/dev/null
+jq '.metrics.legacy_only_metadata_ids = ["missing-from-rust"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/legacy-metadata-omission.json"
+if jq -e -f "$POLICY" "$tmp_dir/legacy-metadata-omission.json" >/dev/null; then
+  printf 'gate policy accepted metadata missing from Rust\n' >&2
+  exit 1
+fi
+jq '.metrics.legacy_only_settlement_ids = ["missing-from-rust"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/legacy-settlement-omission.json"
+if jq -e -f "$POLICY" "$tmp_dir/legacy-settlement-omission.json" >/dev/null; then
+  printf 'gate policy accepted a mature settlement missing from Rust\n' >&2
+  exit 1
+fi
+jq '.metrics.settlement_shared_values_match = false' \
+  "$tmp_dir/gate.json" >"$tmp_dir/settlement-value-mismatch.json"
+if jq -e -f "$POLICY" "$tmp_dir/settlement-value-mismatch.json" >/dev/null; then
+  printf 'gate policy accepted contradictory settlement values\n' >&2
+  exit 1
+fi
+jq '.metrics.settlement_event_window_started_at_unix += 1' \
+  "$tmp_dir/gate.json" >"$tmp_dir/unbound-settlement-start.json"
+if jq -e -f "$POLICY" "$tmp_dir/unbound-settlement-start.json" >/dev/null; then
+  printf 'gate policy accepted an unbound settlement start window\n' >&2
+  exit 1
+fi
+jq '.metrics.settlement_event_window_started_at_unix = -800' \
+  "$tmp_dir/gate.json" >"$tmp_dir/non-saturating-settlement-start.json"
+if jq -e -f "$POLICY" "$tmp_dir/non-saturating-settlement-start.json" >/dev/null; then
+  printf 'gate policy accepted a negative settlement start below the Unix epoch\n' >&2
+  exit 1
+fi
+jq '.metrics.settlement_event_window_ended_at_unix += 1' \
+  "$tmp_dir/gate.json" >"$tmp_dir/unbound-settlement-end.json"
+if jq -e -f "$POLICY" "$tmp_dir/unbound-settlement-end.json" >/dev/null; then
+  printf 'gate policy accepted an unbound settlement end window\n' >&2
+  exit 1
+fi
 jq '.duration_seconds = 3599' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
 if jq -e -f "$POLICY" "$tmp_dir/short.json" >/dev/null; then
   printf 'gate policy accepted a shadow shorter than one hour\n' >&2
@@ -1006,6 +1100,8 @@ done
 
 grep -Fq 'readonly REQUIRED_DURATION_SECONDS=3600' "$GATE"
 grep -Fq 'readonly PARITY_TAIL_SECONDS=300' "$GATE"
+grep -Fq 'readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900' "$GATE"
+grep -Fq 'bounded_parity_window_start' "$GATE"
 grep -Fq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$GATE"
 grep -Fq 'readonly INITIAL_HEALTH_GRACE_SECONDS=60' "$GATE"
 grep -Fq 'readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))' "$GATE"
