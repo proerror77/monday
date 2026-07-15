@@ -50,6 +50,7 @@ mod tests {
         FactorObservation {
             time_remaining_secs,
             settlement_up: 0.0,
+            official_resolution_observed_at: None,
             event_id: "e".into(),
             symbol: "BTC".into(),
             tick_ts: Utc::now(),

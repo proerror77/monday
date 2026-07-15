@@ -12,18 +12,30 @@ The supported model lane is the native Burn binary-probability trainer in
   `official_resolution` is the required settlement-label authority.
 - Binance spot, aggTrade, and L2 are predictive inputs only; they cannot replace
   the reference, settlement label, or executable Polymarket price.
-- Training and validation event IDs are disjoint. The latest training event
-  settlement boundary must be no later than the earliest validation decision.
+- Training and validation event IDs are disjoint. The latest time at which a
+  complete official training label was locally observed must be no later than
+  the earliest validation decision.
 - Split inputs carry only event ID and decision timestamp selectors. Rust
   projects feature values from a closed, label-free registry against that exact
   content-addressed snapshot row; callers cannot supply feature values, clocks,
   outcomes, or settlement timestamps.
-- Snapshot construction and coverage gates enforce point-in-time source
-  freshness. The trainer derives the official label and event settlement
-  boundary from the governed row; it does not claim to model resolution latency.
-- Ordered feature names and their schema hash, mission/snapshot hashes, dataset
-  hash, training configuration and seed, and partition counts are bound into
-  the typed model manifest.
+- Snapshot v2 atomically reads the exact UP/DOWN token pair, its complementary
+  official outcome, and when both persisted token versions became locally
+  available. It uses the later of `resolved_at` and a content-changing
+  `fetched_at` (which also covers legacy resolved rows). Snapshot construction,
+  coverage checks, and the trainer reject missing, pre-settlement,
+  inconsistent, or post-snapshot clocks.
+- The trainer accepts only a `VerifiedBinarySnapshot`: Rust reloads the written
+  snapshot, hashes and parses the same captured artifact bytes, and matches its
+  `snapshot_contract_hash` against the trusted mission/registry SHA-256 before
+  feature materialization. Parquet exports preserve the label clock at
+  microsecond precision. Existing v1 snapshots must be rebuilt.
+- The actual LoopRun's four walk-forward evaluators use the same availability
+  cutoff against the first retained validation decision; they do not bypass
+  this rule by calling a non-Burn evaluator.
+- Ordered feature names and their schema hash, mission and strong snapshot
+  contract hashes, training configuration and seed, and partition counts are
+  bound into the typed model manifest.
 - Split IDs and purge/embargo fields are not part of the current binary-model
   contract. If they become policy gates, add typed manifest fields and
   fail-closed tests before relying on them.

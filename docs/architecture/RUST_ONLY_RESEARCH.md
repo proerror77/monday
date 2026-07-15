@@ -39,6 +39,18 @@ split, seed, training configuration, metrics, model checksum, framework version,
 and research-only scope. Loaders verify the manifest and checksum before reading
 weights. Existing bundles are never overwritten.
 
+Prediction training additionally accepts only an immutable
+`VerifiedBinarySnapshot` handle. The loader verifies the snapshot's evaluator
+artifacts against a caller-supplied trusted `snapshot_contract_hash`; no public
+constructor or mutable accessor can bypass that check. Snapshot v2 atomically
+binds the exact UP/DOWN token pair, its complementary official outcome, and the
+locally recorded availability time of both persisted token versions. The loader
+hashes and parses the same captured artifact bytes, including the Parquet label
+clock at microsecond precision. Both Burn training and the shared walk-forward
+path used by the actual LoopRun cut off training labels by that availability
+clock rather than by scheduled expiry alone. Snapshot v1 artifacts must be
+rebuilt before use in this lane.
+
 ## Factor proposal loop
 
 The LLM does not invent executable strategy code. For continuous contracts it

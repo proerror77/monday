@@ -70,6 +70,17 @@ must be rebuilt into a new snapshot. The mission binds the snapshot's strong
 `snapshot_contract_hash`, which covers the evaluator-visible manifest semantics
 and artifacts, rather than relying only on the legacy content hash.
 
+Prediction snapshot v2 atomically reads the exact UP/DOWN token pair, its
+complementary official outcome, and the local availability time of both
+persisted token versions from `pm_token_settlements`. Coverage gates reject
+missing or impossible clocks, while the loader hashes and parses the same
+captured artifact bytes. Burn training accepts only a sealed snapshot reloaded
+against the mission's trusted `snapshot_contract_hash`. The shared walk-forward
+path used by the actual LoopRun also requires training-label availability—not
+scheduled event expiry—to precede the first retained validation decision.
+Existing v1 snapshots therefore require a deterministic rebuild from retained
+raw data; they are never silently upgraded.
+
 The prediction LoopRun also keeps an append-only ledger for every LLM call and
 links each accepted proposal to its full retry lineage. Prompts, responses,
 priors, evaluator attempts, feedback, and deterministic decisions are

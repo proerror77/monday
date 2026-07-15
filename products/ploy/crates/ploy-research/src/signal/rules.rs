@@ -32,6 +32,7 @@ mod tests {
             distance_over_sigma,
             time_remaining_secs: 250,
             settlement_up: 0.0,
+            official_resolution_observed_at: None,
             event_id: "e".into(),
             symbol: "BTC".into(),
             tick_ts: Utc::now(),

@@ -640,6 +640,7 @@ pub fn validate_prediction_snapshot_coverage(
     }
 
     let mut labels = BTreeMap::<&str, f64>::new();
+    let mut label_observation_clocks = BTreeMap::<&str, chrono::DateTime<chrono::Utc>>::new();
     let mut token_ids = BTreeMap::<&str, (&str, &str)>::new();
     let mut chainlink_events = BTreeSet::new();
     let mut binance_spot_events = BTreeSet::new();
@@ -694,6 +695,30 @@ pub fn validate_prediction_snapshot_coverage(
         {
             return Err(format!(
                 "snapshot event {} has inconsistent official settlement labels",
+                row.event_id
+            ));
+        }
+        let settlement_at = row.tick_ts + chrono::Duration::seconds(row.time_remaining_secs);
+        let resolution_observed_at = row.official_resolution_observed_at.ok_or_else(|| {
+            format!(
+                "snapshot event {} lacks an official resolution observation clock",
+                row.event_id
+            )
+        })?;
+        if resolution_observed_at < settlement_at
+            || resolution_observed_at > snapshot.manifest.generated_at
+        {
+            return Err(format!(
+                "snapshot event {} has an invalid official resolution observation clock",
+                row.event_id
+            ));
+        }
+        if label_observation_clocks
+            .insert(row.event_id.as_str(), resolution_observed_at)
+            .is_some_and(|previous| previous != resolution_observed_at)
+        {
+            return Err(format!(
+                "snapshot event {} has inconsistent official resolution observation clocks",
                 row.event_id
             ));
         }
@@ -3782,6 +3807,7 @@ mod tests {
             pm_down_ask_size: 10.0,
             pm_lag_secs: 0.0,
             settlement_up: 1.0,
+            official_resolution_observed_at: Some(tick_ts + chrono::Duration::seconds(60)),
             future_up_ask_change_30s: None,
             future_up_ask_change_60s: None,
             cum_obi_delta_5m: 0.0,
@@ -3977,14 +4003,33 @@ mod tests {
     fn prediction_snapshot_coverage_is_symbol_and_event_scoped() {
         let tick_ts = Utc::now();
         let observation = test_prediction_observation(tick_ts);
+        let mut manifest = snapshot_manifest();
+        manifest.generated_at = tick_ts + chrono::Duration::seconds(61);
         let snapshot = ResearchSnapshot {
-            manifest: snapshot_manifest(),
+            manifest,
             observations: vec![observation.clone()],
             deribit_snapshots: Vec::new(),
             pm_book_snapshots: test_prediction_books(tick_ts),
         };
         validate_prediction_snapshot_coverage(&snapshot, &mission())
             .expect("event-scoped authority coverage");
+
+        let mut missing_resolution_clock = snapshot.clone();
+        missing_resolution_clock.observations[0].official_resolution_observed_at = None;
+        assert!(
+            validate_prediction_snapshot_coverage(&missing_resolution_clock, &mission())
+                .expect_err("missing official label availability must fail")
+                .contains("official resolution observation clock")
+        );
+
+        let mut future_resolution_clock = snapshot.clone();
+        future_resolution_clock.observations[0].official_resolution_observed_at =
+            Some(future_resolution_clock.manifest.generated_at + chrono::Duration::milliseconds(1));
+        assert!(
+            validate_prediction_snapshot_coverage(&future_resolution_clock, &mission())
+                .expect_err("a label observed after snapshot generation must fail")
+                .contains("invalid official resolution observation clock")
+        );
 
         let mut wrong_symbol = snapshot.clone();
         wrong_symbol.observations[0].symbol = "SOLUSDT".to_string();
@@ -4021,6 +4066,7 @@ mod tests {
         let mut mixed_freshness = snapshot.clone();
         let mut stale_row = observation.clone();
         stale_row.tick_ts += chrono::Duration::seconds(1);
+        stale_row.time_remaining_secs -= 1;
         stale_row.binance_lob_fresh = false;
         mixed_freshness.observations.push(stale_row);
         assert!(

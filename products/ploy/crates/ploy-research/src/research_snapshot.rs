@@ -1,3 +1,5 @@
+#[cfg(any(feature = "db", test))]
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -17,7 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::factors::normalized_underlying_symbol;
 use crate::{DeribitFeatureSnapshot, FactorObservation, ResearchPmBookSnapshot};
 
-pub const RESEARCH_SNAPSHOT_SCHEMA_VERSION: &str = "research_snapshot_v1";
+pub const RESEARCH_SNAPSHOT_SCHEMA_VERSION: &str = "research_snapshot_v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchSnapshotArtifacts {
@@ -161,6 +163,39 @@ pub struct ResearchSnapshotRequest<'a> {
     pub require_official_settlement: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ResearchSnapshotArtifactBytes {
+    observations_json: Vec<u8>,
+    deribit_snapshots_json: Vec<u8>,
+    pm_book_snapshots_json: Vec<u8>,
+    observations_parquet: Option<Vec<u8>>,
+}
+
+fn load_snapshot_artifact_bytes_with<F>(
+    manifest: &ResearchSnapshotManifest,
+    include_contract_artifacts: bool,
+    mut read: F,
+) -> Result<ResearchSnapshotArtifactBytes>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
+    Ok(ResearchSnapshotArtifactBytes {
+        observations_json: read(&manifest.artifacts.observations_json)?,
+        deribit_snapshots_json: read(&manifest.artifacts.deribit_snapshots_json)?,
+        pm_book_snapshots_json: read(&manifest.artifacts.pm_book_snapshots_json)?,
+        observations_parquet: if include_contract_artifacts {
+            manifest
+                .artifacts
+                .observations_parquet
+                .as_deref()
+                .map(&mut read)
+                .transpose()?
+        } else {
+            None
+        },
+    })
+}
+
 pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<ResearchSnapshot> {
     let snapshot_dir = snapshot_dir.as_ref();
     let manifest: ResearchSnapshotManifest =
@@ -173,6 +208,14 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
             RESEARCH_SNAPSHOT_SCHEMA_VERSION
         );
     }
+    let artifact_bytes = load_snapshot_artifact_bytes_with(
+        &manifest,
+        manifest.snapshot_contract_hash.is_some(),
+        |artifact| {
+            fs::read(snapshot_dir.join(artifact))
+                .with_context(|| format!("read snapshot artifact {artifact}"))
+        },
+    )?;
     if let Some(recorded_contract_hash) = manifest.snapshot_contract_hash.as_deref() {
         let contract_hex = recorded_contract_hash
             .strip_prefix("sha256:")
@@ -184,7 +227,7 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
             })
             .context("research snapshot contract hash must use sha256:<64hex>")?;
         debug_assert_eq!(contract_hex.len(), 64);
-        let computed_contract_hash = compute_snapshot_contract_hash(snapshot_dir, &manifest)
+        let computed_contract_hash = compute_snapshot_contract_hash(&manifest, &artifact_bytes)
             .context("verify research snapshot evaluator contract hash")?;
         if recorded_contract_hash != computed_contract_hash {
             anyhow::bail!(
@@ -199,7 +242,7 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
         .as_deref()
         .filter(|hash| !hash.is_empty())
         .context("research snapshot manifest is missing snapshot_hash")?;
-    let computed_hash = compute_snapshot_hash(snapshot_dir, &manifest)
+    let computed_hash = compute_snapshot_hash(&manifest, &artifact_bytes)
         .context("verify research snapshot content hash")?;
     if recorded_hash != computed_hash {
         anyhow::bail!(
@@ -209,14 +252,12 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
         );
     }
 
-    let observations = read_json(snapshot_dir.join(&manifest.artifacts.observations_json))
-        .context("read snapshot observations")?;
-    let deribit_snapshots =
-        read_json(snapshot_dir.join(&manifest.artifacts.deribit_snapshots_json))
-            .context("read snapshot Deribit rows")?;
-    let pm_book_snapshots =
-        read_json(snapshot_dir.join(&manifest.artifacts.pm_book_snapshots_json))
-            .context("read snapshot PM book rows")?;
+    let observations = serde_json::from_slice(&artifact_bytes.observations_json)
+        .context("parse snapshot observations")?;
+    let deribit_snapshots = serde_json::from_slice(&artifact_bytes.deribit_snapshots_json)
+        .context("parse snapshot Deribit rows")?;
+    let pm_book_snapshots = serde_json::from_slice(&artifact_bytes.pm_book_snapshots_json)
+        .context("parse snapshot PM book rows")?;
 
     Ok(ResearchSnapshot {
         manifest,
@@ -244,18 +285,27 @@ pub fn write_research_snapshot(
         pm_book_snapshots: snapshot.pm_book_snapshots.len(),
     };
 
-    write_json(
+    let observations_json = serde_json::to_vec_pretty(&snapshot.observations)
+        .context("serialize snapshot observations")?;
+    let deribit_snapshots_json = serde_json::to_vec_pretty(&snapshot.deribit_snapshots)
+        .context("serialize snapshot Deribit rows")?;
+    let pm_book_snapshots_json = serde_json::to_vec_pretty(&snapshot.pm_book_snapshots)
+        .context("serialize snapshot PM book rows")?;
+    fs::write(
         snapshot_dir.join(&snapshot.manifest.artifacts.observations_json),
-        &snapshot.observations,
-    )?;
-    write_json(
+        &observations_json,
+    )
+    .context("write snapshot observations")?;
+    fs::write(
         snapshot_dir.join(&snapshot.manifest.artifacts.deribit_snapshots_json),
-        &snapshot.deribit_snapshots,
-    )?;
-    write_json(
+        &deribit_snapshots_json,
+    )
+    .context("write snapshot Deribit rows")?;
+    fs::write(
         snapshot_dir.join(&snapshot.manifest.artifacts.pm_book_snapshots_json),
-        &snapshot.pm_book_snapshots,
-    )?;
+        &pm_book_snapshots_json,
+    )
+    .context("write snapshot PM book rows")?;
 
     #[cfg(feature = "polars-export")]
     {
@@ -268,11 +318,28 @@ pub fn write_research_snapshot(
         snapshot.manifest.artifacts.observations_parquet = Some(parquet_name.to_string());
     }
 
+    let observations_parquet = snapshot
+        .manifest
+        .artifacts
+        .observations_parquet
+        .as_deref()
+        .map(|artifact| {
+            fs::read(snapshot_dir.join(artifact))
+                .with_context(|| format!("read written snapshot artifact {artifact}"))
+        })
+        .transpose()?;
+    let artifact_bytes = ResearchSnapshotArtifactBytes {
+        observations_json,
+        deribit_snapshots_json,
+        pm_book_snapshots_json,
+        observations_parquet,
+    };
+
     snapshot.manifest.snapshot_hash =
-        Some(compute_snapshot_hash(snapshot_dir, &snapshot.manifest)?);
+        Some(compute_snapshot_hash(&snapshot.manifest, &artifact_bytes)?);
     snapshot.manifest.snapshot_contract_hash = Some(compute_snapshot_contract_hash(
-        snapshot_dir,
         &snapshot.manifest,
+        &artifact_bytes,
     )?);
 
     write_json(
@@ -876,6 +943,147 @@ fn merge_pm_book_snapshots(
     hot_rows
 }
 
+#[cfg(any(feature = "db", test))]
+type OfficialOutcomeKey = (String, String, String);
+
+#[cfg(any(feature = "db", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OfficialBinaryOutcome {
+    settlement_up: bool,
+    observed_at: DateTime<Utc>,
+}
+
+#[cfg(feature = "db")]
+async fn load_official_binary_outcomes(
+    pool: &sqlx::PgPool,
+    observations: &[FactorObservation],
+) -> Result<HashMap<OfficialOutcomeKey, OfficialBinaryOutcome>> {
+    let mut contracts = observations
+        .iter()
+        .map(|row| {
+            (
+                row.event_id.clone(),
+                row.up_token_id.clone(),
+                row.down_token_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    contracts.sort();
+    contracts.dedup();
+    if contracts.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let event_ids = contracts
+        .iter()
+        .map(|(event_id, _, _)| event_id.clone())
+        .collect::<Vec<_>>();
+    let up_token_ids = contracts
+        .iter()
+        .map(|(_, up_token_id, _)| up_token_id.clone())
+        .collect::<Vec<_>>();
+    let down_token_ids = contracts
+        .iter()
+        .map(|(_, _, down_token_id)| down_token_id.clone())
+        .collect::<Vec<_>>();
+    let rows: Vec<(String, String, String, bool, DateTime<Utc>)> = sqlx::query_as(
+        r#"
+        WITH requested(event_id, up_token_id, down_token_id) AS (
+            SELECT *
+            FROM UNNEST($1::text[], $2::text[], $3::text[])
+        )
+        SELECT
+            requested.event_id,
+            requested.up_token_id,
+            requested.down_token_id,
+            up_settlement.settled_price = 1::numeric AS settlement_up,
+            GREATEST(
+                COALESCE(up_settlement.resolved_at, up_settlement.fetched_at),
+                up_settlement.fetched_at,
+                COALESCE(down_settlement.resolved_at, down_settlement.fetched_at),
+                down_settlement.fetched_at
+            ) AS label_observed_at
+        FROM requested
+        JOIN pm_token_settlements AS up_settlement
+          ON up_settlement.market_slug = requested.event_id
+         AND up_settlement.token_id = requested.up_token_id
+         AND up_settlement.resolved = TRUE
+        JOIN pm_token_settlements AS down_settlement
+          ON down_settlement.market_slug = requested.event_id
+         AND down_settlement.token_id = requested.down_token_id
+         AND down_settlement.resolved = TRUE
+        WHERE up_settlement.settled_price IN (0::numeric, 1::numeric)
+          AND down_settlement.settled_price IN (0::numeric, 1::numeric)
+          AND up_settlement.settled_price + down_settlement.settled_price = 1::numeric
+        "#,
+    )
+    .bind(&event_ids)
+    .bind(&up_token_ids)
+    .bind(&down_token_ids)
+    .fetch_all(pool)
+    .await
+    .context("load exact official binary outcomes and observation clocks")?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(event_id, up_token_id, down_token_id, settlement_up, observed_at)| {
+                (
+                    (event_id, up_token_id, down_token_id),
+                    OfficialBinaryOutcome {
+                        settlement_up,
+                        observed_at,
+                    },
+                )
+            },
+        )
+        .collect())
+}
+
+#[cfg(any(feature = "db", test))]
+fn exact_official_binary_outcome<'a>(
+    outcomes: &'a HashMap<OfficialOutcomeKey, OfficialBinaryOutcome>,
+    event_id: &str,
+    up_token_id: &str,
+    down_token_id: &str,
+) -> Option<&'a OfficialBinaryOutcome> {
+    outcomes.get(&(
+        event_id.to_string(),
+        up_token_id.to_string(),
+        down_token_id.to_string(),
+    ))
+}
+
+#[cfg(feature = "db")]
+fn bind_official_binary_outcomes(
+    observations: &mut [FactorObservation],
+    outcomes: &HashMap<OfficialOutcomeKey, OfficialBinaryOutcome>,
+    require_official_settlement: bool,
+) -> Result<()> {
+    for row in observations {
+        if let Some(outcome) = exact_official_binary_outcome(
+            outcomes,
+            &row.event_id,
+            &row.up_token_id,
+            &row.down_token_id,
+        ) {
+            row.settlement_up = f64::from(outcome.settlement_up);
+            row.official_resolution_observed_at = Some(outcome.observed_at);
+        } else {
+            row.official_resolution_observed_at = None;
+            if require_official_settlement {
+                anyhow::bail!(
+                    "exact complementary official settlement pair is missing for event {} tokens {}/{}",
+                    row.event_id,
+                    row.up_token_id,
+                    row.down_token_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "db")]
 pub async fn build_research_snapshot_from_database(
     pool: &sqlx::PgPool,
@@ -1082,7 +1290,7 @@ pub async fn build_research_snapshot_from_database(
     let lob_slice = slice_by_time(&all_lob_snapshots, history_start, options.end, |snapshot| {
         snapshot.ts
     });
-    let observations = build_factor_observations_with_lob_sampled_and_source_clocks(
+    let mut observations = build_factor_observations_with_lob_sampled_and_source_clocks(
         updates_slice,
         lob_slice,
         &binance_source_clocks,
@@ -1093,6 +1301,19 @@ pub async fn build_research_snapshot_from_database(
         phase: "factor_observations".to_string(),
         elapsed_ms: started.elapsed().as_millis(),
         rows: Some(observations.len()),
+    });
+
+    let started = Instant::now();
+    let official_binary_outcomes = load_official_binary_outcomes(pool, &observations).await?;
+    bind_official_binary_outcomes(
+        &mut observations,
+        &official_binary_outcomes,
+        options.require_official_settlement,
+    )?;
+    phase_timings.push(ResearchSnapshotPhaseTiming {
+        phase: "exact_official_binary_outcomes".to_string(),
+        elapsed_ms: started.elapsed().as_millis(),
+        rows: Some(official_binary_outcomes.len()),
     });
 
     let quality_flags = research_snapshot_quality_flags(ResearchSnapshotQualityInputs {
@@ -1198,8 +1419,8 @@ pub async fn build_research_snapshot_from_database(
                     raw_full_fidelity: true,
                     snapshot_sampled: false,
                     sample_secs: None,
-                    row_count: None,
-                    notes: "Official binary outcome labels are required for prediction evaluation when require_official_settlement=true; they are not execution evidence.".to_string(),
+                    row_count: Some(official_binary_outcomes.len()),
+                    notes: "Exact complementary UP/DOWN official outcome pairs and their content-version availability clocks are required for prediction evaluation when require_official_settlement=true; they are not execution evidence.".to_string(),
                 },
                 ResearchSnapshotSourceSurface {
                     name: "deribit_feature_snapshots".to_string(),
@@ -1233,7 +1454,8 @@ pub async fn build_research_snapshot_from_database(
                     all_updates.len()
                         + all_lob_snapshots.len()
                         + all_pm_book_snapshots.len()
-                        + deribit_snapshots.len(),
+                        + deribit_snapshots.len()
+                        + official_binary_outcomes.len(),
                 ),
             }],
             data_requirements: options.data_requirements,
@@ -1278,8 +1500,8 @@ fn write_json<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
 }
 
 fn compute_snapshot_hash(
-    snapshot_dir: &Path,
     manifest: &ResearchSnapshotManifest,
+    artifacts: &ResearchSnapshotArtifactBytes,
 ) -> Result<String> {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -1361,22 +1583,29 @@ fn compute_snapshot_hash(
             .unwrap_or("")
             .as_bytes(),
     );
-    for artifact in [
-        &manifest.artifacts.observations_json,
-        &manifest.artifacts.deribit_snapshots_json,
-        &manifest.artifacts.pm_book_snapshots_json,
+    for (artifact, bytes) in [
+        (
+            manifest.artifacts.observations_json.as_str(),
+            artifacts.observations_json.as_slice(),
+        ),
+        (
+            manifest.artifacts.deribit_snapshots_json.as_str(),
+            artifacts.deribit_snapshots_json.as_slice(),
+        ),
+        (
+            manifest.artifacts.pm_book_snapshots_json.as_str(),
+            artifacts.pm_book_snapshots_json.as_slice(),
+        ),
     ] {
         update(&mut hash, artifact.as_bytes());
-        let bytes = fs::read(snapshot_dir.join(artifact))
-            .with_context(|| format!("read snapshot artifact {artifact} for hashing"))?;
-        update(&mut hash, &bytes);
+        update(&mut hash, bytes);
     }
     Ok(format!("{hash:016x}"))
 }
 
 fn compute_snapshot_contract_hash(
-    snapshot_dir: &Path,
     manifest: &ResearchSnapshotManifest,
+    artifacts: &ResearchSnapshotArtifactBytes,
 ) -> Result<String> {
     fn update_framed(hasher: &mut Sha256, bytes: &[u8]) {
         hasher.update((bytes.len() as u64).to_be_bytes());
@@ -1393,20 +1622,38 @@ fn compute_snapshot_contract_hash(
     update_framed(&mut hasher, b"ploy.research_snapshot.evaluator_contract.v1");
     update_framed(&mut hasher, &manifest_bytes);
 
-    for artifact in [
-        Some(manifest.artifacts.observations_json.as_str()),
-        Some(manifest.artifacts.deribit_snapshots_json.as_str()),
-        Some(manifest.artifacts.pm_book_snapshots_json.as_str()),
-        manifest.artifacts.observations_parquet.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for (artifact, bytes) in [
+        (
+            manifest.artifacts.observations_json.as_str(),
+            artifacts.observations_json.as_slice(),
+        ),
+        (
+            manifest.artifacts.deribit_snapshots_json.as_str(),
+            artifacts.deribit_snapshots_json.as_slice(),
+        ),
+        (
+            manifest.artifacts.pm_book_snapshots_json.as_str(),
+            artifacts.pm_book_snapshots_json.as_slice(),
+        ),
+    ] {
         update_framed(&mut hasher, artifact.as_bytes());
-        let bytes = fs::read(snapshot_dir.join(artifact)).with_context(|| {
-            format!("read evaluator artifact {artifact} for snapshot contract hashing")
-        })?;
-        update_framed(&mut hasher, &bytes);
+        update_framed(&mut hasher, bytes);
+    }
+    match (
+        manifest.artifacts.observations_parquet.as_deref(),
+        artifacts.observations_parquet.as_deref(),
+    ) {
+        (Some(artifact), Some(bytes)) => {
+            update_framed(&mut hasher, artifact.as_bytes());
+            update_framed(&mut hasher, bytes);
+        }
+        (None, None) => {}
+        (Some(_), None) => anyhow::bail!(
+            "snapshot manifest declares observations_parquet but its bytes are unavailable"
+        ),
+        (None, Some(_)) => {
+            anyhow::bail!("snapshot artifact bytes contain undeclared observations_parquet data")
+        }
     }
 
     Ok(format!("sha256:{:x}", hasher.finalize()))
@@ -1590,6 +1837,39 @@ mod tests {
     }
 
     #[test]
+    fn official_outcome_lookup_requires_the_exact_event_token_pair() {
+        let observed_at = "2026-07-15T12:00:00.123456Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let expected = OfficialBinaryOutcome {
+            settlement_up: true,
+            observed_at,
+        };
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            (
+                "event-1".to_string(),
+                "stale-up".to_string(),
+                "stale-down".to_string(),
+            ),
+            OfficialBinaryOutcome {
+                settlement_up: false,
+                observed_at: observed_at - chrono::Duration::hours(1),
+            },
+        );
+        assert!(exact_official_binary_outcome(&outcomes, "event-1", "up", "down").is_none());
+
+        outcomes.insert(
+            ("event-1".to_string(), "up".to_string(), "down".to_string()),
+            expected,
+        );
+        assert_eq!(
+            exact_official_binary_outcome(&outcomes, "event-1", "up", "down"),
+            Some(&expected)
+        );
+    }
+
+    #[test]
     fn write_and_load_empty_snapshot_roundtrips_manifest() {
         let root = std::env::temp_dir().join(format!(
             "ploy-research-snapshot-test-{}-{}",
@@ -1727,12 +2007,80 @@ mod tests {
         assert!(quality.contains("snapshot_sampled=`true`"));
         assert!(quality.contains("## Input Artifacts"));
 
+        let mut artifact_reads = HashMap::<String, usize>::new();
+        let captured = load_snapshot_artifact_bytes_with(&loaded.manifest, true, |artifact| {
+            *artifact_reads.entry(artifact.to_string()).or_default() += 1;
+            fs::read(root.join(artifact)).with_context(|| format!("read test artifact {artifact}"))
+        })
+        .expect("capture each evaluator artifact once");
+        assert!(artifact_reads.values().all(|count| *count == 1));
+        assert_eq!(
+            Some(compute_snapshot_hash(&loaded.manifest, &captured).unwrap()),
+            loaded.manifest.snapshot_hash
+        );
+        assert_eq!(
+            Some(compute_snapshot_contract_hash(&loaded.manifest, &captured).unwrap()),
+            loaded.manifest.snapshot_contract_hash
+        );
+        let captured_observations: Vec<FactorObservation> =
+            serde_json::from_slice(&captured.observations_json).unwrap();
+        assert!(captured_observations.is_empty());
+
+        #[cfg(feature = "polars-export")]
+        {
+            let legacy_hash = compute_snapshot_hash(&loaded.manifest, &captured).unwrap();
+            let strong_hash = compute_snapshot_contract_hash(&loaded.manifest, &captured).unwrap();
+            let mut changed_parquet = captured.clone();
+            changed_parquet
+                .observations_parquet
+                .as_mut()
+                .expect("writer declares parquet")
+                .push(0);
+            assert_eq!(
+                compute_snapshot_hash(&loaded.manifest, &changed_parquet).unwrap(),
+                legacy_hash
+            );
+            assert_ne!(
+                compute_snapshot_contract_hash(&loaded.manifest, &changed_parquet).unwrap(),
+                strong_hash
+            );
+            changed_parquet.observations_parquet = None;
+            assert!(compute_snapshot_contract_hash(&loaded.manifest, &changed_parquet).is_err());
+        }
+
         let mut legacy_manifest = serde_json::to_value(&loaded.manifest).expect("legacy manifest");
         legacy_manifest
             .as_object_mut()
             .expect("manifest object")
             .remove("snapshot_contract_hash");
         write_json(root.join("manifest.json"), &legacy_manifest).expect("write legacy manifest");
+
+        #[cfg(feature = "polars-export")]
+        {
+            let parquet_path = root.join(
+                loaded
+                    .manifest
+                    .artifacts
+                    .observations_parquet
+                    .as_deref()
+                    .expect("writer declares parquet"),
+            );
+            let parquet_bytes = fs::read(&parquet_path).expect("read parquet before deletion");
+            fs::remove_file(&parquet_path).expect("remove optional legacy parquet");
+            load_research_snapshot(&root)
+                .expect("legacy snapshot must not depend on an unverified parquet artifact");
+
+            write_json(root.join("manifest.json"), &loaded.manifest)
+                .expect("restore strong snapshot manifest");
+            let missing_parquet = load_research_snapshot(&root)
+                .expect_err("strong snapshot must require its declared parquet artifact");
+            assert!(missing_parquet
+                .to_string()
+                .contains("read snapshot artifact"));
+            fs::write(&parquet_path, parquet_bytes).expect("restore parquet artifact");
+        }
+
+        #[cfg(not(feature = "polars-export"))]
         load_research_snapshot(&root).expect("legacy snapshot without contract hash must load");
 
         let mut semantic_tamper = loaded.manifest.clone();

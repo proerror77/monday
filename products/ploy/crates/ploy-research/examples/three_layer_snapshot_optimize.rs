@@ -2224,6 +2224,7 @@ mod tests {
             tick_ts: Utc.with_ymd_and_hms(2026, 4, 25, 0, 0, 0).unwrap()
                 + chrono::Duration::seconds(ts_offset_secs),
             time_remaining_secs: 120,
+            official_resolution_observed_at: None,
             regime: Regime::Middle,
             side: ReviewSide::Up,
             pm_token_id: "up-token".to_string(),

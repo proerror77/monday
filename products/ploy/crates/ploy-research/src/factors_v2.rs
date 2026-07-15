@@ -130,6 +130,9 @@ pub struct FactorObservationV2 {
     pub symbol: String,
     pub tick_ts: DateTime<Utc>,
     pub time_remaining_secs: i64,
+    /// Label provenance only; never exposed through the factor registry.
+    #[serde(default)]
+    pub official_resolution_observed_at: Option<DateTime<Utc>>,
     pub regime: Regime,
     pub side: ReviewSide,
     #[serde(default)]
@@ -2271,6 +2274,7 @@ fn walk_forward_factor_rows(
         })
         .collect();
     let event_ends = inferred_event_ends(v2_rows);
+    let label_observation_times = official_label_observation_times(v2_rows);
 
     let mut windows = Vec::new();
     let mut train_start = start;
@@ -2282,6 +2286,7 @@ fn walk_forward_factor_rows(
         let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
             v2_rows,
             &event_ends,
+            &label_observation_times,
             train_start,
             train_end,
             test_start,
@@ -2957,6 +2962,7 @@ pub fn walk_forward_settlement_probability_report_with_prior(
     let probability_options =
         normalize_settlement_probability_report_options(options.probability.clone());
     let event_ends = inferred_event_ends(&rows);
+    let label_observation_times = official_label_observation_times(&rows);
 
     let mut windows = Vec::new();
     let mut train_start = start;
@@ -2968,6 +2974,7 @@ pub fn walk_forward_settlement_probability_report_with_prior(
         let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
             &rows,
             &event_ends,
+            &label_observation_times,
             train_start,
             train_end,
             test_start,
@@ -3992,6 +3999,7 @@ fn walk_forward_factor_combo_from_v2_rows(
     let test_duration = options.walk_forward.test_duration();
     let step_duration = options.walk_forward.step_duration();
     let event_ends = inferred_event_ends(v2_rows);
+    let label_observation_times = official_label_observation_times(v2_rows);
     let mut train_start = start;
     let mut window_index = 0usize;
     while train_start + train_duration + test_duration <= end + Duration::seconds(1) {
@@ -4001,6 +4009,7 @@ fn walk_forward_factor_combo_from_v2_rows(
         let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
             v2_rows,
             &event_ends,
+            &label_observation_times,
             train_start,
             train_end,
             test_start,
@@ -4402,6 +4411,7 @@ fn walk_forward_meta_label_v1_rows(
     let test_duration = Duration::days(options.test_window_days.max(1));
     let step_duration = Duration::days(options.step_days.max(1));
     let event_ends = inferred_event_ends(v2_rows);
+    let label_observation_times = official_label_observation_times(v2_rows);
     let mut train_start = start;
     let mut window_index = 0usize;
 
@@ -4412,6 +4422,7 @@ fn walk_forward_meta_label_v1_rows(
         let (train_slice, test_slice) = event_disjoint_walk_forward_slices(
             v2_rows,
             &event_ends,
+            &label_observation_times,
             train_start,
             train_end,
             test_start,
@@ -7304,6 +7315,7 @@ fn walk_forward_time_slice(
 }
 
 type EventEndIndex<'a> = HashMap<&'a str, Option<DateTime<Utc>>>;
+type EventLabelObservationIndex<'a> = HashMap<&'a str, Option<DateTime<Utc>>>;
 
 fn inferred_event_ends(rows: &[FactorObservationV2]) -> EventEndIndex<'_> {
     let mut event_ends = HashMap::new();
@@ -7325,9 +7337,29 @@ fn inferred_event_ends(rows: &[FactorObservationV2]) -> EventEndIndex<'_> {
     event_ends
 }
 
+fn official_label_observation_times(
+    rows: &[FactorObservationV2],
+) -> EventLabelObservationIndex<'_> {
+    let mut observed_at = HashMap::new();
+    for row in rows {
+        match observed_at.entry(row.event_id.as_str()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(row.official_resolution_observed_at);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if *entry.get() != row.official_resolution_observed_at {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    observed_at
+}
+
 fn event_disjoint_walk_forward_slices<'a>(
     rows: &'a [FactorObservationV2],
     event_ends: &EventEndIndex<'_>,
+    label_observation_times: &EventLabelObservationIndex<'_>,
     train_start: DateTime<Utc>,
     train_end: DateTime<Utc>,
     test_start: DateTime<Utc>,
@@ -7342,15 +7374,32 @@ fn event_disjoint_walk_forward_slices<'a>(
             .is_some_and(|event_end| *event_end >= start && *event_end < end)
     };
 
-    (
-        train
-            .iter()
-            .filter(|row| ends_in(row, train_start, train_end))
-            .collect(),
-        test.iter()
-            .filter(|row| ends_in(row, test_start, test_end))
-            .collect(),
-    )
+    let test_rows = test
+        .iter()
+        .filter(|row| ends_in(row, test_start, test_end))
+        .collect::<Vec<_>>();
+    let Some(first_test_decision) = test_rows.iter().map(|row| row.tick_ts).min() else {
+        return (Vec::new(), test_rows);
+    };
+    let train_rows = train
+        .iter()
+        .filter(|row| ends_in(row, train_start, train_end))
+        .filter(|row| {
+            let event_id = row.event_id.as_str();
+            let event_end = event_ends.get(event_id).and_then(Option::as_ref);
+            let label_observed_at = label_observation_times
+                .get(event_id)
+                .and_then(Option::as_ref);
+            matches!(
+                (event_end, label_observed_at),
+                (Some(event_end), Some(label_observed_at))
+                    if *label_observed_at >= *event_end
+                        && *label_observed_at <= first_test_decision
+            )
+        })
+        .collect();
+
+    (train_rows, test_rows)
 }
 
 fn inferred_event_end(row: &FactorObservationV2) -> Option<DateTime<Utc>> {
@@ -9399,6 +9448,7 @@ fn side_row(
         symbol: row.symbol.clone(),
         tick_ts: row.tick_ts,
         time_remaining_secs: row.time_remaining_secs,
+        official_resolution_observed_at: row.official_resolution_observed_at,
         regime: Regime::from_secs(row.time_remaining_secs),
         side,
         pm_token_id: side_token_id(row, side).to_string(),
@@ -10454,10 +10504,11 @@ mod tests {
     }
 
     fn base_obs() -> FactorObservation {
+        let tick_ts = Utc::now();
         FactorObservation {
             event_id: "evt".into(),
             symbol: "BTCUSDT".into(),
-            tick_ts: Utc::now(),
+            tick_ts,
             up_token_id: "up-token".into(),
             down_token_id: "down-token".into(),
             chainlink_reference_fresh: false,
@@ -10504,6 +10555,7 @@ mod tests {
             pm_down_ask_size: 40.0,
             pm_lag_secs: 1.0,
             settlement_up: 1.0,
+            official_resolution_observed_at: Some(tick_ts + Duration::seconds(220)),
             future_up_ask_change_30s: Some(0.05),
             future_up_ask_change_60s: Some(0.08),
             cum_obi_delta_5m: 0.1,
@@ -10519,6 +10571,41 @@ mod tests {
             cex_consecutive_down_bars: 0.0,
             cex_breakout_volume_score: 1.2,
         }
+    }
+
+    fn bind_test_resolution_clocks(rows: &mut [FactorObservation]) {
+        let mut event_ends = HashMap::<String, DateTime<Utc>>::new();
+        for row in rows.iter() {
+            if let Some(event_end) = Duration::try_seconds(row.time_remaining_secs)
+                .and_then(|remaining| row.tick_ts.checked_add_signed(remaining))
+            {
+                event_ends
+                    .entry(row.event_id.clone())
+                    .and_modify(|current| *current = (*current).max(event_end))
+                    .or_insert(event_end);
+            }
+        }
+        for row in rows {
+            row.official_resolution_observed_at = event_ends.get(&row.event_id).copied();
+        }
+    }
+
+    fn test_walk_forward_split(
+        rows: &[FactorObservationV2],
+        start: DateTime<Utc>,
+        boundary: DateTime<Utc>,
+    ) -> (Vec<&FactorObservationV2>, Vec<&FactorObservationV2>) {
+        let event_ends = inferred_event_ends(rows);
+        let label_observation_times = official_label_observation_times(rows);
+        event_disjoint_walk_forward_slices(
+            rows,
+            &event_ends,
+            &label_observation_times,
+            start,
+            boundary,
+            boundary,
+            boundary + Duration::hours(12),
+        )
     }
 
     fn make_settlement_probability_eligible(rows: &mut [FactorObservationV2]) {
@@ -11455,6 +11542,7 @@ mod tests {
             row.tick_ts = tick_ts;
             source_rows.push(row);
         }
+        bind_test_resolution_clocks(&mut source_rows);
         let mut rows = build_factor_observations_v2(
             &source_rows,
             &FactorReviewOptions {
@@ -11468,6 +11556,7 @@ mod tests {
         let (train, test) = event_disjoint_walk_forward_slices(
             &rows,
             &inferred_event_ends(&rows),
+            &official_label_observation_times(&rows),
             start,
             boundary,
             boundary,
@@ -11490,6 +11579,82 @@ mod tests {
     }
 
     #[test]
+    fn walk_forward_label_cutoff_uses_first_actual_test_decision() {
+        let start = Utc::now();
+        let boundary = start + Duration::hours(12);
+        let first_test_decision = boundary + Duration::minutes(5);
+        let mut train_source = base_obs();
+        train_source.event_id = "train-event".to_string();
+        train_source.tick_ts = start + Duration::hours(1);
+        train_source.time_remaining_secs = 60;
+        let mut test_source = base_obs();
+        test_source.event_id = "test-event".to_string();
+        test_source.tick_ts = first_test_decision;
+        test_source.time_remaining_secs = 60;
+        let mut source_rows = vec![train_source, test_source];
+        bind_test_resolution_clocks(&mut source_rows);
+        let mut rows = build_factor_observations_v2(&source_rows, &FactorReviewOptions::default());
+        rows.sort_by_key(|row| row.tick_ts);
+
+        for row in rows.iter_mut().filter(|row| row.event_id == "train-event") {
+            row.official_resolution_observed_at = Some(boundary + Duration::minutes(1));
+        }
+        let (train, test) = test_walk_forward_split(&rows, start, boundary);
+        assert_eq!(train.len(), 2, "nominal test_start is not the cutoff");
+        assert_eq!(test.len(), 2);
+
+        for row in rows.iter_mut().filter(|row| row.event_id == "train-event") {
+            row.official_resolution_observed_at = Some(first_test_decision);
+        }
+        assert_eq!(
+            test_walk_forward_split(&rows, start, boundary).0.len(),
+            2,
+            "equal availability is admissible"
+        );
+
+        for row in rows.iter_mut().filter(|row| row.event_id == "train-event") {
+            row.official_resolution_observed_at =
+                Some(first_test_decision + Duration::microseconds(1));
+        }
+        assert!(test_walk_forward_split(&rows, start, boundary).0.is_empty());
+        assert_eq!(
+            test_walk_forward_split(&rows, start, boundary).1.len(),
+            2,
+            "test scoring remains unchanged"
+        );
+    }
+
+    #[test]
+    fn walk_forward_label_cutoff_excludes_missing_or_inconsistent_event_clock() {
+        let start = Utc::now();
+        let boundary = start + Duration::hours(12);
+        let mut train_source = base_obs();
+        train_source.event_id = "train-event".to_string();
+        train_source.tick_ts = start + Duration::hours(1);
+        train_source.time_remaining_secs = 60;
+        let mut test_source = base_obs();
+        test_source.event_id = "test-event".to_string();
+        test_source.tick_ts = boundary + Duration::minutes(1);
+        test_source.time_remaining_secs = 60;
+        let mut source_rows = vec![train_source, test_source];
+        bind_test_resolution_clocks(&mut source_rows);
+        let mut rows = build_factor_observations_v2(&source_rows, &FactorReviewOptions::default());
+        rows.sort_by_key(|row| row.tick_ts);
+        rows.iter_mut()
+            .find(|row| row.event_id == "train-event")
+            .unwrap()
+            .official_resolution_observed_at = None;
+        assert!(test_walk_forward_split(&rows, start, boundary).0.is_empty());
+
+        let train_clock = start + Duration::hours(2);
+        let mut train_rows = rows.iter_mut().filter(|row| row.event_id == "train-event");
+        train_rows.next().unwrap().official_resolution_observed_at = Some(train_clock);
+        train_rows.next().unwrap().official_resolution_observed_at =
+            Some(train_clock + Duration::microseconds(1));
+        assert!(test_walk_forward_split(&rows, start, boundary).0.is_empty());
+    }
+
+    #[test]
     fn walk_forward_excludes_unsettled_train_event_without_test_ticks() {
         let start = Utc::now();
         let boundary = start + Duration::hours(12);
@@ -11504,6 +11669,7 @@ mod tests {
         let (train, test) = event_disjoint_walk_forward_slices(
             &rows,
             &inferred_event_ends(&rows),
+            &official_label_observation_times(&rows),
             start,
             boundary,
             boundary,
@@ -12211,7 +12377,7 @@ mod tests {
     #[test]
     fn liquidity_gated_alpha_v1_reviews_only_tradeable_rows() {
         let base = Utc::now();
-        let observations = (0..96)
+        let mut observations = (0..96)
             .map(|idx| {
                 let mut obs = base_obs();
                 obs.event_id = format!("event-{idx}");
@@ -12229,6 +12395,7 @@ mod tests {
                 obs
             })
             .collect::<Vec<_>>();
+        bind_test_resolution_clocks(&mut observations);
 
         let report = liquidity_gated_alpha_v1_with_deribit(
             &observations,
@@ -12342,7 +12509,7 @@ mod tests {
     #[test]
     fn meta_label_walk_forward_tests_fixed_rules_out_of_sample() {
         let base = Utc::now();
-        let observations = (0..96)
+        let mut observations = (0..96)
             .map(|idx| {
                 let mut obs = base_obs();
                 obs.event_id = format!("event-{idx}");
@@ -12364,6 +12531,7 @@ mod tests {
                 obs
             })
             .collect::<Vec<_>>();
+        bind_test_resolution_clocks(&mut observations);
 
         let report = walk_forward_meta_label_v1_with_deribit(
             &observations,
@@ -12853,6 +13021,7 @@ mod tests {
             obs.settlement_up = if i % 2 == 0 { 1.0 } else { 0.0 };
             observations.push(obs);
         }
+        bind_test_resolution_clocks(&mut observations);
 
         let report = walk_forward_factors_v2_with_deribit(
             &observations,
@@ -13056,6 +13225,7 @@ mod tests {
             obs.settlement_up = if i % 2 == 0 { 1.0 } else { 0.0 };
             observations.push(obs);
         }
+        bind_test_resolution_clocks(&mut observations);
 
         let report = walk_forward_factor_combo_v1_with_deribit(
             &observations,

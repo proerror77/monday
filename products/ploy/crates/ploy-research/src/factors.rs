@@ -247,6 +247,10 @@ pub struct FactorObservation {
     pub pm_down_ask_size: f64,
     pub pm_lag_secs: f64,
     pub settlement_up: f64,
+    /// Locally recorded time at which this version of the complete official
+    /// binary outcome became available. This is label provenance, never a feature.
+    #[serde(default)]
+    pub official_resolution_observed_at: Option<DateTime<Utc>>,
     pub future_up_ask_change_30s: Option<f64>,
     pub future_up_ask_change_60s: Option<f64>,
     pub cum_obi_delta_5m: f64,
@@ -1862,6 +1866,7 @@ pub fn build_factor_observations_with_lob_sampled_and_source_clocks(
                         pm_down_ask_size: down_ask_sz,
                         pm_lag_secs,
                         settlement_up: if resolved_up_won { 1.0 } else { 0.0 },
+                        official_resolution_observed_at: None,
                         future_up_ask_change_30s: None,
                         future_up_ask_change_60s: None,
                         cum_obi_delta_5m: lob_flow
@@ -2269,6 +2274,7 @@ pub fn observations_to_frame(rows: &[FactorObservation]) -> PolarsResult<DataFra
         "pm_down_ask_size" => rows.iter().map(|row| row.pm_down_ask_size).collect::<Vec<_>>(),
         "pm_lag_secs" => rows.iter().map(|row| row.pm_lag_secs).collect::<Vec<_>>(),
         "settlement_up" => rows.iter().map(|row| row.settlement_up).collect::<Vec<_>>(),
+        "official_resolution_observed_at_us" => rows.iter().map(|row| row.official_resolution_observed_at.map(|value| value.timestamp_micros())).collect::<Vec<_>>(),
         "future_up_ask_change_30s" => rows.iter().map(|row| row.future_up_ask_change_30s.unwrap_or(f64::NAN)).collect::<Vec<_>>(),
         "future_up_ask_change_60s" => rows.iter().map(|row| row.future_up_ask_change_60s.unwrap_or(f64::NAN)).collect::<Vec<_>>(),
         "cex_bar_return_30s" => rows.iter().map(|row| row.cex_bar_return_30s).collect::<Vec<_>>(),
@@ -2878,6 +2884,7 @@ mod tests {
             pm_down_ask_size: 1.0,
             pm_lag_secs: 0.0,
             settlement_up,
+            official_resolution_observed_at: None,
             future_up_ask_change_30s,
             future_up_ask_change_60s: None,
             cum_obi_delta_5m: 0.0,
@@ -2893,6 +2900,22 @@ mod tests {
             cex_consecutive_down_bars: 0.0,
             cex_breakout_volume_score: 0.0,
         }
+    }
+
+    #[cfg(feature = "polars-export")]
+    #[test]
+    fn parquet_frame_preserves_official_resolution_clock_at_microsecond_precision() {
+        let mut observation = test_factor_observation("evt", "BTCUSDT", 100, 1.0, None);
+        let observed_at = Utc.timestamp_micros(100_123_456).single().unwrap();
+        observation.official_resolution_observed_at = Some(observed_at);
+
+        let frame = super::observations_to_frame(&[observation]).unwrap();
+        let clocks = frame
+            .column("official_resolution_observed_at_us")
+            .unwrap()
+            .i64()
+            .unwrap();
+        assert_eq!(clocks.get(0), Some(observed_at.timestamp_micros()));
     }
 
     #[test]
@@ -3665,6 +3688,7 @@ mod tests {
                     pm_down_ask_size: f64::NAN,
                     pm_lag_secs: 0.0,
                     settlement_up: 1.0,
+                    official_resolution_observed_at: None,
                     future_up_ask_change_30s: None,
                     future_up_ask_change_60s: None,
                     cum_obi_delta_5m: 0.0,
@@ -3730,6 +3754,7 @@ mod tests {
                     pm_down_ask_size: f64::NAN,
                     pm_lag_secs: 0.0,
                     settlement_up: 1.0,
+                    official_resolution_observed_at: None,
                     future_up_ask_change_30s: None,
                     future_up_ask_change_60s: None,
                     cum_obi_delta_5m: 0.0,
@@ -3795,6 +3820,7 @@ mod tests {
                     pm_down_ask_size: f64::NAN,
                     pm_lag_secs: 0.0,
                     settlement_up: 1.0,
+                    official_resolution_observed_at: None,
                     future_up_ask_change_30s: None,
                     future_up_ask_change_60s: None,
                     cum_obi_delta_5m: 0.0,

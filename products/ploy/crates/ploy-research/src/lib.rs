@@ -170,6 +170,7 @@ pub use model::supervised::{
     train_event_disjoint_binary, BinaryArtifactScope, BinaryBundleDigest, BinaryDatasetContract,
     BinaryDecisionRow, BinaryModelManifest, BinaryOosMetrics, BinaryProbabilityModel,
     BinarySettlementAuthority, BinaryTrainingConfig, EventDisjointBinarySplit, FeatureNormalizer,
+    VerifiedBinarySnapshot,
 };
 #[cfg(any(feature = "ml", feature = "rl"))]
 pub use model::{RlAgent, StrategyModel, Transition};

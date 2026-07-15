@@ -498,6 +498,7 @@ mod tests {
             pm_down_ask_size: 13.0,
             pm_lag_secs: 0.0,
             settlement_up,
+            official_resolution_observed_at: None,
             future_up_ask_change_30s: repricing_label,
             future_up_ask_change_60s: None,
             cum_obi_delta_5m: 0.0,

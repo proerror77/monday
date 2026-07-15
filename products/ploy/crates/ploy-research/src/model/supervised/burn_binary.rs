@@ -29,11 +29,11 @@ use crate::{
         validate_prediction_snapshot_sources, PredictionResearchMission,
         PREDICTION_EVENT_WINDOW_SECS,
     },
-    research_snapshot::ResearchSnapshot,
+    research_snapshot::{load_research_snapshot, ResearchSnapshot},
     FactorObservation,
 };
 
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
+const MANIFEST_SCHEMA_VERSION: u32 = 2;
 const BURN_VERSION: &str = "0.20.1";
 const MODEL_FAMILY: &str = "burn_linear_logit";
 const BACKEND_NAME: &str = "burn_ndarray_f32";
@@ -51,6 +51,52 @@ const MIN_STANDARD_DEVIATION: f64 = 1.0e-12;
 type InferenceBackend = NdArray<f32>;
 type TrainingBackend = Autodiff<InferenceBackend>;
 
+/// Snapshot handle that can only be created by loading and verifying an
+/// immutable snapshot against a caller-supplied trusted content digest.
+///
+/// The inner snapshot is intentionally private and has no mutable accessor, so
+/// binary training cannot accept an in-memory structure with forged manifest
+/// strings or post-verification feature mutations.
+#[derive(Debug)]
+pub struct VerifiedBinarySnapshot {
+    snapshot: ResearchSnapshot,
+}
+
+impl VerifiedBinarySnapshot {
+    /// Load a research snapshot, verify its on-disk content hash, and bind it to
+    /// the digest supplied by the trusted snapshot registry or mission runner.
+    pub fn load(
+        snapshot_dir: impl AsRef<Path>,
+        expected_snapshot_contract_sha256: &str,
+    ) -> Result<Self> {
+        ensure!(
+            is_prefixed_sha256(expected_snapshot_contract_sha256),
+            "expected snapshot contract digest must use sha256:<64 lowercase hex>"
+        );
+        let snapshot = load_research_snapshot(snapshot_dir)
+            .context("load and verify binary research snapshot")?;
+        let actual = snapshot
+            .manifest
+            .snapshot_contract_hash
+            .as_deref()
+            .context("verified snapshot is missing snapshot_contract_hash")?;
+        ensure!(
+            actual == expected_snapshot_contract_sha256,
+            "binary research snapshot does not match the trusted evaluator-contract digest"
+        );
+        Ok(Self { snapshot })
+    }
+
+    fn snapshot(&self) -> &ResearchSnapshot {
+        &self.snapshot
+    }
+
+    #[cfg(test)]
+    fn from_test_snapshot(snapshot: ResearchSnapshot) -> Self {
+        Self { snapshot }
+    }
+}
+
 /// Settlement authority accepted by this research lane.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -64,7 +110,6 @@ pub enum BinarySettlementAuthority {
 pub struct BinaryDatasetContract {
     pub mission_id: String,
     pub mission_sha256: String,
-    pub snapshot_hash: String,
     pub snapshot_contract_hash: String,
     pub symbols: Vec<String>,
     pub target_horizon_seconds: u32,
@@ -76,12 +121,13 @@ pub struct BinaryDatasetContract {
 
 impl BinaryDatasetContract {
     /// Bind a five-minute BTC/SOL training projection to a validated prediction
-    /// mission and a snapshot returned by [`crate::load_research_snapshot`].
+    /// mission and a snapshot loaded by [`VerifiedBinarySnapshot::load`].
     pub fn from_prediction_snapshot(
-        snapshot: &ResearchSnapshot,
+        verified_snapshot: &VerifiedBinarySnapshot,
         mission: &PredictionResearchMission,
         feature_names: Vec<String>,
     ) -> Result<Self> {
+        let snapshot = verified_snapshot.snapshot();
         validate_prediction_mission(mission, &mission.search_policy_snapshot_id)
             .map_err(anyhow::Error::msg)
             .context("validate prediction mission contract")?;
@@ -106,10 +152,6 @@ impl BinaryDatasetContract {
             manifest.require_official_settlement,
             "binary ML requires official settlement labels"
         );
-        let snapshot_hash = manifest
-            .snapshot_hash
-            .clone()
-            .context("loaded snapshot is missing snapshot_hash")?;
         let snapshot_contract_hash = manifest
             .snapshot_contract_hash
             .clone()
@@ -128,7 +170,6 @@ impl BinaryDatasetContract {
             mission_sha256: prefixed_sha256_bytes(
                 &serde_json::to_vec(mission).context("serialize prediction mission")?,
             ),
-            snapshot_hash,
             snapshot_contract_hash,
             symbols: mission.symbols.clone(),
             target_horizon_seconds: PREDICTION_EVENT_WINDOW_SECS as u32,
@@ -149,10 +190,6 @@ impl BinaryDatasetContract {
         ensure!(
             is_prefixed_sha256(&self.mission_sha256),
             "mission_sha256 must use sha256:<64 lowercase hex>"
-        );
-        ensure!(
-            is_prefixed_sha256(&self.snapshot_hash),
-            "snapshot_hash must use sha256:<64 lowercase hex>"
         );
         ensure!(
             is_prefixed_sha256(&self.snapshot_contract_hash),
@@ -242,6 +279,7 @@ struct MaterializedBinarySample {
     event_id: String,
     decision_at_ms: i64,
     settlement_at_ms: i64,
+    label_observed_at_us: i64,
     features: Vec<f32>,
     outcome: bool,
 }
@@ -728,16 +766,17 @@ impl BinaryProbabilityModel {
 /// the caller-selected event-disjoint validation partition. Feature values and
 /// labels are always materialized from the bound governed snapshot.
 pub fn train_event_disjoint_binary(
-    snapshot: &ResearchSnapshot,
+    verified_snapshot: &VerifiedBinarySnapshot,
     mission: &PredictionResearchMission,
     split: &EventDisjointBinarySplit,
     config: BinaryTrainingConfig,
 ) -> Result<BinaryProbabilityModel> {
+    let snapshot = verified_snapshot.snapshot();
     config.validate()?;
     split.contract.validate()?;
     split.contract.validate_mission_binding(mission)?;
     let expected_contract = BinaryDatasetContract::from_prediction_snapshot(
-        snapshot,
+        verified_snapshot,
         mission,
         split.contract.feature_names.clone(),
     )?;
@@ -936,21 +975,28 @@ fn validate_split(split: &MaterializedBinarySplit<'_>, input_dim: usize) -> Resu
     if let Some(overlap) = train_events.intersection(&validation_events).next() {
         bail!("event-disjoint split violation: event {overlap:?} appears in train and validation");
     }
-    let latest_training_settlement = split
+    let latest_training_label_us = split
         .train
         .iter()
-        .map(|sample| sample.settlement_at_ms)
+        .map(|sample| sample.label_observed_at_us)
         .max()
         .expect("non-empty training partition was checked above");
-    let earliest_validation_decision = split
+    let earliest_validation_decision_us = split
         .validation
         .iter()
-        .map(|sample| sample.decision_at_ms)
+        .map(|sample| {
+            sample
+                .decision_at_ms
+                .checked_mul(1_000)
+                .context("validation decision timestamp overflows microseconds")
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         .min()
         .expect("non-empty validation partition was checked above");
     ensure!(
-        latest_training_settlement <= earliest_validation_decision,
-        "OOS cutoff violation: a training event settles after validation decisions begin"
+        latest_training_label_us <= earliest_validation_decision_us,
+        "OOS cutoff violation: a training label was observed after validation decisions begin"
     );
     ensure!(
         split.train.iter().any(|sample| sample.outcome)
@@ -966,7 +1012,7 @@ fn validate_partition<'a>(
     input_dim: usize,
 ) -> Result<HashSet<&'a str>> {
     let mut events = HashSet::new();
-    let mut event_contracts: HashMap<&str, (i64, bool)> = HashMap::new();
+    let mut event_contracts: HashMap<&str, (i64, i64, bool)> = HashMap::new();
     for (row, sample) in samples.iter().enumerate() {
         ensure!(
             !sample.event_id.trim().is_empty(),
@@ -989,14 +1035,33 @@ fn validate_partition<'a>(
             sample.decision_at_ms < sample.settlement_at_ms,
             "settlement cutoff violation in {partition} row {row}: decision is not before settlement"
         );
+        let settlement_at_us = sample
+            .settlement_at_ms
+            .checked_mul(1_000)
+            .context("settlement timestamp overflows microseconds")?;
+        ensure!(
+            sample.label_observed_at_us >= settlement_at_us,
+            "settlement label violation in {partition} row {row}: official outcome was observed before settlement"
+        );
         let event_id = sample.event_id.as_str();
-        if let Some((settlement_at_ms, outcome)) = event_contracts.get(event_id) {
+        if let Some((settlement_at_ms, label_observed_at_us, outcome)) =
+            event_contracts.get(event_id)
+        {
             ensure!(
-                *settlement_at_ms == sample.settlement_at_ms && *outcome == sample.outcome,
+                *settlement_at_ms == sample.settlement_at_ms
+                    && *label_observed_at_us == sample.label_observed_at_us
+                    && *outcome == sample.outcome,
                 "inconsistent settlement contract for event {event_id:?} in {partition}"
             );
         } else {
-            event_contracts.insert(event_id, (sample.settlement_at_ms, sample.outcome));
+            event_contracts.insert(
+                event_id,
+                (
+                    sample.settlement_at_ms,
+                    sample.label_observed_at_us,
+                    sample.outcome,
+                ),
+            );
         }
         events.insert(event_id);
     }
@@ -1022,6 +1087,7 @@ fn materialize_split<'a>(
     let materialize_partition = |partition: &str,
                                  selectors: &[BinaryDecisionRow]|
      -> Result<Vec<_>> {
+        let mut seen = HashSet::with_capacity(selectors.len());
         selectors
                 .iter()
                 .enumerate()
@@ -1030,6 +1096,12 @@ fn materialize_split<'a>(
                         !selector.event_id.trim().is_empty()
                             && selector.event_id.trim() == selector.event_id,
                         "{partition} row {index} has an invalid event_id"
+                    );
+                    ensure!(
+                        seen.insert((selector.event_id.as_str(), selector.decision_at_ms)),
+                        "{partition} contains duplicate decision selector {:?} at {}",
+                        selector.event_id,
+                        selector.decision_at_ms
                     );
                     let snapshot_row = governed_rows
                         .get(&(selector.event_id.as_str(), selector.decision_at_ms))
@@ -1056,6 +1128,10 @@ fn materialize_split<'a>(
                             snapshot_row.event_id
                         ),
                     };
+                    let label_observed_at_us = snapshot_row
+                        .official_resolution_observed_at
+                        .context("snapshot row is missing official resolution observation clock")?
+                        .timestamp_micros();
                     let features = split
                         .contract
                         .feature_names
@@ -1066,6 +1142,7 @@ fn materialize_split<'a>(
                         event_id: selector.event_id.clone(),
                         decision_at_ms: selector.decision_at_ms,
                         settlement_at_ms,
+                        label_observed_at_us,
                         features,
                         outcome,
                     })
@@ -1292,8 +1369,9 @@ mod tests {
             REQUIRED_POLYMARKET_SOURCE_SURFACE, REQUIRED_SETTLEMENT_SOURCE_SURFACE,
         },
         research_snapshot::{
-            ResearchSnapshotArtifacts, ResearchSnapshotInputArtifact, ResearchSnapshotPhaseTiming,
-            ResearchSnapshotPmBookSource, ResearchSnapshotRowCounts, ResearchSnapshotSourceSurface,
+            write_research_snapshot, ResearchSnapshotArtifacts, ResearchSnapshotInputArtifact,
+            ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource, ResearchSnapshotRowCounts,
+            ResearchSnapshotSourceSurface,
         },
         FactorObservation, ResearchPmBookLevel, ResearchPmBookSnapshot,
     };
@@ -1301,7 +1379,7 @@ mod tests {
 
     struct TestContext {
         mission: PredictionResearchMission,
-        snapshot: ResearchSnapshot,
+        snapshot: VerifiedBinarySnapshot,
         split: EventDisjointBinarySplit,
     }
 
@@ -1419,6 +1497,9 @@ mod tests {
             pm_down_ask_size: 10.0,
             pm_lag_secs: 0.0,
             settlement_up: f64::from(sample.outcome),
+            official_resolution_observed_at: Utc
+                .timestamp_millis_opt(sample.settlement_at_ms + 100)
+                .single(),
             future_up_ask_change_30s: None,
             future_up_ask_change_60s: None,
             cum_obi_delta_5m: 0.0,
@@ -1460,9 +1541,14 @@ mod tests {
             .collect()
     }
 
-    fn snapshot(samples: &[TestDecision]) -> ResearchSnapshot {
+    fn raw_snapshot(samples: &[TestDecision]) -> ResearchSnapshot {
+        let generated_at_ms = samples
+            .iter()
+            .map(|sample| sample.settlement_at_ms + 100)
+            .max()
+            .expect("non-empty test decisions");
         let generated_at = Utc
-            .timestamp_millis_opt(samples[0].decision_at_ms)
+            .timestamp_millis_opt(generated_at_ms)
             .single()
             .expect("valid test timestamp");
         let observations = samples.iter().map(observation).collect::<Vec<_>>();
@@ -1470,7 +1556,7 @@ mod tests {
         ResearchSnapshot {
             manifest: crate::ResearchSnapshotManifest {
                 schema_version: crate::RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_owned(),
-                snapshot_hash: Some(format!("sha256:{}", "3".repeat(64))),
+                snapshot_hash: Some("0123456789abcdef".to_owned()),
                 snapshot_contract_hash: Some(format!("sha256:{}", "1".repeat(64))),
                 generated_at,
                 git_sha: None,
@@ -1553,6 +1639,10 @@ mod tests {
         }
     }
 
+    fn snapshot(samples: &[TestDecision]) -> VerifiedBinarySnapshot {
+        VerifiedBinarySnapshot::from_test_snapshot(raw_snapshot(samples))
+    }
+
     fn context() -> TestContext {
         let train = (0..12)
             .map(|index| sample("train", index, index % 2 == 0))
@@ -1578,7 +1668,7 @@ mod tests {
     }
 
     fn validation_rows(context: &TestContext) -> Vec<Vec<f32>> {
-        materialize_split(&context.split, &context.snapshot)
+        materialize_split(&context.split, context.snapshot.snapshot())
             .expect("valid governed test split")
             .validation
             .into_iter()
@@ -1613,7 +1703,7 @@ mod tests {
     #[test]
     fn rejects_stale_non_finite_and_invalid_settlement_snapshot_rows() {
         let mut stale = context();
-        stale.snapshot.observations[0].binance_lob_fresh = false;
+        stale.snapshot.snapshot.observations[0].binance_lob_fresh = false;
         let error = train_event_disjoint_binary(
             &stale.snapshot,
             &stale.mission,
@@ -1624,7 +1714,7 @@ mod tests {
         assert!(format!("{error:#}").contains("fresh Binance L2 context"));
 
         let mut non_finite = context();
-        non_finite.snapshot.observations[0].cex_bar_return_30s = f64::NAN;
+        non_finite.snapshot.snapshot.observations[0].cex_bar_return_30s = f64::NAN;
         let error = train_event_disjoint_binary(
             &non_finite.snapshot,
             &non_finite.mission,
@@ -1635,7 +1725,7 @@ mod tests {
         assert!(error.to_string().contains("snapshot feature"));
 
         let mut settlement = context();
-        settlement.snapshot.observations[0].time_remaining_secs = 0;
+        settlement.snapshot.snapshot.observations[0].time_remaining_secs = 0;
         let error = train_event_disjoint_binary(
             &settlement.snapshot,
             &settlement.mission,
@@ -1669,17 +1759,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_training_events_settling_after_validation_begins() {
+    fn rejects_training_labels_observed_after_validation_begins() {
         let mut context = context();
         let validation_start = context.split.validation[0].decision_at_ms;
         let train_selector = context.split.train.last().unwrap();
         let row = context
             .snapshot
+            .snapshot
             .observations
             .iter_mut()
             .find(|row| row.event_id == train_selector.event_id)
             .unwrap();
-        row.time_remaining_secs = (validation_start - train_selector.decision_at_ms) / 1_000 + 1;
+        row.official_resolution_observed_at =
+            Utc.timestamp_micros(validation_start * 1_000 + 1).single();
 
         let error = train_event_disjoint_binary(
             &context.snapshot,
@@ -1689,6 +1781,71 @@ mod tests {
         )
         .expect_err("future training label must not validate past decisions");
         assert!(error.to_string().contains("OOS cutoff violation"));
+    }
+
+    #[test]
+    fn rejects_duplicate_decision_selectors() {
+        let mut context = context();
+        context.split.train.push(context.split.train[0].clone());
+
+        let error = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            test_config(),
+        )
+        .expect_err("duplicate selectors must not reweight governed observations");
+        assert!(error.to_string().contains("duplicate decision selector"));
+    }
+
+    #[test]
+    fn written_snapshot_must_reload_with_trusted_contract_before_training() {
+        let train = (0..12)
+            .map(|index| sample("train", index, index % 2 == 0))
+            .collect::<Vec<_>>();
+        let validation = (20..26)
+            .map(|index| sample("validation", index, index % 2 == 0))
+            .collect::<Vec<_>>();
+        let all_samples = train.iter().chain(&validation).cloned().collect::<Vec<_>>();
+        let temp = tempfile::tempdir().unwrap();
+        let written = write_research_snapshot(temp.path(), raw_snapshot(&all_samples)).unwrap();
+        let trusted_contract = written
+            .snapshot_contract_hash
+            .clone()
+            .expect("writer emits evaluator contract SHA-256");
+
+        assert_eq!(written.snapshot_hash.as_deref().unwrap().len(), 16);
+        let mismatch =
+            VerifiedBinarySnapshot::load(temp.path(), &format!("sha256:{}", "f".repeat(64)))
+                .expect_err("registry digest mismatch must fail closed");
+        assert!(mismatch
+            .to_string()
+            .contains("trusted evaluator-contract digest"));
+
+        let snapshot = VerifiedBinarySnapshot::load(temp.path(), &trusted_contract).unwrap();
+        let mut mission = mission();
+        mission.data_snapshot_id = trusted_contract;
+        let split = EventDisjointBinarySplit {
+            contract: BinaryDatasetContract::from_prediction_snapshot(
+                &snapshot,
+                &mission,
+                feature_names(),
+            )
+            .unwrap(),
+            train: train.iter().map(selector).collect(),
+            validation: validation.iter().map(selector).collect(),
+        };
+
+        let model =
+            train_event_disjoint_binary(&snapshot, &mission, &split, test_config()).unwrap();
+        assert_eq!(
+            model.manifest().dataset_contract.snapshot_contract_hash,
+            mission.data_snapshot_id
+        );
+        assert_eq!(
+            model.manifest().validation_metrics.sample_count,
+            validation.len()
+        );
     }
 
     #[test]
@@ -1711,7 +1868,7 @@ mod tests {
     #[test]
     fn rejects_snapshot_without_isolated_symbol_or_official_authority() {
         let mut wrong_symbol = context();
-        wrong_symbol.snapshot.manifest.symbols = vec!["SOLUSDT".to_owned()];
+        wrong_symbol.snapshot.snapshot.manifest.symbols = vec!["SOLUSDT".to_owned()];
         let error = train_event_disjoint_binary(
             &wrong_symbol.snapshot,
             &wrong_symbol.mission,
@@ -1722,7 +1879,11 @@ mod tests {
         assert!(error.to_string().contains("isolate the mission underlying"));
 
         let mut unofficial = context();
-        unofficial.snapshot.manifest.require_official_settlement = false;
+        unofficial
+            .snapshot
+            .snapshot
+            .manifest
+            .require_official_settlement = false;
         let error = train_event_disjoint_binary(
             &unofficial.snapshot,
             &unofficial.mission,
@@ -1783,12 +1944,12 @@ mod tests {
             .iter()
             .map(|row| row.event_id.as_str())
             .collect::<HashSet<_>>();
-        for observation in &mut context.snapshot.observations {
+        for observation in &mut context.snapshot.snapshot.observations {
             if validation_ids.contains(observation.event_id.as_str()) {
                 observation.cex_bar_return_30s += 10_000.0;
             }
         }
-        let materialized = materialize_split(&context.split, &context.snapshot).unwrap();
+        let materialized = materialize_split(&context.split, context.snapshot.snapshot()).unwrap();
         let expected_train_mean = materialized
             .train
             .iter()

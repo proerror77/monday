@@ -78,6 +78,7 @@ mod tests {
     fn obs(settlement_up: f64, pm_up_ask: f64) -> FactorObservation {
         FactorObservation {
             settlement_up,
+            official_resolution_observed_at: None,
             pm_up_ask,
             time_remaining_secs: 120,
             event_id: "e1".into(),

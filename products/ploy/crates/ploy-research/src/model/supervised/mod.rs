@@ -11,4 +11,5 @@ pub use burn_binary::{
     train_event_disjoint_binary, BinaryArtifactScope, BinaryBundleDigest, BinaryDatasetContract,
     BinaryDecisionRow, BinaryModelManifest, BinaryOosMetrics, BinaryProbabilityModel,
     BinarySettlementAuthority, BinaryTrainingConfig, EventDisjointBinarySplit, FeatureNormalizer,
+    VerifiedBinarySnapshot,
 };

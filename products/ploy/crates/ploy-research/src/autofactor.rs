@@ -3120,6 +3120,7 @@ mod tests {
                 + chrono::Duration::days((idx / 20) as i64)
                 + chrono::Duration::seconds(idx as i64),
             time_remaining_secs: 120,
+            official_resolution_observed_at: None,
             regime: Regime::Middle,
             side: ReviewSide::Up,
             pm_token_id: "up-token".to_string(),

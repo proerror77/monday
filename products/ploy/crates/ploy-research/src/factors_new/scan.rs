@@ -111,6 +111,7 @@ mod tests {
             time_remaining_secs,
             distance_over_sigma,
             settlement_up,
+            official_resolution_observed_at: None,
             signed_distance_to_beat: 0.0,
             abs_distance_to_beat: 0.0,
             drift_10s: 0.0,
