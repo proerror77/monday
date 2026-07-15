@@ -116,7 +116,9 @@ jobs:
 
       - name: Verify collector release control plane
         run: |
-          bash -n ../deployment/aliyun/*.sh
+          for script in ../deployment/aliyun/*.sh; do
+            bash -n "$script"
+          done
           shellcheck ../deployment/aliyun/*.sh
           ../deployment/aliyun/test-rust-lob-control-plane.sh
 

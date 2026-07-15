@@ -156,7 +156,14 @@ if systemctl is-active --quiet binance-lob-archiver-rust@spot.service \
 fi
 
 work_dir=$(mktemp -d)
-trap 'rm -rf "$work_dir"' EXIT
+release_staging=
+cleanup() {
+  rm -rf "$work_dir"
+  if [[ -n $release_staging && ( -e $release_staging || -L $release_staging ) ]]; then
+    rm -rf "$release_staging"
+  fi
+}
+trap cleanup EXIT
 artifact_tmp="$work_dir/binance-lob-archiver"
 bundle_tmp="$work_dir/deployment.tar"
 bundle_dir="$work_dir/deployment"
@@ -182,8 +189,12 @@ if ! id hftcollector >/dev/null 2>&1; then
     --shell /usr/sbin/nologin hftcollector
 fi
 install -d -m 0755 /opt/monday/bin
-install -d -m 0755 "/opt/monday/releases/binance-lob-archiver/$artifact_sha256"
-install -d -m 0755 "/opt/monday/releases/binance-lob-archiver/$artifact_sha256/deployment"
+release_root=/opt/monday/releases/binance-lob-archiver
+release_dir="$release_root/$artifact_sha256"
+release_binary="$release_dir/binance-lob-archiver"
+release_deployment="$release_dir/deployment"
+release_metadata="$release_dir/release.json"
+install -d -m 0755 "$release_root"
 install -d -m 0755 /etc/monday
 install -d -m 0750 -o hftcollector -g hftcollector \
   /data/monday/spool/binance-lob-rust-shadow/spot \
@@ -198,32 +209,78 @@ for path in \
   fi
 done
 
-release_binary="/opt/monday/releases/binance-lob-archiver/$artifact_sha256/binance-lob-archiver"
-install -m 0755 "$artifact_tmp" "$release_binary"
-printf '%s  %s\n' "$artifact_sha256" "$release_binary" | sha256sum --check --strict
-"$release_binary" --self-test
+if [[ -e $release_dir || -L $release_dir ]]; then
+  [[ -d $release_dir && ! -L $release_dir && $(readlink -f "$release_dir") == "$release_dir" ]] \
+    || { printf 'existing release path is indirect: %s\n' "$release_dir" >&2; exit 1; }
+  [[ -f $release_metadata && ! -L $release_metadata ]] \
+    || { printf 'existing release metadata is not a regular file: %s\n' "$release_metadata" >&2; exit 1; }
+  jq -e \
+    --arg artifact_uri "$artifact_uri" \
+    --arg artifact_sha256 "$artifact_sha256" \
+    --arg source_revision "$source_revision" \
+    --arg bundle_uri "$bundle_uri" \
+    --arg bundle_sha256 "$bundle_sha256" \
+    '.artifact_uri == $artifact_uri
+      and .artifact_sha256 == $artifact_sha256
+      and .deployment_source_revision == $source_revision
+      and .deployment_bundle_uri == $bundle_uri
+      and .deployment_bundle_sha256 == $bundle_sha256' \
+    "$release_metadata" >/dev/null \
+    || { printf 'existing release identity does not match requested artifact, bundle, and source\n' >&2; exit 1; }
+  [[ -f $release_binary && ! -L $release_binary && -x $release_binary ]] \
+    || { printf 'existing release binary is not a regular executable\n' >&2; exit 1; }
+  printf '%s  %s\n' "$artifact_sha256" "$release_binary" | sha256sum --check --strict
+  [[ -d $release_deployment && ! -L $release_deployment ]] \
+    || { printf 'existing release deployment is not a direct directory\n' >&2; exit 1; }
+  expected_assets=0
+  for source in "$bundle_dir"/*; do
+    [[ -f $source && ! -L $source ]] \
+      || { printf 'deployment bundle contains a non-regular asset: %s\n' "$source" >&2; exit 1; }
+    asset=${source##*/}
+    destination="$release_deployment/$asset"
+    if [[ ! -f $destination || -L $destination ]] || ! cmp -s "$source" "$destination"; then
+      printf 'existing release deployment differs from the requested bundle: %s\n' "$asset" >&2
+      exit 1
+    fi
+    expected_assets=$((expected_assets + 1))
+  done
+  actual_assets=$(find "$release_deployment" -mindepth 1 -maxdepth 1 -print | wc -l)
+  (( actual_assets == expected_assets )) \
+    || { printf 'existing release deployment contains unexpected assets\n' >&2; exit 1; }
+else
+  release_staging=$(mktemp -d "$release_root/.${artifact_sha256}.new.XXXXXX")
+  install -d -m 0755 "$release_staging/deployment"
+  install -m 0755 "$artifact_tmp" "$release_staging/binance-lob-archiver"
+  cp -a "$bundle_dir/." "$release_staging/deployment/"
+  printf '{"artifact_uri":"%s","artifact_sha256":"%s","deployment_source_revision":"%s","deployment_bundle_uri":"%s","deployment_bundle_sha256":"%s"}\n' \
+    "$artifact_uri" "$artifact_sha256" "$source_revision" "$bundle_uri" "$bundle_sha256" \
+    > "$release_staging/release.json"
+  chmod 0644 "$release_staging/release.json"
+  printf '%s  %s\n' "$artifact_sha256" "$release_staging/binance-lob-archiver" \
+    | sha256sum --check --strict
+  chmod 0755 "$release_staging"
+  mv -T "$release_staging" "$release_dir"
+  release_staging=
+fi
+
+[[ $(stat -c %a "$release_dir") == 755 ]] \
+  || { printf 'release directory must be traversable with mode 0755\n' >&2; exit 1; }
+runuser -u hftcollector -- "$release_binary" --self-test
 "$release_binary" --help | grep -Fq -- '--upload-only'
 
-cp -a "$bundle_dir/." \
-  "/opt/monday/releases/binance-lob-archiver/$artifact_sha256/deployment/"
-install -m 0644 "$bundle_dir/binance-lob-archiver-rust@.service" \
+install -m 0644 "$release_deployment/binance-lob-archiver-rust@.service" \
   /etc/systemd/system/binance-lob-archiver-rust@.service
-install -m 0644 "$bundle_dir/binance-lob-archiver-rust-upload@.service" \
+install -m 0644 "$release_deployment/binance-lob-archiver-rust-upload@.service" \
   /etc/systemd/system/binance-lob-archiver-rust-upload@.service
-install -m 0640 "$bundle_dir/binance-lob-archiver-rust-spot.env" \
+install -m 0640 "$release_deployment/binance-lob-archiver-rust-spot.env" \
   /etc/monday/binance-lob-archiver-rust-spot.env
-install -m 0640 "$bundle_dir/binance-lob-archiver-rust-usdm.env" \
+install -m 0640 "$release_deployment/binance-lob-archiver-rust-usdm.env" \
   /etc/monday/binance-lob-archiver-rust-usdm.env
 
 ln -sfn "$release_binary" /opt/monday/bin/binance-lob-archiver-shadow
 printf '%s  %s\n' "$artifact_sha256" /opt/monday/bin/binance-lob-archiver-shadow \
   | sha256sum --check --strict
 
-metadata_tmp="/opt/monday/releases/binance-lob-archiver/$artifact_sha256/release.json.tmp"
-printf '{"artifact_uri":"%s","artifact_sha256":"%s","deployment_source_revision":"%s","deployment_bundle_uri":"%s","deployment_bundle_sha256":"%s"}\n' \
-  "$artifact_uri" "$artifact_sha256" "$source_revision" "$bundle_uri" "$bundle_sha256" \
-  > "$metadata_tmp"
-mv "$metadata_tmp" "/opt/monday/releases/binance-lob-archiver/$artifact_sha256/release.json"
 systemctl daemon-reload
 printf 'installed Rust collector candidate %s from %s; no service was started\n' \
   "$artifact_sha256" "$source_revision"

@@ -16,7 +16,7 @@ if [[ $# -ne 1 || ! $1 =~ ^[A-Fa-f0-9]{64}$ ]]; then
   exit 2
 fi
 
-for command in awk chmod date env find flock grep id install jq ln mountpoint mv readlink rm runuser sha256sum sleep stat systemctl tr wc; do
+for command in awk chmod cmp date env find flock grep id install jq ln mkdir mountpoint mv readlink rm runuser sha256sum sleep stat systemctl tr wc; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'missing required command: %s\n' "$command" >&2
     exit 2
@@ -31,6 +31,7 @@ CANDIDATE_DEPLOYMENT="$CANDIDATE_RELEASE/deployment"
 GATE_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-shadow-gate-policy.jq"
 RUNTIME_HEALTH_POLICY="$CANDIDATE_DEPLOYMENT/rust-lob-runtime-health-policy.jq"
 GATE_ROOT=/data/monday/evidence/shadow-gates
+GATE_BUNDLE_DIR=
 GATE_DIR=
 GATE_JSON=
 GATE_MARKER=
@@ -52,7 +53,15 @@ UPLOAD_UNITS=(
   binance-lob-archiver-upload@spot.service
   binance-lob-archiver-upload@usdm.service
 )
-TRANSITION_MASK_UNITS=("${PRODUCTION_UNITS[@]}" "${UPLOAD_UNITS[@]}")
+LEGACY_UNITS=(
+  binance-lob-archiver@spot.service
+  binance-lob-archiver@usdm.service
+)
+TRANSITION_MASK_UNITS=(
+  "${PRODUCTION_UNITS[@]}"
+  "${UPLOAD_UNITS[@]}"
+  "${LEGACY_UNITS[@]}"
+)
 QUIESCENT_UNITS=(
   binance-lob-archiver-rust@spot.service
   binance-lob-archiver-rust@usdm.service
@@ -60,6 +69,7 @@ QUIESCENT_UNITS=(
   binance-lob-archiver-rust-upload@usdm.service
   binance-lob-archiver-upload@spot.service
   binance-lob-archiver-upload@usdm.service
+  "${LEGACY_UNITS[@]}"
 )
 DEPLOYMENT_ASSETS=(
   binance-lob-archiver-production@.service
@@ -106,12 +116,15 @@ for path in /data/monday /data/monday/evidence /data/monday/evidence/cutovers; d
     exit 1
   fi
 done
-install -d -m 0750 "$EVIDENCE_DIR"
+install -d -m 0750 /data/monday/evidence/cutovers
+mkdir -m 0750 -- "$EVIDENCE_DIR" \
+  || { printf 'refusing to reuse cutover evidence directory: %s\n' "$EVIDENCE_DIR" >&2; exit 1; }
 
 STEP=preflight
 RESULT=preflight
 FAILURE_REASON=
 ROLLBACK_RESULT=not-needed
+ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=
 OLD_SHA256=
 OLD_BINARY=
 OLD_DEPLOYMENT=
@@ -120,6 +133,7 @@ TRANSITION_STARTED=0
 SUCCESS=0
 OLD_SESSION_SPOT=
 OLD_SESSION_USDM=
+CANDIDATE_STARTED_NS=0
 
 fail() {
   FAILURE_REASON=$*
@@ -298,35 +312,52 @@ run_candidate_drain() {
 }
 
 stage_existing_deployment_for_rollback() {
-  local existing=0 asset source mode
+  local existing=0 asset source installed_source mode source_kind
+  local release_deployment=$OLD_DEPLOYMENT
+  local snapshot="$EVIDENCE_DIR/rollback-deployment"
+  local manifest="$EVIDENCE_DIR/rollback-deployment.sha256"
   [[ ! -L $OLD_DEPLOYMENT ]] || fail "old staged deployment is a symlink: $OLD_DEPLOYMENT"
   for asset in "${DEPLOYMENT_ASSETS[@]}"; do
-    if [[ -e $OLD_DEPLOYMENT/$asset ]]; then
+    if [[ -e $release_deployment/$asset ]]; then
       ((existing += 1))
     fi
   done
   if (( existing == ${#DEPLOYMENT_ASSETS[@]} )); then
-    validate_deployment "$OLD_DEPLOYMENT" false
-    return
+    validate_deployment "$release_deployment" false
+    source_kind=release
+  elif (( existing == 0 )); then
+    source_kind=installed
+  else
+    fail "old release has a partial staged deployment: $release_deployment"
   fi
-  (( existing == 0 )) || fail "old release has a partial staged deployment: $OLD_DEPLOYMENT"
 
-  install -d -m 0755 "$OLD_DEPLOYMENT"
+  [[ ! -e $snapshot && ! -L $snapshot ]] \
+    || fail "rollback evidence snapshot already exists: $snapshot"
+  install -d -m 0750 "$snapshot"
   for asset in "${DEPLOYMENT_ASSETS[@]}"; do
     case "$asset" in
-      *.service)
-        source="/etc/systemd/system/$asset"
-        mode=0644
-        ;;
-      *.env)
-        source="/etc/monday/$asset"
-        mode=0640
-        ;;
+      *.service) installed_source="/etc/systemd/system/$asset"; mode=0644 ;;
+      *.env) installed_source="/etc/monday/$asset"; mode=0640 ;;
     esac
-    secure_regular_file "$source"
-    atomic_install "$mode" "$source" "$OLD_DEPLOYMENT/$asset"
+    secure_regular_file "$installed_source"
+    if [[ $source_kind == release ]]; then
+      source="$release_deployment/$asset"
+      secure_regular_file "$source"
+      cmp -s -- "$source" "$installed_source" \
+        || fail "installed production asset drifted from the active immutable release: $installed_source"
+    else
+      source=$installed_source
+    fi
+    atomic_install "$mode" "$source" "$snapshot/$asset"
   done
-  validate_deployment "$OLD_DEPLOYMENT" false
+  validate_deployment "$snapshot" false
+  (
+    cd "$snapshot"
+    sha256sum "${DEPLOYMENT_ASSETS[@]}"
+  ) >"$manifest"
+  chmod 0640 "$manifest"
+  ROLLBACK_DEPLOYMENT_MANIFEST_SHA256=$(sha256sum "$manifest" | awk '{print $1}')
+  OLD_DEPLOYMENT=$snapshot
 }
 
 unit_active_json() {
@@ -349,10 +380,18 @@ copy_health_evidence() {
 }
 
 health_ready_for_release() {
-  local market=$1 minimum_symbols=$2 old_session=$3 minimum_updated_ns=${4:-0} health
+  local market=$1 minimum_symbols=$2 old_session=$3 minimum_updated_ns=${4:-0}
+  local health expected_dataset
   health="$CANONICAL_SPOOL/$market/health.json"
   [[ -f $health && ! -L $health ]] || return 1
+  case "$market" in
+    spot) expected_dataset=spot_all ;;
+    usdm) expected_dataset=usdm_perpetual_all ;;
+    *) return 1 ;;
+  esac
   jq -e \
+    --arg expected_market "$market" \
+    --arg expected_dataset "$expected_dataset" \
     --arg old_session "$old_session" \
     --argjson minimum_symbols "$minimum_symbols" \
     --argjson minimum_updated_ns "$minimum_updated_ns" \
@@ -405,11 +444,8 @@ clear_health_before_restart() {
 
 production_is_fail_closed() {
   local unit state
-  for unit in "${PRODUCTION_UNITS[@]}"; do
-    systemctl is-active --quiet "$unit" && return 1
-    systemctl is-enabled --quiet "$unit" && return 1
-  done
   for unit in "${TRANSITION_MASK_UNITS[@]}"; do
+    systemctl is-active --quiet "$unit" && return 1
     state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
     [[ $state == masked || $state == masked-runtime ]] || return 1
   done
@@ -428,6 +464,7 @@ write_evidence() {
     --arg step "$STEP" \
     --arg failure_reason "$FAILURE_REASON" \
     --arg rollback_result "$ROLLBACK_RESULT" \
+    --arg rollback_deployment_manifest_sha256 "$ROLLBACK_DEPLOYMENT_MANIFEST_SHA256" \
     --arg candidate_sha256 "$CANDIDATE_SHA256" \
     --arg deployment_bundle_sha256 "$DEPLOYMENT_BUNDLE_SHA256" \
     --arg previous_sha256 "$OLD_SHA256" \
@@ -442,6 +479,9 @@ write_evidence() {
       last_step: $step,
       failure_reason: (if $failure_reason == "" then null else $failure_reason end),
       rollback_result: $rollback_result,
+      rollback_deployment_manifest_sha256:
+        (if $rollback_deployment_manifest_sha256 == "" then null
+         else $rollback_deployment_manifest_sha256 end),
       candidate_sha256: $candidate_sha256,
       deployment_bundle_sha256: (if $deployment_bundle_sha256 == "" then null else $deployment_bundle_sha256 end),
       previous_sha256: (if $previous_sha256 == "" then null else $previous_sha256 end),
@@ -480,7 +520,20 @@ rollback_after_failure() {
   fi
 
   if [[ $OLD_MODE == upgrade ]]; then
-    if ! install_deployment "$OLD_DEPLOYMENT"; then
+    if [[ -n $ROLLBACK_DEPLOYMENT_MANIFEST_SHA256 ]]; then
+      printf '%s  %s\n' "$ROLLBACK_DEPLOYMENT_MANIFEST_SHA256" \
+        "$EVIDENCE_DIR/rollback-deployment.sha256" | sha256sum --check --strict \
+        || safe_to_restart=0
+      (
+        cd "$OLD_DEPLOYMENT"
+        sha256sum --check --strict "$EVIDENCE_DIR/rollback-deployment.sha256"
+      ) || safe_to_restart=0
+    else
+      safe_to_restart=0
+    fi
+    if (( safe_to_restart == 0 )); then
+      ROLLBACK_RESULT=rollback-evidence-unverified-disabled
+    elif ! install_deployment "$OLD_DEPLOYMENT"; then
       safe_to_restart=0
       ROLLBACK_RESULT=restore-assets-failed-disabled
     elif ! atomic_symlink "$OLD_BINARY" "$PRODUCTION_LINK"; then
@@ -535,7 +588,11 @@ rollback_after_failure() {
     if [[ $(readlink -f "$PRODUCTION_LINK" 2>/dev/null || true) == "$CANDIDATE_BINARY" ]]; then
       rm -f "$PRODUCTION_LINK"
     fi
-    ROLLBACK_RESULT=new-host-disabled
+    if production_is_fail_closed; then
+      ROLLBACK_RESULT=new-host-disabled
+    else
+      ROLLBACK_RESULT=new-host-containment-failed
+    fi
   fi
   copy_health_evidence rollback
 }
@@ -590,9 +647,7 @@ jq -e --arg sha "$CANDIDATE_SHA256" --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
   '.artifact_sha256 == $sha and .deployment_bundle_sha256 == $bundle' \
   "$CANDIDATE_RELEASE/release.json" >/dev/null \
   || fail 'candidate release metadata does not match the requested identity'
-GATE_DIR="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256"
-GATE_JSON="$GATE_DIR/gate.json"
-GATE_MARKER="$GATE_DIR/PASSED.sha256"
+GATE_BUNDLE_DIR="$GATE_ROOT/$CANDIDATE_SHA256/$DEPLOYMENT_BUNDLE_SHA256"
 validate_deployment "$CANDIDATE_DEPLOYMENT" true
 id hftcollector >/dev/null 2>&1 || fail 'service account hftcollector is missing'
 runuser -u hftcollector -- "$CANDIDATE_BINARY" --self-test
@@ -601,9 +656,20 @@ runuser -u hftcollector -- "$CANDIDATE_BINARY" --self-test
   || fail 'shadow symlink does not point to the gated candidate binary'
 
 STEP=validate-shadow-gate
-for path in "$GATE_ROOT" "$GATE_ROOT/$CANDIDATE_SHA256" "$GATE_DIR"; do
+for path in "$GATE_ROOT" "$GATE_ROOT/$CANDIDATE_SHA256" "$GATE_BUNDLE_DIR" \
+  "$GATE_BUNDLE_DIR/runs"; do
   path_is_direct_or_absent "$path" || fail "shadow gate path contains a symlink: $path"
 done
+shopt -s nullglob
+gate_markers=("$GATE_BUNDLE_DIR"/runs/*/PASSED.sha256)
+shopt -u nullglob
+(( ${#gate_markers[@]} == 1 )) \
+  || fail "expected exactly one immutable passed shadow gate, found ${#gate_markers[@]}"
+GATE_MARKER=${gate_markers[0]}
+GATE_DIR=${GATE_MARKER%/*}
+GATE_JSON="$GATE_DIR/gate.json"
+path_is_direct_or_absent "$GATE_DIR" \
+  || fail "shadow gate run path contains a symlink: $GATE_DIR"
 secure_regular_file "$GATE_JSON"
 secure_regular_file "$GATE_MARKER"
 [[ $(wc -l < "$GATE_MARKER") -eq 1 ]] || fail 'PASSED.sha256 must contain exactly one entry'
@@ -625,6 +691,10 @@ STEP=validate-host-state
 canonical_spool_paths_safe || fail 'canonical spool path contains a symlink or escapes /data'
 for unit in "${QUIESCENT_UNITS[@]}"; do
   systemctl is-active --quiet "$unit" && fail "unit must be inactive before cutover: $unit"
+done
+for unit in "${LEGACY_UNITS[@]}"; do
+  systemctl is-enabled --quiet "$unit" \
+    && fail "legacy collector unit must be disabled before cutover: $unit"
 done
 
 active_count=0
@@ -660,6 +730,11 @@ fi
 
 STEP=stop-production
 TRANSITION_STARTED=1
+systemctl disable --now "${LEGACY_UNITS[@]}" >/dev/null 2>&1 || true
+for unit in "${LEGACY_UNITS[@]}"; do
+  systemctl is-active --quiet "$unit" && fail "legacy collector unit did not stop: $unit"
+  systemctl is-enabled --quiet "$unit" && fail "legacy collector unit remained enabled: $unit"
+done
 if [[ $OLD_MODE == upgrade ]]; then
   systemctl disable --now "${PRODUCTION_UNITS[@]}"
 else
@@ -690,13 +765,20 @@ STEP=switch-production-symlink
 atomic_symlink "$CANDIDATE_BINARY" "$PRODUCTION_LINK"
 printf '%s  %s\n' "$CANDIDATE_SHA256" "$PRODUCTION_LINK" | sha256sum --check --strict
 
+STEP=clear-stale-candidate-health
+copy_health_evidence previous-production
+clear_health_before_restart \
+  || fail 'could not clear stale production health before starting the candidate'
+CANDIDATE_STARTED_NS=$(date +%s%N)
+
 STEP=start-candidate-production
 systemctl reset-failed "${PRODUCTION_UNITS[@]}" >/dev/null 2>&1 || true
 systemctl unmask --runtime "${PRODUCTION_UNITS[@]}" >/dev/null
 systemctl start "${PRODUCTION_UNITS[@]}"
 
 STEP=verify-candidate-production
-wait_for_release_health "$CANDIDATE_BINARY" "$OLD_SESSION_SPOT" "$OLD_SESSION_USDM" \
+wait_for_release_health \
+  "$CANDIDATE_BINARY" "$OLD_SESSION_SPOT" "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
   || fail 'candidate production did not reach verified full-catalog health'
 copy_health_evidence production
 
@@ -704,9 +786,9 @@ STEP=enable-verified-candidate
 systemctl enable "${PRODUCTION_UNITS[@]}" >/dev/null
 runtime_matches_release "$CANDIDATE_BINARY" true \
   || fail 'candidate runtime identity changed while enabling production'
-health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" \
+health_ready_for_release spot 1000 "$OLD_SESSION_SPOT" "$CANDIDATE_STARTED_NS" \
   || fail 'Spot health changed while enabling production'
-health_ready_for_release usdm 400 "$OLD_SESSION_USDM" \
+health_ready_for_release usdm 400 "$OLD_SESSION_USDM" "$CANDIDATE_STARTED_NS" \
   || fail 'USD-M health changed while enabling production'
 systemctl unmask --runtime "${UPLOAD_UNITS[@]}" >/dev/null
 

@@ -8,7 +8,7 @@ usage() {
     'The command always targets ap-northeast-1 and uses Alibaba Cloud Assistant.'
 }
 
-for command in aliyun base64 jq; do
+for command in aliyun base64 jq seq sleep tr; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'missing required command: %s\n' "$command" >&2
     exit 2

@@ -1,6 +1,12 @@
-.status == "synced"
+.market == $expected_market
+and .dataset == $expected_dataset
+and .status == "synced"
 and .sequence_gaps == 0
+and (.symbol_count | type) == "number"
+and .symbol_count == (.symbol_count | floor)
 and .symbol_count >= $minimum_symbols
+and (.snapshot_ready_count | type) == "number"
+and .snapshot_ready_count == (.snapshot_ready_count | floor)
 and .snapshot_ready_count == .symbol_count
 and .pending_upload_segments == 0
 and .queue_saturated == false

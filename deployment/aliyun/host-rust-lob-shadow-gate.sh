@@ -35,7 +35,7 @@ usage() {
   exit 2
 }
 
-for command in aliyun awk chmod chown cmp date dirname find flock grep id install jq mktemp \
+for command in aliyun awk chmod chown cmp date dirname find flock grep id install jq mkdir mktemp \
   mountpoint mv readlink rm runuser sed sha256sum sleep sort stat systemctl tr wc; do
   command -v "$command" >/dev/null 2>&1 || die "missing required command: $command"
 done
@@ -187,7 +187,10 @@ min_symbols[spot]=1000
 min_symbols[usdm]=400
 
 binary_evidence_dir="$EVIDENCE_ROOT/$candidate_sha"
-evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"
+bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"
+runs_dir="$bundle_evidence_dir/runs"
+gate_run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+evidence_dir="$runs_dir/$gate_run_id"
 gate_json="$evidence_dir/gate.json"
 passed_marker="$evidence_dir/PASSED.sha256"
 gate_tmp="$evidence_dir/.gate.json.tmp"
@@ -203,9 +206,37 @@ done
 install -d -m 0750 "$binary_evidence_dir"
 direct_directory "$binary_evidence_dir" \
   || die 'binary evidence directory is indirect or a symlink'
-install -d -m 0750 "$evidence_dir"
-direct_directory "$evidence_dir" || die 'bundle evidence directory is indirect or a symlink'
-rm -f "$gate_json" "$passed_marker" "$gate_tmp" "$marker_tmp"
+install -d -m 0750 "$bundle_evidence_dir" "$runs_dir"
+direct_directory "$bundle_evidence_dir" \
+  || die 'bundle evidence directory is indirect or a symlink'
+direct_directory "$runs_dir" || die 'gate runs directory is indirect or a symlink'
+if [[ $test_only != true ]]; then
+  shopt -s nullglob
+  existing_passes=("$runs_dir"/*/PASSED.sha256)
+  shopt -u nullglob
+  (( ${#existing_passes[@]} == 0 )) \
+    || die 'an immutable production-eligible gate already exists for this release identity'
+fi
+mkdir -m 0750 -- "$evidence_dir" \
+  || die 'gate run evidence directory already exists or could not be created atomically'
+direct_directory "$evidence_dir" || die 'gate run evidence directory is indirect or a symlink'
+run_created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+jq -n \
+  --arg schema monday.rust_lob_shadow_gate_run.v1 \
+  --arg run_id "$gate_run_id" \
+  --arg created_at "$run_created_at" \
+  --arg candidate_sha256 "$candidate_sha" \
+  --arg deployment_bundle_sha256 "$deployment_bundle_sha256" \
+  --arg deployment_source_revision "$deployment_source_revision" \
+  --argjson requested_duration_seconds "$gate_seconds" \
+  --argjson test_only "$test_only" \
+  '{schema:$schema,run_id:$run_id,created_at:$created_at,
+    candidate_sha256:$candidate_sha256,
+    deployment_bundle_sha256:$deployment_bundle_sha256,
+    deployment_source_revision:$deployment_source_revision,
+    requested_duration_seconds:$requested_duration_seconds,test_only:$test_only}' \
+  >"$evidence_dir/run.json"
+chmod 0640 "$evidence_dir/run.json"
 
 tmp_dir=$(mktemp -d)
 chown "$SERVICE_USER:$SERVICE_USER" "$tmp_dir"
@@ -216,7 +247,6 @@ cleanup() {
   rm -rf "$tmp_dir"
   rm -f "$gate_tmp" "$marker_tmp"
   if [[ $gate_finished != true ]]; then
-    rm -f "$passed_marker"
     systemctl stop "${unit[spot]}" "${unit[usdm]}" >/dev/null 2>&1 || true
   fi
   exit "$status"
@@ -234,7 +264,7 @@ assert_candidate() {
 assert_spool_drained() {
   local market=$1
   local remaining
-  remaining=$(find "${spool_dir[$market]}" -type f \( \
+  remaining=$(find "${spool_dir[$market]}" \( -type f -o -type l \) \( \
     -name '*.manifest.json' -o -name '*.jsonl.part' -o \
     -name '*.zst.tmp' -o -name '*.part.corrupt' -o \
     -name '*.jsonl.zst' -o -name '*._SUCCESS' -o \
@@ -362,9 +392,12 @@ health_passes() {
       and .updated_at_ns >= $gate_started_ns
       and .status == "synced"
       and .sequence_gaps == 0
+      and (.symbol_count | type) == "number"
+      and .symbol_count == (.symbol_count | floor)
       and .symbol_count >= $minimum_symbols
+      and (.snapshot_ready_count | type) == "number"
+      and .snapshot_ready_count == (.snapshot_ready_count | floor)
       and .snapshot_ready_count == .symbol_count
-      and .pending_upload_segments == 0
       and .queue_saturated == false
       and .disk_warning == false
       and .upload_warning == false
@@ -707,6 +740,7 @@ jq -n \
     test_only:$test_only,checks_passed:$checks_passed,
     production_eligible:$production_eligible,passed:$passed,markets:$markets}' \
   >"$gate_tmp"
+[[ ! -e $gate_json && ! -L $gate_json ]] || die 'gate evidence path already exists'
 install -m 0640 "$gate_tmp" "$gate_json"
 rm -f "$gate_tmp"
 
@@ -714,6 +748,8 @@ if [[ $production_eligible == true ]]; then
   gate_sha=$(sha256sum "$gate_json" | awk '{print $1}')
   printf '%s  gate.json\n' "$gate_sha" >"$marker_tmp"
   chmod 0640 "$marker_tmp"
+  [[ ! -e $passed_marker && ! -L $passed_marker ]] \
+    || die 'gate pass marker already exists'
   mv "$marker_tmp" "$passed_marker"
   printf 'production shadow gate passed: %s\nmarker: %s\n' "$gate_json" "$passed_marker"
 else

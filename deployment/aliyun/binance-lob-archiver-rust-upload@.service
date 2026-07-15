@@ -13,7 +13,7 @@ Environment=RUST_LOG=info
 Environment=HOME=/var/lib/hft-collector
 EnvironmentFile=/etc/monday/binance-lob-archiver-rust-%i.env
 ExecStart=/opt/monday/bin/binance-lob-archiver-shadow --upload-only
-TimeoutStartSec=600
+TimeoutStartSec=0
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

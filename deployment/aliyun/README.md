@@ -222,7 +222,12 @@ and the shadow symlink. Production unit/env files remain staged under:
 
 Candidate installation refuses an unmounted `/data`, an active shadow, a digest
 mismatch, or a concurrent release operation. It does not start any service and
-does not overwrite production configuration or the production symlink.
+does not overwrite production configuration or the production symlink. A
+pre-existing artifact directory is reusable only when its binary, deployment
+assets, artifact URI, bundle digest, bundle URI, and source revision all match
+exactly; otherwise installation fails instead of rewriting historical release
+evidence. First installation is assembled in a sibling directory and renamed
+into place only after all identity checks pass.
 
 The committed shadow environments use `SYMBOLS=ALL`, ten-minute segments, the
 isolated spools below, and isolated OSS datasets:
@@ -255,7 +260,8 @@ these are true for the entire candidate run:
 - every discovered symbol has a ready snapshot and sequence gaps remain zero;
 - neither session nor catalog membership changes, health never stops advancing
   for more than 90 seconds, and the persistent upload-failure count is unchanged;
-- pending uploads are zero and queue, disk, and upload warnings are false;
+- queue, disk, and upload warnings are false, while the persistent upload-failure
+  count does not increase during normal segment rotations;
 - CPU accounting and peak memory stay inside the systemd limits;
 - after stop, the candidate's `--upload-only` drain leaves no partial,
   temporary, corrupt, compressed, success-marker, or cleanup-marker artifact;
@@ -265,14 +271,18 @@ these are true for the entire candidate run:
 A successful production gate writes:
 
 ```text
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/gate.json
-/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/PASSED.sha256
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/run.json
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/gate.json
+/data/monday/evidence/shadow-gates/<artifact-sha256>/<deployment-bundle-sha256>/runs/<run-id>/PASSED.sha256
 ```
 
-The marker hashes exactly that `gate.json`. Evidence also binds the clean source
-revision and deployment-bundle SHA-256, so unit or env changes cannot consume an
-older gate for the same binary. A short test override is available
-only for script testing; it writes `passed=false` and never creates
+Every invocation gets a new append-only run directory; prior gate evidence is
+never deleted or replaced. The marker hashes exactly that run's `gate.json`.
+Evidence also binds the clean source revision and deployment-bundle SHA-256, so
+unit or env changes cannot consume an older gate for the same binary. A second
+production gate for an identity that already has a passing run is refused, and
+cutover requires exactly one immutable passing run. A short test override is
+available only for script testing; it writes `passed=false` and never creates
 `PASSED.sha256`, so it cannot authorize cutover.
 
 ### 3. Cut over or roll back
@@ -291,7 +301,10 @@ ARTIFACT_SHA256=REPLACE_WITH_64_HEX_DIGEST \
 The host cutover revalidates the binary, release metadata, staged deployment
 files, gate JSON, marker hash, duration, full-catalog counts, and OSS round trips.
 Only then does it disable and stop the current production units. After production
-is stopped, it installs the target production unit/env files.
+is stopped, it installs the target production unit/env files. Deleted legacy
+Python instance units must be inactive and disabled before the transition; they
+are included in the transition mask so they cannot become a second canonical
+writer.
 
 The drain is bootstrap-safe: it runs the digest-pinned target binary directly
 against the canonical production env, so the first upgrade does not depend on
@@ -303,12 +316,15 @@ and each process's `/proc/<pid>/exe` resolving to the requested release; only a
 verified candidate is enabled for reboot.
 
 Any failure after production stops triggers a fail-closed Rust-to-Rust restore of
-the previous digest-addressed binary and its staged production assets. Rollback
-removes candidate health, starts the old units while disabled, requires health
-written after that restart, and verifies full catalog, zero restarts, and the old
+the previous digest-addressed binary. Before production stops, its deployment
+assets are copied into the unique cutover evidence directory and covered by a
+SHA-256 manifest; mutable `/etc` files are never written back into an old
+digest-addressed release. Rollback verifies that snapshot before use, removes
+candidate health, starts the old units while disabled, requires health written
+after that restart, and verifies full catalog, zero restarts, and the old
 `/proc/<pid>/exe` targets before enabling. If a safe restore cannot be proved,
-both production units remain disabled and masked. Cutover evidence
-is written under `/data/monday/evidence/cutovers/`.
+both production units remain disabled and masked. Cutover evidence is written
+under `/data/monday/evidence/cutovers/`.
 
 Rollback uses the same `ACTION=cutover` operation with a previously installed,
 previously gated artifact digest. There is no Python fallback and no manual
@@ -318,8 +334,11 @@ symlink shortcut.
 
 After all three OSS objects upload successfully, the Rust collector atomically
 writes an uploaded-cleanup marker. Restart recovery consumes that marker first,
-removes local data/manifest/success artifacts idempotently, fsyncs the directory,
-and removes the marker last. An interrupted or invalid cleanup marker makes
+derives the only permitted data/manifest/success names from the marker's segment
+name, validates all three before deleting any file, removes them idempotently,
+fsyncs the directory, and removes the marker last. Cleanup temp files use
+exclusive creation and refuse symlinks or other non-regular stale paths. An
+interrupted or invalid cleanup marker makes
 `--upload-only` fail closed. Normal collection and upload-only drain also share
 an exclusive per-spool process lock, so they cannot mutate one market spool
 concurrently even if an operator bypasses the systemd transition mask. Recursive
@@ -331,3 +350,7 @@ canonical writer, or bypass `PASSED.sha256`. Do not open general SSH for a
 release. When a Cloud Assistant deadline expires, the local wrapper requests
 cancellation and waits for a terminal invocation state; host-side `flock`
 prevents a retry from racing an earlier operation.
+
+Full-catalog symbol discovery has a 15-second HTTP request timeout, so a stalled
+Binance `exchangeInfo` response fails startup instead of leaving an active but
+idle service until the systemd runtime limit.
