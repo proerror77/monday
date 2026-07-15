@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Dynamically sourced production functions consume fixture globals and mocks.
-# shellcheck disable=SC2016,SC2034,SC2329
+# shellcheck disable=SC2016,SC2034,SC2317,SC2329
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
