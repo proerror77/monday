@@ -27,10 +27,10 @@ The repository provides the durable goal loop and CLI. Time-based or event-based
 | Binance closed-candle OHLCV v2 Data Missions | `governed` | Content-addressed trace, immutable DuckDB registry, point-in-time and quality checks |
 | Binance W3W Prediction order adapter | `implemented, activation disabled` | Official SDK wallet verification, quote/place/cancel, balance, and open-order reconciliation; fill/settlement promotion still requires a dedicated acceptance gate |
 | Tick/LOB and multi-venue streaming connectors | `runtime-only` | Connector availability is not a governed research-dataset claim |
-| Formula search with GP, MCTS, and Bayesian optimization | `governed` | Eligible for evaluator v2 and Formula-only promotion |
+| Formula search with GP, MCTS, and Bayesian optimization | `governed` | Eligible for evaluator v3 and Formula-only promotion |
 | Offline Q-learning | `lab-only` | Search-policy experiment; blocked from holdout, promotion, allocation, and runtime authority |
 | OpenAI-compatible hypothesis/failure critic | `lab-only` | Optional `ALPHA_LLM_*` calls; outputs remain evidence/proposals |
-| Purged walk-forward and one-time sealed holdout v2 | `governed` | Typed metrics/config hashes are recomputed before promotion |
+| Purged walk-forward and one-time sealed holdout v3 | `governed` | Typed predictive/trading metrics and config hashes are recomputed before promotion |
 | ONNX loading | `runtime-compatibility` | No governed ONNX producer until point-in-time training lineage and model evaluation exist |
 | Signed Formula Paper/Shadow handoff | `implemented` | Ed25519 verification, runtime-owned approval evidence, policy binding, durable nonce and audit records |
 | Runtime attribution and follow-up learning | `implemented` | Signed deployment/strategy-scoped events; validator-gated lab policy adoption |
@@ -47,7 +47,7 @@ flowchart LR
     D --> C["Content-addressed dataset"]
     C --> S["MCTS / Bayesian LoopRun"]
     C --> Q["Standalone GP / RL / LLM Lab missions"]
-    S --> E["Evaluator v2"]
+    S --> E["Evaluator v3"]
     E -->|"fail + evidence"| L["Learning directive / follow-up mission"]
     L --> S
     E -->|"walk-forward + sealed pass"| P["Promotion + Formula bundle"]

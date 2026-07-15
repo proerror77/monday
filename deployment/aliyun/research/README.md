@@ -250,6 +250,20 @@ Kubernetes Secret and must never be committed. Use distinct DuckDB files and
 result objects per parallel Mission; a later single-writer aggregator may merge
 their immutable evidence.
 
+ACK research workers are private and have no public NAT path. Sign feature,
+materialization, and result URLs against the regional internal OSS endpoint
+`https://oss-ap-northeast-1-internal.aliyuncs.com`; a public OSS URL will time
+out from the worker pool. The result PUT signature must cover both
+`Content-Type: application/zip` and `x-oss-forbid-overwrite: true`, matching the
+native runner request. Delete the short-lived URL Secret after the Job reaches a
+terminal state.
+
+Treat Kubernetes completion as transport evidence only. Read `bundle_sha256`
+from the Job's final JSON log, download the immutable result object, verify that
+SHA-256 and `unzip -t`, then confirm every walk-forward record reports
+`purged-walk-forward-v3`. A complete result may legitimately contain zero
+sealed evaluations when no candidate passes walk-forward.
+
 Run many parameter batches without rebuilding:
 
 ```bash
