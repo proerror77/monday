@@ -211,6 +211,8 @@ grep -Fq 'existing release deployment differs from the requested bundle' "$INSTA
 grep -Fq 'bundle_evidence_dir="$binary_evidence_dir/$deployment_bundle_sha256"' "$GATE"
 grep -Fq 'evidence_dir="$runs_dir/$gate_run_id"' "$GATE"
 grep -Fq 'an immutable production-eligible gate already exists' "$GATE"
+grep -Fq 'for candidate_unit in "${candidate_units[@]}"; do' "$GATE"
+grep -Fq 'systemctl reset-failed "$candidate_unit" >/dev/null 2>&1 || true' "$GATE"
 if grep -Fq 'rm -f "$gate_json"' "$GATE"; then
   printf 'shadow gate still deletes immutable gate evidence\n' >&2
   exit 1

@@ -294,10 +294,18 @@ for market in "${markets[@]}"; do
   run_candidate_drain "$market"
   rm -f "${spool_dir[$market]}/health.json"
 done
-systemctl reset-failed \
-  "${unit[spot]}" "${unit[usdm]}" \
-  binance-lob-archiver-rust-upload@spot.service \
+candidate_units=(
+  "${unit[spot]}"
+  "${unit[usdm]}"
+  binance-lob-archiver-rust-upload@spot.service
   binance-lob-archiver-rust-upload@usdm.service
+)
+for candidate_unit in "${candidate_units[@]}"; do
+  # A never-started template instance is legitimately not loaded. Reset each
+  # unit independently so that condition cannot skip the remaining cleanup;
+  # the identity assertion and start below remain fail-closed.
+  systemctl reset-failed "$candidate_unit" >/dev/null 2>&1 || true
+done
 assert_candidate
 
 gate_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
