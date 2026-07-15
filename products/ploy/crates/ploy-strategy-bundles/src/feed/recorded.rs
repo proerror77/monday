@@ -144,6 +144,7 @@ struct MarketUpdateLogWriter {
     limits: RecordingLimits,
     rotate_seconds: Option<u64>,
     rotation_bucket: Option<i64>,
+    rotation_retry_after: Option<DateTime<Utc>>,
 }
 
 impl MarketUpdateLogWriter {
@@ -186,6 +187,7 @@ impl MarketUpdateLogWriter {
             limits,
             rotate_seconds,
             rotation_bucket: rotation_bucket(rotate_seconds),
+            rotation_retry_after: None,
         })
     }
 
@@ -235,6 +237,9 @@ impl MarketUpdateLogWriter {
 
     fn rotation_due(&self) -> bool {
         self.rotation_bucket != rotation_bucket(self.rotate_seconds)
+            && self
+                .rotation_retry_after
+                .is_none_or(|retry_after| Utc::now() >= retry_after)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -262,6 +267,7 @@ impl MarketUpdateLogWriter {
         {
             Ok(file) => file,
             Err(error) => {
+                self.rotation_retry_after = Some(Utc::now() + chrono::Duration::minutes(1));
                 warn!(
                     path = %self.path.display(),
                     error = %error,
@@ -272,6 +278,7 @@ impl MarketUpdateLogWriter {
         };
         if let Err(error) = fs::rename(&self.path, &rotated) {
             let _ = fs::remove_file(&temporary);
+            self.rotation_retry_after = Some(Utc::now() + chrono::Duration::minutes(1));
             warn!(
                 path = %self.path.display(),
                 error = %error,
@@ -286,6 +293,7 @@ impl MarketUpdateLogWriter {
                 )));
             }
             let _ = fs::remove_file(&temporary);
+            self.rotation_retry_after = Some(Utc::now() + chrono::Duration::minutes(1));
             warn!(
                 path = %self.path.display(),
                 error = %publish_error,
@@ -298,6 +306,7 @@ impl MarketUpdateLogWriter {
         self.pending_records = 0;
         self.bytes_written = 0;
         self.rotation_bucket = rotation_bucket(self.rotate_seconds);
+        self.rotation_retry_after = None;
         info!(
             active = %self.path.display(),
             rotated = %rotated.display(),
@@ -466,12 +475,6 @@ where
 {
     async fn next(&mut self) -> Option<MarketUpdate> {
         let update = self.inner.next().await?;
-        let recorded_update = if self.writer.is_some() {
-            self.prepare_recorded_update(&update)
-        } else {
-            None
-        };
-
         let rotation_due = self
             .writer
             .as_ref()
@@ -490,6 +493,11 @@ where
             Vec::new()
         };
         event_checkpoints.sort_by(|left, right| left.0.cmp(&right.0));
+        let recorded_update = if self.writer.is_some() {
+            self.prepare_recorded_update(&update)
+        } else {
+            None
+        };
 
         let mut recording_error = None;
         let mut limit_reached = false;
@@ -774,6 +782,21 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn rotation_retry_backoff_suppresses_per_update_retries() {
+        let path = temp_log_path("writer-rotation-backoff");
+        let mut writer =
+            MarketUpdateLogWriter::create_with_limits(&path, RecordingLimits::default(), Some(60))
+                .unwrap();
+        writer.rotation_bucket = writer.rotation_bucket.map(|bucket| bucket - 1);
+        writer.rotation_retry_after = Some(Utc::now() + Duration::minutes(1));
+        assert!(!writer.rotation_due());
+        writer.rotation_retry_after = Some(Utc::now() - Duration::seconds(1));
+        assert!(writer.rotation_due());
+        drop(writer);
+        let _ = fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn in_process_rotation_seeds_active_event_context_before_quotes() {
         let now = Utc::now();
@@ -830,6 +853,60 @@ mod tests {
         ));
         assert_eq!(records[1].sequence, 1);
         assert!(matches!(records[1].update, MarketUpdate::Quote { .. }));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn rotation_snapshots_lifecycle_state_before_applying_boundary_update() {
+        let now = Utc::now();
+        let discovered = MarketUpdate::EventDiscovered {
+            event_id: "evt-boundary".into(),
+            symbol: "BTCUSDT".into(),
+            up_token: "up-boundary".into(),
+            down_token: "down-boundary".into(),
+            end_time: now + Duration::minutes(5),
+            window_secs: 300,
+            price_to_beat: Some(dec!(100000)),
+            resolved_up_won: None,
+        };
+        let expired = MarketUpdate::EventExpired {
+            event_id: "evt-boundary".into(),
+            end_time: now + Duration::minutes(5),
+            resolved_up_won: None,
+        };
+        let path = temp_log_path("rotation-lifecycle-boundary");
+        let mut feed = RecordingFeed::with_policy(
+            crate::HistoricalFeed::new(vec![discovered.clone(), expired.clone()]),
+            &path,
+            RecordingPolicy {
+                rotate_seconds: Some(3600),
+                include_kinds: vec![RecordingKind::EventDiscovered, RecordingKind::EventExpired],
+                ..RecordingPolicy::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(feed.next().await, Some(discovered));
+        let writer = feed.writer.as_mut().unwrap();
+        writer.rotation_bucket = writer.rotation_bucket.map(|bucket| bucket - 1);
+        assert_eq!(feed.next().await, Some(expired));
+        drop(feed);
+
+        let records = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<RecordedMarketUpdate>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            records[0].update,
+            MarketUpdate::EventDiscovered { .. }
+        ));
+        assert!(matches!(
+            records[1].update,
+            MarketUpdate::EventExpired { .. }
+        ));
 
         let _ = fs::remove_file(path);
     }
