@@ -30,7 +30,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+static NEXT_BUNDLE_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 
 pub fn candidate_list(args: MissionStatusArgs) -> anyhow::Result<()> {
     let store = AlphaStore::open(args.db)?;
@@ -157,7 +160,8 @@ pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
     if mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
         bail!("mission dataset id does not match the supplied manifest");
     }
-    let protocol = args.dataset.validation.evaluation_protocol()?;
+    let labels = manifest.evaluation_label_spec()?;
+    let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
     let dataset = prepare_dataset(
         manifest.load_rows(
             args.dataset.validation.fee_bps,
@@ -172,6 +176,7 @@ pub fn register_onnx_candidate(args: RegisterOnnxArgs) -> anyhow::Result<()> {
         .evaluate(&model, &model_path, &dataset.engine_context())
         .map_err(anyhow::Error::msg)?;
     let now = Utc::now();
+    store.bind_mission_evaluation_protocol(&mission.mission_id, false, &protocol, now)?;
     let evaluation_id = format!("{}-onnx-evaluation-1", args.mission_id);
     let iteration = ResearchIteration {
         iteration_id: format!("{}-onnx-iteration-1", args.mission_id),
@@ -230,7 +235,13 @@ pub fn evaluate(args: EvaluateArgs) -> anyhow::Result<()> {
 pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRevision> {
     let mut store = AlphaStore::open(&args.db)?;
     let lineage = store.mission_lineage(&args.mission_id)?;
-    let requested_protocol = args.dataset.validation.evaluation_protocol()?;
+    let manifest =
+        data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
+    if lineage.mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
+        bail!("mission dataset id does not match the supplied manifest");
+    }
+    let labels = manifest.evaluation_label_spec()?;
+    let requested_protocol = args.dataset.validation.evaluation_protocol(&labels)?;
     let requested_protocol_hash = requested_protocol.content_hash()?;
     if !validated_walk_forward_evidence_in_lineage(&lineage)?
         .iter()
@@ -240,6 +251,12 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
     {
         bail!("candidate lacks canonical walk-forward evidence for this evaluation protocol");
     }
+    store.bind_mission_evaluation_protocol(
+        &lineage.mission.mission_id,
+        !lineage.iterations.is_empty(),
+        &requested_protocol,
+        Utc::now(),
+    )?;
     let candidate = lineage
         .candidates
         .iter()
@@ -318,11 +335,6 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
         return Ok(existing);
     }
 
-    let manifest =
-        data_mission::read_registered_research_dataset(&store, &args.dataset.dataset_manifest)?;
-    if lineage.mission.dataset_manifest_id.as_str() != manifest.manifest_id() {
-        bail!("mission dataset id does not match the supplied manifest");
-    }
     let rows = manifest.load_rows(
         args.dataset.validation.fee_bps,
         args.dataset.validation.funding_bps,
@@ -464,11 +476,12 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
     if !evaluation.passed {
         bail!("candidate failed sealed holdout and cannot be promoted");
     }
-    let (_, sealed_protocol_hash) = evaluation
+    let (sealed_protocol, sealed_protocol_hash) = evaluation
         .protocol_binding()
         .map_err(anyhow::Error::new)
         .context("sealed evaluation has no valid protocol binding")?;
     let evaluation_protocol_hash = sealed_protocol_hash.to_string();
+    store.require_mission_evaluation_protocol(&lineage.mission.mission_id, sealed_protocol)?;
     if sealed.asset_id != candidate.candidate_id
         || sealed
             .payload
@@ -546,16 +559,18 @@ pub fn promote(args: PromoteArgs) -> anyhow::Result<()> {
         bundle_hash: bundle.bundle_hash.clone(),
         created_at: now,
     };
-    materialize_bundle(&bundle, bundle_out.as_deref(), model_root.as_deref())?;
     if let Some(existing) = existing {
         let stored_bundle = store.get_strategy_bundle(&existing.record.bundle_id)?;
         ensure_exact_promotion_replay(&existing.record, &stored_bundle, &promotion, &bundle)?;
+        materialize_bundle(&stored_bundle, bundle_out.as_deref(), model_root.as_deref())?;
         return print_json(&serde_json::json!({
             "promotion": existing,
             "bundle": stored_bundle,
         }));
     }
+    let staged = stage_bundle(&bundle, bundle_out.as_deref(), model_root.as_deref())?;
     let stored = store.promote_candidate(&bundle, &promotion)?;
+    staged.publish()?;
     print_json(&serde_json::json!({
         "promotion": stored,
         "bundle": bundle,
@@ -567,6 +582,165 @@ fn materialize_bundle(
     bundle_out: Option<&Path>,
     model_root: Option<&Path>,
 ) -> anyhow::Result<()> {
+    stage_bundle(bundle, bundle_out, model_root)?.publish()
+}
+
+struct StagedBundle {
+    staging_dir: Option<PathBuf>,
+    created_dirs: Vec<PathBuf>,
+    bundle_out: Option<PathBuf>,
+    staged_bundle: Option<PathBuf>,
+    model_target: Option<PathBuf>,
+    staged_model: Option<PathBuf>,
+    model: Option<OnnxModelCandidate>,
+}
+
+impl StagedBundle {
+    fn publish(mut self) -> anyhow::Result<()> {
+        let mut published_model = None;
+        let result = (|| {
+            if let Some(staged_model) = self.staged_model.take() {
+                let model_target = self
+                    .model_target
+                    .clone()
+                    .context("staged ONNX artifact has no target path")?;
+                let model = self
+                    .model
+                    .clone()
+                    .context("staged ONNX artifact has no model metadata")?;
+                let target_parent = model_target
+                    .parent()
+                    .context("ONNX bundle target has no parent directory")?;
+                let bundle_dir = self
+                    .bundle_out
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .canonicalize()?;
+                if !target_parent.canonicalize()?.starts_with(&bundle_dir) {
+                    bail!("ONNX bundle target escapes the bundle directory");
+                }
+                if model_target.exists() {
+                    verify_onnx_file(&model_target, &model, "existing ONNX bundle artifact")?;
+                    std::fs::remove_file(staged_model)?;
+                } else {
+                    match std::fs::hard_link(&staged_model, &model_target) {
+                        Ok(()) => published_model = Some((model_target, model.clone())),
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            verify_onnx_file(
+                                &model_target,
+                                &model,
+                                "concurrently published ONNX bundle artifact",
+                            )?;
+                            std::fs::remove_file(staged_model)?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            if let Some(staged_bundle) = self.staged_bundle.take() {
+                let bundle_out = self
+                    .bundle_out
+                    .clone()
+                    .context("staged strategy bundle has no output path")?;
+                if bundle_out.exists() {
+                    let existing: StrategyBundle =
+                        serde_json::from_slice(&std::fs::read(&bundle_out)?)?;
+                    let requested: StrategyBundle =
+                        serde_json::from_slice(&std::fs::read(&staged_bundle)?)?;
+                    if existing != requested {
+                        bail!("existing strategy bundle has different content");
+                    }
+                    std::fs::remove_file(staged_bundle)?;
+                } else {
+                    match std::fs::hard_link(&staged_bundle, &bundle_out) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            let existing: StrategyBundle =
+                                serde_json::from_slice(&std::fs::read(&bundle_out)?)?;
+                            let requested: StrategyBundle =
+                                serde_json::from_slice(&std::fs::read(&staged_bundle)?)?;
+                            if existing != requested {
+                                bail!(
+                                    "concurrently published strategy bundle has different content"
+                                );
+                            }
+                            std::fs::remove_file(staged_bundle)?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if let Some((path, model)) = published_model {
+                let published_bundle_uses_model = self
+                    .bundle_out
+                    .as_deref()
+                    .and_then(|bundle_out| std::fs::read(bundle_out).ok())
+                    .and_then(|bytes| serde_json::from_slice::<StrategyBundle>(&bytes).ok())
+                    .is_some_and(|bundle| {
+                        matches!(
+                            bundle.artifact,
+                            alpha_domain::StrategyBundleArtifact::Onnx {
+                                model: published_model
+                            } if published_model == model
+                        )
+                    });
+                if !published_bundle_uses_model {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            let _ = self.cleanup();
+            return Err(error);
+        }
+        self.cleanup_staging()?;
+        self.created_dirs.clear();
+        Ok(())
+    }
+
+    fn cleanup_staging(&mut self) -> anyhow::Result<()> {
+        if let Some(staging_dir) = self.staging_dir.take() {
+            if staging_dir.exists() {
+                std::fs::remove_dir_all(staging_dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup(&mut self) -> anyhow::Result<()> {
+        self.cleanup_staging()?;
+        for path in self.created_dirs.iter().rev() {
+            if path.exists() && std::fs::read_dir(path)?.next().is_none() {
+                match std::fs::remove_dir(path) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                        ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        self.created_dirs.clear();
+        Ok(())
+    }
+}
+
+impl Drop for StagedBundle {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+fn stage_bundle(
+    bundle: &StrategyBundle,
+    bundle_out: Option<&Path>,
+    model_root: Option<&Path>,
+) -> anyhow::Result<StagedBundle> {
     let Some(bundle_out) = bundle_out else {
         if matches!(
             &bundle.artifact,
@@ -574,14 +748,56 @@ fn materialize_bundle(
         ) {
             bail!("ONNX promotion requires --bundle-out and --model-root");
         }
-        return Ok(());
+        return Ok(StagedBundle {
+            staging_dir: None,
+            created_dirs: Vec::new(),
+            bundle_out: None,
+            staged_bundle: None,
+            model_target: None,
+            staged_model: None,
+            model: None,
+        });
     };
     let bundle_dir = bundle_out
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(bundle_dir)?;
+    let created_dirs = create_dir_all_tracked(bundle_dir)?;
+    let mut staged = StagedBundle {
+        staging_dir: None,
+        created_dirs,
+        bundle_out: Some(bundle_out.to_path_buf()),
+        staged_bundle: None,
+        model_target: None,
+        staged_model: None,
+        model: None,
+    };
     let canonical_bundle_dir = bundle_dir.canonicalize()?;
+    let canonical_bundle_out = canonical_bundle_dir.join(
+        bundle_out
+            .file_name()
+            .context("strategy bundle output has no file name")?,
+    );
+    staged.bundle_out = Some(canonical_bundle_out.clone());
+    let staging_dir = canonical_bundle_dir.join(format!(
+        ".alpha-bundle-{}-{}-{}-staging",
+        std::process::id(),
+        &bundle.bundle_hash[..16],
+        NEXT_BUNDLE_STAGE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&staging_dir)?;
+    staged.staging_dir = Some(staging_dir.clone());
+    let staged_bundle = staging_dir.join("bundle.json");
+    std::fs::write(&staged_bundle, serde_json::to_vec_pretty(bundle)?)?;
+    std::fs::File::open(&staged_bundle)?.sync_all()?;
+    staged.staged_bundle = Some(staged_bundle);
+    if canonical_bundle_out.exists() {
+        let existing: StrategyBundle =
+            serde_json::from_slice(&std::fs::read(&canonical_bundle_out)?)?;
+        if &existing != bundle {
+            bail!("existing strategy bundle has different content");
+        }
+    }
     if let alpha_domain::StrategyBundleArtifact::Onnx { model } = &bundle.artifact {
         let source = verified_model_path(
             model,
@@ -589,29 +805,74 @@ fn materialize_bundle(
         )?;
         let relative = Path::new(&model.artifact.uri);
         let target = canonical_bundle_dir.join(relative);
+        if target == canonical_bundle_out {
+            bail!("strategy bundle JSON and ONNX artifact cannot share a path");
+        }
         let target_parent = target
             .parent()
             .context("ONNX bundle target has no parent directory")?;
-        std::fs::create_dir_all(target_parent)?;
+        staged
+            .created_dirs
+            .extend(create_dir_all_tracked(target_parent)?);
         let canonical_target_parent = target_parent.canonicalize()?;
         if !canonical_target_parent.starts_with(&canonical_bundle_dir) {
             bail!("ONNX bundle target escapes the bundle directory");
         }
         if target.exists() {
-            let bytes = std::fs::read(&target)?;
-            let checksum = hex::encode(Sha256::digest(&bytes));
-            if bytes.len() as u64 != model.byte_len
-                || model.artifact.checksum.as_deref() != Some(checksum.as_str())
-            {
-                bail!("existing ONNX bundle artifact has different content");
-            }
-        } else if source != target {
-            let temporary = target.with_extension("onnx.tmp");
-            std::fs::copy(&source, &temporary)?;
-            std::fs::rename(temporary, &target)?;
+            verify_onnx_file(&target, model, "existing ONNX bundle artifact")?;
+        } else {
+            let staged_model = staging_dir.join("model.onnx");
+            std::fs::copy(&source, &staged_model)?;
+            std::fs::File::open(&staged_model)?.sync_all()?;
+            verify_onnx_file(&staged_model, model, "staged ONNX bundle artifact")?;
+            staged.model_target = Some(target);
+            staged.staged_model = Some(staged_model);
+            staged.model = Some(model.clone());
         }
     }
-    data_mission::write_json_atomic(bundle_out, bundle)
+    Ok(staged)
+}
+
+fn verify_onnx_file(
+    path: &Path,
+    model: &OnnxModelCandidate,
+    description: &str,
+) -> anyhow::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let checksum = hex::encode(Sha256::digest(&bytes));
+    if bytes.len() as u64 != model.byte_len
+        || model.artifact.checksum.as_deref() != Some(checksum.as_str())
+    {
+        bail!("{description} has different content");
+    }
+    Ok(())
+}
+
+fn create_dir_all_tracked(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        missing.push(current.to_path_buf());
+        current = current
+            .parent()
+            .context("directory path has no existing ancestor")?;
+    }
+    missing.reverse();
+    let mut created = Vec::new();
+    for directory in missing {
+        match std::fs::create_dir(&directory) {
+            Ok(()) => created.push(directory),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+            Err(error) => {
+                for created_directory in created.iter().rev() {
+                    let _ = std::fs::remove_dir(created_directory);
+                }
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(created)
 }
 
 fn ensure_exact_promotion_replay(
@@ -814,6 +1075,7 @@ mod tests {
     use alpha_engine::evaluation::ResearchRow;
     use alpha_store::{StoredCandidate, StoredEvaluation};
     use chrono::Duration;
+    use std::sync::{Arc, Barrier};
 
     fn evaluation_protocol() -> EvaluationProtocolV1 {
         EvaluationProtocolV1::new(
@@ -821,7 +1083,7 @@ mod tests {
                 initial_train_rows: 1,
                 validation_rows: 32,
                 fold_count: 2,
-                purge_rows: 0,
+                purge_rows: 1,
                 embargo_rows: 0,
                 sealed_holdout_rows: 1,
             },
@@ -959,6 +1221,27 @@ mod tests {
         })
     }
 
+    fn conflicting_onnx_bundles_for_shared_model(
+        model_bytes: &[u8],
+    ) -> (StrategyBundle, StrategyBundle) {
+        let mut model = match onnx_candidate() {
+            CandidateArtifact::OnnxModel(model) => model,
+            _ => unreachable!("ONNX fixture must contain an ONNX model"),
+        };
+        model.byte_len = model_bytes.len() as u64;
+        model.artifact.checksum = Some(hex::encode(Sha256::digest(model_bytes)));
+
+        let (_, mut first) = promotion_fixture();
+        first.artifact = CandidateArtifact::OnnxModel(model)
+            .to_governed_strategy_bundle_artifact()
+            .unwrap();
+        first.bundle_hash = first.calculated_hash().unwrap();
+        let mut second = first.clone();
+        second.candidate_content_hash = "f".repeat(64);
+        second.bundle_hash = second.calculated_hash().unwrap();
+        (first, second)
+    }
+
     #[test]
     fn promotion_idempotency_requires_an_exact_replay_binding() {
         let (promotion, bundle) = promotion_fixture();
@@ -984,6 +1267,165 @@ mod tests {
             ensure_exact_promotion_replay(&promotion, &bundle, &promotion, &different_bundle)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn bundle_staging_cleans_up_on_persistence_failure_without_partial_output() {
+        let (promotion, bundle) = promotion_fixture();
+        let directory = std::env::temp_dir().join(format!(
+            "alpha-bundle-stage-failure-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let bundle_out = directory.join("bundle.json");
+        let staged = stage_bundle(&bundle, Some(&bundle_out), None).unwrap();
+        assert!(!bundle_out.exists());
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        assert!(store.promote_candidate(&bundle, &promotion).is_err());
+
+        drop(staged);
+
+        assert!(!bundle_out.exists());
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn conflicting_bundle_output_is_rejected_before_any_overwrite() {
+        let (_, bundle) = promotion_fixture();
+        let directory = std::env::temp_dir().join(format!(
+            "alpha-bundle-conflict-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let bundle_out = directory.join("bundle.json");
+        let sentinel = b"pre-existing different content";
+        std::fs::write(&bundle_out, sentinel).unwrap();
+
+        assert!(stage_bundle(&bundle, Some(&bundle_out), None).is_err());
+        assert_eq!(std::fs::read(&bundle_out).unwrap(), sentinel);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_bundle_publish_is_atomic_and_never_clobbers() {
+        let (_, first) = promotion_fixture();
+        let mut second = first.clone();
+        second.candidate_content_hash = "f".repeat(64);
+        second.bundle_hash = second.calculated_hash().unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "alpha-bundle-concurrent-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let bundle_out = directory.join("bundle.json");
+        let first_staged = stage_bundle(&first, Some(&bundle_out), None).unwrap();
+        let second_staged = stage_bundle(&second, Some(&bundle_out), None).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let first_publish = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_staged.publish()
+        });
+        let second_barrier = barrier.clone();
+        let second_publish = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_staged.publish()
+        });
+        barrier.wait();
+        let results = [
+            first_publish.join().unwrap(),
+            second_publish.join().unwrap(),
+        ];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let published: StrategyBundle =
+            serde_json::from_slice(&std::fs::read(&bundle_out).unwrap()).unwrap();
+        assert!(published == first || published == second);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_onnx_bundle_publish_preserves_the_winners_shared_model() {
+        let model_bytes = b"shared-onnx-model";
+        let (first, second) = conflicting_onnx_bundles_for_shared_model(model_bytes);
+
+        let directory = std::env::temp_dir().join(format!(
+            "alpha-onnx-bundle-concurrent-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let model_root = directory.join("source");
+        let output = directory.join("output");
+        std::fs::create_dir_all(&model_root).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(model_root.join("model.onnx"), model_bytes).unwrap();
+        let bundle_out = output.join("bundle.json");
+        let first_staged = stage_bundle(&first, Some(&bundle_out), Some(&model_root)).unwrap();
+        let second_staged = stage_bundle(&second, Some(&bundle_out), Some(&model_root)).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let first_publish = std::thread::spawn(move || {
+            first_barrier.wait();
+            first_staged.publish()
+        });
+        let second_barrier = barrier.clone();
+        let second_publish = std::thread::spawn(move || {
+            second_barrier.wait();
+            second_staged.publish()
+        });
+        barrier.wait();
+        let results = [
+            first_publish.join().unwrap(),
+            second_publish.join().unwrap(),
+        ];
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let published: StrategyBundle =
+            serde_json::from_slice(&std::fs::read(&bundle_out).unwrap()).unwrap();
+        assert!(published == first || published == second);
+        assert_eq!(
+            std::fs::read(output.join("model.onnx")).unwrap(),
+            model_bytes.to_vec()
+        );
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bundle_conflict_keeps_a_shared_model_referenced_by_the_winner() {
+        let model_bytes = b"shared-onnx-model";
+        let (first, second) = conflicting_onnx_bundles_for_shared_model(model_bytes);
+        let directory = std::env::temp_dir().join(format!(
+            "alpha-onnx-bundle-shared-model-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let model_root = directory.join("source");
+        let output = directory.join("output");
+        std::fs::create_dir_all(&model_root).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(model_root.join("model.onnx"), model_bytes).unwrap();
+        let bundle_out = output.join("bundle.json");
+        let first_staged = stage_bundle(&first, Some(&bundle_out), Some(&model_root)).unwrap();
+
+        std::fs::write(&bundle_out, serde_json::to_vec_pretty(&second).unwrap()).unwrap();
+        assert!(first_staged.publish().is_err());
+
+        let published: StrategyBundle =
+            serde_json::from_slice(&std::fs::read(&bundle_out).unwrap()).unwrap();
+        assert_eq!(published, second);
+        assert_eq!(
+            std::fs::read(output.join("model.onnx")).unwrap(),
+            model_bytes.to_vec()
+        );
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

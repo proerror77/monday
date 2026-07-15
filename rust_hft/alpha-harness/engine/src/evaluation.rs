@@ -1,4 +1,4 @@
-use alpha_domain::{EvaluationProtocolV1, ResearchMission};
+use alpha_domain::{DomainError, EvaluationProtocolV1, ResearchMission};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops::Range};
@@ -6,10 +6,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum EvaluationError {
-    #[error(
-        "walk-forward configuration must use positive train, validation, holdout, and fold sizes"
-    )]
-    InvalidConfiguration,
+    #[error("evaluation protocol is invalid: {0}")]
+    InvalidConfiguration(DomainError),
     #[error("dataset does not contain enough rows for the requested folds")]
     InsufficientRows,
     #[error("dataset available_time is not monotonic")]
@@ -183,15 +181,8 @@ pub fn prepare_dataset(
 ) -> Result<PreparedDataset, EvaluationError> {
     protocol
         .validate()
-        .map_err(|_| EvaluationError::InvalidConfiguration)?;
+        .map_err(EvaluationError::InvalidConfiguration)?;
     let config = &protocol.walk_forward;
-    if config.initial_train_rows == 0
-        || config.validation_rows == 0
-        || config.fold_count == 0
-        || config.sealed_holdout_rows == 0
-    {
-        return Err(EvaluationError::InvalidConfiguration);
-    }
     if rows.iter().any(|row| {
         [
             row.signal,
@@ -238,9 +229,18 @@ pub fn prepare_dataset(
         return Err(EvaluationError::InsufficientRows);
     }
     let holdout_start = rows.len() - config.sealed_holdout_rows;
+    let fold_step = config
+        .validation_rows
+        .checked_add(config.embargo_rows)
+        .ok_or(EvaluationError::InvalidConfiguration(
+            DomainError::InvalidEvaluationProtocol,
+        ))?;
     let mut folds = Vec::with_capacity(config.fold_count);
     for fold_index in 0..config.fold_count {
-        let train_end = config.initial_train_rows + fold_index * config.validation_rows;
+        let train_end = fold_index
+            .checked_mul(fold_step)
+            .and_then(|offset| config.initial_train_rows.checked_add(offset))
+            .ok_or(EvaluationError::InsufficientRows)?;
         let validation_start = train_end
             .checked_add(config.purge_rows)
             .ok_or(EvaluationError::InsufficientRows)?;
@@ -331,7 +331,33 @@ mod tests {
         assert_eq!(dataset.plan().folds[0].purge, 20..22);
         assert_eq!(dataset.plan().folds[0].validation, 22..27);
         assert_eq!(dataset.plan().folds[0].embargo, 27..28);
+        assert_eq!(dataset.plan().folds[1].train, 0..26);
+        assert_eq!(dataset.plan().folds[1].purge, 26..28);
+        assert_eq!(dataset.plan().folds[1].validation, 28..33);
+        assert!(dataset.plan().folds[0].embargo.end <= dataset.plan().folds[1].validation.start);
         assert_eq!(dataset.plan().sealed_holdout, 40..50);
+    }
+
+    #[test]
+    fn walk_forward_rejects_purge_shorter_than_label_horizon() {
+        let mut protocol = protocol();
+        protocol.labels.horizon_buckets = 3;
+
+        assert_eq!(
+            prepare_dataset(rows(50), &protocol, "holdout-1").unwrap_err(),
+            EvaluationError::InvalidConfiguration(DomainError::InvalidEvaluationProtocol)
+        );
+    }
+
+    #[test]
+    fn walk_forward_rejects_overflowing_fold_schedule() {
+        let mut protocol = protocol();
+        protocol.walk_forward.fold_count = usize::MAX;
+
+        assert_eq!(
+            prepare_dataset(rows(50), &protocol, "holdout-1").unwrap_err(),
+            EvaluationError::InvalidConfiguration(DomainError::InvalidEvaluationProtocol)
+        );
     }
 
     #[test]

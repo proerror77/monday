@@ -103,8 +103,10 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         || feature_manifest.source_revisions.get(&source_key)
             != Some(&materialization.source_revision)
         || feature_manifest.artifact_sha256 != feature_sha256
+        || feature_manifest.label_spec.horizon_buckets != materialization.label_horizon_buckets
+        || feature_manifest.label_spec.observation_frequency_millis != materialization.bucket_ms
     {
-        bail!("registered feature lineage does not match the materialization");
+        bail!("registered feature lineage or label facts do not match the materialization");
     }
     data_mission::write_json_atomic(&feature_manifest_path, &feature_manifest)?;
     data_mission::write_json_atomic(
@@ -579,7 +581,7 @@ mod tests {
                 initial_train_rows: 40,
                 validation_rows: 30,
                 fold_count: 2,
-                purge_rows: 1,
+                purge_rows: 5,
                 embargo_rows: 1,
                 sealed_holdout_rows: 30,
                 fee_bps: 1.0,

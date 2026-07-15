@@ -229,6 +229,22 @@ where
             Err(StoreError::NotFound) => None,
             Err(error) => return Err(error.into()),
         };
+        let evaluation_protocol_hash = dataset
+            .protocol()
+            .content_hash()
+            .map_err(|error| EngineError::Evaluation(error.to_string()))?;
+        if checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.evaluation_protocol_hash.as_deref())
+            .is_some_and(|hash| hash != evaluation_protocol_hash.as_str())
+        {
+            return Err(EngineError::Checkpoint(
+                "checkpoint evaluation protocol does not match this run".to_string(),
+            ));
+        }
+        let mut allow_legacy_checkpoint_upgrade = checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.evaluation_protocol_hash.is_none());
         let expected_last_iteration = lineage
             .iterations
             .last()
@@ -277,6 +293,12 @@ where
                 .restore(&historical)
                 .map_err(EngineError::Proposal)?;
         }
+        self.store.bind_mission_evaluation_protocol(
+            mission_id,
+            !lineage.iterations.is_empty(),
+            dataset.protocol(),
+            now,
+        )?;
         if matches!(
             mission.status,
             MissionStatus::Pending | MissionStatus::Paused
@@ -462,19 +484,31 @@ where
                 mission_id: mission_id.to_string(),
                 last_iteration_id: Some(iteration.iteration_id.clone()),
                 budget_usage: usage.clone(),
+                evaluation_protocol_hash: Some(evaluation_protocol_hash.clone()),
                 engine_kind: engine_checkpoint.kind,
                 engine_version: engine_checkpoint.version,
                 engine_state: engine_checkpoint.state,
                 updated_at: created_at,
             };
-            self.store.append_iteration_with_checkpoint(
-                &iteration,
-                candidate
-                    .as_ref()
-                    .map(|(candidate_id, artifact)| (candidate_id.as_str(), artifact)),
-                evaluation.as_ref(),
-                &checkpoint,
-            )?;
+            let candidate = candidate
+                .as_ref()
+                .map(|(candidate_id, artifact)| (candidate_id.as_str(), artifact));
+            if allow_legacy_checkpoint_upgrade {
+                self.store.append_iteration_with_legacy_checkpoint_upgrade(
+                    &iteration,
+                    candidate,
+                    evaluation.as_ref(),
+                    &checkpoint,
+                )?;
+                allow_legacy_checkpoint_upgrade = false;
+            } else {
+                self.store.append_iteration_with_checkpoint(
+                    &iteration,
+                    candidate,
+                    evaluation.as_ref(),
+                    &checkpoint,
+                )?;
+            }
             total_iterations += 1;
             new_iterations += 1;
             if kept >= mission.completion_policy.min_kept_candidates {
@@ -565,7 +599,7 @@ fn historical_evaluation(payload: &serde_json::Value) -> Result<CandidateEvaluat
     );
     if !pre_predictive_schema {
         evaluation
-            .validate()
+            .validate_for_historical_search_replay()
             .map_err(|error| format!("historical evaluation is invalid: {error}"))?;
     }
     Ok(evaluation)
@@ -768,6 +802,10 @@ mod tests {
     }
 
     fn dataset() -> PreparedDataset {
+        dataset_with_frequency(1_000)
+    }
+
+    fn dataset_with_frequency(observation_frequency_millis: u64) -> PreparedDataset {
         let start = Utc::now();
         let rows = (0..50)
             .map(|index| ResearchRow {
@@ -798,7 +836,7 @@ mod tests {
                 },
                 EvaluationLabelSpecV1 {
                     horizon_buckets: 1,
-                    observation_frequency_millis: 1_000,
+                    observation_frequency_millis,
                 },
             )
             .unwrap(),
@@ -842,6 +880,19 @@ mod tests {
         assert_eq!(restored.score, evaluation.score);
         assert!(restored.metrics.net_sharpe.is_nan());
         assert!(restored.validate().is_err());
+
+        let mut unbound_v3 = evaluation;
+        unbound_v3.evaluator_version = alpha_domain::WALK_FORWARD_EVALUATOR_VERSION.to_string();
+        unbound_v3.evaluator_config =
+            serde_json::to_value(alpha_domain::FormulaEvaluatorConfig::for_trials(1).unwrap())
+                .unwrap();
+        unbound_v3.evaluation_protocol = None;
+        unbound_v3.evaluation_protocol_hash = None;
+        unbound_v3.passed = false;
+        unbound_v3.failure_reasons = vec!["legacy walk-forward evidence".to_string()];
+        let restored = historical_evaluation(&serde_json::to_value(&unbound_v3).unwrap()).unwrap();
+        assert!(restored.validate().is_err());
+        assert!(restored.validate_for_historical_search_replay().is_ok());
     }
 
     #[test]
@@ -881,6 +932,164 @@ mod tests {
         let lineage = store.mission_lineage("mission-1").unwrap();
         assert_eq!(lineage.iterations.len(), 3);
         assert_eq!(lineage.evaluations.len(), 3);
+    }
+
+    #[test]
+    fn resume_replays_unbound_v3_history_without_making_it_governance_evidence() {
+        let input = dataset();
+        let proposal = EngineProposal {
+            candidate_id: "mission-1-candidate-0".to_string(),
+            hypothesis: "legacy v3 fixture".to_string(),
+            artifact: CandidateArtifact::Program(serde_json::json!({"op": "identity"})),
+            expansions: 1,
+            tokens: 0,
+            elapsed_ms: 1,
+        };
+        let mut legacy = PassingEvaluator
+            .evaluate(&proposal, &input.engine_context())
+            .unwrap();
+        legacy.evaluator_version = alpha_domain::WALK_FORWARD_EVALUATOR_VERSION.to_string();
+        legacy.evaluator_config =
+            serde_json::to_value(alpha_domain::FormulaEvaluatorConfig::for_trials(1).unwrap())
+                .unwrap();
+        legacy.evaluation_protocol = None;
+        legacy.evaluation_protocol_hash = None;
+        legacy.passed = false;
+        legacy.failure_reasons = vec!["legacy protocol was not persisted".to_string()];
+        assert!(legacy.validate().is_err());
+
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let created_at = Utc::now();
+        store
+            .transition_mission("mission-1", MissionStatus::Running, created_at)
+            .unwrap();
+        let iteration = ResearchIteration {
+            iteration_id: "mission-1-iteration-0".to_string(),
+            mission_id: "mission-1".to_string(),
+            parent_candidate_ids: vec![],
+            engine: EngineKind::ManualSeed,
+            hypothesis: proposal.hypothesis.clone(),
+            candidate_artifact_id: Some(proposal.candidate_id.clone()),
+            evaluation_artifact_id: Some("mission-1-evaluation-0".to_string()),
+            budget_usage: alpha_domain::SearchBudgetUsage {
+                candidates: 1,
+                expansions: 1,
+                tokens: 0,
+                elapsed_ms: 1,
+            },
+            verdict: IterationVerdict::Discard,
+            failure_class: None,
+            failure_explanation: Some(legacy.failure_reasons.join("; ")),
+            created_at,
+        };
+        let evaluation = EvaluationRecord {
+            evaluation_id: "mission-1-evaluation-0".to_string(),
+            mission_id: "mission-1".to_string(),
+            candidate_id: proposal.candidate_id.clone(),
+            payload: serde_json::to_value(&legacy).unwrap(),
+            created_at,
+        };
+        let checkpoint = RunCheckpoint {
+            mission_id: "mission-1".to_string(),
+            last_iteration_id: Some(iteration.iteration_id.clone()),
+            budget_usage: iteration.budget_usage.clone(),
+            evaluation_protocol_hash: Some(input.protocol().content_hash().unwrap()),
+            engine_kind: EngineKind::ManualSeed,
+            engine_version: 1,
+            engine_state: serde_json::json!({"mode": "history_replay"}),
+            updated_at: created_at,
+        };
+        store
+            .bind_mission_evaluation_protocol("mission-1", true, input.protocol(), created_at)
+            .unwrap();
+        store
+            .append_iteration_with_checkpoint(
+                &iteration,
+                Some((&proposal.candidate_id, &proposal.artifact)),
+                Some(&evaluation),
+                &checkpoint,
+            )
+            .unwrap();
+        store
+            .rewrite_checkpoint_as_legacy_unbound_test_fixture("mission-1")
+            .unwrap();
+        assert!(store
+            .get_checkpoint("mission-1")
+            .unwrap()
+            .evaluation_protocol_hash
+            .is_none());
+
+        let outcome = AutoResearchKernel::new(
+            &mut store,
+            CountingEngine {
+                calls: Arc::new(AtomicUsize::new(0)),
+                crash: false,
+            },
+            PassingEvaluator,
+        )
+        .run(
+            "mission-1",
+            &input,
+            RunControl {
+                max_new_iterations: Some(1),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.new_iterations, 1);
+        assert!(legacy.validate().is_err());
+        assert_eq!(
+            store
+                .get_checkpoint("mission-1")
+                .unwrap()
+                .evaluation_protocol_hash,
+            Some(input.protocol().content_hash().unwrap())
+        );
+    }
+
+    #[test]
+    fn resume_rejects_checkpoint_protocol_drift_before_running_the_engine() {
+        let input = dataset();
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        AutoResearchKernel::new(
+            &mut store,
+            CountingEngine {
+                calls: Arc::new(AtomicUsize::new(0)),
+                crash: false,
+            },
+            PassingEvaluator,
+        )
+        .run(
+            "mission-1",
+            &input,
+            RunControl {
+                max_new_iterations: Some(1),
+            },
+        )
+        .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let error = AutoResearchKernel::new(
+            &mut store,
+            CountingEngine {
+                calls: calls.clone(),
+                crash: false,
+            },
+            PassingEvaluator,
+        )
+        .run(
+            "mission-1",
+            &dataset_with_frequency(2_000),
+            RunControl {
+                max_new_iterations: Some(1),
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, EngineError::Checkpoint(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

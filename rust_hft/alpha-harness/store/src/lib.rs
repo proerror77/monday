@@ -2,13 +2,13 @@
 
 use alpha_domain::{
     canonical_json_hash, AllowedIntentType, AttributionKind, AttributionMode, CandidateArtifact,
-    CandidateEvaluation, DeploymentEnvelope, EngineKind, FormulaEvaluatorConfig, IterationVerdict,
-    LearningDirective, LiveSmallEligibilityEvidence, LoopRun, MissionStatus, MissionTerminalReason,
-    PromotionRecord, ResearchIteration, ResearchMission, RuntimeAttributionEvent,
-    SearchBudgetUsage, SearchPolicyRevision, SignedDeploymentEnvelope, StrategyBundle,
-    StrategyBundleArtifact, ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION,
-    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
-    WALK_FORWARD_EVALUATOR_VERSION,
+    CandidateEvaluation, DeploymentEnvelope, EngineKind, EvaluationProtocolV1,
+    FormulaEvaluatorConfig, IterationVerdict, LearningDirective, LiveSmallEligibilityEvidence,
+    LoopRun, MissionStatus, MissionTerminalReason, PromotionRecord, ResearchIteration,
+    ResearchMission, RuntimeAttributionEvent, SearchBudgetUsage, SearchPolicyRevision,
+    SignedDeploymentEnvelope, StrategyBundle, StrategyBundleArtifact,
+    ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
+    SEALED_HOLDOUT_EVALUATOR_VERSION, WALK_FORWARD_EVALUATOR_VERSION,
 };
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, Transaction};
@@ -28,9 +28,55 @@ const MIGRATION_002: &str = include_str!("../migrations/002_promotion_bundles.sq
 const MIGRATION_003: &str = include_str!("../migrations/003_loop_runs_and_engine_checkpoints.sql");
 const INTEGRITY_KEY_ENV: &str = "ALPHA_STORE_INTEGRITY_KEY_HEX";
 const INTEGRITY_KEY_BYTES: usize = 32;
+const MISSION_EVALUATION_PROTOCOL_KIND: &str = "mission_evaluation_protocol";
 
 fn sealed_evaluation_revision_id(candidate_id: &str, evaluator_version: &str) -> String {
     format!("sealed-evaluation:{evaluator_version}:{candidate_id}")
+}
+
+fn mission_evaluation_protocol_revision_id(mission_id: &str) -> String {
+    format!("mission-evaluation-protocol:{mission_id}")
+}
+
+fn validate_mission_evaluation_protocol_revision(
+    revision: &RegistryRevision,
+    mission_id: &str,
+) -> Result<MissionEvaluationProtocolBinding, StoreError> {
+    if revision.registry_kind != MISSION_EVALUATION_PROTOCOL_KIND || revision.asset_id != mission_id
+    {
+        return Err(StoreError::Domain(
+            "mission evaluation protocol binding is invalid".to_string(),
+        ));
+    }
+    let binding: MissionEvaluationProtocolBinding =
+        serde_json::from_value(revision.payload.clone()).map_err(serialization_error)?;
+    binding
+        .evaluation_protocol
+        .validate()
+        .map_err(domain_error)?;
+    if binding
+        .evaluation_protocol
+        .content_hash()
+        .map_err(domain_error)?
+        != binding.evaluation_protocol_hash
+    {
+        return Err(StoreError::Domain(
+            "mission evaluation protocol binding is invalid".to_string(),
+        ));
+    }
+    Ok(binding)
+}
+
+fn mission_evaluation_protocol_binding(
+    connection: &Connection,
+    mission_id: &str,
+) -> Result<MissionEvaluationProtocolBinding, StoreError> {
+    let revision: RegistryRevision = read_json_row(
+        connection,
+        "SELECT payload_json, content_hash FROM registry_revisions WHERE revision_id = ?",
+        &mission_evaluation_protocol_revision_id(mission_id),
+    )?;
+    validate_mission_evaluation_protocol_revision(&revision, mission_id)
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +112,9 @@ pub struct RunCheckpoint {
     pub mission_id: String,
     pub last_iteration_id: Option<String>,
     pub budget_usage: SearchBudgetUsage,
+    /// `None` is accepted only for checkpoint records written before protocol binding existed.
+    #[serde(default)]
+    pub evaluation_protocol_hash: Option<String>,
     pub engine_kind: EngineKind,
     pub engine_version: u32,
     pub engine_state: serde_json::Value,
@@ -113,6 +162,15 @@ pub struct RegistryRevision {
     pub parent_revision_id: Option<String>,
     pub payload: serde_json::Value,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MissionEvaluationProtocolBinding {
+    evaluation_protocol: EvaluationProtocolV1,
+    evaluation_protocol_hash: String,
+    #[serde(default)]
+    legacy_history_unbound: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,12 +565,42 @@ impl AlphaStore {
         evaluation: Option<&EvaluationRecord>,
         checkpoint: &RunCheckpoint,
     ) -> Result<(), StoreError> {
+        self.append_iteration_with_checkpoint_mode(
+            iteration, candidate, evaluation, checkpoint, false,
+        )
+    }
+
+    pub fn append_iteration_with_legacy_checkpoint_upgrade(
+        &mut self,
+        iteration: &ResearchIteration,
+        candidate: Option<(&str, &CandidateArtifact)>,
+        evaluation: Option<&EvaluationRecord>,
+        checkpoint: &RunCheckpoint,
+    ) -> Result<(), StoreError> {
+        self.append_iteration_with_checkpoint_mode(
+            iteration, candidate, evaluation, checkpoint, true,
+        )
+    }
+
+    fn append_iteration_with_checkpoint_mode(
+        &mut self,
+        iteration: &ResearchIteration,
+        candidate: Option<(&str, &CandidateArtifact)>,
+        evaluation: Option<&EvaluationRecord>,
+        checkpoint: &RunCheckpoint,
+        allow_legacy_protocol_upgrade: bool,
+    ) -> Result<(), StoreError> {
         validate_iteration_records(iteration, candidate, evaluation)?;
         validate_checkpoint_for_iteration(checkpoint, iteration)?;
         let transaction = self.connection.transaction().map_err(database_error)?;
         let iteration_hash =
             insert_iteration_records(&transaction, iteration, candidate, evaluation)?;
-        let checkpoint_hash = upsert_checkpoint(&transaction, checkpoint, &self.integrity_key)?;
+        let checkpoint_hash = upsert_checkpoint(
+            &transaction,
+            checkpoint,
+            &self.integrity_key,
+            allow_legacy_protocol_upgrade,
+        )?;
         append_journal(
             &transaction,
             Some(&iteration.mission_id),
@@ -534,7 +622,7 @@ impl AlphaStore {
 
     pub fn save_checkpoint(&mut self, checkpoint: &RunCheckpoint) -> Result<(), StoreError> {
         let transaction = self.connection.transaction().map_err(database_error)?;
-        let hash = upsert_checkpoint(&transaction, checkpoint, &self.integrity_key)?;
+        let hash = upsert_checkpoint(&transaction, checkpoint, &self.integrity_key, false)?;
         append_journal(
             &transaction,
             Some(&checkpoint.mission_id),
@@ -573,6 +661,42 @@ impl AlphaStore {
                     &auth_tag,
                 )
             })
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn rewrite_checkpoint_as_legacy_unbound_test_fixture(
+        &mut self,
+        mission_id: &str,
+    ) -> Result<(), StoreError> {
+        let checkpoint = self.get_checkpoint(mission_id)?;
+        let mut value = serde_json::to_value(checkpoint).map_err(serialization_error)?;
+        value
+            .as_object_mut()
+            .ok_or_else(|| StoreError::Serialization("checkpoint is not an object".to_string()))?
+            .remove("evaluation_protocol_hash");
+        let checkpoint_json = serde_json::to_string(&value).map_err(serialization_error)?;
+        let content_hash = hex::encode(Sha256::digest(checkpoint_json.as_bytes()));
+        let auth_tag = authentication_tag(
+            &self.integrity_key,
+            "checkpoint",
+            mission_id,
+            &checkpoint_json,
+        )?;
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        transaction
+            .execute(
+                "UPDATE checkpoints SET checkpoint_json = ?, content_hash = ?, auth_tag = ? WHERE mission_id = ?",
+                params![checkpoint_json, content_hash, auth_tag, mission_id],
+            )
+            .map_err(database_error)?;
+        transaction
+            .execute(
+                "DELETE FROM registry_revisions WHERE revision_id = ?",
+                params![mission_evaluation_protocol_revision_id(mission_id)],
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)
     }
 
     pub fn fork_legacy_checkpoint(
@@ -823,6 +947,64 @@ impl AlphaStore {
         )
     }
 
+    pub fn bind_mission_evaluation_protocol(
+        &mut self,
+        mission_id: &str,
+        has_legacy_history: bool,
+        protocol: &EvaluationProtocolV1,
+        at: DateTime<Utc>,
+    ) -> Result<String, StoreError> {
+        self.get_mission(mission_id)?;
+        let evaluation_protocol_hash = protocol.content_hash().map_err(domain_error)?;
+        let revision_id = mission_evaluation_protocol_revision_id(mission_id);
+        match self.get_registry_revision(&revision_id) {
+            Ok(revision) => {
+                let binding = validate_mission_evaluation_protocol_revision(&revision, mission_id)?;
+                if binding.evaluation_protocol != *protocol
+                    || binding.evaluation_protocol_hash != evaluation_protocol_hash
+                {
+                    return Err(StoreError::Domain(
+                        "mission evaluation protocol drift is not allowed".to_string(),
+                    ));
+                }
+            }
+            Err(StoreError::NotFound) => {
+                let binding = MissionEvaluationProtocolBinding {
+                    evaluation_protocol: protocol.clone(),
+                    evaluation_protocol_hash: evaluation_protocol_hash.clone(),
+                    legacy_history_unbound: has_legacy_history,
+                };
+                self.put_registry_revision(&RegistryRevision {
+                    revision_id,
+                    registry_kind: MISSION_EVALUATION_PROTOCOL_KIND.to_string(),
+                    asset_id: mission_id.to_string(),
+                    parent_revision_id: None,
+                    payload: serde_json::to_value(binding).map_err(serialization_error)?,
+                    created_at: at,
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(evaluation_protocol_hash)
+    }
+
+    pub fn require_mission_evaluation_protocol(
+        &self,
+        mission_id: &str,
+        protocol: &EvaluationProtocolV1,
+    ) -> Result<String, StoreError> {
+        let binding = mission_evaluation_protocol_binding(&self.connection, mission_id)?;
+        let requested_hash = protocol.content_hash().map_err(domain_error)?;
+        if binding.evaluation_protocol != *protocol
+            || binding.evaluation_protocol_hash != requested_hash
+        {
+            return Err(StoreError::Domain(
+                "mission evaluation protocol drift is not allowed".to_string(),
+            ));
+        }
+        Ok(requested_hash)
+    }
+
     fn canonical_walk_forward_protocol_hash(
         &self,
         mission: &ResearchMission,
@@ -929,6 +1111,18 @@ impl AlphaStore {
                 "promotion candidate lacks canonical walk-forward evidence".to_string(),
             ));
         };
+        let mission_protocol_hash =
+            mission_evaluation_protocol_binding(&self.connection, &promotion.mission_id)?
+                .evaluation_protocol_hash;
+        if mission_protocol_hash != walk_forward_protocol_hash
+            || mission_protocol_hash != bundle.evaluation_protocol_hash
+            || mission_protocol_hash != promotion.evaluation_protocol_hash
+        {
+            return Err(StoreError::Domain(
+                "promotion evaluation protocol does not match the immutable mission binding"
+                    .to_string(),
+            ));
+        }
         let expected_sealed_evaluation_id =
             sealed_evaluation_revision_id(&bundle.candidate_id, &bundle.evaluator_version);
         if promotion.sealed_evaluation_id != expected_sealed_evaluation_id {
@@ -1089,6 +1283,15 @@ impl AlphaStore {
             "SELECT payload_json, content_hash FROM strategy_bundles WHERE bundle_id = ?",
             bundle_id,
         )?;
+        bundle.validate_for_readback().map_err(domain_error)?;
+        Ok(bundle)
+    }
+
+    pub fn get_canonical_strategy_bundle(
+        &self,
+        bundle_id: &str,
+    ) -> Result<StrategyBundle, StoreError> {
+        let bundle = self.get_strategy_bundle(bundle_id)?;
         bundle.validate().map_err(domain_error)?;
         Ok(bundle)
     }
@@ -1100,19 +1303,39 @@ impl AlphaStore {
             promotion_id,
         )?;
         let bundle = self.get_strategy_bundle(&record.bundle_id)?;
-        record.validate(&bundle).map_err(domain_error)?;
+        record
+            .validate_for_readback(&bundle)
+            .map_err(domain_error)?;
         Ok(StoredPromotion {
             record,
             content_hash,
         })
     }
 
+    pub fn get_canonical_promotion(
+        &self,
+        promotion_id: &str,
+    ) -> Result<StoredPromotion, StoreError> {
+        let promotion = self.get_promotion(promotion_id)?;
+        let bundle = self.get_canonical_strategy_bundle(&promotion.record.bundle_id)?;
+        promotion.record.validate(&bundle).map_err(domain_error)?;
+        let mission_protocol_hash =
+            mission_evaluation_protocol_binding(&self.connection, &promotion.record.mission_id)?
+                .evaluation_protocol_hash;
+        if mission_protocol_hash != promotion.record.evaluation_protocol_hash {
+            return Err(StoreError::Domain(
+                "promotion does not match the immutable mission evaluation protocol".to_string(),
+            ));
+        }
+        Ok(promotion)
+    }
+
     pub fn validate_deployment_binding(
         &self,
         envelope: &DeploymentEnvelope,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
-        let promotion = self.get_promotion(&envelope.promotion_id)?;
-        let bundle = self.get_strategy_bundle(&envelope.bundle_id)?;
+        let promotion = self.get_canonical_promotion(&envelope.promotion_id)?;
+        let bundle = self.get_canonical_strategy_bundle(&envelope.bundle_id)?;
         if promotion.record.bundle_id != envelope.bundle_id
             || promotion.record.bundle_hash != envelope.bundle_hash
             || promotion.record.candidate_id != envelope.asset_revision_id
@@ -1492,6 +1715,12 @@ impl AlphaStore {
         };
         let bundle = self.get_strategy_bundle(&promotion.bundle_id)?;
         promotion.validate(&bundle).map_err(domain_error)?;
+        if mission_evaluation_protocol_binding(&self.connection, mission_id)?
+            .evaluation_protocol_hash
+            != promotion.evaluation_protocol_hash
+        {
+            return Ok(None);
+        }
 
         let approvals = {
             let mut statement = self
@@ -2059,9 +2288,19 @@ fn upsert_checkpoint(
     transaction: &Transaction<'_>,
     checkpoint: &RunCheckpoint,
     integrity_key: &[u8; INTEGRITY_KEY_BYTES],
+    allow_legacy_protocol_upgrade: bool,
 ) -> Result<String, StoreError> {
     require_text(&checkpoint.mission_id)?;
-    if checkpoint.engine_version == 0 {
+    let evaluation_protocol_hash = checkpoint
+        .evaluation_protocol_hash
+        .as_deref()
+        .ok_or(StoreError::CheckpointMismatch)?;
+    if checkpoint.engine_version == 0
+        || evaluation_protocol_hash.len() != 64
+        || !evaluation_protocol_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(StoreError::CheckpointMismatch);
     }
     ensure_present(
@@ -2070,6 +2309,54 @@ fn upsert_checkpoint(
         "mission_id",
         &checkpoint.mission_id,
     )?;
+    let mission_binding = mission_evaluation_protocol_binding(transaction, &checkpoint.mission_id)?;
+    if mission_binding.evaluation_protocol_hash != evaluation_protocol_hash {
+        return Err(StoreError::CheckpointMismatch);
+    }
+    let existing = transaction
+        .query_row(
+            "SELECT checkpoint_json, content_hash, auth_tag FROM checkpoints WHERE mission_id = ?",
+            params![checkpoint.mission_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .map_err(map_query_error);
+    match existing {
+        Ok((checkpoint_json, content_hash, auth_tag)) => {
+            let existing: RunCheckpoint = decode_authenticated(
+                integrity_key,
+                "checkpoint",
+                &checkpoint.mission_id,
+                checkpoint_json
+                    .as_deref()
+                    .ok_or(StoreError::LegacyCheckpoint)?,
+                content_hash
+                    .as_deref()
+                    .ok_or(StoreError::LegacyCheckpoint)?,
+                auth_tag
+                    .as_deref()
+                    .ok_or(StoreError::MissingAuthenticityTag)?,
+            )?;
+            match existing.evaluation_protocol_hash.as_deref() {
+                Some(existing_hash) if existing_hash != evaluation_protocol_hash => {
+                    return Err(StoreError::CheckpointMismatch)
+                }
+                None if !allow_legacy_protocol_upgrade
+                    || !mission_binding.legacy_history_unbound =>
+                {
+                    return Err(StoreError::CheckpointMismatch)
+                }
+                Some(_) | None => {}
+            }
+        }
+        Err(StoreError::NotFound) => {}
+        Err(error) => return Err(error),
+    }
     if let Some(iteration_id) = checkpoint.last_iteration_id.as_deref() {
         ensure_present(transaction, "iterations", "iteration_id", iteration_id)?;
         let iteration: ResearchIteration = read_json_row(
@@ -2486,7 +2773,7 @@ mod tests {
                 initial_train_rows: 200,
                 validation_rows: 30,
                 fold_count: 2,
-                purge_rows: 1,
+                purge_rows: 5,
                 embargo_rows: 1,
                 sealed_holdout_rows: 30,
             },
@@ -2501,6 +2788,13 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn bind_evaluation_protocol(store: &mut AlphaStore) -> String {
+        let protocol = evaluation_protocol();
+        store
+            .bind_mission_evaluation_protocol("mission-1", false, &protocol, Utc::now())
+            .unwrap()
     }
 
     fn evaluation_fixture_with_protocol(
@@ -2592,7 +2886,7 @@ mod tests {
         now: DateTime<Utc>,
         engine: EngineKind,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
-        try_persist_formula_promotion_with_evidence(store, now, engine, true, None, None)
+        try_persist_formula_promotion_with_evidence(store, now, engine, true, None, None, true)
     }
 
     fn try_persist_formula_promotion_with_evidence(
@@ -2602,6 +2896,7 @@ mod tests {
         include_walk_forward: bool,
         sealed_revision_id: Option<&str>,
         sealed_protocol: Option<EvaluationProtocolV1>,
+        include_mission_binding: bool,
     ) -> Result<(StoredPromotion, StrategyBundle), StoreError> {
         let candidate = CandidateArtifact::Formula(FactorAst::Terminal(FactorTerminal::Field(
             "signal".to_string(),
@@ -2609,6 +2904,14 @@ mod tests {
         let mut candidate_iteration = iteration();
         candidate_iteration.engine = engine;
         let walk_forward_protocol = evaluation_protocol();
+        if include_mission_binding {
+            store.bind_mission_evaluation_protocol(
+                "mission-1",
+                false,
+                &walk_forward_protocol,
+                now,
+            )?;
+        }
         let walk_forward = include_walk_forward.then(|| EvaluationRecord {
             evaluation_id: "evaluation-1".to_string(),
             mission_id: "mission-1".to_string(),
@@ -2810,6 +3113,111 @@ mod tests {
     }
 
     #[test]
+    fn canonical_promotion_eligibility_requires_the_mission_protocol_binding() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let (promotion, _) = persist_formula_promotion(&mut store, Utc::now());
+        store
+            .connection
+            .execute(
+                "DELETE FROM registry_revisions WHERE revision_id = ?",
+                params![mission_evaluation_protocol_revision_id("mission-1")],
+            )
+            .unwrap();
+
+        assert!(store.get_promotion(&promotion.record.promotion_id).is_ok());
+        assert!(store
+            .get_canonical_promotion(&promotion.record.promotion_id)
+            .is_err());
+    }
+
+    #[test]
+    fn legacy_promotion_and_bundle_are_readable_but_not_canonical() {
+        #[derive(Serialize)]
+        struct LegacySignableBundle<'a> {
+            candidate_content_hash: &'a str,
+            dataset_manifest_id: &'a ManifestId,
+            evaluator_version: &'a str,
+            evaluator_config_hash: &'a str,
+            evaluation_metrics_hash: &'a str,
+            sealed_evaluation_hash: &'a str,
+            artifact: &'a StrategyBundleArtifact,
+        }
+
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let (promotion, bundle) = persist_formula_promotion(&mut store, Utc::now());
+        let legacy_bundle_hash = canonical_json_hash(&LegacySignableBundle {
+            candidate_content_hash: &bundle.candidate_content_hash,
+            dataset_manifest_id: &bundle.dataset_manifest_id,
+            evaluator_version: &bundle.evaluator_version,
+            evaluator_config_hash: &bundle.evaluator_config_hash,
+            evaluation_metrics_hash: &bundle.evaluation_metrics_hash,
+            sealed_evaluation_hash: &bundle.sealed_evaluation_hash,
+            artifact: &bundle.artifact,
+        })
+        .unwrap();
+
+        let mut legacy_bundle = serde_json::to_value(&bundle).unwrap();
+        let bundle_object = legacy_bundle.as_object_mut().unwrap();
+        bundle_object.remove("evaluation_protocol_hash");
+        bundle_object.insert(
+            "bundle_hash".to_string(),
+            serde_json::Value::String(legacy_bundle_hash.clone()),
+        );
+        let legacy_bundle_json = serde_json::to_string(&legacy_bundle).unwrap();
+        let legacy_bundle_content_hash = hex::encode(Sha256::digest(legacy_bundle_json.as_bytes()));
+
+        let mut legacy_promotion = serde_json::to_value(&promotion.record).unwrap();
+        let promotion_object = legacy_promotion.as_object_mut().unwrap();
+        promotion_object.remove("evaluation_protocol_hash");
+        promotion_object.insert(
+            "bundle_hash".to_string(),
+            serde_json::Value::String(legacy_bundle_hash),
+        );
+        let legacy_promotion_json = serde_json::to_string(&legacy_promotion).unwrap();
+        let legacy_promotion_content_hash =
+            hex::encode(Sha256::digest(legacy_promotion_json.as_bytes()));
+
+        store
+            .connection
+            .execute(
+                "UPDATE strategy_bundles SET payload_json = ?, content_hash = ? WHERE bundle_id = ?",
+                params![
+                    legacy_bundle_json,
+                    legacy_bundle_content_hash,
+                    bundle.bundle_id
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE promotions SET payload_json = ?, content_hash = ? WHERE promotion_id = ?",
+                params![
+                    legacy_promotion_json,
+                    legacy_promotion_content_hash,
+                    promotion.record.promotion_id
+                ],
+            )
+            .unwrap();
+
+        let readable_bundle = store.get_strategy_bundle(&bundle.bundle_id).unwrap();
+        let readable_promotion = store.get_promotion(&promotion.record.promotion_id).unwrap();
+        assert!(readable_bundle.evaluation_protocol_hash.is_empty());
+        assert!(readable_promotion
+            .record
+            .evaluation_protocol_hash
+            .is_empty());
+        assert!(store
+            .get_canonical_strategy_bundle(&bundle.bundle_id)
+            .is_err());
+        assert!(store
+            .get_canonical_promotion(&promotion.record.promotion_id)
+            .is_err());
+    }
+
+    #[test]
     fn promotion_rejects_missing_walk_forward_evidence_without_partial_bundle() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
@@ -2821,12 +3229,38 @@ mod tests {
             false,
             None,
             None,
+            true,
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("canonical walk-forward"));
         assert!(matches!(
             store.get_strategy_bundle("bundle:candidate-1"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn promotion_rejects_missing_mission_protocol_binding_without_partial_bundle() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+
+        assert!(try_persist_formula_promotion_with_evidence(
+            &mut store,
+            Utc::now(),
+            EngineKind::ManualSeed,
+            true,
+            None,
+            None,
+            false,
+        )
+        .is_err());
+        assert!(matches!(
+            store.get_strategy_bundle("bundle:candidate-1"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.get_promotion("promotion-1"),
             Err(StoreError::NotFound)
         ));
     }
@@ -2864,7 +3298,7 @@ mod tests {
         changed.walk_forward.sealed_holdout_rows += 1;
         variants.push(("sealed_holdout", changed));
         let mut changed = base.clone();
-        changed.labels.horizon_buckets += 1;
+        changed.labels.horizon_buckets = 4;
         variants.push(("label_horizon", changed));
         let mut changed = base;
         changed.labels.observation_frequency_millis += 1;
@@ -2881,6 +3315,7 @@ mod tests {
                 true,
                 None,
                 Some(sealed_protocol),
+                true,
             )
             .expect_err(field);
 
@@ -2908,6 +3343,7 @@ mod tests {
             true,
             Some("legacy-sealed-evaluation:candidate-1"),
             None,
+            true,
         )
         .unwrap_err();
 
@@ -3256,6 +3692,31 @@ mod tests {
     }
 
     #[test]
+    fn mission_evaluation_protocol_binding_is_immutable() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let protocol = evaluation_protocol();
+        let hash = store
+            .bind_mission_evaluation_protocol("mission-1", false, &protocol, Utc::now())
+            .unwrap();
+        assert_eq!(
+            store
+                .require_mission_evaluation_protocol("mission-1", &protocol)
+                .unwrap(),
+            hash
+        );
+
+        let mut drifted = protocol;
+        drifted.costs.fee_bps += 1.0;
+        assert!(store
+            .bind_mission_evaluation_protocol("mission-1", false, &drifted, Utc::now())
+            .is_err());
+        assert!(store
+            .require_mission_evaluation_protocol("mission-1", &drifted)
+            .is_err());
+    }
+
+    #[test]
     fn mission_read_rejects_payload_tampering() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
@@ -3295,6 +3756,7 @@ mod tests {
             mission_id: iteration.mission_id.clone(),
             last_iteration_id: Some(iteration.iteration_id.clone()),
             budget_usage: iteration.budget_usage.clone(),
+            evaluation_protocol_hash: Some(evaluation_protocol().content_hash().unwrap()),
             engine_kind: iteration.engine.clone(),
             engine_version: 1,
             engine_state: serde_json::json!({"mode": "test"}),
@@ -3303,6 +3765,7 @@ mod tests {
         {
             let mut store = AlphaStore::open(&path).unwrap();
             store.create_mission(&mission()).unwrap();
+            bind_evaluation_protocol(&mut store);
             store.append_iteration(&iteration, None, None).unwrap();
             store.save_checkpoint(&checkpoint).unwrap();
         }
@@ -3311,14 +3774,51 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_rejects_unbound_or_rewritten_protocol_hashes() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        let protocol_hash = bind_evaluation_protocol(&mut store);
+        let iteration = iteration_without_candidate();
+        let mut checkpoint = RunCheckpoint {
+            mission_id: iteration.mission_id.clone(),
+            last_iteration_id: Some(iteration.iteration_id.clone()),
+            budget_usage: iteration.budget_usage.clone(),
+            evaluation_protocol_hash: None,
+            engine_kind: iteration.engine.clone(),
+            engine_version: 1,
+            engine_state: serde_json::json!({"mode": "exact"}),
+            updated_at: iteration.created_at,
+        };
+        assert!(store
+            .append_iteration_with_checkpoint(&iteration, None, None, &checkpoint)
+            .is_err());
+        assert!(store
+            .mission_lineage("mission-1")
+            .unwrap()
+            .iterations
+            .is_empty());
+
+        checkpoint.evaluation_protocol_hash = Some(protocol_hash);
+        store
+            .append_iteration_with_checkpoint(&iteration, None, None, &checkpoint)
+            .unwrap();
+        let canonical = store.get_checkpoint("mission-1").unwrap();
+        checkpoint.evaluation_protocol_hash = Some("f".repeat(64));
+        assert!(store.save_checkpoint(&checkpoint).is_err());
+        assert_eq!(store.get_checkpoint("mission-1").unwrap(), canonical);
+    }
+
+    #[test]
     fn iteration_and_checkpoint_commit_atomically() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
+        bind_evaluation_protocol(&mut store);
         let iteration = iteration_without_candidate();
         let checkpoint = RunCheckpoint {
             mission_id: iteration.mission_id.clone(),
             last_iteration_id: Some(iteration.iteration_id.clone()),
             budget_usage: iteration.budget_usage.clone(),
+            evaluation_protocol_hash: Some(evaluation_protocol().content_hash().unwrap()),
             engine_kind: iteration.engine.clone(),
             engine_version: 0,
             engine_state: serde_json::json!({}),
@@ -3343,12 +3843,14 @@ mod tests {
     fn checkpoint_read_fails_closed_on_legacy_or_tampered_payloads() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
+        bind_evaluation_protocol(&mut store);
         let iteration = iteration_without_candidate();
         store.append_iteration(&iteration, None, None).unwrap();
         let checkpoint = RunCheckpoint {
             mission_id: iteration.mission_id.clone(),
             last_iteration_id: Some(iteration.iteration_id.clone()),
             budget_usage: iteration.budget_usage.clone(),
+            evaluation_protocol_hash: Some(evaluation_protocol().content_hash().unwrap()),
             engine_kind: iteration.engine,
             engine_version: 1,
             engine_state: serde_json::json!({"mode": "exact"}),
@@ -3383,12 +3885,14 @@ mod tests {
     fn checkpoint_and_loop_run_require_keyed_authenticity() {
         let mut store = AlphaStore::open_in_memory().unwrap();
         store.create_mission(&mission()).unwrap();
+        bind_evaluation_protocol(&mut store);
         let iteration = iteration_without_candidate();
         store.append_iteration(&iteration, None, None).unwrap();
         let mut checkpoint = RunCheckpoint {
             mission_id: iteration.mission_id.clone(),
             last_iteration_id: Some(iteration.iteration_id.clone()),
             budget_usage: iteration.budget_usage.clone(),
+            evaluation_protocol_hash: Some(evaluation_protocol().content_hash().unwrap()),
             engine_kind: iteration.engine,
             engine_version: 1,
             engine_state: serde_json::json!({"mode": "exact"}),
@@ -3449,6 +3953,7 @@ mod tests {
         {
             let mut store = AlphaStore::open(&path).unwrap();
             store.create_mission(&mission()).unwrap();
+            bind_evaluation_protocol(&mut store);
             let iteration = iteration_without_candidate();
             store.append_iteration(&iteration, None, None).unwrap();
             store
@@ -3456,6 +3961,7 @@ mod tests {
                     mission_id: iteration.mission_id.clone(),
                     last_iteration_id: Some(iteration.iteration_id.clone()),
                     budget_usage: iteration.budget_usage.clone(),
+                    evaluation_protocol_hash: Some(evaluation_protocol().content_hash().unwrap()),
                     engine_kind: iteration.engine,
                     engine_version: 1,
                     engine_state: serde_json::json!({"mode": "exact"}),

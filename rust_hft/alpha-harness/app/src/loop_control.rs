@@ -854,7 +854,7 @@ mod tests {
                         initial_train_rows: 1,
                         validation_rows: 30,
                         fold_count: 2,
-                        purge_rows: 0,
+                        purge_rows: 1,
                         embargo_rows: 0,
                         sealed_holdout_rows: 30,
                         fee_bps: 1.0,
@@ -908,7 +908,7 @@ mod tests {
                 initial_train_rows: 1,
                 validation_rows: 30,
                 fold_count: 2,
-                purge_rows: 0,
+                purge_rows: 1,
                 embargo_rows: 0,
                 sealed_holdout_rows: 30,
             },
@@ -957,10 +957,42 @@ mod tests {
         candidate_id: &str,
         engine: EngineKind,
     ) {
+        create_completed_mission_with_engine_and_dataset(
+            db,
+            mission_id,
+            candidate_id,
+            engine,
+            None,
+        );
+    }
+
+    fn create_completed_mission_with_engine_and_dataset(
+        db: &PathBuf,
+        mission_id: &str,
+        candidate_id: &str,
+        engine: EngineKind,
+        dataset: Option<&DatasetManifest>,
+    ) {
         let now = Utc::now();
         let mut store = AlphaStore::open(db).unwrap();
-        let mission = mission_fixture(now, mission_id);
+        let mut mission = mission_fixture(now, mission_id);
+        if let Some(dataset) = dataset {
+            mission.dataset_manifest_id =
+                serde_json::from_value(serde_json::json!(dataset.manifest_id)).unwrap();
+        }
         store.create_mission(&mission).unwrap();
+        if let Some(dataset) = dataset {
+            store
+                .put_registry_revision(&RegistryRevision {
+                    revision_id: dataset.manifest_id.clone(),
+                    registry_kind: "dataset".to_string(),
+                    asset_id: dataset.symbol.clone(),
+                    parent_revision_id: None,
+                    payload: serde_json::to_value(dataset).unwrap(),
+                    created_at: dataset.created_at,
+                })
+                .unwrap();
+        }
         let evaluation_id = format!("evaluation-{mission_id}");
         let iteration = ResearchIteration {
             iteration_id: format!("iteration-{mission_id}"),
@@ -1012,6 +1044,12 @@ mod tests {
 
     fn add_sealed_holdout_pass(db: &PathBuf, mission_id: &str, candidate_id: &str) {
         let mut store = AlphaStore::open(db).unwrap();
+        let dataset_manifest_id = store
+            .get_mission(mission_id)
+            .unwrap()
+            .dataset_manifest_id
+            .as_str()
+            .to_string();
         let candidate_hash = store
             .mission_lineage(mission_id)
             .unwrap()
@@ -1038,7 +1076,7 @@ mod tests {
                 payload: serde_json::json!({
                     "mission_id": mission_id,
                     "candidate_content_hash": candidate_hash,
-                    "dataset_manifest_id": "dataset-loop",
+                    "dataset_manifest_id": dataset_manifest_id,
                     "evaluation_protocol_hash": evaluation_protocol_hash,
                     "evaluation": evaluation,
                 }),
@@ -1278,7 +1316,14 @@ mod tests {
         let db = temp_db_path("alpha-loop-legacy-sealed");
         let mission_id = "mission-loop";
         let candidate_id = "candidate-1";
-        create_completed_mission(&db, mission_id, candidate_id);
+        let (directory, manifest_path, manifest) = governed_dataset_fixture(mission_id);
+        create_completed_mission_with_engine_and_dataset(
+            &db,
+            mission_id,
+            candidate_id,
+            EngineKind::ManualSeed,
+            Some(&manifest),
+        );
         let mut store = AlphaStore::open(&db).unwrap();
         let candidate_hash = store.mission_lineage(mission_id).unwrap().candidates[0]
             .content_hash
@@ -1295,7 +1340,7 @@ mod tests {
                 payload: serde_json::json!({
                     "mission_id": mission_id,
                     "candidate_content_hash": candidate_hash,
-                    "dataset_manifest_id": "dataset-loop",
+                    "dataset_manifest_id": manifest.manifest_id,
                     "evaluation": {
                         "passed": true,
                         "score": 1.0,
@@ -1308,7 +1353,8 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        let mut args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        args.mission.dataset.dataset_manifest = manifest_path;
         let error = governance::evaluate(EvaluateArgs {
             db: db.clone(),
             mission_id: mission_id.to_string(),
@@ -1319,6 +1365,7 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("legacy or malformed"));
         let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1326,15 +1373,18 @@ mod tests {
         let db = temp_db_path("alpha-loop-offline-rl-lab");
         let mission_id = "mission-loop";
         let candidate_id = "candidate-rl";
-        create_completed_mission_with_engine(
+        let (directory, manifest_path, manifest) = governed_dataset_fixture(mission_id);
+        create_completed_mission_with_engine_and_dataset(
             &db,
             mission_id,
             candidate_id,
             EngineKind::OfflineReinforcementLearning,
+            Some(&manifest),
         );
         add_sealed_holdout_pass(&db, mission_id, candidate_id);
 
-        let args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        let mut args = loop_args(db.clone(), mission_id, LoopTargetChoice::HoldoutPassed);
+        args.mission.dataset.dataset_manifest = manifest_path;
         let dataset = args.mission.dataset.clone();
         run_loop(args).unwrap();
         let run = AlphaStore::open(&db)
@@ -1364,6 +1414,7 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("lab search-policy output"));
         let _ = std::fs::remove_file(db);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1495,7 +1546,13 @@ mod tests {
         let research_rows = data_mission::load_research_rows(&manifest, 0.0, 0.0, 0.0).unwrap();
         let prepared = prepare_dataset(
             research_rows,
-            &dataset_args.validation.evaluation_protocol().unwrap(),
+            &dataset_args
+                .validation
+                .evaluation_protocol(&alpha_domain::EvaluationLabelSpecV1 {
+                    horizon_buckets: 1,
+                    observation_frequency_millis: 60_000,
+                })
+                .unwrap(),
             format!("sealed:{}", manifest.manifest_id),
         )
         .unwrap();

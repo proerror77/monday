@@ -173,7 +173,15 @@ pub struct ValidationArgs {
 }
 
 impl ValidationArgs {
-    pub fn evaluation_protocol(&self) -> Result<EvaluationProtocolV1, alpha_domain::DomainError> {
+    pub fn evaluation_protocol(
+        &self,
+        labels: &EvaluationLabelSpecV1,
+    ) -> Result<EvaluationProtocolV1, alpha_domain::DomainError> {
+        if self.label_horizon_buckets != labels.horizon_buckets
+            || self.observation_frequency_millis != labels.observation_frequency_millis
+        {
+            return Err(alpha_domain::DomainError::InvalidEvaluationProtocol);
+        }
         EvaluationProtocolV1::new(
             EvaluationWalkForwardV1 {
                 initial_train_rows: self.initial_train_rows,
@@ -188,10 +196,7 @@ impl ValidationArgs {
                 funding_bps: self.funding_bps,
                 latency_bps: self.latency_bps,
             },
-            EvaluationLabelSpecV1 {
-                horizon_buckets: self.label_horizon_buckets,
-                observation_frequency_millis: self.observation_frequency_millis,
-            },
+            labels.clone(),
         )
     }
 }
@@ -569,7 +574,7 @@ mod tests {
             initial_train_rows: 200,
             validation_rows: 64,
             fold_count: 3,
-            purge_rows: 1,
+            purge_rows: 5,
             embargo_rows: 1,
             sealed_holdout_rows: 64,
             fee_bps: 1.0,
@@ -579,13 +584,25 @@ mod tests {
             observation_frequency_millis: 1_000,
         };
 
-        let protocol = args.evaluation_protocol().unwrap();
+        let protocol = args
+            .evaluation_protocol(&EvaluationLabelSpecV1 {
+                horizon_buckets: 5,
+                observation_frequency_millis: 1_000,
+            })
+            .unwrap();
 
         assert_eq!(protocol.labels.horizon_buckets, 5);
         assert_eq!(protocol.labels.observation_frequency_millis, 1_000);
         assert_eq!(
             protocol.metrics,
             alpha_domain::EvaluationMetricDefinitionsV1::default()
+        );
+        assert_eq!(
+            args.evaluation_protocol(&EvaluationLabelSpecV1 {
+                horizon_buckets: 4,
+                observation_frequency_millis: 1_000,
+            }),
+            Err(alpha_domain::DomainError::InvalidEvaluationProtocol)
         );
     }
 

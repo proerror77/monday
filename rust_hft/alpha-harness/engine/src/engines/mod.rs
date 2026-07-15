@@ -58,7 +58,7 @@ fn test_dataset() -> crate::evaluation::PreparedDataset {
                 initial_train_rows: 1,
                 validation_rows: 1,
                 fold_count: 1,
-                purge_rows: 0,
+                purge_rows: 1,
                 embargo_rows: 0,
                 sealed_holdout_rows: 1,
             },

@@ -215,7 +215,7 @@ mod tests {
                 initial_train_rows: 1,
                 validation_rows: 250,
                 fold_count: 2,
-                purge_rows: 0,
+                purge_rows: 1,
                 embargo_rows: 0,
                 sealed_holdout_rows: 1,
             },

@@ -60,7 +60,8 @@ pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<Mi
         args.dataset.validation.funding_bps,
         args.dataset.validation.latency_bps,
     )?;
-    let protocol = args.dataset.validation.evaluation_protocol()?;
+    let labels = manifest.evaluation_label_spec()?;
+    let protocol = args.dataset.validation.evaluation_protocol(&labels)?;
     let dataset = prepare_dataset(
         rows,
         &protocol,
