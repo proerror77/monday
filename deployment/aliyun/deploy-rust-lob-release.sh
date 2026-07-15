@@ -94,7 +94,7 @@ for asset in "${assets[@]}"; do
 done
 
 BUNDLE_PATH="$TMP_DIR/deployment.tar"
-tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@]}"
+COPYFILE_DISABLE=1 tar -C "$SCRIPT_DIR" -cf "$BUNDLE_PATH" "${assets[@]}"
 if command -v sha256sum >/dev/null 2>&1; then
   BUNDLE_SHA256=$(sha256sum "$BUNDLE_PATH" | awk '{print $1}')
 else
@@ -189,6 +189,7 @@ if ! id hftcollector >/dev/null 2>&1; then
     --shell /usr/sbin/nologin hftcollector
 fi
 install -d -m 0755 /opt/monday/bin
+install -d -m 0755 /opt/monday/releases
 release_root=/opt/monday/releases/binance-lob-archiver
 release_dir="$release_root/$artifact_sha256"
 release_binary="$release_dir/binance-lob-archiver"
