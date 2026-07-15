@@ -1,0 +1,44 @@
+schema_version: v2
+quotes_only: true
+
+engine:
+  queue_capacity: 1024
+  stale_us: 1000000
+  top_n: 20
+  ack_timeout_ms: 3000
+  reconcile_interval_ms: 5000
+  balance_reconcile_tolerance_usd: 1
+  auto_cancel_exchange_only: false
+
+venues:
+  - name: binance-prediction-quotes
+    venue_type: BinancePrediction
+    rest: "https://api.binance.com"
+    api_key: "${BINANCE_PREDICTION_API_KEY}"
+    secret: "${BINANCE_PREDICTION_API_SECRET}"
+    execution_mode: Paper
+    capabilities:
+      ws_order_placement: false
+      snapshot_crc: false
+      all_in_one_topics: false
+      private_ws_heartbeat: false
+      use_incremental_books: false
+    simulate_execution: false
+    symbol_catalog:
+      - "REPLACE_WITH_OUTCOME_TOKEN_ID@BINANCE_PREDICTION"
+    data_config:
+      poll_interval_ms: 1000
+      outcomes:
+        - token_id: "REPLACE_WITH_OUTCOME_TOKEN_ID"
+          market_id: 1
+          vendor: predict_fun
+
+strategies: []
+
+risk:
+  risk_type: Default
+  global_position_limit: 0
+  global_notional_limit: 0
+  max_daily_trades: 0
+  max_orders_per_second: 0
+  staleness_threshold_us: 1000000

@@ -5066,6 +5066,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hft-data-adapter-binance-prediction"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "binance-sdk",
+ "futures",
+ "hft-core",
+ "hft-ports",
+ "rust_decimal",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "hft-data-adapter-bitget"
 version = "0.1.0"
 dependencies = [
@@ -5935,6 +5949,7 @@ dependencies = [
  "hft-data-adapter-asterdex",
  "hft-data-adapter-backpack",
  "hft-data-adapter-binance",
+ "hft-data-adapter-binance-prediction",
  "hft-data-adapter-bitget",
  "hft-data-adapter-bybit",
  "hft-data-adapter-grvt",
