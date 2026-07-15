@@ -20,8 +20,8 @@ use ploy_research::{
     liquidity_gated_alpha_v1_with_deribit_and_pm_books, load_research_snapshot,
     mine_domain_autofactors_from_v2_with_guidance, read_mcts_search_state,
     review_fillability_v1_with_deribit_and_pm_books, review_repricing_ic_with_deribit_and_pm_books,
-    review_trade_formation_v1_with_deribit_and_pm_books, validate_snapshot_request_coverage,
-    walk_forward_factor_combo_v1_with_deribit_and_pm_books,
+    review_trade_formation_v1_with_deribit_and_pm_books, validate_prediction_research_prior,
+    validate_snapshot_request_coverage, walk_forward_factor_combo_v1_with_deribit_and_pm_books,
     walk_forward_factors_v2_with_deribit_and_pm_books,
     walk_forward_meta_label_v1_with_deribit_and_pm_books,
     walk_forward_settlement_probability_report_with_prior,
@@ -34,6 +34,7 @@ use ploy_research::{
     SettlementProbabilityPromotionGateOptions, SettlementProbabilityReportOptions,
     SettlementProbabilityWalkForwardOptions, TradeFormationReviewOptions,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
@@ -44,6 +45,33 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 fn flag_present(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+fn prediction_underlying_symbol(raw: &str) -> String {
+    let normalized = raw.trim().to_ascii_uppercase().replace(['/', '-', '_'], "");
+    for quote in ["USDT", "USDC", "USD"] {
+        if let Some(base) = normalized.strip_suffix(quote) {
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    normalized
+}
+
+fn validate_prediction_snapshot_contract_id(
+    prior_snapshot_id: &str,
+    snapshot_contract_hash: Option<&str>,
+) -> Result<(), String> {
+    let snapshot_contract_hash = snapshot_contract_hash
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "loaded snapshot is missing snapshot_contract_hash".to_string())?;
+    if prior_snapshot_id != snapshot_contract_hash {
+        return Err(format!(
+            "prediction research prior data_snapshot_id {prior_snapshot_id} does not match loaded snapshot_contract_hash {snapshot_contract_hash}"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_date_start(raw: &str) -> DateTime<Utc> {
@@ -163,7 +191,7 @@ fn replay_parity_evidence(path: &str) -> (bool, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::replay_parity_evidence;
+    use super::{replay_parity_evidence, validate_prediction_snapshot_contract_id};
     use std::fs;
 
     fn write_parity_fixture(name: &str, payload: &str) -> String {
@@ -235,6 +263,20 @@ mod tests {
         assert!(evidence.contains("runtime_ready=true"));
         assert!(evidence.contains("event_ready=true"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn prediction_prior_matches_snapshot_contract_hash_not_content_hash() {
+        let contract_hash = format!("sha256:{}", "a".repeat(64));
+        let content_hash = "b".repeat(64);
+
+        assert!(
+            validate_prediction_snapshot_contract_id(&contract_hash, Some(&contract_hash)).is_ok()
+        );
+        assert!(
+            validate_prediction_snapshot_contract_id(&content_hash, Some(&contract_hash)).is_err()
+        );
+        assert!(validate_prediction_snapshot_contract_id(&contract_hash, None).is_err());
     }
 }
 
@@ -392,6 +434,12 @@ async fn main() {
     let observation_sample_secs: i64 = flag_value(&args, "--observation-sample-secs")
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(30);
+    let event_window_secs = flag_value(&args, "--event-window-secs").map(|raw| {
+        raw.parse::<i64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| panic!("invalid --event-window-secs: {raw}"))
+    });
     let review = FactorReviewOptions {
         stake_usd: flag_value(&args, "--stake-usd")
             .and_then(|raw| raw.parse().ok())
@@ -431,7 +479,7 @@ async fn main() {
     let report_suite = ReportSuite::parse(flag_value(&args, "--report-suite"));
 
     eprintln!(
-        "factor_walk_forward_v2: {} -> {} for {:?}, stake_usd={:.2}, train_window={}, test_window={}, step={}, observation_sample_secs={}, pm_book_sample_secs={}, factor_name_filter={}, report_suite={}",
+        "factor_walk_forward_v2: {} -> {} for {:?}, stake_usd={:.2}, train_window={}, test_window={}, step={}, event_window_secs={}, observation_sample_secs={}, pm_book_sample_secs={}, factor_name_filter={}, report_suite={}",
         start,
         end,
         symbols,
@@ -439,6 +487,9 @@ async fn main() {
         options.train_window_label(),
         options.test_window_label(),
         options.step_label(),
+        event_window_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "<all>".to_string()),
         observation_sample_secs,
         pm_book_sample_secs,
         options.factor_name_filter.as_deref().unwrap_or("<none>"),
@@ -451,6 +502,25 @@ async fn main() {
     let alpha_search_output_dir = flag_value(&args, "--alpha-search-output-dir");
     let alpha_search_plan_json = flag_value(&args, "--alpha-search-plan-json");
     let alpha_search_llm_prior_json = flag_value(&args, "--alpha-search-llm-prior-json");
+    let llm_prior = alpha_search_llm_prior_json.as_deref().map(read_llm_prior);
+    let governed_prediction_prior = llm_prior
+        .as_ref()
+        .filter(|prior| prior.mission_id.is_some() || !prior.probability_blends.is_empty());
+    if let Some(prior) = governed_prediction_prior {
+        validate_prediction_research_prior(prior)
+            .unwrap_or_else(|reason| panic!("prediction research prior is not governed: {reason}"));
+        if prior.horizon.as_deref() == Some("5m") && event_window_secs != Some(300) {
+            panic!(
+                "governed 5m prediction research requires --event-window-secs 300, got {}",
+                event_window_secs
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<missing>".to_string())
+            );
+        }
+    }
+    if let Some(path) = alpha_search_llm_prior_json.as_deref() {
+        eprintln!("alpha search typed LLM prior loaded from {path}");
+    }
     let alpha_search_state_json = flag_value(&args, "--alpha-search-state-json");
     let alpha_zoo_snapshot_json = flag_value(&args, "--alpha-zoo-snapshot-json");
     let data_quality_mode = parse_data_quality_mode(flag_value(&args, "--data-quality-mode"));
@@ -470,7 +540,9 @@ async fn main() {
         eprintln!("ERROR: --snapshot-dir is required for factor_walk_forward_v2");
         std::process::exit(2);
     });
-    let mut snapshot_provenance: Option<String> = None;
+    let snapshot_provenance: String;
+    let snapshot_hash: String;
+    let snapshot_contract_hash: Option<String>;
     let snapshot_data_audit_status: Option<String>;
     let include_deribit: bool;
     let (observations, deribit_snapshots, all_pm_book_snapshots): (
@@ -515,15 +587,12 @@ async fn main() {
             },
         )
         .expect("snapshot does not cover requested walk-forward inputs");
-        let snapshot_hash = snapshot
-            .manifest
-            .snapshot_hash
-            .as_deref()
-            .unwrap_or("<missing>");
+        snapshot_hash = snapshot.manifest.snapshot_hash.clone().unwrap_or_default();
+        snapshot_contract_hash = snapshot.manifest.snapshot_contract_hash.clone();
         eprintln!(
             "snapshot: schema={} hash={} generated_at={} observations={} deribit={} pm_books={} load_ms={}",
             snapshot.manifest.schema_version,
-            snapshot_hash,
+            if snapshot_hash.is_empty() { "<missing>" } else { &snapshot_hash },
             snapshot.manifest.generated_at,
             snapshot.observations.len(),
             snapshot.deribit_snapshots.len(),
@@ -532,10 +601,11 @@ async fn main() {
         );
         snapshot_data_audit_status = snapshot.manifest.data_audit_status.clone();
         include_deribit = snapshot.manifest.include_deribit;
-        snapshot_provenance = Some(format!(
-            "# Snapshot\nsnapshot_schema={}\nsnapshot_hash={}\nsnapshot_generated_at={}\nsnapshot_optimizer_data_dir={}\nsnapshot_data_requirements={}\nsnapshot_data_audit_status={}\nsnapshot_data_audit_report={}\nsnapshot_include_deribit={}\n",
+        snapshot_provenance = format!(
+            "# Snapshot\nsnapshot_schema={}\nsnapshot_hash={}\nsnapshot_contract_hash={}\nsnapshot_generated_at={}\nsnapshot_optimizer_data_dir={}\nsnapshot_data_requirements={}\nsnapshot_data_audit_status={}\nsnapshot_data_audit_report={}\nsnapshot_include_deribit={}\n",
             snapshot.manifest.schema_version,
-            snapshot_hash,
+            if snapshot_hash.is_empty() { "<missing>" } else { &snapshot_hash },
+            snapshot_contract_hash.as_deref().unwrap_or("<missing>"),
             snapshot.manifest.generated_at,
             snapshot
                 .manifest
@@ -558,12 +628,15 @@ async fn main() {
                 .as_deref()
                 .unwrap_or("<not-recorded>"),
             snapshot.manifest.include_deribit
-        ));
+        );
         let requested_symbol_set: HashSet<&str> = symbols.iter().map(String::as_str).collect();
         let mut observations: Vec<FactorObservation> = snapshot
             .observations
             .into_iter()
             .filter(|row| requested_symbol_set.contains(row.symbol.as_str()))
+            .filter(|row| {
+                event_window_secs.is_none_or(|expected| row.event_window_secs == expected)
+            })
             .collect();
         let event_ids: HashSet<String> = observations
             .iter()
@@ -581,14 +654,48 @@ async fn main() {
             .collect();
         observations.shrink_to_fit();
         eprintln!(
-            "snapshot filtered: requested_symbols={:?} observations={} deribit={} pm_books={}",
+            "snapshot filtered: requested_symbols={:?} event_window_secs={} observations={} deribit={} pm_books={}",
             symbols,
+            event_window_secs
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<all>".to_string()),
             observations.len(),
             deribit_snapshots.len(),
             pm_book_snapshots.len()
         );
         (observations, deribit_snapshots, pm_book_snapshots)
     };
+
+    if let Some(prior) = governed_prediction_prior {
+        let prior_snapshot_id = prior
+            .data_snapshot_id
+            .as_deref()
+            .expect("validated prediction snapshot id");
+        validate_prediction_snapshot_contract_id(
+            prior_snapshot_id,
+            snapshot_contract_hash.as_deref(),
+        )
+        .unwrap_or_else(|reason| panic!("{reason}"));
+        let prior_symbol = prediction_underlying_symbol(&prior.symbols[0]);
+        let requested_underlyings = symbols
+            .iter()
+            .map(|symbol| prediction_underlying_symbol(symbol))
+            .collect::<HashSet<_>>();
+        if requested_underlyings.len() != 1 || !requested_underlyings.contains(&prior_symbol) {
+            panic!(
+                "prediction research prior symbol {} does not match requested symbols {:?}",
+                prior.symbols[0], symbols
+            );
+        }
+        if observations.is_empty() {
+            panic!(
+                "governed 5m prediction research found no 300s observations; legacy snapshots default event_window_secs to 0 and must be rebuilt"
+            );
+        }
+        if observations.iter().any(|row| row.event_window_secs != 300) {
+            panic!("governed 5m prediction evaluator received a non-300s observation");
+        }
+    }
 
     if observations.is_empty() {
         eprintln!("no observations — check date range, symbols, quote coverage, and settlements");
@@ -603,9 +710,7 @@ async fn main() {
         end,
         options.clone(),
     );
-    if let Some(snapshot_provenance) = snapshot_provenance {
-        println!("{snapshot_provenance}");
-    }
+    println!("{snapshot_provenance}");
     println!("{}", format_factor_walk_forward_v2_report(&report));
     let execution_matrix = build_full_depth_execution_matrix(
         &observations,
@@ -654,10 +759,6 @@ async fn main() {
         &all_pm_book_snapshots,
         &options.review,
     );
-    let llm_prior = alpha_search_llm_prior_json.as_deref().map(read_llm_prior);
-    if let Some(path) = alpha_search_llm_prior_json.as_deref() {
-        eprintln!("alpha search typed LLM prior loaded from {path}");
-    }
     let settlement_probability_report = build_settlement_probability_report_with_prior(
         &autofactor_rows,
         llm_prior.as_ref(),
@@ -753,15 +854,33 @@ async fn main() {
                     output_dir.display()
                 )
             });
-            let output_path = output_dir.join("prediction-research-feedback.json");
             let json = serde_json::to_string_pretty(&feedback)
                 .expect("serialize prediction research feedback");
-            std::fs::write(&output_path, format!("{json}\n")).unwrap_or_else(|err| {
-                panic!(
-                    "write prediction research feedback {} failed: {err}",
+            let bytes = format!("{json}\n");
+            let content_hash = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+            let output_path =
+                output_dir.join(format!("prediction-research-feedback-{content_hash}.json"));
+            if output_path.exists() {
+                let existing = std::fs::read(&output_path).unwrap_or_else(|err| {
+                    panic!(
+                        "read existing prediction research feedback {} failed: {err}",
+                        output_path.display()
+                    )
+                });
+                assert_eq!(
+                    existing,
+                    bytes.as_bytes(),
+                    "content-addressed prediction feedback collision at {}",
                     output_path.display()
-                )
-            });
+                );
+            } else {
+                std::fs::write(&output_path, bytes).unwrap_or_else(|err| {
+                    panic!(
+                        "write prediction research feedback {} failed: {err}",
+                        output_path.display()
+                    )
+                });
+            }
             eprintln!(
                 "prediction research feedback written mission_id={} candidates={} path={}",
                 feedback.mission_id,

@@ -106,11 +106,13 @@ jobs:
           set -euo pipefail
           python3 -m unittest discover -s tests -p 'test_psql_connection.py'
           python3 -m unittest tests.test_alpha_search_llm_propose
+          python3 -m unittest tests.test_prediction_research_loop
           python3 -m py_compile \
             scripts/psql_connection.py \
             scripts/audit_market_data_gaps.py \
             scripts/alpha_search_closed_loop_agent.py \
-            scripts/alpha_search_llm_propose.py
+            scripts/alpha_search_llm_propose.py \
+            scripts/prediction_research_loop.py
           python3 -m pip install \
             --disable-pip-version-check \
             --requirement examples/openclaw/skill-ploy-rpc/requirements.txt

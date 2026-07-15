@@ -101,6 +101,7 @@ mod tests {
             event_id: "e1".into(),
             symbol: "BTC".into(),
             tick_ts: Utc::now(),
+            event_window_secs: 300,
             time_remaining_secs,
             distance_over_sigma,
             settlement_up,

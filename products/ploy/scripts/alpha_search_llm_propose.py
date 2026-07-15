@@ -29,6 +29,7 @@ all run before a `next-llm-prior.json` is written.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -55,7 +56,7 @@ except ModuleNotFoundError:
 # Fields accepted by LlmMutationSpec (crates/ploy-research/src/autofactor.rs:238-255).
 # Kept in sync by hand with that struct; a mismatch here fails validation loudly
 # rather than letting an unknown field silently pass through to the Rust compiler.
-REQUIRED_MUTATION_FIELDS = {"base_factor", "mutation_type"}
+REQUIRED_MUTATION_FIELDS = {"base_factor", "mutation_type", "hypothesis"}
 OPTIONAL_MUTATION_FIELDS = {
     "name",
     "feature",
@@ -87,7 +88,6 @@ MISSION_SCHEMA_VERSION = "prediction_research_mission.v1"
 SAFE_CANDIDATE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 TARGET_HORIZONS = {
     "full_depth_settlement_executable_pnl": "5m",
-    "tradeable_full_depth_settlement_pnl": "5m",
 }
 
 MAX_SCHEMA_RETRIES = 2
@@ -163,6 +163,7 @@ def _proposal_json_schema() -> dict[str, Any]:
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
+                        "hypothesis": {"type": "string"},
                         "market_midpoint_weight": {"type": "number", "minimum": 0},
                         "distance_lob_vol_weight": {"type": "number", "minimum": 0},
                         "event_surface_weight": {"type": "number", "minimum": 0},
@@ -225,8 +226,8 @@ class AnthropicLlmClient:
                     {
                         "name": self.TOOL_NAME,
                         "description": (
-                            "Propose bounded factor-formula mutations for the "
-                            "alpha search loop."
+                            "Propose mission-authorized typed factor mutations "
+                            "and probability blends for the research loop."
                         ),
                         "input_schema": _proposal_json_schema(),
                     }
@@ -374,6 +375,18 @@ def _mission_provenance(payload: dict[str, Any], field: str) -> str:
     return value
 
 
+def research_brief_snapshot_id(payload: dict[str, Any]) -> str:
+    """Content address the exact human research brief exposed to the model."""
+    brief = {
+        "hypothesis_scope": _mission_text(payload, "hypothesis_scope"),
+        "objective": _mission_text(payload, "objective"),
+    }
+    body = json.dumps(
+        brief, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    return f"sha256:{hashlib.sha256(body).hexdigest()}"
+
+
 def validate_mission(payload: Any, expected_target: str) -> dict[str, Any]:
     """Validate and reduce the cross-workspace prediction mission protocol.
 
@@ -395,6 +408,10 @@ def validate_mission(payload: Any, expected_target: str) -> dict[str, Any]:
     if target != expected_target:
         raise MissionValidationError(
             f"mission.target {target!r} does not match run target {expected_target!r}"
+        )
+    if target not in TARGET_HORIZONS:
+        raise MissionValidationError(
+            f"mission.target {target!r} is not supported by the prediction loop"
         )
 
     symbols = payload.get("symbols")
@@ -418,6 +435,12 @@ def validate_mission(payload: Any, expected_target: str) -> dict[str, Any]:
         )
     normalized_scope = sorted({item.strip() for item in mutable_scope})
     allowed_scope = FORMULA_MUTABLE_SCOPES | {PROBABILITY_BLEND_MUTABLE_SCOPE}
+    unknown_scope = sorted(set(normalized_scope) - allowed_scope)
+    if unknown_scope:
+        raise MissionValidationError(
+            "mission.mutable_scope contains unsupported authority: "
+            + ", ".join(unknown_scope)
+        )
     if not set(normalized_scope).intersection(allowed_scope):
         raise MissionValidationError(
             "mission.mutable_scope grants neither factor-formula nor "
@@ -444,18 +467,28 @@ def validate_mission(payload: Any, expected_target: str) -> dict[str, Any]:
             f"{expected_horizon!r}"
         )
 
+    objective = _mission_text(payload, "objective")
+    hypothesis_scope = _mission_text(payload, "hypothesis_scope")
+    prompt_snapshot_id = _mission_provenance(payload, "prompt_snapshot_id")
+    expected_prompt_snapshot_id = research_brief_snapshot_id(payload)
+    if prompt_snapshot_id != expected_prompt_snapshot_id:
+        raise MissionValidationError(
+            "mission.prompt_snapshot_id does not content-address objective and "
+            f"hypothesis_scope; expected {expected_prompt_snapshot_id}"
+        )
+
     return {
         "schema_version": MISSION_SCHEMA_VERSION,
         "mission_id": _mission_text(payload, "mission_id"),
         "lane": "prediction_market",
-        "objective": _mission_text(payload, "objective"),
-        "hypothesis_scope": _mission_text(payload, "hypothesis_scope"),
+        "objective": objective,
+        "hypothesis_scope": hypothesis_scope,
         "mutable_scope": normalized_scope,
         "data_snapshot_id": _mission_provenance(payload, "data_snapshot_id"),
         "target": target,
         "symbols": [symbols[0].strip().upper()],
         "horizon": horizon,
-        "prompt_snapshot_id": _mission_provenance(payload, "prompt_snapshot_id"),
+        "prompt_snapshot_id": prompt_snapshot_id,
         "search_policy_snapshot_id": _mission_provenance(
             payload, "search_policy_snapshot_id"
         ),
@@ -509,9 +542,26 @@ def weak_dimensions_summary(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def qualitative_prediction_feedback(payload: Any) -> list[dict[str, Any]]:
-    """Expose bounded verdicts to the model, never labels, metrics, or gates."""
-    if not isinstance(payload, dict):
+def qualitative_prediction_feedback(
+    payload: Any, mission: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Expose same-mission verdicts and candidate definitions, never evaluator metrics."""
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != "prediction_research_feedback.v1"
+        or any(
+            payload.get(field) != mission[field]
+            for field in (
+                "mission_id",
+                "target",
+                "symbols",
+                "horizon",
+                "data_snapshot_id",
+                "prompt_snapshot_id",
+                "search_policy_snapshot_id",
+            )
+        )
+    ):
         return []
     candidates = payload.get("candidates")
     if not isinstance(candidates, list):
@@ -524,23 +574,43 @@ def qualitative_prediction_feedback(payload: Any) -> list[dict[str, Any]]:
         hypothesis = candidate.get("hypothesis")
         verdict = candidate.get("verdict")
         reasons = candidate.get("reason_codes")
+        blend = candidate.get("probability_blend")
         if not isinstance(model, str) or verdict not in {"keep", "discard"}:
             continue
-        out.append(
-            {
-                "model": model,
-                "hypothesis": hypothesis.strip()[:500]
-                if isinstance(hypothesis, str) and hypothesis.strip()
-                else "<not-recorded>",
-                "verdict": verdict,
-                "reason_codes": [
-                    reason
-                    for reason in reasons if isinstance(reason, str)
-                ][:8]
-                if isinstance(reasons, list)
-                else [],
+        item = {
+            "model": model,
+            "hypothesis": hypothesis.strip()[:500]
+            if isinstance(hypothesis, str) and hypothesis.strip()
+            else "<not-recorded>",
+            "verdict": verdict,
+            "reason_codes": [reason for reason in reasons if isinstance(reason, str)][:8]
+            if isinstance(reasons, list)
+            else [],
+        }
+        if isinstance(blend, dict):
+            candidate_definition = {
+                field: blend.get(field)
+                for field in REQUIRED_PROBABILITY_BLEND_FIELDS
+                if field != "hypothesis"
             }
-        )
+            weights = [
+                candidate_definition.get(f"{component}_weight")
+                for component in PROBABILITY_COMPONENTS
+            ]
+            if (
+                isinstance(candidate_definition.get("name"), str)
+                and all(
+                    isinstance(weight, (int, float))
+                    and not isinstance(weight, bool)
+                    and math.isfinite(float(weight))
+                    and float(weight) >= 0.0
+                    for weight in weights
+                )
+                and math.isfinite(sum(float(weight) for weight in weights))
+                and sum(float(weight) for weight in weights) > 0.0
+            ):
+                item["probability_blend"] = candidate_definition
+        out.append(item)
     return out
 
 
@@ -614,7 +684,8 @@ def build_prompt(
             f"Propose up to {mutation_limit} typed candidates for this governed "
             "prediction-market mission. Change only fields named by mutable_scope. "
             "Factor mutations must reference an available_base_factor. Probability "
-            "blends must state one falsifiable hypothesis, may only assign finite "
+            "blends and factor mutations must state one falsifiable hypothesis. "
+            "Probability blends may only assign finite "
             "non-negative weights to registered components, and must have a positive "
             "total weight. Do not change labels, "
             "evaluation gates, costs, settlement rules, or execution settings."
@@ -626,7 +697,7 @@ def build_prompt(
         "registered_probability_components": list(PROBABILITY_COMPONENTS),
         "weak_dimensions": weak_dimensions,
         "prior_candidate_outcomes": qualitative_prediction_feedback(
-            run.get("prediction_feedback")
+            run.get("prediction_feedback"), mission
         ),
         "crowded_structural_shapes_within_batch": crowded_signatures_summary(
             avoided_subtrees
@@ -637,6 +708,7 @@ def build_prompt(
                 {
                     "base_factor": "string, required, must match an existing factor name",
                     "mutation_type": "string, required, one of allowed_mutation_types",
+                    "hypothesis": "one falsifiable sentence, required",
                     "name": "string, optional",
                     "feature": "string, optional",
                     "denominator_feature": "string, optional",
@@ -733,6 +805,16 @@ def validate_response(
                 f"mutations[{index}].mutation_type {mutation_type!r} is not in "
                 f"the allowed set: {', '.join(sorted(ALLOWED_MUTATIONS))}"
             )
+        hypothesis = item.get("hypothesis")
+        if (
+            not isinstance(hypothesis, str)
+            or not hypothesis.strip()
+            or len(hypothesis) > 500
+        ):
+            raise SchemaValidationError(
+                f"mutations[{index}].hypothesis must be a non-empty string "
+                "of at most 500 characters"
+            )
         for numeric_field in ("constant", "lo", "hi"):
             if numeric_field in item and (
                 isinstance(item[numeric_field], bool)
@@ -805,7 +887,7 @@ def validate_response(
                     f"probability_blends[{index}].{field} must be finite and non-negative"
                 )
             total_weight += float(value)
-        if total_weight <= 0.0:
+        if not math.isfinite(total_weight) or total_weight <= 0.0:
             raise SchemaValidationError(
                 f"probability_blends[{index}] must have positive total weight"
             )

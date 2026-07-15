@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -19,7 +20,7 @@ def mission(
     symbol: str = "BTC",
     mutable_scope: list[str] | None = None,
 ) -> dict:
-    return {
+    payload = {
         "schema_version": "prediction_research_mission.v1",
         "mission_id": f"polymarket-{symbol.lower()}-5m-v1",
         "lane": "prediction_market",
@@ -32,7 +33,7 @@ def mission(
         "target": target,
         "symbols": [symbol],
         "horizon": "5m",
-        "prompt_snapshot_id": f"sha256:{symbol.lower()}-prompt",
+        "prompt_snapshot_id": "pending",
         "search_policy_snapshot_id": "prediction-blend-policy-v1",
         "search_budget": {
             "max_candidates": 6,
@@ -40,6 +41,8 @@ def mission(
             "max_seconds": 600,
         },
     }
+    payload["prompt_snapshot_id"] = propose.research_brief_snapshot_id(payload)
+    return payload
 
 
 def artifact(
@@ -125,6 +128,38 @@ class FakeClient:
 
 
 class BuildPromptTests(unittest.TestCase):
+    def test_load_artifact_verifies_content_addressed_prediction_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = artifact(Path(tmp))
+            alpha_root = (
+                path
+                / "factor-walk-forward-v2"
+                / "alpha-search"
+                / "full_depth_settlement_executable_pnl"
+            )
+            payload = {"mission_id": "polymarket-btc-5m-v1", "candidates": []}
+            raw = (json.dumps(payload, sort_keys=True) + "\n").encode()
+            digest = hashlib.sha256(raw).hexdigest()
+            feedback_path = alpha_root / f"prediction-research-feedback-{digest}.json"
+            feedback_path.write_bytes(raw)
+            from scripts.alpha_search_closed_loop_agent import DEFAULT_TARGET, load_artifact
+
+            self.assertEqual(load_artifact(path, DEFAULT_TARGET)["prediction_feedback"], payload)
+            feedback_path.write_text("{}\n", encoding="utf-8")
+            self.assertEqual(load_artifact(path, DEFAULT_TARGET)["prediction_feedback"], {})
+
+    def test_provider_schema_requires_hypotheses_for_both_candidate_types(self) -> None:
+        schema = propose._proposal_json_schema()
+        mutation_properties = schema["properties"]["mutations"]["items"]["properties"]
+        blend_schema = schema["properties"]["probability_blends"]["items"]
+
+        self.assertIn("hypothesis", mutation_properties)
+        self.assertIn(
+            "hypothesis", schema["properties"]["mutations"]["items"]["required"]
+        )
+        self.assertIn("hypothesis", blend_schema["properties"])
+        self.assertIn("hypothesis", blend_schema["required"])
+
     def test_prompt_lists_allowed_mutations_from_shared_constant(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = artifact(Path(tmp))
@@ -207,15 +242,31 @@ class BuildPromptTests(unittest.TestCase):
         self.assertEqual(payload["crowded_root_genes_across_all_history"], [])
 
     def test_prompt_carries_governed_mission_and_only_qualitative_feedback(self) -> None:
+        btc_mission = mission()
         with tempfile.TemporaryDirectory() as tmp:
             path = artifact(
                 Path(tmp),
                 prediction_feedback={
+                    "schema_version": "prediction_research_feedback.v1",
                     "mission_id": "polymarket-btc-5m-v1",
+                    "target": "full_depth_settlement_executable_pnl",
+                    "symbols": ["BTC"],
+                    "horizon": "5m",
+                    "data_snapshot_id": "sha256:btc-dataset",
+                    "prompt_snapshot_id": btc_mission["prompt_snapshot_id"],
+                    "search_policy_snapshot_id": "prediction-blend-policy-v1",
                     "candidates": [
                         {
                             "model": "q_llm_microstructure",
                             "hypothesis": "CEX flow improves calibration.",
+                            "probability_blend": {
+                                "name": "microstructure",
+                                "hypothesis": "CEX flow improves calibration.",
+                                "market_midpoint_weight": 0.4,
+                                "distance_lob_vol_weight": 0.3,
+                                "event_surface_weight": 0.2,
+                                "existing_model_weight": 0.1,
+                            },
                             "verdict": "discard",
                             "reason_codes": ["calibration_gate_failed"],
                             "metrics": {"avg_test_brier_score": 0.42},
@@ -226,7 +277,7 @@ class BuildPromptTests(unittest.TestCase):
             from scripts.alpha_search_closed_loop_agent import DEFAULT_TARGET, load_artifact
 
             run = load_artifact(path, DEFAULT_TARGET)
-            prompt = propose.build_prompt(run, mission())
+            prompt = propose.build_prompt(run, btc_mission)
 
         payload = json.loads(prompt)
         self.assertEqual(payload["mission"]["symbols"], ["BTC"])
@@ -238,6 +289,13 @@ class BuildPromptTests(unittest.TestCase):
                 {
                     "model": "q_llm_microstructure",
                     "hypothesis": "CEX flow improves calibration.",
+                    "probability_blend": {
+                        "name": "microstructure",
+                        "market_midpoint_weight": 0.4,
+                        "distance_lob_vol_weight": 0.3,
+                        "event_surface_weight": 0.2,
+                        "existing_model_weight": 0.1,
+                    },
                     "verdict": "discard",
                     "reason_codes": ["calibration_gate_failed"],
                 }
@@ -245,11 +303,44 @@ class BuildPromptTests(unittest.TestCase):
         )
         self.assertNotIn("0.42", prompt)
 
+    def test_prompt_rejects_feedback_from_another_mission(self) -> None:
+        feedback = {
+            "schema_version": "prediction_research_feedback.v1",
+            "mission_id": "polymarket-sol-5m-v1",
+            "target": "full_depth_settlement_executable_pnl",
+            "symbols": ["SOL"],
+            "horizon": "5m",
+            "data_snapshot_id": "sha256:sol-dataset",
+            "prompt_snapshot_id": "sha256:sol-prompt",
+            "search_policy_snapshot_id": "prediction-blend-policy-v1",
+            "candidates": [
+                {
+                    "model": "q_llm_sol_flow",
+                    "hypothesis": "SOL flow improves calibration.",
+                    "verdict": "discard",
+                    "reason_codes": ["calibration_gate_failed"],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = artifact(Path(tmp), prediction_feedback=feedback)
+            from scripts.alpha_search_closed_loop_agent import DEFAULT_TARGET, load_artifact
+
+            run = load_artifact(path, DEFAULT_TARGET)
+            prompt = propose.build_prompt(run, mission(symbol="BTC"))
+
+        self.assertEqual(json.loads(prompt)["prior_candidate_outcomes"], [])
+
 
 class MissionValidationTests(unittest.TestCase):
     def test_rejects_cross_target_mission(self) -> None:
         with self.assertRaises(propose.MissionValidationError):
             propose.validate_mission(mission(target="reprice_pnl_10s"), "full_depth_settlement_executable_pnl")
+
+    def test_probability_blends_reject_unsupported_settlement_target(self) -> None:
+        target = "tradeable_full_depth_settlement_pnl"
+        with self.assertRaises(propose.MissionValidationError):
+            propose.validate_mission(mission(target=target), target)
 
     def test_rejects_multi_symbol_mission(self) -> None:
         payload = mission()
@@ -261,6 +352,16 @@ class MissionValidationTests(unittest.TestCase):
         with self.assertRaises(propose.MissionValidationError):
             propose.validate_mission(
                 mission(mutable_scope=["validator_thresholds"]),
+                "full_depth_settlement_executable_pnl",
+            )
+        with self.assertRaises(propose.MissionValidationError):
+            propose.validate_mission(
+                mission(
+                    mutable_scope=[
+                        "probability_blend_weights",
+                        "validator_thresholds",
+                    ]
+                ),
                 "full_depth_settlement_executable_pnl",
             )
 
@@ -279,6 +380,15 @@ class MissionValidationTests(unittest.TestCase):
                 unresolved, "full_depth_settlement_executable_pnl"
             )
 
+        changed_brief = mission()
+        changed_brief["objective"] = "A different unreviewed objective."
+        with self.assertRaisesRegex(
+            propose.MissionValidationError, "prompt_snapshot_id"
+        ):
+            propose.validate_mission(
+                changed_brief, "full_depth_settlement_executable_pnl"
+            )
+
 
 class ValidateResponseTests(unittest.TestCase):
     def test_accepts_a_well_formed_response(self) -> None:
@@ -287,6 +397,7 @@ class ValidateResponseTests(unittest.TestCase):
                 {
                     "base_factor": "auto_settlement_x",
                     "mutation_type": "add_capacity_gate",
+                    "hypothesis": "Capacity gating should remove unfillable false edges.",
                     "feature": "entry_capacity_score",
                 }
             ],
@@ -313,7 +424,11 @@ class ValidateResponseTests(unittest.TestCase):
     def test_rejects_unknown_base_factor(self) -> None:
         response = {
             "mutations": [
-                {"base_factor": "invented", "mutation_type": "add_capacity_gate"}
+                {
+                    "base_factor": "invented",
+                    "mutation_type": "add_capacity_gate",
+                    "hypothesis": "The invented factor should fail closed.",
+                }
             ],
             "probability_blends": [],
         }
@@ -347,7 +462,11 @@ class ValidateResponseTests(unittest.TestCase):
             )
 
     def test_rejects_negative_or_all_zero_probability_weights(self) -> None:
-        for weights in ((-0.1, 0.3, 0.3, 0.5), (0.0, 0.0, 0.0, 0.0)):
+        for weights in (
+            (-0.1, 0.3, 0.3, 0.5),
+            (0.0, 0.0, 0.0, 0.0),
+            (1e308, 1e308, 0.0, 0.0),
+        ):
             response = {
                 "mutations": [],
                 "probability_blends": [
@@ -379,7 +498,11 @@ class ValidateResponseTests(unittest.TestCase):
     def test_rejects_unknown_mutation_type(self) -> None:
         response = {
             "mutations": [
-                {"base_factor": "auto_settlement_x", "mutation_type": "delete_everything"}
+                {
+                    "base_factor": "auto_settlement_x",
+                    "mutation_type": "delete_everything",
+                    "hypothesis": "Unsupported mutation authority must fail closed.",
+                }
             ]
         }
         with self.assertRaises(propose.SchemaValidationError) as ctx:
@@ -398,6 +521,7 @@ class ValidateResponseTests(unittest.TestCase):
                 {
                     "base_factor": "auto_settlement_x",
                     "mutation_type": "add_capacity_gate",
+                    "hypothesis": "Capacity gating should remove unfillable false edges.",
                     "unexpected_field": "value",
                 }
             ]
@@ -412,6 +536,7 @@ class ValidateResponseTests(unittest.TestCase):
                 {
                     "base_factor": "auto_settlement_x",
                     "mutation_type": "add_spread_penalty",
+                    "hypothesis": "Spread penalization should improve executable edge.",
                     "constant": "not-a-number",
                 }
             ]
@@ -425,6 +550,7 @@ class ValidateResponseTests(unittest.TestCase):
                 {
                     "base_factor": "auto_settlement_x",
                     "mutation_type": "change_time_window",
+                    "hypothesis": "A different window should expose stable information.",
                     "window": 30.5,
                 }
             ]
@@ -438,6 +564,7 @@ class ValidateResponseTests(unittest.TestCase):
                 {
                     "base_factor": "auto_settlement_x",
                     "mutation_type": "change_time_window",
+                    "hypothesis": "A different window should expose stable information.",
                     "window": True,
                 }
             ]
@@ -451,6 +578,7 @@ class ValidateResponseTests(unittest.TestCase):
                 {
                     "base_factor": "auto_settlement_x",
                     "mutation_type": "add_spread_penalty",
+                    "hypothesis": "Spread penalization should improve executable edge.",
                     "constant": False,
                 }
             ]
@@ -476,6 +604,7 @@ class ProposeMutationsTests(unittest.TestCase):
                             {
                                 "base_factor": "auto_settlement_full_depth_settlement_edge",
                                 "mutation_type": "add_capacity_gate",
+                                "hypothesis": "Capacity gating should improve executable OOS PnL.",
                                 "feature": "entry_capacity_score",
                             }
                         ]
@@ -501,6 +630,7 @@ class ProposeMutationsTests(unittest.TestCase):
                             {
                                 "base_factor": "auto_settlement_full_depth_settlement_edge",
                                 "mutation_type": "add_capacity_gate",
+                                "hypothesis": "Capacity gating should improve executable OOS PnL.",
                             }
                         ],
                         "probability_blends": [],
@@ -535,6 +665,7 @@ class ProposeMutationsTests(unittest.TestCase):
                 {
                     "base_factor": "auto_settlement_full_depth_settlement_edge",
                     "mutation_type": "add_capacity_gate",
+                    "hypothesis": "Capacity gating should improve executable OOS PnL.",
                 }
                 for _ in range(5)
             ]
@@ -709,7 +840,11 @@ class ClientFromEnvTests(unittest.TestCase):
 class BuildPriorFromMutationsTests(unittest.TestCase):
     def test_matches_closed_loop_agent_prior_shape(self) -> None:
         mutations = [
-            {"base_factor": "auto_settlement_x", "mutation_type": "add_capacity_gate"}
+            {
+                "base_factor": "auto_settlement_x",
+                "mutation_type": "add_capacity_gate",
+                "hypothesis": "Capacity gating should improve executable OOS PnL.",
+            }
         ]
         probability_blends = [
             {
@@ -734,7 +869,10 @@ class BuildPriorFromMutationsTests(unittest.TestCase):
         self.assertEqual(prior["mutations"], mutations)
         self.assertEqual(prior["probability_blends"], probability_blends)
         self.assertEqual(prior["mission_id"], "polymarket-btc-5m-v1")
-        self.assertEqual(prior["mission"]["prompt_snapshot_id"], "sha256:btc-prompt")
+        self.assertEqual(
+            prior["mission"]["prompt_snapshot_id"],
+            propose.research_brief_snapshot_id(prior["mission"]),
+        )
         self.assertEqual(prior["runtime_avoid_factors"], [])
 
 
@@ -752,6 +890,7 @@ class MainIntegrationTests(unittest.TestCase):
                             {
                                 "base_factor": "auto_settlement_full_depth_settlement_edge",
                                 "mutation_type": "add_capacity_gate",
+                                "hypothesis": "Capacity gating should improve executable OOS PnL.",
                                 "feature": "entry_capacity_score",
                             }
                         ],

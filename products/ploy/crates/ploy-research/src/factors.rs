@@ -86,6 +86,8 @@ pub struct FactorObservation {
     pub event_id: String,
     pub symbol: String,
     pub tick_ts: DateTime<Utc>,
+    #[serde(default)]
+    pub event_window_secs: i64,
     pub time_remaining_secs: i64,
     pub signed_distance_to_beat: f64,
     pub abs_distance_to_beat: f64,
@@ -1561,6 +1563,7 @@ pub fn build_factor_observations_with_lob_sampled(
                         event_id: event.event_id.clone(),
                         symbol: sym.clone(),
                         tick_ts: *ts,
+                        event_window_secs: event.window_secs.unwrap_or_default(),
                         time_remaining_secs: time_remaining,
                         signed_distance_to_beat: signed_distance,
                         abs_distance_to_beat: signed_distance.abs(),
@@ -1960,6 +1963,7 @@ pub fn observations_to_frame(rows: &[FactorObservation]) -> PolarsResult<DataFra
         "event_id" => rows.iter().map(|row| row.event_id.as_str()).collect::<Vec<_>>(),
         "symbol" => rows.iter().map(|row| row.symbol.as_str()).collect::<Vec<_>>(),
         "tick_ts" => rows.iter().map(|row| row.tick_ts.timestamp_millis()).collect::<Vec<_>>(),
+        "event_window_secs" => rows.iter().map(|row| row.event_window_secs).collect::<Vec<_>>(),
         "time_remaining_secs" => rows.iter().map(|row| row.time_remaining_secs).collect::<Vec<_>>(),
         "signed_distance_to_beat" => rows.iter().map(|row| row.signed_distance_to_beat).collect::<Vec<_>>(),
         "abs_distance_to_beat" => rows.iter().map(|row| row.abs_distance_to_beat).collect::<Vec<_>>(),
@@ -2494,6 +2498,7 @@ mod tests {
             tick_ts: chrono::DateTime::from_timestamp(tick_ts_secs, 0)
                 .unwrap()
                 .with_timezone(&Utc),
+            event_window_secs: 300,
             time_remaining_secs: 60,
             signed_distance_to_beat: 0.0,
             abs_distance_to_beat: 0.0,
@@ -2622,6 +2627,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_snapshot_observation_defaults_missing_event_window_to_zero() {
+        let observation = test_factor_observation("evt", "BTCUSDT", 100, 1.0, None);
+        let mut json = serde_json::to_value(observation).expect("serialize observation");
+        json.as_object_mut()
+            .expect("observation object")
+            .remove("event_window_secs");
+
+        let decoded: FactorObservation =
+            serde_json::from_value(json).expect("deserialize legacy observation");
+
+        assert_eq!(decoded.event_window_secs, 0);
+    }
+
+    #[test]
     fn factor_observations_only_include_active_event_window() {
         let start = Utc.timestamp_opt(700, 0).unwrap();
         let end = Utc.timestamp_opt(1000, 0).unwrap();
@@ -2677,6 +2696,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tick_ts, Utc.timestamp_opt(710, 0).unwrap());
+        assert_eq!(rows[0].event_window_secs, 300);
         assert!(rows[0].tick_ts >= start);
     }
 
@@ -2891,6 +2911,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts2,
+                    event_window_secs: 300,
                     time_remaining_secs: 10,
                     signed_distance_to_beat: 0.0,
                     abs_distance_to_beat: 0.0,
@@ -2948,6 +2969,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts0,
+                    event_window_secs: 300,
                     time_remaining_secs: 90,
                     signed_distance_to_beat: 0.0,
                     abs_distance_to_beat: 0.0,
@@ -3005,6 +3027,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts1,
+                    event_window_secs: 300,
                     time_remaining_secs: 50,
                     signed_distance_to_beat: 0.0,
                     abs_distance_to_beat: 0.0,

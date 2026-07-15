@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
 use ploy_operator_contracts::Regime;
@@ -428,6 +428,7 @@ pub struct SettlementProbabilityBaselineRow {
     pub avg_edge: f64,
     pub avg_full_depth_settlement_pnl: f64,
     pub avg_conservative_settlement_pnl: f64,
+    pub conservative_coverage_rate: f64,
     pub profit_factor: f64,
     pub edge_bucket_monotonic_non_decreasing: bool,
     pub top_edge_count: usize,
@@ -435,6 +436,7 @@ pub struct SettlementProbabilityBaselineRow {
     pub top_edge_win_rate: f64,
     pub top_edge_avg_full_depth_settlement_pnl: f64,
     pub top_edge_avg_conservative_settlement_pnl: f64,
+    pub top_edge_conservative_coverage_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -530,6 +532,8 @@ pub struct SettlementProbabilityWalkForwardWindow {
     pub train_top_edge_avg_full_depth_settlement_pnl: f64,
     pub test_top_edge_avg_full_depth_settlement_pnl: f64,
     pub test_top_edge_avg_conservative_settlement_pnl: f64,
+    pub train_top_edge_conservative_coverage_rate: f64,
+    pub test_top_edge_conservative_coverage_rate: f64,
     pub test_edge_bucket_monotonic_non_decreasing: bool,
     pub pass: bool,
 }
@@ -545,6 +549,9 @@ pub struct SettlementProbabilityWalkForwardAggregate {
     pub avg_test_expected_calibration_error: f64,
     pub avg_test_top_edge_avg_full_depth_settlement_pnl: f64,
     pub min_test_top_edge_avg_full_depth_settlement_pnl: f64,
+    pub avg_test_top_edge_avg_conservative_settlement_pnl: f64,
+    pub min_test_top_edge_avg_conservative_settlement_pnl: f64,
+    pub min_top_edge_conservative_coverage_rate: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +565,7 @@ pub struct SettlementProbabilityWalkForwardReport {
 pub struct PredictionResearchCandidateFeedback {
     pub model: String,
     pub hypothesis: String,
+    pub probability_blend: LlmProbabilityBlendSpec,
     pub verdict: String,
     pub reason_codes: Vec<String>,
     pub metrics: serde_json::Value,
@@ -567,9 +575,12 @@ pub struct PredictionResearchCandidateFeedback {
 pub struct PredictionResearchFeedback {
     pub schema_version: String,
     pub mission_id: String,
-    pub data_snapshot_id: Option<String>,
-    pub prompt_snapshot_id: Option<String>,
-    pub search_policy_snapshot_id: Option<String>,
+    pub target: String,
+    pub symbols: Vec<String>,
+    pub horizon: String,
+    pub data_snapshot_id: String,
+    pub prompt_snapshot_id: String,
+    pub search_policy_snapshot_id: String,
     pub candidates: Vec<PredictionResearchCandidateFeedback>,
 }
 
@@ -2720,9 +2731,17 @@ fn build_settlement_probability_report_with_surface<'a>(
 
     let typed_blends = validated_probability_blends(prior);
     let mut by_model: BTreeMap<String, Vec<SettlementProbabilitySample>> = BTreeMap::new();
-    for (row, win, pnl) in eligible_rows {
+    for (row, win, pnl, conservative_pnl) in eligible_rows {
         for (model, q) in settlement_probability_models(row) {
-            push_settlement_probability_sample(&mut by_model, model, row, win, pnl, q);
+            push_settlement_probability_sample(
+                &mut by_model,
+                model,
+                row,
+                win,
+                pnl,
+                conservative_pnl,
+                q,
+            );
         }
         let event_q = event_surface.predict(row);
         if let Some(q) = event_q {
@@ -2732,6 +2751,7 @@ fn build_settlement_probability_report_with_surface<'a>(
                 row,
                 win,
                 pnl,
+                conservative_pnl,
                 q,
             );
         }
@@ -2742,6 +2762,7 @@ fn build_settlement_probability_report_with_surface<'a>(
                 row,
                 win,
                 pnl,
+                conservative_pnl,
                 q,
             );
         }
@@ -2754,6 +2775,7 @@ fn build_settlement_probability_report_with_surface<'a>(
                         row,
                         win,
                         pnl,
+                        conservative_pnl,
                         q,
                     );
                 }
@@ -2778,7 +2800,7 @@ fn normalize_settlement_probability_report_options(
 
 fn settlement_probability_eligible_rows<'a>(
     rows: &[&'a FactorObservationV2],
-) -> Vec<(&'a FactorObservationV2, f64, f64)> {
+) -> Vec<(&'a FactorObservationV2, f64, f64, Option<f64>)> {
     let mut eligible_rows = Vec::new();
     for &row in rows {
         let Some(win) = row.label_settlement_win.filter(|win| win.is_finite()) else {
@@ -2793,7 +2815,12 @@ fn settlement_probability_eligible_rows<'a>(
         if !row.label_full_depth_entry_fillable || !valid_price(row.entry_sweep_avg_price_15u) {
             continue;
         }
-        eligible_rows.push((row, win, pnl));
+        let conservative_pnl = row
+            .label_conservative_entry_fillable
+            .then_some(row.label_conservative_executable_pnl_15u)
+            .flatten()
+            .filter(|pnl| pnl.is_finite());
+        eligible_rows.push((row, win, pnl, conservative_pnl));
     }
     eligible_rows
 }
@@ -2988,8 +3015,13 @@ fn settlement_probability_walk_forward_windows(
                 .top_edge_avg_full_depth_settlement_pnl,
             test_top_edge_avg_conservative_settlement_pnl: test
                 .top_edge_avg_conservative_settlement_pnl,
+            train_top_edge_conservative_coverage_rate: train.top_edge_conservative_coverage_rate,
+            test_top_edge_conservative_coverage_rate: test.top_edge_conservative_coverage_rate,
             test_edge_bucket_monotonic_non_decreasing: test.edge_bucket_monotonic_non_decreasing,
             pass: test.top_edge_avg_full_depth_settlement_pnl > 0.0
+                && test.top_edge_avg_conservative_settlement_pnl > 0.0
+                && train.top_edge_conservative_coverage_rate >= 1.0
+                && test.top_edge_conservative_coverage_rate >= 1.0
                 && test.brier_score.is_finite()
                 && test.brier_score <= options.max_test_brier_score
                 && test.log_loss.is_finite()
@@ -3037,6 +3069,21 @@ fn aggregate_settlement_probability_walk_forward_windows(
                 min_test_top_edge_avg_full_depth_settlement_pnl: rows
                     .iter()
                     .map(|row| row.test_top_edge_avg_full_depth_settlement_pnl)
+                    .fold(f64::INFINITY, f64::min),
+                avg_test_top_edge_avg_conservative_settlement_pnl: mean(
+                    rows.iter()
+                        .map(|row| row.test_top_edge_avg_conservative_settlement_pnl),
+                ),
+                min_test_top_edge_avg_conservative_settlement_pnl: rows
+                    .iter()
+                    .map(|row| row.test_top_edge_avg_conservative_settlement_pnl)
+                    .fold(f64::INFINITY, f64::min),
+                min_top_edge_conservative_coverage_rate: rows
+                    .iter()
+                    .map(|row| {
+                        row.train_top_edge_conservative_coverage_rate
+                            .min(row.test_top_edge_conservative_coverage_rate)
+                    })
                     .fold(f64::INFINITY, f64::min),
             }
         })
@@ -3242,7 +3289,7 @@ pub fn build_settlement_probability_promotion_gate_report(
                     || "no non-naive model has non-empty OOS windows".to_string(),
                     |row| {
                         format!(
-                            "rejected model={} windows={} positive_window_ratio={:.4} pass_window_ratio={:.4} min_ratio={:.4} avg_test_brier={:.6} max_brier={:.6} avg_test_log_loss={:.6} max_log_loss={:.6} avg_test_ece={:.6} max_ece={:.6} min_test_top_edge_pnl={:.4}",
+                            "rejected model={} windows={} positive_window_ratio={:.4} pass_window_ratio={:.4} min_ratio={:.4} avg_test_brier={:.6} max_brier={:.6} avg_test_log_loss={:.6} max_log_loss={:.6} avg_test_ece={:.6} max_ece={:.6} min_test_top_edge_pnl={:.4} min_test_top_edge_conservative_pnl={:.4}",
                             row.model,
                             row.windows,
                             row.positive_window_ratio,
@@ -3255,13 +3302,14 @@ pub fn build_settlement_probability_promotion_gate_report(
                             row.avg_test_expected_calibration_error,
                             walk_forward.options.max_test_expected_calibration_error,
                             row.min_test_top_edge_avg_full_depth_settlement_pnl,
+                            row.min_test_top_edge_avg_conservative_settlement_pnl,
                         )
                     },
                 )
             },
             |row| {
                 format!(
-                    "model={} windows={} positive_window_ratio={:.4} pass_window_ratio={:.4} min_ratio={:.4} avg_test_brier={:.6} max_brier={:.6} avg_test_log_loss={:.6} max_log_loss={:.6} avg_test_ece={:.6} max_ece={:.6} min_test_top_edge_pnl={:.4}",
+                    "model={} windows={} positive_window_ratio={:.4} pass_window_ratio={:.4} min_ratio={:.4} avg_test_brier={:.6} max_brier={:.6} avg_test_log_loss={:.6} max_log_loss={:.6} avg_test_ece={:.6} max_ece={:.6} min_test_top_edge_pnl={:.4} min_test_top_edge_conservative_pnl={:.4}",
                     row.model,
                     row.windows,
                     row.positive_window_ratio,
@@ -3273,7 +3321,8 @@ pub fn build_settlement_probability_promotion_gate_report(
                     walk_forward.options.max_test_log_loss,
                     row.avg_test_expected_calibration_error,
                     walk_forward.options.max_test_expected_calibration_error,
-                    row.min_test_top_edge_avg_full_depth_settlement_pnl
+                    row.min_test_top_edge_avg_full_depth_settlement_pnl,
+                    row.min_test_top_edge_avg_conservative_settlement_pnl
                 )
             },
         ),
@@ -3358,6 +3407,7 @@ fn best_conservative_edge_model(
         .baselines
         .iter()
         .filter(|row| is_settlement_probability_candidate_model(&row.model))
+        .filter(|row| row.top_edge_conservative_coverage_rate >= 1.0)
         .filter(|row| row.top_edge_avg_conservative_settlement_pnl > 0.0)
         .max_by(|a, b| {
             a.top_edge_avg_conservative_settlement_pnl
@@ -3436,6 +3486,8 @@ fn best_walk_forward_oos_model(
                     <= report.options.max_test_expected_calibration_error
         })
         .filter(|row| row.min_test_top_edge_avg_full_depth_settlement_pnl > 0.0)
+        .filter(|row| row.min_test_top_edge_avg_conservative_settlement_pnl > 0.0)
+        .filter(|row| row.min_top_edge_conservative_coverage_rate >= 1.0)
         .max_by(|a, b| {
             a.pass_window_ratio
                 .total_cmp(&b.pass_window_ratio)
@@ -3451,24 +3503,38 @@ pub fn build_prediction_research_feedback(
     report: &SettlementProbabilityWalkForwardReport,
     min_positive_window_ratio: f64,
 ) -> Option<PredictionResearchFeedback> {
+    if validate_prediction_research_prior(prior).is_err() {
+        return None;
+    }
     let mission_id = prior.mission_id.as_deref()?.trim();
     if mission_id.is_empty() {
         return None;
     }
     let allowed_models = validated_probability_blends(Some(prior))
         .into_iter()
-        .map(|(model, blend)| (model, blend.hypothesis.trim().to_string()))
+        .map(|(model, blend)| (model, blend.clone()))
         .collect::<BTreeMap<_, _>>();
-    let min_ratio = min_positive_window_ratio.clamp(0.0, 1.0);
-    let candidates = report
+    let aggregates = report
         .aggregates
         .iter()
-        .filter(|aggregate| allowed_models.contains_key(&aggregate.model))
-        .map(|aggregate| {
+        .map(|aggregate| (aggregate.model.as_str(), aggregate))
+        .collect::<BTreeMap<_, _>>();
+    let min_ratio = min_positive_window_ratio.clamp(0.0, 1.0);
+    let candidates = allowed_models
+        .into_iter()
+        .map(|(model, probability_blend)| {
+            let hypothesis = probability_blend.hypothesis.trim().to_string();
+            let Some(aggregate) = aggregates.get(model.as_str()).copied() else {
+                return PredictionResearchCandidateFeedback {
+                    model,
+                    hypothesis,
+                    probability_blend,
+                    verdict: "discard".to_string(),
+                    reason_codes: vec!["no_oos_windows".to_string()],
+                    metrics: serde_json::json!({"windows": 0}),
+                };
+            };
             let mut reason_codes = Vec::new();
-            if aggregate.windows == 0 {
-                reason_codes.push("no_oos_windows".to_string());
-            }
             if aggregate.positive_window_ratio < min_ratio {
                 reason_codes.push("insufficient_positive_windows".to_string());
             }
@@ -3494,9 +3560,17 @@ pub fn build_prediction_research_feedback(
             if aggregate.min_test_top_edge_avg_full_depth_settlement_pnl <= 0.0 {
                 reason_codes.push("nonpositive_oos_settlement_pnl".to_string());
             }
+            if aggregate.min_test_top_edge_avg_conservative_settlement_pnl <= 0.0 {
+                reason_codes.push("nonpositive_oos_conservative_capacity_pnl".to_string());
+            }
+            if aggregate.min_top_edge_conservative_coverage_rate < 1.0 {
+                reason_codes
+                    .push("incomplete_oos_top_edge_conservative_capacity_coverage".to_string());
+            }
             PredictionResearchCandidateFeedback {
-                model: aggregate.model.clone(),
-                hypothesis: allowed_models[&aggregate.model].clone(),
+                model,
+                hypothesis,
+                probability_blend,
                 verdict: if reason_codes.is_empty() {
                     "keep".to_string()
                 } else {
@@ -3512,6 +3586,9 @@ pub fn build_prediction_research_feedback(
                     "avg_test_expected_calibration_error": aggregate.avg_test_expected_calibration_error,
                     "avg_test_top_edge_avg_full_depth_settlement_pnl": aggregate.avg_test_top_edge_avg_full_depth_settlement_pnl,
                     "min_test_top_edge_avg_full_depth_settlement_pnl": aggregate.min_test_top_edge_avg_full_depth_settlement_pnl,
+                    "avg_test_top_edge_avg_conservative_settlement_pnl": aggregate.avg_test_top_edge_avg_conservative_settlement_pnl,
+                    "min_test_top_edge_avg_conservative_settlement_pnl": aggregate.min_test_top_edge_avg_conservative_settlement_pnl,
+                    "min_top_edge_conservative_coverage_rate": aggregate.min_top_edge_conservative_coverage_rate,
                 }),
             }
         })
@@ -3519,9 +3596,21 @@ pub fn build_prediction_research_feedback(
     Some(PredictionResearchFeedback {
         schema_version: "prediction_research_feedback.v1".to_string(),
         mission_id: mission_id.to_string(),
-        data_snapshot_id: prior.data_snapshot_id.clone(),
-        prompt_snapshot_id: prior.prompt_snapshot_id.clone(),
-        search_policy_snapshot_id: prior.search_policy_snapshot_id.clone(),
+        target: prior.target.clone().expect("validated prediction target"),
+        symbols: prior.symbols.clone(),
+        horizon: prior.horizon.clone().expect("validated prediction horizon"),
+        data_snapshot_id: prior
+            .data_snapshot_id
+            .clone()
+            .expect("validated data snapshot"),
+        prompt_snapshot_id: prior
+            .prompt_snapshot_id
+            .clone()
+            .expect("validated prompt snapshot"),
+        search_policy_snapshot_id: prior
+            .search_policy_snapshot_id
+            .clone()
+            .expect("validated search policy snapshot"),
         candidates,
     })
 }
@@ -3537,12 +3626,12 @@ pub fn format_settlement_probability_report(report: &SettlementProbabilityReport
         report.options.event_surface_min_bucket_observations,
         report.options.event_surface_shrinkage_observations,
     ));
-    out.push_str("Population is full-depth entry-fillable candidate rows with settled labels. Edge is q_side - full_depth_entry_sweep_avg_price; PnL is full-depth settlement PnL after crypto fee. Conservative PnL uses 50% visible depth and max 3 CLOB levels.\n");
+    out.push_str("Population is full-depth entry-fillable candidate rows with settled labels. Edge is q_side - full_depth_entry_sweep_avg_price; PnL is full-depth settlement PnL after crypto fee. Conservative PnL uses 50% visible depth and max 3 CLOB levels; uncovered rows remain in the denominator with zero conservative PnL, and promoted top-edge selections require 100% conservative coverage.\n");
     out.push_str("\n--- Baseline Comparison ---\n");
-    out.push_str("model,n,avg_q,actual_win,brier,log_loss,ece,avg_edge,avg_full_depth_settlement_pnl,avg_conservative_settlement_pnl,profit_factor,edge_bucket_monotonic,top_edge_count,top_edge_avg_edge,top_edge_win,top_edge_avg_full_depth_settlement_pnl,top_edge_avg_conservative_settlement_pnl\n");
+    out.push_str("model,n,avg_q,actual_win,brier,log_loss,ece,avg_edge,avg_full_depth_settlement_pnl,avg_conservative_settlement_pnl,conservative_coverage_rate,profit_factor,edge_bucket_monotonic,top_edge_count,top_edge_avg_edge,top_edge_win,top_edge_avg_full_depth_settlement_pnl,top_edge_avg_conservative_settlement_pnl,top_edge_conservative_coverage_rate\n");
     for row in &report.baselines {
         out.push_str(&format!(
-            "{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{},{},{:.4},{:.4},{:.4},{:.4}\n",
+            "{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
             row.model,
             row.n,
             row.avg_predicted_q,
@@ -3553,6 +3642,7 @@ pub fn format_settlement_probability_report(report: &SettlementProbabilityReport
             row.avg_edge,
             row.avg_full_depth_settlement_pnl,
             row.avg_conservative_settlement_pnl,
+            row.conservative_coverage_rate,
             row.profit_factor,
             row.edge_bucket_monotonic_non_decreasing,
             row.top_edge_count,
@@ -3560,6 +3650,7 @@ pub fn format_settlement_probability_report(report: &SettlementProbabilityReport
             row.top_edge_win_rate,
             row.top_edge_avg_full_depth_settlement_pnl,
             row.top_edge_avg_conservative_settlement_pnl,
+            row.top_edge_conservative_coverage_rate,
         ));
     }
     out.push_str("\n--- Calibration Buckets ---\n");
@@ -3662,10 +3753,10 @@ pub fn format_settlement_probability_walk_forward_report(
     ));
     out.push_str("Test windows evaluate formula probabilities on future rows; EventVolSurface and q_final use only the train window as empirical prior.\n");
     out.push_str("\n--- Aggregate ---\n");
-    out.push_str("model,windows,positive_window_ratio,pass_window_ratio,avg_test_brier,avg_test_log_loss,avg_test_ece,avg_test_top_edge_full_depth_pnl,min_test_top_edge_full_depth_pnl\n");
+    out.push_str("model,windows,positive_window_ratio,pass_window_ratio,avg_test_brier,avg_test_log_loss,avg_test_ece,avg_test_top_edge_full_depth_pnl,min_test_top_edge_full_depth_pnl,avg_test_top_edge_conservative_pnl,min_test_top_edge_conservative_pnl,min_top_edge_conservative_coverage_rate\n");
     for row in &report.aggregates {
         out.push_str(&format!(
-            "{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4}\n",
+            "{},{},{:.4},{:.4},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
             row.model,
             row.windows,
             row.positive_window_ratio,
@@ -3675,13 +3766,16 @@ pub fn format_settlement_probability_walk_forward_report(
             row.avg_test_expected_calibration_error,
             row.avg_test_top_edge_avg_full_depth_settlement_pnl,
             row.min_test_top_edge_avg_full_depth_settlement_pnl,
+            row.avg_test_top_edge_avg_conservative_settlement_pnl,
+            row.min_test_top_edge_avg_conservative_settlement_pnl,
+            row.min_top_edge_conservative_coverage_rate,
         ));
     }
     out.push_str("\n--- Windows ---\n");
-    out.push_str("window,model,train_start,train_end,test_start,test_end,train_n,test_n,train_brier,test_brier,train_log_loss,test_log_loss,train_ece,test_ece,train_top_edge_full_depth_pnl,test_top_edge_full_depth_pnl,test_top_edge_conservative_pnl,test_edge_monotonic,pass\n");
+    out.push_str("window,model,train_start,train_end,test_start,test_end,train_n,test_n,train_brier,test_brier,train_log_loss,test_log_loss,train_ece,test_ece,train_top_edge_full_depth_pnl,test_top_edge_full_depth_pnl,test_top_edge_conservative_pnl,train_top_edge_conservative_coverage_rate,test_top_edge_conservative_coverage_rate,test_edge_monotonic,pass\n");
     for row in &report.windows {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{},{}\n",
+            "{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4},{:.4},{:.4},{:.4},{:.4},{},{}\n",
             row.window_index,
             row.model,
             row.train_start,
@@ -3699,6 +3793,8 @@ pub fn format_settlement_probability_walk_forward_report(
             row.train_top_edge_avg_full_depth_settlement_pnl,
             row.test_top_edge_avg_full_depth_settlement_pnl,
             row.test_top_edge_avg_conservative_settlement_pnl,
+            row.train_top_edge_conservative_coverage_rate,
+            row.test_top_edge_conservative_coverage_rate,
             row.test_edge_bucket_monotonic_non_decreasing,
             row.pass,
         ));
@@ -7916,7 +8012,8 @@ struct SettlementProbabilitySample {
     entry_price: f64,
     edge: f64,
     pnl: f64,
-    conservative_pnl: Option<f64>,
+    conservative_pnl: f64,
+    conservative_covered: bool,
 }
 
 fn push_settlement_probability_sample(
@@ -7925,6 +8022,7 @@ fn push_settlement_probability_sample(
     row: &FactorObservationV2,
     win: f64,
     pnl: f64,
+    conservative_pnl: Option<f64>,
     q: f64,
 ) {
     let q = clamp_probability(q);
@@ -7939,7 +8037,8 @@ fn push_settlement_probability_sample(
             entry_price,
             edge: q - entry_price,
             pnl,
-            conservative_pnl: row.label_conservative_executable_pnl_15u,
+            conservative_pnl: conservative_pnl.unwrap_or(0.0),
+            conservative_covered: conservative_pnl.is_some(),
         });
 }
 
@@ -7998,7 +8097,7 @@ struct EventVolSurface {
 
 impl EventVolSurface {
     fn fit(
-        rows: &[(&FactorObservationV2, f64, f64)],
+        rows: &[(&FactorObservationV2, f64, f64, Option<f64>)],
         min_bucket_observations: usize,
         shrinkage_observations: usize,
     ) -> Self {
@@ -8009,7 +8108,7 @@ impl EventVolSurface {
             buckets: HashMap::new(),
             events: HashMap::new(),
         };
-        for (row, win, _) in rows {
+        for (row, win, _, _) in rows {
             if !win.is_finite() {
                 continue;
             }
@@ -8130,27 +8229,65 @@ fn validated_probability_blends(
     prior: Option<&LlmPriorSpec>,
 ) -> Vec<(String, &LlmProbabilityBlendSpec)> {
     let mut by_name = BTreeMap::new();
-    let Some(prior) = prior else {
+    let Some(prior) = prior.filter(|prior| validate_prediction_research_prior(prior).is_ok())
+    else {
         return Vec::new();
     };
     for blend in &prior.probability_blends {
-        if blend.name.is_empty()
-            || blend.name.len() > 80
-            || blend.hypothesis.trim().is_empty()
-            || blend.hypothesis.len() > 500
-            || !blend
-                .name
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-            || !probability_blend_weights_valid(blend)
-        {
-            continue;
-        }
         by_name
             .entry(format!("q_llm_{}", blend.name))
             .or_insert(blend);
     }
     by_name.into_iter().collect()
+}
+
+pub fn validate_prediction_research_prior(prior: &LlmPriorSpec) -> Result<(), &'static str> {
+    if prior.target.as_deref() != Some("full_depth_settlement_executable_pnl") {
+        return Err("target must be full_depth_settlement_executable_pnl");
+    }
+    for (value, message) in [
+        (prior.mission_id.as_deref(), "mission_id is required"),
+        (
+            prior.data_snapshot_id.as_deref(),
+            "data_snapshot_id is required",
+        ),
+        (
+            prior.prompt_snapshot_id.as_deref(),
+            "prompt_snapshot_id is required",
+        ),
+        (
+            prior.search_policy_snapshot_id.as_deref(),
+            "search_policy_snapshot_id is required",
+        ),
+    ] {
+        if !value.is_some_and(|value| {
+            !value.trim().is_empty() && !value.trim().starts_with("REPLACE_WITH_")
+        }) {
+            return Err(message);
+        }
+    }
+    if prior.symbols.len() != 1 || prior.symbols[0].trim().is_empty() {
+        return Err("exactly one symbol is required");
+    }
+    if prior.horizon.as_deref() != Some("5m") {
+        return Err("horizon must be 5m");
+    }
+    if !prior.mutations.is_empty() {
+        return Err("prediction prior may not contain factor mutations");
+    }
+    if prior.probability_blends.is_empty() {
+        return Err("prediction prior must contain at least one probability blend");
+    }
+    let mut names = BTreeSet::new();
+    for blend in &prior.probability_blends {
+        if !probability_blend_schema_valid(blend) {
+            return Err("probability blend is invalid");
+        }
+        if !names.insert(blend.name.as_str()) {
+            return Err("probability blend names must be unique");
+        }
+    }
+    Ok(())
 }
 
 fn prediction_prior_matches_row(prior: &LlmPriorSpec, row: &FactorObservationV2) -> bool {
@@ -8183,10 +8320,24 @@ fn probability_blend_weights_valid(blend: &LlmProbabilityBlendSpec) -> bool {
         blend.event_surface_weight,
         blend.existing_model_weight,
     ];
+    let total = weights.iter().sum::<f64>();
     weights
         .iter()
         .all(|weight| weight.is_finite() && *weight >= 0.0)
-        && weights.iter().sum::<f64>() > EPS
+        && total.is_finite()
+        && total > EPS
+}
+
+fn probability_blend_schema_valid(blend: &LlmProbabilityBlendSpec) -> bool {
+    !blend.name.is_empty()
+        && blend.name.len() <= 80
+        && !blend.hypothesis.trim().is_empty()
+        && blend.hypothesis.len() <= 500
+        && blend
+            .name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        && probability_blend_weights_valid(blend)
 }
 
 fn settlement_probability_weighted_blend(
@@ -8394,8 +8545,13 @@ fn build_probability_baseline_row(
         expected_calibration_error: expected_calibration_error(calibration, n),
         avg_edge: mean(samples.iter().map(|sample| sample.edge)),
         avg_full_depth_settlement_pnl: mean(samples.iter().map(|sample| sample.pnl)),
-        avg_conservative_settlement_pnl: mean(
-            samples.iter().filter_map(|sample| sample.conservative_pnl),
+        avg_conservative_settlement_pnl: mean(samples.iter().map(|sample| sample.conservative_pnl)),
+        conservative_coverage_rate: ratio(
+            samples
+                .iter()
+                .filter(|sample| sample.conservative_covered)
+                .count(),
+            n,
         ),
         profit_factor: profit_factor(samples.iter().map(|sample| sample.pnl)),
         edge_bucket_monotonic_non_decreasing: edge_bucket_monotonic(edge_buckets),
@@ -8404,7 +8560,13 @@ fn build_probability_baseline_row(
         top_edge_win_rate: mean(top.iter().map(|sample| sample.win)),
         top_edge_avg_full_depth_settlement_pnl: mean(top.iter().map(|sample| sample.pnl)),
         top_edge_avg_conservative_settlement_pnl: mean(
-            top.iter().filter_map(|sample| sample.conservative_pnl),
+            top.iter().map(|sample| sample.conservative_pnl),
+        ),
+        top_edge_conservative_coverage_rate: ratio(
+            top.iter()
+                .filter(|sample| sample.conservative_covered)
+                .count(),
+            top.len(),
         ),
     }
 }
@@ -8436,9 +8598,7 @@ fn build_probability_calibration_rows(
                 avg_edge: mean(bucket_samples.iter().map(|sample| sample.edge)),
                 avg_full_depth_settlement_pnl: mean(bucket_samples.iter().map(|sample| sample.pnl)),
                 avg_conservative_settlement_pnl: mean(
-                    bucket_samples
-                        .iter()
-                        .filter_map(|sample| sample.conservative_pnl),
+                    bucket_samples.iter().map(|sample| sample.conservative_pnl),
                 ),
             }
         })
@@ -8477,15 +8637,11 @@ fn build_probability_edge_bucket_rows(
             ),
             avg_full_depth_settlement_pnl: mean(bucket_samples.iter().map(|sample| sample.pnl)),
             avg_conservative_settlement_pnl: mean(
-                bucket_samples
-                    .iter()
-                    .filter_map(|sample| sample.conservative_pnl),
+                bucket_samples.iter().map(|sample| sample.conservative_pnl),
             ),
             profit_factor: profit_factor(bucket_samples.iter().map(|sample| sample.pnl)),
             conservative_profit_factor: profit_factor(
-                bucket_samples
-                    .iter()
-                    .filter_map(|sample| sample.conservative_pnl),
+                bucket_samples.iter().map(|sample| sample.conservative_pnl),
             ),
         });
     }
@@ -10161,6 +10317,7 @@ mod tests {
             event_id: "evt".into(),
             symbol: "BTCUSDT".into(),
             tick_ts: Utc::now(),
+            event_window_secs: 300,
             time_remaining_secs: 220,
             signed_distance_to_beat: 0.01,
             abs_distance_to_beat: 0.01,
@@ -10213,6 +10370,20 @@ mod tests {
             cex_consecutive_up_bars: 2.0,
             cex_consecutive_down_bars: 0.0,
             cex_breakout_volume_score: 1.2,
+        }
+    }
+
+    fn make_settlement_probability_eligible(rows: &mut [FactorObservationV2]) {
+        for row in rows {
+            row.label_full_depth_entry_fillable = true;
+            row.label_conservative_entry_fillable = true;
+            row.entry_sweep_avg_price_15u = row.entry_ask;
+            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
+            let pnl = row
+                .label_settlement_win
+                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
+            row.label_full_depth_executable_pnl_15u = pnl;
+            row.label_conservative_executable_pnl_15u = pnl;
         }
     }
 
@@ -10353,14 +10524,7 @@ mod tests {
     fn settlement_probability_report_uses_full_depth_entry_population() {
         let options = FactorReviewOptions::default();
         let mut rows = build_factor_observations_v2(&[base_obs()], &options);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
         let base_rows = rows.clone();
         rows.extend(base_rows.iter().cloned());
         rows.extend(base_rows.iter().cloned());
@@ -10442,14 +10606,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut rows = build_factor_observations_v2(&source_rows, &options);
         rows.retain(|row| row.side == ReviewSide::Up);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
 
         let report = build_settlement_probability_report(
             &rows,
@@ -10495,14 +10652,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut rows = build_factor_observations_v2(&source_rows, &options);
         rows.retain(|row| row.side == ReviewSide::Up);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
 
         let event_surface = EventVolSurface::fit(
             &rows
@@ -10512,6 +10662,7 @@ mod tests {
                         row,
                         row.label_settlement_win.unwrap(),
                         row.label_full_depth_executable_pnl_15u.unwrap(),
+                        row.label_conservative_executable_pnl_15u,
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -10546,6 +10697,74 @@ mod tests {
     }
 
     #[test]
+    fn settlement_probability_requires_complete_conservative_capacity_labels() {
+        let source_rows = (0..4)
+            .map(|idx| {
+                let mut obs = base_obs();
+                obs.event_id = format!("conservative-{idx}");
+                obs.tick_ts += Duration::seconds(idx);
+                obs
+            })
+            .collect::<Vec<_>>();
+        let mut rows = build_factor_observations_v2(
+            &source_rows,
+            &FactorReviewOptions {
+                min_observations: 1,
+                ..Default::default()
+            },
+        );
+        rows.retain(|row| row.side == ReviewSide::Up);
+        make_settlement_probability_eligible(&mut rows);
+        rows[1].label_conservative_executable_pnl_15u = None;
+        rows[2].label_conservative_executable_pnl_15u = Some(f64::NAN);
+        rows[3].label_conservative_entry_fillable = false;
+
+        let report = build_settlement_probability_report(
+            &rows,
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                top_edge_quantile: 1.0,
+                event_surface_min_bucket_observations: 1,
+                event_surface_shrinkage_observations: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(!report.baselines.is_empty());
+        assert!(report.baselines.iter().all(|row| row.n == 4));
+        assert!(report
+            .baselines
+            .iter()
+            .all(|row| row.avg_conservative_settlement_pnl.is_finite()));
+        assert!(report
+            .baselines
+            .iter()
+            .all(|row| (row.conservative_coverage_rate - 0.25).abs() < 1e-9));
+        assert!(report
+            .baselines
+            .iter()
+            .all(|row| (row.top_edge_conservative_coverage_rate - 0.25).abs() < 1e-9));
+        assert!(best_conservative_edge_model(&report).is_none());
+
+        for row in &mut rows {
+            row.label_conservative_executable_pnl_15u = None;
+        }
+        let uncovered = build_settlement_probability_report(
+            &rows,
+            SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                top_edge_quantile: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(uncovered.baselines.iter().all(|row| row.n == 4));
+        assert!(uncovered.baselines.iter().all(|row| {
+            row.conservative_coverage_rate == 0.0 && row.avg_conservative_settlement_pnl == 0.0
+        }));
+        assert!(best_conservative_edge_model(&uncovered).is_none());
+    }
+
+    #[test]
     fn typed_prior_probability_blend_enters_probability_evaluator() {
         let options = FactorReviewOptions::default();
         let mut source_rows = (0..8)
@@ -10567,17 +10786,13 @@ mod tests {
         source_rows.push(sol);
         let mut rows = build_factor_observations_v2(&source_rows, &options);
         rows.retain(|row| row.side == ReviewSide::Up);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
         let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
             "mission_id": "polymarket-btc-5m-v1",
+            "data_snapshot_id": "sha256:btc-data",
             "prompt_snapshot_id": "sha256:prompt",
+            "search_policy_snapshot_id": "prediction-probability-blend-v1",
             "symbols": ["BTC"],
             "horizon": "5m",
             "probability_blends": [{
@@ -10618,15 +10833,15 @@ mod tests {
     fn invalid_typed_probability_blends_fail_closed() {
         let options = FactorReviewOptions::default();
         let mut rows = build_factor_observations_v2(&[base_obs()], &options);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
         let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "polymarket-btc-5m-invalid",
+            "data_snapshot_id": "sha256:btc-data",
+            "prompt_snapshot_id": "sha256:btc-prompt",
+            "search_policy_snapshot_id": "prediction-probability-blend-v1",
+            "symbols": ["BTC"],
+            "horizon": "5m",
             "probability_blends": [
                 {
                     "name": "negative",
@@ -10641,6 +10856,14 @@ mod tests {
                     "hypothesis": "Zero total weight must be rejected.",
                     "market_midpoint_weight": 0.0,
                     "distance_lob_vol_weight": 0.0,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0
+                },
+                {
+                    "name": "overflow",
+                    "hypothesis": "Overflowing total weight must be rejected.",
+                    "market_midpoint_weight": 1e308,
+                    "distance_lob_vol_weight": 1e308,
                     "event_surface_weight": 0.0,
                     "existing_model_weight": 0.0
                 }
@@ -10664,20 +10887,99 @@ mod tests {
     }
 
     #[test]
+    fn multi_symbol_probability_prior_fails_closed() {
+        let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "mixed-symbol-mission",
+            "data_snapshot_id": "sha256:mixed-data",
+            "prompt_snapshot_id": "sha256:mixed-prompt",
+            "search_policy_snapshot_id": "prediction-probability-blend-v1",
+            "symbols": ["BTC", "SOL"],
+            "horizon": "5m",
+            "probability_blends": [{
+                "name": "mixed",
+                "hypothesis": "A mixed-symbol candidate must not be evaluated.",
+                "market_midpoint_weight": 1.0,
+                "distance_lob_vol_weight": 0.0,
+                "event_surface_weight": 0.0,
+                "existing_model_weight": 0.0
+            }]
+        }))
+        .expect("typed prior");
+
+        assert!(validate_prediction_research_prior(&prior).is_err());
+        assert!(validated_probability_blends(Some(&prior)).is_empty());
+    }
+
+    #[test]
+    fn prediction_prior_rejects_formula_mutations_and_empty_blends() {
+        let base = serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
+            "mission_id": "blend-only-mission",
+            "data_snapshot_id": "sha256:btc-data",
+            "prompt_snapshot_id": "sha256:btc-prompt",
+            "search_policy_snapshot_id": "prediction-probability-blend-v1",
+            "symbols": ["BTC"],
+            "horizon": "5m"
+        });
+        let empty: crate::autofactor::LlmPriorSpec =
+            serde_json::from_value(base.clone()).expect("empty typed prior");
+        assert_eq!(
+            validate_prediction_research_prior(&empty),
+            Err("prediction prior must contain at least one probability blend")
+        );
+
+        let mut formula = base;
+        formula["mutations"] = serde_json::json!([{
+            "base_factor": "auto_settlement_model_full_depth_settlement_edge",
+            "mutation_type": "add_capacity_gate",
+            "hypothesis": "A formula mutation must not cross into the blend-only loop."
+        }]);
+        formula["probability_blends"] = serde_json::json!([{
+            "name": "otherwise_valid",
+            "hypothesis": "The blend itself is valid.",
+            "market_midpoint_weight": 1.0,
+            "distance_lob_vol_weight": 0.0,
+            "event_surface_weight": 0.0,
+            "existing_model_weight": 0.0
+        }]);
+        let formula: crate::autofactor::LlmPriorSpec =
+            serde_json::from_value(formula).expect("formula typed prior");
+        assert_eq!(
+            validate_prediction_research_prior(&formula),
+            Err("prediction prior may not contain factor mutations")
+        );
+        assert!(validated_probability_blends(Some(&formula)).is_empty());
+    }
+
+    #[test]
     fn prediction_feedback_is_candidate_specific_and_machine_readable() {
         let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
             "mission_id": "polymarket-sol-5m-v1",
             "data_snapshot_id": "sha256:sol-data",
             "prompt_snapshot_id": "sha256:sol-prompt",
             "search_policy_snapshot_id": "prediction-probability-blend-v1",
-            "probability_blends": [{
-                "name": "sol_flow",
-                "hypothesis": "SOL flow components improve OOS calibration.",
-                "market_midpoint_weight": 0.5,
-                "distance_lob_vol_weight": 0.3,
-                "event_surface_weight": 0.2,
-                "existing_model_weight": 0.0
-            }]
+            "symbols": ["SOL"],
+            "horizon": "5m",
+            "probability_blends": [
+                {
+                    "name": "sol_flow",
+                    "hypothesis": "SOL flow components improve OOS calibration.",
+                    "market_midpoint_weight": 0.5,
+                    "distance_lob_vol_weight": 0.3,
+                    "event_surface_weight": 0.2,
+                    "existing_model_weight": 0.0
+                },
+                {
+                    "name": "no_oos",
+                    "hypothesis": "This candidate still requires OOS evidence.",
+                    "market_midpoint_weight": 1.0,
+                    "distance_lob_vol_weight": 0.0,
+                    "event_surface_weight": 0.0,
+                    "existing_model_weight": 0.0
+                }
+            ]
         }))
         .expect("typed prior");
         let report = SettlementProbabilityWalkForwardReport {
@@ -10693,6 +10995,9 @@ mod tests {
                 avg_test_expected_calibration_error: 0.20,
                 avg_test_top_edge_avg_full_depth_settlement_pnl: -1.0,
                 min_test_top_edge_avg_full_depth_settlement_pnl: -2.0,
+                avg_test_top_edge_avg_conservative_settlement_pnl: -1.5,
+                min_test_top_edge_avg_conservative_settlement_pnl: -2.5,
+                min_top_edge_conservative_coverage_rate: 1.0,
             }],
         };
 
@@ -10700,20 +11005,48 @@ mod tests {
             build_prediction_research_feedback(&prior, &report, 0.6).expect("mission feedback");
 
         assert_eq!(feedback.mission_id, "polymarket-sol-5m-v1");
-        assert_eq!(
-            feedback.data_snapshot_id.as_deref(),
-            Some("sha256:sol-data")
-        );
-        assert_eq!(feedback.candidates.len(), 1);
-        assert!(feedback.candidates[0].hypothesis.contains("SOL flow"));
-        assert_eq!(feedback.candidates[0].verdict, "discard");
-        assert!(feedback.candidates[0]
+        assert_eq!(feedback.target, "full_depth_settlement_executable_pnl");
+        assert_eq!(feedback.symbols, ["SOL"]);
+        assert_eq!(feedback.horizon, "5m");
+        assert_eq!(feedback.data_snapshot_id, "sha256:sol-data");
+        assert_eq!(feedback.candidates.len(), 2);
+        let sol_feedback = feedback
+            .candidates
+            .iter()
+            .find(|candidate| candidate.model == "q_llm_sol_flow")
+            .expect("SOL feedback");
+        assert!(sol_feedback.hypothesis.contains("SOL flow"));
+        assert_eq!(sol_feedback.probability_blend.name, "sol_flow");
+        assert_eq!(sol_feedback.verdict, "discard");
+        assert!(sol_feedback
             .reason_codes
             .contains(&"calibration_gate_failed".to_string()));
+        assert!(sol_feedback
+            .reason_codes
+            .contains(&"nonpositive_oos_conservative_capacity_pnl".to_string()));
         assert_eq!(
-            feedback.candidates[0].metrics["avg_test_brier_score"],
+            sol_feedback.metrics["avg_test_brier_score"],
             serde_json::json!(0.40)
         );
+        let no_oos = feedback
+            .candidates
+            .iter()
+            .find(|candidate| candidate.model == "q_llm_no_oos")
+            .expect("no-OOS feedback");
+        assert_eq!(no_oos.verdict, "discard");
+        assert_eq!(no_oos.reason_codes, ["no_oos_windows"]);
+
+        let mut incomplete = report.clone();
+        incomplete.aggregates[0].min_top_edge_conservative_coverage_rate = 0.5;
+        let incomplete_feedback = build_prediction_research_feedback(&prior, &incomplete, 0.6)
+            .expect("incomplete capacity feedback");
+        assert!(incomplete_feedback
+            .candidates
+            .iter()
+            .find(|candidate| candidate.model == "q_llm_sol_flow")
+            .expect("SOL feedback")
+            .reason_codes
+            .contains(&"incomplete_oos_top_edge_conservative_capacity_coverage".to_string()));
     }
 
     #[test]
@@ -10735,17 +11068,16 @@ mod tests {
             .collect::<Vec<_>>();
         let mut rows = build_factor_observations_v2(&source_rows, &FactorReviewOptions::default());
         rows.retain(|row| row.side == ReviewSide::Up);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
 
         let prior: crate::autofactor::LlmPriorSpec = serde_json::from_value(serde_json::json!({
+            "target": "full_depth_settlement_executable_pnl",
             "mission_id": "polymarket-btc-5m-v1",
+            "data_snapshot_id": "sha256:btc-data",
+            "prompt_snapshot_id": "sha256:btc-prompt",
+            "search_policy_snapshot_id": "prediction-probability-blend-v1",
+            "symbols": ["BTC"],
+            "horizon": "5m",
             "probability_blends": [{
                 "name": "walk_forward",
                 "hypothesis": "The blend improves event-disjoint OOS calibration.",
@@ -10893,14 +11225,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut rows = build_factor_observations_v2(&source_rows, &FactorReviewOptions::default());
         rows.retain(|row| row.side == ReviewSide::Up);
-        for row in &mut rows {
-            row.label_full_depth_entry_fillable = true;
-            row.entry_sweep_avg_price_15u = row.entry_ask;
-            row.entry_sweep_shares_15u = 15.0 / row.entry_sweep_avg_price_15u;
-            row.label_full_depth_executable_pnl_15u = row
-                .label_settlement_win
-                .map(|win| win * row.entry_sweep_shares_15u - 15.0);
-        }
+        make_settlement_probability_eligible(&mut rows);
 
         let report = walk_forward_settlement_probability_report(
             &rows,
@@ -10954,6 +11279,9 @@ mod tests {
                 avg_test_expected_calibration_error: 0.01,
                 avg_test_top_edge_avg_full_depth_settlement_pnl: 2.0,
                 min_test_top_edge_avg_full_depth_settlement_pnl: 1.0,
+                avg_test_top_edge_avg_conservative_settlement_pnl: 1.5,
+                min_test_top_edge_avg_conservative_settlement_pnl: 0.5,
+                min_top_edge_conservative_coverage_rate: 1.0,
             }],
         };
 
@@ -10965,6 +11293,9 @@ mod tests {
         assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
         report.aggregates[0].avg_test_log_loss = 0.2;
         report.aggregates[0].avg_test_expected_calibration_error = 0.1;
+        assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
+        report.aggregates[0].avg_test_expected_calibration_error = 0.01;
+        report.aggregates[0].min_top_edge_conservative_coverage_rate = 0.99;
         assert!(best_walk_forward_oos_model(&report, 0.6).is_none());
     }
 
@@ -10983,6 +11314,7 @@ mod tests {
                 avg_edge: 0.05,
                 avg_full_depth_settlement_pnl: 1.0,
                 avg_conservative_settlement_pnl: 0.8,
+                conservative_coverage_rate: 1.0,
                 profit_factor: 1.2,
                 edge_bucket_monotonic_non_decreasing: true,
                 top_edge_count: 20,
@@ -10990,6 +11322,7 @@ mod tests {
                 top_edge_win_rate: 0.8,
                 top_edge_avg_full_depth_settlement_pnl: 2.0,
                 top_edge_avg_conservative_settlement_pnl: 1.5,
+                top_edge_conservative_coverage_rate: 1.0,
             }],
             calibration: Vec::new(),
             edge_buckets: Vec::new(),
@@ -11038,6 +11371,9 @@ mod tests {
                 avg_test_expected_calibration_error: 0.01,
                 avg_test_top_edge_avg_full_depth_settlement_pnl: 2.0,
                 min_test_top_edge_avg_full_depth_settlement_pnl: 1.0,
+                avg_test_top_edge_avg_conservative_settlement_pnl: 1.5,
+                min_test_top_edge_avg_conservative_settlement_pnl: 0.5,
+                min_top_edge_conservative_coverage_rate: 1.0,
             }],
         };
         let execution = FullDepthExecutionMatrixReport {

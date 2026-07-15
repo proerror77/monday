@@ -7,8 +7,11 @@ use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike, Utc};
+#[cfg(feature = "db")]
+use chrono::Timelike;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{DeribitFeatureSnapshot, FactorObservation, ResearchPmBookSnapshot};
 
@@ -93,6 +96,8 @@ pub struct ResearchSnapshotPmBookSource {
 pub struct ResearchSnapshotManifest {
     pub schema_version: String,
     pub snapshot_hash: Option<String>,
+    #[serde(default)]
+    pub snapshot_contract_hash: Option<String>,
     pub generated_at: DateTime<Utc>,
     pub git_sha: Option<String>,
     pub symbols: Vec<String>,
@@ -166,6 +171,41 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
             RESEARCH_SNAPSHOT_SCHEMA_VERSION
         );
     }
+    if let Some(recorded_contract_hash) = manifest.snapshot_contract_hash.as_deref() {
+        let contract_hex = recorded_contract_hash
+            .strip_prefix("sha256:")
+            .filter(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .context("research snapshot contract hash must use sha256:<64hex>")?;
+        debug_assert_eq!(contract_hex.len(), 64);
+        let computed_contract_hash = compute_snapshot_contract_hash(snapshot_dir, &manifest)
+            .context("verify research snapshot evaluator contract hash")?;
+        if recorded_contract_hash != computed_contract_hash {
+            anyhow::bail!(
+                "research snapshot evaluator contract hash mismatch: manifest={} computed={}",
+                recorded_contract_hash,
+                computed_contract_hash
+            );
+        }
+    }
+    let recorded_hash = manifest
+        .snapshot_hash
+        .as_deref()
+        .filter(|hash| !hash.is_empty())
+        .context("research snapshot manifest is missing snapshot_hash")?;
+    let computed_hash = compute_snapshot_hash(snapshot_dir, &manifest)
+        .context("verify research snapshot content hash")?;
+    if recorded_hash != computed_hash {
+        anyhow::bail!(
+            "research snapshot content hash mismatch: manifest={} computed={}",
+            recorded_hash,
+            computed_hash
+        );
+    }
 
     let observations = read_json(snapshot_dir.join(&manifest.artifacts.observations_json))
         .context("read snapshot observations")?;
@@ -228,6 +268,10 @@ pub fn write_research_snapshot(
 
     snapshot.manifest.snapshot_hash =
         Some(compute_snapshot_hash(snapshot_dir, &snapshot.manifest)?);
+    snapshot.manifest.snapshot_contract_hash = Some(compute_snapshot_contract_hash(
+        snapshot_dir,
+        &snapshot.manifest,
+    )?);
 
     write_json(
         snapshot_dir.join(&snapshot.manifest.artifacts.query_timings_json),
@@ -986,6 +1030,7 @@ pub async fn build_research_snapshot_from_database(
         manifest: ResearchSnapshotManifest {
             schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
             snapshot_hash: None,
+            snapshot_contract_hash: None,
             generated_at: Utc::now(),
             git_sha: options.git_sha,
             symbols: options.symbols,
@@ -1215,6 +1260,44 @@ fn compute_snapshot_hash(
     Ok(format!("{hash:016x}"))
 }
 
+fn compute_snapshot_contract_hash(
+    snapshot_dir: &Path,
+    manifest: &ResearchSnapshotManifest,
+) -> Result<String> {
+    fn update_framed(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+
+    let mut contract_manifest = manifest.clone();
+    contract_manifest.snapshot_hash = None;
+    contract_manifest.snapshot_contract_hash = None;
+
+    let manifest_bytes = serde_json::to_vec(&contract_manifest)
+        .context("serialize manifest for research snapshot evaluator contract hash")?;
+    let mut hasher = Sha256::new();
+    update_framed(&mut hasher, b"ploy.research_snapshot.evaluator_contract.v1");
+    update_framed(&mut hasher, &manifest_bytes);
+
+    for artifact in [
+        Some(manifest.artifacts.observations_json.as_str()),
+        Some(manifest.artifacts.deribit_snapshots_json.as_str()),
+        Some(manifest.artifacts.pm_book_snapshots_json.as_str()),
+        manifest.artifacts.observations_parquet.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        update_framed(&mut hasher, artifact.as_bytes());
+        let bytes = fs::read(snapshot_dir.join(artifact)).with_context(|| {
+            format!("read evaluator artifact {artifact} for snapshot contract hashing")
+        })?;
+        update_framed(&mut hasher, &bytes);
+    }
+
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
 fn write_quality_markdown(path: &Path, manifest: &ResearchSnapshotManifest) -> Result<()> {
     let mut body = String::new();
     body.push_str("# Research Snapshot Quality\n\n");
@@ -1222,6 +1305,13 @@ fn write_quality_markdown(path: &Path, manifest: &ResearchSnapshotManifest) -> R
     body.push_str(&format!(
         "- Snapshot hash: `{}`\n",
         manifest.snapshot_hash.as_deref().unwrap_or("<missing>")
+    ));
+    body.push_str(&format!(
+        "- Snapshot contract hash: `{}`\n",
+        manifest
+            .snapshot_contract_hash
+            .as_deref()
+            .unwrap_or("<legacy-unavailable>")
     ));
     body.push_str(&format!("- Generated at: `{}`\n", manifest.generated_at));
     body.push_str(&format!(
@@ -1388,6 +1478,7 @@ mod tests {
             manifest: ResearchSnapshotManifest {
                 schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
                 snapshot_hash: None,
+                snapshot_contract_hash: None,
                 generated_at: Utc::now(),
                 git_sha: Some("test-sha".to_string()),
                 symbols: vec!["BTCUSDT".to_string()],
@@ -1442,6 +1533,13 @@ mod tests {
         let loaded = load_research_snapshot(&root).expect("load snapshot");
         assert_eq!(written.schema_version, RESEARCH_SNAPSHOT_SCHEMA_VERSION);
         assert!(written.snapshot_hash.is_some());
+        let contract_hex = written
+            .snapshot_contract_hash
+            .as_deref()
+            .and_then(|hash| hash.strip_prefix("sha256:"))
+            .expect("SHA-256 contract hash");
+        assert_eq!(contract_hex.len(), 64);
+        assert!(contract_hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(loaded.manifest.git_sha.as_deref(), Some("test-sha"));
         assert_eq!(loaded.manifest.source_surfaces.len(), 1);
         assert!(loaded.manifest.source_surfaces[0].snapshot_sampled);
@@ -1497,10 +1595,41 @@ mod tests {
         assert!(exact_subset_result.is_err());
         assert_eq!(loaded.manifest.row_counts.observations, 0);
         let quality = std::fs::read_to_string(root.join("quality.md")).expect("read quality");
+        assert!(quality.contains("Snapshot contract hash: `sha256:"));
         assert!(quality.contains("## Source Surfaces"));
         assert!(quality.contains("gate_category=`required_for_prediction`"));
         assert!(quality.contains("snapshot_sampled=`true`"));
         assert!(quality.contains("## Input Artifacts"));
+
+        let mut legacy_manifest = serde_json::to_value(&loaded.manifest).expect("legacy manifest");
+        legacy_manifest
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("snapshot_contract_hash");
+        write_json(root.join("manifest.json"), &legacy_manifest).expect("write legacy manifest");
+        load_research_snapshot(&root).expect("legacy snapshot without contract hash must load");
+
+        let mut semantic_tamper = loaded.manifest.clone();
+        semantic_tamper.max_quote_age_secs += 1;
+        write_json(root.join("manifest.json"), &semantic_tamper)
+            .expect("tamper snapshot manifest semantics");
+        let tampered_manifest =
+            load_research_snapshot(&root).expect_err("semantic tamper must fail");
+        assert!(tampered_manifest
+            .to_string()
+            .contains("evaluator contract hash mismatch"));
+
+        write_json(root.join("manifest.json"), &loaded.manifest)
+            .expect("restore snapshot manifest");
+        std::fs::write(
+            root.join(&loaded.manifest.artifacts.observations_json),
+            "[]\n",
+        )
+        .expect("tamper snapshot observations");
+        let tampered = load_research_snapshot(&root).expect_err("tampered snapshot must fail");
+        assert!(tampered
+            .to_string()
+            .contains("evaluator contract hash mismatch"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1512,6 +1641,7 @@ mod tests {
         let manifest = ResearchSnapshotManifest {
             schema_version: RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
             snapshot_hash: Some("hash".to_string()),
+            snapshot_contract_hash: None,
             generated_at: Utc::now(),
             git_sha: Some("test-sha".to_string()),
             symbols: vec!["BTCUSDT".to_string()],

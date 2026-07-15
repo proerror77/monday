@@ -529,8 +529,22 @@ The optional LLM turn is mission-driven and remains off by default. Its first
 turn requires a reviewed `prediction_research_mission.v1` JSON; later turns may
 recover the same mission from the previous typed prior. BTC and SOL must use
 separate mission files so a candidate cannot silently broaden its symbol
-population. Start from one of the checked-in examples, replace both provenance
-placeholders, and run:
+population. Start from one of the checked-in examples. Set `data_snapshot_id`
+to the immutable snapshot manifest's `snapshot_contract_hash`, then verify the
+brief and implementation IDs before running one manual proposal:
+
+```bash
+python3 scripts/prediction_research_loop.py \
+  --print-brief-snapshot-id \
+  config/research_missions/polymarket-btc-5m.json
+python3 scripts/prediction_research_loop.py --print-policy-snapshot-id
+```
+
+The printed values must equal `prompt_snapshot_id` and
+`search_policy_snapshot_id`. A brief or implementation change requires a new
+mission revision; do not rewrite an existing run's identity.
+
+Then run:
 
 ```bash
 python3 scripts/alpha_search_llm_propose.py \
@@ -539,6 +553,43 @@ python3 scripts/alpha_search_llm_propose.py \
   --mission-json config/research_missions/polymarket-btc-5m.json \
   --output-prior-json /tmp/next-llm-prior.json
 ```
+
+The mission LoopRun driver is the normal BTC/SOL research entrypoint once the
+immutable research snapshot exists:
+
+```bash
+python3 scripts/prediction_research_loop.py \
+  config/research_missions/polymarket-btc-5m.json \
+  /var/lib/ploy/research-snapshots/btc-5m \
+  /var/lib/ploy/research-runs/btc-5m-loop-001
+```
+
+The driver runs a deterministic baseline, proposes a typed batch, invokes the
+same Rust evaluator, ingests candidate feedback, and repeats until a candidate
+is kept, a budget is exhausted, or an explicit failure pauses the run. Rerun
+the same command only after a `paused` result. `completed`, `stopped`, and
+`failed` are immutable terminal ledgers; continuing one of those requires a new
+reviewed mission revision and a new output directory. Evaluator failures reuse
+the already persisted prior without another LLM call. Every LLM attempt is
+retained in an append-only call ledger, including schema rejection, provider
+failure, a response missing after process interruption, and a response that
+arrived after the time budget. A durably persisted response is replayed after a
+crash before any new provider call or call-budget check.
+
+The output directory is exclusively locked while the LoopRun owns it. Reusing
+it for SOL, another mission revision, another snapshot, or another policy
+implementation is rejected. The prediction LoopRun requires `mutable_scope` to
+contain only `probability_blend_weights`; formula/IC diagnostics remain a
+separate standalone research lane.
+
+Governed five-minute missions pass `--event-window-secs 300` at both the Python
+driver and Rust evaluator boundaries. They require observations whose persisted
+`event_window_secs` is exactly `300`, plus a verified
+`snapshot_contract_hash` that binds the complete evaluator manifest and input
+artifacts. Legacy snapshots default that field to zero and do not have the
+strong contract hash, so they must be regenerated before this LoopRun can use
+them. Rebuilding the snapshot does not imply recollecting an already retained
+raw source, but it does require producing a new immutable evaluator artifact.
 
 The call requires `PLOY_RESEARCH_LLM_API_KEY`; provider and model remain
 selectable through the existing environment variables. Missing mission
@@ -551,18 +602,21 @@ components, available base-factor names, and at most eight qualitative
 `keep`/`discard` outcomes. It does not receive raw labels, evaluator thresholds,
 or numeric evaluation metrics. Output is limited by `mutable_scope`:
 
-- `factor_formula` / `factor_ast` allows an existing typed `LlmMutationSpec`,
-  which remains an IC/ICIR diagnostic in AutoFactor.
+- `factor_formula` / `factor_ast` allows an existing typed `LlmMutationSpec`
+  with a falsifiable hypothesis, which remains an IC/ICIR diagnostic in
+  AutoFactor.
 - `probability_blend_weights` allows a named non-negative logit blend over the
   four registered probability components. These candidates enter the real
   event-disjoint probability evaluator as `q_llm_<name>` and are scored with
   Brier score, log loss, calibration error, executable settlement PnL, and
-  capacity evidence.
+  conservative-depth capacity evidence.
 
-After evaluation, `prediction-research-feedback.json` records candidate metrics
-and deterministic reason codes. Only the candidate name, verdict, and reason
-codes are returned to the next LLM turn. This closes the proposal/evaluation/
-feedback loop without giving the model evaluator or execution authority.
+After evaluation, `prediction-research-feedback-<sha256>.json` records the
+candidate definition, metrics, and deterministic reason codes. Only the
+candidate definition, hypothesis, verdict, and reason codes are returned to the
+next LLM turn; evaluator metrics and thresholds are withheld. This closes the
+proposal/evaluation/feedback loop without giving the model evaluator or
+execution authority.
 
 When the provider returns usage data, the script writes
 `llm-expansion-usage.json` next to `next-llm-prior.json` in the alpha-search

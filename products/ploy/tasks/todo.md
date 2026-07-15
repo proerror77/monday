@@ -36,6 +36,9 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [x] Gate prediction OOS evidence with Brier score, log loss, calibration error, settlement PnL, and event-level capacity.
 - [x] Route typed probability-blend candidates into the prediction evaluator and emit candidate-specific loop feedback.
 - [x] Add separate governed BTC and SOL five-minute mission templates; reject mixed-symbol missions and unresolved provenance.
+- [x] Add a resumable PLOY prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
+- [x] Enforce mission, symbol, horizon, and exact snapshot provenance again at the Rust evaluator boundary.
+- [x] Keep feedback mission-local and return no-OOS plus conservative-capacity failure reasons for every proposed blend.
 
 ## Safety
 

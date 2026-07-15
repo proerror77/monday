@@ -2,8 +2,8 @@
   "schema_version": "prediction_research_mission.v1",
   "mission_id": "polymarket-btc-5m-v1",
   "lane": "prediction_market",
-  "objective": "Estimate the official settlement probability for one BTC five-minute Polymarket event before the entry cutoff.",
-  "hypothesis_scope": "Test whether the registered market midpoint, distance-plus-LOB-volatility estimate, event surface, and existing model contain complementary pre-settlement information.",
+  "objective": "Estimate official settlement probabilities for BTC five-minute Polymarket events before each entry cutoff.",
+  "hypothesis_scope": "Generate falsifiable BTC microstructure probability theories and test whether the registered market midpoint, distance-plus-LOB-volatility estimate, event surface, and existing model contain complementary pre-settlement information.",
   "mutable_scope": [
     "probability_blend_weights"
   ],
@@ -13,11 +13,11 @@
     "BTC"
   ],
   "horizon": "5m",
-  "prompt_snapshot_id": "REPLACE_WITH_CONTENT_ADDRESSED_RESEARCH_BRIEF_ID",
-  "search_policy_snapshot_id": "prediction-probability-blend-v1",
+  "prompt_snapshot_id": "sha256:a059a6629db75bff352cb89385f4dd4e9a30bb5c08231090b95d2d073572a772",
+  "search_policy_snapshot_id": "sha256:c236dffe69f59f6a1843b56ac305b2e01b961665ba8c42ec2ef9f3ae1e53130f",
   "search_budget": {
     "max_candidates": 6,
     "max_llm_calls": 2,
-    "max_seconds": 120
+    "max_seconds": 900
   }
 }

@@ -10,6 +10,7 @@ ready strategy through the existing promotion path.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -84,6 +85,22 @@ def optional_json(path: Path) -> Any:
     return load_json(path)
 
 
+def optional_prediction_feedback(alpha_root: Path) -> Any:
+    """Read one unambiguous feedback artifact and verify hashed evidence."""
+    legacy = alpha_root / "prediction-research-feedback.json"
+    hashed = sorted(alpha_root.glob("prediction-research-feedback-*.json"))
+    candidates = ([legacy] if legacy.exists() else []) + hashed
+    if len(candidates) != 1:
+        return None
+    path = candidates[0]
+    raw = path.read_bytes()
+    if path != legacy:
+        expected = path.stem.removeprefix("prediction-research-feedback-")
+        if hashlib.sha256(raw).hexdigest() != expected:
+            return None
+    return json.loads(raw)
+
+
 def artifact_root(path: Path) -> Path:
     if (path / "factor-walk-forward-v2").is_dir():
         return path / "factor-walk-forward-v2"
@@ -130,10 +147,7 @@ def load_artifact(path: Path, target: str) -> dict[str, Any]:
         "registry_preview": optional_json(alpha_root / "factor-registry-preview.json") or {},
         "chain": chain,
         "search_space": optional_json(alpha_root / "search-space.json") or {},
-        "prediction_feedback": optional_json(
-            alpha_root / "prediction-research-feedback.json"
-        )
-        or {},
+        "prediction_feedback": optional_prediction_feedback(alpha_root) or {},
         "candidate_strategy_replay": candidate_strategy_replay or {},
         "input_prior": optional_json(
             path / "alpha-search-chain" / "input-alpha-search-plan" / "next-llm-prior.json"
