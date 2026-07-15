@@ -72,6 +72,33 @@ jobs:
             sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
             sha256sum polymarket-raw-ops | tee polymarket-raw-ops.sha256
           )
+          control_assets=(
+            polymarket-raw-ops-shadow-gate.sh
+            polymarket-raw-ops-cutover.sh
+            polymarket-shadow-gate-policy.jq
+            polymarket-legacy-health-policy.jq
+            polymarket-rust-health-policy.jq
+            polymarket-reference-collector-shadow@.service
+            polymarket-reference-collector.service
+            polymarket-reference-upload.service
+            polymarket-reference-upload.timer
+            polymarket-market-tape-upload.service
+            polymarket-market-tape-upload.timer
+          )
+          (
+            cd deployment/aliyun
+            sha256sum "${control_assets[@]}" > ../../artifact/polymarket-raw-ops-control-assets.sha256
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -czf ../../artifact/polymarket-raw-ops-control.tar.gz "${control_assets[@]}"
+          )
+          (
+            cd artifact
+            sha256sum polymarket-raw-ops-control-assets.sha256 \
+              | awk '{print $1}' > deployment-bundle.sha256
+            sha256sum polymarket-raw-ops-control.tar.gz \
+              > polymarket-raw-ops-control.tar.gz.sha256
+            printf '%s\n' '${{ github.sha }}' > source-revision.txt
+          )
 
       - name: Upload collector binary artifact bundle
         if: matrix.repository == 'binance-lob-archiver'

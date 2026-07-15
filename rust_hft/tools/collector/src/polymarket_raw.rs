@@ -16,6 +16,8 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const ACTIVE_TAPE: &str = "market-updates.ndjson";
@@ -27,6 +29,7 @@ const TRADE_ID_VERSION: &str = "v2";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
+const HARD_CYCLE_WATCHDOG_EXIT_CODE: i32 = 124;
 const HTTP_GET_ATTEMPTS: usize = 3;
 const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const HTTP_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
@@ -48,6 +51,51 @@ const SYMBOL_ALIASES: [(&str, &[&str]); 7] = [
     ("HYPEUSDT", &["HYPERLIQUID", "HYPE"]),
     ("BNBUSDT", &["BINANCE COIN", "BNB"]),
 ];
+
+struct CycleWatchdog {
+    completed: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CycleWatchdog {
+    fn arm(timeout: Duration) -> std::io::Result<Self> {
+        let completed = Arc::new((Mutex::new(false), Condvar::new()));
+        let watcher = Arc::clone(&completed);
+        let handle = std::thread::Builder::new()
+            .name("polymarket-cycle-watchdog".to_owned())
+            .spawn(move || {
+                let (lock, condition) = &*watcher;
+                let completed = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (completed, wait) = condition
+                    .wait_timeout_while(completed, timeout, |completed| !*completed)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if wait.timed_out() && !*completed {
+                    eprintln!(
+                        "Polymarket reference cycle exceeded the hard {}ms wall-clock deadline",
+                        timeout.as_millis()
+                    );
+                    std::process::exit(HARD_CYCLE_WATCHDOG_EXIT_CODE);
+                }
+            })?;
+        Ok(Self {
+            completed,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for CycleWatchdog {
+    fn drop(&mut self) {
+        let (lock, condition) = &*self.completed;
+        let mut completed = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *completed = true;
+        condition.notify_one();
+        drop(completed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 #[derive(Debug)]
 struct DataCompletenessError(String);
@@ -1945,6 +1993,9 @@ impl ReferenceCollector {
     }
 
     async fn collect_once_bounded(&mut self) -> Result<Value> {
+        let _hard_watchdog = CycleWatchdog::arm(MAX_CYCLE_DURATION).map_err(|error| {
+            completeness_error(format!("could not arm the hard cycle watchdog: {error}"))
+        })?;
         tokio::time::timeout(MAX_CYCLE_DURATION, self.collect_once())
             .await
             .map_err(|_| {
@@ -1990,6 +2041,8 @@ pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    const HARD_WATCHDOG_TEST_ENV: &str = "MONDAY_TEST_POLYMARKET_HARD_WATCHDOG";
+
     struct TestDir {
         _temp: tempfile::TempDir,
         path: PathBuf,
@@ -2014,6 +2067,72 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    #[ignore = "subprocess target for the hard cycle watchdog test"]
+    fn hard_cycle_watchdog_child() {
+        if std::env::var_os(HARD_WATCHDOG_TEST_ENV).is_none() {
+            return;
+        }
+        let _watchdog = CycleWatchdog::arm(Duration::from_millis(100)).unwrap();
+        std::thread::sleep(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn hard_cycle_watchdog_terminates_non_yielding_work() {
+        let started = Instant::now();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("hard_cycle_watchdog_child")
+            .env(HARD_WATCHDOG_TEST_ENV, "1")
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(HARD_CYCLE_WATCHDOG_EXIT_CODE));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "hard watchdog did not terminate the child promptly"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("hard 100ms wall-clock deadline"));
+    }
+
+    #[test]
+    fn hard_cycle_watchdog_disarms_without_waiting_for_deadline() {
+        let started = Instant::now();
+        {
+            let _watchdog = CycleWatchdog::arm(Duration::from_secs(10)).unwrap();
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn systemd_memory_envelope_covers_measured_polymarket_cold_start() {
+        const UNITS: [&str; 2] = [
+            include_str!("../../../../deployment/aliyun/polymarket-reference-collector.service"),
+            include_str!(
+                "../../../../deployment/aliyun/polymarket-reference-collector-shadow@.service"
+            ),
+        ];
+
+        fn memory_limit_mebibytes(unit: &str, property: &str) -> u64 {
+            let prefix = format!("{property}=");
+            let values = unit
+                .lines()
+                .filter_map(|line| line.strip_prefix(&prefix))
+                .collect::<Vec<_>>();
+            assert_eq!(values.len(), 1, "{property} must have one assignment");
+            values[0].strip_suffix('M').unwrap().parse::<u64>().unwrap()
+        }
+
+        for unit in UNITS {
+            let high = memory_limit_mebibytes(unit, "MemoryHigh");
+            let maximum = memory_limit_mebibytes(unit, "MemoryMax");
+            assert_eq!(high, 512);
+            assert_eq!(maximum, 768);
+            assert!(high < maximum);
+        }
     }
 
     fn market(question: &str, start: &str, end: &str) -> Value {

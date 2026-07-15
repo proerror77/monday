@@ -236,6 +236,7 @@ jobs:
           ../deployment/aliyun/test-rust-lob-control-plane.sh
           ../deployment/aliyun/test-rust-lob-release-adoption.sh
           ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
+          cargo test -p hft-collector systemd_memory_envelope_covers_measured_polymarket_cold_start --locked
 
       - name: Build focused packages
         run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p alpha-harness -p hft-harnessctl --locked

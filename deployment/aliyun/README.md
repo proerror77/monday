@@ -98,12 +98,19 @@ request, including a second pagination request for the same market, passes throu
 shared start-time pacer with at least 100ms between request starts. Up to four requests
 may remain in flight, and each processing chunk retains at most four market responses,
 so slow I/O overlaps without creating an unbounded request or memory fan-out. An
-absolute 180-second cycle deadline cancels stalled network work and fails closed;
-health evidence over that duration is rejected by the shadow gate.
-The 112-request budget and the collector units' 384MiB/512MiB memory high/max
-limits are a measured pair: a clean Tokyo cold start covered all 112 priority
-markets in 45.091 seconds with zero priority backlog. The health policy pins the
-budget so a later default drift cannot silently invalidate that evidence.
+absolute 180-second cycle deadline cancels stalled network work and fails closed.
+A separate OS-thread watchdog enforces the same wall-clock deadline across synchronous
+tape fsync and atomic state publication, where a cooperative Tokio timeout cannot
+preempt non-yielding work. Health evidence over that duration is rejected by the
+shadow gate.
+The 112-request budget and the collector units' 512MiB/768MiB memory high/max
+limits are a measured pair. A Tokyo cold-start probe covered all 112 priority
+markets in 31.425 seconds with zero priority backlog, while the retired 384MiB
+high watermark put the same full-catalog workload under sustained cgroup reclaim
+and prevented health publication. The health policy pins the budget so a later
+default drift cannot silently invalidate that evidence. The host, cgroup pressure,
+invocation IDs, and control probes are recorded in
+`docs/reports/polymarket-shadow-memory-calibration-2026-07-16.md`.
 The shadow gate allows a separate 60-second initial-health grace after that
 deadline so a cycle completing at the boundary can finish durable health
 publication before the first sample. This does not relax the 180-second health
@@ -124,29 +131,73 @@ Neither companion unit contains private keys or an execution command.
 Both companion units use the same `polymarket-raw-ops` Rust binary. Its
 `collect-reference` subcommand owns metadata/trade/settlement collection and its
 `upload` subcommand owns validation, compression, OSS upload, and remote readback.
-The retired compatibility collector, uploader, parity scripts, and rollback lane are
-not part of the active deployment and must not be restored.
+Retired Python collectors and uploaders are rollback inputs only and are never
+reintroduced as application code. The root-only shadow-gate and cutover controls
+remain part of the release bundle until the Python-to-Rust migration and its rollback
+retention window are complete; they do not collect data or execute trades.
 
 Obtain `polymarket-raw-ops` and its SHA-256 from the immutable collector build
-artifact and verify the digest from the extracted artifact directory:
+artifact. Verify the binary, source revision, control archive, control manifest,
+and deployment-bundle digest from the extracted artifact directory before
+installing anything:
 
 ```bash
+set -euo pipefail
+artifact_dir=$(pwd -P)
+
 sha256sum -c polymarket-raw-ops.sha256
 candidate_sha=$(awk '{print $1}' polymarket-raw-ops.sha256)
-source_revision=$(git rev-parse HEAD)
+[[ $(wc -l < source-revision.txt) -eq 1 ]]
+grep -Eq '^[0-9a-f]{40}$' source-revision.txt
+source_revision=$(<source-revision.txt)
+
+sha256sum -c polymarket-raw-ops-control.tar.gz.sha256
+[[ $(wc -l < deployment-bundle.sha256) -eq 1 ]]
+grep -Eq '^[0-9a-f]{64}$' deployment-bundle.sha256
+deployment_bundle_sha=$(<deployment-bundle.sha256)
+manifest_sha=$(sha256sum polymarket-raw-ops-control-assets.sha256 | awk '{print $1}')
+[[ $manifest_sha == "$deployment_bundle_sha" ]]
+
+control_assets=(
+  polymarket-raw-ops-shadow-gate.sh
+  polymarket-raw-ops-cutover.sh
+  polymarket-shadow-gate-policy.jq
+  polymarket-legacy-health-policy.jq
+  polymarket-rust-health-policy.jq
+  polymarket-reference-collector-shadow@.service
+  polymarket-reference-collector.service
+  polymarket-reference-upload.service
+  polymarket-reference-upload.timer
+  polymarket-market-tape-upload.service
+  polymarket-market-tape-upload.timer
+)
+control_dir=$(mktemp -d)
+trap 'rm -rf -- "$control_dir"' EXIT
+diff -u <(printf '%s\n' "${control_assets[@]}" | LC_ALL=C sort) \
+  <(tar -tzf polymarket-raw-ops-control.tar.gz | LC_ALL=C sort)
+tar --no-same-owner --no-same-permissions \
+  -xzf polymarket-raw-ops-control.tar.gz -C "$control_dir"
+(
+  cd "$control_dir"
+  sha256sum -c "$artifact_dir/polymarket-raw-ops-control-assets.sha256"
+)
 ```
 
-Install the Rust services and their immutable configuration through the release
-workflow. Do not copy historical control scripts into `/opt/monday/control` or
-replace a production unit manually:
+Install the binary and the exact control bundle from the same reviewed revision
+through the release workflow. Never combine a candidate binary with control assets
+from another revision or replace a production unit manually:
 
 ```bash
 sudo install -m 0644 \
-  deployment/aliyun/polymarket-rust-health-policy.jq \
-  deployment/aliyun/polymarket-reference-collector-shadow@.service \
-  deployment/aliyun/polymarket-reference-{collector,upload}.service \
-  deployment/aliyun/polymarket-reference-upload.timer \
-  deployment/aliyun/polymarket-market-tape-upload.{service,timer} \
+  "$control_dir"/polymarket-{legacy,rust}-health-policy.jq \
+  "$control_dir"/polymarket-shadow-gate-policy.jq \
+  "$control_dir"/polymarket-reference-collector-shadow@.service \
+  "$control_dir"/polymarket-reference-{collector,upload}.service \
+  "$control_dir"/polymarket-reference-upload.timer \
+  "$control_dir"/polymarket-market-tape-upload.{service,timer} \
+  /opt/monday/control/polymarket-raw-ops/
+sudo install -m 0755 \
+  "$control_dir"/polymarket-raw-ops-{shadow-gate,cutover}.sh \
   /opt/monday/control/polymarket-raw-ops/
 ```
 
