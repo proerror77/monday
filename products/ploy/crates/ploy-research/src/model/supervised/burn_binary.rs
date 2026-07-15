@@ -102,6 +102,137 @@ fn validate_snapshot_row_budget(
     Ok(())
 }
 
+struct PolymarketEvidenceIndex<'a> {
+    book_tokens: BTreeMap<(&'a str, &'static str), &'a str>,
+    valid_book_times: BTreeMap<(&'a str, &'static str), Vec<chrono::DateTime<chrono::Utc>>>,
+}
+
+impl<'a> PolymarketEvidenceIndex<'a> {
+    fn from_snapshot(snapshot: &'a ResearchSnapshot) -> Result<Self, String> {
+        let observation_events = snapshot
+            .observations
+            .iter()
+            .map(|row| row.event_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut book_tokens = BTreeMap::new();
+        let mut valid_book_times = BTreeMap::<_, Vec<_>>::new();
+        for book in &snapshot.pm_book_snapshots {
+            if !observation_events.contains(book.event_id.as_str()) {
+                return Err(format!(
+                    "snapshot contains Polymarket book rows outside the mission event set: {}",
+                    book.event_id
+                ));
+            }
+            let side = if book.side.eq_ignore_ascii_case("up") {
+                "up"
+            } else if book.side.eq_ignore_ascii_case("down") {
+                "down"
+            } else {
+                return Err(format!(
+                    "snapshot event {} has unknown Polymarket book side {}",
+                    book.event_id, book.side
+                ));
+            };
+            if book.token_id.trim().is_empty() || book.token_id.trim() != book.token_id {
+                return Err(format!(
+                    "snapshot event {} has an invalid Polymarket {side} token identity",
+                    book.event_id
+                ));
+            }
+            let key = (book.event_id.as_str(), side);
+            if book_tokens
+                .insert(key, book.token_id.as_str())
+                .is_some_and(|previous| previous != book.token_id)
+            {
+                return Err(format!(
+                    "snapshot event {} has inconsistent Polymarket {side} token identities",
+                    book.event_id
+                ));
+            }
+            if !book.bids.is_empty()
+                && !book.asks.is_empty()
+                && book.bids.iter().chain(&book.asks).all(|level| {
+                    level.price.is_finite()
+                        && level.price > 0.0
+                        && level.price < 1.0
+                        && level.size.is_finite()
+                        && level.size > 0.0
+                })
+            {
+                valid_book_times.entry(key).or_default().push(book.ts);
+            }
+        }
+        for timestamps in valid_book_times.values_mut() {
+            timestamps.sort_unstable();
+        }
+        Ok(Self {
+            book_tokens,
+            valid_book_times,
+        })
+    }
+
+    fn has_fresh_quote(&self, row: &FactorObservation, max_age_ms: i64) -> bool {
+        let max_age_secs = max_age_ms as f64 / 1_000.0;
+        row.pm_lag_secs.is_finite()
+            && row.pm_lag_secs >= 0.0
+            && row.pm_lag_secs <= max_age_secs
+            && [
+                (
+                    row.source_availability.polymarket_up_quote,
+                    row.pm_up_bid,
+                    row.pm_up_ask,
+                ),
+                (
+                    row.source_availability.polymarket_down_quote,
+                    row.pm_down_bid,
+                    row.pm_down_ask,
+                ),
+            ]
+            .into_iter()
+            .all(|(available_at, bid, ask)| {
+                available_at.is_some_and(|available_at| {
+                    let age_ms = (row.tick_ts - available_at).num_milliseconds();
+                    age_ms >= 0 && age_ms <= max_age_ms && (bid.is_finite() || ask.is_finite())
+                })
+            })
+    }
+
+    fn has_fresh_book(&self, row: &FactorObservation, side: &'static str, max_age_ms: i64) -> bool {
+        let Some(timestamps) = self.valid_book_times.get(&(row.event_id.as_str(), side)) else {
+            return false;
+        };
+        let upper = timestamps.partition_point(|timestamp| timestamp <= &row.tick_ts);
+        let Some(timestamp) = upper.checked_sub(1).and_then(|index| timestamps.get(index)) else {
+            return false;
+        };
+        let age_ms = (row.tick_ts - *timestamp).num_milliseconds();
+        age_ms >= 0 && age_ms <= max_age_ms
+    }
+
+    fn validate_decision_row(
+        &self,
+        partition: &str,
+        index: usize,
+        row: &FactorObservation,
+        max_age_ms: i64,
+    ) -> Result<()> {
+        ensure!(
+            self.has_fresh_quote(row, max_age_ms),
+            "{partition} row {index} for event {:?} at {} lacks a fresh matching Polymarket quote",
+            row.event_id,
+            row.tick_ts
+        );
+        ensure!(
+            self.has_fresh_book(row, "up", max_age_ms)
+                && self.has_fresh_book(row, "down", max_age_ms),
+            "{partition} row {index} for event {:?} at {} lacks fresh matching nonempty Polymarket UP/DOWN full-depth book evidence",
+            row.event_id,
+            row.tick_ts
+        );
+        Ok(())
+    }
+}
+
 fn validate_binary_snapshot_coverage(
     snapshot: &ResearchSnapshot,
     mission: &PredictionResearchMission,
@@ -128,81 +259,19 @@ fn validate_binary_snapshot_coverage(
         snapshot.pm_book_snapshots.len(),
     )?;
 
-    let observation_events = snapshot
-        .observations
-        .iter()
-        .map(|row| row.event_id.as_str())
-        .collect::<BTreeSet<_>>();
     let settlement_evidence = snapshot
         .manifest
         .chainlink_oracle_settlement_evidence
         .iter()
         .map(|evidence| (evidence.event_id.as_str(), evidence))
         .collect::<BTreeMap<_, _>>();
-    let mut book_tokens = BTreeMap::<(&str, &str), &str>::new();
-    let mut valid_book_times = BTreeMap::<(&str, &str), Vec<_>>::new();
-    for book in &snapshot.pm_book_snapshots {
-        if !observation_events.contains(book.event_id.as_str()) {
-            return Err(format!(
-                "snapshot contains Polymarket book rows outside the mission event set: {}",
-                book.event_id
-            ));
-        }
-        let side = if book.side.eq_ignore_ascii_case("up") {
-            "up"
-        } else if book.side.eq_ignore_ascii_case("down") {
-            "down"
-        } else {
-            return Err(format!(
-                "snapshot event {} has unknown Polymarket book side {}",
-                book.event_id, book.side
-            ));
-        };
-        if book.token_id.trim().is_empty() || book.token_id.trim() != book.token_id {
-            return Err(format!(
-                "snapshot event {} has an invalid Polymarket {side} token identity",
-                book.event_id
-            ));
-        }
-        let key = (book.event_id.as_str(), side);
-        if book_tokens
-            .insert(key, book.token_id.as_str())
-            .is_some_and(|previous| previous != book.token_id)
-        {
-            return Err(format!(
-                "snapshot event {} has inconsistent Polymarket {side} token identities",
-                book.event_id
-            ));
-        }
-        if !book.bids.is_empty()
-            && !book.asks.is_empty()
-            && book.bids.iter().chain(&book.asks).all(|level| {
-                level.price.is_finite()
-                    && level.price > 0.0
-                    && level.price < 1.0
-                    && level.size.is_finite()
-                    && level.size > 0.0
-            })
-        {
-            valid_book_times.entry(key).or_default().push(book.ts);
-        }
-    }
-    for timestamps in valid_book_times.values_mut() {
-        timestamps.sort_unstable();
-    }
-
-    let max_book_age_secs = snapshot.manifest.max_quote_age_secs.max(0) as f64;
-    let has_fresh_book = |row: &FactorObservation, side: &str| {
-        let Some(timestamps) = valid_book_times.get(&(row.event_id.as_str(), side)) else {
-            return false;
-        };
-        let upper = timestamps.partition_point(|timestamp| timestamp <= &row.tick_ts);
-        let Some(timestamp) = upper.checked_sub(1).and_then(|index| timestamps.get(index)) else {
-            return false;
-        };
-        let age_secs = (row.tick_ts - *timestamp).num_milliseconds() as f64 / 1_000.0;
-        age_secs >= 0.0 && age_secs <= max_book_age_secs
-    };
+    let polymarket_evidence = PolymarketEvidenceIndex::from_snapshot(snapshot)?;
+    let max_age_ms = snapshot
+        .manifest
+        .max_quote_age_secs
+        .max(0)
+        .checked_mul(1_000)
+        .ok_or_else(|| "snapshot max_quote_age_secs overflows milliseconds".to_string())?;
 
     let mut labels = BTreeMap::<&str, f64>::new();
     let mut quote_events = BTreeSet::new();
@@ -293,31 +362,26 @@ fn validate_binary_snapshot_coverage(
                 row.event_id, row.tick_ts
             ));
         }
-        if row.pm_lag_secs.is_finite()
-            && row.pm_lag_secs >= 0.0
-            && row.pm_lag_secs <= max_book_age_secs
-            && [
-                row.pm_up_bid,
-                row.pm_up_ask,
-                row.pm_down_bid,
-                row.pm_down_ask,
-            ]
-            .iter()
-            .any(|value| value.is_finite())
-        {
+        if polymarket_evidence.has_fresh_quote(row, max_age_ms) {
             quote_events.insert(row.event_id.as_str());
         }
-        if has_fresh_book(row, "up") {
+        if polymarket_evidence.has_fresh_book(row, "up", max_age_ms) {
             up_book_events.insert(row.event_id.as_str());
         }
-        if has_fresh_book(row, "down") {
+        if polymarket_evidence.has_fresh_book(row, "down", max_age_ms) {
             down_book_events.insert(row.event_id.as_str());
         }
     }
 
     for event_id in labels.keys().copied() {
-        let up_token = book_tokens.get(&(event_id, "up")).copied();
-        let down_token = book_tokens.get(&(event_id, "down")).copied();
+        let up_token = polymarket_evidence
+            .book_tokens
+            .get(&(event_id, "up"))
+            .copied();
+        let down_token = polymarket_evidence
+            .book_tokens
+            .get(&(event_id, "down"))
+            .copied();
         if up_token.is_none() || down_token.is_none() || up_token == down_token {
             return Err(format!(
                 "snapshot event {event_id} lacks distinct Polymarket UP/DOWN token identities"
@@ -882,11 +946,15 @@ impl BinaryProbabilityModel {
             "prediction snapshot contract does not match the trained model"
         );
         let governed_rows = governed_observation_index(snapshot)?;
+        let polymarket_evidence = PolymarketEvidenceIndex::from_snapshot(snapshot)
+            .map_err(anyhow::Error::msg)
+            .context("index prediction Polymarket evidence")?;
         let feature_rows = materialize_governed_feature_rows(
             "prediction",
             selectors,
             &self.manifest.dataset_contract,
             &governed_rows,
+            &polymarket_evidence,
         )?;
         predict_feature_rows(&self.model, &self.manifest.normalizer, &feature_rows)
     }
@@ -1554,6 +1622,7 @@ fn materialize_governed_feature_row(
     selector: &BinaryDecisionRow,
     contract: &BinaryDatasetContract,
     governed_rows: &GovernedObservationIndex<'_>,
+    polymarket_evidence: &PolymarketEvidenceIndex<'_>,
 ) -> Result<Vec<f32>> {
     ensure!(
         !selector.event_id.trim().is_empty() && selector.event_id.trim() == selector.event_id,
@@ -1567,6 +1636,12 @@ fn materialize_governed_feature_row(
                 "{partition} row {index} is not an exact decision row in the bound prediction snapshot"
             )
         })?;
+    polymarket_evidence.validate_decision_row(
+        partition,
+        index,
+        snapshot_row,
+        contract.max_feature_age_ms,
+    )?;
     contract
         .feature_names
         .iter()
@@ -1579,12 +1654,20 @@ fn materialize_governed_feature_rows(
     selectors: &[BinaryDecisionRow],
     contract: &BinaryDatasetContract,
     governed_rows: &GovernedObservationIndex<'_>,
+    polymarket_evidence: &PolymarketEvidenceIndex<'_>,
 ) -> Result<Vec<Vec<f32>>> {
     selectors
         .iter()
         .enumerate()
         .map(|(index, selector)| {
-            materialize_governed_feature_row(partition, index, selector, contract, governed_rows)
+            materialize_governed_feature_row(
+                partition,
+                index,
+                selector,
+                contract,
+                governed_rows,
+                polymarket_evidence,
+            )
         })
         .collect()
 }
@@ -1594,6 +1677,9 @@ fn materialize_split<'a>(
     snapshot: &ResearchSnapshot,
 ) -> Result<MaterializedBinarySplit<'a>> {
     let governed_rows = governed_observation_index(snapshot)?;
+    let polymarket_evidence = PolymarketEvidenceIndex::from_snapshot(snapshot)
+        .map_err(anyhow::Error::msg)
+        .context("index training Polymarket evidence")?;
     let governed_events = snapshot
         .manifest
         .chainlink_oracle_settlement_evidence
@@ -1613,6 +1699,7 @@ fn materialize_split<'a>(
                         selector,
                         &split.contract,
                         &governed_rows,
+                        &polymarket_evidence,
                     )?;
                     let settlement_evidence = governed_events
                         .get(selector.event_id.as_str())
@@ -2234,6 +2321,56 @@ mod tests {
         context
     }
 
+    fn add_fresh_polymarket_sibling(
+        context: &mut TestContext,
+        selected: &BinaryDecisionRow,
+    ) -> BinaryDecisionRow {
+        let selected_index = context
+            .snapshot
+            .observations
+            .iter()
+            .position(|row| {
+                row.event_id == selected.event_id
+                    && row.tick_ts.timestamp_millis() == selected.decision_at_ms
+            })
+            .expect("selected observation must exist");
+        let selected_tick = context.snapshot.observations[selected_index].tick_ts;
+        let fresh_tick = selected_tick + Duration::seconds(1);
+
+        let mut fresh = context.snapshot.observations[selected_index].clone();
+        fresh.tick_ts = fresh_tick;
+        fresh.time_remaining_secs -= 1;
+        fresh.source_availability.spot = Some(fresh_tick);
+        fresh.source_availability.lob = Some(fresh_tick);
+        fresh.source_availability.aggregate_trade = Some(fresh_tick);
+        fresh.source_availability.polymarket_up_quote = Some(fresh_tick);
+        fresh.source_availability.polymarket_down_quote = Some(fresh_tick);
+        fresh.source_availability.chainlink_reference = Some(fresh_tick);
+        fresh.pm_lag_secs = 0.0;
+
+        let stale = &mut context.snapshot.observations[selected_index];
+        stale.source_availability.polymarket_up_quote = Some(selected_tick - Duration::seconds(31));
+        stale.source_availability.polymarket_down_quote =
+            Some(selected_tick - Duration::seconds(31));
+        stale.pm_lag_secs = 31.0;
+
+        for book in context
+            .snapshot
+            .pm_book_snapshots
+            .iter_mut()
+            .filter(|book| book.event_id == selected.event_id)
+        {
+            book.ts = fresh_tick;
+        }
+        context.snapshot.observations.push(fresh);
+        context.snapshot.manifest.row_counts.observations += 1;
+
+        BinaryDecisionRow {
+            event_id: selected.event_id.clone(),
+            decision_at_ms: fresh_tick.timestamp_millis(),
+        }
+    }
+
     fn test_config() -> BinaryTrainingConfig {
         BinaryTrainingConfig {
             seed: 7,
@@ -2302,6 +2439,130 @@ mod tests {
             )
             .expect_err("an exact selector duplicate must fail closed");
             assert!(error.to_string().contains("duplicate decision selector"));
+        }
+    }
+
+    #[test]
+    fn selected_train_and_validation_rows_require_their_own_polymarket_evidence() {
+        for partition in ["train", "validation"] {
+            let mut context = context();
+            let selected = match partition {
+                "train" => context.split.train[0].clone(),
+                "validation" => context.split.validation[0].clone(),
+                _ => unreachable!(),
+            };
+            add_fresh_polymarket_sibling(&mut context, &selected);
+            let context = reseal_context(context);
+
+            let error = train_event_disjoint_binary(
+                &context.snapshot,
+                &context.mission,
+                &context.split,
+                test_config(),
+            )
+            .expect_err("another fresh row must not cover stale selected PM evidence");
+            let message = format!("{error:#}");
+            assert!(message.contains(&format!("{partition} row 0")));
+            assert!(message.contains("Polymarket"));
+        }
+    }
+
+    #[test]
+    fn selected_prediction_row_requires_its_own_polymarket_evidence() {
+        let mut context = context();
+        let stale_selector = context.split.validation[0].clone();
+        let fresh_selector = add_fresh_polymarket_sibling(&mut context, &stale_selector);
+        context.split.validation[0] = fresh_selector;
+        let context = reseal_context(context);
+        let model = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            test_config(),
+        )
+        .expect("fresh sibling selector must remain trainable");
+
+        let error = model
+            .predict_probabilities(&context.snapshot, &context.mission, &[stale_selector])
+            .expect_err("another fresh row must not cover stale prediction PM evidence");
+        let message = format!("{error:#}");
+        assert!(message.contains("prediction row 0"));
+        assert!(message.contains("Polymarket"));
+    }
+
+    #[test]
+    fn selected_row_requires_its_own_nonempty_full_depth_books() {
+        let mut context = context();
+        let selected = context.split.train[0].clone();
+        add_fresh_polymarket_sibling(&mut context, &selected);
+        let selected_row = context
+            .snapshot
+            .observations
+            .iter_mut()
+            .find(|row| {
+                row.event_id == selected.event_id
+                    && row.tick_ts.timestamp_millis() == selected.decision_at_ms
+            })
+            .expect("selected observation must exist");
+        selected_row.source_availability.polymarket_up_quote = Some(selected_row.tick_ts);
+        selected_row.source_availability.polymarket_down_quote = Some(selected_row.tick_ts);
+        selected_row.pm_lag_secs = 0.0;
+        let context = reseal_context(context);
+
+        let error = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            test_config(),
+        )
+        .expect_err("another fresh row must not cover selected full-depth books");
+        let message = format!("{error:#}");
+        assert!(message.contains("train row 0"));
+        assert!(message.contains("full-depth book evidence"));
+    }
+
+    #[test]
+    fn selected_row_requires_fresh_quotes_for_both_polymarket_sides() {
+        for missing_up_quote in [true, false] {
+            let mut context = context();
+            let selected = context.split.train[0].clone();
+            add_fresh_polymarket_sibling(&mut context, &selected);
+            let selected_row = context
+                .snapshot
+                .observations
+                .iter_mut()
+                .find(|row| {
+                    row.event_id == selected.event_id
+                        && row.tick_ts.timestamp_millis() == selected.decision_at_ms
+                })
+                .expect("selected observation must exist");
+            selected_row.source_availability.polymarket_up_quote = if missing_up_quote {
+                None
+            } else {
+                Some(selected_row.tick_ts - Duration::seconds(31))
+            };
+            selected_row.source_availability.polymarket_down_quote = Some(selected_row.tick_ts);
+            selected_row.pm_lag_secs = 0.0;
+            for book in context
+                .snapshot
+                .pm_book_snapshots
+                .iter_mut()
+                .filter(|book| book.event_id == selected.event_id)
+            {
+                book.ts = selected_row.tick_ts;
+            }
+            let context = reseal_context(context);
+
+            let error = train_event_disjoint_binary(
+                &context.snapshot,
+                &context.mission,
+                &context.split,
+                test_config(),
+            )
+            .expect_err("one fresh PM side must not cover a missing or stale opposite quote");
+            let message = format!("{error:#}");
+            assert!(message.contains("train row 0"));
+            assert!(message.contains("fresh matching Polymarket quote"));
         }
     }
 
