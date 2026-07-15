@@ -1326,6 +1326,7 @@ impl ReferenceCollector {
     }
 
     async fn collect_once(&mut self) -> Result<Value> {
+        let cycle_started = Instant::now();
         let now = utc_now();
         let retrieved_at = iso_z(now);
         let mut updates = Vec::new();
@@ -1622,6 +1623,9 @@ impl ReferenceCollector {
         self.state = next_state;
         atomic_write_json(&self.state_path, &self.state)?;
         self.last_success = Instant::now();
+        let completed_at = iso_z(utc_now());
+        let cycle_duration_ms =
+            u64::try_from(cycle_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         overdue_unresolved_markets.sort();
         truncated_markets.sort();
@@ -1643,8 +1647,10 @@ impl ReferenceCollector {
             })
             .collect::<BTreeMap<_, _>>();
         let health = json!({
-            "updated_at": retrieved_at,
-            "last_success_at": retrieved_at,
+            "cycle_started_at": retrieved_at,
+            "cycle_duration_ms": cycle_duration_ms,
+            "updated_at": completed_at,
+            "last_success_at": completed_at,
             "target_markets": targets.len(),
             "missing_target_symbols": missing_target_symbols,
             "tracked_markets": self.state.markets.len(),

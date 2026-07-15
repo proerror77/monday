@@ -94,6 +94,9 @@ rotates by oldest successful poll so cold-start backfill cannot prevent health f
 advancing. `priority_trade_backlog` must be zero for the shadow gate to accept a
 health sample, while `deferred_trade_markets` makes bounded historical backfill
 explicit rather than silently claiming full-cycle trade coverage.
+`cycle_started_at` preserves the API snapshot boundary, while `updated_at` and
+`last_success_at` are stamped only after tape and state durability completes;
+`cycle_duration_ms` makes the 90-second gate freshness budget directly auditable.
 Each append batch rolls back to its starting offset if write or fsync fails, so a retry
 cannot duplicate a durable prefix, suppress a required hourly metadata seed, or leave
 a partial record behind. A durable per-hour seed marker also forces Rust metadata when
