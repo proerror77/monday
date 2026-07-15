@@ -26,6 +26,9 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [x] Add a fail-closed ECS config and hardened systemd service.
 - [x] Build and install the Linux runner artifact.
 - [x] Enable the BTC/ETH/SOL/XRP 5-minute/15-minute service and verify event rollover, token-mapped quotes, and zero intents/fills.
+- [x] Archive hourly Polymarket tapes to OSS with manifest and readback verification.
+- [x] Retain full visible CLOB depth in one-second snapshots for all seven configured crypto assets.
+- [x] Add a collection-only metadata/trade/settlement tape and verify a complete OSS artifact.
 
 ## Safety
 

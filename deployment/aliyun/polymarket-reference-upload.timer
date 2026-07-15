@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry closed Monday Polymarket reference tape uploads every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=polymarket-reference-upload.service
+
+[Install]
+WantedBy=timers.target

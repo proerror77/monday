@@ -1,0 +1,30 @@
+[Unit]
+Description=Archive closed Monday Polymarket reference tapes to OSS
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=oneshot
+User=hftcollector
+Group=hftcollector
+Environment=HOME=/var/lib/hft-collector
+EnvironmentFile=/etc/monday/polymarket-market-tape-upload.env
+ExecStart=/usr/bin/python3 /opt/monday/bin/polymarket_market_tape_upload.py --spool-dir /data/monday/spool/polymarket-reference --dataset crypto_expiry_reference --quote-depth-levels 0 --quote-sample-ms 0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+StateDirectory=hft-collector
+ReadWritePaths=/data/monday/spool/polymarket-reference
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0027
+CPUQuota=20%
+MemoryHigh=256M
+MemoryMax=384M

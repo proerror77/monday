@@ -1,0 +1,34 @@
+[Unit]
+Description=Monday Polymarket metadata, trade, and settlement tape
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/data
+ConditionPathIsMountPoint=/data
+
+[Service]
+Type=simple
+User=hftcollector
+Group=hftcollector
+ExecStart=/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py
+Restart=always
+RestartSec=5
+RuntimeMaxSec=21600
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+ReadWritePaths=/data/monday/spool/polymarket-reference
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0027
+CPUQuota=20%
+MemoryHigh=256M
+MemoryMax=384M
+
+[Install]
+WantedBy=multi-user.target
