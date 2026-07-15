@@ -29,6 +29,7 @@ Integrate the maintained PLOY product workspace into Monday without transferring
 - [x] Archive hourly Polymarket tapes to OSS with manifest and readback verification.
 - [x] Retain full visible CLOB depth in one-second snapshots for all seven configured crypto assets.
 - [x] Add a collection-only metadata/trade/settlement tape and verify a complete OSS artifact.
+- [x] Port the long-lived Polymarket reference collector and raw-tape uploader to Rust, and retire their Python runtime entry points.
 
 ## Safety
 

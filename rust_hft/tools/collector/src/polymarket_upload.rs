@@ -1,0 +1,2673 @@
+//! Validation and fail-closed OSS upload for closed Polymarket raw tapes.
+
+use crate::lob_archiver::{command_status_with_timeout, sha256_file, write_success_marker};
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use rand::random;
+use rust_decimal::Decimal;
+use serde::Serialize;
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::str::FromStr;
+use std::time::Duration;
+
+const ALLOWED_KINDS: [&str; 7] = [
+    "quote",
+    "event_discovered",
+    "event_expired",
+    "reference_price",
+    "market_metadata",
+    "polymarket_trade",
+    "market_settlement",
+];
+const SUPPORTED_SYMBOL_ALIASES: [(&str, &[&str]); 7] = [
+    ("BTCUSDT", &["BITCOIN", "BTC"]),
+    ("ETHUSDT", &["ETHEREUM", "ETH"]),
+    ("SOLUSDT", &["SOLANA", "SOL "]),
+    ("XRPUSDT", &["XRP"]),
+    ("DOGEUSDT", &["DOGECOIN", "DOGE"]),
+    ("HYPEUSDT", &["HYPERLIQUID", "HYPE"]),
+    ("BNBUSDT", &["BINANCE COIN", "BNB"]),
+];
+const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
+const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
+const SETTLEMENT_SUM_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
+
+#[derive(Debug, Clone)]
+pub struct UploadConfig {
+    pub spool_dir: PathBuf,
+    pub dataset: String,
+    pub quote_depth_levels: usize,
+    pub quote_sample_ms: u64,
+    pub bucket: String,
+    pub endpoint: String,
+    pub region: String,
+    pub profile: String,
+    pub zstd_timeout: Duration,
+    pub oss_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct UploadSummary {
+    pub uploaded_segments: usize,
+    pub canonical_uploaded_segments: usize,
+}
+
+impl UploadConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.dataset.is_empty()
+            || !self.dataset.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_-".contains(&byte)
+            })
+        {
+            bail!("dataset must match [a-z0-9_-]+");
+        }
+        if self.bucket.trim().is_empty()
+            || self.endpoint.trim().is_empty()
+            || self.region.trim().is_empty()
+            || self.profile.trim().is_empty()
+            || self.zstd_timeout.is_zero()
+            || self.oss_timeout.is_zero()
+        {
+            bail!("upload destination and timeouts must be non-empty");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Artifacts {
+    source: PathBuf,
+    data: PathBuf,
+    manifest: PathBuf,
+    success: PathBuf,
+    object_prefix: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScanResult {
+    manifest: Value,
+    identity: FileIdentity,
+}
+
+#[derive(Debug)]
+struct UploadedSegment {
+    object: String,
+    canonical_complete: bool,
+}
+
+struct ExclusiveTempDir(PathBuf);
+
+impl ExclusiveTempDir {
+    fn create(parent: &Path, prefix: &str) -> Result<Self> {
+        ensure_canonical_directory(parent)?;
+        for _ in 0..32 {
+            let path = parent.join(format!("{prefix}.{:016x}", random::<u64>()));
+            match DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("could not allocate an exclusive temporary directory")
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ExclusiveTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn utc_now() -> String {
+    Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
+pub(crate) fn ensure_canonical_directory(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        bail!(
+            "directory path must be absolute and canonical: {}",
+            path.display()
+        );
+    }
+    let mut existing = path;
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| anyhow!("directory has no existing ancestor"))?;
+    }
+    let metadata = fs::symlink_metadata(existing)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "directory ancestor is a symlink or non-directory: {}",
+            existing.display()
+        );
+    }
+    if fs::canonicalize(existing)? != existing {
+        bail!("directory has an indirect ancestor: {}", path.display());
+    }
+    let missing = path.strip_prefix(existing)?;
+    let mut current = existing.to_path_buf();
+    for component in missing.components() {
+        current.push(component.as_os_str());
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "directory path component is a symlink or non-directory: {}",
+                current.display()
+            );
+        }
+    }
+    if fs::canonicalize(path)? != path {
+        bail!("directory has an indirect ancestor: {}", path.display());
+    }
+    Ok(())
+}
+
+fn regular_identity(path: &Path) -> Result<FileIdentity> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect closed tape {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        bail!(
+            "closed tape must be a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    Ok(FileIdentity::from_metadata(&metadata))
+}
+
+fn ensure_identity(path: &Path, expected: FileIdentity) -> Result<()> {
+    let actual = regular_identity(path)?;
+    if actual != expected {
+        bail!("tape changed while being validated; refusing to archive an active file");
+    }
+    Ok(())
+}
+
+fn parse_timestamp(
+    value: Option<&Value>,
+    field: &str,
+    line_number: usize,
+) -> Result<DateTime<Utc>> {
+    let value = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("line {line_number}: {field} must be a string"))?;
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|_| anyhow!("line {line_number}: invalid {field}: {value}"))
+}
+
+fn decimal_or_none(
+    value: Option<&Value>,
+    field: &str,
+    line_number: usize,
+) -> Result<Option<Decimal>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string());
+    Decimal::from_str(&text)
+        .map(Some)
+        .map_err(|_| anyhow!("line {line_number}: {field} must be numeric"))
+}
+
+fn value_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Null) | None => "None".to_owned(),
+        Some(Value::Bool(true)) => "True".to_owned(),
+        Some(Value::Bool(false)) => "False".to_owned(),
+        Some(value) => value.to_string(),
+    }
+}
+
+fn canonical_decimal(value: Option<&Value>) -> String {
+    let raw = value_text(value);
+    Decimal::from_str(&raw)
+        .map(|value| value.normalize().to_string())
+        .unwrap_or(raw)
+}
+
+fn required_object_text<'a>(
+    object: &'a Map<String, Value>,
+    field: &str,
+    object_label: &str,
+    line_number: usize,
+) -> Result<&'a str> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("line {line_number}: {object_label} requires {field}"))
+}
+
+fn raw_trade_timestamp(value: Option<&Value>, line_number: usize) -> Result<i64> {
+    let timestamp = match value {
+        Some(Value::Number(value)) => value.as_i64(),
+        Some(Value::String(value)) => value.parse().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| anyhow!("line {line_number}: raw trade timestamp must be integer seconds"))?;
+    DateTime::from_timestamp(timestamp, 0)
+        .ok_or_else(|| anyhow!("line {line_number}: raw trade timestamp is out of range"))?;
+    Ok(timestamp)
+}
+
+fn parse_market_datetime(value: Option<&Value>) -> Option<DateTime<Utc>> {
+    let value = value?.as_str()?;
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .map(|parsed| parsed.and_utc())
+        })
+}
+
+fn contains_window_token(text: &str, token: &str) -> bool {
+    text.match_indices(token).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + token.len()..].chars().next();
+        before.is_none_or(|value| matches!(value, '-' | '_' | ' '))
+            && after.is_none_or(|value| matches!(value, '-' | '_' | ' '))
+    })
+}
+
+fn raw_market_window(market: &Map<String, Value>) -> Option<u64> {
+    let event = market
+        .get("events")
+        .and_then(Value::as_array)
+        .and_then(|events| events.first());
+    let start = [
+        market.get("eventStartTime"),
+        market.get("startDate"),
+        event.and_then(|event| event.get("startTime")),
+        event.and_then(|event| event.get("startDate")),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| parse_market_datetime(Some(value)));
+    if let (Some(start), Some(end)) = (start, parse_market_datetime(market.get("endDate"))) {
+        let seconds = (end - start).num_seconds();
+        if matches!(seconds, 300 | 900) {
+            return u64::try_from(seconds).ok();
+        }
+    }
+    let text = format!(
+        "{} {}",
+        market
+            .get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        market
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    if contains_window_token(&text, "15m") || text.contains("15 minute") {
+        Some(900)
+    } else if contains_window_token(&text, "5m") || text.contains("5 minute") {
+        Some(300)
+    } else {
+        None
+    }
+}
+
+fn parse_json_array(value: Option<&Value>) -> Option<Vec<Value>> {
+    match value {
+        Some(Value::Array(values)) => Some(values.clone()),
+        Some(Value::String(value)) => serde_json::from_str::<Vec<Value>>(value).ok(),
+        _ => None,
+    }
+}
+
+fn unique_string_pair(
+    market: &Map<String, Value>,
+    field: &str,
+    record_kind: &str,
+    line_number: usize,
+) -> Result<[String; 2]> {
+    let values = parse_json_array(market.get(field)).unwrap_or_default();
+    let strings = values
+        .iter()
+        .map(|value| value.as_str().filter(|value| !value.is_empty()))
+        .collect::<Option<Vec<_>>>();
+    let Some(strings) = strings else {
+        bail!("line {line_number}: {record_kind} raw market requires two unique {field}");
+    };
+    if strings.len() != 2 || strings[0] == strings[1] {
+        bail!("line {line_number}: {record_kind} raw market requires two unique {field}");
+    }
+    Ok([strings[0].to_owned(), strings[1].to_owned()])
+}
+
+fn derived_trade_record_id(trade: &Map<String, Value>) -> String {
+    let parts = [
+        value_text(trade.get("transactionHash")),
+        value_text(trade.get("conditionId")),
+        value_text(trade.get("asset")),
+        value_text(trade.get("side")),
+        value_text(trade.get("timestamp")),
+        value_text(trade.get("proxyWallet")),
+        canonical_decimal(trade.get("size")),
+        canonical_decimal(trade.get("price")),
+        value_text(trade.get("outcomeIndex")),
+    ];
+    hex::encode(Sha256::digest(parts.join("|").as_bytes()))
+}
+
+fn validate_canonical_trade(update: &Map<String, Value>, line_number: usize) -> Result<String> {
+    if update.get("record_id_version").and_then(Value::as_str) != Some("v2") {
+        bail!("line {line_number}: polymarket_trade record_id_version must be v2");
+    }
+    for field in [
+        "record_id",
+        "market_id",
+        "condition_id",
+        "token_id",
+        "symbol",
+        "side",
+        "trade_ts",
+        "transaction_hash",
+        "proxy_wallet",
+        "outcome",
+    ] {
+        required_text(update, field, line_number)
+            .map_err(|_| anyhow!("line {line_number}: polymarket_trade requires {field}"))?;
+    }
+
+    let trade = update
+        .get("trade")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("line {line_number}: polymarket_trade.trade must be an object"))?;
+    let transaction_hash =
+        required_object_text(trade, "transactionHash", "raw trade", line_number)?;
+    let condition_id = required_object_text(trade, "conditionId", "raw trade", line_number)?;
+    let asset = required_object_text(trade, "asset", "raw trade", line_number)?;
+    let side = required_object_text(trade, "side", "raw trade", line_number)?;
+    if !matches!(side, "BUY" | "SELL") {
+        bail!("line {line_number}: raw trade side must be BUY or SELL");
+    }
+    let proxy_wallet = required_object_text(trade, "proxyWallet", "raw trade", line_number)?;
+    let outcome = required_object_text(trade, "outcome", "raw trade", line_number)?;
+    let timestamp = raw_trade_timestamp(trade.get("timestamp"), line_number)?;
+    let size = decimal_or_none(trade.get("size"), "raw trade size", line_number)?;
+    if size.is_none_or(|value| value <= Decimal::ZERO) {
+        bail!("line {line_number}: raw trade size must be positive");
+    }
+    let price = decimal_or_none(trade.get("price"), "raw trade price", line_number)?;
+    if !price.is_some_and(|value| (Decimal::ZERO..=Decimal::ONE).contains(&value)) {
+        bail!("line {line_number}: raw trade price must be within [0, 1]");
+    }
+    let outcome_index = trade.get("outcomeIndex").and_then(Value::as_i64);
+    if !matches!(outcome_index, Some(0 | 1)) {
+        bail!("line {line_number}: raw trade outcomeIndex must be 0 or 1");
+    }
+
+    for (field, expected) in [
+        ("transaction_hash", transaction_hash),
+        ("condition_id", condition_id),
+        ("token_id", asset),
+        ("side", side),
+        ("proxy_wallet", proxy_wallet),
+        ("outcome", outcome),
+    ] {
+        if update.get(field).and_then(Value::as_str) != Some(expected) {
+            bail!("line {line_number}: polymarket_trade {field} does not match raw trade");
+        }
+    }
+    if decimal_or_none(update.get("size"), "size", line_number)? != size {
+        bail!("line {line_number}: polymarket_trade size does not match raw trade");
+    }
+    if decimal_or_none(update.get("price"), "price", line_number)? != price {
+        bail!("line {line_number}: polymarket_trade price does not match raw trade");
+    }
+    if update.get("outcome_index").and_then(Value::as_i64) != outcome_index {
+        bail!("line {line_number}: polymarket_trade outcome_index does not match raw trade");
+    }
+    if update.get("trade_ts_unix").and_then(Value::as_i64) != Some(timestamp) {
+        bail!("line {line_number}: polymarket_trade trade_ts_unix does not match raw trade");
+    }
+    let trade_ts = parse_timestamp(update.get("trade_ts"), "trade_ts", line_number)?;
+    if trade_ts != DateTime::from_timestamp(timestamp, 0).expect("timestamp was validated") {
+        bail!("line {line_number}: polymarket_trade trade_ts does not match raw trade");
+    }
+
+    let record_id = required_text(update, "record_id", line_number)?.to_owned();
+    if record_id != derived_trade_record_id(trade) {
+        bail!("line {line_number}: record_id does not match raw trade");
+    }
+    Ok(record_id)
+}
+
+fn validate_market_context(
+    update: &Map<String, Value>,
+    record_kind: &str,
+    line_number: usize,
+) -> Result<([String; 2], [String; 2])> {
+    let market_id = required_text(update, "market_id", line_number)
+        .map_err(|_| anyhow!("line {line_number}: {record_kind} requires market_id"))?;
+    let condition_id = required_text(update, "condition_id", line_number)
+        .map_err(|_| anyhow!("line {line_number}: {record_kind} requires condition_id"))?;
+    let market = update
+        .get("market")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("line {line_number}: {record_kind}.market must be an object"))?;
+    let raw_market_id = required_object_text(
+        market,
+        "id",
+        &format!("{record_kind} raw market"),
+        line_number,
+    )?;
+    let raw_condition_id = required_object_text(
+        market,
+        "conditionId",
+        &format!("{record_kind} raw market"),
+        line_number,
+    )?;
+    if market_id != raw_market_id {
+        bail!("line {line_number}: {record_kind} market_id does not match raw market");
+    }
+    if condition_id != raw_condition_id {
+        bail!("line {line_number}: {record_kind} condition_id does not match raw market");
+    }
+    let symbol = required_text(update, "symbol", line_number)
+        .map_err(|_| anyhow!("line {line_number}: {record_kind} requires symbol"))?;
+    let raw_question = market
+        .get("question")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let raw_symbol = SUPPORTED_SYMBOL_ALIASES
+        .iter()
+        .find_map(|(candidate, aliases)| {
+            aliases
+                .iter()
+                .any(|alias| raw_question.contains(alias))
+                .then_some(*candidate)
+        });
+    if raw_symbol != Some(symbol) {
+        bail!("line {line_number}: {record_kind} symbol is unsupported or contradicts raw market");
+    }
+    let window = update.get("market_window_secs").and_then(Value::as_u64);
+    if !matches!(window, Some(300 | 900)) || raw_market_window(market) != window {
+        bail!("line {line_number}: {record_kind} window is unsupported or contradicts raw market");
+    }
+    let tokens = unique_string_pair(market, "clobTokenIds", record_kind, line_number)?;
+    let outcomes = unique_string_pair(market, "outcomes", record_kind, line_number)?;
+    Ok((tokens, outcomes))
+}
+
+fn validate_market_settlement(update: &Map<String, Value>, line_number: usize) -> Result<()> {
+    let (tokens, outcomes) = validate_market_context(update, "market_settlement", line_number)?;
+    let market = update
+        .get("market")
+        .and_then(Value::as_object)
+        .expect("market context validation requires an object");
+    if market.get("closed").and_then(Value::as_bool) != Some(true) {
+        bail!("line {line_number}: market_settlement raw market must be closed");
+    }
+    let raw_prices = parse_json_array(market.get("outcomePrices")).unwrap_or_default();
+    if raw_prices.len() != 2 {
+        bail!("line {line_number}: market_settlement requires exactly two outcomePrices");
+    }
+    let prices = raw_prices
+        .iter()
+        .map(|value| Decimal::from_str(&value_text(Some(value))).ok())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            anyhow!("line {line_number}: market_settlement outcomePrices must be numeric")
+        })?;
+    if prices
+        .iter()
+        .any(|price| !(Decimal::ZERO..=Decimal::ONE).contains(price))
+    {
+        bail!("line {line_number}: market_settlement outcomePrices must be within [0, 1]");
+    }
+    let winners = prices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, price)| (*price >= SETTLEMENT_PRICE).then_some(index))
+        .collect::<Vec<_>>();
+    if winners.len() != 1 {
+        bail!("line {line_number}: market_settlement requires exactly one winning price");
+    }
+    let winner = winners[0];
+    let loser = 1 - winner;
+    if prices[loser] > SETTLEMENT_LOSER_PRICE {
+        bail!("line {line_number}: market_settlement losing price must be near zero");
+    }
+    let price_sum = prices[0] + prices[1];
+    if price_sum < Decimal::ONE - SETTLEMENT_SUM_TOLERANCE
+        || price_sum > Decimal::ONE + SETTLEMENT_SUM_TOLERANCE
+    {
+        bail!("line {line_number}: market_settlement prices must sum to one");
+    }
+    if update.get("winning_token_id").and_then(Value::as_str) != Some(tokens[winner].as_str()) {
+        bail!("line {line_number}: market_settlement winning_token_id does not match raw market");
+    }
+    if update.get("winning_outcome").and_then(Value::as_str) != Some(outcomes[winner].as_str()) {
+        bail!("line {line_number}: market_settlement winning_outcome does not match raw market");
+    }
+    let outcome_set = outcomes
+        .iter()
+        .map(|outcome| outcome.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if outcome_set != BTreeSet::from(["down".to_owned(), "up".to_owned()])
+        && outcome_set != BTreeSet::from(["no".to_owned(), "yes".to_owned()])
+    {
+        bail!("line {line_number}: market_settlement outcomes must be Up/Down or Yes/No");
+    }
+    let resolved_up_won = matches!(outcomes[winner].to_ascii_lowercase().as_str(), "up" | "yes");
+    if update.get("resolved_up_won").and_then(Value::as_bool) != Some(resolved_up_won) {
+        bail!("line {line_number}: market_settlement resolved_up_won does not match raw market");
+    }
+    Ok(())
+}
+
+fn required_text<'a>(
+    update: &'a Map<String, Value>,
+    field: &str,
+    line_number: usize,
+) -> Result<&'a str> {
+    update
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("line {line_number}: update requires {field}"))
+}
+
+fn reference_context(update: &Map<String, Value>, line_number: usize) -> Result<(String, String)> {
+    Ok((
+        required_text(update, "market_id", line_number)?.to_owned(),
+        required_text(update, "condition_id", line_number)?.to_owned(),
+    ))
+}
+
+fn increment_nested(counts: &mut BTreeMap<String, BTreeMap<String, u64>>, kind: &str, field: &str) {
+    *counts
+        .entry(kind.to_owned())
+        .or_default()
+        .entry(field.to_owned())
+        .or_default() += 1;
+}
+
+fn strict_rotation_name(name: &str) -> bool {
+    let Some(middle) = name
+        .strip_prefix("market-updates.")
+        .and_then(|name| name.strip_suffix(".ndjson"))
+    else {
+        return false;
+    };
+    let mut parts = middle.split('.');
+    let Some(stamp) = parts.next() else {
+        return false;
+    };
+    if !strict_timestamp(stamp) {
+        return false;
+    }
+    match (parts.next(), parts.next()) {
+        (None, None) => true,
+        (Some(uuid), None) => strict_uuid(uuid),
+        _ => false,
+    }
+}
+
+fn strict_timestamp(value: &str) -> bool {
+    let format = match value.len() {
+        15 => "%Y%m%dT%H%M%S",
+        21 => "%Y%m%dT%H%M%S%6f",
+        _ => return false,
+    };
+    NaiveDateTime::parse_from_str(value, format).is_ok()
+}
+
+fn strict_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn discover_rotated_tapes(spool_dir: &Path) -> Result<Vec<PathBuf>> {
+    ensure_canonical_directory(spool_dir)?;
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(spool_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| anyhow!("spool entry name is not UTF-8"))?;
+        if strict_rotation_name(name) {
+            regular_identity(&entry.path())?;
+            paths.push(entry.path());
+        } else if name != "market-updates.ndjson" && name.starts_with("market-updates.") {
+            bail!("invalid rotated tape name: {name}");
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Validate a closed tape and return the manifest body used by the uploader.
+pub fn scan_tape(
+    path: &Path,
+    dataset: &str,
+    quote_depth_levels: usize,
+    quote_sample_ms: u64,
+) -> Result<Value> {
+    Ok(scan_tape_with_identity(path, dataset, quote_depth_levels, quote_sample_ms)?.manifest)
+}
+
+fn scan_tape_with_identity(
+    path: &Path,
+    dataset: &str,
+    quote_depth_levels: usize,
+    quote_sample_ms: u64,
+) -> Result<ScanResult> {
+    let identity = regular_identity(path)?;
+    let file = File::open(path).with_context(|| format!("open tape {}", path.display()))?;
+    if FileIdentity::from_metadata(&file.metadata()?) != identity {
+        bail!("tape changed while being opened; refusing to archive an active file");
+    }
+    let mut reader = BufReader::new(file);
+    let mut event_types = BTreeMap::<String, u64>::new();
+    let mut present_fields = BTreeMap::<String, BTreeMap<String, u64>>::new();
+    let mut non_null_fields = BTreeMap::<String, BTreeMap<String, u64>>::new();
+    let mut symbols = BTreeSet::new();
+    let mut token_ids = BTreeSet::new();
+    let mut known_event_tokens = BTreeSet::new();
+    let mut contextless_quote_tokens = BTreeSet::new();
+    let mut first_recorded_at: Option<String> = None;
+    let mut last_recorded_at: Option<String> = None;
+    let mut previous_recorded_at: Option<DateTime<Utc>> = None;
+    let mut first_sequence: Option<u64> = None;
+    let mut last_sequence: Option<u64> = None;
+    let mut expected_sequence: Option<u64> = None;
+    let mut crossed_quotes = 0_u64;
+    let mut one_sided_quotes = 0_u64;
+    let mut empty_quotes = 0_u64;
+    let mut out_of_range_prices = 0_u64;
+    let mut negative_sizes = 0_u64;
+    let mut max_bid_levels = 0_usize;
+    let mut max_ask_levels = 0_usize;
+    let mut contextless_quotes = 0_u64;
+    let mut market_ids = BTreeSet::new();
+    let mut condition_ids = BTreeSet::new();
+    let mut record_ids = BTreeSet::new();
+    let mut record_id_versions = BTreeSet::new();
+    let mut metadata_contexts = BTreeSet::new();
+    let mut dependent_reference_contexts = BTreeSet::new();
+    let mut source_field_presence = BTreeMap::<String, BTreeMap<String, u64>>::new();
+    let mut source_field_non_null = BTreeMap::<String, BTreeMap<String, u64>>::new();
+    let mut raw_line = Vec::new();
+    let mut line_number = 0_usize;
+
+    loop {
+        raw_line.clear();
+        let read = reader.read_until(b'\n', &mut raw_line)?;
+        if read == 0 {
+            break;
+        }
+        line_number += 1;
+        if !raw_line.ends_with(b"\n") {
+            bail!("line {line_number}: tape ends with an incomplete record");
+        }
+        let record: Value = serde_json::from_slice(&raw_line)
+            .map_err(|_| anyhow!("line {line_number}: invalid JSON"))?;
+        let record = record
+            .as_object()
+            .ok_or_else(|| anyhow!("line {line_number}: record must be an object"))?;
+        let sequence = record
+            .get("sequence")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                anyhow!("line {line_number}: sequence must be a non-negative integer")
+            })?;
+        let expected = expected_sequence.get_or_insert(sequence);
+        if sequence != *expected {
+            bail!(
+                "line {line_number}: sequence gap expected={} actual={sequence}",
+                *expected
+            );
+        }
+        let recorded_at = parse_timestamp(record.get("recorded_at"), "recorded_at", line_number)?;
+        if previous_recorded_at.is_some_and(|previous| recorded_at < previous) {
+            bail!("line {line_number}: recorded_at moved backwards");
+        }
+        let update = record
+            .get("update")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("line {line_number}: update must be an object"))?;
+        let kind = update
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("line {line_number}: unsupported update kind None"))?;
+        if !ALLOWED_KINDS.contains(&kind) {
+            bail!("line {line_number}: unsupported update kind {kind:?}");
+        }
+
+        *event_types.entry(kind.to_owned()).or_default() += 1;
+        for (field, value) in update {
+            increment_nested(&mut present_fields, kind, field);
+            if !value.is_null() {
+                increment_nested(&mut non_null_fields, kind, field);
+            }
+        }
+        if let Some(symbol) = update
+            .get("symbol")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            symbols.insert(symbol.to_owned());
+        }
+        let token_id = update.get("token_id").and_then(Value::as_str);
+        if let Some(token_id) = token_id.filter(|value| !value.is_empty()) {
+            token_ids.insert(token_id.to_owned());
+        }
+        if kind == "event_discovered" {
+            for field in ["up_token", "down_token"] {
+                if let Some(token) = update
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                {
+                    known_event_tokens.insert(token.to_owned());
+                }
+            }
+        }
+        if let Some(market_id) = update
+            .get("market_id")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            market_ids.insert(market_id.to_owned());
+        }
+        if let Some(condition_id) = update
+            .get("condition_id")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            condition_ids.insert(condition_id.to_owned());
+        }
+        let raw_field = match kind {
+            "market_metadata" | "market_settlement" => Some("market"),
+            "polymarket_trade" => Some("trade"),
+            _ => None,
+        };
+        if let Some(raw_field) = raw_field {
+            let raw_payload = update
+                .get(raw_field)
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    anyhow!("line {line_number}: {kind}.{raw_field} must be an object")
+                })?;
+            for (field, value) in raw_payload {
+                increment_nested(&mut source_field_presence, kind, field);
+                if !value.is_null() {
+                    increment_nested(&mut source_field_non_null, kind, field);
+                }
+            }
+        }
+
+        match kind {
+            "market_metadata" => {
+                for field in ["market_id", "condition_id", "symbol", "retrieved_at"] {
+                    required_text(update, field, line_number).map_err(|_| {
+                        anyhow!("line {line_number}: market_metadata requires {field}")
+                    })?;
+                }
+                validate_market_context(update, "market_metadata", line_number)?;
+                metadata_contexts.insert(reference_context(update, line_number)?);
+            }
+            "polymarket_trade" => {
+                let record_id = validate_canonical_trade(update, line_number)?;
+                if !record_ids.insert(record_id) {
+                    bail!("line {line_number}: duplicate polymarket_trade record_id");
+                }
+                record_id_versions.insert("v2".to_owned());
+                dependent_reference_contexts.insert(reference_context(update, line_number)?);
+            }
+            "market_settlement" => {
+                for field in [
+                    "market_id",
+                    "condition_id",
+                    "symbol",
+                    "winning_token_id",
+                    "winning_outcome",
+                    "resolution_source",
+                    "retrieved_at",
+                ] {
+                    required_text(update, field, line_number).map_err(|_| {
+                        anyhow!("line {line_number}: market_settlement requires {field}")
+                    })?;
+                }
+                validate_market_settlement(update, line_number)?;
+                dependent_reference_contexts.insert(reference_context(update, line_number)?);
+            }
+            _ => {}
+        }
+
+        if kind == "quote" {
+            if !token_id.is_some_and(|token| known_event_tokens.contains(token)) {
+                contextless_quotes += 1;
+                if let Some(token) = token_id {
+                    contextless_quote_tokens.insert(token.to_owned());
+                }
+            }
+            let bid = decimal_or_none(update.get("bid"), "bid", line_number)?;
+            let ask = decimal_or_none(update.get("ask"), "ask", line_number)?;
+            let bid_size = decimal_or_none(update.get("bid_size"), "bid_size", line_number)?;
+            let ask_size = decimal_or_none(update.get("ask_size"), "ask_size", line_number)?;
+            let bid_levels = quote_levels(update.get("bid_levels"), line_number)?;
+            let ask_levels = quote_levels(update.get("ask_levels"), line_number)?;
+            if quote_depth_levels > 0
+                && (bid_levels.len() > quote_depth_levels || ask_levels.len() > quote_depth_levels)
+            {
+                bail!("line {line_number}: quote exceeds configured depth");
+            }
+            max_bid_levels = max_bid_levels.max(bid_levels.len());
+            max_ask_levels = max_ask_levels.max(ask_levels.len());
+            for (side, levels) in [("bid_levels", bid_levels), ("ask_levels", ask_levels)] {
+                for (level_index, level) in levels.iter().enumerate() {
+                    let level = level.as_object().ok_or_else(|| {
+                        anyhow!("line {line_number}: {side}[{level_index}] must be an object")
+                    })?;
+                    let level_price = decimal_or_none(
+                        level.get("price"),
+                        &format!("{side}[{level_index}].price"),
+                        line_number,
+                    )?;
+                    let level_size = decimal_or_none(
+                        level.get("size"),
+                        &format!("{side}[{level_index}].size"),
+                        line_number,
+                    )?;
+                    let (Some(level_price), Some(level_size)) = (level_price, level_size) else {
+                        bail!("line {line_number}: {side}[{level_index}] requires price and size");
+                    };
+                    if !(Decimal::ZERO..=Decimal::ONE).contains(&level_price) {
+                        out_of_range_prices += 1;
+                    }
+                    if level_size < Decimal::ZERO {
+                        negative_sizes += 1;
+                    }
+                }
+            }
+            match (bid, ask) {
+                (None, None) => empty_quotes += 1,
+                (None, Some(_)) | (Some(_), None) => one_sided_quotes += 1,
+                (Some(bid), Some(ask)) if bid > ask => crossed_quotes += 1,
+                _ => {}
+            }
+            for price in [bid, ask].into_iter().flatten() {
+                if !(Decimal::ZERO..=Decimal::ONE).contains(&price) {
+                    out_of_range_prices += 1;
+                }
+            }
+            for size in [bid_size, ask_size].into_iter().flatten() {
+                if size < Decimal::ZERO {
+                    negative_sizes += 1;
+                }
+            }
+        }
+
+        let recorded_at_text = record
+            .get("recorded_at")
+            .and_then(Value::as_str)
+            .expect("recorded_at was validated")
+            .to_owned();
+        first_recorded_at.get_or_insert_with(|| recorded_at_text.clone());
+        last_recorded_at = Some(recorded_at_text);
+        first_sequence.get_or_insert(sequence);
+        last_sequence = Some(sequence);
+        expected_sequence = sequence.checked_add(1);
+        if expected_sequence.is_none() {
+            bail!("line {line_number}: sequence overflow");
+        }
+        previous_recorded_at = Some(recorded_at);
+    }
+
+    let after = FileIdentity::from_metadata(&reader.get_ref().metadata()?);
+    if after != identity {
+        bail!("tape changed while being validated; refusing to archive an active file");
+    }
+    ensure_identity(path, identity)?;
+    let first_sequence = first_sequence.ok_or_else(|| anyhow!("tape is empty"))?;
+    let last_sequence = last_sequence.expect("non-empty tape has a final sequence");
+    let first_recorded_at = first_recorded_at.expect("non-empty tape has a first timestamp");
+    let last_recorded_at = last_recorded_at.expect("non-empty tape has a final timestamp");
+    let partition = DateTime::parse_from_rfc3339(&first_recorded_at)
+        .expect("recorded_at was validated")
+        .with_timezone(&Utc);
+    let event_context_complete = contextless_quotes == 0;
+    let has_quotes = event_types.get("quote").copied().unwrap_or_default() > 0;
+    let has_reference_records = ["market_metadata", "polymarket_trade", "market_settlement"]
+        .iter()
+        .any(|kind| event_types.get(*kind).copied().unwrap_or_default() > 0);
+    let reference_context_complete = dependent_reference_contexts.is_subset(&metadata_contexts);
+    let depth_complete = has_quotes && quote_depth_levels == 0;
+    let temporal_updates_complete = has_quotes && quote_sample_ms == 0;
+    let replay_scope = if !reference_context_complete {
+        "reference_hour_segment_requires_market_metadata_context"
+    } else if has_reference_records && !has_quotes {
+        "complete_reference_hour_segment"
+    } else if event_context_complete {
+        if depth_complete {
+            if temporal_updates_complete {
+                "complete_full_depth_normalized_hour_segment"
+            } else {
+                "complete_full_depth_sampled_normalized_hour_segment"
+            }
+        } else {
+            "complete_sampled_normalized_hour_segment"
+        }
+    } else {
+        "sampled_normalized_hour_segment_requires_prior_event_context"
+    };
+    let source_file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("source file name is not UTF-8"))?;
+    let mut manifest = json!({
+        "schema": "monday.polymarket.raw.v1",
+        "canonical": reference_context_complete,
+        "venue": "polymarket",
+        "dataset": dataset,
+        "format": "ndjson.zst",
+        "replay_scope": replay_scope,
+        "venue_depth_complete": depth_complete,
+        "temporal_updates_complete": temporal_updates_complete,
+        "segment_complete": reference_context_complete,
+        "source_session_closed": true,
+        "event_context_complete": event_context_complete,
+        "contextless_quote_tokens": contextless_quote_tokens,
+        "events": last_sequence - first_sequence + 1,
+        "event_types": event_types,
+        "start_sequence": first_sequence,
+        "end_sequence": last_sequence,
+        "sequence_gaps": 0,
+        "start_recorded_at": first_recorded_at,
+        "end_recorded_at": last_recorded_at,
+        "date": partition.format("%Y-%m-%d").to_string(),
+        "hour": partition.format("%H").to_string(),
+        "symbols": symbols,
+        "token_count": token_ids.len(),
+        "market_count": market_ids.len(),
+        "condition_count": condition_ids.len(),
+        "record_id_versions": record_id_versions,
+        "recording_policy": {
+            "quote_sample_ms": quote_sample_ms,
+            "quote_depth_levels": quote_depth_levels,
+            "event_scoped_quotes": true,
+        },
+        "field_presence": present_fields,
+        "field_non_null": non_null_fields,
+        "source_field_presence": source_field_presence,
+        "source_field_non_null": source_field_non_null,
+        "quality": {
+            "crossed_quotes": crossed_quotes,
+            "one_sided_quotes": one_sided_quotes,
+            "empty_quotes": empty_quotes,
+            "out_of_range_prices": out_of_range_prices,
+            "negative_sizes": negative_sizes,
+            "max_bid_levels": max_bid_levels,
+            "max_ask_levels": max_ask_levels,
+            "contextless_quotes": contextless_quotes,
+            "duplicate_record_ids": 0,
+        },
+        "source_file": source_file,
+        "source_bytes": identity.bytes,
+    });
+    manifest
+        .as_object_mut()
+        .expect("manifest is an object")
+        .insert(
+            "reference_context_complete".to_owned(),
+            json!(reference_context_complete),
+        );
+    Ok(ScanResult { manifest, identity })
+}
+
+fn quote_levels(value: Option<&Value>, line_number: usize) -> Result<&[Value]> {
+    match value {
+        None | Some(Value::Null) => Ok(&[]),
+        Some(Value::Array(levels)) => Ok(levels),
+        _ => bail!("line {line_number}: quote levels must be arrays"),
+    }
+}
+
+fn split_tape_by_utc_hour(source: &Path, staging_dir: &Path) -> Result<Vec<PathBuf>> {
+    let file = File::open(source)?;
+    let mut reader = BufReader::new(file);
+    let stem = source
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow!("source file name is not UTF-8"))?;
+    let mut chunks = Vec::new();
+    let mut current_hour: Option<String> = None;
+    let mut output: Option<(PathBuf, BufWriter<File>)> = None;
+    let mut raw_line = Vec::new();
+    let mut line_number = 0_usize;
+    loop {
+        raw_line.clear();
+        let read = reader.read_until(b'\n', &mut raw_line)?;
+        if read == 0 {
+            break;
+        }
+        line_number += 1;
+        let record: Value = serde_json::from_slice(&raw_line)?;
+        let hour = parse_timestamp(record.get("recorded_at"), "recorded_at", line_number)?
+            .format("%Y%m%dT%H")
+            .to_string();
+        if current_hour.as_deref() != Some(&hour) {
+            if let Some((path, mut writer)) = output.take() {
+                writer.flush()?;
+                writer.get_ref().sync_all()?;
+                chunks.push(path);
+            }
+            let path = staging_dir.join(format!("{stem}.{hour}.ndjson"));
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            output = Some((path, BufWriter::new(file)));
+            current_hour = Some(hour);
+        }
+        output
+            .as_mut()
+            .expect("a chunk is opened before writing")
+            .1
+            .write_all(&raw_line)?;
+    }
+    if let Some((path, mut writer)) = output {
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        chunks.push(path);
+    }
+    File::open(staging_dir)?.sync_all()?;
+    Ok(chunks)
+}
+
+fn append_name(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("file name is not UTF-8"))?;
+    Ok(path.with_file_name(format!("{name}{suffix}")))
+}
+
+fn exclusive_sibling(path: &Path, suffix: &str) -> Result<(PathBuf, File)> {
+    let parent = path.parent().ok_or_else(|| anyhow!("file has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("file name is not UTF-8"))?;
+    for _ in 0..32 {
+        let temporary = parent.join(format!(".{name}.{:016x}{suffix}", random::<u64>()));
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("could not allocate an exclusive temporary file")
+}
+
+fn atomic_json(path: &Path, payload: &Value) -> Result<()> {
+    let (temporary, mut file) = exclusive_sibling(path, ".tmp")?;
+    let result = (|| -> Result<()> {
+        serde_json::to_writer(&mut file, payload)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn prepare_artifacts(source: &Path, config: &UploadConfig) -> Result<(Artifacts, Value)> {
+    let scan = scan_tape_with_identity(
+        source,
+        &config.dataset,
+        config.quote_depth_levels,
+        config.quote_sample_ms,
+    )?;
+    let data = append_name(source, ".zst")?;
+    let (temporary_data, temporary_file) = exclusive_sibling(&data, ".tmp")?;
+    let output = temporary_file.try_clone()?;
+    let mut command = Command::new("zstd");
+    command
+        .args(["-q", "-T1", "-3", "-c"])
+        .arg(source)
+        .stdout(Stdio::from(output));
+    match command_status_with_timeout(&mut command, config.zstd_timeout) {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            let _ = fs::remove_file(&temporary_data);
+            bail!("zstd exited with {status}");
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_data);
+            return Err(error);
+        }
+    }
+    temporary_file.sync_all()?;
+    if let Err(error) = ensure_identity(source, scan.identity) {
+        let _ = fs::remove_file(&temporary_data);
+        return Err(error);
+    }
+    fs::rename(&temporary_data, &data)?;
+    let digest = sha256_file(&data)?;
+    let mut metadata = scan
+        .manifest
+        .as_object()
+        .cloned()
+        .expect("scan manifest is an object");
+    metadata.insert(
+        "file".to_owned(),
+        json!(data.file_name().and_then(|name| name.to_str())),
+    );
+    metadata.insert("bytes".to_owned(), json!(fs::metadata(&data)?.len()));
+    metadata.insert("sha256".to_owned(), json!(digest.clone()));
+    let manifest_value = Value::Object(metadata);
+    let manifest = append_name(&data, ".manifest.json")?;
+    atomic_json(&manifest, &manifest_value)?;
+    let success = write_success_marker(&data, &digest)?;
+    let date = manifest_value["date"]
+        .as_str()
+        .expect("scan manifest has a date");
+    let hour = manifest_value["hour"]
+        .as_str()
+        .expect("scan manifest has an hour");
+    let object_prefix = format!(
+        "lake/raw/venue=polymarket/dataset={}/date={date}/hour={hour}/sha256={digest}",
+        config.dataset,
+    );
+    Ok((
+        Artifacts {
+            source: source.to_path_buf(),
+            data,
+            manifest,
+            success,
+            object_prefix,
+        },
+        manifest_value,
+    ))
+}
+
+fn oss_copy_command(source: &str, destination: &str, config: &UploadConfig) -> Command {
+    let mut command = Command::new("aliyun");
+    command.args([
+        "ossutil",
+        "cp",
+        source,
+        destination,
+        "--profile",
+        &config.profile,
+        "--endpoint",
+        &config.endpoint,
+        "--region",
+        &config.region,
+    ]);
+    command
+}
+
+fn oss_upload_command(source: &str, destination: &str, config: &UploadConfig) -> Command {
+    let mut command = oss_copy_command(source, destination, config);
+    command.arg("--ignore-existing");
+    command
+}
+
+fn run_checked(command: &mut Command, timeout: Duration) -> Result<ExitStatus> {
+    let status = command_status_with_timeout(command, timeout)?;
+    if !status.success() {
+        bail!("child process exited with {status}");
+    }
+    Ok(status)
+}
+
+fn download_remote_artifacts_with<F>(
+    artifacts: &Artifacts,
+    config: &UploadConfig,
+    runner: &mut F,
+) -> Result<(ExclusiveTempDir, BTreeMap<String, PathBuf>)>
+where
+    F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
+{
+    let parent = artifacts
+        .source
+        .parent()
+        .ok_or_else(|| anyhow!("artifact has no parent"))?;
+    let verify_dir = ExclusiveTempDir::create(parent, ".oss-verify")?;
+    let mut downloaded = BTreeMap::new();
+    for source in [&artifacts.data, &artifacts.manifest, &artifacts.success] {
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
+        let destination = verify_dir.path().join(name);
+        let remote = format!("oss://{}/{}/{name}", config.bucket, artifacts.object_prefix);
+        let mut command = oss_copy_command(
+            &remote,
+            destination
+                .to_str()
+                .ok_or_else(|| anyhow!("verification path is not UTF-8"))?,
+            config,
+        );
+        runner(&mut command, config.oss_timeout)?;
+        regular_identity(&destination)?;
+        downloaded.insert(name.to_owned(), destination);
+    }
+    Ok((verify_dir, downloaded))
+}
+
+fn verify_downloaded_artifacts(
+    artifacts: &Artifacts,
+    downloaded: &BTreeMap<String, PathBuf>,
+) -> Result<()> {
+    let expected_manifest: Value = serde_json::from_slice(&fs::read(&artifacts.manifest)?)?;
+    let data_name = artifacts
+        .data
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap();
+    let manifest_name = artifacts
+        .manifest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap();
+    let success_name = artifacts
+        .success
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap();
+    let remote_data = &downloaded[data_name];
+    let expected_bytes = expected_manifest["bytes"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("manifest bytes must be an integer"))?;
+    let expected_sha = expected_manifest["sha256"]
+        .as_str()
+        .ok_or_else(|| anyhow!("manifest sha256 must be a string"))?;
+    if fs::metadata(remote_data)?.len() != expected_bytes {
+        bail!("remote data size does not match manifest");
+    }
+    if sha256_file(remote_data)? != expected_sha {
+        bail!("remote data sha256 does not match manifest");
+    }
+    if fs::read(&downloaded[manifest_name])? != fs::read(&artifacts.manifest)? {
+        bail!("remote manifest does not match local manifest");
+    }
+    if fs::read_to_string(&downloaded[success_name])?.trim() != expected_sha {
+        bail!("remote _SUCCESS does not match manifest");
+    }
+    Ok(())
+}
+
+fn verify_remote_artifacts_with<F>(
+    artifacts: &Artifacts,
+    config: &UploadConfig,
+    runner: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
+{
+    let (_verify_dir, downloaded) = download_remote_artifacts_with(artifacts, config, runner)?;
+    verify_downloaded_artifacts(artifacts, &downloaded)
+}
+
+fn remote_artifacts_exist_and_match_with<F>(
+    artifacts: &Artifacts,
+    config: &UploadConfig,
+    runner: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
+{
+    let Ok((_verify_dir, downloaded)) = download_remote_artifacts_with(artifacts, config, runner)
+    else {
+        return Ok(false);
+    };
+    verify_downloaded_artifacts(artifacts, &downloaded)?;
+    Ok(true)
+}
+
+fn remove_regular(path: &Path) -> Result<()> {
+    regular_identity(path)?;
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn remove_artifacts(artifacts: &Artifacts) -> Result<()> {
+    let paths = [
+        artifacts.source.as_path(),
+        artifacts.data.as_path(),
+        artifacts.manifest.as_path(),
+        artifacts.success.as_path(),
+    ];
+    let identities = paths
+        .iter()
+        .map(|path| regular_identity(path))
+        .collect::<Result<Vec<_>>>()?;
+    for (path, identity) in paths.iter().zip(identities) {
+        ensure_identity(path, identity)?;
+    }
+    for path in paths {
+        remove_regular(path)?;
+    }
+    Ok(())
+}
+
+fn upload_artifacts(artifacts: &Artifacts, config: &UploadConfig) -> Result<String> {
+    upload_artifacts_with(artifacts, config, &mut run_checked)
+}
+
+fn upload_artifacts_with<F>(
+    artifacts: &Artifacts,
+    config: &UploadConfig,
+    runner: &mut F,
+) -> Result<String>
+where
+    F: FnMut(&mut Command, Duration) -> Result<ExitStatus>,
+{
+    if !remote_artifacts_exist_and_match_with(artifacts, config, runner)? {
+        for source in [&artifacts.data, &artifacts.manifest, &artifacts.success] {
+            let name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
+            let destination = format!("oss://{}/{}/{name}", config.bucket, artifacts.object_prefix);
+            let mut command = oss_upload_command(
+                source
+                    .to_str()
+                    .ok_or_else(|| anyhow!("artifact path is not UTF-8"))?,
+                &destination,
+                config,
+            );
+            runner(&mut command, config.oss_timeout)?;
+        }
+        verify_remote_artifacts_with(artifacts, config, runner)?;
+    }
+    remove_artifacts(artifacts)?;
+    let data_name = artifacts
+        .data
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("artifact file name is not UTF-8"))?;
+    Ok(format!(
+        "oss://{}/{}/{data_name}",
+        config.bucket, artifacts.object_prefix
+    ))
+}
+
+fn canonical_complete_manifest(manifest: &Value) -> bool {
+    manifest.get("canonical").and_then(Value::as_bool) == Some(true)
+        && manifest.get("segment_complete").and_then(Value::as_bool) == Some(true)
+}
+
+fn archive_source(source: &Path, config: &UploadConfig) -> Result<Vec<UploadedSegment>> {
+    let source_scan = scan_tape_with_identity(
+        source,
+        &config.dataset,
+        config.quote_depth_levels,
+        config.quote_sample_ms,
+    )?;
+    if source_scan.manifest["start_sequence"].as_u64() != Some(0) {
+        bail!(
+            "closed source tape must start at sequence 0; actual={}",
+            source_scan.manifest["start_sequence"]
+        );
+    }
+    let spool_dir = source
+        .parent()
+        .ok_or_else(|| anyhow!("source has no parent"))?;
+    let staging_root = spool_dir.join(".upload-staging");
+    match fs::symlink_metadata(&staging_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&staging_root)?;
+        }
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => bail!("upload staging root must be a plain directory"),
+        Err(error) => return Err(error.into()),
+    }
+    let staging = ExclusiveTempDir::create(&staging_root, "session")?;
+    let chunks = split_tape_by_utc_hour(source, staging.path())?;
+    ensure_identity(source, source_scan.identity)?;
+    let mut uploaded = Vec::new();
+    for chunk in chunks {
+        let (artifacts, manifest) = prepare_artifacts(&chunk, config)?;
+        uploaded.push(UploadedSegment {
+            object: upload_artifacts(&artifacts, config)?,
+            canonical_complete: canonical_complete_manifest(&manifest),
+        });
+    }
+    ensure_identity(source, source_scan.identity)?;
+    fs::remove_file(source)?;
+    File::open(spool_dir)?.sync_all()?;
+    Ok(uploaded)
+}
+
+fn read_status(path: &Path) -> Result<Map<String, Value>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Ok(serde_json::from_slice::<Value>(&fs::read(path)?)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default())
+        }
+        Ok(_) => bail!("upload status must be a regular non-symlink file"),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Upload all closed tapes, continuing past bad segments while returning failure.
+pub fn upload_pending(config: &UploadConfig) -> Result<UploadSummary> {
+    upload_pending_with(config, archive_source)
+}
+
+/// Binary-friendly alias for [`upload_pending`].
+pub fn run_upload(config: &UploadConfig) -> Result<UploadSummary> {
+    upload_pending(config)
+}
+
+fn upload_pending_with<F>(config: &UploadConfig, mut archive: F) -> Result<UploadSummary>
+where
+    F: FnMut(&Path, &UploadConfig) -> Result<Vec<UploadedSegment>>,
+{
+    config.validate()?;
+    ensure_canonical_directory(&config.spool_dir)?;
+    let status_path = config.spool_dir.join("upload-status.json");
+    let mut status = read_status(&status_path)?;
+    let mut failures = Vec::new();
+    let mut uploaded_segments = 0_usize;
+    let mut canonical_uploaded_segments = 0_usize;
+    for source in discover_rotated_tapes(&config.spool_dir)? {
+        match archive(&source, config) {
+            Ok(uploaded) if !uploaded.is_empty() => {
+                uploaded_segments += uploaded.len();
+                canonical_uploaded_segments += uploaded
+                    .iter()
+                    .filter(|segment| segment.canonical_complete)
+                    .count();
+                status.insert("last_success_at".to_owned(), json!(utc_now()));
+                status.insert(
+                    "last_uploaded_object".to_owned(),
+                    json!(&uploaded.last().expect("non-empty upload result").object),
+                );
+            }
+            Ok(_) => failures.push(json!({
+                "source": source.file_name().and_then(|name| name.to_str()),
+                "error": "closed tape produced no upload artifacts",
+            })),
+            Err(error) => {
+                eprintln!(
+                    "Polymarket tape upload failed for {}: {error}",
+                    source.display()
+                );
+                failures.push(json!({
+                    "source": source.file_name().and_then(|name| name.to_str()),
+                    "error": error.to_string(),
+                }));
+            }
+        }
+    }
+    let now = utc_now();
+    let pending = discover_rotated_tapes(&config.spool_dir)?.len();
+    status.insert("updated_at".to_owned(), json!(now));
+    status.insert("uploaded_segments".to_owned(), json!(uploaded_segments));
+    status.insert(
+        "canonical_uploaded_segments".to_owned(),
+        json!(canonical_uploaded_segments),
+    );
+    status.insert("pending_segments".to_owned(), json!(pending));
+    status.insert("failed_segments".to_owned(), Value::Array(failures.clone()));
+    status.insert(
+        "last_error_at".to_owned(),
+        if failures.is_empty() {
+            Value::Null
+        } else {
+            json!(utc_now())
+        },
+    );
+    status.insert(
+        "last_error".to_owned(),
+        failures
+            .last()
+            .and_then(|failure| failure.get("error"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    atomic_json(&status_path, &Value::Object(status))?;
+    if failures.is_empty() {
+        Ok(UploadSummary {
+            uploaded_segments,
+            canonical_uploaded_segments,
+        })
+    } else {
+        bail!(
+            "{} closed Polymarket tape segment(s) failed",
+            failures.len()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::os::unix::fs::symlink;
+    use std::process::ExitStatus;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            for _ in 0..32 {
+                let path = std::env::temp_dir().join(format!(
+                    "monday-polymarket-upload-test-{:016x}",
+                    random::<u64>()
+                ));
+                if fs::create_dir(&path).is_ok() {
+                    return Self(fs::canonicalize(path).unwrap());
+                }
+            }
+            panic!("could not create test directory")
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record(sequence: u64, recorded_at: &str, update: Value) -> Value {
+        json!({"sequence": sequence, "recorded_at": recorded_at, "update": update})
+    }
+
+    fn sample_rows() -> Vec<Value> {
+        vec![
+            record(
+                0,
+                "2026-07-15T01:00:00.000000000Z",
+                json!({
+                    "kind": "event_discovered", "event_id": "event-1", "symbol": "BTCUSDT",
+                    "up_token": "up-1", "down_token": "down-1",
+                    "end_time": "2026-07-15T01:05:00Z", "window_secs": 300,
+                    "price_to_beat": "100", "resolved_up_won": null,
+                }),
+            ),
+            record(
+                1,
+                "2026-07-15T01:00:01.000000000Z",
+                json!({
+                    "kind": "quote", "token_id": "up-1", "bid": "0.49", "ask": "0.51",
+                    "bid_size": "10", "ask_size": "11",
+                    "bid_levels": [{"price": "0.49", "size": "10"}],
+                    "ask_levels": [{"price": "0.51", "size": "11"}],
+                    "ts": "2026-07-15T01:00:01Z",
+                }),
+            ),
+            record(
+                2,
+                "2026-07-15T01:00:02.000000000Z",
+                json!({
+                    "kind": "reference_price", "symbol": "BTCUSDT", "source": "binance",
+                    "asset_class": "crypto", "price": "100", "full_accuracy_value": null,
+                    "is_carried_forward": false, "ts": "2026-07-15T01:00:02Z",
+                }),
+            ),
+        ]
+    }
+
+    fn valid_v2_trade_update() -> Value {
+        json!({
+            "kind": "polymarket_trade",
+            "record_id": "6a476c3be58fcb8d789224feba3e079f372bc933e838cd0dbb76435d4fad9cbe",
+            "record_id_version": "v2",
+            "market_id": "market-1",
+            "condition_id": "0xcondition",
+            "token_id": "up-token",
+            "symbol": "BTCUSDT",
+            "market_window_secs": 300,
+            "side": "BUY",
+            "size": "10.0",
+            "price": "0.780",
+            "trade_ts": "2026-07-15T03:09:55Z",
+            "trade_ts_unix": 1_784_084_995,
+            "transaction_hash": "0xtx",
+            "proxy_wallet": "0xwallet",
+            "outcome": "Up",
+            "outcome_index": 0,
+            "source": "polymarket_data_api",
+            "received_at": "2026-07-15T03:10:00Z",
+            "trade": {
+                "transactionHash": "0xtx",
+                "conditionId": "0xcondition",
+                "asset": "up-token",
+                "side": "BUY",
+                "timestamp": 1_784_084_995,
+                "proxyWallet": "0xwallet",
+                "size": "10.0",
+                "price": "0.780",
+                "outcome": "Up",
+                "outcomeIndex": 0,
+                "sourceOnlyField": {"preserved": true},
+            },
+        })
+    }
+
+    fn valid_market_metadata_update() -> Value {
+        json!({
+            "kind": "market_metadata",
+            "market_id": "market-1",
+            "condition_id": "0xcondition",
+            "symbol": "BTCUSDT",
+            "market_window_secs": 300,
+            "source": "gamma_api",
+            "retrieved_at": "2026-07-15T03:00:00Z",
+            "market": {
+                "id": "market-1",
+                "conditionId": "0xcondition",
+                "question": "Bitcoin Up or Down - 5 minutes",
+                "slug": "btc-updown-5m-1784084400",
+                "startDate": "2026-07-15T03:00:00Z",
+                "endDate": "2026-07-15T03:05:00Z",
+                "clobTokenIds": "[\"up-token\",\"down-token\"]",
+                "outcomes": "[\"Up\",\"Down\"]",
+                "makerBaseFee": 1000,
+                "takerBaseFee": 1000,
+            },
+        })
+    }
+
+    fn valid_market_settlement_update() -> Value {
+        let mut update = valid_market_metadata_update();
+        update["kind"] = json!("market_settlement");
+        update["winning_token_id"] = json!("up-token");
+        update["winning_outcome"] = json!("Up");
+        update["resolved_up_won"] = json!(true);
+        update["resolution_source"] = json!("gamma_api_closed_market");
+        update["market"]["closed"] = json!(true);
+        update["market"]["outcomePrices"] = json!("[\"0.999\",\"0.001\"]");
+        update
+    }
+
+    fn write_tape(root: &Path, name: &str, rows: &[Value]) -> PathBuf {
+        let path = root.join(name);
+        let mut file = File::create(&path).unwrap();
+        for row in rows {
+            serde_json::to_writer(&mut file, row).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.sync_all().unwrap();
+        path
+    }
+
+    fn config(root: &Path) -> UploadConfig {
+        UploadConfig {
+            spool_dir: root.to_path_buf(),
+            dataset: "crypto_expiry".to_owned(),
+            quote_depth_levels: 1,
+            quote_sample_ms: 1_000,
+            bucket: "bucket".to_owned(),
+            endpoint: "endpoint".to_owned(),
+            region: "region".to_owned(),
+            profile: "profile".to_owned(),
+            zstd_timeout: Duration::from_secs(30),
+            oss_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn validates_manifest_quality_and_reference_fields() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let manifest = scan_tape(&tape, "crypto_expiry", 1, 1_000).unwrap();
+        assert_eq!(manifest["events"], 3);
+        assert_eq!(manifest["event_types"]["quote"], 1);
+        assert_eq!(manifest["quality"]["max_bid_levels"], 1);
+        assert_eq!(manifest["field_non_null"]["quote"]["bid"], 1);
+        assert_eq!(manifest["field_non_null"]["reference_price"]["price"], 1);
+    }
+
+    #[test]
+    fn rejects_sequence_gap_incomplete_numeric_and_depth_errors() {
+        let root = TestDir::new();
+        let mut rows = sample_rows();
+        rows[1]["sequence"] = json!(2);
+        let gap = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
+        assert!(scan_tape(&gap, "crypto_expiry", 1, 1_000)
+            .unwrap_err()
+            .to_string()
+            .contains("sequence gap"));
+
+        let incomplete = root.path().join("market-updates.20260715T020000.ndjson");
+        fs::write(&incomplete, b"{\"sequence\":0").unwrap();
+        assert!(scan_tape(&incomplete, "crypto_expiry", 1, 1_000)
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete record"));
+
+        let mut rows = sample_rows();
+        rows[1]["update"]["bid"] = json!("not-a-number");
+        let numeric = write_tape(root.path(), "market-updates.20260715T030000.ndjson", &rows);
+        assert!(scan_tape(&numeric, "crypto_expiry", 1, 1_000)
+            .unwrap_err()
+            .to_string()
+            .contains("bid must be numeric"));
+
+        let mut rows = sample_rows();
+        rows[1]["update"]["bid_levels"][0]["size"] = Value::Null;
+        let depth = write_tape(root.path(), "market-updates.20260715T040000.ndjson", &rows);
+        assert!(scan_tape(&depth, "crypto_expiry", 1, 1_000)
+            .unwrap_err()
+            .to_string()
+            .contains("requires price and size"));
+    }
+
+    #[test]
+    fn full_book_context_and_reference_records_match_python_contract() {
+        let root = TestDir::new();
+        let mut rows = sample_rows();
+        rows[1]["update"]["bid_levels"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"price": "0.48", "size": "12"}));
+        let full = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
+        let manifest = scan_tape(&full, "crypto_expiry", 0, 1_000).unwrap();
+        assert_eq!(manifest["venue_depth_complete"], true);
+        assert_eq!(manifest["quality"]["max_bid_levels"], 2);
+
+        let mut quote = sample_rows().remove(1);
+        quote["sequence"] = json!(0);
+        let contextless = write_tape(
+            root.path(),
+            "market-updates.20260715T020000.ndjson",
+            &[quote],
+        );
+        let manifest = scan_tape(&contextless, "crypto_expiry", 1, 1_000).unwrap();
+        assert_eq!(manifest["event_context_complete"], false);
+        assert!(manifest["replay_scope"]
+            .as_str()
+            .unwrap()
+            .contains("requires_prior_event_context"));
+
+        let reference = vec![
+            record(0, "2026-07-15T03:00:00Z", valid_market_metadata_update()),
+            record(1, "2026-07-15T03:10:00Z", valid_v2_trade_update()),
+        ];
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &reference,
+        );
+        let manifest = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap();
+        assert_eq!(manifest["replay_scope"], "complete_reference_hour_segment");
+        assert_eq!(manifest["record_id_versions"], json!(["v2"]));
+        assert_eq!(
+            manifest["source_field_non_null"]["market_metadata"]["makerBaseFee"],
+            1
+        );
+
+        for (stamp, invalid_size) in [("040000", Value::Null), ("050000", json!(-1))] {
+            let mut invalid = reference.clone();
+            invalid[1]["update"]["size"] = invalid_size.clone();
+            invalid[1]["update"]["trade"]["size"] = invalid_size;
+            let tape = write_tape(
+                root.path(),
+                &format!("market-updates.20260715T{stamp}.ndjson"),
+                &invalid,
+            );
+            assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("size must be positive"));
+        }
+    }
+
+    #[test]
+    fn rejects_market_metadata_wrapper_id_contradiction() {
+        let root = TestDir::new();
+        let mut update = valid_market_metadata_update();
+        update["market_id"] = json!("different-market");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:00:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("market_metadata market_id does not match raw market"));
+    }
+
+    #[test]
+    fn rejects_unsupported_market_metadata_symbol() {
+        let root = TestDir::new();
+        let mut update = valid_market_metadata_update();
+        update["symbol"] = json!("ADAUSDT");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:00:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("market_metadata symbol is unsupported or contradicts raw market"));
+    }
+
+    #[test]
+    fn rejects_market_metadata_window_contradiction() {
+        let root = TestDir::new();
+        let mut update = valid_market_metadata_update();
+        update["market_window_secs"] = json!(900);
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:00:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("market_metadata window is unsupported or contradicts raw market"));
+    }
+
+    #[test]
+    fn rejects_market_metadata_without_two_unique_tokens() {
+        let root = TestDir::new();
+        let mut update = valid_market_metadata_update();
+        update["market"]["clobTokenIds"] = json!(["same-token", "same-token"]);
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:00:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("market_metadata raw market requires two unique clobTokenIds"));
+    }
+
+    #[test]
+    fn rejects_market_metadata_without_two_unique_outcomes() {
+        let root = TestDir::new();
+        let mut update = valid_market_metadata_update();
+        update["market"]["outcomes"] = json!(["Up", "Up"]);
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:00:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("market_metadata raw market requires two unique outcomes"));
+    }
+
+    #[test]
+    fn rejects_non_object_market_metadata_payload() {
+        let root = TestDir::new();
+        let mut update = valid_market_metadata_update();
+        update["market"] = json!("not-an-object");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:00:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("market_metadata.market must be an object"));
+    }
+
+    #[test]
+    fn rejects_settlement_when_raw_market_is_not_closed() {
+        let root = TestDir::new();
+        let mut update = valid_market_settlement_update();
+        update["market"]["closed"] = json!(false);
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:06:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("market_settlement raw market must be closed"));
+    }
+
+    #[test]
+    fn rejects_settlement_wrapper_winner_contradiction() {
+        let root = TestDir::new();
+        let mut update = valid_market_settlement_update();
+        update["winning_token_id"] = json!("down-token");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:06:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("market_settlement winning_token_id does not match raw market"));
+    }
+
+    #[test]
+    fn rejects_invalid_or_ambiguous_settlement_prices() {
+        for (index, prices, expected) in [
+            (0, json!(["1", "1"]), "exactly one winning price"),
+            (1, json!(["1.1", "0"]), "within [0, 1]"),
+            (2, json!(["invalid", "0"]), "must be numeric"),
+            (3, json!(["0.999", "0.5"]), "losing price must be near zero"),
+            (4, json!(["1", "0.001"]), "prices must sum to one"),
+        ] {
+            let root = TestDir::new();
+            let mut update = valid_market_settlement_update();
+            update["market"]["outcomePrices"] = prices;
+            let tape = write_tape(
+                root.path(),
+                &format!("market-updates.20260715T03000{index}.ndjson"),
+                &[record(0, "2026-07-15T03:06:00Z", update)],
+            );
+            assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_settlement_outcome_and_resolution_contradictions() {
+        for (index, field, value, expected) in [
+            (0, "winning_outcome", json!("Down"), "winning_outcome"),
+            (1, "resolved_up_won", json!(false), "resolved_up_won"),
+        ] {
+            let root = TestDir::new();
+            let mut update = valid_market_settlement_update();
+            update[field] = value;
+            let tape = write_tape(
+                root.path(),
+                &format!("market-updates.20260715T03001{index}.ndjson"),
+                &[record(0, "2026-07-15T03:06:00Z", update)],
+            );
+            assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+        }
+    }
+
+    #[test]
+    fn trade_only_reference_segment_is_not_complete_or_canonical() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:10:00Z", valid_v2_trade_update())],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap();
+        assert_eq!(manifest["canonical"], false);
+        assert_eq!(manifest["segment_complete"], false);
+        assert_eq!(manifest["reference_context_complete"], false);
+        assert_eq!(
+            manifest["replay_scope"],
+            "reference_hour_segment_requires_market_metadata_context"
+        );
+    }
+
+    #[test]
+    fn settlement_only_reference_segment_is_not_complete_or_canonical() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(
+                0,
+                "2026-07-15T03:06:00Z",
+                valid_market_settlement_update(),
+            )],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap();
+        assert_eq!(manifest["canonical"], false);
+        assert_eq!(manifest["segment_complete"], false);
+        assert_eq!(manifest["reference_context_complete"], false);
+    }
+
+    #[test]
+    fn metadata_context_makes_settlement_segment_complete() {
+        let root = TestDir::new();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[
+                record(0, "2026-07-15T03:00:00Z", valid_market_metadata_update()),
+                record(1, "2026-07-15T03:06:00Z", valid_market_settlement_update()),
+            ],
+        );
+
+        let manifest = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap();
+        assert_eq!(manifest["canonical"], true);
+        assert_eq!(manifest["segment_complete"], true);
+        assert_eq!(manifest["reference_context_complete"], true);
+        assert_eq!(manifest["replay_scope"], "complete_reference_hour_segment");
+    }
+
+    #[test]
+    fn canonical_upload_count_requires_both_manifest_flags() {
+        assert!(canonical_complete_manifest(
+            &json!({"canonical": true, "segment_complete": true})
+        ));
+        for manifest in [
+            json!({"canonical": false, "segment_complete": true}),
+            json!({"canonical": true, "segment_complete": false}),
+            json!({"canonical": true}),
+        ] {
+            assert!(!canonical_complete_manifest(&manifest));
+        }
+    }
+
+    #[test]
+    fn rejects_trade_record_id_not_derived_from_raw_payload() {
+        let root = TestDir::new();
+        let mut update = valid_v2_trade_update();
+        update["record_id"] = json!("0".repeat(64));
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:10:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("record_id does not match raw trade"));
+    }
+
+    #[test]
+    fn rejects_legacy_trade_id_version() {
+        let root = TestDir::new();
+        let mut update = valid_v2_trade_update();
+        update["record_id_version"] = json!("v1_legacy");
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:10:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("record_id_version must be v2"));
+    }
+
+    #[test]
+    fn rejects_duplicate_trade_record_ids() {
+        let root = TestDir::new();
+        let update = valid_v2_trade_update();
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[
+                record(0, "2026-07-15T03:10:00Z", update.clone()),
+                record(1, "2026-07-15T03:10:01Z", update),
+            ],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate polymarket_trade record_id"));
+    }
+
+    #[test]
+    fn rejects_non_object_raw_trade() {
+        let root = TestDir::new();
+        let mut update = valid_v2_trade_update();
+        update["trade"] = json!([]);
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:10:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("polymarket_trade.trade must be an object"));
+    }
+
+    #[test]
+    fn rejects_invalid_raw_trade_fields() {
+        let root = TestDir::new();
+        let mut update = valid_v2_trade_update();
+        update["trade"]["proxyWallet"] = Value::Null;
+        let tape = write_tape(
+            root.path(),
+            "market-updates.20260715T030000.ndjson",
+            &[record(0, "2026-07-15T03:10:00Z", update)],
+        );
+
+        assert!(scan_tape(&tape, "crypto_expiry_reference", 0, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("raw trade requires proxyWallet"));
+    }
+
+    #[test]
+    fn splits_utc_hours_without_rebasing_sequences() {
+        let root = TestDir::new();
+        let mut rows = sample_rows();
+        rows.push(record(
+            3,
+            "2026-07-15T02:00:00Z",
+            json!({"kind": "event_expired", "event_id": "event-1", "end_time": null}),
+        ));
+        let tape = write_tape(root.path(), "market-updates.20260715T010000.ndjson", &rows);
+        let staging = ExclusiveTempDir::create(root.path(), ".split").unwrap();
+        let chunks = split_tape_by_utc_hour(&tape, staging.path()).unwrap();
+        assert_eq!(chunks.len(), 2);
+        let first = scan_tape(&chunks[0], "crypto_expiry", 1, 1_000).unwrap();
+        let second = scan_tape(&chunks[1], "crypto_expiry", 1, 1_000).unwrap();
+        assert_eq!(
+            (
+                first["start_sequence"].as_u64(),
+                first["end_sequence"].as_u64()
+            ),
+            (Some(0), Some(2))
+        );
+        assert_eq!(
+            (
+                second["start_sequence"].as_u64(),
+                second["end_sequence"].as_u64()
+            ),
+            (Some(3), Some(3))
+        );
+        assert_eq!(
+            (first["hour"].as_str(), second["hour"].as_str()),
+            (Some("01"), Some("02"))
+        );
+    }
+
+    #[test]
+    fn hash_triplet_and_remote_tamper_are_fail_closed() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let upload_config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, manifest) = prepare_artifacts(&source, &upload_config).unwrap();
+        assert_eq!(
+            fs::read_to_string(&artifacts.success).unwrap().trim(),
+            manifest["sha256"].as_str().unwrap()
+        );
+        assert_eq!(
+            artifacts.object_prefix,
+            format!(
+                "lake/raw/venue=polymarket/dataset=crypto_expiry/date=2026-07-15/hour=01/sha256={}",
+                manifest["sha256"].as_str().unwrap()
+            )
+        );
+        let remote = BTreeMap::from([
+            (
+                artifacts
+                    .data
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                fs::read(&artifacts.data).unwrap(),
+            ),
+            (
+                artifacts
+                    .manifest
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                fs::read(&artifacts.manifest).unwrap(),
+            ),
+            (
+                artifacts
+                    .success
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                fs::read(&artifacts.success).unwrap(),
+            ),
+        ]);
+        let mut good_runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let remote_name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+            fs::write(&args[3], &remote[remote_name])?;
+            Ok(success_status())
+        };
+        verify_remote_artifacts_with(&artifacts, &upload_config, &mut good_runner).unwrap();
+
+        for tampered_suffix in [".zst", ".manifest.json", "._SUCCESS"] {
+            let root = TestDir::new();
+            let config = config(root.path());
+            let source = write_tape(
+                root.path(),
+                "market-updates.20260715T010000.ndjson",
+                &sample_rows(),
+            );
+            let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+            let mut uploaded_remote = BTreeMap::<String, Vec<u8>>::new();
+            let mut bad_runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+                let args = command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                if args[2].starts_with("oss://") {
+                    let remote_name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+                    let Some(remote_bytes) = uploaded_remote.get(remote_name) else {
+                        bail!("remote object not found");
+                    };
+                    let bytes = if remote_name.ends_with(tampered_suffix) {
+                        b"tampered".to_vec()
+                    } else {
+                        remote_bytes.clone()
+                    };
+                    fs::write(&args[3], bytes)?;
+                } else {
+                    assert!(args.iter().any(|arg| arg == "--ignore-existing"));
+                    assert!(!args.iter().any(|arg| arg == "--force"));
+                    let remote_name = Path::new(&args[3])
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned();
+                    uploaded_remote.insert(remote_name, fs::read(&args[2])?);
+                }
+                Ok(success_status())
+            };
+            assert!(upload_artifacts_with(&artifacts, &config, &mut bad_runner).is_err());
+            for local in [
+                &source,
+                &artifacts.data,
+                &artifacts.manifest,
+                &artifacts.success,
+            ] {
+                assert!(
+                    local.exists(),
+                    "readback failure deleted {}",
+                    local.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn existing_remote_triplet_is_verified_without_overwrite() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let remote = [&artifacts.data, &artifacts.manifest, &artifacts.success]
+            .into_iter()
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_str().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut uploads = 0;
+        let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if args[2].starts_with("oss://") {
+                let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+                fs::write(&args[3], &remote[name])?;
+            } else {
+                uploads += 1;
+            }
+            Ok(success_status())
+        };
+
+        upload_artifacts_with(&artifacts, &config, &mut runner).unwrap();
+
+        assert_eq!(uploads, 0);
+    }
+
+    #[test]
+    fn new_remote_triplet_is_no_clobber_uploaded_then_read_back() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let mut remote = BTreeMap::<String, Vec<u8>>::new();
+        let mut uploads = 0;
+        let mut downloads = 0;
+        let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if args[2].starts_with("oss://") {
+                downloads += 1;
+                let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+                let bytes = remote
+                    .get(name)
+                    .ok_or_else(|| anyhow!("remote object not found"))?;
+                fs::write(&args[3], bytes)?;
+            } else {
+                assert!(args.iter().any(|arg| arg == "--ignore-existing"));
+                let name = Path::new(&args[3])
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                remote.entry(name).or_insert(fs::read(&args[2])?);
+                uploads += 1;
+            }
+            Ok(success_status())
+        };
+
+        upload_artifacts_with(&artifacts, &config, &mut runner).unwrap();
+
+        assert_eq!((uploads, downloads), (3, 4));
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn mismatched_existing_remote_is_refused_before_upload() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let root = TestDir::new();
+        let config = config(root.path());
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let (artifacts, _) = prepare_artifacts(&source, &config).unwrap();
+        let mut remote = [&artifacts.data, &artifacts.manifest, &artifacts.success]
+            .into_iter()
+            .map(|path| {
+                (
+                    path.file_name().unwrap().to_str().unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let manifest_name = artifacts.manifest.file_name().unwrap().to_str().unwrap();
+        remote.insert(manifest_name.to_owned(), b"tampered".to_vec());
+        let mut uploads = 0;
+        let mut runner = |command: &mut Command, _: Duration| -> Result<ExitStatus> {
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if args[2].starts_with("oss://") {
+                let name = Path::new(&args[2]).file_name().unwrap().to_str().unwrap();
+                fs::write(&args[3], &remote[name])?;
+            } else {
+                uploads += 1;
+            }
+            Ok(success_status())
+        };
+
+        assert!(upload_artifacts_with(&artifacts, &config, &mut runner).is_err());
+        assert_eq!(uploads, 0);
+        for local in [
+            &source,
+            &artifacts.data,
+            &artifacts.manifest,
+            &artifacts.success,
+        ] {
+            assert!(local.exists(), "mismatch deleted {}", local.display());
+        }
+    }
+
+    #[test]
+    fn strict_discovery_rejects_malformed_names_and_symlinks() {
+        assert!(strict_rotation_name(
+            "market-updates.20260715T010000123456.ndjson"
+        ));
+        assert!(strict_rotation_name(
+            "market-updates.20260715T010000123456.123e4567-e89b-12d3-a456-426614174000.ndjson"
+        ));
+        assert!(!strict_rotation_name(
+            "market-updates.20269999T999999.ndjson"
+        ));
+        let root = TestDir::new();
+        write_tape(root.path(), "market-updates.ndjson", &sample_rows());
+        write_tape(root.path(), "market-updates.backup.ndjson", &sample_rows());
+        assert!(discover_rotated_tapes(root.path())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid rotated tape name"));
+        fs::remove_file(root.path().join("market-updates.backup.ndjson")).unwrap();
+        let valid = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let target = root.path().join("target");
+        fs::write(&target, b"victim").unwrap();
+        let linked = root.path().join("market-updates.20260715T020000.ndjson");
+        symlink(&target, &linked).unwrap();
+        let error = discover_rotated_tapes(root.path()).unwrap_err().to_string();
+        assert!(error.contains("regular non-symlink"));
+        fs::remove_file(&linked).unwrap();
+        assert_eq!(discover_rotated_tapes(root.path()).unwrap(), vec![valid]);
+        assert_eq!(fs::read(target).unwrap(), b"victim");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_rejects_symlinked_or_noncanonical_spool_ancestors() {
+        let root = TestDir::new();
+        let actual = root.path().join("actual");
+        fs::create_dir(&actual).unwrap();
+        let linked = root.path().join("linked");
+        symlink(&actual, &linked).unwrap();
+
+        for spool_dir in [
+            linked.join("spool"),
+            actual.join("child").join("..").join("child"),
+        ] {
+            let upload_config = config(&spool_dir);
+            assert!(upload_pending(&upload_config)
+                .unwrap_err()
+                .to_string()
+                .contains("directory"));
+        }
+    }
+
+    #[test]
+    fn continues_after_bad_segment_and_persists_failure() {
+        let root = TestDir::new();
+        let first = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let second = write_tape(
+            root.path(),
+            "market-updates.20260715T020000.ndjson",
+            &sample_rows(),
+        );
+        let config = config(root.path());
+        let mut visited = Vec::new();
+        let result = upload_pending_with(&config, |source, _| {
+            visited.push(source.to_path_buf());
+            if source == first {
+                bail!("bad tape");
+            }
+            fs::remove_file(source)?;
+            Ok(vec![UploadedSegment {
+                object: "oss://bucket/second".to_owned(),
+                canonical_complete: true,
+            }])
+        });
+        assert!(result.is_err());
+        assert_eq!(visited, vec![first.clone(), second]);
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["pending_segments"], 1);
+        assert_eq!(
+            status["failed_segments"][0]["source"],
+            first.file_name().unwrap().to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn reports_uploaded_hour_segments_not_source_files() {
+        let root = TestDir::new();
+        let source = write_tape(
+            root.path(),
+            "market-updates.20260715T010000.ndjson",
+            &sample_rows(),
+        );
+        let config = config(root.path());
+        let uploaded = upload_pending_with(&config, |source, _| {
+            fs::remove_file(source)?;
+            Ok(vec![
+                UploadedSegment {
+                    object: "oss://bucket/hour=01/data".to_owned(),
+                    canonical_complete: true,
+                },
+                UploadedSegment {
+                    object: "oss://bucket/hour=02/data".to_owned(),
+                    canonical_complete: false,
+                },
+            ])
+        })
+        .unwrap();
+        assert_eq!(
+            uploaded,
+            UploadSummary {
+                uploaded_segments: 2,
+                canonical_uploaded_segments: 1,
+            }
+        );
+        assert!(!source.exists());
+        let status: Value =
+            serde_json::from_slice(&fs::read(root.path().join("upload-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(status["canonical_uploaded_segments"], 1);
+    }
+
+    #[cfg(unix)]
+    fn success_status() -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+}

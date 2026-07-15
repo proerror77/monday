@@ -122,6 +122,7 @@ jobs:
           shellcheck ../deployment/aliyun/*.sh
           ../deployment/aliyun/test-rust-lob-control-plane.sh
           ../deployment/aliyun/test-rust-lob-release-adoption.sh
+          ../deployment/aliyun/test-polymarket-raw-ops-control-plane.sh
 
       - name: Build focused packages
         run: cargo build -p hft-live -p hft-paper -p hft-all-in-one -p alpha-harness -p hft-harnessctl --locked

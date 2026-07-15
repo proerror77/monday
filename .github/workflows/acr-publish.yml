@@ -54,7 +54,7 @@ jobs:
         run: |
           echo '${{ matrix.repository }}=${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Extract collector binary for bare-metal ECS
+      - name: Extract collector binaries for bare-metal ECS
         if: matrix.repository == 'binance-lob-archiver'
         env:
           IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ github.sha }}
@@ -64,10 +64,16 @@ jobs:
           container_id=$(docker create "$IMAGE")
           trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
           docker cp "$container_id:/usr/local/bin/binance-lob-archiver" artifact/binance-lob-archiver
+          docker cp "$container_id:/usr/local/bin/polymarket-raw-ops" artifact/polymarket-raw-ops
           chmod 0755 artifact/binance-lob-archiver
-          sha256sum artifact/binance-lob-archiver | tee artifact/binance-lob-archiver.sha256
+          chmod 0755 artifact/polymarket-raw-ops
+          (
+            cd artifact
+            sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
+            sha256sum polymarket-raw-ops | tee polymarket-raw-ops.sha256
+          )
 
-      - name: Upload collector binary artifact
+      - name: Upload collector binary artifact bundle
         if: matrix.repository == 'binance-lob-archiver'
         uses: actions/upload-artifact@v4
         with:

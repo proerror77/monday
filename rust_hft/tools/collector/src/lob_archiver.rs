@@ -1,4 +1,5 @@
 use engine::binance_md::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
+use rand::random;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -960,20 +961,39 @@ fn atomic_write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let temporary = path.with_extension(format!(
-        "{}.tmp",
-        path.extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default()
-    ));
-    let mut output = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temporary)?;
-    output.write_all(bytes)?;
-    output.sync_all()?;
-    fs::rename(temporary, path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("atomic target has no parent"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    let (temporary, mut output) = (0..32)
+        .find_map(|_| {
+            let temporary = parent.join(format!(".{file_name}.{:016x}.tmp", random::<u64>()));
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+            {
+                Ok(output) => Some(Ok((temporary, output))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("could not allocate exclusive atomic-write temporary"))?;
+    let write_result = (|| -> anyhow::Result<()> {
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        drop(output);
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result?;
     sync_parent(path)
 }
 
@@ -1239,6 +1259,25 @@ mod tests {
             fs::read_to_string(&artifacts.success).unwrap(),
             format!("{}\n", artifacts.sha256)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn success_marker_atomic_write_does_not_follow_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("monday-marker-test-{}", now_ns().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let data = root.join("segment.ndjson.zst");
+        fs::write(&data, b"compressed").unwrap();
+        let victim = root.join("victim");
+        fs::write(&victim, b"do-not-touch\n").unwrap();
+        symlink(&victim, root.join("segment.ndjson.zst._SUCCESS.tmp")).unwrap();
+
+        let marker = write_success_marker(&data, "abcd").unwrap();
+        assert_eq!(fs::read_to_string(marker).unwrap(), "abcd\n");
+        assert_eq!(fs::read(&victim).unwrap(), b"do-not-touch\n");
         fs::remove_dir_all(root).unwrap();
     }
 }
