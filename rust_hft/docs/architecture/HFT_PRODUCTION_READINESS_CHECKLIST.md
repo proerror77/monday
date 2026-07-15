@@ -167,7 +167,11 @@ QUEUE_KIND=spsc-spin PROCESS_CORES=1,2 RECEIVER_CORE=1 ENGINE_CORE=2 MAX_MESSAGE
 多 run 比較使用：
 
 ```bash
-scripts/summarize_bitget_latency.py target/latency-audit
+cargo run --release --locked -p hft-data-adapter-bitget --bin latency-report -- \
+  target/latency-audit
 ```
+
+需要机器可读的完整字段时追加 `--csv`；可用 `--sort engine-p999`、
+`--sort queue-p99` 或 `--limit N` 固定比较范围。
 
 解讀：Bitget 本地 parser/convert 路徑的 p99 仍在數十微秒級內；更大的問題是 receiver -> engine 調度尾延遲。下一步優先在 Linux staging 上跑 pinned engine thread / CPU isolation / IRQ affinity 驗證，而不是繼續微調 JSON parser。Mac 本機可以完成架構、測試和 replay，但不能作為最終 p99/p999 依據。
