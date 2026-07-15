@@ -272,7 +272,7 @@ run_failure_fixture() (
   old_sha=$CURRENT_SHA256
   candidate_sha=$CANDIDATE_SHA256
   # Overrides the sourced implementation to exercise post-symlink rollback.
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   write_adoption_evidence() { return 1; }
   if adopt_release "$old_sha" "$candidate_sha" >"$fixture/failure.out" 2>&1; then
     printf 'adoption unexpectedly passed after evidence failure\n' >&2
