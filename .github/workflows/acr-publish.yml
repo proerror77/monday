@@ -2,6 +2,17 @@ name: Publish ACR Images
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Image target to publish
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - research-runner
+          - hft-trading
+          - binance-lob-archiver
 
 permissions:
   contents: read
@@ -11,28 +22,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  selector:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select publish targets
+        id: select
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          case "$TARGET" in
+            all|research-runner|hft-trading|binance-lob-archiver) ;;
+            *) echo "Unsupported publish target: $TARGET" >&2; exit 1 ;;
+          esac
+          matrix=$(jq -cn --arg target "$TARGET" '
+            [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research"},
+             {repository:"hft-trading",file:"rust_hft/deployment/docker/Dockerfile.trading"},
+             {repository:"binance-lob-archiver",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"}]
+            | {include: map(select($target == "all" or .repository == $target))}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   publish:
+    needs: selector
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - repository: research-runner
-            file: rust_hft/deployment/docker/Dockerfile.research
-          - repository: hft-trading
-            file: rust_hft/deployment/docker/Dockerfile.trading
-          - repository: binance-lob-archiver
-            file: rust_hft/deployment/docker/Dockerfile.binance-lob-archiver
+      matrix: ${{ fromJSON(needs.selector.outputs.matrix) }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to ACR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ vars.ACR_REGISTRY }}
           username: ${{ vars.ACR_USERNAME }}
@@ -40,13 +66,15 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: rust_hft
           file: ${{ matrix.file }}
           platforms: linux/amd64
           push: true
-          tags: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ github.sha }}
+          tags: |
+            ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ github.sha }}
+            ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:run-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=acr-${{ matrix.repository }}
           cache-to: type=gha,mode=max,scope=acr-${{ matrix.repository }}
 
@@ -54,10 +82,90 @@ jobs:
         run: |
           echo '${{ matrix.repository }}=${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Package bare-metal trading host contract
+        if: matrix.repository == 'hft-trading'
+        env:
+          IMAGE_REPOSITORY: ${{ vars.ACR_REGISTRY }}/wildcard0923/hft-trading
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p trading-host-artifact
+          trading_control_assets=(
+            hft-trading-ecs.service
+            trading-ecs-hostctl.sh
+            trading-ecs-paper-shadow-policy.jq
+            trading-ecs-runtime.sh
+          )
+          (
+            cd deployment/aliyun
+            sha256sum "${trading_control_assets[@]}" \
+              > ../../trading-host-artifact/trading-ecs-control-assets.sha256
+            tar --sort=name --mtime='UTC 1970-01-01' \
+              --owner=0 --group=0 --numeric-owner \
+              -czf ../../trading-host-artifact/trading-ecs-control.tar.gz \
+              "${trading_control_assets[@]}"
+          )
+          (
+            cd trading-host-artifact
+            published_registry=${IMAGE_REPOSITORY%%/*}
+            repository_path=${IMAGE_REPOSITORY#*/}
+            case "$published_registry" in
+              *-vpc.ap-northeast-1.personal.cr.aliyuncs.com)
+                vpc_registry=$published_registry
+                published_registry=${published_registry/-vpc.ap-northeast-1.personal.cr.aliyuncs.com/.ap-northeast-1.personal.cr.aliyuncs.com}
+                ;;
+              *.ap-northeast-1.personal.cr.aliyuncs.com)
+                vpc_registry=${published_registry/.ap-northeast-1.personal.cr.aliyuncs.com/-vpc.ap-northeast-1.personal.cr.aliyuncs.com}
+                ;;
+              *)
+                echo "ACR_REGISTRY must be a Tokyo Personal Edition endpoint" >&2
+                exit 1
+                ;;
+            esac
+            published_repository="$published_registry/$repository_path"
+            vpc_repository="$vpc_registry/$repository_path"
+            control_manifest_sha=$(sha256sum trading-ecs-control-assets.sha256 \
+              | awk '{print $1}')
+            control_archive_sha=$(sha256sum trading-ecs-control.tar.gz \
+              | awk '{print $1}')
+            jq -S -n \
+              --arg source_revision '${{ github.sha }}' \
+              --arg published_repository "$published_repository" \
+              --arg image_repository "$vpc_repository" \
+              --arg image_digest "$IMAGE_DIGEST" \
+              --arg image_reference "$vpc_repository@$IMAGE_DIGEST" \
+              --arg control_manifest_sha256 "$control_manifest_sha" \
+              --arg control_archive_sha256 "$control_archive_sha" \
+              '{schema:"monday.hft_trading_ecs_release.v1",
+                source_revision:$source_revision,
+                image:{published_repository:$published_repository,
+                  repository:$image_repository,digest:$image_digest,
+                  reference:$image_reference},
+                control_manifest:{file:"trading-ecs-control-assets.sha256",
+                  sha256:$control_manifest_sha256},
+                control_archive:{file:"trading-ecs-control.tar.gz",
+                  sha256:$control_archive_sha256},
+                platform:{region:"ap-northeast-1",host_os:"ubuntu",
+                  host_version:"26.04",architecture:"amd64",
+                  orchestrator:"none"}}' \
+              > hft-trading-ecs-release.json
+            sha256sum hft-trading-ecs-release.json \
+              > hft-trading-ecs-release.json.sha256
+          )
+
+      - name: Upload bare-metal trading host contract
+        if: matrix.repository == 'hft-trading'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hft-trading-ecs-linux-amd64-${{ github.sha }}
+          path: trading-host-artifact/
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Extract collector binaries for bare-metal ECS
         if: matrix.repository == 'binance-lob-archiver'
         env:
-          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:${{ github.sha }}
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
         run: |
           mkdir -p artifact
           docker pull "$IMAGE"
@@ -72,12 +180,71 @@ jobs:
             sha256sum binance-lob-archiver | tee binance-lob-archiver.sha256
             sha256sum polymarket-raw-ops | tee polymarket-raw-ops.sha256
           )
+          control_assets=(
+            polymarket-raw-ops-shadow-gate.sh
+            polymarket-raw-ops-cutover.sh
+            polymarket-shadow-gate-policy.jq
+            polymarket-legacy-health-policy.jq
+            polymarket-rust-health-policy.jq
+            polymarket-reference-collector-shadow@.service
+            polymarket-reference-collector.service
+            polymarket-reference-upload.service
+            polymarket-reference-upload.timer
+            polymarket-market-tape-upload.service
+            polymarket-market-tape-upload.timer
+          )
+          (
+            cd deployment/aliyun
+            sha256sum "${control_assets[@]}" > ../../artifact/polymarket-raw-ops-control-assets.sha256
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -czf ../../artifact/polymarket-raw-ops-control.tar.gz "${control_assets[@]}"
+          )
+          (
+            cd artifact
+            candidate_sha=$(awk 'NR == 1 {print $1}' polymarket-raw-ops.sha256)
+            control_manifest_sha=$(sha256sum polymarket-raw-ops-control-assets.sha256 \
+              | awk '{print $1}')
+            control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz \
+              | awk '{print $1}')
+            jq -S -n \
+              --arg source_revision '${{ github.sha }}' \
+              --arg candidate_sha256 "$candidate_sha" \
+              --arg control_manifest_sha256 "$control_manifest_sha" \
+              --arg control_archive_sha256 "$control_archive_sha" \
+              '{schema:"monday.polymarket_raw_ops_release.v1",
+                source_revision:$source_revision,
+                candidate:{file:"polymarket-raw-ops",sha256:$candidate_sha256},
+                control_manifest:{file:"polymarket-raw-ops-control-assets.sha256",
+                  sha256:$control_manifest_sha256},
+                control_archive:{file:"polymarket-raw-ops-control.tar.gz",
+                  sha256:$control_archive_sha256}}' \
+              > polymarket-raw-ops-release.json
+            sha256sum polymarket-raw-ops-release.json \
+              > polymarket-raw-ops-release.json.sha256
+            jq -er '.source_revision' polymarket-raw-ops-release.json \
+              > source-revision.txt
+            jq -er '.control_manifest.sha256' polymarket-raw-ops-release.json \
+              > deployment-bundle.sha256
+            printf '%s  %s\n' \
+              "$(jq -er '.control_archive.sha256' polymarket-raw-ops-release.json)" \
+              polymarket-raw-ops-control.tar.gz \
+              > polymarket-raw-ops-control.tar.gz.sha256
+          )
 
       - name: Upload collector binary artifact bundle
         if: matrix.repository == 'binance-lob-archiver'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: binance-lob-archiver-linux-amd64-${{ github.sha }}
           path: artifact/
           if-no-files-found: error
           retention-days: 7
+
+      - name: Remove ACR credentials
+        if: always()
+        env:
+          ACR_REGISTRY: ${{ vars.ACR_REGISTRY }}
+        run: |
+          docker logout "$ACR_REGISTRY" >/dev/null 2>&1 || true
+          docker_config_root=${DOCKER_CONFIG:-$HOME/.docker}
+          rm -f -- "$docker_config_root/config.json"

@@ -31,14 +31,14 @@ dependencies:
 ```bash
 cargo test --manifest-path rust_hft/Cargo.toml -p <package> --locked
 cargo clippy --manifest-path rust_hft/Cargo.toml -p <package> --all-targets --locked -- -D warnings
-cargo test --manifest-path products/ploy/Cargo.toml -p <package> --locked
-cargo clippy --manifest-path products/ploy/Cargo.toml -p <package> --all-targets --locked -- -D warnings
+cargo test --manifest-path rust_hft/prediction-markets/Cargo.toml -p <package> --locked
+cargo clippy --manifest-path rust_hft/prediction-markets/Cargo.toml -p <package> --all-targets --locked -- -D warnings
 ```
 
 Use a test filter or one integration-test target during diagnosis:
 
 ```bash
-cargo test --manifest-path products/ploy/Cargo.toml -p ploy --test workspace_runtime_retirement --locked
+cargo test --manifest-path rust_hft/prediction-markets/Cargo.toml -p ploy --test workspace_runtime_retirement --locked
 cargo test --manifest-path rust_hft/Cargo.toml -p hft-live --no-default-features --test deployment_artifacts --locked
 ```
 
@@ -46,9 +46,9 @@ PLOY frontend validation is direct npm execution; this product currently has no
 generic `npm test` script:
 
 ```bash
-npm --prefix products/ploy/ploy-frontend run contracts:check
-npm --prefix products/ploy/ploy-frontend run lint
-npm --prefix products/ploy/ploy-frontend run build
+npm --prefix rust_hft/prediction-markets/ploy-frontend run contracts:check
+npm --prefix rust_hft/prediction-markets/ploy-frontend run lint
+npm --prefix rust_hft/prediction-markets/ploy-frontend run build
 ```
 
 Do not invent package names. Read the nearest `Cargo.toml` or `package.json` first.

@@ -1,20 +1,20 @@
-name: PLOY Product CI
+name: Prediction Markets CI
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - "products/ploy/**"
+      - "rust_hft/prediction-markets/**"
       - ".github/workflows/ploy-ci.yml"
   push:
     branches: [main]
     paths:
-      - "products/ploy/**"
+      - "rust_hft/prediction-markets/**"
       - ".github/workflows/ploy-ci.yml"
   workflow_dispatch:
 
 concurrency:
-  group: ploy-product-${{ github.ref }}
+  group: prediction-markets-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -22,7 +22,7 @@ permissions:
 
 defaults:
   run:
-    working-directory: products/ploy
+    working-directory: rust_hft/prediction-markets
 
 env:
   CARGO_TERM_COLOR: always
@@ -300,14 +300,14 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: products/ploy
-          shared-key: rust-control-plane-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          workspaces: rust_hft/prediction-markets
+          shared-key: rust-control-plane-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Cache sccache
         uses: actions/cache@v5
         with:
           path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-control-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          key: ${{ runner.os }}-sccache-control-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-sccache-control-
             ${{ runner.os }}-sccache-
@@ -393,14 +393,14 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: products/ploy
-          shared-key: rust-runner-lean-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          workspaces: rust_hft/prediction-markets
+          shared-key: rust-runner-lean-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Cache sccache
         uses: actions/cache@v5
         with:
           path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-runner-lean-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          key: ${{ runner.os }}-sccache-runner-lean-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-sccache-runner-lean-
             ${{ runner.os }}-sccache-
@@ -451,14 +451,14 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: products/ploy
-          shared-key: rust-runner-full-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          workspaces: rust_hft/prediction-markets
+          shared-key: rust-runner-full-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Cache sccache
         uses: actions/cache@v5
         with:
           path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-runner-full-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          key: ${{ runner.os }}-sccache-runner-full-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-sccache-runner-full-
             ${{ runner.os }}-sccache-
@@ -527,14 +527,14 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: products/ploy
-          shared-key: rust-market-data-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          workspaces: rust_hft/prediction-markets
+          shared-key: rust-market-data-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Cache sccache
         uses: actions/cache@v5
         with:
           path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-market-data-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          key: ${{ runner.os }}-sccache-market-data-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-sccache-market-data-
             ${{ runner.os }}-sccache-
@@ -597,14 +597,14 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: products/ploy
-          shared-key: rust-research-heavy-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          workspaces: rust_hft/prediction-markets
+          shared-key: rust-research-heavy-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Cache sccache
         uses: actions/cache@v5
         with:
           path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-research-heavy-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          key: ${{ runner.os }}-sccache-research-heavy-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-sccache-research-heavy-
             ${{ runner.os }}-sccache-
@@ -676,7 +676,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: products/ploy/ploy-frontend/package-lock.json
+          cache-dependency-path: rust_hft/prediction-markets/ploy-frontend/package-lock.json
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -686,8 +686,8 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: products/ploy
-          shared-key: frontend-contracts-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          workspaces: rust_hft/prediction-markets
+          shared-key: frontend-contracts-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Validate frontend
         run: |
@@ -748,14 +748,14 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: products/ploy
-          shared-key: rust-integration-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          workspaces: rust_hft/prediction-markets
+          shared-key: rust-integration-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
 
       - name: Cache sccache
         uses: actions/cache@v5
         with:
           path: ~/.cache/sccache
-          key: ${{ runner.os }}-sccache-integration-${{ hashFiles('products/ploy/**/Cargo.lock') }}
+          key: ${{ runner.os }}-sccache-integration-${{ hashFiles('rust_hft/prediction-markets/**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-sccache-integration-
             ${{ runner.os }}-sccache-

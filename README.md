@@ -1,6 +1,6 @@
 # Rust Loop Engineer Trading System
 
-Rust-first, bounded alpha discovery and paper/shadow execution platform. The research plane may acquire governed data, propose and evaluate candidates, learn from failures, and prepare signed deployments. Deterministic Rust runtime code alone owns market connectivity, risk, OMS, reconciliation, cancellation, and execution.
+Rust-first, multi-venue alpha discovery and paper/shadow execution platform. The research plane may acquire governed data, propose and evaluate candidates, learn from failures, and prepare signed deployments. Deterministic Rust runtime code alone owns market connectivity, risk, OMS, reconciliation, cancellation, and execution.
 
 ## Production Boundary
 
@@ -11,7 +11,7 @@ This repository is locally production-gated for governed research plus signed **
 The implemented loop is goal-based and evidence-driven:
 
 1. A `LoopRun` declares a target stage, bounded mission budget, and explicit completion policy.
-2. Continuous-contract Formula `LoopRun` execution uses MCTS or Bayesian engines with exact engine-state checkpoints. GP, offline RL, and free-form LLM formula search remain standalone Lab missions. PLOY's separate binary-settlement lane may run its bounded, typed probability-blend LLM loop under the event-disjoint Rust evaluator; it has no promotion or execution authority outside that lane.
+2. Continuous-contract Formula `LoopRun` execution uses MCTS or Bayesian engines with exact engine-state checkpoints. GP, offline RL, and free-form LLM formula search remain standalone Lab missions. Monday's prediction-market module may run its bounded, typed probability-blend LLM loop under the event-disjoint Rust evaluator; it has no promotion or execution authority outside that research lane.
 3. The versioned evaluator applies point-in-time data, purged walk-forward folds, costs, drawdown limits, minimum evidence, and a pre-registered multiple-testing haircut.
 4. Failures remain queryable and may create one bounded follow-up mission with a validator-gated learning directive.
 5. Promotion binds candidate, dataset, evaluator config/metrics, sealed result, approval, and bundle hashes.
@@ -30,7 +30,7 @@ The repository provides the durable goal loop and CLI. Time-based or event-based
 | Formula search with GP, MCTS, and Bayesian optimization | `governed` | Eligible for evaluator v3 and Formula-only promotion |
 | Offline Q-learning | `lab-only` | Search-policy experiment; blocked from holdout, promotion, allocation, and runtime authority |
 | OpenAI-compatible hypothesis/failure critic | `lab-only` | Optional `ALPHA_LLM_*` calls; outputs remain evidence/proposals |
-| PLOY typed probability-blend LoopRun | `governed-research` | BTC/SOL five-minute event lane only; Rust schema, budget, event-disjoint evaluator, and content-addressed ledger; no order authority |
+| Prediction-market probability-blend LoopRun | `governed-research` | BTC/SOL five-minute event lane only; Rust schema, budget, event-disjoint evaluator, and content-addressed ledger; no order authority |
 | Purged walk-forward and one-time sealed holdout v3 | `governed` | Typed predictive/trading metrics and config hashes are recomputed before promotion |
 | Native Rust contract-model training | `governed-lab` | Burn 0.20.1, point-in-time rows, immutable dataset binding, deterministic seed, Burnpack artifact; never self-promotes |
 | ONNX loading | `runtime-compatibility` | Read-only compatibility for already governed artifacts; native training uses Burnpack |
@@ -38,7 +38,7 @@ The repository provides the durable goal loop and CLI. Time-based or event-based
 | Runtime attribution and follow-up learning | `implemented` | Signed deployment/strategy-scoped events; validator-gated lab policy adoption |
 | Live-small runtime activation | `disabled` | Human eligibility evidence does not bypass the runtime fail-closed gate |
 | Repository language boundary | `rust-only` | No tracked Python source, PyTorch, libtorch, `tch`, synthetic trainer fallback, or Python CI/deployment path |
-| PLOY product workspace | `integrated-product` | `products/ploy` owns prediction-market product, operator UI, sidecar, and research capabilities; Monday risk, OMS, and execution remain authoritative |
+| Prediction-market module | `integrated-market-family` | `rust_hft/prediction-markets` owns event-settlement research and operator tooling; venue connectivity, risk, OMS, and execution use Monday's canonical seams |
 | Real alpha profitability | `not claimed` | Requires real point-in-time data, valid evaluation, and venue soak evidence |
 
 ## Architecture
@@ -96,8 +96,9 @@ Ordinary changes should use package-scoped checks. Run a release graph, containe
 - [Current approved design](docs/superpowers/specs/2026-07-11-loop-engineer-production-hardening-design.md)
 - [Current implementation plan](docs/superpowers/plans/2026-07-11-loop-engineer-production-hardening.md)
 - [Design document status](docs/superpowers/README.md)
-- [PLOY integration boundary](docs/architecture/PLOY_INTEGRATION.md)
+- [Repository layout](docs/architecture/REPOSITORY_LAYOUT.md)
+- [Prediction-market integration](docs/architecture/PREDICTION_MARKETS.md)
 - [Rust-only research and model boundary](docs/architecture/RUST_ONLY_RESEARCH.md)
-- [PLOY product workspace](products/ploy/README.md)
+- [Prediction-market module](rust_hft/prediction-markets/README.md)
 
 DuckDB is the local research control-plane source of truth. Raw and large derived market data belongs in content-addressed trace/Parquet artifacts; ClickHouse is optional analytics storage, not control-plane authority.

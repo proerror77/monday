@@ -1,15 +1,20 @@
 def sha256: type == "string" and test("^[a-f0-9]{64}$");
 def positive_integer: type == "number" and floor == . and . > 0;
+def nonnegative_integer: type == "number" and floor == . and . >= 0;
+def nonnegative_sub($left; $right):
+  if $left < $right then 0 else ($left - $right) end;
 
 .schema == "monday.polymarket_shadow_gate.v1"
 and (.candidate_sha256 | sha256)
 and (.deployment_bundle_sha256 | sha256)
 and (.deployment_source_revision | type == "string" and test("^[a-f0-9]{40,64}$"))
+and (.release_manifest_sha256 | sha256)
+and (.control_archive_sha256 | sha256)
 and (.oss_config_sha256 | sha256)
-and (.duration_seconds | positive_integer and . >= 3900)
+and (.duration_seconds | positive_integer and . >= 4201)
 and (.parity_window_started_at_unix | positive_integer)
 and (.parity_window_ended_at_unix | positive_integer)
-and (.parity_window_ended_at_unix - .parity_window_started_at_unix >= 300)
+and (.parity_window_ended_at_unix - .parity_window_started_at_unix >= 601)
 and (.completed_at | type == "string" and (fromdateiso8601? | type == "number"))
 and .production_eligible == true
 and .passed == true
@@ -19,7 +24,8 @@ and .legacy_runtime.cmdline_sha256 == "dffeb118d105e9312898460249f514eb982c20433
 and .legacy_runtime.fragment_path == "/etc/systemd/system/polymarket-reference-collector.service"
 and .legacy_runtime.drop_in_paths == []
 and (.legacy_runtime.main_pid | positive_integer)
-and .legacy_runtime.restarts == 0
+and (.legacy_runtime.restarts | nonnegative_integer)
+and (.legacy_runtime.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
 and (
   .shadow_runtime.exec_start == (
     "/opt/monday/releases/polymarket-raw-ops/" + .candidate_sha256
@@ -37,6 +43,7 @@ and .shadow_runtime.fragment_path == "/etc/systemd/system/polymarket-reference-c
 and .shadow_runtime.drop_in_paths == []
 and (.shadow_runtime.main_pid | positive_integer)
 and .shadow_runtime.restarts == 0
+and (.shadow_runtime.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
 and .checks.byte_parity == true
 and .checks.metadata_parity == true
 and .checks.field_parity == true
@@ -55,10 +62,54 @@ and (.metrics.market_oss_canonical_uploaded_segments | positive_integer)
 and (.metrics.rust_closed_tape_count | positive_integer)
 and (.metrics.legacy_trade_count | positive_integer)
 and (.metrics.rust_trade_count | positive_integer)
+and (.metrics.legacy_only_trade_ids | type == "array" and length == 0)
+and (.metrics.rust_only_trade_ids | type == "array" and length == 0)
 and (.metrics.legacy_metadata_count | positive_integer)
 and (.metrics.rust_metadata_count | positive_integer)
 and (.metrics.legacy_only_metadata_ids | type == "array" and length == 0)
-and (.metrics.rust_only_metadata_ids | type == "array" and length == 0)
+and (.metrics.rust_only_metadata_ids | type == "array")
+and .metrics.metadata_shared_values_match == true
+and (.metrics.metadata_shared_value_mismatch_ids | type == "array" and length == 0)
 and (.metrics.legacy_settlement_count | positive_integer)
 and (.metrics.rust_settlement_count | positive_integer)
+and (.metrics.legacy_only_settlement_ids | type == "array" and length == 0)
+and (.metrics.rust_only_settlement_ids | type == "array")
+and .metrics.settlement_shared_values_match == true
+and (.metrics.settlement_shared_value_mismatch_ids | type == "array" and length == 0)
+and .metrics.trade_shared_values_match == true
+and (.metrics.trade_shared_value_mismatch_ids | type == "array" and length == 0)
+and .metrics.trade_metadata_shared_values_match == true
+and (.metrics.trade_metadata_shared_value_mismatch_market_ids
+  | type == "array" and length == 0)
+and .metrics.trade_maturity_lag_seconds == 600
+and .metrics.trade_event_window_started_at_unix == .parity_window_started_at_unix
+and (.metrics.trade_event_window_ended_at_unix ==
+  nonnegative_sub(.parity_window_ended_at_unix;
+    .metrics.trade_maturity_lag_seconds))
+and (.metrics.trade_event_window_ended_at_unix
+  > .metrics.trade_event_window_started_at_unix)
+and .metrics.legacy_trade_metadata_context_match == true
+and .metrics.rust_trade_metadata_context_match == true
+and (.metrics.legacy_trade_metadata_context_mismatch_market_ids
+  | type == "array" and length == 0)
+and (.metrics.rust_trade_metadata_context_mismatch_market_ids
+  | type == "array" and length == 0)
+and .metrics.settlement_event_lookback_seconds == 900
+and .metrics.settlement_maturity_lag_seconds == 600
+and (.metrics.settlement_event_window_started_at_unix ==
+  nonnegative_sub(.parity_window_started_at_unix;
+    .metrics.settlement_event_lookback_seconds))
+and (.metrics.settlement_event_window_ended_at_unix ==
+  nonnegative_sub(.parity_window_ended_at_unix;
+    .metrics.settlement_maturity_lag_seconds))
+and .metrics.legacy_settlement_metadata_context_match == true
+and .metrics.rust_settlement_metadata_context_match == true
+and (.metrics.legacy_settlement_metadata_context_mismatch_market_ids
+  | type == "array" and length == 0)
+and (.metrics.rust_settlement_metadata_context_mismatch_market_ids
+  | type == "array" and length == 0)
+and (.metrics.legacy_duplicate_trade_ids | type == "array" and length == 0)
 and (.metrics.rust_duplicate_trade_ids | type == "array" and length == 0)
+and (.metrics.normalized_trade_sha256 | sha256)
+and (.metrics.normalized_metadata_sha256 | sha256)
+and (.metrics.normalized_settlement_sha256 | sha256)

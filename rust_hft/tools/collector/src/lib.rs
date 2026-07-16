@@ -9,7 +9,7 @@ pub mod source_catalog;
 
 pub use feature_matrix::{
     import_feature_dataset, read_feature_rows, DataModality, FeatureDatasetManifest,
-    PointInTimeFeatureRow,
+    FeatureLabelSpec, PointInTimeFeatureRow,
 };
 pub use source_catalog::{
     acquire_dataset, source_catalog, CandleInterval, DataAcquisitionMission, DatasetManifest,

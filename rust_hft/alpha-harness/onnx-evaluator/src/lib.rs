@@ -31,6 +31,7 @@ impl OnnxEvaluator {
             &signals,
             context.folds().iter().map(|fold| fold.validation.clone()),
             false,
+            context.protocol(),
         )
     }
 
@@ -43,8 +44,13 @@ impl OnnxEvaluator {
         let predictor = load_predictor(model, model_path)?;
         evaluate_sealed_holdout(dataset, |rows| {
             let signals = infer_signals(model, rows, |input| predictor.infer(input))?;
-            self.policy
-                .evaluate_onnx_signals(rows, &signals, std::iter::once(0..rows.len()), true)
+            self.policy.evaluate_onnx_signals(
+                rows,
+                &signals,
+                std::iter::once(0..rows.len()),
+                true,
+                dataset.protocol(),
+            )
         })
     }
 }
@@ -124,7 +130,10 @@ fn infer_signals<E: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alpha_domain::{TensorElementType, TensorSpec, LOB_ONNX_PREPROCESSING_VERSION};
+    use alpha_domain::{
+        EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
+        TensorElementType, TensorSpec, LOB_ONNX_PREPROCESSING_VERSION,
+    };
     use chrono::{Duration, Utc};
     use hft_research_manifest::ArtifactRef;
     use std::collections::BTreeMap;
@@ -201,8 +210,28 @@ mod tests {
         let signals =
             infer_signals(&model(), &rows, |input| Ok::<_, String>(vec![input[0]])).unwrap();
         let policy = FormulaEvaluator::for_trials(1).unwrap();
+        let protocol = EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
+                initial_train_rows: 1,
+                validation_rows: 250,
+                fold_count: 2,
+                purge_rows: 1,
+                embargo_rows: 0,
+                sealed_holdout_rows: 1,
+            },
+            EvaluationCostsV1 {
+                fee_bps: 0.0,
+                funding_bps: 0.0,
+                latency_bps: 0.0,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: 1_000,
+            },
+        )
+        .unwrap();
         let evaluation = policy
-            .evaluate_onnx_signals(&rows, &signals, [0..250, 250..500], false)
+            .evaluate_onnx_signals(&rows, &signals, [0..250, 250..500], false, &protocol)
             .unwrap();
         assert!(evaluation.passed);
     }

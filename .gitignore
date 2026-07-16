@@ -16,7 +16,7 @@ venv/
 *.pdb
 Cargo.lock
 !/rust_hft/Cargo.lock
-!products/ploy/**/Cargo.lock
+!rust_hft/prediction-markets/**/Cargo.lock
 
 # IDE files
 .vscode/
@@ -49,17 +49,17 @@ rust_hft/redis/data/
 *.onnx
 *.pkl
 models/
-!products/ploy/models/
-!products/ploy/models/**
+!rust_hft/prediction-markets/models/
+!rust_hft/prediction-markets/models/**
 
 # Data files
 *.jsonl
 *.json
 *.csv
 !rust_hft/data/backtest/*.manifest.json
-!products/ploy/**/*.json
-!products/ploy/**/*.jsonl
-!products/ploy/**/*.csv
+!rust_hft/prediction-markets/**/*.json
+!rust_hft/prediction-markets/**/*.jsonl
+!rust_hft/prediction-markets/**/*.csv
 *.xlsx
 *.zip
 test_data/
@@ -142,3 +142,4 @@ AWSCLIV2.pkg
 /hft-collector-linux*
 /hft-collector-darwin*
 .omx/
+.worktrees

@@ -1,0 +1,32 @@
+[Unit]
+Description=Monday digest-pinned HFT Paper/Shadow runtime (bare ECS)
+Documentation=https://github.com/proerror77/monday/tree/main/deployment/aliyun
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/monday/hft-trading-current.env
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=HFT_CURRENT_FILE=/etc/monday/hft-trading-current.env
+ExecStartPre=/usr/local/libexec/monday-hft-trading-runtime preflight
+ExecStart=/usr/local/libexec/monday-hft-trading-runtime run
+ExecStop=/usr/local/libexec/monday-hft-trading-runtime stop
+ExecStopPost=/usr/local/libexec/monday-hft-trading-runtime ensure-stopped
+Restart=no
+TimeoutStartSec=180
+TimeoutStopSec=75
+KillMode=process
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/monday /var/lib/monday /var/run/docker.sock
+
+# Deliberately no [Install] section. The service is static and cannot start at
+# boot. A reviewed hostctl cutover is the only supported start path.

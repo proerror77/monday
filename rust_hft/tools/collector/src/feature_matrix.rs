@@ -46,6 +46,13 @@ pub struct FeatureDatasetTimeBounds {
     pub last_ingestion_time: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureLabelSpec {
+    pub horizon_buckets: usize,
+    pub observation_frequency_millis: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeatureDatasetManifest {
@@ -57,6 +64,7 @@ pub struct FeatureDatasetManifest {
     pub source_revisions: BTreeMap<String, String>,
     pub modalities: BTreeSet<DataModality>,
     pub feature_names: Vec<String>,
+    pub label_spec: FeatureLabelSpec,
     pub rows: usize,
     pub time_bounds: FeatureDatasetTimeBounds,
     pub artifact_path: PathBuf,
@@ -67,7 +75,7 @@ pub struct FeatureDatasetManifest {
 impl FeatureDatasetManifest {
     pub fn validate_trace(&self, rows: &[PointInTimeFeatureRow]) -> Result<(), String> {
         if self.dataset_kind != "point_in_time_feature_matrix"
-            || self.schema_version != "pit-feature-matrix-v1"
+            || self.schema_version != "pit-feature-matrix-v2"
             || self.mission_id.trim().is_empty()
             || self.symbol.trim().is_empty()
             || self.rows != rows.len()
@@ -80,6 +88,7 @@ impl FeatureDatasetManifest {
             || self.source_revisions != facts.source_revisions
             || self.modalities != facts.modalities
             || self.feature_names != facts.feature_names
+            || self.label_spec != facts.label_spec
             || self.time_bounds != facts.time_bounds
         {
             return Err("feature dataset manifest does not match trace facts".to_string());
@@ -93,6 +102,7 @@ struct TraceFacts {
     source_revisions: BTreeMap<String, String>,
     modalities: BTreeSet<DataModality>,
     feature_names: Vec<String>,
+    label_spec: FeatureLabelSpec,
     time_bounds: FeatureDatasetTimeBounds,
 }
 
@@ -127,10 +137,11 @@ pub fn import_feature_dataset(
         manifest_id: format!("dataset-{hash}"),
         mission_id,
         symbol: facts.symbol,
-        schema_version: "pit-feature-matrix-v1".to_string(),
+        schema_version: "pit-feature-matrix-v2".to_string(),
         source_revisions: facts.source_revisions,
         modalities: facts.modalities,
         feature_names: facts.feature_names,
+        label_spec: facts.label_spec,
         rows: rows.len(),
         time_bounds: facts.time_bounds,
         artifact_path,
@@ -225,11 +236,55 @@ fn validate_rows(
     }) {
         return Err("feature matrix times must be strictly ordered".to_string());
     }
+    let observation_frequency_millis = rows
+        .windows(2)
+        .next()
+        .map(|window| {
+            window[1]
+                .event_time
+                .signed_duration_since(window[0].event_time)
+                .num_milliseconds()
+        })
+        .filter(|frequency| *frequency > 0)
+        .and_then(|frequency| u64::try_from(frequency).ok())
+        .ok_or_else(|| "feature matrix observation frequency is invalid".to_string())?;
+    if rows.windows(2).any(|window| {
+        window[1]
+            .event_time
+            .signed_duration_since(window[0].event_time)
+            .num_milliseconds()
+            != observation_frequency_millis as i64
+    }) {
+        return Err("feature matrix observation frequency is not uniform".to_string());
+    }
+    let horizon_millis = first
+        .label_available_time
+        .signed_duration_since(first.event_time)
+        .num_milliseconds();
+    if horizon_millis <= 0
+        || horizon_millis % observation_frequency_millis as i64 != 0
+        || rows.iter().any(|row| {
+            row.label_available_time
+                .signed_duration_since(row.event_time)
+                .num_milliseconds()
+                != horizon_millis
+        })
+    {
+        return Err("feature matrix label horizon is invalid or inconsistent".to_string());
+    }
+    let horizon_buckets = usize::try_from(horizon_millis / observation_frequency_millis as i64)
+        .ok()
+        .filter(|horizon| *horizon > 0)
+        .ok_or_else(|| "feature matrix label horizon is invalid".to_string())?;
     Ok(TraceFacts {
         symbol: first.symbol.clone(),
         source_revisions: first.source_revisions.clone(),
         modalities: first.modalities.clone(),
         feature_names,
+        label_spec: FeatureLabelSpec {
+            horizon_buckets,
+            observation_frequency_millis,
+        },
         time_bounds: FeatureDatasetTimeBounds {
             first_event_time: first.event_time,
             last_event_time: last.event_time,
@@ -311,6 +366,14 @@ mod tests {
             manifest.feature_names,
             vec!["lob_imbalance", "onchain_flow"]
         );
+        assert_eq!(manifest.label_spec.observation_frequency_millis, 60_000);
+        assert_eq!(manifest.label_spec.horizon_buckets, 1);
+        let mut legacy_manifest = serde_json::to_value(&manifest).unwrap();
+        legacy_manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("label_spec");
+        assert!(serde_json::from_value::<FeatureDatasetManifest>(legacy_manifest).is_err());
         std::fs::remove_file(input).unwrap();
         std::fs::remove_dir_all(output).unwrap();
     }
@@ -324,5 +387,9 @@ mod tests {
         let mut drifted = rows();
         drifted[1].features.remove("onchain_flow");
         assert!(validate_rows(&drifted, Utc::now()).is_err());
+
+        let mut inconsistent_label_horizon = rows();
+        inconsistent_label_horizon[1].label_available_time += Duration::minutes(1);
+        assert!(validate_rows(&inconsistent_label_horizon, Utc::now()).is_err());
     }
 }

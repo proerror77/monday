@@ -12,7 +12,7 @@ second-language trainer or a libtorch binding.
 
 - Continuous contracts use `rust_hft/research-core/ml` and forward-return labels
   with purged, embargoed walk-forward evidence.
-- Prediction markets use `products/ploy/crates/ploy-research` and official binary
+- Prediction markets use `rust_hft/prediction-markets/crates/ploy-research` and official binary
   settlement labels with event-disjoint splits.
 - Burn with the NdArray backend is the native training stack. Burnpack plus a
   typed, externally verified manifest is the native bundle format.
@@ -42,7 +42,7 @@ Run the narrowest locked Cargo lane first:
 ```bash
 cargo test --manifest-path rust_hft/Cargo.toml -p hft-research-ml --locked
 cargo clippy --manifest-path rust_hft/Cargo.toml -p hft-research-ml --all-targets --locked -- -D warnings
-cargo test --manifest-path products/ploy/Cargo.toml -p ploy-research --features ml --lib --locked
+cargo test --manifest-path rust_hft/prediction-markets/Cargo.toml -p ploy-research --features ml --lib --locked
 ```
 
 Report local model proof separately from remote deployment or live-trading truth.

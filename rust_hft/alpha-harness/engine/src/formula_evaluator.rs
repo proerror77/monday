@@ -4,7 +4,8 @@ use crate::{
     FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
 };
 use alpha_domain::{
-    CandidateArtifact, ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
+    CandidateArtifact, EvaluationProtocolV1, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
+    SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 pub use alpha_domain::{
     FormulaEvaluatorConfig, MultipleTestingAdjustment, WALK_FORWARD_EVALUATOR_VERSION,
@@ -141,6 +142,7 @@ impl FormulaEvaluator {
         signals: &[f64],
         ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
         sealed: bool,
+        protocol: &EvaluationProtocolV1,
     ) -> Result<CandidateEvaluation, String> {
         self.evaluate_ranges(
             rows,
@@ -151,6 +153,7 @@ impl FormulaEvaluator {
             } else {
                 alpha_domain::ONNX_WALK_FORWARD_EVALUATOR_VERSION
             },
+            protocol,
         )
     }
 
@@ -167,6 +170,7 @@ impl FormulaEvaluator {
                 &signals,
                 std::iter::once(0..rows.len()),
                 SEALED_HOLDOUT_EVALUATOR_VERSION,
+                dataset.protocol(),
             )
         })
     }
@@ -177,9 +181,18 @@ impl FormulaEvaluator {
         signals: &[f64],
         ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
         evaluator_version: &str,
+        protocol: &EvaluationProtocolV1,
     ) -> Result<CandidateEvaluation, String> {
+        protocol.validate().map_err(|error| error.to_string())?;
         if signals.len() != rows.len() {
             return Err("formula output length does not match dataset".to_string());
+        }
+        if rows.iter().any(|row| {
+            row.fee_bps.to_bits() != protocol.costs.fee_bps.to_bits()
+                || row.funding_bps.to_bits() != protocol.costs.funding_bps.to_bits()
+                || row.latency_bps.to_bits() != protocol.costs.latency_bps.to_bits()
+        }) {
+            return Err("dataset costs do not match the evaluation protocol".to_string());
         }
         if signals
             .iter()
@@ -191,6 +204,20 @@ impl FormulaEvaluator {
         let ranges = ranges.into_iter().collect::<Vec<_>>();
         if ranges.is_empty() {
             return Err("evaluation has no folds".to_string());
+        }
+        let sealed = matches!(
+            evaluator_version,
+            SEALED_HOLDOUT_EVALUATOR_VERSION | alpha_domain::ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION
+        );
+        if (sealed
+            && (ranges.len() != 1 || ranges[0].len() != protocol.walk_forward.sealed_holdout_rows))
+            || (!sealed
+                && (ranges.len() != protocol.walk_forward.fold_count
+                    || ranges
+                        .iter()
+                        .any(|range| range.len() != protocol.walk_forward.validation_rows)))
+        {
+            return Err("evaluation ranges do not match the evaluation protocol".to_string());
         }
         for range in &ranges {
             if range.len() < self.config.min_validation_rows || range.end > rows.len() {
@@ -292,6 +319,10 @@ impl FormulaEvaluator {
             failure_reasons: failures,
             evaluator_version: evaluator_version.to_string(),
             evaluator_config: self.config_evidence()?,
+            evaluation_protocol: Some(protocol.clone()),
+            evaluation_protocol_hash: Some(
+                protocol.content_hash().map_err(|error| error.to_string())?,
+            ),
             metrics,
         };
         evaluation.validate().map_err(|error| error.to_string())?;
@@ -312,6 +343,7 @@ impl CandidateEvaluator for FormulaEvaluator {
             &signals,
             context.folds().iter().map(|fold| fold.validation.clone()),
             WALK_FORWARD_EVALUATOR_VERSION,
+            context.protocol(),
         )
     }
 }
@@ -629,7 +661,8 @@ fn max_drawdown(returns: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evaluation::{prepare_dataset, ResearchRow, WalkForwardConfig};
+    use crate::evaluation::{prepare_dataset, ResearchRow};
+    use alpha_domain::{EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationWalkForwardV1};
     use chrono::{Duration, Utc};
 
     fn proposal(ast: FactorAst) -> EngineProposal {
@@ -658,20 +691,31 @@ mod tests {
             .collect()
     }
 
-    fn dataset(fee_bps: f64) -> PreparedDataset {
-        prepare_dataset(
-            rows(fee_bps),
-            &WalkForwardConfig {
+    fn protocol(fee_bps: f64, fold_count: usize) -> EvaluationProtocolV1 {
+        EvaluationProtocolV1::new(
+            EvaluationWalkForwardV1 {
                 initial_train_rows: 200,
                 validation_rows: 64,
-                fold_count: 3,
+                fold_count,
                 purge_rows: 1,
                 embargo_rows: 1,
                 sealed_holdout_rows: 64,
             },
-            "sealed-1",
+            EvaluationCostsV1 {
+                fee_bps,
+                funding_bps: 0.0,
+                latency_bps: 0.0,
+            },
+            EvaluationLabelSpecV1 {
+                horizon_buckets: 1,
+                observation_frequency_millis: 60_000,
+            },
         )
         .unwrap()
+    }
+
+    fn dataset(fee_bps: f64) -> PreparedDataset {
+        prepare_dataset(rows(fee_bps), &protocol(fee_bps, 3), "sealed-1").unwrap()
     }
 
     #[test]
@@ -756,19 +800,7 @@ mod tests {
 
     #[test]
     fn single_fold_walk_forward_records_missing_icir_as_a_failed_evaluation() {
-        let input = prepare_dataset(
-            rows(0.0),
-            &WalkForwardConfig {
-                initial_train_rows: 200,
-                validation_rows: 64,
-                fold_count: 1,
-                purge_rows: 1,
-                embargo_rows: 1,
-                sealed_holdout_rows: 64,
-            },
-            "single-fold",
-        )
-        .unwrap();
+        let input = prepare_dataset(rows(0.0), &protocol(0.0, 1), "single-fold").unwrap();
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let result = evaluator
             .evaluate(
@@ -829,19 +861,7 @@ mod tests {
         for row in &mut rows {
             row.features.insert("lob_imbalance".to_string(), row.signal);
         }
-        let dataset = prepare_dataset(
-            rows,
-            &WalkForwardConfig {
-                initial_train_rows: 200,
-                validation_rows: 64,
-                fold_count: 3,
-                purge_rows: 1,
-                embargo_rows: 1,
-                sealed_holdout_rows: 64,
-            },
-            "sealed-1",
-        )
-        .unwrap();
+        let dataset = prepare_dataset(rows, &protocol(0.0, 3), "sealed-1").unwrap();
 
         assert!(
             evaluator
@@ -932,19 +952,7 @@ mod tests {
         let mut input = rows(0.0);
         let holdout_loss = input.len() - 32;
         input[holdout_loss].label = -0.5 * input[holdout_loss].signal.signum();
-        let dataset = prepare_dataset(
-            input,
-            &WalkForwardConfig {
-                initial_train_rows: 200,
-                validation_rows: 64,
-                fold_count: 3,
-                purge_rows: 1,
-                embargo_rows: 1,
-                sealed_holdout_rows: 64,
-            },
-            "sealed-drawdown",
-        )
-        .unwrap();
+        let dataset = prepare_dataset(input, &protocol(0.0, 3), "sealed-drawdown").unwrap();
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
             "signal".to_string(),

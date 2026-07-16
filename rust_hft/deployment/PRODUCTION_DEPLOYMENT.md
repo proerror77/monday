@@ -12,6 +12,12 @@ This directory deploys the deterministic Rust runtime. It does not deploy an LLM
 
 Market-data and sentinel manifests remain separate runtime services. The research LoopRun is invoked separately and cannot mutate these manifests or runtime secrets.
 
+The Kubernetes manifests are not the Monday live-host target. The future Tokyo
+bare-ECS image path is defined by
+[`../../deployment/aliyun/TRADING_ECS_HOST.md`](../../deployment/aliyun/TRADING_ECS_HOST.md).
+That path is digest-only, static/boot-disabled, and currently permits signed
+Paper or Shadow activation only.
+
 ## Build
 
 From `rust_hft/`:
