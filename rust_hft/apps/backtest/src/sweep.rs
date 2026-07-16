@@ -63,6 +63,7 @@ pub fn run(options: SweepOptions<'_>) -> anyhow::Result<()> {
             combo_output.display()
         );
         if options.dry_run {
+            crate::validate_dry_run(&cfg)?;
             let strategy = config_value
                 .as_mapping()
                 .and_then(|mapping| mapping.get(Value::String("strategy".to_string())))
@@ -274,5 +275,34 @@ execution:
         let error = build_plan(GRID, 2, 2).expect_err("invalid shard must fail");
         assert!(error.to_string().contains("--shard-index"));
         assert!(build_plan(GRID, 0, 0).is_err());
+    }
+
+    #[test]
+    fn dry_run_rejects_invalid_output_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.yaml");
+        let grid_path = directory.path().join("grid.yaml");
+        let base = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/backtest/default.yaml"),
+        )
+        .unwrap()
+        .replace(
+            "summary_csv: backtest_summary.csv",
+            "summary_csv: backtest_trades.csv",
+        );
+        std::fs::write(&config_path, base).unwrap();
+        std::fs::write(&grid_path, GRID).unwrap();
+
+        let error = run(SweepOptions {
+            config_path: config_path.to_str().unwrap(),
+            grid_path: grid_path.to_str().unwrap(),
+            output_root: directory.path().join("output").to_str().unwrap(),
+            shard_index: 0,
+            shard_count: 1,
+            dry_run: true,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("output artifact names"));
     }
 }

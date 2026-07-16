@@ -24,6 +24,7 @@ portfolio_core = { package = "hft-portfolio-core", path = "../../risk-control/po
 # Data adapters (optional)
 adapter-bitget-data = { package = "hft-data-adapter-bitget", path = "../../data-pipelines/adapters/adapter-bitget", optional = true }
 adapter-binance-data = { package = "hft-data-adapter-binance", path = "../../data-pipelines/adapters/adapter-binance", optional = true }
+adapter-binance-prediction-data = { package = "hft-data-adapter-binance-prediction", path = "../../data-pipelines/adapters/adapter-binance-prediction", optional = true }
 adapter-backpack-data = { package = "hft-data-adapter-backpack", path = "../../data-pipelines/adapters/adapter-backpack", optional = true }
 adapter-bybit-data = { package = "hft-data-adapter-bybit", path = "../../data-pipelines/adapters/adapter-bybit", optional = true }
 adapter-mock-data = { package = "hft-data-adapter-mock", path = "../../data-pipelines/adapters/adapter-mock", optional = true }
@@ -108,6 +109,7 @@ json-simd = [
 # Data adapters
 adapter-bitget-data = ["dep:adapter-bitget-data"]
 adapter-binance-data = ["dep:adapter-binance-data"]
+adapter-binance-prediction-data = ["dep:adapter-binance-prediction-data"]
 adapter-backpack-data = ["dep:adapter-backpack-data"]
 adapter-bybit-data = ["dep:adapter-bybit-data"]
 adapter-mock-data = ["dep:adapter-mock-data"]
@@ -150,7 +152,7 @@ infra-secrets = ["dep:infra-secrets"]
 # Convenience features
 bitget = ["adapter-bitget-data", "adapter-bitget-execution"]
 binance = ["adapter-binance-data", "adapter-binance-execution"]
-binance-prediction = ["adapter-binance-prediction-execution"]
+binance-prediction = ["adapter-binance-prediction-data", "adapter-binance-prediction-execution"]
 backpack = ["adapter-backpack-data", "adapter-backpack-execution"]
 bybit = ["adapter-bybit-data", "adapter-bybit-execution"]
 okx = ["adapter-okx-execution"]

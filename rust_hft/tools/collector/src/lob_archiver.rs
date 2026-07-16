@@ -1,3 +1,6 @@
+pub use data::binance_lob_replay::{
+    source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
+};
 use engine::binance_md::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
 use rand::random;
 use rust_decimal::Decimal;
@@ -14,34 +17,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 
 pub const RAW_SCHEMA: &str = "binance.lob_tape.v2";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Market {
-    Spot,
-    Usdm,
-}
-
-impl FromStr for Market {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "spot" => Ok(Self::Spot),
-            "usdm" => Ok(Self::Usdm),
-            other => Err(format!("unsupported MARKET={other}")),
-        }
-    }
-}
-
-impl Market {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Spot => "spot",
-            Self::Usdm => "usdm",
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepthDiff {

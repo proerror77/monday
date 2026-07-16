@@ -30,8 +30,9 @@ venues:
       funding_source: CEX
       timeout_ms: 3000
 
-# Execution-only venue: a strategy must target BINANCE_PREDICTION explicitly and use the
-# outcome token ID as OrderIntent.symbol. Live orders also require envelope max_slippage_bps.
+# A strategy must target BINANCE_PREDICTION explicitly and use the outcome token ID as
+# OrderIntent.symbol. For REST order-book collection, add data_config.outcomes with the token,
+# market ID, and vendor. Live orders also require envelope max_slippage_bps.
 strategies: []
 
 # Zero limits keep this example fail-closed until an approved deployment supplies real limits.

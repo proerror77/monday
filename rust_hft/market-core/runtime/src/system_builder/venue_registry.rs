@@ -57,8 +57,12 @@ impl SystemBuilder {
         venue: &VenueConfig,
         instruments: &[InstrumentSpec],
     ) -> Self {
-        if venue.venue_type == VenueType::BinancePrediction {
-            info!("Binance Prediction is execution-only; skipping streaming market adapter");
+        if venue.venue_type == VenueType::BinancePrediction
+            && (venue.symbol_catalog.is_empty() || venue.data_config.is_none())
+        {
+            info!(
+                "Binance Prediction needs an explicit outcome catalog and data_config; keeping the venue execution-only"
+            );
             return self;
         }
         let venue_id = to_venue_id(&venue.venue_type);
@@ -128,6 +132,7 @@ fn instrument_for_venue(symbol: Symbol, venue: VenueId) -> InstrumentSpec {
         }
         VenueId::ONDO_PERPS => InstrumentSpec::ondo_perp(symbol),
         VenueId::POLYMARKET => InstrumentSpec::polymarket_outcome(symbol),
+        VenueId::BINANCE_PREDICTION => InstrumentSpec::prediction_market_outcome(symbol),
         _ => InstrumentSpec::crypto_spot(symbol, venue),
     }
 }
@@ -281,6 +286,105 @@ mod tests {
             instruments,
             &[InstrumentSpec::ondo_perp(Symbol::new("TSLA"))]
         );
+    }
+
+    #[test]
+    fn binance_prediction_catalog_drives_prediction_market_plan() {
+        let mut config = SystemConfig::default();
+        config.venues.push(VenueConfig {
+            name: "binance-prediction".into(),
+            account_id: None,
+            venue_type: VenueType::BinancePrediction,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: Some("Paper".into()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: false,
+            symbol_catalog: vec![InstrumentId::new("112233@BINANCE_PREDICTION")],
+            data_config: Some(
+                serde_yaml::from_str(
+                    "outcomes:\n  - token_id: '112233'\n    market_id: 1\n    vendor: predict_fun\n",
+                )
+                .expect("valid Binance Prediction outcome config"),
+            ),
+            execution_config: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        });
+
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        let (venue, _, instruments) = &builder.market_stream_plans[0];
+        assert_eq!(*venue, VenueType::BinancePrediction);
+        assert_eq!(
+            instruments,
+            &[InstrumentSpec::prediction_market_outcome(Symbol::new(
+                "112233"
+            ))]
+        );
+    }
+
+    #[test]
+    fn binance_prediction_without_an_outcome_catalog_stays_execution_only() {
+        let mut config = SystemConfig::default();
+        config.venues.push(VenueConfig {
+            name: "binance-prediction".into(),
+            account_id: None,
+            venue_type: VenueType::BinancePrediction,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: Some("Live".into()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: false,
+            symbol_catalog: Vec::new(),
+            data_config: None,
+            execution_config: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        });
+
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder.market_stream_plans.is_empty());
+    }
+
+    #[test]
+    fn binance_prediction_without_quote_data_stays_execution_only() {
+        let mut config = SystemConfig::default();
+        config.venues.push(VenueConfig {
+            name: "binance-prediction".into(),
+            account_id: None,
+            venue_type: VenueType::BinancePrediction,
+            ws_public: None,
+            ws_private: None,
+            rest: None,
+            api_key: None,
+            secret: None,
+            passphrase: None,
+            execution_mode: Some("Live".into()),
+            capabilities: VenueCapabilities::default(),
+            inst_type: None,
+            simulate_execution: false,
+            symbol_catalog: vec![InstrumentId::new("112233@BINANCE_PREDICTION")],
+            data_config: None,
+            execution_config: None,
+            secret_ref_api_key: None,
+            secret_ref_secret: None,
+            secret_ref_passphrase: None,
+        });
+
+        let builder = SystemBuilder::new(config).register_market_streams_from_config();
+        assert!(builder.market_stream_plans.is_empty());
     }
 
     #[test]
