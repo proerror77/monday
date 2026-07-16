@@ -60,7 +60,7 @@ ENV HFT_TARGET=${TARGET}
 
 # 健康檢查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD if [ "$HFT_TARGET" = "live" ]; then curl --fail --silent http://localhost:9090/readiness; else exit 0; fi
+    CMD if [ "$HFT_TARGET" = "live" ]; then curl --fail --silent http://localhost:9090/health; else exit 0; fi
 
 # 默認暴露端口
 EXPOSE 9090 9092

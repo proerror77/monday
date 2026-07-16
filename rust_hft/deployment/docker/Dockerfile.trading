@@ -39,7 +39,7 @@ ENV RUST_LOG=info
 
 EXPOSE 9090 9092
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl --fail --silent http://127.0.0.1:9090/readiness || exit 1
+    CMD curl --fail --silent http://127.0.0.1:9090/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/hft-live"]
 CMD ["--config", "/app/config/system.yaml"]
