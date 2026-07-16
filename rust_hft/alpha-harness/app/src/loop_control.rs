@@ -1180,7 +1180,7 @@ mod tests {
 
     #[test]
     fn durable_loop_rejects_engines_without_exact_checkpoint_semantics() {
-        for engine in [EngineChoice::Gp, EngineChoice::OfflineRl, EngineChoice::Llm] {
+        for engine in [EngineChoice::Gp, EngineChoice::Llm] {
             let db = temp_db_path("alpha-loop-unsupported-engine");
             let mut args = loop_args(db.clone(), "mission-loop", LoopTargetChoice::Researching);
             args.mission.engine = engine;
@@ -1201,6 +1201,11 @@ mod tests {
                 EngineChoice::Bayesian,
                 vec!["book_imbalance".to_string()],
                 "Bayesian window search is research-only",
+            ),
+            (
+                EngineChoice::OfflineRl,
+                vec!["book_imbalance".to_string()],
+                "Offline RL search is research-only",
             ),
             (
                 EngineChoice::Mcts,

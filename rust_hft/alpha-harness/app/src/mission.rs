@@ -17,6 +17,8 @@ use hft_factor_dsl::{validate_live_formula, FactorAst, FactorTerminal, LiveEvent
 
 pub(crate) const BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR: &str =
     "Bayesian window search is research-only and cannot produce live-executable formulas";
+pub(crate) const OFFLINE_RL_LIVE_CAPABILITY_ERROR: &str =
+    "Offline RL search is research-only and cannot produce live-executable formulas";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -170,7 +172,7 @@ fn build_engine(
                 .map_err(anyhow::Error::msg)?,
         ),
         EngineChoice::Mcts => Box::new(
-            MctsEngine::new(args.seed, primary.clone(), secondary, 1.414, 5)
+            MctsEngine::new_live(args.seed, primary.clone(), secondary, 1.414, 5)
                 .map_err(anyhow::Error::msg)?,
         ),
         EngineChoice::Bayesian => bail!(BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR),
@@ -199,10 +201,11 @@ fn build_engine(
 }
 
 pub(crate) fn validate_live_formula_engine(engine: EngineChoice) -> anyhow::Result<()> {
-    if matches!(engine, EngineChoice::Bayesian) {
-        bail!(BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR);
+    match engine {
+        EngineChoice::Bayesian => bail!(BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR),
+        EngineChoice::OfflineRl => bail!(OFFLINE_RL_LIVE_CAPABILITY_ERROR),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 pub(crate) fn validate_live_mission_args(args: &RunMissionArgs) -> anyhow::Result<()> {
@@ -275,6 +278,11 @@ mod tests {
                 EngineChoice::Bayesian,
                 vec!["book_imbalance".to_string()],
                 "Bayesian window search is research-only",
+            ),
+            (
+                EngineChoice::OfflineRl,
+                vec!["book_imbalance".to_string()],
+                "Offline RL search is research-only",
             ),
             (
                 EngineChoice::Mcts,

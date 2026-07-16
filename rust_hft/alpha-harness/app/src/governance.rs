@@ -119,6 +119,11 @@ fn validated_walk_forward_evidence_in_lineage(
         ) {
             continue;
         }
+        if let CandidateArtifact::Formula(ast) = &candidate.artifact {
+            if validate_live_formula(ast).is_err() {
+                continue;
+            }
+        }
         let evaluation: CandidateEvaluation = serde_json::from_value(stored.record.payload.clone())
             .with_context(|| format!("walk-forward evaluation {evaluation_id} is malformed"))?;
         evaluation
@@ -1535,6 +1540,30 @@ mod tests {
         assert_eq!(
             validated_walk_forward_candidates_in_lineage(&lineage).unwrap(),
             vec!["candidate-1".to_string()]
+        );
+
+        let mut legacy_formula_lineage = lineage.clone();
+        legacy_formula_lineage.candidates[0].artifact = CandidateArtifact::Formula(
+            hft_factor_dsl::FactorAst::call(
+                hft_factor_dsl::FactorOperator::Rank,
+                vec![hft_factor_dsl::FactorAst::Terminal(
+                    hft_factor_dsl::FactorTerminal::Field("mid_price".to_string()),
+                )],
+            )
+            .unwrap(),
+        );
+        let mut legacy_evaluation: CandidateEvaluation =
+            serde_json::from_value(legacy_formula_lineage.evaluations[0].record.payload.clone())
+                .unwrap();
+        legacy_evaluation.evaluator_version = WALK_FORWARD_EVALUATOR_VERSION.to_string();
+        assert!(legacy_evaluation.validate().is_ok());
+        legacy_formula_lineage.evaluations[0].record.payload =
+            serde_json::to_value(legacy_evaluation).unwrap();
+
+        assert!(
+            validated_walk_forward_candidates_in_lineage(&legacy_formula_lineage)
+                .unwrap()
+                .is_empty()
         );
     }
 

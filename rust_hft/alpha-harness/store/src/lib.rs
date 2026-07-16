@@ -712,15 +712,25 @@ impl AlphaStore {
                 "legacy checkpoint recovery requires a new mission id".to_string(),
             ));
         }
-        match self.get_checkpoint(mission_id) {
-            Err(StoreError::LegacyCheckpoint | StoreError::MissingAuthenticityTag) => {}
-            Ok(_) => {
-                return Err(StoreError::Domain(
-                    "checkpoint already has resumable engine state".to_string(),
-                ))
+        let recovery_reason = match self.get_checkpoint(mission_id) {
+            Err(StoreError::LegacyCheckpoint | StoreError::MissingAuthenticityTag) => {
+                "legacy checkpoint lacks exact engine state and cannot be resumed safely"
+                    .to_string()
             }
+            Ok(checkpoint)
+                if checkpoint.engine_kind == EngineKind::Mcts && checkpoint.engine_version < 2 =>
+            {
+                format!(
+                    "MCTS checkpoint version {} predates the live-only checkpoint contract and cannot be resumed safely",
+                    checkpoint.engine_version
+                )
+            }
+            Ok(_) => return Err(StoreError::Domain(
+                "checkpoint is resumable; recovery forks only legacy or pre-v2 MCTS checkpoints"
+                    .to_string(),
+            )),
             Err(error) => return Err(error),
-        }
+        };
 
         let mut source = self.get_mission(mission_id)?;
         let mut replacement = source.clone();
@@ -757,7 +767,7 @@ impl AlphaStore {
                 "kind": "legacy_checkpoint_fork",
                 "source_mission_id": mission_id,
                 "replacement_mission_id": replacement_mission_id,
-                "reason": "legacy checkpoint lacks exact engine state and cannot be resumed safely",
+                "reason": recovery_reason,
             }),
             created_at: at,
         };
@@ -4058,6 +4068,42 @@ mod tests {
         );
         assert!(matches!(
             store.get_checkpoint("mission-recovered"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn pre_live_mcts_checkpoint_can_be_forked_without_resume() {
+        let mut store = AlphaStore::open_in_memory().unwrap();
+        store.create_mission(&mission()).unwrap();
+        bind_evaluation_protocol(&mut store);
+        let mut iteration = iteration_without_candidate();
+        iteration.engine = EngineKind::Mcts;
+        let checkpoint = RunCheckpoint {
+            mission_id: iteration.mission_id.clone(),
+            last_iteration_id: Some(iteration.iteration_id.clone()),
+            budget_usage: iteration.budget_usage.clone(),
+            evaluation_protocol_hash: Some(evaluation_protocol().content_hash().unwrap()),
+            engine_kind: EngineKind::Mcts,
+            engine_version: 1,
+            engine_state: serde_json::json!({"mode": "pre-live-only"}),
+            updated_at: iteration.created_at,
+        };
+        store.append_iteration(&iteration, None, None).unwrap();
+        store.save_checkpoint(&checkpoint).unwrap();
+
+        let replacement = store
+            .fork_legacy_checkpoint("mission-1", "mission-v2", Utc::now())
+            .unwrap();
+
+        assert_eq!(replacement.mission_id, "mission-v2");
+        assert_eq!(replacement.status, MissionStatus::Pending);
+        assert_eq!(
+            store.get_mission("mission-1").unwrap().status,
+            MissionStatus::Failed
+        );
+        assert!(matches!(
+            store.get_checkpoint("mission-v2"),
             Err(StoreError::NotFound)
         ));
     }

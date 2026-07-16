@@ -441,9 +441,12 @@ where
                         }
                         Err((failure_class, error)) => {
                             self.proposal_engine.abandon(&proposal);
-                            let candidate_id = is_novel.then(|| proposal.candidate_id.clone());
-                            let candidate =
-                                is_novel.then_some((proposal.candidate_id, proposal.artifact));
+                            let persist_candidate =
+                                is_novel && failure_class != "live_capability_reject";
+                            let candidate_id =
+                                persist_candidate.then(|| proposal.candidate_id.clone());
+                            let candidate = persist_candidate
+                                .then_some((proposal.candidate_id, proposal.artifact));
                             (
                                 ResearchIteration {
                                     iteration_id,
@@ -685,16 +688,12 @@ mod tests {
     };
     use crate::evaluation::{prepare_dataset, ResearchRow};
     use alpha_domain::{
-        DomainError, EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1,
-        EvaluationWalkForwardV1, MissionCompletionPolicy, ResearchMission, SearchBudget,
-        ValidatorMode,
+        EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
+        MissionCompletionPolicy, ResearchMission, SearchBudget, ValidatorMode,
     };
     use chrono::Duration;
     use hft_core::Symbol;
-    use hft_factor_dsl::{
-        validate_live_formula, FactorAst, FactorOperator, FactorTerminal,
-        LiveFormulaCapabilityError,
-    };
+    use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
     use hft_research_manifest::ManifestId;
     use rust_decimal::Decimal;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1260,6 +1259,8 @@ mod tests {
         assert_eq!(outcome.status, MissionStatus::BudgetExhausted);
         assert_eq!(evaluator_calls.load(Ordering::SeqCst), 0);
         let lineage = store.mission_lineage("mission-1").unwrap();
+        assert!(lineage.candidates.is_empty());
+        assert!(lineage.iterations[0].candidate_artifact_id.is_none());
         assert_eq!(lineage.evaluations.len(), 0);
         assert_eq!(lineage.iterations[0].verdict, IterationVerdict::Crash);
         assert_eq!(
@@ -1360,8 +1361,17 @@ mod tests {
             .iter()
             .map(|candidate| serde_json::to_string(&candidate.artifact).unwrap())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(lineage.candidates.len(), 4);
-        assert_eq!(unique.len(), 4);
+        // A non-live proposal is intentionally recorded only as a crash, not as a
+        // candidate artifact. Resuming must preserve the accepted GP history and
+        // never duplicate one of those artifacts.
+        assert_eq!(lineage.iterations.len(), 4);
+        assert_eq!(lineage.candidates.len(), unique.len());
+        assert!(lineage.candidates.iter().all(|candidate| {
+            matches!(
+                &candidate.artifact,
+                CandidateArtifact::Formula(ast) if validate_live_formula(ast).is_ok()
+            )
+        }));
     }
 
     #[test]
@@ -1384,20 +1394,24 @@ mod tests {
 
     #[test]
     fn real_engines_run_through_persistent_kernel() {
-        let fields = vec!["oi".to_string(), "imbalance".to_string()];
+        let fields = vec!["best_bid".to_string(), "best_ask".to_string()];
         let gp_left =
-            run_single_engine(GeneticProgrammingEngine::new(9, fields.clone(), 4, 4).unwrap());
-        let gp_right = run_single_engine(GeneticProgrammingEngine::new(9, fields, 4, 4).unwrap());
+            run_single_engine(GeneticProgrammingEngine::new(3, fields.clone(), 4, 4).unwrap());
+        let gp_right = run_single_engine(GeneticProgrammingEngine::new(3, fields, 4, 4).unwrap());
         assert_eq!(gp_left, gp_right);
+        assert!(gp_left.is_some());
 
-        let mcts_left = run_single_engine(MctsEngine::new(9, "oi", "imbalance", 1.4, 3).unwrap());
-        let mcts_right = run_single_engine(MctsEngine::new(9, "oi", "imbalance", 1.4, 3).unwrap());
+        let mcts_left =
+            run_single_engine(MctsEngine::new_live(9, "best_bid", "best_ask", 1.4, 3).unwrap());
+        let mcts_right =
+            run_single_engine(MctsEngine::new_live(9, "best_bid", "best_ask", 1.4, 3).unwrap());
         assert_eq!(mcts_left, mcts_right);
+        assert!(mcts_left.is_some());
 
-        assert!(!run_single_engine(
+        assert!(run_single_engine(
             BayesianOptimizerEngine::new("oi", 5.0, 60.0, 12, 1e-6, 10.0, 0.01).unwrap()
         )
-        .is_empty());
+        .is_none());
 
         let traces = vec![
             OfflineTrace {
@@ -1422,10 +1436,10 @@ mod tests {
                 terminal: false,
             },
         ];
-        assert!(!run_single_engine(
+        assert!(run_single_engine(
             OfflineRlEngine::train("oi", "policy-1", &traces, 3, 0.2, 0.9, 20).unwrap()
         )
-        .is_empty());
+        .is_none());
     }
 
     #[test]
@@ -1448,33 +1462,35 @@ mod tests {
 
             let lineage = store.mission_lineage("mission-1").unwrap();
             let iteration = &lineage.iterations[0];
-            let candidate = &lineage.candidates[0];
-            let CandidateArtifact::Formula(ast) = &candidate.artifact else {
-                panic!("search engine did not produce a formula")
-            };
-            let proposal = EngineProposal {
-                candidate_id: candidate.candidate_id.clone(),
-                hypothesis: iteration.hypothesis.clone(),
-                artifact: candidate.artifact.clone(),
-                expansions: 0,
-                tokens: 0,
-                elapsed_ms: 0,
-            };
-            let sealed = crate::formula_evaluator::FormulaEvaluator::new(
-                alpha_domain::FormulaEvaluatorConfig::default(),
-            )
-            .unwrap()
-            .evaluate_sealed(&proposal, &dataset);
-            let promotion_artifact = candidate.artifact.to_governed_strategy_bundle_artifact();
-            let strategy = FormulaStrategy::new(FormulaStrategyConfig {
-                name: "live-contract".to_string(),
-                symbol: Symbol::from("BTCUSDT"),
-                ast: ast.clone(),
-                max_order_notional: Decimal::ONE,
-                signal_threshold: 0.0,
-            });
-
             if expected_live {
+                let candidate = lineage
+                    .candidates
+                    .first()
+                    .expect("live-capable engine should persist its candidate");
+                let CandidateArtifact::Formula(ast) = &candidate.artifact else {
+                    panic!("search engine did not produce a formula")
+                };
+                let proposal = EngineProposal {
+                    candidate_id: candidate.candidate_id.clone(),
+                    hypothesis: iteration.hypothesis.clone(),
+                    artifact: candidate.artifact.clone(),
+                    expansions: 0,
+                    tokens: 0,
+                    elapsed_ms: 0,
+                };
+                let sealed = crate::formula_evaluator::FormulaEvaluator::new(
+                    alpha_domain::FormulaEvaluatorConfig::default(),
+                )
+                .unwrap()
+                .evaluate_sealed(&proposal, &dataset);
+                let promotion_artifact = candidate.artifact.to_governed_strategy_bundle_artifact();
+                let strategy = FormulaStrategy::new(FormulaStrategyConfig {
+                    name: "live-contract".to_string(),
+                    symbol: Symbol::from("BTCUSDT"),
+                    ast: ast.clone(),
+                    max_order_notional: Decimal::ONE,
+                    signal_threshold: 0.0,
+                });
                 assert_eq!(iteration.verdict, IterationVerdict::Keep);
                 assert!(validate_live_formula(ast).is_ok());
                 assert!(sealed.unwrap().passed);
@@ -1486,18 +1502,9 @@ mod tests {
                     iteration.failure_class.as_deref(),
                     Some("live_capability_reject")
                 );
-                assert!(matches!(
-                    validate_live_formula(ast),
-                    Err(LiveFormulaCapabilityError::UnsupportedOperator(_))
-                ));
-                assert!(sealed.is_err());
-                assert!(matches!(
-                    promotion_artifact,
-                    Err(DomainError::UnsupportedLiveFormula(
-                        LiveFormulaCapabilityError::UnsupportedOperator(_)
-                    ))
-                ));
-                assert!(strategy.is_err());
+                assert!(lineage.candidates.is_empty());
+                assert!(iteration.candidate_artifact_id.is_none());
+                assert!(lineage.evaluations.is_empty());
             }
         }
 
@@ -1506,7 +1513,7 @@ mod tests {
             true,
         );
         check(
-            MctsEngine::new(4, "book_imbalance", "book_imbalance", 1.4, 3).unwrap(),
+            MctsEngine::new_live(4, "book_imbalance", "book_imbalance", 1.4, 3).unwrap(),
             true,
         );
         check(
@@ -1586,7 +1593,7 @@ mod tests {
         assert_eq!(candidates(Some(2)), candidates(None));
     }
 
-    fn run_single_engine<P: ProposalEngine>(engine: P) -> String {
+    fn run_single_engine<P: ProposalEngine>(engine: P) -> Option<String> {
         let mut store = AlphaStore::open_in_memory().unwrap();
         let mut mission = mission();
         mission.search_budget.max_candidates = 1;
@@ -1594,9 +1601,14 @@ mod tests {
         AutoResearchKernel::new(&mut store, engine, PassingEvaluator)
             .run("mission-1", &dataset(), RunControl::default())
             .unwrap();
-        match &store.mission_lineage("mission-1").unwrap().candidates[0].artifact {
-            CandidateArtifact::Formula(ast) => ast.to_string(),
-            other => panic!("expected formula candidate, got {other:?}"),
-        }
+        store
+            .mission_lineage("mission-1")
+            .unwrap()
+            .candidates
+            .first()
+            .map(|candidate| match &candidate.artifact {
+                CandidateArtifact::Formula(ast) => ast.to_string(),
+                other => panic!("expected formula candidate, got {other:?}"),
+            })
     }
 }

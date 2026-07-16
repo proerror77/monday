@@ -1652,16 +1652,13 @@ impl StrategyBundle {
     /// Legacy bundles remain ineligible for promotion or deployment because [`Self::validate`]
     /// still requires a protocol binding.
     pub fn validate_for_readback(&self) -> Result<(), DomainError> {
+        if !self.evaluation_protocol_hash.is_empty() {
+            return self.validate();
+        }
         self.validate_common_fields()?;
         self.artifact.validate_for_readback()?;
         validate_sha256(&self.bundle_hash)?;
-        let calculated_hash = if self.evaluation_protocol_hash.is_empty() {
-            self.calculated_legacy_hash()?
-        } else {
-            validate_sha256(&self.evaluation_protocol_hash)?;
-            self.calculated_hash()?
-        };
-        if self.bundle_hash != calculated_hash {
+        if self.bundle_hash != self.calculated_legacy_hash()? {
             return Err(DomainError::StrategyBundleHashMismatch);
         }
         Ok(())
@@ -3090,6 +3087,34 @@ mod tests {
 
         assert!(legacy.validate_for_readback().is_ok());
         assert!(legacy.validate().is_err());
+    }
+
+    #[test]
+    fn canonical_non_live_formula_is_not_readable_as_valid() {
+        let mut canonical = StrategyBundle::new(
+            "bundle-canonical".to_string(),
+            "candidate-canonical".to_string(),
+            "a".repeat(64),
+            ManifestId::new("dataset-canonical").unwrap(),
+            SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            "e".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            "b".repeat(64),
+            StrategyBundleArtifact::Formula {
+                ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                    "mid_price".to_string(),
+                )),
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        canonical.artifact = StrategyBundleArtifact::Formula {
+            ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field("signal".to_string())),
+        };
+        canonical.bundle_hash = canonical.calculated_hash().unwrap();
+
+        assert!(canonical.validate_for_readback().is_err());
     }
 
     #[test]

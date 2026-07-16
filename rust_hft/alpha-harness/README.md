@@ -36,6 +36,7 @@ cargo run -p alpha-harness -- mission run \
   --db var/alpha.duckdb \
   --mission-id mission-1 \
   --engine gp \
+  --feature-fields book_imbalance \
   --dataset-manifest var/datasets/dataset-....manifest.json \
   --label-horizon-buckets 1 \
   --observation-frequency-millis 60000
@@ -47,7 +48,7 @@ cargo run -p alpha-harness -- candidate list \
   --db var/alpha.duckdb --mission-id mission-1
 ```
 
-Supported engines are `gp`, `mcts`, `bayesian`, `offline-rl`, and `llm`. Offline RL requires an explicit trace file and minimum history; its output is lab search-policy evidence and cannot access sealed holdout or promotion authority. LLM requires:
+`--feature-fields` is required. Supply comma-delimited fields that are present in the prepared dataset, live-executable, and all belong to the same live event domain. A live-capable mission accepts `gp`, `mcts`, or `llm`; every Formula candidate is checked before evaluation or persistence, and `mcts` uses a live-only formula grammar. `bayesian` and `offline-rl` remain research engines but are rejected before opening mission state because their proposal grammars cannot produce live-executable formulas. LLM requires:
 
 ```text
 ALPHA_LLM_ENDPOINT
@@ -81,7 +82,7 @@ cargo run -p alpha-harness -- loop status \
   --loop-run-id loop-btc-1
 ```
 
-The durable LoopRun accepts only `mcts` or `bayesian`, the two engines with versioned exact engine-state checkpoints. GP, offline RL, and LLM remain available through standalone `mission run` commands but cannot claim exact LoopRun resume. The LoopRun records ordered stages, completion policy, child missions, and an explicit stop reason. Missing evaluation, holdout, Paper, Shadow, or human evidence pauses the loop instead of fabricating progress. An external scheduler may invoke this command, but invocation does not bypass stage evidence.
+The durable LoopRun accepts only `mcts`, the live-capable engine with a versioned exact-state checkpoint. GP and LLM remain available through standalone `mission run` commands but cannot claim exact LoopRun resume. Bayesian and offline RL are rejected during preflight. The LoopRun records ordered stages, completion policy, child missions, and an explicit stop reason. Missing evaluation, holdout, Paper, Shadow, or human evidence pauses the loop instead of fabricating progress. An external scheduler may invoke this command, but invocation does not bypass stage evidence.
 
 ## Prediction-Market Research
 
