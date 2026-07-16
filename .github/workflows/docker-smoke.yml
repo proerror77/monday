@@ -12,6 +12,17 @@ on:
       - 'rust_hft/docker/**'
       - 'rust_hft/deployment/docker/**'
       - 'rust_hft/deployment/k8s/**'
+      - 'rust_hft/alpha-harness/**'
+      - 'rust_hft/apps/backtest/**'
+      - 'rust_hft/data-pipelines/core/**'
+      - 'rust_hft/market-core/**'
+      - 'rust_hft/research-core/**'
+      - 'rust_hft/strategy-framework/infer-onnx/**'
+      - 'rust_hft/tools/collector/**'
+      - 'rust_hft/prediction-markets/Cargo.toml'
+      - 'rust_hft/prediction-markets/Cargo.lock'
+      - 'rust_hft/prediction-markets/config/**'
+      - 'rust_hft/prediction-markets/crates/ploy-*/**'
   pull_request:
     branches: [main, develop]
     paths:
@@ -23,6 +34,17 @@ on:
       - 'rust_hft/docker/**'
       - 'rust_hft/deployment/docker/**'
       - 'rust_hft/deployment/k8s/**'
+      - 'rust_hft/alpha-harness/**'
+      - 'rust_hft/apps/backtest/**'
+      - 'rust_hft/data-pipelines/core/**'
+      - 'rust_hft/market-core/**'
+      - 'rust_hft/research-core/**'
+      - 'rust_hft/strategy-framework/infer-onnx/**'
+      - 'rust_hft/tools/collector/**'
+      - 'rust_hft/prediction-markets/Cargo.toml'
+      - 'rust_hft/prediction-markets/Cargo.lock'
+      - 'rust_hft/prediction-markets/config/**'
+      - 'rust_hft/prediction-markets/crates/ploy-*/**'
   workflow_dispatch:
 
 permissions:
@@ -39,6 +61,8 @@ jobs:
           - dockerfile: rust_hft/docker/Dockerfile
             context: rust_hft
           - dockerfile: rust_hft/deployment/docker/Dockerfile.trading
+            context: rust_hft
+          - dockerfile: rust_hft/deployment/docker/Dockerfile.research
             context: rust_hft
           - dockerfile: deploy/Dockerfile.hft
             context: .

@@ -342,7 +342,9 @@ jobs:
           docker run --rm \
             -v "$PWD:/work:ro" \
             ghcr.io/yannh/kubeconform:v0.7.0 \
-            -strict -summary /work/rust_hft/deployment/k8s
+            -strict -summary \
+            /work/rust_hft/deployment/k8s \
+            /work/deployment/aliyun/research/k8s
 
   rust_hft_engine_fast_lane:
     name: Rust HFT Engine Fast Lane
