@@ -1,5 +1,10 @@
 # Aliyun Binance data host
 
+The public-data collector host described below is not the trading host. The
+future Tokyo bare-ECS trading contract is documented separately in
+[`TRADING_ECS_HOST.md`](TRADING_ECS_HOST.md). Trading does not run on ACK, and
+staging its ACR image does not enable or start a runtime.
+
 The Tokyo ECS runs the Rust Binance LOB archiver as two public-market-data
 services. Neither service has trading credentials or submits orders.
 The legacy Python collector, its systemd template, and its deployment tests have
