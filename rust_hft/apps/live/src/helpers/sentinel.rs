@@ -101,16 +101,10 @@ async fn run_sentinel_loop(
                     .orders_submitted
                     .saturating_sub(last_orders_submitted) as f64
                     / (check_interval_ms.max(1) as f64 / 1_000.0),
-                // ponytail: engine does not expose venue reconnects; wire adapter metrics here
-                // if Sentinel policy begins to act on reconnect frequency.
-                ws_reconnect_count: 0,
-                data_gap_count: u32::try_from(
-                    engine_stats
-                        .market_events_dropped
-                        .saturating_add(engine_stats.snapshot_publish_failed)
-                        .saturating_add(engine_stats.data_integrity_gaps),
-                )
-                .unwrap_or(u32::MAX),
+                data_gap_count: engine_stats
+                    .market_events_dropped
+                    .saturating_add(engine_stats.snapshot_publish_failed)
+                    .saturating_add(engine_stats.data_integrity_gaps),
             };
             last_orders_submitted = engine_stats.orders_submitted;
 
