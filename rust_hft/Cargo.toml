@@ -27,6 +27,7 @@ members = [
     "data-pipelines/adapters-common",
     "data-pipelines/adapters/adapter-bitget",
     "data-pipelines/adapters/adapter-binance",
+    "data-pipelines/adapters/adapter-binance-prediction",
     "data-pipelines/adapters/adapter-backpack",
     "data-pipelines/adapters/adapter-mock",
     "data-pipelines/adapters/adapter-replay",

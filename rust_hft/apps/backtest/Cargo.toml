@@ -15,6 +15,11 @@ ordered-float = "3.9"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
+sha2 = { workspace = true }
+hex = { workspace = true }
+data = { package = "hft-data", path = "../../data-pipelines/core" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[dev-dependencies]
+tempfile = "3.10"

@@ -49,6 +49,11 @@ const METADATA_CONTRACT_FIELDS: [&str; 17] = [
     "feesEnabled",
     "negRisk",
 ];
+// Pricing configuration is still validated and retained in the raw tape, but
+// the provider can revise its price tick within a few seconds of market close.
+// Treat that single field as observed state rather than a cross-collector
+// identity mismatch; every other governed metadata field remains exact.
+const OBSERVED_METADATA_PARITY_FIELDS: [&str; 1] = ["orderPriceMinTickSize"];
 
 #[derive(Debug, Clone)]
 pub struct ShadowParityConfig {
@@ -412,6 +417,30 @@ fn metadata_contract(value: &Value) -> Result<Value> {
         "retrieved_at": retrieved_at,
         "market": raw,
     }))
+}
+
+fn metadata_parity_contract(contract: &Value) -> Result<Value> {
+    let mut comparable = contract.clone();
+    let market = comparable
+        .get_mut("market")
+        .and_then(Value::as_object_mut)
+        .context("metadata contract has no market object")?;
+    market.retain(|field, _| !OBSERVED_METADATA_PARITY_FIELDS.contains(&field.as_str()));
+    Ok(comparable)
+}
+
+fn metadata_parity_map(metadata: &BTreeMap<String, Value>) -> Result<BTreeMap<String, Value>> {
+    metadata
+        .iter()
+        .map(|(market_id, contract)| {
+            Ok((
+                market_id.clone(),
+                metadata_parity_contract(contract).with_context(|| {
+                    format!("metadata {market_id} has no comparable parity contract")
+                })?,
+            ))
+        })
+        .collect()
 }
 
 fn metadata_map(
@@ -800,9 +829,13 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
 
     let legacy_metadata = metadata_map(&legacy_rows, config.started_at_unix, config.ended_at_unix)?;
     let rust_metadata = metadata_map(&rust_rows, config.started_at_unix, config.ended_at_unix)?;
+    let legacy_metadata_parity = metadata_parity_map(&legacy_metadata)?;
+    let rust_metadata_parity = metadata_parity_map(&rust_metadata)?;
     let legacy_metadata_ids = map_ids(&legacy_metadata);
     let rust_metadata_ids = map_ids(&rust_metadata);
     let metadata_shared_value_mismatch_ids =
+        shared_value_mismatch_ids(&legacy_metadata_parity, &rust_metadata_parity)?;
+    let metadata_observed_value_mismatch_ids =
         shared_value_mismatch_ids(&legacy_metadata, &rust_metadata)?;
     let metadata_shared_values_match = metadata_shared_value_mismatch_ids.is_empty();
     let metadata_parity = !legacy_metadata_ids.is_empty()
@@ -842,8 +875,10 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         metadata_context_for_trades(&legacy_rows, config.ended_at_unix, &legacy_trades)?;
     let rust_trade_metadata =
         metadata_context_for_trades(&rust_rows, config.ended_at_unix, &rust_trades)?;
+    let legacy_trade_metadata_parity = metadata_parity_map(&legacy_trade_metadata)?;
+    let rust_trade_metadata_parity = metadata_parity_map(&rust_trade_metadata)?;
     let trade_metadata_shared_value_mismatch_market_ids =
-        shared_value_mismatch_ids(&legacy_trade_metadata, &rust_trade_metadata)?;
+        shared_value_mismatch_ids(&legacy_trade_metadata_parity, &rust_trade_metadata_parity)?;
     let trade_metadata_shared_values_match =
         trade_metadata_shared_value_mismatch_market_ids.is_empty();
     let legacy_trade_metadata_context_mismatch_market_ids =
@@ -934,6 +969,7 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
             "rust_only_metadata_ids": rust_metadata_ids.difference(&legacy_metadata_ids).cloned().collect::<Vec<_>>(),
             "metadata_shared_values_match": metadata_shared_values_match,
             "metadata_shared_value_mismatch_ids": metadata_shared_value_mismatch_ids,
+            "metadata_observed_value_mismatch_ids": metadata_observed_value_mismatch_ids,
             "legacy_duplicate_trade_ids": legacy_duplicates,
             "rust_duplicate_trade_ids": rust_duplicates,
             "trade_shared_values_match": trade_shared_values_match,
@@ -1348,6 +1384,35 @@ mod tests {
         let evidence = compare(&config).unwrap();
         assert_eq!(evidence["passed"], true);
         assert_eq!(evidence["checks"]["metadata_parity"], true);
+    }
+
+    #[test]
+    fn independently_polled_tick_size_is_retained_but_not_an_identity_mismatch() {
+        let (_root, config) = fixture();
+        let mut legacy_rows = fixture_rows();
+        let mut rust_rows = fixture_rows();
+        legacy_rows[0]["market"]["orderPriceMinTickSize"] = json!(0.01);
+        rust_rows[0]["market"]["orderPriceMinTickSize"] = json!(0.001);
+        write_tape(
+            &config.legacy_spool.join(ACTIVE_TAPE),
+            &legacy_rows,
+            "1970-01-01T00:03:20Z",
+        );
+        write_tape(
+            &config
+                .rust_spool
+                .join("market-updates.19700101T000400000000.ndjson"),
+            &rust_rows,
+            "1970-01-01T00:03:20Z",
+        );
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(evidence["checks"]["metadata_parity"], true);
+        assert_eq!(
+            evidence["metrics"]["metadata_observed_value_mismatch_ids"],
+            json!(["market-BTCUSDT"])
+        );
     }
 
     #[test]

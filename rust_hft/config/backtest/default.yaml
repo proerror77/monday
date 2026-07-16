@@ -4,13 +4,16 @@ data:
   tick_size: 0.5
   lot_size: 0.01
   max_depth_levels: 20
+  manifest_path: data/backtest/sample.manifest.json
+  manifest_sha256: f4f1c30fd7bb6317c6c8f482b23adbcb3a530b64bf82fcfbef7c905f5095cff8
+  require_sequence: true
 
 strategy:
   liquidity_window_secs: 900    # ΔT = 15 分鐘
   breakout_window_secs: 5       # Δt = 5 秒
   price_delta_ticks: 2
-  volume_factor: 1.0
-  cvd_threshold: 80.0
+  volume_factor: 0.0       # LOB-only manifest: trade-flow gate disabled explicitly
+  cvd_threshold: 0.0       # LOB-only manifest: CVD gate disabled explicitly
   ofi_threshold: 50.0
   support_count: 3
   resistance_count: 3
@@ -22,6 +25,8 @@ execution:
   stop_loss_ticks: 8.0
   take_profit_ticks: 12.0
   hold_secs: 600.0
+  fee_bps: 10.0
+  max_fill_ratio: 0.1
 
 risk:
   inventory_limit: 0.1
@@ -32,4 +37,3 @@ output:
   trades_csv: backtest_trades.csv
   summary_csv: backtest_summary.csv
   metrics_json: backtest_metrics.json
-

@@ -881,6 +881,22 @@ impl SystemRuntime {
                         self.engine.lock().await.register_event_consumer(consumer);
                     }
                 }
+                VenueType::BinancePrediction => {
+                    #[cfg(feature = "adapter-binance-prediction-data")]
+                    {
+                        let config = parse_binance_prediction_market_config(
+                            &venue_type,
+                            venue_cfg.as_ref(),
+                        )?;
+                        let stream =
+                            adapter_binance_prediction_data::BinancePredictionMarketStream::new(
+                                config,
+                            )?;
+                        let consumer = bridge.bridge_instrument_stream(stream, instruments).await?;
+                        self.engine.lock().await.register_event_consumer(consumer);
+                        info!("Binance Prediction REST order books bridged into the engine");
+                    }
+                }
                 VenueType::Bybit => {
                     #[cfg(feature = "adapter-bybit-data")]
                     {
@@ -1452,6 +1468,38 @@ impl SystemRuntime {
         self.portfolio_manager.as_ref()
     }
     // Legacy 方法已移至 runtime_management 模組
+}
+
+#[cfg(feature = "adapter-binance-prediction-data")]
+fn parse_binance_prediction_market_config(
+    venue: &VenueType,
+    venue_cfg: Option<&VenueConfig>,
+) -> HftResult<adapter_binance_prediction_data::BinancePredictionMarketDataConfig> {
+    if *venue != VenueType::BinancePrediction {
+        return Err(HftError::Config(
+            "Binance Prediction market config was requested for another venue".to_string(),
+        ));
+    }
+    let venue_cfg = venue_cfg.ok_or_else(|| {
+        HftError::Config("Binance Prediction market data requires venue config".to_string())
+    })?;
+    let mut config: adapter_binance_prediction_data::BinancePredictionMarketDataConfig = venue_cfg
+        .data_config
+        .clone()
+        .ok_or_else(|| {
+            HftError::Config(
+                "Binance Prediction market data requires data_config.outcomes".to_string(),
+            )
+        })
+        .and_then(|value| {
+            serde_yaml::from_value(value).map_err(|error| HftError::Config(error.to_string()))
+        })?;
+    config.api_key = venue_cfg.api_key.clone().unwrap_or_default();
+    config.api_secret = venue_cfg.secret.clone().unwrap_or_default();
+    if let Some(rest) = &venue_cfg.rest {
+        config.rest_base_url = rest.clone();
+    }
+    Ok(config)
 }
 
 #[cfg(feature = "adapter-binance-data")]
