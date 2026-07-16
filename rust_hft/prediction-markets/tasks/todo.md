@@ -41,7 +41,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Promote snapshot, prediction LoopRun, and event evaluator to precompiled
   Monday binaries; remove runtime `cargo run --example` and research-policy
   coupling to the legacy OMS/runtime workspace.
-- [ ] Route snapshot and mission transport through `alpha-harness prediction`,
+- [x] Route snapshot and mission transport through `alpha-harness prediction`,
   including signed inputs, outer hashes, safe ZIP extraction, immutable result
   publication, and cross-Job paused-state resume.
 - [ ] Build the binaries into the shared Monday research image and validate the
