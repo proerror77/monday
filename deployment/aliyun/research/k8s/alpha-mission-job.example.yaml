@@ -9,7 +9,8 @@ metadata:
     app.kubernetes.io/name: monday-alpha-mission
     app.kubernetes.io/part-of: monday
 spec:
-  backoffLimit: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
   ttlSecondsAfterFinished: 86400
   template:
     metadata:

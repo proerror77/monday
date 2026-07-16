@@ -192,7 +192,7 @@ Build once for each source revision:
 docker buildx build \
   --platform linux/amd64 \
   --file rust_hft/deployment/docker/Dockerfile.research \
-  --tag REPLACE_REGISTRY/monday-research:REPLACE_GIT_SHA \
+  --tag REPLACE_REGISTRY/research-runner:REPLACE_GIT_SHA \
   --push \
   rust_hft
 ```
@@ -238,17 +238,39 @@ ext4 filesystem, mount it at `/build-cache`, and persist its UUID in
 `/etc/fstab`. On later builders, attach and mount the existing filesystem; do
 not format it again.
 
-The image contains three stable entrypoints:
+The image contains six stable entrypoints:
 
 - `/usr/local/bin/hft-backtest`
 - `/usr/local/bin/alpha-harness`
 - `/usr/local/bin/lob-pit-materializer`
+- `/usr/local/bin/monday-prediction-research`
+- `/usr/local/bin/monday-prediction-evaluator`
+- `/usr/local/bin/monday-prediction-snapshot`
 
 `k8s/alpha-mission-job.example.yaml` runs one MCTS or Bayesian mission against a
 pre-materialized PIT feature file. The one-time signed OSS URLs belong in a
 Kubernetes Secret and must never be committed. Use distinct DuckDB files and
 result objects per parallel Mission; a later single-writer aggregator may merge
 their immutable evidence.
+
+`k8s/prediction-mission-job.example.yaml` uses the same image, restricted Pod
+security context, signed-URL input transport, and immutable result upload for one
+event-settlement mission. Its evaluator remains the prediction-specific
+event-disjoint binary and the Job contains no exchange credential or execution
+entrypoint. Missions that use an LLM receive only the
+`MONDAY_PREDICTION_LLM_BASE_URL`, `MONDAY_PREDICTION_LLM_MODEL`,
+`MONDAY_PREDICTION_LLM_API_KEY`, and `MONDAY_PREDICTION_LLM_PROVIDER`
+variables from the dedicated LLM Secret. The base URL must be reachable through
+the VPC, and every non-loopback endpoint must use HTTPS; a public LLM endpoint is
+not reachable from the private worker pool.
+
+The URL Secret must always contain `resume-url` and `resume-sha256`; set both to
+empty strings for the first attempt. A paused or failed runner still uploads its
+results and append-only state to the attempt's immutable result URL before the
+Job fails. To resume a paused run, create a new Job and a new result PUT URL,
+then set `resume-url` and `resume-sha256` to the previous result bundle. The
+harness restores only the bundle's `results/` state and the prediction LoopRun
+revalidates its mission, policy, and snapshot identity before continuing.
 
 ACK research workers are private and have no public NAT path. Sign feature,
 materialization, and result URLs against the regional internal OSS endpoint
@@ -260,9 +282,14 @@ terminal state.
 
 Treat Kubernetes completion as transport evidence only. Read `bundle_sha256`
 from the Job's final JSON log, download the immutable result object, verify that
-SHA-256 and `unzip -t`, then confirm every walk-forward record reports
-`purged-walk-forward-v3`. A complete result may legitimately contain zero
-sealed evaluations when no candidate passes walk-forward.
+SHA-256 and `unzip -t`. For a continuous Mission, confirm every walk-forward
+record reports `purged-walk-forward-v3`; a complete result may legitimately
+contain zero sealed evaluations when no candidate passes. For a prediction
+Mission, confirm `artifacts/execution-evidence.json` reports lane
+`prediction_market`, the submitted mission and snapshot SHA-256 values, and the
+mission-pinned evaluator version. A failed Job can still have a valid immutable
+evidence bundle; use its runner exit code and LoopRun ledger to distinguish a
+resumable pause from a terminal failure.
 
 Run many parameter batches without rebuilding:
 

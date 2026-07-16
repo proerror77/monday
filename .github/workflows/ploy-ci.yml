@@ -5,11 +5,17 @@ on:
     branches: [main]
     paths:
       - "rust_hft/prediction-markets/**"
+      - "rust_hft/alpha-harness/**"
+      - "rust_hft/deployment/docker/Dockerfile.research"
+      - "deployment/aliyun/research/**"
       - ".github/workflows/ploy-ci.yml"
   push:
     branches: [main]
     paths:
       - "rust_hft/prediction-markets/**"
+      - "rust_hft/alpha-harness/**"
+      - "rust_hft/deployment/docker/Dockerfile.research"
+      - "deployment/aliyun/research/**"
       - ".github/workflows/ploy-ci.yml"
   workflow_dispatch:
 
@@ -72,6 +78,39 @@ jobs:
       - name: Run actionlint
         run: >-
           "${HOME}/go/bin/actionlint" -color ../../.github/workflows/ploy-ci.yml
+
+  research-image-smoke:
+    name: Research image smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the unified research image
+        uses: docker/build-push-action@v7
+        with:
+          context: rust_hft
+          file: rust_hft/deployment/docker/Dockerfile.research
+          load: true
+          tags: monday-research-smoke:local
+          cache-from: type=gha,scope=prediction-research-image
+          cache-to: type=gha,mode=max,scope=prediction-research-image
+
+      - name: Probe precompiled prediction entrypoints
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --entrypoint /usr/local/bin/monday-prediction-research \
+            monday-research-smoke:local \
+            --print-policy-snapshot-id | grep -Eq '^sha256:[0-9a-f]{64}$'
+          docker run --rm \
+            --entrypoint /usr/local/bin/alpha-harness \
+            monday-research-smoke:local \
+            prediction --help
 
   rust-format:
     name: Rust formatting
