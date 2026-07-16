@@ -632,6 +632,25 @@ fn open_append(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+#[cfg(target_os = "linux")]
+fn release_clean_file_cache(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // cgroup v2 charges clean tape pages to the service's memory.current.
+    // SAFETY: `file` owns a valid descriptor for the duration of this call.
+    let result = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result))
+            .context("could not release clean tape pages");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn release_clean_file_cache(_file: &File) -> Result<()> {
+    Ok(())
+}
+
 struct TapeWriter {
     spool_dir: PathBuf,
     active: PathBuf,
@@ -774,6 +793,7 @@ impl TapeWriter {
                 self.sequence += 1;
             }
             sync(file)?;
+            release_clean_file_cache(file)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -1334,8 +1354,8 @@ impl ReferenceCollector {
         if !self.writer.active.exists() {
             return Ok(());
         }
-        let reader = BufReader::new(open_read_regular(&self.writer.active)?);
-        for line in reader.split(b'\n') {
+        let mut reader = BufReader::new(open_read_regular(&self.writer.active)?);
+        for line in (&mut reader).split(b'\n') {
             let line = line?;
             if line.is_empty() {
                 continue;
@@ -1391,6 +1411,7 @@ impl ReferenceCollector {
                 }
             }
         }
+        release_clean_file_cache(reader.get_ref())?;
         Ok(())
     }
 
@@ -3095,6 +3116,19 @@ mod tests {
             )
             .unwrap();
         assert!(!writer.needs_hour_context(now));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clean_page_cache_advice_accepts_active_tape() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(&[json!({"kind": "market_metadata"})], now)
+            .unwrap();
+
+        release_clean_file_cache(writer.file.as_ref().unwrap()).unwrap();
     }
 
     #[test]
