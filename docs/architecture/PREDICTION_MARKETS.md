@@ -76,9 +76,11 @@ lab-only Formula proposer for derivatives missions. The prediction-market module
 `prediction_research_mission.v1` JSON brief and its existing `LlmPriorSpec`; it
 does not import the alpha-harness Rust domain or loop runtime. Instead, the module has
 its own bounded Rust prediction-research LoopRun in `crates/ploy-research`, with
-`prediction_research_loop` as its CLI example, because an event settlement loop
-cannot reuse the derivatives return/IC state machine. No compatibility script is
-an authoritative prediction LoopRun or promotion surface. Standalone formula
+`monday-prediction-research` as its precompiled process entrypoint, because an
+event settlement loop cannot reuse the derivatives return/IC state machine.
+`alpha-harness prediction` owns only the shared Monday transport, evidence, and
+resume envelope around that process. No compatibility script is an authoritative
+prediction LoopRun or promotion surface. Standalone formula
 mutations may carry a falsifiable hypothesis and compile through AutoFactor as
 IC/ICIR diagnostics, but the prediction LoopRun accepts only typed
 probability-blend candidates. Those candidates enter the module's

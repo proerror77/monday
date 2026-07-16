@@ -1,4 +1,7 @@
-use crate::{data_mission, governance, loop_control, mission, mission_runner, prediction_snapshot};
+use crate::{
+    data_mission, governance, loop_control, mission, mission_runner, prediction_runner,
+    prediction_snapshot,
+};
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
 };
@@ -88,7 +91,29 @@ enum DataCommand {
 
 #[derive(Debug, Subcommand)]
 enum PredictionCommand {
+    Execute(PredictionExecuteArgs),
     Snapshot(PredictionSnapshotArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PredictionExecuteArgs {
+    #[arg(long)]
+    pub work_dir: PathBuf,
+    #[arg(long)]
+    pub mission_url: String,
+    #[arg(long)]
+    pub mission_sha256: String,
+    #[arg(long)]
+    pub snapshot_url: String,
+    #[arg(long)]
+    pub snapshot_sha256: String,
+    /// Prior immutable prediction result bundle for a paused LoopRun.
+    #[arg(long, requires = "resume_sha256")]
+    pub resume_url: Option<String>,
+    #[arg(long, requires = "resume_url")]
+    pub resume_sha256: Option<String>,
+    #[arg(long)]
+    pub result_put_url: String,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -557,6 +582,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         },
         Command::Prediction { command } => match command {
+            PredictionCommand::Execute(args) => prediction_runner::execute(args),
             PredictionCommand::Snapshot(args) => prediction_snapshot::snapshot(args),
         },
         Command::Candidate { command } => match command {
@@ -674,6 +700,28 @@ mod tests {
             "BTCUSDT",
             "--artifact-dir",
             "artifacts",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "prediction",
+            "execute",
+            "--work-dir",
+            "work",
+            "--mission-url",
+            "mission.json",
+            "--mission-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--snapshot-url",
+            "snapshot.zip",
+            "--snapshot-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--resume-url",
+            "previous-results.zip",
+            "--resume-sha256",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "--result-put-url",
+            "results.zip",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
