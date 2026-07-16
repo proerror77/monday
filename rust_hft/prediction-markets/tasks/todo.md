@@ -56,6 +56,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Gate prediction OOS evidence with Brier score, log loss, calibration error, settlement PnL, and event-level capacity.
 - [x] Route typed probability-blend candidates into the prediction evaluator and emit candidate-specific loop feedback.
 - [x] Add separate governed BTC and SOL five-minute mission templates; reject mixed-symbol missions and unresolved provenance.
+- [x] Pin a canonical reviewed Linux prediction-policy graph and fail closed when its lockfile or policy path-manifest inputs change; preserve package, checksum, and feature evidence, exclude host/proc-macro runtime dependencies, then pin the v5 identity in both mission templates.
 - [x] Add a resumable Monday prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
 - [x] Implement the complete authoritative prediction LoopRun and tests in `ploy-research` Rust without introducing a Python runner; retire the Binance-to-opening-reference backfill helper.
 - [x] Recompute terminal provisional models from typed Brier, log-loss, ECE, settlement-PnL, and conservative-capacity metrics recorded in append-only feedback; require a separate sealed snapshot for final keep.

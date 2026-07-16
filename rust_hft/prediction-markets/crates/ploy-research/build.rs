@@ -1,43 +1,40 @@
-use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 const POLICY_TARGET: &str = "x86_64-unknown-linux-gnu";
+const POLICY_GRAPH_SCHEMA: &str = "prediction-policy-dependencies.v5";
+const POLICY_GRAPH_FILE: &str = "prediction-policy-dependencies.linux.txt";
+const CANONICAL_POLICY_DEPENDENCY_HASH_FILE: &str = "prediction-policy-dependencies.linux.sha256";
+const POLICY_INPUTS: [(&str, &str); 6] = [
+    ("Cargo.lock", "Cargo.lock"),
+    ("Cargo.toml", "Cargo.toml"),
+    (
+        "crates/ploy-research/Cargo.toml",
+        "crates/ploy-research/Cargo.toml",
+    ),
+    (
+        "crates/ploy-feed-loaders/Cargo.toml",
+        "crates/ploy-feed-loaders/Cargo.toml",
+    ),
+    (
+        "crates/ploy-market-contracts/Cargo.toml",
+        "crates/ploy-market-contracts/Cargo.toml",
+    ),
+    (
+        "crates/ploy-market-data/Cargo.toml",
+        "crates/ploy-market-data/Cargo.toml",
+    ),
+];
 const FORBIDDEN_RUNTIME_PACKAGES: [&str; 3] = [
     "ploy-operator-contracts",
     "ploy-strategy-bundles",
     "ploy-trading",
 ];
-
-#[derive(Deserialize)]
-struct Metadata {
-    packages: Vec<Package>,
-}
-
-#[derive(Deserialize)]
-struct Package {
-    name: String,
-    version: String,
-    source: Option<String>,
-    manifest_path: PathBuf,
-}
-
-#[derive(Deserialize)]
-struct Lockfile {
-    package: Vec<LockPackage>,
-}
-
-#[derive(Deserialize)]
-struct LockPackage {
-    name: String,
-    version: String,
-    source: Option<String>,
-    checksum: Option<String>,
-}
+const EXCLUDED_HOST_OR_PROC_MACRO_PACKAGES: [&str; 3] =
+    ["core-foundation-sys", "security-framework", "sqlx-macros"];
 
 fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
@@ -46,178 +43,158 @@ fn main() {
         .parent()
         .and_then(Path::parent)
         .expect("ploy-research must remain under <workspace>/crates");
-    println!(
-        "cargo:rerun-if-changed={}",
-        workspace_dir.join("Cargo.toml").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        workspace_dir.join("Cargo.lock").display()
-    );
+    let graph_path = manifest_dir.join(POLICY_GRAPH_FILE);
+    let canonical_hash_path = manifest_dir.join(CANONICAL_POLICY_DEPENDENCY_HASH_FILE);
+    println!("cargo:rerun-if-changed={}", graph_path.display());
+    println!("cargo:rerun-if-changed={}", canonical_hash_path.display());
+    for (_, relative_path) in POLICY_INPUTS {
+        println!(
+            "cargo:rerun-if-changed={}",
+            workspace_dir.join(relative_path).display()
+        );
+    }
 
-    let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .current_dir(&manifest_dir)
-        .args([
-            "metadata",
-            "--manifest-path",
-            "Cargo.toml",
-            "--format-version",
-            "1",
-            "--locked",
-            "--features",
-            "db",
-        ])
-        .output()
-        .expect("run cargo metadata for the governed prediction policy profile");
-    if !output.status.success() {
+    let graph = fs::read_to_string(&graph_path).unwrap_or_else(|error| {
         panic!(
-            "cargo metadata failed for the governed prediction policy profile: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "read checked-in Linux policy dependency graph {}: {error}",
+            graph_path.display()
+        )
+    });
+    validate_checked_in_graph(&graph, workspace_dir);
+
+    let canonical_hash = read_canonical_dependency_hash(&canonical_hash_path);
+    let graph_hash = dependency_fingerprint_hash(&graph);
+    if canonical_hash != graph_hash {
+        panic!(
+            "checked-in Linux prediction-policy dependency graph hash {graph_hash} does not match {}; regenerate both reviewed policy graph artifacts together",
+            canonical_hash_path.display()
         );
     }
-    let metadata: Metadata = serde_json::from_slice(&output.stdout)
-        .expect("parse cargo metadata for the governed prediction policy profile");
-    let tree_output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .current_dir(&manifest_dir)
-        .args([
-            "tree",
-            "--manifest-path",
-            "Cargo.toml",
-            "--locked",
-            "--features",
-            "db",
-            "--target",
-            POLICY_TARGET,
-            "--edges",
-            "normal,build",
-            "--prefix",
-            "none",
-            "--format",
-            "{p}\t{f}",
-        ])
-        .output()
-        .expect("run cargo tree for the governed prediction policy profile");
-    if !tree_output.status.success() {
-        panic!(
-            "cargo tree failed for the governed prediction policy profile: {}",
-            String::from_utf8_lossy(&tree_output.stderr)
-        );
-    }
-    let lockfile: Lockfile = toml::from_str(
-        &fs::read_to_string(workspace_dir.join("Cargo.lock"))
-            .expect("read Cargo.lock for the governed prediction policy profile"),
-    )
-    .expect("parse Cargo.lock for the governed prediction policy profile");
-    let fingerprint = normalized_active_graph(
-        &metadata,
-        &lockfile,
-        &String::from_utf8(tree_output.stdout).expect("cargo tree output must be UTF-8"),
-    )
-    .expect("normalize governed prediction policy dependency graph");
+
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     fs::write(
-        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("prediction-policy-dependencies.txt"),
-        fingerprint,
+        out_dir.join("prediction-policy-dependencies.txt"),
+        format!("{canonical_hash}\n"),
     )
-    .expect("write governed prediction policy dependency fingerprint");
+    .expect("write canonical governed prediction policy dependency hash");
+}
 
-    for package in &metadata.packages {
-        if package.source.is_none() && package.manifest_path.starts_with(workspace_dir) {
-            println!("cargo:rerun-if-changed={}", package.manifest_path.display());
+pub(crate) fn validate_checked_in_graph(graph: &str, workspace_dir: &Path) {
+    let mut lines = graph.lines();
+    let headers = [
+        POLICY_GRAPH_SCHEMA.to_owned(),
+        format!("target={POLICY_TARGET}"),
+        "profile=default,db".to_owned(),
+    ];
+    for expected in headers {
+        let actual = lines.next().unwrap_or_else(|| {
+            panic!("checked-in Linux policy dependency graph is missing {expected}")
+        });
+        if actual != expected {
+            panic!(
+                "checked-in Linux policy dependency graph expected {expected:?}, found {actual:?}"
+            );
         }
+    }
+    for (label, relative_path) in POLICY_INPUTS {
+        let expected = format!(
+            "input:{label}={}",
+            sha256_file(&workspace_dir.join(relative_path))
+        );
+        let actual = lines.next().unwrap_or_else(|| {
+            panic!("checked-in Linux policy dependency graph is missing {expected}")
+        });
+        if actual != expected {
+            panic!(
+                "checked-in Linux policy dependency graph input {label} is stale: expected {expected:?}, found {actual:?}; regenerate the reviewed graph"
+            );
+        }
+    }
+
+    let mut package_count = 0usize;
+    let mut has_sqlx_postgres = false;
+    let mut sqlx_has_postgres_feature = false;
+    for line in lines {
+        let package = line.strip_prefix("package:").unwrap_or_else(|| {
+            panic!("checked-in Linux policy dependency graph has invalid line {line:?}")
+        });
+        let (package_id, fields) = package.split_once('|').unwrap_or_else(|| {
+            panic!("checked-in Linux policy dependency graph has invalid package {line:?}")
+        });
+        let (name, version) = package_id.split_once('@').unwrap_or_else(|| {
+            panic!("checked-in Linux policy dependency graph has invalid package id {package_id:?}")
+        });
+        if name.is_empty()
+            || version.is_empty()
+            || !fields.starts_with("source=")
+            || !fields.contains("|checksum=")
+            || !fields.contains("|features=")
+        {
+            panic!("checked-in Linux policy dependency graph has invalid package {line:?}");
+        }
+        if FORBIDDEN_RUNTIME_PACKAGES.contains(&name) {
+            panic!("checked-in Linux policy dependency graph includes runtime authority {name}");
+        }
+        if EXCLUDED_HOST_OR_PROC_MACRO_PACKAGES.contains(&name) {
+            panic!(
+                "checked-in Linux policy dependency graph includes host or proc-macro dependency {name}"
+            );
+        }
+        if name == "sqlx-sqlite" {
+            panic!("checked-in Linux policy dependency graph includes sqlx-sqlite");
+        }
+        has_sqlx_postgres |= name == "sqlx-postgres";
+        if name == "sqlx" {
+            let features = fields
+                .split_once("|features=")
+                .map(|(_, features)| features)
+                .expect("validated sqlx package must include features");
+            sqlx_has_postgres_feature |= features.split(',').any(|feature| feature == "postgres");
+        }
+        package_count += 1;
+    }
+    if package_count == 0 {
+        panic!("checked-in Linux policy dependency graph has no packages");
+    }
+    if !has_sqlx_postgres || !sqlx_has_postgres_feature {
+        panic!(
+            "checked-in Linux policy dependency graph must retain the PostgreSQL sqlx runtime profile"
+        );
     }
 }
 
-fn normalized_active_graph(
-    metadata: &Metadata,
-    lockfile: &Lockfile,
-    tree: &str,
-) -> Result<String, String> {
-    let mut packages = BTreeMap::<(&str, &str), Vec<&Package>>::new();
-    for package in &metadata.packages {
-        packages
-            .entry((package.name.as_str(), package.version.as_str()))
-            .or_default()
-            .push(package);
-    }
-    let checksums = lockfile
-        .package
-        .iter()
-        .map(|package| {
-            (
-                (
-                    package.name.as_str(),
-                    package.version.as_str(),
-                    package.source.as_deref().unwrap_or("path"),
-                ),
-                package.checksum.as_deref().unwrap_or("none"),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut normalized_packages = BTreeSet::new();
-    let mut selected_names = BTreeSet::new();
-    for line in tree.lines().filter(|line| !line.trim().is_empty()) {
-        let line = line.strip_suffix(" (*)").unwrap_or(line);
-        let (display, features) = line
-            .split_once('\t')
-            .ok_or_else(|| format!("cargo tree line has no feature delimiter: {line}"))?;
-        let mut display_parts = display.split_whitespace();
-        let name = display_parts
-            .next()
-            .ok_or_else(|| format!("cargo tree line has no package name: {line}"))?;
-        let version = display_parts
-            .next()
-            .and_then(|value| value.strip_prefix('v'))
-            .ok_or_else(|| format!("cargo tree line has no package version: {line}"))?;
-        let candidates = packages
-            .get(&(name, version))
-            .ok_or_else(|| format!("cargo metadata has no package for {name}@{version}"))?;
-        let package = match candidates.as_slice() {
-            [package] => *package,
-            _ => {
-                return Err(format!(
-                    "cargo metadata package identity is ambiguous for {name}@{version}"
-                ))
-            }
-        };
-        let source = package.source.as_deref().unwrap_or("path");
-        let checksum = checksums
-            .get(&(package.name.as_str(), package.version.as_str(), source))
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "Cargo.lock is missing {}@{} from {source}",
-                    package.name, package.version
-                )
-            })?;
-        let mut features = features
-            .split(',')
-            .filter(|feature| !feature.is_empty())
-            .collect::<Vec<_>>();
-        features.sort();
-        selected_names.insert(package.name.as_str());
-        normalized_packages.insert(format!(
-            "{}@{}|source={}|checksum={}|features={}",
-            package.name,
-            package.version,
-            source,
-            checksum,
-            features.join(",")
-        ));
-    }
-    for forbidden in FORBIDDEN_RUNTIME_PACKAGES {
-        if selected_names.contains(forbidden) {
-            return Err(format!(
-                "governed prediction policy graph includes runtime authority {forbidden}"
-            ));
-        }
-    }
+fn sha256_file(path: &Path) -> String {
+    let bytes = fs::read(path)
+        .unwrap_or_else(|error| panic!("read policy dependency input {}: {error}", path.display()));
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
 
-    let mut output =
-        format!("prediction-policy-dependencies.v2\ntarget={POLICY_TARGET}\nprofile=default,db\n");
-    for package in normalized_packages {
-        output.push_str("package:");
-        output.push_str(&package);
-        output.push('\n');
+fn read_canonical_dependency_hash(path: &Path) -> String {
+    let value = fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "read canonical Linux policy dependency hash {}: {error}",
+            path.display()
+        )
+    });
+    let value = value.trim();
+    if !is_sha256_id(value) {
+        panic!(
+            "canonical Linux policy dependency hash {} must contain one sha256:<64 lowercase hexadecimal characters> value",
+            path.display()
+        );
     }
-    Ok(output)
+    value.to_owned()
+}
+
+fn dependency_fingerprint_hash(fingerprint: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(fingerprint))
+}
+
+fn is_sha256_id(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }

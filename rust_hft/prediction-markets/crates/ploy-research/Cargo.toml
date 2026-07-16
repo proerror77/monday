@@ -52,9 +52,7 @@ rust_decimal_macros.workspace = true
 tempfile.workspace = true
 
 [build-dependencies]
-serde.workspace = true
-serde_json.workspace = true
-toml.workspace = true
+sha2.workspace = true
 
 [[example]]
 name = "event_dataset_baseline"
