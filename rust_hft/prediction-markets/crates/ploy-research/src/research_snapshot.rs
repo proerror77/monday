@@ -15,7 +15,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[cfg(any(feature = "db", test))]
 use crate::factors::normalized_underlying_symbol;
 use crate::{DeribitFeatureSnapshot, FactorObservation, ResearchPmBookSnapshot};
 
@@ -297,6 +296,18 @@ pub fn validate_prediction_research_snapshot(snapshot: &ResearchSnapshot) -> Res
     }
     crate::prediction_loop::validate_prediction_snapshot_sources(manifest)
         .map_err(|error| anyhow::anyhow!("prediction snapshot source eligibility: {error}"))?;
+    let [symbol] = manifest.symbols.as_slice() else {
+        anyhow::bail!("prediction snapshot must be isolated to exactly one BTC or SOL underlying");
+    };
+    let underlying = normalized_underlying_symbol(symbol);
+    if !matches!(underlying.as_str(), "BTC" | "SOL") {
+        anyhow::bail!("prediction snapshot must be isolated to exactly one BTC or SOL underlying");
+    }
+    crate::prediction_loop::validate_prediction_snapshot_coverage_for_underlying(
+        snapshot,
+        &underlying,
+    )
+    .map_err(|error| anyhow::anyhow!("prediction snapshot coverage eligibility: {error}"))?;
     Ok(())
 }
 
