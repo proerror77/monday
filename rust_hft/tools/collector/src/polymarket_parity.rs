@@ -26,7 +26,11 @@ const KINDS: [&str; 3] = ["market_metadata", "polymarket_trade", "market_settlem
 // independently scheduled retrieval timestamps.
 const SETTLEMENT_EVENT_LOOKBACK_SECONDS: i64 = 900;
 const SETTLEMENT_MATURITY_LAG_SECONDS: i64 = 600;
-const METADATA_CONTRACT_FIELDS: [&str; 23] = [
+// Trade APIs are eventually consistent and the two collectors poll on
+// independent schedules. Keep the full retrieval cutoff, but compare only
+// trades whose event time is mature enough to have appeared in both lanes.
+const TRADE_MATURITY_LAG_SECONDS: i64 = 600;
+const METADATA_CONTRACT_FIELDS: [&str; 17] = [
     "id",
     "conditionId",
     "question",
@@ -43,13 +47,7 @@ const METADATA_CONTRACT_FIELDS: [&str; 23] = [
     "makerBaseFee",
     "takerBaseFee",
     "feesEnabled",
-    "active",
-    "closed",
-    "acceptingOrders",
-    "enableOrderBook",
     "negRisk",
-    "umaEndDate",
-    "umaEndDateIso",
 ];
 
 #[derive(Debug, Clone)]
@@ -309,6 +307,21 @@ fn required_text<'a>(object: &'a Map<String, Value>, field: &str, label: &str) -
         .ok_or_else(|| anyhow!("{label} {field} is empty"))
 }
 
+fn required_f64(object: &Map<String, Value>, field: &str, label: &str) -> Result<f64> {
+    object
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow!("{label} {field} is missing or not a finite number"))
+}
+
+fn required_bool(object: &Map<String, Value>, field: &str, label: &str) -> Result<bool> {
+    object
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("{label} {field} is missing or not a boolean"))
+}
+
 fn metadata_contract(value: &Value) -> Result<Value> {
     let update = value
         .as_object()
@@ -339,6 +352,23 @@ fn metadata_contract(value: &Value) -> Result<Value> {
     {
         bail!("metadata wrapper IDs contradict the embedded market");
     }
+    let tick_size = required_f64(market, "orderPriceMinTickSize", "metadata market")?;
+    let minimum_size = required_f64(market, "orderMinSize", "metadata market")?;
+    let fees_enabled = required_bool(market, "feesEnabled", "metadata market")?;
+    required_bool(market, "negRisk", "metadata market")?;
+    if !(0.0 < tick_size && tick_size <= 1.0) {
+        bail!("metadata market orderPriceMinTickSize is outside (0, 1]");
+    }
+    if minimum_size <= 0.0 {
+        bail!("metadata market orderMinSize must be positive");
+    }
+    for field in ["makerBaseFee", "takerBaseFee"] {
+        match market.get(field) {
+            Some(Value::Null) | None if !fees_enabled => {}
+            _ if required_f64(market, field, "metadata market")? >= 0.0 => {}
+            _ => bail!("metadata market {field} must be non-negative"),
+        }
+    }
     let outcomes = normalized_array(market.get("outcomes"), "outcomes")?;
     let token_ids = normalized_array(market.get("clobTokenIds"), "clobTokenIds")?;
     for (label, values) in [("outcomes", &outcomes), ("token IDs", &token_ids)] {
@@ -357,6 +387,10 @@ fn metadata_contract(value: &Value) -> Result<Value> {
 
     let mut raw = Map::new();
     for field in METADATA_CONTRACT_FIELDS {
+        if matches!(field, "makerBaseFee" | "takerBaseFee") && !fees_enabled {
+            raw.insert(field.to_owned(), Value::Null);
+            continue;
+        }
         let Some(field_value) = market.get(field) else {
             continue;
         };
@@ -448,18 +482,22 @@ fn digest_values<'a>(values: impl Iterator<Item = &'a Value>) -> Result<String> 
 fn trade_map(
     rows: &[TapeRow],
     started_at: i64,
-    ended_at: i64,
+    event_ended_at: i64,
+    recorded_ended_at: i64,
 ) -> Result<(BTreeMap<String, Value>, Vec<String>)> {
     let mut result = BTreeMap::new();
     let mut counts = BTreeMap::<String, u64>::new();
-    for row in rows.iter().filter(|row| row.recorded_at <= ended_at) {
+    for row in rows
+        .iter()
+        .filter(|row| row.recorded_at <= recorded_ended_at)
+    {
         if row.update["kind"] != "polymarket_trade" {
             continue;
         }
         let Some(timestamp) = row.update.get("trade_ts_unix").and_then(Value::as_i64) else {
             bail!("trade has an invalid trade_ts_unix");
         };
-        if !(started_at..=ended_at).contains(&timestamp) {
+        if !(started_at..=event_ended_at).contains(&timestamp) {
             continue;
         }
         let update = row
@@ -482,6 +520,33 @@ fn trade_map(
         .filter_map(|(identity, count)| (count > 1).then_some(identity))
         .collect();
     Ok((result, duplicates))
+}
+
+fn metadata_context_for_trades(
+    rows: &[TapeRow],
+    ended_at: i64,
+    trades: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>> {
+    let required_ids = trades
+        .values()
+        .filter_map(|trade| trade.get("market_id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let mut result = BTreeMap::new();
+    for row in rows.iter().filter(|row| row.recorded_at <= ended_at) {
+        if row.update["kind"] != "market_metadata" {
+            continue;
+        }
+        let market_id = row
+            .update
+            .get("market_id")
+            .and_then(Value::as_str)
+            .filter(|market_id| required_ids.contains(market_id));
+        let Some(market_id) = market_id else {
+            continue;
+        };
+        result.insert(market_id.to_owned(), metadata_contract(&row.update)?);
+    }
+    Ok(result)
 }
 
 fn settlement_map(
@@ -580,29 +645,33 @@ fn map_ids(values: &BTreeMap<String, Value>) -> BTreeSet<String> {
     values.keys().cloned().collect()
 }
 
-fn shared_values_match(
+fn shared_value_mismatch_ids(
     left: &BTreeMap<String, Value>,
     right: &BTreeMap<String, Value>,
-) -> Result<bool> {
+) -> Result<Vec<String>> {
+    let mut mismatches = Vec::new();
     for identity in map_ids(left).intersection(&map_ids(right)) {
         if canonical_bytes(&left[identity])? != canonical_bytes(&right[identity])? {
-            return Ok(false);
+            mismatches.push(identity.clone());
         }
     }
-    Ok(true)
+    Ok(mismatches)
 }
 
-fn settlements_match_metadata(
+fn settlement_metadata_context_mismatch_ids(
     settlements: &BTreeMap<String, Value>,
     metadata: &BTreeMap<String, Value>,
-) -> Result<bool> {
+) -> Result<Vec<String>> {
+    let mut mismatches = Vec::new();
     for (market_id, settlement) in settlements {
         let Some(context) = metadata.get(market_id) else {
-            return Ok(false);
+            mismatches.push(market_id.clone());
+            continue;
         };
+        let mut context_matches = true;
         for field in ["condition_id", "symbol", "market_window_secs"] {
             if settlement.get(field) != context.get(field) {
-                return Ok(false);
+                context_matches = false;
             }
         }
         let settlement_end_epoch = settlement
@@ -610,7 +679,7 @@ fn settlements_match_metadata(
             .and_then(Value::as_i64)
             .context("settlement contract has no governed market_end_epoch")?;
         if settlement_end_epoch != market_end_epoch(context, &format!("metadata {market_id}"))? {
-            return Ok(false);
+            context_matches = false;
         }
         let settlement_market = settlement["market"]
             .as_object()
@@ -622,27 +691,33 @@ fn settlements_match_metadata(
             if normalized_array(settlement_market.get(field), field)?
                 != normalized_array(metadata_market.get(field), field)?
             {
-                return Ok(false);
+                context_matches = false;
             }
         }
+        if !context_matches {
+            mismatches.push(market_id.clone());
+        }
     }
-    Ok(true)
+    Ok(mismatches)
 }
 
-fn trades_match_metadata(
+fn trade_metadata_context_mismatch_ids(
     trades: &BTreeMap<String, Value>,
     metadata: &BTreeMap<String, Value>,
-) -> Result<bool> {
+) -> Result<Vec<String>> {
+    let mut mismatches = BTreeSet::new();
     for trade in trades.values() {
         let Some(market_id) = trade.get("market_id").and_then(Value::as_str) else {
-            return Ok(false);
+            continue;
         };
         let Some(context) = metadata.get(market_id) else {
-            return Ok(false);
+            mismatches.insert(market_id.to_owned());
+            continue;
         };
+        let mut context_matches = true;
         for field in ["condition_id", "symbol", "market_window_secs"] {
             if trade.get(field) != context.get(field) {
-                return Ok(false);
+                context_matches = false;
             }
         }
         let metadata_market = context["market"]
@@ -651,20 +726,25 @@ fn trades_match_metadata(
         let tokens = normalized_array(metadata_market.get("clobTokenIds"), "clobTokenIds")?;
         let outcomes = normalized_array(metadata_market.get("outcomes"), "outcomes")?;
         let Some(outcome_index) = trade.get("outcome_index").and_then(Value::as_u64) else {
-            return Ok(false);
+            mismatches.insert(market_id.to_owned());
+            continue;
         };
         let Ok(outcome_index) = usize::try_from(outcome_index) else {
-            return Ok(false);
+            mismatches.insert(market_id.to_owned());
+            continue;
         };
         if tokens.get(outcome_index).and_then(Value::as_str)
             != trade.get("token_id").and_then(Value::as_str)
             || outcomes.get(outcome_index).and_then(Value::as_str)
                 != trade.get("outcome").and_then(Value::as_str)
         {
-            return Ok(false);
+            context_matches = false;
+        }
+        if !context_matches {
+            mismatches.insert(market_id.to_owned());
         }
     }
-    Ok(true)
+    Ok(mismatches.into_iter().collect())
 }
 
 fn required_fields_present(kind: &str, values: &BTreeMap<String, Value>) -> bool {
@@ -722,25 +802,63 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
     let rust_metadata = metadata_map(&rust_rows, config.started_at_unix, config.ended_at_unix)?;
     let legacy_metadata_ids = map_ids(&legacy_metadata);
     let rust_metadata_ids = map_ids(&rust_metadata);
-    let metadata_shared_values_match = shared_values_match(&legacy_metadata, &rust_metadata)?;
+    let metadata_shared_value_mismatch_ids =
+        shared_value_mismatch_ids(&legacy_metadata, &rust_metadata)?;
+    let metadata_shared_values_match = metadata_shared_value_mismatch_ids.is_empty();
     let metadata_parity = !legacy_metadata_ids.is_empty()
         && legacy_metadata_ids.is_subset(&rust_metadata_ids)
         && metadata_shared_values_match;
 
-    let (legacy_trades, legacy_duplicates) =
-        trade_map(&legacy_rows, config.started_at_unix, config.ended_at_unix)?;
-    let (rust_trades, rust_duplicates) =
-        trade_map(&rust_rows, config.started_at_unix, config.ended_at_unix)?;
+    let trade_event_window_end =
+        nonnegative_epoch_sub(config.ended_at_unix, TRADE_MATURITY_LAG_SECONDS);
+    if trade_event_window_end <= config.started_at_unix {
+        bail!("trade maturity window end must be after its start");
+    }
+    let (legacy_trades, legacy_duplicates) = trade_map(
+        &legacy_rows,
+        config.started_at_unix,
+        trade_event_window_end,
+        config.ended_at_unix,
+    )?;
+    let (rust_trades, rust_duplicates) = trade_map(
+        &rust_rows,
+        config.started_at_unix,
+        trade_event_window_end,
+        config.ended_at_unix,
+    )?;
     let legacy_trade_ids = map_ids(&legacy_trades);
     let rust_trade_ids = map_ids(&rust_trades);
-    let trade_shared_values_match = shared_values_match(&legacy_trades, &rust_trades)?;
+    let legacy_only_trade_ids = legacy_trade_ids
+        .difference(&rust_trade_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    let rust_only_trade_ids = rust_trade_ids
+        .difference(&legacy_trade_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    let trade_shared_value_mismatch_ids = shared_value_mismatch_ids(&legacy_trades, &rust_trades)?;
+    let trade_shared_values_match = trade_shared_value_mismatch_ids.is_empty();
+    let legacy_trade_metadata =
+        metadata_context_for_trades(&legacy_rows, config.ended_at_unix, &legacy_trades)?;
+    let rust_trade_metadata =
+        metadata_context_for_trades(&rust_rows, config.ended_at_unix, &rust_trades)?;
+    let trade_metadata_shared_value_mismatch_market_ids =
+        shared_value_mismatch_ids(&legacy_trade_metadata, &rust_trade_metadata)?;
+    let trade_metadata_shared_values_match =
+        trade_metadata_shared_value_mismatch_market_ids.is_empty();
+    let legacy_trade_metadata_context_mismatch_market_ids =
+        trade_metadata_context_mismatch_ids(&legacy_trades, &legacy_trade_metadata)?;
+    let rust_trade_metadata_context_mismatch_market_ids =
+        trade_metadata_context_mismatch_ids(&rust_trades, &rust_trade_metadata)?;
     let legacy_trade_metadata_context_match =
-        trades_match_metadata(&legacy_trades, &legacy_metadata)?;
-    let rust_trade_metadata_context_match = trades_match_metadata(&rust_trades, &rust_metadata)?;
+        legacy_trade_metadata_context_mismatch_market_ids.is_empty();
+    let rust_trade_metadata_context_match =
+        rust_trade_metadata_context_mismatch_market_ids.is_empty();
     let dedupe_parity = legacy_duplicates.is_empty()
         && rust_duplicates.is_empty()
         && !legacy_trade_ids.is_empty()
         && legacy_trade_ids == rust_trade_ids
+        && trade_metadata_shared_values_match
         && legacy_trade_metadata_context_match
         && rust_trade_metadata_context_match;
 
@@ -750,12 +868,17 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         settlement_map(&rust_rows, config.started_at_unix, config.ended_at_unix)?;
     let legacy_settlement_ids = map_ids(&legacy_settlements);
     let rust_settlement_ids = map_ids(&rust_settlements);
-    let settlement_shared_values_match =
-        shared_values_match(&legacy_settlements, &rust_settlements)?;
+    let settlement_shared_value_mismatch_ids =
+        shared_value_mismatch_ids(&legacy_settlements, &rust_settlements)?;
+    let settlement_shared_values_match = settlement_shared_value_mismatch_ids.is_empty();
+    let legacy_settlement_metadata_context_mismatch_market_ids =
+        settlement_metadata_context_mismatch_ids(&legacy_settlements, &legacy_metadata)?;
+    let rust_settlement_metadata_context_mismatch_market_ids =
+        settlement_metadata_context_mismatch_ids(&rust_settlements, &rust_metadata)?;
     let legacy_settlement_metadata_context_match =
-        settlements_match_metadata(&legacy_settlements, &legacy_metadata)?;
+        legacy_settlement_metadata_context_mismatch_market_ids.is_empty();
     let rust_settlement_metadata_context_match =
-        settlements_match_metadata(&rust_settlements, &rust_metadata)?;
+        rust_settlement_metadata_context_mismatch_market_ids.is_empty();
     let settlement_parity = !legacy_settlement_ids.is_empty()
         && legacy_settlement_ids.is_subset(&rust_settlement_ids)
         && settlement_shared_values_match
@@ -798,7 +921,7 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         .expect("checks is an object")
         .values()
         .all(|value| value == &Value::Bool(true));
-    Ok(json!({
+    let mut evidence = json!({
         "schema": "monday.polymarket_shadow_parity.v1",
         "passed": passed,
         "checks": checks,
@@ -810,16 +933,24 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
             "legacy_only_metadata_ids": legacy_metadata_ids.difference(&rust_metadata_ids).cloned().collect::<Vec<_>>(),
             "rust_only_metadata_ids": rust_metadata_ids.difference(&legacy_metadata_ids).cloned().collect::<Vec<_>>(),
             "metadata_shared_values_match": metadata_shared_values_match,
+            "metadata_shared_value_mismatch_ids": metadata_shared_value_mismatch_ids,
             "legacy_duplicate_trade_ids": legacy_duplicates,
             "rust_duplicate_trade_ids": rust_duplicates,
             "trade_shared_values_match": trade_shared_values_match,
+            "trade_shared_value_mismatch_ids": trade_shared_value_mismatch_ids,
+            "trade_maturity_lag_seconds": TRADE_MATURITY_LAG_SECONDS,
+            "trade_event_window_started_at_unix": config.started_at_unix,
+            "trade_event_window_ended_at_unix": trade_event_window_end,
             "legacy_trade_metadata_context_match": legacy_trade_metadata_context_match,
             "rust_trade_metadata_context_match": rust_trade_metadata_context_match,
+            "legacy_trade_metadata_context_mismatch_market_ids": legacy_trade_metadata_context_mismatch_market_ids,
+            "rust_trade_metadata_context_mismatch_market_ids": rust_trade_metadata_context_mismatch_market_ids,
             "legacy_settlement_count": legacy_settlement_ids.len(),
             "rust_settlement_count": rust_settlement_ids.len(),
             "legacy_only_settlement_ids": legacy_settlement_ids.difference(&rust_settlement_ids).cloned().collect::<Vec<_>>(),
             "rust_only_settlement_ids": rust_settlement_ids.difference(&legacy_settlement_ids).cloned().collect::<Vec<_>>(),
             "settlement_shared_values_match": settlement_shared_values_match,
+            "settlement_shared_value_mismatch_ids": settlement_shared_value_mismatch_ids,
             "legacy_settlement_metadata_context_match": legacy_settlement_metadata_context_match,
             "rust_settlement_metadata_context_match": rust_settlement_metadata_context_match,
             "settlement_event_lookback_seconds": SETTLEMENT_EVENT_LOOKBACK_SECONDS,
@@ -832,7 +963,32 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
             "normalized_metadata_sha256": digest_values(rust_metadata.values())?,
             "normalized_settlement_sha256": digest_values(rust_settlements.values())?,
         },
-    }))
+    });
+    let metrics = evidence["metrics"]
+        .as_object_mut()
+        .expect("evidence metrics is an object");
+    metrics.insert(
+        "legacy_only_trade_ids".to_owned(),
+        json!(legacy_only_trade_ids),
+    );
+    metrics.insert("rust_only_trade_ids".to_owned(), json!(rust_only_trade_ids));
+    metrics.insert(
+        "trade_metadata_shared_values_match".to_owned(),
+        json!(trade_metadata_shared_values_match),
+    );
+    metrics.insert(
+        "trade_metadata_shared_value_mismatch_market_ids".to_owned(),
+        json!(trade_metadata_shared_value_mismatch_market_ids),
+    );
+    metrics.insert(
+        "legacy_settlement_metadata_context_mismatch_market_ids".to_owned(),
+        json!(legacy_settlement_metadata_context_mismatch_market_ids),
+    );
+    metrics.insert(
+        "rust_settlement_metadata_context_mismatch_market_ids".to_owned(),
+        json!(rust_settlement_metadata_context_mismatch_market_ids),
+    );
+    Ok(evidence)
 }
 
 fn atomic_write_json(path: &Path, value: &Value) -> Result<()> {
@@ -937,7 +1093,10 @@ mod tests {
                 "clobTokenIds":[format!("up-{symbol}"),format!("down-{symbol}")],
                 "orderPriceMinTickSize":0.01,
                 "orderMinSize":5,
-                "feesEnabled":true
+                "makerBaseFee":1000,
+                "takerBaseFee":1000,
+                "feesEnabled":true,
+                "negRisk":false
             }
         })
     }
@@ -957,6 +1116,20 @@ mod tests {
                 "proxyWallet":"0x2","size":"1","price":"0.5",
                 "outcomeIndex":0,"outcome":"Up"}
         });
+        let record_id = derived_trade_record_id(update["trade"].as_object().unwrap());
+        update["record_id"] = Value::String(record_id);
+        update
+    }
+
+    fn trade_at(seed: &str, timestamp: i64) -> Value {
+        let mut update = trade(seed);
+        update["trade_ts"] = Value::String(
+            DateTime::from_timestamp(timestamp, 0)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        update["trade_ts_unix"] = Value::from(timestamp);
+        update["trade"]["timestamp"] = Value::from(timestamp);
         let record_id = derived_trade_record_id(update["trade"].as_object().unwrap());
         update["record_id"] = Value::String(record_id);
         update
@@ -1129,6 +1302,236 @@ mod tests {
         let evidence = compare(&config).unwrap();
         assert_eq!(evidence["passed"], false);
         assert_eq!(evidence["checks"]["metadata_parity"], false);
+        assert_eq!(
+            evidence["metrics"]["metadata_shared_value_mismatch_ids"],
+            json!(["market-BTCUSDT"])
+        );
+    }
+
+    #[test]
+    fn independently_polled_metadata_state_does_not_poison_identity_parity() {
+        let (_root, config) = fixture();
+        let mut legacy_rows = fixture_rows();
+        let mut rust_rows = fixture_rows();
+        for (field, legacy, rust) in [
+            ("active", json!(true), json!(false)),
+            ("closed", json!(false), json!(true)),
+            ("acceptingOrders", json!(true), json!(false)),
+            ("enableOrderBook", json!(true), json!(false)),
+            (
+                "umaEndDate",
+                json!("1970-01-01T00:05:00Z"),
+                json!("1970-01-01T00:05:01Z"),
+            ),
+            (
+                "umaEndDateIso",
+                json!("1970-01-01T00:05:00Z"),
+                json!("1970-01-01T00:05:01Z"),
+            ),
+        ] {
+            legacy_rows[0]["market"][field] = legacy;
+            rust_rows[0]["market"][field] = rust;
+        }
+        write_tape(
+            &config.legacy_spool.join(ACTIVE_TAPE),
+            &legacy_rows,
+            "1970-01-01T00:03:20Z",
+        );
+        write_tape(
+            &config
+                .rust_spool
+                .join("market-updates.19700101T000400000000.ndjson"),
+            &rust_rows,
+            "1970-01-01T00:03:20Z",
+        );
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(evidence["checks"]["metadata_parity"], true);
+    }
+
+    #[test]
+    fn governed_metadata_fields_are_required_and_typed() {
+        let mut missing = metadata("BTCUSDT");
+        missing["market"]
+            .as_object_mut()
+            .unwrap()
+            .remove("makerBaseFee");
+        assert!(metadata_contract(&missing).is_err());
+
+        let mut malformed = metadata("BTCUSDT");
+        malformed["market"]["negRisk"] = json!("false");
+        assert!(metadata_contract(&malformed).is_err());
+
+        let mut invalid_domain = metadata("BTCUSDT");
+        invalid_domain["market"]["orderMinSize"] = json!(0);
+        assert!(metadata_contract(&invalid_domain).is_err());
+
+        let mut fees_disabled = metadata("BTCUSDT");
+        fees_disabled["market"]["feesEnabled"] = json!(false);
+        fees_disabled["market"]
+            .as_object_mut()
+            .unwrap()
+            .remove("makerBaseFee");
+        fees_disabled["market"]["takerBaseFee"] = Value::Null;
+        let contract = metadata_contract(&fees_disabled).unwrap();
+        assert_eq!(contract["market"]["makerBaseFee"], Value::Null);
+        assert_eq!(contract["market"]["takerBaseFee"], Value::Null);
+
+        let mut enabled_without_fee = metadata("BTCUSDT");
+        enabled_without_fee["market"]["makerBaseFee"] = Value::Null;
+        assert!(metadata_contract(&enabled_without_fee).is_err());
+    }
+
+    #[test]
+    fn trade_parity_uses_mature_event_time_with_the_full_retrieval_cutoff() {
+        let (_root, config) = fixture();
+        append_tape(
+            &config.legacy_spool.join(ACTIVE_TAPE),
+            &trade_at("late-provider-trade", 950),
+            "1970-01-01T00:16:30Z",
+        );
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(evidence["metrics"]["legacy_trade_count"], 1);
+        assert_eq!(evidence["metrics"]["rust_trade_count"], 1);
+        assert_eq!(evidence["metrics"]["trade_maturity_lag_seconds"], 600);
+        assert_eq!(
+            evidence["metrics"]["trade_event_window_started_at_unix"],
+            100
+        );
+        assert_eq!(evidence["metrics"]["trade_event_window_ended_at_unix"], 400);
+
+        let (_root, config) = fixture();
+        append_tape(
+            &config.legacy_spool.join(ACTIVE_TAPE),
+            &trade_at("mature-provider-trade", 300),
+            "1970-01-01T00:05:50Z",
+        );
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], false);
+        assert_eq!(evidence["checks"]["dedupe_parity"], false);
+        assert_eq!(
+            evidence["metrics"]["legacy_only_trade_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(evidence["metrics"]["rust_only_trade_ids"], json!([]));
+    }
+
+    #[test]
+    fn trade_context_joins_metadata_by_market_id_outside_event_projection() {
+        let (_root, config) = fixture();
+        let mut future_metadata = extra_metadata();
+        future_metadata["market"]["startDate"] = json!("1970-01-01T00:28:20Z");
+        future_metadata["market"]["endDate"] = json!("1970-01-01T00:33:20Z");
+        let mut future_trade = trade("future-market-trade");
+        future_trade["market_id"] = json!("market-extra");
+        future_trade["condition_id"] = json!("condition-extra");
+        future_trade["trade"]["conditionId"] = json!("condition-extra");
+        let record_id = derived_trade_record_id(future_trade["trade"].as_object().unwrap());
+        future_trade["record_id"] = Value::String(record_id);
+
+        for spool in [&config.legacy_spool, &config.rust_spool] {
+            append_tape(
+                &spool.join(ACTIVE_TAPE),
+                &future_metadata,
+                "1970-01-01T00:03:21Z",
+            );
+            append_tape(
+                &spool.join(ACTIVE_TAPE),
+                &future_trade,
+                "1970-01-01T00:03:21Z",
+            );
+        }
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], true);
+        assert_eq!(
+            evidence["metrics"]["legacy_trade_metadata_context_match"],
+            true
+        );
+        assert_eq!(
+            evidence["metrics"]["rust_trade_metadata_context_match"],
+            true
+        );
+
+        let (_root, config) = fixture();
+        append_tape(
+            &config.legacy_spool.join(ACTIVE_TAPE),
+            &future_metadata,
+            "1970-01-01T00:03:21Z",
+        );
+        for spool in [&config.legacy_spool, &config.rust_spool] {
+            append_tape(
+                &spool.join(ACTIVE_TAPE),
+                &future_trade,
+                "1970-01-01T00:03:21Z",
+            );
+        }
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], false);
+        assert_eq!(
+            evidence["metrics"]["legacy_trade_metadata_context_match"],
+            true
+        );
+        assert_eq!(
+            evidence["metrics"]["rust_trade_metadata_context_match"],
+            false
+        );
+        assert_eq!(
+            evidence["metrics"]["rust_trade_metadata_context_mismatch_market_ids"],
+            json!(["market-extra"])
+        );
+    }
+
+    #[test]
+    fn trade_context_compares_governed_metadata_outside_event_projection() {
+        let (_root, config) = fixture();
+        let mut future_metadata = extra_metadata();
+        future_metadata["market"]["startDate"] = json!("1970-01-01T00:28:20Z");
+        future_metadata["market"]["endDate"] = json!("1970-01-01T00:33:20Z");
+        let mut rust_future_metadata = future_metadata.clone();
+        rust_future_metadata["market"]["orderMinSize"] = json!(10);
+        let mut future_trade = trade("future-market-governed-mismatch");
+        future_trade["market_id"] = json!("market-extra");
+        future_trade["condition_id"] = json!("condition-extra");
+        future_trade["trade"]["conditionId"] = json!("condition-extra");
+        let record_id = derived_trade_record_id(future_trade["trade"].as_object().unwrap());
+        future_trade["record_id"] = Value::String(record_id);
+
+        append_tape(
+            &config.legacy_spool.join(ACTIVE_TAPE),
+            &future_metadata,
+            "1970-01-01T00:03:21Z",
+        );
+        append_tape(
+            &config.rust_spool.join(ACTIVE_TAPE),
+            &rust_future_metadata,
+            "1970-01-01T00:03:21Z",
+        );
+        for spool in [&config.legacy_spool, &config.rust_spool] {
+            append_tape(
+                &spool.join(ACTIVE_TAPE),
+                &future_trade,
+                "1970-01-01T00:03:21Z",
+            );
+        }
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], false);
+        assert_eq!(evidence["checks"]["metadata_parity"], true);
+        assert_eq!(evidence["checks"]["dedupe_parity"], false);
+        assert_eq!(
+            evidence["metrics"]["trade_metadata_shared_values_match"],
+            false
+        );
+        assert_eq!(
+            evidence["metrics"]["trade_metadata_shared_value_mismatch_market_ids"],
+            json!(["market-extra"])
+        );
     }
 
     #[test]
@@ -1281,6 +1684,10 @@ mod tests {
         let evidence = compare(&config).unwrap();
         assert_eq!(evidence["passed"], false);
         assert_eq!(evidence["checks"]["settlement_parity"], false);
+        assert_eq!(
+            evidence["metrics"]["rust_settlement_metadata_context_mismatch_market_ids"],
+            json!(["market-extra"])
+        );
     }
 
     #[test]

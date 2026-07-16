@@ -708,7 +708,8 @@ for symbol in BTCUSDT ETHUSDT SOLUSDT XRPUSDT DOGEUSDT HYPEUSDT BNBUSDT; do
         question:($market_name + " Up or Down"),slug:("market-" + $symbol),
         startDate:"1970-01-01T00:00:00Z",endDate:"1970-01-01T00:05:00Z",
         outcomes:["Up","Down"],clobTokenIds:[("up-" + $symbol),("down-" + $symbol)],
-        orderPriceMinTickSize:0.01,orderMinSize:5,feesEnabled:true}}')"
+        orderPriceMinTickSize:0.01,orderMinSize:5,makerBaseFee:1000,takerBaseFee:1000,
+        feesEnabled:true,negRisk:false}}')"
 done
 
 trade_id=$(printf '%s' '0x1|condition-BTCUSDT|up-BTCUSDT|BUY|200|0x2|1|0.5|0' \
@@ -855,6 +856,48 @@ jq \
     })
   } | .passed = true' "$parity" >"$tmp_dir/gate.json"
 jq -e -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+jq '.metrics.trade_maturity_lag_seconds = 599' \
+  "$tmp_dir/gate.json" >"$tmp_dir/short-trade-maturity.json"
+if jq -e -f "$POLICY" "$tmp_dir/short-trade-maturity.json" >/dev/null; then
+  printf 'gate policy accepted a shortened trade maturity lag\n' >&2
+  exit 1
+fi
+jq '.metrics.trade_event_window_ended_at_unix += 1' \
+  "$tmp_dir/gate.json" >"$tmp_dir/unbound-trade-end.json"
+if jq -e -f "$POLICY" "$tmp_dir/unbound-trade-end.json" >/dev/null; then
+  printf 'gate policy accepted an unbound mature trade window\n' >&2
+  exit 1
+fi
+jq '.metrics.rust_trade_metadata_context_mismatch_market_ids = ["missing-context"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/trade-context-mismatch.json"
+if jq -e -f "$POLICY" "$tmp_dir/trade-context-mismatch.json" >/dev/null; then
+  printf 'gate policy accepted a trade metadata context mismatch\n' >&2
+  exit 1
+fi
+jq '.metrics.legacy_only_trade_ids = ["missing-from-rust"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/legacy-trade-omission.json"
+if jq -e -f "$POLICY" "$tmp_dir/legacy-trade-omission.json" >/dev/null; then
+  printf 'gate policy accepted a mature trade missing from Rust\n' >&2
+  exit 1
+fi
+jq '.metrics.rust_only_trade_ids = ["missing-from-legacy"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/rust-trade-addition.json"
+if jq -e -f "$POLICY" "$tmp_dir/rust-trade-addition.json" >/dev/null; then
+  printf 'gate policy accepted a mature trade missing from legacy\n' >&2
+  exit 1
+fi
+jq '.metrics.trade_metadata_shared_value_mismatch_market_ids = ["market-extra"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/trade-metadata-value-mismatch.json"
+if jq -e -f "$POLICY" "$tmp_dir/trade-metadata-value-mismatch.json" >/dev/null; then
+  printf 'gate policy accepted contradictory trade metadata context\n' >&2
+  exit 1
+fi
+jq '.metrics.rust_settlement_metadata_context_mismatch_market_ids = ["market-extra"]' \
+  "$tmp_dir/gate.json" >"$tmp_dir/settlement-context-mismatch.json"
+if jq -e -f "$POLICY" "$tmp_dir/settlement-context-mismatch.json" >/dev/null; then
+  printf 'gate policy accepted a settlement metadata context mismatch\n' >&2
+  exit 1
+fi
 jq 'del(.metrics.normalized_settlement_sha256)' \
   "$tmp_dir/gate.json" >"$tmp_dir/missing-settlement-digest.json"
 if jq -e -f "$POLICY" "$tmp_dir/missing-settlement-digest.json" >/dev/null; then
