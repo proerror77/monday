@@ -19,7 +19,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::Duration,
@@ -324,15 +324,16 @@ pub(crate) fn fetch_to_file(
             }
             Box::new(file)
         };
-    let temporary = destination.with_extension("tmp");
-    let mut output = File::create(&temporary)?;
-    let bytes = std::io::copy(&mut reader.by_ref().take(max_bytes + 1), &mut output)?;
-    output.sync_all()?;
+    let mut temporary = data_mission::temporary_output_file(destination, ".monday-fetch-")?;
+    let bytes = std::io::copy(
+        &mut reader.by_ref().take(max_bytes + 1),
+        temporary.as_file_mut(),
+    )?;
+    temporary.as_file().sync_all()?;
     if bytes > max_bytes {
-        let _ = std::fs::remove_file(&temporary);
         bail!("source exceeds the allowed size");
     }
-    std::fs::rename(&temporary, destination)?;
+    data_mission::persist_output_file(temporary, destination, "fetched source")?;
     Ok((bytes, sha256_file(destination)?))
 }
 
@@ -346,7 +347,8 @@ pub(crate) fn create_bundle<'a>(
         collect_files(root, &mut files)?;
     }
     files.sort();
-    let mut archive = ZipWriter::new(File::create(bundle)?);
+    let temporary = data_mission::temporary_output_file(bundle, ".monday-bundle-")?;
+    let mut archive = ZipWriter::new(temporary.reopen()?);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     for path in files {
         let name = path
@@ -357,7 +359,10 @@ pub(crate) fn create_bundle<'a>(
         archive.start_file(name, options)?;
         std::io::copy(&mut File::open(path)?, &mut archive)?;
     }
-    archive.finish()?.sync_all()?;
+    let file = archive.finish()?;
+    file.sync_all()?;
+    drop(file);
+    data_mission::persist_output_file(temporary, bundle, "bundle")?;
     Ok(())
 }
 
@@ -393,29 +398,17 @@ pub(crate) fn publish_result(
         return Ok(());
     }
     let path = Path::new(destination.strip_prefix("file://").unwrap_or(destination));
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut output = match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+    let mut output = data_mission::temporary_output_file(path, ".monday-result-")?;
+    std::io::copy(&mut File::open(bundle)?, output.as_file_mut())?;
+    output.as_file().sync_all()?;
+    match output.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             bail!("result destination already exists: {}", path.display())
         }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to create result {}", path.display()))
-        }
-    };
-    let publication =
-        std::io::copy(&mut File::open(bundle)?, &mut output).and_then(|_| output.sync_all());
-    if let Err(error) = publication {
-        let _ = std::fs::remove_file(path);
-        return Err(error.into());
+        Err(error) => Err(error.error)
+            .with_context(|| format!("atomically publish result to {}", path.display())),
     }
-    Ok(())
 }
 
 pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
@@ -506,6 +499,88 @@ mod tests {
             .to_string()
             .contains("result destination already exists"));
         std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_bundle_rejects_a_stale_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "alpha-bundle-symlink-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let results_dir = root.join("results");
+        std::fs::create_dir_all(&results_dir).unwrap();
+        std::fs::write(results_dir.join("summary.json"), "{}\n").unwrap();
+        let protected_target = root.join("protected-target");
+        std::fs::write(&protected_target, "preserve\n").unwrap();
+        let bundle = root.join("checkpoint.zip");
+        symlink(&protected_target, &bundle).unwrap();
+
+        let error = create_bundle(&root, &bundle, [&results_dir])
+            .expect_err("a symlinked bundle path must be rejected");
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(
+            std::fs::read_to_string(protected_target).unwrap(),
+            "preserve\n"
+        );
+        let metadata = std::fs::symlink_metadata(&bundle).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publish_result_does_not_leave_a_destination_when_the_bundle_is_missing() {
+        let root = tempfile::tempdir().expect("create result publication test root");
+        let destination = root.path().join("result.zip");
+        let client = Client::builder().build().unwrap();
+
+        publish_result(
+            &client,
+            &destination.to_string_lossy(),
+            &root.path().join("missing-bundle.zip"),
+        )
+        .expect_err("a missing bundle must fail before publication");
+
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_result_rejects_a_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "alpha-result-parent-symlink-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle = root.join("bundle.zip");
+        std::fs::write(&bundle, "bundle").unwrap();
+        let protected_directory = root.join("protected-directory");
+        std::fs::create_dir(&protected_directory).unwrap();
+        let linked_parent = root.join("linked-parent");
+        symlink(&protected_directory, &linked_parent).unwrap();
+        let client = Client::builder().build().unwrap();
+
+        let error = publish_result(
+            &client,
+            &linked_parent.join("result.zip").to_string_lossy(),
+            &bundle,
+        )
+        .expect_err("a symlinked result parent must be rejected");
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(std::fs::read_dir(protected_directory)
+            .unwrap()
+            .next()
+            .is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     struct Fixture {
