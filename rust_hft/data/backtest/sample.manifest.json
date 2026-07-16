@@ -1,0 +1,29 @@
+{
+  "dataset_kind": "backtest_point_in_time_event_tape",
+  "schema_version": "backtest-pit-v1",
+  "mission_id": "sample-backtest-fixture",
+  "market": "spot",
+  "symbol": "BTCUSDT",
+  "dataset": "binance_spot_lob",
+  "source_revision": "1fd99199bb65251b6af5af2ac0726a464467e5c0e73450c57f5e0672deda922f",
+  "source_segments": [
+    {
+      "path": "data/backtest/sample.raw.ndjson",
+      "sha256": "def1428c8e1f21914a0eb7fac6ea6b02309f5ebcd3212006363cff4186a6418c",
+      "collector_manifest_path": "data/backtest/sample.raw.manifest.json",
+      "collector_manifest_sha256": "e7c503b63c6cbfbdecf9df4217330e65190de676cba374720371cd9b678e52d8",
+      "success_marker_path": "data/backtest/sample.raw.ndjson._SUCCESS",
+      "start_received_at_ns": 1700000000100000000,
+      "end_received_at_ns": 1700000000500000000,
+      "events": 5
+    }
+  ],
+  "rows": 4,
+  "first_event_time_us": 1700000000100000,
+  "last_event_time_us": 1700000000500000,
+  "sequence_start": 1,
+  "sequence_end": 4,
+  "artifact_path": "data/backtest/sample.ndjson",
+  "artifact_sha256": "fb23300c1a947a39aff4848104d44c014b12e599f461647afa206235dece4027",
+  "point_in_time": true
+}

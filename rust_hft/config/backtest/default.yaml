@@ -4,6 +4,9 @@ data:
   tick_size: 0.5
   lot_size: 0.01
   max_depth_levels: 20
+  manifest_path: data/backtest/sample.manifest.json
+  manifest_sha256: 0892719a8b5bbc460fac93e307e56b62234bbc8c6f323ad8c08257908b60b4c7
+  require_sequence: true
 
 strategy:
   liquidity_window_secs: 900    # ΔT = 15 分鐘
@@ -22,6 +25,8 @@ execution:
   stop_loss_ticks: 8.0
   take_profit_ticks: 12.0
   hold_secs: 600.0
+  fee_bps: 10.0
+  max_fill_ratio: 0.1
 
 risk:
   inventory_limit: 0.1
@@ -32,4 +37,3 @@ output:
   trades_csv: backtest_trades.csv
   summary_csv: backtest_summary.csv
   metrics_json: backtest_metrics.json
-
