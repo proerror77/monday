@@ -111,6 +111,10 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
 }
 
 fn validate_snapshot_manifest_identity(manifest: &SnapshotManifestIdentity) -> anyhow::Result<()> {
+    if manifest.schema_version != "research_snapshot_v2" {
+        bail!("prediction snapshot manifest schema_version must be research_snapshot_v2");
+    }
+
     let snapshot_hash = manifest
         .snapshot_hash
         .as_deref()
@@ -257,6 +261,15 @@ mod tests {
         let valid_snapshot_hash = "0123456789abcdef";
         let valid_contract_hash = format!("sha256:{}", "a".repeat(64));
         let uppercase_contract_hash = format!("sha256:{}", "A".repeat(64));
+        let legacy_manifest = SnapshotManifestIdentity {
+            schema_version: "research_snapshot_v1".to_string(),
+            snapshot_hash: Some(valid_snapshot_hash.to_string()),
+            snapshot_contract_hash: Some(valid_contract_hash.clone()),
+        };
+        assert!(validate_snapshot_manifest_identity(&legacy_manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("schema_version"));
 
         for (snapshot_hash, snapshot_contract_hash, expected_error) in [
             ("", valid_contract_hash.as_str(), "snapshot_hash"),
