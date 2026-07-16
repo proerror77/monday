@@ -104,7 +104,6 @@ async fn run_sentinel_loop(
                 position_count: active_orders as i64,
                 notional_value: 0.0,
                 order_rate: 0.0,
-                ws_reconnect_count: 0,
                 data_gap_count: 0,
             };
 
