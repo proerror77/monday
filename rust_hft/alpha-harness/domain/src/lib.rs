@@ -3084,9 +3084,7 @@ mod tests {
         .unwrap();
         legacy.evaluation_protocol_hash.clear();
         legacy.artifact = StrategyBundleArtifact::Formula {
-            ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
-                "signal".to_string(),
-            )),
+            ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field("signal".to_string())),
         };
         legacy.bundle_hash = legacy.calculated_legacy_hash().unwrap();
 
