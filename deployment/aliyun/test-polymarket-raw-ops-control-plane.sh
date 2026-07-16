@@ -846,16 +846,48 @@ jq \
         + "/data/monday/spool/polymarket-reference-rust-shadow/" + $candidate + "/run-1"),
       fragment_path:"/etc/systemd/system/polymarket-reference-collector-shadow@.service",
       drop_in_paths:[],main_pid:11,restarts:0,
-      invocation_id:$shadow_invocation_id
+      invocation_id:$shadow_invocation_id,
+      memory_events:{
+        start:{high:0,max:0,oom:0,oom_kill:0,oom_group_kill:0},
+        end:{high:0,max:0,oom:0,oom_kill:0,oom_group_kill:0}
+      }
     },
     checks:(.checks + {health_freshness:true,candidate_identity:true,
-      oss_readback_parity:true,market_oss_readback_parity:true}),
+      memory_events_stable:true,oss_readback_parity:true,
+      market_oss_readback_parity:true}),
     metrics:(.metrics + {
       oss_uploaded_segments:1,oss_canonical_uploaded_segments:1,
       market_oss_uploaded_segments:1,market_oss_canonical_uploaded_segments:1
     })
   } | .passed = true' "$parity" >"$tmp_dir/gate.json"
 jq -e -f "$POLICY" "$tmp_dir/gate.json" >/dev/null
+jq '.shadow_runtime.memory_events.start.high = 1
+    | .shadow_runtime.memory_events.end.high = 1' \
+  "$tmp_dir/gate.json" >"$tmp_dir/nonzero-memory-high-baseline.json"
+if jq -e -f "$POLICY" "$tmp_dir/nonzero-memory-high-baseline.json" >/dev/null; then
+  printf 'gate policy accepted a nonzero memory.events high baseline\n' >&2
+  exit 1
+fi
+jq '.shadow_runtime.memory_events.end.high += 1' \
+  "$tmp_dir/gate.json" >"$tmp_dir/growing-memory-high.json"
+if jq -e -f "$POLICY" "$tmp_dir/growing-memory-high.json" >/dev/null; then
+  printf 'gate policy accepted a growing memory.events high counter\n' >&2
+  exit 1
+fi
+for memory_counter_path in \
+  start.max start.oom start.oom_kill start.oom_group_kill \
+  end.max end.oom end.oom_kill end.oom_group_kill; do
+  memory_counter_file=${memory_counter_path//./-}
+  jq --arg path "$memory_counter_path" \
+    'setpath((["shadow_runtime","memory_events"] + ($path | split("."))); 1)' \
+    "$tmp_dir/gate.json" >"$tmp_dir/nonzero-memory-$memory_counter_file.json"
+  if jq -e -f "$POLICY" \
+    "$tmp_dir/nonzero-memory-$memory_counter_file.json" >/dev/null; then
+    printf 'gate policy accepted nonzero memory.events %s\n' \
+      "$memory_counter_path" >&2
+    exit 1
+  fi
+done
 jq '.metrics.trade_maturity_lag_seconds = 599' \
   "$tmp_dir/gate.json" >"$tmp_dir/short-trade-maturity.json"
 if jq -e -f "$POLICY" "$tmp_dir/short-trade-maturity.json" >/dev/null; then
@@ -1178,6 +1210,72 @@ grep -Fq 'polymarket-rust-health-policy.jq' "$GATE"
 grep -Fq 'polymarket-rust-health-policy.jq' "$CUTOVER"
 grep -Fq 'oss_readback_parity:true' "$GATE"
 grep -Fq 'market_oss_readback_parity:true' "$GATE"
+grep -Fq 'ControlGroup' "$GATE"
+grep -Fq 'valid_absolute_path "$control_group"' "$GATE"
+grep -Fq '[[ $control_group == /system.slice/*' "$GATE"
+grep -Fq '${control_group##*/} == "$shadow_unit"' "$GATE"
+grep -Fq 'proc_binding == "0::$control_group"' "$GATE"
+grep -Fq 'cgroup_dir="/sys/fs/cgroup$control_group"' "$GATE"
+grep -Fq 'direct_directory "$cgroup_dir"' "$GATE"
+grep -Fq '$(readlink -f -- "$file") == "$file"' "$GATE"
+grep -Fq 'stable_memory_events_snapshot' "$GATE"
+grep -Fq 'memory_events:{start:$memory_events_start,end:$memory_events_end}' "$GATE"
+grep -Fq 'memory_events_stable:true' "$GATE"
+grep -Fq 'systemctl freeze "$shadow_unit"' "$GATE"
+grep -Fq 'FreezerState' "$GATE"
+grep -Fq '[[ $shadow_freezer_state == frozen ]]' "$GATE"
+grep -Fq 'systemctl kill --kill-whom=main --signal=SIGTERM "$shadow_unit"' "$GATE"
+
+cleanup_thaw_line=$(grep -n '^    systemctl thaw "$shadow_unit"' "$GATE" | cut -d: -f1)
+cleanup_stop_line=$(grep -n '^    systemctl stop "$shadow_unit" >/dev/null' "$GATE" \
+  | cut -d: -f1)
+[[ $cleanup_thaw_line =~ ^[1-9][0-9]*$ \
+  && $cleanup_stop_line =~ ^[1-9][0-9]*$ \
+  && $cleanup_thaw_line -lt $cleanup_stop_line ]] || {
+  printf 'shadow cleanup does not thaw before stop\n' >&2
+  exit 1
+}
+
+freeze_line=$(grep -n '^systemctl freeze "$shadow_unit"' "$GATE" | cut -d: -f1)
+freezer_state_line=$(grep -n '^shadow_freezer_state=.*FreezerState' "$GATE" | cut -d: -f1)
+final_memory_line=$(grep -n '^memory_events_end=$(stable_memory_events_snapshot' "$GATE" \
+  | tail -1 | cut -d: -f1)
+kill_line=$(grep -n '^systemctl kill --kill-whom=main --signal=SIGTERM' "$GATE" \
+  | cut -d: -f1)
+final_stop_line=$(grep -n '^systemctl stop "$shadow_unit"$' "$GATE" | tail -1 | cut -d: -f1)
+[[ $freeze_line =~ ^[1-9][0-9]*$ \
+  && $freezer_state_line =~ ^[1-9][0-9]*$ \
+  && $final_memory_line =~ ^[1-9][0-9]*$ \
+  && $kill_line =~ ^[1-9][0-9]*$ \
+  && $final_stop_line =~ ^[1-9][0-9]*$ \
+  && $freeze_line -lt $freezer_state_line \
+  && $freezer_state_line -lt $final_memory_line \
+  && $final_memory_line -lt $kill_line \
+  && $kill_line -lt $final_stop_line ]] || {
+  printf 'shadow final freeze/snapshot/kill/stop sequence is unsafe\n' >&2
+  exit 1
+}
+
+validator_functions="$tmp_dir/control-group-validator.sh"
+sed -n '/^valid_absolute_path() {$/,/^}$/p' "$GATE" >"$validator_functions"
+sed -n '/^valid_shadow_control_group() {$/,/^}$/p' "$GATE" >>"$validator_functions"
+grep -Fq 'valid_absolute_path()' "$validator_functions"
+grep -Fq 'valid_shadow_control_group()' "$validator_functions"
+# shellcheck disable=SC1090
+source "$validator_functions"
+shadow_unit="polymarket-reference-collector-shadow@${candidate}.service"
+valid_shadow_control_group \
+  "/system.slice/system-polymarket\\x2dreference\\x2dcollector\\x2dshadow.slice/$shadow_unit"
+for invalid_control_group in \
+  "/system.slice/system-polymarket.slice/not-$shadow_unit" \
+  "/system.slice/../$shadow_unit" \
+  "/system.slice//nested/$shadow_unit"; do
+  if valid_shadow_control_group "$invalid_control_group"; then
+    printf 'control-group validator accepted unsafe path: %s\n' \
+      "$invalid_control_group" >&2
+    exit 1
+  fi
+done
 grep -Fq '.missing_target_symbols == []' "$RUST_HEALTH_POLICY"
 grep -Fq 'systemctl restart "$COLLECTOR_UNIT"' "$CUTOVER"
 grep -Fq 'clear_health_before_restart "$evidence_dir" pre-cutover' "$CUTOVER"
@@ -1210,9 +1308,9 @@ grep -Fq 'shadow gate evidence is stale or from the future' "$CUTOVER"
 grep -Fq 'secure_release_directory "$release_dir"' "$GATE"
 grep -Fq 'secure_release_directory "$candidate_release_dir"' "$CUTOVER"
 grep -Fxq 'Type=exec' "$SCRIPT_DIR/polymarket-reference-collector-shadow@.service"
-grep -Fxq 'MemoryHigh=512M' "$SCRIPT_DIR/polymarket-reference-collector-shadow@.service"
+grep -Fxq 'MemoryHigh=576M' "$SCRIPT_DIR/polymarket-reference-collector-shadow@.service"
 grep -Fxq 'MemoryMax=768M' "$SCRIPT_DIR/polymarket-reference-collector-shadow@.service"
-grep -Fxq 'MemoryHigh=512M' "$SCRIPT_DIR/polymarket-reference-collector.service"
+grep -Fxq 'MemoryHigh=576M' "$SCRIPT_DIR/polymarket-reference-collector.service"
 grep -Fxq 'MemoryMax=768M' "$SCRIPT_DIR/polymarket-reference-collector.service"
 grep -Fxq 'TimeoutStartSec=0' "$SCRIPT_DIR/polymarket-reference-upload.service"
 grep -Fxq 'TimeoutStartSec=0' "$SCRIPT_DIR/polymarket-market-tape-upload.service"

@@ -365,6 +365,82 @@ verify_shadow_identity() {
   [[ $cmdline == "$release_binary collect-reference --spool-dir $shadow_spool " ]]
 }
 
+valid_shadow_control_group() {
+  local control_group=$1
+  valid_absolute_path "$control_group" \
+    && [[ $control_group == /system.slice/* \
+      && ${control_group##*/} == "$shadow_unit" ]]
+}
+
+shadow_memory_events_file() {
+  local pid=$1 control_group cgroup_dir file proc_cgroup_file proc_binding owner mode
+  control_group=$(systemctl show --property=ControlGroup --value "$shadow_unit") \
+    || return 1
+  valid_shadow_control_group "$control_group" || return 1
+
+  proc_cgroup_file="/proc/$pid/cgroup"
+  [[ -f $proc_cgroup_file && ! -L $proc_cgroup_file \
+    && $(readlink -f -- "$proc_cgroup_file") == "$proc_cgroup_file" ]] || return 1
+  proc_binding=$(<"$proc_cgroup_file") || return 1
+  [[ $proc_binding == "0::$control_group" ]] || return 1
+
+  cgroup_dir="/sys/fs/cgroup$control_group"
+  direct_directory "$cgroup_dir" || return 1
+  owner=$(stat -c %u -- "$cgroup_dir") || return 1
+  mode=$(stat -c %a -- "$cgroup_dir") || return 1
+  [[ $owner == 0 ]] || return 1
+  (( (8#$mode & 022) == 0 )) || return 1
+
+  file="$cgroup_dir/memory.events"
+  [[ -f $file && ! -L $file \
+    && $(readlink -f -- "$file") == "$file" ]] || return 1
+  owner=$(stat -c %u -- "$file") || return 1
+  mode=$(stat -c %a -- "$file") || return 1
+  [[ $owner == 0 ]] || return 1
+  (( (8#$mode & 022) == 0 )) || return 1
+  printf '%s\n' "$file"
+}
+
+memory_events_snapshot() {
+  local file=$1 key value high='' max='' oom='' oom_kill='' oom_group_kill=''
+  while read -r key value; do
+    [[ $value =~ ^[0-9]+$ ]] || return 1
+    case "$key" in
+      high) high=$value ;;
+      max) max=$value ;;
+      oom) oom=$value ;;
+      oom_kill) oom_kill=$value ;;
+      oom_group_kill) oom_group_kill=$value ;;
+    esac
+  done <"$file"
+  [[ $high =~ ^[0-9]+$ && $max =~ ^[0-9]+$ && $oom =~ ^[0-9]+$ \
+    && $oom_kill =~ ^[0-9]+$ && $oom_group_kill =~ ^[0-9]+$ ]] || return 1
+  printf '%s %s %s %s %s\n' \
+    "$high" "$max" "$oom" "$oom_kill" "$oom_group_kill"
+}
+
+stable_memory_events_snapshot() {
+  local file=$1 baseline_high=$2 snapshot high max oom oom_kill oom_group_kill
+  snapshot=$(memory_events_snapshot "$file") || return 1
+  read -r high max oom oom_kill oom_group_kill <<<"$snapshot"
+  [[ $high == "$baseline_high" && $max == 0 && $oom == 0 \
+    && $oom_kill == 0 && $oom_group_kill == 0 ]] || return 1
+  printf '%s\n' "$snapshot"
+}
+
+memory_events_json() {
+  local snapshot=$1 high max oom oom_kill oom_group_kill
+  read -r high max oom oom_kill oom_group_kill <<<"$snapshot"
+  jq -cn \
+    --argjson high "$high" \
+    --argjson max "$max" \
+    --argjson oom "$oom" \
+    --argjson oom_kill "$oom_kill" \
+    --argjson oom_group_kill "$oom_group_kill" \
+    '{high:$high,max:$max,oom:$oom,oom_kill:$oom_kill,
+      oom_group_kill:$oom_group_kill}'
+}
+
 [[ ${EUID} -eq 0 ]] || die 'must run as root'
 [[ $# -eq 3 ]] || {
   usage >&2
@@ -452,7 +528,10 @@ release_binary="$release_dir/polymarket-raw-ops"
 cleanup() {
   local status=$?
   trap - EXIT
-  systemctl stop "${shadow_unit:-}" >/dev/null 2>&1 || true
+  if [[ -n ${shadow_unit:-} ]]; then
+    systemctl thaw "$shadow_unit" >/dev/null 2>&1 || true
+    systemctl stop "$shadow_unit" >/dev/null 2>&1 || true
+  fi
   rm -rf "${staging:-}"
   rm -f "${shadow_env_file:-}" "${shadow_env_tmp:-}"
   exit "$status"
@@ -534,13 +613,27 @@ systemctl start "$shadow_unit"
 shadow_invocation_id=$(systemctl show --property=InvocationID --value "$shadow_unit")
 [[ $shadow_invocation_id =~ ^[a-f0-9]{32}$ ]] \
   || die 'Rust shadow has no verifiable systemd invocation ID'
+shadow_pid=$(systemctl show --property=MainPID --value "$shadow_unit")
+[[ $shadow_pid =~ ^[1-9][0-9]*$ ]] || die 'Rust shadow has no initial MainPID'
+initial_shadow_pid=$shadow_pid
+shadow_memory_events=$(shadow_memory_events_file "$initial_shadow_pid") \
+  || die 'Rust shadow has no trusted cgroup memory.events file'
+memory_events_start=$(memory_events_snapshot "$shadow_memory_events") \
+  || die 'Rust shadow memory.events baseline is invalid'
+read -r memory_events_start_high memory_events_start_max memory_events_start_oom \
+  memory_events_start_oom_kill memory_events_start_oom_group_kill \
+  <<<"$memory_events_start"
+[[ $memory_events_start_high == 0 && $memory_events_start_max == 0 \
+  && $memory_events_start_oom == 0 \
+  && $memory_events_start_oom_kill == 0 \
+  && $memory_events_start_oom_group_kill == 0 ]] \
+  || die 'Rust shadow reached MemoryHigh, MemoryMax, or OOM before the gate baseline'
+memory_events_end=$memory_events_start
 
 last_health=
 last_health_change=$start_uptime
 last_legacy_health=
 last_legacy_health_change=$start_uptime
-shadow_pid=
-initial_shadow_pid=
 common_cutoff=
 parity_window_started_at=
 while :; do
@@ -550,13 +643,12 @@ while :; do
     || die 'legacy collector PID, restart count, or effective unit identity changed during gate'
   shadow_pid=$(systemctl show --property=MainPID --value "$shadow_unit")
   [[ $shadow_pid =~ ^[1-9][0-9]*$ ]] || die 'Rust shadow has no MainPID'
-  if [[ -z $initial_shadow_pid ]]; then
-    initial_shadow_pid=$shadow_pid
-  else
-    [[ $shadow_pid == "$initial_shadow_pid" ]] || die 'Rust shadow MainPID changed during gate'
-  fi
+  [[ $shadow_pid == "$initial_shadow_pid" ]] || die 'Rust shadow MainPID changed during gate'
   verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id" \
     || die 'Rust shadow systemd identity, PID, or command line changed during gate'
+  memory_events_end=$(stable_memory_events_snapshot \
+    "$shadow_memory_events" "$memory_events_start_high") \
+    || die 'Rust shadow memory.events high grew or a MemoryMax/OOM event occurred'
   if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]; then
     health="$shadow_spool/health.json"
     [[ -f $health && ! -L $health ]] || die 'Rust shadow health is missing'
@@ -659,6 +751,22 @@ shadow_stop_cursor=$(journal_cursor "$shadow_unit") \
   || die 'could not capture the Rust shadow journal cursor before stop'
 verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id" \
   || die 'Rust shadow identity changed immediately before stop'
+systemctl freeze "$shadow_unit" \
+  || die 'could not freeze the Rust shadow before its final memory snapshot'
+shadow_freezer_state=$(systemctl show --property=FreezerState --value "$shadow_unit")
+[[ $shadow_freezer_state == frozen ]] \
+  || die 'Rust shadow did not enter the frozen state before its final memory snapshot'
+verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id" \
+  || die 'Rust shadow identity changed while entering the frozen state'
+memory_events_end=$(stable_memory_events_snapshot \
+  "$shadow_memory_events" "$memory_events_start_high") \
+  || die 'Rust shadow memory.events changed immediately before stop'
+memory_events_start_json=$(memory_events_json "$memory_events_start") \
+  || die 'could not serialize the Rust shadow memory.events baseline'
+memory_events_end_json=$(memory_events_json "$memory_events_end") \
+  || die 'could not serialize the final Rust shadow memory.events snapshot'
+systemctl kill --kill-whom=main --signal=SIGTERM "$shadow_unit" \
+  || die 'could not terminate the frozen Rust shadow main process'
 systemctl stop "$shadow_unit"
 verify_no_restart_after_cursor "$shadow_unit" "$shadow_stop_cursor" "$shadow_invocation_id" \
   || die 'Rust shadow journal recorded a restart during final stop'
@@ -789,6 +897,8 @@ jq \
   --argjson shadow_drop_in_paths "$shadow_drop_ins_json" \
   --argjson shadow_pid "$shadow_pid" \
   --argjson shadow_restarts "$shadow_restarts" \
+  --argjson memory_events_start "$memory_events_start_json" \
+  --argjson memory_events_end "$memory_events_end_json" \
   --arg shadow_run_id "$run_id" \
   --argjson duration_seconds "$observed_duration_seconds" \
   --argjson parity_window_started_at_unix "$parity_window_started_at" \
@@ -821,10 +931,12 @@ jq \
     shadow_runtime:{exec_start:$shadow_exec,cmdline:$shadow_cmdline,
       fragment_path:$shadow_fragment_path,drop_in_paths:$shadow_drop_in_paths,
       main_pid:$shadow_pid,restarts:$shadow_restarts,
-      invocation_id:$shadow_invocation_id},
+      invocation_id:$shadow_invocation_id,
+      memory_events:{start:$memory_events_start,end:$memory_events_end}},
     checks:(.checks + {
       health_freshness:true,
       candidate_identity:true,
+      memory_events_stable:true,
       oss_readback_parity:true,
       market_oss_readback_parity:true
     }),

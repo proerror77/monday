@@ -49,12 +49,25 @@ without the shadow unit's old memory envelope:
 These probes isolate cgroup reclaim as the formal-shadow slowdown; they are not
 production gate evidence and cannot authorize cutover.
 
+## Follow-up at the 512 MiB watermark
+
+A later formal shadow used `MemoryHigh=536870912` bytes (512 MiB) and
+`MemoryMax=805306368` bytes (768 MiB). It reached a measured
+`MemoryPeak=538951680` bytes. During steady observation, `memory.events high`
+increased from 102 to 112 in 68 seconds while `max=0`, `oom=0`, and memory
+pressure averages were zero. The lack of OOM did not make the run eligible:
+the growing `high` counter proved that the working set still crossed the soft
+watermark. The run was stopped and cannot authorize cutover.
+
 ## Decision
 
-The reviewed service envelope is `MemoryHigh=512M` and `MemoryMax=768M`. On this
-8 GB host, simultaneous production and shadow hard limits total 1.5 GiB. The formal
-one-hour-plus-tail gate must still prove zero restarts, current health, 112/112 polls,
-zero priority backlog, no growing `memory.events high`, and no OOM before promotion.
+The reviewed service envelope is `MemoryHigh=576M` and `MemoryMax=768M`. The
+576 MiB soft watermark leaves 65,028,096 bytes of headroom over the observed
+538,951,680-byte peak without raising the hard limit. On this 8 GB host,
+simultaneous production and shadow hard limits remain 1.5 GiB. This calibration
+does not replace promotion evidence: a new formal one-hour-plus-tail gate must
+still prove zero restarts, current health, 112/112 polls, zero priority backlog,
+and zero high/max/OOM events from its first cgroup sample before promotion.
 
 The Rust collector also uses an independent 180-second OS-thread watchdog so
 non-yielding fsync or atomic state publication cannot evade the cooperative Tokio

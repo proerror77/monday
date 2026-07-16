@@ -44,6 +44,18 @@ and .shadow_runtime.drop_in_paths == []
 and (.shadow_runtime.main_pid | positive_integer)
 and .shadow_runtime.restarts == 0
 and (.shadow_runtime.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+and .shadow_runtime.memory_events.start.high == 0
+and .shadow_runtime.memory_events.start.max == 0
+and .shadow_runtime.memory_events.start.oom == 0
+and .shadow_runtime.memory_events.start.oom_kill == 0
+and .shadow_runtime.memory_events.start.oom_group_kill == 0
+and (.shadow_runtime.memory_events.end.high | nonnegative_integer)
+and (.shadow_runtime.memory_events.end.high ==
+  .shadow_runtime.memory_events.start.high)
+and .shadow_runtime.memory_events.end.max == 0
+and .shadow_runtime.memory_events.end.oom == 0
+and .shadow_runtime.memory_events.end.oom_kill == 0
+and .shadow_runtime.memory_events.end.oom_group_kill == 0
 and .checks.byte_parity == true
 and .checks.metadata_parity == true
 and .checks.field_parity == true
@@ -53,6 +65,7 @@ and .checks.rotation_parity == true
 and .checks.asset_parity == true
 and .checks.health_freshness == true
 and .checks.candidate_identity == true
+and .checks.memory_events_stable == true
 and .checks.oss_readback_parity == true
 and .checks.market_oss_readback_parity == true
 and (.metrics.oss_uploaded_segments | positive_integer)
