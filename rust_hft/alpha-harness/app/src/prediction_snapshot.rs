@@ -7,7 +7,6 @@ use anyhow::{bail, Context};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::File,
     path::Path,
     process::{Command, Stdio},
     time::Duration,
@@ -48,21 +47,39 @@ pub fn snapshot(args: PredictionSnapshotArgs) -> anyhow::Result<()> {
 fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyhow::Result<()> {
     validate_snapshot_args(&args)?;
     let artifact_dir = args.work_dir.join("artifacts");
-    let snapshot_dir = args.work_dir.join("snapshot");
-    std::fs::create_dir_all(&artifact_dir)?;
-    std::fs::create_dir_all(&snapshot_dir)?;
+    data_mission::ensure_real_directory(&args.work_dir, "prediction snapshot work")?;
+    data_mission::ensure_real_directory(&artifact_dir, "prediction snapshot artifact")?;
+    let stdout_path = artifact_dir.join("snapshot-compiler.stdout");
+    let stderr_path = artifact_dir.join("snapshot-compiler.stderr");
+    data_mission::ensure_output_path_is_not_symlink(&stdout_path, "snapshot compiler stdout")?;
+    data_mission::ensure_output_path_is_not_symlink(&stderr_path, "snapshot compiler stderr")?;
+    // A failed immutable upload cannot make a writable previous output
+    // trustworthy. Compile each retry into a new private directory.
+    let snapshot_dir = tempfile::Builder::new()
+        .prefix("prediction-snapshot-output-")
+        .tempdir_in(&args.work_dir)
+        .with_context(|| {
+            format!(
+                "create isolated prediction snapshot directory in {}",
+                args.work_dir.display()
+            )
+        })?;
 
-    let stdout = File::create(artifact_dir.join("snapshot-compiler.stdout"))?;
-    let stderr = File::create(artifact_dir.join("snapshot-compiler.stderr"))?;
+    let stdout = data_mission::temporary_output_file(&stdout_path, ".monday-artifact-log-")?;
+    let stderr = data_mission::temporary_output_file(&stderr_path, ".monday-artifact-log-")?;
     let status = Command::new(compiler)
         .arg("--output-dir")
-        .arg(&snapshot_dir)
+        .arg(snapshot_dir.path())
         .args(&args.compiler_args)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stdout(Stdio::from(stdout.reopen()?))
+        .stderr(Stdio::from(stderr.reopen()?))
         .status()
         .with_context(|| format!("start prediction snapshot compiler {}", compiler.display()))?;
+    stdout.as_file().sync_all()?;
+    stderr.as_file().sync_all()?;
+    data_mission::persist_output_file(stdout, &stdout_path, "snapshot compiler stdout")?;
+    data_mission::persist_output_file(stderr, &stderr_path, "snapshot compiler stderr")?;
     if !status.success() {
         bail!(
             "prediction snapshot compiler exited unsuccessfully with {:?}; see {}",
@@ -71,7 +88,7 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
         );
     }
 
-    let manifest_path = snapshot_dir.join("manifest.json");
+    let manifest_path = snapshot_dir.path().join("manifest.json");
     let manifest: SnapshotManifestIdentity =
         serde_json::from_slice(&std::fs::read(&manifest_path).with_context(|| {
             format!(
@@ -89,14 +106,15 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
         compiler_exit_code: status.code(),
     };
     data_mission::write_json_atomic(
-        &snapshot_dir.join("monday-snapshot-evidence.json"),
+        &snapshot_dir.path().join("monday-snapshot-evidence.json"),
         &evidence,
     )?;
 
     let bundle = args.work_dir.join("snapshot.zip");
     // Consumers expect manifest.json at the archive root. Compiler logs remain
     // local and the evidence record carries no evaluator or execution authority.
-    create_bundle(&snapshot_dir, &bundle, [&snapshot_dir])?;
+    let snapshot_root = snapshot_dir.path().to_path_buf();
+    create_bundle(&snapshot_root, &bundle, [&snapshot_root])?;
     let bundle_bytes = bundle.metadata()?.len();
     let bundle_sha256 = sha256_file(&bundle)?;
     let client = Client::builder()
@@ -234,6 +252,97 @@ mod tests {
         let mut archive = ZipArchive::new(File::open(&published).unwrap()).unwrap();
         assert!(archive.by_name("manifest.json").is_ok());
         assert!(archive.by_name("snapshot/manifest.json").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_retry_uses_a_fresh_output_directory_despite_stale_work_tree_state() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = temporary_root("snapshot-retry");
+        let compiler = root.join("monday-prediction-snapshot");
+        std::fs::write(
+            &compiler,
+            "#!/bin/sh\ntest \"$1\" = '--output-dir' || exit 2\nprintf 'attempt\\n' >> \"$2/../compiler-attempts\"\nmkdir -p \"$2\"\nprintf '{\"schema_version\":\"research_snapshot_v2\",\"snapshot_hash\":\"0123456789abcdef\",\"snapshot_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\"}\\n' > \"$2/manifest.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let published = root.join("published-snapshot.zip");
+        std::fs::write(&published, "occupied").unwrap();
+        let args = PredictionSnapshotArgs {
+            work_dir: root.join("work"),
+            result_put_url: published.to_string_lossy().into_owned(),
+            compiler_args: vec![OsString::from("--start-date"), OsString::from("2026-07-01")],
+        };
+
+        snapshot_with_compiler(args.clone(), &compiler)
+            .expect_err("occupied destination must fail the first publication");
+        let protected_target = root.join("protected-manifest");
+        std::fs::write(&protected_target, "preserve\n").unwrap();
+        let stale_manifest = args.work_dir.join("snapshot/manifest.json");
+        if stale_manifest.exists() {
+            std::fs::remove_file(&stale_manifest).unwrap();
+        } else {
+            std::fs::create_dir_all(stale_manifest.parent().unwrap()).unwrap();
+        }
+        symlink(&protected_target, &stale_manifest).unwrap();
+        std::fs::remove_file(&published).unwrap();
+
+        snapshot_with_compiler(args, &compiler)
+            .expect("retry must rebuild from a fresh private output directory");
+
+        assert_eq!(
+            std::fs::read_to_string(protected_target).unwrap(),
+            "preserve\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("work/compiler-attempts")).unwrap(),
+            "attempt\nattempt\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_a_symlinked_artifact_leaf_before_starting_compiler() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = temporary_root("symlinked-artifact-leaf");
+        let compiler = root.join("must-not-start");
+        std::fs::write(
+            &compiler,
+            "#!/bin/sh\nprintf started > \"$2/../compiler-started\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let work_dir = root.join("work");
+        let artifact_dir = work_dir.join("artifacts");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let protected_target = root.join("protected-compiler-stdout");
+        std::fs::write(&protected_target, "preserve\n").unwrap();
+        symlink(
+            &protected_target,
+            artifact_dir.join("snapshot-compiler.stdout"),
+        )
+        .unwrap();
+
+        let error = snapshot_with_compiler(
+            PredictionSnapshotArgs {
+                work_dir: work_dir.clone(),
+                result_put_url: root.join("published.zip").to_string_lossy().into_owned(),
+                compiler_args: vec![OsString::from("--start-date"), OsString::from("2026-07-01")],
+            },
+            &compiler,
+        )
+        .expect_err("a symlinked artifact path must be rejected before the compiler starts");
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(
+            std::fs::read_to_string(&protected_target).unwrap(),
+            "preserve\n"
+        );
+        assert!(!work_dir.join("compiler-started").exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 

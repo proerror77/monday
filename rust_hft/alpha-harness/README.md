@@ -122,14 +122,17 @@ alpha-harness prediction execute \
 ```
 
 If the prediction LoopRun pauses, the failed attempt still publishes its state
-and evidence. Start a new attempt with a new result PUT URL and add
+and evidence. Start a new attempt in a new work directory with a new result PUT URL and add
 `--resume-url <previous-results-get-url> --resume-sha256 <previous-bundle-sha>`;
-the harness restores only `results/`, and the LoopRun revalidates the frozen
-mission, policy, and snapshot identity before continuing.
+the harness restores only `results/` and refuses non-empty local results, and
+the LoopRun revalidates the frozen mission, policy, and snapshot identity before
+continuing.
 
-The harness verifies both outer hashes before starting the precompiled Rust
-runner, safely extracts the snapshot, preserves runner evidence, and uses an
-immutable result PUT. The runner directly invokes the precompiled prediction
+The harness verifies the mission and snapshot outer hashes (and the resume
+bundle hash when supplied) before starting the precompiled Rust runner, safely
+extracts the snapshot into a new private directory on every retry, preserves
+runner evidence with atomic artifact writes, and uses an immutable result PUT.
+The runner directly invokes the precompiled prediction
 evaluator; the runtime image contains no Cargo or source tree. These commands
 have no order, submit, cancel, replace, reconciliation, OMS, or venue-key input.
 All production execution remains in Monday `risk-control`,

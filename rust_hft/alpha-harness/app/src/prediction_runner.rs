@@ -65,9 +65,14 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     let input_dir = args.work_dir.join("input");
     let artifact_dir = args.work_dir.join("artifacts");
     let results_dir = args.work_dir.join("results");
-    std::fs::create_dir_all(&input_dir)?;
-    std::fs::create_dir_all(&artifact_dir)?;
-    std::fs::create_dir_all(&results_dir)?;
+    data_mission::ensure_real_directory(&args.work_dir, "prediction work")?;
+    data_mission::ensure_real_directory(&input_dir, "prediction input")?;
+    data_mission::ensure_real_directory(&artifact_dir, "prediction artifact")?;
+    ensure_empty_results_directory(&results_dir)?;
+    let stdout_path = artifact_dir.join("runner.stdout");
+    let stderr_path = artifact_dir.join("runner.stderr");
+    data_mission::ensure_output_path_is_not_symlink(&stdout_path, "prediction runner stdout")?;
+    data_mission::ensure_output_path_is_not_symlink(&stderr_path, "prediction runner stderr")?;
 
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
@@ -92,8 +97,19 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     if snapshot_sha256 != normalized_sha256("snapshot archive", &args.snapshot_sha256)? {
         bail!("prediction snapshot archive SHA256 mismatch");
     }
-    let snapshot_dir = input_dir.join("snapshot");
-    extract_archive(&snapshot_archive, &snapshot_dir, None)?;
+    // The declared archive SHA-256 is the trust anchor. A prior work-dir
+    // extraction is writable state, so a retry always extracts into a fresh
+    // private directory instead of attempting to reuse it.
+    let snapshot_dir = tempfile::Builder::new()
+        .prefix("prediction-snapshot-")
+        .tempdir_in(&input_dir)
+        .with_context(|| {
+            format!(
+                "create isolated prediction snapshot directory in {}",
+                input_dir.display()
+            )
+        })?;
+    extract_archive(&snapshot_archive, snapshot_dir.path(), None)?;
 
     let resume_bundle_sha256 = if let Some((resume_url, resume_sha256)) = resume_source(&args)? {
         let resume_archive = input_dir.join("resume.zip");
@@ -112,17 +128,21 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         None
     };
 
-    let stdout = File::create(artifact_dir.join("runner.stdout"))?;
-    let stderr = File::create(artifact_dir.join("runner.stderr"))?;
+    let stdout = data_mission::temporary_output_file(&stdout_path, ".monday-artifact-log-")?;
+    let stderr = data_mission::temporary_output_file(&stderr_path, ".monday-artifact-log-")?;
     let status = Command::new(runner)
         .arg(&mission_path)
-        .arg(&snapshot_dir)
+        .arg(snapshot_dir.path())
         .arg(&results_dir)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
+        .stdout(Stdio::from(stdout.reopen()?))
+        .stderr(Stdio::from(stderr.reopen()?))
         .status()
         .with_context(|| format!("start prediction research runner {}", runner.display()))?;
+    stdout.as_file().sync_all()?;
+    stderr.as_file().sync_all()?;
+    data_mission::persist_output_file(stdout, &stdout_path, "prediction runner stdout")?;
+    data_mission::persist_output_file(stderr, &stderr_path, "prediction runner stderr")?;
     let evidence = PredictionExecutionEvidence {
         lane: "prediction_market",
         mission_id: &mission.mission_id,
@@ -195,6 +215,20 @@ fn validate_mission_identity(mission: &PredictionMissionIdentity) -> anyhow::Res
         || mission.search_policy_snapshot_id.trim().is_empty()
     {
         bail!("prediction mission identity or lane is invalid");
+    }
+    Ok(())
+}
+
+fn ensure_empty_results_directory(results_dir: &Path) -> anyhow::Result<()> {
+    data_mission::ensure_real_directory(results_dir, "prediction results")?;
+    if std::fs::read_dir(results_dir)?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        bail!(
+            "prediction results directory is not empty; start a new work directory and restore from a pinned resume bundle"
+        );
     }
     Ok(())
 }
@@ -384,6 +418,121 @@ mod tests {
         assert!(archive
             .file_names()
             .any(|name| name == "results/checkpoint.json"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_work_dir_retry_uses_a_fresh_verified_snapshot_extraction() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = execute_fixture("same-work-dir-retry");
+        let paused_runner = fixture.root.join("paused-runner");
+        std::fs::write(&paused_runner, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&paused_runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        execute_with_runner(fixture.args.clone(), &paused_runner)
+            .expect_err("first attempt must publish its pause checkpoint");
+        std::fs::create_dir_all(fixture.args.work_dir.join("input/snapshot")).unwrap();
+        std::fs::write(
+            fixture.args.work_dir.join("input/snapshot/manifest.json"),
+            "tampered\n",
+        )
+        .unwrap();
+        let resumed_runner = fixture.root.join("resumed-runner");
+        std::fs::write(
+            &resumed_runner,
+            "#!/bin/sh\ntest \"$(cat \"$2/manifest.json\")\" = '{}' || exit 4\nprintf '{\"status\":\"budget_exhausted\"}\\n' > \"$3/summary.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&resumed_runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut retry_args = fixture.args.clone();
+        retry_args.result_put_url = fixture
+            .root
+            .join("resumed-results.zip")
+            .to_string_lossy()
+            .into_owned();
+
+        execute_with_runner(retry_args, &resumed_runner)
+            .expect("retry with no local results must ignore stale extraction");
+
+        assert!(fixture.root.join("resumed-results.zip").is_file());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_rejects_a_symlinked_artifact_leaf_before_starting_runner() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let fixture = execute_fixture("symlinked-artifact-leaf");
+        let artifact_dir = fixture.args.work_dir.join("artifacts");
+        std::fs::create_dir_all(&artifact_dir).unwrap();
+        let protected_target = fixture.root.join("protected-runner-stdout");
+        std::fs::write(&protected_target, "preserve\n").unwrap();
+        symlink(&protected_target, artifact_dir.join("runner.stdout")).unwrap();
+        let runner = fixture.root.join("must-not-start");
+        std::fs::write(
+            &runner,
+            "#!/bin/sh\nprintf started > \"$3/runner-started\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = execute_with_runner(fixture.args.clone(), &runner)
+            .expect_err("a symlinked artifact path must be rejected before the runner starts");
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(
+            std::fs::read_to_string(&protected_target).unwrap(),
+            "preserve\n"
+        );
+        assert!(!fixture
+            .args
+            .work_dir
+            .join("results/runner-started")
+            .exists());
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_rejects_untrusted_local_results_state() {
+        let fixture = execute_fixture("untrusted-local-results");
+        let results_dir = fixture.args.work_dir.join("results");
+        std::fs::create_dir_all(&results_dir).unwrap();
+        std::fs::write(results_dir.join("checkpoint.json"), "tampered\n").unwrap();
+
+        let error = execute_with_runner(fixture.args, Path::new("/runner-must-not-start"))
+            .expect_err("local writable results must not become resume input");
+
+        assert!(error
+            .to_string()
+            .contains("prediction results directory is not empty"));
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_rejects_a_work_directory_with_a_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = execute_fixture("symlinked-artifacts");
+        let protected_directory = fixture.root.join("protected-artifacts");
+        let protected_work_directory = protected_directory.join("work");
+        std::fs::create_dir_all(&protected_work_directory).unwrap();
+        let linked_parent = fixture.root.join("linked-parent");
+        symlink(&protected_directory, &linked_parent).unwrap();
+        let mut args = fixture.args;
+        args.work_dir = linked_parent.join("work");
+
+        let error = execute_with_runner(args, Path::new("/runner-must-not-start"))
+            .expect_err("a symlinked work directory ancestor must be rejected");
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(std::fs::read_dir(protected_work_directory)
+            .unwrap()
+            .next()
+            .is_none());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 

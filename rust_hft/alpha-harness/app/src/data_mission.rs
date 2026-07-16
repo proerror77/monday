@@ -7,7 +7,10 @@ use hft_collector::{
     DatasetManifest, FeatureDatasetManifest, OhlcvTraceRow,
 };
 use sha2::{Digest, Sha256};
-use std::{io::BufRead, path::Path};
+use std::{
+    io::BufRead,
+    path::{Component, Path, PathBuf},
+};
 
 pub async fn acquire_and_register(
     store: &mut AlphaStore,
@@ -262,17 +265,151 @@ fn load_feature_research_rows(
         .collect()
 }
 
-pub fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
-    if let Some(parent) = path
+pub(crate) fn ensure_real_directory(path: &Path, label: &str) -> anyhow::Result<()> {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for output safety")?
+            .join(path)
+    };
+    ensure_real_directory_at(&normalize_platform_root_alias(&absolute_path)?, label)
+}
+
+fn normalize_platform_root_alias(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    let mut resolved_root_component = false;
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => {}
+            Component::ParentDir => normalized.push(".."),
+            Component::Normal(component) if !resolved_root_component => {
+                let root_component = normalized.join(component);
+                normalized = if is_platform_root_alias(component) {
+                    match std::fs::symlink_metadata(&root_component) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            std::fs::canonicalize(&root_component).with_context(|| {
+                                format!(
+                                    "resolve platform root alias for output safety: {}",
+                                    root_component.display()
+                                )
+                            })?
+                        }
+                        Ok(_) | Err(_) => root_component,
+                    }
+                } else {
+                    root_component
+                };
+                resolved_root_component = true;
+            }
+            Component::Normal(component) => {
+                normalized.push(component);
+                resolved_root_component = true;
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn is_platform_root_alias(component: &std::ffi::OsStr) -> bool {
+    // On macOS these are symlinks into /private. They are the only root-level
+    // aliases we normalize; every other symlink must fail the directory walk.
+    #[cfg(target_os = "macos")]
+    {
+        component == std::ffi::OsStr::new("tmp") || component == std::ffi::OsStr::new("var")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = component;
+        false
+    }
+}
+
+fn ensure_real_directory_at(path: &Path, label: &str) -> anyhow::Result<()> {
+    // Root-level platform aliases (for example macOS /var) are normalized
+    // above. Every remaining component is application-controlled and must not
+    // resolve through a symlink.
+    if let Some(parent) = path.parent().filter(|parent| *parent != path) {
+        ensure_real_directory_at(parent, label)?;
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("create {label} directory {}", path.display()))
+                }
+            }
+            std::fs::symlink_metadata(path)
+                .with_context(|| format!("inspect {label} directory {}", path.display()))?
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect {label} directory {}", path.display()))
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "{label} directory cannot be a symbolic link: {}",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!("{label} path must be a directory: {}", path.display());
+    }
+    Ok(())
+}
+
+pub(crate) fn temporary_output_file(
+    path: &Path,
+    prefix: &str,
+) -> anyhow::Result<tempfile::NamedTempFile> {
+    let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)?;
+        .unwrap_or_else(|| Path::new("."));
+    ensure_real_directory(parent, "temporary output parent")?;
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempfile_in(parent)
+        .with_context(|| format!("create private temporary output in {}", parent.display()))
+}
+
+pub(crate) fn ensure_output_path_is_not_symlink(path: &Path, label: &str) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("{label} path cannot be a symbolic link: {}", path.display());
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect {label} path {}", path.display()))
+        }
     }
-    let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
-    std::fs::rename(temporary, path)?;
+}
+
+pub(crate) fn persist_output_file(
+    file: tempfile::NamedTempFile,
+    path: &Path,
+    label: &str,
+) -> anyhow::Result<()> {
+    ensure_output_path_is_not_symlink(path, label)?;
+    file.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("atomically publish {label} to {}", path.display()))?;
     Ok(())
+}
+
+pub fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
+    let mut temporary = temporary_output_file(path, ".monday-json-")?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), value)?;
+    temporary.as_file().sync_all()?;
+    persist_output_file(temporary, path, "JSON evidence")
 }
 
 pub fn default_manifest_path(manifest: &DatasetManifest) -> std::path::PathBuf {
@@ -293,6 +430,68 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_atomic_rejects_a_stale_output_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create JSON output test root");
+        let path = root.path().join("evidence.json");
+        let protected_target = root.path().join("protected-target");
+        std::fs::write(&protected_target, "preserve\n").unwrap();
+        symlink(&protected_target, &path).unwrap();
+
+        let error = write_json_atomic(&path, &serde_json::json!({"status": "fresh"}))
+            .expect_err("a symlinked JSON output path must be rejected");
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(
+            std::fs::read_to_string(protected_target).unwrap(),
+            "preserve\n"
+        );
+        assert!(std::fs::symlink_metadata(path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_output_file_rejects_a_symlinked_ancestor_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("create temporary output test root");
+        let protected_directory = root.path().join("protected-directory");
+        let protected_work_directory = protected_directory.join("work");
+        std::fs::create_dir_all(&protected_work_directory).unwrap();
+        let linked_parent = root.path().join("linked-parent");
+        symlink(&protected_directory, &linked_parent).unwrap();
+        let artifact_directory = linked_parent.join("work/artifacts");
+
+        let error = temporary_output_file(
+            &artifact_directory.join("execution-evidence.json"),
+            ".monday-json-",
+        )
+        .expect_err("a symlinked output ancestor must be rejected");
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(std::fs::read_dir(protected_work_directory)
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn platform_root_aliases_are_explicitly_whitelisted() {
+        assert!(!is_platform_root_alias(std::ffi::OsStr::new("evil")));
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_platform_root_alias(std::ffi::OsStr::new("tmp")));
+            assert!(is_platform_root_alias(std::ffi::OsStr::new("var")));
+        }
+    }
 
     #[test]
     fn registered_multimodal_feature_matrix_loads_without_losing_pit_availability() {
