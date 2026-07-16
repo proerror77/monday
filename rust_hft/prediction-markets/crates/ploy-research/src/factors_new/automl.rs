@@ -1,5 +1,5 @@
 use crate::factors_new::registry::{FactorMeta, FactorRegistry};
-use ploy_operator_contracts::Regime;
+use ploy_market_contracts::Regime;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AutomlFactorAttribution {

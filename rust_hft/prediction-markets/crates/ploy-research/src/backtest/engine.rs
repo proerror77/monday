@@ -1,6 +1,6 @@
 use crate::factors::FactorObservation;
 use crate::signal::traits::{Signal, SignalSource};
-use ploy_operator_contracts::Regime;
+use ploy_market_contracts::Regime;
 
 #[derive(Debug, Clone)]
 pub struct SimulatedFill {

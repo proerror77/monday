@@ -1,5 +1,6 @@
 [package]
 name = "ploy-research"
+build = "build.rs"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -16,7 +17,7 @@ db = ["dep:sqlx", "dep:ploy-feed-loaders"]
 polars-export = ["dep:polars"]
 ml = ["dep:burn", "dep:burn-ndarray", "dep:burn-store", "dep:ciborium"]
 rl = ["dep:burn", "dep:burn-ndarray"]
-strategy-runtime = []
+strategy-runtime = ["dep:ploy-strategy-bundles", "dep:ploy-trading"]
 
 [dependencies]
 rand.workspace = true
@@ -25,10 +26,9 @@ chrono.workspace = true
 polars = { workspace = true, optional = true }
 ploy-market-contracts.workspace = true
 ploy-market-data.workspace = true
-ploy-operator-contracts.workspace = true
 ploy-feed-loaders = { workspace = true, optional = true }
-ploy-strategy-bundles.workspace = true
-ploy-trading.workspace = true
+ploy-strategy-bundles = { workspace = true, optional = true }
+ploy-trading = { workspace = true, optional = true }
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -47,8 +47,14 @@ ciborium = { version = "0.2", optional = true }
 optimizer.workspace = true
 
 [dev-dependencies]
+ploy-operator-contracts.workspace = true
 rust_decimal_macros.workspace = true
 tempfile.workspace = true
+
+[build-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
 
 [[example]]
 name = "event_dataset_baseline"
@@ -131,3 +137,4 @@ path = "examples/research_snapshot_parity.rs"
 [[example]]
 name = "three_layer_snapshot_optimize"
 path = "examples/three_layer_snapshot_optimize.rs"
+required-features = ["strategy-runtime"]

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Duration, Utc};
-use ploy_operator_contracts::Regime;
+use ploy_market_contracts::Regime;
 use serde::{Deserialize, Serialize};
 
 use crate::autofactor::{LlmPriorSpec, LlmProbabilityBlendSpec};

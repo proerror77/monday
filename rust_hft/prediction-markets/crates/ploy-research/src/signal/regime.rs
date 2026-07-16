@@ -1,6 +1,6 @@
 use crate::factors::FactorObservation;
 use crate::signal::traits::{Signal, SignalSource};
-use ploy_operator_contracts::Regime;
+use ploy_market_contracts::Regime;
 use std::collections::HashMap;
 
 pub struct RegimeRouter {
@@ -37,7 +37,7 @@ mod tests {
     use crate::factors::FactorObservation;
     use crate::signal::traits::{Signal, SignalSource};
     use chrono::Utc;
-    use ploy_operator_contracts::Regime;
+    use ploy_market_contracts::Regime;
 
     struct FixedSignal(Signal);
     impl SignalSource for FixedSignal {
