@@ -530,46 +530,6 @@ fn failed_output(reason: String) -> PredictionEvaluationOutput {
     PredictionEvaluationOutput::failure(reason, String::new(), String::new())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn evaluator_capture_stops_at_the_governed_byte_limit() {
-        let (sender, receiver) = mpsc::channel();
-        spawn_bounded_capture(
-            std::io::Cursor::new(vec![b'x'; MAX_EVALUATOR_LOG_BYTES + 1]),
-            EvaluatorStream::Stdout,
-            sender,
-        );
-
-        let capture = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("bounded capture");
-        assert!(capture.overflow);
-        assert_eq!(capture.bytes.len(), MAX_EVALUATOR_LOG_BYTES);
-        assert!(capture
-            .failure_reason()
-            .expect("overflow reason")
-            .contains("exceeded"));
-    }
-
-    #[test]
-    fn evaluator_process_is_the_precompiled_monday_binary() {
-        let evaluator = RustProcessEvaluator {
-            executable: PathBuf::from("/usr/local/bin/monday-prediction-evaluator"),
-        };
-
-        let command = evaluator.process();
-
-        assert_eq!(
-            command.get_program(),
-            Path::new("/usr/local/bin/monday-prediction-evaluator")
-        );
-        assert_ne!(command.get_program(), "cargo");
-    }
-}
-
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["--print-policy-snapshot-id"] {
@@ -622,5 +582,45 @@ fn main() {
         LoopRunStatus::Paused | LoopRunStatus::Failed
     ) {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluator_capture_stops_at_the_governed_byte_limit() {
+        let (sender, receiver) = mpsc::channel();
+        spawn_bounded_capture(
+            std::io::Cursor::new(vec![b'x'; MAX_EVALUATOR_LOG_BYTES + 1]),
+            EvaluatorStream::Stdout,
+            sender,
+        );
+
+        let capture = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bounded capture");
+        assert!(capture.overflow);
+        assert_eq!(capture.bytes.len(), MAX_EVALUATOR_LOG_BYTES);
+        assert!(capture
+            .failure_reason()
+            .expect("overflow reason")
+            .contains("exceeded"));
+    }
+
+    #[test]
+    fn evaluator_process_is_the_precompiled_monday_binary() {
+        let evaluator = RustProcessEvaluator {
+            executable: PathBuf::from("/usr/local/bin/monday-prediction-evaluator"),
+        };
+
+        let command = evaluator.process();
+
+        assert_eq!(
+            command.get_program(),
+            Path::new("/usr/local/bin/monday-prediction-evaluator")
+        );
+        assert_ne!(command.get_program(), "cargo");
     }
 }
