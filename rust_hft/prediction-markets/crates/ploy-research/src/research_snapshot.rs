@@ -267,6 +267,37 @@ pub fn load_research_snapshot(snapshot_dir: impl AsRef<Path>) -> Result<Research
     })
 }
 
+/// Load a snapshot that is eligible for a governed prediction LoopRun.
+///
+/// This keeps the control-plane wrapper from publishing snapshots that the
+/// research runner would necessarily reject later.
+pub fn load_prediction_research_snapshot(
+    snapshot_dir: impl AsRef<Path>,
+) -> Result<ResearchSnapshot> {
+    let snapshot = load_research_snapshot(snapshot_dir)?;
+    validate_prediction_research_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+pub fn validate_prediction_research_snapshot(snapshot: &ResearchSnapshot) -> Result<()> {
+    let manifest = &snapshot.manifest;
+    if manifest
+        .snapshot_contract_hash
+        .as_deref()
+        .filter(|hash| !hash.is_empty())
+        .is_none()
+    {
+        anyhow::bail!("prediction snapshot is missing snapshot_contract_hash");
+    }
+    if !manifest.immutable_input {
+        anyhow::bail!("prediction snapshot is not marked immutable_input=true");
+    }
+    if !manifest.require_official_settlement {
+        anyhow::bail!("prediction snapshot must require official settlement");
+    }
+    Ok(())
+}
+
 pub fn write_research_snapshot(
     snapshot_dir: impl AsRef<Path>,
     mut snapshot: ResearchSnapshot,
@@ -2130,6 +2161,8 @@ mod tests {
 
         let written = write_research_snapshot(&root, snapshot).expect("write snapshot");
         let loaded = load_research_snapshot(&root).expect("load snapshot");
+        validate_prediction_research_snapshot(&loaded)
+            .expect("snapshot is eligible for a governed prediction LoopRun");
         assert_eq!(written.schema_version, RESEARCH_SNAPSHOT_SCHEMA_VERSION);
         assert!(written.snapshot_hash.is_some());
         let contract_hex = written
@@ -2147,6 +2180,22 @@ mod tests {
             "required_for_prediction"
         );
         assert_eq!(loaded.manifest.input_artifacts.len(), 1);
+        let mut missing_contract = loaded.clone();
+        missing_contract.manifest.snapshot_contract_hash = None;
+        assert!(validate_prediction_research_snapshot(&missing_contract)
+            .expect_err("prediction snapshots must have a contract hash")
+            .to_string()
+            .contains("snapshot_contract_hash"));
+        let mut missing_official_settlement = loaded.clone();
+        missing_official_settlement
+            .manifest
+            .require_official_settlement = false;
+        assert!(
+            validate_prediction_research_snapshot(&missing_official_settlement)
+                .expect_err("prediction snapshots must require official settlement")
+                .to_string()
+                .contains("official settlement")
+        );
         validate_snapshot_request(
             &loaded.manifest,
             ResearchSnapshotRequest {

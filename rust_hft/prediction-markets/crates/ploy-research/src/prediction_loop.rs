@@ -19,9 +19,9 @@ use crate::prediction_loop_fs::{
     write_content_addressed_text, ArtifactRef, OutputLock,
 };
 use crate::{
-    load_research_snapshot, normalized_underlying_symbol, validate_prediction_research_prior,
-    LlmPriorSpec, LlmProbabilityBlendSpec, PredictionResearchFeedback, ResearchSnapshot,
-    ResearchSnapshotManifest,
+    load_prediction_research_snapshot, normalized_underlying_symbol,
+    validate_prediction_research_prior, LlmPriorSpec, LlmProbabilityBlendSpec,
+    PredictionResearchFeedback, ResearchSnapshot, ResearchSnapshotManifest,
 };
 
 pub const PREDICTION_MISSION_SCHEMA_VERSION: &str = "prediction_research_mission.v1";
@@ -229,7 +229,7 @@ pub fn current_prediction_policy_snapshot_id() -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 27] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 28] {
     [
         ("Cargo.lock", include_bytes!("../../../Cargo.lock")),
         ("Cargo.toml", include_bytes!("../../../Cargo.toml")),
@@ -329,6 +329,10 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 27] {
         (
             "crates/ploy-market-contracts/src/venue.rs",
             include_bytes!("../../ploy-market-contracts/src/venue.rs"),
+        ),
+        (
+            "crates/ploy-operator-contracts/src/trading.rs",
+            include_bytes!("../../ploy-operator-contracts/src/trading.rs"),
         ),
     ]
 }
@@ -1181,7 +1185,7 @@ pub fn run_or_resume<C: ProposalClient, E: PredictionEvaluator>(
 
     let current_policy = current_prediction_policy_snapshot_id();
     validate_prediction_mission(&mission, &current_policy)?;
-    let snapshot = load_research_snapshot(snapshot_dir)
+    let snapshot = load_prediction_research_snapshot(snapshot_dir)
         .map_err(|error| format!("load governed research snapshot: {error:#}"))?;
     validate_prediction_snapshot_sources(&snapshot.manifest)?;
     validate_mission_snapshot_binding(&mission, &snapshot.manifest)?;
@@ -3900,7 +3904,7 @@ mod tests {
     }
 
     #[test]
-    fn prediction_policy_identity_excludes_runtime_and_oms_authority() {
+    fn prediction_policy_identity_tracks_shared_regime_but_excludes_runtime_and_oms_authority() {
         let paths = prediction_policy_sources()
             .into_iter()
             .map(|(path, _)| path)
@@ -3908,7 +3912,7 @@ mod tests {
 
         assert!(paths
             .iter()
-            .all(|path| !path.contains("operator-contracts")));
+            .any(|path| *path == "crates/ploy-operator-contracts/src/trading.rs"));
         assert!(paths.iter().all(|path| !path.contains("ploy-trading")));
         assert!(paths
             .iter()

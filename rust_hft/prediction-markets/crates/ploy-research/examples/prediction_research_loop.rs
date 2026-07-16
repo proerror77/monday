@@ -21,7 +21,7 @@ use ploy_research::prediction_loop::{
     PredictionResearchMission, ProposalCallOutput, ProposalClient,
 };
 use ploy_research::{
-    load_research_snapshot, normalized_underlying_symbol, PredictionResearchFeedback,
+    load_prediction_research_snapshot, normalized_underlying_symbol, PredictionResearchFeedback,
 };
 use sha2::{Digest, Sha256};
 
@@ -29,7 +29,7 @@ const MAX_EVALUATOR_LOG_BYTES: usize = 16 * 1024 * 1024;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  monday-prediction-research --print-policy-snapshot-id\n  monday-prediction-research --print-brief-snapshot-id <mission.json>\n  monday-prediction-research <mission.json> <snapshot-dir> <output-dir>"
+        "usage:\n  monday-prediction-research --print-policy-snapshot-id\n  monday-prediction-research --print-brief-snapshot-id <mission.json>\n  monday-prediction-research --verify-snapshot <snapshot-dir>\n  monday-prediction-research <mission.json> <snapshot-dir> <output-dir>"
     );
     std::process::exit(2);
 }
@@ -45,24 +45,7 @@ struct RustProcessEvaluator {
 
 impl RustProcessEvaluator {
     fn new() -> Result<Self, String> {
-        let executable = std::env::var_os("MONDAY_PREDICTION_EVALUATOR_BIN")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .map(Ok)
-            .unwrap_or_else(|| {
-                let current = std::env::current_exe()
-                    .map_err(|error| format!("resolve prediction research executable: {error}"))?;
-                let parent = current.parent().ok_or_else(|| {
-                    "prediction research executable has no parent directory".to_string()
-                })?;
-                Ok::<_, String>(parent.join("monday-prediction-evaluator"))
-            })?;
-        if !executable.is_file() {
-            return Err(format!(
-                "configured prediction evaluator does not exist: {}",
-                executable.display()
-            ));
-        }
+        let executable = sibling_pinned_binary("monday-prediction-evaluator")?;
         Ok(Self { executable })
     }
 
@@ -71,7 +54,7 @@ impl RustProcessEvaluator {
     }
 
     fn command(&self, request: &PredictionEvaluationRequest) -> Result<Command, String> {
-        let snapshot = load_research_snapshot(&request.snapshot_dir)
+        let snapshot = load_prediction_research_snapshot(&request.snapshot_dir)
             .map_err(|error| format!("load evaluator snapshot: {error:#}"))?;
         let underlying = request.mission.symbols[0].as_str();
         let symbol = snapshot
@@ -126,6 +109,63 @@ impl RustProcessEvaluator {
         }
         Ok(command)
     }
+}
+
+fn sibling_pinned_binary(name: &str) -> Result<PathBuf, String> {
+    let current = std::env::current_exe()
+        .map_err(|error| format!("resolve prediction research executable: {error}"))?;
+    let parent = current
+        .parent()
+        .ok_or_else(|| "prediction research executable has no parent directory".to_string())?;
+    let executable = parent.join(name);
+    if !executable.is_file() {
+        return Err(format!(
+            "release-pinned prediction evaluator does not exist: {}",
+            executable.display()
+        ));
+    }
+    verify_pinned_binary(&executable)?;
+    Ok(executable)
+}
+
+fn verify_pinned_binary(path: &Path) -> Result<(), String> {
+    let digest_path = path.with_extension("sha256");
+    let expected = fs::read_to_string(&digest_path)
+        .map_err(|error| {
+            format!(
+                "read pinned evaluator digest {}: {error}",
+                digest_path.display()
+            )
+        })?
+        .trim()
+        .to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "pinned evaluator digest is invalid: {}",
+            digest_path.display()
+        ));
+    }
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("read release-pinned evaluator {}: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let bytes = file.read(&mut buffer).map_err(|error| {
+            format!("hash release-pinned evaluator {}: {error}", path.display())
+        })?;
+        if bytes == 0 {
+            break;
+        }
+        digest.update(&buffer[..bytes]);
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if actual != expected {
+        return Err(format!(
+            "release-pinned prediction evaluator digest mismatch: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 impl PredictionEvaluator for RustProcessEvaluator {
@@ -530,6 +570,22 @@ fn failed_output(reason: String) -> PredictionEvaluationOutput {
     PredictionEvaluationOutput::failure(reason, String::new(), String::new())
 }
 
+fn verify_snapshot(snapshot_dir: &Path) -> Result<(), String> {
+    let snapshot = load_prediction_research_snapshot(snapshot_dir)
+        .map_err(|error| format!("verify governed prediction snapshot: {error:#}"))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": snapshot.manifest.schema_version,
+            "snapshot_hash": snapshot.manifest.snapshot_hash,
+            "snapshot_contract_hash": snapshot.manifest.snapshot_contract_hash,
+            "immutable_input": snapshot.manifest.immutable_input,
+            "require_official_settlement": snapshot.manifest.require_official_settlement,
+        })
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +624,18 @@ mod tests {
         );
         assert_ne!(command.get_program(), "cargo");
     }
+
+    #[test]
+    fn pinned_evaluator_rejects_a_digest_mismatch() {
+        let root = tempfile::tempdir().expect("temporary evaluator root");
+        let evaluator = root.path().join("monday-prediction-evaluator");
+        fs::write(&evaluator, "release binary").expect("write evaluator");
+        fs::write(evaluator.with_extension("sha256"), "0".repeat(64)).expect("write pinned digest");
+
+        let error = verify_pinned_binary(&evaluator).expect_err("mismatch must fail");
+
+        assert!(error.contains("digest mismatch"));
+    }
 }
 
 fn main() {
@@ -586,6 +654,16 @@ fn main() {
                 std::process::exit(2);
             });
         println!("{}", research_brief_snapshot_id(&mission));
+        return;
+    }
+    if args.first().map(String::as_str) == Some("--verify-snapshot") {
+        let [_, snapshot_dir] = args.as_slice() else {
+            usage();
+        };
+        verify_snapshot(Path::new(snapshot_dir)).unwrap_or_else(|reason| {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(2);
+        });
         return;
     }
     let [mission_path, snapshot_dir, output_dir] = args.as_slice() else {
