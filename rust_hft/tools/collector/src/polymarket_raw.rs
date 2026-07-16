@@ -2162,7 +2162,7 @@ mod tests {
         for unit in UNITS {
             let high = memory_limit_mebibytes(unit, "MemoryHigh");
             let maximum = memory_limit_mebibytes(unit, "MemoryMax");
-            assert_eq!(high, 512);
+            assert_eq!(high, 576);
             assert_eq!(maximum, 768);
             assert!(high < maximum);
         }
