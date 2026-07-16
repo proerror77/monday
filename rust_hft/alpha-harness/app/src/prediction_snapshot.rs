@@ -80,9 +80,7 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
             )
         })?)
         .context("prediction snapshot manifest identity is invalid JSON")?;
-    if manifest.snapshot_hash.is_none() || manifest.snapshot_contract_hash.is_none() {
-        bail!("prediction snapshot manifest is not content addressed");
-    }
+    validate_snapshot_manifest_identity(&manifest)?;
     let evidence = SnapshotExecutionEvidence {
         lane: "prediction_market_snapshot",
         schema_version: &manifest.schema_version,
@@ -110,6 +108,34 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
         bundle_bytes,
         bundle_sha256,
     })
+}
+
+fn validate_snapshot_manifest_identity(manifest: &SnapshotManifestIdentity) -> anyhow::Result<()> {
+    let snapshot_hash = manifest
+        .snapshot_hash
+        .as_deref()
+        .context("prediction snapshot manifest is missing snapshot_hash")?;
+    if snapshot_hash.len() != 16
+        || !snapshot_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("prediction snapshot manifest snapshot_hash must be exactly 16 ASCII hex characters");
+    }
+
+    let snapshot_contract_hash = manifest
+        .snapshot_contract_hash
+        .as_deref()
+        .context("prediction snapshot manifest is missing snapshot_contract_hash")?;
+    let contract_hex = snapshot_contract_hash.strip_prefix("sha256:").unwrap_or("");
+    if contract_hex.len() != 64
+        || !contract_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("prediction snapshot manifest snapshot_contract_hash must use sha256:<64 ASCII hex>");
+    }
+    Ok(())
 }
 
 fn validate_snapshot_args(args: &PredictionSnapshotArgs) -> anyhow::Result<()> {
@@ -185,7 +211,7 @@ mod tests {
         let compiler = root.join("monday-prediction-snapshot");
         std::fs::write(
             &compiler,
-            "#!/bin/sh\ntest \"$1\" = '--output-dir' || exit 2\nmkdir -p \"$2\"\nprintf '{\"schema_version\":\"research_snapshot_v2\",\"snapshot_hash\":\"sha256:outer\",\"snapshot_contract_hash\":\"sha256:contract\"}\\n' > \"$2/manifest.json\"\n",
+            "#!/bin/sh\ntest \"$1\" = '--output-dir' || exit 2\nmkdir -p \"$2\"\nprintf '{\"schema_version\":\"research_snapshot_v2\",\"snapshot_hash\":\"0123456789abcdef\",\"snapshot_contract_hash\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\"}\\n' > \"$2/manifest.json\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -224,6 +250,44 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported"));
+    }
+
+    #[test]
+    fn snapshot_manifest_identity_rejects_empty_or_malformed_hashes() {
+        let valid_snapshot_hash = "0123456789abcdef";
+        let valid_contract_hash = format!("sha256:{}", "a".repeat(64));
+        let uppercase_contract_hash = format!("sha256:{}", "A".repeat(64));
+
+        for (snapshot_hash, snapshot_contract_hash, expected_error) in [
+            ("", valid_contract_hash.as_str(), "snapshot_hash"),
+            (
+                "0123456789abcdeg",
+                valid_contract_hash.as_str(),
+                "snapshot_hash",
+            ),
+            (
+                "0123456789ABCDEf",
+                valid_contract_hash.as_str(),
+                "snapshot_hash",
+            ),
+            (valid_snapshot_hash, "", "snapshot_contract_hash"),
+            (valid_snapshot_hash, "sha256:abc", "snapshot_contract_hash"),
+            (
+                valid_snapshot_hash,
+                uppercase_contract_hash.as_str(),
+                "snapshot_contract_hash",
+            ),
+        ] {
+            let manifest = SnapshotManifestIdentity {
+                schema_version: "research_snapshot_v2".to_string(),
+                snapshot_hash: Some(snapshot_hash.to_string()),
+                snapshot_contract_hash: Some(snapshot_contract_hash.to_string()),
+            };
+            assert!(validate_snapshot_manifest_identity(&manifest)
+                .unwrap_err()
+                .to_string()
+                .contains(expected_error));
+        }
     }
 
     fn temporary_root(name: &str) -> PathBuf {
