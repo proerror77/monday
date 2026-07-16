@@ -26,9 +26,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --locked \
     -p hft-collector \
     --bin lob-pit-materializer \
+    && CARGO_TARGET_DIR=/work/target/prediction-markets \
+    cargo --config 'build.rustc-wrapper=""' build \
+    --manifest-path prediction-markets/Cargo.toml \
+    --release \
+    --locked \
+    -p ploy-research \
+    --features db \
+    --bin monday-prediction-research \
+    --bin monday-prediction-evaluator \
+    --bin monday-prediction-snapshot \
     && install -D -m 0755 /work/target/release/hft-backtest /out/bin/hft-backtest \
     && install -D -m 0755 /work/target/release/alpha-harness /out/bin/alpha-harness \
-    && install -D -m 0755 /work/target/release/lob-pit-materializer /out/bin/lob-pit-materializer
+    && install -D -m 0755 /work/target/release/lob-pit-materializer /out/bin/lob-pit-materializer \
+    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-research /out/bin/monday-prediction-research \
+    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-evaluator /out/bin/monday-prediction-evaluator \
+    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-snapshot /out/bin/monday-prediction-snapshot
 
 FROM debian:bookworm-slim AS runtime
 
@@ -42,6 +55,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /out/bin/hft-backtest /usr/local/bin/hft-backtest
 COPY --from=builder /out/bin/alpha-harness /usr/local/bin/alpha-harness
 COPY --from=builder /out/bin/lob-pit-materializer /usr/local/bin/lob-pit-materializer
+COPY --from=builder /out/bin/monday-prediction-research /usr/local/bin/monday-prediction-research
+COPY --from=builder /out/bin/monday-prediction-evaluator /usr/local/bin/monday-prediction-evaluator
+COPY --from=builder /out/bin/monday-prediction-snapshot /usr/local/bin/monday-prediction-snapshot
 
 RUN mkdir -p /work/config /work/data /work/results \
     && chown -R research:research /work
@@ -49,5 +65,8 @@ RUN mkdir -p /work/config /work/data /work/results \
 USER research
 WORKDIR /work
 ENV ALPHA_HARNESS_BIN=/usr/local/bin/alpha-harness
+ENV MONDAY_PREDICTION_RESEARCH_BIN=/usr/local/bin/monday-prediction-research \
+    MONDAY_PREDICTION_EVALUATOR_BIN=/usr/local/bin/monday-prediction-evaluator \
+    MONDAY_PREDICTION_SNAPSHOT_BIN=/usr/local/bin/monday-prediction-snapshot
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hft-backtest"]
