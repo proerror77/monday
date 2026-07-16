@@ -41,10 +41,8 @@ async fn run_axum_metrics_server(
             interval.tick().await;
 
             if let Ok(engine) = sync_engine_arc.try_lock() {
-                let latency_stats = engine.get_latency_stats();
-                if !latency_stats.is_empty() {
-                    infra_metrics::MetricsRegistry::global()
-                        .update_from_latency_monitor(&latency_stats);
+                if engine.get_statistics().is_running {
+                    engine.sync_latency_metrics_to_prometheus();
                 }
             }
         }

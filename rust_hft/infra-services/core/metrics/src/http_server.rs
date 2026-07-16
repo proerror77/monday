@@ -214,9 +214,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_handler() {
+    async fn health_remains_live_when_runtime_is_fail_closed() {
+        MetricsRegistry::global().update_engine_statistics(&crate::EngineStatisticsExport {
+            cycle_count: 1,
+            execution_events_processed: 1,
+            orders_submitted: 0,
+            orders_ack: 0,
+            orders_filled: 0,
+            orders_rejected: 0,
+            orders_canceled: 0,
+            runtime_truth_observed_at_us: crate::now_micros(),
+            reconciliation_complete: false,
+            reconciliation_healthy: false,
+            risk_halted: true,
+            data_integrity_gaps: 1,
+        });
         let response = health_handler().await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("health response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("health response JSON");
+        assert_eq!(body["status"], "healthy");
+
+        let readiness = readiness_handler(State(Arc::new(MetricsServerConfig {
+            readiness_max_idle_secs: u64::MAX,
+            readiness_max_utilization: 1.0,
+            ..Default::default()
+        })))
+        .await
+        .into_response();
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // 集成测试：启动服务器并测试端点

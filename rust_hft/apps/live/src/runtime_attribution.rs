@@ -7,9 +7,9 @@ use crate::deployment_envelope::{
 };
 use alpha_domain::{AttributionKind, AttributionMode, AttributionOutcome, RuntimeAttributionEvent};
 use chrono::{DateTime, Utc};
-use engine::aggregation::MarketView;
+use engine::{aggregation::MarketView, RuntimeTruthStatus};
 use hft_core::{Side, Symbol, VenueId, VenueSymbol};
-use ports::ExecutionEvent;
+use ports::{AccountView, ExecutionEvent};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use snapshot::SnapshotReader;
@@ -22,6 +22,8 @@ const COVERAGE_MISSING: f64 = 0.0;
 pub struct RuntimeAttributionObserver {
     receiver: broadcast::Receiver<ExecutionEvent>,
     market_reader: Arc<dyn SnapshotReader<MarketView>>,
+    account_reader: Arc<dyn SnapshotReader<AccountView>>,
+    runtime_truth_reader: Arc<dyn SnapshotReader<RuntimeTruthStatus>>,
     activation: ActivationRequest,
     feedback_log: RuntimeFeedbackLog,
     stale_us: u64,
@@ -81,6 +83,8 @@ impl RuntimeAttributionObserver {
     pub fn new(
         receiver: broadcast::Receiver<ExecutionEvent>,
         market_reader: Arc<dyn SnapshotReader<MarketView>>,
+        account_reader: Arc<dyn SnapshotReader<AccountView>>,
+        runtime_truth_reader: Arc<dyn SnapshotReader<RuntimeTruthStatus>>,
         activation: ActivationRequest,
         feedback_log: RuntimeFeedbackLog,
         stale_us: u64,
@@ -88,6 +92,8 @@ impl RuntimeAttributionObserver {
         Self {
             receiver,
             market_reader,
+            account_reader,
+            runtime_truth_reader,
             activation,
             feedback_log,
             stale_us,
@@ -120,10 +126,14 @@ impl RuntimeAttributionObserver {
                 },
                 _ = snapshots.tick() => {
                     let market = self.market_reader.load();
+                    let account = self.account_reader.load();
+                    let runtime_truth = self.runtime_truth_reader.load();
                     for event in portfolio_attribution(
                         &self.activation,
                         &mut state,
                         market.as_ref(),
+                        account.as_ref(),
+                        runtime_truth.as_ref(),
                         Utc::now(),
                         self.stale_us,
                     )? {
@@ -133,10 +143,14 @@ impl RuntimeAttributionObserver {
                 _ = &mut shutdown => {
                     self.drain_pending(&mut state)?;
                     let market = self.market_reader.load();
+                    let account = self.account_reader.load();
+                    let runtime_truth = self.runtime_truth_reader.load();
                     for event in portfolio_attribution(
                         &self.activation,
                         &mut state,
                         market.as_ref(),
+                        account.as_ref(),
+                        runtime_truth.as_ref(),
                         Utc::now(),
                         self.stale_us,
                     )? {
@@ -457,6 +471,8 @@ fn portfolio_attribution(
     activation: &ActivationRequest,
     state: &mut AttributionState,
     market: &MarketView,
+    account: &AccountView,
+    runtime_truth: &RuntimeTruthStatus,
     observed_at: DateTime<Utc>,
     stale_us: u64,
 ) -> anyhow::Result<Vec<RuntimeAttributionEvent>> {
@@ -545,10 +561,101 @@ fn portfolio_attribution(
                 )?,
             }
         };
+        let mut event = event;
+        attach_authoritative_account_metrics(
+            &mut event,
+            &activation.account_id,
+            account,
+            runtime_truth,
+            observed_at,
+        )?;
         events.push(event);
     }
 
     Ok(events)
+}
+
+fn attach_authoritative_account_metrics(
+    event: &mut RuntimeAttributionEvent,
+    expected_account_id: &str,
+    account: &AccountView,
+    runtime_truth: &RuntimeTruthStatus,
+    observed_at: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let account_matches = runtime_truth
+        .account_id
+        .as_ref()
+        .is_some_and(|account_id| account_id.0 == expected_account_id);
+    if account_matches {
+        for (name, value) in [
+            ("authoritative_account_cash_balance", account.cash_balance),
+            ("authoritative_account_realized_pnl", account.realized_pnl),
+            (
+                "authoritative_account_unrealized_pnl",
+                account.unrealized_pnl,
+            ),
+            ("authoritative_account_total_pnl", account.total_pnl()),
+            ("authoritative_account_equity", account.equity()),
+        ] {
+            event
+                .metrics
+                .insert(name.to_string(), decimal_metric(name, value)?);
+        }
+        event.metrics.insert(
+            "authoritative_account_open_positions".to_string(),
+            account.positions.len() as f64,
+        );
+    }
+    event.metrics.insert(
+        "authoritative_account_snapshot_coverage".to_string(),
+        if account_matches
+            && runtime_truth.reconciliation_complete
+            && runtime_truth.reconciliation_healthy
+        {
+            COVERAGE_COMPLETE
+        } else {
+            COVERAGE_MISSING
+        },
+    );
+    event.metrics.insert(
+        "venue_reconciliation_complete".to_string(),
+        if runtime_truth.reconciliation_complete {
+            COVERAGE_COMPLETE
+        } else {
+            COVERAGE_MISSING
+        },
+    );
+    event.metrics.insert(
+        "venue_reconciliation_healthy".to_string(),
+        if runtime_truth.reconciliation_healthy {
+            COVERAGE_COMPLETE
+        } else {
+            COVERAGE_MISSING
+        },
+    );
+    let observed_at_us = u64::try_from(observed_at.timestamp_micros()).unwrap_or_default();
+    let reconciliation_age_us = observed_at_us.saturating_sub(runtime_truth.observed_at_us);
+    event.metrics.insert(
+        "venue_reconciliation_age_us".to_string(),
+        reconciliation_age_us as f64,
+    );
+    const MAX_RECONCILIATION_AGE_US: u64 = 30_000_000;
+    if event.mode == AttributionMode::LiveSmall
+        && event.kind == AttributionKind::PortfolioSnapshot
+        && event.outcome == AttributionOutcome::Healthy
+        && (!runtime_truth.reconciliation_complete
+            || !runtime_truth.reconciliation_healthy
+            || runtime_truth.observed_at_us == 0
+            || !account_matches
+            || reconciliation_age_us > MAX_RECONCILIATION_AGE_US)
+    {
+        event.outcome = AttributionOutcome::Decayed;
+        event.reason = Some(
+            "authoritative venue reconciliation is missing, unhealthy, stale, or not scoped to the activation account; portfolio evidence withheld from promotion"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn stream_gap_attribution(
@@ -1029,7 +1136,21 @@ mod tests {
         state: &mut AttributionState,
         market: &MarketView,
     ) -> Vec<RuntimeAttributionEvent> {
-        portfolio_attribution(activation, state, market, execution_time(NOW_US), u64::MAX).unwrap()
+        portfolio_attribution(
+            activation,
+            state,
+            market,
+            &AccountView::default(),
+            &RuntimeTruthStatus {
+                reconciliation_complete: true,
+                reconciliation_healthy: true,
+                observed_at_us: NOW_US,
+                account_id: Some(hft_core::AccountId(activation.account_id.clone())),
+            },
+            execution_time(NOW_US),
+            u64::MAX,
+        )
+        .unwrap()
     }
 
     fn event_for<'a>(
@@ -1419,6 +1540,11 @@ mod tests {
         assert_eq!(event.symbol, None);
         assert_eq!(event.metrics["gross_total_pnl"], 15.0);
         assert_eq!(event.metrics["session_equity"], 1015.0);
+        assert_eq!(
+            event.metrics["authoritative_account_snapshot_coverage"],
+            1.0
+        );
+        assert_eq!(event.metrics["authoritative_account_equity"], 0.0);
     }
 
     #[test]
@@ -1535,35 +1661,138 @@ mod tests {
     }
 
     #[test]
+    fn paper_and_shadow_snapshots_do_not_require_live_reconciliation() {
+        for mode in [ActivationMode::Paper, ActivationMode::Shadow] {
+            let mut activation = activation();
+            activation.mode = mode;
+            let mut state = AttributionState::new(&activation).unwrap();
+            let events = portfolio_attribution(
+                &activation,
+                &mut state,
+                &market_with_mid(&[("BTCUSDT", 100.0)]),
+                &AccountView::default(),
+                &RuntimeTruthStatus::default(),
+                execution_time(NOW_US),
+                u64::MAX,
+            )
+            .unwrap();
+
+            assert_eq!(events[0].outcome, AttributionOutcome::Healthy);
+        }
+    }
+
+    #[test]
+    fn live_small_snapshot_decays_without_authoritative_reconciliation() {
+        let mut activation = activation();
+        activation.mode = ActivationMode::LiveSmall;
+        let mut state = AttributionState::new(&activation).unwrap();
+        let events = portfolio_attribution(
+            &activation,
+            &mut state,
+            &market_with_mid(&[("BTCUSDT", 100.0)]),
+            &AccountView::default(),
+            &RuntimeTruthStatus::default(),
+            execution_time(NOW_US),
+            u64::MAX,
+        )
+        .unwrap();
+
+        assert_eq!(events[0].outcome, AttributionOutcome::Decayed);
+    }
+
+    #[test]
+    fn global_account_view_is_not_attributed_to_activation_account() {
+        let mut activation = activation();
+        activation.mode = ActivationMode::LiveSmall;
+        let mut state = AttributionState::new(&activation).unwrap();
+        let account = AccountView {
+            cash_balance: Decimal::from(42_000),
+            ..AccountView::default()
+        };
+        let events = portfolio_attribution(
+            &activation,
+            &mut state,
+            &market_with_mid(&[("BTCUSDT", 100.0)]),
+            &account,
+            &RuntimeTruthStatus {
+                reconciliation_complete: true,
+                reconciliation_healthy: true,
+                observed_at_us: NOW_US,
+                account_id: None,
+            },
+            execution_time(NOW_US),
+            u64::MAX,
+        )
+        .unwrap();
+
+        assert_eq!(events[0].outcome, AttributionOutcome::Decayed);
+        assert_eq!(events[0].account_id.as_deref(), Some("account-1"));
+        assert_eq!(
+            events[0].metrics["authoritative_account_snapshot_coverage"],
+            0.0
+        );
+        assert!(!events[0]
+            .metrics
+            .contains_key("authoritative_account_equity"));
+    }
+
+    #[test]
     fn multi_instrument_portfolio_requires_each_mark_to_be_fresh() {
         let activation = formula_activation(&["BTCUSDT", "ETHUSDT"]);
         let mut state = AttributionState::new(&activation).unwrap();
         let observed_at = Utc::now();
         let now_us = observed_at.timestamp_micros().max(0) as u64;
         let stale_us = 1_000;
+        let runtime_truth = RuntimeTruthStatus {
+            reconciliation_complete: true,
+            reconciliation_healthy: true,
+            observed_at_us: now_us,
+            account_id: Some(hft_core::AccountId(activation.account_id.clone())),
+        };
 
         let one_stale = market_with_timed_mids(&[
             ("BTCUSDT", 100.0, now_us),
             ("ETHUSDT", 50.0, now_us - stale_us - 1),
         ]);
-        let events =
-            portfolio_attribution(&activation, &mut state, &one_stale, observed_at, stale_us)
-                .unwrap();
+        let events = portfolio_attribution(
+            &activation,
+            &mut state,
+            &one_stale,
+            &AccountView::default(),
+            &runtime_truth,
+            observed_at,
+            stale_us,
+        )
+        .unwrap();
         assert!(events.is_empty());
 
         let complete =
             market_with_timed_mids(&[("BTCUSDT", 100.0, now_us), ("ETHUSDT", 50.0, now_us)]);
-        let events =
-            portfolio_attribution(&activation, &mut state, &complete, observed_at, stale_us)
-                .unwrap();
+        let events = portfolio_attribution(
+            &activation,
+            &mut state,
+            &complete,
+            &AccountView::default(),
+            &runtime_truth,
+            observed_at,
+            stale_us,
+        )
+        .unwrap();
         assert_eq!(events.len(), 2);
         assert!(events
             .iter()
             .all(|event| event.outcome == AttributionOutcome::Healthy));
 
-        let events =
-            portfolio_attribution(&activation, &mut state, &one_stale, observed_at, stale_us)
-                .unwrap();
+        let events = portfolio_attribution(
+            &activation,
+            &mut state,
+            &one_stale,
+            &AccountView::default(),
+            &runtime_truth,
+            observed_at,
+            stale_us,
+        )
+        .unwrap();
         assert_eq!(events.len(), 2);
         assert!(events
             .iter()
@@ -1684,6 +1913,14 @@ mod tests {
         let observer = RuntimeAttributionObserver::new(
             execution_tx.subscribe(),
             market.reader(),
+            snapshot::SnapshotContainer::new(AccountView::default()).reader(),
+            snapshot::SnapshotContainer::new(RuntimeTruthStatus {
+                reconciliation_complete: true,
+                reconciliation_healthy: true,
+                observed_at_us: hft_core::now_micros(),
+                account_id: Some(hft_core::AccountId(activation.account_id.clone())),
+            })
+            .reader(),
             activation,
             feedback_log,
             u64::MAX,
