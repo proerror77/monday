@@ -158,6 +158,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_hft
+          shared-key: strict-alpha-research-ml-v1
 
       - name: Run Clippy (strict)
         run: |
