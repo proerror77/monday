@@ -63,6 +63,7 @@ pub fn run(options: SweepOptions<'_>) -> anyhow::Result<()> {
             combo_output.display()
         );
         if options.dry_run {
+            cfg.validate_data_artifact()?;
             let strategy = config_value
                 .as_mapping()
                 .and_then(|mapping| mapping.get(Value::String("strategy".to_string())))

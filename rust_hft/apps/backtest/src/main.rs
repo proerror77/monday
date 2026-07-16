@@ -66,6 +66,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if args.dry_run {
+        validate_dry_run(&cfg)?;
         info!("dry-run 模式：僅檢查配置成功");
         return Ok(());
     }
@@ -82,6 +83,10 @@ fn main() -> anyhow::Result<()> {
     print_summary(&result.summary);
 
     Ok(())
+}
+
+fn validate_dry_run(cfg: &BacktestConfig) -> anyhow::Result<()> {
+    cfg.validate_data_artifact().map(drop)
 }
 
 fn resolve_usize(value: Option<usize>, env_name: &str, fallback: usize) -> anyhow::Result<usize> {
@@ -132,6 +137,22 @@ fn write_outputs(
     if !out_dir.exists() {
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("無法建立輸出目錄: {}", out_dir.display()))?;
+    }
+    for name in [
+        Some(&output.trades_csv),
+        Some(&output.summary_csv),
+        output.metrics_json.as_ref(),
+        Some(&output.evidence_json),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if out_dir.join(name).try_exists()? {
+            anyhow::bail!(
+                "backtest output already exists: {}",
+                out_dir.join(name).display()
+            );
+        }
     }
     let evidence = result
         .input_evidence
@@ -191,11 +212,19 @@ fn write_output_evidence(
         "input": result.input_evidence,
         "artifacts": artifacts,
     });
-    std::fs::write(
-        out_dir.join(&output.evidence_json),
-        serde_json::to_vec_pretty(&evidence)?,
+    serde_json::to_writer_pretty(
+        create_output(&out_dir.join(&output.evidence_json))?,
+        &evidence,
     )?;
     Ok(())
+}
+
+fn create_output(path: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("refusing to overwrite backtest output: {}", path.display()))
 }
 
 fn write_trades_csv(
@@ -203,8 +232,7 @@ fn write_trades_csv(
     trades: &[TradeRecord],
     evidence: &BacktestInputEvidence,
 ) -> anyhow::Result<()> {
-    let mut writer = csv::Writer::from_path(path)
-        .with_context(|| format!("無法寫入交易檔案: {}", path.display()))?;
+    let mut writer = csv::Writer::from_writer(create_output(path)?);
     writer.write_record([
         "entry_ts",
         "exit_ts",
@@ -220,6 +248,7 @@ fn write_trades_csv(
         "reference_depth",
         "input_manifest_sha256",
         "effective_config_sha256",
+        "source_revision",
     ])?;
     for trade in trades {
         writer.write_record([
@@ -237,6 +266,7 @@ fn write_trades_csv(
             format!("{:.6}", trade.reference_depth),
             evidence.manifest_sha256.clone(),
             evidence.config_sha256.clone(),
+            evidence.source_revision.clone(),
         ])?;
     }
     writer.flush()?;
@@ -248,8 +278,7 @@ fn write_summary_csv(
     summary: &SummaryMetrics,
     evidence: &BacktestInputEvidence,
 ) -> anyhow::Result<()> {
-    let mut writer = csv::Writer::from_path(path)
-        .with_context(|| format!("無法寫入摘要檔案: {}", path.display()))?;
+    let mut writer = csv::Writer::from_writer(create_output(path)?);
     writer.write_record([
         "total_pnl",
         "gross_pnl",
@@ -262,6 +291,7 @@ fn write_summary_csv(
         "open_position_qty",
         "input_manifest_sha256",
         "effective_config_sha256",
+        "source_revision",
     ])?;
     writer.write_record([
         format!("{:.6}", summary.total_pnl),
@@ -275,6 +305,7 @@ fn write_summary_csv(
         format!("{:.6}", summary.open_position_qty),
         evidence.manifest_sha256.clone(),
         evidence.config_sha256.clone(),
+        evidence.source_revision.clone(),
     ])?;
     writer.flush()?;
     Ok(())
@@ -286,8 +317,7 @@ fn write_metrics_json(path: &Path, result: &BacktestResult) -> anyhow::Result<()
         "summary": result.summary,
     }))
     .context("序列化回測指標失敗")?;
-    std::fs::write(path, buffer)
-        .with_context(|| format!("寫入指標檔案失敗: {}", path.display()))?;
+    std::io::Write::write_all(&mut create_output(path)?, buffer.as_bytes())?;
     Ok(())
 }
 
@@ -307,6 +337,16 @@ fn print_summary(summary: &SummaryMetrics) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dry_run_validates_the_input_artifact() {
+        let config_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/backtest/default.yaml");
+        let mut config = BacktestConfig::from_file(config_path).unwrap();
+        config.data.manifest_sha256 = Some("0".repeat(64));
+
+        assert!(validate_dry_run(&config).is_err());
+    }
 
     #[test]
     fn output_evidence_binds_inputs_and_every_result_artifact() {
@@ -340,6 +380,7 @@ mod tests {
             input_evidence: Some(BacktestInputEvidence {
                 manifest_sha256: "a".repeat(64),
                 config_sha256: "b".repeat(64),
+                source_revision: "c".repeat(64),
             }),
         };
 
@@ -350,10 +391,18 @@ mod tests {
                 .unwrap();
         assert_eq!(evidence["input"]["manifest_sha256"], "a".repeat(64));
         assert_eq!(evidence["input"]["config_sha256"], "b".repeat(64));
+        assert_eq!(evidence["input"]["source_revision"], "c".repeat(64));
         assert_eq!(evidence["artifacts"].as_object().unwrap().len(), 3);
         for name in ["trades.csv", "summary.csv", "metrics.json"] {
             assert_eq!(evidence["artifacts"][name].as_str().unwrap().len(), 64);
         }
+
+        let original_evidence = std::fs::read(out_dir.join(&output.evidence_json)).unwrap();
+        assert!(write_outputs(&output, Some(out_dir.to_str().unwrap()), &result).is_err());
+        assert_eq!(
+            std::fs::read(out_dir.join(&output.evidence_json)).unwrap(),
+            original_evidence
+        );
 
         let mut colliding_output = output.clone();
         colliding_output.evidence_json = colliding_output.summary_csv.clone();

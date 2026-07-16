@@ -63,9 +63,6 @@ impl BacktestConfig {
         if self.risk.inventory_limit <= 0.0 {
             self.risk.inventory_limit = self.execution.max_position * 2.0;
         }
-        if self.risk.slippage_limit_ticks <= 0.0 {
-            self.risk.slippage_limit_ticks = self.execution.max_slippage_ticks;
-        }
         if self.strategy.support_count == 0 {
             self.strategy.support_count = 3;
         }
@@ -107,8 +104,9 @@ impl BacktestConfig {
         self.validate_modalities()?;
 
         let artifact_path = resolve_path(&self.data.path);
-        let (actual, mut file, _) = open_hashed_source(&artifact_path)
+        let bytes = fs::read(&artifact_path)
             .with_context(|| format!("无法读取回测数据: {}", self.data.path))?;
+        let actual = hex::encode(Sha256::digest(&bytes));
         if actual != manifest.artifact_sha256 {
             bail!(
                 "backtest data SHA-256 mismatch: expected {}, actual {actual}",
@@ -118,17 +116,15 @@ impl BacktestConfig {
         if canonical_path(&self.data.path)? != canonical_path(&manifest.artifact_path)? {
             bail!("data.path does not match manifest artifact_path");
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        file.seek(SeekFrom::Start(0))?;
         validate_source_segments(&manifest, &bytes)?;
         validate_event_tape(&bytes, &manifest)?;
         self.validate_execution_model()?;
         Ok(VerifiedBacktestData {
-            file,
+            bytes,
             evidence: BacktestInputEvidence {
                 manifest_sha256: actual_manifest_sha256,
                 config_sha256: hex::encode(Sha256::digest(serde_json::to_vec(self)?)),
+                source_revision: manifest.source_revision,
             },
         })
     }
@@ -147,6 +143,16 @@ impl BacktestConfig {
     }
 
     fn validate_execution_model(&self) -> anyhow::Result<()> {
+        if !self.execution.max_slippage_ticks.is_finite()
+            || self.execution.max_slippage_ticks < 0.0
+            || !self.risk.slippage_limit_ticks.is_finite()
+            || self.risk.slippage_limit_ticks < 0.0
+            || self.execution.max_slippage_ticks > self.risk.slippage_limit_ticks
+        {
+            bail!(
+                "execution.max_slippage_ticks must be finite/non-negative and within risk.slippage_limit_ticks"
+            );
+        }
         if !self.execution.fee_bps.is_finite() || self.execution.fee_bps < 0.0 {
             bail!("execution.fee_bps must be finite and non-negative");
         }
@@ -162,7 +168,7 @@ impl BacktestConfig {
 
 #[derive(Debug)]
 pub struct VerifiedBacktestData {
-    pub file: File,
+    pub bytes: Vec<u8>,
     pub evidence: BacktestInputEvidence,
 }
 
@@ -170,6 +176,7 @@ pub struct VerifiedBacktestData {
 pub struct BacktestInputEvidence {
     pub manifest_sha256: String,
     pub config_sha256: String,
+    pub source_revision: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -651,6 +658,7 @@ fn resolve_path(path: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn fixture_manifest() -> BacktestDataManifest {
         serde_json::from_value(fixture_manifest_value()).unwrap()
@@ -677,6 +685,10 @@ mod tests {
         let verified = config.validate_data_artifact().unwrap();
         assert_eq!(verified.evidence.manifest_sha256.len(), 64);
         assert_eq!(verified.evidence.config_sha256.len(), 64);
+        assert_eq!(
+            verified.evidence.source_revision,
+            fixture_manifest().source_revision
+        );
 
         let manifest = fixture_manifest();
         assert_ne!(
@@ -727,6 +739,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("requires trade flow"));
+    }
+
+    #[test]
+    fn execution_slippage_must_be_finite_and_within_risk_limit() {
+        let mut config =
+            BacktestConfig::from_file(resolve_path("config/backtest/default.yaml")).unwrap();
+
+        config.execution.max_slippage_ticks = 4.0;
+        config.risk.slippage_limit_ticks = 3.0;
+        assert!(config.validate_execution_model().is_err());
+
+        config.execution.max_slippage_ticks = f64::NAN;
+        assert!(config.validate_execution_model().is_err());
+
+        config.execution.max_slippage_ticks = 2.0;
+        config.risk.slippage_limit_ticks = f64::INFINITY;
+        assert!(config.validate_execution_model().is_err());
+
+        let yaml = fs::read_to_string(resolve_path("config/backtest/default.yaml"))
+            .unwrap()
+            .replace("slippage_limit_ticks: 3.0", "slippage_limit_ticks: -1.0");
+        let config = BacktestConfig::from_yaml_str(&yaml, "negative risk slippage").unwrap();
+        assert!(config.validate_execution_model().is_err());
     }
 
     #[test]
@@ -964,18 +999,26 @@ mod tests {
         );
         let config = BacktestConfig::from_yaml_str(&yaml, "compressed fixture").unwrap();
 
-        let mut verified = config.validate_data_artifact().unwrap();
+        let verified = config.validate_data_artifact().unwrap();
+        let verified_contents = verified.bytes.clone();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&artifact)
+            .unwrap()
+            .write_all(b"malicious append\n")
+            .unwrap();
+        assert_ne!(fs::read(&artifact).unwrap(), verified_contents);
+        assert_eq!(verified.bytes, verified_contents);
+
         let preserved_artifact = directory.join("verified-backtest.ndjson");
         fs::rename(&artifact, &preserved_artifact).unwrap();
         fs::write(&artifact, b"malicious replacement\n").unwrap();
-        let mut verified_contents = String::new();
-        verified
-            .file
-            .read_to_string(&mut verified_contents)
-            .unwrap();
-        assert!(verified_contents.contains("\"event\":\"snapshot\""));
+        assert!(std::str::from_utf8(&verified.bytes)
+            .unwrap()
+            .contains("\"event\":\"snapshot\""));
         fs::remove_file(&artifact).unwrap();
         fs::rename(&preserved_artifact, &artifact).unwrap();
+        fs::write(&artifact, &verified_contents).unwrap();
         fs::write(&segment, b"corrupt").unwrap();
         assert!(config.validate_data_artifact().is_err());
         fs::remove_dir_all(directory).unwrap();

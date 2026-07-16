@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::mem;
 
 use anyhow::Result;
@@ -46,7 +46,7 @@ impl BacktestEngine {
     pub fn run(&mut self) -> Result<BacktestResult> {
         let verified = self.cfg.validate_data_artifact()?;
         let stream = EventStream::new(
-            BufReader::new(verified.file),
+            BufReader::new(Cursor::new(verified.bytes)),
             self.cfg.data.start_ts,
             self.cfg.data.end_ts,
             self.cfg.data.require_sequence,
