@@ -372,14 +372,16 @@ impl ExecutionControlHandle {
         &self,
         include_balances: bool,
     ) -> HftResult<RuntimeReconciliationReport> {
-        self.engine
-            .lock()
-            .await
-            .publish_runtime_truth_status(crate::RuntimeTruthStatus {
-                reconciliation_complete: false,
-                reconciliation_healthy: false,
-                observed_at_us: hft_core::now_micros(),
-            });
+        if include_balances {
+            self.engine
+                .lock()
+                .await
+                .publish_runtime_truth_status(crate::RuntimeTruthStatus {
+                    reconciliation_complete: false,
+                    reconciliation_healthy: false,
+                    observed_at_us: hft_core::now_micros(),
+                });
+        }
         let worker_tx = self.worker_sender()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         worker_tx
@@ -453,14 +455,16 @@ impl ExecutionControlHandle {
             complete,
             healthy,
         };
-        self.engine
-            .lock()
-            .await
-            .publish_runtime_truth_status(crate::RuntimeTruthStatus {
-                reconciliation_complete: report.complete,
-                reconciliation_healthy: report.healthy,
-                observed_at_us: hft_core::now_micros(),
-            });
+        if include_balances {
+            self.engine
+                .lock()
+                .await
+                .publish_runtime_truth_status(crate::RuntimeTruthStatus {
+                    reconciliation_complete: report.complete,
+                    reconciliation_healthy: report.healthy,
+                    observed_at_us: hft_core::now_micros(),
+                });
+        }
         Ok(report)
     }
 
@@ -1258,6 +1262,52 @@ mod tests {
         assert!(!report.healthy);
         assert_eq!(report.order_report.local_only.len(), 1);
         worker.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn order_only_reconciliation_does_not_publish_authoritative_account_truth() {
+        let engine = Arc::new(Mutex::new(Engine::new(EngineConfig::default())));
+        let runtime_truth = engine.lock().await.runtime_truth_reader();
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let control = ExecutionControlHandle::new(engine, Some(worker_tx), true);
+        let worker = tokio::spawn(async move {
+            match worker_rx.recv().await.expect("control command") {
+                ControlCommand::Reconcile {
+                    include_balances,
+                    include_positions,
+                    include_recent_fills,
+                    reply,
+                } => {
+                    assert!(!include_balances);
+                    assert!(!include_positions);
+                    assert!(!include_recent_fills);
+                    reply
+                        .send(WorkerReconcileSnapshot {
+                            clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                                client_index: 0,
+                                venue: Some(VenueId::POLYMARKET),
+                                account_id: None,
+                                open_orders: Ok(Vec::new()),
+                                balances: None,
+                                positions: None,
+                                recent_fills: None,
+                            }],
+                        })
+                        .expect("send reconciliation");
+                }
+                _ => panic!("unexpected control command"),
+            }
+        });
+
+        let report = control.reconcile(false).await.expect("reconcile");
+        worker.await.expect("worker task");
+
+        assert!(report.complete);
+        assert!(report.healthy);
+        let truth = runtime_truth.load();
+        assert!(!truth.reconciliation_complete);
+        assert!(!truth.reconciliation_healthy);
+        assert_eq!(truth.observed_at_us, 0);
     }
 
     #[tokio::test]
