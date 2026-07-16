@@ -291,7 +291,7 @@ fn validate_materialization(
     Ok(())
 }
 
-fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<String> {
+pub(crate) fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<String> {
     let value = value.trim().to_ascii_lowercase();
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("{label} SHA256 is invalid");
@@ -299,7 +299,7 @@ fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<String> {
     Ok(value)
 }
 
-fn fetch_to_file(
+pub(crate) fn fetch_to_file(
     client: &Client,
     source: &str,
     destination: &Path,
