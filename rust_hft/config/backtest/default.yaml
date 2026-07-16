@@ -5,7 +5,7 @@ data:
   lot_size: 0.01
   max_depth_levels: 20
   manifest_path: data/backtest/sample.manifest.json
-  manifest_sha256: deefdc34806124380569919a2e43c74d8914d98a6da050f7d1c69f6891de53a8
+  manifest_sha256: 0892719a8b5bbc460fac93e307e56b62234bbc8c6f323ad8c08257908b60b4c7
   require_sequence: true
 
 strategy:

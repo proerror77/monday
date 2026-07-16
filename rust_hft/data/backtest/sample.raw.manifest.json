@@ -2,20 +2,21 @@
   "schema": "binance.lob_tape.v2",
   "venue": "binance",
   "market": "spot",
-  "dataset": "sample_backtest_raw",
+  "dataset": "binance_spot_lob",
+  "symbols": ["BTCUSDT"],
   "mode": "diff",
   "replay_scope": "captured_snapshot_seed_plus_sequence_checked_diffs",
-  "events": 9,
+  "events": 5,
+  "bytes": 1240,
   "event_types": {
     "snapshot": 1,
     "checkpoint": 1,
-    "l2_update": 2,
-    "trade": 5
+    "diff": 3
   },
   "has_replay_safe_checkpoint": true,
   "all_symbols_bridged": true,
-  "start_received_at_ns": 1700000000000000000,
-  "end_received_at_ns": 1700000001800000000,
+  "start_received_at_ns": 1700000000100000000,
+  "end_received_at_ns": 1700000000500000000,
   "file": "sample.raw.ndjson",
-  "sha256": "145db91a1fe40a9d4fe3a122a7c4a06a7f4865c5293a17636fe9121ed59b2048"
+  "sha256": "def1428c8e1f21914a0eb7fac6ea6b02309f5ebcd3212006363cff4186a6418c"
 }

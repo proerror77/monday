@@ -1,7 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
-use hft_collector::{DataModality, PointInTimeFeatureRow};
+use hft_collector::{
+    lob_archiver::{
+        source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceValidator,
+    },
+    DataModality, PointInTimeFeatureRow,
+};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -151,11 +156,19 @@ struct Replay {
     next_bucket_ns: Option<u64>,
     series_id: u64,
     saw_seed: bool,
+    sequence_validator: ReplaySequenceValidator,
 }
 
 impl Replay {
-    fn new(market: Market, symbol: String, bucket_ns: u64, depth: usize) -> Self {
-        Self {
+    fn new(market: Market, symbol: String, bucket_ns: u64, depth: usize) -> Result<Self> {
+        let sequence_validator = ReplaySequenceValidator::new(
+            match market {
+                Market::Spot => LobMarket::Spot,
+                Market::Usdm => LobMarket::Usdm,
+            },
+            &symbol,
+        )?;
+        Ok(Self {
             market,
             symbol,
             bucket_ns,
@@ -166,7 +179,8 @@ impl Replay {
             next_bucket_ns: None,
             series_id: 0,
             saw_seed: false,
-        }
+            sequence_validator,
+        })
     }
 
     fn start_series(&mut self, state: BookState, received_at_ns: u64) -> Result<()> {
@@ -226,11 +240,20 @@ impl Replay {
 
     fn process_event(&mut self, event: Value) -> Result<()> {
         let received_at_ns = json_u64(&event, "received_at_ns")?;
-        match event.get("type").and_then(Value::as_str) {
-            Some("sequence_gap") => bail!("LOB tape contains a sequence gap event"),
-            Some("snapshot") => self.process_snapshot(event, received_at_ns),
-            Some("checkpoint") => self.process_checkpoint(event, received_at_ns),
-            Some("diff") => self.process_diff(event, received_at_ns),
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .context("event has no type")?;
+        self.sequence_validator.observe(
+            event_type,
+            event.as_object().context("event is not an object")?,
+            received_at_ns,
+        )?;
+        match event_type {
+            "sequence_gap" => bail!("LOB tape contains a sequence gap event"),
+            "snapshot" => self.process_snapshot(event, received_at_ns),
+            "checkpoint" => self.process_checkpoint(event, received_at_ns),
+            "diff" => self.process_diff(event, received_at_ns),
             _ => Ok(()),
         }
     }
@@ -337,7 +360,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .bucket_ms
         .checked_mul(1_000_000)
         .context("bucket size overflow")?;
-    let mut replay = Replay::new(args.market, symbol.clone(), bucket_ns, args.top_depth);
+    let mut replay = Replay::new(args.market, symbol.clone(), bucket_ns, args.top_depth)?;
     for segment in &segments {
         replay_segment(segment.path(), &symbol, &mut replay)?;
     }
@@ -347,6 +370,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     if replay.state.as_ref().is_some_and(|state| !state.bridged) {
         bail!("snapshot-only replay series never received a valid first diff");
     }
+    replay.sequence_validator.finish()?;
 
     let revision = source_revision(&segments);
     let created_at = Utc::now();
@@ -791,12 +815,11 @@ fn publish_immutable(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn source_revision(segments: &[VerifiedSegment]) -> String {
-    let mut digest = Sha256::new();
-    for segment in segments {
-        digest.update(segment.evidence.sha256.as_bytes());
-        digest.update(b"\n");
-    }
-    hex::encode(digest.finalize())
+    governed_source_revision(
+        segments
+            .iter()
+            .map(|segment| segment.evidence.sha256.as_str()),
+    )
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -1011,7 +1034,9 @@ mod tests {
                 .status()
                 .unwrap()
                 .success());
-            std::fs::remove_file(raw).unwrap();
+            if raw.exists() {
+                std::fs::remove_file(raw).unwrap();
+            }
             let hash = sha256_file(&data).unwrap();
             let event_types = events.iter().fold(BTreeMap::new(), |mut counts, event| {
                 *counts

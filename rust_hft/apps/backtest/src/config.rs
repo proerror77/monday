@@ -1,7 +1,12 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
+use hft_collector::lob_archiver::{
+    source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -159,6 +164,9 @@ struct BacktestDataManifest {
     dataset_kind: String,
     schema_version: String,
     mission_id: String,
+    market: String,
+    symbol: String,
+    dataset: String,
     source_revision: String,
     source_segments: Vec<SourceSegmentEvidence>,
     rows: usize,
@@ -189,9 +197,11 @@ struct CollectorRawManifest {
     venue: String,
     market: String,
     dataset: String,
+    symbols: Vec<String>,
     mode: String,
     replay_scope: String,
     events: u64,
+    bytes: u64,
     event_types: std::collections::HashMap<String, u64>,
     has_replay_safe_checkpoint: bool,
     all_symbols_bridged: bool,
@@ -204,8 +214,11 @@ struct CollectorRawManifest {
 impl BacktestDataManifest {
     fn validate(&self) -> anyhow::Result<()> {
         if self.dataset_kind != "backtest_point_in_time_event_tape"
-            || self.schema_version.trim().is_empty()
+            || self.schema_version != "backtest-pit-v1"
             || self.mission_id.trim().is_empty()
+            || self.market.trim().is_empty()
+            || self.symbol.trim().is_empty()
+            || self.dataset.trim().is_empty()
             || !self.point_in_time
             || self.rows == 0
             || self.source_segments.is_empty()
@@ -215,7 +228,8 @@ impl BacktestDataManifest {
         valid_sha256(&self.artifact_sha256, "manifest.artifact_sha256")?;
         valid_sha256(&self.source_revision, "manifest.source_revision")?;
         if self.first_event_time_us > self.last_event_time_us
-            || self.sequence_start > self.sequence_end
+            || self.sequence_start != 1
+            || self.sequence_end < self.sequence_start
             || self.sequence_end - self.sequence_start + 1 != self.rows as u64
         {
             bail!("backtest manifest time/sequence coverage is inconsistent");
@@ -230,6 +244,12 @@ fn validate_source_segments(
 ) -> anyhow::Result<()> {
     let mut hashes = Vec::with_capacity(manifest.source_segments.len());
     let mut unique = HashSet::new();
+    let mut previous_segment_end = None;
+    let market = manifest
+        .market
+        .parse::<Market>()
+        .map_err(anyhow::Error::msg)?;
+    let mut replay = ReplaySequenceValidator::new(market, &manifest.symbol)?;
     let artifact_rows = parse_ndjson_values(artifact_bytes, "backtest event tape")?;
     let mut materialized_rows = Vec::with_capacity(artifact_rows.len());
     for segment in &manifest.source_segments {
@@ -237,12 +257,14 @@ fn validate_source_segments(
         if !unique.insert(expected.to_string())
             || segment.events == 0
             || segment.start_received_at_ns > segment.end_received_at_ns
+            || previous_segment_end.is_some_and(|previous| segment.start_received_at_ns < previous)
         {
             bail!("backtest source segment evidence is incomplete or duplicated");
         }
-        let bytes = fs::read(resolve_path(&segment.path))
+        previous_segment_end = Some(segment.end_received_at_ns);
+        let source_path = resolve_path(&segment.path);
+        let (actual, source, source_bytes) = open_hashed_source(&source_path)
             .with_context(|| format!("无法读取源数据 segment: {}", segment.path))?;
-        let actual = hex::encode(Sha256::digest(&bytes));
         if actual != expected {
             bail!(
                 "source segment SHA-256 mismatch for {}: expected {expected}, actual {actual}",
@@ -272,7 +294,7 @@ fn validate_source_segments(
         }
         let collector: CollectorRawManifest = serde_json::from_slice(&collector_manifest_bytes)
             .context("无法解析 collector raw manifest")?;
-        validate_collector_manifest(segment, &collector, expected)?;
+        validate_collector_manifest(manifest, segment, &collector, expected, source_bytes)?;
 
         let success =
             fs::read_to_string(resolve_path(&segment.success_marker_path)).with_context(|| {
@@ -285,13 +307,11 @@ fn validate_source_segments(
             bail!("collector success marker is not bound to the raw segment digest");
         }
 
-        let raw_rows = parse_ndjson_values(&bytes, "collector raw segment")?;
-        if raw_rows.len() as u64 != segment.events {
-            bail!("collector raw row count does not match source evidence");
-        }
+        let mut raw_count = 0_u64;
         let mut previous_received_at = None;
         let mut observed_types = std::collections::HashMap::<String, u64>::new();
-        for raw in raw_rows {
+        visit_collector_rows(&segment.path, source, |raw| {
+            raw_count = raw_count.checked_add(1).context("collector row overflow")?;
             let mut raw = raw
                 .as_object()
                 .cloned()
@@ -312,40 +332,38 @@ fn validate_source_segments(
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .context("collector raw row is missing type")?;
             *observed_types.entry(event_type.clone()).or_default() += 1;
-            if event_type == "checkpoint" {
-                if raw.get("synced").and_then(serde_json::Value::as_bool) != Some(true)
+            validate_collector_event_type(&event_type)?;
+            let replay_events = replay.observe(&event_type, &raw, received_at_ns)?;
+            if event_type == "checkpoint"
+                && (raw.get("replay_safe").and_then(serde_json::Value::as_bool) != Some(true)
+                    || raw.get("synced").and_then(serde_json::Value::as_bool) != Some(true)
                     || raw.get("bridged").and_then(serde_json::Value::as_bool) != Some(true)
                     || raw
                         .get("symbol")
                         .and_then(serde_json::Value::as_str)
                         .map(str::is_empty)
-                        .unwrap_or(true)
-                {
-                    bail!("collector replay checkpoint is incomplete");
-                }
-                continue;
+                        .unwrap_or(true))
+            {
+                bail!("collector replay checkpoint is incomplete");
             }
-            if received_at_ns % 1_000 != 0 {
-                bail!("materialized collector row does not have microsecond-aligned receive time");
+            for event in replay_events {
+                materialized_rows.push(materialize_replay_event(
+                    event,
+                    materialized_rows.len() as u64 + 1,
+                )?);
             }
-            raw.insert(
-                "timestamp".to_owned(),
-                serde_json::Value::from((received_at_ns / 1_000) as i64),
-            );
-            raw.insert("event".to_owned(), serde_json::Value::from(event_type));
-            materialized_rows.push(serde_json::Value::Object(raw));
+            Ok(())
+        })?;
+        if raw_count != segment.events {
+            bail!("collector raw row count does not match source evidence");
         }
         if observed_types != collector.event_types {
             bail!("collector raw event types do not match its manifest");
         }
         hashes.push(expected.to_string());
     }
-    hashes.sort();
-    let mut revision = Sha256::new();
-    for hash in hashes {
-        revision.update(hash.as_bytes());
-    }
-    let actual_revision = hex::encode(revision.finalize());
+    replay.finish()?;
+    let actual_revision = source_revision(hashes.iter().map(String::as_str));
     if actual_revision != manifest.source_revision {
         bail!(
             "source revision mismatch: expected {}, actual {actual_revision}",
@@ -359,9 +377,11 @@ fn validate_source_segments(
 }
 
 fn validate_collector_manifest(
+    manifest: &BacktestDataManifest,
     segment: &SourceSegmentEvidence,
     collector: &CollectorRawManifest,
     expected_source_sha: &str,
+    source_bytes: u64,
 ) -> anyhow::Result<()> {
     let source_file = Path::new(&segment.path)
         .file_name()
@@ -369,13 +389,18 @@ fn validate_collector_manifest(
         .unwrap_or_default();
     if collector.schema != "binance.lob_tape.v2"
         || collector.venue != "binance"
-        || collector.market.trim().is_empty()
-        || collector.dataset.trim().is_empty()
+        || collector.market != manifest.market
+        || collector.dataset != manifest.dataset
+        || !collector
+            .symbols
+            .iter()
+            .any(|symbol| symbol == &manifest.symbol)
         || collector.mode != "diff"
         || collector.replay_scope != "captured_snapshot_seed_plus_sequence_checked_diffs"
         || !collector.has_replay_safe_checkpoint
         || !collector.all_symbols_bridged
         || collector.events != segment.events
+        || collector.bytes != source_bytes
         || collector.start_received_at_ns != segment.start_received_at_ns
         || collector.end_received_at_ns != segment.end_received_at_ns
         || collector.file != source_file
@@ -387,10 +412,69 @@ fn validate_collector_manifest(
             .copied()
             .unwrap_or(0)
             == 0
+        || collector
+            .event_types
+            .get("sequence_gap")
+            .copied()
+            .unwrap_or(0)
+            != 0
     {
         bail!("collector raw manifest is incomplete or does not match source evidence");
     }
     Ok(())
+}
+
+fn materialize_replay_event(
+    replay_event: ReplaySequenceEvent,
+    sequence: u64,
+) -> anyhow::Result<serde_json::Value> {
+    let (event, received_at_ns, bids, asks) = match replay_event {
+        ReplaySequenceEvent::Snapshot {
+            received_at_ns,
+            bids,
+            asks,
+        } => ("snapshot", received_at_ns, bids, asks),
+        ReplaySequenceEvent::Diff {
+            received_at_ns,
+            bids,
+            asks,
+        } => ("l2_update", received_at_ns, bids, asks),
+    };
+    let received_at_us = received_at_ns / 1_000 + u64::from(!received_at_ns.is_multiple_of(1_000));
+    let timestamp = i64::try_from(received_at_us).context("receive time exceeds i64")?;
+    Ok(serde_json::json!({
+        "timestamp": timestamp,
+        "sequence": sequence,
+        "event": event,
+        "bids": normalize_replay_levels(bids, "bids")?,
+        "asks": normalize_replay_levels(asks, "asks")?,
+    }))
+}
+
+fn validate_collector_event_type(event_type: &str) -> anyhow::Result<()> {
+    match event_type {
+        "snapshot" | "diff" | "checkpoint" => Ok(()),
+        "trade" => bail!("binance.lob_tape.v2 does not contain trade events"),
+        unsupported => bail!("unsupported collector event type: {unsupported}"),
+    }
+}
+
+fn normalize_replay_levels(levels: Vec<[String; 2]>, field: &str) -> anyhow::Result<Vec<[f64; 2]>> {
+    levels
+        .into_iter()
+        .map(|[price, quantity]| {
+            let price = price
+                .parse::<f64>()
+                .with_context(|| format!("{field} contains a non-numeric price"))?;
+            let quantity = quantity
+                .parse::<f64>()
+                .with_context(|| format!("{field} contains a non-numeric quantity"))?;
+            if !price.is_finite() || !quantity.is_finite() || price <= 0.0 || quantity < 0.0 {
+                bail!("{field} contains an invalid price or quantity");
+            }
+            Ok([price, quantity])
+        })
+        .collect()
 }
 
 fn parse_ndjson_values(bytes: &[u8], label: &str) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -400,6 +484,73 @@ fn parse_ndjson_values(bytes: &[u8], label: &str) -> anyhow::Result<Vec<serde_js
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).with_context(|| format!("invalid {label} row")))
         .collect()
+}
+
+fn open_hashed_source(path: &Path) -> anyhow::Result<(String, File, u64)> {
+    let mut source = File::open(path)?;
+    let bytes = source.metadata()?.len();
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    source.seek(SeekFrom::Start(0))?;
+    Ok((hex::encode(digest.finalize()), source, bytes))
+}
+
+fn visit_collector_rows(
+    path: &str,
+    source: File,
+    mut visitor: impl FnMut(serde_json::Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if path.ends_with(".zst") {
+        let mut child = Command::new("zstd")
+            .args(["-q", "-dc"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("failed to start zstd for collector segment: {path}"))?;
+        let mut stdin = child.stdin.take().context("zstd stdin unavailable")?;
+        let stdout = child.stdout.take().context("zstd stdout unavailable")?;
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let writer = scope.spawn(move || std::io::copy(&mut &source, &mut stdin));
+            let visit_result = visit_ndjson(BufReader::new(stdout), &mut visitor);
+            if visit_result.is_err() {
+                let _ = child.kill();
+            }
+            let status = child.wait()?;
+            writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("zstd input writer panicked"))??;
+            visit_result?;
+            if !status.success() {
+                bail!("zstd failed for collector segment {path}: {status}");
+            }
+            Ok(())
+        })?;
+    } else {
+        visit_ndjson(BufReader::new(source), &mut visitor)?;
+    }
+    Ok(())
+}
+
+fn visit_ndjson(
+    reader: impl BufRead,
+    visitor: &mut impl FnMut(serde_json::Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    for line in reader.lines() {
+        let line = line.context("failed to read collector raw segment")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        visitor(serde_json::from_str(&line).context("invalid collector raw segment row")?)?;
+    }
+    Ok(())
 }
 
 fn validate_event_tape(path: &str, manifest: &BacktestDataManifest) -> anyhow::Result<()> {
@@ -462,15 +613,31 @@ fn resolve_path(path: &str) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    fn fixture_manifest() -> BacktestDataManifest {
+        serde_json::from_value(fixture_manifest_value()).unwrap()
+    }
+
+    fn fixture_manifest_value() -> serde_json::Value {
+        serde_json::from_slice(
+            &fs::read(resolve_path("data/backtest/sample.manifest.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn fixture_collector_manifest_value() -> serde_json::Value {
+        serde_json::from_slice(
+            &fs::read(resolve_path("data/backtest/sample.raw.manifest.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn default_backtest_fixture_has_verified_pit_provenance() {
         let config =
             BacktestConfig::from_file(resolve_path("config/backtest/default.yaml")).unwrap();
         config.validate_data_artifact().unwrap();
 
-        let manifest_path = config.data.manifest_path.as_deref().unwrap();
-        let manifest: BacktestDataManifest =
-            serde_json::from_slice(&fs::read(resolve_path(manifest_path)).unwrap()).unwrap();
+        let manifest = fixture_manifest();
         assert_ne!(
             canonical_path(&manifest.source_segments[0].path).unwrap(),
             canonical_path(&manifest.artifact_path).unwrap()
@@ -478,6 +645,265 @@ mod tests {
         assert!(!manifest.source_segments[0]
             .collector_manifest_path
             .is_empty());
+        let raw = fs::read_to_string(resolve_path(&manifest.source_segments[0].path)).unwrap();
+        assert!(raw.contains("\"type\":\"diff\""));
+        assert!(raw.contains("\"frame\":{\"stream\""));
+        assert!(raw.contains("\"snapshot\":{\"lastUpdateId\""));
+        assert!(!raw.contains("\"type\":\"trade\""));
+
+        let tape = fs::read_to_string(resolve_path(&manifest.artifact_path)).unwrap();
+        assert!(tape.contains("\"event\":\"snapshot\""));
+        assert!(tape.contains("\"event\":\"l2_update\""));
+        assert!(!tape.contains("\"event\":\"trade\""));
+    }
+
+    #[test]
+    fn rejects_unknown_backtest_schema() {
+        let mut manifest = fixture_manifest_value();
+        manifest["schema_version"] = "backtest-pit-v2".into();
+        let manifest: BacktestDataManifest = serde_json::from_value(manifest).unwrap();
+
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn collector_identity_is_bound_to_backtest_manifest() {
+        let manifest = fixture_manifest();
+        let segment = &manifest.source_segments[0];
+        for (field, replacement) in [
+            ("market", serde_json::json!("usdm")),
+            ("dataset", serde_json::json!("other-dataset")),
+            ("symbols", serde_json::json!(["ETHUSDT"])),
+            ("bytes", serde_json::json!(999)),
+        ] {
+            let mut collector = fixture_collector_manifest_value();
+            collector[field] = replacement;
+            let collector: CollectorRawManifest = serde_json::from_value(collector).unwrap();
+            assert!(validate_collector_manifest(
+                &manifest,
+                segment,
+                &collector,
+                &segment.sha256,
+                fs::metadata(resolve_path(&segment.path)).unwrap().len(),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn collector_trade_events_are_not_fabricated_into_lob_tape() {
+        let error = validate_collector_event_type("trade").unwrap_err();
+        assert!(error.to_string().contains("does not contain trade events"));
+    }
+
+    #[test]
+    fn rejects_collector_sequence_gap() {
+        let rows = parse_ndjson_values(
+            &fs::read(resolve_path("data/backtest/sample.raw.ndjson")).unwrap(),
+            "fixture",
+        )
+        .unwrap();
+        let mut replay = ReplaySequenceValidator::new(Market::Spot, "BTCUSDT").unwrap();
+        let snapshot = rows[0].as_object().unwrap();
+        replay.observe("snapshot", snapshot, 100).unwrap();
+        let mut gap = rows[1].clone();
+        gap["frame"]["data"]["U"] = 105.into();
+        gap["frame"]["data"]["u"] = 105.into();
+
+        assert!(replay
+            .observe("diff", gap.as_object().unwrap(), 200)
+            .is_err());
+    }
+
+    #[test]
+    fn governed_replay_buffers_pre_snapshot_diff_and_skips_stale_diff() {
+        let rows = parse_ndjson_values(
+            &fs::read(resolve_path("data/backtest/sample.raw.ndjson")).unwrap(),
+            "fixture",
+        )
+        .unwrap();
+        let mut replay = ReplaySequenceValidator::new(Market::Spot, "BTCUSDT").unwrap();
+        let diff = rows[1].as_object().unwrap();
+        assert!(replay.observe("diff", diff, 50).unwrap().is_empty());
+
+        let emitted = replay
+            .observe("snapshot", rows[0].as_object().unwrap(), 100)
+            .unwrap();
+        assert!(matches!(
+            emitted.as_slice(),
+            [
+                ReplaySequenceEvent::Snapshot {
+                    received_at_ns: 100,
+                    ..
+                },
+                ReplaySequenceEvent::Diff {
+                    received_at_ns: 100,
+                    ..
+                }
+            ]
+        ));
+
+        let mut stale = rows[1].clone();
+        stale["frame"]["data"]["U"] = 90.into();
+        stale["frame"]["data"]["u"] = 100.into();
+        assert!(replay
+            .observe("diff", stale.as_object().unwrap(), 200)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn governed_replay_rejects_checkpoint_book_mismatch() {
+        let rows = parse_ndjson_values(
+            &fs::read(resolve_path("data/backtest/sample.raw.ndjson")).unwrap(),
+            "fixture",
+        )
+        .unwrap();
+        let mut replay = ReplaySequenceValidator::new(Market::Spot, "BTCUSDT").unwrap();
+        replay
+            .observe("snapshot", rows[0].as_object().unwrap(), 100)
+            .unwrap();
+        replay
+            .observe("diff", rows[1].as_object().unwrap(), 200)
+            .unwrap();
+        let mut checkpoint = rows[2].clone();
+        checkpoint["bids"][0][1] = "999".into();
+
+        assert!(replay
+            .observe("checkpoint", checkpoint.as_object().unwrap(), 300)
+            .is_err());
+    }
+
+    #[test]
+    fn receive_time_is_never_materialized_early() {
+        let received_at_ns = 1_700_000_000_100_000_001;
+        let materialized = materialize_replay_event(
+            ReplaySequenceEvent::Snapshot {
+                received_at_ns,
+                bids: vec![["100".to_string(), "1".to_string()]],
+                asks: vec![["101".to_string(), "1".to_string()]],
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(materialized["timestamp"], 1_700_000_000_100_001_i64);
+    }
+
+    #[test]
+    fn reads_real_zstd_collector_segment() {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "monday-backtest-collector-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let raw_path = resolve_path("data/backtest/sample.raw.ndjson");
+        let compressed_path = directory.join("part-1.jsonl.zst");
+        assert!(Command::new("zstd")
+            .args(["-q", "-f"])
+            .arg(&raw_path)
+            .arg("-o")
+            .arg(&compressed_path)
+            .status()
+            .unwrap()
+            .success());
+        let (_, source, _) = open_hashed_source(&compressed_path).unwrap();
+        fs::rename(&compressed_path, directory.join("verified.zst")).unwrap();
+        fs::write(&compressed_path, b"replaced after verified read").unwrap();
+        let mut rows = Vec::new();
+        visit_collector_rows(compressed_path.to_str().unwrap(), source, |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0]["snapshot"]["lastUpdateId"], 100);
+        assert_eq!(rows[1]["frame"]["data"]["s"], "BTCUSDT");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compressed_collector_segment_passes_full_governed_chain() {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("monday-backtest-chain-{}-{id}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let segment = directory.join("part-1.jsonl.zst");
+        assert!(Command::new("zstd")
+            .args(["-q", "-f"])
+            .arg(resolve_path("data/backtest/sample.raw.ndjson"))
+            .arg("-o")
+            .arg(&segment)
+            .status()
+            .unwrap()
+            .success());
+        let segment_bytes = fs::read(&segment).unwrap();
+        let segment_sha = hex::encode(Sha256::digest(&segment_bytes));
+
+        let collector_manifest_path = directory.join("part-1.jsonl.zst.manifest.json");
+        let mut collector = fixture_collector_manifest_value();
+        collector["file"] = "part-1.jsonl.zst".into();
+        collector["bytes"] = segment_bytes.len().into();
+        collector["sha256"] = segment_sha.clone().into();
+        let collector_bytes = serde_json::to_vec(&collector).unwrap();
+        fs::write(&collector_manifest_path, &collector_bytes).unwrap();
+        let collector_sha = hex::encode(Sha256::digest(&collector_bytes));
+        let success = directory.join("part-1.jsonl.zst._SUCCESS");
+        fs::write(&success, format!("{segment_sha}\n")).unwrap();
+
+        let artifact = directory.join("backtest.ndjson");
+        let artifact_bytes = fs::read(resolve_path("data/backtest/sample.ndjson")).unwrap();
+        fs::write(&artifact, &artifact_bytes).unwrap();
+        let artifact_sha = hex::encode(Sha256::digest(&artifact_bytes));
+        let manifest = directory.join("backtest.manifest.json");
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "dataset_kind": "backtest_point_in_time_event_tape",
+            "schema_version": "backtest-pit-v1",
+            "mission_id": "compressed-fixture",
+            "market": "spot",
+            "symbol": "BTCUSDT",
+            "dataset": "binance_spot_lob",
+            "source_revision": source_revision([segment_sha.as_str()]),
+            "source_segments": [{
+                "path": segment,
+                "sha256": segment_sha,
+                "collector_manifest_path": collector_manifest_path,
+                "collector_manifest_sha256": collector_sha,
+                "success_marker_path": success,
+                "start_received_at_ns": 1_700_000_000_100_000_000_u64,
+                "end_received_at_ns": 1_700_000_000_500_000_000_u64,
+                "events": 5
+            }],
+            "rows": 4,
+            "first_event_time_us": 1_700_000_000_100_000_i64,
+            "last_event_time_us": 1_700_000_000_500_000_i64,
+            "sequence_start": 1,
+            "sequence_end": 4,
+            "artifact_path": artifact,
+            "artifact_sha256": artifact_sha,
+            "point_in_time": true
+        }))
+        .unwrap();
+        fs::write(&manifest, &manifest_bytes).unwrap();
+        let manifest_sha = hex::encode(Sha256::digest(&manifest_bytes));
+        let yaml = format!(
+            "data:\n  path: {}\n  format: ndjson\n  manifest_path: {}\n  manifest_sha256: {}\n  require_sequence: true\nstrategy: {{}}\nexecution: {{}}\nrisk: {{}}\noutput: {{}}\n",
+            artifact.display(),
+            manifest.display(),
+            manifest_sha,
+        );
+        let config = BacktestConfig::from_yaml_str(&yaml, "compressed fixture").unwrap();
+
+        config.validate_data_artifact().unwrap();
+        fs::write(&segment, b"corrupt").unwrap();
+        assert!(config.validate_data_artifact().is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 }
 
