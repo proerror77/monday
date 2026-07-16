@@ -295,6 +295,8 @@ pub fn validate_prediction_research_snapshot(snapshot: &ResearchSnapshot) -> Res
     if !manifest.require_official_settlement {
         anyhow::bail!("prediction snapshot must require official settlement");
     }
+    crate::prediction_loop::validate_prediction_snapshot_sources(manifest)
+        .map_err(|error| anyhow::anyhow!("prediction snapshot source eligibility: {error}"))?;
     Ok(())
 }
 
@@ -2094,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn write_and_load_empty_snapshot_roundtrips_manifest() {
+    fn write_and_load_empty_snapshot_roundtrips_manifest_but_is_not_prediction_eligible() {
         let root = std::env::temp_dir().join(format!(
             "ploy-research-snapshot-test-{}-{}",
             std::process::id(),
@@ -2161,8 +2163,6 @@ mod tests {
 
         let written = write_research_snapshot(&root, snapshot).expect("write snapshot");
         let loaded = load_research_snapshot(&root).expect("load snapshot");
-        validate_prediction_research_snapshot(&loaded)
-            .expect("snapshot is eligible for a governed prediction LoopRun");
         assert_eq!(written.schema_version, RESEARCH_SNAPSHOT_SCHEMA_VERSION);
         assert!(written.snapshot_hash.is_some());
         let contract_hex = written
@@ -2196,6 +2196,10 @@ mod tests {
                 .to_string()
                 .contains("official settlement")
         );
+        assert!(load_prediction_research_snapshot(&root)
+            .expect_err("empty snapshots cannot be published for a prediction LoopRun")
+            .to_string()
+            .contains("omitted required Binance sources"));
         validate_snapshot_request(
             &loaded.manifest,
             ResearchSnapshotRequest {

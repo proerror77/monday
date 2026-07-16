@@ -8,7 +8,6 @@ use anyhow::{bail, Context};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    ffi::OsString,
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -206,10 +205,10 @@ fn verify_existing_result_bundle(
     let mut evidence_index = None;
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
-        if entry.name() == "artifacts/execution-evidence.json" {
-            if evidence_index.replace(index).is_some() {
-                bail!("existing prediction result bundle has duplicate execution evidence");
-            }
+        if entry.name() == "artifacts/execution-evidence.json"
+            && evidence_index.replace(index).is_some()
+        {
+            bail!("existing prediction result bundle has duplicate execution evidence");
         }
     }
     let Some(evidence_index) = evidence_index else {
@@ -505,7 +504,10 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Result<()> 
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        ffi::OsString,
+        sync::atomic::{AtomicU64, Ordering},
+    };
     use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
