@@ -569,6 +569,10 @@ impl ExecutionWorker {
                         .record_submission_latency(execution_latency as f64);
 
                     self.stats.orders_placed += 1;
+                    if self.latch_duplicate_order_id(&order_id, client_idx) {
+                        self.stats.orders_failed += 1;
+                        continue;
+                    }
                     self.order_to_client.insert(order_id.clone(), client_idx);
 
                     let venue_for_client = intent
@@ -657,6 +661,9 @@ impl ExecutionWorker {
                                 .find_map(|(account_id, index)| {
                                     (*index == client_idx).then_some(account_id.clone())
                                 });
+                        if self.latch_duplicate_order_id(&order_id, client_idx) {
+                            continue;
+                        }
                         self.order_to_client.insert(order_id.clone(), client_idx);
                         self.tracked_orders.insert(
                             order_id.clone(),
@@ -786,6 +793,25 @@ impl ExecutionWorker {
         )
     }
 
+    fn latch_duplicate_order_id(&mut self, order_id: &OrderId, client_idx: usize) -> bool {
+        if !self.order_to_client.contains_key(order_id)
+            && !self.tracked_orders.contains_key(order_id)
+            && !self.pending_acks.contains_key(order_id)
+        {
+            return false;
+        }
+
+        error!(
+            order_id = %order_id.0,
+            existing_client_idx = ?self.order_to_client.get(order_id),
+            duplicate_client_idx = client_idx,
+            "duplicate execution order id; preserving the first lifecycle and latching intake"
+        );
+        self.accepting_intents = false;
+        self.emergency_latched = true;
+        true
+    }
+
     /// 轮询执行回报流
     async fn poll_execution_events(&mut self) -> u32 {
         let mut events_count = 0;
@@ -796,6 +822,10 @@ impl ExecutionWorker {
                     client_idx,
                     result: Ok(event),
                 })) => {
+                    if !self.private_order_event_matches_client(client_idx, &event) {
+                        events_count += 1;
+                        continue;
+                    }
                     let requires_reconciliation =
                         self.event_requires_reconciliation(client_idx, &event);
                     self.update_connection_tracking(client_idx, &event);
@@ -841,6 +871,9 @@ impl ExecutionWorker {
                 client_idx,
                 result: Ok(event),
             }) => {
+                if !self.private_order_event_matches_client(client_idx, &event) {
+                    return;
+                }
                 let requires_reconciliation =
                     self.event_requires_reconciliation(client_idx, &event);
                 self.update_connection_tracking(client_idx, &event);
@@ -1002,6 +1035,39 @@ impl ExecutionWorker {
             ExecutionEvent::ReconciliationRequired { .. } => true,
             _ => false,
         }
+    }
+
+    fn private_order_event_matches_client(
+        &mut self,
+        client_idx: usize,
+        event: &ExecutionEvent,
+    ) -> bool {
+        let order_id = match event {
+            ExecutionEvent::OrderAck { order_id, .. }
+            | ExecutionEvent::Fill { order_id, .. }
+            | ExecutionEvent::FeeCharged { order_id, .. }
+            | ExecutionEvent::OrderReject { order_id, .. }
+            | ExecutionEvent::OrderCompleted { order_id, .. }
+            | ExecutionEvent::OrderCanceled { order_id, .. }
+            | ExecutionEvent::OrderModified { order_id, .. } => order_id,
+            _ => return true,
+        };
+        let Some(expected_client_idx) = self.order_to_client.get(order_id).copied() else {
+            return true;
+        };
+        if expected_client_idx == client_idx {
+            return true;
+        }
+
+        error!(
+            order_id = %order_id.0,
+            expected_client_idx,
+            conflicting_client_idx = client_idx,
+            "discarded private order event from the wrong execution client"
+        );
+        self.emergency_latched = true;
+        self.latch_stream_recovery();
+        false
     }
 
     fn latch_stream_recovery(&mut self) {
@@ -1604,6 +1670,14 @@ pub struct WorkerReconcileSnapshot {
 }
 
 impl WorkerReconcileSnapshot {
+    pub(crate) fn account_id(&self) -> Option<AccountId> {
+        let mut clients = self.clients.iter();
+        let account_id = clients.next()?.account_id.as_ref()?;
+        clients
+            .all(|client| client.account_id.as_ref() == Some(account_id))
+            .then(|| account_id.clone())
+    }
+
     pub fn is_complete(&self) -> bool {
         !self.clients.is_empty()
             && self.clients.iter().all(|client| {
@@ -1877,6 +1951,37 @@ mod tests {
     use ports::{ConnectionHealth, HftResult, OrderIntent};
     use std::collections::HashSet;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn reconciliation_account_scope_requires_one_complete_identity() {
+        let client = |client_index, account_id: Option<&str>| ClientReconcileSnapshot {
+            client_index,
+            venue: None,
+            account_id: account_id.map(|value| AccountId(value.to_string())),
+            open_orders: Ok(Vec::new()),
+            balances: None,
+            positions: None,
+            recent_fills: None,
+        };
+
+        let one_account = WorkerReconcileSnapshot {
+            clients: vec![client(0, Some("account-1")), client(1, Some("account-1"))],
+        };
+        assert_eq!(
+            one_account.account_id(),
+            Some(AccountId("account-1".to_string()))
+        );
+        assert!(WorkerReconcileSnapshot {
+            clients: vec![client(0, Some("account-1")), client(1, Some("account-2"))],
+        }
+        .account_id()
+        .is_none());
+        assert!(WorkerReconcileSnapshot {
+            clients: vec![client(0, Some("account-1")), client(1, None)],
+        }
+        .account_id()
+        .is_none());
+    }
 
     #[tokio::test]
     async fn downstream_backpressure_prevents_prefetching_the_next_adapter_event() {
@@ -3034,6 +3139,136 @@ mod tests {
                 ..
             }] if order_id == &provisional_id && event_client_id == &client_order_id
         ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_order_id_across_clients_latches_without_overwriting_first_order() {
+        let first_state = Arc::new(StdMutex::new(MockExecutionState::default()));
+        let second_state = Arc::new(StdMutex::new(MockExecutionState::default()));
+        let clients = vec![
+            Box::new(MockExecutionClient {
+                state: first_state,
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            }) as Box<dyn ExecutionClient>,
+            Box::new(MockExecutionClient {
+                state: second_state,
+                place_error: false,
+                list_error: false,
+                cancel_error: false,
+            }) as Box<dyn ExecutionClient>,
+        ];
+        let (mut engine_queues, worker_queues) =
+            crate::create_execution_queues(crate::ExecutionQueueConfig::default());
+        let mut first = create_test_intent("BTCUSDT");
+        first.strategy_id = "binance".to_string();
+        first.target_venue = Some(VenueId::BINANCE);
+        let mut second = create_test_intent("ETHUSDT");
+        second.strategy_id = "bitget".to_string();
+        second.target_venue = Some(VenueId::BITGET);
+        engine_queues
+            .send_intent(first)
+            .expect("queue first intent");
+        engine_queues
+            .send_intent(second)
+            .expect("queue second intent");
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+        let mut worker = ExecutionWorker::new(
+            ExecutionWorkerConfig::default(),
+            worker_queues,
+            clients,
+            control_rx,
+        );
+        worker.venue_to_client = [(VenueId::BINANCE, 0usize), (VenueId::BITGET, 1usize)]
+            .into_iter()
+            .collect();
+        worker.account_to_client = [
+            (AccountId("binance-main".to_string()), 0usize),
+            (AccountId("bitget-main".to_string()), 1usize),
+        ]
+        .into_iter()
+        .collect();
+        let mut queued = worker.queues.receive_envelopes();
+
+        worker.process_order_intents(&mut queued).await;
+
+        let order_id = OrderId("placed".to_string());
+        assert!(!worker.accepting_intents);
+        assert!(worker.emergency_latched);
+        assert_eq!(worker.order_to_client.get(&order_id), Some(&0));
+        assert_eq!(
+            worker
+                .tracked_orders
+                .get(&order_id)
+                .map(|order| &order.symbol),
+            Some(&Symbol::new("BTCUSDT"))
+        );
+        assert!(worker.pending_acks.contains_key(&order_id));
+        assert_eq!(
+            worker
+                .tracked_orders
+                .get(&order_id)
+                .and_then(|order| order.venue),
+            Some(VenueId::BINANCE)
+        );
+        assert_eq!(
+            worker
+                .tracked_orders
+                .get(&order_id)
+                .and_then(|order| order.account_id.as_ref()),
+            Some(&AccountId("binance-main".to_string()))
+        );
+        assert_eq!(worker.stats.orders_placed, 2);
+        assert_eq!(worker.stats.orders_failed, 1);
+        let mut events = Vec::new();
+        engine_queues.receive_events_into(&mut events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ExecutionEvent::OrderNew { .. }))
+                .count(),
+            1
+        );
+
+        worker
+            .execution_streams
+            .push(Box::pin(futures::stream::iter(
+                [
+                    ExecutionEvent::Fill {
+                        order_id: order_id.clone(),
+                        price: Price::from_f64(100.0).unwrap(),
+                        quantity: Quantity::from_f64(0.25).unwrap(),
+                        timestamp: 1,
+                        fill_id: "bitget-fill".to_string(),
+                    },
+                    ExecutionEvent::OrderCanceled {
+                        order_id: order_id.clone(),
+                        timestamp: 2,
+                    },
+                ]
+                .into_iter()
+                .map(|event| IndexedExecutionStreamItem::Event {
+                    client_idx: 1,
+                    result: Ok::<_, HftError>(event),
+                }),
+            )));
+
+        assert_eq!(worker.poll_execution_events().await, 2);
+        assert!(worker.emergency_latched);
+        assert!(worker.stream_recovery_pending);
+        assert_eq!(worker.order_to_client.get(&order_id), Some(&0));
+        assert_eq!(
+            worker
+                .tracked_orders
+                .get(&order_id)
+                .map(|order| order.remaining_quantity),
+            Some(Quantity::from_f64(1.0).unwrap())
+        );
+        assert!(worker.pending_acks.contains_key(&order_id));
+        events.clear();
+        engine_queues.receive_events_into(&mut events);
+        assert!(events.is_empty());
     }
 
     #[tokio::test]

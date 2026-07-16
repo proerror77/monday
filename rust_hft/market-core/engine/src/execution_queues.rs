@@ -129,6 +129,7 @@ pub fn create_execution_queues(config: ExecutionQueueConfig) -> (EngineQueues, W
 
 impl EngineQueues {
     /// 发送订单意图到执行 worker (非阻塞)
+    #[allow(clippy::result_large_err)] // Returning ownership avoids a heap allocation on the hot path.
     pub fn send_intent(&mut self, intent: OrderIntent) -> Result<(), OrderIntent> {
         let now = hft_core::now_micros();
         let envelope = OrderIntentEnvelope::new(

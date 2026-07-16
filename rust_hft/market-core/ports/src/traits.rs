@@ -242,6 +242,9 @@ pub struct Position {
     pub quantity: Quantity,
     pub avg_price: Price,
     pub unrealized_pnl: rust_decimal::Decimal,
+    /// Realized PnL accumulated while the current position lifecycle is open.
+    #[serde(default)]
+    pub realized_pnl: rust_decimal::Decimal,
 }
 
 /// 策略接口

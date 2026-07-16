@@ -4107,6 +4107,7 @@ impl ExecutionClient for PolymarketExecutionClient {
                 quantity: Quantity(position.size),
                 avg_price: Price(position.avg_price),
                 unrealized_pnl: position.cash_pnl,
+                realized_pnl: position.realized_pnl,
             })
             .collect())
     }
