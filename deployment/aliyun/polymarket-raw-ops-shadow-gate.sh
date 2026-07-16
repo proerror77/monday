@@ -767,6 +767,11 @@ memory_events_end_json=$(memory_events_json "$memory_events_end") \
   || die 'could not serialize the final Rust shadow memory.events snapshot'
 systemctl kill --kill-whom=main --signal=SIGTERM "$shadow_unit" \
   || die 'could not terminate the frozen Rust shadow main process'
+systemctl thaw "$shadow_unit" \
+  || die 'could not thaw the Rust shadow before its final stop'
+shadow_thawed_state=$(systemctl show --property=FreezerState --value "$shadow_unit")
+[[ $shadow_thawed_state == running ]] \
+  || die 'Rust shadow did not leave the frozen state before its final stop'
 systemctl stop "$shadow_unit"
 verify_no_restart_after_cursor "$shadow_unit" "$shadow_stop_cursor" "$shadow_invocation_id" \
   || die 'Rust shadow journal recorded a restart during final stop'
