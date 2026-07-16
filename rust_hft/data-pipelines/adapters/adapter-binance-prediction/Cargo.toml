@@ -1,0 +1,18 @@
+[package]
+name = "hft-data-adapter-binance-prediction"
+version = "0.1.0"
+edition = "2021"
+description = "Binance Prediction public order-book market data adapter"
+
+[dependencies]
+hft-core = { package = "hft-core", path = "../../../market-core/core" }
+ports = { package = "hft-ports", path = "../../../market-core/ports" }
+async-trait = { workspace = true }
+binance-sdk = { version = "61.0.0", default-features = false, features = ["rustls-tls", "w3w_prediction"] }
+futures = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[lib]
+name = "adapter_binance_prediction_data"

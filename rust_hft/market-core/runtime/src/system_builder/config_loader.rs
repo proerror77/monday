@@ -1314,7 +1314,7 @@ risk:
     }
 
     #[test]
-    fn loads_binance_prediction_as_an_execution_only_venue() {
+    fn loads_binance_prediction_with_an_explicit_execution_boundary() {
         let config = load_config_from_str(
             r#"
 engine:
@@ -1359,6 +1359,26 @@ strategies: []
                 .and_then(serde_yaml::Value::as_str),
             Some("wallet-1")
         );
+    }
+
+    #[test]
+    fn binance_prediction_quotes_example_keeps_execution_disabled() {
+        let content =
+            include_str!("../../../../config/dev/binance_prediction_quotes_only.yaml.example")
+                .replace("${BINANCE_PREDICTION_API_KEY}", "test-key")
+                .replace("${BINANCE_PREDICTION_API_SECRET}", "test-secret")
+                .replace("REPLACE_WITH_OUTCOME_TOKEN_ID", "112233");
+        let config =
+            load_config_from_str(&content).expect("load Binance Prediction quotes example");
+
+        assert!(config.quotes_only);
+        assert_eq!(config.venues[0].venue_type, VenueType::BinancePrediction);
+        assert_eq!(
+            config.venues[0].symbol_catalog[0].venue_id(),
+            Some(VenueId::BINANCE_PREDICTION)
+        );
+        assert_eq!(config.venues[0].execution_mode.as_deref(), Some("Paper"));
+        assert!(config.strategies.is_empty());
     }
 
     #[test]
