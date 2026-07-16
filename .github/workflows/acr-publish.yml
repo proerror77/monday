@@ -2,6 +2,17 @@ name: Publish ACR Images
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Image target to publish
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - research-runner
+          - hft-trading
+          - binance-lob-archiver
 
 permissions:
   contents: read
@@ -11,18 +22,33 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  selector:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select publish targets
+        id: select
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          case "$TARGET" in
+            all|research-runner|hft-trading|binance-lob-archiver) ;;
+            *) echo "Unsupported publish target: $TARGET" >&2; exit 1 ;;
+          esac
+          matrix=$(jq -cn --arg target "$TARGET" '
+            [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research"},
+             {repository:"hft-trading",file:"rust_hft/deployment/docker/Dockerfile.trading"},
+             {repository:"binance-lob-archiver",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"}]
+            | {include: map(select($target == "all" or .repository == $target))}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   publish:
+    needs: selector
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - repository: research-runner
-            file: rust_hft/deployment/docker/Dockerfile.research
-          - repository: hft-trading
-            file: rust_hft/deployment/docker/Dockerfile.trading
-          - repository: binance-lob-archiver
-            file: rust_hft/deployment/docker/Dockerfile.binance-lob-archiver
+      matrix: ${{ fromJSON(needs.selector.outputs.matrix) }}
 
     steps:
       - name: Checkout
