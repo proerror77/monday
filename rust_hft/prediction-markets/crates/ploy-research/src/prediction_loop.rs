@@ -630,6 +630,13 @@ pub fn validate_prediction_snapshot_coverage(
         .first()
         .map(String::as_str)
         .ok_or_else(|| "prediction coverage requires one mission symbol".to_string())?;
+    validate_prediction_snapshot_coverage_for_underlying(snapshot, requested)
+}
+
+pub(crate) fn validate_prediction_snapshot_coverage_for_underlying(
+    snapshot: &ResearchSnapshot,
+    requested: &str,
+) -> Result<(), String> {
     if snapshot.observations.is_empty() {
         return Err("prediction snapshot contains no evaluator observations".to_string());
     }
@@ -3666,9 +3673,9 @@ fn verify_state(
 mod tests {
     use super::*;
     use crate::research_snapshot::{
-        write_research_snapshot, ResearchSnapshot, ResearchSnapshotArtifacts,
-        ResearchSnapshotInputArtifact, ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource,
-        ResearchSnapshotRowCounts, ResearchSnapshotSourceSurface,
+        validate_prediction_research_snapshot, write_research_snapshot, ResearchSnapshot,
+        ResearchSnapshotArtifacts, ResearchSnapshotInputArtifact, ResearchSnapshotPhaseTiming,
+        ResearchSnapshotPmBookSource, ResearchSnapshotRowCounts, ResearchSnapshotSourceSurface,
     };
     use chrono::Utc;
     use std::collections::VecDeque;
@@ -4195,6 +4202,27 @@ mod tests {
                 .expect_err("multiple CEX symbols must not be silently subsetted")
                 .contains("isolated")
         );
+    }
+
+    #[test]
+    fn published_prediction_snapshot_requires_event_level_coverage() {
+        let tick_ts = Utc::now();
+        let mut manifest = snapshot_manifest();
+        manifest.generated_at = tick_ts + chrono::Duration::seconds(61);
+        let mut snapshot = ResearchSnapshot {
+            manifest,
+            observations: vec![test_prediction_observation(tick_ts)],
+            deribit_snapshots: Vec::new(),
+            pm_book_snapshots: test_prediction_books(tick_ts),
+        };
+        validate_prediction_research_snapshot(&snapshot)
+            .expect("a publishable snapshot has complete event-level coverage");
+
+        snapshot.observations[0].binance_lob_fresh = false;
+        assert!(validate_prediction_research_snapshot(&snapshot)
+            .expect_err("an incomplete snapshot must not be published")
+            .to_string()
+            .contains("Binance L2"));
     }
 
     struct FakeProposalClient {
