@@ -4,10 +4,7 @@ use crate::{
 };
 use alpha_domain::MissionStatus;
 use alpha_engine::{
-    engines::{
-        BayesianOptimizerEngine, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
-        OfflineTrace,
-    },
+    engines::{GeneticProgrammingEngine, MctsEngine, OfflineRlEngine, OfflineTrace},
     evaluation::prepare_dataset,
     formula_evaluator::FormulaEvaluator,
     learning::{close_learning_loop, FailureCritic, LearningConfig},
@@ -16,7 +13,10 @@ use alpha_engine::{
 };
 use alpha_store::{AlphaStore, StoreError};
 use anyhow::{bail, Context};
-use hft_factor_dsl::{validate_live_formula, FactorAst, FactorTerminal};
+use hft_factor_dsl::{validate_live_formula, FactorAst, FactorTerminal, LiveEventDomain};
+
+pub(crate) const BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR: &str =
+    "Bayesian window search is research-only and cannot produce live-executable formulas";
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -171,10 +171,7 @@ fn build_engine(
             MctsEngine::new(args.seed, primary.clone(), secondary, 1.414, 5)
                 .map_err(anyhow::Error::msg)?,
         ),
-        EngineChoice::Bayesian => Box::new(
-            BayesianOptimizerEngine::new(primary.clone(), 2.0, 60.0, 30, 1e-6, 10.0, 0.01)
-                .map_err(anyhow::Error::msg)?,
-        ),
+        EngineChoice::Bayesian => bail!(BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR),
         EngineChoice::OfflineRl => {
             let path = args
                 .offline_trace
@@ -200,14 +197,50 @@ fn build_engine(
 }
 
 pub(crate) fn validate_live_feature_fields(fields: &[String]) -> anyhow::Result<()> {
+    let mut event_domain = None;
     for field in fields {
         let field = field.trim();
-        validate_live_formula(&FactorAst::Terminal(FactorTerminal::Field(
+        let capability = validate_live_formula(&FactorAst::Terminal(FactorTerminal::Field(
             field.to_string(),
         )))
         .map_err(|error| {
             anyhow::anyhow!("feature field {field} is not live executable: {error}")
         })?;
+        if let Some(existing) = event_domain {
+            if existing != capability.event_domain {
+                bail!(
+                    "feature fields span live event domains: {} and {}",
+                    live_event_domain_name(existing),
+                    live_event_domain_name(capability.event_domain)
+                );
+            }
+        } else {
+            event_domain = Some(capability.event_domain);
+        }
     }
     Ok(())
+}
+
+fn live_event_domain_name(domain: LiveEventDomain) -> &'static str {
+    match domain {
+        LiveEventDomain::Snapshot => "snapshot",
+        LiveEventDomain::Bar => "bar",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_feature_fields_reject_mixed_event_domains() {
+        let error =
+            validate_live_feature_fields(&["best_bid".to_string(), "bar_return".to_string()])
+                .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "feature fields span live event domains: snapshot and bar"
+        );
+    }
 }

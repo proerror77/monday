@@ -315,7 +315,7 @@ pub struct RunMissionArgs {
     pub engine: EngineChoice,
     #[arg(long, default_value_t = 7)]
     pub seed: u64,
-    #[arg(long, value_delimiter = ',', default_value = "bar_return")]
+    #[arg(long, value_delimiter = ',', required = true)]
     pub feature_fields: Vec<String>,
     #[arg(long)]
     pub offline_trace: Option<PathBuf>,
@@ -784,6 +784,8 @@ mod tests {
             "mission-1",
             "--engine",
             "mcts",
+            "--feature-fields",
+            "book_imbalance",
             "--dataset-manifest",
             "dataset.json",
             "--loop-run-id",
@@ -804,7 +806,31 @@ mod tests {
         else {
             panic!("expected loop run command")
         };
-        assert_eq!(args.mission.feature_fields, ["bar_return"]);
+        assert_eq!(args.mission.feature_fields, ["book_imbalance"]);
+    }
+
+    #[test]
+    fn loop_run_requires_explicit_live_feature_fields() {
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "loop",
+            "run",
+            "--db",
+            "alpha.duckdb",
+            "--mission-id",
+            "mission-1",
+            "--engine",
+            "mcts",
+            "--dataset-manifest",
+            "dataset.json",
+            "--loop-run-id",
+            "loop-1",
+            "--label-horizon-buckets",
+            "1",
+            "--observation-frequency-millis",
+            "60000",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -819,6 +845,8 @@ mod tests {
             "mission-1",
             "--engine",
             "mcts",
+            "--feature-fields",
+            "book_imbalance",
             "--dataset-manifest",
             "dataset.json",
             "--loop-run-id",

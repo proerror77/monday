@@ -683,7 +683,7 @@ mod tests {
         BayesianOptimizerEngine, GeneticProgrammingEngine, MctsEngine, OfflineRlEngine,
         OfflineTrace,
     };
-    use crate::evaluation::{prepare_dataset, ResearchRow, WalkForwardConfig};
+    use crate::evaluation::{prepare_dataset, ResearchRow};
     use alpha_domain::{
         DomainError, EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1,
         EvaluationWalkForwardV1, MissionCompletionPolicy, ResearchMission, SearchBudget,
@@ -931,14 +931,26 @@ mod tests {
             .collect();
         prepare_dataset(
             rows,
-            &WalkForwardConfig {
-                initial_train_rows: 200,
-                validation_rows: 64,
-                fold_count: 3,
-                purge_rows: 1,
-                embargo_rows: 1,
-                sealed_holdout_rows: 64,
-            },
+            &EvaluationProtocolV1::new(
+                EvaluationWalkForwardV1 {
+                    initial_train_rows: 200,
+                    validation_rows: 64,
+                    fold_count: 3,
+                    purge_rows: 1,
+                    embargo_rows: 1,
+                    sealed_holdout_rows: 64,
+                },
+                EvaluationCostsV1 {
+                    fee_bps: 0.0,
+                    funding_bps: 0.0,
+                    latency_bps: 0.0,
+                },
+                EvaluationLabelSpecV1 {
+                    horizon_buckets: 1,
+                    observation_frequency_millis: 1_000,
+                },
+            )
+            .unwrap(),
             "live-contract-holdout",
         )
         .unwrap()

@@ -1577,6 +1577,15 @@ impl StrategyBundleArtifact {
             Self::Onnx { model } => model.validate(),
         }
     }
+
+    fn validate_for_readback(&self) -> Result<(), DomainError> {
+        match self {
+            Self::Formula { ast } => ast
+                .validate()
+                .map_err(|_| DomainError::InvalidStrategyBundle),
+            Self::Onnx { model } => model.validate(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1643,12 +1652,16 @@ impl StrategyBundle {
     /// Legacy bundles remain ineligible for promotion or deployment because [`Self::validate`]
     /// still requires a protocol binding.
     pub fn validate_for_readback(&self) -> Result<(), DomainError> {
-        if !self.evaluation_protocol_hash.is_empty() {
-            return self.validate();
-        }
         self.validate_common_fields()?;
+        self.artifact.validate_for_readback()?;
         validate_sha256(&self.bundle_hash)?;
-        if self.bundle_hash != self.calculated_legacy_hash()? {
+        let calculated_hash = if self.evaluation_protocol_hash.is_empty() {
+            self.calculated_legacy_hash()?
+        } else {
+            validate_sha256(&self.evaluation_protocol_hash)?;
+            self.calculated_hash()?
+        };
+        if self.bundle_hash != calculated_hash {
             return Err(DomainError::StrategyBundleHashMismatch);
         }
         Ok(())
@@ -1656,6 +1669,7 @@ impl StrategyBundle {
 
     fn validate_fields(&self) -> Result<(), DomainError> {
         self.validate_common_fields()?;
+        self.artifact.validate()?;
         validate_sha256(&self.evaluation_protocol_hash)
     }
 
@@ -1670,7 +1684,7 @@ impl StrategyBundle {
         self.dataset_manifest_id
             .validate()
             .map_err(|_| DomainError::InvalidStrategyBundle)?;
-        self.artifact.validate()
+        Ok(())
     }
 
     fn calculated_legacy_hash(&self) -> Result<String, DomainError> {
@@ -3025,7 +3039,7 @@ mod tests {
             "b".repeat(64),
             StrategyBundleArtifact::Formula {
                 ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
-                    "signal".to_string(),
+                    "mid_price".to_string(),
                 )),
             },
             Utc::now(),
@@ -3046,6 +3060,38 @@ mod tests {
         legacy.bundle_hash = legacy.calculated_legacy_hash().unwrap();
         assert!(legacy.validate_for_readback().is_ok());
         assert_eq!(legacy.validate(), Err(DomainError::InvalidStrategyBundle));
+    }
+
+    #[test]
+    fn legacy_non_live_formula_remains_readable_for_forensics() {
+        let mut legacy = StrategyBundle::new(
+            "bundle-legacy".to_string(),
+            "candidate-legacy".to_string(),
+            "a".repeat(64),
+            ManifestId::new("dataset-legacy").unwrap(),
+            SEALED_HOLDOUT_EVALUATOR_VERSION.to_string(),
+            "e".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+            "b".repeat(64),
+            StrategyBundleArtifact::Formula {
+                ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                    "mid_price".to_string(),
+                )),
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        legacy.evaluation_protocol_hash.clear();
+        legacy.artifact = StrategyBundleArtifact::Formula {
+            ast: FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                "signal".to_string(),
+            )),
+        };
+        legacy.bundle_hash = legacy.calculated_legacy_hash().unwrap();
+
+        assert!(legacy.validate_for_readback().is_ok());
+        assert!(legacy.validate().is_err());
     }
 
     #[test]

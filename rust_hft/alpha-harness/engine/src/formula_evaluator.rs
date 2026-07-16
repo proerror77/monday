@@ -163,7 +163,6 @@ impl FormulaEvaluator {
         dataset: &PreparedDataset,
     ) -> Result<CandidateEvaluation, String> {
         let ast = formula(proposal)?;
-        validate_live_formula(ast).map_err(|error| error.to_string())?;
         evaluate_sealed_holdout(dataset, |rows| {
             let signals = evaluate_ast(ast, rows)?;
             self.evaluate_ranges(
@@ -353,6 +352,7 @@ fn formula(proposal: &EngineProposal) -> Result<&FactorAst, String> {
     match &proposal.artifact {
         CandidateArtifact::Formula(ast) => {
             ast.validate().map_err(|error| error.to_string())?;
+            validate_live_formula(ast).map_err(|error| error.to_string())?;
             Ok(ast)
         }
         _ => Err("formula evaluator only accepts DSL formula artifacts".to_string()),
@@ -747,7 +747,7 @@ mod tests {
     fn causal_signal_records_predictive_metrics_before_trading_mapping() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "book_imbalance".to_string(),
         )));
 
         let result = evaluator
@@ -809,7 +809,7 @@ mod tests {
         let result = evaluator
             .evaluate(
                 &proposal(FactorAst::Terminal(FactorTerminal::Field(
-                    "signal".to_string(),
+                    "book_imbalance".to_string(),
                 ))),
                 &input.engine_context(),
             )
@@ -830,29 +830,24 @@ mod tests {
     }
 
     #[test]
-    fn rank_factor_keeps_predictive_evidence_but_cannot_bypass_trading_gate() {
+    fn walk_forward_rejects_a_formula_that_live_cannot_construct() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(
             FactorAst::call(
                 FactorOperator::Rank,
                 vec![FactorAst::Terminal(FactorTerminal::Field(
-                    "signal".to_string(),
+                    "book_imbalance".to_string(),
                 ))],
             )
             .unwrap(),
         );
 
-        let result = evaluator
-            .evaluate(&proposal, &dataset(0.0).engine_context())
-            .unwrap();
-
-        assert!(result.metrics.predictive.time_series_rank_ic.unwrap() > 0.0);
-        assert_eq!(result.metrics.trade_count, 3);
-        assert!(!result.passed);
-        assert!(result
-            .failure_reasons
-            .iter()
-            .any(|reason| reason.contains("trades")));
+        assert_eq!(
+            evaluator
+                .evaluate(&proposal, &dataset(0.0).engine_context())
+                .unwrap_err(),
+            "unsupported live operator: rank"
+        );
     }
 
     #[test]
@@ -877,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn registered_point_in_time_feature_can_drive_a_formula() {
+    fn registered_research_only_feature_is_rejected_before_evidence() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
             "lob_imbalance".to_string(),
@@ -888,11 +883,11 @@ mod tests {
         }
         let dataset = prepare_dataset(rows, &protocol(0.0, 3), "sealed-1").unwrap();
 
-        assert!(
+        assert_eq!(
             evaluator
                 .evaluate(&proposal, &dataset.engine_context())
-                .unwrap()
-                .passed
+                .unwrap_err(),
+            "unsupported live field: lob_imbalance"
         );
     }
 
@@ -900,7 +895,7 @@ mod tests {
     fn transaction_cost_can_reject_a_high_turnover_formula() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "book_imbalance".to_string(),
         )));
         let result = evaluator
             .evaluate(&proposal, &dataset(100.0).engine_context())
@@ -913,7 +908,7 @@ mod tests {
     fn derived_return_overflow_is_rejected_before_evidence_is_emitted() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Field(
-            "signal".to_string(),
+            "book_imbalance".to_string(),
         )));
 
         assert!(evaluator
@@ -922,31 +917,18 @@ mod tests {
     }
 
     #[test]
-    fn zero_signal_cannot_pass_without_trades_or_positive_edge() {
+    fn constant_formula_is_rejected_without_evidence() {
         let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
         let proposal = proposal(FactorAst::Terminal(FactorTerminal::Constant(
             "0".to_string(),
         )));
         let input = dataset(0.0);
-        let result = evaluator
-            .evaluate(&proposal, &input.engine_context())
-            .unwrap();
-
-        assert!(!result.passed);
-        assert_eq!(result.metrics.trade_count, 0);
-        assert_eq!(result.metrics.mean_net_return, 0.0);
-        assert!(result
-            .failure_reasons
-            .iter()
-            .any(|reason| reason.contains("trades")));
-        assert!(result
-            .failure_reasons
-            .iter()
-            .any(|reason| reason.contains("positive net edge")));
-        assert!(result
-            .failure_reasons
-            .iter()
-            .any(|reason| reason.contains("time-series IC")));
+        assert_eq!(
+            evaluator
+                .evaluate(&proposal, &input.engine_context())
+                .unwrap_err(),
+            "formula must reference a snapshot or bar field"
+        );
         assert_eq!(
             evaluator.evaluate_sealed(&proposal, &input).unwrap_err(),
             "formula must reference a snapshot or bar field"

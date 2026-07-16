@@ -213,9 +213,7 @@ fn validate_live_node(
                 FactorOperator::Add
                     | FactorOperator::Sub
                     | FactorOperator::Mul
-                    | FactorOperator::Div
                     | FactorOperator::Abs
-                    | FactorOperator::Log
                     | FactorOperator::GreaterThan
                     | FactorOperator::LessThan
                     | FactorOperator::IfElse
@@ -373,6 +371,8 @@ mod tests {
             FactorOperator::Mean,
             FactorOperator::Std,
             FactorOperator::ZScore,
+            FactorOperator::Div,
+            FactorOperator::Log,
         ] {
             let mut args = vec![FactorAst::Terminal(FactorTerminal::Field(
                 "mid_price".to_string(),

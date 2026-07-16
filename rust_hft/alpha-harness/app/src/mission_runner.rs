@@ -230,7 +230,10 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
 }
 
 fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
-    if !matches!(args.engine, EngineChoice::Mcts | EngineChoice::Bayesian) {
+    if matches!(args.engine, EngineChoice::Bayesian) {
+        bail!(mission::BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR);
+    }
+    if !matches!(args.engine, EngineChoice::Mcts) {
         bail!(
             "unsupported durable Mission engine: {}",
             engine_name(args.engine)
@@ -473,6 +476,20 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "feature field book_imbalance_top5 is not live executable: unsupported live field: book_imbalance_top5"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_bayesian_window_search_before_materialization() {
+        let mut fixture = fixture("bayesian-window-search");
+        fixture.args.engine = EngineChoice::Bayesian;
+
+        let error = validate_args(&fixture.args).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Bayesian window search is research-only and cannot produce live-executable formulas"
         );
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
