@@ -824,7 +824,7 @@ jq \
     release_manifest_sha256:$release_manifest_sha,
     control_archive_sha256:$control_archive_sha,
     oss_config_sha256:$oss_config,
-    duration_seconds:3900,
+    duration_seconds:4201,
     parity_window_started_at_unix:100,
     parity_window_ended_at_unix:1000,
     completed_at:"2026-07-15T00:00:00Z",
@@ -866,6 +866,14 @@ jq '.metrics.trade_event_window_ended_at_unix += 1' \
   "$tmp_dir/gate.json" >"$tmp_dir/unbound-trade-end.json"
 if jq -e -f "$POLICY" "$tmp_dir/unbound-trade-end.json" >/dev/null; then
   printf 'gate policy accepted an unbound mature trade window\n' >&2
+  exit 1
+fi
+jq '.parity_window_ended_at_unix = 700
+    | .metrics.trade_event_window_ended_at_unix = 100
+    | .metrics.settlement_event_window_ended_at_unix = 100' \
+  "$tmp_dir/gate.json" >"$tmp_dir/empty-mature-trade-window.json"
+if jq -e -f "$POLICY" "$tmp_dir/empty-mature-trade-window.json" >/dev/null; then
+  printf 'gate policy accepted an empty mature trade window\n' >&2
   exit 1
 fi
 jq '.metrics.rust_trade_metadata_context_mismatch_market_ids = ["missing-context"]' \
@@ -949,9 +957,9 @@ if jq -e -f "$POLICY" "$tmp_dir/unbound-settlement-end.json" >/dev/null; then
   printf 'gate policy accepted an unbound settlement end window\n' >&2
   exit 1
 fi
-jq '.duration_seconds = 3599' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
+jq '.duration_seconds = 4200' "$tmp_dir/gate.json" >"$tmp_dir/short.json"
 if jq -e -f "$POLICY" "$tmp_dir/short.json" >/dev/null; then
-  printf 'gate policy accepted a shadow shorter than one hour\n' >&2
+  printf 'gate policy accepted a shadow shorter than one hour plus its maturity tail\n' >&2
   exit 1
 fi
 jq '.production_eligible = false' "$tmp_dir/gate.json" >"$tmp_dir/test-only.json"
@@ -959,10 +967,10 @@ if jq -e -f "$POLICY" "$tmp_dir/test-only.json" >/dev/null; then
   printf 'gate policy accepted test-only evidence\n' >&2
   exit 1
 fi
-jq '.parity_window_ended_at_unix = 399' "$tmp_dir/gate.json" \
+jq '.parity_window_ended_at_unix = 700' "$tmp_dir/gate.json" \
   >"$tmp_dir/short-parity-tail.json"
 if jq -e -f "$POLICY" "$tmp_dir/short-parity-tail.json" >/dev/null; then
-  printf 'gate policy accepted a parity tail shorter than five minutes\n' >&2
+  printf 'gate policy accepted a parity tail too short for mature trades\n' >&2
   exit 1
 fi
 jq '.checks.metadata_parity = false | .passed = true' "$tmp_dir/gate.json" \
@@ -1142,7 +1150,7 @@ for mutation in \
 done
 
 grep -Fq 'readonly REQUIRED_DURATION_SECONDS=3600' "$GATE"
-grep -Fq 'readonly PARITY_TAIL_SECONDS=300' "$GATE"
+grep -Fq 'readonly PARITY_TAIL_SECONDS=601' "$GATE"
 grep -Fq 'readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900' "$GATE"
 grep -Fq 'bounded_parity_window_start' "$GATE"
 grep -Fq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$GATE"
