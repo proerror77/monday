@@ -126,17 +126,12 @@ async fn metrics_handler(State(config): State<Arc<MetricsServerConfig>>) -> impl
 }
 
 /// /health 端点处理器 - 简单健康检查
-async fn health_handler(State(config): State<Arc<MetricsServerConfig>>) -> impl IntoResponse {
-    let (healthy, detail) = MetricsRegistry::global().assess_readiness(
-        config.readiness_max_utilization,
-        config.readiness_max_idle_secs,
-    );
+async fn health_handler() -> impl IntoResponse {
     let health_info = serde_json::json!({
-        "status": if healthy { "healthy" } else { "unhealthy" },
+        "status": "healthy",
         "service": "hft-metrics-server",
         "version": env!("CARGO_PKG_VERSION"),
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "detail": detail,
         "features": {
             "prometheus": true,
             "http_server": cfg!(feature = "http-server"),
@@ -144,11 +139,7 @@ async fn health_handler(State(config): State<Arc<MetricsServerConfig>>) -> impl 
     });
 
     Response::builder()
-        .status(if healthy {
-            StatusCode::OK
-        } else {
-            StatusCode::SERVICE_UNAVAILABLE
-        })
+        .status(StatusCode::OK)
         .header("content-type", "application/json")
         .body(health_info.to_string())
         .unwrap()
@@ -223,7 +214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_handler() {
+    async fn health_remains_live_when_runtime_is_fail_closed() {
         MetricsRegistry::global().update_engine_statistics(&crate::EngineStatisticsExport {
             cycle_count: 1,
             execution_events_processed: 1,
@@ -233,18 +224,27 @@ mod tests {
             orders_rejected: 0,
             orders_canceled: 0,
             runtime_truth_observed_at_us: crate::now_micros(),
-            reconciliation_complete: true,
-            reconciliation_healthy: true,
-            risk_halted: false,
-            data_integrity_gaps: 0,
+            reconciliation_complete: false,
+            reconciliation_healthy: false,
+            risk_halted: true,
+            data_integrity_gaps: 1,
         });
-        let config = Arc::new(MetricsServerConfig {
+        let response = health_handler().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("health response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("health response JSON");
+        assert_eq!(body["status"], "healthy");
+
+        let readiness = readiness_handler(State(Arc::new(MetricsServerConfig {
             readiness_max_idle_secs: u64::MAX,
             readiness_max_utilization: 1.0,
             ..Default::default()
-        });
-        let response = health_handler(State(config)).await.into_response();
-        assert_eq!(response.status(), StatusCode::OK);
+        })))
+        .await
+        .into_response();
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // 集成测试：启动服务器并测试端点

@@ -205,13 +205,18 @@ fn docker_artifacts_enforce_the_live_runtime_contract() {
         "curl",
         "protobuf-compiler",
         "--mount=type=cache,target=/usr/local/cargo/registry",
-        "/readiness",
+        "/health",
         "ENTRYPOINT [\"/usr/local/bin/hft-live\"]",
         "EXPOSE 9090 9092",
         "USER hft",
         "clickhouse,redis,grpc",
     ];
-    let runtime_image_forbidden = ["hft-collector", "EXPOSE 9090 9091 9092", "|| true"];
+    let runtime_image_forbidden = [
+        "hft-collector",
+        "EXPOSE 9090 9091 9092",
+        "|| true",
+        "/readiness",
+    ];
 
     for (label, content) in [
         ("rust_hft/docker/Dockerfile", RUST_HFT_DOCKERFILE),
@@ -233,11 +238,11 @@ fn docker_artifacts_enforce_the_live_runtime_contract() {
         ROOT_DOCKERFILE,
         &[
             "curl",
-            "http://localhost:9090/readiness",
+            "http://localhost:9090/health",
             "EXPOSE 9090 9092",
             "USER hft",
         ],
-        &["EXPOSE 9090 9091 9092"],
+        &["EXPOSE 9090 9091 9092", "/readiness"],
     );
     assert_text_contract(
         "deploy/docker-compose.yml",
@@ -275,6 +280,7 @@ fn kubernetes_artifacts_enforce_the_live_runtime_contract() {
         "rust_hft/deployment/k8s/trading-engine.yaml",
         K8S_TRADING_ENGINE,
         &[
+            "path: /health",
             "path: /readiness",
             "--deployment-envelope",
             "--strategy-bundle",
@@ -301,6 +307,8 @@ fn kubernetes_artifacts_enforce_the_live_runtime_contract() {
         ],
         &["path: /ready", "containerPort: 9091", "BITGET_API_SECRET"],
     );
+    assert_eq!(K8S_TRADING_ENGINE.matches("path: /health").count(), 2);
+    assert_eq!(K8S_TRADING_ENGINE.matches("path: /readiness").count(), 1);
     assert_text_contract(
         "rust_hft/deployment/k8s/configmaps.yaml",
         K8S_CONFIG_MAPS,
