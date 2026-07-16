@@ -1357,6 +1357,8 @@ pub fn runtime_stage_is_healthy(
         }
         if event.outcome == AttributionOutcome::Healthy
             && event.kind == AttributionKind::PortfolioSnapshot
+            && (mode != AttributionMode::LiveSmall
+                || portfolio_snapshot_has_authoritative_truth(event))
         {
             if let Some(strategy_id) = event.strategy_id.as_ref() {
                 health
@@ -1385,6 +1387,27 @@ pub fn runtime_stage_is_healthy(
                 .values()
                 .any(|strategy| strategy.healthy_snapshot && strategy.fill)
     })
+}
+
+const MAX_RUNTIME_RECONCILIATION_AGE_US: f64 = 30_000_000.0;
+
+fn portfolio_snapshot_has_authoritative_truth(event: &RuntimeAttributionEvent) -> bool {
+    let metric_is_one = |name: &str| {
+        event
+            .metrics
+            .get(name)
+            .is_some_and(|value| value.is_finite() && *value >= 1.0)
+    };
+    let age_is_fresh = event
+        .metrics
+        .get("venue_reconciliation_age_us")
+        .is_some_and(|value| {
+            value.is_finite() && *value >= 0.0 && *value <= MAX_RUNTIME_RECONCILIATION_AGE_US
+        });
+    metric_is_one("authoritative_account_snapshot_coverage")
+        && metric_is_one("venue_reconciliation_complete")
+        && metric_is_one("venue_reconciliation_healthy")
+        && age_is_fresh
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2569,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_health_requires_activation_fill_and_snapshot_from_one_strategy() {
+    fn runtime_health_requires_reconciliation_truth_only_for_live_small() {
         let now = Utc::now();
         let scoped = |id: &str,
                       kind: AttributionKind,
@@ -2618,6 +2641,34 @@ mod tests {
             &events,
             "candidate-1",
             AttributionMode::Shadow
+        ));
+
+        let mut live_small_events = events.clone();
+        for event in &mut live_small_events {
+            event.mode = AttributionMode::LiveSmall;
+        }
+        assert!(!runtime_stage_is_healthy(
+            &live_small_events,
+            "candidate-1",
+            AttributionMode::LiveSmall
+        ));
+        let snapshot = live_small_events.last_mut().unwrap();
+        snapshot
+            .metrics
+            .insert("authoritative_account_snapshot_coverage".to_string(), 1.0);
+        snapshot
+            .metrics
+            .insert("venue_reconciliation_complete".to_string(), 1.0);
+        snapshot
+            .metrics
+            .insert("venue_reconciliation_healthy".to_string(), 1.0);
+        snapshot
+            .metrics
+            .insert("venue_reconciliation_age_us".to_string(), 1_000.0);
+        assert!(runtime_stage_is_healthy(
+            &live_small_events,
+            "candidate-1",
+            AttributionMode::LiveSmall
         ));
     }
 
