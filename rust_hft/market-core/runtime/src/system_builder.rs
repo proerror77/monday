@@ -663,6 +663,15 @@ impl SystemBuilder {
         // Create configurable risk manager using factory
         let risk_manager =
             crate::RiskManagerFactory::create_strategy_aware_risk_manager(&self.config.risk);
+        let risk_manager: Box<dyn ports::RiskManager> = if self.config.portfolios.is_empty() {
+            risk_manager
+        } else {
+            Box::new(crate::PortfolioBudgetRiskManager::new(
+                risk_manager,
+                self.config.portfolios.clone(),
+                &self.config.strategies,
+            ))
+        };
         engine.register_risk_manager_boxed(risk_manager);
         info!(
             "已注册风控管理器 (类型: {}, 策略覆盖数: {})",

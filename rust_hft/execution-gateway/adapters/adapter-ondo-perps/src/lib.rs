@@ -558,6 +558,7 @@ mod tests {
                 jurisdiction: Some("SG".into()),
                 eligibility_confirmed: true,
                 allow_tokenized_securities: true,
+                ..Default::default()
             },
             side: Side::Buy,
             quantity: Quantity(Decimal::from(2)),

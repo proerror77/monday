@@ -56,15 +56,15 @@ impl Default for SentinelConfig {
     fn default() -> Self {
         Self {
             // 延遲閾值
-            latency_warn_us: 15_000,      // 15ms 警告
-            latency_degrade_us: 25_000,   // 25ms 降頻
-            latency_stop_us: 50_000,      // 50ms 停止
+            latency_warn_us: 15_000,    // 15ms 警告
+            latency_degrade_us: 25_000, // 25ms 降頻
+            latency_stop_us: 50_000,    // 50ms 停止
 
             // 回撤閾值
-            drawdown_warn_pct: 2.0,       // 2% 警告
-            drawdown_degrade_pct: 3.0,    // 3% 降頻
-            drawdown_stop_pct: 5.0,       // 5% 停止
-            drawdown_emergency_pct: 7.0,  // 7% 緊急平倉
+            drawdown_warn_pct: 2.0,      // 2% 警告
+            drawdown_degrade_pct: 3.0,   // 3% 降頻
+            drawdown_stop_pct: 5.0,      // 5% 停止
+            drawdown_emergency_pct: 7.0, // 7% 緊急平倉
 
             // 降頻策略
             degrade_reduce_position_pct: 50.0,
@@ -151,10 +151,8 @@ pub struct SystemStats {
     pub notional_value: f64,
     /// 訂單提交率 (orders/second)
     pub order_rate: f64,
-    /// WebSocket 重連次數
-    pub ws_reconnect_count: u32,
     /// 數據間隙次數
-    pub data_gap_count: u32,
+    pub data_gap_count: u64,
 }
 
 /// Sentinel 哨兵 - 自動化風控核心
@@ -167,6 +165,7 @@ pub struct Sentinel {
 
     // 回撤追蹤
     consecutive_drawdown_violations: u32,
+    last_data_gap_count: u64,
 
     // 恢復追蹤
     last_violation_time: Option<Instant>,
@@ -187,6 +186,7 @@ impl Sentinel {
             state: SentinelState::Normal,
             consecutive_latency_violations: 0,
             consecutive_drawdown_violations: 0,
+            last_data_gap_count: 0,
             last_violation_time: None,
             degraded_since: None,
             total_checks: 0,
@@ -229,18 +229,32 @@ impl Sentinel {
         // 檢查回撤
         let drawdown_action = self.check_drawdown(stats);
 
+        // A newly dropped market event or failed account snapshot invalidates the trading view.
+        // Stop immediately and require operator-controlled recovery.
+        let data_action = if stats.data_gap_count > self.last_data_gap_count {
+            error!(
+                "Market-data integrity gap detected: {} -> {}",
+                self.last_data_gap_count, stats.data_gap_count
+            );
+            self.last_data_gap_count = stats.data_gap_count;
+            SentinelAction::Stop
+        } else {
+            SentinelAction::Continue
+        };
+
         // 合併動作（取更嚴重的）
-        let action = latency_action.merge(drawdown_action);
+        let action = latency_action.merge(drawdown_action).merge(data_action);
 
         // 更新狀態
         self.update_state(action);
 
         // 檢查恢復條件
         if (self.state == SentinelState::Degraded || self.state == SentinelState::Recovering)
-            && self.should_recover(stats) {
-                self.recover();
-                return SentinelAction::Continue;
-            }
+            && self.should_recover(stats)
+        {
+            self.recover();
+            return SentinelAction::Continue;
+        }
 
         action
     }
@@ -274,7 +288,10 @@ impl Sentinel {
                 return SentinelAction::Degrade;
             }
         } else if latency >= self.config.latency_warn_us {
-            warn!("Latency warning: {}us >= {}us", latency, self.config.latency_warn_us);
+            warn!(
+                "Latency warning: {}us >= {}us",
+                latency, self.config.latency_warn_us
+            );
             self.total_warnings += 1;
             return SentinelAction::Warn;
         } else {
@@ -492,6 +509,18 @@ mod tests {
         let action = sentinel.check(&stats);
         assert_eq!(action, SentinelAction::EmergencyExit);
         assert_eq!(sentinel.state(), SentinelState::Emergency);
+    }
+
+    #[test]
+    fn test_sentinel_stops_on_new_data_gap() {
+        let mut sentinel = Sentinel::with_defaults();
+        let action = sentinel.check(&SystemStats {
+            data_gap_count: 1,
+            ..Default::default()
+        });
+
+        assert_eq!(action, SentinelAction::Stop);
+        assert_eq!(sentinel.state(), SentinelState::Stopped);
     }
 
     #[test]
