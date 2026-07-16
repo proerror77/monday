@@ -42,6 +42,7 @@ pub fn run_mission(args: RunMissionArgs, resume: bool) -> anyhow::Result<()> {
 }
 
 pub fn execute_mission(args: &RunMissionArgs, resume: bool) -> anyhow::Result<MissionRunReport> {
+    validate_live_mission_args(args)?;
     let mut store = AlphaStore::open(&args.db)?;
     let mission = store.get_mission(&args.mission_id)?;
     match (resume, &mission.status) {
@@ -142,7 +143,7 @@ fn build_engine(
     args: &RunMissionArgs,
     dataset: &alpha_engine::evaluation::PreparedDataset,
 ) -> anyhow::Result<Box<dyn ProposalEngine>> {
-    validate_live_formula_engine(args.engine)?;
+    validate_live_mission_args(args)?;
     let fields = args
         .feature_fields
         .iter()
@@ -204,6 +205,19 @@ pub(crate) fn validate_live_formula_engine(engine: EngineChoice) -> anyhow::Resu
     Ok(())
 }
 
+pub(crate) fn validate_live_mission_args(args: &RunMissionArgs) -> anyhow::Result<()> {
+    validate_live_formula_engine(args.engine)?;
+    if args.feature_fields.is_empty()
+        || args
+            .feature_fields
+            .iter()
+            .any(|field| field.trim().is_empty())
+    {
+        bail!("mission feature fields are required");
+    }
+    validate_live_feature_fields(&args.feature_fields)
+}
+
 pub(crate) fn validate_live_feature_fields(fields: &[String]) -> anyhow::Result<()> {
     let mut event_domain = None;
     for field in fields {
@@ -239,6 +253,8 @@ fn live_event_domain_name(domain: LiveEventDomain) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{DatasetArgs, ValidationArgs};
+    use std::path::PathBuf;
 
     #[test]
     fn live_feature_fields_reject_mixed_event_domains() {
@@ -250,5 +266,75 @@ mod tests {
             error.to_string(),
             "feature fields span live event domains: snapshot and bar"
         );
+    }
+
+    #[test]
+    fn mission_preflight_rejects_live_capability_before_opening_store() {
+        let cases = [
+            (
+                EngineChoice::Bayesian,
+                vec!["book_imbalance".to_string()],
+                "Bayesian window search is research-only",
+            ),
+            (
+                EngineChoice::Mcts,
+                vec!["signal".to_string()],
+                "feature field signal is not live executable",
+            ),
+            (
+                EngineChoice::Mcts,
+                vec!["best_bid".to_string(), "bar_return".to_string()],
+                "feature fields span live event domains",
+            ),
+        ];
+
+        for (engine, feature_fields, expected) in cases {
+            for resume in [false, true] {
+                let db = temporary_db_path("mission-live-capability");
+                let args = RunMissionArgs {
+                    db: db.clone(),
+                    mission_id: "mission-1".to_string(),
+                    engine,
+                    seed: 7,
+                    feature_fields: feature_fields.clone(),
+                    offline_trace: None,
+                    max_new_iterations: None,
+                    dataset: DatasetArgs {
+                        dataset_manifest: db.with_extension("dataset.json"),
+                        validation: ValidationArgs {
+                            initial_train_rows: 1,
+                            validation_rows: 30,
+                            fold_count: 2,
+                            purge_rows: 1,
+                            embargo_rows: 0,
+                            sealed_holdout_rows: 30,
+                            fee_bps: 1.0,
+                            funding_bps: 0.0,
+                            latency_bps: 0.5,
+                            label_horizon_buckets: 1,
+                            observation_frequency_millis: 60_000,
+                        },
+                    },
+                };
+
+                let error = execute_mission(&args, resume).unwrap_err().to_string();
+                assert!(error.contains(expected), "unexpected error: {error}");
+                assert!(
+                    !db.exists(),
+                    "mission preflight must happen before the durable store is opened"
+                );
+            }
+        }
+    }
+
+    fn temporary_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "alpha-{name}-{}-{}.duckdb",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ))
     }
 }

@@ -213,7 +213,7 @@ pub fn recover_legacy_checkpoint(args: RecoverLegacyCheckpointArgs) -> anyhow::R
 }
 
 fn validate_loop_args(args: &LoopRunArgs) -> anyhow::Result<()> {
-    mission::validate_live_formula_engine(args.mission.engine)?;
+    mission::validate_live_mission_args(&args.mission)?;
     if !matches!(args.mission.engine, EngineChoice::Mcts) {
         bail!(
             "durable LoopRun supports only mcts live-capable exact-resume engines; run gp, offline-rl, or llm as standalone lab missions"
@@ -222,16 +222,7 @@ fn validate_loop_args(args: &LoopRunArgs) -> anyhow::Result<()> {
     if args.max_research_missions == 0 {
         bail!("max_research_missions must be positive");
     }
-    if args.mission.feature_fields.is_empty()
-        || args
-            .mission
-            .feature_fields
-            .iter()
-            .any(|field| field.trim().is_empty())
-    {
-        bail!("loop feature fields are required");
-    }
-    mission::validate_live_feature_fields(&args.mission.feature_fields)
+    Ok(())
 }
 
 fn load_or_create_run(
