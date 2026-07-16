@@ -41,6 +41,17 @@ struct PredictionExecutionEvidence<'a> {
     runner_exit_code: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StoredPredictionExecutionEvidence {
+    lane: String,
+    mission_id: String,
+    data_snapshot_id: String,
+    evaluator_version: String,
+    mission_sha256: String,
+    snapshot_archive_sha256: String,
+    runner_exit_code: Option<i32>,
+}
+
 #[derive(Debug, Serialize)]
 struct PredictionExecutionReport<'a> {
     #[serde(flatten)]
@@ -74,13 +85,12 @@ struct SnapshotExecutionReport<'a> {
 }
 
 pub fn execute(args: PredictionExecuteArgs) -> anyhow::Result<()> {
-    let runner = configured_binary(
-        "MONDAY_PREDICTION_RESEARCH_BIN",
-        "monday-prediction-research",
-    )?;
+    let runner = sibling_pinned_binary("monday-prediction-research")?;
     execute_with_runner(args, &runner)
 }
 
+// Production resolves only the release-pinned sibling above. The path parameter
+// keeps the process boundary testable without exposing a CLI-configurable runner.
 fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Result<()> {
     validate_execute_args(&args)?;
     let input_dir = args.work_dir.join("input");
@@ -113,6 +123,29 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     if snapshot_sha256 != normalized_sha256("snapshot archive", &args.snapshot_sha256)? {
         bail!("prediction snapshot archive SHA256 mismatch");
     }
+
+    let bundle = args.work_dir.join("results.zip");
+    if bundle.exists() {
+        verify_existing_result_bundle(&bundle, &mission, &mission_sha256, &snapshot_sha256)?;
+        let evidence = PredictionExecutionEvidence {
+            lane: "prediction_market",
+            mission_id: &mission.mission_id,
+            data_snapshot_id: &mission.data_snapshot_id,
+            evaluator_version: &mission.search_policy_snapshot_id,
+            mission_sha256: &mission_sha256,
+            snapshot_archive_sha256: &snapshot_sha256,
+            runner_exit_code: Some(0),
+        };
+        let bundle_bytes = bundle.metadata()?.len();
+        let bundle_sha256 = sha256_file(&bundle)?;
+        publish_result(&client, &args.result_put_url, &bundle)?;
+        return print_json(&PredictionExecutionReport {
+            evidence,
+            bundle_bytes,
+            bundle_sha256,
+        });
+    }
+
     let snapshot_dir = input_dir.join("snapshot");
     extract_snapshot_archive(&snapshot_archive, &snapshot_dir)?;
 
@@ -145,7 +178,6 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
         );
     }
 
-    let bundle = args.work_dir.join("results.zip");
     create_bundle(&args.work_dir, &bundle, [&results_dir, &artifact_dir])?;
     let bundle_bytes = bundle.metadata()?.len();
     let bundle_sha256 = sha256_file(&bundle)?;
@@ -157,15 +189,64 @@ fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Re
     })
 }
 
-pub fn snapshot(args: PredictionSnapshotArgs) -> anyhow::Result<()> {
-    let compiler = configured_binary(
-        "MONDAY_PREDICTION_SNAPSHOT_BIN",
-        "monday-prediction-snapshot",
-    )?;
-    snapshot_with_compiler(args, &compiler)
+fn verify_existing_result_bundle(
+    bundle: &Path,
+    mission: &PredictionMissionIdentity,
+    mission_sha256: &str,
+    snapshot_archive_sha256: &str,
+) -> anyhow::Result<()> {
+    if !bundle.is_file() {
+        bail!(
+            "existing prediction result bundle is not a regular file: {}",
+            bundle.display()
+        );
+    }
+    let mut archive = ZipArchive::new(File::open(bundle)?)
+        .context("existing prediction result bundle is not a valid ZIP archive")?;
+    let mut evidence_index = None;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        if entry.name() == "artifacts/execution-evidence.json" {
+            if evidence_index.replace(index).is_some() {
+                bail!("existing prediction result bundle has duplicate execution evidence");
+            }
+        }
+    }
+    let Some(evidence_index) = evidence_index else {
+        bail!("existing prediction result bundle has no execution evidence");
+    };
+    let mut entry = archive.by_index(evidence_index)?;
+    if !entry.is_file() {
+        bail!("existing prediction execution evidence is not a regular file");
+    }
+    let evidence: StoredPredictionExecutionEvidence = serde_json::from_reader(&mut entry)
+        .context("existing prediction execution evidence is invalid JSON")?;
+    if evidence.lane != "prediction_market"
+        || evidence.mission_id != mission.mission_id
+        || evidence.data_snapshot_id != mission.data_snapshot_id
+        || evidence.evaluator_version != mission.search_policy_snapshot_id
+        || evidence.mission_sha256 != mission_sha256
+        || evidence.snapshot_archive_sha256 != snapshot_archive_sha256
+        || evidence.runner_exit_code != Some(0)
+    {
+        bail!(
+            "existing prediction result bundle does not match this verified mission and snapshot"
+        );
+    }
+    Ok(())
 }
 
-fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyhow::Result<()> {
+pub fn snapshot(args: PredictionSnapshotArgs) -> anyhow::Result<()> {
+    let compiler = sibling_pinned_binary("monday-prediction-snapshot")?;
+    let verifier = sibling_pinned_binary("monday-prediction-research")?;
+    snapshot_with_compiler(args, &compiler, &verifier)
+}
+
+fn snapshot_with_compiler(
+    args: PredictionSnapshotArgs,
+    compiler: &Path,
+    verifier: &Path,
+) -> anyhow::Result<()> {
     validate_snapshot_args(&args)?;
     let artifact_dir = args.work_dir.join("artifacts");
     let snapshot_dir = args.work_dir.join("snapshot");
@@ -191,18 +272,7 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
         );
     }
 
-    let manifest_path = snapshot_dir.join("manifest.json");
-    let manifest: SnapshotManifestIdentity =
-        serde_json::from_slice(&std::fs::read(&manifest_path).with_context(|| {
-            format!(
-                "snapshot compiler did not create {}",
-                manifest_path.display()
-            )
-        })?)
-        .context("prediction snapshot manifest identity is invalid JSON")?;
-    if manifest.snapshot_hash.is_none() || manifest.snapshot_contract_hash.is_none() {
-        bail!("prediction snapshot manifest is not content addressed");
-    }
+    let manifest = verify_snapshot_with_runner(&snapshot_dir, verifier, &artifact_dir)?;
     let evidence = SnapshotExecutionEvidence {
         lane: "prediction_market_snapshot",
         schema_version: &manifest.schema_version,
@@ -231,6 +301,44 @@ fn snapshot_with_compiler(args: PredictionSnapshotArgs, compiler: &Path) -> anyh
         bundle_bytes,
         bundle_sha256,
     })
+}
+
+fn verify_snapshot_with_runner(
+    snapshot_dir: &Path,
+    verifier: &Path,
+    artifact_dir: &Path,
+) -> anyhow::Result<SnapshotManifestIdentity> {
+    let stdout = File::create(artifact_dir.join("snapshot-verifier.stdout"))?;
+    let stderr = File::create(artifact_dir.join("snapshot-verifier.stderr"))?;
+    let status = Command::new(verifier)
+        .arg("--verify-snapshot")
+        .arg(snapshot_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()
+        .with_context(|| format!("start prediction snapshot verifier {}", verifier.display()))?;
+    if !status.success() {
+        bail!(
+            "prediction snapshot verifier exited unsuccessfully with {:?}; see {}",
+            status.code(),
+            artifact_dir.display()
+        );
+    }
+
+    let manifest_path = snapshot_dir.join("manifest.json");
+    let manifest: SnapshotManifestIdentity =
+        serde_json::from_slice(&std::fs::read(&manifest_path).with_context(|| {
+            format!(
+                "snapshot verifier did not leave {}",
+                manifest_path.display()
+            )
+        })?)
+        .context("prediction snapshot manifest identity is invalid JSON")?;
+    if manifest.snapshot_hash.is_none() || manifest.snapshot_contract_hash.is_none() {
+        bail!("verified prediction snapshot manifest is not content addressed");
+    }
+    Ok(manifest)
 }
 
 fn validate_execute_args(args: &PredictionExecuteArgs) -> anyhow::Result<()> {
@@ -270,9 +378,10 @@ fn validate_snapshot_args(args: &PredictionSnapshotArgs) -> anyhow::Result<()> {
             "prediction snapshot work directory, result URL, and compiler arguments are required"
         );
     }
-    const FORBIDDEN: [&str; 7] = [
+    const FORBIDDEN: [&str; 8] = [
         "--output-dir",
         "--db-url",
+        "--allow-missing-official-settlement",
         "--live",
         "--deploy",
         "--submit",
@@ -291,25 +400,39 @@ fn validate_snapshot_args(args: &PredictionSnapshotArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn configured_binary(environment: &str, name: &str) -> anyhow::Result<PathBuf> {
-    let path = std::env::var_os(environment)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(|| {
-            let current = std::env::current_exe().context("resolve alpha-harness executable")?;
-            let parent = current
-                .parent()
-                .context("alpha-harness executable has no parent directory")?;
-            Ok::<_, anyhow::Error>(parent.join(name))
-        })?;
+fn sibling_pinned_binary(name: &str) -> anyhow::Result<PathBuf> {
+    let current = std::env::current_exe().context("resolve alpha-harness executable")?;
+    let parent = current
+        .parent()
+        .context("alpha-harness executable has no parent directory")?;
+    let path = parent.join(name);
     if !path.is_file() {
         bail!(
-            "configured prediction binary does not exist: {}",
+            "release-pinned prediction binary does not exist: {}",
             path.display()
         );
     }
+    verify_pinned_binary(&path)?;
     Ok(path)
+}
+
+fn verify_pinned_binary(path: &Path) -> anyhow::Result<()> {
+    let digest_path = path.with_extension("sha256");
+    let expected = std::fs::read_to_string(&digest_path).with_context(|| {
+        format!(
+            "read pinned prediction binary digest {}",
+            digest_path.display()
+        )
+    })?;
+    let expected = normalized_sha256("pinned prediction binary", &expected)?;
+    let actual = sha256_file(path)?;
+    if actual != expected {
+        bail!(
+            "release-pinned prediction binary digest mismatch: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn extract_snapshot_archive(archive_path: &Path, destination: &Path) -> anyhow::Result<()> {
@@ -441,6 +564,19 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn pinned_binary_rejects_a_digest_mismatch() {
+        let root = temporary_root("pinned-binary");
+        let binary = root.join("monday-prediction-research");
+        std::fs::write(&binary, "release binary").unwrap();
+        std::fs::write(binary.with_extension("sha256"), "0".repeat(64)).unwrap();
+
+        let error = verify_pinned_binary(&binary).expect_err("mismatched binary must fail");
+
+        assert!(error.to_string().contains("digest mismatch"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn execute_publishes_one_bundle_through_a_precompiled_runner() {
@@ -467,6 +603,79 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn execute_republishes_a_verified_bundle_after_upload_failure_without_rerunning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = execute_fixture("retry-upload");
+        let runner = fixture.root.join("monday-prediction-research");
+        std::fs::write(
+            &runner,
+            "#!/bin/sh\nprintf 'attempt\\n' >> \"$3/../../runner-attempts\"\nmkdir -p \"$3\"\nprintf '{\"status\":\"budget_exhausted\"}\\n' > \"$3/summary.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&fixture.result_path, "occupied").unwrap();
+        let args = fixture.args.clone();
+
+        let first = execute_with_runner(args.clone(), &runner)
+            .expect_err("occupied destination must fail publication");
+        assert!(first
+            .to_string()
+            .contains("result destination already exists"));
+        assert!(args.work_dir.join("results.zip").is_file());
+
+        std::fs::remove_file(&fixture.result_path).unwrap();
+        execute_with_runner(args, &runner).expect("retry must republish the existing bundle");
+
+        assert_eq!(
+            std::fs::read_to_string(fixture.root.join("runner-attempts")).unwrap(),
+            "attempt\n"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_a_malformed_manifest_before_publish() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temporary_root("snapshot-layout");
+        let compiler = root.join("monday-prediction-snapshot");
+        std::fs::write(
+            &compiler,
+            "#!/bin/sh\ntest \"$1\" = '--output-dir' || exit 2\nmkdir -p \"$2\"\nprintf '{\"schema_version\":\"research_snapshot_v2\",\"snapshot_hash\":\"sha256:outer\",\"snapshot_contract_hash\":\"sha256:contract\"}\\n' > \"$2/manifest.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let verifier = root.join("monday-prediction-research");
+        std::fs::write(
+            &verifier,
+            "#!/bin/sh\ntest \"$1\" = '--verify-snapshot' || exit 2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let published = root.join("published-snapshot.zip");
+
+        let error = snapshot_with_compiler(
+            PredictionSnapshotArgs {
+                work_dir: root.join("work"),
+                result_put_url: published.to_string_lossy().into_owned(),
+                compiler_args: vec![OsString::from("--start-date"), OsString::from("2026-07-01")],
+            },
+            &compiler,
+            &verifier,
+        )
+        .expect_err("manifest without verified snapshot artifacts must fail");
+
+        assert!(error
+            .to_string()
+            .contains("prediction snapshot verifier exited unsuccessfully"));
+        assert!(!published.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn snapshot_bundle_has_the_archive_root_expected_by_execute() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -478,6 +687,13 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let verifier = root.join("monday-prediction-research");
+        std::fs::write(
+            &verifier,
+            "#!/bin/sh\ntest \"$1\" = '--verify-snapshot' || exit 2\ntest -f \"$2/manifest.json\" || exit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&verifier, std::fs::Permissions::from_mode(0o700)).unwrap();
         let published = root.join("published-snapshot.zip");
 
         snapshot_with_compiler(
@@ -487,8 +703,9 @@ mod tests {
                 compiler_args: vec![OsString::from("--start-date"), OsString::from("2026-07-01")],
             },
             &compiler,
+            &verifier,
         )
-        .unwrap();
+        .expect("verified snapshot must publish");
 
         let archive = ZipArchive::new(File::open(&published).unwrap()).unwrap();
         let names = archive.file_names().collect::<Vec<_>>();
@@ -501,16 +718,18 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_wrapper_rejects_execution_authority_flags() {
-        let args = PredictionSnapshotArgs {
-            work_dir: PathBuf::from("work"),
-            result_put_url: "snapshot.zip".to_string(),
-            compiler_args: vec![OsString::from("--submit")],
-        };
-        assert!(validate_snapshot_args(&args)
-            .unwrap_err()
-            .to_string()
-            .contains("forbidden"));
+    fn snapshot_wrapper_rejects_execution_and_non_official_settlement_flags() {
+        for forbidden in ["--submit", "--allow-missing-official-settlement"] {
+            let args = PredictionSnapshotArgs {
+                work_dir: PathBuf::from("work"),
+                result_put_url: "snapshot.zip".to_string(),
+                compiler_args: vec![OsString::from(forbidden)],
+            };
+            assert!(validate_snapshot_args(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("forbidden"));
+        }
     }
 
     struct ExecuteFixture {
