@@ -219,7 +219,18 @@ pub fn build_prediction_prompt(
 }
 
 pub fn current_prediction_policy_snapshot_id() -> String {
-    let sources: [(&str, &[u8]); 30] = [
+    let mut digest = Sha256::new();
+    for (path, body) in prediction_policy_sources() {
+        digest.update(path.as_bytes());
+        digest.update([0]);
+        digest.update(body);
+        digest.update([0]);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 27] {
+    [
         ("Cargo.lock", include_bytes!("../../../Cargo.lock")),
         ("Cargo.toml", include_bytes!("../../../Cargo.toml")),
         (
@@ -260,11 +271,11 @@ pub fn current_prediction_policy_snapshot_id() -> String {
             include_bytes!("research_snapshot.rs"),
         ),
         (
-            "crates/ploy-research/examples/factor_walk_forward_v2.rs",
+            "crates/ploy-research/bin/monday-prediction-evaluator.rs",
             include_bytes!("../examples/factor_walk_forward_v2.rs"),
         ),
         (
-            "crates/ploy-research/examples/prediction_research_loop.rs",
+            "crates/ploy-research/bin/monday-prediction-research.rs",
             include_bytes!("../examples/prediction_research_loop.rs"),
         ),
         (
@@ -278,18 +289,6 @@ pub fn current_prediction_policy_snapshot_id() -> String {
         (
             "crates/ploy-feed-loaders/src/lib.rs",
             include_bytes!("../../ploy-feed-loaders/src/lib.rs"),
-        ),
-        (
-            "crates/ploy-operator-contracts/Cargo.toml",
-            include_bytes!("../../ploy-operator-contracts/Cargo.toml"),
-        ),
-        (
-            "crates/ploy-operator-contracts/src/lib.rs",
-            include_bytes!("../../ploy-operator-contracts/src/lib.rs"),
-        ),
-        (
-            "crates/ploy-operator-contracts/src/trading.rs",
-            include_bytes!("../../ploy-operator-contracts/src/trading.rs"),
         ),
         (
             "config/autofactor_accounting_catalog.json",
@@ -331,15 +330,7 @@ pub fn current_prediction_policy_snapshot_id() -> String {
             "crates/ploy-market-contracts/src/venue.rs",
             include_bytes!("../../ploy-market-contracts/src/venue.rs"),
         ),
-    ];
-    let mut digest = Sha256::new();
-    for (path, body) in sources {
-        digest.update(path.as_bytes());
-        digest.update([0]);
-        digest.update(body);
-        digest.update([0]);
-    }
-    format!("sha256:{:x}", digest.finalize())
+    ]
 }
 
 pub fn research_brief_snapshot_id(mission: &PredictionResearchMission) -> String {
@@ -3906,6 +3897,25 @@ mod tests {
                 .expect_err("formula authority must fail")
                 .contains("probability_blend_weights")
         );
+    }
+
+    #[test]
+    fn prediction_policy_identity_excludes_runtime_and_oms_authority() {
+        let paths = prediction_policy_sources()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+
+        assert!(paths
+            .iter()
+            .all(|path| !path.contains("operator-contracts")));
+        assert!(paths.iter().all(|path| !path.contains("ploy-trading")));
+        assert!(paths
+            .iter()
+            .any(|path| path.contains("monday-prediction-evaluator")));
+        assert!(paths
+            .iter()
+            .any(|path| path.contains("monday-prediction-research")));
     }
 
     #[test]

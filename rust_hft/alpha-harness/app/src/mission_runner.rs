@@ -291,7 +291,7 @@ fn validate_materialization(
     Ok(())
 }
 
-fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<String> {
+pub(crate) fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<String> {
     let value = value.trim().to_ascii_lowercase();
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("{label} SHA256 is invalid");
@@ -299,7 +299,7 @@ fn normalized_sha256(label: &str, value: &str) -> anyhow::Result<String> {
     Ok(value)
 }
 
-fn fetch_to_file(
+pub(crate) fn fetch_to_file(
     client: &Client,
     source: &str,
     destination: &Path,
@@ -336,7 +336,7 @@ fn fetch_to_file(
     Ok((bytes, sha256_file(destination)?))
 }
 
-fn create_bundle<'a>(
+pub(crate) fn create_bundle<'a>(
     work_dir: &Path,
     bundle: &Path,
     roots: impl IntoIterator<Item = &'a PathBuf>,
@@ -377,7 +377,11 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<(
     Ok(())
 }
 
-fn publish_result(client: &Client, destination: &str, bundle: &Path) -> anyhow::Result<()> {
+pub(crate) fn publish_result(
+    client: &Client,
+    destination: &str,
+    bundle: &Path,
+) -> anyhow::Result<()> {
     if destination.starts_with("http://") || destination.starts_with("https://") {
         client
             .put(destination)
@@ -414,7 +418,7 @@ fn publish_result(client: &Client, destination: &str, bundle: &Path) -> anyhow::
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
     std::io::copy(&mut file, &mut digest)?;

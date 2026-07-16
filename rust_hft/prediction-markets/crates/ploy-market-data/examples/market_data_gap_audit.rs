@@ -59,11 +59,13 @@ fn parse_symbols(args: &[String]) -> Vec<String> {
 }
 
 fn database_url() -> Result<String> {
-    std::env::var("PLOY_DATABASE__URL")
+    std::env::var("MONDAY_RESEARCH_DATABASE_URL")
         .ok()
         .or_else(|| std::env::var("DATABASE_URL").ok())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("database URL is required via PLOY_DATABASE__URL or DATABASE_URL"))
+        .ok_or_else(|| {
+            anyhow!("database URL is required via MONDAY_RESEARCH_DATABASE_URL or DATABASE_URL")
+        })
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -123,7 +125,7 @@ async fn main() -> Result<()> {
         .any(|arg| arg == "--db-url" || arg.starts_with("--db-url="))
     {
         return Err(anyhow!(
-            "--db-url is forbidden because it exposes credentials; use PLOY_DATABASE__URL or DATABASE_URL"
+            "--db-url is forbidden because it exposes credentials; use MONDAY_RESEARCH_DATABASE_URL or DATABASE_URL"
         ));
     }
     let snapshot_start = parse_timestamp(&args, "--start-ts")?;

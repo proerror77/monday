@@ -83,6 +83,52 @@ cargo run -p alpha-harness -- loop status \
 
 The durable LoopRun accepts only `mcts` or `bayesian`, the two engines with versioned exact engine-state checkpoints. GP, offline RL, and LLM remain available through standalone `mission run` commands but cannot claim exact LoopRun resume. The LoopRun records ordered stages, completion policy, child missions, and an explicit stop reason. Missing evaluation, holdout, Paper, Shadow, or human evidence pauses the loop instead of fabricating progress. An external scheduler may invoke this command, but invocation does not bypass stage evidence.
 
+## Prediction-Market Research
+
+`alpha-harness` is also the single Monday transport and evidence entrypoint for
+prediction-market research. It does not merge the evaluators: continuous
+contracts keep the IC/RankIC/ICIR evaluator above, while binary event contracts
+use the event-disjoint Brier/log-loss/calibration/full-depth settlement evaluator
+compiled as `monday-prediction-evaluator`.
+
+Build an immutable snapshot from the governed read-only research database and
+publish it once:
+
+```bash
+MONDAY_RESEARCH_DATABASE_URL='postgresql://...' \
+alpha-harness prediction snapshot \
+  --work-dir /work/snapshot-btc-001 \
+  --result-put-url 'https://signed-oss-put-url' \
+  -- \
+  --start-date 2026-07-01 \
+  --end-date 2026-07-02 \
+  --symbols BTCUSDT \
+  --optimizer-data-dir /inputs/optimizer \
+  --data-audit-report /inputs/prediction-data-audit.json
+```
+
+The report returns both the archive SHA-256 and the snapshot contract hash.
+Bind the latter into a reviewed BTC- or SOL-only mission revision, then run the
+mission from immutable GET URLs and publish one evidence bundle:
+
+```bash
+alpha-harness prediction execute \
+  --work-dir /work/prediction-btc-001 \
+  --mission-url 'https://signed-mission-get-url' \
+  --mission-sha256 "$MISSION_SHA256" \
+  --snapshot-url 'https://signed-snapshot-get-url' \
+  --snapshot-sha256 "$SNAPSHOT_ARCHIVE_SHA256" \
+  --result-put-url 'https://signed-results-put-url'
+```
+
+The harness verifies both outer hashes before starting the precompiled Rust
+runner, safely extracts the snapshot, preserves runner evidence, and uses an
+immutable result PUT. The runner directly invokes the precompiled prediction
+evaluator; the runtime image contains no Cargo or source tree. These commands
+have no order, submit, cancel, replace, reconciliation, OMS, or venue-key input.
+All production execution remains in Monday `risk-control`,
+`execution-gateway`, and `apps/live`.
+
 ## Evaluation and Learning
 
 ```bash

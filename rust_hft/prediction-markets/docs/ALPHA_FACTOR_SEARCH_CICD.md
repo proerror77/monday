@@ -537,43 +537,42 @@ recover the same mission from the previous typed prior. BTC and SOL must use
 separate mission files so a candidate cannot silently broaden its symbol
 population. Start from one of the checked-in examples. Set `data_snapshot_id`
 to the immutable snapshot manifest's `snapshot_contract_hash`, then verify the
-brief and implementation IDs before running one manual proposal:
+brief and implementation IDs before dispatching the governed mission. The
+checked-in paths keep the `.example.json` suffix until an operator creates a
+reviewed immutable mission revision:
 
 ```bash
-cargo run -p ploy-research --example prediction_research_loop -- \
+cargo run -p ploy-research --bin monday-prediction-research -- \
   --print-brief-snapshot-id \
-  config/research_missions/polymarket-btc-5m.json
-cargo run -p ploy-research --example prediction_research_loop -- \
+  config/research_missions/polymarket-btc-5m.example.json
+cargo run -p ploy-research --bin monday-prediction-research -- \
   --print-policy-snapshot-id
 ```
 
 The printed values must equal `prompt_snapshot_id` and
 `search_policy_snapshot_id`. A brief or implementation change requires a new
-mission revision; do not rewrite an existing run's identity.
-
-Then run:
-
-```bash
-python3 scripts/alpha_search_llm_propose.py \
-  /tmp/downloaded-alpha-search-artifact \
-  --target full_depth_settlement_executable_pnl \
-  --mission-json config/research_missions/polymarket-btc-5m.json \
-  --output-prior-json /tmp/next-llm-prior.json
-```
-
-That Python command is a standalone compatibility helper for a manually
-reviewed proposal. It does not own LoopRun state, evaluation, promotion, or
-execution authority. The governed BTC/SOL loop below is Rust-only.
+mission revision; do not rewrite an existing run's identity. There is no
+Python proposal compatibility path.
 
 The mission LoopRun driver is the normal BTC/SOL research entrypoint once the
 immutable research snapshot exists:
 
 ```bash
-cargo run -p ploy-research --example prediction_research_loop -- \
-  config/research_missions/polymarket-btc-5m.json \
-  /var/lib/ploy/research-snapshots/btc-5m \
-  /var/lib/ploy/research-runs/btc-5m-loop-001
+alpha-harness prediction execute \
+  --work-dir /work/prediction-btc-001 \
+  --mission-url 'https://signed-mission-get-url' \
+  --mission-sha256 "$MISSION_SHA256" \
+  --snapshot-url 'https://signed-snapshot-get-url' \
+  --snapshot-sha256 "$SNAPSHOT_ARCHIVE_SHA256" \
+  --result-put-url 'https://signed-results-put-url'
 ```
+
+`alpha-harness` owns download, outer hashes, safe extraction, evidence bundling,
+and immutable upload. It starts the precompiled
+`monday-prediction-research`, which directly starts the precompiled
+`monday-prediction-evaluator`; the ACK runtime neither contains nor invokes
+Cargo. This is a research-only chain and has no PLOY daemon, OMS, order, cancel,
+replace, reconciliation, or venue credential path.
 
 The driver runs a deterministic baseline, proposes a typed batch, invokes the
 same Rust evaluator, ingests candidate feedback, and repeats until a candidate
@@ -602,10 +601,10 @@ strong contract hash, so they must be regenerated before this LoopRun can use
 them. Rebuilding the snapshot does not imply recollecting an already retained
 raw source, but it does require producing a new immutable evaluator artifact.
 
-The Rust client requires `PLOY_RESEARCH_LLM_BASE_URL` and
-`PLOY_RESEARCH_LLM_MODEL`. `PLOY_RESEARCH_LLM_API_KEY` is optional for a
+The Rust client requires `MONDAY_PREDICTION_LLM_BASE_URL` and
+`MONDAY_PREDICTION_LLM_MODEL`. `MONDAY_PREDICTION_LLM_API_KEY` is optional for a
 loopback Grok Builder and should be set for an authenticated remote HTTPS
-endpoint; `PLOY_RESEARCH_LLM_PROVIDER` labels the durable call record. Missing mission
+endpoint; `MONDAY_PREDICTION_LLM_PROVIDER` labels the durable call record. Missing mission
 authority, unresolved provenance placeholders, a target/horizon mismatch, a
 provider failure, or an invalid response fails soft and leaves the deterministic
 prior unchanged.
@@ -817,10 +816,9 @@ Current implementation status:
   `factor_registry` rows by root gene; `persist_research_trace
   --export-alpha-zoo-snapshot` produces it, and `factor_walk_forward_v2
   --alpha-zoo-snapshot-json <path>` consumes it. Omitting the flag is a no-op.
-- Implemented but opt-in: direct LLM API proposal inside hosted CI through
-  `scripts/alpha_search_llm_propose.py` and
-  `options_json.enable_llm_expansion=true`. It writes only a typed prior draft
-  and fails soft back to the deterministic closed-loop prior.
+- Implemented but opt-in: direct OpenAI-compatible proposal inside the governed
+  Rust prediction LoopRun. It writes only a typed prior draft and fails soft
+  back to the deterministic closed-loop prior.
 
 The current system is enough to start systematizing alpha discovery in CI: every
 walk-forward run can now expand interpretable bounded multi-depth mutations,
