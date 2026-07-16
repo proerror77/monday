@@ -36,15 +36,27 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 
 ## Research framework cleanup
 
+### Unified Monday prediction research control plane (2026-07-16)
+
+- [x] Promote snapshot, prediction LoopRun, and event evaluator to precompiled
+  Monday binaries; remove runtime `cargo run --example` and research-policy
+  coupling to the legacy OMS/runtime workspace.
+- [ ] Route snapshot and mission transport through `alpha-harness prediction`,
+  including signed inputs, outer hashes, safe ZIP extraction, immutable result
+  publication, and cross-Job paused-state resume.
+- [ ] Build the binaries into the shared Monday research image and validate the
+  restricted ACK Job in prediction-market CI without adding an OMS, risk,
+  reconciliation, or venue execution path.
+
 - [x] Adapt the prediction Loop to binary/digital-option factors by exposing a point-in-time Chainlink endpoint-probability component without duplicating the existing CEX model.
 - [x] Split every prediction walk-forward lane by event end so unresolved events cannot cross train/test boundaries.
 - [x] Run `ploy-research` library tests in the active root CI workflow.
-- [x] Preserve Monday's Factor Bank, Search Protocol, artifact/experiment/factor stores, `factorctl`, active DSL, manifest, and harness contracts while moving the prediction research loop into PLOY Rust.
+- [x] Preserve Monday's Factor Bank, Search Protocol, artifact/experiment/factor stores, `factorctl`, active DSL, manifest, and harness contracts while keeping the event-specific loop inside the prediction-market module.
 - [x] Pass governed mission context and bounded prior verdicts into LLM proposals, with code-enforced mutable scope.
 - [x] Gate prediction OOS evidence with Brier score, log loss, calibration error, settlement PnL, and event-level capacity.
 - [x] Route typed probability-blend candidates into the prediction evaluator and emit candidate-specific loop feedback.
 - [x] Add separate governed BTC and SOL five-minute mission templates; reject mixed-symbol missions and unresolved provenance.
-- [x] Add a resumable PLOY prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
+- [x] Add a resumable Monday prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
 - [x] Implement the complete authoritative prediction LoopRun and tests in `ploy-research` Rust without introducing a Python runner; retire the Binance-to-opening-reference backfill helper.
 - [x] Recompute terminal provisional models from typed Brier, log-loss, ECE, settlement-PnL, and conservative-capacity metrics recorded in append-only feedback; require a separate sealed snapshot for final keep.
 - [x] Recover LLM provider, model, and usage provenance from the same content-addressed response envelope after a crash.
@@ -53,25 +65,8 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Enforce mission, symbol, horizon, and exact snapshot provenance again at the Rust evaluator boundary.
 - [x] Keep feedback mission-local and return no-OOS plus conservative-capacity failure reasons for every proposed blend.
 - [x] Add a governed Rust-only Burn binary probability lane with event-disjoint snapshot-bound inputs and content-addressed model evidence.
-
-## Research framework cleanup
-
 - [x] Complete the repository-wide Rust-only cutover: remove tracked Python and PyTorch/libtorch paths, add native Burn training for both research lanes, and pass focused Rust validation.
-
-- [x] Adapt the prediction Loop to binary/digital-option factors by exposing a point-in-time Chainlink endpoint-probability component without duplicating the existing CEX model.
-- [x] Split every prediction walk-forward lane by event end so unresolved events cannot cross train/test boundaries.
-- [x] Run `ploy-research` library tests in the active root CI workflow.
 - [x] Remove unused Monday research-store/search crates while preserving active DSL, manifest, and harness contracts.
-- [x] Pass governed mission context and bounded prior verdicts into LLM proposals, with code-enforced mutable scope.
-- [x] Gate prediction OOS evidence with Brier score, log loss, calibration error, settlement PnL, and event-level capacity.
-- [x] Route typed probability-blend candidates into the prediction evaluator and emit candidate-specific loop feedback.
-- [x] Add separate governed BTC and SOL five-minute mission templates; reject mixed-symbol missions and unresolved provenance.
-- [x] Add a resumable PLOY prediction LoopRun with mission candidate/call/time budgets and content-addressed iteration evidence.
-- [x] Move the authoritative prediction LoopRun into `ploy-research` Rust and retire the non-authoritative compatibility proposal helper.
-- [x] Require explicit, non-empty Chainlink reference plus Binance spot/aggTrade/L2 snapshot surfaces, replayed by `received_at`, before a BTC/SOL LoopRun starts.
-- [x] Retire the legacy Binance-to-`price_to_beat` backfill path so Binance cannot override Chainlink reference-price authority or Polymarket official resolution.
-- [x] Enforce mission, symbol, horizon, and exact snapshot provenance again at the Rust evaluator boundary.
-- [x] Keep feedback mission-local and return no-OOS plus conservative-capacity failure reasons for every proposed blend.
 
 ## Safety
 

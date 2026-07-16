@@ -17,10 +17,10 @@ use serde_json::{json, Value};
 
 use crate::prediction_loop::{prediction_proposal_json_schema, ProposalCallOutput, ProposalClient};
 
-pub const PLOY_RESEARCH_LLM_BASE_URL_ENV: &str = "PLOY_RESEARCH_LLM_BASE_URL";
-pub const PLOY_RESEARCH_LLM_MODEL_ENV: &str = "PLOY_RESEARCH_LLM_MODEL";
-pub const PLOY_RESEARCH_LLM_API_KEY_ENV: &str = "PLOY_RESEARCH_LLM_API_KEY";
-pub const PLOY_RESEARCH_LLM_PROVIDER_ENV: &str = "PLOY_RESEARCH_LLM_PROVIDER";
+pub const MONDAY_PREDICTION_LLM_BASE_URL_ENV: &str = "MONDAY_PREDICTION_LLM_BASE_URL";
+pub const MONDAY_PREDICTION_LLM_MODEL_ENV: &str = "MONDAY_PREDICTION_LLM_MODEL";
+pub const MONDAY_PREDICTION_LLM_API_KEY_ENV: &str = "MONDAY_PREDICTION_LLM_API_KEY";
+pub const MONDAY_PREDICTION_LLM_PROVIDER_ENV: &str = "MONDAY_PREDICTION_LLM_PROVIDER";
 pub const DEFAULT_PROPOSAL_RESPONSE_MAX_BYTES: usize = 256 * 1024;
 
 pub struct ProposalClientConfig {
@@ -47,13 +47,13 @@ impl fmt::Debug for ProposalClientConfig {
 
 impl ProposalClientConfig {
     pub fn from_env(timeout: Duration) -> Result<Self> {
-        let base_url = required_env(PLOY_RESEARCH_LLM_BASE_URL_ENV)?;
-        let model = required_env(PLOY_RESEARCH_LLM_MODEL_ENV)?;
-        let api_key = std::env::var(PLOY_RESEARCH_LLM_API_KEY_ENV)
+        let base_url = required_env(MONDAY_PREDICTION_LLM_BASE_URL_ENV)?;
+        let model = required_env(MONDAY_PREDICTION_LLM_MODEL_ENV)?;
+        let api_key = std::env::var(MONDAY_PREDICTION_LLM_API_KEY_ENV)
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let provider = std::env::var(PLOY_RESEARCH_LLM_PROVIDER_ENV)
+        let provider = std::env::var(MONDAY_PREDICTION_LLM_PROVIDER_ENV)
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
