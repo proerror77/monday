@@ -1,5 +1,5 @@
 use crate::backtest::engine::SimulatedFill;
-use ploy_operator_contracts::Regime;
+use ploy_market_contracts::Regime;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Default)]
@@ -37,7 +37,7 @@ mod tests {
     use super::*;
     use crate::backtest::engine::SimulatedFill;
     use crate::signal::traits::Signal;
-    use ploy_operator_contracts::Regime;
+    use ploy_market_contracts::Regime;
 
     fn fill(regime: Regime, pnl: f64) -> SimulatedFill {
         SimulatedFill {

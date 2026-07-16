@@ -3085,7 +3085,7 @@ mod tests {
     use super::*;
     use crate::factors_v2::ReviewSide;
     use chrono::TimeZone;
-    use ploy_operator_contracts::Regime;
+    use ploy_market_contracts::Regime;
 
     fn synthetic_matrix(rows: usize) -> (AutoFactorMatrix, Vec<f64>, Vec<String>) {
         let mut columns = BTreeMap::new();

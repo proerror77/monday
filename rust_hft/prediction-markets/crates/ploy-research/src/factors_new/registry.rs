@@ -1,4 +1,4 @@
-use ploy_operator_contracts::Regime;
+use ploy_market_contracts::Regime;
 
 #[derive(Debug, Clone)]
 pub struct FactorMeta {

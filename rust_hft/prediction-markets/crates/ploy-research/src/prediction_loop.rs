@@ -226,10 +226,14 @@ pub fn current_prediction_policy_snapshot_id() -> String {
         digest.update(body);
         digest.update([0]);
     }
+    digest.update(b"prediction-policy-dependency-profile");
+    digest.update([0]);
+    digest.update(crate::prediction_policy_identity::prediction_dependency_fingerprint());
+    digest.update([0]);
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 24] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 27] {
     [
         (
             "crates/ploy-research/src/autofactor.rs",
@@ -259,6 +263,14 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 24] {
         (
             "crates/ploy-research/src/prediction_llm.rs",
             include_bytes!("prediction_llm.rs"),
+        ),
+        (
+            "crates/ploy-research/src/prediction_policy_identity.rs",
+            include_bytes!("prediction_policy_identity.rs"),
+        ),
+        (
+            "crates/ploy-research/build.rs",
+            include_bytes!("../build.rs"),
         ),
         (
             "crates/ploy-research/src/research_snapshot.rs",
@@ -319,6 +331,10 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 24] {
         (
             "crates/ploy-market-contracts/src/instrument.rs",
             include_bytes!("../../ploy-market-contracts/src/instrument.rs"),
+        ),
+        (
+            "crates/ploy-market-contracts/src/regime.rs",
+            include_bytes!("../../ploy-market-contracts/src/regime.rs"),
         ),
         (
             "crates/ploy-market-contracts/src/venue.rs",

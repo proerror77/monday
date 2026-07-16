@@ -9,6 +9,7 @@ description = "Ploy shared operator contracts crate"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+ploy-market-contracts.workspace = true
 rust_decimal.workspace = true
 schemars = { version = "0.8", features = ["chrono", "rust_decimal"] }
 serde = { version = "1", features = ["derive"] }
