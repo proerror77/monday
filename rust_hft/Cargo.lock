@@ -5289,6 +5289,7 @@ dependencies = [
  "hft-data-adapter-bitget",
  "hft-infra-metrics",
  "hft-instrument",
+ "hft-oms-core",
  "hft-ports",
  "hft-snapshot",
  "hft-strategy-arbitrage",

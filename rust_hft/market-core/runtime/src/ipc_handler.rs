@@ -235,9 +235,7 @@ impl CommandHandler for SystemCommandHandler {
                             average_price: pos.avg_price.0,
                             market_value: pos.avg_price.0 * pos.quantity.0 + pos.unrealized_pnl,
                             unrealized_pnl: pos.unrealized_pnl,
-                            realized_pnl: rust_decimal::Decimal::ZERO, // TODO: 逐部位已实现损益追踪需要扩展 ports::Position 结构
-                            // 当前系统仅在 AccountView 层面追踪总已实现损益
-                            // 未来改进：在 Position 中添加 realized_pnl 字段，并在 PortfolioCore 中追踪每个仓位的平仓损益
+                            realized_pnl: pos.realized_pnl,
                             last_update: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -1072,6 +1070,7 @@ mod tests {
                         quantity: Quantity(Decimal::from(2)),
                         avg_price: Price(Decimal::new(51, 2)),
                         unrealized_pnl: Decimal::new(5, 2),
+                        realized_pnl: Decimal::ZERO,
                     }])),
                     recent_fills: Some(Ok(vec![ports::AccountFill {
                         fill_id: "fill-1".to_string(),

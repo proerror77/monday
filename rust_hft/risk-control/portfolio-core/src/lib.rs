@@ -244,6 +244,7 @@ impl Portfolio {
                 quantity: Quantity::zero(),
                 avg_price: Price::zero(),
                 unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
             });
 
         let old_qty = pos.quantity.0;
@@ -267,7 +268,9 @@ impl Portfolio {
             } else {
                 -Decimal::ONE
             };
-            self.view.realized_pnl += (price.0 - pos.avg_price.0) * closed_quantity * direction;
+            let realized_delta = (price.0 - pos.avg_price.0) * closed_quantity * direction;
+            pos.realized_pnl += realized_delta;
+            self.view.realized_pnl += realized_delta;
 
             if new_qty == Decimal::ZERO {
                 pos.avg_price = Price::zero();
@@ -454,6 +457,7 @@ mod tests {
         let position = view.positions.get(&symbol).unwrap();
         assert_eq!(position.quantity.0, Decimal::from(2));
         assert_eq!(position.avg_price.0, Decimal::from(110));
+        assert_eq!(position.realized_pnl, Decimal::from(30));
         assert_eq!(view.realized_pnl, Decimal::from(30));
 
         fill(&mut portfolio, "S-2", "f4", &symbol, Side::Sell, 90, 2);
@@ -485,6 +489,7 @@ mod tests {
         let position = view.positions.get(&symbol).unwrap();
         assert_eq!(position.quantity.0, Decimal::from(-1));
         assert_eq!(position.avg_price.0, Decimal::from(110));
+        assert_eq!(position.realized_pnl, Decimal::from(20));
         assert_eq!(view.realized_pnl, Decimal::from(20));
 
         fill(&mut portfolio, "B-2", "f4", &symbol, Side::Buy, 100, 2);
@@ -493,6 +498,7 @@ mod tests {
         let position = view.positions.get(&symbol).unwrap();
         assert_eq!(position.quantity.0, Decimal::ONE);
         assert_eq!(position.avg_price.0, Decimal::from(100));
+        assert_eq!(position.realized_pnl, Decimal::from(30));
         assert_eq!(view.realized_pnl, Decimal::from(30));
         assert_eq!(view.cash_balance, Decimal::from(930));
         assert_eq!(view.equity(), Decimal::from(1030));
