@@ -8,7 +8,12 @@ description = "公共行情：統一 MarketStream；多交易所 adapters"
 hft-core = { package = "hft-core", path = "../../market-core/core" }
 ports = { package = "hft-ports", path = "../../market-core/ports" }
 integration = { package = "hft-integration", path = "../../market-core/integration" }
+anyhow = "1"
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rust_decimal = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 

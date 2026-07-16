@@ -34,6 +34,7 @@ ordered-float = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 engine = { package = "hft-engine", path = "../../market-core/engine" }
+data = { package = "hft-data", path = "../../data-pipelines/core" }
 
 # CLI 參數解析
 clap = { version = "4", features = ["derive"] }
