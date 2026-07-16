@@ -1242,19 +1242,29 @@ final_memory_line=$(grep -n '^memory_events_end=$(stable_memory_events_snapshot'
   | tail -1 | cut -d: -f1)
 kill_line=$(grep -n '^systemctl kill --kill-whom=main --signal=SIGTERM' "$GATE" \
   | cut -d: -f1)
+final_thaw_line=$(grep -n '^systemctl thaw "$shadow_unit"' "$GATE" \
+  | tail -1 | cut -d: -f1 || true)
+thawed_state_line=$(grep -n '^shadow_thawed_state=.*FreezerState' "$GATE" \
+  | cut -d: -f1 || true)
 final_stop_line=$(grep -n '^systemctl stop "$shadow_unit"$' "$GATE" | tail -1 | cut -d: -f1)
 [[ $freeze_line =~ ^[1-9][0-9]*$ \
   && $freezer_state_line =~ ^[1-9][0-9]*$ \
   && $final_memory_line =~ ^[1-9][0-9]*$ \
   && $kill_line =~ ^[1-9][0-9]*$ \
+  && $final_thaw_line =~ ^[1-9][0-9]*$ \
+  && $thawed_state_line =~ ^[1-9][0-9]*$ \
   && $final_stop_line =~ ^[1-9][0-9]*$ \
   && $freeze_line -lt $freezer_state_line \
   && $freezer_state_line -lt $final_memory_line \
   && $final_memory_line -lt $kill_line \
+  && $kill_line -lt $final_thaw_line \
+  && $final_thaw_line -lt $thawed_state_line \
+  && $thawed_state_line -lt $final_stop_line \
   && $kill_line -lt $final_stop_line ]] || {
-  printf 'shadow final freeze/snapshot/kill/stop sequence is unsafe\n' >&2
+  printf 'shadow final freeze/snapshot/kill/thaw/stop sequence is unsafe\n' >&2
   exit 1
 }
+grep -Fq '[[ $shadow_thawed_state == running ]]' "$GATE"
 
 validator_functions="$tmp_dir/control-group-validator.sh"
 sed -n '/^valid_absolute_path() {$/,/^}$/p' "$GATE" >"$validator_functions"
