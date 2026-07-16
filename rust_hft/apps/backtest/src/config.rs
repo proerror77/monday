@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
-use hft_collector::lob_archiver::{
+use data::binance_lob_replay::{
     source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
 };
 use serde::{Deserialize, Serialize};
@@ -889,17 +889,9 @@ mod tests {
 
     #[test]
     fn reads_real_zstd_collector_segment() {
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "monday-backtest-collector-{}-{id}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&directory).unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let raw_path = resolve_path("data/backtest/sample.raw.ndjson");
-        let compressed_path = directory.join("part-1.jsonl.zst");
+        let compressed_path = directory.path().join("part-1.jsonl.zst");
         assert!(Command::new("zstd")
             .args(["-q", "-f"])
             .arg(&raw_path)
@@ -909,7 +901,7 @@ mod tests {
             .unwrap()
             .success());
         let (_, source, _) = open_hashed_source(&compressed_path).unwrap();
-        fs::rename(&compressed_path, directory.join("verified.zst")).unwrap();
+        fs::rename(&compressed_path, directory.path().join("verified.zst")).unwrap();
         fs::write(&compressed_path, b"replaced after verified read").unwrap();
         let mut rows = Vec::new();
         visit_collector_rows(compressed_path.to_str().unwrap(), source, |row| {
@@ -920,19 +912,12 @@ mod tests {
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[0]["snapshot"]["lastUpdateId"], 100);
         assert_eq!(rows[1]["frame"]["data"]["s"], "BTCUSDT");
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn compressed_collector_segment_passes_full_governed_chain() {
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("monday-backtest-chain-{}-{id}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
-        let segment = directory.join("part-1.jsonl.zst");
+        let directory = tempfile::tempdir().unwrap();
+        let segment = directory.path().join("part-1.jsonl.zst");
         assert!(Command::new("zstd")
             .args(["-q", "-f"])
             .arg(resolve_path("data/backtest/sample.raw.ndjson"))
@@ -944,7 +929,7 @@ mod tests {
         let segment_bytes = fs::read(&segment).unwrap();
         let segment_sha = hex::encode(Sha256::digest(&segment_bytes));
 
-        let collector_manifest_path = directory.join("part-1.jsonl.zst.manifest.json");
+        let collector_manifest_path = directory.path().join("part-1.jsonl.zst.manifest.json");
         let mut collector = fixture_collector_manifest_value();
         collector["file"] = "part-1.jsonl.zst".into();
         collector["bytes"] = segment_bytes.len().into();
@@ -952,14 +937,14 @@ mod tests {
         let collector_bytes = serde_json::to_vec(&collector).unwrap();
         fs::write(&collector_manifest_path, &collector_bytes).unwrap();
         let collector_sha = hex::encode(Sha256::digest(&collector_bytes));
-        let success = directory.join("part-1.jsonl.zst._SUCCESS");
+        let success = directory.path().join("part-1.jsonl.zst._SUCCESS");
         fs::write(&success, format!("{segment_sha}\n")).unwrap();
 
-        let artifact = directory.join("backtest.ndjson");
+        let artifact = directory.path().join("backtest.ndjson");
         let artifact_bytes = fs::read(resolve_path("data/backtest/sample.ndjson")).unwrap();
         fs::write(&artifact, &artifact_bytes).unwrap();
         let artifact_sha = hex::encode(Sha256::digest(&artifact_bytes));
-        let manifest = directory.join("backtest.manifest.json");
+        let manifest = directory.path().join("backtest.manifest.json");
         let manifest_bytes = serde_json::to_vec(&serde_json::json!({
             "dataset_kind": "backtest_point_in_time_event_tape",
             "schema_version": "backtest-pit-v1",
@@ -1010,7 +995,7 @@ mod tests {
         assert_ne!(fs::read(&artifact).unwrap(), verified_contents);
         assert_eq!(verified.bytes, verified_contents);
 
-        let preserved_artifact = directory.join("verified-backtest.ndjson");
+        let preserved_artifact = directory.path().join("verified-backtest.ndjson");
         fs::rename(&artifact, &preserved_artifact).unwrap();
         fs::write(&artifact, b"malicious replacement\n").unwrap();
         assert!(std::str::from_utf8(&verified.bytes)
@@ -1021,7 +1006,6 @@ mod tests {
         fs::write(&artifact, &verified_contents).unwrap();
         fs::write(&segment, b"corrupt").unwrap();
         assert!(config.validate_data_artifact().is_err());
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 

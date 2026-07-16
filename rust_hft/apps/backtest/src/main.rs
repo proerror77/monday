@@ -361,14 +361,7 @@ mod tests {
 
     #[test]
     fn output_evidence_binds_inputs_and_every_result_artifact() {
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let out_dir = std::env::temp_dir().join(format!(
-            "monday-backtest-output-evidence-{}-{id}",
-            std::process::id()
-        ));
+        let out_dir = tempfile::tempdir().unwrap();
         let output = OutputConfig {
             trades_csv: "trades.csv".to_string(),
             summary_csv: "summary.csv".to_string(),
@@ -395,11 +388,12 @@ mod tests {
             }),
         };
 
-        write_outputs(&output, Some(out_dir.to_str().unwrap()), &result).unwrap();
+        write_outputs(&output, out_dir.path().to_str(), &result).unwrap();
 
-        let evidence: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(out_dir.join(&output.evidence_json)).unwrap())
-                .unwrap();
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(out_dir.path().join(&output.evidence_json)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(evidence["input"]["manifest_sha256"], "a".repeat(64));
         assert_eq!(evidence["input"]["config_sha256"], "b".repeat(64));
         assert_eq!(evidence["input"]["source_revision"], "c".repeat(64));
@@ -408,19 +402,15 @@ mod tests {
             assert_eq!(evidence["artifacts"][name].as_str().unwrap().len(), 64);
         }
 
-        let original_evidence = std::fs::read(out_dir.join(&output.evidence_json)).unwrap();
-        assert!(write_outputs(&output, Some(out_dir.to_str().unwrap()), &result).is_err());
+        let original_evidence = std::fs::read(out_dir.path().join(&output.evidence_json)).unwrap();
+        assert!(write_outputs(&output, out_dir.path().to_str(), &result).is_err());
         assert_eq!(
-            std::fs::read(out_dir.join(&output.evidence_json)).unwrap(),
+            std::fs::read(out_dir.path().join(&output.evidence_json)).unwrap(),
             original_evidence
         );
 
         let mut colliding_output = output.clone();
         colliding_output.evidence_json = colliding_output.summary_csv.clone();
-        assert!(
-            write_outputs(&colliding_output, Some(out_dir.to_str().unwrap()), &result).is_err()
-        );
-
-        std::fs::remove_dir_all(out_dir).unwrap();
+        assert!(write_outputs(&colliding_output, out_dir.path().to_str(), &result).is_err());
     }
 }

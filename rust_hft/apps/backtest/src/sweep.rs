@@ -279,17 +279,9 @@ execution:
 
     #[test]
     fn dry_run_rejects_invalid_output_names() {
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "monday-backtest-sweep-dry-run-{}-{id}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let config_path = directory.join("config.yaml");
-        let grid_path = directory.join("grid.yaml");
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.yaml");
+        let grid_path = directory.path().join("grid.yaml");
         let base = std::fs::read_to_string(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/backtest/default.yaml"),
         )
@@ -304,7 +296,7 @@ execution:
         let error = run(SweepOptions {
             config_path: config_path.to_str().unwrap(),
             grid_path: grid_path.to_str().unwrap(),
-            output_root: directory.join("output").to_str().unwrap(),
+            output_root: directory.path().join("output").to_str().unwrap(),
             shard_index: 0,
             shard_count: 1,
             dry_run: true,
@@ -312,6 +304,5 @@ execution:
         .unwrap_err();
 
         assert!(error.to_string().contains("output artifact names"));
-        std::fs::remove_dir_all(directory).unwrap();
     }
 }

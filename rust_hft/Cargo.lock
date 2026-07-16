@@ -4914,11 +4914,15 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
+ "hex",
+ "hft-data",
  "itertools 0.12.1",
  "ordered-float 3.9.2",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4957,6 +4961,7 @@ dependencies = [
  "fs4",
  "futures",
  "hex",
+ "hft-data",
  "hft-engine",
  "http 0.2.12",
  "libc",
@@ -4994,11 +4999,16 @@ dependencies = [
 name = "hft-data"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "futures",
+ "hex",
  "hft-core",
  "hft-integration",
  "hft-ports",
+ "rust_decimal",
  "serde",
+ "serde_json",
+ "sha2",
  "simd-json",
  "tracing",
 ]

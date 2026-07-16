@@ -1,12 +1,10 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
-use hft_collector::{
-    lob_archiver::{
-        source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceValidator,
-    },
-    DataModality, PointInTimeFeatureRow,
+use data::binance_lob_replay::{
+    source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceValidator,
 };
+use hft_collector::{DataModality, PointInTimeFeatureRow};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
