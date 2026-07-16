@@ -86,6 +86,13 @@ pub struct EngineStatisticsExport {
     pub orders_filled: u64,
     pub orders_rejected: u64,
     pub orders_canceled: u64,
+    // Account-truth facts are emitted by the engine. The readiness policy that
+    // interprets them remains in the runtime-health layer.
+    pub runtime_truth_observed_at_us: u64,
+    pub reconciliation_complete: bool,
+    pub reconciliation_healthy: bool,
+    pub risk_halted: bool,
+    pub data_integrity_gaps: u64,
 }
 
 impl MetricsRegistry {

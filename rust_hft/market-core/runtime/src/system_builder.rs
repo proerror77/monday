@@ -1320,6 +1320,8 @@ impl SystemRuntime {
                     interval.tick().await;
                     let (cash, pos, unr, rlz, stats) = {
                         let eng = engine_arc.lock().await;
+                        #[cfg(feature = "metrics")]
+                        eng.sync_latency_metrics_to_prometheus();
                         let av = eng.get_account_view();
                         let st = eng.get_statistics();
                         (
@@ -1330,21 +1332,6 @@ impl SystemRuntime {
                             st,
                         )
                     };
-                    // 導出引擎統計到 Prometheus（僅在 metrics feature 啟用時）
-                    #[cfg(feature = "metrics")]
-                    {
-                        infra_metrics::MetricsRegistry::global().update_engine_statistics(
-                            &infra_metrics::EngineStatisticsExport {
-                                cycle_count: stats.cycle_count,
-                                execution_events_processed: stats.execution_events_processed,
-                                orders_submitted: stats.orders_submitted,
-                                orders_ack: stats.orders_ack,
-                                orders_filled: stats.orders_filled,
-                                orders_rejected: stats.orders_rejected,
-                                orders_canceled: stats.orders_canceled,
-                            },
-                        );
-                    }
                     // 當引擎停止時，狀態任務退出，避免 Ctrl-C 卡住
                     if !stats.is_running {
                         break;
