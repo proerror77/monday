@@ -26,6 +26,7 @@ use ploy_research::{
 use sha2::{Digest, Sha256};
 
 const MAX_EVALUATOR_LOG_BYTES: usize = 16 * 1024 * 1024;
+const RELEASE_BIN_DIR: &str = "/usr/local/bin";
 
 fn usage() -> ! {
     eprintln!(
@@ -45,7 +46,7 @@ struct RustProcessEvaluator {
 
 impl RustProcessEvaluator {
     fn new() -> Result<Self, String> {
-        let executable = sibling_pinned_binary("monday-prediction-evaluator")?;
+        let executable = release_pinned_binary("monday-prediction-evaluator")?;
         Ok(Self { executable })
     }
 
@@ -111,13 +112,8 @@ impl RustProcessEvaluator {
     }
 }
 
-fn sibling_pinned_binary(name: &str) -> Result<PathBuf, String> {
-    let current = std::env::current_exe()
-        .map_err(|error| format!("resolve prediction research executable: {error}"))?;
-    let parent = current
-        .parent()
-        .ok_or_else(|| "prediction research executable has no parent directory".to_string())?;
-    let executable = parent.join(name);
+fn release_pinned_binary(name: &str) -> Result<PathBuf, String> {
+    let executable = Path::new(RELEASE_BIN_DIR).join(name);
     if !executable.is_file() {
         return Err(format!(
             "release-pinned prediction evaluator does not exist: {}",
@@ -700,5 +696,13 @@ mod tests {
         let error = verify_pinned_binary(&evaluator).expect_err("mismatch must fail");
 
         assert!(error.contains("digest mismatch"));
+    }
+
+    #[test]
+    fn evaluator_lookup_stays_in_the_trusted_release_directory() {
+        let error = release_pinned_binary("__ploy_missing_prediction_evaluator__")
+            .expect_err("missing release evaluator must fail");
+
+        assert!(error.contains("/usr/local/bin/__ploy_missing_prediction_evaluator__"));
     }
 }

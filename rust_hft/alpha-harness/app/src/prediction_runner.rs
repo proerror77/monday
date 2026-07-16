@@ -84,11 +84,11 @@ struct SnapshotExecutionReport<'a> {
 }
 
 pub fn execute(args: PredictionExecuteArgs) -> anyhow::Result<()> {
-    let runner = sibling_pinned_binary("monday-prediction-research")?;
+    let runner = release_pinned_binary("monday-prediction-research")?;
     execute_with_runner(args, &runner)
 }
 
-// Production resolves only the release-pinned sibling above. The path parameter
+// Production resolves only the release-pinned binary above. The path parameter
 // keeps the process boundary testable without exposing a CLI-configurable runner.
 fn execute_with_runner(args: PredictionExecuteArgs, runner: &Path) -> anyhow::Result<()> {
     validate_execute_args(&args)?;
@@ -236,8 +236,8 @@ fn verify_existing_result_bundle(
 }
 
 pub fn snapshot(args: PredictionSnapshotArgs) -> anyhow::Result<()> {
-    let compiler = sibling_pinned_binary("monday-prediction-snapshot")?;
-    let verifier = sibling_pinned_binary("monday-prediction-research")?;
+    let compiler = release_pinned_binary("monday-prediction-snapshot")?;
+    let verifier = release_pinned_binary("monday-prediction-research")?;
     snapshot_with_compiler(args, &compiler, &verifier)
 }
 
@@ -399,12 +399,10 @@ fn validate_snapshot_args(args: &PredictionSnapshotArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sibling_pinned_binary(name: &str) -> anyhow::Result<PathBuf> {
-    let current = std::env::current_exe().context("resolve alpha-harness executable")?;
-    let parent = current
-        .parent()
-        .context("alpha-harness executable has no parent directory")?;
-    let path = parent.join(name);
+const RELEASE_BIN_DIR: &str = "/usr/local/bin";
+
+fn release_pinned_binary(name: &str) -> anyhow::Result<PathBuf> {
+    let path = Path::new(RELEASE_BIN_DIR).join(name);
     if !path.is_file() {
         bail!(
             "release-pinned prediction binary does not exist: {}",
@@ -504,13 +502,8 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> anyhow::Result<()> 
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use std::{
-        ffi::OsString,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+    use std::ffi::OsString;
     use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
-
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn execute_rejects_snapshot_hash_mismatch_before_starting_runner() {
@@ -577,6 +570,16 @@ mod tests {
 
         assert!(error.to_string().contains("digest mismatch"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_binary_lookup_stays_in_the_trusted_release_directory() {
+        let error = release_pinned_binary("__alpha_harness_missing_prediction_binary__")
+            .expect_err("missing release binary must fail");
+
+        assert!(error
+            .to_string()
+            .contains("/usr/local/bin/__alpha_harness_missing_prediction_binary__"));
     }
 
     #[cfg(unix)]
@@ -775,12 +778,10 @@ mod tests {
     }
 
     fn temporary_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "alpha-prediction-runner-{name}-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        root
+        tempfile::Builder::new()
+            .prefix(&format!("alpha-prediction-runner-{name}-"))
+            .tempdir()
+            .expect("create unique temporary prediction runner root")
+            .keep()
     }
 }
