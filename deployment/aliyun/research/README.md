@@ -247,6 +247,10 @@ The image contains six stable entrypoints:
 - `/usr/local/bin/monday-prediction-evaluator`
 - `/usr/local/bin/monday-prediction-snapshot`
 
+Each prediction binary ships beside a SHA-256 pin generated in the same image
+build. The runner resolves only these sibling binaries and rejects an absent or
+mismatched pin; the example Job also uses a read-only root filesystem.
+
 `k8s/alpha-mission-job.example.yaml` runs one MCTS or Bayesian mission against a
 pre-materialized PIT feature file. The one-time signed OSS URLs belong in a
 Kubernetes Secret and must never be committed. Use distinct DuckDB files and

@@ -41,7 +41,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && install -D -m 0755 /work/target/release/lob-pit-materializer /out/bin/lob-pit-materializer \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-research /out/bin/monday-prediction-research \
     && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-evaluator /out/bin/monday-prediction-evaluator \
-    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-snapshot /out/bin/monday-prediction-snapshot
+    && install -D -m 0755 /work/target/prediction-markets/release/monday-prediction-snapshot /out/bin/monday-prediction-snapshot \
+    && for binary in monday-prediction-research monday-prediction-evaluator monday-prediction-snapshot; do \
+        sha256sum "/out/bin/$binary" | awk '{print $1}' > "/out/bin/$binary.sha256"; \
+    done
 
 FROM debian:bookworm-slim AS runtime
 
@@ -58,6 +61,9 @@ COPY --from=builder /out/bin/lob-pit-materializer /usr/local/bin/lob-pit-materia
 COPY --from=builder /out/bin/monday-prediction-research /usr/local/bin/monday-prediction-research
 COPY --from=builder /out/bin/monday-prediction-evaluator /usr/local/bin/monday-prediction-evaluator
 COPY --from=builder /out/bin/monday-prediction-snapshot /usr/local/bin/monday-prediction-snapshot
+COPY --from=builder /out/bin/monday-prediction-research.sha256 /usr/local/bin/monday-prediction-research.sha256
+COPY --from=builder /out/bin/monday-prediction-evaluator.sha256 /usr/local/bin/monday-prediction-evaluator.sha256
+COPY --from=builder /out/bin/monday-prediction-snapshot.sha256 /usr/local/bin/monday-prediction-snapshot.sha256
 
 RUN mkdir -p /work/config /work/data /work/results \
     && chown -R research:research /work
@@ -65,8 +71,5 @@ RUN mkdir -p /work/config /work/data /work/results \
 USER research
 WORKDIR /work
 ENV ALPHA_HARNESS_BIN=/usr/local/bin/alpha-harness
-ENV MONDAY_PREDICTION_RESEARCH_BIN=/usr/local/bin/monday-prediction-research \
-    MONDAY_PREDICTION_EVALUATOR_BIN=/usr/local/bin/monday-prediction-evaluator \
-    MONDAY_PREDICTION_SNAPSHOT_BIN=/usr/local/bin/monday-prediction-snapshot
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hft-backtest"]
