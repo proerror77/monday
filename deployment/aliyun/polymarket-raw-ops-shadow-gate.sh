@@ -5,7 +5,9 @@ umask 027
 export LC_ALL=C
 
 readonly REQUIRED_DURATION_SECONDS=3600
-readonly PARITY_TAIL_SECONDS=300
+# The verifier subtracts a 600-second trade maturity lag and requires a
+# non-empty event window, so the deployment tail must be strictly longer.
+readonly PARITY_TAIL_SECONDS=601
 readonly MINIMUM_GATE_SECONDS=$((REQUIRED_DURATION_SECONDS + PARITY_TAIL_SECONDS))
 readonly MAX_ACCEPTED_CYCLE_SECONDS=180
 readonly INITIAL_HEALTH_GRACE_SECONDS=60
@@ -55,7 +57,7 @@ usage() {
   printf '%s\n' \
     'Usage: polymarket-raw-ops-shadow-gate.sh <candidate-binary> <sha256> <source-revision>' \
     '' \
-    'A production-eligible gate observes for 3600 seconds plus a 300-second current-hour parity tail.'
+    'A production-eligible gate observes for 3600 seconds plus a 601-second current-hour parity tail.'
 }
 
 valid_parity_window() {
@@ -632,7 +634,7 @@ if [[ $test_only == false ]]; then
   ((observed_duration_seconds >= MINIMUM_GATE_SECONDS)) \
     || die 'production shadow duration is shorter than required'
   ((common_cutoff - parity_window_started_at >= PARITY_TAIL_SECONDS)) \
-    || die 'production parity window has less than five minutes in one UTC hour'
+    || die 'production parity window is too short for the mature trade interval'
 fi
 
 shadow_pid=$(systemctl show --property=MainPID --value "$shadow_unit")

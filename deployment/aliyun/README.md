@@ -142,14 +142,29 @@ remain part of the release bundle until the Python-to-Rust migration and its rol
 retention window are complete; they do not collect data or execute trades.
 
 The one-hour shadow compares trades by event timestamp and exact stable record ID.
+It retains the full common retrieval cutoff but applies a 10-minute trade-event
+maturity lag, matching the measured bounded delay of the rotating Data API poller;
+the mature legacy and Rust ID sets must still be exactly equal. Trade context is
+joined to the latest metadata for each trade's market ID before the cutoff instead
+of reusing the settlement-oriented market-end projection, and those two context
+snapshots must have the same governed values even when the market is outside the
+normal metadata event projection. Evidence includes both trade-ID set differences
+and context-value mismatch market IDs.
 Settlement parity uses each market's end time with a 15-minute lookback and a
 10-minute maturity lag, because independent 30-second polling schedules can record
 the same closed market on opposite sides of a wall-clock boundary. Every mature
 legacy settlement and metadata record must exist in Rust with the same canonical
-value. Additional valid Rust records are allowed, but a legacy-only record or any
-shared-value mismatch still fails closed. Field parity checks the governed record
-contract on both lanes rather than requiring every historical provider field to be
-identical.
+value. Metadata parity validates each complete raw provider row, then compares the
+immutable identity, timing, outcome/token, tick, size, fee, and `negRisk` projection;
+tick and size must be finite and positive, and the fee/`negRisk` flags must be
+booleans. Enabled fees must be finite and non-negative; disabled fees may be
+absent or null and are normalized to null before comparison. Tick, size,
+`feesEnabled`, and `negRisk` are required rather than silently omitted from the
+projection. Independently sampled lifecycle fields such as `active`, `closed`, and
+`acceptingOrders` are not cross-lane byte-equality inputs. Additional valid Rust
+records are allowed, but a legacy-only record or any governed shared-value mismatch
+still fails closed. Field parity checks the governed record contract on both lanes
+rather than requiring every historical provider field to be identical.
 
 Obtain `polymarket-raw-ops` and its SHA-256 from the immutable collector build
 artifact. Verify the binary, source revision, control archive, control manifest,
