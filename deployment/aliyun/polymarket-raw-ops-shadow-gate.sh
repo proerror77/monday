@@ -649,7 +649,10 @@ while :; do
   memory_events_end=$(stable_memory_events_snapshot \
     "$shadow_memory_events" "$memory_events_start_high") \
     || die 'Rust shadow memory.events high grew or a MemoryMax/OOM event occurred'
-  if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]; then
+  # A short gate may reduce the observation window, but it still starts with an
+  # empty per-run spool. Keep the same bounded wait for the first health record
+  # so test mode cannot fail before the collector has one full poll cycle.
+  if ((elapsed >= HEALTH_SETTLE_SECONDS)); then
     health="$shadow_spool/health.json"
     [[ -f $health && ! -L $health ]] || die 'Rust shadow health is missing'
     jq -e -f "$RUST_HEALTH_POLICY" "$health" >/dev/null \
