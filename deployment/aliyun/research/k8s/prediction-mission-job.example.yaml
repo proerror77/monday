@@ -1,0 +1,137 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: REPLACE_PREDICTION_JOB_NAME
+  namespace: monday-research
+  annotations:
+    research.monday/evaluator-version: REPLACE_PREDICTION_EVALUATOR_VERSION
+    research.monday/lane: prediction_market
+  labels:
+    app.kubernetes.io/name: monday-prediction-research
+    app.kubernetes.io/part-of: monday
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      annotations:
+        research.monday/evaluator-version: REPLACE_PREDICTION_EVALUATOR_VERSION
+        research.monday/lane: prediction_market
+      labels:
+        app.kubernetes.io/name: monday-prediction-research
+        app.kubernetes.io/part-of: monday
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: monday-acr
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        workload: backtest
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prediction-mission
+          image: crpi-ygobwehhof7qs9m3-vpc.ap-northeast-1.personal.cr.aliyuncs.com/wildcard0923/research-runner@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/alpha-harness"]
+          args:
+            - prediction
+            - execute
+            - --work-dir
+            - /work
+            - --mission-url
+            - $(MISSION_URL)
+            - --mission-sha256
+            - $(MISSION_SHA256)
+            - --snapshot-url
+            - $(SNAPSHOT_URL)
+            - --snapshot-sha256
+            - $(SNAPSHOT_SHA256)
+            - --resume-url
+            - $(RESUME_URL)
+            - --resume-sha256
+            - $(RESUME_SHA256)
+            - --result-put-url
+            - $(RESULT_PUT_URL)
+          env:
+            - name: MISSION_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: mission-url
+            - name: SNAPSHOT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: snapshot-url
+            - name: RESULT_PUT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: result-put-url
+            - name: RESUME_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: resume-url
+            - name: RESUME_SHA256
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_URL_SECRET_NAME
+                  key: resume-sha256
+            - name: MISSION_SHA256
+              value: REPLACE_MISSION_SHA256
+            - name: SNAPSHOT_SHA256
+              value: REPLACE_SNAPSHOT_SHA256
+            - name: MONDAY_PREDICTION_LLM_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_LLM_SECRET_NAME
+                  key: base-url
+            - name: MONDAY_PREDICTION_LLM_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_LLM_SECRET_NAME
+                  key: model
+            - name: MONDAY_PREDICTION_LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_LLM_SECRET_NAME
+                  key: api-key
+                  optional: true
+            - name: MONDAY_PREDICTION_LLM_PROVIDER
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_LLM_SECRET_NAME
+                  key: provider
+                  optional: true
+          resources:
+            requests:
+              cpu: "3500m"
+              memory: 8Gi
+            limits:
+              cpu: "3500m"
+              memory: 12Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: work
+          emptyDir:
+            sizeLimit: 40Gi
+        - name: tmp
+          emptyDir: {}

@@ -44,7 +44,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Route snapshot and mission transport through `alpha-harness prediction`,
   including signed inputs, outer hashes, safe ZIP extraction, immutable result
   publication, and cross-Job paused-state resume.
-- [ ] Build the binaries into the shared Monday research image and validate the
+- [x] Build the binaries into the shared Monday research image and validate the
   restricted ACK Job in prediction-market CI without adding an OMS, risk,
   reconciliation, or venue execution path.
 
