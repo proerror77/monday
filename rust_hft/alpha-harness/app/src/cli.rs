@@ -1,4 +1,4 @@
-use crate::{data_mission, governance, loop_control, mission, mission_runner};
+use crate::{data_mission, governance, loop_control, mission, mission_runner, prediction_snapshot};
 use alpha_domain::{
     EvaluationCostsV1, EvaluationLabelSpecV1, EvaluationProtocolV1, EvaluationWalkForwardV1,
 };
@@ -6,6 +6,7 @@ use alpha_store::AlphaStore;
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hft_collector::{source_catalog, DataAcquisitionMission, QualityRequirements};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -32,6 +33,10 @@ enum Command {
     Data {
         #[command(subcommand)]
         command: DataCommand,
+    },
+    Prediction {
+        #[command(subcommand)]
+        command: PredictionCommand,
     },
     Candidate {
         #[command(subcommand)]
@@ -79,6 +84,23 @@ enum DataCommand {
     Sources,
     Acquire(AcquireDataArgs),
     ImportFeatures(ImportFeatureDataArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum PredictionCommand {
+    Snapshot(PredictionSnapshotArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PredictionSnapshotArgs {
+    #[arg(long)]
+    pub work_dir: PathBuf,
+    #[arg(long)]
+    pub result_put_url: String,
+    /// Arguments forwarded to the governed snapshot compiler. `--output-dir`
+    /// is owned by alpha-harness and must not be supplied here.
+    #[arg(last = true, required = true, allow_hyphen_values = true)]
+    pub compiler_args: Vec<OsString>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -534,6 +556,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 }))
             }
         },
+        Command::Prediction { command } => match command {
+            PredictionCommand::Snapshot(args) => prediction_snapshot::snapshot(args),
+        },
         Command::Candidate { command } => match command {
             CandidateCommand::List(args) => governance::candidate_list(args),
             CandidateCommand::RegisterOnnx(args) => governance::register_onnx_candidate(*args),
@@ -616,6 +641,25 @@ mod tests {
             "alpha.duckdb",
             "--mission-id",
             "mission-1",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "alpha-harness",
+            "prediction",
+            "snapshot",
+            "--work-dir",
+            "work",
+            "--result-put-url",
+            "snapshot.zip",
+            "--",
+            "--start-date",
+            "2026-07-01",
+            "--end-date",
+            "2026-07-02",
+            "--optimizer-data-dir",
+            "optimizer",
+            "--data-audit-report",
+            "audit.json",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([

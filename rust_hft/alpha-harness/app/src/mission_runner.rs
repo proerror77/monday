@@ -336,7 +336,7 @@ fn fetch_to_file(
     Ok((bytes, sha256_file(destination)?))
 }
 
-fn create_bundle<'a>(
+pub(crate) fn create_bundle<'a>(
     work_dir: &Path,
     bundle: &Path,
     roots: impl IntoIterator<Item = &'a PathBuf>,
@@ -377,7 +377,11 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<(
     Ok(())
 }
 
-fn publish_result(client: &Client, destination: &str, bundle: &Path) -> anyhow::Result<()> {
+pub(crate) fn publish_result(
+    client: &Client,
+    destination: &str,
+    bundle: &Path,
+) -> anyhow::Result<()> {
     if destination.starts_with("http://") || destination.starts_with("https://") {
         client
             .put(destination)
@@ -414,11 +418,32 @@ fn publish_result(client: &Client, destination: &str, bundle: &Path) -> anyhow::
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
     std::io::copy(&mut file, &mut digest)?;
     Ok(hex::encode(digest.finalize()))
+}
+
+pub(crate) fn configured_sibling_binary(environment: &str, name: &str) -> anyhow::Result<PathBuf> {
+    let path = std::env::var_os(environment)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            let current = std::env::current_exe().context("resolve alpha-harness executable")?;
+            let parent = current
+                .parent()
+                .context("alpha-harness executable has no parent directory")?;
+            Ok::<_, anyhow::Error>(parent.join(name))
+        })?;
+    if !path.is_file() {
+        bail!(
+            "configured sibling binary does not exist: {}",
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 fn engine_name(engine: EngineChoice) -> &'static str {
