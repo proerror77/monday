@@ -14,17 +14,7 @@ use anyhow::{bail, Context};
 use chrono::Utc;
 
 pub fn run_loop(args: LoopRunArgs) -> anyhow::Result<()> {
-    if !matches!(
-        args.mission.engine,
-        EngineChoice::Mcts | EngineChoice::Bayesian
-    ) {
-        bail!(
-            "durable LoopRun supports only mcts or bayesian exact-resume engines; run gp, offline-rl, or llm as standalone lab missions"
-        );
-    }
-    if args.max_research_missions == 0 {
-        bail!("max_research_missions must be positive");
-    }
+    validate_loop_args(&args)?;
     let target_stage = match args.target_stage {
         LoopTargetChoice::Researching => LoopTargetStage::Researching,
         LoopTargetChoice::WalkForwardKept => LoopTargetStage::WalkForwardKept,
@@ -220,6 +210,28 @@ pub fn recover_legacy_checkpoint(args: RecoverLegacyCheckpointArgs) -> anyhow::R
         Utc::now(),
     )?;
     print_json(&replacement)
+}
+
+fn validate_loop_args(args: &LoopRunArgs) -> anyhow::Result<()> {
+    mission::validate_live_formula_engine(args.mission.engine)?;
+    if !matches!(args.mission.engine, EngineChoice::Mcts) {
+        bail!(
+            "durable LoopRun supports only mcts live-capable exact-resume engines; run gp, offline-rl, or llm as standalone lab missions"
+        );
+    }
+    if args.max_research_missions == 0 {
+        bail!("max_research_missions must be positive");
+    }
+    if args.mission.feature_fields.is_empty()
+        || args
+            .mission
+            .feature_fields
+            .iter()
+            .any(|field| field.trim().is_empty())
+    {
+        bail!("loop feature fields are required");
+    }
+    mission::validate_live_feature_fields(&args.mission.feature_fields)
 }
 
 fn load_or_create_run(
@@ -846,7 +858,7 @@ mod tests {
                 mission_id: mission_id.to_string(),
                 engine: EngineChoice::Mcts,
                 seed: 7,
-                feature_fields: vec!["signal".to_string()],
+                feature_fields: vec!["book_imbalance".to_string()],
                 offline_trace: None,
                 max_new_iterations: None,
                 dataset: DatasetArgs {
@@ -1183,10 +1195,45 @@ mod tests {
             args.mission.engine = engine;
 
             let error = run_loop(args).unwrap_err().to_string();
-            assert!(error.contains("supports only mcts or bayesian"));
+            assert!(error.contains("supports only mcts live-capable"));
             assert!(
                 !db.exists(),
                 "validation must happen before durable state is opened"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_loop_rejects_live_capability_failures_before_opening_state() {
+        let cases = [
+            (
+                EngineChoice::Bayesian,
+                vec!["book_imbalance".to_string()],
+                "Bayesian window search is research-only",
+            ),
+            (
+                EngineChoice::Mcts,
+                vec!["signal".to_string()],
+                "feature field signal is not live executable",
+            ),
+            (
+                EngineChoice::Mcts,
+                vec!["best_bid".to_string(), "bar_return".to_string()],
+                "feature fields span live event domains",
+            ),
+        ];
+
+        for (engine, feature_fields, expected) in cases {
+            let db = temp_db_path("alpha-loop-live-capability");
+            let mut args = loop_args(db.clone(), "mission-loop", LoopTargetChoice::Researching);
+            args.mission.engine = engine;
+            args.mission.feature_fields = feature_fields;
+
+            let error = run_loop(args).unwrap_err().to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+            assert!(
+                !db.exists(),
+                "live capability validation must happen before durable state is opened"
             );
         }
     }

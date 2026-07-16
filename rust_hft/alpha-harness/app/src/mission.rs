@@ -142,6 +142,7 @@ fn build_engine(
     args: &RunMissionArgs,
     dataset: &alpha_engine::evaluation::PreparedDataset,
 ) -> anyhow::Result<Box<dyn ProposalEngine>> {
+    validate_live_formula_engine(args.engine)?;
     let fields = args
         .feature_fields
         .iter()
@@ -194,6 +195,13 @@ fn build_engine(
         }
     };
     Ok(engine)
+}
+
+pub(crate) fn validate_live_formula_engine(engine: EngineChoice) -> anyhow::Result<()> {
+    if matches!(engine, EngineChoice::Bayesian) {
+        bail!(BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR);
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_live_feature_fields(fields: &[String]) -> anyhow::Result<()> {

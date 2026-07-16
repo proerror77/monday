@@ -230,9 +230,7 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
 }
 
 fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
-    if matches!(args.engine, EngineChoice::Bayesian) {
-        bail!(mission::BAYESIAN_WINDOW_SEARCH_LIVE_CAPABILITY_ERROR);
-    }
+    mission::validate_live_formula_engine(args.engine)?;
     if !matches!(args.engine, EngineChoice::Mcts) {
         bail!(
             "unsupported durable Mission engine: {}",
