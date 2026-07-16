@@ -1,4 +1,4 @@
-//! Governed Rust LoopRun for one BTC or SOL five-minute prediction mission.
+//! Governed Monday LoopRun for one BTC or SOL five-minute prediction mission.
 //!
 //! Binance is predictor context, Chainlink is the contract reference-price
 //! source, Polymarket resolution is the binary label, and the CLOB is the
@@ -29,7 +29,7 @@ const MAX_EVALUATOR_LOG_BYTES: usize = 16 * 1024 * 1024;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  prediction_research_loop --print-policy-snapshot-id\n  prediction_research_loop --print-brief-snapshot-id <mission.json>\n  prediction_research_loop <mission.json> <snapshot-dir> <output-dir>"
+        "usage:\n  monday-prediction-research --print-policy-snapshot-id\n  monday-prediction-research --print-brief-snapshot-id <mission.json>\n  monday-prediction-research <mission.json> <snapshot-dir> <output-dir>"
     );
     std::process::exit(2);
 }
@@ -40,18 +40,34 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
 }
 
 struct RustProcessEvaluator {
-    workspace_dir: PathBuf,
+    executable: PathBuf,
 }
 
 impl RustProcessEvaluator {
-    fn new() -> Self {
-        Self {
-            workspace_dir: Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(Path::parent)
-                .expect("ploy-research is nested under the prediction-market workspace")
-                .to_path_buf(),
+    fn new() -> Result<Self, String> {
+        let executable = std::env::var_os("MONDAY_PREDICTION_EVALUATOR_BIN")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(|| {
+                let current = std::env::current_exe()
+                    .map_err(|error| format!("resolve prediction research executable: {error}"))?;
+                let parent = current.parent().ok_or_else(|| {
+                    "prediction research executable has no parent directory".to_string()
+                })?;
+                Ok::<_, String>(parent.join("monday-prediction-evaluator"))
+            })?;
+        if !executable.is_file() {
+            return Err(format!(
+                "configured prediction evaluator does not exist: {}",
+                executable.display()
+            ));
         }
+        Ok(Self { executable })
+    }
+
+    fn process(&self) -> Command {
+        Command::new(&self.executable)
     }
 
     fn command(&self, request: &PredictionEvaluationRequest) -> Result<Command, String> {
@@ -65,20 +81,8 @@ impl RustProcessEvaluator {
             .find(|symbol| normalized_underlying_symbol(symbol) == underlying)
             .ok_or_else(|| format!("snapshot has no {underlying} evaluator symbol"))?;
 
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-        let mut command = Command::new(cargo);
+        let mut command = self.process();
         command
-            .current_dir(&self.workspace_dir)
-            .arg("run")
-            .arg("--quiet")
-            .arg("--locked")
-            .arg("-p")
-            .arg("ploy-research")
-            .arg("--example")
-            .arg("factor_walk_forward_v2")
-            .arg("--features")
-            .arg("db")
-            .arg("--")
             .arg("--snapshot-dir")
             .arg(&request.snapshot_dir)
             .arg("--start-ts")
@@ -281,7 +285,7 @@ fn terminate_evaluator_group(child: &mut Child) -> Option<std::process::ExitStat
     {
         let process_group = -(child.id() as libc::pid_t);
         // The child was spawned as process-group leader. Always signal the
-        // group so the nested evaluator cannot outlive Cargo or the LoopRun lock.
+        // group so the evaluator cannot outlive the LoopRun lock.
         unsafe {
             libc::kill(process_group, libc::SIGTERM);
         }
@@ -526,31 +530,6 @@ fn failed_output(reason: String) -> PredictionEvaluationOutput {
     PredictionEvaluationOutput::failure(reason, String::new(), String::new())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn evaluator_capture_stops_at_the_governed_byte_limit() {
-        let (sender, receiver) = mpsc::channel();
-        spawn_bounded_capture(
-            std::io::Cursor::new(vec![b'x'; MAX_EVALUATOR_LOG_BYTES + 1]),
-            EvaluatorStream::Stdout,
-            sender,
-        );
-
-        let capture = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("bounded capture");
-        assert!(capture.overflow);
-        assert_eq!(capture.bytes.len(), MAX_EVALUATOR_LOG_BYTES);
-        assert!(capture
-            .failure_reason()
-            .expect("overflow reason")
-            .contains("exceeded"));
-    }
-}
-
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["--print-policy-snapshot-id"] {
@@ -579,7 +558,10 @@ fn main() {
         });
     let timeout = Duration::from_secs(mission.search_budget.max_seconds.max(1));
     let mut client = LazyProposalClient::new(timeout);
-    let mut evaluator = RustProcessEvaluator::new();
+    let mut evaluator = RustProcessEvaluator::new().unwrap_or_else(|reason| {
+        eprintln!("ERROR: {reason}");
+        std::process::exit(2);
+    });
     let summary = run_or_resume(
         mission,
         Path::new(snapshot_dir),
@@ -600,5 +582,45 @@ fn main() {
         LoopRunStatus::Paused | LoopRunStatus::Failed
     ) {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluator_capture_stops_at_the_governed_byte_limit() {
+        let (sender, receiver) = mpsc::channel();
+        spawn_bounded_capture(
+            std::io::Cursor::new(vec![b'x'; MAX_EVALUATOR_LOG_BYTES + 1]),
+            EvaluatorStream::Stdout,
+            sender,
+        );
+
+        let capture = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bounded capture");
+        assert!(capture.overflow);
+        assert_eq!(capture.bytes.len(), MAX_EVALUATOR_LOG_BYTES);
+        assert!(capture
+            .failure_reason()
+            .expect("overflow reason")
+            .contains("exceeded"));
+    }
+
+    #[test]
+    fn evaluator_process_is_the_precompiled_monday_binary() {
+        let evaluator = RustProcessEvaluator {
+            executable: PathBuf::from("/usr/local/bin/monday-prediction-evaluator"),
+        };
+
+        let command = evaluator.process();
+
+        assert_eq!(
+            command.get_program(),
+            Path::new("/usr/local/bin/monday-prediction-evaluator")
+        );
+        assert_ne!(command.get_program(), "cargo");
     }
 }

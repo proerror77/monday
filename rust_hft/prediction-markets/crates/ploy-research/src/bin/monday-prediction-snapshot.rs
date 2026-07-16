@@ -1,4 +1,4 @@
-//! Compile a point-in-time research snapshot from Tango PostgreSQL raw tables.
+//! Compile a governed point-in-time snapshot from Monday research PostgreSQL tables.
 //!
 //! This binary is the boundary between collector storage and repeated research
 //! scoring. Factor review, walk-forward, and optimizer jobs should consume the
@@ -93,15 +93,17 @@ async fn main() -> anyhow::Result<()> {
         .any(|arg| arg == "--db-url" || arg.starts_with("--db-url="))
     {
         anyhow::bail!(
-            "--db-url is forbidden because it exposes credentials; use PLOY_DATABASE__URL or DATABASE_URL"
+            "--db-url is forbidden because it exposes credentials; use MONDAY_RESEARCH_DATABASE_URL or DATABASE_URL"
         );
     }
-    let db_url = std::env::var("PLOY_DATABASE__URL")
+    let db_url = std::env::var("MONDAY_RESEARCH_DATABASE_URL")
         .ok()
         .or_else(|| std::env::var("DATABASE_URL").ok())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!("database URL is required via PLOY_DATABASE__URL or DATABASE_URL")
+            anyhow::anyhow!(
+                "database URL is required via MONDAY_RESEARCH_DATABASE_URL or DATABASE_URL"
+            )
         })?;
     let output_dir =
         PathBuf::from(flag_value(&args, "--output-dir").expect("--output-dir required"));
@@ -144,13 +146,12 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let include_deribit = !flag_present(&args, "--skip-deribit");
     let pm_book_archive_dir = flag_value(&args, "--pm-book-archive-dir")
-        .or_else(|| std::env::var("PLOY_CLOB_BOOK_ARCHIVE_DIR").ok())
-        .or_else(|| Some("/opt/ploy/data/lake/orderbook_snapshots".to_string()))
+        .or_else(|| std::env::var("MONDAY_PREDICTION_BOOK_ARCHIVE_DIR").ok())
         .filter(|raw| !raw.trim().is_empty())
         .map(PathBuf::from);
 
     eprintln!(
-        "research_snapshot_compile: {} -> {} for {:?}, stake_usd={:.2}, output={}, data_requirements={}, include_deribit={}, pm_book_sample_secs={}, pm_book_archive_dir={}",
+        "monday-prediction-snapshot: {} -> {} for {:?}, stake_usd={:.2}, output={}, data_requirements={}, include_deribit={}, pm_book_sample_secs={}, pm_book_archive_dir={}",
         start,
         end,
         symbols,

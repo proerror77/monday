@@ -1759,7 +1759,7 @@ pub fn root_gene(expr: &FactorExpr) -> String {
 /// `full_depth_settlement_executable_pnl` must not penalize
 /// `full_depth_reprice_pnl_10s` candidates just because they share a root
 /// operator. Without this check, a caller that scores multiple targets with
-/// the same snapshot (see `factor_walk_forward_v2.rs`) would cross-contaminate
+/// the same snapshot (see `monday-prediction-evaluator`) would cross-contaminate
 /// unrelated target populations.
 ///
 /// NOTE: this reuses the coarse root-operator-only `root_gene()` fingerprint
