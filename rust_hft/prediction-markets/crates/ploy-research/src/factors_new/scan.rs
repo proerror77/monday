@@ -1,6 +1,6 @@
 use crate::factors::{spearman_ic, FactorObservation};
 use crate::factors_new::registry::{FactorMeta, FactorRegistry};
-use ploy_operator_contracts::Regime;
+use ploy_market_contracts::Regime;
 
 const MIN_OBS: usize = 10;
 
@@ -93,7 +93,7 @@ mod tests {
     use crate::factors::FactorObservation;
     use crate::factors_new::registry::FactorRegistry;
     use chrono::Utc;
-    use ploy_operator_contracts::Regime;
+    use ploy_market_contracts::Regime;
 
     fn obs(
         time_remaining_secs: i64,

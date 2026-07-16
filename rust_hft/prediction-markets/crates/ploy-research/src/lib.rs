@@ -2,6 +2,7 @@ pub mod alpha_search;
 pub mod attribution;
 pub mod autofactor;
 pub mod backtest;
+#[cfg(feature = "strategy-runtime")]
 pub mod backtesting;
 pub mod dataset;
 #[cfg(feature = "db")]
@@ -16,11 +17,14 @@ pub mod orderbook;
 pub mod prediction_llm;
 pub mod prediction_loop;
 mod prediction_loop_fs;
+mod prediction_policy_identity;
+#[cfg(feature = "strategy-runtime")]
 pub mod replay;
 pub mod research_os;
 pub mod research_snapshot;
 pub mod signal;
 
+#[cfg(feature = "strategy-runtime")]
 pub use backtesting::{run_backtest, BacktestReport};
 pub use dataset::{
     assign_chronological_event_splits, build_canonical_event_chronology, build_event_root_dataset,
@@ -67,6 +71,7 @@ pub use factors::{
     load_research_lob_snapshots, load_research_lob_snapshots_sampled,
     load_research_pm_book_snapshots_sampled,
 };
+#[cfg(feature = "strategy-runtime")]
 pub use replay::replay_fills;
 #[cfg(feature = "db")]
 pub use research_snapshot::{build_research_snapshot_from_database, ResearchSnapshotBuildOptions};
@@ -85,7 +90,7 @@ pub fn crate_marker() -> &'static str {
 
 // New layered pipeline exports.
 //
-// Keep `Regime` as a single root-level export from operator contracts. The
+// Keep `Regime` as a single root-level export from market contracts. The
 // factor registry uses the same type internally, but does not re-export its own
 // `factors_new::Regime` alias.
 pub use alpha_search::{
@@ -174,5 +179,5 @@ pub use model::supervised::{
 };
 #[cfg(any(feature = "ml", feature = "rl"))]
 pub use model::{RlAgent, StrategyModel, Transition};
-pub use ploy_operator_contracts::Regime;
+pub use ploy_market_contracts::Regime;
 pub use signal::{RegimeRouter, Signal, SignalSource, ThresholdRule};

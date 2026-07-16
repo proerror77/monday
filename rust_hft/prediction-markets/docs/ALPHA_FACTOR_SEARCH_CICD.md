@@ -554,6 +554,12 @@ The printed values must equal `prompt_snapshot_id` and
 mission revision; do not rewrite an existing run's identity. There is no
 Python proposal compatibility path.
 
+The policy identity binds both the curated evaluator/LoopRun sources and
+Cargo's resolved `x86_64-unknown-linux-gnu` `default,db` package, checksum, and
+feature set. Generation fails closed if operator, strategy-bundle, or trading
+packages enter that production research graph; those compatibility packages
+remain available only behind the separate `strategy-runtime` feature.
+
 The mission LoopRun driver is the normal BTC/SOL research entrypoint once the
 immutable research snapshot exists:
 

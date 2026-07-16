@@ -5,6 +5,7 @@ pub mod family;
 pub mod feed;
 pub mod fees;
 pub mod instrument;
+pub mod regime;
 pub mod venue;
 
 pub use events::{
@@ -18,4 +19,5 @@ pub use fees::{
     FeeAsset, FeeCharge, FeeFormula, FeeRounding, FeeSchedule, FeeSettlement, LiquidityRole,
 };
 pub use instrument::InstrumentKind;
+pub use regime::Regime;
 pub use venue::VenueKind;

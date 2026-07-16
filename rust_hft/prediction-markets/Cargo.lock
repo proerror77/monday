@@ -5631,6 +5631,7 @@ name = "ploy-operator-contracts"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "ploy-market-contracts",
  "rust_decimal",
  "schemars 0.8.22",
  "serde",
@@ -5704,6 +5705,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "uuid",
 ]
