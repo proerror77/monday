@@ -95,7 +95,7 @@ The prediction snapshot must consume a typed Rust data audit; a hand-written
 status is rejected:
 
 ```bash
-PLOY_DATABASE__URL="${PLOY_DATABASE__URL:?required}" \
+MONDAY_RESEARCH_DATABASE_URL="${MONDAY_RESEARCH_DATABASE_URL:?required}" \
   cargo run -p ploy-market-data --features audit \
   --example market_data_gap_audit -- \
   --start-ts 2026-07-01T00:00:00Z \

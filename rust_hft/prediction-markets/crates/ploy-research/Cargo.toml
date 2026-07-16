@@ -5,7 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Ploy research and backtesting crate"
+description = "Monday prediction-market research and backtesting crate"
+autoexamples = false
+autobins = false
 
 [features]
 default = []
@@ -91,17 +93,25 @@ path = "examples/factor_review_v2.rs"
 required-features = ["db"]
 
 [[example]]
-name = "factor_walk_forward_v2"
-path = "examples/factor_walk_forward_v2.rs"
+name = "factor_evolve_daily_plan"
+path = "examples/factor_evolve_daily_plan.rs"
+
+[[example]]
+name = "factor_portfolio_builder"
+path = "examples/factor_portfolio_builder.rs"
+
+[[bin]]
+name = "monday-prediction-evaluator"
+path = "src/bin/monday-prediction-evaluator.rs"
 required-features = ["db"]
 
-[[example]]
-name = "prediction_research_loop"
-path = "examples/prediction_research_loop.rs"
+[[bin]]
+name = "monday-prediction-research"
+path = "src/bin/monday-prediction-research.rs"
 
-[[example]]
-name = "research_snapshot_compile"
-path = "examples/research_snapshot_compile.rs"
+[[bin]]
+name = "monday-prediction-snapshot"
+path = "src/bin/monday-prediction-snapshot.rs"
 required-features = ["db"]
 
 [[example]]

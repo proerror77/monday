@@ -1,4 +1,4 @@
-//! factor_walk_forward_v2 — executable PM5D factor walk-forward review
+//! monday-prediction-evaluator — executable PM5D factor walk-forward review
 //!
 //! The training window fits each factor's direction and selected-quantile
 //! threshold. The following test window only applies that trained threshold and
@@ -524,7 +524,7 @@ async fn main() {
     let report_suite = ReportSuite::parse(flag_value(&args, "--report-suite"));
 
     eprintln!(
-        "factor_walk_forward_v2: {} -> {} for {:?}, stake_usd={:.2}, train_window={}, test_window={}, step={}, event_window_secs={}, observation_sample_secs={}, pm_book_sample_secs={}, factor_name_filter={}, report_suite={}",
+        "monday-prediction-evaluator: {} -> {} for {:?}, stake_usd={:.2}, train_window={}, test_window={}, step={}, event_window_secs={}, observation_sample_secs={}, pm_book_sample_secs={}, factor_name_filter={}, report_suite={}",
         start,
         end,
         symbols,
@@ -588,7 +588,7 @@ async fn main() {
             SettlementProbabilityPromotionGateOptions::default().min_entry_fill_rate
         });
     let snapshot_dir = snapshot_dir.unwrap_or_else(|| {
-        eprintln!("ERROR: --snapshot-dir is required for factor_walk_forward_v2");
+        eprintln!("ERROR: --snapshot-dir is required for monday-prediction-evaluator");
         std::process::exit(2);
     });
     let snapshot_provenance: String;

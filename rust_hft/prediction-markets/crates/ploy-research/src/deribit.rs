@@ -167,7 +167,7 @@ async fn relation_exists(pool: &sqlx::PgPool, relation: &str) -> bool {
 }
 
 fn raw_iv_fallback_enabled() -> bool {
-    std::env::var("PLOY_RESEARCH_DERIBIT_RAW_IV_FALLBACK")
+    std::env::var("MONDAY_PREDICTION_DERIBIT_RAW_IV_FALLBACK")
         .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
         .unwrap_or(false)
 }
