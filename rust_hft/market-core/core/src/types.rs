@@ -421,6 +421,24 @@ pub struct ComplianceContext {
     pub eligibility_confirmed: bool,
     #[serde(default)]
     pub allow_tokenized_securities: bool,
+    /// Executable top-of-book depth captured with the order decision.
+    #[serde(default)]
+    pub top_depth_usd: Option<rust_decimal::Decimal>,
+    /// Spread captured with the order decision, in basis points.
+    #[serde(default)]
+    pub spread_bps: Option<rust_decimal::Decimal>,
+    /// Corporate-action state from an authoritative reference-data source.
+    #[serde(default)]
+    pub corporate_action_active: Option<bool>,
+    /// Identity of the authoritative compliance/market-quality evidence producer.
+    #[serde(default)]
+    pub evidence_source: Option<String>,
+    /// Venue for which the evidence was produced.
+    #[serde(default)]
+    pub evidence_venue: Option<VenueId>,
+    /// Local observation timestamp of the evidence, in microseconds since epoch.
+    #[serde(default)]
+    pub evidence_observed_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

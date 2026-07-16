@@ -57,6 +57,13 @@ pub enum TradingMode {
     Emergency,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeTruthStatus {
+    pub reconciliation_complete: bool,
+    pub reconciliation_healthy: bool,
+    pub observed_at_us: u64,
+}
+
 /// 引擎運行統計（內部狀態）
 #[derive(Debug, Default)]
 pub struct EngineStats {
@@ -72,6 +79,7 @@ pub struct EngineStats {
     pub market_events_dropped: u64,
     pub intents_dropped: u64,
     pub snapshot_publish_failed: u64,
+    pub data_integrity_gaps: u64,
     // Sentinel 控制
     pub trading_mode: TradingMode,
     /// 引擎啟動時間 (微秒時間戳)
@@ -231,6 +239,7 @@ pub struct Engine {
     market_snapshots: SnapshotContainer<MarketView>,
     /// 帳戶快照發佈容器
     account_snapshots: SnapshotContainer<AccountView>,
+    runtime_truth_snapshots: SnapshotContainer<RuntimeTruthStatus>,
     /// 註冊的策略
     strategies: Vec<Box<dyn Strategy>>,
     /// 風控管理器（可選）
@@ -321,6 +330,7 @@ impl Engine {
             aggregation_engine,
             market_snapshots: SnapshotContainer::new(initial_market_view),
             account_snapshots: SnapshotContainer::new(initial_account_view),
+            runtime_truth_snapshots: SnapshotContainer::new(RuntimeTruthStatus::default()),
             strategies: Vec::new(),
             risk_manager: None,
             venue_specs: VenueSpec::build_default_venue_specs(),
@@ -341,6 +351,7 @@ impl Engine {
                 market_events_dropped: 0,
                 intents_dropped: 0,
                 snapshot_publish_failed: 0,
+                data_integrity_gaps: 0,
                 trading_mode: TradingMode::Normal,
                 start_time_us: now_micros(),
             },
@@ -622,6 +633,7 @@ impl Engine {
         }
         // 同步引擎統計（以 Gauge）
         let s = self.get_statistics();
+        let runtime_truth = self.runtime_truth_snapshots.load();
         let export = infra_metrics::EngineStatisticsExport {
             cycle_count: s.cycle_count,
             execution_events_processed: s.execution_events_processed,
@@ -630,6 +642,14 @@ impl Engine {
             orders_filled: s.orders_filled,
             orders_rejected: s.orders_rejected,
             orders_canceled: s.orders_canceled,
+            runtime_truth_observed_at_us: runtime_truth.observed_at_us,
+            reconciliation_complete: runtime_truth.reconciliation_complete,
+            reconciliation_healthy: runtime_truth.reconciliation_healthy,
+            risk_halted: matches!(
+                self.stats.trading_mode,
+                TradingMode::Paused | TradingMode::Emergency
+            ),
+            data_integrity_gaps: s.data_integrity_gaps,
         };
         infra_metrics::MetricsRegistry::global().update_engine_statistics(&export);
     }
@@ -815,6 +835,14 @@ impl Engine {
         self.account_snapshots.reader()
     }
 
+    pub fn runtime_truth_reader(&self) -> Arc<dyn snapshot::SnapshotReader<RuntimeTruthStatus>> {
+        self.runtime_truth_snapshots.reader()
+    }
+
+    pub(crate) fn publish_runtime_truth_status(&mut self, status: RuntimeTruthStatus) {
+        self.runtime_truth_snapshots.store(Arc::new(status));
+    }
+
     /// 提交訂單意圖到執行隊列（用於 dry-run 測試）
     pub fn submit_order_intent(&mut self, intent: ports::OrderIntent) -> Result<(), HftError> {
         self.ensure_accepting_new_intents()?;
@@ -979,6 +1007,10 @@ impl Engine {
                         }
 
                         for event in aggregation_events.drain(..) {
+                            if matches!(event, ports::MarketEvent::Disconnect { .. }) {
+                                self.stats.data_integrity_gaps =
+                                    self.stats.data_integrity_gaps.saturating_add(1);
+                            }
                             let book = Self::event_venue_symbol(&event).and_then(|key| {
                                 self.aggregation_engine
                                     .orderbooks
@@ -1772,20 +1804,36 @@ impl Engine {
             .unwrap_or((0, 0));
 
         // 從 Portfolio 獲取 PnL 和回撤（如果有）
-        let (pnl, unrealized_pnl, drawdown_pct, max_drawdown_pct, high_water_mark) =
-            if let Some(pm) = &self.portfolio_manager {
-                let av = pm.reader().load();
-                let total_pnl = av.total_pnl();
-                (
-                    total_pnl.to_string().parse::<f64>().unwrap_or(0.0),
-                    av.unrealized_pnl.to_string().parse::<f64>().unwrap_or(0.0),
-                    av.drawdown_pct,
-                    av.max_drawdown_pct,
-                    av.high_water_mark.to_string().parse::<f64>().unwrap_or(0.0),
-                )
-            } else {
-                (0.0, 0.0, 0.0, 0.0, 0.0)
-            };
+        let (
+            pnl,
+            unrealized_pnl,
+            drawdown_pct,
+            max_drawdown_pct,
+            high_water_mark,
+            position_count,
+            notional_value,
+        ) = if let Some(pm) = &self.portfolio_manager {
+            let av = pm.reader().load();
+            let total_pnl = av.total_pnl();
+            let notional = av
+                .positions
+                .values()
+                .map(|position| {
+                    (position.avg_price.0 * position.quantity.0 + position.unrealized_pnl).abs()
+                })
+                .sum::<rust_decimal::Decimal>();
+            (
+                total_pnl.to_string().parse::<f64>().unwrap_or(0.0),
+                av.unrealized_pnl.to_string().parse::<f64>().unwrap_or(0.0),
+                av.drawdown_pct,
+                av.max_drawdown_pct,
+                av.high_water_mark.to_string().parse::<f64>().unwrap_or(0.0),
+                av.positions.len() as i64,
+                notional.to_string().parse::<f64>().unwrap_or(0.0),
+            )
+        } else {
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        };
 
         SentinelStats {
             latency_p99_us,
@@ -1795,6 +1843,8 @@ impl Engine {
             drawdown_pct,
             max_drawdown_pct,
             high_water_mark,
+            position_count,
+            notional_value,
         }
     }
 
@@ -1901,6 +1951,10 @@ impl Engine {
             orders_filled: self.stats.orders_filled,
             orders_rejected: self.stats.orders_rejected,
             orders_canceled: self.stats.orders_canceled,
+            market_events_dropped: self.stats.market_events_dropped,
+            intents_dropped: self.stats.intents_dropped,
+            snapshot_publish_failed: self.stats.snapshot_publish_failed,
+            data_integrity_gaps: self.stats.data_integrity_gaps,
             latency,
             uptime_seconds,
         }
@@ -2058,6 +2112,10 @@ pub struct SentinelStats {
     pub max_drawdown_pct: f64,
     /// 高水位標記
     pub high_water_mark: f64,
+    /// Number of authoritative open positions.
+    pub position_count: i64,
+    /// Gross marked notional across authoritative positions.
+    pub notional_value: f64,
 }
 
 /// 引擎延遲統計信息
@@ -2097,6 +2155,10 @@ pub struct EngineStatistics {
     pub orders_filled: u64,
     pub orders_rejected: u64,
     pub orders_canceled: u64,
+    pub market_events_dropped: u64,
+    pub intents_dropped: u64,
+    pub snapshot_publish_failed: u64,
+    pub data_integrity_gaps: u64,
     /// 延遲統計
     pub latency: EngineLatencyStats,
     /// 引擎運行時間（秒）

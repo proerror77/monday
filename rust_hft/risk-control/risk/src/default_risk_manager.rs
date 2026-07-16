@@ -176,10 +176,7 @@ impl DefaultRiskManager {
                     if position.quantity.0 == Decimal::ZERO {
                         None
                     } else {
-                        Some(
-                            position.avg_price.0
-                                + position.unrealized_pnl / position.quantity.0,
-                        )
+                        Some(position.avg_price.0 + position.unrealized_pnl / position.quantity.0)
                     }
                 })
             })
@@ -192,8 +189,7 @@ impl DefaultRiskManager {
                 (position.avg_price.0 * position.quantity.0 + position.unrealized_pnl).abs()
             })
             .sum::<Decimal>();
-        let projected_notional =
-            other_notional + reference_price.abs() * new_position.0.abs();
+        let projected_notional = other_notional + reference_price.abs() * new_position.0.abs();
 
         if projected_notional > self.config.max_global_notional {
             return Err(format!(
@@ -260,6 +256,7 @@ impl RiskManager for DefaultRiskManager {
         self.last_account = Some(account.clone());
         self.last_account_update_us = Self::current_time_us();
         let mut approved_intents = Vec::new();
+        let mut projected_account = account.clone();
 
         for mut intent in intents {
             // 第一步：精度标准化
@@ -285,7 +282,7 @@ impl RiskManager for DefaultRiskManager {
             let checks = vec![
                 venue_check,
                 rate_check,
-                self.check_position_limits(&intent, account),
+                self.check_position_limits(&intent, &projected_account),
                 self.check_daily_loss(account),
                 self.check_drawdown(account),
             ];
@@ -307,6 +304,24 @@ impl RiskManager for DefaultRiskManager {
                 );
 
                 self.update_state(&intent.symbol);
+                let signed_quantity = match intent.side {
+                    hft_core::Side::Buy => intent.quantity.0,
+                    hft_core::Side::Sell => -intent.quantity.0,
+                };
+                let position = projected_account
+                    .positions
+                    .entry(intent.symbol.clone())
+                    .or_insert_with(|| ports::Position {
+                        symbol: intent.symbol.clone(),
+                        quantity: Quantity::zero(),
+                        avg_price: intent.price.unwrap_or(Price(Decimal::ZERO)),
+                        unrealized_pnl: Decimal::ZERO,
+                        realized_pnl: Decimal::ZERO,
+                    });
+                position.quantity.0 += signed_quantity;
+                if let Some(price) = intent.price {
+                    position.avg_price = price;
+                }
                 approved_intents.push(intent);
             } else {
                 // 风控拒绝
@@ -614,6 +629,7 @@ mod tests {
                 quantity: Quantity::from_f64(0.5).unwrap(),
                 avg_price: Price::from_f64(67000.0).unwrap(),
                 unrealized_pnl: Decimal::from(100),
+                realized_pnl: Decimal::ZERO,
             },
         );
 
@@ -740,6 +756,28 @@ mod tests {
     }
 
     #[test]
+    fn batch_review_uses_projected_account_exposure() {
+        let config = RiskConfig {
+            max_global_notional: Decimal::from(100),
+            max_position_per_symbol: Quantity::from_f64(100.0).unwrap(),
+            aggressive_mode: true,
+            ..Default::default()
+        };
+        let mut mgr = DefaultRiskManager::new(config);
+        let account = AccountView::default();
+        let venue = VenueSpec {
+            min_notional: Decimal::ZERO,
+            ..VenueSpec::default()
+        };
+        let first = create_test_intent("BTCUSDT", Side::Buy, 0.6, Some(100.0));
+        let second = create_test_intent("BTCUSDT", Side::Buy, 0.6, Some(100.0));
+
+        let approved = mgr.review(vec![first, second], &account, &venue);
+
+        assert_eq!(approved.len(), 1);
+    }
+
+    #[test]
     fn reduce_and_close_orders_bypass_an_already_breached_global_cap() {
         let config = RiskConfig {
             max_position_per_symbol: Quantity::from_f64(100.0).unwrap(),
@@ -756,6 +794,7 @@ mod tests {
                 quantity: Quantity::from_f64(11.0).unwrap(),
                 avg_price: Price::from_f64(100.0).unwrap(),
                 unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
             },
         );
 
@@ -766,8 +805,7 @@ mod tests {
         assert!(mgr.check_position_limits(&close, &account).is_ok());
         assert!(mgr.check_position_limits(&increase, &account).is_err());
 
-        account.positions.get_mut(&symbol).unwrap().quantity =
-            Quantity::from_f64(-11.0).unwrap();
+        account.positions.get_mut(&symbol).unwrap().quantity = Quantity::from_f64(-11.0).unwrap();
         let cover = create_test_intent("BTCUSDT", Side::Buy, 1.0, Some(100.0));
         assert!(mgr.check_position_limits(&cover, &account).is_ok());
     }
@@ -860,7 +898,7 @@ mod tests {
         let result = PrecisionNormalizer::validate_order_minimums(
             &intent,
             Quantity::from_f64(0.0001).unwrap(), // qty check passes
-            Decimal::from(10),                    // notional check fails
+            Decimal::from(10),                   // notional check fails
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("名义价值低于最小值"));
@@ -913,7 +951,10 @@ mod tests {
         }
 
         let metrics = mgr.get_risk_metrics();
-        assert_eq!(*metrics.get("total_orders_today").unwrap(), Decimal::from(5));
+        assert_eq!(
+            *metrics.get("total_orders_today").unwrap(),
+            Decimal::from(5)
+        );
     }
 
     #[test]

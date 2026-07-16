@@ -151,6 +151,8 @@ fn write_trades_csv(path: &Path, trades: &[TradeRecord]) -> anyhow::Result<()> {
         "qty",
         "entry_price",
         "exit_price",
+        "gross_pnl",
+        "fees",
         "pnl",
         "reason",
         "reference_level",
@@ -164,6 +166,8 @@ fn write_trades_csv(path: &Path, trades: &[TradeRecord]) -> anyhow::Result<()> {
             format!("{:.6}", trade.qty),
             format!("{:.6}", trade.entry_price),
             format!("{:.6}", trade.exit_price),
+            format!("{:.6}", trade.gross_pnl),
+            format!("{:.6}", trade.fees),
             format!("{:.6}", trade.pnl),
             format!("{:?}", trade.reason),
             format!("{:.6}", trade.reference_level),
@@ -179,17 +183,25 @@ fn write_summary_csv(path: &Path, summary: &SummaryMetrics) -> anyhow::Result<()
         .with_context(|| format!("無法寫入摘要檔案: {}", path.display()))?;
     writer.write_record([
         "total_pnl",
+        "gross_pnl",
+        "total_fees",
+        "turnover",
         "trades",
         "win_rate",
         "max_drawdown",
         "max_position",
+        "open_position_qty",
     ])?;
     writer.write_record([
         format!("{:.6}", summary.total_pnl),
+        format!("{:.6}", summary.gross_pnl),
+        format!("{:.6}", summary.total_fees),
+        format!("{:.6}", summary.turnover),
         summary.trades.to_string(),
         format!("{:.4}", summary.win_rate),
         format!("{:.6}", summary.max_drawdown),
         format!("{:.6}", summary.max_position),
+        format!("{:.6}", summary.open_position_qty),
     ])?;
     writer.flush()?;
     Ok(())
@@ -205,8 +217,12 @@ fn write_metrics_json(path: &Path, summary: &SummaryMetrics) -> anyhow::Result<(
 fn print_summary(summary: &SummaryMetrics) {
     info!("===== 回測摘要 =====");
     info!("總損益 (PnL): {:.6}", summary.total_pnl);
+    info!("總毛利: {:.6}", summary.gross_pnl);
+    info!("總費用: {:.6}", summary.total_fees);
+    info!("成交額: {:.6}", summary.turnover);
     info!("交易筆數: {}", summary.trades);
     info!("勝率: {:.2}%", summary.win_rate * 100.0);
     info!("最大回撤: {:.6}", summary.max_drawdown);
     info!("最高持倉: {:.6}", summary.max_position);
+    info!("未平倉殘量: {:.6}", summary.open_position_qty);
 }

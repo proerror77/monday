@@ -8,6 +8,7 @@
 //! - Risk managers
 //! - Event consumers
 
+mod exposure_projection;
 pub mod ipc_handler;
 pub mod portfolio_manager;
 pub mod risk_manager_factory;

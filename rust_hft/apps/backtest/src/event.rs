@@ -9,6 +9,8 @@ use serde::Deserialize;
 pub struct EventEnvelope {
     #[serde(alias = "timestamp")]
     pub ts: i64,
+    #[serde(default)]
+    pub sequence: Option<u64>,
     #[serde(flatten)]
     pub payload: EventPayload,
 }
@@ -77,15 +79,26 @@ pub struct EventStream<R: BufRead> {
     line_no: usize,
     start_ts: Option<i64>,
     end_ts: Option<i64>,
+    require_sequence: bool,
+    next_sequence: Option<u64>,
+    last_ts: Option<i64>,
 }
 
 impl<R: BufRead> EventStream<R> {
-    pub fn new(reader: R, start_ts: Option<i64>, end_ts: Option<i64>) -> Self {
+    pub fn new(
+        reader: R,
+        start_ts: Option<i64>,
+        end_ts: Option<i64>,
+        require_sequence: bool,
+    ) -> Self {
         Self {
             reader: reader.lines(),
             line_no: 0,
             start_ts,
             end_ts,
+            require_sequence,
+            next_sequence: None,
+            last_ts: None,
         }
     }
 
@@ -93,10 +106,16 @@ impl<R: BufRead> EventStream<R> {
         path: P,
         start_ts: Option<i64>,
         end_ts: Option<i64>,
+        require_sequence: bool,
     ) -> anyhow::Result<EventStream<BufReader<File>>> {
         let file = File::open(&path)
             .with_context(|| format!("無法開啟事件檔案: {}", path.as_ref().display()))?;
-        Ok(EventStream::new(BufReader::new(file), start_ts, end_ts))
+        Ok(EventStream::new(
+            BufReader::new(file),
+            start_ts,
+            end_ts,
+            require_sequence,
+        ))
     }
 }
 
@@ -117,6 +136,46 @@ impl<R: BufRead> Iterator for EventStream<R> {
                             return Some(Err(error));
                         }
                     };
+
+                    if self.require_sequence {
+                        let sequence = match event.sequence {
+                            Some(sequence) => sequence,
+                            None => {
+                                return Some(Err(anyhow::anyhow!(
+                                    "事件缺少 sequence (line {})",
+                                    self.line_no
+                                )))
+                            }
+                        };
+                        if let Some(expected) = self.next_sequence {
+                            if sequence != expected {
+                                return Some(Err(anyhow::anyhow!(
+                                    "事件 sequence gap (line {}): expected {}, actual {}",
+                                    self.line_no,
+                                    expected,
+                                    sequence
+                                )));
+                            }
+                        }
+                        self.next_sequence = match sequence.checked_add(1) {
+                            Some(next) => Some(next),
+                            None => {
+                                return Some(Err(anyhow::anyhow!(
+                                    "事件 sequence overflow (line {})",
+                                    self.line_no
+                                )))
+                            }
+                        };
+                    }
+                    if self.last_ts.is_some_and(|last| event.ts < last) {
+                        return Some(Err(anyhow::anyhow!(
+                            "事件时间倒退 (line {}): previous {}, actual {}",
+                            self.line_no,
+                            self.last_ts.unwrap_or_default(),
+                            event.ts
+                        )));
+                    }
+                    self.last_ts = Some(event.ts);
 
                     if let Some(start) = self.start_ts {
                         if event.ts < start {
@@ -144,6 +203,29 @@ pub fn open_event_stream<P: AsRef<Path>>(
     path: P,
     start_ts: Option<i64>,
     end_ts: Option<i64>,
+    require_sequence: bool,
 ) -> anyhow::Result<EventStream<BufReader<File>>> {
-    EventStream::<BufReader<File>>::from_path(path, start_ts, end_ts)
+    EventStream::<BufReader<File>>::from_path(path, start_ts, end_ts, require_sequence)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn required_sequence_rejects_gaps() {
+        let rows = concat!(
+            "{\"ts\":1,\"sequence\":4,\"event\":\"snapshot\",\"bids\":[[1,1]],\"asks\":[[2,1]]}\n",
+            "{\"ts\":2,\"sequence\":6,\"event\":\"trade\",\"side\":\"buy\",\"price\":1,\"quantity\":1}\n"
+        );
+        let mut stream = EventStream::new(Cursor::new(rows), None, None, true);
+        assert!(stream.next().expect("first row").is_ok());
+        assert!(stream
+            .next()
+            .expect("gap row")
+            .expect_err("gap must fail")
+            .to_string()
+            .contains("sequence gap"));
+    }
 }

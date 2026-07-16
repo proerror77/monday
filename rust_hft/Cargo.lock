@@ -4914,11 +4914,13 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
+ "hex",
  "itertools 0.12.1",
  "ordered-float 3.9.2",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tracing",
  "tracing-subscriber",
 ]

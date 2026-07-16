@@ -1,0 +1,26 @@
+{
+  "dataset_kind": "backtest_point_in_time_event_tape",
+  "schema_version": "backtest-pit-v1",
+  "mission_id": "sample-backtest-fixture",
+  "source_revision": "eb4f5298f663b6081332249d04b9c0d2430c0edbfa5bedc7565712a9fb1308e2",
+  "source_segments": [
+    {
+      "path": "data/backtest/sample.raw.ndjson",
+      "sha256": "145db91a1fe40a9d4fe3a122a7c4a06a7f4865c5293a17636fe9121ed59b2048",
+      "collector_manifest_path": "data/backtest/sample.raw.manifest.json",
+      "collector_manifest_sha256": "5194cade04ccd08dc4cb81dabedd78745c3d17ce55b607abf1ab4fa369eef118",
+      "success_marker_path": "data/backtest/sample.raw.ndjson._SUCCESS",
+      "start_received_at_ns": 1700000000000000000,
+      "end_received_at_ns": 1700000001800000000,
+      "events": 9
+    }
+  ],
+  "rows": 8,
+  "first_event_time_us": 1700000000000000,
+  "last_event_time_us": 1700000001800000,
+  "sequence_start": 1,
+  "sequence_end": 8,
+  "artifact_path": "data/backtest/sample.ndjson",
+  "artifact_sha256": "55aacc6b688196804208ef949598de60d29d6d9db3ecf7447138b1c8872aa815",
+  "point_in_time": true
+}

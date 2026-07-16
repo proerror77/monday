@@ -8,9 +8,10 @@ use engine::{
 use futures::stream;
 use hft_core::{
     AssetClass, ComplianceContext, HftResult, OrderId, OrderType, Price, ProductType, Quantity,
-    RegulatoryProfile, Side, Symbol, TimeInForce,
+    RegulatoryProfile, Side, Symbol, TimeInForce, VenueId,
 };
 use ports::{BoxStream, ConnectionHealth, ExecutionClient, ExecutionEvent, OpenOrder, OrderIntent};
+use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 
 #[derive(Default)]
@@ -95,6 +96,12 @@ fn tokenized_security_intent() -> OrderIntent {
         jurisdiction: Some("AE".to_string()),
         eligibility_confirmed: true,
         allow_tokenized_securities: true,
+        top_depth_usd: Some(Decimal::from(100_000)),
+        spread_bps: Some(Decimal::ONE),
+        corporate_action_active: Some(false),
+        evidence_source: Some("paper-reference-feed".to_string()),
+        evidence_venue: Some(VenueId::BINANCE_TOKENIZED_SECURITIES),
+        evidence_observed_at: Some(hft_core::now_micros()),
     })
 }
 

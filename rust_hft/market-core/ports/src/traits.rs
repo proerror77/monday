@@ -242,6 +242,9 @@ pub struct Position {
     pub quantity: Quantity,
     pub avg_price: Price,
     pub unrealized_pnl: rust_decimal::Decimal,
+    /// Realized PnL accumulated while the current position lifecycle is open.
+    #[serde(default)]
+    pub realized_pnl: rust_decimal::Decimal,
 }
 
 /// 策略接口
@@ -557,8 +560,11 @@ pub trait RiskManager: Send + Sync {
         account: &AccountView,
         venue_specs: &std::collections::HashMap<VenueId, VenueSpec>,
     ) -> Vec<OrderIntent> {
-        // 默認實現：批量調用 review()，根據 target_venue 或 symbol 查找對應 VenueSpec
+        // Keep a projected account across the whole batch. Calling review() with the same
+        // account snapshot for every intent lets individually-valid orders exceed aggregate
+        // position/notional limits when they are emitted in one engine tick.
         let mut approved_intents = Vec::new();
+        let mut projected_account = account.clone();
 
         for intent in intents {
             if matches!(intent.asset_class, AssetClass::TokenizedSecurity)
@@ -586,7 +592,27 @@ pub trait RiskManager: Send + Sync {
             };
 
             if let Some(spec) = venue_spec {
-                let reviewed = self.review(vec![intent], account, spec);
+                let reviewed = self.review(vec![intent], &projected_account, spec);
+                for approved in &reviewed {
+                    let signed_quantity = match approved.side {
+                        Side::Buy => approved.quantity.0,
+                        Side::Sell => -approved.quantity.0,
+                    };
+                    let position = projected_account
+                        .positions
+                        .entry(approved.symbol.clone())
+                        .or_insert_with(|| Position {
+                            symbol: approved.symbol.clone(),
+                            quantity: Quantity::zero(),
+                            avg_price: approved.price.unwrap_or_else(Price::zero),
+                            unrealized_pnl: rust_decimal::Decimal::ZERO,
+                            realized_pnl: rust_decimal::Decimal::ZERO,
+                        });
+                    position.quantity.0 += signed_quantity;
+                    if let Some(price) = approved.price {
+                        position.avg_price = price;
+                    }
+                }
                 approved_intents.extend(reviewed);
             } else {
                 // 沒有找到對應的 VenueSpec，拒絕此訂單

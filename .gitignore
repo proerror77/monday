@@ -56,6 +56,7 @@ models/
 *.jsonl
 *.json
 *.csv
+!rust_hft/data/backtest/*.manifest.json
 !products/ploy/**/*.json
 !products/ploy/**/*.jsonl
 !products/ploy/**/*.csv

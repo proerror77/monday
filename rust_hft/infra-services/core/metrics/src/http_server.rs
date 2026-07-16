@@ -126,12 +126,17 @@ async fn metrics_handler(State(config): State<Arc<MetricsServerConfig>>) -> impl
 }
 
 /// /health 端点处理器 - 简单健康检查
-async fn health_handler() -> impl IntoResponse {
+async fn health_handler(State(config): State<Arc<MetricsServerConfig>>) -> impl IntoResponse {
+    let (healthy, detail) = MetricsRegistry::global().assess_readiness(
+        config.readiness_max_utilization,
+        config.readiness_max_idle_secs,
+    );
     let health_info = serde_json::json!({
-        "status": "healthy",
+        "status": if healthy { "healthy" } else { "unhealthy" },
         "service": "hft-metrics-server",
         "version": env!("CARGO_PKG_VERSION"),
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        "detail": detail,
         "features": {
             "prometheus": true,
             "http_server": cfg!(feature = "http-server"),
@@ -139,7 +144,11 @@ async fn health_handler() -> impl IntoResponse {
     });
 
     Response::builder()
-        .status(StatusCode::OK)
+        .status(if healthy {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        })
         .header("content-type", "application/json")
         .body(health_info.to_string())
         .unwrap()
@@ -215,7 +224,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_handler() {
-        let response = health_handler().await.into_response();
+        MetricsRegistry::global().update_engine_statistics(&crate::EngineStatisticsExport {
+            cycle_count: 1,
+            execution_events_processed: 1,
+            orders_submitted: 0,
+            orders_ack: 0,
+            orders_filled: 0,
+            orders_rejected: 0,
+            orders_canceled: 0,
+            runtime_truth_observed_at_us: crate::now_micros(),
+            reconciliation_complete: true,
+            reconciliation_healthy: true,
+            risk_halted: false,
+            data_integrity_gaps: 0,
+        });
+        let config = Arc::new(MetricsServerConfig {
+            readiness_max_idle_secs: u64::MAX,
+            readiness_max_utilization: 1.0,
+            ..Default::default()
+        });
+        let response = health_handler(State(config)).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
 

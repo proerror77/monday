@@ -1,0 +1,9 @@
+{"received_at_ns":1700000000000000000,"type":"snapshot","sequence":1,"bids":[[29990.0,1.5],[29989.5,1.2],[29989.0,1.0]],"asks":[[29990.5,1.3],[29991.0,1.1],[29991.5,1.0]]}
+{"received_at_ns":1700000000000000001,"type":"checkpoint","symbol":"BTCUSDT","synced":true,"bridged":true}
+{"received_at_ns":1700000000500000000,"type":"trade","sequence":2,"side":"sell","price":29989.5,"quantity":0.8}
+{"received_at_ns":1700000000600000000,"type":"l2_update","sequence":3,"bids":[[29989.0,1.8],[29988.5,2.0],[29988.0,1.5]],"asks":[[29990.5,1.0],[29991.0,0.8],[29991.5,0.6]]}
+{"received_at_ns":1700000000700000000,"type":"trade","sequence":4,"side":"sell","price":29988.5,"quantity":1.0}
+{"received_at_ns":1700000000800000000,"type":"trade","sequence":5,"side":"buy","price":29990.0,"quantity":0.3}
+{"received_at_ns":1700000000900000000,"type":"l2_update","sequence":6,"bids":[[29987.5,2.5],[29987.0,2.1],[29986.5,2.0]],"asks":[[29989.5,0.9],[29990.0,0.8],[29990.5,0.7]]}
+{"received_at_ns":1700000001200000000,"type":"trade","sequence":7,"side":"sell","price":29987.0,"quantity":1.2}
+{"received_at_ns":1700000001800000000,"type":"trade","sequence":8,"side":"buy","price":29989.0,"quantity":0.6}

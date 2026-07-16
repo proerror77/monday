@@ -1137,6 +1137,7 @@ pub fn runtime_stage_is_healthy(
         }
         if event.outcome == AttributionOutcome::Healthy
             && event.kind == AttributionKind::PortfolioSnapshot
+            && portfolio_snapshot_has_authoritative_truth(event)
         {
             if let Some(strategy_id) = event.strategy_id.as_ref() {
                 health
@@ -1165,6 +1166,27 @@ pub fn runtime_stage_is_healthy(
                 .values()
                 .any(|strategy| strategy.healthy_snapshot && strategy.fill)
     })
+}
+
+const MAX_RUNTIME_RECONCILIATION_AGE_US: f64 = 30_000_000.0;
+
+fn portfolio_snapshot_has_authoritative_truth(event: &RuntimeAttributionEvent) -> bool {
+    let metric_is_one = |name: &str| {
+        event
+            .metrics
+            .get(name)
+            .is_some_and(|value| value.is_finite() && *value >= 1.0)
+    };
+    let age_is_fresh = event
+        .metrics
+        .get("venue_reconciliation_age_us")
+        .is_some_and(|value| {
+            value.is_finite() && *value >= 0.0 && *value <= MAX_RUNTIME_RECONCILIATION_AGE_US
+        });
+    metric_is_one("authoritative_account_snapshot_coverage")
+        && metric_is_one("venue_reconciliation_complete")
+        && metric_is_one("venue_reconciliation_healthy")
+        && age_is_fresh
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2298,6 +2320,24 @@ mod tests {
             AttributionOutcome::Healthy,
             Some("strategy-1"),
         ));
+        assert!(!runtime_stage_is_healthy(
+            &events,
+            "candidate-1",
+            AttributionMode::Shadow
+        ));
+        let snapshot = events.last_mut().unwrap();
+        snapshot
+            .metrics
+            .insert("authoritative_account_snapshot_coverage".to_string(), 1.0);
+        snapshot
+            .metrics
+            .insert("venue_reconciliation_complete".to_string(), 1.0);
+        snapshot
+            .metrics
+            .insert("venue_reconciliation_healthy".to_string(), 1.0);
+        snapshot
+            .metrics
+            .insert("venue_reconciliation_age_us".to_string(), 1_000.0);
         assert!(runtime_stage_is_healthy(
             &events,
             "candidate-1",

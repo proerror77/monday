@@ -2,7 +2,7 @@
 //!
 //! 為 HFT 系統提供分段延遲監控、隊列利用率、事件計數等關鍵指標
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use tracing::debug;
 
@@ -70,10 +70,19 @@ pub struct MetricsRegistry {
     pub engine_orders_filled: Gauge,
     pub engine_orders_rejected: Gauge,
     pub engine_orders_canceled: Gauge,
+    pub runtime_reconciliation_complete: Gauge,
+    pub runtime_reconciliation_healthy: Gauge,
+    pub runtime_risk_halted: Gauge,
+    pub runtime_data_integrity_gaps: Gauge,
 
     // 本地就緒狀態跟蹤（不依賴 Prometheus 讀取，使 /readiness 更輕量）
     last_activity_micros: AtomicU64,
     last_queue_utilization_ppm: AtomicU64, // 以百萬分位儲存（ppm），避免 f64 原子
+    runtime_truth_observed_at_us: AtomicU64,
+    reconciliation_complete: AtomicBool,
+    reconciliation_healthy: AtomicBool,
+    risk_halted: AtomicBool,
+    data_integrity_gaps: AtomicU64,
 }
 
 /// 引擎統計快照（由 engine 匯出，用於更新 gauges）
@@ -86,6 +95,11 @@ pub struct EngineStatisticsExport {
     pub orders_filled: u64,
     pub orders_rejected: u64,
     pub orders_canceled: u64,
+    pub runtime_truth_observed_at_us: u64,
+    pub reconciliation_complete: bool,
+    pub reconciliation_healthy: bool,
+    pub risk_halted: bool,
+    pub data_integrity_gaps: u64,
 }
 
 impl MetricsRegistry {
@@ -274,6 +288,24 @@ impl MetricsRegistry {
         let engine_orders_canceled =
             Gauge::new("hft_engine_orders_canceled", "已撤銷訂單數（當前快照）")
                 .expect("創建 engine_orders_canceled 失敗");
+        let runtime_reconciliation_complete = Gauge::new(
+            "hft_runtime_reconciliation_complete",
+            "交易所持倉與成交對帳是否完整",
+        )
+        .expect("創建 runtime_reconciliation_complete 失敗");
+        let runtime_reconciliation_healthy = Gauge::new(
+            "hft_runtime_reconciliation_healthy",
+            "交易所持倉與成交對帳是否健康",
+        )
+        .expect("創建 runtime_reconciliation_healthy 失敗");
+        let runtime_risk_halted =
+            Gauge::new("hft_runtime_risk_halted", "風控是否已暫停或緊急停止交易")
+                .expect("創建 runtime_risk_halted 失敗");
+        let runtime_data_integrity_gaps = Gauge::new(
+            "hft_runtime_data_integrity_gaps",
+            "運行期偵測到的市場資料完整性斷層",
+        )
+        .expect("創建 runtime_data_integrity_gaps 失敗");
 
         // 對帳指標
         let reconcile_runs = IntCounter::new("hft_reconcile_runs_total", "對帳執行次數")
@@ -383,6 +415,18 @@ impl MetricsRegistry {
             .register(Box::new(engine_orders_canceled.clone()))
             .expect("註冊 engine_orders_canceled 失敗");
         registry
+            .register(Box::new(runtime_reconciliation_complete.clone()))
+            .expect("註冊 runtime_reconciliation_complete 失敗");
+        registry
+            .register(Box::new(runtime_reconciliation_healthy.clone()))
+            .expect("註冊 runtime_reconciliation_healthy 失敗");
+        registry
+            .register(Box::new(runtime_risk_halted.clone()))
+            .expect("註冊 runtime_risk_halted 失敗");
+        registry
+            .register(Box::new(runtime_data_integrity_gaps.clone()))
+            .expect("註冊 runtime_data_integrity_gaps 失敗");
+        registry
             .register(Box::new(reconcile_runs.clone()))
             .expect("註冊對帳次數指標失敗");
         registry
@@ -454,8 +498,17 @@ impl MetricsRegistry {
             engine_orders_filled,
             engine_orders_rejected,
             engine_orders_canceled,
+            runtime_reconciliation_complete,
+            runtime_reconciliation_healthy,
+            runtime_risk_halted,
+            runtime_data_integrity_gaps,
             last_activity_micros: AtomicU64::new(now),
             last_queue_utilization_ppm: AtomicU64::new(0),
+            runtime_truth_observed_at_us: AtomicU64::new(0),
+            reconciliation_complete: AtomicBool::new(false),
+            reconciliation_healthy: AtomicBool::new(false),
+            risk_halted: AtomicBool::new(false),
+            data_integrity_gaps: AtomicU64::new(0),
         }
     }
 
@@ -629,6 +682,23 @@ impl MetricsRegistry {
         self.engine_orders_filled.set(s.orders_filled as f64);
         self.engine_orders_rejected.set(s.orders_rejected as f64);
         self.engine_orders_canceled.set(s.orders_canceled as f64);
+        self.runtime_reconciliation_complete
+            .set(if s.reconciliation_complete { 1.0 } else { 0.0 });
+        self.runtime_reconciliation_healthy
+            .set(if s.reconciliation_healthy { 1.0 } else { 0.0 });
+        self.runtime_risk_halted
+            .set(if s.risk_halted { 1.0 } else { 0.0 });
+        self.runtime_data_integrity_gaps
+            .set(s.data_integrity_gaps as f64);
+        self.runtime_truth_observed_at_us
+            .store(s.runtime_truth_observed_at_us, Ordering::Relaxed);
+        self.reconciliation_complete
+            .store(s.reconciliation_complete, Ordering::Relaxed);
+        self.reconciliation_healthy
+            .store(s.reconciliation_healthy, Ordering::Relaxed);
+        self.risk_halted.store(s.risk_halted, Ordering::Relaxed);
+        self.data_integrity_gaps
+            .store(s.data_integrity_gaps, Ordering::Relaxed);
         self.note_activity();
     }
 
@@ -720,7 +790,24 @@ impl MetricsRegistry {
         let last = self.last_activity_micros.load(Ordering::Relaxed);
         let idle_secs = (now.saturating_sub(last)) as f64 / 1_000_000.0;
         let util = self.queue_utilization_value();
-        let ready = idle_secs <= max_idle_secs as f64 && util <= max_utilization;
+        let truth_observed_at_us = self.runtime_truth_observed_at_us.load(Ordering::Relaxed);
+        let truth_age_secs = (truth_observed_at_us > 0)
+            .then(|| now.saturating_sub(truth_observed_at_us) as f64 / 1_000_000.0);
+        let reconciliation_complete = self.reconciliation_complete.load(Ordering::Relaxed);
+        let reconciliation_healthy = self.reconciliation_healthy.load(Ordering::Relaxed);
+        let risk_halted = self.risk_halted.load(Ordering::Relaxed);
+        let data_integrity_gaps = self.data_integrity_gaps.load(Ordering::Relaxed);
+        let reconciliation_ready = match truth_age_secs {
+            None => false,
+            Some(age) => {
+                reconciliation_complete && reconciliation_healthy && age <= max_idle_secs as f64
+            }
+        };
+        let ready = idle_secs <= max_idle_secs as f64
+            && util <= max_utilization
+            && reconciliation_ready
+            && !risk_halted
+            && data_integrity_gaps == 0;
         (
             ready,
             serde_json::json!({
@@ -728,8 +815,44 @@ impl MetricsRegistry {
                 "queue_utilization": util,
                 "max_idle_secs": max_idle_secs,
                 "max_utilization": max_utilization,
+                "reconciliation_complete": reconciliation_complete,
+                "reconciliation_healthy": reconciliation_healthy,
+                "reconciliation_age_secs": truth_age_secs,
+                "risk_halted": risk_halted,
+                "data_integrity_gaps": data_integrity_gaps,
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod runtime_readiness_tests {
+    use super::*;
+
+    #[test]
+    fn readiness_fails_closed_on_unhealthy_runtime_truth() {
+        let registry = MetricsRegistry::create_with_prometheus();
+        assert!(!registry.assess_readiness(1.0, 60).0);
+        registry.update_engine_statistics(&EngineStatisticsExport {
+            cycle_count: 1,
+            execution_events_processed: 1,
+            orders_submitted: 0,
+            orders_ack: 0,
+            orders_filled: 0,
+            orders_rejected: 0,
+            orders_canceled: 0,
+            runtime_truth_observed_at_us: now_micros(),
+            reconciliation_complete: false,
+            reconciliation_healthy: false,
+            risk_halted: true,
+            data_integrity_gaps: 1,
+        });
+
+        let (ready, detail) = registry.assess_readiness(1.0, 60);
+
+        assert!(!ready);
+        assert_eq!(detail["risk_halted"], true);
+        assert_eq!(detail["data_integrity_gaps"], 1);
     }
 }
 

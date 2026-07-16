@@ -41,16 +41,12 @@ impl BacktestEngine {
     }
 
     pub fn run(&mut self) -> Result<BacktestResult> {
-        if self.cfg.data.format.to_lowercase() != "ndjson" {
-            warn!(
-                "資料格式 {} 尚未實作專用解析器，將以 ndjson 模式處理",
-                self.cfg.data.format
-            );
-        }
+        self.cfg.validate_data_artifact()?;
         let stream = open_event_stream(
             &self.cfg.data.path,
             self.cfg.data.start_ts,
             self.cfg.data.end_ts,
+            self.cfg.data.require_sequence,
         )?;
         self.run_with_stream(stream)
     }
@@ -66,13 +62,22 @@ impl BacktestEngine {
 
         // 平倉殘餘持倉
         if self.execution.has_position() {
-            if let Some(mid) = self.order_book.mid_price() {
+            if let Some((fill_qty, fill_price)) = self.order_book.executable_exit(
+                self.execution.position.side.unwrap(),
+                self.execution.position.qty,
+                self.cfg.execution.max_fill_ratio,
+            ) {
                 let ts = self
                     .last_ts
                     .map(|t| t as f64 / MICROS_IN_SECOND)
                     .unwrap_or(0.0);
-                self.execution
-                    .exit_position(ts, mid, ExitReason::SessionEnd, &mut self.stats);
+                self.execution.exit_position(
+                    ts,
+                    fill_price,
+                    fill_qty,
+                    ExitReason::SessionEnd,
+                    &mut self.stats,
+                );
             }
         }
 
@@ -150,15 +155,19 @@ impl BacktestEngine {
             let ofi_condition = ofi <= -self.cfg.strategy.ofi_threshold.abs().max(1e-9);
 
             if price_condition && depth_condition && cvd_condition && ofi_condition {
-                if let Some((bid_price, _)) = self.order_book.best_bid() {
-                    let entry_price =
-                        bid_price - self.cfg.execution.max_slippage_ticks * self.cfg.data.tick_size;
-                    let qty = self.execution.calc_short_qty(
-                        level.depth,
-                        tt_vol_down,
-                        self.cfg.execution.base_qty,
-                    );
-                    if qty > 0.0 && self.execution.can_enter(qty) {
+                let requested_qty = self.execution.calc_short_qty(
+                    level.depth,
+                    tt_vol_down,
+                    self.cfg.execution.base_qty,
+                );
+                if let Some((qty, entry_price)) = self.order_book.executable_entry(
+                    PositionSide::Short,
+                    requested_qty,
+                    self.cfg.execution.max_fill_ratio,
+                    self.cfg.execution.max_slippage_ticks,
+                    self.cfg.data.tick_size,
+                ) {
+                    if self.execution.can_enter(qty) {
                         self.execution.enter_short(
                             ts_sec,
                             entry_price,
@@ -182,15 +191,19 @@ impl BacktestEngine {
             let ofi_condition = ofi >= self.cfg.strategy.ofi_threshold.abs().max(1e-9);
 
             if price_condition && depth_condition && cvd_condition && ofi_condition {
-                if let Some((ask_price, _)) = self.order_book.best_ask() {
-                    let entry_price =
-                        ask_price + self.cfg.execution.max_slippage_ticks * self.cfg.data.tick_size;
-                    let qty = self.execution.calc_long_qty(
-                        level.depth,
-                        tt_vol_up,
-                        self.cfg.execution.base_qty,
-                    );
-                    if qty > 0.0 && self.execution.can_enter(qty) {
+                let requested_qty = self.execution.calc_long_qty(
+                    level.depth,
+                    tt_vol_up,
+                    self.cfg.execution.base_qty,
+                );
+                if let Some((qty, entry_price)) = self.order_book.executable_entry(
+                    PositionSide::Long,
+                    requested_qty,
+                    self.cfg.execution.max_fill_ratio,
+                    self.cfg.execution.max_slippage_ticks,
+                    self.cfg.data.tick_size,
+                ) {
+                    if self.execution.can_enter(qty) {
                         self.execution.enter_long(
                             ts_sec,
                             entry_price,
@@ -204,8 +217,14 @@ impl BacktestEngine {
             }
         }
 
-        self.execution
-            .evaluate_exit(ts_sec, mid, ofi, cvd_delta, &mut self.stats);
+        self.execution.evaluate_exit(
+            ts_sec,
+            mid,
+            ofi,
+            cvd_delta,
+            &self.order_book,
+            &mut self.stats,
+        );
 
         Ok(())
     }
@@ -213,7 +232,9 @@ impl BacktestEngine {
     fn finish(&mut self) -> BacktestResult {
         BacktestResult {
             trades: mem::take(&mut self.execution.trades),
-            summary: self.stats.clone_into_summary(),
+            summary: self
+                .stats
+                .clone_into_summary(self.execution.position.qty.abs()),
         }
     }
 }
@@ -304,6 +325,114 @@ impl OrderBook {
             (Some((bid, _)), Some((ask, _))) if ask >= bid => Some((bid + ask) / 2.0),
             _ => None,
         }
+    }
+
+    fn executable_exit(
+        &self,
+        position_side: PositionSide,
+        requested_qty: f64,
+        max_fill_ratio: f64,
+    ) -> Option<(f64, f64)> {
+        let participation = max_fill_ratio.clamp(0.0, 1.0);
+        if requested_qty <= 0.0 || participation <= 0.0 {
+            return None;
+        }
+        let levels: Box<dyn Iterator<Item = (f64, f64)> + '_> = match position_side {
+            PositionSide::Long => Box::new(
+                self.bids
+                    .iter()
+                    .rev()
+                    .map(|(price, qty)| (price.into_inner(), *qty)),
+            ),
+            PositionSide::Short => Box::new(
+                self.asks
+                    .iter()
+                    .map(|(price, qty)| (price.into_inner(), *qty)),
+            ),
+        };
+        let mut remaining = requested_qty;
+        let mut filled = 0.0;
+        let mut notional = 0.0;
+        for (price, displayed_qty) in levels {
+            let level_fill = remaining.min(displayed_qty.max(0.0) * participation);
+            if level_fill <= 0.0 {
+                continue;
+            }
+            filled += level_fill;
+            notional += level_fill * price;
+            remaining -= level_fill;
+            if remaining <= 1e-12 {
+                break;
+            }
+        }
+        (filled > 0.0).then_some((filled, notional / filled))
+    }
+
+    fn executable_entry(
+        &self,
+        position_side: PositionSide,
+        requested_qty: f64,
+        max_fill_ratio: f64,
+        max_slippage_ticks: f64,
+        tick_size: f64,
+    ) -> Option<(f64, f64)> {
+        let participation = max_fill_ratio.clamp(0.0, 1.0);
+        if requested_qty <= 0.0
+            || participation <= 0.0
+            || max_slippage_ticks < 0.0
+            || tick_size <= 0.0
+        {
+            return None;
+        }
+        let (levels, worst_price): (Box<dyn Iterator<Item = (f64, f64)> + '_>, f64) =
+            match position_side {
+                PositionSide::Long => {
+                    let best = self.best_ask()?.0;
+                    (
+                        Box::new(
+                            self.asks
+                                .iter()
+                                .map(|(price, qty)| (price.into_inner(), *qty)),
+                        ),
+                        best + max_slippage_ticks * tick_size,
+                    )
+                }
+                PositionSide::Short => {
+                    let best = self.best_bid()?.0;
+                    (
+                        Box::new(
+                            self.bids
+                                .iter()
+                                .rev()
+                                .map(|(price, qty)| (price.into_inner(), *qty)),
+                        ),
+                        best - max_slippage_ticks * tick_size,
+                    )
+                }
+            };
+        let mut remaining = requested_qty;
+        let mut filled = 0.0;
+        let mut notional = 0.0;
+        for (price, displayed_qty) in levels {
+            let outside_slippage = match position_side {
+                PositionSide::Long => price > worst_price + 1e-12,
+                PositionSide::Short => price < worst_price - 1e-12,
+            };
+            if outside_slippage {
+                break;
+            }
+            let level_fill = remaining.min(displayed_qty.max(0.0) * participation);
+            if level_fill <= 0.0 {
+                continue;
+            }
+            filled += level_fill;
+            notional += level_fill * price;
+            remaining -= level_fill;
+            if remaining <= 1e-12 {
+                break;
+            }
+        }
+        (filled > 0.0).then_some((filled, notional / filled))
     }
 
     fn snapshot(&self, max_levels: usize) -> DepthSnapshot {
@@ -734,6 +863,8 @@ pub struct TradeRecord {
     pub entry_price: f64,
     pub exit_price: f64,
     pub pnl: f64,
+    pub gross_pnl: f64,
+    pub fees: f64,
     pub reason: ExitReason,
     pub reference_level: f64,
     pub reference_depth: f64,
@@ -787,7 +918,10 @@ impl ExecutionManager {
             return 0.0;
         }
         let ratio = (vol / depth).min(self.cfg.max_position / base_qty);
-        (base_qty * ratio).min(self.cfg.max_position).max(0.0)
+        (base_qty * ratio)
+            .min(self.cfg.max_position)
+            .min(depth * self.cfg.max_fill_ratio.clamp(0.0, 1.0))
+            .max(0.0)
     }
 
     fn calc_long_qty(&self, depth: f64, vol: f64, base_qty: f64) -> f64 {
@@ -795,7 +929,10 @@ impl ExecutionManager {
             return 0.0;
         }
         let ratio = (vol / depth).min(self.cfg.max_position / base_qty);
-        (base_qty * ratio).min(self.cfg.max_position).max(0.0)
+        (base_qty * ratio)
+            .min(self.cfg.max_position)
+            .min(depth * self.cfg.max_fill_ratio.clamp(0.0, 1.0))
+            .max(0.0)
     }
 
     fn enter_short(
@@ -877,6 +1014,7 @@ impl ExecutionManager {
         mid: f64,
         ofi: f64,
         cvd_delta: f64,
+        order_book: &OrderBook,
         stats: &mut BacktestStats,
     ) {
         if self.position.side.is_none() {
@@ -935,7 +1073,13 @@ impl ExecutionManager {
         };
 
         if let Some(reason) = reason {
-            self.exit_position(ts, mid, reason, stats);
+            if let Some((fill_qty, fill_price)) = order_book.executable_exit(
+                self.position.side.unwrap(),
+                self.position.qty,
+                self.cfg.max_fill_ratio,
+            ) {
+                self.exit_position(ts, fill_price, fill_qty, reason, stats);
+            }
         }
     }
 
@@ -943,22 +1087,30 @@ impl ExecutionManager {
         &mut self,
         ts: f64,
         price: f64,
+        fill_qty: f64,
         reason: ExitReason,
         stats: &mut BacktestStats,
     ) {
         if self.position.side.is_none() || self.position.qty == 0.0 {
             return;
         }
-        let qty = self.position.qty;
+        let qty = fill_qty.min(self.position.qty).max(0.0);
+        if qty <= 0.0 {
+            return;
+        }
         let entry_price = self.position.entry_price;
         let side = self.position.side.unwrap();
-        let pnl = match side {
+        let gross_pnl = match side {
             PositionSide::Short => (entry_price - price) * qty,
             PositionSide::Long => (price - entry_price) * qty,
         };
+        let fees =
+            (entry_price.abs() + price.abs()) * qty.abs() * self.cfg.fee_bps.max(0.0) / 10_000.0;
+        let pnl = gross_pnl - fees;
+        let turnover = (entry_price.abs() + price.abs()) * qty.abs();
         self.pnl += pnl;
         self.equity_curve.push((ts, self.pnl));
-        stats.update(pnl, self.pnl);
+        stats.update(pnl, gross_pnl, fees, turnover, self.pnl);
 
         if pnl < 0.0 {
             self.consecutive_losses += 1;
@@ -990,12 +1142,17 @@ impl ExecutionManager {
             entry_price,
             exit_price: price,
             pnl,
+            gross_pnl,
+            fees,
             reason: exit_reason,
             reference_level: self.position.reference_level,
             reference_depth: self.position.reference_depth,
         });
 
-        self.position.reset();
+        self.position.qty -= qty;
+        if self.position.qty <= 1e-12 {
+            self.position.reset();
+        }
     }
 }
 
@@ -1003,6 +1160,9 @@ impl ExecutionManager {
 #[derive(Default)]
 struct BacktestStats {
     pub total_pnl: f64,
+    pub gross_pnl: f64,
+    pub total_fees: f64,
+    pub turnover: f64,
     pub wins: usize,
     pub losses: usize,
     pub max_drawdown: f64,
@@ -1012,8 +1172,11 @@ struct BacktestStats {
 }
 
 impl BacktestStats {
-    fn update(&mut self, pnl: f64, equity: f64) {
+    fn update(&mut self, pnl: f64, gross_pnl: f64, fees: f64, turnover: f64, equity: f64) {
         self.total_pnl += pnl;
+        self.gross_pnl += gross_pnl;
+        self.total_fees += fees;
+        self.turnover += turnover;
         if pnl >= 0.0 {
             self.wins += 1;
         } else {
@@ -1024,7 +1187,7 @@ impl BacktestStats {
         self.max_drawdown = self.max_drawdown.max(drawdown);
     }
 
-    fn clone_into_summary(&self) -> SummaryMetrics {
+    fn clone_into_summary(&self, open_position_qty: f64) -> SummaryMetrics {
         let total_trades = self.wins + self.losses;
         let win_rate = if total_trades > 0 {
             self.wins as f64 / total_trades as f64
@@ -1033,10 +1196,14 @@ impl BacktestStats {
         };
         SummaryMetrics {
             total_pnl: self.total_pnl,
+            gross_pnl: self.gross_pnl,
+            total_fees: self.total_fees,
+            turnover: self.turnover,
             trades: total_trades,
             win_rate,
             max_drawdown: self.max_drawdown,
             max_position: self.max_position,
+            open_position_qty,
         }
     }
 }
@@ -1044,10 +1211,14 @@ impl BacktestStats {
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryMetrics {
     pub total_pnl: f64,
+    pub gross_pnl: f64,
+    pub total_fees: f64,
+    pub turnover: f64,
     pub trades: usize,
     pub win_rate: f64,
     pub max_drawdown: f64,
     pub max_position: f64,
+    pub open_position_qty: f64,
 }
 
 #[cfg(test)]
@@ -1065,6 +1236,9 @@ mod tests {
                 tick_size: 0.01,
                 lot_size: 0.01,
                 max_depth_levels: 5,
+                manifest_path: None,
+                manifest_sha256: None,
+                require_sequence: false,
                 start_ts: None,
                 end_ts: None,
             },
@@ -1091,6 +1265,7 @@ mod tests {
         let stream = vec![
             Ok(EventEnvelope {
                 ts: 1_000_000,
+                sequence: None,
                 payload: EventPayload::Snapshot {
                     bids: vec![Level {
                         price: 100.0,
@@ -1104,6 +1279,7 @@ mod tests {
             }),
             Ok(EventEnvelope {
                 ts: 1_100_000,
+                sequence: None,
                 payload: EventPayload::L2Update {
                     bids: vec![Level {
                         price: 100.1,
@@ -1117,6 +1293,7 @@ mod tests {
             }),
             Ok(EventEnvelope {
                 ts: 1_200_000,
+                sequence: None,
                 payload: EventPayload::Trade {
                     side: TradeSide::Buy,
                     price: 100.1,
@@ -1131,5 +1308,103 @@ mod tests {
 
         assert_eq!(result.summary.trades, result.trades.len());
         assert_eq!(engine.stats.last_trade_price, Some(100.1));
+    }
+
+    #[test]
+    fn execution_fees_are_deducted_from_backtest_pnl() {
+        let mut execution = ExecutionManager::new(
+            ExecutionConfig {
+                fee_bps: 10.0,
+                ..ExecutionConfig::default()
+            },
+            RiskConfig::default(),
+            0.01,
+        );
+        let mut stats = BacktestStats::default();
+        execution.enter_long(1.0, 100.0, 1.0, 100.0, 10.0, &mut stats);
+        execution.exit_position(2.0, 110.0, 1.0, ExitReason::SessionEnd, &mut stats);
+
+        assert_eq!(execution.trades.len(), 1);
+        assert_eq!(execution.trades[0].gross_pnl, 10.0);
+        assert!((execution.trades[0].fees - 0.21).abs() < 1e-9);
+        assert!((execution.trades[0].pnl - 9.79).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exit_respects_displayed_depth_and_leaves_residual_position() {
+        let mut execution = ExecutionManager::new(
+            ExecutionConfig {
+                max_fill_ratio: 0.5,
+                ..ExecutionConfig::default()
+            },
+            RiskConfig::default(),
+            0.01,
+        );
+        let mut stats = BacktestStats::default();
+        execution.enter_long(1.0, 100.0, 2.0, 100.0, 10.0, &mut stats);
+        let mut book = OrderBook::new(5);
+        book.apply_snapshot(
+            2,
+            &[Level {
+                price: 101.0,
+                quantity: 1.0,
+            }],
+            &[Level {
+                price: 102.0,
+                quantity: 1.0,
+            }],
+        );
+        let (fill_qty, fill_price) = book
+            .executable_exit(PositionSide::Long, execution.position.qty, 0.5)
+            .unwrap();
+        execution.exit_position(
+            2.0,
+            fill_price,
+            fill_qty,
+            ExitReason::SessionEnd,
+            &mut stats,
+        );
+
+        assert_eq!(execution.trades[0].qty, 0.5);
+        assert_eq!(execution.position.qty, 1.5);
+    }
+
+    #[test]
+    fn entry_walks_current_l2_and_respects_slippage_band() {
+        let mut book = OrderBook::new(5);
+        book.apply_snapshot(
+            1,
+            &[
+                Level {
+                    price: 99.9,
+                    quantity: 1.0,
+                },
+                Level {
+                    price: 99.8,
+                    quantity: 4.0,
+                },
+            ],
+            &[
+                Level {
+                    price: 100.0,
+                    quantity: 1.0,
+                },
+                Level {
+                    price: 100.1,
+                    quantity: 4.0,
+                },
+                Level {
+                    price: 100.2,
+                    quantity: 10.0,
+                },
+            ],
+        );
+
+        let (fill_qty, fill_price) = book
+            .executable_entry(PositionSide::Long, 10.0, 0.5, 1.0, 0.1)
+            .unwrap();
+
+        assert_eq!(fill_qty, 2.5);
+        assert!((fill_price - 100.08).abs() < 1e-9);
     }
 }

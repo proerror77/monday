@@ -16,6 +16,7 @@ pub struct RuntimeReconciliationReport {
     pub order_report: OrderReconciliationReport,
     pub balance_report: Option<BalanceReconciliationReport>,
     pub position_report: Option<PositionReconciliationReport>,
+    pub fill_report: Option<FillReconciliationReport>,
     pub complete: bool,
     pub healthy: bool,
 }
@@ -44,6 +45,15 @@ pub struct PositionReconciliationReport {
     pub local_only: Vec<Symbol>,
     pub exchange_only: Vec<Symbol>,
     pub quantity_mismatch: Vec<PositionQuantityMismatch>,
+    pub client_errors: Vec<String>,
+    pub complete: bool,
+    pub healthy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FillReconciliationReport {
+    /// Authoritative venue fills that are absent from the local accounting ledger.
+    pub exchange_only_fill_ids: Vec<String>,
     pub client_errors: Vec<String>,
     pub complete: bool,
     pub healthy: bool,
@@ -362,13 +372,21 @@ impl ExecutionControlHandle {
         &self,
         include_balances: bool,
     ) -> HftResult<RuntimeReconciliationReport> {
+        self.engine
+            .lock()
+            .await
+            .publish_runtime_truth_status(crate::RuntimeTruthStatus {
+                reconciliation_complete: false,
+                reconciliation_healthy: false,
+                observed_at_us: hft_core::now_micros(),
+            });
         let worker_tx = self.worker_sender()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         worker_tx
             .send(ControlCommand::Reconcile {
                 include_balances,
                 include_positions: include_balances,
-                include_recent_fills: false,
+                include_recent_fills: include_balances,
                 reply: reply_tx,
             })
             .map_err(|_| HftError::Execution("execution worker control channel closed".into()))?;
@@ -384,8 +402,10 @@ impl ExecutionControlHandle {
             let engine = self.engine.lock().await;
             engine.reconcile_open_orders(&exchange_orders)
         };
-        let (balance_report, position_report) = if include_balances {
-            let account_view = self.engine.lock().await.get_account_view();
+        let (balance_report, position_report, fill_report) = if include_balances {
+            let engine = self.engine.lock().await;
+            let account_view = engine.get_account_view();
+            let portfolio_state = engine.export_portfolio_state();
             (
                 Some(reconcile_balances(
                     &worker_snapshot,
@@ -393,17 +413,27 @@ impl ExecutionControlHandle {
                     self.balance_tolerance_usd,
                 )),
                 reconcile_positions(&worker_snapshot, &account_view.positions),
+                Some(reconcile_recent_fills(
+                    &worker_snapshot,
+                    &portfolio_state.processed_fill_ids,
+                )),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
         let complete = worker_snapshot.is_complete()
+            && (!include_balances
+                || worker_snapshot.clients.iter().all(|client| {
+                    client.positions.as_ref().is_some_and(Result::is_ok)
+                        && client.recent_fills.as_ref().is_some_and(Result::is_ok)
+                }))
             && balance_report
                 .as_ref()
                 .is_none_or(|balances| balances.complete)
             && position_report
                 .as_ref()
-                .is_none_or(|positions| positions.complete);
+                .is_none_or(|positions| positions.complete)
+            && fill_report.as_ref().is_none_or(|fills| fills.complete);
         let healthy = complete
             && !order_report.has_discrepancies()
             && balance_report
@@ -411,16 +441,27 @@ impl ExecutionControlHandle {
                 .is_none_or(|balances| balances.healthy)
             && position_report
                 .as_ref()
-                .is_none_or(|positions| positions.healthy);
+                .is_none_or(|positions| positions.healthy)
+            && fill_report.as_ref().is_none_or(|fills| fills.healthy);
 
-        Ok(RuntimeReconciliationReport {
+        let report = RuntimeReconciliationReport {
             worker_snapshot,
             order_report,
             balance_report,
             position_report,
+            fill_report,
             complete,
             healthy,
-        })
+        };
+        self.engine
+            .lock()
+            .await
+            .publish_runtime_truth_status(crate::RuntimeTruthStatus {
+                reconciliation_complete: report.complete,
+                reconciliation_healthy: report.healthy,
+                observed_at_us: hft_core::now_micros(),
+            });
+        Ok(report)
     }
 
     /// Quiesce both strategy production and worker intake before taking an authoritative
@@ -514,6 +555,9 @@ impl ExecutionControlHandle {
 
         let mut cash_balance = Decimal::ZERO;
         let mut positions = std::collections::HashMap::new();
+        let mut baseline_processed_fill_ids =
+            std::collections::HashMap::<OrderId, std::collections::HashSet<String>>::new();
+        let mut baseline_recent_accounting_event_ids = Vec::new();
         let mut saw_balances = false;
         for client in &snapshot.clients {
             let balances = client.balances.as_ref().ok_or_else(|| {
@@ -562,6 +606,38 @@ impl ExecutionControlHandle {
                     )));
                 }
             }
+
+            let recent_fills = client.recent_fills.as_ref().ok_or_else(|| {
+                HftError::Execution(format!(
+                    "execution client {} did not provide recent fills for account bootstrap",
+                    client.client_index
+                ))
+            })?;
+            for fill in recent_fills.as_ref().map_err(|error| {
+                HftError::Execution(format!(
+                    "execution client {} recent-fill bootstrap failed: {error}",
+                    client.client_index
+                ))
+            })? {
+                if fill.fill_id.is_empty() {
+                    return Err(HftError::Execution(format!(
+                        "execution client {} returned a recent fill without fill_id",
+                        client.client_index
+                    )));
+                }
+                let inserted = baseline_processed_fill_ids
+                    .entry(fill.order_id.clone())
+                    .or_default()
+                    .insert(fill.fill_id.clone());
+                if !inserted {
+                    return Err(HftError::Execution(format!(
+                        "account bootstrap found duplicate recent fill {}:{}",
+                        fill.order_id.0, fill.fill_id
+                    )));
+                }
+                baseline_recent_accounting_event_ids
+                    .push((fill.order_id.clone(), format!("fill:{}", fill.fill_id)));
+            }
         }
         if !saw_balances {
             return Err(HftError::Execution(
@@ -599,8 +675,8 @@ impl ExecutionControlHandle {
             account_view,
             order_meta: current.order_meta,
             market_prices: current.market_prices,
-            processed_fill_ids: current.processed_fill_ids,
-            recent_accounting_event_ids: current.recent_accounting_event_ids,
+            processed_fill_ids: baseline_processed_fill_ids,
+            recent_accounting_event_ids: baseline_recent_accounting_event_ids,
         })?;
         Ok(true)
     }
@@ -724,18 +800,70 @@ fn reconcile_balances(
     }
 }
 
+fn reconcile_recent_fills(
+    snapshot: &WorkerReconcileSnapshot,
+    processed_fill_ids: &std::collections::HashMap<OrderId, std::collections::HashSet<String>>,
+) -> FillReconciliationReport {
+    let mut exchange_only_fill_ids = Vec::new();
+    let mut client_errors = Vec::new();
+    let mut observed = std::collections::HashSet::new();
+
+    if snapshot.clients.is_empty() {
+        client_errors.push("no execution clients returned recent-fill snapshots".to_string());
+    }
+    for client in &snapshot.clients {
+        match &client.recent_fills {
+            None => client_errors.push(format!(
+                "client={} does not support authoritative recent fills",
+                client.client_index
+            )),
+            Some(Err(error)) => client_errors.push(format!(
+                "client={} recent-fill snapshot failed: {}",
+                client.client_index, error
+            )),
+            Some(Ok(fills)) => {
+                for fill in fills {
+                    let identity = (fill.order_id.clone(), fill.fill_id.clone());
+                    if fill.fill_id.is_empty() {
+                        client_errors.push(format!(
+                            "client={} returned a recent fill without fill_id",
+                            client.client_index
+                        ));
+                        continue;
+                    }
+                    if !observed.insert(identity.clone()) {
+                        client_errors.push(format!(
+                            "duplicate authoritative fill identity order={} fill={}",
+                            fill.order_id.0, fill.fill_id
+                        ));
+                        continue;
+                    }
+                    let locally_processed = processed_fill_ids
+                        .get(&fill.order_id)
+                        .is_some_and(|ids| ids.contains(&fill.fill_id));
+                    if !locally_processed {
+                        exchange_only_fill_ids
+                            .push(format!("{}:{}", fill.order_id.0, fill.fill_id));
+                    }
+                }
+            }
+        }
+    }
+    exchange_only_fill_ids.sort();
+    let complete = client_errors.is_empty();
+    let healthy = complete && exchange_only_fill_ids.is_empty();
+    FillReconciliationReport {
+        exchange_only_fill_ids,
+        client_errors,
+        complete,
+        healthy,
+    }
+}
+
 fn reconcile_positions(
     snapshot: &WorkerReconcileSnapshot,
     local_positions: &std::collections::HashMap<Symbol, ports::Position>,
 ) -> Option<PositionReconciliationReport> {
-    if snapshot
-        .clients
-        .iter()
-        .all(|client| client.positions.is_none())
-    {
-        return None;
-    }
-
     #[derive(Default)]
     struct VenuePositions {
         quantities: BTreeMap<String, Decimal>,
@@ -1274,10 +1402,13 @@ mod tests {
             match worker_rx.recv().await.expect("control command") {
                 ControlCommand::Reconcile {
                     include_balances,
+                    include_positions,
+                    include_recent_fills,
                     reply,
-                    ..
                 } => {
                     assert!(include_balances);
+                    assert!(include_positions);
+                    assert!(include_recent_fills);
                     reply
                         .send(WorkerReconcileSnapshot {
                             clients: vec![crate::execution_worker::ClientReconcileSnapshot {
@@ -1286,8 +1417,8 @@ mod tests {
                                 account_id: None,
                                 open_orders: Ok(Vec::new()),
                                 balances: Some(balances),
-                                positions: None,
-                                recent_fills: None,
+                                positions: Some(Ok(Vec::new())),
+                                recent_fills: Some(Ok(Vec::new())),
                             }],
                         })
                         .expect("send reconciliation");
@@ -1359,6 +1490,80 @@ mod tests {
     }
 
     #[test]
+    fn recent_fill_reconciliation_detects_unaccounted_exchange_fill() {
+        let order_id = OrderId("order-1".to_string());
+        let snapshot = WorkerReconcileSnapshot {
+            clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                client_index: 0,
+                venue: Some(VenueId::POLYMARKET),
+                account_id: None,
+                open_orders: Ok(Vec::new()),
+                balances: None,
+                positions: None,
+                recent_fills: Some(Ok(vec![ports::AccountFill {
+                    fill_id: "fill-1".to_string(),
+                    order_id: order_id.clone(),
+                    symbol: Symbol::new("123"),
+                    side: Side::Buy,
+                    price: Price(Decimal::new(5, 1)),
+                    quantity: Quantity(Decimal::ONE),
+                    fee: None,
+                    timestamp: 1,
+                }])),
+            }],
+        };
+
+        let missing = reconcile_recent_fills(&snapshot, &HashMap::new());
+        assert!(missing.complete);
+        assert!(!missing.healthy);
+        assert_eq!(missing.exchange_only_fill_ids, vec!["order-1:fill-1"]);
+
+        let processed = HashMap::from([(
+            order_id,
+            std::collections::HashSet::from(["fill-1".to_string()]),
+        )]);
+        let matched = reconcile_recent_fills(&snapshot, &processed);
+        assert!(matched.healthy);
+    }
+
+    #[tokio::test]
+    async fn live_reconciliation_is_incomplete_without_positions_and_recent_fills() {
+        let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+        let control =
+            ExecutionControlHandle::new(engine_with_equity(Decimal::ZERO), Some(worker_tx), true);
+        let worker = tokio::spawn(async move {
+            match worker_rx.recv().await.expect("control command") {
+                ControlCommand::Reconcile { reply, .. } => reply
+                    .send(WorkerReconcileSnapshot {
+                        clients: vec![crate::execution_worker::ClientReconcileSnapshot {
+                            client_index: 0,
+                            venue: Some(VenueId::BINANCE),
+                            account_id: None,
+                            open_orders: Ok(Vec::new()),
+                            balances: Some(Ok(Vec::new())),
+                            positions: None,
+                            recent_fills: None,
+                        }],
+                    })
+                    .expect("send reconciliation"),
+                _ => panic!("unexpected control command"),
+            }
+        });
+
+        let report = control.reconcile(true).await.expect("reconcile");
+        worker.await.expect("worker task");
+
+        assert!(!report.complete);
+        assert!(!report.healthy);
+        assert!(report
+            .position_report
+            .expect("position report")
+            .client_errors
+            .iter()
+            .any(|error| error.contains("does not support")));
+    }
+
+    #[test]
     fn position_reconciliation_detects_exchange_only_and_quantity_mismatch() {
         let token_a = Symbol::new("111");
         let token_b = Symbol::new("222");
@@ -1369,6 +1574,7 @@ mod tests {
                 quantity: Quantity(Decimal::from(2)),
                 avg_price: Price(Decimal::new(45, 2)),
                 unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
             },
         )]);
         let snapshot = WorkerReconcileSnapshot {
@@ -1384,12 +1590,14 @@ mod tests {
                         quantity: Quantity(Decimal::from(3)),
                         avg_price: Price(Decimal::new(45, 2)),
                         unrealized_pnl: Decimal::ZERO,
+                        realized_pnl: Decimal::ZERO,
                     },
                     ports::Position {
                         symbol: token_b.clone(),
                         quantity: Quantity(Decimal::ONE),
                         avg_price: Price(Decimal::new(55, 2)),
                         unrealized_pnl: Decimal::ZERO,
+                        realized_pnl: Decimal::ZERO,
                     },
                 ])),
                 recent_fills: None,
@@ -1415,6 +1623,7 @@ mod tests {
                 quantity: Quantity(Decimal::ONE),
                 avg_price: Price(Decimal::new(50, 2)),
                 unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
             },
         )]);
         let snapshot = WorkerReconcileSnapshot {
@@ -1462,6 +1671,7 @@ mod tests {
                 quantity: Quantity(Decimal::ONE),
                 avg_price: Price(Decimal::from(100)),
                 unrealized_pnl: Decimal::ZERO,
+                realized_pnl: Decimal::ZERO,
             },
         )]);
         let snapshot = WorkerReconcileSnapshot {
@@ -1544,12 +1754,22 @@ mod tests {
                     Some(Decimal::from(80)),
                 )])),
                 positions: Some(Ok(vec![ports::Position {
-                    symbol: token,
+                    symbol: token.clone(),
                     quantity: Quantity(Decimal::from(2)),
                     avg_price: Price(Decimal::new(45, 2)),
                     unrealized_pnl: Decimal::new(10, 2),
+                    realized_pnl: Decimal::ZERO,
                 }])),
-                recent_fills: None,
+                recent_fills: Some(Ok(vec![ports::AccountFill {
+                    fill_id: "historical-fill-1".to_string(),
+                    order_id: OrderId("historical-order-1".to_string()),
+                    symbol: token,
+                    side: Side::Buy,
+                    price: Price(Decimal::new(45, 2)),
+                    quantity: Quantity(Decimal::from(2)),
+                    fee: None,
+                    timestamp: 1,
+                }])),
             }],
         }
     }
@@ -1572,6 +1792,12 @@ mod tests {
         assert_eq!(account.unrealized_pnl, Decimal::new(10, 2));
         assert_eq!(account.high_water_mark, account.equity());
         assert!(account.session_start_us > 0);
+        drop(account);
+        let state = engine.lock().await.export_portfolio_state();
+        assert!(state
+            .processed_fill_ids
+            .get(&OrderId("historical-order-1".to_string()))
+            .is_some_and(|ids| ids.contains("historical-fill-1")));
 
         assert!(!control
             .bootstrap_pristine_account(&polymarket_account_snapshot(Vec::new()))

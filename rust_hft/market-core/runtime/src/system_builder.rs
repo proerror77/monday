@@ -663,6 +663,15 @@ impl SystemBuilder {
         // Create configurable risk manager using factory
         let risk_manager =
             crate::RiskManagerFactory::create_strategy_aware_risk_manager(&self.config.risk);
+        let risk_manager: Box<dyn ports::RiskManager> = if self.config.portfolios.is_empty() {
+            risk_manager
+        } else {
+            Box::new(crate::PortfolioBudgetRiskManager::new(
+                risk_manager,
+                self.config.portfolios.clone(),
+                &self.config.strategies,
+            ))
+        };
         engine.register_risk_manager_boxed(risk_manager);
         info!(
             "已注册风控管理器 (类型: {}, 策略覆盖数: {})",
@@ -1196,7 +1205,7 @@ impl SystemRuntime {
                         return Ok::<(), HftError>(());
                     }
                     return Err(HftError::Execution(format!(
-                        "initial live reconciliation failed: complete={}, exchange_only={}, local_only={}, quantity_mismatch={}, balance_complete={}, balance_difference_usd={:?}, position_complete={}, position_exchange_only={}, position_local_only={}, position_quantity_mismatch={}",
+                        "initial live reconciliation failed: complete={}, exchange_only={}, local_only={}, quantity_mismatch={}, balance_complete={}, balance_difference_usd={:?}, position_complete={}, position_exchange_only={}, position_local_only={}, position_quantity_mismatch={}, fill_complete={}, exchange_only_fills={}",
                         report.complete,
                         report.order_report.exchange_only.len(),
                         report.order_report.local_only.len(),
@@ -1225,6 +1234,14 @@ impl SystemRuntime {
                             .position_report
                             .as_ref()
                             .map_or(0, |positions| positions.quantity_mismatch.len()),
+                        report
+                            .fill_report
+                            .as_ref()
+                            .is_none_or(|fills| fills.complete),
+                        report
+                            .fill_report
+                            .as_ref()
+                            .map_or(0, |fills| fills.exchange_only_fill_ids.len()),
                     )));
                 }
                 if operator_control_only {
@@ -1316,6 +1333,14 @@ impl SystemRuntime {
                                     .position_report
                                     .as_ref()
                                     .map_or(0, |positions| positions.quantity_mismatch.len()),
+                                fill_complete = report
+                                    .fill_report
+                                    .as_ref()
+                                    .is_none_or(|fills| fills.complete),
+                                exchange_only_fills = report
+                                    .fill_report
+                                    .as_ref()
+                                    .map_or(0, |fills| fills.exchange_only_fill_ids.len()),
                                 "runtime order reconciliation unhealthy; pausing new intents"
                             );
                         }
@@ -1336,6 +1361,8 @@ impl SystemRuntime {
                     interval.tick().await;
                     let (cash, pos, unr, rlz, stats) = {
                         let eng = engine_arc.lock().await;
+                        #[cfg(feature = "metrics")]
+                        eng.sync_latency_metrics_to_prometheus();
                         let av = eng.get_account_view();
                         let st = eng.get_statistics();
                         (
@@ -1346,21 +1373,6 @@ impl SystemRuntime {
                             st,
                         )
                     };
-                    // 導出引擎統計到 Prometheus（僅在 metrics feature 啟用時）
-                    #[cfg(feature = "metrics")]
-                    {
-                        infra_metrics::MetricsRegistry::global().update_engine_statistics(
-                            &infra_metrics::EngineStatisticsExport {
-                                cycle_count: stats.cycle_count,
-                                execution_events_processed: stats.execution_events_processed,
-                                orders_submitted: stats.orders_submitted,
-                                orders_ack: stats.orders_ack,
-                                orders_filled: stats.orders_filled,
-                                orders_rejected: stats.orders_rejected,
-                                orders_canceled: stats.orders_canceled,
-                            },
-                        );
-                    }
                     // 當引擎停止時，狀態任務退出，避免 Ctrl-C 卡住
                     if !stats.is_running {
                         break;
