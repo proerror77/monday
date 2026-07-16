@@ -617,10 +617,10 @@ jobs:
           cargo test --locked -p ploy-research --lib
           cargo test --locked -p ploy-research --features ml --lib
           cargo clippy --locked -p ploy-research --features ml --all-targets --no-deps -- -D warnings
-          cargo check --locked -p ploy-research --example prediction_research_loop
-          cargo check --locked -p ploy-research --features db --example factor_walk_forward_v2
+          cargo check --locked -p ploy-research --bin monday-prediction-research
+          cargo check --locked -p ploy-research --features db --bin monday-prediction-evaluator
           cargo test --locked -p ploy-market-data --features audit --lib --examples
-          cargo test --locked -p ploy-research --features db --example research_snapshot_compile
+          cargo test --locked -p ploy-research --features db --bin monday-prediction-snapshot
 
       - name: Install SQLx CLI
         run: |

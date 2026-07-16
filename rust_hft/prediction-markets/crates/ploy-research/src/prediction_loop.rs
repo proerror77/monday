@@ -3917,9 +3917,7 @@ mod tests {
             .map(|(path, _)| path)
             .collect::<Vec<_>>();
 
-        assert!(paths
-            .iter()
-            .any(|path| *path == "crates/ploy-operator-contracts/src/trading.rs"));
+        assert!(paths.contains(&"crates/ploy-operator-contracts/src/trading.rs"));
         assert!(paths.iter().all(|path| !path.contains("ploy-trading")));
         assert!(paths
             .iter()
