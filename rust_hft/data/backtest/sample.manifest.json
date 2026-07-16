@@ -5,6 +5,7 @@
   "market": "spot",
   "symbol": "BTCUSDT",
   "dataset": "binance_spot_lob",
+  "modalities": ["lob"],
   "source_revision": "1fd99199bb65251b6af5af2ac0726a464467e5c0e73450c57f5e0672deda922f",
   "source_segments": [
     {

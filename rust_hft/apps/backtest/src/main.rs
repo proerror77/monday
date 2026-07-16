@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::Parser;
+use sha2::Digest;
 use tracing::info;
 
-use config::{BacktestConfig, OutputConfig, StrategyConfig};
+use config::{BacktestConfig, BacktestInputEvidence, OutputConfig, StrategyConfig};
 use engine::{BacktestEngine, BacktestResult, SummaryMetrics, TradeRecord};
 
 #[derive(Parser, Debug)]
@@ -124,6 +125,7 @@ fn write_outputs(
     override_dir: Option<&str>,
     result: &BacktestResult,
 ) -> anyhow::Result<()> {
+    validate_output_names(output)?;
     let out_dir = override_dir
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -131,17 +133,76 @@ fn write_outputs(
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("無法建立輸出目錄: {}", out_dir.display()))?;
     }
+    let evidence = result
+        .input_evidence
+        .as_ref()
+        .context("backtest result is missing input evidence")?;
 
-    write_trades_csv(&out_dir.join(&output.trades_csv), &result.trades)?;
-    write_summary_csv(&out_dir.join(&output.summary_csv), &result.summary)?;
+    write_trades_csv(&out_dir.join(&output.trades_csv), &result.trades, evidence)?;
+    write_summary_csv(
+        &out_dir.join(&output.summary_csv),
+        &result.summary,
+        evidence,
+    )?;
 
     if let Some(metrics_path) = &output.metrics_json {
-        write_metrics_json(&out_dir.join(metrics_path), &result.summary)?;
+        write_metrics_json(&out_dir.join(metrics_path), result)?;
+    }
+    write_output_evidence(&out_dir, output, result)?;
+    Ok(())
+}
+
+fn validate_output_names(output: &OutputConfig) -> anyhow::Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for name in [
+        Some(&output.trades_csv),
+        Some(&output.summary_csv),
+        output.metrics_json.as_ref(),
+        Some(&output.evidence_json),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if name.trim().is_empty() || !names.insert(name) {
+            anyhow::bail!("backtest output artifact names must be non-empty and unique");
+        }
     }
     Ok(())
 }
 
-fn write_trades_csv(path: &Path, trades: &[TradeRecord]) -> anyhow::Result<()> {
+fn write_output_evidence(
+    out_dir: &Path,
+    output: &OutputConfig,
+    result: &BacktestResult,
+) -> anyhow::Result<()> {
+    let mut artifacts = std::collections::BTreeMap::new();
+    for name in [
+        Some(&output.trades_csv),
+        Some(&output.summary_csv),
+        output.metrics_json.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let bytes = std::fs::read(out_dir.join(name))?;
+        artifacts.insert(name, hex::encode(sha2::Sha256::digest(bytes)));
+    }
+    let evidence = serde_json::json!({
+        "input": result.input_evidence,
+        "artifacts": artifacts,
+    });
+    std::fs::write(
+        out_dir.join(&output.evidence_json),
+        serde_json::to_vec_pretty(&evidence)?,
+    )?;
+    Ok(())
+}
+
+fn write_trades_csv(
+    path: &Path,
+    trades: &[TradeRecord],
+    evidence: &BacktestInputEvidence,
+) -> anyhow::Result<()> {
     let mut writer = csv::Writer::from_path(path)
         .with_context(|| format!("無法寫入交易檔案: {}", path.display()))?;
     writer.write_record([
@@ -151,10 +212,14 @@ fn write_trades_csv(path: &Path, trades: &[TradeRecord]) -> anyhow::Result<()> {
         "qty",
         "entry_price",
         "exit_price",
+        "gross_pnl",
+        "fees",
         "pnl",
         "reason",
         "reference_level",
         "reference_depth",
+        "input_manifest_sha256",
+        "effective_config_sha256",
     ])?;
     for trade in trades {
         writer.write_record([
@@ -164,39 +229,63 @@ fn write_trades_csv(path: &Path, trades: &[TradeRecord]) -> anyhow::Result<()> {
             format!("{:.6}", trade.qty),
             format!("{:.6}", trade.entry_price),
             format!("{:.6}", trade.exit_price),
+            format!("{:.6}", trade.gross_pnl),
+            format!("{:.6}", trade.fees),
             format!("{:.6}", trade.pnl),
             format!("{:?}", trade.reason),
             format!("{:.6}", trade.reference_level),
             format!("{:.6}", trade.reference_depth),
+            evidence.manifest_sha256.clone(),
+            evidence.config_sha256.clone(),
         ])?;
     }
     writer.flush()?;
     Ok(())
 }
 
-fn write_summary_csv(path: &Path, summary: &SummaryMetrics) -> anyhow::Result<()> {
+fn write_summary_csv(
+    path: &Path,
+    summary: &SummaryMetrics,
+    evidence: &BacktestInputEvidence,
+) -> anyhow::Result<()> {
     let mut writer = csv::Writer::from_path(path)
         .with_context(|| format!("無法寫入摘要檔案: {}", path.display()))?;
     writer.write_record([
         "total_pnl",
+        "gross_pnl",
+        "total_fees",
+        "turnover",
         "trades",
         "win_rate",
         "max_drawdown",
         "max_position",
+        "open_position_qty",
+        "input_manifest_sha256",
+        "effective_config_sha256",
     ])?;
     writer.write_record([
         format!("{:.6}", summary.total_pnl),
+        format!("{:.6}", summary.gross_pnl),
+        format!("{:.6}", summary.total_fees),
+        format!("{:.6}", summary.turnover),
         summary.trades.to_string(),
         format!("{:.4}", summary.win_rate),
         format!("{:.6}", summary.max_drawdown),
         format!("{:.6}", summary.max_position),
+        format!("{:.6}", summary.open_position_qty),
+        evidence.manifest_sha256.clone(),
+        evidence.config_sha256.clone(),
     ])?;
     writer.flush()?;
     Ok(())
 }
 
-fn write_metrics_json(path: &Path, summary: &SummaryMetrics) -> anyhow::Result<()> {
-    let buffer = serde_json::to_string_pretty(summary).context("序列化回測指標失敗")?;
+fn write_metrics_json(path: &Path, result: &BacktestResult) -> anyhow::Result<()> {
+    let buffer = serde_json::to_string_pretty(&serde_json::json!({
+        "input": result.input_evidence,
+        "summary": result.summary,
+    }))
+    .context("序列化回測指標失敗")?;
     std::fs::write(path, buffer)
         .with_context(|| format!("寫入指標檔案失敗: {}", path.display()))?;
     Ok(())
@@ -205,8 +294,73 @@ fn write_metrics_json(path: &Path, summary: &SummaryMetrics) -> anyhow::Result<(
 fn print_summary(summary: &SummaryMetrics) {
     info!("===== 回測摘要 =====");
     info!("總損益 (PnL): {:.6}", summary.total_pnl);
+    info!("總毛利: {:.6}", summary.gross_pnl);
+    info!("總費用: {:.6}", summary.total_fees);
+    info!("成交額: {:.6}", summary.turnover);
     info!("交易筆數: {}", summary.trades);
     info!("勝率: {:.2}%", summary.win_rate * 100.0);
     info!("最大回撤: {:.6}", summary.max_drawdown);
     info!("最高持倉: {:.6}", summary.max_position);
+    info!("未平倉殘量: {:.6}", summary.open_position_qty);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_evidence_binds_inputs_and_every_result_artifact() {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let out_dir = std::env::temp_dir().join(format!(
+            "monday-backtest-output-evidence-{}-{id}",
+            std::process::id()
+        ));
+        let output = OutputConfig {
+            trades_csv: "trades.csv".to_string(),
+            summary_csv: "summary.csv".to_string(),
+            metrics_json: Some("metrics.json".to_string()),
+            evidence_json: "evidence.json".to_string(),
+        };
+        let result = BacktestResult {
+            trades: Vec::new(),
+            summary: SummaryMetrics {
+                total_pnl: 0.0,
+                gross_pnl: 0.0,
+                total_fees: 0.0,
+                turnover: 0.0,
+                trades: 0,
+                win_rate: 0.0,
+                max_drawdown: 0.0,
+                max_position: 0.0,
+                open_position_qty: 0.0,
+            },
+            input_evidence: Some(BacktestInputEvidence {
+                manifest_sha256: "a".repeat(64),
+                config_sha256: "b".repeat(64),
+            }),
+        };
+
+        write_outputs(&output, Some(out_dir.to_str().unwrap()), &result).unwrap();
+
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out_dir.join(&output.evidence_json)).unwrap())
+                .unwrap();
+        assert_eq!(evidence["input"]["manifest_sha256"], "a".repeat(64));
+        assert_eq!(evidence["input"]["config_sha256"], "b".repeat(64));
+        assert_eq!(evidence["artifacts"].as_object().unwrap().len(), 3);
+        for name in ["trades.csv", "summary.csv", "metrics.json"] {
+            assert_eq!(evidence["artifacts"][name].as_str().unwrap().len(), 64);
+        }
+
+        let mut colliding_output = output.clone();
+        colliding_output.evidence_json = colliding_output.summary_csv.clone();
+        assert!(
+            write_outputs(&colliding_output, Some(out_dir.to_str().unwrap()), &result).is_err()
+        );
+
+        std::fs::remove_dir_all(out_dir).unwrap();
+    }
 }

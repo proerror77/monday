@@ -7,11 +7,11 @@ use anyhow::{bail, Context};
 use hft_collector::lob_archiver::{
     source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BacktestConfig {
     pub data: DataConfig,
     pub strategy: StrategyConfig,
@@ -74,7 +74,7 @@ impl BacktestConfig {
         }
     }
 
-    pub fn validate_data_artifact(&self) -> anyhow::Result<()> {
+    pub fn validate_data_artifact(&self) -> anyhow::Result<VerifiedBacktestData> {
         if !self.data.format.eq_ignore_ascii_case("ndjson") {
             bail!("unsupported backtest data format: {}", self.data.format);
         }
@@ -104,10 +104,11 @@ impl BacktestConfig {
         let manifest: BacktestDataManifest =
             serde_json::from_slice(&manifest_bytes).context("无法解析回测数据 manifest")?;
         manifest.validate()?;
+        self.validate_modalities()?;
 
-        let bytes = fs::read(resolve_path(&self.data.path))
+        let artifact_path = resolve_path(&self.data.path);
+        let (actual, mut file, _) = open_hashed_source(&artifact_path)
             .with_context(|| format!("无法读取回测数据: {}", self.data.path))?;
-        let actual = hex::encode(Sha256::digest(&bytes));
         if actual != manifest.artifact_sha256 {
             bail!(
                 "backtest data SHA-256 mismatch: expected {}, actual {actual}",
@@ -117,9 +118,32 @@ impl BacktestConfig {
         if canonical_path(&self.data.path)? != canonical_path(&manifest.artifact_path)? {
             bail!("data.path does not match manifest artifact_path");
         }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        file.seek(SeekFrom::Start(0))?;
         validate_source_segments(&manifest, &bytes)?;
-        validate_event_tape(&self.data.path, &manifest)?;
-        self.validate_execution_model()
+        validate_event_tape(&bytes, &manifest)?;
+        self.validate_execution_model()?;
+        Ok(VerifiedBacktestData {
+            file,
+            evidence: BacktestInputEvidence {
+                manifest_sha256: actual_manifest_sha256,
+                config_sha256: hex::encode(Sha256::digest(serde_json::to_vec(self)?)),
+            },
+        })
+    }
+
+    fn validate_modalities(&self) -> anyhow::Result<()> {
+        if !self.strategy.volume_factor.is_finite()
+            || self.strategy.volume_factor < 0.0
+            || !self.strategy.cvd_threshold.is_finite()
+        {
+            bail!("strategy volume factor must be finite/non-negative and CVD threshold finite");
+        }
+        if self.strategy.volume_factor > 0.0 || self.strategy.cvd_threshold != 0.0 {
+            bail!("strategy requires trade flow but dataset manifest is LOB-only");
+        }
+        Ok(())
     }
 
     fn validate_execution_model(&self) -> anyhow::Result<()> {
@@ -136,7 +160,19 @@ impl BacktestConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug)]
+pub struct VerifiedBacktestData {
+    pub file: File,
+    pub evidence: BacktestInputEvidence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BacktestInputEvidence {
+    pub manifest_sha256: String,
+    pub config_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DataConfig {
     pub path: String,
     #[serde(default = "default_format")]
@@ -167,6 +203,7 @@ struct BacktestDataManifest {
     market: String,
     symbol: String,
     dataset: String,
+    modalities: Vec<String>,
     source_revision: String,
     source_segments: Vec<SourceSegmentEvidence>,
     rows: usize,
@@ -219,6 +256,8 @@ impl BacktestDataManifest {
             || self.market.trim().is_empty()
             || self.symbol.trim().is_empty()
             || self.dataset.trim().is_empty()
+            || self.modalities.len() != 1
+            || self.modalities[0] != "lob"
             || !self.point_in_time
             || self.rows == 0
             || self.source_segments.is_empty()
@@ -553,8 +592,8 @@ fn visit_ndjson(
     Ok(())
 }
 
-fn validate_event_tape(path: &str, manifest: &BacktestDataManifest) -> anyhow::Result<()> {
-    let contents = fs::read_to_string(resolve_path(path))?;
+fn validate_event_tape(bytes: &[u8], manifest: &BacktestDataManifest) -> anyhow::Result<()> {
+    let contents = std::str::from_utf8(bytes).context("event tape is not UTF-8")?;
     let mut rows = 0_usize;
     let mut first_time = None;
     let mut last_time = None;
@@ -635,7 +674,9 @@ mod tests {
     fn default_backtest_fixture_has_verified_pit_provenance() {
         let config =
             BacktestConfig::from_file(resolve_path("config/backtest/default.yaml")).unwrap();
-        config.validate_data_artifact().unwrap();
+        let verified = config.validate_data_artifact().unwrap();
+        assert_eq!(verified.evidence.manifest_sha256.len(), 64);
+        assert_eq!(verified.evidence.config_sha256.len(), 64);
 
         let manifest = fixture_manifest();
         assert_ne!(
@@ -664,6 +705,28 @@ mod tests {
         let manifest: BacktestDataManifest = serde_json::from_value(manifest).unwrap();
 
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_trade_modality_not_produced_by_collector_schema() {
+        let mut manifest = fixture_manifest_value();
+        manifest["modalities"] = serde_json::json!(["lob", "trade"]);
+        let manifest: BacktestDataManifest = serde_json::from_value(manifest).unwrap();
+
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn lob_only_manifest_rejects_trade_flow_strategy() {
+        let mut config =
+            BacktestConfig::from_file(resolve_path("config/backtest/default.yaml")).unwrap();
+        config.strategy.volume_factor = 1.0;
+
+        assert!(config
+            .validate_data_artifact()
+            .unwrap_err()
+            .to_string()
+            .contains("requires trade flow"));
     }
 
     #[test]
@@ -869,6 +932,7 @@ mod tests {
             "market": "spot",
             "symbol": "BTCUSDT",
             "dataset": "binance_spot_lob",
+            "modalities": ["lob"],
             "source_revision": source_revision([segment_sha.as_str()]),
             "source_segments": [{
                 "path": segment,
@@ -893,14 +957,25 @@ mod tests {
         fs::write(&manifest, &manifest_bytes).unwrap();
         let manifest_sha = hex::encode(Sha256::digest(&manifest_bytes));
         let yaml = format!(
-            "data:\n  path: {}\n  format: ndjson\n  manifest_path: {}\n  manifest_sha256: {}\n  require_sequence: true\nstrategy: {{}}\nexecution: {{}}\nrisk: {{}}\noutput: {{}}\n",
+            "data:\n  path: {}\n  format: ndjson\n  manifest_path: {}\n  manifest_sha256: {}\n  require_sequence: true\nstrategy:\n  volume_factor: 0\n  cvd_threshold: 0\nexecution: {{}}\nrisk: {{}}\noutput: {{}}\n",
             artifact.display(),
             manifest.display(),
             manifest_sha,
         );
         let config = BacktestConfig::from_yaml_str(&yaml, "compressed fixture").unwrap();
 
-        config.validate_data_artifact().unwrap();
+        let mut verified = config.validate_data_artifact().unwrap();
+        let preserved_artifact = directory.join("verified-backtest.ndjson");
+        fs::rename(&artifact, &preserved_artifact).unwrap();
+        fs::write(&artifact, b"malicious replacement\n").unwrap();
+        let mut verified_contents = String::new();
+        verified
+            .file
+            .read_to_string(&mut verified_contents)
+            .unwrap();
+        assert!(verified_contents.contains("\"event\":\"snapshot\""));
+        fs::remove_file(&artifact).unwrap();
+        fs::rename(&preserved_artifact, &artifact).unwrap();
         fs::write(&segment, b"corrupt").unwrap();
         assert!(config.validate_data_artifact().is_err());
         fs::remove_dir_all(directory).unwrap();
@@ -923,7 +998,7 @@ fn default_depth_levels() -> usize {
     20
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StrategyConfig {
     #[serde(default = "default_liquidity_window")]
     pub liquidity_window_secs: f64,
@@ -981,7 +1056,7 @@ fn default_smoothing_alpha() -> f64 {
     0.2
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExecutionConfig {
     #[serde(default = "default_base_qty")]
     pub base_qty: f64,
@@ -1032,7 +1107,7 @@ fn default_max_fill_ratio() -> f64 {
     0.1
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RiskConfig {
     #[serde(default = "default_inventory_limit")]
     pub inventory_limit: f64,
@@ -1063,7 +1138,7 @@ fn default_max_consecutive_losses() -> usize {
     3
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct OutputConfig {
     #[serde(default = "default_trade_csv")]
     pub trades_csv: String,
@@ -1071,6 +1146,8 @@ pub struct OutputConfig {
     pub summary_csv: String,
     #[serde(default)]
     pub metrics_json: Option<String>,
+    #[serde(default = "default_evidence_json")]
+    pub evidence_json: String,
 }
 
 fn default_trade_csv() -> String {
@@ -1079,4 +1156,8 @@ fn default_trade_csv() -> String {
 
 fn default_summary_csv() -> String {
     "backtest_summary.csv".to_string()
+}
+
+fn default_evidence_json() -> String {
+    "backtest_evidence.json".to_string()
 }
