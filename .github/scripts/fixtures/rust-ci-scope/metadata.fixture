@@ -1,0 +1,14 @@
+{
+  "packages": [
+    { "name": "hft-collector", "manifest_path": "rust_hft/tools/collector/Cargo.toml", "dependencies": [] },
+    {
+      "name": "alpha-harness",
+      "manifest_path": "rust_hft/alpha-harness/app/Cargo.toml",
+      "dependencies": [{ "name": "hft-collector", "path": "rust_hft/tools/collector" }]
+    },
+    { "name": "hft-live", "manifest_path": "rust_hft/apps/live/Cargo.toml", "dependencies": [] },
+    { "name": "hft-integration", "manifest_path": "rust_hft/market-core/integration/Cargo.toml", "dependencies": [] },
+    { "name": "hft-data-adapter-ondo-perps", "manifest_path": "rust_hft/data-pipelines/adapters/adapter-ondo-perps/Cargo.toml", "dependencies": [] },
+    { "name": "hft-paper", "manifest_path": "rust_hft/apps/paper/Cargo.toml", "dependencies": [] }
+  ]
+}
