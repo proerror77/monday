@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn validate_dry_run(cfg: &BacktestConfig) -> anyhow::Result<()> {
+    validate_output_names(&cfg.output)?;
     cfg.validate_data_artifact().map(drop)
 }
 
@@ -344,6 +345,16 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/backtest/default.yaml");
         let mut config = BacktestConfig::from_file(config_path).unwrap();
         config.data.manifest_sha256 = Some("0".repeat(64));
+
+        assert!(validate_dry_run(&config).is_err());
+    }
+
+    #[test]
+    fn dry_run_rejects_invalid_output_names() {
+        let config_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/backtest/default.yaml");
+        let mut config = BacktestConfig::from_file(config_path).unwrap();
+        config.output.summary_csv = config.output.trades_csv.clone();
 
         assert!(validate_dry_run(&config).is_err());
     }
