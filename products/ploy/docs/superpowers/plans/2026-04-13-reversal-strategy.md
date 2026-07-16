@@ -291,7 +291,8 @@ This tool replays historical data and writes one CSV row per spot tick per event
 //! Signal attribution tool for PM5D reversal research.
 //!
 //! Replays historical data and writes one row per (event, spot_tick) pair.
-//! Output CSV can be analyzed in Python/pandas to validate reversal signal quality.
+//! Output CSV/Parquet can be analyzed through the repository's Rust/Polars
+//! research export path to validate reversal signal quality.
 //!
 //! Usage:
 //!   cargo run --release -p ploy-strategy-bundles --example signal_attribution -- \
@@ -556,28 +557,17 @@ cargo run --release -p ploy-strategy-bundles --example signal_attribution -- \
   --output /tmp/attribution.csv
 ```
 
-- [ ] **Step 2: Analyze in Python**
+- [ ] **Step 2: Analyze with Rust/Polars**
 
-```python
-import pandas as pd
-df = pd.read_csv("/tmp/attribution.csv")
-
-# Filter to reversal moments
-rev = df[df["drift_direction_flipped"] == 1].copy()
-
-# Win rate by symbol when reversal is fresh (< 15s old)
-fresh = rev[rev["drift_flip_age_secs"] < 15]
-print(fresh.groupby("symbol")["outcome_up_won"].apply(
-    lambda x: (x.astype(float)).mean()
-))
-
-# Distance filter: what range has best win rate?
-df["dist_bucket"] = pd.cut(df["distance_to_beat_pct"].abs(), bins=[0, 0.005, 0.01, 0.02, 0.05, 1.0])
-print(df.groupby("dist_bucket")["outcome_up_won"].apply(lambda x: x.astype(float).mean()))
-
-# PM lag: how long does ask stay low after reversal?
-print(rev.groupby("symbol")["pm_ask_lag_secs"].describe())
+```bash
+cargo run --release -p ploy-research --example event_factor_attribution \
+  --features polars-export -- \
+  --dataset /path/to/event-root-dataset \
+  --output-dir /tmp/attribution
 ```
+
+Keep the analysis in the Rust/Polars path so the research result uses the
+same typed schema and Parquet/CSV semantics as backtests and promotion gates.
 
 - [ ] **Step 3: Record findings in `tasks/todo.md`**
 
