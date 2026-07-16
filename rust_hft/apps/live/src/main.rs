@@ -195,13 +195,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut system = builder.build();
     let attribution_observer = if let Some(deployment) = activation.as_ref() {
         let feedback_log = open_feedback_log(&args)?;
-        let (receiver, market_reader) = {
+        let (receiver, market_reader, account_reader, runtime_truth_reader) = {
             let engine = system.engine.lock().await;
-            (engine.subscribe_execution_events(), engine.market_reader())
+            (
+                engine.subscribe_execution_events(),
+                engine.market_reader(),
+                engine.account_reader(),
+                engine.runtime_truth_reader(),
+            )
         };
         Some(RuntimeAttributionObserver::new(
             receiver,
             market_reader,
+            account_reader,
+            runtime_truth_reader,
             deployment.request.clone(),
             feedback_log,
             market_stale_us,

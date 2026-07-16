@@ -76,6 +76,7 @@ async fn run_sentinel_loop(
     let mut interval = tokio::time::interval(Duration::from_millis(check_interval_ms));
 
     let mut last_state = SentinelState::Normal;
+    let mut last_orders_submitted = 0_u64;
 
     loop {
         interval.tick().await;
@@ -88,25 +89,30 @@ async fn run_sentinel_loop(
             // 從引擎獲取真實 PnL、延遲和回撤統計 (drawdown 現在由 Portfolio 計算)
             let sentinel_stats = engine.get_sentinel_stats();
 
-            // 估算活躍訂單數：提交 - 完成 - 取消 - 拒絕
-            let active_orders = engine_stats
-                .orders_submitted
-                .saturating_sub(engine_stats.orders_filled)
-                .saturating_sub(engine_stats.orders_canceled)
-                .saturating_sub(engine_stats.orders_rejected);
-
             let stats = SystemStats {
                 latency_p99_us: sentinel_stats.latency_p99_us,
                 latency_p50_us: sentinel_stats.latency_p50_us,
                 drawdown_pct: sentinel_stats.drawdown_pct,
                 pnl: sentinel_stats.pnl,
                 high_water_mark: sentinel_stats.high_water_mark,
-                position_count: active_orders as i64,
-                notional_value: 0.0,
-                order_rate: 0.0,
+                position_count: sentinel_stats.position_count,
+                notional_value: sentinel_stats.notional_value,
+                order_rate: engine_stats
+                    .orders_submitted
+                    .saturating_sub(last_orders_submitted) as f64
+                    / (check_interval_ms.max(1) as f64 / 1_000.0),
+                // ponytail: engine does not expose venue reconnects; wire adapter metrics here
+                // if Sentinel policy begins to act on reconnect frequency.
                 ws_reconnect_count: 0,
-                data_gap_count: 0,
+                data_gap_count: u32::try_from(
+                    engine_stats
+                        .market_events_dropped
+                        .saturating_add(engine_stats.snapshot_publish_failed)
+                        .saturating_add(engine_stats.data_integrity_gaps),
+                )
+                .unwrap_or(u32::MAX),
             };
+            last_orders_submitted = engine_stats.orders_submitted;
 
             (stats, engine_stats.is_running)
         };

@@ -387,12 +387,13 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
         .register_strategies_from_config_strict()
         .unwrap()
         .build();
-    let (execution_receiver, mut diagnostic_receiver, market_reader, notify) = {
+    let (execution_receiver, mut diagnostic_receiver, market_reader, account_reader, notify) = {
         let engine = system.engine.lock().await;
         (
             engine.subscribe_execution_events(),
             engine.subscribe_execution_events(),
             engine.market_reader(),
+            engine.account_reader(),
             engine.get_wakeup_notify(),
         )
     };
@@ -422,9 +423,18 @@ async fn shadow_activation_waits_for_market_then_produces_loop_consumable_eviden
             observed_at: now,
         })
         .unwrap();
+    let runtime_truth_reader = snapshot::SnapshotContainer::new(engine::RuntimeTruthStatus {
+        reconciliation_complete: true,
+        reconciliation_healthy: true,
+        observed_at_us: hft_core::now_micros(),
+        account_id: Some(hft_core::AccountId(request.account_id.clone())),
+    })
+    .reader();
     let observer = RuntimeAttributionObserver::new(
         execution_receiver,
         market_reader,
+        account_reader,
+        runtime_truth_reader,
         request.clone(),
         feedback_log,
         u64::MAX,
