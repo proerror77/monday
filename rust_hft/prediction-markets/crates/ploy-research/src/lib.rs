@@ -14,6 +14,7 @@ pub mod factors_v2;
 #[cfg(any(feature = "ml", feature = "rl"))]
 pub mod model;
 pub mod orderbook;
+pub mod polymarket_evidence_projection;
 pub mod prediction_llm;
 pub mod prediction_loop;
 mod prediction_loop_fs;
@@ -70,6 +71,10 @@ pub use factors::{export_observations_parquet, observations_to_frame};
 pub use factors::{
     load_research_lob_snapshots, load_research_lob_snapshots_sampled,
     load_research_pm_book_snapshots_sampled,
+};
+pub use polymarket_evidence_projection::{
+    project_verified_polymarket_evidence, PolymarketResearchProjection,
+    PolymarketResearchSurfaceCounts, ResearchPolymarketContract, ResearchPolymarketSettlement,
 };
 #[cfg(feature = "strategy-runtime")]
 pub use replay::replay_fills;
