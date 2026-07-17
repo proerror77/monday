@@ -507,6 +507,17 @@ fn market_rows(
     })
 }
 
+const FORBIDDEN_DERIVED_FIELDS: [&str; 3] = ["outcome", "up_token_id", "down_token_id"];
+
+fn validate_source_neutral_row(value: &Value) -> Result<()> {
+    for field in FORBIDDEN_DERIVED_FIELDS {
+        if value.get(field).is_some() {
+            bail!("evidence row must not include {field}");
+        }
+    }
+    Ok(())
+}
+
 fn encode_rows(mut rows: Vec<Row>) -> Result<(Vec<u8>, BTreeMap<String, u64>)> {
     rows.sort_by(|left, right| left.key.cmp(&right.key));
     let mut ndjson = Vec::new();
@@ -515,6 +526,7 @@ fn encode_rows(mut rows: Vec<Row>) -> Result<(Vec<u8>, BTreeMap<String, u64>)> {
         let surface = row.value["surface"]
             .as_str()
             .expect("all rows have a surface");
+        validate_source_neutral_row(&row.value)?;
         *surface_counts.entry(surface.to_owned()).or_default() += 1;
         serde_json::to_writer(&mut ndjson, &row.value)?;
         ndjson.push(b'\n');
@@ -682,6 +694,34 @@ mod tests {
         assert_eq!(left, right);
         assert_eq!(left_counts, right_counts);
         assert_eq!(left_counts["test"], 2);
+    }
+
+    #[test]
+    fn encode_rows_preserves_source_arrays_and_rejects_derived_fields() {
+        let row = |id: &str, value| Row {
+            key: RowKey {
+                surface: SurfaceOrder::MarketContract,
+                event_start: String::new(),
+                symbol: String::new(),
+                market_id: String::new(),
+                clock: String::new(),
+                identity: id.to_owned(),
+                sequence: 0,
+            },
+            value,
+        };
+        let value = json!({"surface":"test","source_token_ids":["down","up"],"source_outcomes":["Higher","Lower"]});
+        let line =
+            String::from_utf8(encode_rows(vec![row("a", value.clone())]).unwrap().0).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(line.trim()).unwrap(), value);
+        for field in FORBIDDEN_DERIVED_FIELDS {
+            let mut value = json!({"surface":"test"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), Value::Bool(true));
+            assert!(encode_rows(vec![row(field, value)]).is_err());
+        }
     }
 
     #[test]
