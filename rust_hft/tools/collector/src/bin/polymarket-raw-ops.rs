@@ -5,6 +5,9 @@ use hft_collector::polymarket_raw::{
     run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
     DEFAULT_MAX_MARKETS_PER_LANE, DEFAULT_MAX_TRADE_POLLS_PER_CYCLE,
 };
+use hft_collector::polymarket_research_import::{
+    validate_research_segments, ArtifactTriplet, ResearchSegmentValidationConfig,
+};
 use hft_collector::polymarket_upload::{run_upload, UploadConfig};
 use std::env;
 use std::path::PathBuf;
@@ -92,6 +95,21 @@ enum Command {
         ended_at_unix: i64,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Fail closed unless staged market/reference segments are research-safe.
+    ValidateResearchSegments {
+        #[arg(long)]
+        market_data: PathBuf,
+        #[arg(long)]
+        market_manifest: PathBuf,
+        #[arg(long)]
+        market_success: PathBuf,
+        #[arg(long)]
+        reference_data: PathBuf,
+        #[arg(long)]
+        reference_manifest: PathBuf,
+        #[arg(long)]
+        reference_success: PathBuf,
     },
 }
 
@@ -206,6 +224,29 @@ async fn main() -> Result<()> {
             if !verify_shadow_parity(&config)? {
                 bail!("byte/field/dedupe/settlement/rotation parity failed");
             }
+            Ok(())
+        }
+        Command::ValidateResearchSegments {
+            market_data,
+            market_manifest,
+            market_success,
+            reference_data,
+            reference_manifest,
+            reference_success,
+        } => {
+            let report = validate_research_segments(&ResearchSegmentValidationConfig {
+                market: ArtifactTriplet {
+                    data: market_data,
+                    manifest: market_manifest,
+                    success: market_success,
+                },
+                reference: ArtifactTriplet {
+                    data: reference_data,
+                    manifest: reference_manifest,
+                    success: reference_success,
+                },
+            })?;
+            println!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
     }

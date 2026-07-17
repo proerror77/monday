@@ -1,0 +1,771 @@
+use crate::lob_archiver::command_status_with_timeout;
+use crate::polymarket_upload::{ensure_canonical_directory, scan_tape};
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
+use rand::random;
+use serde::Serialize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct ArtifactTriplet {
+    pub data: PathBuf,
+    pub manifest: PathBuf,
+    pub success: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResearchSegmentValidationConfig {
+    pub market: ArtifactTriplet,
+    pub reference: ArtifactTriplet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SegmentIdentity {
+    pub schema: String,
+    pub venue: String,
+    pub dataset: String,
+    pub date: String,
+    pub hour: String,
+    pub file: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub events: u64,
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+    pub sequence_gaps: u64,
+    pub start_recorded_at: String,
+    pub end_recorded_at: String,
+    pub source_file: String,
+    pub replay_scope: String,
+    pub recording_policy: Value,
+    pub record_id_versions: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResearchSegmentValidationReport {
+    pub schema: &'static str,
+    pub market: SegmentIdentity,
+    pub reference: SegmentIdentity,
+}
+
+struct ValidatedArtifact {
+    manifest: Value,
+    identity: SegmentIdentity,
+    files: BoundTriplet,
+    superseded_marker: PathBuf,
+}
+
+type FileIdentity = (u64, u64, u64);
+
+const MARKET_EVENT_TYPES: [&str; 4] = [
+    "event_discovered",
+    "event_expired",
+    "quote",
+    "reference_price",
+];
+const REFERENCE_EVENT_TYPES: [&str; 3] =
+    ["market_metadata", "polymarket_trade", "market_settlement"];
+
+fn file_identity(metadata: &Metadata) -> FileIdentity {
+    (metadata.dev(), metadata.ino(), metadata.len())
+}
+
+struct BoundFile {
+    path: PathBuf,
+    file: File,
+    snapshot: File,
+    identity: FileIdentity,
+    sha256: String,
+}
+
+impl BoundFile {
+    fn open(path: &Path, snapshot_path: &Path) -> Result<Self> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+        {
+            bail!("artifact path must be absolute and canonical");
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .context("open artifact without following links")?;
+        let identity = file_identity(&file.metadata()?);
+        let current = fs::symlink_metadata(path)?;
+        if !current.is_file()
+            || current.file_type().is_symlink()
+            || file_identity(&current) != identity
+            || fs::canonicalize(path)? != path
+        {
+            bail!("artifact path does not identify the opened regular file");
+        }
+        let mut snapshot = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(snapshot_path)?;
+        std::io::copy(&mut file.try_clone()?, &mut snapshot)?;
+        let sha256 = Self::hash(&snapshot)?;
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+            snapshot,
+            identity,
+            sha256,
+        })
+    }
+
+    fn read(&self) -> Result<Vec<u8>> {
+        let mut file = self.snapshot.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn hash(source: &File) -> Result<String> {
+        let mut file = source.try_clone()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(hex::encode(digest.finalize()))
+    }
+
+    fn verify(&self) -> Result<()> {
+        let current = fs::symlink_metadata(&self.path)?;
+        if file_identity(&self.file.metadata()?) != self.identity
+            || !current.is_file()
+            || current.file_type().is_symlink()
+            || file_identity(&current) != self.identity
+            || fs::canonicalize(&self.path)? != self.path
+            || Self::hash(&self.file)? != self.sha256
+            || Self::hash(&self.snapshot)? != self.sha256
+        {
+            bail!("artifact content or path identity changed during validation");
+        }
+        Ok(())
+    }
+}
+
+struct BoundTriplet {
+    data: BoundFile,
+    manifest: BoundFile,
+    success: BoundFile,
+}
+
+impl BoundTriplet {
+    fn verify(&self) -> Result<()> {
+        self.data.verify()?;
+        self.manifest.verify()?;
+        self.success.verify()
+    }
+}
+
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn create() -> Result<Self> {
+        let parent = fs::canonicalize(std::env::temp_dir())?;
+        ensure_canonical_directory(&parent)?;
+        for _ in 0..32 {
+            let path = parent.join(format!("monday-research-validate.{:016x}", random::<u64>()));
+            match DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("could not allocate validation staging directory")
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn partition<'a>(path: &'a Path, prefix: &str) -> Result<&'a str> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.strip_prefix(prefix))
+        .ok_or_else(|| anyhow!("content-addressed path requires {prefix}<value>"))
+}
+
+fn reject_superseded(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => bail!("adjacent SUPERSEDED marker rejects this research input"),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn text(manifest: &Value, field: &str) -> Result<String> {
+    manifest
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("manifest {field} must be a string"))
+}
+
+fn has_only_event_types(manifest: &Value, allowed: &[&str]) -> bool {
+    manifest["event_types"]
+        .as_object()
+        .is_some_and(|types| types.keys().all(|kind| allowed.contains(&kind.as_str())))
+}
+fn validate_triplet(
+    triplet: &ArtifactTriplet,
+    dataset: &str,
+    scratch: &Path,
+) -> Result<ValidatedArtifact> {
+    let sha_dir = triplet
+        .data
+        .parent()
+        .ok_or_else(|| anyhow!("data path has no parent"))?;
+    if triplet.manifest.parent() != Some(sha_dir) || triplet.success.parent() != Some(sha_dir) {
+        bail!("artifact triplet must share one content-addressed directory");
+    }
+    let data_name = triplet
+        .data
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("data file name is not UTF-8"))?;
+    if triplet
+        .manifest
+        .file_name()
+        .and_then(|value| value.to_str())
+        != Some(&format!("{data_name}.manifest.json"))
+        || triplet.success.file_name().and_then(|value| value.to_str())
+            != Some(&format!("{data_name}._SUCCESS"))
+    {
+        bail!("manifest and _SUCCESS names must derive from the data file");
+    }
+    let superseded_marker = sha_dir.join(format!("{data_name}.SUPERSEDED.json"));
+    reject_superseded(&superseded_marker)?;
+    let files = BoundTriplet {
+        data: BoundFile::open(&triplet.data, &scratch.join(format!("{dataset}.data")))?,
+        manifest: BoundFile::open(
+            &triplet.manifest,
+            &scratch.join(format!("{dataset}.manifest")),
+        )?,
+        success: BoundFile::open(
+            &triplet.success,
+            &scratch.join(format!("{dataset}.success")),
+        )?,
+    };
+    let digest = partition(sha_dir, "sha256=")?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("sha256 path digest must be 64 lowercase hex characters");
+    }
+    let hour_dir = sha_dir
+        .parent()
+        .ok_or_else(|| anyhow!("missing hour partition"))?;
+    let date_dir = hour_dir
+        .parent()
+        .ok_or_else(|| anyhow!("missing date partition"))?;
+    let dataset_dir = date_dir
+        .parent()
+        .ok_or_else(|| anyhow!("missing dataset partition"))?;
+    let venue_dir = dataset_dir
+        .parent()
+        .ok_or_else(|| anyhow!("missing venue partition"))?;
+    let raw_dir = venue_dir
+        .parent()
+        .ok_or_else(|| anyhow!("missing raw lake partition"))?;
+    let lake_dir = raw_dir
+        .parent()
+        .ok_or_else(|| anyhow!("missing lake partition"))?;
+    let hour = partition(hour_dir, "hour=")?;
+    let date = partition(date_dir, "date=")?;
+    if partition(dataset_dir, "dataset=")? != dataset
+        || partition(venue_dir, "venue=")? != "polymarket"
+        || raw_dir.file_name().and_then(|value| value.to_str()) != Some("raw")
+        || lake_dir.file_name().and_then(|value| value.to_str()) != Some("lake")
+    {
+        bail!("content-addressed lake/raw/venue/dataset suffix is wrong");
+    }
+    let manifest: Value = serde_json::from_slice(&files.manifest.read()?)?;
+    for (field, expected) in [
+        ("schema", "monday.polymarket.raw.v1"),
+        ("venue", "polymarket"),
+        ("dataset", dataset),
+        ("format", "ndjson.zst"),
+    ] {
+        if manifest.get(field).and_then(Value::as_str) != Some(expected) {
+            bail!("manifest {field} must be {expected}");
+        }
+    }
+    if manifest.get("canonical").and_then(Value::as_bool) != Some(true)
+        || manifest.get("segment_complete").and_then(Value::as_bool) != Some(true)
+        || manifest
+            .get("source_session_closed")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        bail!("manifest must be canonical, segment-complete, and source-closed");
+    }
+    if manifest.get("superseded").and_then(Value::as_bool) == Some(true)
+        || manifest
+            .get("superseded_by")
+            .is_some_and(|value| !value.is_null())
+    {
+        bail!("superseded segments are not valid research inputs");
+    }
+    let bytes = files.data.identity.2;
+    if manifest.get("date").and_then(Value::as_str) != Some(date)
+        || manifest.get("hour").and_then(Value::as_str) != Some(hour)
+        || manifest.get("file").and_then(Value::as_str) != Some(data_name)
+        || manifest.get("bytes").and_then(Value::as_u64) != Some(bytes)
+        || manifest.get("sha256").and_then(Value::as_str) != Some(digest)
+        || manifest.get("sequence_gaps").and_then(Value::as_u64) != Some(0)
+    {
+        bail!("manifest source identity or sequence declaration does not match staged path");
+    }
+    let end_recorded_at = text(&manifest, "end_recorded_at")?;
+    let end_partition = DateTime::parse_from_rfc3339(&end_recorded_at)?
+        .with_timezone(&Utc)
+        .format("%Y-%m-%dT%H")
+        .to_string();
+    if end_partition != format!("{date}T{hour}") {
+        bail!("segment crosses its UTC-hour partition");
+    }
+    let start_sequence = manifest
+        .get("start_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("manifest start_sequence is missing"))?;
+    let end_sequence = manifest
+        .get("end_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("manifest end_sequence is missing"))?;
+    let events = manifest
+        .get("events")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("manifest events is missing"))?;
+    if end_sequence < start_sequence || events != end_sequence - start_sequence + 1 {
+        bail!("manifest sequence bounds do not match event count");
+    }
+    if files.data.sha256 != digest {
+        bail!("data SHA-256 does not match sha256= path");
+    }
+    if files.success.read()? != format!("{digest}\n").as_bytes() {
+        bail!("_SUCCESS must contain the exact data digest and newline");
+    }
+    Ok(ValidatedArtifact {
+        identity: SegmentIdentity {
+            schema: text(&manifest, "schema")?,
+            venue: text(&manifest, "venue")?,
+            dataset: text(&manifest, "dataset")?,
+            date: date.to_owned(),
+            hour: hour.to_owned(),
+            file: data_name.to_owned(),
+            bytes,
+            sha256: digest.to_owned(),
+            events,
+            start_sequence,
+            end_sequence,
+            sequence_gaps: 0,
+            start_recorded_at: text(&manifest, "start_recorded_at")?,
+            end_recorded_at,
+            source_file: text(&manifest, "source_file")?,
+            replay_scope: text(&manifest, "replay_scope")?,
+            recording_policy: manifest["recording_policy"].clone(),
+            record_id_versions: manifest["record_id_versions"].clone(),
+        },
+        manifest,
+        files,
+        superseded_marker,
+    })
+}
+
+fn decompress_and_rescan(
+    artifact: &ValidatedArtifact,
+    dataset: &str,
+    directory: &Path,
+) -> Result<()> {
+    fs::create_dir(directory)?;
+    let source_file = artifact
+        .manifest
+        .get("source_file")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("manifest source_file is missing"))?;
+    let expected_source = artifact
+        .identity
+        .file
+        .strip_suffix(".zst")
+        .ok_or_else(|| anyhow!("compressed data file must end in .zst"))?;
+    if source_file != expected_source || Path::new(source_file).components().count() != 1 {
+        bail!("manifest source_file does not match compressed data name");
+    }
+    let raw = directory.join(source_file);
+    let output = OpenOptions::new().write(true).create_new(true).open(&raw)?;
+    let mut input = artifact.files.data.snapshot.try_clone()?;
+    input.seek(SeekFrom::Start(0))?;
+    let mut command = Command::new("zstd");
+    command
+        .args(["-q", "-d", "-c"])
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::from(output.try_clone()?));
+    let status = command_status_with_timeout(&mut command, Duration::from_secs(300))
+        .context("run zstd decompression")?;
+    if !status.success() {
+        bail!("zstd decompression failed with {status}");
+    }
+    output.sync_all()?;
+    if artifact
+        .manifest
+        .get("source_bytes")
+        .and_then(Value::as_u64)
+        != Some(fs::metadata(&raw)?.len())
+    {
+        bail!("decompressed source bytes do not match manifest");
+    }
+    let policy = &artifact.manifest["recording_policy"];
+    let depth = policy
+        .get("quote_depth_levels")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("recording_policy.quote_depth_levels is missing"))?;
+    let sample_ms = policy
+        .get("quote_sample_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("recording_policy.quote_sample_ms is missing"))?;
+    let rescanned = scan_tape(&raw, dataset, usize::try_from(depth)?, sample_ms)?;
+    for (field, value) in rescanned.as_object().expect("scan manifest is an object") {
+        if artifact.manifest.get(field) != Some(value) {
+            bail!("manifest field {field} does not match producer rescan");
+        }
+    }
+    Ok(())
+}
+fn validate_market_policy(manifest: &Value) -> Result<()> {
+    if manifest
+        .get("venue_depth_complete")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || manifest
+            .get("event_context_complete")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || manifest["recording_policy"]["quote_depth_levels"].as_u64() != Some(0)
+        || manifest["recording_policy"]["quote_sample_ms"].as_u64() != Some(1_000)
+        || manifest["recording_policy"]["event_scoped_quotes"].as_bool() != Some(true)
+        || !has_only_event_types(manifest, &MARKET_EVENT_TYPES)
+        || manifest["event_types"]["quote"]
+            .as_u64()
+            .unwrap_or_default()
+            == 0
+        || manifest["event_types"]["reference_price"]
+            .as_u64()
+            .unwrap_or_default()
+            == 0
+    {
+        bail!("primary market segment must contain only event-scoped full visible L2 records");
+    }
+    Ok(())
+}
+fn validate_reference_policy(manifest: &Value) -> Result<()> {
+    if manifest
+        .get("reference_context_complete")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || ["market_metadata", "polymarket_trade", "market_settlement"]
+            .iter()
+            .any(|kind| manifest["event_types"][kind].as_u64().unwrap_or_default() == 0)
+        || manifest["record_id_versions"] != Value::from(vec!["v2"])
+        || manifest["recording_policy"]["quote_depth_levels"].as_u64() != Some(0)
+        || manifest["recording_policy"]["quote_sample_ms"].as_u64() != Some(0)
+        || manifest["recording_policy"]["event_scoped_quotes"].as_bool() != Some(true)
+        || !has_only_event_types(manifest, &REFERENCE_EVENT_TYPES)
+    {
+        bail!("reference segment must contain only metadata, v2 trades, settlements, and exact recording policy");
+    }
+    Ok(())
+}
+pub fn validate_research_segments(
+    config: &ResearchSegmentValidationConfig,
+) -> Result<ResearchSegmentValidationReport> {
+    let scratch = ScratchDir::create()?;
+    let market = validate_triplet(&config.market, "crypto_expiry", &scratch.0)?;
+    let reference = validate_triplet(&config.reference, "crypto_expiry_reference", &scratch.0)?;
+    validate_market_policy(&market.manifest)?;
+    validate_reference_policy(&reference.manifest)?;
+    decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
+    decompress_and_rescan(
+        &reference,
+        "crypto_expiry_reference",
+        &scratch.0.join("reference"),
+    )?;
+    for artifact in [&market, &reference] {
+        artifact.files.verify()?;
+        reject_superseded(&artifact.superseded_marker)?;
+    }
+    Ok(ResearchSegmentValidationReport {
+        schema: "monday.polymarket.research_segment_validation.v1",
+        market: market.identity,
+        reference: reference.identity,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lob_archiver::sha256_file;
+    use crate::polymarket_upload::derived_trade_record_id;
+    use serde_json::json;
+    use std::fs::File;
+    use std::io::Write;
+    fn row(sequence: u64, update: Value) -> Value {
+        json!({"sequence": sequence, "recorded_at": "2026-07-17T05:01:00Z", "update": update})
+    }
+    fn metadata(kind: &str) -> Value {
+        let mut value = json!({
+            "kind": kind, "market_id": "market-1", "condition_id": "0xcondition",
+            "symbol": "BTCUSDT", "market_window_secs": 300, "source": "gamma_api",
+            "retrieved_at": "2026-07-17T05:01:00Z",
+            "market": {
+                "id": "market-1", "conditionId": "0xcondition",
+                "question": "Bitcoin Up or Down - 5 minutes", "slug": "btc-updown-5m-test",
+                "startDate": "2026-07-17T05:00:00Z", "endDate": "2026-07-17T05:05:00Z",
+                "clobTokenIds": "[\"up-token\",\"down-token\"]",
+                "outcomes": "[\"Up\",\"Down\"]", "makerBaseFee": 1000, "takerBaseFee": 1000,
+            },
+        });
+        if kind == "market_settlement" {
+            value["winning_token_id"] = json!("up-token");
+            value["winning_outcome"] = json!("Up");
+            value["resolved_up_won"] = json!(true);
+            value["resolution_source"] = json!("gamma_api_closed_market");
+            value["market"]["closed"] = json!(true);
+            value["market"]["outcomePrices"] = json!("[\"0.999\",\"0.001\"]");
+        }
+        value
+    }
+
+    fn trade() -> Value {
+        let raw = json!({
+            "transactionHash": "0xtx", "conditionId": "0xcondition", "asset": "up-token",
+            "side": "BUY", "timestamp": 1_784_084_995_i64, "proxyWallet": "0xwallet",
+            "size": "10.0", "price": "0.780", "outcome": "Up", "outcomeIndex": 0,
+        });
+        let raw_object = raw.as_object().unwrap();
+        json!({
+            "kind": "polymarket_trade", "record_id": derived_trade_record_id(raw_object),
+            "record_id_version": "v2", "market_id": "market-1", "condition_id": "0xcondition",
+            "token_id": "up-token", "symbol": "BTCUSDT", "market_window_secs": 300,
+            "side": "BUY", "size": "10.0", "price": "0.780",
+            "trade_ts": "2026-07-15T03:09:55Z", "trade_ts_unix": 1_784_084_995_i64,
+            "transaction_hash": "0xtx", "proxy_wallet": "0xwallet", "outcome": "Up",
+            "outcome_index": 0, "source": "polymarket_data_api",
+            "received_at": "2026-07-17T05:01:00Z", "trade": raw,
+        })
+    }
+
+    fn market_rows() -> Vec<Value> {
+        vec![
+            row(
+                0,
+                json!({
+                    "kind": "event_discovered", "event_id": "market-1", "symbol": "BTCUSDT",
+                    "up_token": "up-token", "down_token": "down-token",
+                    "end_time": "2026-07-17T05:05:00Z", "window_secs": 300,
+                    "price_to_beat": "100", "resolved_up_won": null,
+                }),
+            ),
+            row(
+                1,
+                json!({
+                    "kind": "quote", "token_id": "up-token", "bid": "0.49", "ask": "0.51",
+                    "bid_size": "10", "ask_size": "11",
+                    "bid_levels": [{"price": "0.49", "size": "10"}],
+                    "ask_levels": [{"price": "0.51", "size": "11"}], "ts": "2026-07-17T05:00:59Z",
+                }),
+            ),
+            row(
+                2,
+                json!({
+                    "kind": "reference_price", "symbol": "btc/usd", "source": "chainlink",
+                    "asset_class": "crypto", "price": "100", "full_accuracy_value": null,
+                    "is_carried_forward": false, "ts": "2026-07-17T05:00:59Z",
+                }),
+            ),
+        ]
+    }
+
+    fn reference_rows(settlement: bool) -> Vec<Value> {
+        let mut rows = vec![row(0, metadata("market_metadata")), row(1, trade())];
+        if settlement {
+            rows.push(row(2, metadata("market_settlement")));
+        }
+        rows
+    }
+
+    fn triplet(root: &Path, dataset: &str, rows: &[Value]) -> ArtifactTriplet {
+        let raw_name = format!("market-updates.{dataset}.ndjson");
+        let raw = root.join(&raw_name);
+        let mut file = File::create(&raw).unwrap();
+        for value in rows {
+            serde_json::to_writer(&mut file, value).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.sync_all().unwrap();
+        let sample_ms = if dataset == "crypto_expiry" { 1_000 } else { 0 };
+        let mut manifest = scan_tape(&raw, dataset, 0, sample_ms).unwrap();
+        let compressed = root.join(format!("{raw_name}.zst"));
+        let output = File::create(&compressed).unwrap();
+        assert!(Command::new("zstd")
+            .args(["-q", "-3", "-c"])
+            .arg(&raw)
+            .stdout(Stdio::from(output))
+            .status()
+            .unwrap()
+            .success());
+        let digest = sha256_file(&compressed).unwrap();
+        let directory = root
+            .join("lake/raw/venue=polymarket")
+            .join(format!("dataset={dataset}"))
+            .join("date=2026-07-17/hour=05")
+            .join(format!("sha256={digest}"));
+        fs::create_dir_all(&directory).unwrap();
+        let data = directory.join(compressed.file_name().unwrap());
+        fs::rename(compressed, &data).unwrap();
+        manifest["file"] = json!(data.file_name().unwrap().to_str().unwrap());
+        manifest["bytes"] = json!(fs::metadata(&data).unwrap().len());
+        manifest["sha256"] = json!(digest);
+        let manifest_path = directory.join(format!(
+            "{}.manifest.json",
+            manifest["file"].as_str().unwrap()
+        ));
+        fs::write(
+            &manifest_path,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+        let success = directory.join(format!("{}._SUCCESS", manifest["file"].as_str().unwrap()));
+        fs::write(
+            &success,
+            format!("{}\n", manifest["sha256"].as_str().unwrap()),
+        )
+        .unwrap();
+        ArtifactTriplet {
+            data,
+            manifest: manifest_path,
+            success,
+        }
+    }
+
+    fn fixture_rows(
+        market_rows: &[Value],
+        reference_rows: &[Value],
+    ) -> (tempfile::TempDir, ResearchSegmentValidationConfig) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", market_rows);
+        let reference = triplet(&root, "crypto_expiry_reference", reference_rows);
+        (temp, ResearchSegmentValidationConfig { market, reference })
+    }
+
+    fn fixture(settlement: bool) -> (tempfile::TempDir, ResearchSegmentValidationConfig) {
+        fixture_rows(&market_rows(), &reference_rows(settlement))
+    }
+
+    fn rejects(config: &ResearchSegmentValidationConfig, expected: &str) {
+        assert!(validate_research_segments(config)
+            .unwrap_err()
+            .to_string()
+            .contains(expected));
+    }
+
+    #[test]
+    fn bound_file_validates_the_captured_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let path = root.join("artifact");
+        fs::write(&path, b"before").unwrap();
+        let bound = BoundFile::open(&path, &root.join("snapshot")).unwrap();
+        fs::write(&path, b"after!").unwrap();
+        assert_eq!(bound.read().unwrap(), b"before");
+        assert!(bound.verify().is_err());
+    }
+
+    #[test]
+    fn validates_complete_triplets_deterministically() {
+        let (_temp, config) = fixture(true);
+        let first = validate_research_segments(&config).unwrap();
+        let second = validate_research_segments(&config).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.market.recording_policy["quote_depth_levels"], 0);
+        assert_eq!(first.market.recording_policy["quote_sample_ms"], 1_000);
+        assert_eq!(first.reference.record_id_versions, json!(["v2"]));
+        assert_eq!(first.reference.recording_policy["quote_sample_ms"], 0);
+    }
+
+    #[test]
+    fn rejects_tampered_success_marker() {
+        let (_temp, config) = fixture(true);
+        fs::write(&config.market.success, b"tampered\n").unwrap();
+        rejects(&config, "_SUCCESS");
+    }
+
+    #[test]
+    fn rejects_invalid_reference_contracts() {
+        let (_temp, config) = fixture(false);
+        rejects(&config, "settlements");
+        let (_temp, config) = fixture(true);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&config.reference.manifest).unwrap()).unwrap();
+        manifest["recording_policy"]["quote_sample_ms"] = json!(1_000);
+        fs::write(
+            &config.reference.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+        rejects(&config, "exact recording policy");
+    }
+
+    #[test]
+    fn rejects_cross_hour_and_mixed_dataset_segments() {
+        let mut market = market_rows();
+        market.last_mut().unwrap()["recorded_at"] = json!("2026-07-17T06:00:00Z");
+        let (_temp, config) = fixture_rows(&market, &reference_rows(true));
+        rejects(&config, "crosses its UTC-hour partition");
+
+        let mut reference = reference_rows(true);
+        for mut record in market_rows().into_iter().take(2) {
+            record["sequence"] = json!(reference.len());
+            reference.push(record);
+        }
+        let (_temp, config) = fixture_rows(&market_rows(), &reference);
+        rejects(&config, "only metadata");
+    }
+
+    #[test]
+    fn rejects_adjacent_superseded_marker() {
+        let (_temp, config) = fixture(true);
+        let name = format!(
+            "{}.SUPERSEDED.json",
+            config.market.data.file_name().unwrap().to_str().unwrap()
+        );
+        fs::write(config.market.data.with_file_name(name), b"{}\n").unwrap();
+        rejects(&config, "SUPERSEDED");
+    }
+}
