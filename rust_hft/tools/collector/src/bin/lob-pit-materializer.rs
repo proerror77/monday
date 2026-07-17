@@ -80,6 +80,10 @@ struct RawSegmentManifest {
 struct SourceSegmentEvidence {
     path: PathBuf,
     sha256: String,
+    collector_manifest_path: PathBuf,
+    collector_manifest_sha256: String,
+    success_marker_path: PathBuf,
+    success_marker_sha256: String,
     start_received_at_ns: u64,
     end_received_at_ns: u64,
     events: u64,
@@ -113,7 +117,8 @@ struct BookSample {
     spread_bps: f64,
     bid_depth: f64,
     ask_depth: f64,
-    imbalance: f64,
+    top_depth_imbalance: f64,
+    book_imbalance: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,11 +441,11 @@ fn verify_segment(path: &Path, market: Market, symbol: &str) -> Result<VerifiedS
             path.display()
         );
     }
-    let manifest: RawSegmentManifest = serde_json::from_slice(
-        &std::fs::read(&manifest_path)
-            .with_context(|| format!("failed to read {}", manifest_path.display()))?,
-    )
-    .with_context(|| format!("invalid segment manifest {}", manifest_path.display()))?;
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
+    let manifest: RawSegmentManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("invalid segment manifest {}", manifest_path.display()))?;
     if manifest.schema != RAW_SCHEMA
         || manifest.venue != "binance"
         || manifest.market != market.as_str()
@@ -474,7 +479,12 @@ fn verify_segment(path: &Path, market: Market, symbol: &str) -> Result<VerifiedS
     if !manifest.has_replay_safe_checkpoint {
         bail!("segment is not marked replay safe: {}", path.display());
     }
-    let success_hash = std::fs::read_to_string(&success_path)?.trim().to_string();
+    let success_bytes = std::fs::read(&success_path)
+        .with_context(|| format!("failed to read {}", success_path.display()))?;
+    let success_marker_sha256 = hex::encode(Sha256::digest(&success_bytes));
+    let success_hash = std::str::from_utf8(&success_bytes)
+        .with_context(|| format!("invalid _SUCCESS marker {}", success_path.display()))?
+        .trim();
     if success_hash != manifest.sha256 {
         bail!(
             "_SUCCESS marker does not match manifest: {}",
@@ -495,6 +505,10 @@ fn verify_segment(path: &Path, market: Market, symbol: &str) -> Result<VerifiedS
         evidence: SourceSegmentEvidence {
             path: path.to_path_buf(),
             sha256: actual_hash,
+            collector_manifest_path: manifest_path,
+            collector_manifest_sha256: manifest_sha256,
+            success_marker_path: success_path,
+            success_marker_sha256,
             start_received_at_ns: manifest.start_received_at_ns,
             end_received_at_ns: manifest.end_received_at_ns,
             events: manifest.events,
@@ -676,8 +690,8 @@ fn sample_book(
 ) -> Result<BookSample> {
     let bid_levels = state.bids.iter().rev().take(depth).collect::<Vec<_>>();
     let ask_levels = state.asks.iter().take(depth).collect::<Vec<_>>();
-    let (best_bid, _) = bid_levels.first().context("order book has no bids")?;
-    let (best_ask, _) = ask_levels.first().context("order book has no asks")?;
+    let (best_bid, best_bid_quantity) = bid_levels.first().context("order book has no bids")?;
+    let (best_ask, best_ask_quantity) = ask_levels.first().context("order book has no asks")?;
     if best_bid >= best_ask {
         bail!("replayed order book is crossed");
     }
@@ -699,7 +713,12 @@ fn sample_book(
         spread_bps: decimal_f64((**best_ask - **best_bid) / mid * Decimal::from(10_000))?,
         bid_depth: decimal_f64(bid_depth)?,
         ask_depth: decimal_f64(ask_depth)?,
-        imbalance: decimal_f64((bid_depth - ask_depth) / total_depth)?,
+        top_depth_imbalance: decimal_f64((bid_depth - ask_depth) / total_depth)?,
+        book_imbalance: {
+            let bid_size = decimal_f64(**best_bid_quantity)?;
+            let ask_size = decimal_f64(**best_ask_quantity)?;
+            (bid_size - ask_size) / (bid_size + ask_size)
+        },
     })
 }
 
@@ -732,7 +751,11 @@ fn materialize_rows(
         let features = BTreeMap::from([
             (format!("ask_depth_top{depth}"), current.ask_depth),
             (format!("bid_depth_top{depth}"), current.bid_depth),
-            (format!("book_imbalance_top{depth}"), current.imbalance),
+            ("book_imbalance".to_string(), current.book_imbalance),
+            (
+                format!("book_imbalance_top{depth}"),
+                current.top_depth_imbalance,
+            ),
             ("mid_price".to_string(), current.mid_price),
             (
                 "mid_return_1".to_string(),
@@ -919,7 +942,9 @@ fn datetime_ns(value: u64) -> Result<DateTime<Utc>> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
     fn event_ns(second: f64) -> u64 {
         1_783_987_200_000_000_000 + (second * 1_000_000_000.0) as u64
@@ -1010,10 +1035,7 @@ mod tests {
 
     impl Fixture {
         fn new(events: &[Value]) -> Self {
-            let id = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
             let directory = std::env::temp_dir()
                 .join(format!("lob-pit-materializer-{}-{id}", std::process::id()));
             std::fs::create_dir_all(&directory).unwrap();
@@ -1204,6 +1226,40 @@ mod tests {
         let error = materialize(&fixture.args()).unwrap_err().to_string();
 
         assert!(error.contains("never received a valid first diff"));
+    }
+
+    #[test]
+    fn publishes_live_imbalance_and_binds_raw_sidecar_bytes() {
+        let fixture = Fixture::new(&valid_events());
+        let published = materialize(&fixture.args()).unwrap();
+        let first_row = BufReader::new(File::open(&published.report.artifact_path).unwrap())
+            .lines()
+            .next()
+            .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
+            .unwrap();
+        let manifest_path = sibling(&fixture.data, ".manifest.json").unwrap();
+        let output = serde_json::to_value(&published).unwrap();
+        let source = &output["report"]["source_segments"][0];
+
+        assert_eq!(
+            json!({
+                "book_imbalance": first_row.features.get("book_imbalance").copied(),
+                "book_imbalance_top5": first_row.features.get("book_imbalance_top5").copied(),
+                "collector_manifest_path": source["collector_manifest_path"],
+                "collector_manifest_sha256": source["collector_manifest_sha256"],
+                "success_marker_path": source["success_marker_path"],
+                "success_marker_sha256": source["success_marker_sha256"],
+            }),
+            json!({
+                // Fixture row 0 has best-bid quantity 10 and best-ask quantity 4.
+                "book_imbalance": 0.428_571_428_571_428_55,
+                "book_imbalance_top5": 0.2,
+                "collector_manifest_path": manifest_path,
+                "collector_manifest_sha256": hex::encode(Sha256::digest(std::fs::read(&manifest_path).unwrap())),
+                "success_marker_path": fixture.success,
+                "success_marker_sha256": hex::encode(Sha256::digest(std::fs::read(&fixture.success).unwrap())),
+            })
+        );
     }
 
     #[test]
