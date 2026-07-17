@@ -67,3 +67,20 @@ Every PR description must include: change contract, out of scope, dependency
 or merge order, focused validation, and rollout/rollback impact; write `None`
 where a field does not apply. A safety boundary needs a targeted counterexample
 test, not only workspace compilation.
+
+## Concurrent Work Control
+
+- Each branch, worktree, and PR has exactly one write owner at a time. Record
+  the owner and current head before delegating; reviewers and researchers are
+  read-only unless ownership is explicitly transferred.
+- Before every edit, commit, push, rebase, or merge, re-read the branch name,
+  `HEAD`, worktree status, and PR head. Stop if any value moved unexpectedly;
+  never absorb an unexplained concurrent change into the current PR.
+- Do not run writable agents on overlapping files or the same dependency lane.
+  A predecessor PR must merge before its dependent branch is rewritten or
+  promoted, unless the stack and merge order were declared in advance.
+- A behavior fix belongs to one PR only. Close or archive stale experiments
+  before another implementation of the same contract is promoted.
+- Runtime, deployment, and collector cutover commands require one named
+  controller. Other tasks may inspect them read-only until control is handed
+  over explicitly.
