@@ -545,7 +545,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 store.create_mission(&mission)?;
                 print_json(&mission)
             }
-            MissionCommand::Execute(args) => mission_runner::execute(*args),
+            MissionCommand::Execute(args) => {
+                tokio::task::spawn_blocking(move || mission_runner::execute(*args))
+                    .await
+                    .context("mission execution worker failed")?
+            }
             MissionCommand::Run(args) => mission::run_mission(args, false),
             MissionCommand::Resume(args) => mission::run_mission(args, true),
             MissionCommand::Status(args) => mission::mission_status(args),
@@ -638,6 +642,59 @@ pub fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mission_execute_runs_blocking_pipeline_outside_async_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let work_dir = root.path().join("work").display().to_string();
+        let missing_features = root
+            .path()
+            .join("missing-features.jsonl")
+            .display()
+            .to_string();
+        let missing_materialization = root
+            .path()
+            .join("missing-materialization.json")
+            .display()
+            .to_string();
+        let result = root.path().join("results.zip").display().to_string();
+        let cli = Cli::try_parse_from(vec![
+            "alpha-harness".to_owned(),
+            "mission".to_owned(),
+            "execute".to_owned(),
+            "--work-dir".to_owned(),
+            work_dir,
+            "--feature-url".to_owned(),
+            missing_features.clone(),
+            "--materialization-url".to_owned(),
+            missing_materialization,
+            "--materialization-sha256".to_owned(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "--result-put-url".to_owned(),
+            result,
+            "--data-mission-id".to_owned(),
+            "data-1".to_owned(),
+            "--mission-id".to_owned(),
+            "mission-1".to_owned(),
+            "--engine".to_owned(),
+            "mcts".to_owned(),
+            "--feature-fields".to_owned(),
+            "book_imbalance".to_owned(),
+            "--label-horizon-buckets".to_owned(),
+            "5".to_owned(),
+            "--observation-frequency-millis".to_owned(),
+            "1000".to_owned(),
+        ])
+        .unwrap();
+
+        let error = run(cli).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}")
+                .contains(&format!("failed to open local source {missing_features}")),
+            "unexpected error: {error:#}"
+        );
+    }
 
     #[test]
     fn validation_args_build_an_explicit_label_and_metric_protocol() {
