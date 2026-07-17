@@ -2324,7 +2324,7 @@ mod tests {
             let high = memory_limit_mebibytes(unit, "MemoryHigh");
             let maximum = memory_limit_mebibytes(unit, "MemoryMax");
             let cpu_quota = cpu_quota_percent(unit);
-            assert_eq!(high, 576);
+            assert_eq!(high, 672);
             assert_eq!(maximum, 768);
             assert!(high < maximum);
             assert_eq!(cpu_quota, 80);
