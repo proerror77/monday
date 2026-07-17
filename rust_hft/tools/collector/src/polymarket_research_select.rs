@@ -337,10 +337,12 @@ fn metadata(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("line {line}: resolutionSource is missing"))?;
     validate_resolution_source(resolution_source, &contract.symbol, line)?;
+    let retrieved_at = required(update, "retrieved_at")?;
+    timestamp(retrieved_at, "retrieved_at")?;
     Ok(SelectedMetadata {
         condition_id: required(update, "condition_id")?.to_owned(),
         resolution_source: resolution_source.to_owned(),
-        retrieved_at: required(update, "retrieved_at")?.to_owned(),
+        retrieved_at: retrieved_at.to_owned(),
         recorded_at: String::new(),
         sequence: 0,
         tokens,
@@ -544,5 +546,36 @@ mod tests {
             1
         )
         .is_err());
+    }
+
+    #[test]
+    fn metadata_rejects_invalid_retrieved_at() {
+        let event_start = timestamp("2026-07-17T05:30:00Z", "start").unwrap();
+        let contract = contract("market-1", "BTCUSDT", event_start);
+        let mut update = json!({
+            "market_id": "market-1",
+            "condition_id": "0xcondition",
+            "symbol": "BTCUSDT",
+            "market_window_secs": 300,
+            "retrieved_at": "not-a-timestamp",
+            "market": {
+                "id": "market-1",
+                "conditionId": "0xcondition",
+                "question": "Bitcoin Up or Down - 5 minutes",
+                "slug": "btc-updown-5m-test",
+                "startDate": "2026-07-17T05:30:00Z",
+                "endDate": "2026-07-17T05:35:00Z",
+                "clobTokenIds": "[\"market-1-up\",\"market-1-down\"]",
+                "outcomes": "[\"Up\",\"Down\"]",
+                "resolutionSource": "https://data.chain.link/streams/btc-usd",
+                "makerBaseFee": 1000,
+                "takerBaseFee": 1000
+            }
+        });
+        let error = match metadata(update.as_object_mut().unwrap(), &contract, 1) {
+            Ok(_) => panic!("invalid retrieved_at should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid retrieved_at"));
     }
 }
