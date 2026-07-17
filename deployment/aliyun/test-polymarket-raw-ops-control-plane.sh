@@ -522,6 +522,96 @@ sed -n \
 # shellcheck source=/dev/null
 source "$rollback_evidence_helpers"
 
+# Exercise the public rollback branch through its filesystem/system boundaries.
+# Admission may recover markerless or pending evidence at the saved baseline,
+# but must reject any unrelated active release before mutation begins.
+manual_lineage_contract="$tmp_dir/manual-lineage-contract.sh"
+sed -n '/^if \[\[ \$mode == rollback \]\]; then$/,/^# Cutover depends/p' "$CUTOVER" \
+  | sed '$d' >"$manual_lineage_contract"
+[[ -s $manual_lineage_contract ]] || {
+  printf 'manual rollback lineage contract is missing\n' >&2
+  exit 1
+}
+lineage_root="$tmp_dir/manual-lineage"
+lineage_release_root="$lineage_root/releases"
+lineage_evidence_root="$lineage_root/evidence"
+lineage_active="$lineage_root/bin/polymarket-raw-ops"
+mkdir -p "$lineage_release_root" "$lineage_evidence_root" "${lineage_active%/*}"
+make_lineage_release() {
+  local label=$1 staging sha path
+  staging=$(mktemp "$lineage_root/release.XXXXXX")
+  printf '%s\n' "$label" >"$staging"
+  sha=$(sha256sum "$staging" | awk '{print $1}')
+  path="$lineage_release_root/$sha/polymarket-raw-ops"
+  mkdir -p "${path%/*}"
+  mv "$staging" "$path"
+  chmod +x "$path"
+  printf '%s\n' "$path"
+}
+lineage_candidate=$(make_lineage_release candidate)
+lineage_saved=$(make_lineage_release saved-baseline)
+lineage_third=$(make_lineage_release unrelated-third-release)
+lineage_candidate_sha=${lineage_candidate%/*}; lineage_candidate_sha=${lineage_candidate_sha##*/}
+lineage_saved_sha=${lineage_saved%/*}; lineage_saved_sha=${lineage_saved_sha##*/}
+make_lineage_evidence() {
+  local name=$1 marker_state=$2 evidence manifest_sha
+  evidence="$lineage_evidence_root/$name"
+  mkdir -p "$evidence/rollback"
+  jq -n --arg candidate "$lineage_candidate_sha" --arg saved "$lineage_saved" \
+    --arg saved_sha "$lineage_saved_sha" \
+    '{baseline_mode:"rust_release",candidate_sha256:$candidate,
+      active_symlink:{target:$saved,sha256:$saved_sha}}' >"$evidence/rollback/state.json"
+  (cd "$evidence/rollback" && sha256sum state.json >manifest.sha256)
+  if [[ $marker_state == pending ]]; then
+    manifest_sha=$(sha256sum "$evidence/rollback/manifest.sha256" | awk '{print $1}')
+    jq -n --arg candidate "$lineage_candidate_sha" --arg manifest "$manifest_sha" \
+      '{candidate_sha256:$candidate,rollback_manifest_sha256:$manifest}' \
+      >"$evidence/cutover.json"
+    (cd "$evidence" && sha256sum cutover.json >PASSED.rollback-pending.sha256)
+  fi
+  printf '%s\n' "$evidence"
+}
+exercise_manual_lineage() (
+  set -euo pipefail
+  local evidence=$1 active=$2 mutation_log=$1/mutations
+  EVIDENCE_ROOT=$lineage_evidence_root RELEASE_ROOT=$lineage_release_root
+  ACTIVE_BINARY=$lineage_active mode=rollback
+  set -- rollback "$evidence"
+  : >"$mutation_log"
+  rm -f "$ACTIVE_BINARY"
+  ln -s "$active" "$ACTIVE_BINARY"
+  secure_root_chain() { [[ -d $1 && ! -L $1 ]]; }
+  secure_release_directory() { [[ -d $1 && ! -L $1 ]]; }
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  prepare_rollback_evidence() { printf 'prepare\n' >>"$mutation_log"; }
+  restore_legacy() { printf 'restore\n' >>"$mutation_log"; }
+  finalize_rollback_evidence() { printf 'finalize\n' >>"$mutation_log"; }
+  die() { printf 'manual lineage rejected: %s\n' "$*" >&2; exit 1; }
+  # shellcheck source=/dev/null
+  source "$manual_lineage_contract"
+)
+markerless_lineage=$(make_lineage_evidence markerless none)
+exercise_manual_lineage "$markerless_lineage" "$lineage_saved" >/dev/null
+[[ $(<"$markerless_lineage/mutations") == $'prepare\nrestore\nfinalize' ]] || {
+  printf 'markerless rollback snapshot was not admitted\n' >&2
+  exit 1
+}
+pending_lineage=$(make_lineage_evidence pending-saved pending)
+exercise_manual_lineage "$pending_lineage" "$lineage_saved" >/dev/null
+[[ $(<"$pending_lineage/mutations") == $'prepare\nrestore\nfinalize' ]] || {
+  printf 'pending rollback rejected the exact saved baseline\n' >&2
+  exit 1
+}
+third_lineage=$(make_lineage_evidence pending-third pending)
+set +e
+exercise_manual_lineage "$third_lineage" "$lineage_third" >/dev/null 2>&1
+third_lineage_status=$?
+set -e
+[[ $third_lineage_status -ne 0 && ! -s $third_lineage/mutations ]] || {
+  printf 'manual rollback admitted an unrelated active release\n' >&2
+  exit 1
+}
+
 cutover_failure_cleanup="$tmp_dir/cutover-failure-cleanup.sh"
 sed -n '/^on_exit() {$/,/^}$/p' "$CUTOVER" >"$cutover_failure_cleanup"
 [[ -s $cutover_failure_cleanup ]] || {
@@ -710,6 +800,58 @@ set -e
   cd "$manual_failure_dir"
   sha256sum --check --strict PASSED.rolled-back.sha256 >/dev/null
 )
+
+restore_legacy_contract="$tmp_dir/restore-legacy-contract.sh"
+sed -n '/^restore_legacy() (/,/^)/p' "$CUTOVER" >"$restore_legacy_contract"
+[[ -s $restore_legacy_contract ]] || {
+  printf 'restore_legacy contract is missing\n' >&2
+  exit 1
+}
+exercise_restore_manifest_guard() (
+  set +e
+  evidence_dir=$1
+  rollback_dir=$evidence_dir/rollback
+  mutation_log=$evidence_dir/mutation.log
+  mkdir -p "$rollback_dir/control"
+  printf 'legacy health policy\n' >"$rollback_dir/control/polymarket-legacy-health-policy.jq"
+  printf '{}\n' >"$rollback_dir/state.json"
+  printf 'keep spool state\n' >"$rollback_dir/spool.keep"
+  (
+    cd "$rollback_dir"
+    sha256sum control/polymarket-legacy-health-policy.jq >manifest.sha256
+  )
+  jq -n --arg wrong "$(printf '0%.0s' {1..64})" \
+    '{rollback_manifest_sha256:$wrong}' >"$evidence_dir/cutover.json"
+  : >"$mutation_log"
+  secure_root_chain() { [[ -e $1 && ! -L $1 ]]; }
+  secure_regular_file() { [[ -f $1 && ! -L $1 ]]; }
+  clear_health_before_restart() { printf 'clear_health\n' >>"$mutation_log"; }
+  atomic_install() { printf 'atomic_install\n' >>"$mutation_log"; }
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$mutation_log"; return 0; }
+  rm() { printf 'rm %s\n' "$*" >>"$mutation_log"; return 0; }
+  verify_fresh_legacy_runtime() { printf 'verify_fresh_legacy_runtime\n' >>"$mutation_log"; return 0; }
+  verify_saved_unit_state() { printf 'verify_saved_unit_state\n' >>"$mutation_log"; return 0; }
+  die() {
+    printf 'restore manifest guard failed: %s\n' "$*" >&2
+    exit 1
+  }
+  # shellcheck source=/dev/null
+  source "$restore_legacy_contract"
+  restore_legacy "$evidence_dir" >/dev/null 2>&1
+)
+restore_guard_dir="$tmp_dir/restore-manifest-guard"
+mkdir "$restore_guard_dir"
+set +e
+exercise_restore_manifest_guard "$restore_guard_dir"
+restore_manifest_guard_status=$?
+set -e
+[[ $restore_manifest_guard_status -ne 0 \
+  && ! -s $restore_guard_dir/mutation.log \
+  && -f $restore_guard_dir/rollback/state.json \
+  && -f $restore_guard_dir/rollback/spool.keep ]] || {
+  printf 'restore_legacy mutated runtime or deleted saved state before manifest lineage validation\n' >&2
+  exit 1
+}
 
 legacy="$tmp_dir/legacy"
 rust="$tmp_dir/rust"
@@ -1586,6 +1728,42 @@ rollback_pending_dir_sync_line=$(grep -n '^    sync -f "$evidence_dir"' "$CUTOVE
   exit 1
 }
 
+restore_manifest_extract_line=$(grep -n \
+  "expected_manifest_sha=.*'\\.rollback_manifest_sha256'" "$CUTOVER" | cut -d: -f1)
+restore_manifest_compare_line=$(grep -n \
+  'actual_manifest_sha == "\$expected_manifest_sha"' "$CUTOVER" | cut -d: -f1)
+restore_first_stop_line=$(grep -n '^  systemctl stop "\$REFERENCE_UPLOAD_TIMER" "\$MARKET_UPLOAD_TIMER"$' \
+  "$CUTOVER" | cut -d: -f1)
+((restore_manifest_extract_line < restore_manifest_compare_line \
+  && restore_manifest_compare_line < restore_first_stop_line)) || {
+  printf 'restore_legacy can mutate runtime before validating rollback manifest lineage\n' >&2
+  exit 1
+}
+
+active_target_line=$(grep -n '^    active_target=$(readlink -f -- "\$ACTIVE_BINARY")$' "$CUTOVER" \
+  | cut -d: -f1)
+active_target_guard_line=$(grep -n \
+  'active_target == "\$RELEASE_ROOT"/\*/polymarket-raw-ops' "$CUTOVER" | cut -d: -f1)
+active_rm_line=$(grep -n '^    rm -f "\$ACTIVE_BINARY"$' "$CUTOVER" | cut -d: -f1)
+active_link_line=$(grep -n '^ln -s "\$candidate_binary" "\$temporary_link"$' "$CUTOVER" \
+  | cut -d: -f1)
+((active_target_line < active_target_guard_line \
+  && active_target_guard_line < active_rm_line \
+  && active_rm_line < active_link_line)) || {
+  printf 'cutover no longer proves active Rust symlink lineage before replacement\n' >&2
+  exit 1
+}
+
+if grep -Eq 'rm -[^[:space:]]* .*state\.json|unlink .*state\.json' "$CUTOVER"; then
+  printf 'cutover explicitly deletes rollback state JSON\n' >&2
+  exit 1
+fi
+if grep -Eq 'rm -[^[:space:]]* .*/data/monday/spool/polymarket-reference|unlink .*/data/monday/spool/polymarket-reference' \
+  "$CUTOVER"; then
+  printf 'cutover explicitly deletes the production spool\n' >&2
+  exit 1
+fi
+
 automatic_prepare_line=$(grep -n \
   '^    prepare_rollback_evidence "$evidence_dir" || {' "$CUTOVER" | cut -d: -f1)
 automatic_restore_line=$(grep -n '^    restore_legacy "$evidence_dir" >/dev/null$' "$CUTOVER" \
@@ -1680,7 +1858,9 @@ grep -Fq '"${control_assets[@]}" | LC_ALL=C sort' "$README"
 grep -Fq 'tar -tzf polymarket-raw-ops-control.tar.gz | LC_ALL=C sort' "$README"
 grep -Fq '"$control_dir"/polymarket-reference-{collector,upload}.service' "$README"
 grep -Fq 'flock -n /run/monday/polymarket-raw-ops.lock' "$README"
-grep -Fq 'sync -f /opt/monday/control/polymarket-raw-ops' "$README"
+grep -Fq 'sync -f "$candidate_control_parent"' "$README"
+grep -Fq 'pinned_control_dir="/opt/monday/releases/polymarket-raw-ops/$candidate_sha/control"' \
+  "$README"
 if grep -Fq 'deployment/aliyun/polymarket-reference-collector.service' "$README"; then
   printf 'README installs the production unit from a mutable checkout\n' >&2
   exit 1
@@ -1714,6 +1894,25 @@ cutover_transition_line=$(grep -n '^transition_started=true$' "$CUTOVER" | cut -
   printf 'cutover mutates runtime before revalidating the immutable release binding\n' >&2
   exit 1
 }
+rust_baseline_verify_line=$(grep -n '^  verify_rust_runtime "\$gate_baseline_release_path"' \
+  "$CUTOVER" | head -1 | cut -d: -f1)
+rust_snapshot_line=$(grep -n '^snapshot_legacy "\$rollback_dir" "\$baseline_mode"' \
+  "$CUTOVER" | cut -d: -f1)
+((rust_baseline_verify_line < rust_snapshot_line \
+  && rust_snapshot_line < cutover_transition_line)) || {
+  printf 'Rust cutover snapshots or mutates before proving the gated baseline\n' >&2
+  exit 1
+}
+candidate_link_line=$(grep -n '^ln -s "\$candidate_binary" "\$temporary_link"$' "$CUTOVER" | cut -d: -f1)
+candidate_controls_line=$(grep -n '^install_control_release "\$SCRIPT_DIR"$' "$CUTOVER" | cut -d: -f1)
+candidate_units_line=$(grep -n '^for asset in "\${UNIT_ASSETS\[@\]}"; do$' "$CUTOVER" | tail -1 | cut -d: -f1)
+((candidate_link_line < candidate_controls_line && candidate_controls_line < candidate_units_line)) || {
+  printf 'candidate release, controls, and units are not installed in the governed order\n' >&2
+  exit 1
+}
+grep -Fq '.control_modes[$asset]=$mode' "$CUTOVER"
+grep -Fq '.active_symlink={target:$path,sha256:$sha}' "$CUTOVER"
+grep -Fq 'verify_control_release "$CONTROL_DIR" "$rollback_sha" "$active_target"' "$CUTOVER"
 cutover_final_binding_line=$(grep -n '^verify_release_binding "\$RELEASE_MANIFEST"' "$CUTOVER" \
   | tail -1 | cut -d: -f1)
 cutover_success_marker_line=$(grep -n '^success_marker="\$evidence_dir/PASSED.sha256"$' \
