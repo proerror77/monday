@@ -606,8 +606,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
         },
         Command::Prediction { command } => match command {
-            PredictionCommand::Execute(args) => prediction_runner::execute(args),
-            PredictionCommand::Snapshot(args) => prediction_snapshot::snapshot(args),
+            PredictionCommand::Execute(args) => {
+                tokio::task::spawn_blocking(move || prediction_runner::execute(args))
+                    .await
+                    .context("prediction execution worker failed")?
+            }
+            PredictionCommand::Snapshot(args) => {
+                tokio::task::spawn_blocking(move || prediction_snapshot::snapshot(args))
+                    .await
+                    .context("prediction snapshot worker failed")?
+            }
         },
         Command::Candidate { command } => match command {
             CandidateCommand::List(args) => governance::candidate_list(args),
@@ -642,6 +650,32 @@ pub fn print_json(value: &impl serde::Serialize) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{OsStr, OsString};
+
+    static PREDICTION_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn mission_execute_runs_blocking_pipeline_outside_async_runtime() {
@@ -692,6 +726,94 @@ mod tests {
         assert!(
             format!("{error:#}")
                 .contains(&format!("failed to open local source {missing_features}")),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prediction_execute_runs_blocking_pipeline_outside_async_runtime() {
+        let _lock = PREDICTION_ENV_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let runner = root.path().join("unused-prediction-runner");
+        std::fs::write(&runner, b"unused").unwrap();
+        let _runner = EnvVarGuard::set("MONDAY_PREDICTION_RESEARCH_BIN", &runner);
+        let missing_mission = root.path().join("missing-mission.json");
+        let cli = Cli::try_parse_from([
+            OsString::from("alpha-harness"),
+            OsString::from("prediction"),
+            OsString::from("execute"),
+            OsString::from("--work-dir"),
+            root.path().join("work").into_os_string(),
+            OsString::from("--mission-url"),
+            missing_mission.clone().into_os_string(),
+            OsString::from("--mission-sha256"),
+            OsString::from("a".repeat(64)),
+            OsString::from("--snapshot-url"),
+            root.path().join("missing-snapshot.zip").into_os_string(),
+            OsString::from("--snapshot-sha256"),
+            OsString::from("b".repeat(64)),
+            OsString::from("--result-put-url"),
+            root.path().join("results.zip").into_os_string(),
+        ])
+        .unwrap();
+
+        let error = run(cli).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "failed to open local source {}",
+                missing_mission.display()
+            )),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn prediction_snapshot_runs_blocking_pipeline_outside_async_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = PREDICTION_ENV_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let compiler = root.path().join("snapshot-compiler.sh");
+        std::fs::write(
+            &compiler,
+            format!(
+                r#"#!/bin/sh
+set -eu
+test "$1" = "--output-dir"
+mkdir -p "$2"
+printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"0123456789abcdef","snapshot_contract_hash":"sha256:{}"}}' > "$2/manifest.json"
+"#,
+                "1".repeat(64)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _compiler = EnvVarGuard::set("MONDAY_PREDICTION_SNAPSHOT_BIN", &compiler);
+        let published = root.path().join("published-snapshot.zip");
+        std::fs::write(&published, b"occupied").unwrap();
+        let cli = Cli::try_parse_from([
+            OsString::from("alpha-harness"),
+            OsString::from("prediction"),
+            OsString::from("snapshot"),
+            OsString::from("--work-dir"),
+            root.path().join("work").into_os_string(),
+            OsString::from("--result-put-url"),
+            published.clone().into_os_string(),
+            OsString::from("--"),
+            OsString::from("--start-date"),
+            OsString::from("2026-07-01"),
+        ])
+        .unwrap();
+
+        let error = run(cli).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "result destination already exists: {}",
+                published.display()
+            )),
             "unexpected error: {error:#}"
         );
     }
