@@ -1,5 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use hft_collector::polymarket_evidence_artifact::{
+    publish_polymarket_evidence, PolymarketEvidenceArtifactConfig,
+};
 use hft_collector::polymarket_parity::{verify_shadow_parity, ShadowParityConfig};
 use hft_collector::polymarket_raw::{
     run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
@@ -8,6 +11,7 @@ use hft_collector::polymarket_raw::{
 use hft_collector::polymarket_research_import::{
     validate_research_segments, ArtifactTriplet, ResearchSegmentValidationConfig,
 };
+use hft_collector::polymarket_research_normalize::PolymarketEvidenceConfig;
 use hft_collector::polymarket_upload::{run_upload, UploadConfig};
 use std::env;
 use std::path::PathBuf;
@@ -110,6 +114,27 @@ enum Command {
         reference_manifest: PathBuf,
         #[arg(long)]
         reference_success: PathBuf,
+    },
+    /// Publish validated BTC/SOL five-minute evidence as an immutable artifact.
+    PublishPolymarketEvidence {
+        #[arg(long)]
+        market_data: PathBuf,
+        #[arg(long)]
+        market_manifest: PathBuf,
+        #[arg(long)]
+        market_success: PathBuf,
+        #[arg(long)]
+        reference_data: PathBuf,
+        #[arg(long)]
+        reference_manifest: PathBuf,
+        #[arg(long)]
+        reference_success: PathBuf,
+        #[arg(long)]
+        event_start_gte: String,
+        #[arg(long)]
+        event_start_lt: String,
+        #[arg(long)]
+        output_root: PathBuf,
     },
 }
 
@@ -249,6 +274,39 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
+        Command::PublishPolymarketEvidence {
+            market_data,
+            market_manifest,
+            market_success,
+            reference_data,
+            reference_manifest,
+            reference_success,
+            event_start_gte,
+            event_start_lt,
+            output_root,
+        } => {
+            let report = publish_polymarket_evidence(&PolymarketEvidenceArtifactConfig {
+                evidence: PolymarketEvidenceConfig {
+                    segments: ResearchSegmentValidationConfig {
+                        market: ArtifactTriplet {
+                            data: market_data,
+                            manifest: market_manifest,
+                            success: market_success,
+                        },
+                        reference: ArtifactTriplet {
+                            data: reference_data,
+                            manifest: reference_manifest,
+                            success: reference_success,
+                        },
+                    },
+                    event_start_gte,
+                    event_start_lt,
+                },
+                output_root,
+            })?;
+            println!("{}", serde_json::to_string(&report)?);
+            Ok(())
+        }
     }
 }
 
@@ -279,5 +337,34 @@ mod tests {
             max_concurrent_trade_polls,
             ReferenceConfig::default().max_concurrent_trade_polls
         );
+    }
+
+    #[test]
+    fn publish_polymarket_evidence_cli_requires_a_bounded_window_and_output_root() {
+        let command = Cli::try_parse_from([
+            "polymarket-raw-ops",
+            "publish-polymarket-evidence",
+            "--market-data",
+            "/tmp/market",
+            "--market-manifest",
+            "/tmp/market.manifest",
+            "--market-success",
+            "/tmp/market.success",
+            "--reference-data",
+            "/tmp/reference",
+            "--reference-manifest",
+            "/tmp/reference.manifest",
+            "--reference-success",
+            "/tmp/reference.success",
+            "--event-start-gte",
+            "2026-07-17T05:30:00Z",
+            "--event-start-lt",
+            "2026-07-17T05:40:00Z",
+            "--output-root",
+            "/tmp/output",
+        ])
+        .expect("bounded normalizer CLI must parse")
+        .command;
+        assert!(matches!(command, Command::PublishPolymarketEvidence { .. }));
     }
 }
