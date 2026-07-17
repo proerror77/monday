@@ -40,11 +40,18 @@ pub struct PolymarketEvidenceArtifactConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishedPolymarketEvidenceDigests {
+    pub expected_content_sha256: String,
+    pub expected_manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PublishedPolymarketEvidence {
     pub schema: &'static str,
     pub data_path: PathBuf,
     pub manifest_path: PathBuf,
     pub success_path: PathBuf,
+    pub published_digests: PublishedPolymarketEvidenceDigests,
     pub evidence: PolymarketEvidenceReport,
 }
 
@@ -492,6 +499,7 @@ fn publish_normalized(
     let manifest_path = directory.join(format!("{data_name}.manifest.json"));
     let success_path = directory.join(format!("{data_name}._SUCCESS"));
     let manifest = manifest_bytes(&evidence.report, &data_name)?;
+    let manifest_sha256 = hex::encode(Sha256::digest(&manifest));
     let success = format!("{digest}\n");
     publish_triplet(
         &data_path,
@@ -508,6 +516,10 @@ fn publish_normalized(
         data_path,
         manifest_path,
         success_path,
+        published_digests: PublishedPolymarketEvidenceDigests {
+            expected_content_sha256: digest.clone(),
+            expected_manifest_sha256: manifest_sha256,
+        },
         evidence: evidence.report,
     })
 }
@@ -523,6 +535,8 @@ pub fn publish_polymarket_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::polymarket_research_import::{ResearchSegmentValidationReport, SegmentIdentity};
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
@@ -596,6 +610,74 @@ mod tests {
         let error = publish_triplet(&data, &manifest, &success, &triplet).unwrap_err();
         assert!(error.to_string().contains("differs from expected bytes"));
         assert_eq!(fs::read(data).unwrap(), b"changed\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn published_result_returns_digests_for_the_exact_triplet() {
+        fn segment(dataset: &str) -> SegmentIdentity {
+            SegmentIdentity {
+                schema: "monday.polymarket.raw.v1".into(),
+                venue: "polymarket".into(),
+                dataset: dataset.into(),
+                date: "2026-07-17".into(),
+                hour: "05".into(),
+                file: format!("{dataset}.ndjson.zst"),
+                bytes: 1,
+                sha256: "0".repeat(64),
+                events: 1,
+                start_sequence: 1,
+                end_sequence: 1,
+                sequence_gaps: 0,
+                start_recorded_at: "2026-07-17T05:00:00Z".into(),
+                end_recorded_at: "2026-07-17T05:00:01Z".into(),
+                source_file: format!("{dataset}.ndjson"),
+                replay_scope: "fixture".into(),
+                recording_policy: serde_json::json!({}),
+                record_id_versions: serde_json::json!(["v2"]),
+            }
+        }
+
+        let ndjson = b"{}\n{}\n{}\n{}\n{}\n".to_vec();
+        let content_sha256 = hex::encode(Sha256::digest(&ndjson));
+        let evidence = NormalizedPolymarketEvidence {
+            report: PolymarketEvidenceReport {
+                schema: "monday.polymarket.normalized_evidence.v1",
+                content_sha256: content_sha256.clone(),
+                content_bytes: u64::try_from(ndjson.len()).unwrap(),
+                rows: 5,
+                events: 1,
+                surface_counts: SURFACES
+                    .into_iter()
+                    .map(|surface| (surface.to_owned(), 1))
+                    .collect(),
+                event_start_gte: "2026-07-17T05:30:00Z".into(),
+                event_start_lt: "2026-07-17T05:35:00Z".into(),
+                symbols: ["BTCUSDT", "SOLUSDT"],
+                window_secs: 300,
+                event_selection: "event_start in [event_start_gte,event_start_lt)",
+                trust_boundary: "fixture",
+                validated_inputs: ResearchSegmentValidationReport {
+                    schema: "monday.polymarket.research_segment_validation.v1",
+                    market: segment("crypto_expiry"),
+                    reference: segment("crypto_expiry_reference"),
+                },
+            },
+            ndjson,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+
+        let published = publish_normalized(&root, evidence).unwrap();
+
+        assert_eq!(
+            published.published_digests.expected_content_sha256,
+            content_sha256
+        );
+        assert_eq!(
+            published.published_digests.expected_manifest_sha256,
+            hex::encode(Sha256::digest(fs::read(published.manifest_path).unwrap()))
+        );
     }
 
     #[cfg(target_os = "linux")]
