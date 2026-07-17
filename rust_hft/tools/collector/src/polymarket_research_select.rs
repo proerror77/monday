@@ -210,6 +210,10 @@ fn discover(
         if up_token == down_token {
             bail!("line {line}: discovery has duplicate outcome tokens");
         }
+        let price_to_beat = decimal_text(update.get("price_to_beat"), "price_to_beat")?;
+        if Decimal::from_str(&price_to_beat)? <= Decimal::ZERO {
+            bail!("line {line}: price_to_beat must be positive");
+        }
         let contract = SelectedContract {
             market_id: market_id.clone(),
             symbol: symbol.to_owned(),
@@ -217,7 +221,7 @@ fn discover(
             event_end,
             up_token,
             down_token,
-            price_to_beat: decimal_text(update.get("price_to_beat"), "price_to_beat")?,
+            price_to_beat,
             discovery_recorded_at: recorded_at.to_owned(),
             discovery_sequence: sequence,
             metadata: None,
@@ -546,6 +550,56 @@ mod tests {
             1
         )
         .is_err());
+    }
+
+    #[test]
+    fn discovery_rejects_non_positive_price_to_beat() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("market.ndjson");
+        let rows = [
+            json!({
+                "sequence": 0,
+                "recorded_at": "2026-07-17T05:29:00Z",
+                "update": {
+                    "kind": "event_discovered",
+                    "window_secs": 300,
+                    "symbol": "BTCUSDT",
+                    "end_time": "2026-07-17T05:35:00Z",
+                    "event_id": "btc-market",
+                    "up_token": "btc-up",
+                    "down_token": "btc-down",
+                    "price_to_beat": "0"
+                }
+            }),
+            json!({
+                "sequence": 1,
+                "recorded_at": "2026-07-17T05:29:01Z",
+                "update": {
+                    "kind": "event_discovered",
+                    "window_secs": 300,
+                    "symbol": "SOLUSDT",
+                    "end_time": "2026-07-17T05:35:00Z",
+                    "event_id": "sol-market",
+                    "up_token": "sol-up",
+                    "down_token": "sol-down",
+                    "price_to_beat": "100"
+                }
+            }),
+        ];
+        let tape = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, tape).unwrap();
+        let start = timestamp("2026-07-17T05:30:00Z", "start").unwrap();
+        let error = match discover(&path, start, start + Duration::seconds(WINDOW_SECS)) {
+            Ok(_) => panic!("non-positive price_to_beat should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("price_to_beat must be positive"));
     }
 
     #[test]
