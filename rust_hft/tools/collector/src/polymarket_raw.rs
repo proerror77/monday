@@ -11,8 +11,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -728,6 +730,56 @@ fn release_clean_file_cache(_file: &File) -> Result<()> {
     Ok(())
 }
 
+fn path_c_string(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("path contains a NUL byte: {}", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
+    let source = path_c_string(source)?;
+    let target = path_c_string(target)?;
+    // SAFETY: both C strings are NUL-terminated and live for the call.
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("no-clobber rename failed");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
+    let source = path_c_string(source)?;
+    let target = path_c_string(target)?;
+    // SAFETY: both C strings are NUL-terminated and live for the call.
+    if unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("no-clobber rename failed");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_noreplace(_source: &Path, _target: &Path) -> Result<()> {
+    bail!("atomic no-clobber rename is unsupported on this platform")
+}
+
 struct TapeWriter {
     spool_dir: PathBuf,
     active: PathBuf,
@@ -952,9 +1004,16 @@ impl TapeWriter {
     }
 
     fn rotate(&mut self, now: DateTime<Utc>) -> Result<()> {
-        let current = self.file.take().context("active tape is closed")?;
-        current.sync_all()?;
-        drop(current);
+        self.rotate_with_rename(now, rename_noreplace)
+    }
+
+    fn rotate_with_rename<F>(&mut self, now: DateTime<Utc>, mut rename: F) -> Result<()>
+    where
+        F: FnMut(&Path, &Path) -> Result<()>,
+    {
+        if self.file.is_none() {
+            bail!("active tape is closed");
+        }
         let staged = self
             .spool_dir
             .join(format!(".{ACTIVE_TAPE}.{}.rotate", random::<u64>()));
@@ -962,17 +1021,49 @@ impl TapeWriter {
             .create_new(true)
             .write(true)
             .open(&staged)?;
-        staged_file.sync_all()?;
+        if let Err(error) = staged_file.sync_all() {
+            drop(staged_file);
+            let cleanup = fs::remove_file(&staged);
+            return Err(anyhow!(
+                "failed to sync staged next tape: {error}; cleanup={cleanup:?}"
+            ));
+        }
         drop(staged_file);
+        if let Err(error) = self
+            .file
+            .as_ref()
+            .expect("active tape was checked above")
+            .sync_all()
+        {
+            let cleanup = fs::remove_file(&staged);
+            return Err(anyhow!(
+                "failed to sync active tape before rotation: {error}; cleanup={cleanup:?}"
+            ));
+        }
+        drop(self.file.take().expect("active tape was checked above"));
         let rotated = self.spool_dir.join(format!(
             "market-updates.{}.ndjson",
             now.format("%Y%m%dT%H%M%S%6f")
         ));
-        fs::rename(&self.active, &rotated)?;
-        if let Err(error) = fs::rename(&staged, &self.active) {
-            let rollback = fs::rename(&rotated, &self.active);
+        if let Err(error) = rename(&self.active, &rotated) {
+            let cleanup = fs::remove_file(&staged);
+            let directory_sync = File::open(&self.spool_dir).and_then(|file| file.sync_all());
+            let reopen = directory_sync
+                .is_ok()
+                .then(|| open_append(&self.active).map(|file| self.file = Some(file)));
             return Err(anyhow!(
-                "failed to publish next tape: {error}; rollback={rollback:?}"
+                "refusing to replace closed tape {}: {error:#}; cleanup={cleanup:?}; directory_sync={directory_sync:?}; reopen={reopen:?}",
+                rotated.display()
+            ));
+        }
+        if let Err(error) = rename(&staged, &self.active) {
+            let rollback = rename(&rotated, &self.active);
+            let cleanup = fs::remove_file(&staged);
+            let directory_sync = File::open(&self.spool_dir).and_then(|file| file.sync_all());
+            let reopen = (rollback.is_ok() && directory_sync.is_ok())
+                .then(|| open_append(&self.active).map(|file| self.file = Some(file)));
+            return Err(anyhow!(
+                "failed to publish next tape: {error}; rollback={rollback:?}; cleanup={cleanup:?}; directory_sync={directory_sync:?}; reopen={reopen:?}"
             ));
         }
         File::open(&self.spool_dir)?.sync_all()?;
@@ -3600,6 +3691,90 @@ mod tests {
             })
             .count();
         assert_eq!(rotated, 1);
+    }
+
+    #[test]
+    fn rotation_refuses_an_existing_closed_tape_without_clobbering_either_file() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let closed = root.path().join(format!(
+            "market-updates.{}.ndjson",
+            now.format("%Y%m%dT%H%M%S%6f")
+        ));
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(&[json!({"kind": "first"})], now)
+            .unwrap();
+        let active_before = fs::read(root.path().join(ACTIVE_TAPE)).unwrap();
+        fs::write(&closed, b"existing-closed-tape\n").unwrap();
+
+        let error = writer.rotate(now).unwrap_err();
+
+        assert!(error.to_string().contains("exist"));
+        assert_eq!(
+            fs::read(root.path().join(ACTIVE_TAPE)).unwrap(),
+            active_before
+        );
+        assert_eq!(fs::read(closed).unwrap(), b"existing-closed-tape\n");
+        assert!(
+            writer.file.is_some(),
+            "collision must reopen the active tape"
+        );
+        assert_eq!(
+            fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".rotate"))
+                .count(),
+            0
+        );
+        writer
+            .write_updates(&[json!({"kind": "second"})], now)
+            .unwrap();
+        assert_eq!(writer.sequence, 2);
+    }
+
+    #[test]
+    fn failed_next_tape_publish_rolls_back_without_leaking_stage_or_closing_writer() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(&[json!({"kind": "first"})], now)
+            .unwrap();
+        let active_before = fs::read(root.path().join(ACTIVE_TAPE)).unwrap();
+        let mut rename_calls = 0;
+
+        let error = writer
+            .rotate_with_rename(now, |source, target| {
+                rename_calls += 1;
+                if rename_calls == 2 {
+                    bail!("injected next-tape publish failure");
+                }
+                rename_noreplace(source, target)
+            })
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected next-tape publish failure"));
+        assert_eq!(rename_calls, 3);
+        assert_eq!(
+            fs::read(root.path().join(ACTIVE_TAPE)).unwrap(),
+            active_before
+        );
+        assert!(
+            writer.file.is_some(),
+            "rollback must reopen the active tape"
+        );
+        assert_eq!(
+            fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".rotate"))
+                .count(),
+            0
+        );
     }
 
     #[test]
