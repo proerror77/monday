@@ -61,9 +61,23 @@ watermark. The run was stopped and cannot authorize cutover.
 
 ## Decision
 
-The reviewed service envelope is `MemoryHigh=576M` and `MemoryMax=768M`. The
-576 MiB soft watermark leaves 65,028,096 bytes of headroom over the observed
-538,951,680-byte peak without raising the hard limit. On this 8 GB host,
+The initially reviewed service envelope was `MemoryHigh=576M` and
+`MemoryMax=768M`. That July 16 calibration left 65,028,096 bytes of headroom
+over the then-observed 538,951,680-byte peak without raising the hard limit.
+
+Three July 17 formal production gates against source revision
+`eb3ec638c99e763dd0db06843cefa9294aee56dd` invalidated that earlier soft-limit
+assumption without showing an OOM:
+
+- 2026-07-17 16:26:06 to 16:26:37 Asia/Shanghai: `MemoryPeak=586.1M`
+- 2026-07-17 16:27:07 to 16:27:38 Asia/Shanghai: `MemoryPeak=605.8M`
+- 2026-07-17 16:29:12 to 16:29:43 Asia/Shanghai: `MemoryPeak=601.9M`
+
+These runs failed because `memory.events high` increased while `MemoryMax=768M`
+remained untouched. The updated reviewed envelope is therefore
+`MemoryHigh=672M` and `MemoryMax=768M`. The new 672 MiB soft watermark restores
+roughly the same safety margin over the observed peak while preserving the
+existing hard limit and fail-closed gate semantics. On this 8 GB host,
 simultaneous production and shadow hard limits remain 1.5 GiB. This calibration
 does not replace promotion evidence: a new formal one-hour-plus-tail gate must
 still prove zero restarts, current health, 112/112 polls, zero priority backlog,

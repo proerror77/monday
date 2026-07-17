@@ -108,14 +108,16 @@ A separate OS-thread watchdog enforces the same wall-clock deadline across synch
 tape fsync and atomic state publication, where a cooperative Tokio timeout cannot
 preempt non-yielding work. Health evidence over that duration is rejected by the
 shadow gate.
-The 112-request budget and the collector units' 576MiB/768MiB memory high/max
+The 112-request budget and the collector units' 672MiB/768MiB memory high/max
 limits are a measured pair. A Tokyo cold-start probe covered all 112 priority
 markets in 31.425 seconds with zero priority backlog. The retired 384MiB high
 watermark prevented health publication, while a later formal shadow reached a
 538,951,680-byte peak and continued incrementing `memory.events high` under the
-512MiB watermark. The 576MiB watermark leaves measured headroom without changing
-the 768MiB hard limit. It is calibration, not promotion evidence: the formal gate
-still requires zero high/max/OOM events. The health policy
+512MiB watermark. July 17 formal gates then measured 586.1MiB, 605.8MiB, and
+601.9MiB cold-start peaks under the former 576MiB watermark without reaching
+`MemoryMax=768M` or recording an OOM. The 672MiB watermark restores measured
+headroom without changing that hard limit. It is calibration, not promotion
+evidence: the formal gate still requires zero high/max/OOM events. The health policy
 pins the budget so a later default drift cannot silently invalidate that evidence.
 Both reference units reserve up to 80% of one CPU so observed collector work can
 complete before the same 180-second fail-closed deadline; the quota does not relax
