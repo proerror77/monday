@@ -225,8 +225,8 @@ fn contract_rows(
         insert(
             &mut value,
             json!({
-                "up_token_id": contract.up_token,
-                "down_token_id": contract.down_token,
+                "source_token_ids": metadata.tokens,
+                "source_outcomes": metadata.outcomes,
                 "price_to_beat": contract.price_to_beat,
                 "resolution_source": metadata.resolution_source,
                 "metadata_retrieved_at": metadata.retrieved_at,
@@ -288,13 +288,6 @@ fn trade_rows(
                 pending.line
             );
         }
-        let semantic_outcome = if token == contract.up_token {
-            "Up"
-        } else if token == contract.down_token {
-            "Down"
-        } else {
-            bail!("line {}: trade token has no semantic outcome", pending.line)
-        };
         let trade_ts = required(&pending.update, "trade_ts")?.to_owned();
         let mut value = base(contract, "polymarket_trade");
         insert(
@@ -303,7 +296,6 @@ fn trade_rows(
                 "record_id": record_id,
                 "record_id_version": "v2",
                 "token_id": token,
-                "outcome": semantic_outcome,
                 "source_outcome": outcome,
                 "outcome_index": index,
                 "side": required(&pending.update, "side")?,
@@ -430,16 +422,10 @@ fn market_rows(
                 if source_ts < contract.event_start || source_ts >= contract.event_end {
                     return Ok(());
                 }
-                let outcome = if token == contract.up_token {
-                    "Up"
-                } else {
-                    "Down"
-                };
                 let mut value = base(contract, "orderbook_snapshot");
                 insert(
                     &mut value,
                     json!({
-                        "outcome": outcome,
                         "token_id": token,
                         "ts": required(update, "ts")?,
                         "recorded_at": recorded_at,
