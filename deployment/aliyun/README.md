@@ -260,18 +260,26 @@ tar --no-same-owner --no-same-permissions \
 )
 ```
 
-Install the binary and the exact control bundle from the same reviewed revision
-through the release workflow. Never combine a candidate binary with control assets
-from another revision or replace a production unit manually:
+Stage the exact control bundle from the same reviewed revision without replacing
+the active global controls. The shadow gate pins that bundle under the candidate's
+immutable release; only cutover may install it globally. Never combine a candidate
+binary with control assets from another revision or replace a production unit
+manually:
 
 ```bash
+candidate_control_dir="/opt/monday/candidates/polymarket-raw-ops/$release_manifest_sha"
 sudo install -d -o root -g root -m 0755 /run/monday
 sudo flock -n /run/monday/polymarket-raw-ops.lock \
-  bash -s -- "$control_dir" "$artifact_dir" <<'ROOT_INSTALL'
+  bash -s -- "$control_dir" "$artifact_dir" "$candidate_control_dir" <<'ROOT_INSTALL'
 set -euo pipefail
 control_dir=$1
 artifact_dir=$2
-install -d -o root -g root -m 0755 /opt/monday/control/polymarket-raw-ops
+candidate_control_dir=$3
+candidate_control_parent=${candidate_control_dir%/*}
+[[ ! -e $candidate_control_dir && ! -L $candidate_control_dir ]]
+install -d -o root -g root -m 0755 "$candidate_control_parent"
+staging=$(mktemp -d "$candidate_control_parent/.new.XXXXXX")
+trap '[[ -z ${staging:-} ]] || rm -rf -- "$staging"' EXIT
 install -o root -g root -m 0644 \
   "$control_dir"/polymarket-{legacy,rust}-health-policy.jq \
   "$control_dir"/polymarket-shadow-gate-policy.jq \
@@ -279,18 +287,24 @@ install -o root -g root -m 0644 \
   "$control_dir"/polymarket-reference-{collector,upload}.service \
   "$control_dir"/polymarket-reference-upload.timer \
   "$control_dir"/polymarket-market-tape-upload.{service,timer} \
-  /opt/monday/control/polymarket-raw-ops/
+  "$staging"/
 install -o root -g root -m 0755 \
   "$control_dir"/polymarket-raw-ops-{shadow-gate,cutover}.sh \
-  /opt/monday/control/polymarket-raw-ops/
+  "$staging"/
 install -o root -g root -m 0444 \
   "$artifact_dir/polymarket-raw-ops-release.json" \
-  /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-release.json
-sync -f /opt/monday/control/polymarket-raw-ops
+  "$staging/polymarket-raw-ops-release.json"
+chmod 0755 "$staging"
+mv "$staging" "$candidate_control_dir"
+staging=
+sync -f "$candidate_control_parent"
 ROOT_INSTALL
 
-sudo /opt/monday/control/polymarket-raw-ops/polymarket-raw-ops-shadow-gate.sh \
-  "$artifact_dir/polymarket-raw-ops" "$candidate_sha" "$source_revision"
+gate_json=$(sudo "$candidate_control_dir/polymarket-raw-ops-shadow-gate.sh" \
+  "$artifact_dir/polymarket-raw-ops" "$candidate_sha" "$source_revision")
+pinned_control_dir="/opt/monday/releases/polymarket-raw-ops/$candidate_sha/control"
+sudo "$pinned_control_dir/polymarket-raw-ops-cutover.sh" \
+  cutover "$candidate_sha" "$gate_json"
 ```
 
 The Rust shadow unit must complete its configured observation window and publish
@@ -299,15 +313,16 @@ the candidate binary digest, source revision, symbol set, settled market payload
 and upload readback. Any stale health, missing symbol, sequence gap, or identity
 mismatch blocks promotion. Live execution remains disabled; this lane only collects
 and archives public market data.
-The gate freezes the legacy writer's PID and current systemd restart counter at
-start and requires both to remain unchanged. A nonzero historical counter from the
+The gate detects either the legacy Python writer or the active immutable Rust
+release, then freezes its PID and current systemd restart counter. A nonzero
+historical counter from the
 unit's scheduled six-hour `RuntimeMaxSec` refresh is valid evidence; any increment
-during shadow or before cutover fails the migration. After the legacy writer is
+during shadow or before cutover fails the upgrade. After the baseline writer is
 stopped, cutover explicitly resets the inherited counter and requires the new Rust
 process to remain at zero for post-start verification.
 PID and `NRestarts` are not sufficient across the final stop boundary, so the gate
 also freezes each unit's systemd `InvocationID`. Immediately before stopping the
-shadow or legacy writer, the control captures a synced journal cursor; after the
+shadow or baseline writer, the control captures a synced journal cursor; after the
 stop it scans only records after that cursor, rejects evidence of a new invocation
 or restart, and rechecks the frozen restart counter. This closes the race between
 the final live identity check and `systemctl stop`.
