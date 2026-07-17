@@ -117,6 +117,9 @@ watermark prevented health publication, while a later formal shadow reached a
 the 768MiB hard limit. It is calibration, not promotion evidence: the formal gate
 still requires zero high/max/OOM events. The health policy
 pins the budget so a later default drift cannot silently invalidate that evidence.
+Both reference units reserve up to 80% of one CPU so observed collector work can
+complete before the same 180-second fail-closed deadline; the quota does not relax
+the deadline, completeness checks, or any execution boundary.
 The host, cgroup pressure, invocation IDs, and control probes are recorded in
 `docs/reports/polymarket-shadow-memory-calibration-2026-07-16.md`.
 The shadow gate allows a separate 60-second initial-health grace after that
