@@ -38,6 +38,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 
 ### Unified Monday prediction research control plane (2026-07-16)
 
+- [x] Bind immutable Polymarket evidence to external content and manifest SHA-256 anchors before semantic consumption.
 - [x] Promote snapshot, prediction LoopRun, and event evaluator to precompiled
   Monday binaries; remove runtime `cargo run --example` and research-policy
   coupling to the legacy OMS/runtime workspace.

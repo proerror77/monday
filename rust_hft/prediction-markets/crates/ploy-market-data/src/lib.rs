@@ -15,6 +15,7 @@ pub mod feeds;
 mod gamma_keyset;
 #[cfg(feature = "live")]
 pub mod pm_trades;
+pub mod polymarket_evidence;
 #[cfg(feature = "live")]
 pub mod predict_fun;
 #[cfg(feature = "live")]
