@@ -40,6 +40,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 
 - [x] Verify sealed Polymarket evidence into semantic read-only typed projections.
 - [x] Bind immutable Polymarket evidence to external content and manifest SHA-256 anchors before semantic consumption.
+- [x] Project verified Polymarket evidence into availability-safe research carriers without replaying discovery metadata or settlement labels before observation.
 - [x] Promote snapshot, prediction LoopRun, and event evaluator to precompiled
   Monday binaries; remove runtime `cargo run --example` and research-policy
   coupling to the legacy OMS/runtime workspace.
