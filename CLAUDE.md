@@ -1,4 +1,7 @@
 # Repository Instructions
+
+@AGENTS.md
+
 ## Architecture
 
 The current system is a Rust-first bounded Loop Engineer research/control plane plus a separately owned deterministic Rust trading runtime.

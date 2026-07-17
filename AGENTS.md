@@ -6,9 +6,32 @@
   irreversible, or genuinely ambiguous action.
 - Verify claims from repository, runtime, or deployed-state evidence. Preserve
   unrelated user changes.
-- Use the narrowest applicable engineering workflow: triage for intake,
-  diagnosing-bugs for root cause, tdd for behavior changes, implement for an
-  approved change, and code-review before merge.
+- Prefer the installed Matt Pocock engineering skills. Use the narrowest match:
+  `to-prd` for product definition, `triage` for intake, `diagnosing-bugs` for
+  root cause, `tdd` for behavior changes, `implement` for an approved change,
+  and `code-review` before merge.
+- Do not default to Superpowers or require the user to name a Matt skill. Use
+  another installed skill only when it more directly matches the request or the
+  user explicitly asks for that workflow.
+
+## Karpathy-Inspired Coding Principles
+
+- **Think Before Coding.** State material assumptions explicitly. When ambiguity
+  would change behavior or scope, present the plausible interpretations and ask
+  rather than choosing silently. Surface tradeoffs and push back when a simpler
+  approach is sufficient.
+- **Simplicity First.** Prefer the minimum code that solves the requested
+  problem. Do not add speculative features, single-use abstractions,
+  unrequested flexibility, or handling for scenarios excluded by proven
+  invariants. Never simplify away validation, security, data-loss prevention,
+  or other trust-boundary checks.
+- **Surgical Changes.** Every changed line must trace to the request. Match the
+  existing style; do not refactor, reformat, or remove unrelated code. Remove
+  only the imports, variables, or functions made obsolete by the current change.
+- **Goal-Driven Execution.** Define success criteria before non-trivial work;
+  reproduce bugs with a focused test, preserve before/after checks for
+  refactors, and loop until focused validation passes. For multi-step work, use
+  a brief `step -> verification` plan.
 
 ## Pull Request Scope Guardrail
 
