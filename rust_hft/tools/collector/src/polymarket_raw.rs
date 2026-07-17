@@ -44,6 +44,22 @@ const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
 const SETTLEMENT_SUM_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
 
+struct ReferenceEndpoints {
+    gamma_markets: String,
+    gamma_market: String,
+    data_trades: String,
+}
+
+impl Default for ReferenceEndpoints {
+    fn default() -> Self {
+        Self {
+            gamma_markets: GAMMA_MARKETS_URL.to_owned(),
+            gamma_market: GAMMA_MARKET_URL.to_owned(),
+            data_trades: DATA_TRADES_URL.to_owned(),
+        }
+    }
+}
+
 const SYMBOL_ALIASES: [(&str, &[&str]); 7] = [
     ("BTCUSDT", &["BITCOIN", "BTC"]),
     ("ETHUSDT", &["ETHEREUM", "ETH"]),
@@ -1501,9 +1517,10 @@ fn trade_updates(
     symbol: &str,
     window_secs: u64,
     trades: Vec<Value>,
-    now: DateTime<Utc>,
+    cutoff_at: DateTime<Utc>,
+    received_at: DateTime<Utc>,
 ) -> (Vec<Value>, BTreeMap<String, u64>) {
-    let cutoff = now.timestamp() - config.market_lookback_secs;
+    let cutoff = cutoff_at.timestamp() - config.market_lookback_secs;
     let mut parsed = Vec::new();
     let mut malformed = BTreeMap::new();
     for trade in trades {
@@ -1600,7 +1617,7 @@ fn trade_updates(
             "outcome": trade.get("outcome"),
             "outcome_index": trade.get("outcomeIndex"),
             "source": "polymarket_data_api",
-            "received_at": iso_z(now),
+            "received_at": iso_z(received_at),
             "trade": null,
         });
         update
@@ -1655,6 +1672,8 @@ struct ReferenceCollector {
     state: CollectorState,
     writer: TapeWriter,
     http: reqwest::Client,
+    endpoints: ReferenceEndpoints,
+    clock: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     trade_request_started_at: tokio::sync::Mutex<Option<Instant>>,
     #[cfg(test)]
     trade_request_attempts_started_at: std::sync::Mutex<Vec<Instant>>,
@@ -1809,11 +1828,17 @@ impl ReferenceCollector {
             state,
             writer,
             http,
+            endpoints: ReferenceEndpoints::default(),
+            clock: Box::new(utc_now),
             trade_request_started_at: tokio::sync::Mutex::new(None),
             #[cfg(test)]
             trade_request_attempts_started_at: std::sync::Mutex::new(Vec::new()),
             last_success: Instant::now(),
         })
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        (self.clock)()
     }
 
     async fn get_json(&self, url: &str, params: &[(String, String)]) -> Result<Value> {
@@ -1921,7 +1946,9 @@ impl ReferenceCollector {
                 if let Some(cursor) = cursor.as_ref() {
                     params.push(("after_cursor".to_owned(), cursor.clone()));
                 }
-                let payload = self.get_json(GAMMA_MARKETS_URL, &params).await?;
+                let payload = self
+                    .get_json(&self.endpoints.gamma_markets, &params)
+                    .await?;
                 cursor = discovery.append_page(
                     lane,
                     &payload,
@@ -1948,7 +1975,7 @@ impl ReferenceCollector {
         for offset in [0_u64, 10_000] {
             let payload = self
                 .get_json_rate_limited(
-                    DATA_TRADES_URL,
+                    &self.endpoints.data_trades,
                     &[
                         ("market".to_owned(), condition_id.to_owned()),
                         ("limit".to_owned(), "10000".to_owned()),
@@ -1976,7 +2003,7 @@ impl ReferenceCollector {
 
     async fn collect_once(&mut self) -> Result<Value> {
         let cycle_started = Instant::now();
-        let now = utc_now();
+        let now = self.now();
         let retrieved_at = iso_z(now);
         let mut updates = PendingUpdates::new(&self.config.spool_dir)?;
         let mut errors = Vec::new();
@@ -2044,7 +2071,7 @@ impl ReferenceCollector {
         let fetcher = &*self;
         let mut market_detail_fetches = stream::iter(market_detail_plan.selected.iter())
             .map(|market_id| async move {
-                let url = format!("{GAMMA_MARKET_URL}/{market_id}");
+                let url = format!("{}/{market_id}", fetcher.endpoints.gamma_market);
                 (market_id.clone(), fetcher.get_json(&url, &[]).await)
             })
             .buffer_unordered(self.config.max_concurrent_trade_polls)
@@ -2172,7 +2199,8 @@ impl ReferenceCollector {
                 Some(((*market_id).clone(), condition_id))
             }))
             .map(move |(market_id, condition_id)| async move {
-                (market_id, fetcher.fetch_trades(&condition_id).await)
+                let result = fetcher.fetch_trades(&condition_id).await;
+                (market_id, (result, fetcher.now()))
             })
             .buffer_unordered(self.config.max_concurrent_trade_polls)
             .collect::<Vec<_>>()
@@ -2243,9 +2271,10 @@ impl ReferenceCollector {
                     && trade_poll_plan.selected.contains(market_id)
                 {
                     trade_polls += 1;
-                    let trade_fetch = trade_fetches.remove(market_id).ok_or_else(|| {
-                        anyhow!("selected trade market {market_id} has no scheduled fetch")
-                    })?;
+                    let (trade_fetch, trade_received_at) =
+                        trade_fetches.remove(market_id).ok_or_else(|| {
+                            anyhow!("selected trade market {market_id} has no scheduled fetch")
+                        })?;
                     match trade_fetch {
                         Ok((trades, truncated, non_object_rows)) => {
                             successful_trade_polls += 1;
@@ -2258,6 +2287,7 @@ impl ReferenceCollector {
                                 target.window_secs,
                                 trades,
                                 now,
+                                trade_received_at,
                             );
                             if non_object_rows > 0 {
                                 *malformed.entry("non_object_trade".to_owned()).or_default() +=
@@ -2358,14 +2388,15 @@ impl ReferenceCollector {
 
         let records_written = updates.len();
         let record_types = updates.record_types();
-        updates.replay(&mut self.writer, now)?;
+        let recorded_at = self.now();
+        updates.replay(&mut self.writer, recorded_at)?;
         if missing_target_symbols.is_empty() {
             next_state.context_seed_hour = Some(target_hour);
         }
         self.state = next_state;
         atomic_write_json(&self.state_path, &self.state)?;
         self.last_success = Instant::now();
-        let completed_at = iso_z(utc_now());
+        let completed_at = iso_z(self.now());
         let cycle_duration_ms =
             u64::try_from(cycle_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -2776,10 +2807,139 @@ mod tests {
             300,
             vec![valid_trade(trade_timestamp)],
             recorded_at,
+            recorded_at,
         );
         assert!(malformed.is_empty());
         assert_eq!(updates.len(), 1);
         updates.pop().unwrap()
+    }
+
+    #[tokio::test]
+    async fn collect_once_stamps_trade_batch_after_its_network_response() {
+        use std::io::Read as _;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let cycle_started_at = fixed_time("2026-07-18T00:00:00Z");
+        let lookback_secs = 7_200;
+        let retention_edge_at = cycle_started_at - TimeDelta::seconds(lookback_secs - 5);
+        let trade_source_at = cycle_started_at + TimeDelta::seconds(5);
+        let post_fetch_at = cycle_started_at + TimeDelta::seconds(10);
+        let trade_response_started = Arc::new(AtomicBool::new(false));
+        let server_trade_response_started = Arc::clone(&trade_response_started);
+        let discovery = serde_json::to_vec(&json!({
+            "markets": [market(
+                "Bitcoin Up or Down - 5 minutes",
+                "2026-07-18T00:00:00Z",
+                "2026-07-18T00:05:00Z",
+            )],
+            "next_cursor": "",
+        }))
+        .unwrap();
+        let trades = serde_json::to_vec(&json!([
+            valid_trade(retention_edge_at.timestamp()),
+            valid_trade(trade_source_at.timestamp()),
+        ]))
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut requests = Vec::new();
+            while requests.len() < 3 && Instant::now() < deadline {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                connection.set_nonblocking(false).unwrap();
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut chunk = [0_u8; 1_024];
+                    let bytes = connection.read(&mut chunk).unwrap();
+                    assert!(bytes > 0, "HTTP request ended before its headers");
+                    request.extend_from_slice(&chunk[..bytes]);
+                    assert!(
+                        request.len() <= 16_384,
+                        "HTTP request headers are unbounded"
+                    );
+                }
+                let request = std::str::from_utf8(&request).unwrap();
+                let request_line = request.lines().next().unwrap_or_default();
+                let (kind, body) = if request_line.starts_with("GET /trades?") {
+                    ("trade", &trades)
+                } else if request_line.starts_with("GET /markets/keyset?") {
+                    ("discovery", &discovery)
+                } else {
+                    panic!("unexpected test request: {request_line}");
+                };
+                requests.push(kind);
+                if kind == "trade" {
+                    server_trade_response_started.store(true, AtomicOrdering::SeqCst);
+                }
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                connection.write_all(body).unwrap();
+                connection.flush().unwrap();
+            }
+            assert_eq!(requests, ["discovery", "discovery", "trade"]);
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            market_lookback_secs: lookback_secs,
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+        let clock_trade_response_started = Arc::clone(&trade_response_started);
+        collector.clock = Box::new(move || {
+            if clock_trade_response_started.load(AtomicOrdering::SeqCst) {
+                post_fetch_at
+            } else {
+                cycle_started_at
+            }
+        });
+
+        collector.collect_once().await.unwrap();
+        server.join().unwrap();
+        let rows = fs::read_to_string(temp.path().join(ACTIVE_TAPE)).unwrap();
+        let trades = rows
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["update"]["kind"] == "polymarket_trade")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            trades.len(),
+            2,
+            "post-fetch arrival time must not move the cycle-start retention cutoff"
+        );
+        let trade = trades
+            .iter()
+            .find(|row| row["update"]["trade_ts_unix"] == trade_source_at.timestamp())
+            .expect("cycle must archive the fetched trade after cycle start");
+
+        assert!(trade_source_at > cycle_started_at);
+        assert!(trade_source_at < post_fetch_at);
+        assert_eq!(trade["update"]["received_at"], iso_z(post_fetch_at));
+        assert_eq!(trade["recorded_at"], iso_z(post_fetch_at));
     }
 
     #[tokio::test]
@@ -3704,6 +3864,7 @@ mod tests {
                 malformed,
             ],
             now,
+            now,
         );
         assert_eq!(updates.len(), 2);
         assert_ne!(updates[0]["record_id"], updates[1]["record_id"]);
@@ -3719,6 +3880,7 @@ mod tests {
             "BTCUSDT",
             300,
             vec![valid_trade(now.timestamp())],
+            now,
             now,
         );
         assert!(again.is_empty());
