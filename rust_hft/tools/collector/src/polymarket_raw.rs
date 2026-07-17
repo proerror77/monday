@@ -2162,7 +2162,7 @@ mod tests {
     }
 
     #[test]
-    fn systemd_memory_envelope_covers_measured_polymarket_cold_start() {
+    fn systemd_reference_resource_envelope_is_pinned() {
         const UNITS: [&str; 2] = [
             include_str!("../../../../deployment/aliyun/polymarket-reference-collector.service"),
             include_str!(
@@ -2180,12 +2180,23 @@ mod tests {
             values[0].strip_suffix('M').unwrap().parse::<u64>().unwrap()
         }
 
+        fn cpu_quota_percent(unit: &str) -> u64 {
+            let values = unit
+                .lines()
+                .filter_map(|line| line.strip_prefix("CPUQuota="))
+                .collect::<Vec<_>>();
+            assert_eq!(values.len(), 1, "CPUQuota must have one assignment");
+            values[0].strip_suffix('%').unwrap().parse::<u64>().unwrap()
+        }
+
         for unit in UNITS {
             let high = memory_limit_mebibytes(unit, "MemoryHigh");
             let maximum = memory_limit_mebibytes(unit, "MemoryMax");
+            let cpu_quota = cpu_quota_percent(unit);
             assert_eq!(high, 576);
             assert_eq!(maximum, 768);
             assert!(high < maximum);
+            assert_eq!(cpu_quota, 80);
         }
     }
 
