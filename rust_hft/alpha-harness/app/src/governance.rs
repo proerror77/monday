@@ -1100,6 +1100,11 @@ mod tests {
                 fee_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.0,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
             },
             EvaluationLabelSpecV1 {
                 horizon_buckets: 1,

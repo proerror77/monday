@@ -864,6 +864,11 @@ mod tests {
                         fee_bps: 1.0,
                         funding_bps: 0.0,
                         latency_bps: 0.5,
+                        slippage_bps: 0.0,
+                        cross_spread: false,
+                        position_notional_usd: 0.0,
+                        capacity_depth_levels: 0,
+                        max_book_depth_fraction: 0.0,
                         label_horizon_buckets: 1,
                         observation_frequency_millis: 60_000,
                     },
@@ -895,6 +900,7 @@ mod tests {
                 max_drawdown: 0.01,
                 net_sharpe: 1.0,
                 raw_score: 2.0,
+                max_book_depth_fraction: None,
             })
             .collect::<Vec<_>>();
         let predictive = PredictiveMetrics::from_folds(
@@ -920,6 +926,11 @@ mod tests {
                 fee_bps: 1.0,
                 funding_bps: 0.0,
                 latency_bps: 0.5,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
             },
             EvaluationLabelSpecV1 {
                 horizon_buckets: 1,
@@ -1583,6 +1594,11 @@ mod tests {
                 fee_bps: 0.0,
                 funding_bps: 0.0,
                 latency_bps: 0.0,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
                 label_horizon_buckets: 1,
                 observation_frequency_millis: 60_000,
             },

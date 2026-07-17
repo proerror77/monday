@@ -213,6 +213,21 @@ pub struct ValidationArgs {
     pub funding_bps: f64,
     #[arg(long, default_value_t = 0.5)]
     pub latency_bps: f64,
+    /// Additional adverse execution slippage charged per unit of turnover.
+    #[arg(long, default_value_t = 0.0)]
+    pub slippage_bps: f64,
+    /// Model taker execution by charging half of each row's observed spread_bps.
+    #[arg(long, default_value_t = false)]
+    pub cross_spread: bool,
+    /// Gross USD notional represented by a unit position; zero disables capacity checks.
+    #[arg(long, default_value_t = 0.0)]
+    pub position_notional_usd: f64,
+    /// Number N in the bid_depth_topN/ask_depth_topN capacity features.
+    #[arg(long, default_value_t = 0)]
+    pub capacity_depth_levels: usize,
+    /// Maximum fraction of observed same-side top-N depth consumed by one position change.
+    #[arg(long, default_value_t = 0.0)]
+    pub max_book_depth_fraction: f64,
     #[arg(long)]
     pub label_horizon_buckets: usize,
     #[arg(long)]
@@ -242,6 +257,11 @@ impl ValidationArgs {
                 fee_bps: self.fee_bps,
                 funding_bps: self.funding_bps,
                 latency_bps: self.latency_bps,
+                slippage_bps: self.slippage_bps,
+                cross_spread: self.cross_spread,
+                position_notional_usd: self.position_notional_usd,
+                capacity_depth_levels: self.capacity_depth_levels,
+                max_book_depth_fraction: self.max_book_depth_fraction,
             },
             labels.clone(),
         )
@@ -631,6 +651,11 @@ mod tests {
             fee_bps: 1.0,
             funding_bps: 0.0,
             latency_bps: 0.5,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
             label_horizon_buckets: 5,
             observation_frequency_millis: 1_000,
         };
@@ -764,6 +789,63 @@ mod tests {
             "mission-1-recovered",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn parses_explicit_taker_execution_costs() {
+        let cli = Cli::try_parse_from([
+            "alpha-harness",
+            "mission",
+            "execute",
+            "--work-dir",
+            "work",
+            "--feature-url",
+            "features.jsonl",
+            "--materialization-url",
+            "materialization.json",
+            "--materialization-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--result-put-url",
+            "results.zip",
+            "--data-mission-id",
+            "data-1",
+            "--mission-id",
+            "mission-1",
+            "--engine",
+            "mcts",
+            "--feature-fields",
+            "book_imbalance",
+            "--fee-bps",
+            "2",
+            "--latency-bps",
+            "0.5",
+            "--slippage-bps",
+            "0.75",
+            "--cross-spread",
+            "--position-notional-usd",
+            "10000",
+            "--capacity-depth-levels",
+            "5",
+            "--max-book-depth-fraction",
+            "0.1",
+            "--label-horizon-buckets",
+            "5",
+            "--observation-frequency-millis",
+            "1000",
+        ])
+        .expect("explicit taker execution costs must be accepted");
+
+        let Command::Mission {
+            command: MissionCommand::Execute(args),
+        } = cli.command
+        else {
+            panic!("expected mission execute command")
+        };
+        assert_eq!(args.validation.slippage_bps, 0.75);
+        assert!(args.validation.cross_spread);
+        assert_eq!(args.validation.position_notional_usd, 10_000.0);
+        assert_eq!(args.validation.capacity_depth_levels, 5);
+        assert_eq!(args.validation.max_book_depth_fraction, 0.1);
     }
 
     #[test]
