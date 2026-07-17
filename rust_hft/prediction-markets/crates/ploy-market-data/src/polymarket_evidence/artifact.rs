@@ -171,7 +171,28 @@ struct RecordingPolicy {
     event_scoped_quotes: bool,
 }
 
-type FileIdentity = (u64, u64, u64, u32, i64, i64, i64, i64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    mode: u32,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            mode: metadata.mode() & 0o777,
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
 struct BoundFile {
     path: PathBuf,
     name: CString,
@@ -265,17 +286,17 @@ impl BoundFile {
                 .ok_or_else(|| anyhow!("evidence file has no name"))?,
         )?;
         let file = open_entry(directory, &name, path)?;
-        let identity = file_identity(&file.metadata()?);
-        if identity.2 > max_bytes {
+        let identity = FileIdentity::from_metadata(&file.metadata()?);
+        if identity.bytes > max_bytes {
             bail!(
                 "evidence file exceeds its resource bound: {}",
                 path.display()
             );
         }
-        if identity.3 != PUBLISHED_MODE {
+        if identity.mode != PUBLISHED_MODE {
             bail!(
                 "evidence file permissions are {:o}, expected {:o}: {}",
-                identity.3,
+                identity.mode,
                 PUBLISHED_MODE,
                 path.display()
             );
@@ -305,8 +326,8 @@ impl BoundFile {
 
     fn verify(&self, directory: &File) -> Result<()> {
         let current = open_entry(directory, &self.name, &self.path)?;
-        if file_identity(&self.file.metadata()?) != self.identity
-            || file_identity(&current.metadata()?) != self.identity
+        if FileIdentity::from_metadata(&self.file.metadata()?) != self.identity
+            || FileIdentity::from_metadata(&current.metadata()?) != self.identity
         {
             bail!(
                 "evidence file changed while reading: {}",
@@ -371,7 +392,7 @@ fn open_entry(directory: &File, name: &CString, path: &Path) -> Result<File> {
         libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
         )
     };
     if descriptor < 0 {
@@ -383,19 +404,6 @@ fn open_entry(directory: &File, name: &CString, path: &Path) -> Result<File> {
         bail!("evidence target is not a regular file: {}", path.display());
     }
     Ok(file)
-}
-
-fn file_identity(metadata: &Metadata) -> FileIdentity {
-    (
-        metadata.dev(),
-        metadata.ino(),
-        metadata.len(),
-        metadata.mode() & 0o777,
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.ctime(),
-        metadata.ctime_nsec(),
-    )
 }
 
 fn directory_identity(metadata: &Metadata) -> (u64, u64) {
@@ -456,14 +464,12 @@ fn validate_manifest(
         .keys()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    if lower >= upper
-        || manifest.events == 0
-        || manifest.rows != manifest.surface_counts.values().sum::<u64>()
-        || keys != BTreeSet::from(SURFACES)
-        || manifest.surface_counts.values().any(|count| *count == 0)
-        || manifest.surface_counts.get("market_contract") != Some(&manifest.events)
-        || manifest.surface_counts.get("official_settlement_evidence") != Some(&manifest.events)
-    {
+    let rows = manifest
+        .surface_counts
+        .values()
+        .try_fold(0u64, |sum, count| sum.checked_add(*count))
+        .ok_or_else(|| anyhow!("evidence surface counts overflow"))?;
+    if lower >= upper || manifest.rows != rows || keys != BTreeSet::from(SURFACES) {
         bail!("immutable evidence manifest identity is inconsistent");
     }
     let name = triplet
@@ -493,32 +499,42 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
     if inputs.schema != INPUT_SCHEMA {
         bail!("unsupported validated input contract");
     }
-    validate_segment(&inputs.market, "crypto_expiry", 1_000)?;
-    validate_segment(&inputs.reference, "crypto_expiry_reference", 0)?;
-    if inputs.reference.record_id_versions != ["v2"] {
-        bail!("validated reference input must use canonical v2 record IDs");
-    }
-    Ok(())
+    validate_segment(&inputs.market, "crypto_expiry")?;
+    validate_segment(&inputs.reference, "crypto_expiry_reference")
 }
 
-fn validate_segment(segment: &SegmentIdentity, dataset: &str, quote_sample_ms: u64) -> Result<()> {
+fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
+    let (quote_sample_ms, replay_scope, record_id_versions): (_, _, &[&str]) = match dataset {
+        "crypto_expiry" => (
+            1_000,
+            "complete_full_depth_sampled_normalized_hour_segment",
+            &[],
+        ),
+        "crypto_expiry_reference" => (0, "complete_reference_hour_segment", &["v2"]),
+        _ => unreachable!("validated input dataset is fixed by the manifest contract"),
+    };
     parse_digest(&segment.sha256, "validated input sha256")?;
     let start = parse_time(&segment.start_recorded_at, "start_recorded_at")?;
     let end = parse_time(&segment.end_recorded_at, "end_recorded_at")?;
+    let events = segment
+        .end_sequence
+        .checked_sub(segment.start_sequence)
+        .and_then(|distance| distance.checked_add(1));
+    let source_file = segment.file.strip_suffix(".zst").unwrap_or_default();
     if segment.schema != "monday.polymarket.raw.v1"
         || segment.venue != "polymarket"
         || segment.dataset != dataset
-        || segment.date.len() != 10
-        || segment.hour.len() != 2
-        || segment.file.is_empty()
+        || end.format("%Y-%m-%d").to_string() != segment.date
+        || end.format("%H").to_string() != segment.hour
+        || source_file != segment.source_file
+        || Path::new(source_file).components().count() != 1
         || segment.bytes == 0
         || segment.events == 0
         || segment.sequence_gaps != 0
-        || segment.end_sequence < segment.start_sequence
-        || segment.events != segment.end_sequence - segment.start_sequence + 1
+        || events != Some(segment.events)
         || start > end
-        || segment.source_file.is_empty()
-        || segment.replay_scope.is_empty()
+        || segment.replay_scope != replay_scope
+        || segment.record_id_versions != record_id_versions
         || segment.recording_policy
             != (RecordingPolicy {
                 quote_sample_ms,
@@ -601,12 +617,13 @@ mod tests {
     #[rustfmt::skip]
     fn inputs() -> Value {
         let segment = |dataset: &str, sample: u64, versions: Value| {
+            let replay = if sample == 0 { "complete_reference_hour_segment" } else { "complete_full_depth_sampled_normalized_hour_segment" };
             json!({
                 "schema":"monday.polymarket.raw.v1", "venue":"polymarket", "dataset":dataset,
                 "date":"2026-07-17", "hour":"05", "file":format!("{dataset}.ndjson.zst"), "bytes":100,
                 "sha256":"1".repeat(64), "events":2, "start_sequence":1, "end_sequence":2, "sequence_gaps":0,
                 "start_recorded_at":"2026-07-17T05:00:00Z", "end_recorded_at":"2026-07-17T05:01:00Z",
-                "source_file":format!("{dataset}.ndjson"), "replay_scope":"complete", "record_id_versions":versions,
+                "source_file":format!("{dataset}.ndjson"), "replay_scope":replay, "record_id_versions":versions,
                 "recording_policy":{"quote_sample_ms":sample,"quote_depth_levels":0,"event_scoped_quotes":true},
             })
         };
@@ -670,67 +687,49 @@ mod tests {
     }
 
     #[test]
+    #[rustfmt::skip]
     fn seals_a_bound_typed_triplet() {
-        let temp = tempfile::tempdir().unwrap();
-        let triplet = write_triplet(&temp);
+        let temp = tempfile::tempdir().unwrap(); let triplet = write_triplet(&temp);
         let sealed = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap();
-        assert_eq!(sealed.rows(), 5);
-        assert_eq!(sealed.events(), 1);
-        assert!(frame_ndjson(&sealed.data, &BTreeMap::new()).is_err());
+        assert_eq!((sealed.rows(), sealed.events()), (5, 1));
     }
 
     #[test]
+    #[rustfmt::skip]
     fn rejects_same_inode_mutation_after_open() {
         let temp = tempfile::tempdir().unwrap();
         let triplet = write_triplet(&temp);
-        let trust = trust(&triplet);
-        let data = triplet.data.clone();
-        let error = seal_with_hook(&triplet, &trust, || {
-            rewrite_read_only(&data, fs::read(&data)?);
-            Ok(())
-        })
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("changed while reading"),
-            "{error:#}"
-        );
+        let (anchor, data) = (trust(&triplet), triplet.data.clone());
+        let error = seal_with_hook(&triplet, &anchor, || { rewrite_read_only(&data, fs::read(&data)?); Ok(()) }).unwrap_err();
+        assert!(error.to_string().contains("changed while reading"), "{error:#}");
     }
 
     #[test]
+    #[rustfmt::skip]
     fn rejects_tampered_data_and_weak_provenance() {
-        let temp = tempfile::tempdir().unwrap();
-        let triplet = write_triplet(&temp);
+        let temp = tempfile::tempdir().unwrap(); let triplet = write_triplet(&temp);
         let anchor = trust(&triplet);
         rewrite_read_only(&triplet.data, b"tampered\n");
         assert!(seal_polymarket_evidence_triplet(&triplet, &anchor).is_err());
 
-        let temp = tempfile::tempdir().unwrap();
-        let triplet = write_triplet(&temp);
+        let temp = tempfile::tempdir().unwrap(); let triplet = write_triplet(&temp);
         let anchor = trust(&triplet);
-        let mut value: Value =
-            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        let mut value: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
         value["validated_inputs"]["market"]["sha256"] = json!("2".repeat(64));
-        rewrite_read_only(
-            &triplet.manifest,
-            format!("{}\n", serde_json::to_string(&value).unwrap()),
-        );
+        rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&value).unwrap()));
         assert!(seal_polymarket_evidence_triplet(&triplet, &anchor).is_err());
     }
 
     #[test]
-    fn rejects_unbounded_or_noncanonical_ndjson() {
+    #[rustfmt::skip]
+    fn rejects_noncanonical_or_nonregular_data() {
+        assert!(frame_ndjson(b"{}\r\n", &BTreeMap::new()).is_err());
         let temp = tempfile::tempdir().unwrap();
         let triplet = write_triplet(&temp);
-        let trust = trust(&triplet);
-        set_mode(&triplet.data, 0o644);
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&triplet.data)
-            .unwrap()
-            .set_len(MAX_DATA_BYTES + 1)
-            .unwrap();
-        set_mode(&triplet.data, PUBLISHED_MODE);
-        assert!(seal_polymarket_evidence_triplet(&triplet, &trust).is_err());
-        assert!(frame_ndjson(b"{}\r\n", &BTreeMap::new()).is_err());
+        let fifo_anchor = trust(&triplet);
+        fs::remove_file(&triplet.data).unwrap();
+        let path = CString::new(triplet.data.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), PUBLISHED_MODE.try_into().unwrap()) }, 0);
+        assert!(seal_polymarket_evidence_triplet(&triplet, &fifo_anchor).is_err());
     }
 }

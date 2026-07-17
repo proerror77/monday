@@ -6,7 +6,7 @@ input:Cargo.toml=sha256:fbcd5c33c246ade9700e461e9fd62c1f56f3af262ac67d8206a29b4d
 input:crates/ploy-research/Cargo.toml=sha256:1215f293ae9a79f63e2d88feea7ddf64b9e999a0cf974f25d49c2c6461bd29b8
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
-input:crates/ploy-market-data/Cargo.toml=sha256:5316340ef49fe6626284ffb706252b28fb87e29e9acff53bffc3f6b486fce78e
+input:crates/ploy-market-data/Cargo.toml=sha256:4f3c213c3d8283de4672b7c2de6f9c9c30d12db11bb8460495f5ebf09225b2bd
 package:allocator-api2@0.2.21|source=registry+https://github.com/rust-lang/crates.io-index|checksum=683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923|features=alloc
 package:anyhow@1.0.102|source=registry+https://github.com/rust-lang/crates.io-index|checksum=7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c|features=default,std
 package:arrayvec@0.7.6|source=registry+https://github.com/rust-lang/crates.io-index|checksum=7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50|features=std
