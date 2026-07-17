@@ -201,6 +201,46 @@ if verify_release_manifest "$release_manifest_dir/multiple.json" 2>/dev/null; th
 fi
 )
 
+# Exercise the Rust-only wrapper around the established systemd identity check.
+baseline_identity_contract="$tmp_dir/verify-baseline-identity.sh"
+sed -n '/^verify_baseline_identity() {$/,/^}$/p' "$GATE" >"$baseline_identity_contract"
+exercise_rust_baseline_identity() (
+  set -euo pipefail
+  RUST_ACTIVE_BINARY="$tmp_dir/active" baseline_mode=rust_release legacy_pid=42
+  RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference'
+  legacy_restarts=1 legacy_invocation_id=$(printf '1%.0s' {1..32})
+  baseline_release_sha=$(printf '9%.0s' {1..64})
+  baseline_release_path="$tmp_dir/$baseline_release_sha/polymarket-raw-ops"
+  mkdir -p "${baseline_release_path%/*}"
+  printf 'test\n' >"$baseline_release_path"; chmod +x "$baseline_release_path"
+  mock_active=$baseline_release_path mock_proc=$baseline_release_path
+  mock_digest=true mock_runtime=true
+  verify_runtime_identity() { [[ $mock_runtime == true ]]; }
+  verify_legacy_identity() { return 1; }
+  secure_release_directory() { return 0; }
+  secure_control_file() { return 0; }
+  readlink() {
+    [[ $3 == "$RUST_ACTIVE_BINARY" ]] && printf '%s\n' "$mock_active" \
+      || printf '%s\n' "$mock_proc"
+  }
+  sha256sum() { cat >/dev/null; [[ $mock_digest == true ]]; }
+  # shellcheck source=/dev/null
+  source "$baseline_identity_contract"
+  verify_baseline_identity
+  for drift in active proc digest runtime; do
+    mock_active=$baseline_release_path mock_proc=$baseline_release_path
+    mock_digest=true mock_runtime=true
+    case "$drift" in
+      active) mock_active=/tmp/wrong ;;
+      proc) mock_proc=/tmp/wrong ;;
+      digest) mock_digest=false ;;
+      runtime) mock_runtime=false ;;
+    esac
+    verify_baseline_identity && { printf 'accepted %s baseline drift\n' "$drift" >&2; exit 1; }
+  done
+)
+exercise_rust_baseline_identity
+
 # Both controls must carry the same root-chain contract. Run it with deterministic
 # stat/direct-directory doubles so these macOS-hosted tests cover Linux ownership
 # semantics without requiring local root-owned fixtures.
@@ -819,6 +859,7 @@ jq \
   '. + {
     schema:"monday.polymarket_shadow_gate.v1",
     candidate_sha256:$candidate,
+    baseline_mode:"legacy_python",
     deployment_bundle_sha256:$bundle,
     deployment_source_revision:$source,
     release_manifest_sha256:$release_manifest_sha,
@@ -1116,7 +1157,42 @@ if jq -e -f "$POLICY" "$tmp_dir/shadow-once-cmdline.json" >/dev/null; then
   printf 'gate policy accepted a Rust shadow --once command line\n' >&2
   exit 1
 fi
-
+baseline_sha=$(printf '9%.0s' {1..64})
+jq --arg baseline "$baseline_sha" '.baseline_mode = "rust_release"
+  | .legacy_runtime += {
+      exec_start:"/opt/monday/bin/polymarket-raw-ops collect-reference",
+      cmdline:"/opt/monday/bin/polymarket-raw-ops collect-reference",
+      cmdline_sha256:"7b06db4beb374f013a090e023289f8b026f39c324ee527f194b706656f6a1f94",
+      fragment_path:"/etc/systemd/system/polymarket-reference-collector.service",
+      drop_in_paths:[],
+      main_pid:12,restarts:0,invocation_id:("1" * 32),
+      release_sha256:$baseline,
+      release_path:("/opt/monday/releases/polymarket-raw-ops/" + $baseline + "/polymarket-raw-ops"),
+      proc_exe:("/opt/monday/releases/polymarket-raw-ops/" + $baseline + "/polymarket-raw-ops")
+    }
+' "$tmp_dir/gate.json" >"$tmp_dir/rust-release-gate.json"
+jq -e -f "$POLICY" "$tmp_dir/rust-release-gate.json" >/dev/null
+while IFS='|' read -r name filter; do
+  jq "$filter" "$tmp_dir/rust-release-gate.json" >"$tmp_dir/rust-release-$name.json"
+  if jq -e -f "$POLICY" "$tmp_dir/rust-release-$name.json" >/dev/null; then
+    printf 'rust release gate accepted %s drift\n' "$name" >&2
+    exit 1
+  fi
+done <<'EOF'
+release_path|.legacy_runtime.release_path = "/tmp/polymarket-raw-ops"
+release_sha|.legacy_runtime.release_sha256 = "not-a-digest"
+proc_exe|.legacy_runtime.proc_exe = "/tmp/polymarket-raw-ops"
+candidate_equals_baseline|.candidate_sha256 = .legacy_runtime.release_sha256
+EOF
+jq '.legacy_runtime += {
+    release_sha256:("'"$baseline_sha"'"),
+    release_path:("/opt/monday/releases/polymarket-raw-ops/" + "'"$baseline_sha"'" + "/polymarket-raw-ops"),
+    proc_exe:("/opt/monday/releases/polymarket-raw-ops/" + "'"$baseline_sha"'" + "/polymarket-raw-ops")
+  }' "$tmp_dir/gate.json" >"$tmp_dir/legacy-mixed-rust-fields.json"
+if jq -e -f "$POLICY" "$tmp_dir/legacy-mixed-rust-fields.json" >/dev/null; then
+  printf 'gate policy accepted legacy baseline evidence with Rust-only release fields\n' >&2
+  exit 1
+fi
 jq -n '{
   updated_at:"2026-07-15T00:00:01Z",last_success_at:"2026-07-15T00:00:01Z",
   target_markets:14,api_errors:[],malformed_trade_rows:0,
@@ -1543,11 +1619,11 @@ manual_exit_line=$(grep -n '^  exit 0$' "$CUTOVER" | head -1 | cut -d: -f1)
 }
 
 market_upload_line=$(grep -n '^market_upload_json=' "$GATE" | cut -d: -f1)
-legacy_final_line=$(grep -n 'verify_legacy_identity "$legacy_pid"' "$GATE" \
+baseline_final_line=$(grep -n 'verify_baseline_identity' "$GATE" \
   | tail -1 | cut -d: -f1)
 oss_final_line=$(grep -n 'verify_current_oss_config' "$GATE" | tail -1 | cut -d: -f1)
-((legacy_final_line > market_upload_line && oss_final_line > market_upload_line)) || {
-  printf 'gate does not revalidate legacy identity and OSS config after both uploads\n' >&2
+((baseline_final_line > market_upload_line && oss_final_line > market_upload_line)) || {
+  printf 'gate does not revalidate baseline identity and OSS config after both uploads\n' >&2
   exit 1
 }
 grep -Fq 'cd artifact' "$WORKFLOW"
@@ -1617,7 +1693,7 @@ grep -Fq 'deployment/aliyun/polymarket-raw-ops-cutover[.]sh:' "$CI_WORKFLOW"
 
 grep -Fq 'candidate CLI digest differs from the verified release manifest' "$GATE"
 grep -Fq 'source CLI revision differs from the verified release manifest' "$GATE"
-gate_final_binding_line=$(grep -n '^  verify_release_binding "\$RELEASE_MANIFEST"' "$GATE" \
+gate_final_binding_line=$(grep -n '^  verify_release_binding "\$pinned_release_manifest"' "$GATE" \
   | tail -1 | cut -d: -f1)
 gate_marker_line=$(grep -n '^  marker="\$evidence_dir/PASSED.sha256"$' "$GATE" \
   | cut -d: -f1)
