@@ -18,6 +18,8 @@ readonly PARITY_CUTOFF_LAG_SECONDS=60
 readonly SETTLEMENT_EVENT_LOOKBACK_SECONDS=900
 readonly LEGACY_UNIT=polymarket-reference-collector.service
 readonly LEGACY_EXEC='/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py'
+readonly RUST_PRODUCTION_EXEC='/opt/monday/bin/polymarket-raw-ops collect-reference'
+readonly RUST_ACTIVE_BINARY=/opt/monday/bin/polymarket-raw-ops
 readonly LEGACY_FRAGMENT=/etc/systemd/system/polymarket-reference-collector.service
 readonly SHADOW_FRAGMENT=/etc/systemd/system/polymarket-reference-collector-shadow@.service
 readonly LEGACY_SPOOL=/data/monday/spool/polymarket-reference
@@ -81,8 +83,9 @@ bounded_parity_window_start() {
 }
 
 bundle_sha256() {
+  local directory=${1:-$SCRIPT_DIR}
   (
-    cd "$SCRIPT_DIR"
+    cd "$directory"
     sha256sum "${BUNDLE_ASSETS[@]}" | sha256sum | awk '{print $1}'
   )
 }
@@ -195,7 +198,7 @@ verify_release_manifest() {
 verify_release_binding() {
   local manifest=$1 expected_manifest_sha=$2 expected_candidate_sha=$3
   local expected_source_revision=$4 expected_bundle_sha=$5 expected_archive_sha=$6
-  local candidate=$7
+  local candidate=$7 control_dir=${8:-$SCRIPT_DIR}
   verify_release_manifest "$manifest" || return 1
   [[ $(sha256sum "$manifest" | awk '{print $1}') == "$expected_manifest_sha" ]] \
     || return 1
@@ -209,7 +212,7 @@ verify_release_binding() {
     == "$expected_bundle_sha" ]] || return 1
   [[ $(jq -er -s '.[0].control_archive.sha256' "$manifest") \
     == "$expected_archive_sha" ]] || return 1
-  [[ $(bundle_sha256) == "$expected_bundle_sha" ]] || return 1
+  [[ $(bundle_sha256 "$control_dir") == "$expected_bundle_sha" ]] || return 1
   printf '%s  %s\n' "$expected_candidate_sha" "$candidate" \
     | sha256sum --check --strict >/dev/null
 }
@@ -251,8 +254,8 @@ verify_no_restart_after_cursor() {
     ' >/dev/null || return 1
 }
 
-verify_legacy_identity() {
-  local expected_pid=$1 expected_restarts=$2 expected_invocation_id=$3
+verify_runtime_identity() {
+  local expected_exec=$1 expected_pid=$2 expected_restarts=$3 expected_invocation_id=$4
   local pid restarts invocation_id fragment drop_ins exec_argv cmdline
   systemctl is-active --quiet "$LEGACY_UNIT" || return 1
   fragment=$(systemctl show --property=FragmentPath --value "$LEGACY_UNIT") || return 1
@@ -260,7 +263,7 @@ verify_legacy_identity() {
   drop_ins=$(systemctl show --property=DropInPaths --value "$LEGACY_UNIT") || return 1
   [[ -z $drop_ins ]] || return 1
   exec_argv=$(effective_exec_argv "$LEGACY_UNIT") || return 1
-  [[ $exec_argv == "$LEGACY_EXEC" ]] || return 1
+  [[ $exec_argv == "$expected_exec" ]] || return 1
   pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT") || return 1
   [[ $pid == "$expected_pid" ]] || return 1
   restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT") || return 1
@@ -268,7 +271,41 @@ verify_legacy_identity() {
   invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT") || return 1
   [[ $invocation_id == "$expected_invocation_id" ]] || return 1
   cmdline=$(proc_cmdline "$pid") || return 1
-  [[ $cmdline == "$LEGACY_EXEC " ]]
+  [[ $cmdline == "$expected_exec " ]]
+}
+
+verify_legacy_identity() {
+  verify_runtime_identity "$LEGACY_EXEC" "$@"
+}
+
+verify_baseline_identity() {
+  if [[ $baseline_mode == legacy_python ]]; then
+    verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id"
+    return
+  fi
+  verify_runtime_identity "$RUST_PRODUCTION_EXEC" "$legacy_pid" \
+    "$legacy_restarts" "$legacy_invocation_id" || return 1
+  [[ $(readlink -f -- "$RUST_ACTIVE_BINARY") == "$baseline_release_path" ]] \
+    || return 1
+  secure_release_directory "${baseline_release_path%/*}" || return 1
+  secure_control_file "$baseline_release_path"
+  [[ -x $baseline_release_path ]] || return 1
+  printf '%s  %s\n' "$baseline_release_sha" "$baseline_release_path" \
+    | sha256sum --check --strict >/dev/null || return 1
+  [[ $(readlink -f -- "/proc/$legacy_pid/exe") == "$baseline_release_path" ]]
+}
+
+verify_fresh_baseline_health() {
+  local health=$1 policy=${2:-$LEGACY_HEALTH_POLICY} field timestamp epoch now
+  [[ -f $health && ! -L $health ]] || return 1
+  jq -e -f "$policy" "$health" >/dev/null || return 1
+  now=$(date -u +%s) || return 1
+  for field in updated_at last_success_at; do
+    timestamp=$(jq -er --arg field "$field" \
+      '.[$field] | select(type == "string" and length > 0)' "$health") || return 1
+    epoch=$(date -u -d "$timestamp" +%s) || return 1
+    ((epoch <= now && now - epoch <= MAX_HEALTH_SILENCE_SECONDS)) || return 1
+  done
 }
 
 env_value() {
@@ -503,6 +540,28 @@ secure_root_chain /run/monday || die 'runtime control directory is not trusted'
 exec 9>"$LOCK_FILE"
 flock -n 9 || die 'another Polymarket release operation is running'
 
+baseline_exec=$(effective_exec_argv "$LEGACY_UNIT") || \
+  die 'active reference collector has no verifiable ExecStart'
+baseline_release_path=
+baseline_release_sha=
+case "$baseline_exec" in
+  "$LEGACY_EXEC")
+    baseline_mode=legacy_python
+    baseline_label=Python
+    ;;
+  "$RUST_PRODUCTION_EXEC")
+    baseline_mode=rust_release
+    baseline_label='Rust production'
+    baseline_release_path=$(readlink -f -- "$RUST_ACTIVE_BINARY") || \
+      die 'active Rust collector symlink cannot be resolved'
+    [[ $baseline_release_path =~ ^$RELEASE_ROOT/([a-f0-9]{64})/polymarket-raw-ops$ ]] \
+      || die 'active Rust collector does not resolve to an immutable release'
+    baseline_release_sha=${BASH_REMATCH[1]}
+    [[ $candidate_sha != "$baseline_release_sha" ]] || \
+      die 'candidate digest matches the active Rust release'
+    ;;
+  *) die 'active reference collector ExecStart is not an approved baseline' ;;
+esac
 legacy_pid=$(systemctl show --property=MainPID --value "$LEGACY_UNIT")
 [[ $legacy_pid =~ ^[1-9][0-9]*$ ]] || die 'active legacy collector has no verifiable MainPID'
 legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
@@ -511,8 +570,10 @@ legacy_restarts=$(systemctl show --property=NRestarts --value "$LEGACY_UNIT")
 legacy_invocation_id=$(systemctl show --property=InvocationID --value "$LEGACY_UNIT")
 [[ $legacy_invocation_id =~ ^[a-f0-9]{32}$ ]] \
   || die 'active legacy collector has no verifiable systemd invocation ID'
-verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
+verify_baseline_identity \
   || die 'active reference collector identity or restart counter is not exact'
+[[ $baseline_mode != rust_release ]] || verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" \
+  || die 'active Rust collector health is not fresh and fail-closed clean'
 
 gate_seconds=${MONDAY_POLYMARKET_GATE_SECONDS:-$MINIMUM_GATE_SECONDS}
 [[ $gate_seconds =~ ^[1-9][0-9]*$ ]] || die 'gate duration must be a positive integer'
@@ -533,6 +594,7 @@ cleanup() {
     systemctl stop "$shadow_unit" >/dev/null 2>&1 || true
   fi
   rm -rf "${staging:-}"
+  rm -rf "${control_staging:-}"
   rm -f "${shadow_env_file:-}" "${shadow_env_tmp:-}"
   exit "$status"
 }
@@ -562,6 +624,29 @@ secure_release_directory "$release_dir" \
   || die 'candidate release directory is not root-owned mode 0755'
 secure_control_file "$release_binary"
 [[ -x $release_binary ]] || die 'candidate release is not executable'
+release_control_dir="$release_dir/control"
+if [[ ! -e $release_control_dir && ! -L $release_control_dir ]]; then
+  control_staging=$(mktemp -d "$release_dir/.control.new.XXXXXX")
+  for asset in "${BUNDLE_ASSETS[@]}"; do
+    mode=0644; [[ $asset == *.sh ]] && mode=0755
+    install -m "$mode" "$SCRIPT_DIR/$asset" "$control_staging/$asset"
+  done
+  install -m 0444 "$RELEASE_MANIFEST" \
+    "$control_staging/${RELEASE_MANIFEST##*/}"
+  chmod 0755 "$control_staging"
+  mv "$control_staging" "$release_control_dir"
+  sync -f "$release_dir"
+fi
+secure_release_directory "$release_control_dir" \
+  || die 'candidate release control directory is not root-owned mode 0755'
+for asset in "${BUNDLE_ASSETS[@]}"; do
+  secure_control_file "$release_control_dir/$asset"
+done
+pinned_release_manifest="$release_control_dir/${RELEASE_MANIFEST##*/}"
+verify_release_binding "$pinned_release_manifest" "$release_manifest_sha" \
+  "$candidate_sha" "$source_revision" "$deployment_bundle_sha" \
+  "$control_archive_sha" "$release_binary" "$release_control_dir" \
+  || die 'candidate release controls differ from the verified release bundle'
 pinned_upload_env="$release_dir/polymarket-upload-env-$oss_config_sha.env"
 install_pinned_upload_env "$pinned_upload_env"
 
@@ -602,7 +687,7 @@ chmod 0644 "$shadow_env_tmp"
 mv "$shadow_env_tmp" "$shadow_env_file"
 shadow_env_tmp=
 
-install -m 0644 "$SERVICE_TEMPLATE" \
+install -m 0644 "$release_control_dir/${SERVICE_TEMPLATE##*/}" \
   /etc/systemd/system/polymarket-reference-collector-shadow@.service
 systemctl daemon-reload
 
@@ -639,8 +724,8 @@ parity_window_started_at=
 while :; do
   now_uptime=$SECONDS
   elapsed=$((now_uptime - start_uptime))
-  verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
-    || die 'legacy collector PID, restart count, or effective unit identity changed during gate'
+  verify_baseline_identity \
+    || die 'baseline collector PID, restart count, or effective unit identity changed during gate'
   shadow_pid=$(systemctl show --property=MainPID --value "$shadow_unit")
   [[ $shadow_pid =~ ^[1-9][0-9]*$ ]] || die 'Rust shadow has no MainPID'
   [[ $shadow_pid == "$initial_shadow_pid" ]] || die 'Rust shadow MainPID changed during gate'
@@ -655,7 +740,7 @@ while :; do
   if ((elapsed >= HEALTH_SETTLE_SECONDS)); then
     health="$shadow_spool/health.json"
     [[ -f $health && ! -L $health ]] || die 'Rust shadow health is missing'
-    jq -e -f "$RUST_HEALTH_POLICY" "$health" >/dev/null \
+    jq -e -f "$release_control_dir/${RUST_HEALTH_POLICY##*/}" "$health" >/dev/null \
       || die 'Rust shadow health is not fail-closed clean'
     current_health=$(jq -r '.updated_at' "$health")
     if [[ $current_health != "$last_health" ]]; then
@@ -666,21 +751,22 @@ while :; do
       || die 'Rust shadow health stopped advancing'
 
     legacy_health="$LEGACY_SPOOL/health.json"
-    [[ -f $legacy_health && ! -L $legacy_health ]] || die 'Python health is missing'
-    jq -e -f "$LEGACY_HEALTH_POLICY" "$legacy_health" >/dev/null \
-      || die 'Python health is not fail-closed clean during shadow'
+    [[ -f $legacy_health && ! -L $legacy_health ]] \
+      || die "$baseline_label health is missing"
+    jq -e -f "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" "$legacy_health" >/dev/null \
+      || die "$baseline_label health is not fail-closed clean during shadow"
     current_legacy_health=$(jq -r '.updated_at' "$legacy_health")
     if [[ $current_legacy_health != "$last_legacy_health" ]]; then
       last_legacy_health=$current_legacy_health
       last_legacy_health_change=$now_uptime
     fi
     ((now_uptime - last_legacy_health_change <= MAX_HEALTH_SILENCE_SECONDS)) \
-      || die 'Python health stopped advancing during shadow'
+      || die "$baseline_label health stopped advancing during shadow"
 
     rust_success_at=$(jq -er '.last_success_at | select(type == "string" and length > 0)' \
       "$health") || die 'Rust health has no last_success_at'
     legacy_success_at=$(jq -er '.last_success_at | select(type == "string" and length > 0)' \
-      "$legacy_health") || die 'Python health has no last_success_at'
+      "$legacy_health") || die "$baseline_label health has no last_success_at"
     rust_success_epoch=$(date -u -d "$rust_success_at" +%s) \
       || die 'Rust last_success_at is invalid'
     legacy_success_epoch=$(date -u -d "$legacy_success_at" +%s) \
@@ -689,7 +775,7 @@ while :; do
     ((rust_success_epoch <= now_epoch && now_epoch - rust_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
       || die 'Rust last_success_at is stale or from the future'
     ((legacy_success_epoch <= now_epoch && now_epoch - legacy_success_epoch <= MAX_HEALTH_SILENCE_SECONDS)) \
-      || die 'Python last_success_at is stale or from the future'
+      || die "$baseline_label last_success_at is stale or from the future"
     common_cutoff=$rust_success_epoch
     ((legacy_success_epoch < common_cutoff)) && common_cutoff=$legacy_success_epoch
     if [[ $test_only == false ]]; then
@@ -739,8 +825,8 @@ shadow_restarts=$(systemctl show --property=NRestarts --value "$shadow_unit")
   || die 'Rust shadow did not remain a single continuous process'
 verify_shadow_identity "$initial_shadow_pid" "$shadow_invocation_id" \
   || die 'final Rust shadow systemd identity differs from the gated candidate'
-verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
-  || die 'legacy collector identity changed before parity evidence was captured'
+verify_baseline_identity \
+  || die 'baseline collector identity changed before parity evidence was captured'
 shadow_exec_argv=$(effective_exec_argv "$shadow_unit") \
   || die 'could not capture the effective Rust shadow ExecStart'
 shadow_cmdline=$(proc_cmdline "$initial_shadow_pid") \
@@ -863,8 +949,13 @@ market_canonical_uploaded_segments=$(jq -er \
   <<<"$market_upload_json") \
   || die 'market-tape shadow uploader did not verify a canonical closed segment'
 
-verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
-  || die 'legacy collector identity changed while parity or OSS readback was running'
+if [[ $baseline_mode == legacy_python ]]; then
+  verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id"
+else
+  verify_baseline_identity
+fi || die 'baseline collector identity changed while parity or OSS readback was running'
+baseline_proc_exe=''
+[[ $baseline_mode != rust_release ]] || baseline_proc_exe=$(readlink -f -- "/proc/$legacy_pid/exe") || die 'could not capture the production Rust executable identity'
 verify_current_oss_config
 legacy_exec_argv=$(effective_exec_argv "$LEGACY_UNIT") \
   || die 'could not capture the effective legacy ExecStart'
@@ -890,6 +981,7 @@ jq \
   --arg oss_config_sha256 "$oss_config_sha" \
   --arg started_at "$started_at" \
   --arg completed_at "$completed_at" \
+  --arg baseline_mode "$baseline_mode" \
   --arg legacy_exec "$legacy_exec_argv" \
   --arg legacy_cmdline "$legacy_cmdline_argv" \
   --arg legacy_cmdline_sha256 "$legacy_cmdline_sha" \
@@ -898,6 +990,8 @@ jq \
   --argjson legacy_drop_in_paths "$legacy_drop_ins_json" \
   --argjson legacy_pid "$legacy_pid" \
   --argjson legacy_restarts "$legacy_restarts" \
+  --arg baseline_release_path "$baseline_release_path" \
+  --arg baseline_release_sha256 "$baseline_release_sha" --arg baseline_proc_exe "$baseline_proc_exe" \
   --arg shadow_exec "$shadow_exec_argv" \
   --arg shadow_cmdline "$shadow_cmdline_argv" \
   --arg shadow_invocation_id "$shadow_invocation_id" \
@@ -918,6 +1012,7 @@ jq \
   --argjson market_canonical_uploaded_segments "$market_canonical_uploaded_segments" \
   '. + {
     schema:"monday.polymarket_shadow_gate.v1",
+    baseline_mode:$baseline_mode,
     candidate_sha256:$candidate_sha256,
     deployment_bundle_sha256:$deployment_bundle_sha256,
     deployment_source_revision:$deployment_source_revision,
@@ -931,11 +1026,14 @@ jq \
     parity_window_started_at_unix:$parity_window_started_at_unix,
     parity_window_ended_at_unix:$parity_window_ended_at_unix,
     production_eligible:$production_eligible,
-    legacy_runtime:{exec_start:$legacy_exec,cmdline:$legacy_cmdline,
-      cmdline_sha256:$legacy_cmdline_sha256,
-      fragment_path:$legacy_fragment_path,drop_in_paths:$legacy_drop_in_paths,
-      main_pid:$legacy_pid,restarts:$legacy_restarts,
-      invocation_id:$legacy_invocation_id},
+    legacy_runtime:({exec_start:$legacy_exec,cmdline:$legacy_cmdline,
+        cmdline_sha256:$legacy_cmdline_sha256,
+        fragment_path:$legacy_fragment_path,drop_in_paths:$legacy_drop_in_paths,
+        main_pid:$legacy_pid,restarts:$legacy_restarts,
+        invocation_id:$legacy_invocation_id}
+      + if $baseline_mode == "rust_release" then
+          {release_path:$baseline_release_path,proc_exe:$baseline_proc_exe,
+            release_sha256:$baseline_release_sha256} else {} end),
     shadow_runtime:{exec_start:$shadow_exec,cmdline:$shadow_cmdline,
       fragment_path:$shadow_fragment_path,drop_in_paths:$shadow_drop_in_paths,
       main_pid:$shadow_pid,restarts:$shadow_restarts,
@@ -962,14 +1060,16 @@ sync "$gate_json"
 if [[ $production_eligible == true ]]; then
   secure_root_chain "$evidence_dir" \
     || die 'evidence directory trust changed before marker publication'
-  verify_release_binding "$RELEASE_MANIFEST" "$release_manifest_sha" \
+  verify_release_binding "$pinned_release_manifest" "$release_manifest_sha" \
     "$candidate_sha" "$source_revision" "$deployment_bundle_sha" \
-    "$control_archive_sha" "$release_binary" \
+    "$control_archive_sha" "$release_binary" "$release_control_dir" \
     || die 'release manifest, candidate, or installed control bundle changed during gate'
-  verify_legacy_identity "$legacy_pid" "$legacy_restarts" "$legacy_invocation_id" \
-    || die 'legacy collector identity changed before the gate marker was published'
+  verify_baseline_identity \
+    || die 'baseline collector identity changed before the gate marker was published'
+  [[ $baseline_mode != rust_release ]] || verify_fresh_baseline_health "$LEGACY_SPOOL/health.json" "$release_control_dir/${LEGACY_HEALTH_POLICY##*/}" \
+    || die 'active Rust collector health became stale before marker publication'
   verify_current_oss_config
-  jq -e -f "$GATE_POLICY" "$gate_json" >/dev/null \
+  jq -e -f "$release_control_dir/${GATE_POLICY##*/}" "$gate_json" >/dev/null \
     || die 'combined gate evidence failed the production policy'
   marker="$evidence_dir/PASSED.sha256"
   (

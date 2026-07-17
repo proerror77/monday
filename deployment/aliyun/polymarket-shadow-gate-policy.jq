@@ -1,6 +1,12 @@
 def sha256: type == "string" and test("^[a-f0-9]{64}$");
 def positive_integer: type == "number" and floor == . and . > 0;
 def nonnegative_integer: type == "number" and floor == . and . >= 0;
+def runtime_identity($exec; $digest):
+  .exec_start == $exec and .cmdline == $exec
+  and .cmdline_sha256 == $digest
+  and .fragment_path == "/etc/systemd/system/polymarket-reference-collector.service" and .drop_in_paths == []
+  and (.main_pid | positive_integer) and (.restarts | nonnegative_integer)
+  and (.invocation_id | type == "string" and test("^[a-f0-9]{32}$"));
 def nonnegative_sub($left; $right):
   if $left < $right then 0 else ($left - $right) end;
 
@@ -18,14 +24,27 @@ and (.parity_window_ended_at_unix - .parity_window_started_at_unix >= 601)
 and (.completed_at | type == "string" and (fromdateiso8601? | type == "number"))
 and .production_eligible == true
 and .passed == true
-and .legacy_runtime.exec_start == "/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py"
-and .legacy_runtime.cmdline == "/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py"
-and .legacy_runtime.cmdline_sha256 == "dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a"
-and .legacy_runtime.fragment_path == "/etc/systemd/system/polymarket-reference-collector.service"
-and .legacy_runtime.drop_in_paths == []
-and (.legacy_runtime.main_pid | positive_integer)
-and (.legacy_runtime.restarts | nonnegative_integer)
-and (.legacy_runtime.invocation_id | type == "string" and test("^[a-f0-9]{32}$"))
+and (
+  (
+    .baseline_mode == "legacy_python"
+    and (.legacy_runtime |
+      runtime_identity("/usr/bin/python3 /opt/monday/bin/polymarket_reference_collector.py";
+        "dffeb118d105e9312898460249f514eb982c20433cd20840ffb2107c64bbca4a")
+      and ([has("release_path"),has("release_sha256"),has("proc_exe")] | any | not))
+  )
+  or
+  (
+    .baseline_mode == "rust_release"
+    and (.legacy_runtime |
+      runtime_identity("/opt/monday/bin/polymarket-raw-ops collect-reference";
+        "7b06db4beb374f013a090e023289f8b026f39c324ee527f194b706656f6a1f94"))
+    and (.legacy_runtime.release_sha256 | sha256)
+    and .candidate_sha256 != .legacy_runtime.release_sha256
+    and .legacy_runtime.release_path == ("/opt/monday/releases/polymarket-raw-ops/"
+      + .legacy_runtime.release_sha256 + "/polymarket-raw-ops")
+    and .legacy_runtime.proc_exe == .legacy_runtime.release_path
+  )
+)
 and (
   .shadow_runtime.exec_start == (
     "/opt/monday/releases/polymarket-raw-ops/" + .candidate_sha256
