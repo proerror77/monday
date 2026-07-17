@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -182,117 +182,230 @@ fn tape_paths(spool: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn stable_file_bytes(path: &Path) -> Result<Vec<u8>> {
-    let mut last_reason = "file changed while being read".to_owned();
-    for _ in 0..5 {
-        let before = fs::symlink_metadata(path)?;
-        if before.file_type().is_symlink() || !before.is_file() {
-            bail!("tape is not a direct regular file: {}", path.display());
-        }
-        let expected = FileFingerprint::from_metadata(&before);
-        let mut file = File::open(path)?;
-        if FileFingerprint::from_metadata(&file.metadata()?) != expected {
-            last_reason = "tape identity changed while being opened".to_owned();
-            thread::sleep(Duration::from_millis(20));
-            continue;
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let after = FileFingerprint::from_metadata(&file.metadata()?);
-        if after != expected {
-            last_reason = "tape changed while being read".to_owned();
-            thread::sleep(Duration::from_millis(20));
-            continue;
-        }
-        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
-            last_reason = "tape ends with an incomplete record".to_owned();
-            thread::sleep(Duration::from_millis(20));
-            continue;
-        }
-        return Ok(bytes);
+fn parse_tape_row(
+    raw: &[u8],
+    path: &Path,
+    line_number: usize,
+    expected_sequence: &mut u64,
+) -> Result<TapeRow> {
+    if raw.is_empty() {
+        bail!("blank row in {}:{line_number}", path.display());
     }
-    bail!("{}: {last_reason}", path.display())
+    let row: Value = serde_json::from_slice(raw)
+        .with_context(|| format!("invalid JSON in {}:{line_number}", path.display()))?;
+    let object = row
+        .as_object()
+        .ok_or_else(|| anyhow!("non-object row in {}:{line_number}", path.display()))?;
+    let sequence = object
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("invalid sequence in {}:{line_number}", path.display()))?;
+    if sequence != *expected_sequence {
+        bail!(
+            "sequence gap in {}:{line_number} expected={} actual={sequence}",
+            path.display(),
+            *expected_sequence
+        );
+    }
+    *expected_sequence = expected_sequence
+        .checked_add(1)
+        .context("tape sequence overflow")?;
+    let recorded_at = parse_timestamp(object.get("recorded_at"))
+        .ok_or_else(|| anyhow!("invalid recorded_at in {}:{line_number}", path.display()))?;
+    let update = object
+        .get("update")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| anyhow!("invalid update in {}:{line_number}", path.display()))?;
+    let kind = update.get("kind").and_then(Value::as_str);
+    if !kind.is_some_and(|kind| KINDS.contains(&kind)) {
+        bail!("invalid update kind in {}:{line_number}", path.display());
+    }
+    Ok(TapeRow {
+        recorded_at,
+        update,
+    })
 }
 
-fn load_rows(spool: &Path) -> Result<(Vec<TapeRow>, usize, bool)> {
+fn stream_stable_rows(
+    path: &Path,
+    expected_fingerprint: Option<FileFingerprint>,
+    mut visit: impl FnMut(TapeRow) -> Result<()>,
+) -> Result<Option<FileFingerprint>> {
+    let before = fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        bail!("tape is not a direct regular file: {}", path.display());
+    }
+    let fingerprint = FileFingerprint::from_metadata(&before);
+    if expected_fingerprint.is_some_and(|expected| expected != fingerprint) {
+        return Ok(None);
+    }
+    let file = File::open(path)?;
+    if FileFingerprint::from_metadata(&file.metadata()?) != fingerprint {
+        return Ok(None);
+    }
+
+    let mut reader = BufReader::new(file);
+    let mut raw = Vec::new();
+    let mut line_number = 0_usize;
+    let mut expected_sequence = 0_u64;
+    loop {
+        raw.clear();
+        let bytes_read = reader.read_until(b'\n', &mut raw)?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        if raw.last() != Some(&b'\n') {
+            return Ok(None);
+        }
+        raw.pop();
+        let row = match parse_tape_row(&raw, path, line_number, &mut expected_sequence) {
+            Ok(row) => row,
+            Err(error) => {
+                if FileFingerprint::from_metadata(&reader.get_ref().metadata()?) != fingerprint {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = visit(row) {
+            if FileFingerprint::from_metadata(&reader.get_ref().metadata()?) != fingerprint {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    }
+    if FileFingerprint::from_metadata(&reader.get_ref().metadata()?) != fingerprint {
+        return Ok(None);
+    }
+    Ok(Some(fingerprint))
+}
+
+fn retain_primary_row(
+    row: &TapeRow,
+    started_at: i64,
+    ended_at: i64,
+    trade_event_window_end: i64,
+) -> Result<bool> {
+    if row.recorded_at > ended_at {
+        return Ok(false);
+    }
+    match row.update.get("kind").and_then(Value::as_str) {
+        Some("market_metadata") => {
+            let market = row.update["market"]
+                .as_object()
+                .context("metadata market is not an object")?;
+            let end_epoch = parse_timestamp(market.get("endDate"))
+                .or_else(|| parse_timestamp(market.get("endDateIso")))
+                .context("metadata has no valid end time")?;
+            Ok(
+                (started_at.saturating_sub(900)..=ended_at.saturating_add(900))
+                    .contains(&end_epoch),
+            )
+        }
+        Some("polymarket_trade") => {
+            let timestamp = row
+                .update
+                .get("trade_ts_unix")
+                .and_then(Value::as_i64)
+                .context("trade has an invalid trade_ts_unix")?;
+            Ok((started_at..=trade_event_window_end).contains(&timestamp))
+        }
+        Some("market_settlement") => {
+            let event_window_start =
+                nonnegative_epoch_sub(started_at, SETTLEMENT_EVENT_LOOKBACK_SECONDS);
+            if row.recorded_at < event_window_start {
+                return Ok(false);
+            }
+            let market_id = row
+                .update
+                .get("market_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .context("settlement has an empty market_id")?;
+            let end_epoch = market_end_epoch(&row.update, &format!("settlement {market_id}"))?;
+            let event_window_end = nonnegative_epoch_sub(ended_at, SETTLEMENT_MATURITY_LAG_SECONDS);
+            Ok((event_window_start..=event_window_end).contains(&end_epoch))
+        }
+        _ => unreachable!("stream_stable_rows validates update kinds"),
+    }
+}
+
+fn load_rows(
+    spool: &Path,
+    started_at: i64,
+    ended_at: i64,
+    trade_event_window_end: i64,
+) -> Result<(Vec<TapeRow>, usize, bool)> {
+    let mut last_reason = "spool changed while reading parity window".to_owned();
     for _ in 0..5 {
         let paths = tape_paths(spool)?;
         let mut rows = Vec::new();
-        let mut closed_count = 0_usize;
-        let mut active_present = false;
+        let mut fingerprints = Vec::with_capacity(paths.len());
+        let mut retry = false;
         for path in &paths {
-            let active = path.file_name().and_then(|name| name.to_str()) == Some(ACTIVE_TAPE);
-            active_present |= active;
-            closed_count += usize::from(!active);
-            let bytes = stable_file_bytes(path)?;
-            let mut expected_sequence = 0_u64;
-            let lines = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-            for (line_index, raw) in lines.iter().enumerate() {
-                if raw.is_empty() {
-                    if line_index + 1 == lines.len() {
-                        continue;
+            let fingerprint = stream_stable_rows(path, None, |row| {
+                if retain_primary_row(&row, started_at, ended_at, trade_event_window_end)? {
+                    rows.push(row);
+                }
+                Ok(())
+            })?;
+            let Some(fingerprint) = fingerprint else {
+                last_reason = format!("{} changed during first pass", path.display());
+                retry = true;
+                break;
+            };
+            fingerprints.push(fingerprint);
+        }
+        if retry || tape_paths(spool)? != paths {
+            last_reason = "spool changed while enumerating tapes".to_owned();
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        let trade_market_ids = rows
+            .iter()
+            .filter(|row| row.update["kind"] == "polymarket_trade")
+            .filter_map(|row| row.update.get("market_id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let mut trade_metadata = BTreeMap::<String, TapeRow>::new();
+        for (path, fingerprint) in paths.iter().zip(fingerprints.iter().copied()) {
+            let stable = stream_stable_rows(path, Some(fingerprint), |row| {
+                if row.recorded_at <= ended_at && row.update["kind"] == "market_metadata" {
+                    let market_id = row
+                        .update
+                        .get("market_id")
+                        .and_then(Value::as_str)
+                        .filter(|market_id| trade_market_ids.contains(*market_id))
+                        .map(str::to_owned);
+                    if let Some(market_id) = market_id {
+                        metadata_contract(&row.update)?;
+                        trade_metadata.insert(market_id, row);
                     }
-                    bail!("blank row in {}:{}", path.display(), line_index + 1);
                 }
-                let row: Value = serde_json::from_slice(raw).with_context(|| {
-                    format!("invalid JSON in {}:{}", path.display(), line_index + 1)
-                })?;
-                let object = row.as_object().ok_or_else(|| {
-                    anyhow!("non-object row in {}:{}", path.display(), line_index + 1)
-                })?;
-                let sequence = object
-                    .get("sequence")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| {
-                        anyhow!("invalid sequence in {}:{}", path.display(), line_index + 1)
-                    })?;
-                if sequence != expected_sequence {
-                    bail!(
-                        "sequence gap in {}:{} expected={expected_sequence} actual={sequence}",
-                        path.display(),
-                        line_index + 1
-                    );
-                }
-                expected_sequence = expected_sequence
-                    .checked_add(1)
-                    .context("tape sequence overflow")?;
-                let recorded_at = parse_timestamp(object.get("recorded_at")).ok_or_else(|| {
-                    anyhow!(
-                        "invalid recorded_at in {}:{}",
-                        path.display(),
-                        line_index + 1
-                    )
-                })?;
-                let update = object
-                    .get("update")
-                    .filter(|value| value.is_object())
-                    .cloned()
-                    .ok_or_else(|| {
-                        anyhow!("invalid update in {}:{}", path.display(), line_index + 1)
-                    })?;
-                let kind = update.get("kind").and_then(Value::as_str);
-                if !kind.is_some_and(|kind| KINDS.contains(&kind)) {
-                    bail!(
-                        "invalid update kind in {}:{}",
-                        path.display(),
-                        line_index + 1
-                    );
-                }
-                rows.push(TapeRow {
-                    recorded_at,
-                    update,
-                });
+                Ok(())
+            })?;
+            if stable.is_none() {
+                last_reason = format!("{} changed between parity passes", path.display());
+                retry = true;
+                break;
             }
         }
-        if tape_paths(spool)? == paths {
-            return Ok((rows, closed_count, active_present));
+        if retry || tape_paths(spool)? != paths {
+            thread::sleep(Duration::from_millis(20));
+            continue;
         }
-        thread::sleep(Duration::from_millis(20));
+        rows.extend(trade_metadata.into_values());
+
+        let active_present = paths
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some(ACTIVE_TAPE));
+        let closed_count = paths.len() - usize::from(active_present);
+        return Ok((rows, closed_count, active_present));
     }
-    bail!(
-        "spool changed repeatedly while enumerating tapes: {}",
-        spool.display()
-    )
+    bail!("{}: {last_reason}", spool.display())
 }
 
 fn normalized_array(value: Option<&Value>, field: &str) -> Result<Vec<Value>> {
@@ -824,8 +937,23 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
     if config.ended_at_unix <= config.started_at_unix {
         bail!("parity window end must be after its start");
     }
-    let (legacy_rows, _, legacy_active) = load_rows(&config.legacy_spool)?;
-    let (rust_rows, rust_closed, rust_active) = load_rows(&config.rust_spool)?;
+    let trade_event_window_end =
+        nonnegative_epoch_sub(config.ended_at_unix, TRADE_MATURITY_LAG_SECONDS);
+    if trade_event_window_end <= config.started_at_unix {
+        bail!("trade maturity window end must be after its start");
+    }
+    let (legacy_rows, _, legacy_active) = load_rows(
+        &config.legacy_spool,
+        config.started_at_unix,
+        config.ended_at_unix,
+        trade_event_window_end,
+    )?;
+    let (rust_rows, rust_closed, rust_active) = load_rows(
+        &config.rust_spool,
+        config.started_at_unix,
+        config.ended_at_unix,
+        trade_event_window_end,
+    )?;
 
     let legacy_metadata = metadata_map(&legacy_rows, config.started_at_unix, config.ended_at_unix)?;
     let rust_metadata = metadata_map(&rust_rows, config.started_at_unix, config.ended_at_unix)?;
@@ -842,11 +970,6 @@ fn compare(config: &ShadowParityConfig) -> Result<Value> {
         && legacy_metadata_ids.is_subset(&rust_metadata_ids)
         && metadata_shared_values_match;
 
-    let trade_event_window_end =
-        nonnegative_epoch_sub(config.ended_at_unix, TRADE_MATURITY_LAG_SECONDS);
-    if trade_event_window_end <= config.started_at_unix {
-        bail!("trade maturity window end must be after its start");
-    }
     let (legacy_trades, legacy_duplicates) = trade_map(
         &legacy_rows,
         config.started_at_unix,
@@ -1290,7 +1413,15 @@ mod tests {
     fn bounded_parity_ignores_delayed_trade_recorded_after_cutoff() {
         let (_root, config) = fixture();
         let evidence = compare(&config).unwrap();
-        let (rust_rows, _, _) = load_rows(&config.rust_spool).unwrap();
+        let trade_event_window_end =
+            nonnegative_epoch_sub(config.ended_at_unix, TRADE_MATURITY_LAG_SECONDS);
+        let (rust_rows, _, _) = load_rows(
+            &config.rust_spool,
+            config.started_at_unix,
+            config.ended_at_unix,
+            trade_event_window_end,
+        )
+        .unwrap();
         let expected_settlement_digest = digest_values(
             settlement_map(&rust_rows, config.started_at_unix, config.ended_at_unix)
                 .unwrap()
@@ -1308,6 +1439,90 @@ mod tests {
             evidence["metrics"]["settlement_event_window_started_at_unix"],
             0
         );
+    }
+
+    #[test]
+    fn compare_does_not_retain_repeated_trade_metadata_outside_projection() {
+        let (_root, config) = fixture();
+        let historical = (0..2_000)
+            .map(|_| {
+                let mut update = metadata("BTCUSDT");
+                update["market"]["startDate"] = Value::String("1970-01-01T00:28:20Z".to_owned());
+                update["market"]["endDate"] = Value::String("1970-01-01T00:33:20Z".to_owned());
+                update
+            })
+            .collect::<Vec<_>>();
+        write_tape(
+            &config
+                .legacy_spool
+                .join("market-updates.19700101T000010000000.ndjson"),
+            &historical,
+            "1970-01-01T00:03:20Z",
+        );
+
+        let trade_event_window_end =
+            nonnegative_epoch_sub(config.ended_at_unix, TRADE_MATURITY_LAG_SECONDS);
+        let (legacy_rows, _, _) = load_rows(
+            &config.legacy_spool,
+            config.started_at_unix,
+            config.ended_at_unix,
+            trade_event_window_end,
+        )
+        .unwrap();
+        assert!(legacy_rows.len() < 64);
+
+        let evidence = compare(&config).unwrap();
+        assert_eq!(evidence["passed"], true);
+    }
+
+    #[test]
+    fn out_of_projection_trade_metadata_context_still_fails_closed() {
+        let (_root, config) = fixture();
+        let mut historical = metadata("BTCUSDT");
+        historical["market"]["startDate"] = Value::String("1970-01-01T00:28:20Z".to_owned());
+        historical["market"]["endDate"] = Value::String("1970-01-01T00:33:20Z".to_owned());
+        historical["market"]
+            .as_object_mut()
+            .unwrap()
+            .remove("makerBaseFee");
+        write_tape(
+            &config
+                .legacy_spool
+                .join("market-updates.19700101T000010000000.ndjson"),
+            &[historical],
+            "1970-01-01T00:03:20Z",
+        );
+
+        let error = compare(&config).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("makerBaseFee"), "{message}");
+    }
+
+    #[test]
+    fn out_of_window_rows_still_require_sequence_integrity() {
+        let (_root, config) = fixture();
+        let mut historical = extra_metadata();
+        historical["market"]["endDate"] = Value::String("1969-01-01T00:05:00Z".to_owned());
+        let path = config
+            .legacy_spool
+            .join("market-updates.19700101T000010000000.ndjson");
+        let mut output = File::create(path).unwrap();
+        for sequence in [0, 2] {
+            serde_json::to_writer(
+                &mut output,
+                &json!({
+                    "sequence": sequence,
+                    "recorded_at": "1969-01-01T00:00:10Z",
+                    "update": historical,
+                }),
+            )
+            .unwrap();
+            output.write_all(b"\n").unwrap();
+        }
+        output.sync_all().unwrap();
+
+        let error = compare(&config).unwrap_err();
+        assert!(error.to_string().contains("sequence gap"));
     }
 
     #[test]
