@@ -207,7 +207,7 @@ pub struct ValidationArgs {
     pub embargo_rows: usize,
     #[arg(long, default_value_t = 64)]
     pub sealed_holdout_rows: usize,
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 2.0)]
     pub fee_bps: f64,
     #[arg(long, default_value_t = 0.0)]
     pub funding_bps: f64,
@@ -994,8 +994,6 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             "mcts",
             "--feature-fields",
             "book_imbalance",
-            "--fee-bps",
-            "2",
             "--latency-bps",
             "0.5",
             "--slippage-bps",
@@ -1068,6 +1066,9 @@ printf '%s\n' '{{"schema_version":"research_snapshot_v2","snapshot_hash":"012345
             panic!("expected loop run command")
         };
         assert_eq!(args.mission.feature_fields, ["book_imbalance"]);
+        assert_eq!(args.mission.dataset.validation.fee_bps, 2.0);
+        assert_eq!(args.mission.dataset.validation.latency_bps, 0.5);
+        assert_eq!(args.mission.dataset.validation.slippage_bps, 0.0);
     }
 
     #[test]

@@ -915,12 +915,48 @@ mod tests {
     }
 
     #[test]
+    fn full_side_flip_charges_two_units_of_baseline_turnover() {
+        let mut input = rows(2.0);
+        for row in &mut input[..3] {
+            row.label = 0.0;
+            row.latency_bps = 0.5;
+        }
+        let signals = vec![-1.0, 1.0, 1.0];
+        let costs = EvaluationCostsV1 {
+            fee_bps: 2.0,
+            funding_bps: 0.0,
+            latency_bps: 0.5,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        let gate = FormulaEvaluator::new(FormulaEvaluatorConfig::default())
+            .unwrap()
+            .predictive_gates(
+                &input,
+                &signals,
+                std::slice::from_ref(&(0..3)),
+                WALK_FORWARD_EVALUATOR_VERSION,
+            );
+
+        let (net_returns, trade_count, _) =
+            gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
+
+        assert_eq!(trade_count, 2);
+        assert!((net_returns[0] + 0.00025).abs() < 1.0e-12);
+        assert!((net_returns[1] + 0.0005).abs() < 1.0e-12);
+        assert_eq!(net_returns[2], 0.0);
+    }
+
+    #[test]
     fn capacity_uses_trade_notional_and_same_side_top_n_depth() {
         let mut input = rows(0.0);
         for row in &mut input {
             row.features.insert("mid_price".to_string(), 1_000.0);
-            row.features.insert("bid_depth_top5".to_string(), 100.0);
-            row.features.insert("ask_depth_top5".to_string(), 100.0);
+            row.features.insert("bid_depth_top5".to_string(), 200.0);
+            row.features.insert("ask_depth_top5".to_string(), 50.0);
         }
         let signals = input.iter().map(|row| row.signal).collect::<Vec<_>>();
         let costs = EvaluationCostsV1 {
@@ -946,7 +982,7 @@ mod tests {
             gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
 
         assert_eq!(trade_count, 3);
-        assert_eq!(max_fraction, Some(0.2));
+        assert_eq!(max_fraction, Some(0.4));
     }
 
     #[test]

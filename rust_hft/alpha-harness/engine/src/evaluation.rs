@@ -473,6 +473,29 @@ mod tests {
     }
 
     #[test]
+    fn spread_crossing_fails_closed_for_missing_or_non_finite_spread() {
+        let mut missing = rows(50);
+        let mut non_finite = rows(50);
+        for row in &mut missing {
+            row.features.remove("spread_bps");
+        }
+        non_finite[0]
+            .features
+            .insert("spread_bps".to_string(), f64::NAN);
+        let mut protocol = protocol();
+        protocol.costs.cross_spread = true;
+
+        assert_eq!(
+            prepare_dataset(missing, &protocol, "holdout-1").unwrap_err(),
+            EvaluationError::InvalidSpreadFeature
+        );
+        assert_eq!(
+            prepare_dataset(non_finite, &protocol, "holdout-1").unwrap_err(),
+            EvaluationError::NonFiniteValue
+        );
+    }
+
+    #[test]
     fn capacity_check_fails_closed_without_matching_positive_depth_rows() {
         let mut input = rows(50);
         for row in &mut input {

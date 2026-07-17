@@ -6,7 +6,8 @@ use crate::{
     data_mission, governance, mission,
 };
 use alpha_domain::{
-    MissionCompletionPolicy, MissionStatus, ResearchMission, SearchBudget, ValidatorMode,
+    EvaluationCostsV1, EvaluationLabelSpecV1, MissionCompletionPolicy, MissionStatus,
+    ResearchMission, SearchBudget, ValidatorMode,
 };
 use alpha_store::{AlphaStore, StoreError};
 use anyhow::{bail, Context};
@@ -58,6 +59,54 @@ struct ExecutionReport<'a> {
     bundle_sha256: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ExecutionModelEvidence {
+    schema_version: &'static str,
+    fee_bps: f64,
+    funding_bps: f64,
+    latency_bps: f64,
+    additional_slippage_bps: f64,
+    cross_spread: bool,
+    turnover_definition: &'static str,
+    queue_position_modeled: bool,
+    partial_fills_modeled: bool,
+    market_impact_modeled: bool,
+    capacity_modeled: bool,
+    capacity_gate_enabled: bool,
+    capacity_gate_model: &'static str,
+    position_notional_usd: f64,
+    capacity_depth_levels: usize,
+    max_book_depth_fraction: f64,
+}
+
+impl From<&EvaluationCostsV1> for ExecutionModelEvidence {
+    fn from(costs: &EvaluationCostsV1) -> Self {
+        let capacity_gate_enabled = costs.capacity_enabled();
+        Self {
+            schema_version: "execution_cost_model_v1",
+            fee_bps: costs.fee_bps,
+            funding_bps: costs.funding_bps,
+            latency_bps: costs.latency_bps,
+            additional_slippage_bps: costs.slippage_bps,
+            cross_spread: costs.cross_spread,
+            turnover_definition: "absolute_position_change; a full side flip has turnover 2",
+            queue_position_modeled: false,
+            partial_fills_modeled: false,
+            market_impact_modeled: false,
+            capacity_modeled: false,
+            capacity_gate_enabled,
+            capacity_gate_model: if capacity_gate_enabled {
+                "same_side_top_n_depth_fraction"
+            } else {
+                "disabled"
+            },
+            position_notional_usd: costs.position_notional_usd,
+            capacity_depth_levels: costs.capacity_depth_levels,
+            max_book_depth_fraction: costs.max_book_depth_fraction,
+        }
+    }
+}
+
 pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     validate_args(&args)?;
     let input_dir = args.work_dir.join("input");
@@ -88,6 +137,12 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
         serde_json::from_slice(&std::fs::read(&materialization_path)?)
             .context("materialization manifest is invalid JSON")?;
     validate_materialization(&materialization, &feature_sha256, &args.validation)?;
+    let evaluation_protocol = args
+        .validation
+        .evaluation_protocol(&EvaluationLabelSpecV1 {
+            horizon_buckets: materialization.label_horizon_buckets,
+            observation_frequency_millis: materialization.bucket_ms,
+        })?;
 
     let db = results_dir.join("alpha.duckdb");
     let feature_manifest_path = results_dir.join("feature-manifest.json");
@@ -119,6 +174,10 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
     std::fs::copy(
         &materialization_path,
         results_dir.join("materialization.json"),
+    )?;
+    data_mission::write_json_atomic(
+        &results_dir.join("execution-model.json"),
+        &ExecutionModelEvidence::from(&evaluation_protocol.costs),
     )?;
 
     let now = Utc::now();
@@ -548,7 +607,7 @@ mod tests {
         .unwrap();
         let costs =
             &evidence["evaluations"][0]["record"]["payload"]["evaluation_protocol"]["costs"];
-        assert_eq!(costs["fee_bps"], 1.0);
+        assert_eq!(costs["fee_bps"], 2.0);
         assert_eq!(costs["latency_bps"], 0.5);
         assert_eq!(costs["slippage_bps"], 0.75);
         assert_eq!(costs["cross_spread"], true);
@@ -562,6 +621,63 @@ mod tests {
                 .iter()
                 .all(|fold| fold["max_book_depth_fraction"].as_f64().unwrap() <= 0.1)
         );
+        let execution_model: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.args.work_dir.join("results/execution-model.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(execution_model["additional_slippage_bps"], 0.75);
+        assert_eq!(execution_model["queue_position_modeled"], false);
+        assert_eq!(execution_model["partial_fills_modeled"], false);
+        assert_eq!(execution_model["market_impact_modeled"], false);
+        assert_eq!(execution_model["capacity_modeled"], false);
+        assert_eq!(execution_model["capacity_gate_enabled"], true);
+        assert_eq!(
+            execution_model["capacity_gate_model"],
+            "same_side_top_n_depth_fraction"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn baseline_execution_model_discloses_zero_slippage_and_unmodeled_microstructure() {
+        let fixture = fixture("baseline-execution-model");
+        let protocol = fixture
+            .args
+            .validation
+            .evaluation_protocol(&EvaluationLabelSpecV1 {
+                horizon_buckets: fixture.args.validation.label_horizon_buckets,
+                observation_frequency_millis: fixture.args.validation.observation_frequency_millis,
+            })
+            .unwrap();
+        let evidence = serde_json::to_value(ExecutionModelEvidence::from(&protocol.costs)).unwrap();
+
+        assert_eq!(evidence["fee_bps"], 2.0);
+        assert_eq!(evidence["latency_bps"], 0.5);
+        assert_eq!(evidence["additional_slippage_bps"], 0.0);
+        assert_eq!(evidence["cross_spread"], false);
+        assert_eq!(evidence["queue_position_modeled"], false);
+        assert_eq!(evidence["partial_fills_modeled"], false);
+        assert_eq!(evidence["market_impact_modeled"], false);
+        assert_eq!(evidence["capacity_modeled"], false);
+        assert_eq!(evidence["capacity_gate_enabled"], false);
+        assert_eq!(evidence["capacity_gate_model"], "disabled");
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_capacity_inputs_fail_before_execution_evidence_is_written() {
+        let mut fixture = fixture("incomplete-capacity-evidence");
+        fixture.args.validation.position_notional_usd = 10_000.0;
+
+        let error = execute(fixture.args.clone()).unwrap_err();
+
+        assert!(error.to_string().contains("evaluation protocol is invalid"));
+        assert!(!fixture
+            .args
+            .work_dir
+            .join("results/execution-model.json")
+            .exists());
+        assert!(!fixture.args.work_dir.join("results/alpha.duckdb").exists());
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
@@ -751,7 +867,7 @@ mod tests {
                 purge_rows: 5,
                 embargo_rows: 1,
                 sealed_holdout_rows: 30,
-                fee_bps: 1.0,
+                fee_bps: 2.0,
                 funding_bps: 0.0,
                 latency_bps: 0.5,
                 slippage_bps: 0.0,
