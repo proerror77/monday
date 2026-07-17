@@ -21,9 +21,11 @@ live = [
 ]
 
 [dependencies]
+anyhow = "1"
 chrono.workspace = true
 crc32fast = { version = "1", optional = true }
 futures = { version = "0.3", optional = true }
+libc.workspace = true
 ploy-market-contracts.workspace = true
 polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.0", features = ["clob", "data", "gamma", "rtds", "tracing", "ws", "heartbeats"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"], optional = true }
@@ -32,6 +34,7 @@ rust_decimal.workspace = true
 rust_decimal_macros.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
+sha2.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "chrono", "rust_decimal", "json"], optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"], optional = true }
