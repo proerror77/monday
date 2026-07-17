@@ -612,6 +612,32 @@ mod tests {
         ]
     }
 
+    fn valid_two_event_rows() -> Vec<Value> {
+        let mut rows = valid_rows();
+        let mut second = valid_rows();
+        for row in &mut second {
+            row["market_id"] = json!("market-2");
+            row["condition_id"] = json!("condition-2");
+            row["symbol"] = json!("SOLUSDT");
+        }
+        let contract = row(&mut second, "market_contract", 0);
+        contract["source_token_ids"] = json!(["down-token-2", "up-token-2"]);
+        contract["price_to_beat"] = json!("150");
+        contract["resolution_source"] = json!("https://data.chain.link/streams/sol-usd");
+        row(&mut second, "orderbook_snapshot", 0)["token_id"] = json!("down-token-2");
+        row(&mut second, "orderbook_snapshot", 1)["token_id"] = json!("up-token-2");
+        row(&mut second, "chainlink_reference", 0)["source_symbol"] = json!("sol/usd");
+        let trade = row(&mut second, "polymarket_trade", 0);
+        trade["record_id"] = json!("trade-v2-2");
+        trade["token_id"] = json!("up-token-2");
+        trade["transaction_hash"] = json!("0x123");
+        let settlement = row(&mut second, "official_settlement_evidence", 0);
+        settlement["source_token_ids"] = json!(["down-token-2", "up-token-2"]);
+        settlement["winning_token_id"] = json!("up-token-2");
+        rows.extend(second);
+        rows
+    }
+
     fn verify_rows(rows: &[Value]) -> Result<VerifiedPolymarketEvidence> {
         let temp = tempfile::tempdir().unwrap();
         let triplet = tests::write_triplet_rows(&temp, rows);
@@ -705,5 +731,50 @@ mod tests {
         let mut rows = valid_rows();
         row(&mut rows, "market_contract", 0)["source_outcomes"] = json!(["Up", "No"]);
         assert!(verify_rows(&rows).is_err());
+    }
+
+    #[test]
+    fn rejects_global_condition_or_token_identity_reuse() {
+        let mut rows = valid_two_event_rows();
+        for row in rows.iter_mut().filter(|row| row["market_id"] == "market-2") {
+            row["condition_id"] = json!("condition-1");
+        }
+        assert_rejected(&rows, "globally unique");
+
+        let mut rows = valid_two_event_rows();
+        row(&mut rows, "market_contract", 1)["source_token_ids"][0] = json!("down-token");
+        assert_rejected(&rows, "globally unique");
+    }
+
+    #[test]
+    fn rejects_duplicate_trade_or_event_settlement() {
+        let mut rows = valid_rows();
+        let duplicate = row(&mut rows, "polymarket_trade", 0).clone();
+        rows.push(duplicate);
+        assert_rejected(&rows, "duplicate Polymarket trade");
+
+        let mut rows = valid_two_event_rows();
+        let duplicate = row(&mut rows, "official_settlement_evidence", 0).clone();
+        rows.retain(|row| {
+            row["market_id"] != "market-2" || row["surface"] != "official_settlement_evidence"
+        });
+        rows.push(duplicate);
+        assert_rejected(&rows, "duplicate official settlement");
+    }
+
+    #[test]
+    fn rejects_context_mismatch_or_event_local_missing_surface() {
+        let mut rows = valid_rows();
+        row(&mut rows, "orderbook_snapshot", 0)["condition_id"] = json!("wrong-condition");
+        assert_rejected(&rows, "contradicts");
+
+        for surface in ["chainlink_reference", "polymarket_trade"] {
+            let mut rows = valid_two_event_rows();
+            rows.retain(|row| row["market_id"] != "market-1" || row["surface"] != surface);
+            assert_rejected(&rows, "missing");
+        }
+        let mut rows = valid_rows();
+        rows.retain(|row| row["surface"] != "official_settlement_evidence");
+        assert_rejected(&rows, "manifest identity is inconsistent");
     }
 }
