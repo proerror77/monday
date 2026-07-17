@@ -1,6 +1,7 @@
 pub use data::binance_lob_replay::{
     source_revision, Market, ReplaySequenceEvent, ReplaySequenceValidator,
 };
+use data::binance_market_tape::{event_type_allowed, supported_schema, LEGACY_LOB_TAPE_SCHEMA};
 use engine::binance_md::{parse_fixed_6, BookSync, SequenceDecision, UpdateMeta};
 use rand::random;
 use rust_decimal::Decimal;
@@ -16,7 +17,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 
-pub const RAW_SCHEMA: &str = "binance.lob_tape.v2";
+pub use data::binance_market_tape::MARKET_TAPE_SCHEMA as RAW_SCHEMA;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepthDiff {
@@ -353,13 +354,13 @@ pub struct Checkpoint {
     pub asks: Vec<[String; 2]>,
 }
 
-pub fn checkpoint_event(checkpoint: Checkpoint, reason: &str) -> Value {
+pub fn checkpoint_event(checkpoint: Checkpoint, reason: &str, replay_safe: bool) -> Value {
     let mut value = serde_json::to_value(checkpoint).expect("Checkpoint is always serializable");
     let object = value
         .as_object_mut()
         .expect("Checkpoint serializes as object");
     object.insert("reason".to_owned(), reason.into());
-    object.insert("replay_safe".to_owned(), true.into());
+    object.insert("replay_safe".to_owned(), replay_safe.into());
     value
 }
 
@@ -477,6 +478,7 @@ impl Segment {
             }
         }
         envelope.extend(payload.clone());
+        envelope.insert("schema".to_owned(), RAW_SCHEMA.into());
         serde_json::to_writer(&mut self.writer, &envelope)?;
         self.writer.write_all(b"\n")?;
         *self.counts.entry(event_type.to_owned()).or_default() += 1;
@@ -485,6 +487,10 @@ impl Segment {
 
     pub fn mark_replay_unsafe(&mut self) {
         self.replay_safe = false;
+    }
+
+    pub fn is_replay_safe(&self) -> bool {
+        self.replay_safe
     }
 
     pub fn update_catalog(
@@ -525,6 +531,7 @@ impl Segment {
             &self.config,
             &self.path,
             self.counts,
+            RAW_SCHEMA,
             self.start_ns,
             self.end_ns,
             has_replay_safe_checkpoint,
@@ -534,15 +541,22 @@ impl Segment {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_segment(
     config: &SegmentConfig,
     path: &Path,
     counts: BTreeMap<String, u64>,
+    schema: &str,
     start_ns: u64,
     end_ns: u64,
     has_replay_safe_checkpoint: bool,
     readiness: ReadinessSummary,
 ) -> anyhow::Result<SegmentArtifacts> {
+    let replay_scope = match schema {
+        LEGACY_LOB_TAPE_SCHEMA => "captured_snapshot_seed_plus_sequence_checked_diffs",
+        RAW_SCHEMA => "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs",
+        _ => anyhow::bail!("unsupported recovered tape schema {schema}"),
+    };
     let data = path.with_file_name(format!("part-{start_ns}.jsonl.zst"));
     let temporary_data = data.with_extension("zst.tmp");
     let mut command = Command::new("zstd");
@@ -562,8 +576,8 @@ fn finalize_segment(
     let digest = sha256_file(&data)?;
     let (date, hour) = segment_partition(start_ns)?;
     let events: u64 = counts.values().sum();
-    let metadata = json!({
-        "schema": RAW_SCHEMA,
+    let mut metadata = json!({
+        "schema": schema,
         "venue": "binance",
         "market": config.market.as_str(),
         "dataset": config.dataset,
@@ -573,7 +587,7 @@ fn finalize_segment(
         "security_token_symbols": config.security_token_symbols,
         "excluded_symbols": config.excluded_symbols,
         "snapshot_limit": config.snapshot_limit,
-        "replay_scope": "captured_snapshot_seed_plus_sequence_checked_diffs",
+        "replay_scope": replay_scope,
         "venue_depth_complete": false,
         "events": events,
         "event_types": counts,
@@ -590,6 +604,17 @@ fn finalize_segment(
         "bytes": data.metadata()?.len(),
         "sha256": digest,
     });
+    if schema == RAW_SCHEMA {
+        let metadata = metadata.as_object_mut().expect("manifest is an object");
+        metadata.insert(
+            "trade_representation".to_owned(),
+            "aggregate_trade_only".into(),
+        );
+        metadata.insert(
+            "price_surface_derivation".to_owned(),
+            "latest aggregate trade price".into(),
+        );
+    }
     let manifest = data.with_file_name(format!(
         "{}.manifest.json",
         data.file_name()
@@ -636,6 +661,8 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
         let mut end_ns = 0_u64;
         let mut offset = 0_usize;
         let mut invalid_at = None;
+        let mut detected_schema: Option<(bool, String)> = None;
+        let mut quarantine = false;
         for line in bytes.split_inclusive(|byte| *byte == b'\n') {
             let complete = line.last() == Some(&b'\n');
             let parsed = serde_json::from_slice::<Value>(line);
@@ -658,9 +685,42 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
                 start_ns = received;
             }
             end_ns = received;
-            let event_type = event["type"].as_str().unwrap_or("diff");
+            let row_schema = match event.get("schema") {
+                None => (false, LEGACY_LOB_TAPE_SCHEMA.to_owned()),
+                Some(Value::String(schema)) if supported_schema(schema) => {
+                    (true, schema.to_owned())
+                }
+                Some(_) => {
+                    quarantine = true;
+                    break;
+                }
+            };
+            if detected_schema
+                .as_ref()
+                .is_some_and(|detected| detected != &row_schema)
+            {
+                quarantine = true;
+                break;
+            }
+            detected_schema.get_or_insert_with(|| row_schema.clone());
+            let event_type = match event.get("type").and_then(Value::as_str) {
+                Some(event_type) if !event_type.is_empty() => event_type,
+                None if !row_schema.0 => "diff",
+                _ => {
+                    quarantine = true;
+                    break;
+                }
+            };
+            if !event_type_allowed(&row_schema.1, event_type) {
+                quarantine = true;
+                break;
+            }
             *counts.entry(event_type.to_owned()).or_default() += 1;
             offset += line.len();
+        }
+        if quarantine {
+            fs::rename(&path, path.with_extension("part.corrupt"))?;
+            continue;
         }
         if let Some((valid_bytes, has_following_data)) = invalid_at {
             if has_following_data {
@@ -676,10 +736,14 @@ pub fn recover_parts(config: &SegmentConfig) -> anyhow::Result<Vec<SegmentArtifa
             fs::remove_file(path)?;
             continue;
         }
+        let schema = detected_schema
+            .map(|(_, schema)| schema)
+            .expect("non-empty recovered segment has a detected schema");
         artifacts.push(finalize_segment(
             config,
             &path,
             counts,
+            &schema,
             start_ns,
             end_ns,
             false,
@@ -990,6 +1054,40 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn recovery_config(spool_dir: PathBuf) -> SegmentConfig {
+        SegmentConfig {
+            spool_dir,
+            market: Market::Spot,
+            dataset: "spot_all".into(),
+            shard_id: "all".into(),
+            symbols: vec!["BTCUSDT".into()],
+            security_token_symbols: vec![],
+            excluded_symbols: vec![],
+            snapshot_limit: 100,
+            zstd_timeout: Duration::from_secs(30),
+        }
+    }
+
+    fn write_recovery_part(config: &SegmentConfig, start_ns: u64, rows: &[Value]) -> PathBuf {
+        let (date, hour) = segment_partition(start_ns).unwrap();
+        let directory = config
+            .spool_dir
+            .join(format!("date={date}"))
+            .join(format!("hour={hour}"));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("part-{start_ns}.jsonl.part"));
+        let mut bytes = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+            .into_bytes();
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
     fn diff(symbol: &str, first: u64, final_id: u64, pu: Option<u64>) -> DepthDiff {
         DepthDiff {
             symbol: symbol.to_owned(),
@@ -1071,7 +1169,7 @@ mod tests {
         let checkpoint = state.checkpoint("session-1").unwrap();
         assert!(checkpoint.bids.is_empty());
         assert_eq!(checkpoint.asks[1], ["102.12345678", "1.00000001"]);
-        let event = checkpoint_event(checkpoint, "scheduled");
+        let event = checkpoint_event(checkpoint, "scheduled", true);
         assert_eq!(event["session_id"], "session-1");
         assert_eq!(event["last_update_id"], 101);
         assert!(event.get("checkpoint").is_none());
@@ -1187,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn segment_emits_v2_manifest_digest_and_success_marker() {
+    fn segment_declares_complete_market_tape_surface() {
         if Command::new("zstd").arg("--version").output().is_err() {
             return;
         }
@@ -1209,18 +1307,39 @@ mod tests {
             .unwrap();
         segment
             .write(
+                "diff",
+                json!({"symbol":"BTCUSDT","schema":"binance.market_tape.v999"}),
+                segment.start_ns + 1,
+            )
+            .unwrap();
+        segment
+            .write(
+                "agg_trade",
+                json!({"symbol":"BTCUSDT"}),
+                segment.start_ns + 2,
+            )
+            .unwrap();
+        segment
+            .write(
                 "checkpoint",
                 json!({"symbol":"BTCUSDT", "synced":true, "bridged":true}),
-                segment.start_ns + 1,
+                segment.start_ns + 3,
             )
             .unwrap();
         let artifacts = segment.close().unwrap().unwrap();
         let manifest: Value =
             serde_json::from_reader(File::open(&artifacts.manifest).unwrap()).unwrap();
-        assert_eq!(manifest["schema"], RAW_SCHEMA);
+        assert_eq!(
+            manifest["schema"],
+            data::binance_market_tape::MARKET_TAPE_SCHEMA
+        );
         assert_eq!(
             manifest["event_types"],
-            json!({"checkpoint":1,"snapshot":1})
+            json!({"agg_trade":1,"checkpoint":1,"diff":1,"snapshot":1})
+        );
+        assert_eq!(
+            manifest["replay_scope"],
+            "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs"
         );
         assert_eq!(manifest["has_replay_safe_checkpoint"], true);
         assert_eq!(manifest["snapshot_ready_count"], 1);
@@ -1228,6 +1347,24 @@ mod tests {
         assert_eq!(manifest["snapshot_only_symbols"], json!([]));
         assert_eq!(manifest["all_symbols_bridged"], true);
         assert_eq!(manifest["sha256"], artifacts.sha256);
+        let output = Command::new("zstd")
+            .args(["-q", "-d", "-c"])
+            .arg(&artifacts.data)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let rows = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().all(|row| row["schema"] == RAW_SCHEMA));
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["type"].as_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["agg_trade", "checkpoint", "diff", "snapshot"])
+        );
         assert!(!artifacts.success.exists());
         write_success_marker(&artifacts.data, &artifacts.sha256).unwrap();
         assert_eq!(
@@ -1235,6 +1372,96 @@ mod tests {
             format!("{}\n", artifacts.sha256)
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_preserves_legacy_and_current_schema_identity() {
+        if Command::new("zstd").arg("--version").output().is_err() {
+            return;
+        }
+        let start_ns = 1_700_000_000_000_000_000;
+        for (name, row, schema, replay_scope) in [
+            (
+                "legacy",
+                json!({"received_at_ns":start_ns,"type":"diff"}),
+                LEGACY_LOB_TAPE_SCHEMA,
+                "captured_snapshot_seed_plus_sequence_checked_diffs",
+            ),
+            (
+                "current",
+                json!({"schema":RAW_SCHEMA,"received_at_ns":start_ns,"type":"agg_trade"}),
+                RAW_SCHEMA,
+                "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs",
+            ),
+        ] {
+            let root = tempfile::Builder::new()
+                .prefix(&format!("monday-recovery-{name}-"))
+                .tempdir()
+                .unwrap();
+            let config = recovery_config(root.path().to_owned());
+            write_recovery_part(&config, start_ns, &[row]);
+
+            let artifacts = recover_parts(&config).unwrap();
+            let manifest: Value =
+                serde_json::from_reader(File::open(&artifacts[0].manifest).unwrap()).unwrap();
+            assert_eq!(manifest["schema"], schema, "case={name}");
+            assert_eq!(manifest["replay_scope"], replay_scope, "case={name}");
+            if schema == RAW_SCHEMA {
+                assert_eq!(manifest["trade_representation"], "aggregate_trade_only");
+                assert_eq!(
+                    manifest["price_surface_derivation"],
+                    "latest aggregate trade price"
+                );
+            } else {
+                assert!(manifest.get("trade_representation").is_none());
+                assert!(manifest.get("price_surface_derivation").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_quarantines_mixed_or_schema_incompatible_parts() {
+        let start_ns = 1_700_000_000_000_000_000;
+        let cases = [
+            (
+                "mixed",
+                vec![
+                    json!({"schema":RAW_SCHEMA,"received_at_ns":start_ns,"type":"diff"}),
+                    json!({"received_at_ns":start_ns + 1,"type":"diff"}),
+                ],
+            ),
+            (
+                "unknown",
+                vec![
+                    json!({"schema":"binance.market_tape.v999","received_at_ns":start_ns,"type":"diff"}),
+                ],
+            ),
+            (
+                "incompatible",
+                vec![
+                    json!({"schema":LEGACY_LOB_TAPE_SCHEMA,"received_at_ns":start_ns,"type":"agg_trade"}),
+                ],
+            ),
+        ];
+
+        for (name, rows) in cases {
+            let root = tempfile::Builder::new()
+                .prefix(&format!("monday-recovery-{name}-"))
+                .tempdir()
+                .unwrap();
+            let config = recovery_config(root.path().to_owned());
+            let path = write_recovery_part(&config, start_ns, &rows);
+
+            assert!(recover_parts(&config).unwrap().is_empty(), "case={name}");
+            assert!(!path.exists(), "case={name}");
+            assert!(path.with_extension("part.corrupt").exists(), "case={name}");
+            assert!(
+                files_with_suffix(root.path(), ".manifest.json")
+                    .unwrap()
+                    .is_empty(),
+                "case={name}"
+            );
+        }
     }
 
     #[cfg(unix)]
