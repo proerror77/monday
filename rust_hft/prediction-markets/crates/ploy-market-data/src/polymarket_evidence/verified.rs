@@ -27,6 +27,7 @@ pub enum EvidenceTradeSide {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolymarketEvidenceIdentity {
     pub content_sha256: String,
+    pub manifest_sha256: String,
     pub rows: u64,
     pub events: u64,
     pub event_start_gte: DateTime<Utc>,
@@ -235,6 +236,7 @@ pub fn verify_polymarket_evidence(
     let (lower, upper) = sealed.selection_bounds()?;
     let identity = PolymarketEvidenceIdentity {
         content_sha256: sealed.content_sha256().to_owned(),
+        manifest_sha256: sealed.manifest_sha256().to_owned(),
         rows: sealed.rows(),
         events: sealed.events(),
         event_start_gte: lower,
@@ -660,6 +662,12 @@ mod tests {
     #[test]
     fn verifies_reversed_binary_arrays_without_index_assumption() {
         let verified = verify_rows(&valid_rows()).unwrap();
+        assert_eq!(verified.identity().manifest_sha256.len(), 64);
+        assert!(verified
+            .identity()
+            .manifest_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
         assert_eq!(verified.contracts()[0].up_token_id, "up-token");
         assert_eq!(verified.books()[0].side, BinaryOutcomeSide::Down);
         assert_eq!(verified.trades()[0].side, BinaryOutcomeSide::Up);
