@@ -531,6 +531,40 @@ mod tests {
         std::fs::remove_dir_all(fixture.root).unwrap();
     }
 
+    #[test]
+    fn execute_records_explicit_taker_costs_in_evidence() {
+        let mut fixture = fixture("explicit-taker-costs");
+        fixture.args.validation.slippage_bps = 0.75;
+        fixture.args.validation.cross_spread = true;
+        fixture.args.validation.position_notional_usd = 10_000.0;
+        fixture.args.validation.capacity_depth_levels = 5;
+        fixture.args.validation.max_book_depth_fraction = 0.1;
+
+        execute(fixture.args.clone()).unwrap();
+
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.args.work_dir.join("results/candidates.json")).unwrap(),
+        )
+        .unwrap();
+        let costs =
+            &evidence["evaluations"][0]["record"]["payload"]["evaluation_protocol"]["costs"];
+        assert_eq!(costs["fee_bps"], 1.0);
+        assert_eq!(costs["latency_bps"], 0.5);
+        assert_eq!(costs["slippage_bps"], 0.75);
+        assert_eq!(costs["cross_spread"], true);
+        assert_eq!(costs["position_notional_usd"], 10_000.0);
+        assert_eq!(costs["capacity_depth_levels"], 5);
+        assert_eq!(costs["max_book_depth_fraction"], 0.1);
+        assert!(
+            evidence["evaluations"][0]["record"]["payload"]["metrics"]["folds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|fold| fold["max_book_depth_fraction"].as_f64().unwrap() <= 0.1)
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn create_bundle_rejects_a_stale_symlink() {
@@ -645,8 +679,11 @@ mod tests {
                     )]),
                     modalities: BTreeSet::from([DataModality::Lob]),
                     features: BTreeMap::from([
+                        ("ask_depth_top5".to_string(), 10.0),
+                        ("bid_depth_top5".to_string(), 10.0),
                         ("book_imbalance".to_string(), index as f64 / 100.0),
-                        ("spread_bps".to_string(), (index as f64 / 10.0).sin()),
+                        ("mid_price".to_string(), 60_000.0),
+                        ("spread_bps".to_string(), (index as f64 / 10.0).sin().abs()),
                     ]),
                     label: if index % 2 == 0 { 0.001 } else { -0.0005 },
                 }
@@ -717,6 +754,11 @@ mod tests {
                 fee_bps: 1.0,
                 funding_bps: 0.0,
                 latency_bps: 0.5,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
                 label_horizon_buckets: 5,
                 observation_frequency_millis: 1_000,
             },

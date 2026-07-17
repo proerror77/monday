@@ -109,6 +109,34 @@ pub struct EvaluationCostsV1 {
     pub fee_bps: f64,
     pub funding_bps: f64,
     pub latency_bps: f64,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub slippage_bps: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cross_spread: bool,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub position_notional_usd: f64,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub capacity_depth_levels: usize,
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub max_book_depth_fraction: f64,
+}
+
+impl EvaluationCostsV1 {
+    pub fn capacity_enabled(&self) -> bool {
+        self.position_notional_usd > 0.0
+    }
+}
+
+fn is_zero_f64(value: &f64) -> bool {
+    *value == 0.0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +212,15 @@ impl EvaluationProtocolV1 {
             .and_then(|rows| rows.checked_add(self.walk_forward.initial_train_rows))
             .and_then(|rows| rows.checked_add(self.walk_forward.purge_rows))
             .and_then(|rows| rows.checked_add(self.walk_forward.sealed_holdout_rows));
+        let capacity_disabled = self.costs.position_notional_usd == 0.0
+            && self.costs.capacity_depth_levels == 0
+            && self.costs.max_book_depth_fraction == 0.0;
+        let capacity_enabled = self.costs.position_notional_usd.is_finite()
+            && self.costs.position_notional_usd > 0.0
+            && self.costs.capacity_depth_levels > 0
+            && self.costs.max_book_depth_fraction.is_finite()
+            && self.costs.max_book_depth_fraction > 0.0
+            && self.costs.max_book_depth_fraction <= 1.0;
         if self.version != EVALUATION_PROTOCOL_VERSION_V1
             || self.walk_forward.initial_train_rows == 0
             || self.walk_forward.validation_rows == 0
@@ -197,9 +234,11 @@ impl EvaluationProtocolV1 {
                 self.costs.fee_bps,
                 self.costs.funding_bps,
                 self.costs.latency_bps,
+                self.costs.slippage_bps,
             ]
             .iter()
             .any(|value| !value.is_finite() || *value < 0.0)
+            || !(capacity_disabled || capacity_enabled)
             || self.metrics != EvaluationMetricDefinitionsV1::default()
         {
             return Err(DomainError::InvalidEvaluationProtocol);
@@ -379,6 +418,8 @@ pub struct FoldEvaluationMetrics {
     #[serde(default = "missing_evaluation_metric")]
     pub net_sharpe: f64,
     pub raw_score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_book_depth_fraction: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -563,6 +604,9 @@ impl CandidateEvaluation {
                     && fold.row_count > 0
                     && fold.trade_count <= fold.row_count
                     && fold.max_drawdown >= 0.0
+                    && fold
+                        .max_book_depth_fraction
+                        .is_none_or(|fraction| fraction.is_finite() && fraction >= 0.0)
             });
         let row_count = self
             .metrics
@@ -663,6 +707,17 @@ impl CandidateEvaluation {
                         .folds
                         .iter()
                         .any(|fold| fold.row_count != expected_fold_rows))
+                || if protocol.costs.capacity_enabled() {
+                    self.metrics
+                        .folds
+                        .iter()
+                        .any(|fold| fold.max_book_depth_fraction.is_none())
+                } else {
+                    self.metrics
+                        .folds
+                        .iter()
+                        .any(|fold| fold.max_book_depth_fraction.is_some())
+                }
             {
                 return Err(DomainError::InvalidEvaluationEvidence);
             }
@@ -679,6 +734,14 @@ impl CandidateEvaluation {
                 self.evaluator_version.as_str(),
                 WALK_FORWARD_EVALUATOR_VERSION | ONNX_WALK_FORWARD_EVALUATOR_VERSION
             );
+            let capacity_passed = protocol.is_none_or(|protocol| {
+                !protocol.costs.capacity_enabled()
+                    || self.metrics.folds.iter().all(|fold| {
+                        fold.max_book_depth_fraction.is_some_and(|fraction| {
+                            fraction <= protocol.costs.max_book_depth_fraction
+                        })
+                    })
+            });
             let policy_passed = self.metrics.predictive.passes(&config, require_icir)
                 && self.metrics.folds.iter().all(|fold| {
                     fold.row_count >= config.min_validation_rows
@@ -686,6 +749,7 @@ impl CandidateEvaluation {
                         && fold.mean_net_return > config.min_fold_mean_return
                         && fold.max_drawdown <= config.max_drawdown
                 })
+                && capacity_passed
                 && self.metrics.adjusted_score >= config.min_aggregate_score;
             if self.passed != policy_passed
                 || !approximately_equal(
@@ -2706,6 +2770,11 @@ mod tests {
                 fee_bps: 1.0,
                 funding_bps: 0.0,
                 latency_bps: 0.5,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
             },
             EvaluationLabelSpecV1 {
                 horizon_buckets: 5,
@@ -2731,6 +2800,37 @@ mod tests {
     }
 
     #[test]
+    fn legacy_protocol_hash_is_stable_and_new_execution_costs_are_bound() {
+        let protocol = evaluation_protocol();
+        let legacy_hash = protocol.content_hash().unwrap();
+        let legacy_json = serde_json::to_value(&protocol).unwrap();
+        assert!(legacy_json["costs"].get("slippage_bps").is_none());
+        assert!(legacy_json["costs"].get("cross_spread").is_none());
+        assert!(legacy_json["costs"].get("position_notional_usd").is_none());
+        assert!(legacy_json["costs"].get("capacity_depth_levels").is_none());
+        assert!(legacy_json["costs"]
+            .get("max_book_depth_fraction")
+            .is_none());
+
+        let restored: EvaluationProtocolV1 = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(restored.content_hash().unwrap(), legacy_hash);
+
+        let mut with_slippage = restored.clone();
+        with_slippage.costs.slippage_bps = 0.5;
+        assert_ne!(with_slippage.content_hash().unwrap(), legacy_hash);
+
+        let mut with_spread_crossing = restored;
+        with_spread_crossing.costs.cross_spread = true;
+        assert_ne!(with_spread_crossing.content_hash().unwrap(), legacy_hash);
+
+        let mut with_capacity = evaluation_protocol();
+        with_capacity.costs.position_notional_usd = 10_000.0;
+        with_capacity.costs.capacity_depth_levels = 5;
+        with_capacity.costs.max_book_depth_fraction = 0.1;
+        assert_ne!(with_capacity.content_hash().unwrap(), legacy_hash);
+    }
+
+    #[test]
     fn evaluation_protocol_rejects_insufficient_purge_and_schedule_overflow() {
         let mut insufficient_purge = evaluation_protocol();
         insufficient_purge.walk_forward.purge_rows = 4;
@@ -2743,6 +2843,13 @@ mod tests {
         overflowing.walk_forward.fold_count = usize::MAX;
         assert_eq!(
             overflowing.validate(),
+            Err(DomainError::InvalidEvaluationProtocol)
+        );
+
+        let mut partial_capacity = evaluation_protocol();
+        partial_capacity.costs.position_notional_usd = 10_000.0;
+        assert_eq!(
+            partial_capacity.validate(),
             Err(DomainError::InvalidEvaluationProtocol)
         );
     }
@@ -2786,6 +2893,7 @@ mod tests {
                     max_drawdown: 0.01,
                     net_sharpe: 1.0,
                     raw_score,
+                    max_book_depth_fraction: None,
                 }],
             },
         };
@@ -2902,6 +3010,29 @@ mod tests {
             .fee_bps = 2.0;
         assert_eq!(
             tampered_protocol.validate(),
+            Err(DomainError::InvalidEvaluationEvidence)
+        );
+
+        let mut capacity_bound = evaluation.clone();
+        let capacity_protocol = capacity_bound.evaluation_protocol.as_mut().unwrap();
+        capacity_protocol.costs.position_notional_usd = 10_000.0;
+        capacity_protocol.costs.capacity_depth_levels = 5;
+        capacity_protocol.costs.max_book_depth_fraction = 0.1;
+        capacity_bound.evaluation_protocol_hash = Some(capacity_protocol.content_hash().unwrap());
+        capacity_bound.metrics.folds[0].max_book_depth_fraction = Some(0.05);
+        assert!(capacity_bound.validate().is_ok());
+
+        let mut breached_capacity = capacity_bound.clone();
+        breached_capacity.metrics.folds[0].max_book_depth_fraction = Some(0.2);
+        assert_eq!(
+            breached_capacity.validate(),
+            Err(DomainError::InvalidEvaluationEvidence)
+        );
+
+        let mut missing_capacity_evidence = capacity_bound;
+        missing_capacity_evidence.metrics.folds[0].max_book_depth_fraction = None;
+        assert_eq!(
+            missing_capacity_evidence.validate(),
             Err(DomainError::InvalidEvaluationEvidence)
         );
 

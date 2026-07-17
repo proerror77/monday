@@ -16,6 +16,12 @@ pub enum EvaluationError {
     NonFiniteValue,
     #[error("dataset feature schema is empty, inconsistent, or contains an invalid field")]
     InvalidFeatureSchema,
+    #[error("taker spread crossing requires a finite non-negative spread_bps feature")]
+    InvalidSpreadFeature,
+    #[error(
+        "capacity checks require positive mid_price and matching top-N bid/ask depth features"
+    )]
+    InvalidCapacityFeature,
     #[error("dataset costs do not match the bound evaluation protocol")]
     ProtocolMismatch,
 }
@@ -217,6 +223,30 @@ pub fn prepare_dataset(
     {
         return Err(EvaluationError::InvalidFeatureSchema);
     }
+    if protocol.costs.cross_spread
+        && rows.iter().any(|row| {
+            row.features
+                .get("spread_bps")
+                .is_none_or(|spread| *spread < 0.0)
+        })
+    {
+        return Err(EvaluationError::InvalidSpreadFeature);
+    }
+    if protocol.costs.capacity_enabled() {
+        let bid_depth = format!("bid_depth_top{}", protocol.costs.capacity_depth_levels);
+        let ask_depth = format!("ask_depth_top{}", protocol.costs.capacity_depth_levels);
+        if rows.iter().any(|row| {
+            ["mid_price", bid_depth.as_str(), ask_depth.as_str()]
+                .iter()
+                .any(|feature| {
+                    row.features
+                        .get(*feature)
+                        .is_none_or(|value| !value.is_finite() || *value <= 0.0)
+                })
+        }) {
+            return Err(EvaluationError::InvalidCapacityFeature);
+        }
+    }
     let mut registered_features = vec!["signal".to_string()];
     registered_features.extend(feature_names);
     if rows
@@ -314,6 +344,11 @@ mod tests {
                 fee_bps: 1.0,
                 funding_bps: 0.1,
                 latency_bps: 0.2,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
             },
             EvaluationLabelSpecV1 {
                 horizon_buckets: 1,
@@ -418,6 +453,42 @@ mod tests {
         assert_eq!(
             prepare_dataset(rows, &protocol(), "holdout-1").unwrap_err(),
             EvaluationError::ProtocolMismatch
+        );
+    }
+
+    #[test]
+    fn spread_crossing_fails_closed_without_non_negative_spread_rows() {
+        let mut input = rows(50);
+        for row in &mut input {
+            row.features.insert("spread_bps".to_string(), 0.2);
+        }
+        input[0].features.insert("spread_bps".to_string(), -0.1);
+        let mut protocol = protocol();
+        protocol.costs.cross_spread = true;
+
+        assert_eq!(
+            prepare_dataset(input, &protocol, "holdout-1").unwrap_err(),
+            EvaluationError::InvalidSpreadFeature
+        );
+    }
+
+    #[test]
+    fn capacity_check_fails_closed_without_matching_positive_depth_rows() {
+        let mut input = rows(50);
+        for row in &mut input {
+            row.features.insert("mid_price".to_string(), 60_000.0);
+            row.features.insert("bid_depth_top5".to_string(), 10.0);
+            row.features.insert("ask_depth_top5".to_string(), 10.0);
+        }
+        input[0].features.insert("ask_depth_top5".to_string(), 0.0);
+        let mut protocol = protocol();
+        protocol.costs.position_notional_usd = 10_000.0;
+        protocol.costs.capacity_depth_levels = 5;
+        protocol.costs.max_book_depth_fraction = 0.1;
+
+        assert_eq!(
+            prepare_dataset(input, &protocol, "holdout-1").unwrap_err(),
+            EvaluationError::InvalidCapacityFeature
         );
     }
 }

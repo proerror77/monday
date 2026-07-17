@@ -4,8 +4,8 @@ use crate::{
     FoldEvaluationMetrics, FoldPredictiveMetrics, PredictiveMetrics,
 };
 use alpha_domain::{
-    CandidateArtifact, EvaluationProtocolV1, ONNX_WALK_FORWARD_EVALUATOR_VERSION,
-    SEALED_HOLDOUT_EVALUATOR_VERSION,
+    CandidateArtifact, EvaluationCostsV1, EvaluationProtocolV1,
+    ONNX_WALK_FORWARD_EVALUATOR_VERSION, SEALED_HOLDOUT_EVALUATOR_VERSION,
 };
 pub use alpha_domain::{
     FormulaEvaluatorConfig, MultipleTestingAdjustment, WALK_FORWARD_EVALUATOR_VERSION,
@@ -29,25 +29,58 @@ impl PredictiveGateResult {
         rows: &[ResearchRow],
         signals: &[f64],
         range: std::ops::Range<usize>,
-    ) -> (Vec<f64>, usize) {
+        costs: &EvaluationCostsV1,
+    ) -> (Vec<f64>, usize, Option<f64>) {
         let mut previous_position = 0.0;
         let mut trade_count = 0;
+        let capacity_features = costs.capacity_enabled().then(|| {
+            (
+                format!("bid_depth_top{}", costs.capacity_depth_levels),
+                format!("ask_depth_top{}", costs.capacity_depth_levels),
+            )
+        });
+        let mut max_book_depth_fraction = capacity_features.as_ref().map(|_| 0.0_f64);
         let returns = range
             .map(|index| {
                 let position = signal_position(signals[index]);
-                let turnover = (position - previous_position).abs();
+                let position_change = position - previous_position;
+                let turnover = position_change.abs();
                 if turnover > f64::EPSILON {
                     trade_count += 1;
                 }
                 previous_position = position;
                 let row = &rows[index];
-                let transaction_cost =
-                    (row.fee_bps.max(0.0) + row.latency_bps.max(0.0)) * turnover / BPS;
+                let spread_crossing_bps = if costs.cross_spread {
+                    row.features.get("spread_bps").copied().unwrap_or(0.0) / 2.0
+                } else {
+                    0.0
+                };
+                if let (Some((bid_depth, ask_depth)), Some(max_fraction)) =
+                    (&capacity_features, &mut max_book_depth_fraction)
+                {
+                    let depth_feature = if position_change > 0.0 {
+                        ask_depth
+                    } else {
+                        bid_depth
+                    };
+                    let depth_notional = row.features.get(depth_feature).copied().unwrap_or(0.0)
+                        * row.features.get("mid_price").copied().unwrap_or(0.0);
+                    if turnover > f64::EPSILON {
+                        *max_fraction = (*max_fraction)
+                            .max(costs.position_notional_usd * turnover / depth_notional);
+                    }
+                }
+                let transaction_cost = (row.fee_bps.max(0.0)
+                    + row.latency_bps.max(0.0)
+                    + costs.slippage_bps
+                    + spread_crossing_bps)
+                    * turnover
+                    / BPS;
                 let funding_cost = row.funding_bps.max(0.0) * position.abs() / BPS;
                 position * row.label - transaction_cost - funding_cost
             })
             .collect();
-        (returns, trade_count)
+        (returns, trade_count, max_book_depth_fraction)
     }
 }
 
@@ -194,6 +227,36 @@ impl FormulaEvaluator {
         }) {
             return Err("dataset costs do not match the evaluation protocol".to_string());
         }
+        if protocol.costs.cross_spread
+            && rows.iter().any(|row| {
+                row.features
+                    .get("spread_bps")
+                    .is_none_or(|spread| !spread.is_finite() || *spread < 0.0)
+            })
+        {
+            return Err(
+                "taker spread crossing requires a finite non-negative spread_bps feature"
+                    .to_string(),
+            );
+        }
+        if protocol.costs.capacity_enabled() {
+            let bid_depth = format!("bid_depth_top{}", protocol.costs.capacity_depth_levels);
+            let ask_depth = format!("ask_depth_top{}", protocol.costs.capacity_depth_levels);
+            if rows.iter().any(|row| {
+                ["mid_price", bid_depth.as_str(), ask_depth.as_str()]
+                    .iter()
+                    .any(|feature| {
+                        row.features
+                            .get(*feature)
+                            .is_none_or(|value| !value.is_finite() || *value <= 0.0)
+                    })
+            }) {
+                return Err(
+                    "capacity checks require positive mid_price and matching top-N bid/ask depth features"
+                        .to_string(),
+                );
+            }
+        }
         if signals
             .iter()
             .any(|value| !value.is_finite() || value.abs() > self.config.max_abs_signal)
@@ -231,8 +294,8 @@ impl FormulaEvaluator {
         let mut fold_metrics = Vec::with_capacity(ranges.len());
         let mut all_returns = Vec::new();
         for (fold_index, range) in ranges.into_iter().enumerate() {
-            let (returns, trade_count) =
-                predictive_stage.map_positions_to_net_returns(rows, signals, range);
+            let (returns, trade_count, max_book_depth_fraction) = predictive_stage
+                .map_positions_to_net_returns(rows, signals, range, &protocol.costs);
             let mean = mean(&returns);
             let net_sharpe = sharpe_ratio(&returns, mean);
             let raw_score = t_statistic(&returns, mean);
@@ -261,6 +324,17 @@ impl FormulaEvaluator {
                     self.config.max_drawdown
                 ));
             }
+            if max_book_depth_fraction
+                .is_some_and(|fraction| fraction > protocol.costs.max_book_depth_fraction)
+            {
+                predictive_stage.failures.push(format!(
+                    "fold {} top-{} book depth fraction {:.8} exceeds {:.8}",
+                    fold_index + 1,
+                    protocol.costs.capacity_depth_levels,
+                    max_book_depth_fraction.expect("capacity is enabled"),
+                    protocol.costs.max_book_depth_fraction,
+                ));
+            }
             fold_metrics.push(FoldEvaluationMetrics {
                 fold_index: fold_index + 1,
                 row_count: returns.len(),
@@ -270,6 +344,7 @@ impl FormulaEvaluator {
                 max_drawdown,
                 net_sharpe,
                 raw_score,
+                max_book_depth_fraction,
             });
             all_returns.extend(returns);
         }
@@ -709,6 +784,11 @@ mod tests {
                 fee_bps,
                 funding_bps: 0.0,
                 latency_bps: 0.0,
+                slippage_bps: 0.0,
+                cross_spread: false,
+                position_notional_usd: 0.0,
+                capacity_depth_levels: 0,
+                max_book_depth_fraction: 0.0,
             },
             EvaluationLabelSpecV1 {
                 horizon_buckets: 1,
@@ -788,10 +868,121 @@ mod tests {
 
         assert_eq!(predictive_stage.predictive.time_series_ic, Some(1.0));
         assert!(predictive_stage
-            .map_positions_to_net_returns(context.rows(), &signals, ranges[0].clone())
+            .map_positions_to_net_returns(
+                context.rows(),
+                &signals,
+                ranges[0].clone(),
+                &context.protocol().costs,
+            )
             .0
             .iter()
             .any(|value| !value.is_finite()));
+    }
+
+    #[test]
+    fn taker_costs_charge_fee_latency_slippage_and_half_spread_per_turnover() {
+        let mut input = rows(2.0);
+        for row in &mut input {
+            row.latency_bps = 0.5;
+            row.features.insert("spread_bps".to_string(), 0.2);
+        }
+        let signals = input.iter().map(|row| row.signal).collect::<Vec<_>>();
+        let costs = EvaluationCostsV1 {
+            fee_bps: 2.0,
+            funding_bps: 0.0,
+            latency_bps: 0.5,
+            slippage_bps: 0.75,
+            cross_spread: true,
+            position_notional_usd: 0.0,
+            capacity_depth_levels: 0,
+            max_book_depth_fraction: 0.0,
+        };
+        let gate = FormulaEvaluator::new(FormulaEvaluatorConfig::default())
+            .unwrap()
+            .predictive_gates(
+                &input,
+                &signals,
+                std::slice::from_ref(&(0..3)),
+                WALK_FORWARD_EVALUATOR_VERSION,
+            );
+
+        let (net_returns, trade_count, max_book_depth_fraction) =
+            gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
+
+        assert_eq!(trade_count, 3);
+        assert_eq!(max_book_depth_fraction, None);
+        assert!((net_returns.iter().sum::<f64>() - 0.028325).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn capacity_uses_trade_notional_and_same_side_top_n_depth() {
+        let mut input = rows(0.0);
+        for row in &mut input {
+            row.features.insert("mid_price".to_string(), 1_000.0);
+            row.features.insert("bid_depth_top5".to_string(), 100.0);
+            row.features.insert("ask_depth_top5".to_string(), 100.0);
+        }
+        let signals = input.iter().map(|row| row.signal).collect::<Vec<_>>();
+        let costs = EvaluationCostsV1 {
+            fee_bps: 0.0,
+            funding_bps: 0.0,
+            latency_bps: 0.0,
+            slippage_bps: 0.0,
+            cross_spread: false,
+            position_notional_usd: 10_000.0,
+            capacity_depth_levels: 5,
+            max_book_depth_fraction: 0.1,
+        };
+        let gate = FormulaEvaluator::new(FormulaEvaluatorConfig::default())
+            .unwrap()
+            .predictive_gates(
+                &input,
+                &signals,
+                std::slice::from_ref(&(0..3)),
+                WALK_FORWARD_EVALUATOR_VERSION,
+            );
+
+        let (_, trade_count, max_fraction) =
+            gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
+
+        assert_eq!(trade_count, 3);
+        assert_eq!(max_fraction, Some(0.2));
+    }
+
+    #[test]
+    fn capacity_breach_is_a_bound_evaluation_failure() {
+        let mut input = rows(0.0);
+        for row in &mut input {
+            row.features.insert("mid_price".to_string(), 1_000.0);
+            row.features.insert("bid_depth_top5".to_string(), 100.0);
+            row.features.insert("ask_depth_top5".to_string(), 100.0);
+        }
+        let mut protocol = protocol(0.0, 3);
+        protocol.costs.position_notional_usd = 10_000.0;
+        protocol.costs.capacity_depth_levels = 5;
+        protocol.costs.max_book_depth_fraction = 0.1;
+        let dataset = prepare_dataset(input, &protocol, "capacity-bound").unwrap();
+        let evaluator = FormulaEvaluator::new(FormulaEvaluatorConfig::default()).unwrap();
+
+        let result = evaluator
+            .evaluate(
+                &proposal(FactorAst::Terminal(FactorTerminal::Field(
+                    "book_imbalance".to_string(),
+                ))),
+                &dataset.engine_context(),
+            )
+            .unwrap();
+
+        assert!(!result.passed);
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.contains("book depth fraction")));
+        assert!(result
+            .metrics
+            .folds
+            .iter()
+            .all(|fold| fold.max_book_depth_fraction == Some(0.2)));
     }
 
     #[test]
