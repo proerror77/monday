@@ -1,0 +1,581 @@
+use crate::polymarket_research_import::{
+    with_validated_research_segments, ResearchSegmentValidationConfig,
+    ResearchSegmentValidationReport,
+};
+use crate::polymarket_upload::validate_market_metadata;
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use rust_decimal::Decimal;
+use serde::Serialize;
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::str::FromStr;
+use url::Url;
+
+pub(crate) const SYMBOLS: [&str; 2] = ["BTCUSDT", "SOLUSDT"];
+pub(crate) const WINDOW_SECS: i64 = 300;
+
+#[derive(Debug, Clone)]
+pub struct ResearchSelectionConfig {
+    pub segments: ResearchSegmentValidationConfig,
+    pub event_start_gte: String,
+    pub event_start_lt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SelectedResearchContract {
+    pub market_id: String,
+    pub condition_id: String,
+    pub symbol: String,
+    pub event_start: String,
+    pub event_end: String,
+    pub up_token_id: String,
+    pub down_token_id: String,
+    pub price_to_beat: String,
+    pub resolution_source: String,
+    pub discovery_recorded_at: String,
+    pub metadata_retrieved_at: String,
+    pub metadata_recorded_at: String,
+    pub discovery_source_sequence: u64,
+    pub metadata_source_sequence: u64,
+    pub raw_market: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResearchSelectionReport {
+    pub schema: &'static str,
+    pub event_start_gte: String,
+    pub event_start_lt: String,
+    pub symbols: [&'static str; 2],
+    pub window_secs: u64,
+    pub contracts: Vec<SelectedResearchContract>,
+    pub validated_inputs: ResearchSegmentValidationReport,
+}
+
+#[derive(Clone)]
+pub(crate) struct SelectedMetadata {
+    pub condition_id: String,
+    pub resolution_source: String,
+    pub retrieved_at: String,
+    pub recorded_at: String,
+    pub sequence: u64,
+    pub tokens: [String; 2],
+    pub outcomes: [String; 2],
+    pub raw_market: Value,
+}
+
+#[derive(Clone)]
+pub(crate) struct SelectedContract {
+    pub market_id: String,
+    pub symbol: String,
+    pub event_start: DateTime<Utc>,
+    pub event_end: DateTime<Utc>,
+    pub up_token: String,
+    pub down_token: String,
+    pub price_to_beat: String,
+    pub discovery_recorded_at: String,
+    pub discovery_sequence: u64,
+    pub metadata: Option<SelectedMetadata>,
+}
+
+pub(crate) fn timestamp(value: &str, field: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .with_context(|| format!("invalid {field}: {value}"))
+}
+
+pub(crate) fn utc_text(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+pub(crate) fn required<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("{field} must be a non-empty string"))
+}
+
+pub(crate) fn decimal_text(value: Option<&Value>, field: &str) -> Result<String> {
+    let text = value
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .filter(|value| value.is_number())
+                .map(Value::to_string)
+        })
+        .ok_or_else(|| anyhow!("{field} must be numeric"))?;
+    Decimal::from_str(&text).with_context(|| format!("invalid decimal {field}: {text}"))?;
+    Ok(text)
+}
+
+pub(crate) fn json_strings(value: Option<&Value>, field: &str) -> Result<[String; 2]> {
+    let values: Vec<String> = serde_json::from_str(
+        value
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{field} must be a JSON string array"))?,
+    )?;
+    values
+        .try_into()
+        .map_err(|_| anyhow!("{field} must contain exactly two strings"))
+}
+
+pub(crate) fn semantic_index(outcomes: &[String; 2], up: bool) -> Result<usize> {
+    let expected = if up { ["up", "yes"] } else { ["down", "no"] };
+    let matches = outcomes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            expected
+                .contains(&value.to_ascii_lowercase().as_str())
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        bail!(
+            "outcomes do not contain one semantic {} side",
+            if up { "up" } else { "down" }
+        );
+    }
+    Ok(matches[0])
+}
+
+pub(crate) fn visit(
+    path: &Path,
+    mut consume: impl FnMut(usize, u64, &str, &Map<String, Value>) -> Result<()>,
+) -> Result<()> {
+    for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        let line_number = index + 1;
+        let value: Value = serde_json::from_str(&line?)
+            .with_context(|| format!("parse {} line {line_number}", path.display()))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow!("line {line_number}: envelope must be an object"))?;
+        let sequence = object
+            .get("sequence")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("line {line_number}: sequence must be an integer"))?;
+        let recorded_at = required(object, "recorded_at")?;
+        let update = object
+            .get("update")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("line {line_number}: update must be an object"))?;
+        consume(line_number, sequence, recorded_at, update)?;
+    }
+    Ok(())
+}
+
+fn selection(config: &ResearchSelectionConfig) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let start = timestamp(&config.event_start_gte, "event_start_gte")?;
+    let end = timestamp(&config.event_start_lt, "event_start_lt")?;
+    if start.timestamp_subsec_nanos() != 0
+        || end.timestamp_subsec_nanos() != 0
+        || start.timestamp().rem_euclid(WINDOW_SECS) != 0
+        || end.timestamp().rem_euclid(WINDOW_SECS) != 0
+        || end <= start
+    {
+        bail!("event selection must be a positive UTC interval aligned to five minutes");
+    }
+    Ok((start, end))
+}
+
+fn discover(
+    path: &Path,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<BTreeMap<String, SelectedContract>> {
+    let mut contracts = BTreeMap::new();
+    visit(path, |line, sequence, recorded_at, update| {
+        if update.get("kind").and_then(Value::as_str) != Some("event_discovered")
+            || update.get("window_secs").and_then(Value::as_u64) != Some(WINDOW_SECS as u64)
+        {
+            return Ok(());
+        }
+        let symbol = required(update, "symbol")?;
+        if !SYMBOLS.contains(&symbol) {
+            return Ok(());
+        }
+        let event_end = timestamp(required(update, "end_time")?, "end_time")?;
+        let event_start = event_end - Duration::seconds(WINDOW_SECS);
+        if event_start < start || event_start >= end {
+            return Ok(());
+        }
+        let market_id = required(update, "event_id")?.to_owned();
+        let up_token = required(update, "up_token")?.to_owned();
+        let down_token = required(update, "down_token")?.to_owned();
+        if up_token == down_token {
+            bail!("line {line}: discovery has duplicate outcome tokens");
+        }
+        let contract = SelectedContract {
+            market_id: market_id.clone(),
+            symbol: symbol.to_owned(),
+            event_start,
+            event_end,
+            up_token,
+            down_token,
+            price_to_beat: decimal_text(update.get("price_to_beat"), "price_to_beat")?,
+            discovery_recorded_at: recorded_at.to_owned(),
+            discovery_sequence: sequence,
+            metadata: None,
+        };
+        if contracts.insert(market_id.clone(), contract).is_some() {
+            bail!("line {line}: duplicate selected discovery for market {market_id}");
+        }
+        Ok(())
+    })?;
+    verify_grid(&contracts, start, end)?;
+    Ok(contracts)
+}
+
+fn verify_grid(
+    contracts: &BTreeMap<String, SelectedContract>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<()> {
+    let mut slot = start;
+    while slot < end {
+        for symbol in SYMBOLS {
+            let matches = contracts
+                .values()
+                .filter(|contract| contract.symbol == symbol && contract.event_start == slot)
+                .count();
+            if matches != 1 {
+                bail!(
+                    "expected one {symbol} five-minute discovery at {}, found {matches}",
+                    utc_text(slot)
+                );
+            }
+        }
+        slot += Duration::seconds(WINDOW_SECS);
+    }
+    Ok(())
+}
+
+fn raw_market_start(market: &Map<String, Value>) -> Result<DateTime<Utc>> {
+    let value = market
+        .get("eventStartTime")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            market
+                .get("events")
+                .and_then(Value::as_array)
+                .and_then(|events| events.first())
+                .and_then(|event| event.get("startTime"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| market.get("startDate").and_then(Value::as_str))
+        .or_else(|| {
+            market
+                .get("events")
+                .and_then(Value::as_array)
+                .and_then(|events| events.first())
+                .and_then(|event| event.get("startDate"))
+                .and_then(Value::as_str)
+        })
+        .ok_or_else(|| anyhow!("raw market has no event start"))?;
+    timestamp(value, "raw market event start")
+}
+
+fn validate_resolution_source(value: &str, symbol: &str, line: usize) -> Result<()> {
+    let url =
+        Url::parse(value).with_context(|| format!("line {line}: invalid resolutionSource"))?;
+    let expected_path = match symbol {
+        "BTCUSDT" => "/streams/btc-usd",
+        "SOLUSDT" => "/streams/sol-usd",
+        _ => unreachable!("discovery restricts symbols"),
+    };
+    if url.scheme() != "https"
+        || url.host_str() != Some("data.chain.link")
+        || url.path() != expected_path
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        bail!("line {line}: selected market is not resolved by the expected Chainlink stream");
+    }
+    Ok(())
+}
+
+fn metadata(
+    update: &Map<String, Value>,
+    contract: &SelectedContract,
+    line: usize,
+) -> Result<SelectedMetadata> {
+    validate_market_metadata(update, line)?;
+    let market = update["market"]
+        .as_object()
+        .expect("metadata validator checked market");
+    let tokens = json_strings(market.get("clobTokenIds"), "clobTokenIds")?;
+    let outcomes = json_strings(market.get("outcomes"), "outcomes")?;
+    let up = semantic_index(&outcomes, true)?;
+    let down = semantic_index(&outcomes, false)?;
+    let event_start = raw_market_start(market)?;
+    let event_end = timestamp(
+        market
+            .get("endDate")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("raw market endDate is missing"))?,
+        "raw market endDate",
+    )?;
+    if required(update, "market_id")? != contract.market_id
+        || required(update, "symbol")? != contract.symbol
+        || event_start != contract.event_start
+        || event_end != contract.event_end
+        || tokens[up] != contract.up_token
+        || tokens[down] != contract.down_token
+    {
+        bail!("line {line}: metadata contradicts selected discovery");
+    }
+    let resolution_source = market
+        .get("resolutionSource")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("line {line}: resolutionSource is missing"))?;
+    validate_resolution_source(resolution_source, &contract.symbol, line)?;
+    let retrieved_at = required(update, "retrieved_at")?;
+    timestamp(retrieved_at, "retrieved_at")?;
+    Ok(SelectedMetadata {
+        condition_id: required(update, "condition_id")?.to_owned(),
+        resolution_source: resolution_source.to_owned(),
+        retrieved_at: retrieved_at.to_owned(),
+        recorded_at: String::new(),
+        sequence: 0,
+        tokens,
+        outcomes,
+        raw_market: Value::Object(market.clone()),
+    })
+}
+
+fn enrich_metadata(path: &Path, contracts: &mut BTreeMap<String, SelectedContract>) -> Result<()> {
+    visit(path, |line, sequence, recorded_at, update| {
+        if update.get("kind").and_then(Value::as_str) != Some("market_metadata") {
+            return Ok(());
+        }
+        let Some(market_id) = update.get("market_id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let Some(contract) = contracts.get_mut(market_id) else {
+            return Ok(());
+        };
+        let mut candidate = metadata(update, contract, line)?;
+        candidate.recorded_at = recorded_at.to_owned();
+        candidate.sequence = sequence;
+        if let Some(existing) = &contract.metadata {
+            if candidate.condition_id != existing.condition_id
+                || candidate.tokens != existing.tokens
+                || candidate.outcomes != existing.outcomes
+                || candidate.resolution_source != existing.resolution_source
+            {
+                bail!("line {line}: metadata identity changed for market {market_id}");
+            }
+        } else {
+            contract.metadata = Some(candidate);
+        }
+        Ok(())
+    })?;
+    if let Some(contract) = contracts
+        .values()
+        .find(|contract| contract.metadata.is_none())
+    {
+        bail!(
+            "missing metadata for selected market {}",
+            contract.market_id
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn with_selected_research_contracts<T>(
+    config: &ResearchSelectionConfig,
+    consume: impl FnOnce(
+        &ResearchSegmentValidationReport,
+        &Path,
+        &Path,
+        &BTreeMap<String, SelectedContract>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+    ) -> Result<T>,
+) -> Result<T> {
+    let (start, end) = selection(config)?;
+    with_validated_research_segments(&config.segments, |inputs, market_path, reference_path| {
+        let mut contracts = discover(market_path, start, end)?;
+        enrich_metadata(reference_path, &mut contracts)?;
+        consume(inputs, market_path, reference_path, &contracts, start, end)
+    })
+}
+
+pub fn select_research_contracts(
+    config: &ResearchSelectionConfig,
+) -> Result<ResearchSelectionReport> {
+    with_selected_research_contracts(config, |inputs, _, _, contracts, start, end| {
+        let contracts = contracts
+            .values()
+            .map(|contract| {
+                let metadata = contract.metadata.as_ref().expect("metadata was enriched");
+                SelectedResearchContract {
+                    market_id: contract.market_id.clone(),
+                    condition_id: metadata.condition_id.clone(),
+                    symbol: contract.symbol.clone(),
+                    event_start: utc_text(contract.event_start),
+                    event_end: utc_text(contract.event_end),
+                    up_token_id: contract.up_token.clone(),
+                    down_token_id: contract.down_token.clone(),
+                    price_to_beat: contract.price_to_beat.clone(),
+                    resolution_source: metadata.resolution_source.clone(),
+                    discovery_recorded_at: contract.discovery_recorded_at.clone(),
+                    metadata_retrieved_at: metadata.retrieved_at.clone(),
+                    metadata_recorded_at: metadata.recorded_at.clone(),
+                    discovery_source_sequence: contract.discovery_sequence,
+                    metadata_source_sequence: metadata.sequence,
+                    raw_market: metadata.raw_market.clone(),
+                }
+            })
+            .collect();
+        Ok(ResearchSelectionReport {
+            schema: "monday.polymarket.research_selection.v1",
+            event_start_gte: utc_text(start),
+            event_start_lt: utc_text(end),
+            symbols: SYMBOLS,
+            window_secs: WINDOW_SECS as u64,
+            contracts,
+            validated_inputs: inputs.clone(),
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::polymarket_research_import::ArtifactTriplet;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn config(start: &str, end: &str) -> ResearchSelectionConfig {
+        let triplet = ArtifactTriplet {
+            data: PathBuf::new(),
+            manifest: PathBuf::new(),
+            success: PathBuf::new(),
+        };
+        ResearchSelectionConfig {
+            segments: ResearchSegmentValidationConfig {
+                market: triplet.clone(),
+                reference: triplet,
+            },
+            event_start_gte: start.to_owned(),
+            event_start_lt: end.to_owned(),
+        }
+    }
+
+    fn contract(market_id: &str, symbol: &str, event_start: DateTime<Utc>) -> SelectedContract {
+        SelectedContract {
+            market_id: market_id.to_owned(),
+            symbol: symbol.to_owned(),
+            event_start,
+            event_end: event_start + Duration::seconds(WINDOW_SECS),
+            up_token: format!("{market_id}-up"),
+            down_token: format!("{market_id}-down"),
+            price_to_beat: "1".to_owned(),
+            discovery_recorded_at: utc_text(event_start),
+            discovery_sequence: 0,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn selection_rejects_non_five_minute_boundary() {
+        let error = selection(&config("2026-07-17T05:30:01Z", "2026-07-17T05:40:00Z")).unwrap_err();
+        assert!(error.to_string().contains("aligned to five minutes"));
+    }
+
+    #[test]
+    fn semantic_outcomes_support_reversed_arrays_and_reject_duplicates() {
+        let reversed = ["Down".to_owned(), "Up".to_owned()];
+        assert_eq!(semantic_index(&reversed, true).unwrap(), 1);
+        assert_eq!(semantic_index(&reversed, false).unwrap(), 0);
+        assert!(semantic_index(&["Up".to_owned(), "Yes".to_owned()], true).is_err());
+    }
+
+    #[test]
+    fn raw_market_start_prefers_event_start_over_listing_date() {
+        let market = json!({
+            "eventStartTime": "2026-07-17T05:30:00Z",
+            "startDate": "2026-07-15T05:30:00Z",
+            "events": [{"startTime": "2026-07-16T05:30:00Z"}]
+        });
+        assert_eq!(
+            utc_text(raw_market_start(market.as_object().unwrap()).unwrap()),
+            "2026-07-17T05:30:00Z"
+        );
+    }
+
+    #[test]
+    fn grid_rejects_two_market_ids_for_one_symbol_and_slot() {
+        let start = timestamp("2026-07-17T05:30:00Z", "start").unwrap();
+        let end = start + Duration::seconds(WINDOW_SECS);
+        let contracts = BTreeMap::from([
+            ("btc-a".to_owned(), contract("btc-a", "BTCUSDT", start)),
+            ("btc-b".to_owned(), contract("btc-b", "BTCUSDT", start)),
+            ("sol".to_owned(), contract("sol", "SOLUSDT", start)),
+        ]);
+        let error = verify_grid(&contracts, start, end).unwrap_err();
+        assert!(error.to_string().contains("found 2"));
+    }
+
+    #[test]
+    fn chainlink_resolution_requires_exact_https_host_and_stream() {
+        assert!(validate_resolution_source(
+            "https://data.chain.link/streams/btc-usd",
+            "BTCUSDT",
+            1
+        )
+        .is_ok());
+        assert!(validate_resolution_source(
+            "https://data.chain.link.attacker.example/streams/btc-usd",
+            "BTCUSDT",
+            1
+        )
+        .is_err());
+        assert!(validate_resolution_source(
+            "https://data.chain.link/streams/sol-usd",
+            "BTCUSDT",
+            1
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn metadata_rejects_invalid_retrieved_at() {
+        let event_start = timestamp("2026-07-17T05:30:00Z", "start").unwrap();
+        let contract = contract("market-1", "BTCUSDT", event_start);
+        let mut update = json!({
+            "market_id": "market-1",
+            "condition_id": "0xcondition",
+            "symbol": "BTCUSDT",
+            "market_window_secs": 300,
+            "retrieved_at": "not-a-timestamp",
+            "market": {
+                "id": "market-1",
+                "conditionId": "0xcondition",
+                "question": "Bitcoin Up or Down - 5 minutes",
+                "slug": "btc-updown-5m-test",
+                "startDate": "2026-07-17T05:30:00Z",
+                "endDate": "2026-07-17T05:35:00Z",
+                "clobTokenIds": "[\"market-1-up\",\"market-1-down\"]",
+                "outcomes": "[\"Up\",\"Down\"]",
+                "resolutionSource": "https://data.chain.link/streams/btc-usd",
+                "makerBaseFee": 1000,
+                "takerBaseFee": 1000
+            }
+        });
+        let error = match metadata(update.as_object_mut().unwrap(), &contract, 1) {
+            Ok(_) => panic!("invalid retrieved_at should fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid retrieved_at"));
+    }
+}
