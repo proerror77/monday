@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 
 pub const LEGACY_LOB_TAPE_SCHEMA: &str = "binance.lob_tape.v2";
 pub const MARKET_TAPE_SCHEMA: &str = "binance.market_tape.v1";
+pub const MAX_SOURCE_LEAD_MS: u64 = 1_000;
 pub const MAX_SOURCE_DELAY_MS: u64 = 30_000;
 
 pub fn supported_schema(schema: &str) -> bool {
@@ -266,10 +267,10 @@ fn validate_stream_identity(frame: &Value, symbol: &str, channel: &str) -> Resul
 
 fn validate_receive_clock(event_time_ms: u64, received_at_ns: u64, kind: &str) -> Result<()> {
     let received_at_ms = received_at_ns / 1_000_000;
-    if event_time_ms > received_at_ms {
-        anyhow::bail!("{kind} source and receive clocks are reversed");
+    if event_time_ms.saturating_sub(received_at_ms) > MAX_SOURCE_LEAD_MS {
+        anyhow::bail!("{kind} source clock lead exceeds the governed limit");
     }
-    if received_at_ms - event_time_ms > MAX_SOURCE_DELAY_MS {
+    if received_at_ms.saturating_sub(event_time_ms) > MAX_SOURCE_DELAY_MS {
         anyhow::bail!("{kind} source-to-receive delay exceeds the governed limit");
     }
     Ok(())
@@ -532,12 +533,12 @@ mod tests {
             .to_string()
             .contains("rollback"));
         assert!(DepthSourceClock::from_frame(
-            &depth_frame(1_700_000_000_101, None),
+            &depth_frame(1_700_000_001_101, None),
             received_at_ns,
         )
         .unwrap_err()
         .to_string()
-        .contains("reversed"));
+        .contains("lead exceeds"));
         assert!(DepthSourceClock::from_frame(
             &depth_frame(1_700_000_000_000, None),
             1_700_000_031_000_000_000,
@@ -556,6 +557,23 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("delay"));
+    }
+
+    #[test]
+    fn depth_clock_allows_only_bounded_source_lead() {
+        let received_at_ms = 1_700_000_000_000;
+        let received_at_ns = received_at_ms * 1_000_000;
+        let parse = |lead_ms| {
+            DepthSourceClock::from_frame(
+                &depth_frame(received_at_ms + lead_ms, Some(received_at_ms + lead_ms)),
+                received_at_ns,
+            )
+        };
+        parse(MAX_SOURCE_LEAD_MS).unwrap();
+        assert!(parse(MAX_SOURCE_LEAD_MS + 1)
+            .unwrap_err()
+            .to_string()
+            .contains("lead exceeds"));
     }
 
     #[test]
@@ -590,6 +608,23 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("delay"));
+    }
+
+    #[test]
+    fn aggregate_trade_allows_only_bounded_source_lead() {
+        let received_at_ms = 1_700_000_000_000;
+        let received_at_ns = received_at_ms * 1_000_000;
+        let parse = |lead_ms| {
+            AggregateTrade::from_frame(
+                &frame(1, received_at_ms + lead_ms, received_at_ms + lead_ms),
+                received_at_ns,
+            )
+        };
+        parse(MAX_SOURCE_LEAD_MS).unwrap();
+        assert!(parse(MAX_SOURCE_LEAD_MS + 1)
+            .unwrap_err()
+            .to_string()
+            .contains("lead exceeds"));
     }
 
     #[test]
