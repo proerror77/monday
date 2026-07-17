@@ -736,6 +736,164 @@ struct TapeWriter {
     file: Option<File>,
 }
 
+struct PendingUpdates {
+    file: File,
+    len: usize,
+    record_types: BTreeMap<&'static str, usize>,
+}
+
+impl PendingUpdates {
+    fn new(spool_dir: &Path) -> Result<Self> {
+        let (path, file) = (0..32)
+            .find_map(|_| {
+                let path =
+                    spool_dir.join(format!(".pending-updates.{:016x}.ndjson", random::<u64>()));
+                match OpenOptions::new()
+                    .create_new(true)
+                    .read(true)
+                    .write(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                    .open(&path)
+                {
+                    Ok(file) => Some(Ok((path, file))),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .transpose()?
+            .context("could not allocate exclusive pending-update spill")?;
+        fs::remove_file(&path).context("could not unlink private pending-update spill")?;
+        Ok(Self {
+            file,
+            len: 0,
+            record_types: BTreeMap::new(),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn record_types(&self) -> BTreeMap<&'static str, usize> {
+        ["market_metadata", "polymarket_trade", "market_settlement"]
+            .into_iter()
+            .map(|kind| {
+                (
+                    kind,
+                    self.record_types.get(kind).copied().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    fn push(&mut self, update: Value) -> Result<()> {
+        let kind = match update.get("kind").and_then(Value::as_str) {
+            Some("market_metadata") => Some("market_metadata"),
+            Some("polymarket_trade") => Some("polymarket_trade"),
+            Some("market_settlement") => Some("market_settlement"),
+            _ => None,
+        };
+        let mut encoded = serde_json::to_vec(&update)?;
+        encoded.push(b'\n');
+        self.file.write_all(&encoded)?;
+        self.len += 1;
+        if let Some(kind) = kind {
+            *self.record_types.entry(kind).or_default() += 1;
+        }
+        Ok(())
+    }
+
+    fn replay(self, writer: &mut TapeWriter, now: DateTime<Utc>) -> Result<()> {
+        self.replay_with_sync(writer, now, |file| {
+            file.sync_all()?;
+            Ok(())
+        })
+    }
+
+    fn replay_with_sync<F>(
+        mut self,
+        writer: &mut TapeWriter,
+        now: DateTime<Utc>,
+        sync: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut File) -> Result<()>,
+    {
+        self.file.flush()?;
+        self.file.sync_all()?;
+        release_clean_file_cache(&self.file)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        writer.write_update_results_with_sync(
+            PendingUpdateReader::new(self.file, self.len),
+            now,
+            sync,
+        )
+    }
+}
+
+struct PendingUpdateReader {
+    reader: BufReader<File>,
+    expected: usize,
+    read: usize,
+    done: bool,
+}
+
+impl PendingUpdateReader {
+    fn new(file: File, expected: usize) -> Self {
+        Self {
+            reader: BufReader::new(file),
+            expected,
+            read: 0,
+            done: false,
+        }
+    }
+}
+
+impl Iterator for PendingUpdateReader {
+    type Item = Result<Value>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let mut line = Vec::new();
+        let bytes = match self.reader.read_until(b'\n', &mut line) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.done = true;
+                return Some(Err(error.into()));
+            }
+        };
+        if bytes == 0 {
+            self.done = true;
+            return (self.read != self.expected).then(|| {
+                Err(anyhow!(
+                    "pending-update spill ended after {} of {} records",
+                    self.read,
+                    self.expected
+                ))
+            });
+        }
+        if !line.ends_with(b"\n") {
+            self.done = true;
+            return Some(Err(anyhow!(
+                "pending-update spill has an incomplete final record"
+            )));
+        }
+        if self.read == self.expected {
+            self.done = true;
+            return Some(Err(anyhow!(
+                "pending-update spill contains more than {} records",
+                self.expected
+            )));
+        }
+        line.pop();
+        self.read += 1;
+        Some(serde_json::from_slice(&line).context("pending-update spill contains invalid JSON"))
+    }
+}
+
 impl TapeWriter {
     fn new(spool_dir: &Path) -> Result<Self> {
         fs::create_dir_all(spool_dir)?;
@@ -824,6 +982,7 @@ impl TapeWriter {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_updates(&mut self, updates: &[Value], now: DateTime<Utc>) -> Result<()> {
         self.write_updates_with_sync(updates, now, |file| {
             file.sync_all()?;
@@ -831,6 +990,7 @@ impl TapeWriter {
         })
     }
 
+    #[cfg(test)]
     fn write_updates_with_sync<F>(
         &mut self,
         updates: &[Value],
@@ -840,7 +1000,21 @@ impl TapeWriter {
     where
         F: FnOnce(&mut File) -> Result<()>,
     {
-        if updates.is_empty() {
+        self.write_update_results_with_sync(updates.iter().cloned().map(Ok), now, sync)
+    }
+
+    fn write_update_results_with_sync<I, F>(
+        &mut self,
+        updates: I,
+        now: DateTime<Utc>,
+        sync: F,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = Result<Value>>,
+        F: FnOnce(&mut File) -> Result<()>,
+    {
+        let mut updates = updates.into_iter().peekable();
+        if updates.peek().is_none() {
             return Ok(());
         }
         let target_hour = hour_key(now);
@@ -860,6 +1034,7 @@ impl TapeWriter {
         let result = (|| -> Result<()> {
             let file = self.file.as_mut().context("active tape is closed")?;
             for update in updates {
+                let update = update?;
                 let mut encoded = serde_json::to_vec(&json!({
                     "sequence": self.sequence,
                     "recorded_at": recorded_at,
@@ -1672,7 +1847,7 @@ impl ReferenceCollector {
         let cycle_started = Instant::now();
         let now = utc_now();
         let retrieved_at = iso_z(now);
-        let mut updates = Vec::new();
+        let mut updates = PendingUpdates::new(&self.config.spool_dir)?;
         let mut errors = Vec::new();
         let mut truncated_markets = Vec::new();
         let mut non_object_trade_markets = Vec::new();
@@ -1900,7 +2075,7 @@ impl ReferenceCollector {
                         force_hour_context,
                         &mut tracked,
                     )? {
-                        updates.push(metadata);
+                        updates.push(metadata)?;
                     }
                 }
 
@@ -1959,7 +2134,9 @@ impl ReferenceCollector {
                                 non_object_trade_markets.push(condition_id.clone());
                             }
                             let new_trade_count = new_updates.len();
-                            updates.extend(new_updates);
+                            for update in new_updates {
+                                updates.push(update)?;
+                            }
                             for (reason, count) in &malformed {
                                 *malformed_trade_reasons.entry(reason.clone()).or_default() +=
                                     count;
@@ -2005,7 +2182,7 @@ impl ReferenceCollector {
                 }
                 if let Some(settlement) = settlement {
                     if !tracked.settled {
-                        updates.push(settlement);
+                        updates.push(settlement)?;
                         tracked.settled = true;
                     }
                 }
@@ -2048,7 +2225,9 @@ impl ReferenceCollector {
             })
             .collect::<Vec<_>>();
 
-        self.writer.write_updates(&updates, now)?;
+        let records_written = updates.len();
+        let record_types = updates.record_types();
+        updates.replay(&mut self.writer, now)?;
         if missing_target_symbols.is_empty() {
             next_state.context_seed_hour = Some(target_hour);
         }
@@ -2066,18 +2245,6 @@ impl ReferenceCollector {
         invalid_end_time_markets.sort();
         stale_trade_markets.sort();
         stale_settlement_markets.sort();
-        let record_types = ["market_metadata", "polymarket_trade", "market_settlement"]
-            .into_iter()
-            .map(|kind| {
-                (
-                    kind,
-                    updates
-                        .iter()
-                        .filter(|update| update.get("kind").and_then(Value::as_str) == Some(kind))
-                        .count(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         let health = json!({
             "cycle_started_at": retrieved_at,
             "cycle_duration_ms": cycle_duration_ms,
@@ -2093,7 +2260,7 @@ impl ReferenceCollector {
             "market_detail_selected": market_detail_plan.selected.len(),
             "market_detail_deferred": market_detail_plan.deferred,
             "market_detail_priority_deferred": market_detail_plan.priority_deferred,
-            "records_written": updates.len(),
+            "records_written": records_written,
             "record_types": record_types,
             "api_errors": errors,
             "trade_poll_budget": self.config.max_trade_polls_per_cycle,
@@ -3462,6 +3629,120 @@ mod tests {
             )
             .unwrap();
         assert!(!writer.needs_hour_context(now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_update_spill_replays_byte_identically_and_reports_counts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let expected_root = TestDir::new();
+        let actual_root = TestDir::new();
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let updates = vec![
+            json!({"kind": "market_metadata", "market_id": "market-1"}),
+            json!({"kind": "polymarket_trade", "record_id": "trade-1"}),
+            json!({"kind": "market_settlement", "market_id": "market-1"}),
+        ];
+        let mut expected = TapeWriter::new(expected_root.path()).unwrap();
+        expected.write_updates(&updates, now).unwrap();
+        expected.close().unwrap();
+
+        let mut pending = PendingUpdates::new(actual_root.path()).unwrap();
+        assert_eq!(
+            pending.record_types(),
+            BTreeMap::from([
+                ("market_metadata", 0),
+                ("market_settlement", 0),
+                ("polymarket_trade", 0),
+            ])
+        );
+        for update in updates {
+            pending.push(update).unwrap();
+        }
+        assert_eq!(pending.len(), 3);
+        assert_eq!(
+            pending.record_types(),
+            BTreeMap::from([
+                ("market_metadata", 1),
+                ("market_settlement", 1),
+                ("polymarket_trade", 1),
+            ])
+        );
+        assert_eq!(
+            pending.file.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let mut actual = TapeWriter::new(actual_root.path()).unwrap();
+        pending.replay(&mut actual, now).unwrap();
+        actual.close().unwrap();
+
+        assert_eq!(
+            fs::read(expected_root.path().join(ACTIVE_TAPE)).unwrap(),
+            fs::read(actual_root.path().join(ACTIVE_TAPE)).unwrap()
+        );
+    }
+
+    #[test]
+    fn pending_update_replay_rolls_back_the_whole_batch_on_sync_failure() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        writer
+            .write_updates(&[json!({"kind": "prefix"})], now)
+            .unwrap();
+        let before = fs::read(root.path().join(ACTIVE_TAPE)).unwrap();
+
+        let mut pending = PendingUpdates::new(root.path()).unwrap();
+        pending.push(json!({"kind": "first"})).unwrap();
+        pending.push(json!({"kind": "second"})).unwrap();
+        let error = pending
+            .replay_with_sync(&mut writer, now, |_| bail!("injected replay sync failure"))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected replay sync failure"));
+        assert_eq!(writer.sequence, 1);
+        assert_eq!(fs::read(root.path().join(ACTIVE_TAPE)).unwrap(), before);
+    }
+
+    #[test]
+    fn truncated_pending_update_spill_fails_closed_and_rolls_back_tape() {
+        let root = TestDir::new();
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let mut pending = PendingUpdates::new(root.path()).unwrap();
+        pending.push(json!({"kind": "first"})).unwrap();
+        pending.push(json!({"kind": "second"})).unwrap();
+        let mut reader = BufReader::new(pending.file.try_clone().unwrap());
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut first_record = Vec::new();
+        reader.read_until(b'\n', &mut first_record).unwrap();
+        pending
+            .file
+            .set_len(u64::try_from(first_record.len()).unwrap())
+            .unwrap();
+
+        let mut writer = TapeWriter::new(root.path()).unwrap();
+        let error = pending.replay(&mut writer, now).unwrap_err();
+
+        assert!(error.to_string().contains("ended after 1 of 2 records"));
+        assert_eq!(writer.sequence, 0);
+        assert_eq!(
+            fs::metadata(root.path().join(ACTIVE_TAPE)).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn pending_update_spill_has_no_directory_entry_to_leak_on_crash() {
+        let root = TestDir::new();
+        let mut pending = PendingUpdates::new(root.path()).unwrap();
+        pending.push(json!({"kind": "market_metadata"})).unwrap();
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+
+        drop(pending);
+
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[cfg(target_os = "linux")]
