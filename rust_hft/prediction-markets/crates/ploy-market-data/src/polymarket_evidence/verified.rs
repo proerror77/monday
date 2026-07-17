@@ -444,7 +444,37 @@ fn validate_book(raw: &RawBook, contract: &Contract) -> Result<()> {
         probability(level.price, "orderbook level price")?;
         positive(level.size, "orderbook level size")?;
     }
+    if !top_matches_full_depth(raw.bid, raw.bid_size, &raw.bid_levels, true)
+        || !top_matches_full_depth(raw.ask, raw.ask_size, &raw.ask_levels, false)
+    {
+        bail!("orderbook top of book disagrees with full depth");
+    }
     Ok(())
+}
+
+fn top_matches_full_depth(
+    price: Option<Decimal>,
+    size: Option<Decimal>,
+    levels: &Option<Vec<RawBookLevel>>,
+    is_bid: bool,
+) -> bool {
+    match (price.zip(size), levels.as_deref()) {
+        (None, Some([])) => true,
+        (Some((price, size)), Some(levels)) if !levels.is_empty() => {
+            let best_price = if is_bid {
+                levels.iter().map(|level| level.price).max()
+            } else {
+                levels.iter().map(|level| level.price).min()
+            }
+            .expect("non-empty depth has a best price");
+            let mut best_levels = levels.iter().filter(|level| level.price == best_price);
+            best_levels
+                .next()
+                .is_some_and(|level| level.price == price && level.size == size)
+                && best_levels.next().is_none()
+        }
+        _ => false,
+    }
 }
 
 fn project_book_levels(levels: Option<Vec<RawBookLevel>>) -> Option<Vec<PolymarketBookLevel>> {
@@ -712,6 +742,65 @@ mod tests {
         book["recorded_at"] = json!("2026-07-17T05:30:00Z");
         book["available_at"] = json!("2026-07-17T05:30:00Z");
         assert_rejected(&rows, "clock");
+    }
+
+    #[test]
+    fn rejects_top_of_book_that_disagrees_with_full_depth() {
+        let mut rows = valid_rows();
+        row(&mut rows, "orderbook_snapshot", 0)["bid"] = json!("0.3");
+        assert_rejected(&rows, "full depth");
+
+        let mut rows = valid_rows();
+        row(&mut rows, "orderbook_snapshot", 0)["ask_size"] = json!("12");
+        assert_rejected(&rows, "full depth");
+
+        let mut rows = valid_rows();
+        row(&mut rows, "orderbook_snapshot", 0)["bid_levels"] = json!([
+            {"price":"0.4","size":"10"},
+            {"price":"0.4","size":"10"}
+        ]);
+        assert_rejected(&rows, "full depth");
+
+        let mut rows = valid_rows();
+        let book = row(&mut rows, "orderbook_snapshot", 0);
+        book["bid"] = Value::Null;
+        book["bid_size"] = Value::Null;
+        assert_rejected(&rows, "full depth");
+
+        let mut rows = valid_rows();
+        row(&mut rows, "orderbook_snapshot", 0)["bid_levels"] = json!([]);
+        assert_rejected(&rows, "full depth");
+    }
+
+    #[test]
+    fn accepts_unique_best_levels_independent_of_depth_order() {
+        let mut rows = valid_rows();
+        let book = row(&mut rows, "orderbook_snapshot", 0);
+        book["bid_levels"] = json!([
+            {"price":"0.3","size":"7"},
+            {"price":"0.4","size":"10"},
+            {"price":"0.35","size":"8"}
+        ]);
+        book["ask_levels"] = json!([
+            {"price":"0.7","size":"3"},
+            {"price":"0.5","size":"11"},
+            {"price":"0.6","size":"4"}
+        ]);
+        verify_rows(&rows).unwrap();
+
+        let mut rows = valid_rows();
+        let book = row(&mut rows, "orderbook_snapshot", 0);
+        book["bid"] = Value::Null;
+        book["bid_size"] = Value::Null;
+        book["bid_levels"] = json!([]);
+        verify_rows(&rows).unwrap();
+
+        let mut rows = valid_rows();
+        let book = row(&mut rows, "orderbook_snapshot", 0);
+        book["bid"] = Value::Null;
+        book["bid_size"] = Value::Null;
+        book["bid_levels"] = Value::Null;
+        assert_rejected(&rows, "full depth");
     }
 
     #[test]
