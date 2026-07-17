@@ -1,5 +1,9 @@
 use anyhow::Context;
 use clap::Parser;
+use data::binance_market_tape::{
+    AggregateTrade, AggregateTradeSequenceValidator, DepthSourceClock,
+    DepthSourceClockSequenceValidator,
+};
 use futures::StreamExt;
 use hft_collector::lob_archiver::{
     checkpoint_event, command_status_with_timeout, files_with_suffix, read_upload_status,
@@ -210,21 +214,33 @@ impl Config {
     }
 
     fn stream_urls(&self) -> Vec<String> {
-        let base = match self.market {
-            Market::Spot => "wss://data-stream.binance.vision/stream?streams=",
-            Market::Usdm => "wss://fstream.binance.com/stream?streams=",
-        };
         self.active_symbols()
             .chunks(self.ws_shard_size)
-            .map(|symbols| {
-                format!(
-                    "{base}{}",
-                    symbols
-                        .iter()
-                        .map(|symbol| format!("{}@depth@100ms", symbol.to_ascii_lowercase()))
-                        .collect::<Vec<_>>()
-                        .join("/")
-                )
+            .flat_map(|symbols| {
+                let depth = symbols
+                    .iter()
+                    .map(|symbol| format!("{}@depth@100ms", symbol.to_ascii_lowercase()))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let aggregate_trades = symbols
+                    .iter()
+                    .map(|symbol| format!("{}@aggTrade", symbol.to_ascii_lowercase()))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                match self.market {
+                    Market::Spot => vec![
+                        format!("wss://data-stream.binance.vision/stream?streams={depth}"),
+                        format!(
+                            "wss://data-stream.binance.vision/stream?streams={aggregate_trades}"
+                        ),
+                    ],
+                    Market::Usdm => vec![
+                        format!("wss://fstream.binance.com/public/stream?streams={depth}"),
+                        format!(
+                            "wss://fstream.binance.com/market/stream?streams={aggregate_trades}"
+                        ),
+                    ],
+                }
             })
             .collect()
     }
@@ -270,9 +286,20 @@ struct SymbolCatalog {
 }
 
 #[derive(Debug)]
+struct ValidatedDepth {
+    diff: DepthDiff,
+    source_clock: DepthSourceClock,
+}
+
+#[derive(Debug)]
 enum Event {
     Diff {
         received_at_ns: u64,
+        frame: Value,
+        depth: Box<ValidatedDepth>,
+    },
+    AggregateTrade {
+        trade: AggregateTrade,
         frame: Value,
     },
     Snapshot {
@@ -300,6 +327,23 @@ enum ProcessAction {
     Resnapshot(String),
     Excluded,
     InitialSnapshotsComplete,
+}
+
+#[derive(Debug, Default)]
+struct ProcessState {
+    sequence_gaps: u64,
+    depth_source_clocks: DepthSourceClockSequenceValidator,
+    aggregate_trades: AggregateTradeSequenceValidator,
+    aggregate_trade_history_trusted: bool,
+}
+
+impl ProcessState {
+    fn new(aggregate_trade_history_trusted: bool) -> Self {
+        Self {
+            aggregate_trade_history_trusted,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -515,6 +559,15 @@ async fn main() -> anyhow::Result<()> {
     if !recovered.is_empty() {
         info!(segments = recovered.len(), "recovered interrupted segments");
     }
+    let aggregate_trade_history_trusted =
+        !spool_contains_current_market_tape_history(&config.spool_dir)?;
+    if !aggregate_trade_history_trusted {
+        warn!(
+            spool_dir = %config.spool_dir.display(),
+            "market_tape history exists but aggregate-trade continuity restore is not implemented; new segments stay replay-unsafe"
+        );
+    }
+    let mut process_state = ProcessState::new(aggregate_trade_history_trusted);
     let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let upload_task = tokio::spawn(upload_loop(config.clone(), shutdown_rx.clone()));
@@ -522,7 +575,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut backoff = 1_u64;
     while !*shutdown_rx.borrow() {
-        match run_session(config.clone(), shutdown_rx.clone(), watchdog.clone()).await {
+        match run_session(
+            config.clone(),
+            shutdown_rx.clone(),
+            watchdog.clone(),
+            &mut process_state,
+        )
+        .await
+        {
             Ok(()) if *shutdown_rx.borrow() => break,
             Ok(()) => backoff = 1,
             Err(error) => {
@@ -543,6 +603,7 @@ async fn run_session(
     config: Arc<Config>,
     mut shutdown: watch::Receiver<bool>,
     watchdog: ProcessWatchdog,
+    mut process_state: &mut ProcessState,
 ) -> anyhow::Result<()> {
     let session_id = format!("{:x}-{}", now_ns()?, std::process::id());
     let active_symbols = config.active_symbols();
@@ -582,7 +643,6 @@ async fn run_session(
         }),
         now_ns()?,
     )?;
-    let mut sequence_gaps = 0_u64;
     let mut last_health = Instant::now() - Duration::from_secs(60);
     let mut failure = None;
     let mut sync_deadline = None;
@@ -604,7 +664,8 @@ async fn run_session(
                 match joined {
                     Some(Ok(Ok(TaskExit::Stopped(Some(event))))) => {
                         pending_action = process_event(
-                            &config, &mut segment, &mut states, &mut budget, &session_id, event, &mut sequence_gaps
+                            &config, &mut segment, &mut states, &mut budget, &session_id, event,
+                            &mut process_state,
                         )?;
                     }
                     Some(Ok(Ok(TaskExit::SnapshotComplete))) => {},
@@ -628,7 +689,8 @@ async fn run_session(
                 match event {
                     Some(event) => {
                         match process_event(
-                            &config, &mut segment, &mut states, &mut budget, &session_id, event, &mut sequence_gaps
+                            &config, &mut segment, &mut states, &mut budget, &session_id, event,
+                            &mut process_state,
                         ) {
                             Ok(action) => pending_action = action,
                             Err(error) => {
@@ -649,7 +711,14 @@ async fn run_session(
         match pending_action {
             ProcessAction::None => {}
             ProcessAction::Resnapshot(symbol) => {
-                segment = rotate_segment(segment, &config, &states, &session_id, "sequence_gap")?;
+                segment = rotate_segment(
+                    segment,
+                    &config,
+                    &states,
+                    &session_id,
+                    "sequence_gap",
+                    process_state,
+                )?;
                 sync_deadline = Some(Instant::now() + config.sync_timeout);
                 tasks.spawn(produce_snapshot(
                     config.clone(),
@@ -659,8 +728,14 @@ async fn run_session(
                 ));
             }
             ProcessAction::Excluded => {
-                segment =
-                    rotate_segment(segment, &config, &states, &session_id, "symbol_excluded")?;
+                segment = rotate_segment(
+                    segment,
+                    &config,
+                    &states,
+                    &session_id,
+                    "symbol_excluded",
+                    process_state,
+                )?;
             }
             ProcessAction::InitialSnapshotsComplete => {
                 sync_deadline = Some(Instant::now() + config.sync_timeout);
@@ -670,7 +745,14 @@ async fn run_session(
         // This must live outside the biased select: under continuous market
         // data receiver.recv() is always ready and the timer branch can starve.
         if segment_due(&segment, config.segment_seconds)? {
-            segment = rotate_segment(segment, &config, &states, &session_id, "scheduled")?;
+            segment = rotate_segment(
+                segment,
+                &config,
+                &states,
+                &session_id,
+                "scheduled",
+                process_state,
+            )?;
         }
 
         if states.values().all(|state| state.synced) {
@@ -697,7 +779,7 @@ async fn run_session(
                 &config.dataset,
                 &session_id,
                 status,
-                sequence_gaps,
+                process_state.sequence_gaps,
                 files_with_suffix(&config.spool_dir, ".manifest.json")?.len(),
                 QueueHealth::from_sender(&sender),
                 &states,
@@ -717,7 +799,17 @@ async fn run_session(
     while let Ok(event) = receiver.try_recv() {
         archive_only(&mut segment, &session_id, event)?;
     }
-    let _ = close_segment(segment, &config, &states, &session_id, "shutdown")?;
+    if failure.is_some() {
+        segment.mark_replay_unsafe();
+    }
+    let _ = close_segment(
+        segment,
+        &config,
+        &states,
+        &session_id,
+        "shutdown",
+        process_state,
+    )?;
     write_health(
         &config.spool_dir,
         config.market,
@@ -728,7 +820,7 @@ async fn run_session(
         } else {
             "stopped"
         },
-        sequence_gaps,
+        process_state.sequence_gaps,
         files_with_suffix(&config.spool_dir, ".manifest.json")?.len(),
         final_queue_health,
         &states,
@@ -755,16 +847,36 @@ fn process_event(
     budget: &mut PendingBudget,
     session_id: &str,
     event: Event,
-    sequence_gaps: &mut u64,
+    process_state: &mut ProcessState,
 ) -> anyhow::Result<ProcessAction> {
     match event {
         Event::Diff {
             received_at_ns,
             frame,
+            depth,
         } => {
-            let diff = DepthDiff::from_frame(&frame)?;
+            let ValidatedDepth { diff, source_clock } = *depth;
             if config.is_excluded(&diff.symbol) {
                 return Ok(ProcessAction::None);
+            }
+            if source_clock.symbol != diff.symbol {
+                anyhow::bail!("depth sequence and source-clock symbols disagree");
+            }
+            if let Err(error) = process_state.depth_source_clocks.observe(&source_clock) {
+                segment.mark_replay_unsafe();
+                process_state.sequence_gaps += 1;
+                segment.write(
+                    "sequence_gap",
+                    json!({
+                        "session_id":session_id,
+                        "kind":"depth_source_clock",
+                        "symbol":diff.symbol,
+                        "error":error.to_string(),
+                        "frame":frame,
+                    }),
+                    received_at_ns,
+                )?;
+                return Err(error);
             }
             segment.write(
                 "diff",
@@ -776,7 +888,7 @@ fn process_event(
                 .ok_or_else(|| anyhow::anyhow!("unconfigured symbol {}", diff.symbol))?;
             if let Err(error) = state.apply_diff(diff, budget) {
                 segment.mark_replay_unsafe();
-                *sequence_gaps += 1;
+                process_state.sequence_gaps += 1;
                 segment.write(
                     "sequence_gap",
                     json!({"session_id":session_id,"error":error.to_string()}),
@@ -790,6 +902,34 @@ fn process_event(
                 }
                 return Err(error);
             }
+        }
+        Event::AggregateTrade { trade, frame } => {
+            if config.is_excluded(&trade.symbol) {
+                return Ok(ProcessAction::None);
+            }
+            if !states.contains_key(&trade.symbol) {
+                anyhow::bail!("unconfigured symbol {}", trade.symbol);
+            }
+            if let Err(error) = process_state.aggregate_trades.observe(&trade) {
+                segment.mark_replay_unsafe();
+                process_state.sequence_gaps += 1;
+                segment.write(
+                    "aggregate_trade_gap",
+                    json!({
+                        "session_id":session_id,
+                        "symbol":trade.symbol,
+                        "error":error.to_string(),
+                        "frame":frame,
+                    }),
+                    trade.received_at_ns,
+                )?;
+                return Err(error);
+            }
+            segment.write(
+                "agg_trade",
+                json!({"session_id":session_id,"frame":frame}),
+                trade.received_at_ns,
+            )?;
         }
         Event::Snapshot {
             received_at_ns,
@@ -815,7 +955,7 @@ fn process_event(
                 .ok_or_else(|| anyhow::anyhow!("unconfigured symbol {symbol}"))?;
             if let Err(error) = state.install_snapshot(&snapshot, budget) {
                 segment.mark_replay_unsafe();
-                *sequence_gaps += 1;
+                process_state.sequence_gaps += 1;
                 segment.write(
                     "sequence_gap",
                     json!({"session_id":session_id,"error":error.to_string()}),
@@ -862,15 +1002,23 @@ fn segment_due_at(start_ns: u64, now_ns: u64, segment_seconds: u64) -> anyhow::R
 }
 
 fn archive_only(segment: &mut Segment, session_id: &str, event: Event) -> anyhow::Result<()> {
-    segment.mark_replay_unsafe();
+    if !matches!(&event, Event::InitialSnapshotsComplete) {
+        segment.mark_replay_unsafe();
+    }
     match event {
         Event::Diff {
             received_at_ns,
             frame,
+            ..
         } => segment.write(
             "diff",
             json!({"session_id":session_id,"archived_only":true,"frame":frame}),
             received_at_ns,
+        ),
+        Event::AggregateTrade { trade, frame } => segment.write(
+            "agg_trade",
+            json!({"session_id":session_id,"archived_only":true,"frame":frame}),
+            trade.received_at_ns,
         ),
         Event::Snapshot {
             received_at_ns,
@@ -908,8 +1056,9 @@ fn rotate_segment(
     states: &HashMap<String, OrderBookState>,
     session_id: &str,
     reason: &str,
+    process_state: &ProcessState,
 ) -> anyhow::Result<Segment> {
-    close_segment(segment, config, states, session_id, reason)?;
+    close_segment(segment, config, states, session_id, reason, process_state)?;
     Segment::create(config.segment_config(), now_ns()?)
 }
 
@@ -919,6 +1068,7 @@ fn close_segment(
     states: &HashMap<String, OrderBookState>,
     session_id: &str,
     reason: &str,
+    process_state: &ProcessState,
 ) -> anyhow::Result<Option<hft_collector::lob_archiver::SegmentArtifacts>> {
     let catalog = config.segment_config();
     segment.update_catalog(
@@ -926,11 +1076,19 @@ fn close_segment(
         catalog.security_token_symbols,
         catalog.excluded_symbols,
     );
+    if !process_state.aggregate_trade_history_trusted {
+        segment.mark_replay_unsafe();
+    }
     if states.values().all(|state| state.synced) {
+        let checkpoint_replay_safe = segment.is_replay_safe();
         for state in states.values() {
             segment.write(
                 "checkpoint",
-                checkpoint_event(state.checkpoint(session_id)?, reason),
+                checkpoint_event(
+                    state.checkpoint(session_id)?,
+                    reason,
+                    checkpoint_replay_safe,
+                ),
                 now_ns()?,
             )?;
         }
@@ -938,6 +1096,17 @@ fn close_segment(
         segment.mark_replay_unsafe();
     }
     segment.close()
+}
+
+fn spool_contains_current_market_tape_history(spool_dir: &Path) -> anyhow::Result<bool> {
+    for manifest in files_with_suffix(spool_dir, ".manifest.json")? {
+        let manifest: Value = serde_json::from_reader(std::fs::File::open(&manifest)?)
+            .with_context(|| format!("failed to read manifest {}", manifest.display()))?;
+        if manifest.get("schema").and_then(Value::as_str) == Some(RAW_SCHEMA) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn receive_url(
@@ -965,16 +1134,39 @@ async fn receive_url(
         };
         if let Message::Text(text) = message {
             watchdog.mark_data();
-            let event = Event::Diff {
-                received_at_ns: now_ns()?,
-                frame: serde_json::from_str(&text)?,
-            };
+            let received_at_ns = now_ns()?;
+            let frame = serde_json::from_str(&text)?;
+            let event = event_from_frame(frame, received_at_ns)?;
             match send_or_shutdown(&sender, event, &mut shutdown).await? {
                 SendOutcome::Sent => {}
                 SendOutcome::Shutdown(event) => return Ok(TaskExit::Stopped(Some(event))),
             }
         }
     }
+}
+
+fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> {
+    let stream = frame
+        .get("stream")
+        .and_then(Value::as_str)
+        .context("Binance combined frame has no stream")?;
+    if stream.contains("@depth") {
+        let source_clock = DepthSourceClock::from_frame(&frame, received_at_ns)?;
+        let diff = DepthDiff::from_frame(&frame)?;
+        return Ok(Event::Diff {
+            received_at_ns,
+            frame,
+            depth: Box::new(ValidatedDepth { diff, source_clock }),
+        });
+    }
+    if !stream
+        .rsplit_once('@')
+        .is_some_and(|(_, channel)| channel.eq_ignore_ascii_case("aggTrade"))
+    {
+        anyhow::bail!("unsupported Binance research stream {stream}");
+    }
+    let trade = AggregateTrade::from_frame(&frame, received_at_ns)?;
+    Ok(Event::AggregateTrade { trade, frame })
 }
 
 async fn produce_snapshots(
@@ -2106,6 +2298,102 @@ mod tests {
     }
 
     #[test]
+    fn market_tape_subscribes_depth_and_aggregate_trades_separately() {
+        let spot = test_config("http://unused".into()).stream_urls();
+        assert_eq!(spot.len(), 2);
+        assert!(spot
+            .iter()
+            .any(|url| url.contains("btcusdt@depth@100ms") && !url.contains("btcusdt@aggTrade")));
+        assert!(spot
+            .iter()
+            .any(|url| url.contains("btcusdt@aggTrade") && !url.contains("btcusdt@depth")));
+
+        let mut usdm_config = test_config("http://unused".into());
+        usdm_config.market = Market::Usdm;
+        usdm_config.dataset = "usdm_all".into();
+        let usdm = usdm_config.stream_urls();
+        assert!(usdm.iter().any(|url| {
+            url.starts_with("wss://fstream.binance.com/public/stream")
+                && url.contains("btcusdt@depth@100ms")
+        }));
+        assert!(usdm.iter().any(|url| {
+            url.starts_with("wss://fstream.binance.com/market/stream")
+                && url.contains("btcusdt@aggTrade")
+        }));
+        assert!(spot
+            .iter()
+            .chain(&usdm)
+            .all(|url| !url.contains("btcusdt@trade")));
+    }
+
+    #[test]
+    fn aggregate_trade_is_validated_and_archived_without_mutating_lob_state() {
+        let root = env::temp_dir().join(format!(
+            "monday-binance-research-ticks-{}",
+            now_ns().unwrap()
+        ));
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.clone();
+        let mut states = HashMap::from([(
+            "BTCUSDT".to_owned(),
+            OrderBookState::new("BTCUSDT", Market::Spot),
+        )]);
+        let mut budget = PendingBudget::new(1);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = ProcessState::new(true);
+        let received_at_ns = now_ns().unwrap();
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let event = event_from_frame(
+            json!({
+                "stream": "btcusdt@aggTrade",
+                "data": {"e":"aggTrade","E":event_time_ms,"s":"BTCUSDT","a":9,"f":10,"l":11,"p":"101","q":"0.2","T":event_time_ms,"m":true}
+            }),
+            received_at_ns,
+        )
+        .unwrap();
+        process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            event,
+            &mut process_state,
+        )
+        .unwrap();
+        assert_eq!(segment.event_count("agg_trade"), 1);
+        assert!(!states["BTCUSDT"].synced);
+        drop(segment);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_aggregate_trade_is_rejected_before_archival() {
+        let received_at_ns = now_ns().unwrap();
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let frame = json!({
+            "stream": "btcusdt@aggTrade",
+            "data": {"e":"aggTrade","E":event_time_ms,"s":"BTCUSDT","a":9,"f":11,"l":10,"p":"101","q":"0.2","T":event_time_ms,"m":true}
+        });
+        assert!(event_from_frame(frame, received_at_ns)
+            .unwrap_err()
+            .to_string()
+            .contains("id range is reversed"));
+    }
+
+    #[test]
+    fn depth_without_source_clock_is_rejected_before_archival() {
+        let frame = json!({
+            "stream": "btcusdt@depth@100ms",
+            "data": {"e":"depthUpdate","s":"BTCUSDT","U":10,"u":11,"b":[],"a":[]}
+        });
+        assert!(event_from_frame(frame, now_ns().unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("field E is missing"));
+    }
+
+    #[test]
     fn all_catalog_excludes_non_spot_and_security_tokens_and_records_manifest_sets() {
         let catalog = parse_symbol_catalog(
             Market::Spot,
@@ -2262,6 +2550,7 @@ mod tests {
             .collect::<HashMap<_, _>>();
         let mut budget = PendingBudget::new(10);
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = ProcessState::new(true);
         let action = process_event(
             &config,
             &mut segment,
@@ -2272,7 +2561,7 @@ mod tests {
                 symbol: "BADUSDT".into(),
                 reason: error.to_string(),
             },
-            &mut 0,
+            &mut process_state,
         )
         .unwrap();
         assert_eq!(action, ProcessAction::Excluded);
@@ -2280,9 +2569,16 @@ mod tests {
         assert!(config.is_excluded("BADUSDT"));
         assert!(!states.contains_key("BADUSDT"));
 
-        let artifacts = close_segment(segment, &config, &states, "session-1", "test")
-            .unwrap()
-            .unwrap();
+        let artifacts = close_segment(
+            segment,
+            &config,
+            &states,
+            "session-1",
+            "test",
+            &ProcessState::new(true),
+        )
+        .unwrap()
+        .unwrap();
         let manifest: Value =
             serde_json::from_reader(std::fs::File::open(artifacts.manifest).unwrap()).unwrap();
         assert_eq!(manifest["symbols"], json!(["BTCUSDT"]));
@@ -2433,10 +2729,16 @@ mod tests {
 
         for attempt in 1..=2 {
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-            let error = tokio::time::timeout(
-                Duration::from_secs(5),
-                run_session(config.clone(), shutdown_rx, watchdog.clone()),
-            )
+            let error = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut process_state = ProcessState::new(true);
+                run_session(
+                    config.clone(),
+                    shutdown_rx,
+                    watchdog.clone(),
+                    &mut process_state,
+                )
+                .await
+            })
             .await
             .unwrap_or_else(|_| panic!("session attempt {attempt} did not fail promptly"))
             .expect_err("invalid producers must return to the reconnect loop");
@@ -2512,9 +2814,16 @@ mod tests {
         ));
 
         let segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
-        let artifacts = close_segment(segment, &config, &states, "session-1", "test")
-            .unwrap()
-            .unwrap();
+        let artifacts = close_segment(
+            segment,
+            &config,
+            &states,
+            "session-1",
+            "test",
+            &ProcessState::new(true),
+        )
+        .unwrap()
+        .unwrap();
         let manifest: Value =
             serde_json::from_reader(std::fs::File::open(artifacts.manifest).unwrap()).unwrap();
         assert_eq!(manifest["has_replay_safe_checkpoint"], true);
@@ -2566,6 +2875,98 @@ mod tests {
     }
 
     #[test]
+    fn current_market_tape_history_requires_aggregate_trade_restore() {
+        let root = tempfile::Builder::new()
+            .prefix("monday-market-tape-history-")
+            .tempdir()
+            .unwrap();
+        assert!(!spool_contains_current_market_tape_history(root.path()).unwrap());
+        std::fs::write(
+            root.path().join("legacy.manifest.json"),
+            serde_json::to_vec(&json!({"schema":"binance.lob_tape.v2"})).unwrap(),
+        )
+        .unwrap();
+        assert!(!spool_contains_current_market_tape_history(root.path()).unwrap());
+        std::fs::write(
+            root.path().join("current.manifest.json"),
+            serde_json::to_vec(&json!({"schema":RAW_SCHEMA})).unwrap(),
+        )
+        .unwrap();
+        assert!(spool_contains_current_market_tape_history(root.path()).unwrap());
+    }
+
+    #[test]
+    fn untrusted_market_tape_history_keeps_checkpoints_replay_unsafe() {
+        assert!(Command::new("zstd")
+            .arg("--version")
+            .output()
+            .expect("zstd is required for segment lifecycle tests")
+            .status
+            .success());
+        let root = env::temp_dir().join(format!(
+            "monday-untrusted-market-tape-test-{}",
+            now_ns().unwrap()
+        ));
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.clone();
+        config.symbols = vec!["BTCUSDT".into()];
+        let mut bridged = OrderBookState::new("BTCUSDT", Market::Spot);
+        let mut budget = PendingBudget::new(1);
+        bridged
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 100,
+                    "bids": [["100", "1"]],
+                    "asks": [["102", "1"]]
+                }),
+                &mut budget,
+            )
+            .unwrap();
+        bridged
+            .apply_diff(
+                DepthDiff {
+                    symbol: "BTCUSDT".into(),
+                    first_update_id: 101,
+                    final_update_id: 101,
+                    previous_update_id: None,
+                    bids: vec![["100".into(), "2".into()]],
+                    asks: vec![],
+                },
+                &mut budget,
+            )
+            .unwrap();
+        let states = HashMap::from([("BTCUSDT".to_owned(), bridged)]);
+        let segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let artifacts = close_segment(
+            segment,
+            &config,
+            &states,
+            "session-1",
+            "test",
+            &ProcessState::new(false),
+        )
+        .unwrap()
+        .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["has_replay_safe_checkpoint"], false);
+        let output = Command::new("zstd")
+            .args(["-q", "-d", "-c"])
+            .arg(artifacts.data)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let checkpoint = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["type"] == "checkpoint")
+            .unwrap();
+        assert_eq!(checkpoint["replay_safe"], false);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn missing_snapshot_times_out_and_closes_replay_unsafe() {
         assert!(Command::new("zstd")
             .arg("--version")
@@ -2586,20 +2987,25 @@ mod tests {
         )]);
         let mut budget = PendingBudget::new(1);
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = ProcessState::new(true);
+        let received_at_ns = now_ns().unwrap();
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let event = event_from_frame(
+            json!({
+                "stream": "missingusdt@depth@100ms",
+                "data": {"e":"depthUpdate","E":event_time_ms,"s": "MISSINGUSDT", "U": 101, "u": 101, "b": [], "a": []}
+            }),
+            received_at_ns,
+        )
+        .unwrap();
         process_event(
             &config,
             &mut segment,
             &mut states,
             &mut budget,
             "session-1",
-            Event::Diff {
-                received_at_ns: now_ns().unwrap(),
-                frame: json!({
-                    "stream": "missingusdt@depth@100ms",
-                    "data": {"s": "MISSINGUSDT", "U": 101, "u": 101, "b": [], "a": []}
-                }),
-            },
-            &mut 0,
+            event,
+            &mut process_state,
         )
         .unwrap();
         let now = Instant::now();
@@ -2609,9 +3015,16 @@ mod tests {
             now,
         ));
 
-        let artifacts = close_segment(segment, &config, &states, "session-1", "test")
-            .unwrap()
-            .unwrap();
+        let artifacts = close_segment(
+            segment,
+            &config,
+            &states,
+            "session-1",
+            "test",
+            &ProcessState::new(true),
+        )
+        .unwrap()
+        .unwrap();
         let manifest: Value =
             serde_json::from_reader(std::fs::File::open(artifacts.manifest).unwrap()).unwrap();
         assert_eq!(manifest["has_replay_safe_checkpoint"], false);
