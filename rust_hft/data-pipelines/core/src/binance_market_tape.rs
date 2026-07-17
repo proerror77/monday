@@ -213,13 +213,17 @@ impl AggregateTrade {
 
 #[derive(Debug, Default)]
 pub struct AggregateTradeSequenceValidator {
-    last: HashMap<String, (u64, u64, u64)>,
+    last: HashMap<String, (u64, u64, u64, u64)>,
 }
 
 impl AggregateTradeSequenceValidator {
     pub fn observe(&mut self, trade: &AggregateTrade) -> Result<()> {
-        if let Some((previous_id, previous_event_time, previous_trade_time)) =
-            self.last.get(&trade.symbol).copied()
+        if let Some((
+            previous_id,
+            previous_last_trade_id,
+            previous_event_time,
+            previous_trade_time,
+        )) = self.last.get(&trade.symbol).copied()
         {
             let expected = previous_id
                 .checked_add(1)
@@ -232,6 +236,17 @@ impl AggregateTradeSequenceValidator {
                     trade.aggregate_trade_id
                 );
             }
+            let expected_first_trade_id = previous_last_trade_id
+                .checked_add(1)
+                .context("aggregate trade raw trade id overflow")?;
+            if trade.first_trade_id != expected_first_trade_id {
+                anyhow::bail!(
+                    "{} aggregate trade raw trade gap expected={} received={}",
+                    trade.symbol,
+                    expected_first_trade_id,
+                    trade.first_trade_id
+                );
+            }
             if trade.event_time_ms < previous_event_time
                 || trade.trade_time_ms < previous_trade_time
             {
@@ -242,6 +257,7 @@ impl AggregateTradeSequenceValidator {
             trade.symbol.clone(),
             (
                 trade.aggregate_trade_id,
+                trade.last_trade_id,
                 trade.event_time_ms,
                 trade.trade_time_ms,
             ),
@@ -628,5 +644,46 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("rollback"));
+    }
+
+    #[test]
+    fn aggregate_trade_sequence_rejects_raw_trade_range_gap() {
+        let mut first_frame = frame(10, 1_700_000_000_000, 1_700_000_000_000);
+        first_frame["data"]["f"] = json!(100);
+        first_frame["data"]["l"] = json!(101);
+        let mut next_frame = frame(11, 1_700_000_000_001, 1_700_000_000_001);
+        next_frame["data"]["f"] = json!(103);
+        next_frame["data"]["l"] = json!(103);
+        let first = AggregateTrade::from_frame(&first_frame, 1_700_000_000_100_000_000).unwrap();
+        let next = AggregateTrade::from_frame(&next_frame, 1_700_000_000_100_000_000).unwrap();
+
+        let mut sequence = AggregateTradeSequenceValidator::default();
+        sequence.observe(&first).unwrap();
+        assert!(sequence
+            .observe(&next)
+            .unwrap_err()
+            .to_string()
+            .contains("gap"));
+    }
+
+    #[test]
+    fn aggregate_trade_sequence_fails_closed_on_raw_trade_id_overflow() {
+        let mut first_frame = frame(10, 1_700_000_000_000, 1_700_000_000_000);
+        first_frame["data"]["f"] = json!(u64::MAX);
+        first_frame["data"]["l"] = json!(u64::MAX);
+        let first = AggregateTrade::from_frame(&first_frame, 1_700_000_000_100_000_000).unwrap();
+        let next = AggregateTrade::from_frame(
+            &frame(11, 1_700_000_000_001, 1_700_000_000_001),
+            1_700_000_000_100_000_000,
+        )
+        .unwrap();
+
+        let mut sequence = AggregateTradeSequenceValidator::default();
+        sequence.observe(&first).unwrap();
+        assert!(sequence
+            .observe(&next)
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
     }
 }
