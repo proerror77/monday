@@ -402,7 +402,7 @@ fn decompress_and_rescan(
     artifact: &ValidatedArtifact,
     dataset: &str,
     directory: &Path,
-) -> Result<()> {
+) -> Result<PathBuf> {
     fs::create_dir(directory)?;
     let source_file = artifact
         .manifest
@@ -455,7 +455,7 @@ fn decompress_and_rescan(
             bail!("manifest field {field} does not match producer rescan");
         }
     }
-    Ok(())
+    Ok(raw)
 }
 fn validate_market_policy(manifest: &Value) -> Result<()> {
     if manifest
@@ -501,29 +501,38 @@ fn validate_reference_policy(manifest: &Value) -> Result<()> {
     }
     Ok(())
 }
-pub fn validate_research_segments(
+pub(crate) fn with_validated_research_segments<T>(
     config: &ResearchSegmentValidationConfig,
-) -> Result<ResearchSegmentValidationReport> {
+    consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
+) -> Result<T> {
     let scratch = ScratchDir::create()?;
     let market = validate_triplet(&config.market, "crypto_expiry", &scratch.0)?;
     let reference = validate_triplet(&config.reference, "crypto_expiry_reference", &scratch.0)?;
     validate_market_policy(&market.manifest)?;
     validate_reference_policy(&reference.manifest)?;
-    decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
-    decompress_and_rescan(
+    let market_raw = decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
+    let reference_raw = decompress_and_rescan(
         &reference,
         "crypto_expiry_reference",
         &scratch.0.join("reference"),
     )?;
+    let report = ResearchSegmentValidationReport {
+        schema: "monday.polymarket.research_segment_validation.v1",
+        market: market.identity.clone(),
+        reference: reference.identity.clone(),
+    };
+    let result = consume(&report, &market_raw, &reference_raw)?;
     for artifact in [&market, &reference] {
         artifact.files.verify()?;
         reject_superseded(&artifact.superseded_marker)?;
     }
-    Ok(ResearchSegmentValidationReport {
-        schema: "monday.polymarket.research_segment_validation.v1",
-        market: market.identity,
-        reference: reference.identity,
-    })
+    Ok(result)
+}
+
+pub fn validate_research_segments(
+    config: &ResearchSegmentValidationConfig,
+) -> Result<ResearchSegmentValidationReport> {
+    with_validated_research_segments(config, |report, _, _| Ok(report.clone()))
 }
 
 #[cfg(test)]
