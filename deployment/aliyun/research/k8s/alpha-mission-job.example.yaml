@@ -97,14 +97,7 @@ spec:
             - --latency-bps
             - "0.5"
             - --slippage-bps
-            - "0.5"
-            - --cross-spread
-            - --position-notional-usd
-            - "10000"
-            - --capacity-depth-levels
-            - "5"
-            - --max-book-depth-fraction
-            - "0.1"
+            - "0.0"
           env:
             - name: FEATURE_URL
               valueFrom:

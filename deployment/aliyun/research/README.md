@@ -22,8 +22,11 @@ The storage authority remains split deliberately:
 - OSS raw and canonical Parquet are immutable data evidence.
 - ClickHouse is the shared high-speed query and feature plane. It is not the
   source of truth for approvals, run state, or complete sequential LOB replay.
-- Rust replays one selected local partition in event order and owns fees,
-  latency, slippage, fills, and capacity simulation.
+- Rust replays one selected local partition in event order and applies explicit
+  fee, latency, additional-slippage, and optional spread-crossing assumptions.
+  The baseline does not model L3 queue position, partial fills, market impact,
+  or venue capacity; an optional same-side top-N depth gate is only a
+  conservative evidence check, not a capacity simulation.
 - DuckDB has one writer and owns research/control-plane lineage. Parallel Pods
   must never open the same DuckDB file for writes.
 
