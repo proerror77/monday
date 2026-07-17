@@ -603,7 +603,7 @@ async fn run_session(
     config: Arc<Config>,
     mut shutdown: watch::Receiver<bool>,
     watchdog: ProcessWatchdog,
-    mut process_state: &mut ProcessState,
+    process_state: &mut ProcessState,
 ) -> anyhow::Result<()> {
     let session_id = format!("{:x}-{}", now_ns()?, std::process::id());
     let active_symbols = config.active_symbols();
@@ -665,7 +665,7 @@ async fn run_session(
                     Some(Ok(Ok(TaskExit::Stopped(Some(event))))) => {
                         pending_action = process_event(
                             &config, &mut segment, &mut states, &mut budget, &session_id, event,
-                            &mut process_state,
+                            process_state,
                         )?;
                     }
                     Some(Ok(Ok(TaskExit::SnapshotComplete))) => {},
@@ -690,7 +690,7 @@ async fn run_session(
                     Some(event) => {
                         match process_event(
                             &config, &mut segment, &mut states, &mut budget, &session_id, event,
-                            &mut process_state,
+                            process_state,
                         ) {
                             Ok(action) => pending_action = action,
                             Err(error) => {
