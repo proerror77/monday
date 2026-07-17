@@ -400,6 +400,19 @@ fn settlement_rows(
     Ok(())
 }
 
+fn paired_quote_fields(
+    update: &Map<String, Value>,
+    price_field: &str,
+    size_field: &str,
+) -> (Value, Value) {
+    match (update.get(price_field), update.get(size_field)) {
+        (Some(price), Some(size)) if !price.is_null() && !size.is_null() => {
+            (price.clone(), size.clone())
+        }
+        _ => (Value::Null, Value::Null),
+    }
+}
+
 fn market_rows(
     path: &Path,
     contracts: &BTreeMap<String, SelectedContract>,
@@ -428,6 +441,8 @@ fn market_rows(
                 if source_ts < contract.event_start || source_ts >= contract.event_end {
                     return Ok(());
                 }
+                let (bid, bid_size) = paired_quote_fields(update, "bid", "bid_size");
+                let (ask, ask_size) = paired_quote_fields(update, "ask", "ask_size");
                 let mut value = base(contract, "orderbook_snapshot");
                 insert(
                     &mut value,
@@ -438,10 +453,10 @@ fn market_rows(
                         "available_at": recorded_at,
                         "source_sequence": sequence,
                         "source_dataset": "crypto_expiry",
-                        "bid": update.get("bid").cloned().unwrap_or(Value::Null),
-                        "ask": update.get("ask").cloned().unwrap_or(Value::Null),
-                        "bid_size": update.get("bid_size").cloned().unwrap_or(Value::Null),
-                        "ask_size": update.get("ask_size").cloned().unwrap_or(Value::Null),
+                        "bid": bid,
+                        "ask": ask,
+                        "bid_size": bid_size,
+                        "ask_size": ask_size,
                         "bid_levels": update.get("bid_levels").cloned().unwrap_or(Value::Null),
                         "ask_levels": update.get("ask_levels").cloned().unwrap_or(Value::Null)
                     }),
@@ -688,6 +703,26 @@ mod tests {
         (contract, rows, references)
     }
 
+    fn quote_rows(update: Value) -> Vec<Row> {
+        let contract = selected_contract();
+        let contracts = BTreeMap::from([(contract.market_id.clone(), contract)]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("market.ndjson");
+        let envelope = json!({
+            "sequence": 1,
+            "recorded_at": "2026-07-17T05:30:02Z",
+            "update": update,
+        });
+        let mut bytes = serde_json::to_vec(&envelope).unwrap();
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+        let mut rows = Vec::new();
+        let mut books = BTreeMap::new();
+        let mut references = BTreeMap::new();
+        market_rows(&path, &contracts, &mut rows, &mut books, &mut references).unwrap();
+        rows
+    }
+
     #[test]
     fn selected_reference_ignores_unrelated_assets_but_rejects_wrong_btc_source() {
         let unrelated = json!({"symbol": "hype/usd"});
@@ -820,6 +855,46 @@ mod tests {
         assert_eq!(rows[0].value["received_at"], "2026-07-17T05:30:05Z");
         assert_eq!(rows[0].value["recorded_at"], "2026-07-17T05:30:10Z");
         assert_eq!(rows[0].value["available_at"], "2026-07-17T05:30:10Z");
+    }
+
+    #[test]
+    fn boundary_ask_price_without_size_is_not_published_as_top_of_book() {
+        let rows = quote_rows(json!({
+            "kind": "quote",
+            "token_id": "up",
+            "ts": "2026-07-17T05:30:01Z",
+            "bid": "0.99",
+            "bid_size": "10",
+            "ask": "1",
+            "ask_levels": [],
+            "bid_levels": [{"price": "0.99", "size": "10"}],
+        }));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value["bid"], "0.99");
+        assert_eq!(rows[0].value["bid_size"], "10");
+        assert_eq!(rows[0].value["ask"], Value::Null);
+        assert_eq!(rows[0].value["ask_size"], Value::Null);
+    }
+
+    #[test]
+    fn boundary_bid_price_without_size_is_not_published_as_top_of_book() {
+        let rows = quote_rows(json!({
+            "kind": "quote",
+            "token_id": "up",
+            "ts": "2026-07-17T05:30:01Z",
+            "bid": "0",
+            "ask": "0.01",
+            "ask_size": "10",
+            "ask_levels": [{"price": "0.01", "size": "10"}],
+            "bid_levels": [],
+        }));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value["bid"], Value::Null);
+        assert_eq!(rows[0].value["bid_size"], Value::Null);
+        assert_eq!(rows[0].value["ask"], "0.01");
+        assert_eq!(rows[0].value["ask_size"], "10");
     }
 
     #[test]
