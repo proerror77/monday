@@ -1,6 +1,6 @@
 //! Fail-closed Polymarket reference collection and raw tape archival.
 
-use crate::polymarket_upload::ensure_canonical_directory;
+use crate::polymarket_upload::{ensure_canonical_directory, validate_reference_tape_for_recovery};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt};
@@ -947,7 +947,15 @@ impl Iterator for PendingUpdateReader {
 }
 
 impl TapeWriter {
+    #[cfg(test)]
     fn new(spool_dir: &Path) -> Result<Self> {
+        Self::new_with_recovery(spool_dir, |_| Ok(()))
+    }
+
+    fn new_with_recovery<F>(spool_dir: &Path, recover: F) -> Result<Self>
+    where
+        F: FnMut(&Value) -> Result<()>,
+    {
         fs::create_dir_all(spool_dir)?;
         let active = spool_dir.join(ACTIVE_TAPE);
         let mut writer = Self {
@@ -957,11 +965,14 @@ impl TapeWriter {
             sequence: 0,
             file: None,
         };
-        writer.recover_active()?;
+        writer.recover_active(recover)?;
         Ok(writer)
     }
 
-    fn recover_active(&mut self) -> Result<()> {
+    fn recover_active<F>(&mut self, mut recover: F) -> Result<()>
+    where
+        F: FnMut(&Value) -> Result<()>,
+    {
         if !self.active.exists() {
             self.file = Some(open_append(&self.active)?);
             return Ok(());
@@ -986,6 +997,7 @@ impl TapeWriter {
             if first_recorded.is_none() {
                 first_recorded = row.get("recorded_at").and_then(parse_datetime);
             }
+            recover(&row)?;
             expected += 1;
             valid_bytes += u64::try_from(bytes)?;
         }
@@ -997,6 +1009,7 @@ impl TapeWriter {
             file.set_len(valid_bytes)?;
             file.sync_all()?;
         }
+        release_clean_file_cache(reader.get_ref())?;
         self.sequence = expected;
         self.hour = first_recorded.map(|value| value.format("%Y%m%dT%H").to_string());
         self.file = Some(open_append(&self.active)?);
@@ -1648,9 +1661,77 @@ struct ReferenceCollector {
     last_success: Instant,
 }
 
+fn recover_state_from_tape_row(
+    state: &mut CollectorState,
+    row: &Value,
+    trade_cutoff: i64,
+) -> Result<()> {
+    let Some(update) = row.get("update").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let kind = update
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let market_id = update.get("market_id").and_then(Value::as_str);
+    let condition_id = update.get("condition_id").and_then(Value::as_str);
+    if kind == "polymarket_trade" {
+        if update.get("record_id_version").and_then(Value::as_str) == Some(TRADE_ID_VERSION) {
+            if let (Some(condition_id), Some(record_id), Some(timestamp)) = (
+                condition_id,
+                update.get("record_id").and_then(Value::as_str),
+                update.get("trade_ts_unix").and_then(Value::as_i64),
+            ) {
+                if timestamp >= trade_cutoff {
+                    state
+                        .trade_seen
+                        .entry(condition_id.to_owned())
+                        .or_default()
+                        .insert(record_id.to_owned(), timestamp);
+                }
+            }
+        }
+    } else if matches!(kind, "market_metadata" | "market_settlement") {
+        if let Some(market_id) = market_id {
+            let tracked = state.markets.entry(market_id.to_owned()).or_default();
+            tracked.condition_id = condition_id.map(str::to_owned);
+            tracked.symbol = update
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(window) = update.get("market_window_secs").and_then(Value::as_u64) {
+                tracked.market_window_secs = window;
+            }
+            if let Some(market) = update.get("market") {
+                tracked.end_time = market
+                    .get("endDate")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                tracked.last_metadata_hash = Some(stable_payload_hash(market)?);
+            }
+            if kind == "market_settlement" {
+                tracked.settled = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compact_trade_dedupe(state: &mut CollectorState, cutoff: i64) -> bool {
+    let mut changed = false;
+    state.trade_seen.retain(|_, seen| {
+        let before = seen.len();
+        seen.retain(|_, timestamp| *timestamp >= cutoff);
+        changed |= seen.len() != before || seen.is_empty();
+        !seen.is_empty()
+    });
+    changed
+}
+
 impl ReferenceCollector {
     fn new(config: ReferenceConfig) -> Result<Self> {
         config.validate()?;
+        let startup_at = utc_now();
         let symbols = config
             .symbols
             .iter()
@@ -1676,7 +1757,7 @@ impl ReferenceCollector {
                 if fs::metadata(&active)?.len() > 0 {
                     let quarantine = config.spool_dir.join(format!(
                         "superseded-v1-{ACTIVE_TAPE}.{}",
-                        utc_now().timestamp_nanos_opt().unwrap_or_default()
+                        startup_at.timestamp_nanos_opt().unwrap_or_default()
                     ));
                     fs::rename(&active, quarantine)?;
                     File::open(&config.spool_dir)?.sync_all()?;
@@ -1689,12 +1770,38 @@ impl ReferenceCollector {
             state.trade_id_version = Some(TRADE_ID_VERSION.to_owned());
             atomic_write_json(&state_path, &state)?;
         }
-        let writer = TapeWriter::new(&config.spool_dir)?;
+        // trade_updates rejects older rows before dedupe, so their IDs cannot
+        // affect any future emission and need not stay in operational state.
+        let trade_cutoff = startup_at.timestamp() - config.market_lookback_secs;
+        let state_compacted = compact_trade_dedupe(&mut state, trade_cutoff);
+        let mut writer = TapeWriter::new_with_recovery(&config.spool_dir, |row| {
+            recover_state_from_tape_row(&mut state, row, trade_cutoff)
+        })?;
+        let recovered_active = writer.sequence > 0;
+        if recovered_active {
+            let validation = validate_reference_tape_for_recovery(&writer.active, startup_at)
+                .context("recovered active tape failed uploader validation");
+            let cache_release = writer
+                .file
+                .as_ref()
+                .context("recovered active tape is closed")
+                .and_then(release_clean_file_cache);
+            validation?;
+            cache_release?;
+        }
+        if state_compacted || recovered_active {
+            // The state checkpoint must be durable before the recovered segment
+            // stops being the active crash-recovery source.
+            atomic_write_json(&state_path, &state)?;
+        }
+        if recovered_active {
+            writer.rotate(startup_at)?;
+        }
         let http = reqwest::Client::builder()
             .timeout(config.http_timeout)
             .user_agent(USER_AGENT)
             .build()?;
-        let mut collector = Self {
+        Ok(Self {
             config,
             symbols,
             state_path,
@@ -1706,74 +1813,7 @@ impl ReferenceCollector {
             #[cfg(test)]
             trade_request_attempts_started_at: std::sync::Mutex::new(Vec::new()),
             last_success: Instant::now(),
-        };
-        collector.recover_state_from_active_tape()?;
-        Ok(collector)
-    }
-
-    fn recover_state_from_active_tape(&mut self) -> Result<()> {
-        if !self.writer.active.exists() {
-            return Ok(());
-        }
-        let mut reader = BufReader::new(open_read_regular(&self.writer.active)?);
-        for line in (&mut reader).split(b'\n') {
-            let line = line?;
-            if line.is_empty() {
-                continue;
-            }
-            let row: Value = serde_json::from_slice(&line)?;
-            let update = row
-                .get("update")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            let kind = update
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let market_id = update.get("market_id").and_then(Value::as_str);
-            let condition_id = update.get("condition_id").and_then(Value::as_str);
-            if kind == "polymarket_trade" {
-                if update.get("record_id_version").and_then(Value::as_str) == Some(TRADE_ID_VERSION)
-                {
-                    if let (Some(condition_id), Some(record_id), Some(timestamp)) = (
-                        condition_id,
-                        update.get("record_id").and_then(Value::as_str),
-                        update.get("trade_ts_unix").and_then(Value::as_i64),
-                    ) {
-                        self.state
-                            .trade_seen
-                            .entry(condition_id.to_owned())
-                            .or_default()
-                            .insert(record_id.to_owned(), timestamp);
-                    }
-                }
-            } else if matches!(kind, "market_metadata" | "market_settlement") {
-                if let Some(market_id) = market_id {
-                    let tracked = self.state.markets.entry(market_id.to_owned()).or_default();
-                    tracked.condition_id = condition_id.map(str::to_owned);
-                    tracked.symbol = update
-                        .get("symbol")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    if let Some(window) = update.get("market_window_secs").and_then(Value::as_u64) {
-                        tracked.market_window_secs = window;
-                    }
-                    if let Some(market) = update.get("market") {
-                        tracked.end_time = market
-                            .get("endDate")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        tracked.last_metadata_hash = Some(stable_payload_hash(market)?);
-                    }
-                    if kind == "market_settlement" {
-                        tracked.settled = true;
-                    }
-                }
-            }
-        }
-        release_clean_file_cache(reader.get_ref())?;
-        Ok(())
+        })
     }
 
     async fn get_json(&self, url: &str, params: &[(String, String)]) -> Result<Value> {
@@ -2445,10 +2485,25 @@ impl ReferenceCollector {
     }
 }
 
+fn initialize_reference_collector_with_watchdog<F>(
+    timeout: Duration,
+    initialize: F,
+) -> Result<ReferenceCollector>
+where
+    F: FnOnce() -> Result<ReferenceCollector>,
+{
+    let _hard_watchdog = CycleWatchdog::arm(timeout).map_err(|error| {
+        completeness_error(format!("could not arm the hard startup watchdog: {error}"))
+    })?;
+    initialize()
+}
+
 pub async fn run_reference(config: ReferenceConfig, once: bool) -> Result<()> {
     let poll_interval = config.poll_interval;
     let stale_after = config.stale_after;
-    let mut collector = ReferenceCollector::new(config)?;
+    let mut collector = initialize_reference_collector_with_watchdog(MAX_CYCLE_DURATION, || {
+        ReferenceCollector::new(config)
+    })?;
     if once {
         println!(
             "{}",
@@ -2482,6 +2537,7 @@ mod tests {
     const HARD_WATCHDOG_TEST_ENV: &str = "MONDAY_TEST_POLYMARKET_HARD_WATCHDOG";
     const HARD_WATCHDOG_HOLD_STDERR_TEST_ENV: &str =
         "MONDAY_TEST_POLYMARKET_HARD_WATCHDOG_HOLD_STDERR";
+    const STARTUP_WATCHDOG_TEST_ENV: &str = "MONDAY_TEST_POLYMARKET_STARTUP_WATCHDOG";
 
     struct TestDir {
         _temp: tempfile::TempDir,
@@ -2533,6 +2589,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "subprocess target for the startup watchdog test"]
+    fn startup_watchdog_child() {
+        if std::env::var_os(STARTUP_WATCHDOG_TEST_ENV).is_none() {
+            return;
+        }
+        let _ = initialize_reference_collector_with_watchdog(
+            Duration::from_millis(50),
+            || -> Result<ReferenceCollector> {
+                std::thread::sleep(Duration::from_millis(300));
+                bail!("blocked startup unexpectedly returned")
+            },
+        );
+    }
+
+    #[test]
     fn hard_cycle_watchdog_terminates_non_yielding_work() {
         let started = Instant::now();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2547,6 +2618,26 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "hard watchdog did not terminate the child promptly"
+        );
+    }
+
+    #[test]
+    fn startup_watchdog_exits_124_when_initialization_blocks() {
+        let started = Instant::now();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("startup_watchdog_child")
+            .env(STARTUP_WATCHDOG_TEST_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        assert_eq!(status.code(), Some(HARD_CYCLE_WATCHDOG_EXIT_CODE));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "startup watchdog did not terminate the child promptly"
         );
     }
 
@@ -2644,6 +2735,51 @@ mod tests {
             "outcomeIndex": 0,
             "sourceOnlyField": {"preserved": true},
         })
+    }
+
+    fn valid_metadata_update(recorded_at: DateTime<Utc>) -> Value {
+        json!({
+            "kind": "market_metadata",
+            "market_id": "market-1",
+            "condition_id": "condition-1",
+            "symbol": "BTCUSDT",
+            "market_window_secs": 300,
+            "source": "gamma_api",
+            "retrieved_at": iso_z(recorded_at),
+            "market": {
+                "id": "market-1",
+                "conditionId": "condition-1",
+                "question": "Bitcoin Up or Down - 5 minutes",
+                "startDate": iso_z(recorded_at),
+                "endDate": iso_z(recorded_at + TimeDelta::minutes(5)),
+                "clobTokenIds": ["up-token", "down-token"],
+                "outcomes": ["Up", "Down"],
+            },
+        })
+    }
+
+    fn valid_trade_update(recorded_at: DateTime<Utc>, trade_timestamp: i64) -> Value {
+        let config = ReferenceConfig {
+            market_lookback_secs: recorded_at
+                .timestamp()
+                .saturating_sub(trade_timestamp)
+                .max(0)
+                + 1,
+            ..ReferenceConfig::default()
+        };
+        let (mut updates, malformed) = trade_updates(
+            &config,
+            &mut CollectorState::default(),
+            "market-1",
+            "condition-1",
+            "BTCUSDT",
+            300,
+            vec![valid_trade(trade_timestamp)],
+            recorded_at,
+        );
+        assert!(malformed.is_empty());
+        assert_eq!(updates.len(), 1);
+        updates.pop().unwrap()
     }
 
     #[tokio::test]
@@ -4019,6 +4155,10 @@ mod tests {
     #[test]
     fn v2_migration_quarantines_active_tape_and_reopens_trade_collection() {
         let root = TestDir::new();
+        let trade_recorded_at = utc_now();
+        let trade_ts = trade_recorded_at.timestamp();
+        let trade_update = valid_trade_update(trade_recorded_at, trade_ts);
+        let record_id = trade_update["record_id"].as_str().unwrap().to_owned();
         atomic_write_json(
             &root.path().join("collector-state.json"),
             &json!({
@@ -4054,24 +4194,33 @@ mod tests {
         assert_eq!(quarantined, 1);
         collector
             .writer
-            .write_updates(
-                &[json!({
-                    "kind": "polymarket_trade",
-                    "condition_id": "condition-1",
-                    "record_id": "durable-v2",
-                    "record_id_version": "v2",
-                    "trade_ts_unix": 1_784_084_400_i64,
-                })],
-                fixed_time("2026-07-15T03:00:00Z"),
-            )
+            .write_updates(&[trade_update], trade_recorded_at)
             .unwrap();
         collector.writer.close().unwrap();
         drop(collector);
 
         let mut restarted = ReferenceCollector::new(config).unwrap();
-        assert!(fs::read_to_string(root.path().join(ACTIVE_TAPE))
+        assert_eq!(
+            restarted.state.trade_seen["condition-1"][&record_id],
+            trade_ts
+        );
+        let durable_segments = fs::read_dir(root.path())
             .unwrap()
-            .contains("durable-v2"));
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.as_ref() != ACTIVE_TAPE
+                        && name.starts_with("market-updates.")
+                        && name.ends_with(".ndjson")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(durable_segments.len(), 1);
+        assert!(fs::read_to_string(&durable_segments[0])
+            .unwrap()
+            .contains(&record_id));
         let quarantined_after_restart = fs::read_dir(root.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -4089,6 +4238,149 @@ mod tests {
     #[test]
     fn collector_recovers_trade_dedupe_state_from_durable_active_tape() {
         let root = TestDir::new();
+        let trade_recorded_at = utc_now();
+        let trade_ts = trade_recorded_at.timestamp();
+        let trade_update = valid_trade_update(trade_recorded_at, trade_ts);
+        let record_id = trade_update["record_id"].as_str().unwrap().to_owned();
+        atomic_write_json(
+            &root.path().join("collector-state.json"),
+            &json!({"trade_id_version": "v2"}),
+        )
+        .unwrap();
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer
+                .write_updates(&[trade_update], trade_recorded_at)
+                .unwrap();
+        }
+        let config = ReferenceConfig {
+            spool_dir: root.path().to_path_buf(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        assert_eq!(
+            collector.state.trade_seen["condition-1"][&record_id],
+            trade_ts
+        );
+        collector.writer.close().unwrap();
+    }
+
+    #[test]
+    fn startup_rotates_recovered_active_once_instead_of_rescanning_it() {
+        let root = TestDir::new();
+        let trade_recorded_at = utc_now();
+        let trade_ts = trade_recorded_at.timestamp();
+        let trade_update = valid_trade_update(trade_recorded_at, trade_ts);
+        let record_id = trade_update["record_id"].as_str().unwrap().to_owned();
+        atomic_write_json(
+            &root.path().join("collector-state.json"),
+            &json!({"trade_id_version": "v2"}),
+        )
+        .unwrap();
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            let mut updates = vec![valid_metadata_update(trade_recorded_at); 32_768];
+            updates.push(trade_update);
+            writer.write_updates(&updates, trade_recorded_at).unwrap();
+        }
+        OpenOptions::new()
+            .append(true)
+            .open(root.path().join(ACTIVE_TAPE))
+            .unwrap()
+            .write_all(b"{\"sequence\":32769")
+            .unwrap();
+        let config = ReferenceConfig {
+            spool_dir: root.path().to_path_buf(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+
+        let mut collector = ReferenceCollector::new(config.clone()).unwrap();
+        assert_eq!(
+            collector.state.trade_seen["condition-1"][&record_id],
+            trade_ts
+        );
+        collector.writer.close().unwrap();
+        drop(collector);
+
+        let rotated = fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.as_ref() != ACTIVE_TAPE
+                        && name.starts_with("market-updates.")
+                        && name.ends_with(".ndjson")
+                })
+            });
+        let historical = rotated.unwrap_or_else(|| root.path().join(ACTIVE_TAPE));
+        OpenOptions::new()
+            .append(true)
+            .open(historical)
+            .unwrap()
+            .write_all(b"not-json\n")
+            .unwrap();
+
+        let mut restarted = ReferenceCollector::new(config)
+            .expect("a finalized historical segment must not be rescanned on every restart");
+        assert_eq!(
+            restarted.state.trade_seen["condition-1"][&record_id],
+            trade_ts
+        );
+        assert_eq!(
+            fs::metadata(root.path().join(ACTIVE_TAPE)).unwrap().len(),
+            0
+        );
+        restarted.writer.close().unwrap();
+    }
+
+    #[test]
+    fn invalid_active_tape_fails_closed_without_rotation() {
+        let root = TestDir::new();
+        atomic_write_json(
+            &root.path().join("collector-state.json"),
+            &json!({"trade_id_version": "v2"}),
+        )
+        .unwrap();
+        fs::write(root.path().join(ACTIVE_TAPE), b"not-json\n").unwrap();
+        let config = ReferenceConfig {
+            spool_dir: root.path().to_path_buf(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+
+        let error = ReferenceCollector::new(config)
+            .err()
+            .expect("invalid active tape must fail before rotation");
+
+        assert!(error.to_string().contains("expected ident"));
+        assert_eq!(
+            fs::read(root.path().join(ACTIVE_TAPE)).unwrap(),
+            b"not-json\n"
+        );
+        assert_eq!(
+            fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.as_ref() != ACTIVE_TAPE
+                        && name.starts_with("market-updates.")
+                        && name.ends_with(".ndjson")
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn semantically_invalid_active_tape_fails_closed_without_rotation() {
+        let root = TestDir::new();
         atomic_write_json(
             &root.path().join("collector-state.json"),
             &json!({"trade_id_version": "v2"}),
@@ -4100,13 +4392,67 @@ mod tests {
                 .write_updates(
                     &[json!({
                         "kind": "polymarket_trade",
-                        "market_id": "market-1",
-                        "condition_id": "condition-1",
-                        "record_id": "trade-1",
+                        "record_id": "malformed-trade",
                         "record_id_version": "v2",
-                        "trade_ts_unix": 1_784_084_400_i64,
                     })],
-                    fixed_time("2026-07-15T03:00:00Z"),
+                    utc_now(),
+                )
+                .unwrap();
+        }
+        let active = root.path().join(ACTIVE_TAPE);
+        let before = fs::read(&active).unwrap();
+        let config = ReferenceConfig {
+            spool_dir: root.path().to_path_buf(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            ..ReferenceConfig::default()
+        };
+
+        let error = ReferenceCollector::new(config)
+            .err()
+            .expect("uploader-invalid active tape must fail before rotation");
+
+        assert!(format!("{error:#}").contains("polymarket_trade.trade must be an object"));
+        assert_eq!(fs::read(active).unwrap(), before);
+        assert_eq!(
+            fs::read_dir(root.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.as_ref() != ACTIVE_TAPE
+                        && name.starts_with("market-updates.")
+                        && name.ends_with(".ndjson")
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn startup_compacts_dedupe_outside_trade_poll_horizon() {
+        let root = TestDir::new();
+        let now = utc_now();
+        let cutoff = now.timestamp() - ReferenceConfig::default().market_lookback_secs;
+        atomic_write_json(
+            &root.path().join("collector-state.json"),
+            &json!({
+                "trade_id_version": "v2",
+                "trade_seen": {
+                    "condition-state": {
+                        "expired": cutoff - 60,
+                        "recent": cutoff + 60,
+                    }
+                },
+            }),
+        )
+        .unwrap();
+        {
+            let mut writer = TapeWriter::new(root.path()).unwrap();
+            writer
+                .write_updates(
+                    &[valid_trade_update(now - TimeDelta::hours(3), cutoff - 60)],
+                    now - TimeDelta::hours(3),
                 )
                 .unwrap();
         }
@@ -4117,10 +4463,17 @@ mod tests {
         };
 
         let mut collector = ReferenceCollector::new(config).unwrap();
+
         assert_eq!(
-            collector.state.trade_seen["condition-1"]["trade-1"],
-            1_784_084_400
+            collector.state.trade_seen,
+            BTreeMap::from([(
+                "condition-state".to_owned(),
+                BTreeMap::from([("recent".to_owned(), cutoff + 60)]),
+            )])
         );
+        let durable: CollectorState =
+            read_optional_json(&root.path().join("collector-state.json")).unwrap();
+        assert_eq!(durable.trade_seen, collector.state.trade_seen);
         collector.writer.close().unwrap();
     }
 

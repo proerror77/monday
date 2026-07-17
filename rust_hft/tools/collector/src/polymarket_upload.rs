@@ -2,7 +2,7 @@
 
 use crate::lob_archiver::{command_status_with_timeout, sha256_file, write_success_marker};
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use rand::random;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -38,6 +38,7 @@ const SUPPORTED_SYMBOL_ALIASES: [(&str, &[&str]); 7] = [
 const SETTLEMENT_PRICE: Decimal = Decimal::from_parts(999, 0, 0, false, 3);
 const SETTLEMENT_LOSER_PRICE: Decimal = Decimal::from_parts(1, 0, 0, false, 3);
 const SETTLEMENT_SUM_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
+const MAX_FUTURE_RECORDING_SKEW_SECS: i64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct UploadConfig {
@@ -729,11 +730,53 @@ pub fn scan_tape(
     Ok(scan_tape_with_identity(path, dataset, quote_depth_levels, quote_sample_ms)?.manifest)
 }
 
+pub(crate) fn validate_reference_tape_for_recovery(
+    path: &Path,
+    recovery_time: DateTime<Utc>,
+) -> Result<()> {
+    let scan = scan_tape_with_identity_at(path, "crypto_expiry_reference", 0, 0, recovery_time)?;
+    if scan.manifest["start_sequence"].as_u64() != Some(0) {
+        bail!(
+            "recovered active tape must start at sequence 0; actual={}",
+            scan.manifest["start_sequence"]
+        );
+    }
+    for kind in scan.manifest["event_types"]
+        .as_object()
+        .expect("scan manifest has event types")
+        .keys()
+    {
+        if !matches!(
+            kind.as_str(),
+            "market_metadata" | "polymarket_trade" | "market_settlement"
+        ) {
+            bail!("recovered reference tape contains unsupported update kind {kind:?}");
+        }
+    }
+    Ok(())
+}
+
 fn scan_tape_with_identity(
     path: &Path,
     dataset: &str,
     quote_depth_levels: usize,
     quote_sample_ms: u64,
+) -> Result<ScanResult> {
+    scan_tape_with_identity_at(
+        path,
+        dataset,
+        quote_depth_levels,
+        quote_sample_ms,
+        Utc::now(),
+    )
+}
+
+fn scan_tape_with_identity_at(
+    path: &Path,
+    dataset: &str,
+    quote_depth_levels: usize,
+    quote_sample_ms: u64,
+    validation_time: DateTime<Utc>,
 ) -> Result<ScanResult> {
     let identity = regular_identity(path)?;
     let file = File::open(path).with_context(|| format!("open tape {}", path.display()))?;
@@ -802,6 +845,11 @@ fn scan_tape_with_identity(
             );
         }
         let recorded_at = parse_timestamp(record.get("recorded_at"), "recorded_at", line_number)?;
+        if recorded_at > validation_time + TimeDelta::seconds(MAX_FUTURE_RECORDING_SKEW_SECS) {
+            bail!(
+                "line {line_number}: recorded_at is more than {MAX_FUTURE_RECORDING_SKEW_SECS}s in the future"
+            );
+        }
         if previous_recorded_at.is_some_and(|previous| recorded_at < previous) {
             bail!("line {line_number}: recorded_at moved backwards");
         }
@@ -1806,6 +1854,42 @@ mod tests {
         assert_eq!(manifest["quality"]["max_bid_levels"], 1);
         assert_eq!(manifest["field_non_null"]["quote"]["bid"], 1);
         assert_eq!(manifest["field_non_null"]["reference_price"]["price"], 1);
+    }
+
+    #[test]
+    fn recovery_validation_requires_zero_sequence_and_bounded_recording_time() {
+        let root = TestDir::new();
+        let recovery_time = DateTime::parse_from_rfc3339("2026-07-15T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let update = valid_market_metadata_update();
+        let nonzero = write_tape(
+            root.path(),
+            "nonzero.ndjson",
+            &[record(1, "2026-07-15T01:00:00Z", update.clone())],
+        );
+        let error = validate_reference_tape_for_recovery(&nonzero, recovery_time).unwrap_err();
+        assert!(error.to_string().contains("must start at sequence 0"));
+
+        let future = write_tape(
+            root.path(),
+            "future.ndjson",
+            &[record(0, "2026-07-15T01:05:01Z", update)],
+        );
+        let error = validate_reference_tape_for_recovery(&future, recovery_time).unwrap_err();
+        assert!(error.to_string().contains("more than 300s in the future"));
+
+        let wrong_kind = write_tape(
+            root.path(),
+            "wrong-kind.ndjson",
+            &[record(
+                0,
+                "2026-07-15T01:00:00Z",
+                json!({"kind": "reference_price", "symbol": "BTCUSDT", "price": "100"}),
+            )],
+        );
+        let error = validate_reference_tape_for_recovery(&wrong_kind, recovery_time).unwrap_err();
+        assert!(error.to_string().contains("unsupported update kind"));
     }
 
     #[test]
