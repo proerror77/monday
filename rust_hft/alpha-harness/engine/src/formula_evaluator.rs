@@ -899,7 +899,12 @@ mod tests {
         };
         let gate = FormulaEvaluator::new(FormulaEvaluatorConfig::default())
             .unwrap()
-            .predictive_gates(&input, &signals, &[0..3], WALK_FORWARD_EVALUATOR_VERSION);
+            .predictive_gates(
+                &input,
+                &signals,
+                std::slice::from_ref(&(0..3)),
+                WALK_FORWARD_EVALUATOR_VERSION,
+            );
 
         let (net_returns, trade_count, max_book_depth_fraction) =
             gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
@@ -930,7 +935,12 @@ mod tests {
         };
         let gate = FormulaEvaluator::new(FormulaEvaluatorConfig::default())
             .unwrap()
-            .predictive_gates(&input, &signals, &[0..3], WALK_FORWARD_EVALUATOR_VERSION);
+            .predictive_gates(
+                &input,
+                &signals,
+                std::slice::from_ref(&(0..3)),
+                WALK_FORWARD_EVALUATOR_VERSION,
+            );
 
         let (_, trade_count, max_fraction) =
             gate.map_positions_to_net_returns(&input, &signals, 0..3, &costs);
