@@ -1419,6 +1419,33 @@ grep -Fq 'bounded_parity_window_start' "$GATE"
 grep -Fq 'readonly MAX_ACCEPTED_CYCLE_SECONDS=180' "$GATE"
 grep -Fq 'readonly INITIAL_HEALTH_GRACE_SECONDS=60' "$GATE"
 grep -Fq 'readonly HEALTH_SETTLE_SECONDS=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))' "$GATE"
+gate_health_budget_contract="$tmp_dir/gate-health-budget-contract.sh"
+sed -n \
+  -e '/^readonly MAX_ACCEPTED_CYCLE_SECONDS=/p' \
+  -e '/^readonly INITIAL_HEALTH_GRACE_SECONDS=/p' \
+  -e '/^readonly MAX_HEALTH_SILENCE_SECONDS=/p' "$GATE" \
+  >"$gate_health_budget_contract"
+# shellcheck source=/dev/null
+source "$gate_health_budget_contract"
+expected_health_silence_seconds=$((MAX_ACCEPTED_CYCLE_SECONDS + INITIAL_HEALTH_GRACE_SECONDS))
+[[ $expected_health_silence_seconds -eq 240 ]] || {
+  printf 'health freshness budget drifted from the expected 240-second contract\n' >&2
+  exit 1
+}
+gate_health_silence_seconds=$MAX_HEALTH_SILENCE_SECONDS
+[[ $gate_health_silence_seconds -eq $expected_health_silence_seconds ]] || {
+  printf 'shadow gate freshness budget %ss does not cover the 240-second cycle budget\n' \
+    "$gate_health_silence_seconds" >&2
+  exit 1
+}
+cutover_health_silence_seconds=$(
+  sed -n 's/^readonly MAX_HEALTH_SILENCE_SECONDS=//p' "$CUTOVER"
+)
+[[ $cutover_health_silence_seconds -eq $expected_health_silence_seconds ]] || {
+  printf 'cutover freshness budget %ss does not cover the 240-second cycle budget\n' \
+    "$cutover_health_silence_seconds" >&2
+  exit 1
+}
 grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)); then' "$GATE"
 if grep -Fq 'if ((elapsed >= HEALTH_SETTLE_SECONDS)) || [[ $test_only == true ]]; then' "$GATE"; then
   printf 'short shadow gate bypasses the initial health settle window\n' >&2

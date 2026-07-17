@@ -134,7 +134,7 @@ pinned Rust executable has completed `execve`; the first PID, executable, and
 command-line identity check cannot race a pre-exec service process.
 `cycle_started_at` preserves the API snapshot boundary, while `updated_at` and
 `last_success_at` are stamped only after tape and state durability completes;
-`cycle_duration_ms` makes the 90-second gate freshness budget directly auditable.
+`cycle_duration_ms` makes the 240-second gate freshness budget directly auditable.
 Each append batch rolls back to its starting offset if write or fsync fails, so a retry
 cannot duplicate a durable prefix, suppress a required hourly metadata seed, or leave
 a partial record behind. A durable per-hour seed marker also forces Rust metadata when
