@@ -247,11 +247,11 @@ The image contains six stable entrypoints:
 - `/usr/local/bin/monday-prediction-evaluator`
 - `/usr/local/bin/monday-prediction-snapshot`
 
-`k8s/alpha-mission-job.example.yaml` runs one MCTS or Bayesian mission against a
-pre-materialized PIT feature file. The one-time signed OSS URLs belong in a
-Kubernetes Secret and must never be committed. Use distinct DuckDB files and
-result objects per parallel Mission; a later single-writer aggregator may merge
-their immutable evidence.
+`k8s/alpha-mission-job.example.yaml` is the current blessed BTCUSDT top-of-book
+MCTS baseline against a pre-materialized PIT feature file. The one-time signed
+OSS URLs belong in a Kubernetes Secret and must never be committed. Use distinct
+DuckDB files and result objects per parallel Mission; a later single-writer
+aggregator may merge their immutable evidence.
 
 `k8s/prediction-mission-job.example.yaml` uses the same image, restricted Pod
 security context, signed-URL input transport, and immutable result upload for one

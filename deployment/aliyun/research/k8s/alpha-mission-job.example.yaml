@@ -57,23 +57,27 @@ spec:
             - --mission-id
             - $(MISSION_ID)
             - --engine
-            - $(ENGINE)
+            - mcts
             - --seed
             - $(SEED)
             - --feature-fields
-            - $(FEATURE_FIELDS)
+            - book_imbalance
+            - --label-horizon-buckets
+            - "5"
+            - --observation-frequency-millis
+            - "1000"
             - --max-candidates
-            - "8"
+            - "1"
             - --max-expansions
-            - "40"
+            - "1"
             - --max-seconds
             - "300"
             - --max-new-iterations
-            - "8"
+            - "1"
             - --objective
             - Find a cost-aware, out-of-sample LOB factor for BTCUSDT USD-M
             - --hypothesis-scope
-            - Top-5 LOB imbalance and order-flow dynamics at a five-second horizon
+            - Top-of-book imbalance at a five-second horizon
             - --initial-train-rows
             - "800"
             - --validation-rows
@@ -123,10 +127,6 @@ spec:
               value: REPLACE_DATA_MISSION_ID
             - name: MISSION_ID
               value: REPLACE_MISSION_ID
-            - name: ENGINE
-              value: REPLACE_ENGINE
-            - name: FEATURE_FIELDS
-              value: REPLACE_FEATURE_FIELDS
             - name: SEED
               value: "7"
           resources:
