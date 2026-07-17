@@ -294,7 +294,15 @@ fn trade_rows(
                 pending.line
             );
         }
-        let trade_ts = required(&pending.update, "trade_ts")?.to_owned();
+        let trade_ts = required(&pending.update, "trade_ts")?;
+        let received_at = required(&pending.update, "received_at")?;
+        let source_clock = timestamp(trade_ts, "trade_ts")?;
+        let received_clock = timestamp(received_at, "received_at")?;
+        let recorded_clock = timestamp(&pending.recorded_at, "recorded_at")?;
+        if received_clock < source_clock || recorded_clock < source_clock {
+            continue;
+        }
+        let trade_ts = trade_ts.to_owned();
         let mut value = base(contract, "polymarket_trade");
         insert(
             &mut value,
@@ -312,8 +320,8 @@ fn trade_rows(
                 "transaction_hash": required(&pending.update, "transaction_hash")?,
                 "proxy_wallet": required(&pending.update, "proxy_wallet")?,
                 "source": required(&pending.update, "source")?,
-                "received_at": required(&pending.update, "received_at")?,
-                "available_at": latest(required(&pending.update, "received_at")?, &pending.recorded_at)?,
+                "received_at": received_at,
+                "available_at": latest(received_at, &pending.recorded_at)?,
                 "recorded_at": pending.recorded_at,
                 "source_sequence": pending.sequence,
                 "source_dataset": "crypto_expiry_reference"
@@ -646,6 +654,7 @@ pub fn normalize_polymarket_evidence(
 mod tests {
     use super::*;
     use crate::polymarket_research_select::SelectedMetadata;
+    use crate::polymarket_upload::derived_trade_record_id;
     use std::fs;
 
     fn selected_contract() -> SelectedContract {
@@ -721,6 +730,58 @@ mod tests {
         let mut references = BTreeMap::new();
         market_rows(&path, &contracts, &mut rows, &mut books, &mut references).unwrap();
         rows
+    }
+
+    fn trade_pending(
+        sequence: u64,
+        trade_ts: &str,
+        trade_ts_unix: i64,
+        received_at: &str,
+        recorded_at: &str,
+    ) -> Pending {
+        let trade = json!({
+            "transactionHash": format!("0xtx-{sequence}"),
+            "conditionId": "condition",
+            "asset": "up",
+            "side": "BUY",
+            "timestamp": trade_ts_unix,
+            "proxyWallet": "0xwallet",
+            "size": "10",
+            "price": "0.5",
+            "outcome": "Up",
+            "outcomeIndex": 0,
+        });
+        let record_id = derived_trade_record_id(trade.as_object().unwrap());
+        Pending {
+            line: usize::try_from(sequence).unwrap(),
+            sequence,
+            recorded_at: recorded_at.to_owned(),
+            update: json!({
+                "kind": "polymarket_trade",
+                "record_id": record_id,
+                "record_id_version": "v2",
+                "market_id": "market",
+                "condition_id": "condition",
+                "token_id": "up",
+                "symbol": "BTCUSDT",
+                "market_window_secs": 300,
+                "side": "BUY",
+                "size": "10",
+                "price": "0.5",
+                "trade_ts": trade_ts,
+                "trade_ts_unix": trade_ts_unix,
+                "transaction_hash": format!("0xtx-{sequence}"),
+                "proxy_wallet": "0xwallet",
+                "outcome": "Up",
+                "outcome_index": 0,
+                "source": "polymarket_data_api",
+                "received_at": received_at,
+                "trade": trade,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        }
     }
 
     #[test]
@@ -895,6 +956,105 @@ mod tests {
         assert_eq!(rows[0].value["bid_size"], Value::Null);
         assert_eq!(rows[0].value["ask"], "0.01");
         assert_eq!(rows[0].value["ask_size"], "10");
+    }
+
+    #[test]
+    fn noncausal_trade_clock_is_not_published_as_evidence() {
+        let contract = selected_contract();
+        let contracts = BTreeMap::from([(contract.market_id.clone(), contract)]);
+        let mut rows = Vec::new();
+        let mut counts = BTreeMap::new();
+        trade_rows(
+            vec![
+                trade_pending(
+                    1,
+                    "2026-07-17T05:30:03Z",
+                    1_784_266_203,
+                    "2026-07-17T05:30:02Z",
+                    "2026-07-17T05:30:04Z",
+                ),
+                trade_pending(
+                    2,
+                    "2026-07-17T05:30:03Z",
+                    1_784_266_203,
+                    "2026-07-17T05:30:04Z",
+                    "2026-07-17T05:30:02Z",
+                ),
+                trade_pending(
+                    3,
+                    "2026-07-17T05:30:03Z",
+                    1_784_266_203,
+                    "2026-07-17T05:30:04Z",
+                    "2026-07-17T05:30:05Z",
+                ),
+            ],
+            &contracts,
+            &mut rows,
+            &mut counts,
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value["source_sequence"], 3);
+        assert_eq!(counts.get("market"), Some(&1));
+    }
+
+    #[test]
+    fn noncausal_trades_do_not_satisfy_event_completeness() {
+        let contract = selected_contract();
+        let contracts = BTreeMap::from([(contract.market_id.clone(), contract.clone())]);
+        let mut rows = Vec::new();
+        let mut trades = BTreeMap::new();
+        trade_rows(
+            vec![trade_pending(
+                1,
+                "2026-07-17T05:30:03Z",
+                1_784_266_203,
+                "2026-07-17T05:30:02Z",
+                "2026-07-17T05:30:04Z",
+            )],
+            &contracts,
+            &mut rows,
+            &mut trades,
+        )
+        .unwrap();
+
+        let books = BTreeMap::from([(
+            "market".to_owned(),
+            BTreeSet::from(["up".to_owned(), "down".to_owned()]),
+        )]);
+        let references = BTreeMap::from([("market".to_owned(), 1)]);
+        let settlements = BTreeMap::from([("market".to_owned(), "digest".to_owned())]);
+        assert!(rows.is_empty());
+        assert!(trades.is_empty());
+        assert!(!has_all_surfaces(
+            &contract,
+            &books,
+            &references,
+            &trades,
+            &settlements
+        ));
+    }
+
+    #[test]
+    fn malformed_recorded_at_fails_even_when_received_at_is_noncausal() {
+        let contract = selected_contract();
+        let contracts = BTreeMap::from([(contract.market_id.clone(), contract)]);
+        let error = trade_rows(
+            vec![trade_pending(
+                1,
+                "2026-07-17T05:30:03Z",
+                1_784_266_203,
+                "2026-07-17T05:30:02Z",
+                "not-a-timestamp",
+            )],
+            &contracts,
+            &mut Vec::new(),
+            &mut BTreeMap::new(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("recorded_at"), "{error:#}");
     }
 
     #[test]
