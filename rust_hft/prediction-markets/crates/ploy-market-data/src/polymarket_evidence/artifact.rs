@@ -83,6 +83,17 @@ impl SealedPolymarketEvidenceTriplet {
     pub fn events(&self) -> u64 {
         self.manifest.events
     }
+
+    pub(super) fn framed_rows(&self) -> impl Iterator<Item = &[u8]> {
+        self.frames.iter().map(|frame| &self.data[frame.clone()])
+    }
+
+    pub(super) fn selection_bounds(&self) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+        Ok((
+            parse_time(&self.manifest.event_start_gte, "event_start_gte")?,
+            parse_time(&self.manifest.event_start_lt, "event_start_lt")?,
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -609,7 +620,7 @@ fn frame_ndjson(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::{json, Value};
     use std::os::unix::fs::PermissionsExt;
@@ -633,9 +644,15 @@ mod tests {
 
     #[rustfmt::skip]
     fn write_triplet(temp: &tempfile::TempDir) -> PolymarketEvidenceTriplet {
+        let rows = SURFACES.map(|surface| json!({"schema":ROW_SCHEMA,"surface":surface}));
+        write_triplet_rows(temp, &rows)
+    }
+
+    #[rustfmt::skip]
+    pub(in crate::polymarket_evidence) fn write_triplet_rows(temp: &tempfile::TempDir, rows: &[Value]) -> PolymarketEvidenceTriplet {
         let mut data_bytes = Vec::new();
-        for surface in SURFACES {
-            serde_json::to_writer(&mut data_bytes, &json!({"schema":ROW_SCHEMA,"surface":surface})).unwrap();
+        for row in rows {
+            serde_json::to_writer(&mut data_bytes, row).unwrap();
             data_bytes.push(b'\n');
         }
         let digest = format!("{:x}", Sha256::digest(&data_bytes));
@@ -646,10 +663,11 @@ mod tests {
         let manifest = root.join(format!("{name}.manifest.json"));
         let success = root.join(format!("{name}._SUCCESS"));
         fs::write(&data, &data_bytes).unwrap();
-        let counts = BTreeMap::from_iter(SURFACES.map(|surface| (surface, 1)));
+        let mut counts = BTreeMap::new();
+        for row in rows { *counts.entry(row["surface"].as_str().unwrap()).or_insert(0) += 1; }
         let manifest_value = json!({
             "schema":MANIFEST_SCHEMA,"file":name,"format":"ndjson",
-            "content_sha256":digest,"content_bytes":data_bytes.len(),"rows":SURFACES.len(),"events":1,
+            "content_sha256":digest,"content_bytes":data_bytes.len(),"rows":rows.len(),"events":counts["market_contract"],
             "surface_counts":counts,"event_start_gte":"2026-07-17T05:30:00Z",
             "event_start_lt":"2026-07-17T05:35:00Z","symbols":SYMBOLS,"window_secs":300,
             "event_selection":EVENT_SELECTION,"evidence_scope":EVIDENCE_SCOPE,
@@ -675,7 +693,7 @@ mod tests {
     }
 
     #[rustfmt::skip]
-    fn trust(triplet: &PolymarketEvidenceTriplet) -> PolymarketEvidenceTrustAnchor {
+    pub(in crate::polymarket_evidence) fn trust(triplet: &PolymarketEvidenceTriplet) -> PolymarketEvidenceTrustAnchor {
         let digest = |path: &Path| format!("{:x}", Sha256::digest(fs::read(path).unwrap()));
         PolymarketEvidenceTrustAnchor::from_lower_hex(&digest(&triplet.data), &digest(&triplet.manifest)).unwrap()
     }
