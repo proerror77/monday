@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 
+const CHAINLINK_OPEN_LOOKBACK_SECS: i64 = 30;
 const EVIDENCE_TRUST_BOUNDARY: &str = "typed collector staging evidence only; not an evaluator label snapshot or snapshot_contract_hash; validated staged triplets and adjacent local supersession markers; omitted remote-prefix markers are not proven absent";
 
 pub type PolymarketEvidenceConfig = ResearchSelectionConfig;
@@ -181,6 +182,11 @@ fn selected_reference(
         bail!("line {line}: selected reference price is not typed Chainlink crypto");
     }
     Ok(Some((source_symbol, symbol)))
+}
+
+fn reference_belongs_to_contract(source_ts: DateTime<Utc>, contract: &SelectedContract) -> bool {
+    source_ts >= contract.event_start - chrono::Duration::seconds(CHAINLINK_OPEN_LOOKBACK_SECS)
+        && source_ts < contract.event_end
 }
 
 fn record_settlement_fingerprint(
@@ -463,9 +469,7 @@ fn market_rows(
                     bail!("line {line}: reference price must be positive")
                 }
                 for contract in contracts.values().filter(|contract| {
-                    contract.symbol == symbol
-                        && source_ts >= contract.event_start
-                        && source_ts < contract.event_end
+                    contract.symbol == symbol && reference_belongs_to_contract(source_ts, contract)
                 }) {
                     let received_at = update.get("received_at").and_then(Value::as_str);
                     let available_at = match received_at {
@@ -626,6 +630,63 @@ pub fn normalize_polymarket_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::polymarket_research_select::SelectedMetadata;
+    use std::fs;
+
+    fn selected_contract() -> SelectedContract {
+        let start = timestamp("2026-07-17T05:30:00Z", "start").unwrap();
+        SelectedContract {
+            market_id: "market".to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            event_start: start,
+            event_end: start + chrono::Duration::minutes(5),
+            up_token: "up".to_owned(),
+            down_token: "down".to_owned(),
+            price_to_beat: "100".to_owned(),
+            discovery_recorded_at: utc_text(start),
+            discovery_sequence: 0,
+            metadata: Some(SelectedMetadata {
+                condition_id: "condition".to_owned(),
+                resolution_source: "https://data.chain.link/streams/btc-usd".to_owned(),
+                retrieved_at: utc_text(start),
+                recorded_at: utc_text(start),
+                sequence: 0,
+                tokens: ["up".to_owned(), "down".to_owned()],
+                outcomes: ["Up".to_owned(), "Down".to_owned()],
+                raw_market: json!({}),
+            }),
+        }
+    }
+
+    fn reference_rows(source_ts: &str) -> (SelectedContract, Vec<Row>, BTreeMap<String, u64>) {
+        let contract = selected_contract();
+        let contracts = BTreeMap::from([(contract.market_id.clone(), contract.clone())]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("market.ndjson");
+        let envelope = json!({
+            "sequence": 1,
+            "recorded_at": "2026-07-17T05:30:10Z",
+            "update": {
+                "kind": "reference_price",
+                "source": "chainlink",
+                "asset_class": "crypto",
+                "symbol": "btc/usd",
+                "is_carried_forward": false,
+                "ts": source_ts,
+                "received_at": "2026-07-17T05:30:05Z",
+                "price": "100",
+                "full_accuracy_value": "100"
+            }
+        });
+        let mut bytes = serde_json::to_vec(&envelope).unwrap();
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+        let mut rows = Vec::new();
+        let mut books = BTreeMap::new();
+        let mut references = BTreeMap::new();
+        market_rows(&path, &contracts, &mut rows, &mut books, &mut references).unwrap();
+        (contract, rows, references)
+    }
 
     #[test]
     fn selected_reference_ignores_unrelated_assets_but_rejects_wrong_btc_source() {
@@ -731,6 +792,64 @@ mod tests {
             "2026-07-17T05:30:01Z"
         );
         assert!(latest("not-a-time", "2026-07-17T05:30:01Z").is_err());
+    }
+
+    #[test]
+    fn reference_window_is_half_open_with_a_thirty_second_pre_open_bound() {
+        let contract = selected_contract();
+        assert!(reference_belongs_to_contract(
+            contract.event_start - chrono::Duration::seconds(30),
+            &contract
+        ));
+        assert!(!reference_belongs_to_contract(
+            contract.event_start - chrono::Duration::seconds(31),
+            &contract
+        ));
+        assert!(!reference_belongs_to_contract(
+            contract.event_end,
+            &contract
+        ));
+    }
+
+    #[test]
+    fn pre_open_reference_is_retained_without_backdating_availability() {
+        let (_, rows, references) = reference_rows("2026-07-17T05:29:30Z");
+        assert_eq!(references.get("market"), Some(&1));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value["ts"], "2026-07-17T05:29:30Z");
+        assert_eq!(rows[0].value["received_at"], "2026-07-17T05:30:05Z");
+        assert_eq!(rows[0].value["recorded_at"], "2026-07-17T05:30:10Z");
+        assert_eq!(rows[0].value["available_at"], "2026-07-17T05:30:10Z");
+    }
+
+    #[test]
+    fn only_pre_open_reference_satisfies_surface_completeness() {
+        let (contract, _, fresh) = reference_rows("2026-07-17T05:29:30Z");
+        let (_, stale_rows, stale) = reference_rows("2026-07-17T05:29:29Z");
+        let (_, end_rows, end) = reference_rows("2026-07-17T05:35:00Z");
+        let books = BTreeMap::from([(
+            "market".to_owned(),
+            BTreeSet::from(["up".to_owned(), "down".to_owned()]),
+        )]);
+        let trades = BTreeMap::from([("market".to_owned(), 1)]);
+        let settlements = BTreeMap::from([("market".to_owned(), "digest".to_owned())]);
+        assert!(has_all_surfaces(
+            &contract,
+            &books,
+            &fresh,
+            &trades,
+            &settlements
+        ));
+        assert!(stale_rows.is_empty());
+        assert!(end_rows.is_empty());
+        assert!(end.is_empty());
+        assert!(!has_all_surfaces(
+            &contract,
+            &books,
+            &stale,
+            &trades,
+            &settlements
+        ));
     }
 
     #[test]
