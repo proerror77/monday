@@ -3,6 +3,7 @@
 //! - 此處可放 venue 無關的正規化輔助（暫空）
 
 pub mod binance_lob_replay;
+pub mod binance_market_tape;
 
 pub mod capabilities {
     #[derive(Debug, Clone, Default)]
