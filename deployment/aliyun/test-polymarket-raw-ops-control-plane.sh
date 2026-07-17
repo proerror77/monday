@@ -1849,6 +1849,9 @@ workflow_sidecar_line=$(grep -n '^              > source-revision.txt$' "$WORKFL
   exit 1
 }
 grep -Fq 'actual_candidate_sha=$(sha256sum polymarket-raw-ops' "$README"
+grep -Fq 'release_manifest_sha=$(sha256sum polymarket-raw-ops-release.json' "$README"
+grep -Fq 'candidate_control_dir="/opt/monday/candidates/polymarket-raw-ops/$release_manifest_sha"' \
+  "$README"
 grep -Fq 'actual_control_archive_sha=$(sha256sum polymarket-raw-ops-control.tar.gz' \
   "$README"
 grep -Fq 'sha256sum --check --strict' "$README"
