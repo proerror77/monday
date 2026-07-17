@@ -104,6 +104,13 @@ pub enum ReplaySequenceEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayBookSnapshot {
+    pub last_update_id: u64,
+    pub bids: Vec<[String; 2]>,
+    pub asks: Vec<[String; 2]>,
+}
+
 impl ReplaySequenceValidator {
     pub fn new(market: Market, symbol: impl Into<String>) -> Result<Self> {
         let symbol = symbol.into();
@@ -281,6 +288,19 @@ impl ReplaySequenceValidator {
         }
         Ok(())
     }
+
+    pub fn book_snapshot(&self) -> Result<ReplayBookSnapshot> {
+        let state = self
+            .state
+            .as_ref()
+            .filter(|state| state.bridged)
+            .ok_or_else(|| anyhow::anyhow!("collector replay has no bridged book snapshot"))?;
+        Ok(ReplayBookSnapshot {
+            last_update_id: state.last_update_id,
+            bids: sorted_levels(&state.bids, true)?,
+            asks: sorted_levels(&state.asks, false)?,
+        })
+    }
 }
 
 impl ReplayDepthDiff {
@@ -362,11 +382,27 @@ fn update_side(side: &mut HashMap<String, String>, levels: &[[String; 2]]) {
     }
 }
 
+fn sorted_levels(side: &HashMap<String, String>, descending: bool) -> Result<Vec<[String; 2]>> {
+    let mut levels = side
+        .iter()
+        .map(|(price, quantity)| Ok((Decimal::from_str(price)?, [price.clone(), quantity.clone()])))
+        .collect::<Result<Vec<_>>>()?;
+    levels.sort_by(|left, right| {
+        let price_order = if descending {
+            right.0.cmp(&left.0)
+        } else {
+            left.0.cmp(&right.0)
+        };
+        price_order.then_with(|| left.1[0].cmp(&right.1[0]))
+    });
+    Ok(levels.into_iter().map(|(_, level)| level).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{Market, ReplaySequenceEvent, ReplaySequenceValidator};
+    use super::{Market, ReplayBookSnapshot, ReplaySequenceEvent, ReplaySequenceValidator};
 
     #[test]
     fn replay_requires_a_bridged_sequence_before_completion() {
@@ -409,5 +445,74 @@ mod tests {
             [ReplaySequenceEvent::Diff { .. }]
         ));
         replay.finish().unwrap();
+    }
+
+    #[test]
+    fn replay_book_snapshot_requires_a_bridged_sequence() {
+        let mut replay = ReplaySequenceValidator::new(Market::Spot, "BTCUSDT").unwrap();
+        let snapshot = json!({
+            "symbol": "BTCUSDT",
+            "session_id": "session-1",
+            "snapshot": {
+                "lastUpdateId": 100,
+                "bids": [["100", "1"]],
+                "asks": [["101", "1"]]
+            }
+        });
+        replay
+            .observe("snapshot", snapshot.as_object().unwrap(), 100)
+            .unwrap();
+
+        assert!(replay.book_snapshot().is_err());
+    }
+
+    #[test]
+    fn replay_book_snapshot_is_full_and_price_sorted() {
+        let mut replay = ReplaySequenceValidator::new(Market::Spot, "BTCUSDT").unwrap();
+        let snapshot = json!({
+            "symbol": "BTCUSDT",
+            "session_id": "session-1",
+            "snapshot": {
+                "lastUpdateId": 100,
+                "bids": [["99", "1"], ["100", "2"], ["98", "3"]],
+                "asks": [["103", "3"], ["101", "1"], ["102", "2"]]
+            }
+        });
+        replay
+            .observe("snapshot", snapshot.as_object().unwrap(), 100)
+            .unwrap();
+        let diff = json!({
+            "session_id": "session-1",
+            "frame": {
+                "data": {
+                    "s": "BTCUSDT",
+                    "U": 101,
+                    "u": 101,
+                    "b": [["99", "0"], ["101", "4"]],
+                    "a": [["102", "5"], ["104", "6"]]
+                }
+            }
+        });
+        replay
+            .observe("diff", diff.as_object().unwrap(), 101)
+            .unwrap();
+
+        assert_eq!(
+            replay.book_snapshot().unwrap(),
+            ReplayBookSnapshot {
+                last_update_id: 101,
+                bids: vec![
+                    ["101".into(), "4".into()],
+                    ["100".into(), "2".into()],
+                    ["98".into(), "3".into()],
+                ],
+                asks: vec![
+                    ["101".into(), "1".into()],
+                    ["102".into(), "5".into()],
+                    ["103".into(), "3".into()],
+                    ["104".into(), "6".into()],
+                ],
+            }
+        );
     }
 }
