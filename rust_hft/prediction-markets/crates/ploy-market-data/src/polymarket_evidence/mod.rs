@@ -1,4 +1,5 @@
 mod artifact;
-#[allow(dead_code)] // Used by the stacked semantic-verifier PR; no runtime path consumes it alone.
+mod verified;
 mod wire;
 pub use artifact::*;
+pub use verified::*;
