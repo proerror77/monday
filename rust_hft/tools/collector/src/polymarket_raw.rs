@@ -291,6 +291,8 @@ struct TrackedMarket {
     #[serde(default)]
     last_trade_success_at: Option<String>,
     #[serde(default)]
+    last_market_detail_attempt_at: Option<String>,
+    #[serde(default)]
     settlement_seen_at: Option<String>,
     #[serde(default)]
     last_trade_change_at: Option<String>,
@@ -365,6 +367,41 @@ fn plan_trade_polls(candidates: Vec<TradePollCandidate>, max_trade_polls: usize)
         deferred: eligible.saturating_sub(selected_count),
         priority_deferred: priority_count.saturating_sub(max_trade_polls),
     }
+}
+
+fn plan_market_detail_fetches(
+    markets: &BTreeMap<String, TrackedMarket>,
+    target_ids: &BTreeSet<String>,
+    now: DateTime<Utc>,
+    max_fetches: usize,
+) -> TradePollPlan {
+    plan_trade_polls(
+        markets
+            .iter()
+            .filter_map(|(market_id, tracked)| {
+                let end_time = parse_optional_datetime(tracked.end_time.as_deref());
+                (!target_ids.contains(market_id)
+                    && end_time.is_some_and(|end| end <= now)
+                    && !(tracked.settled && tracked.trade_complete))
+                    .then(|| TradePollCandidate {
+                        market_id: market_id.clone(),
+                        priority: !tracked.settled || tracked.settlement_failure_since.is_some(),
+                        last_success_at: parse_optional_datetime(
+                            tracked.last_market_detail_attempt_at.as_deref(),
+                        ),
+                        end_time,
+                    })
+            })
+            .collect(),
+        max_fetches,
+    )
+}
+
+fn remaining_trade_poll_budget(
+    max_requests_per_cycle: usize,
+    selected_market_details: usize,
+) -> usize {
+    max_requests_per_cycle.saturating_sub(selected_market_details)
 }
 
 fn target_processing_chunks<'a>(
@@ -545,6 +582,42 @@ fn target_market(market: &Value, symbols: &BTreeSet<String>) -> Option<TargetMar
         symbol: symbol.to_owned(),
         window_secs,
     })
+}
+
+fn tracked_market_recovery_target(
+    tracked: &TrackedMarket,
+    symbols: &BTreeSet<String>,
+    now: DateTime<Utc>,
+) -> Option<(Value, TargetMarket)> {
+    if !tracked.settled || tracked.trade_complete {
+        return None;
+    }
+    let condition_id = tracked
+        .condition_id
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let symbol = tracked
+        .symbol
+        .as_deref()
+        .filter(|value| symbols.contains(*value))?;
+    let window_secs = tracked.market_window_secs;
+    if !matches!(window_secs, 300 | 900) {
+        return None;
+    }
+    let end_time = tracked.end_time.as_deref()?;
+    if parse_optional_datetime(Some(end_time)).is_none_or(|end| end > now) {
+        return None;
+    }
+    Some((
+        json!({
+            "conditionId": condition_id,
+            "endDate": end_time,
+        }),
+        TargetMarket {
+            symbol: symbol.to_owned(),
+            window_secs,
+        },
+    ))
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1615,6 +1688,35 @@ impl ReferenceCollector {
         }
         let missing_target_symbols = missing_symbols(&self.symbols, &discovered_target_symbols);
 
+        let mut state_recovery_ids = BTreeSet::new();
+        for (market_id, tracked) in &next_state.markets {
+            if targets.contains_key(market_id) {
+                continue;
+            }
+            let Some(recovery_target) = tracked_market_recovery_target(tracked, &self.symbols, now)
+            else {
+                continue;
+            };
+            targets.insert(market_id.clone(), recovery_target);
+            state_recovery_ids.insert(market_id.clone());
+        }
+        let target_ids = targets.keys().cloned().collect::<BTreeSet<_>>();
+        let market_detail_budget = self
+            .config
+            .max_trade_polls_per_cycle
+            .min(self.config.max_concurrent_trade_polls);
+        let market_detail_plan =
+            plan_market_detail_fetches(&next_state.markets, &target_ids, now, market_detail_budget);
+        let fetcher = &*self;
+        let mut market_detail_fetches = stream::iter(market_detail_plan.selected.iter())
+            .map(|market_id| async move {
+                let url = format!("{GAMMA_MARKET_URL}/{market_id}");
+                (market_id.clone(), fetcher.get_json(&url, &[]).await)
+            })
+            .buffer_unordered(self.config.max_concurrent_trade_polls)
+            .collect::<BTreeMap<_, _>>()
+            .await;
+
         let tracked_ids = next_state.markets.keys().cloned().collect::<Vec<_>>();
         for market_id in tracked_ids {
             let Some(mut tracked) = next_state.markets.remove(&market_id) else {
@@ -1634,9 +1736,12 @@ impl ReferenceCollector {
             let needs_detail = !targets.contains_key(&market_id)
                 && end_time.is_some_and(|end| end <= now)
                 && !(tracked.settled && tracked.trade_complete);
-            if needs_detail {
-                let url = format!("{GAMMA_MARKET_URL}/{market_id}");
-                match self.get_json(&url, &[]).await {
+            if needs_detail && market_detail_plan.selected.contains(&market_id) {
+                tracked.last_market_detail_attempt_at = Some(retrieved_at.clone());
+                match market_detail_fetches
+                    .remove(&market_id)
+                    .ok_or_else(|| anyhow!("selected market {market_id} has no detail fetch"))?
+                {
                     Ok(market) if market.is_object() => {
                         targets.insert(
                             market_id.clone(),
@@ -1670,7 +1775,17 @@ impl ReferenceCollector {
             }
             next_state.markets.insert(market_id, tracked);
         }
+        if !market_detail_fetches.is_empty() {
+            bail!(
+                "{} scheduled market detail fetches were not applied",
+                market_detail_fetches.len()
+            );
+        }
 
+        let trade_poll_budget = remaining_trade_poll_budget(
+            self.config.max_trade_polls_per_cycle,
+            market_detail_plan.selected.len(),
+        );
         let priority_cutoff = now - TimeDelta::seconds(self.config.trade_finalization_lag_secs);
         let trade_poll_plan = plan_trade_polls(
             targets
@@ -1699,7 +1814,7 @@ impl ReferenceCollector {
                     })
                 })
                 .collect(),
-            self.config.max_trade_polls_per_cycle,
+            trade_poll_budget,
         );
         let target_chunks = target_processing_chunks(
             targets.keys(),
@@ -1745,39 +1860,47 @@ impl ReferenceCollector {
                     tracked.end_time = Some(end_time.to_owned());
                 }
 
-                if let Some(metadata) = market_metadata_update(
-                    market_id,
-                    market,
-                    target,
-                    &retrieved_at,
-                    force_hour_context,
-                    &mut tracked,
-                )? {
-                    updates.push(metadata);
+                let state_recovery = state_recovery_ids.contains(market_id);
+                if !state_recovery {
+                    if let Some(metadata) = market_metadata_update(
+                        market_id,
+                        market,
+                        target,
+                        &retrieved_at,
+                        force_hour_context,
+                        &mut tracked,
+                    )? {
+                        updates.push(metadata);
+                    }
                 }
 
-                let settlement = match settlement_from_market(
-                    market,
-                    &target.symbol,
-                    target.window_secs,
-                    &retrieved_at,
-                ) {
-                    Ok(settlement) => settlement,
-                    Err(error) => {
-                        let detail = error.to_string();
-                        errors.push(format!("settlement {market_id}: {detail}"));
-                        invalid_settlement_markets.push(market_id.clone());
-                        tracked
-                            .settlement_failure_since
-                            .get_or_insert_with(|| retrieved_at.clone());
-                        tracked.settlement_last_error = Some(detail);
-                        None
+                let settlement = if state_recovery {
+                    None
+                } else {
+                    match settlement_from_market(
+                        market,
+                        &target.symbol,
+                        target.window_secs,
+                        &retrieved_at,
+                    ) {
+                        Ok(settlement) => settlement,
+                        Err(error) => {
+                            let detail = error.to_string();
+                            errors.push(format!("settlement {market_id}: {detail}"));
+                            invalid_settlement_markets.push(market_id.clone());
+                            tracked
+                                .settlement_failure_since
+                                .get_or_insert_with(|| retrieved_at.clone());
+                            tracked.settlement_last_error = Some(detail);
+                            None
+                        }
                     }
                 };
                 if settlement.is_some() {
                     tracked.settlement_failure_since = None;
                     tracked.settlement_last_error = None;
                 }
+                let settlement_available = state_recovery || settlement.is_some();
                 let was_settled = tracked.settled;
                 if !condition_id.is_empty()
                     && !tracked.trade_complete
@@ -1826,7 +1949,7 @@ impl ReferenceCollector {
                             if truncated {
                                 truncated_markets.push(condition_id.clone());
                             }
-                            if settlement.is_some()
+                            if settlement_available
                                 && advance_trade_finalization(
                                     &mut tracked,
                                     now,
@@ -1933,10 +2056,18 @@ impl ReferenceCollector {
             "target_markets": targets.len(),
             "missing_target_symbols": missing_target_symbols,
             "tracked_markets": self.state.markets.len(),
+            "state_recovery_markets": state_recovery_ids.len(),
+            "market_detail_budget": market_detail_budget,
+            "market_detail_eligible": market_detail_plan.eligible,
+            "market_detail_priority": market_detail_plan.priority,
+            "market_detail_selected": market_detail_plan.selected.len(),
+            "market_detail_deferred": market_detail_plan.deferred,
+            "market_detail_priority_deferred": market_detail_plan.priority_deferred,
             "records_written": updates.len(),
             "record_types": record_types,
             "api_errors": errors,
             "trade_poll_budget": self.config.max_trade_polls_per_cycle,
+            "trade_poll_budget_after_market_details": trade_poll_budget,
             "trade_poll_concurrency": self.config.max_concurrent_trade_polls,
             "trade_request_spacing_ms": u64::try_from(self.config.per_market_delay.as_millis()).unwrap_or(u64::MAX),
             "eligible_trade_markets": trade_poll_plan.eligible,
@@ -2796,6 +2927,107 @@ mod tests {
         let plan = plan_trade_polls(candidates, 2);
         assert_eq!(plan.priority_deferred, 1);
         assert_eq!(plan.deferred, 1);
+    }
+
+    #[test]
+    fn stale_market_detail_recovery_is_bounded_and_rotates_backlog() {
+        let now = fixed_time("2026-07-17T05:00:00Z");
+        let tracked = |end_time: &str| TrackedMarket {
+            end_time: Some(end_time.to_owned()),
+            ..TrackedMarket::default()
+        };
+        let mut markets = BTreeMap::from([
+            ("oldest".to_owned(), tracked("2026-07-16T00:00:00Z")),
+            ("middle".to_owned(), tracked("2026-07-16T01:00:00Z")),
+            ("newest".to_owned(), tracked("2026-07-16T02:00:00Z")),
+            (
+                "complete".to_owned(),
+                TrackedMarket {
+                    settled: true,
+                    trade_complete: true,
+                    ..tracked("2026-07-16T03:00:00Z")
+                },
+            ),
+            ("future".to_owned(), tracked("2026-07-17T06:00:00Z")),
+        ]);
+        let targets = BTreeSet::from(["current-target".to_owned()]);
+
+        let first = plan_market_detail_fetches(&markets, &targets, now, 2);
+        assert_eq!(first.eligible, 3);
+        assert_eq!(first.priority, 3);
+        assert_eq!(
+            first.selected,
+            BTreeSet::from(["middle".to_owned(), "newest".to_owned()])
+        );
+
+        for market_id in &first.selected {
+            markets
+                .get_mut(market_id)
+                .unwrap()
+                .last_market_detail_attempt_at = Some(iso_z(now));
+        }
+        let second = plan_market_detail_fetches(&markets, &targets, now, 2);
+        assert!(second.selected.contains("oldest"));
+    }
+
+    #[test]
+    fn settled_trade_incomplete_state_recovers_without_market_detail() {
+        let now = fixed_time("2026-07-17T05:00:00Z");
+        let tracked = TrackedMarket {
+            condition_id: Some("condition-1".to_owned()),
+            symbol: Some("BTCUSDT".to_owned()),
+            market_window_secs: 300,
+            end_time: Some("2026-07-16T00:05:00Z".to_owned()),
+            settled: true,
+            trade_complete: false,
+            ..TrackedMarket::default()
+        };
+        let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
+        let (market, target) = tracked_market_recovery_target(&tracked, &symbols, now).unwrap();
+
+        assert_eq!(market["conditionId"], "condition-1");
+        assert_eq!(target.symbol, "BTCUSDT");
+        assert_eq!(target.window_secs, 300);
+        let markets = BTreeMap::from([("settled".to_owned(), tracked)]);
+        let target_ids = BTreeSet::from(["settled".to_owned()]);
+        assert_eq!(
+            plan_market_detail_fetches(&markets, &target_ids, now, 8).eligible,
+            0
+        );
+    }
+
+    #[test]
+    fn stale_recovery_shares_one_request_budget() {
+        let now = fixed_time("2026-07-17T05:00:00Z");
+        let tracked = |market_id: &str| {
+            (
+                market_id.to_owned(),
+                TrackedMarket {
+                    settled: false,
+                    trade_complete: false,
+                    end_time: Some("2026-07-16T00:00:00Z".to_owned()),
+                    ..TrackedMarket::default()
+                },
+            )
+        };
+        let markets = BTreeMap::from([tracked("stale-a"), tracked("stale-b"), tracked("stale-c")]);
+        let detail_plan = plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 2);
+        let trade_plan = plan_trade_polls(
+            (0..4)
+                .map(|index| TradePollCandidate {
+                    market_id: format!("trade-{index}"),
+                    priority: true,
+                    last_success_at: None,
+                    end_time: None,
+                })
+                .collect(),
+            remaining_trade_poll_budget(4, detail_plan.selected.len()),
+        );
+
+        assert_eq!(detail_plan.selected.len(), 2);
+        assert_eq!(detail_plan.deferred, 1);
+        assert_eq!(trade_plan.selected.len(), 2);
+        assert_eq!(detail_plan.selected.len() + trade_plan.selected.len(), 4);
     }
 
     #[test]

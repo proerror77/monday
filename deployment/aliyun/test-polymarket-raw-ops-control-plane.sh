@@ -1141,11 +1141,15 @@ done
 jq -n '{
   updated_at:"2026-07-15T00:00:01Z",last_success_at:"2026-07-15T00:00:01Z",
   cycle_started_at:"2026-07-15T00:00:00Z",cycle_duration_ms:1000,
-  target_markets:14,missing_target_symbols:[],api_errors:[],malformed_trade_rows:0,
+  target_markets:120,state_recovery_markets:106,
+  missing_target_symbols:[],api_errors:[],malformed_trade_rows:0,
   trade_poll_budget:112,trade_poll_concurrency:4,trade_request_spacing_ms:100,
-  eligible_trade_markets:14,priority_trade_markets:8,
-  selected_trade_markets:14,deferred_trade_markets:0,priority_trade_backlog:0,
-  trade_polls:14,successful_trade_polls:14,
+  market_detail_budget:4,market_detail_eligible:3,market_detail_priority:2,
+  market_detail_selected:3,market_detail_deferred:0,market_detail_priority_deferred:0,
+  trade_poll_budget_after_market_details:109,
+  eligible_trade_markets:112,priority_trade_markets:8,
+  selected_trade_markets:109,deferred_trade_markets:3,priority_trade_backlog:0,
+  trade_polls:109,successful_trade_polls:109,
   truncated_trade_markets:[],non_object_trade_markets:[],invalid_settlement_markets:[],
   invalid_end_time_markets:[],stale_trade_markets:[],stale_settlement_markets:[],
   overdue_unresolved_markets:[]
@@ -1161,14 +1165,22 @@ for mutation in \
   '.trade_poll_concurrency = 0' \
   '.trade_poll_concurrency = 5' \
   '.trade_poll_concurrency = 193' \
+  'del(.state_recovery_markets)' \
+  '.state_recovery_markets = 121' \
+  '.market_detail_budget = 5' \
+  '.market_detail_priority = 4' \
+  '.market_detail_selected = 2' \
+  '.market_detail_deferred = 1' \
+  '.market_detail_priority_deferred = 1' \
+  '.trade_poll_budget_after_market_details = 112' \
   'del(.trade_request_spacing_ms)' \
   '.trade_request_spacing_ms = 99' \
   '.priority_trade_backlog = 1' \
-  '.selected_trade_markets = 13' \
+  '.selected_trade_markets = 108' \
   '.deferred_trade_markets = 1' \
-  '.eligible_trade_markets = 13' \
+  '.eligible_trade_markets = 111' \
   '.successful_trade_polls = 0' \
-  '.successful_trade_polls = 15' \
+  '.successful_trade_polls = 110' \
   '.missing_target_symbols = ["BTCUSDT"]' \
   '.api_errors = ["Gamma unavailable"]' \
   '.non_object_trade_markets = ["condition-1"]' \
