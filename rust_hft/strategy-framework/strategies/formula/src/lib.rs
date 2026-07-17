@@ -1,5 +1,8 @@
 use hft_core::{OrderType, Price, Quantity, Side, Symbol, TimeInForce};
-use hft_factor_dsl::{FactorAst, FactorDslError, FactorOperator, FactorTerminal};
+use hft_factor_dsl::{
+    validate_live_formula, FactorAst, FactorDslError, FactorOperator, FactorTerminal,
+    LiveEventDomain, LiveFormulaCapabilityError,
+};
 use ports::{
     AccountView, AggregatedBar, ExecutionEvent, L2BookView, MarketEvent, MarketSnapshot,
     OrderIntent, Strategy, StrategyContext,
@@ -265,65 +268,24 @@ fn executable_price(event: &MarketEvent, side: Side) -> Option<Decimal> {
 }
 
 fn validate_live_ast(ast: &FactorAst) -> Result<EventDomain, FormulaStrategyError> {
-    ast.validate()?;
-    let mut domain = None;
-    validate_live_node(ast, &mut domain)?;
-    domain.ok_or(FormulaStrategyError::MissingEventDomain)
-}
-
-fn validate_live_node(
-    ast: &FactorAst,
-    domain: &mut Option<EventDomain>,
-) -> Result<(), FormulaStrategyError> {
-    match ast {
-        FactorAst::Terminal(FactorTerminal::Constant(value)) => {
-            let parsed = value
-                .parse::<f64>()
-                .map_err(|_| FormulaStrategyError::InvalidConstant(value.clone()))?;
-            if !parsed.is_finite() {
-                return Err(FormulaStrategyError::InvalidConstant(value.clone()));
-            }
+    let capability = validate_live_formula(ast).map_err(|error| match error {
+        LiveFormulaCapabilityError::InvalidAst(error) => FormulaStrategyError::InvalidAst(error),
+        LiveFormulaCapabilityError::UnsupportedOperator(operator) => {
+            FormulaStrategyError::UnsupportedOperator(operator)
         }
-        FactorAst::Terminal(FactorTerminal::Field(field)) => {
-            let field_domain = match field.as_str() {
-                "best_bid" | "best_ask" | "mid_price" | "spread" | "spread_bps" | "bid_size"
-                | "ask_size" | "book_imbalance" => EventDomain::Snapshot,
-                "open" | "high" | "low" | "close" | "volume" | "trade_count" | "bar_return" => {
-                    EventDomain::Bar
-                }
-                _ => return Err(FormulaStrategyError::UnsupportedField(field.clone())),
-            };
-            match *domain {
-                Some(existing) if existing != field_domain => {
-                    return Err(FormulaStrategyError::MixedEventDomains)
-                }
-                None => *domain = Some(field_domain),
-                _ => {}
-            }
+        LiveFormulaCapabilityError::UnsupportedField(field) => {
+            FormulaStrategyError::UnsupportedField(field)
         }
-        FactorAst::Call { operator, args } => {
-            if !matches!(
-                operator,
-                FactorOperator::Add
-                    | FactorOperator::Sub
-                    | FactorOperator::Mul
-                    | FactorOperator::Div
-                    | FactorOperator::Abs
-                    | FactorOperator::Log
-                    | FactorOperator::GreaterThan
-                    | FactorOperator::LessThan
-                    | FactorOperator::IfElse
-            ) {
-                return Err(FormulaStrategyError::UnsupportedOperator(
-                    operator.symbol().to_string(),
-                ));
-            }
-            for arg in args {
-                validate_live_node(arg, domain)?;
-            }
+        LiveFormulaCapabilityError::MixedEventDomains => FormulaStrategyError::MixedEventDomains,
+        LiveFormulaCapabilityError::MissingEventDomain => FormulaStrategyError::MissingEventDomain,
+        LiveFormulaCapabilityError::InvalidConstant(value) => {
+            FormulaStrategyError::InvalidConstant(value)
         }
-    }
-    Ok(())
+    })?;
+    Ok(match capability.event_domain {
+        LiveEventDomain::Snapshot => EventDomain::Snapshot,
+        LiveEventDomain::Bar => EventDomain::Bar,
+    })
 }
 
 fn evaluate_ast(ast: &FactorAst, field_value: &impl Fn(&str) -> Option<f64>) -> Option<f64> {
@@ -667,37 +629,28 @@ mod tests {
     }
 
     #[test]
-    fn evaluates_supported_operators_and_emits_sized_spot_ioc() {
+    fn evaluates_live_supported_operators_and_emits_sized_spot_ioc() {
         let condition = call(
             FactorOperator::GreaterThan,
             vec![
                 call(
-                    FactorOperator::Log,
+                    FactorOperator::Abs,
                     vec![call(
-                        FactorOperator::Abs,
-                        vec![call(
-                            FactorOperator::Sub,
-                            vec![field("best_ask"), field("best_bid")],
-                        )],
+                        FactorOperator::Sub,
+                        vec![field("best_ask"), field("best_bid")],
                     )],
                 ),
                 constant("0"),
             ],
         );
         let truthy = call(
-            FactorOperator::Div,
+            FactorOperator::Mul,
             vec![
                 call(
-                    FactorOperator::Mul,
-                    vec![
-                        call(
-                            FactorOperator::Add,
-                            vec![field("bid_size"), field("ask_size")],
-                        ),
-                        constant("2"),
-                    ],
+                    FactorOperator::Add,
+                    vec![field("bid_size"), field("ask_size")],
                 ),
-                call(FactorOperator::Sub, vec![constant("5"), constant("1")]),
+                constant("0.5"),
             ],
         );
         let ast = call(
@@ -821,34 +774,44 @@ mod tests {
     }
 
     #[test]
-    fn invalid_arithmetic_and_empty_books_fail_closed() {
-        let invalid_formulas = [
-            call(
-                FactorOperator::Div,
-                vec![
-                    field("best_bid"),
-                    call(
+    fn unsupported_or_invalid_arithmetic_and_empty_books_fail_closed() {
+        for (ast, operator) in [
+            (
+                call(
+                    FactorOperator::Div,
+                    vec![
+                        field("best_bid"),
+                        call(
+                            FactorOperator::Sub,
+                            vec![field("ask_size"), field("ask_size")],
+                        ),
+                    ],
+                ),
+                "/",
+            ),
+            (
+                call(
+                    FactorOperator::Log,
+                    vec![call(
                         FactorOperator::Sub,
-                        vec![field("ask_size"), field("ask_size")],
-                    ),
-                ],
+                        vec![field("best_bid"), field("best_ask")],
+                    )],
+                ),
+                "log",
             ),
-            call(
-                FactorOperator::Log,
-                vec![call(
-                    FactorOperator::Sub,
-                    vec![field("best_bid"), field("best_ask")],
-                )],
-            ),
-            call(
-                FactorOperator::Mul,
-                vec![field("best_bid"), constant("1e308")],
-            ),
-        ];
-        for ast in invalid_formulas {
-            let mut strategy = FormulaStrategy::new(config(ast)).unwrap();
-            assert!(intents(&mut strategy, &snapshot(3, 1)).is_empty());
+        ] {
+            assert_eq!(
+                FormulaStrategy::new(config(ast)).unwrap_err(),
+                FormulaStrategyError::UnsupportedOperator(operator.to_string())
+            );
         }
+
+        let mut strategy = FormulaStrategy::new(config(call(
+            FactorOperator::Mul,
+            vec![field("best_bid"), constant("1e308")],
+        )))
+        .unwrap();
+        assert!(intents(&mut strategy, &snapshot(3, 1)).is_empty());
 
         let mut strategy = FormulaStrategy::new(config(field("best_bid"))).unwrap();
         let MarketEvent::Snapshot(mut empty) = snapshot(3, 1) else {

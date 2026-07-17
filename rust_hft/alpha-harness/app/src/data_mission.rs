@@ -218,14 +218,23 @@ pub fn load_research_rows(
         let next = trace[index + 1].close;
         let signal = current / previous - 1.0;
         let label = next / current - 1.0;
-        if !signal.is_finite() || !label.is_finite() {
+        let bar_return = trace[index].close / trace[index].open - 1.0;
+        if !signal.is_finite() || !label.is_finite() || !bar_return.is_finite() {
             bail!("derived research return is not finite");
         }
         rows.push(ResearchRow {
             // The forward label is only observable when the next bar is available.
             available_time: trace[index + 1].available_time,
             signal,
-            features: std::collections::BTreeMap::from([("return_1".to_string(), signal)]),
+            features: std::collections::BTreeMap::from([
+                ("open".to_string(), trace[index].open),
+                ("high".to_string(), trace[index].high),
+                ("low".to_string(), trace[index].low),
+                ("close".to_string(), trace[index].close),
+                ("volume".to_string(), trace[index].volume),
+                ("bar_return".to_string(), bar_return),
+                ("return_1".to_string(), signal),
+            ]),
             label,
             fee_bps,
             funding_bps,
@@ -688,6 +697,13 @@ mod tests {
         assert_eq!(trace.first().unwrap().receive_time, manifest.created_at);
         assert_eq!(trace.first().unwrap().ingestion_time, manifest.created_at);
         assert!((rows[0].signal - 0.01).abs() < 1e-12);
+        assert_eq!(rows[0].features["open"], trace[1].open);
+        assert_eq!(rows[0].features["high"], trace[1].high);
+        assert_eq!(rows[0].features["low"], trace[1].low);
+        assert_eq!(rows[0].features["close"], trace[1].close);
+        assert_eq!(rows[0].features["volume"], trace[1].volume);
+        assert_eq!(rows[0].features["bar_return"], 0.0);
+        assert!((rows[0].features["return_1"] - 0.01).abs() < 1e-12);
 
         std::fs::write(&manifest.artifact_path, b"tampered").unwrap();
         assert!(load_research_rows(&manifest, 1.0, 0.0, 0.5).is_err());

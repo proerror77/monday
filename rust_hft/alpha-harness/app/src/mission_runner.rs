@@ -230,7 +230,8 @@ pub fn execute(args: ExecuteMissionArgs) -> anyhow::Result<()> {
 }
 
 fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
-    if !matches!(args.engine, EngineChoice::Mcts | EngineChoice::Bayesian) {
+    mission::validate_live_formula_engine(args.engine)?;
+    if !matches!(args.engine, EngineChoice::Mcts) {
         bail!(
             "unsupported durable Mission engine: {}",
             engine_name(args.engine)
@@ -254,6 +255,7 @@ fn validate_args(args: &ExecuteMissionArgs) -> anyhow::Result<()> {
     {
         bail!("Mission execution paths, ids, URLs, and feature fields are required");
     }
+    mission::validate_live_feature_fields(&args.feature_fields)?;
     Ok(())
 }
 
@@ -463,6 +465,34 @@ mod tests {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn execute_rejects_features_that_have_no_live_formula_semantics() {
+        let mut fixture = fixture("unsupported-live-fields");
+        fixture.args.feature_fields = vec!["book_imbalance_top5".to_string()];
+
+        let error = validate_args(&fixture.args).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "feature field book_imbalance_top5 is not live executable: unsupported live field: book_imbalance_top5"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn execute_rejects_bayesian_window_search_before_materialization() {
+        let mut fixture = fixture("bayesian-window-search");
+        fixture.args.engine = EngineChoice::Bayesian;
+
+        let error = validate_args(&fixture.args).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Bayesian window search is research-only and cannot produce live-executable formulas"
+        );
+        std::fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
     fn execute_rejects_feature_hash_mismatch() {
         let fixture = fixture("hash-mismatch");
         let mut materialization = fixture.materialization;
@@ -615,8 +645,8 @@ mod tests {
                     )]),
                     modalities: BTreeSet::from([DataModality::Lob]),
                     features: BTreeMap::from([
-                        ("book_imbalance_top5".to_string(), index as f64 / 100.0),
-                        ("ofi_top5".to_string(), (index as f64 / 10.0).sin()),
+                        ("book_imbalance".to_string(), index as f64 / 100.0),
+                        ("spread_bps".to_string(), (index as f64 / 10.0).sin()),
                     ]),
                     label: if index % 2 == 0 { 0.001 } else { -0.0005 },
                 }
@@ -669,7 +699,7 @@ mod tests {
             data_mission_id: "data-1".to_string(),
             mission_id: "mission-1".to_string(),
             engine: EngineChoice::Mcts,
-            feature_fields: vec!["book_imbalance_top5".to_string(), "ofi_top5".to_string()],
+            feature_fields: vec!["book_imbalance".to_string(), "spread_bps".to_string()],
             seed: 7,
             max_candidates: 1,
             max_expansions: 1,

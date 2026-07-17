@@ -26,6 +26,7 @@ use alpha_store::{
 use anyhow::{bail, Context};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hft_factor_dsl::validate_live_formula;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -117,6 +118,11 @@ fn validated_walk_forward_evidence_in_lineage(
             )
         ) {
             continue;
+        }
+        if let CandidateArtifact::Formula(ast) = &candidate.artifact {
+            if validate_live_formula(ast).is_err() {
+                continue;
+            }
         }
         let evaluation: CandidateEvaluation = serde_json::from_value(stored.record.payload.clone())
             .with_context(|| format!("walk-forward evaluation {evaluation_id} is malformed"))?;
@@ -391,7 +397,10 @@ pub(crate) fn execute_evaluate(args: EvaluateArgs) -> anyhow::Result<RegistryRev
 
 fn sealed_evaluator_version(artifact: &CandidateArtifact) -> anyhow::Result<&'static str> {
     match artifact {
-        CandidateArtifact::Formula(_) => Ok(SEALED_HOLDOUT_EVALUATOR_VERSION),
+        CandidateArtifact::Formula(ast) => {
+            validate_live_formula(ast).map_err(anyhow::Error::new)?;
+            Ok(SEALED_HOLDOUT_EVALUATOR_VERSION)
+        }
         CandidateArtifact::OnnxModel(_) => Ok(ONNX_SEALED_HOLDOUT_EVALUATOR_VERSION),
         _ => bail!("candidate artifact has no governed sealed evaluator"),
     }
@@ -1141,7 +1150,7 @@ mod tests {
             "evaluation_metrics_hash": "3".repeat(64),
             "sealed_evaluation_hash": "4".repeat(64),
             "artifact": {
-                "Formula": {"ast": {"Terminal": {"Field": "signal"}}}
+                "Formula": {"ast": {"Terminal": {"Field": "mid_price"}}}
             },
             "bundle_hash": "",
             "created_at": now,
@@ -1429,6 +1438,29 @@ mod tests {
     }
 
     #[test]
+    fn sealed_and_promotion_entrypoint_rejects_non_live_formula() {
+        let ast = hft_factor_dsl::FactorAst::call(
+            hft_factor_dsl::FactorOperator::Mean,
+            vec![
+                hft_factor_dsl::FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Field(
+                    "mid_price".to_string(),
+                )),
+                hft_factor_dsl::FactorAst::Terminal(hft_factor_dsl::FactorTerminal::Constant(
+                    "20".to_string(),
+                )),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            sealed_evaluator_version(&CandidateArtifact::Formula(ast))
+                .unwrap_err()
+                .to_string(),
+            "unsupported live operator: mean"
+        );
+    }
+
+    #[test]
     fn sealed_revision_id_is_bound_to_evaluator_version() {
         assert_eq!(
             sealed_evaluation_revision_id("candidate-1", SEALED_HOLDOUT_EVALUATOR_VERSION),
@@ -1508,6 +1540,30 @@ mod tests {
         assert_eq!(
             validated_walk_forward_candidates_in_lineage(&lineage).unwrap(),
             vec!["candidate-1".to_string()]
+        );
+
+        let mut legacy_formula_lineage = lineage.clone();
+        legacy_formula_lineage.candidates[0].artifact = CandidateArtifact::Formula(
+            hft_factor_dsl::FactorAst::call(
+                hft_factor_dsl::FactorOperator::Rank,
+                vec![hft_factor_dsl::FactorAst::Terminal(
+                    hft_factor_dsl::FactorTerminal::Field("mid_price".to_string()),
+                )],
+            )
+            .unwrap(),
+        );
+        let mut legacy_evaluation: CandidateEvaluation =
+            serde_json::from_value(legacy_formula_lineage.evaluations[0].record.payload.clone())
+                .unwrap();
+        legacy_evaluation.evaluator_version = WALK_FORWARD_EVALUATOR_VERSION.to_string();
+        assert!(legacy_evaluation.validate().is_ok());
+        legacy_formula_lineage.evaluations[0].record.payload =
+            serde_json::to_value(legacy_evaluation).unwrap();
+
+        assert!(
+            validated_walk_forward_candidates_in_lineage(&legacy_formula_lineage)
+                .unwrap()
+                .is_empty()
         );
     }
 

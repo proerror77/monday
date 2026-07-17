@@ -4,11 +4,19 @@ use crate::{
     ProposalEngine, ProposalEngineCheckpoint, RemainingBudget,
 };
 use alpha_domain::{CandidateArtifact, EngineKind};
-use hft_factor_dsl::{FactorAst, FactorOperator, FactorTerminal};
+use hft_factor_dsl::{validate_live_formula, FactorAst, FactorOperator, FactorTerminal};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-const MCTS_CHECKPOINT_VERSION: u32 = 1;
+const MCTS_CHECKPOINT_VERSION: u32 = 2;
+
+fn expansion_actions(live_only: bool) -> Vec<usize> {
+    if live_only {
+        vec![3]
+    } else {
+        vec![0, 1, 2, 3]
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,18 +33,19 @@ struct Node {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MctsConfigV1 {
+struct MctsConfigV2 {
     seed: u64,
     root_ast: FactorAst,
     secondary_field: String,
     exploration: f64,
     max_depth: usize,
+    live_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MctsCheckpointV1 {
-    config: MctsConfigV1,
+struct MctsCheckpointV2 {
+    config: MctsConfigV2,
     rng: DeterministicRng,
     nodes: Vec<Node>,
     candidates: BTreeMap<String, usize>,
@@ -59,6 +68,7 @@ pub struct MctsEngine {
     exploration: f64,
     max_depth: usize,
     secondary_field: String,
+    live_only: bool,
     nodes: Vec<Node>,
     candidates: BTreeMap<String, usize>,
     seen: BTreeSet<String>,
@@ -71,6 +81,53 @@ impl MctsEngine {
         secondary_field: impl Into<String>,
         exploration: f64,
         max_depth: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_mode(
+            seed,
+            root_field,
+            secondary_field,
+            exploration,
+            max_depth,
+            false,
+        )
+    }
+
+    pub fn new_live(
+        seed: u64,
+        root_field: impl Into<String>,
+        secondary_field: impl Into<String>,
+        exploration: f64,
+        max_depth: usize,
+    ) -> Result<Self, String> {
+        let root_field = root_field.into();
+        let secondary_field = secondary_field.into();
+        let live_seed = FactorAst::call(
+            FactorOperator::Add,
+            vec![
+                FactorAst::Terminal(FactorTerminal::Field(root_field.clone())),
+                FactorAst::Terminal(FactorTerminal::Field(secondary_field.clone())),
+            ],
+        )
+        .map_err(|error| format!("invalid live MCTS fields: {error}"))?;
+        validate_live_formula(&live_seed)
+            .map_err(|error| format!("invalid live MCTS fields: {error}"))?;
+        Self::new_with_mode(
+            seed,
+            root_field,
+            secondary_field,
+            exploration,
+            max_depth,
+            true,
+        )
+    }
+
+    fn new_with_mode(
+        seed: u64,
+        root_field: impl Into<String>,
+        secondary_field: impl Into<String>,
+        exploration: f64,
+        max_depth: usize,
+        live_only: bool,
     ) -> Result<Self, String> {
         let seed = seed.max(1);
         let root_field = root_field.into();
@@ -87,11 +144,12 @@ impl MctsEngine {
             exploration,
             max_depth,
             secondary_field,
+            live_only,
             nodes: vec![Node {
                 ast: FactorAst::Terminal(FactorTerminal::Field(root_field)),
                 parent: None,
                 children: vec![],
-                unexpanded_actions: vec![0, 1, 2, 3],
+                unexpanded_actions: expansion_actions(live_only),
                 depth: 0,
                 visits: 0,
                 total_reward: 0.0,
@@ -117,8 +175,8 @@ impl MctsEngine {
             .collect()
     }
 
-    fn config(&self) -> Result<MctsConfigV1, String> {
-        Ok(MctsConfigV1 {
+    fn config(&self) -> Result<MctsConfigV2, String> {
+        Ok(MctsConfigV2 {
             seed: self.seed,
             root_ast: self
                 .nodes
@@ -129,6 +187,7 @@ impl MctsEngine {
             secondary_field: self.secondary_field.clone(),
             exploration: self.exploration,
             max_depth: self.max_depth,
+            live_only: self.live_only,
         })
     }
 
@@ -194,7 +253,7 @@ impl MctsEngine {
             parent: Some(parent_id),
             children: vec![],
             unexpanded_actions: if depth < self.max_depth {
-                vec![0, 1, 2, 3]
+                expansion_actions(self.live_only)
             } else {
                 vec![]
             },
@@ -294,7 +353,7 @@ impl ProposalEngine for MctsEngine {
     }
 
     fn checkpoint(&self) -> Result<ProposalEngineCheckpoint, String> {
-        let state = MctsCheckpointV1 {
+        let state = MctsCheckpointV2 {
             config: self.config()?,
             rng: self.rng.clone(),
             nodes: self.nodes.clone(),
@@ -318,14 +377,14 @@ impl ProposalEngine for MctsEngine {
         if checkpoint.kind != EngineKind::Mcts || checkpoint.version != MCTS_CHECKPOINT_VERSION {
             return Err("MCTS checkpoint kind or version mismatch".to_string());
         }
-        let state: MctsCheckpointV1 = serde_json::from_value(checkpoint.state.clone())
+        let state: MctsCheckpointV2 = serde_json::from_value(checkpoint.state.clone())
             .map_err(|error| format!("invalid MCTS checkpoint state: {error}"))?;
         state.validate()?;
         if state.config != self.config()? {
             return Err("MCTS checkpoint configuration mismatch".to_string());
         }
 
-        let MctsCheckpointV1 {
+        let MctsCheckpointV2 {
             config,
             rng,
             nodes,
@@ -337,6 +396,7 @@ impl ProposalEngine for MctsEngine {
         self.exploration = config.exploration;
         self.max_depth = config.max_depth;
         self.secondary_field = config.secondary_field;
+        self.live_only = config.live_only;
         self.nodes = nodes;
         self.candidates = candidates;
         self.seen = seen;
@@ -344,7 +404,7 @@ impl ProposalEngine for MctsEngine {
     }
 }
 
-impl MctsCheckpointV1 {
+impl MctsCheckpointV2 {
     fn validate(&self) -> Result<(), String> {
         if self.config.secondary_field.trim().is_empty()
             || !self.config.exploration.is_finite()
@@ -357,6 +417,10 @@ impl MctsCheckpointV1 {
             .root_ast
             .validate()
             .map_err(|error| format!("invalid MCTS checkpoint root: {error}"))?;
+        if self.config.live_only {
+            validate_live_formula(&self.config.root_ast)
+                .map_err(|error| format!("invalid live MCTS checkpoint root: {error}"))?;
+        }
         let Some(root) = self.nodes.first() else {
             return Err("MCTS checkpoint has no root node".to_string());
         };
@@ -368,6 +432,11 @@ impl MctsCheckpointV1 {
             node.ast
                 .validate()
                 .map_err(|error| format!("invalid MCTS checkpoint node {node_id}: {error}"))?;
+            if self.config.live_only {
+                validate_live_formula(&node.ast).map_err(|error| {
+                    format!("invalid live MCTS checkpoint node {node_id}: {error}")
+                })?;
+            }
             if !node.total_reward.is_finite()
                 || node.best_reward.is_some_and(|reward| !reward.is_finite())
                 || node.depth > self.config.max_depth
@@ -385,8 +454,11 @@ impl MctsCheckpointV1 {
                 .iter()
                 .copied()
                 .collect::<BTreeSet<_>>();
+            let permitted_actions = expansion_actions(self.config.live_only);
             if actions.len() != node.unexpanded_actions.len()
-                || actions.iter().any(|action| *action > 3)
+                || actions
+                    .iter()
+                    .any(|action| !permitted_actions.contains(action))
             {
                 return Err(format!(
                     "invalid MCTS checkpoint actions for node {node_id}"
@@ -489,6 +561,29 @@ mod tests {
             .unwrap();
         engine.observe(&proposal, &evaluation(score));
         proposal
+    }
+
+    #[test]
+    fn live_mcts_only_emits_live_formulas() {
+        let mut engine = MctsEngine::new_live(7, "best_bid", "best_ask", 1.4, 3).unwrap();
+        let dataset = super::super::test_dataset();
+
+        for iteration in 0..3 {
+            let proposal = engine
+                .propose("mission", iteration, &dataset.proposal_context(), &budget())
+                .unwrap();
+            let CandidateArtifact::Formula(ast) = &proposal.artifact else {
+                panic!("live MCTS must produce a formula");
+            };
+            validate_live_formula(ast).expect("live MCTS formula must pass the shared gate");
+            engine.abandon(&proposal);
+        }
+    }
+
+    #[test]
+    fn live_mcts_rejects_non_live_or_mixed_domain_fields() {
+        assert!(MctsEngine::new_live(7, "signal", "best_bid", 1.4, 3).is_err());
+        assert!(MctsEngine::new_live(7, "best_bid", "bar_return", 1.4, 3).is_err());
     }
 
     #[test]

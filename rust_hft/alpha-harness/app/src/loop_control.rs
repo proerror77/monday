@@ -14,17 +14,7 @@ use anyhow::{bail, Context};
 use chrono::Utc;
 
 pub fn run_loop(args: LoopRunArgs) -> anyhow::Result<()> {
-    if !matches!(
-        args.mission.engine,
-        EngineChoice::Mcts | EngineChoice::Bayesian
-    ) {
-        bail!(
-            "durable LoopRun supports only mcts or bayesian exact-resume engines; run gp, offline-rl, or llm as standalone lab missions"
-        );
-    }
-    if args.max_research_missions == 0 {
-        bail!("max_research_missions must be positive");
-    }
+    validate_loop_args(&args)?;
     let target_stage = match args.target_stage {
         LoopTargetChoice::Researching => LoopTargetStage::Researching,
         LoopTargetChoice::WalkForwardKept => LoopTargetStage::WalkForwardKept,
@@ -220,6 +210,19 @@ pub fn recover_legacy_checkpoint(args: RecoverLegacyCheckpointArgs) -> anyhow::R
         Utc::now(),
     )?;
     print_json(&replacement)
+}
+
+fn validate_loop_args(args: &LoopRunArgs) -> anyhow::Result<()> {
+    mission::validate_live_mission_args(&args.mission)?;
+    if !matches!(args.mission.engine, EngineChoice::Mcts) {
+        bail!(
+            "durable LoopRun supports only mcts live-capable exact-resume engines; run gp, offline-rl, or llm as standalone lab missions"
+        );
+    }
+    if args.max_research_missions == 0 {
+        bail!("max_research_missions must be positive");
+    }
+    Ok(())
 }
 
 fn load_or_create_run(
@@ -588,6 +591,7 @@ mod tests {
                 let return_rate = if (index / 3) % 2 == 0 { 0.01 } else { -0.01 };
                 *close *= 1.0 + return_rate;
                 let close = *close;
+                let open = close / (1.0 + return_rate);
                 let event_time = start + Duration::minutes(i64::from(index));
                 let available_time = event_time + Duration::minutes(1);
                 Some(OhlcvTraceRow {
@@ -601,9 +605,9 @@ mod tests {
                     quality_flags: vec![],
                     symbol: "BTCUSDT".to_string(),
                     interval: CandleInterval::OneMinute,
-                    open: close * 0.9995,
-                    high: close * 1.001,
-                    low: close * 0.999,
+                    open,
+                    high: open.max(close) * 1.001,
+                    low: open.min(close) * 0.999,
                     close,
                     volume: 1.0,
                 })
@@ -845,7 +849,7 @@ mod tests {
                 mission_id: mission_id.to_string(),
                 engine: EngineChoice::Mcts,
                 seed: 7,
-                feature_fields: vec!["signal".to_string()],
+                feature_fields: vec!["book_imbalance".to_string()],
                 offline_trace: None,
                 max_new_iterations: None,
                 dataset: DatasetArgs {
@@ -1009,7 +1013,7 @@ mod tests {
             created_at: now,
         };
         let candidate: CandidateArtifact = serde_json::from_value(serde_json::json!({
-            "Formula": {"Terminal": {"Field": "signal"}}
+            "Formula": {"Terminal": {"Field": "mid_price"}}
         }))
         .unwrap();
         let evaluation = canonical_evaluation(
@@ -1176,16 +1180,56 @@ mod tests {
 
     #[test]
     fn durable_loop_rejects_engines_without_exact_checkpoint_semantics() {
-        for engine in [EngineChoice::Gp, EngineChoice::OfflineRl, EngineChoice::Llm] {
+        for engine in [EngineChoice::Gp, EngineChoice::Llm] {
             let db = temp_db_path("alpha-loop-unsupported-engine");
             let mut args = loop_args(db.clone(), "mission-loop", LoopTargetChoice::Researching);
             args.mission.engine = engine;
 
             let error = run_loop(args).unwrap_err().to_string();
-            assert!(error.contains("supports only mcts or bayesian"));
+            assert!(error.contains("supports only mcts live-capable"));
             assert!(
                 !db.exists(),
                 "validation must happen before durable state is opened"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_loop_rejects_live_capability_failures_before_opening_state() {
+        let cases = [
+            (
+                EngineChoice::Bayesian,
+                vec!["book_imbalance".to_string()],
+                "Bayesian window search is research-only",
+            ),
+            (
+                EngineChoice::OfflineRl,
+                vec!["book_imbalance".to_string()],
+                "Offline RL search is research-only",
+            ),
+            (
+                EngineChoice::Mcts,
+                vec!["signal".to_string()],
+                "feature field signal is not live executable",
+            ),
+            (
+                EngineChoice::Mcts,
+                vec!["best_bid".to_string(), "bar_return".to_string()],
+                "feature fields span live event domains",
+            ),
+        ];
+
+        for (engine, feature_fields, expected) in cases {
+            let db = temp_db_path("alpha-loop-live-capability");
+            let mut args = loop_args(db.clone(), "mission-loop", LoopTargetChoice::Researching);
+            args.mission.engine = engine;
+            args.mission.feature_fields = feature_fields;
+
+            let error = run_loop(args).unwrap_err().to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+            assert!(
+                !db.exists(),
+                "live capability validation must happen before durable state is opened"
             );
         }
     }
@@ -1253,7 +1297,7 @@ mod tests {
             .create_mission(&mission_fixture(now, mission_id))
             .unwrap();
         let candidate: CandidateArtifact = serde_json::from_value(serde_json::json!({
-            "Formula": {"Terminal": {"Field": "signal"}}
+            "Formula": {"Terminal": {"Field": "mid_price"}}
         }))
         .unwrap();
         store
@@ -1524,7 +1568,7 @@ mod tests {
         research_mission.dataset_manifest_id =
             serde_json::from_value(serde_json::json!(manifest.manifest_id)).unwrap();
         let candidate: CandidateArtifact = serde_json::from_value(serde_json::json!({
-            "Formula": {"Terminal": {"Field": "signal"}}
+            "Formula": {"Terminal": {"Field": "bar_return"}}
         }))
         .unwrap();
         let dataset_args = DatasetArgs {
