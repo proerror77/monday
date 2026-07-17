@@ -338,6 +338,7 @@ struct ProcessState {
 }
 
 impl ProcessState {
+    #[cfg(test)]
     fn new(aggregate_trade_history_trusted: bool) -> Self {
         Self {
             aggregate_trade_history_trusted,
@@ -559,15 +560,11 @@ async fn main() -> anyhow::Result<()> {
     if !recovered.is_empty() {
         info!(segments = recovered.len(), "recovered interrupted segments");
     }
-    let aggregate_trade_history_trusted =
-        !spool_contains_current_market_tape_history(&config.spool_dir)?;
-    if !aggregate_trade_history_trusted {
-        warn!(
-            spool_dir = %config.spool_dir.display(),
-            "market_tape history exists but aggregate-trade continuity restore is not implemented; new segments stay replay-unsafe"
-        );
-    }
-    let mut process_state = ProcessState::new(aggregate_trade_history_trusted);
+    warn!(
+        spool_dir = %config.spool_dir.display(),
+        "aggregate-trade continuity restore is not implemented; new segments stay replay-unsafe"
+    );
+    let mut process_state = ProcessState::default();
     let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let upload_task = tokio::spawn(upload_loop(config.clone(), shutdown_rx.clone()));
@@ -603,7 +600,7 @@ async fn run_session(
     config: Arc<Config>,
     mut shutdown: watch::Receiver<bool>,
     watchdog: ProcessWatchdog,
-    mut process_state: &mut ProcessState,
+    process_state: &mut ProcessState,
 ) -> anyhow::Result<()> {
     let session_id = format!("{:x}-{}", now_ns()?, std::process::id());
     let active_symbols = config.active_symbols();
@@ -665,7 +662,7 @@ async fn run_session(
                     Some(Ok(Ok(TaskExit::Stopped(Some(event))))) => {
                         pending_action = process_event(
                             &config, &mut segment, &mut states, &mut budget, &session_id, event,
-                            &mut process_state,
+                            process_state,
                         )?;
                     }
                     Some(Ok(Ok(TaskExit::SnapshotComplete))) => {},
@@ -690,7 +687,7 @@ async fn run_session(
                     Some(event) => {
                         match process_event(
                             &config, &mut segment, &mut states, &mut budget, &session_id, event,
-                            &mut process_state,
+                            process_state,
                         ) {
                             Ok(action) => pending_action = action,
                             Err(error) => {
@@ -1096,17 +1093,6 @@ fn close_segment(
         segment.mark_replay_unsafe();
     }
     segment.close()
-}
-
-fn spool_contains_current_market_tape_history(spool_dir: &Path) -> anyhow::Result<bool> {
-    for manifest in files_with_suffix(spool_dir, ".manifest.json")? {
-        let manifest: Value = serde_json::from_reader(std::fs::File::open(&manifest)?)
-            .with_context(|| format!("failed to read manifest {}", manifest.display()))?;
-        if manifest.get("schema").and_then(Value::as_str) == Some(RAW_SCHEMA) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 async fn receive_url(
@@ -2875,28 +2861,7 @@ mod tests {
     }
 
     #[test]
-    fn current_market_tape_history_requires_aggregate_trade_restore() {
-        let root = tempfile::Builder::new()
-            .prefix("monday-market-tape-history-")
-            .tempdir()
-            .unwrap();
-        assert!(!spool_contains_current_market_tape_history(root.path()).unwrap());
-        std::fs::write(
-            root.path().join("legacy.manifest.json"),
-            serde_json::to_vec(&json!({"schema":"binance.lob_tape.v2"})).unwrap(),
-        )
-        .unwrap();
-        assert!(!spool_contains_current_market_tape_history(root.path()).unwrap());
-        std::fs::write(
-            root.path().join("current.manifest.json"),
-            serde_json::to_vec(&json!({"schema":RAW_SCHEMA})).unwrap(),
-        )
-        .unwrap();
-        assert!(spool_contains_current_market_tape_history(root.path()).unwrap());
-    }
-
-    #[test]
-    fn untrusted_market_tape_history_keeps_checkpoints_replay_unsafe() {
+    fn startup_default_keeps_checkpoints_replay_unsafe() {
         assert!(Command::new("zstd")
             .arg("--version")
             .output()
@@ -2943,7 +2908,7 @@ mod tests {
             &states,
             "session-1",
             "test",
-            &ProcessState::new(false),
+            &ProcessState::default(),
         )
         .unwrap()
         .unwrap();
