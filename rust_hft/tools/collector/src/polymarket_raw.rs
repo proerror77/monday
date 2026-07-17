@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -664,11 +664,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn read_optional_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match fs::symlink_metadata(path) {
-        Ok(_) => serde_json::from_reader(open_read_regular(path)?)
+        Ok(_) => deserialize_json(open_read_regular(path)?)
             .with_context(|| format!("invalid JSON in {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn deserialize_json<T: DeserializeOwned>(reader: impl Read) -> serde_json::Result<T> {
+    serde_json::from_reader(BufReader::new(reader))
 }
 
 fn open_read_regular(path: &Path) -> Result<File> {
@@ -3372,6 +3376,32 @@ mod tests {
             .unwrap();
 
         release_clean_file_cache(writer.file.as_ref().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn state_deserialization_bounds_underlying_reads() {
+        struct CountingReader<R> {
+            inner: R,
+            reads: usize,
+        }
+
+        impl<R: Read> Read for CountingReader<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.inner.read(buffer)
+            }
+        }
+
+        let input = serde_json::to_vec(&vec!["state"; 16_384]).unwrap();
+        let mut reader = CountingReader {
+            inner: input.as_slice(),
+            reads: 0,
+        };
+
+        let state: Vec<String> = deserialize_json(&mut reader).unwrap();
+
+        assert_eq!(state.len(), 16_384);
+        assert!(reader.reads <= 256, "{} underlying reads", reader.reads);
     }
 
     #[test]
