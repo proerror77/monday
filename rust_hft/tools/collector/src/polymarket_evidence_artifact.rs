@@ -112,7 +112,7 @@ fn recording_semantics() -> RecordingSemantics {
             capacity_modeled: false,
         },
         trades: "exact market_id association using canonical v2 records; trade_ts may fall outside the event lifetime",
-        references: "typed Chainlink BTC/USD or SOL/USD with source timestamp inside the event window",
+        references: "typed Chainlink BTC/USD or SOL/USD with source timestamp in [event_start - 30 seconds, event_end)",
         settlement: "gamma_api_closed_market closed-market evidence joined by exact market_id",
         availability_clock: "point-in-time rows expose the latest validated recorded or retrieved clock as available_at",
     }
@@ -633,6 +633,10 @@ mod tests {
         assert_eq!(orderbook["queue_position_modeled"], false);
         assert_eq!(orderbook["endogenous_impact_modeled"], false);
         assert_eq!(orderbook["capacity_modeled"], false);
+        assert_eq!(
+            semantics["references"],
+            "typed Chainlink BTC/USD or SOL/USD with source timestamp in [event_start - 30 seconds, event_end)"
+        );
         assert!(CONTENT_DIGEST_SEMANTICS.contains("not a snapshot_contract_hash"));
         assert!(!CONTENT_DIGEST_SEMANTICS.contains("snapshot_id"));
         assert!(!CONTENT_DIGEST_SEMANTICS.contains("pm_token_settlements"));
