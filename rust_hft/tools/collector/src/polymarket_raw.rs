@@ -1049,9 +1049,15 @@ impl GammaLane {
 }
 
 #[derive(Default)]
+struct GammaLaneDiscovery {
+    seen: usize,
+    targets: Vec<Value>,
+}
+
+#[derive(Default)]
 struct GammaDiscovery {
-    open: Vec<Value>,
-    closed: Vec<Value>,
+    open: GammaLaneDiscovery,
+    closed: GammaLaneDiscovery,
 }
 
 impl GammaDiscovery {
@@ -1059,24 +1065,26 @@ impl GammaDiscovery {
         &mut self,
         lane: GammaLane,
         payload: &Value,
+        symbols: &BTreeSet<String>,
         max_markets: usize,
     ) -> Result<Option<String>> {
-        let markets = match lane {
+        let discovery = match lane {
             GammaLane::Open => &mut self.open,
             GammaLane::Closed => &mut self.closed,
         };
-        append_gamma_page(markets, payload, max_markets)
+        append_gamma_page(discovery, payload, symbols, max_markets)
     }
 
     fn into_markets(mut self) -> Vec<Value> {
-        self.open.append(&mut self.closed);
-        self.open
+        self.open.targets.append(&mut self.closed.targets);
+        self.open.targets
     }
 }
 
 fn append_gamma_page(
-    markets: &mut Vec<Value>,
+    discovery: &mut GammaLaneDiscovery,
     payload: &Value,
+    symbols: &BTreeSet<String>,
     max_markets: usize,
 ) -> Result<Option<String>> {
     let page = payload
@@ -1098,8 +1106,8 @@ fn append_gamma_page(
             ))
         }
     };
-    let total = markets
-        .len()
+    let total = discovery
+        .seen
         .checked_add(page.len())
         .ok_or_else(|| completeness_error("Gamma market count overflow"))?;
     if total > max_markets || (total == max_markets && next_cursor.is_some()) {
@@ -1107,7 +1115,12 @@ fn append_gamma_page(
             "Gamma market discovery reached max_markets={max_markets} before exhausting its cursor"
         )));
     }
-    markets.extend(page.iter().cloned());
+    discovery.seen = total;
+    discovery.targets.extend(
+        page.iter()
+            .filter(|market| target_market(market, symbols).is_some())
+            .cloned(),
+    );
     Ok(next_cursor)
 }
 
@@ -1137,13 +1150,13 @@ fn gamma_discovery_params(
     ]
 }
 
-fn object_rows(page: &[Value]) -> (Vec<Value>, u64) {
+fn object_rows(page: Vec<Value>) -> (Vec<Value>, u64) {
+    let page_len = page.len();
     let objects = page
-        .iter()
+        .into_iter()
         .filter(|value| value.is_object())
-        .cloned()
         .collect::<Vec<_>>();
-    let rejected = u64::try_from(page.len() - objects.len()).unwrap_or(u64::MAX);
+    let rejected = u64::try_from(page_len - objects.len()).unwrap_or(u64::MAX);
     (objects, rejected)
 }
 
@@ -1204,7 +1217,7 @@ fn trade_updates(
     condition_id: &str,
     symbol: &str,
     window_secs: u64,
-    trades: &[Value],
+    trades: Vec<Value>,
     now: DateTime<Utc>,
 ) -> (Vec<Value>, BTreeMap<String, u64>) {
     let cutoff = now.timestamp() - config.market_lookback_secs;
@@ -1280,12 +1293,12 @@ fn trade_updates(
     let seen = state.trade_seen.entry(condition_id.to_owned()).or_default();
     let mut updates = Vec::new();
     for (timestamp, trade) in parsed {
-        let record_id = stable_trade_id(trade);
+        let record_id = stable_trade_id(&trade);
         if timestamp < cutoff || seen.contains_key(&record_id) {
             continue;
         }
         seen.insert(record_id.clone(), timestamp);
-        updates.push(json!({
+        let mut update = json!({
             "kind": "polymarket_trade",
             "record_id": record_id,
             "record_id_version": TRADE_ID_VERSION,
@@ -1305,8 +1318,13 @@ fn trade_updates(
             "outcome_index": trade.get("outcomeIndex"),
             "source": "polymarket_data_api",
             "received_at": iso_z(now),
-            "trade": trade,
-        }));
+            "trade": null,
+        });
+        update
+            .as_object_mut()
+            .expect("trade update must be an object")
+            .insert("trade".to_owned(), trade);
+        updates.push(update);
     }
     seen.retain(|_, timestamp| *timestamp >= cutoff);
     (updates, malformed)
@@ -1594,7 +1612,12 @@ impl ReferenceCollector {
                     params.push(("after_cursor".to_owned(), cursor.clone()));
                 }
                 let payload = self.get_json(GAMMA_MARKETS_URL, &params).await?;
-                cursor = discovery.append_page(lane, &payload, self.config.max_markets)?;
+                cursor = discovery.append_page(
+                    lane,
+                    &payload,
+                    &self.symbols,
+                    self.config.max_markets,
+                )?;
                 let Some(next_cursor) = cursor.as_ref() else {
                     break;
                 };
@@ -1624,13 +1647,14 @@ impl ReferenceCollector {
                     ],
                 )
                 .await?;
-            let page = payload
-                .as_array()
-                .context("Data API trades response is not an array")?;
+            let Value::Array(page) = payload else {
+                bail!("Data API trades response is not an array");
+            };
+            let page_len = page.len();
             let (objects, rejected) = object_rows(page);
             trades.extend(objects);
             non_object_rows = non_object_rows.saturating_add(rejected);
-            if page.len() < 10_000 {
+            if page_len < 10_000 {
                 break;
             }
             if offset == 10_000 {
@@ -1816,8 +1840,10 @@ impl ReferenceCollector {
                 .collect(),
             trade_poll_budget,
         );
+        let target_count = targets.len();
+        let processing_target_ids = targets.keys().cloned().collect::<Vec<_>>();
         let target_chunks = target_processing_chunks(
-            targets.keys(),
+            processing_target_ids.iter(),
             &trade_poll_plan.selected,
             self.config.max_concurrent_trade_polls,
         );
@@ -1845,7 +1871,7 @@ impl ReferenceCollector {
 
             for market_id in target_chunk {
                 let (market, target) = targets
-                    .get(market_id)
+                    .remove(market_id)
                     .ok_or_else(|| anyhow!("target market {market_id} disappeared"))?;
                 let condition_id = market
                     .get("conditionId")
@@ -1864,8 +1890,8 @@ impl ReferenceCollector {
                 if !state_recovery {
                     if let Some(metadata) = market_metadata_update(
                         market_id,
-                        market,
-                        target,
+                        &market,
+                        &target,
                         &retrieved_at,
                         force_hour_context,
                         &mut tracked,
@@ -1878,7 +1904,7 @@ impl ReferenceCollector {
                     None
                 } else {
                     match settlement_from_market(
-                        market,
+                        &market,
                         &target.symbol,
                         target.window_secs,
                         &retrieved_at,
@@ -1920,7 +1946,7 @@ impl ReferenceCollector {
                                 &condition_id,
                                 &target.symbol,
                                 target.window_secs,
-                                &trades,
+                                trades,
                                 now,
                             );
                             if non_object_rows > 0 {
@@ -2053,7 +2079,7 @@ impl ReferenceCollector {
             "cycle_duration_ms": cycle_duration_ms,
             "updated_at": completed_at,
             "last_success_at": completed_at,
-            "target_markets": targets.len(),
+            "target_markets": target_count,
             "missing_target_symbols": missing_target_symbols,
             "tracked_markets": self.state.markets.len(),
             "state_recovery_markets": state_recovery_ids.len(),
@@ -2734,27 +2760,32 @@ mod tests {
 
     #[test]
     fn gamma_cursor_pages_are_exhausted_or_fail_at_the_configured_cap() {
-        let mut markets = Vec::new();
+        let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
+        let mut discovery = GammaLaneDiscovery::default();
         let cursor = append_gamma_page(
-            &mut markets,
+            &mut discovery,
             &json!({"markets": [{"id": "one"}], "next_cursor": "page-2"}),
+            &symbols,
             2,
         )
         .unwrap();
         assert_eq!(cursor.as_deref(), Some("page-2"));
         assert!(append_gamma_page(
-            &mut markets,
+            &mut discovery,
             &json!({"markets": [{"id": "two"}], "next_cursor": ""}),
+            &symbols,
             2,
         )
         .unwrap()
         .is_none());
-        assert_eq!(markets.len(), 2);
+        assert_eq!(discovery.seen, 2);
+        assert!(discovery.targets.is_empty());
 
-        let mut capped = Vec::new();
+        let mut capped = GammaLaneDiscovery::default();
         let error = append_gamma_page(
             &mut capped,
             &json!({"markets": [{"id": "one"}], "next_cursor": "page-2"}),
+            &symbols,
             1,
         )
         .unwrap_err();
@@ -2762,12 +2793,75 @@ mod tests {
     }
 
     #[test]
+    fn gamma_discovery_drops_non_targets_after_validating_and_counting_them() {
+        let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
+        let target = market(
+            "Will Bitcoin go up?",
+            "2026-07-15T00:00:00Z",
+            "2026-07-15T00:05:00Z",
+        );
+        let mut discovery = GammaDiscovery::default();
+
+        let cursor = discovery
+            .append_page(
+                GammaLane::Open,
+                &json!({
+                    "markets": [{"id": "other"}, target],
+                    "next_cursor": "page-2",
+                }),
+                &symbols,
+                3,
+            )
+            .unwrap();
+        assert_eq!(cursor.as_deref(), Some("page-2"));
+
+        let error = discovery
+            .append_page(
+                GammaLane::Open,
+                &json!({
+                    "markets": [{"id": "another-other"}],
+                    "next_cursor": "page-3",
+                }),
+                &symbols,
+                3,
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<DataCompletenessError>().is_some());
+
+        assert!(discovery
+            .append_page(
+                GammaLane::Closed,
+                &json!({"markets": [{"id": "other"}, null]}),
+                &symbols,
+                3,
+            )
+            .is_err());
+
+        let ids = discovery
+            .into_markets()
+            .into_iter()
+            .map(|market| market["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["market-1"]);
+    }
+
+    #[test]
     fn open_and_closed_discovery_lanes_have_independent_caps() {
+        let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
+        let mut open = market(
+            "Will Bitcoin go up?",
+            "2026-07-15T00:00:00Z",
+            "2026-07-15T00:05:00Z",
+        );
+        open["id"] = json!("open");
+        let mut closed = open.clone();
+        closed["id"] = json!("closed");
         let mut discovery = GammaDiscovery::default();
         assert!(discovery
             .append_page(
                 GammaLane::Open,
-                &json!({"markets": [{"id": "open"}], "next_cursor": ""}),
+                &json!({"markets": [open], "next_cursor": ""}),
+                &symbols,
                 1,
             )
             .unwrap()
@@ -2775,7 +2869,8 @@ mod tests {
         assert!(discovery
             .append_page(
                 GammaLane::Closed,
-                &json!({"markets": [{"id": "closed"}], "next_cursor": ""}),
+                &json!({"markets": [closed], "next_cursor": ""}),
+                &symbols,
                 1,
             )
             .unwrap()
@@ -3123,13 +3218,17 @@ mod tests {
 
     #[test]
     fn gamma_and_trade_pages_reject_schema_loss() {
-        let mut markets = Vec::new();
-        assert!(
-            append_gamma_page(&mut markets, &json!({"markets": [{"id": "one"}, null]}), 10,)
-                .is_err()
-        );
+        let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
+        let mut discovery = GammaLaneDiscovery::default();
+        assert!(append_gamma_page(
+            &mut discovery,
+            &json!({"markets": [{"id": "one"}, null]}),
+            &symbols,
+            10,
+        )
+        .is_err());
 
-        let (objects, rejected) = object_rows(&[json!({"id": "trade"}), Value::Null]);
+        let (objects, rejected) = object_rows(vec![json!({"id": "trade"}), Value::Null]);
         assert_eq!(objects.len(), 1);
         assert_eq!(rejected, 1);
     }
@@ -3200,7 +3299,7 @@ mod tests {
             "condition-1",
             "BTCUSDT",
             300,
-            &[
+            vec![
                 valid_trade(now.timestamp()),
                 valid_trade(now.timestamp()),
                 formerly_colliding,
@@ -3212,7 +3311,7 @@ mod tests {
         assert_ne!(updates[0]["record_id"], updates[1]["record_id"]);
         assert_eq!(reasons.get("invalid_price"), Some(&1));
         assert_eq!(updates[0]["record_id_version"], TRADE_ID_VERSION);
-        assert_eq!(updates[0]["trade"]["sourceOnlyField"]["preserved"], true);
+        assert_eq!(updates[0]["trade"], valid_trade(now.timestamp()));
 
         let (again, _) = trade_updates(
             &ReferenceConfig::default(),
@@ -3221,7 +3320,7 @@ mod tests {
             "condition-1",
             "BTCUSDT",
             300,
-            &[valid_trade(now.timestamp())],
+            vec![valid_trade(now.timestamp())],
             now,
         );
         assert!(again.is_empty());
