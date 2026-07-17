@@ -1166,6 +1166,7 @@ for mutation in \
   '.trade_poll_concurrency = 5' \
   '.trade_poll_concurrency = 193' \
   'del(.state_recovery_markets)' \
+  '.state_recovery_markets = 121' \
   '.market_detail_budget = 5' \
   '.market_detail_priority = 4' \
   '.market_detail_selected = 2' \
