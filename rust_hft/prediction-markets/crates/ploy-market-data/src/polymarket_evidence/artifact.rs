@@ -63,6 +63,7 @@ impl PolymarketEvidenceTrustAnchor {
 #[derive(Debug)]
 pub struct SealedPolymarketEvidenceTriplet {
     manifest: EvidenceManifest,
+    manifest_sha256: String,
     data: Vec<u8>,
     frames: Vec<Range<usize>>,
 }
@@ -70,6 +71,10 @@ pub struct SealedPolymarketEvidenceTriplet {
 impl SealedPolymarketEvidenceTriplet {
     pub fn content_sha256(&self) -> &str {
         &self.manifest.content_sha256
+    }
+
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
     }
 
     pub fn content_bytes(&self) -> u64 {
@@ -258,6 +263,7 @@ fn seal_with_hook(
     }
     Ok(SealedPolymarketEvidenceTriplet {
         manifest: parsed,
+        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
         data: data_bytes,
         frames,
     })
@@ -710,6 +716,7 @@ pub(super) mod tests {
         let temp = tempfile::tempdir().unwrap(); let triplet = write_triplet(&temp);
         let sealed = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap();
         assert_eq!((sealed.rows(), sealed.events()), (5, 1));
+        assert_eq!(sealed.manifest_sha256(), format!("{:x}", Sha256::digest(fs::read(&triplet.manifest).unwrap())));
     }
 
     #[test]
