@@ -238,6 +238,7 @@ exercise_rust_baseline_identity() (
     esac
     verify_baseline_identity && { printf 'accepted %s baseline drift\n' "$drift" >&2; exit 1; }
   done
+  return 0
 )
 exercise_rust_baseline_identity
 
