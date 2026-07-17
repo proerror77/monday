@@ -181,11 +181,11 @@ installing anything:
 set -euo pipefail
 artifact_dir=$(pwd -P)
 
-manifest_sha=$(sha256sum polymarket-raw-ops-release.json | awk '{print $1}')
+release_manifest_sha=$(sha256sum polymarket-raw-ops-release.json | awk '{print $1}')
 [[ $(wc -l < polymarket-raw-ops-release.json.sha256) -eq 1 ]]
 [[ $(<polymarket-raw-ops-release.json.sha256) \
-  == "$manifest_sha  polymarket-raw-ops-release.json" ]]
-printf '%s  %s\n' "$manifest_sha" polymarket-raw-ops-release.json \
+  == "$release_manifest_sha  polymarket-raw-ops-release.json" ]]
+printf '%s  %s\n' "$release_manifest_sha" polymarket-raw-ops-release.json \
   | sha256sum --check --strict
 jq -e -s '
   length == 1 and (.[0] |
