@@ -749,6 +749,20 @@ mod tests {
     }
 
     #[test]
+    fn first_segment_checkpoint_cannot_replace_snapshot_seed() {
+        let root = tempdir();
+        let mut rows = valid_rows();
+        rows.retain(|row| {
+            !matches!(row["type"].as_str(), Some("snapshot") | Some("diff"))
+        });
+        let (triplet, anchor) = write_triplet(root.path(), &rows);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("snapshot seed"));
+    }
+
+    #[test]
     fn every_declared_symbol_requires_an_aggregate_trade() {
         let root = tempdir();
         let rows = two_symbol_rows_without_sol_trade();
