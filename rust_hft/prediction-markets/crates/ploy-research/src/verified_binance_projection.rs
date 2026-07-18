@@ -15,7 +15,6 @@ use rust_decimal::Decimal;
 use crate::ResearchLobSnapshot;
 
 type ProjectedMarketUpdate = (MarketUpdate, BinanceSourceClock);
-type ProjectedTradeRows = (Vec<ProjectedMarketUpdate>, usize, usize);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBinanceResearchSurfaceCounts {
@@ -141,18 +140,30 @@ fn project_trades(
     history_start: DateTime<Utc>,
     end: DateTime<Utc>,
     spot_bucket_ns: u64,
-) -> Result<ProjectedTradeRows> {
+) -> Result<(Vec<ProjectedMarketUpdate>, usize, usize)> {
     let mut spot = BTreeMap::<u64, &AggregateTrade>::new();
     let mut aggregate = BTreeMap::<(u64, bool), AggregateTradeBucket>::new();
     for trade in trades.iter().filter(|trade| trade.symbol == symbol) {
+        let source_at = datetime_from_ms(trade.trade_time_ms)?;
         let received_at = datetime_from_ns(trade.received_at_ns)?;
-        if received_at < history_start || received_at >= end {
+        if source_at < history_start || source_at >= end || received_at >= end {
             continue;
         }
-        let spot_key = trade.received_at_ns / spot_bucket_ns;
+        let spot_key = trade
+            .trade_time_ms
+            .checked_mul(1_000_000)
+            .context("Binance spot source time overflows nanoseconds")?
+            / spot_bucket_ns;
         if spot.get(&spot_key).is_none_or(|current| {
-            (trade.received_at_ns, trade.aggregate_trade_id)
-                > (current.received_at_ns, current.aggregate_trade_id)
+            (
+                trade.trade_time_ms,
+                trade.aggregate_trade_id,
+                trade.received_at_ns,
+            ) > (
+                current.trade_time_ms,
+                current.aggregate_trade_id,
+                current.received_at_ns,
+            )
         }) {
             spot.insert(spot_key, trade);
         }
@@ -345,6 +356,7 @@ fn project_lob_snapshots(
         .filter(|observation| observation.symbol == symbol)
         .peekable();
     let mut latest_source_time_ms = None;
+    let mut latest_source_received_at_ns = None;
     let mut sampled = BTreeMap::new();
     let mut state = None;
     let mut index = 0;
@@ -359,12 +371,23 @@ fn project_lob_snapshots(
             .peek()
             .is_some_and(|observation| observation.received_at_ns <= received_at_ns)
         {
-            latest_source_time_ms = observations.next().map(|row| row.source_time_ms);
+            let observation = observations.next().expect("peeked observation exists");
+            latest_source_time_ms = Some(observation.source_time_ms);
+            latest_source_received_at_ns = Some(observation.received_at_ns);
         }
         let received_at = datetime_from_ns(received_at_ns)?;
-        if received_at >= history_start && received_at < end && latest_source_time_ms.is_some() {
+        let source_at = latest_source_time_ms.map(datetime_from_ms).transpose()?;
+        if source_at.is_some_and(|source_at| source_at >= history_start && source_at < end)
+            && received_at < end
+            && latest_source_received_at_ns == Some(received_at_ns)
+        {
+            let source_bucket = latest_source_time_ms
+                .expect("source clock is present")
+                .checked_mul(1_000_000)
+                .context("Binance LOB source time overflows nanoseconds")?
+                / bucket_ns;
             sampled.insert(
-                received_at_ns / bucket_ns,
+                source_bucket,
                 sample_book(
                     symbol,
                     state
@@ -416,9 +439,30 @@ mod tests {
         }
     }
 
+    fn aggregate_trade(
+        aggregate_trade_id: u64,
+        source_offset_secs: u64,
+        received_offset_secs: u64,
+        price: u64,
+    ) -> AggregateTrade {
+        let trade_time_ms = SOURCE_MS + source_offset_secs * 1_000;
+        AggregateTrade {
+            symbol: "BTCUSDT".to_owned(),
+            aggregate_trade_id,
+            first_trade_id: aggregate_trade_id,
+            last_trade_id: aggregate_trade_id,
+            price: Decimal::from(price),
+            quantity: Decimal::ONE,
+            event_time_ms: trade_time_ms,
+            trade_time_ms,
+            is_buyer_maker: false,
+            received_at_ns: (SOURCE_MS + received_offset_secs * 1_000) * 1_000_000,
+        }
+    }
+
     #[test]
     fn stale_lob_source_clock_is_preserved() {
-        let start = datetime_from_ns(RECEIVED_NS - SECOND_NS).unwrap();
+        let start = datetime_from_ms(SOURCE_MS).unwrap();
         let end = datetime_from_ns(RECEIVED_NS + SECOND_NS).unwrap();
 
         let rows = project_lob_snapshots(
@@ -465,7 +509,8 @@ mod tests {
 
     #[test]
     fn equal_receive_time_book_events_merge_before_one_sample() {
-        let (start, end) = window();
+        let start = datetime_from_ms(SOURCE_MS).unwrap();
+        let end = datetime_from_ns(RECEIVED_NS + SECOND_NS).unwrap();
 
         let rows = project_lob_snapshots(
             "BTCUSDT",
@@ -478,6 +523,108 @@ mod tests {
         .unwrap();
 
         assert_eq!((rows.len(), rows[0].best_bid), (1, 100.5));
+    }
+
+    #[test]
+    fn spot_sampling_uses_source_time_buckets() {
+        let start = datetime_from_ms(SOURCE_MS).unwrap();
+        let end = start + chrono::Duration::seconds(90);
+        let bucket_ns = 30 * SECOND_NS;
+
+        let (same_bucket, same_bucket_count, _) = project_trades(
+            &[
+                aggregate_trade(1, 10, 29, 100),
+                aggregate_trade(2, 20, 31, 101),
+            ],
+            "BTCUSDT",
+            start,
+            end,
+            bucket_ns,
+        )
+        .unwrap();
+        let same_bucket_prices = same_bucket
+            .iter()
+            .filter_map(|(update, _)| match update {
+                MarketUpdate::SpotPrice { price, .. } => Some(*price),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!((same_bucket_count, same_bucket_prices), (1, vec![Decimal::from(101)]));
+
+        let (split_buckets, split_bucket_count, _) = project_trades(
+            &[
+                aggregate_trade(3, 29, 31, 102),
+                aggregate_trade(4, 31, 32, 103),
+            ],
+            "BTCUSDT",
+            start,
+            end,
+            bucket_ns,
+        )
+        .unwrap();
+        let split_bucket_prices = split_buckets
+            .iter()
+            .filter_map(|(update, _)| match update {
+                MarketUpdate::SpotPrice { price, .. } => Some(*price),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (split_bucket_count, split_bucket_prices),
+            (2, vec![Decimal::from(102), Decimal::from(103)])
+        );
+    }
+
+    #[test]
+    fn lob_sampling_uses_source_time_buckets() {
+        let base_ns = SOURCE_MS * 1_000_000;
+        let events = vec![
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                received_at_ns: base_ns,
+                bids: vec![["100".into(), "1".into()]],
+                asks: vec![["101".into(), "1".into()]],
+            }),
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                received_at_ns: base_ns + 31 * SECOND_NS,
+                bids: vec![["100.5".into(), "2".into()]],
+                asks: Vec::new(),
+            }),
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                received_at_ns: base_ns + 32 * SECOND_NS,
+                bids: vec![["100.75".into(), "2".into()]],
+                asks: Vec::new(),
+            }),
+        ];
+        let observations = vec![
+            VerifiedBinanceLobObservation {
+                symbol: "BTCUSDT".to_owned(),
+                source_time_ms: SOURCE_MS + 29_000,
+                received_at_ns: base_ns + 31 * SECOND_NS,
+            },
+            VerifiedBinanceLobObservation {
+                symbol: "BTCUSDT".to_owned(),
+                source_time_ms: SOURCE_MS + 31_000,
+                received_at_ns: base_ns + 32 * SECOND_NS,
+            },
+        ];
+
+        let rows = project_lob_snapshots(
+            "BTCUSDT",
+            &events,
+            &observations,
+            datetime_from_ms(SOURCE_MS).unwrap(),
+            datetime_from_ms(SOURCE_MS + 60_000).unwrap(),
+            30 * SECOND_NS,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rows.iter().map(|row| row.source_ts).collect::<Vec<_>>(),
+            vec![
+                Some(datetime_from_ms(SOURCE_MS + 29_000).unwrap()),
+                Some(datetime_from_ms(SOURCE_MS + 31_000).unwrap()),
+            ]
+        );
     }
 
     #[test]
