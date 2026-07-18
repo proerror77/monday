@@ -667,28 +667,18 @@ mod tests {
 
     #[test]
     fn missing_required_surface_fails_closed() {
-        let complete = VerifiedBinanceResearchSurfaceCounts {
-            spot_prices: 1,
-            aggregate_trades: 1,
-            lob_snapshots: 1,
-        };
-        assert!(ensure_required_surfaces(&complete).is_ok());
-
-        for missing in [
-            VerifiedBinanceResearchSurfaceCounts {
-                spot_prices: 0,
-                ..complete.clone()
-            },
-            VerifiedBinanceResearchSurfaceCounts {
-                aggregate_trades: 0,
-                ..complete.clone()
-            },
-            VerifiedBinanceResearchSurfaceCounts {
-                lob_snapshots: 0,
-                ..complete.clone()
-            },
+        for (spot_prices, aggregate_trades, lob_snapshots, valid) in [
+            (1, 1, 1, true),
+            (0, 1, 1, false),
+            (1, 0, 1, false),
+            (1, 1, 0, false),
         ] {
-            assert!(ensure_required_surfaces(&missing).is_err());
+            let counts = VerifiedBinanceResearchSurfaceCounts {
+                spot_prices,
+                aggregate_trades,
+                lob_snapshots,
+            };
+            assert_eq!(ensure_required_surfaces(&counts).is_ok(), valid);
         }
     }
 }
