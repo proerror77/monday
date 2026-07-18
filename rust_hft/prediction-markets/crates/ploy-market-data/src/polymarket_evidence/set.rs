@@ -32,7 +32,9 @@ impl VerifiedPolymarketEvidenceSet {
     }
 
     pub fn identities(&self) -> impl Iterator<Item = &PolymarketEvidenceIdentity> {
-        self.members.iter().map(VerifiedPolymarketEvidence::identity)
+        self.members
+            .iter()
+            .map(VerifiedPolymarketEvidence::identity)
     }
 
     pub fn contracts(&self) -> impl Iterator<Item = &PolymarketEvidenceContract> {
@@ -69,7 +71,10 @@ impl VerifiedPolymarketEvidenceSet {
 pub fn aggregate_verified_polymarket_evidence(
     mut members: Vec<VerifiedPolymarketEvidence>,
 ) -> Result<VerifiedPolymarketEvidenceSet> {
-    ensure!(!members.is_empty(), "verified evidence set must not be empty");
+    ensure!(
+        !members.is_empty(),
+        "verified evidence set must not be empty"
+    );
     members.sort_by(|left, right| {
         left.identity()
             .event_start_gte
@@ -200,7 +205,10 @@ fn validate_slot_pairs(
             .checked_add_signed(Duration::seconds(WINDOW_SECS))
             .ok_or_else(|| anyhow::anyhow!("verified evidence slot range overflows"))?;
     }
-    ensure!(expected_start == end, "verified evidence set is missing a 5-minute slot");
+    ensure!(
+        expected_start == end,
+        "verified evidence set is missing a 5-minute slot"
+    );
     Ok(())
 }
 
@@ -295,11 +303,8 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&triplet.manifest, fs::Permissions::from_mode(0o444)).unwrap();
-        let sealed = seal_polymarket_evidence_triplet(
-            &triplet,
-            &artifact_tests::trust(&triplet),
-        )
-        .unwrap();
+        let sealed =
+            seal_polymarket_evidence_triplet(&triplet, &artifact_tests::trust(&triplet)).unwrap();
         verify_polymarket_evidence(sealed).unwrap()
     }
 
@@ -338,7 +343,10 @@ mod tests {
 
         assert_eq!(set.members().len(), 2);
         assert_eq!(set.event_start_gte(), start);
-        assert_eq!(set.event_start_lt(), second_start + Duration::seconds(WINDOW_SECS));
+        assert_eq!(
+            set.event_start_lt(),
+            second_start + Duration::seconds(WINDOW_SECS)
+        );
         assert_eq!(set.contracts().count(), 4);
         assert_eq!(set.books().count(), 8);
         assert_eq!(set.references().count(), 4);
@@ -395,7 +403,10 @@ mod tests {
         assert!(overlap.to_string().contains("overlap"), "{overlap:#}");
 
         let duplicate = aggregate_verified_polymarket_evidence(vec![first(), first()]).unwrap_err();
-        assert!(duplicate.to_string().contains("duplicate artifact digest"), "{duplicate:#}");
+        assert!(
+            duplicate.to_string().contains("duplicate artifact digest"),
+            "{duplicate:#}"
+        );
     }
 
     #[test]
@@ -405,15 +416,19 @@ mod tests {
         let first = || verified(&rows(start, "a"), start);
         let mut missing = rows(second_start, "b");
         missing.retain(|row| row["symbol"] != "SOLUSDT");
-        let error = aggregate_verified_polymarket_evidence(vec![
-            first(),
-            verified(&missing, second_start),
-        ])
-        .unwrap_err();
-        assert!(error.to_string().contains("BTCUSDT and SOLUSDT"), "{error:#}");
+        let error =
+            aggregate_verified_polymarket_evidence(vec![first(), verified(&missing, second_start)])
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("BTCUSDT and SOLUSDT"),
+            "{error:#}"
+        );
 
         let mut duplicate = rows(second_start, "c");
-        for row in duplicate.iter_mut().filter(|row| row["symbol"] == "SOLUSDT") {
+        for row in duplicate
+            .iter_mut()
+            .filter(|row| row["symbol"] == "SOLUSDT")
+        {
             row["symbol"] = json!("BTCUSDT");
             if row["surface"] == "chainlink_reference" {
                 row["source_symbol"] = json!("btc/usd");
@@ -433,17 +448,9 @@ mod tests {
         let second_start = start + Duration::seconds(WINDOW_SECS);
         for (from, to, message) in [
             ("market-BTCUSDT-b", "market-BTCUSDT-a", "market_id"),
-            (
-                "condition-BTCUSDT-b",
-                "condition-BTCUSDT-a",
-                "condition_id",
-            ),
+            ("condition-BTCUSDT-b", "condition-BTCUSDT-a", "condition_id"),
             ("up-BTCUSDT-b", "up-BTCUSDT-a", "token_id"),
-            (
-                "trade-BTCUSDT-b",
-                "trade-BTCUSDT-a",
-                "trade record_id",
-            ),
+            ("trade-BTCUSDT-b", "trade-BTCUSDT-a", "trade record_id"),
         ] {
             let mut second_rows = rows(second_start, "b");
             for row in &mut second_rows {
