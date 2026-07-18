@@ -4,10 +4,9 @@ use data::binance_lob_replay::Market;
 use data::binance_market_tape_artifact::VerifiedBinanceMarketTape;
 use ploy_market_data::diagnostics::{
     assemble_prediction_market_data_audit, evaluate_event_completeness,
-    evaluate_time_series_coverage, EventCompletenessObservation,
-    PredictionMarketDataAuditReport, PredictionMarketDataAuditRequest,
-    TimeSeriesCoverageObservation, BINANCE_AGG_TRADE_SURFACE, BINANCE_LOB_SURFACE,
-    BINANCE_PRICE_SURFACE, CHAINLINK_REFERENCE_SURFACE, PM_ORDERBOOK_SURFACE,
+    evaluate_time_series_coverage, EventCompletenessObservation, PredictionMarketDataAuditReport,
+    PredictionMarketDataAuditRequest, TimeSeriesCoverageObservation, BINANCE_AGG_TRADE_SURFACE,
+    BINANCE_LOB_SURFACE, BINANCE_PRICE_SURFACE, CHAINLINK_REFERENCE_SURFACE, PM_ORDERBOOK_SURFACE,
     PM_SETTLEMENT_SURFACE,
 };
 use ploy_market_data::polymarket_evidence::{
@@ -43,7 +42,9 @@ pub fn build_prediction_market_data_audit_from_verified_artifacts(
     let first = segments.first().context("verified Binance tape is empty")?;
     let last = segments.last().context("verified Binance tape is empty")?;
     ensure!(
-        segments.iter().all(|segment| segment.market == Market::Spot),
+        segments
+            .iter()
+            .all(|segment| segment.market == Market::Spot),
         "prediction audit requires a verified Binance spot tape"
     );
     let binance_start = datetime_from_ns(first.start_received_at_ns)?;
@@ -140,7 +141,9 @@ pub fn build_prediction_market_data_audit_from_verified_artifacts(
     ))
 }
 
-fn governed_request(input: &VerifiedArtifactAuditRequest) -> Result<PredictionMarketDataAuditRequest> {
+fn governed_request(
+    input: &VerifiedArtifactAuditRequest,
+) -> Result<PredictionMarketDataAuditRequest> {
     ensure!(
         matches!(input.symbol.as_str(), "BTCUSDT" | "SOLUSDT"),
         "verified artifact audit supports one BTCUSDT or SOLUSDT mission"
@@ -202,7 +205,10 @@ fn expected_bucket_count(
     end: DateTime<Utc>,
     bucket_secs: i64,
 ) -> Result<u64> {
-    ensure!(start < end && bucket_secs > 0, "invalid audit bucket window");
+    ensure!(
+        start < end && bucket_secs > 0,
+        "invalid audit bucket window"
+    );
     let step = Duration::seconds(bucket_secs);
     let mut cursor = start;
     let mut count = 0_u64;
@@ -210,7 +216,9 @@ fn expected_bucket_count(
         cursor = cursor
             .checked_add_signed(step)
             .context("audit bucket window overflows")?;
-        count = count.checked_add(1).context("audit bucket count overflows")?;
+        count = count
+            .checked_add(1)
+            .context("audit bucket count overflows")?;
     }
     Ok(count)
 }
@@ -255,7 +263,9 @@ fn time_series_observation(
         if clock.source < start || clock.source >= request.snapshot_end {
             continue;
         }
-        row_count = row_count.checked_add(1).context("audit row count overflows")?;
+        row_count = row_count
+            .checked_add(1)
+            .context("audit row count overflows")?;
         if clock.received < clock.source {
             causality_violations += 1;
         } else if clock.received - clock.source > maximum_delay {
@@ -322,19 +332,21 @@ fn chainlink_reference_observation<'a, 'b>(
         let Some(event) = event_index.get(reference.market_id.as_str()) else {
             continue;
         };
-        row_count = row_count.checked_add(1).context("audit row count overflows")?;
+        row_count = row_count
+            .checked_add(1)
+            .context("audit row count overflows")?;
         if reference.available_at < reference.source_time {
             causality_violations += 1;
         } else if reference.available_at - reference.source_time > maximum_delay {
             source_delay_rejected_rows += 1;
         } else {
             usable_row_count += 1;
-            first_at = Some(
-                first_at.map_or(reference.source_time, |value| value.min(reference.source_time)),
-            );
-            last_at = Some(
-                last_at.map_or(reference.source_time, |value| value.max(reference.source_time)),
-            );
+            first_at = Some(first_at.map_or(reference.source_time, |value| {
+                value.min(reference.source_time)
+            }));
+            last_at = Some(last_at.map_or(reference.source_time, |value| {
+                value.max(reference.source_time)
+            }));
             present.insert(*event);
         }
     }
@@ -407,7 +419,9 @@ fn polymarket_book_observation<'a, 'b>(
         if book.source_time < start || book.source_time >= end {
             continue;
         }
-        row_count = row_count.checked_add(1).context("audit row count overflows")?;
+        row_count = row_count
+            .checked_add(1)
+            .context("audit row count overflows")?;
         let usable = book
             .bid_levels
             .as_ref()
@@ -482,10 +496,10 @@ fn settlement_observation<'a, 'b>(
         let Some(settlement) = settlements.get(contract.market_id.as_str()) else {
             continue;
         };
-        let up_resolved = settlement.up_price == Decimal::ZERO
-            || settlement.up_price == Decimal::ONE;
-        let down_resolved = settlement.down_price == Decimal::ZERO
-            || settlement.down_price == Decimal::ONE;
+        let up_resolved =
+            settlement.up_price == Decimal::ZERO || settlement.up_price == Decimal::ONE;
+        let down_resolved =
+            settlement.down_price == Decimal::ZERO || settlement.down_price == Decimal::ONE;
         resolved_tokens = resolved_tokens
             .checked_add(u64::from(up_resolved) + u64::from(down_resolved))
             .context("settlement token count overflows")?;
@@ -524,8 +538,8 @@ mod tests {
         evaluate_time_series_coverage, AuditStatus, AuditSurfaceMetrics,
     };
     use ploy_market_data::polymarket_evidence::{
-        BinaryOutcomeSide, PolymarketBookLevel, PolymarketEvidenceBook,
-        PolymarketEvidenceContract, PolymarketEvidenceReference,
+        BinaryOutcomeSide, PolymarketBookLevel, PolymarketEvidenceBook, PolymarketEvidenceContract,
+        PolymarketEvidenceReference,
     };
     use rust_decimal::Decimal;
 
