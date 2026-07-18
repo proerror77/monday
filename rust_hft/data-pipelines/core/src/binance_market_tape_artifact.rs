@@ -186,6 +186,7 @@ pub fn verify_binance_market_tape(
         validate_manifest_quality(&segment.manifest)?;
         let mut counts = BTreeMap::<String, u64>::new();
         let mut checkpoints = BTreeSet::new();
+        let mut snapshot_seeds = BTreeSet::new();
         for (index, range) in segment.rows.iter().enumerate() {
             let raw: Value = serde_json::from_slice(&segment.decoded[range.clone()])
                 .with_context(|| format!("parse {} row {}", segment.manifest.file, index + 1))?;
@@ -208,7 +209,15 @@ pub fn verify_binance_market_tape(
                 "snapshot" | "checkpoint" => {
                     let symbol = required_string(raw, "symbol")?.to_ascii_uppercase();
                     require_symbol(&symbols, &symbol)?;
-                    if event_type == "checkpoint" {
+                    if event_type == "snapshot" {
+                        snapshot_seeds.insert(symbol.clone());
+                    } else {
+                        if identities.is_empty() && !snapshot_seeds.contains(&symbol) {
+                            bail!(
+                                "first market-tape segment checkpoint cannot establish replay \
+                                 state before a snapshot seed"
+                            );
+                        }
                         if raw.get("replay_safe").and_then(Value::as_bool) != Some(true)
                             || raw.get("synced").and_then(Value::as_bool) != Some(true)
                             || raw.get("bridged").and_then(Value::as_bool) != Some(true)
