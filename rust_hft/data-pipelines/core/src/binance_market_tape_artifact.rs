@@ -167,6 +167,7 @@ pub fn verify_binance_market_tape(
         .collect::<Result<BTreeMap<_, _>>>()?;
     let mut identities = Vec::with_capacity(sealed.len());
     let mut aggregate_trades = Vec::new();
+    let mut session_id = None;
 
     for segment in sealed {
         if Market::from_str(&segment.manifest.market).map_err(anyhow::Error::msg)? != market
@@ -191,7 +192,11 @@ pub fn verify_binance_market_tape(
             let raw = raw
                 .as_object()
                 .ok_or_else(|| anyhow!("market-tape row must be an object"))?;
-            let (event_type, received_at_ns) = validate_row(raw, &segment.manifest)?;
+            let (event_type, row_session_id, received_at_ns) =
+                validate_row(raw, &segment.manifest)?;
+            if session_id.get_or_insert_with(|| row_session_id.to_owned()) != row_session_id {
+                bail!("market-tape rows do not share one session_id");
+            }
             *counts.entry(event_type.to_owned()).or_default() += 1;
             match event_type {
                 "diff" => {
@@ -395,32 +400,41 @@ fn validate_manifest_quality(manifest: &TapeManifest) -> Result<()> {
         bail!("market-tape manifest event count mismatch");
     }
     for event_type in manifest.event_types.keys() {
-        if !event_type_allowed(MARKET_TAPE_SCHEMA, event_type)
-            || matches!(
-                event_type.as_str(),
-                "sequence_gap" | "aggregate_trade_gap" | "symbol_excluded"
-            )
-        {
+        if !complete_event_type(event_type) {
             bail!("incomplete market-tape event {event_type}");
         }
     }
     Ok(())
 }
 
+fn complete_event_type(event_type: &str) -> bool {
+    event_type_allowed(MARKET_TAPE_SCHEMA, event_type)
+        && !matches!(
+            event_type,
+            "sequence_gap" | "aggregate_trade_gap" | "symbol_excluded"
+        )
+}
+
+#[rustfmt::skip]
+fn allowed_fields(event_type: &str) -> &'static [&'static str] {
+    match event_type {
+        "session_start" => &["schema", "received_at_ns", "type", "session_id", "market", "symbols", "websocket_shards"],
+        "snapshot" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "symbol", "request_started_at_ns", "snapshot"],
+        "diff" | "agg_trade" => &["schema", "received_at_ns", "type", "session_id", "archived_only", "frame"],
+        "checkpoint" => &["schema", "received_at_ns", "type", "session_id", "symbol", "last_update_id", "synced", "bridged", "bids", "asks", "reason", "replay_safe"],
+        _ => unreachable!("event type checked above"),
+    }
+}
+
 fn validate_row<'a>(
     raw: &'a Map<String, Value>,
     manifest: &TapeManifest,
-) -> Result<(&'a str, u64)> {
+) -> Result<(&'a str, &'a str, u64)> {
     if required_string(raw, "schema")? != MARKET_TAPE_SCHEMA {
         bail!("market-tape row schema mismatch");
     }
     let event_type = required_string(raw, "type")?;
-    if !event_type_allowed(MARKET_TAPE_SCHEMA, event_type)
-        || matches!(
-            event_type,
-            "sequence_gap" | "aggregate_trade_gap" | "symbol_excluded"
-        )
-    {
+    if !complete_event_type(event_type) {
         bail!("incomplete market-tape event {event_type}");
     }
     if raw
@@ -429,54 +443,11 @@ fn validate_row<'a>(
     {
         bail!("market-tape contains archived_only data");
     }
-    let allowed: &[&str] = match event_type {
-        "session_start" => &[
-            "schema",
-            "received_at_ns",
-            "type",
-            "session_id",
-            "market",
-            "symbols",
-            "websocket_shards",
-        ],
-        "snapshot" => &[
-            "schema",
-            "received_at_ns",
-            "type",
-            "session_id",
-            "archived_only",
-            "symbol",
-            "request_started_at_ns",
-            "snapshot",
-        ],
-        "diff" | "agg_trade" => &[
-            "schema",
-            "received_at_ns",
-            "type",
-            "session_id",
-            "archived_only",
-            "frame",
-        ],
-        "checkpoint" => &[
-            "schema",
-            "received_at_ns",
-            "type",
-            "session_id",
-            "symbol",
-            "last_update_id",
-            "synced",
-            "bridged",
-            "bids",
-            "asks",
-            "reason",
-            "replay_safe",
-        ],
-        _ => unreachable!("event type checked above"),
-    };
+    let allowed = allowed_fields(event_type);
     if raw.keys().any(|key| !allowed.contains(&key.as_str())) {
         bail!("market-tape row contains an unknown field");
     }
-    required_string(raw, "session_id")?;
+    let session_id = required_string(raw, "session_id")?;
     let received = raw
         .get("received_at_ns")
         .and_then(Value::as_u64)
@@ -484,7 +455,7 @@ fn validate_row<'a>(
     if !(manifest.start_received_at_ns..=manifest.end_received_at_ns).contains(&received) {
         bail!("market-tape row is outside manifest receive bounds");
     }
-    Ok((event_type, received))
+    Ok((event_type, session_id, received))
 }
 
 fn observe_replay(
@@ -615,7 +586,7 @@ mod tests {
     fn tempdir() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("binance-market-tape-")
-            .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+            .tempdir()
             .unwrap()
     }
 
@@ -647,6 +618,7 @@ mod tests {
 
     #[rustfmt::skip]
     fn write_triplet(root: &Path, rows: &[Value]) -> (BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor) {
+        let root = fs::canonicalize(root).unwrap();
         let start = rows.iter().map(|row| row["received_at_ns"].as_u64().unwrap()).min().unwrap();
         let end = rows.iter().map(|row| row["received_at_ns"].as_u64().unwrap()).max().unwrap();
         let name = format!("part-{start}.jsonl.zst");
@@ -712,6 +684,18 @@ mod tests {
 
         let error = verify_binance_market_tape(sealed).unwrap_err();
         assert!(error.to_string().contains("gap"));
+    }
+
+    #[test]
+    fn mixed_capture_sessions_are_rejected() {
+        let root = tempdir();
+        let mut rows = valid_rows();
+        rows[0]["session_id"] = json!("session-2");
+        let (triplet, anchor) = write_triplet(root.path(), &rows);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("session_id"));
     }
 
     #[test]
