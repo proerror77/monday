@@ -621,7 +621,8 @@ mod tests {
         };
         assert_eq!((*expected_buckets, *present_buckets), buckets);
         assert_eq!(*actual_gap, max_gap_secs);
-        assert_eq!((*source_delay_rejected_rows, *invalid_payload_rows), rejected_rows);
+        let actual_rejected = (*source_delay_rejected_rows, *invalid_payload_rows);
+        assert_eq!(actual_rejected, rejected_rows);
     }
 
     #[test]
@@ -645,8 +646,7 @@ mod tests {
                     .unwrap(),
             )
         };
-        let healthy = evaluate(&references);
-        assert_time_series(&healthy, AuditStatus::Ok, (2, 2), 0, (0, 0));
+        assert_time_series(&evaluate(&references), AuditStatus::Ok, (2, 2), 0, (0, 0));
         let mut post_open = reference(&contracts[0]);
         post_open.source_time = contracts[0].event_start;
         post_open.available_at = post_open.source_time;
@@ -694,20 +694,16 @@ mod tests {
                 polymarket_book_observation(&request, "BTCUSDT", [&contract], rows.iter()).unwrap(),
             )
         };
-        let healthy = evaluate(&books);
-        assert_time_series(&healthy, AuditStatus::Ok, (10, 10), 0, (0, 0));
-        let mut stale_extra = books[0].clone();
-        stale_extra.available_at += Duration::seconds(31);
-        books.push(stale_extra);
+        assert_time_series(&evaluate(&books), AuditStatus::Ok, (10, 10), 0, (0, 0));
+        books.push(books[0].clone());
+        books.last_mut().unwrap().available_at += Duration::seconds(31);
         assert_time_series(&evaluate(&books), AuditStatus::Ok, (10, 10), 0, (0, 1));
         books.pop();
         let ask_levels = books[0].ask_levels.take();
-        let one_sided = evaluate(&books);
-        assert_time_series(&one_sided, AuditStatus::Critical, (10, 9), 60, (0, 1));
+        assert_time_series(&evaluate(&books), AuditStatus::Critical, (10, 9), 60, (0, 1));
         books[0].ask_levels = ask_levels;
         books[0].available_at += Duration::seconds(31);
-        let late_book = evaluate(&books);
-        assert_time_series(&late_book, AuditStatus::Critical, (10, 9), 60, (0, 1));
+        assert_time_series(&evaluate(&books), AuditStatus::Critical, (10, 9), 60, (0, 1));
         books[0].available_at = books[0].source_time;
         let delayed = books.last_mut().unwrap();
         delayed.source_time = contract.event_end - Duration::seconds(1);
@@ -720,7 +716,7 @@ mod tests {
         let short_window = evaluate_time_series_coverage(&book_request, missing.clone());
         assert_time_series(&short_window, AuditStatus::Critical, (10, 9), 60, (0, 0));
         (missing.expected_buckets, missing.present_buckets) = (1_000, 999);
-        let long_window = evaluate_time_series_coverage(&book_request, missing);
-        assert_time_series(&long_window, AuditStatus::Critical, (1_000, 999), 60, (0, 0));
+        let long = evaluate_time_series_coverage(&book_request, missing);
+        assert_time_series(&long, AuditStatus::Critical, (1_000, 999), 60, (0, 0));
     }
 }
