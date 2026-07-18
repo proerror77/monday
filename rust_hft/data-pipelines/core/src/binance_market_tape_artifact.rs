@@ -742,6 +742,25 @@ mod tests {
     }
 
     #[test]
+    fn receive_time_cannot_move_backwards_across_segments() {
+        let root = tempdir();
+        let (first, first_anchor) = write_triplet(root.path(), &valid_rows());
+        let second_rows = vec![
+            depth_row(START_NS + 300_000_000, 102, 101),
+            trade_row(START_NS + 350_000_000, 11),
+            checkpoint_row(START_NS + 400_000_000, 102),
+        ];
+        let (second, second_anchor) = write_triplet(root.path(), &second_rows);
+        let sealed = vec![
+            seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
+            seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
+        ];
+
+        let error = verify_binance_market_tape(sealed).unwrap_err();
+        assert!(error.to_string().contains("receive time moved backwards"));
+    }
+
+    #[test]
     fn mixed_capture_sessions_are_rejected() {
         let root = tempdir();
         let mut rows = valid_rows();
