@@ -123,11 +123,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.91
+          toolchain: 1.91.0
           components: rustfmt
 
       - name: Check Rust formatting
-        run: cargo fmt --all -- --check
+        run: cargo +1.91.0 fmt --all -- --check
 
   safety-scans:
     name: Retired route and SSH safety scans
