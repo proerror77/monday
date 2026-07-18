@@ -186,6 +186,7 @@ pub fn verify_binance_market_tape(
         validate_manifest_quality(&segment.manifest)?;
         let mut counts = BTreeMap::<String, u64>::new();
         let mut checkpoints = BTreeSet::new();
+        let mut snapshot_seeds = BTreeSet::new();
         for (index, range) in segment.rows.iter().enumerate() {
             let raw: Value = serde_json::from_slice(&segment.decoded[range.clone()])
                 .with_context(|| format!("parse {} row {}", segment.manifest.file, index + 1))?;
@@ -208,7 +209,15 @@ pub fn verify_binance_market_tape(
                 "snapshot" | "checkpoint" => {
                     let symbol = required_string(raw, "symbol")?.to_ascii_uppercase();
                     require_symbol(&symbols, &symbol)?;
-                    if event_type == "checkpoint" {
+                    if event_type == "snapshot" {
+                        snapshot_seeds.insert(symbol.clone());
+                    } else {
+                        if identities.is_empty() && !snapshot_seeds.contains(&symbol) {
+                            bail!(
+                                "first market-tape segment checkpoint cannot establish replay \
+                                 state before a snapshot seed"
+                            );
+                        }
                         if raw.get("replay_safe").and_then(Value::as_bool) != Some(true)
                             || raw.get("synced").and_then(Value::as_bool) != Some(true)
                             || raw.get("bridged").and_then(Value::as_bool) != Some(true)
@@ -746,6 +755,18 @@ mod tests {
 
         let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
         assert!(error.to_string().contains("replay-safe checkpoint"));
+    }
+
+    #[test]
+    fn first_segment_checkpoint_cannot_replace_snapshot_seed() {
+        let root = tempdir();
+        let mut rows = valid_rows();
+        rows.retain(|row| !matches!(row["type"].as_str(), Some("snapshot") | Some("diff")));
+        let (triplet, anchor) = write_triplet(root.path(), &rows);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("snapshot seed"));
     }
 
     #[test]
