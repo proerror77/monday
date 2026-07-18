@@ -198,6 +198,10 @@ fn validate_verified_options(options: &VerifiedArtifactSnapshotBuildOptions) -> 
         "snapshot cadences must be positive"
     );
     ensure!(
+        i64::from(options.pm_book_sample_secs) <= options.max_quote_age_secs,
+        "pm_book_sample_secs must not exceed max_quote_age_secs"
+    );
+    ensure!(
         options.stake_usd.is_finite() && options.stake_usd > 0.0,
         "invalid stake_usd"
     );
