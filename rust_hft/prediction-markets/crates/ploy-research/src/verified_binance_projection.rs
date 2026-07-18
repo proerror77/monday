@@ -15,6 +15,7 @@ use rust_decimal::Decimal;
 use crate::ResearchLobSnapshot;
 
 type ProjectedMarketUpdate = (MarketUpdate, BinanceSourceClock);
+const AGG_TRADE_BUCKET_NS: u64 = 5_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBinanceResearchSurfaceCounts {
@@ -100,18 +101,9 @@ pub fn project_verified_binance_market_tape(
 }
 
 fn ensure_required_surfaces(counts: &VerifiedBinanceResearchSurfaceCounts) -> Result<()> {
-    ensure!(
-        counts.spot_prices > 0,
-        "verified Binance projection has no spot prices"
-    );
-    ensure!(
-        counts.aggregate_trades > 0,
-        "verified Binance projection has no aggregate trades"
-    );
-    ensure!(
-        counts.lob_snapshots > 0,
-        "verified Binance projection has no LOB snapshots"
-    );
+    ensure!(counts.spot_prices > 0, "verified Binance projection has no spot prices");
+    ensure!(counts.aggregate_trades > 0, "verified Binance projection has no aggregate trades");
+    ensure!(counts.lob_snapshots > 0, "verified Binance projection has no LOB snapshots");
     Ok(())
 }
 
@@ -142,6 +134,18 @@ fn ensure_verified_window(
     Ok(())
 }
 
+fn source_bucket(
+    source_at: DateTime<Utc>,
+    history_start: DateTime<Utc>,
+    bucket_ns: u64,
+) -> Result<u64> {
+    let elapsed_ns = source_at
+        .signed_duration_since(history_start)
+        .num_nanoseconds()
+        .context("Binance source-time bucket span overflows nanoseconds")?;
+    Ok(u64::try_from(elapsed_ns).context("Binance source time precedes history start")? / bucket_ns)
+}
+
 #[derive(Default)]
 struct AggregateTradeBucket {
     quantity: Decimal,
@@ -166,11 +170,7 @@ fn project_trades(
         if source_at < history_start || source_at >= end || received_at >= end {
             continue;
         }
-        let spot_key = trade
-            .trade_time_ms
-            .checked_mul(1_000_000)
-            .context("Binance spot source time overflows nanoseconds")?
-            / spot_bucket_ns;
+        let spot_key = source_bucket(source_at, history_start, spot_bucket_ns)?;
         if spot.get(&spot_key).is_none_or(|current| {
             (
                 trade.trade_time_ms,
@@ -184,9 +184,8 @@ fn project_trades(
         }) {
             spot.insert(spot_key, trade);
         }
-        let bucket = aggregate
-            .entry((trade.trade_time_ms / 5_000, trade.is_buyer_maker))
-            .or_default();
+        let aggregate_key = source_bucket(source_at, history_start, AGG_TRADE_BUCKET_NS)?;
+        let bucket = aggregate.entry((aggregate_key, trade.is_buyer_maker)).or_default();
         bucket.quantity += trade.quantity;
         bucket.notional += trade.price * trade.quantity;
         bucket.aggregate_trade_id = bucket.aggregate_trade_id.max(trade.aggregate_trade_id);
@@ -398,11 +397,11 @@ fn project_lob_snapshots(
             && received_at < end
             && latest_source_received_at_ns == Some(received_at_ns)
         {
-            let source_bucket = latest_source_time_ms
-                .expect("source clock is present")
-                .checked_mul(1_000_000)
-                .context("Binance LOB source time overflows nanoseconds")?
-                / bucket_ns;
+            let source_bucket = source_bucket(
+                source_at.expect("source clock is present"),
+                history_start,
+                bucket_ns,
+            )?;
             sampled.insert(
                 source_bucket,
                 sample_book(
