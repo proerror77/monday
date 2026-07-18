@@ -209,9 +209,7 @@ fn expected_bucket_count(
 ) -> Result<u64> {
     let duration_secs = (end - start).num_seconds();
     ensure!(
-        bucket_secs > 0
-            && duration_secs > 0
-            && duration_secs.rem_euclid(bucket_secs) == 0,
+        bucket_secs > 0 && duration_secs > 0 && duration_secs.rem_euclid(bucket_secs) == 0,
         "invalid or misaligned audit bucket window"
     );
     u64::try_from(duration_secs / bucket_secs).context("audit bucket count overflows")
