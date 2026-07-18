@@ -315,7 +315,6 @@ fn chainlink_reference_observation<'a, 'b>(
     let mut row_count = 0_u64;
     let mut usable_row_count = 0_u64;
     let mut source_delay_rejected_rows = 0_u64;
-    let mut invalid_payload_rows = 0_u64;
     let mut causality_violations = 0_u64;
     let mut present = BTreeSet::new();
     let mut first_at: Option<DateTime<Utc>> = None;
@@ -324,12 +323,13 @@ fn chainlink_reference_observation<'a, 'b>(
         let Some(&(event, event_start)) = event_index.get(reference.market_id.as_str()) else {
             continue;
         };
+        if reference.source_time >= event_start || reference.is_carried_forward {
+            continue;
+        }
         row_count = row_count
             .checked_add(1)
             .context("audit row count overflows")?;
-        if reference.source_time >= event_start || reference.is_carried_forward {
-            invalid_payload_rows += 1;
-        } else if reference.available_at < reference.source_time {
+        if reference.available_at < reference.source_time {
             causality_violations += 1;
         } else if reference.available_at - reference.source_time > maximum_delay {
             source_delay_rejected_rows += 1;
@@ -351,7 +351,7 @@ fn chainlink_reference_observation<'a, 'b>(
         row_count,
         usable_row_count,
         source_delay_rejected_rows,
-        invalid_payload_rows,
+        invalid_payload_rows: 0,
         causality_violations,
         first_at,
         last_at,
@@ -403,7 +403,6 @@ fn polymarket_book_observation<'a, 'b>(
     let maximum_delay = Duration::seconds(request.maximum_source_delay_secs);
     let mut row_count = 0_u64;
     let mut usable_row_count = 0_u64;
-    let mut source_delay_rejected_rows = 0_u64;
     let mut invalid_payload_rows = 0_u64;
     let mut first_at: Option<DateTime<Utc>> = None;
     let mut last_at: Option<DateTime<Utc>> = None;
@@ -419,7 +418,7 @@ fn polymarket_book_observation<'a, 'b>(
             .checked_add(1)
             .context("audit row count overflows")?;
         if book.available_at - book.source_time > maximum_delay {
-            source_delay_rejected_rows += 1;
+            invalid_payload_rows += 1;
             continue;
         }
         let usable = book
@@ -458,7 +457,7 @@ fn polymarket_book_observation<'a, 'b>(
         symbol: symbol.to_owned(),
         row_count,
         usable_row_count,
-        source_delay_rejected_rows,
+        source_delay_rejected_rows: 0,
         invalid_payload_rows,
         causality_violations: 0,
         first_at,
@@ -606,11 +605,14 @@ mod tests {
         status: AuditStatus,
         buckets: (u64, u64),
         max_gap_secs: u64,
+        rejected_rows: (u64, u64),
     ) {
         assert_eq!(result.status, status);
         let AuditSurfaceMetrics::TimeSeries {
             expected_buckets,
             present_buckets,
+            source_delay_rejected_rows,
+            invalid_payload_rows,
             max_gap_secs: actual_gap,
             ..
         } = &result.metrics
@@ -619,6 +621,7 @@ mod tests {
         };
         assert_eq!((*expected_buckets, *present_buckets), buckets);
         assert_eq!(*actual_gap, max_gap_secs);
+        assert_eq!((*source_delay_rejected_rows, *invalid_payload_rows), rejected_rows);
     }
 
     #[test]
@@ -643,16 +646,22 @@ mod tests {
             )
         };
         let healthy = evaluate(&references);
-        assert_time_series(&healthy, AuditStatus::Ok, (2, 2), 0);
+        assert_time_series(&healthy, AuditStatus::Ok, (2, 2), 0, (0, 0));
+        let mut post_open = reference(&contracts[0]);
+        post_open.source_time = contracts[0].event_start;
+        post_open.available_at = post_open.source_time;
+        references.push(post_open);
+        assert_time_series(&evaluate(&references), AuditStatus::Ok, (2, 2), 0, (0, 0));
+        references.pop();
         let late = contracts[0].event_start;
         references[0].source_time = late;
         references[0].available_at = late;
         let missing = evaluate(&references);
-        assert_time_series(&missing, AuditStatus::Critical, (2, 1), 300);
+        assert_time_series(&missing, AuditStatus::Critical, (2, 1), 300, (0, 0));
         references[0] = reference(&contracts[0]);
         references[0].is_carried_forward = true;
         let carried = evaluate(&references);
-        assert_time_series(&carried, AuditStatus::Critical, (2, 1), 300);
+        assert_time_series(&carried, AuditStatus::Critical, (2, 1), 300, (0, 0));
     }
 
     #[test]
@@ -686,14 +695,19 @@ mod tests {
             )
         };
         let healthy = evaluate(&books);
-        assert_time_series(&healthy, AuditStatus::Ok, (10, 10), 0);
+        assert_time_series(&healthy, AuditStatus::Ok, (10, 10), 0, (0, 0));
+        let mut stale_extra = books[0].clone();
+        stale_extra.available_at += Duration::seconds(31);
+        books.push(stale_extra);
+        assert_time_series(&evaluate(&books), AuditStatus::Ok, (10, 10), 0, (0, 1));
+        books.pop();
         let ask_levels = books[0].ask_levels.take();
         let one_sided = evaluate(&books);
-        assert_time_series(&one_sided, AuditStatus::Critical, (10, 9), 60);
+        assert_time_series(&one_sided, AuditStatus::Critical, (10, 9), 60, (0, 1));
         books[0].ask_levels = ask_levels;
         books[0].available_at += Duration::seconds(31);
         let late_book = evaluate(&books);
-        assert_time_series(&late_book, AuditStatus::Critical, (10, 9), 60);
+        assert_time_series(&late_book, AuditStatus::Critical, (10, 9), 60, (0, 1));
         books[0].available_at = books[0].source_time;
         let delayed = books.last_mut().unwrap();
         delayed.source_time = contract.event_end - Duration::seconds(1);
@@ -704,9 +718,9 @@ mod tests {
         let mut missing =
             polymarket_book_observation(&request, "BTCUSDT", [&contract], books.iter()).unwrap();
         let short_window = evaluate_time_series_coverage(&book_request, missing.clone());
-        assert_time_series(&short_window, AuditStatus::Critical, (10, 9), 60);
+        assert_time_series(&short_window, AuditStatus::Critical, (10, 9), 60, (0, 0));
         (missing.expected_buckets, missing.present_buckets) = (1_000, 999);
         let long_window = evaluate_time_series_coverage(&book_request, missing);
-        assert_time_series(&long_window, AuditStatus::Critical, (1_000, 999), 60);
+        assert_time_series(&long_window, AuditStatus::Critical, (1_000, 999), 60, (0, 0));
     }
 }
