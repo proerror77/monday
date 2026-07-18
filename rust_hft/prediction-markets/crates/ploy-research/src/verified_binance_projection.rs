@@ -425,8 +425,8 @@ mod tests {
     use super::*;
 
     const RECEIVED_NS: u64 = 1_700_000_030_000_000_000;
-    // Keep the fixture aligned to an absolute 30-second source-time bucket.
-    const SOURCE_MS: u64 = 1_700_000_010_000;
+    // Intentionally not aligned to an absolute 30-second epoch bucket.
+    const SOURCE_MS: u64 = 1_700_000_000_000;
     const SECOND_NS: u64 = 1_000_000_000;
 
     fn window() -> (DateTime<Utc>, DateTime<Utc>) {
