@@ -14,7 +14,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::binance_lob_replay::{Market, ReplayBookSnapshot, ReplaySequenceValidator};
+use crate::binance_lob_replay::{
+    Market, ReplayBookSnapshot, ReplaySequenceEvent, ReplaySequenceValidator,
+};
 use crate::binance_market_tape::{
     event_type_allowed, AggregateTrade, AggregateTradeSequenceValidator, DepthSourceClock,
     DepthSourceClockSequenceValidator, MARKET_TAPE_SCHEMA,
@@ -80,12 +82,38 @@ pub struct BinanceMarketTapeSegmentIdentity {
     pub file: String,
     pub content_sha256: String,
     pub manifest_sha256: String,
+    pub start_received_at_ns: u64,
+    pub end_received_at_ns: u64,
+    pub events: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayedBinanceBookEvent {
+    Replay(ReplaySequenceEvent),
+    Checkpoint { received_at_ns: u64 },
+}
+
+impl ReplayedBinanceBookEvent {
+    pub fn received_at_ns(&self) -> u64 {
+        match self {
+            Self::Replay(ReplaySequenceEvent::Snapshot { received_at_ns, .. })
+            | Self::Replay(ReplaySequenceEvent::Diff { received_at_ns, .. })
+            | Self::Checkpoint { received_at_ns } => *received_at_ns,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayedBinanceBook {
     pub symbol: String,
     pub book: ReplayBookSnapshot,
+    events: Vec<ReplayedBinanceBookEvent>,
+}
+
+impl ReplayedBinanceBook {
+    pub fn events(&self) -> &[ReplayedBinanceBookEvent] {
+        &self.events
+    }
 }
 
 #[derive(Debug)]
@@ -168,7 +196,12 @@ pub fn verify_binance_market_tape(
         .collect::<Result<BTreeMap<_, _>>>()?;
     let mut identities = Vec::with_capacity(sealed.len());
     let mut aggregate_trades = Vec::new();
+    let mut replayed_events = symbols
+        .iter()
+        .map(|symbol| (symbol.clone(), Vec::new()))
+        .collect::<BTreeMap<_, _>>();
     let mut session_id = None;
+    let mut last_received_at_ns = None;
 
     for segment in sealed {
         if Market::from_str(&segment.manifest.market).map_err(anyhow::Error::msg)? != market
@@ -196,6 +229,10 @@ pub fn verify_binance_market_tape(
                 .ok_or_else(|| anyhow!("market-tape row must be an object"))?;
             let (event_type, row_session_id, received_at_ns) =
                 validate_row(raw, &segment.manifest)?;
+            if last_received_at_ns.is_some_and(|last| received_at_ns < last) {
+                bail!("market-tape receive time moved backwards");
+            }
+            last_received_at_ns = Some(received_at_ns);
             if session_id.get_or_insert_with(|| row_session_id.to_owned()) != row_session_id {
                 bail!("market-tape rows do not share one session_id");
             }
@@ -205,7 +242,14 @@ pub fn verify_binance_market_tape(
                     let clock = DepthSourceClock::from_archived_event(raw, received_at_ns)?;
                     require_symbol(&symbols, &clock.symbol)?;
                     depth_sequence.observe(&clock)?;
-                    observe_replay(&mut replay, &clock.symbol, event_type, raw, received_at_ns)?;
+                    let events = observe_replay(
+                        &mut replay,
+                        &clock.symbol,
+                        event_type,
+                        raw,
+                        received_at_ns,
+                    )?;
+                    record_replay_events(&mut replayed_events, &clock.symbol, events)?;
                 }
                 "snapshot" | "checkpoint" => {
                     let symbol = required_string(raw, "symbol")?.to_ascii_uppercase();
@@ -227,7 +271,15 @@ pub fn verify_binance_market_tape(
                         }
                         checkpoints.insert(symbol.clone());
                     }
-                    observe_replay(&mut replay, &symbol, event_type, raw, received_at_ns)?;
+                    let events =
+                        observe_replay(&mut replay, &symbol, event_type, raw, received_at_ns)?;
+                    record_replay_events(&mut replayed_events, &symbol, events)?;
+                    if event_type == "checkpoint" {
+                        replayed_events
+                            .get_mut(&symbol)
+                            .context("market-tape replay event symbol is undeclared")?
+                            .push(ReplayedBinanceBookEvent::Checkpoint { received_at_ns });
+                    }
                 }
                 "agg_trade" => {
                     let trade = AggregateTrade::from_archived_event(raw, received_at_ns)?;
@@ -277,7 +329,14 @@ pub fn verify_binance_market_tape(
                 bail!("verified market-tape contains a non-positive replayed book level");
             }
         }
-        replayed_books.push(ReplayedBinanceBook { symbol, book });
+        let events = replayed_events
+            .remove(&symbol)
+            .context("verified market-tape is missing replay events for a declared symbol")?;
+        replayed_books.push(ReplayedBinanceBook {
+            symbol,
+            book,
+            events,
+        });
     }
     Ok(VerifiedBinanceMarketTape {
         segments: identities,
@@ -293,6 +352,9 @@ impl SealedBinanceMarketTapeTriplet {
             file: self.manifest.file.clone(),
             content_sha256: self.manifest.sha256.clone(),
             manifest_sha256: self.manifest_sha256.clone(),
+            start_received_at_ns: self.manifest.start_received_at_ns,
+            end_received_at_ns: self.manifest.end_received_at_ns,
+            events: self.manifest.events,
         }
     }
 }
@@ -488,11 +550,22 @@ fn observe_replay(
     event_type: &str,
     raw: &Map<String, Value>,
     received_at_ns: u64,
-) -> Result<()> {
+) -> Result<Vec<ReplaySequenceEvent>> {
     let validator = validators
         .get_mut(symbol)
         .ok_or_else(|| anyhow!("market-tape symbol is outside its declared scope"))?;
-    validator.observe(event_type, raw, received_at_ns)?;
+    validator.observe(event_type, raw, received_at_ns)
+}
+
+fn record_replay_events(
+    replayed: &mut BTreeMap<String, Vec<ReplayedBinanceBookEvent>>,
+    symbol: &str,
+    events: Vec<ReplaySequenceEvent>,
+) -> Result<()> {
+    replayed
+        .get_mut(symbol)
+        .context("market-tape replay event symbol is undeclared")?
+        .extend(events.into_iter().map(ReplayedBinanceBookEvent::Replay));
     Ok(())
 }
 
@@ -867,9 +940,35 @@ mod tests {
 
         let verified = verify_binance_market_tape(vec![sealed]).unwrap();
         assert_eq!(verified.segments().len(), 1);
+        assert_eq!(verified.segments()[0].start_received_at_ns, START_NS);
+        assert_eq!(
+            verified.segments()[0].end_received_at_ns,
+            START_NS + 400_000_000
+        );
+        assert_eq!(verified.segments()[0].events, 5);
         assert_eq!(verified.aggregate_trades().len(), 1);
         assert_eq!(verified.replayed_books().len(), 1);
         assert_eq!(verified.replayed_books()[0].symbol, "BTCUSDT");
         assert_eq!(verified.replayed_books()[0].book.last_update_id, 101);
+        let events = verified.replayed_books()[0].events();
+        assert_eq!(
+            events
+                .iter()
+                .map(ReplayedBinanceBookEvent::received_at_ns)
+                .collect::<Vec<_>>(),
+            vec![
+                START_NS + 100_000_000,
+                START_NS + 200_000_000,
+                START_NS + 400_000_000,
+            ]
+        );
+        assert!(matches!(
+            events,
+            [
+                ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot { .. }),
+                ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff { .. }),
+                ReplayedBinanceBookEvent::Checkpoint { .. },
+            ]
+        ));
     }
 }
