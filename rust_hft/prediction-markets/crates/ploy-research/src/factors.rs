@@ -1200,6 +1200,43 @@ pub fn build_factor_observations_with_lob_sampled_and_source_clocks(
     max_quote_age_secs: i64,
     observation_sample_secs: i64,
 ) -> Vec<FactorObservation> {
+    build_factor_observations_with_lob_sampled_and_source_clocks_impl(
+        updates,
+        lob_snapshots,
+        binance_source_clocks,
+        max_quote_age_secs,
+        observation_sample_secs,
+        false,
+    )
+}
+
+// Consumed by the stacked verified-artifact snapshot adapter.
+#[allow(dead_code)]
+pub(crate) fn build_unlabeled_factor_observations_with_lob_sampled_and_source_clocks(
+    updates: &[MarketUpdate],
+    lob_snapshots: &[ResearchLobSnapshot],
+    binance_source_clocks: &[BinanceSourceClock],
+    max_quote_age_secs: i64,
+    observation_sample_secs: i64,
+) -> Vec<FactorObservation> {
+    build_factor_observations_with_lob_sampled_and_source_clocks_impl(
+        updates,
+        lob_snapshots,
+        binance_source_clocks,
+        max_quote_age_secs,
+        observation_sample_secs,
+        true,
+    )
+}
+
+fn build_factor_observations_with_lob_sampled_and_source_clocks_impl(
+    updates: &[MarketUpdate],
+    lob_snapshots: &[ResearchLobSnapshot],
+    binance_source_clocks: &[BinanceSourceClock],
+    max_quote_age_secs: i64,
+    observation_sample_secs: i64,
+    allow_unresolved: bool,
+) -> Vec<FactorObservation> {
     let observation_sample_secs = observation_sample_secs.max(0);
     let mut spot_source_clocks = HashMap::new();
     let mut agg_trade_source_clocks = HashMap::new();
@@ -1594,9 +1631,10 @@ pub fn build_factor_observations_with_lob_sampled_and_source_clocks(
                     let Some(end_time) = event.end_time else {
                         continue;
                     };
-                    let Some(resolved_up_won) = event.resolved_up_won else {
+                    let resolved_up_won = event.resolved_up_won;
+                    if resolved_up_won.is_none() && !allow_unresolved {
                         continue;
-                    };
+                    }
                     let time_remaining = (end_time - *ts).num_seconds();
                     if time_remaining < 0 {
                         continue;
@@ -1863,7 +1901,13 @@ pub fn build_factor_observations_with_lob_sampled_and_source_clocks(
                         pm_down_bid_size: down_bid_sz,
                         pm_down_ask_size: down_ask_sz,
                         pm_lag_secs,
-                        settlement_up: if resolved_up_won { 1.0 } else { 0.0 },
+                        settlement_up: resolved_up_won.map_or(f64::NAN, |up_won| {
+                            if up_won {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        }),
                         official_resolution_observed_at: None,
                         future_up_ask_change_30s: None,
                         future_up_ask_change_60s: None,
@@ -2758,9 +2802,10 @@ mod tests {
     use super::{
         accept_monotonic_source_time, attach_future_pm_labels, build_factor_observations_with_lob,
         build_factor_observations_with_lob_sampled_and_source_clocks,
-        build_task_grain_derived_artifacts_for_event_ids, dual_clock_fresh, estimate_probability,
-        pearson_ic, spearman_ic, FactorObservation, LabelField, ResearchLobSnapshot,
-        PM_BOOK_SAMPLED_QUERY,
+        build_task_grain_derived_artifacts_for_event_ids,
+        build_unlabeled_factor_observations_with_lob_sampled_and_source_clocks, dual_clock_fresh,
+        estimate_probability, pearson_ic, spearman_ic, FactorObservation, LabelField,
+        ResearchLobSnapshot, PM_BOOK_SAMPLED_QUERY,
     };
     use chrono::{Duration, TimeZone, Utc};
     use ploy_market_contracts::{BinanceSourceClock, BinanceSourceKind, MarketUpdate};
@@ -3120,6 +3165,70 @@ mod tests {
             rows.is_empty(),
             "governed 5m rows must not fall back to a legacy metadata threshold"
         );
+    }
+
+    #[test]
+    fn factor_builders_defer_only_unresolved_outcomes() {
+        let end = Utc.timestamp_opt(1000, 0).unwrap();
+        let updates = vec![
+            MarketUpdate::EventDiscovered {
+                event_id: Arc::from("evt"),
+                symbol: Arc::from("BTCUSDT"),
+                up_token: Arc::from("up"),
+                down_token: Arc::from("down"),
+                end_time: end,
+                window_secs: 60,
+                price_to_beat: Some(Decimal::new(100, 0)),
+                resolved_up_won: None,
+            },
+            MarketUpdate::Quote {
+                token_id: Arc::from("up"),
+                bid: Some(Decimal::new(49, 2)),
+                ask: Some(Decimal::new(51, 2)),
+                bid_size: Some(Decimal::new(10, 0)),
+                ask_size: Some(Decimal::new(10, 0)),
+                bid_levels: vec![],
+                ask_levels: vec![],
+                ts: Utc.timestamp_opt(949, 0).unwrap(),
+            },
+            MarketUpdate::SpotPrice {
+                symbol: Arc::from("BTCUSDT"),
+                price: Decimal::new(101, 0),
+                ts: Utc.timestamp_opt(950, 0).unwrap(),
+            },
+        ];
+
+        assert!(build_factor_observations_with_lob_sampled_and_source_clocks(
+            &updates, &[], &[], 30, 0,
+        )
+        .is_empty());
+        let unlabeled = build_unlabeled_factor_observations_with_lob_sampled_and_source_clocks(
+            &updates,
+            &[],
+            &[],
+            30,
+            0,
+        );
+        assert_eq!(unlabeled.len(), 1);
+        assert!(unlabeled[0].settlement_up.is_nan());
+        assert!(unlabeled[0].official_resolution_observed_at.is_none());
+
+        for (outcome, expected) in [(false, 0.0), (true, 1.0)] {
+            let mut resolved = updates.clone();
+            resolved.push(MarketUpdate::EventExpired {
+                event_id: Arc::from("evt"),
+                end_time: end,
+                resolved_up_won: Some(outcome),
+            });
+            let rows = build_factor_observations_with_lob_sampled_and_source_clocks(
+                &resolved,
+                &[],
+                &[],
+                30,
+                0,
+            );
+            assert_eq!(rows[0].settlement_up, expected);
+        }
     }
 
     #[test]
