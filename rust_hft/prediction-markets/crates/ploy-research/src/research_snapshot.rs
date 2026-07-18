@@ -342,50 +342,40 @@ fn verified_source_surfaces(
     lob_sample_secs: i32,
     pm_book_sample_secs: i32,
 ) -> Vec<ResearchSnapshotSourceSurface> {
+    let prediction = "required_for_prediction";
+    let execution = "required_for_execution";
     let definitions = [
-        (
-            "chainlink_reference_ticks",
-            None,
-            false,
-            true,
-            "required_for_prediction",
-        ),
+        ("chainlink_reference_ticks", None, false, true, prediction),
         (
             "binance_price_ticks",
             Some(i64::from(lob_sample_secs)),
             false,
             true,
-            "required_for_prediction",
+            prediction,
         ),
-        ("binance_agg_trade_ticks", Some(5), false, true, "required_for_prediction"),
+        ("binance_agg_trade_ticks", Some(5), false, true, prediction),
         (
             "binance_lob_ticks",
             Some(i64::from(lob_sample_secs)),
             true,
             true,
-            "required_for_prediction",
+            prediction,
         ),
         (
             "clob_orderbook_snapshots",
             Some(i64::from(pm_book_sample_secs)),
             true,
             true,
-            "required_for_execution",
+            execution,
         ),
-        ("pm_token_settlements", None, true, false, "required_for_prediction"),
+        ("pm_token_settlements", None, true, false, prediction),
     ];
     definitions
         .into_iter()
         .zip(counts)
         .map(
             |(
-                (
-                    name,
-                    sample_secs,
-                    raw_full_fidelity,
-                    snapshot_sampled,
-                    gate_category,
-                ),
+                (name, sample_secs, raw_full_fidelity, snapshot_sampled, gate_category),
                 row_count,
             )| ResearchSnapshotSourceSurface {
                 name: name.to_string(),
@@ -463,7 +453,12 @@ pub fn build_research_snapshot_from_verified_artifacts(
         .collect::<HashSet<_>>();
     let selected_tokens = contracts
         .iter()
-        .flat_map(|contract| [contract.up_token_id.as_str(), contract.down_token_id.as_str()])
+        .flat_map(|contract| {
+            [
+                contract.up_token_id.as_str(),
+                contract.down_token_id.as_str(),
+            ]
+        })
         .collect::<HashSet<_>>();
     polymarket_updates.retain(|update| {
         update.sort_ts() >= history_start
@@ -499,17 +494,16 @@ pub fn build_research_snapshot_from_verified_artifacts(
     updates.extend(polymarket_updates);
     updates.sort_by_key(MarketUpdate::sort_ts);
     pm_book_snapshots.sort_by(|left, right| {
-        (left.ts, &left.event_id, &left.token_id)
-            .cmp(&(right.ts, &right.event_id, &right.token_id))
+        (left.ts, &left.event_id, &left.token_id).cmp(&(right.ts, &right.event_id, &right.token_id))
     });
     let observations =
         crate::factors::build_unlabeled_factor_observations_with_lob_sampled_and_source_clocks(
-        &updates,
-        &binance_projection.lob_snapshots,
-        &binance_projection.source_clocks,
-        options.max_quote_age_secs,
-        options.observation_sample_secs,
-    );
+            &updates,
+            &binance_projection.lob_snapshots,
+            &binance_projection.source_clocks,
+            options.max_quote_age_secs,
+            options.observation_sample_secs,
+        );
     let observations = bind_and_filter_verified_observations(
         observations,
         &contracts,
@@ -586,8 +580,12 @@ pub fn build_research_snapshot_from_verified_artifacts(
             ),
             input_artifacts,
             data_requirements: [
-                "chainlink_reference", "binance_price", "binance_agg_trades", "binance_lob",
-                "polymarket_orderbook", "polymarket_official_settlement",
+                "chainlink_reference",
+                "binance_price",
+                "binance_agg_trades",
+                "binance_lob",
+                "polymarket_orderbook",
+                "polymarket_official_settlement",
             ]
             .map(str::to_owned)
             .to_vec(),
@@ -2356,7 +2354,9 @@ mod tests {
         row
     }
 
-    fn verified_outcomes(settlement_up: bool) -> HashMap<OfficialOutcomeKey, OfficialBinaryOutcome> {
+    fn verified_outcomes(
+        settlement_up: bool,
+    ) -> HashMap<OfficialOutcomeKey, OfficialBinaryOutcome> {
         HashMap::from([(
             ("event-1".into(), "up".into(), "down".into()),
             OfficialBinaryOutcome {
@@ -2453,7 +2453,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string()
-            .contains("no available factor observation"));
+        .contains("no available factor observation"));
     }
 
     #[test]
@@ -2497,36 +2497,36 @@ mod tests {
             start,
             end
         ));
-        assert!(observation_is_available(contract.available_at, &contract, start, end));
-        let settlement =
-            |winning_token_id: &str, resolved_up_won: bool, available_at: &str| {
-                ResearchPolymarketSettlement {
-                    event_id: contract.event_id.clone(),
-                    winning_token_id: winning_token_id.into(),
-                    resolved_up_won,
-                    available_at: available_at.parse().unwrap(),
-                }
-            };
-        assert!(
-            append_verified_contracts(
-                &mut Vec::new(),
-                std::slice::from_ref(&contract),
-                &[settlement("up", true, "2026-07-17T05:34:59Z")]
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("early settlement clock")
-        );
-        assert!(
-            append_verified_contracts(
-                &mut Vec::new(),
-                std::slice::from_ref(&contract),
-                &[settlement("down", true, "2026-07-17T05:35:02Z")]
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("settlement event/token mismatch")
-        );
+        assert!(observation_is_available(
+            contract.available_at,
+            &contract,
+            start,
+            end
+        ));
+        let settlement = |winning_token_id: &str, resolved_up_won: bool, available_at: &str| {
+            ResearchPolymarketSettlement {
+                event_id: contract.event_id.clone(),
+                winning_token_id: winning_token_id.into(),
+                resolved_up_won,
+                available_at: available_at.parse().unwrap(),
+            }
+        };
+        assert!(append_verified_contracts(
+            &mut Vec::new(),
+            std::slice::from_ref(&contract),
+            &[settlement("up", true, "2026-07-17T05:34:59Z")]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("early settlement clock"));
+        assert!(append_verified_contracts(
+            &mut Vec::new(),
+            std::slice::from_ref(&contract),
+            &[settlement("down", true, "2026-07-17T05:35:02Z")]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("settlement event/token mismatch"));
         let mut updates = Vec::new();
         let outcomes = append_verified_contracts(
             &mut updates,
