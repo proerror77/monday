@@ -266,7 +266,9 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         .replayed_books()
         .iter()
         .find(|book| book.symbol == symbol)
-        .with_context(|| format!("verified market-tape does not contain requested symbol {symbol}"))?;
+        .with_context(|| {
+            format!("verified market-tape does not contain requested symbol {symbol}")
+        })?;
 
     let bucket_ns = args
         .bucket_ms
@@ -347,10 +349,7 @@ fn verify_segments(args: &Args) -> Result<(VerifiedBinanceMarketTape, BTreeMap<S
         .zip(&args.segment_content_sha256)
         .zip(&args.segment_manifest_sha256)
     {
-        if paths
-            .insert(content_sha256.clone(), path.clone())
-            .is_some()
-        {
+        if paths.insert(content_sha256.clone(), path.clone()).is_some() {
             bail!("duplicate LOB segment supplied");
         }
         let triplet = BinanceMarketTapeTriplet {
@@ -358,10 +357,7 @@ fn verify_segments(args: &Args) -> Result<(VerifiedBinanceMarketTape, BTreeMap<S
             manifest: sibling(path, ".manifest.json")?,
             success: sibling(path, "._SUCCESS")?,
         };
-        let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(
-            content_sha256,
-            manifest_sha256,
-        )?;
+        let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
         sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
     }
     Ok((verify_binance_market_tape(sealed)?, paths))
@@ -593,11 +589,7 @@ fn publish_immutable(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn source_revision(segments: &[SourceSegmentEvidence]) -> String {
-    governed_source_revision(
-        segments
-            .iter()
-            .map(|segment| segment.sha256.as_str()),
-    )
+    governed_source_revision(segments.iter().map(|segment| segment.sha256.as_str()))
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
