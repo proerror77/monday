@@ -535,7 +535,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use ploy_market_data::diagnostics::{
-        evaluate_time_series_coverage, AuditStatus, AuditSurfaceMetrics,
+        evaluate_time_series_coverage, AuditStatus, AuditSurfaceMetrics, AuditSurfaceResult,
     };
     use ploy_market_data::polymarket_evidence::{
         BinaryOutcomeSide, PolymarketBookLevel, PolymarketEvidenceBook, PolymarketEvidenceContract,
@@ -616,6 +616,28 @@ mod tests {
         }
     }
 
+    fn assert_time_series(
+        result: &AuditSurfaceResult,
+        status: AuditStatus,
+        buckets: (u64, u64),
+        max_gap_secs: Option<u64>,
+    ) {
+        assert_eq!(result.status, status);
+        let AuditSurfaceMetrics::TimeSeries {
+            expected_buckets,
+            present_buckets,
+            max_gap_secs: actual_gap,
+            ..
+        } = &result.metrics
+        else {
+            panic!("expected time-series audit metrics");
+        };
+        assert_eq!((*expected_buckets, *present_buckets), buckets);
+        if let Some(expected_gap) = max_gap_secs {
+            assert_eq!(*actual_gap, expected_gap);
+        }
+    }
+
     #[test]
     fn chainlink_gate_requires_one_usable_reference_per_event() {
         let mut request = request();
@@ -640,15 +662,7 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(healthy.status, AuditStatus::Ok);
-        assert!(matches!(
-            healthy.metrics,
-            AuditSurfaceMetrics::TimeSeries {
-                expected_buckets: 2,
-                present_buckets: 2,
-                ..
-            }
-        ));
+        assert_time_series(&healthy, AuditStatus::Ok, (2, 2), None);
         references.pop();
         let missing = evaluate_time_series_coverage(
             &request,
@@ -660,16 +674,7 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(missing.status, AuditStatus::Critical);
-        assert!(matches!(
-            missing.metrics,
-            AuditSurfaceMetrics::TimeSeries {
-                expected_buckets: 2,
-                present_buckets: 1,
-                max_gap_secs: 300,
-                ..
-            }
-        ));
+        assert_time_series(&missing, AuditStatus::Critical, (2, 1), Some(300));
     }
 
     #[test]
@@ -706,15 +711,7 @@ mod tests {
             &request,
             polymarket_book_observation(&request, "BTCUSDT", [&contract], books.iter()).unwrap(),
         );
-        assert_eq!(healthy.status, AuditStatus::Ok);
-        assert!(matches!(
-            healthy.metrics,
-            AuditSurfaceMetrics::TimeSeries {
-                expected_buckets: 10,
-                present_buckets: 10,
-                ..
-            }
-        ));
+        assert_time_series(&healthy, AuditStatus::Ok, (10, 10), None);
         let delayed = books.last_mut().unwrap();
         delayed.source_time = contract.event_end - Duration::seconds(1);
         delayed.available_at = contract.event_end;
@@ -728,14 +725,6 @@ mod tests {
             &request,
             polymarket_book_observation(&request, "BTCUSDT", [&contract], books.iter()).unwrap(),
         );
-        assert_eq!(missing.status, AuditStatus::Critical);
-        assert!(matches!(
-            missing.metrics,
-            AuditSurfaceMetrics::TimeSeries {
-                expected_buckets: 10,
-                present_buckets: 9,
-                ..
-            }
-        ));
+        assert_time_series(&missing, AuditStatus::Critical, (10, 9), None);
     }
 }
