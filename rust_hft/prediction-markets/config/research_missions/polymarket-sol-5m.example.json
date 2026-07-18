@@ -14,7 +14,7 @@
   ],
   "horizon": "5m",
   "prompt_snapshot_id": "sha256:0816ebccf4c75ee6bdcfe315b253c84ddf1808a38687ebe3b924b87bd72a52a9",
-  "search_policy_snapshot_id": "sha256:7dd434d5401c17245313e6e1db78cd6dd9d7fde6033dafa8e1d1be544fdd2884",
+  "search_policy_snapshot_id": "sha256:d11c896b6ab3dd9a0d1ce37092285d3a5b9754ab6d2e1ef9aff115aa36b6d266",
   "search_budget": {
     "max_candidates": 6,
     "max_llm_calls": 2,

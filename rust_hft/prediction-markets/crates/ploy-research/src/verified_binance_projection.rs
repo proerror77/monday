@@ -50,7 +50,9 @@ pub fn project_verified_binance_market_tape(
     let first = segments.first().context("verified Binance tape is empty")?;
     let last = segments.last().context("verified Binance tape is empty")?;
     ensure!(
-        segments.iter().all(|segment| segment.market == Market::Spot),
+        segments
+            .iter()
+            .all(|segment| segment.market == Market::Spot),
         "verified Binance tape is not spot"
     );
     ensure_verified_window(
@@ -359,10 +361,7 @@ fn project_lob_snapshots(
             latest_source_time_ms = observations.next().map(|row| row.source_time_ms);
         }
         let received_at = datetime_from_ns(received_at_ns)?;
-        if received_at >= history_start
-            && received_at < end
-            && latest_source_time_ms.is_some()
-        {
+        if received_at >= history_start && received_at < end && latest_source_time_ms.is_some() {
             sampled.insert(
                 received_at_ns / bucket_ns,
                 sample_book(
@@ -456,7 +455,10 @@ mod tests {
 
         assert!(matches!(
             (&rows[0].0, &rows[1].0),
-            (MarketUpdate::AggTrade { .. }, MarketUpdate::SpotPrice { .. })
+            (
+                MarketUpdate::AggTrade { .. },
+                MarketUpdate::SpotPrice { .. }
+            )
         ));
     }
 

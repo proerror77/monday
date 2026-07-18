@@ -77,10 +77,6 @@ pub use polymarket_evidence_projection::{
     project_verified_polymarket_evidence, PolymarketResearchProjection,
     PolymarketResearchSurfaceCounts, ResearchPolymarketContract, ResearchPolymarketSettlement,
 };
-pub use verified_binance_projection::{
-    project_verified_binance_market_tape, VerifiedBinanceResearchProjection,
-    VerifiedBinanceResearchSurfaceCounts,
-};
 #[cfg(feature = "strategy-runtime")]
 pub use replay::replay_fills;
 #[cfg(feature = "db")]
@@ -90,6 +86,10 @@ pub use research_snapshot::{
     write_research_snapshot, ResearchSnapshot, ResearchSnapshotArtifacts, ResearchSnapshotManifest,
     ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource, ResearchSnapshotRequest,
     ResearchSnapshotRowCounts, RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+};
+pub use verified_binance_projection::{
+    project_verified_binance_market_tape, VerifiedBinanceResearchProjection,
+    VerifiedBinanceResearchSurfaceCounts,
 };
 
 pub const CRATE_MARKER: &str = "ploy-research";
