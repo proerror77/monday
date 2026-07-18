@@ -10,6 +10,7 @@ use rust_decimal::Decimal;
 use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::Arc;
 
+use crate::verified_artifact_audit::{usable_polymarket_book, usable_polymarket_reference};
 use crate::{ResearchPmBookLevel, ResearchPmBookSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,9 +56,13 @@ pub struct PolymarketResearchProjection {
 pub fn project_verified_polymarket_evidence(
     verified: &VerifiedPolymarketEvidence,
     pm_book_sample_secs: i64,
+    maximum_source_delay_secs: i64,
 ) -> Result<PolymarketResearchProjection> {
     if pm_book_sample_secs <= 0 {
         bail!("pm_book_sample_secs must be positive");
+    }
+    if maximum_source_delay_secs <= 0 {
+        bail!("maximum_source_delay_secs must be positive");
     }
 
     let contracts_by_market = verified
@@ -98,6 +103,9 @@ pub fn project_verified_polymarket_evidence(
         let contract = contracts_by_market
             .get(reference.market_id.as_str())
             .expect("verified reference belongs to a verified contract");
+        if !usable_polymarket_reference(contract, reference, maximum_source_delay_secs) {
+            continue;
+        }
         updates.push(MarketUpdate::ReferencePrice {
             symbol: Arc::from(contract.symbol.as_str()),
             source: Arc::from("chainlink"),
@@ -112,6 +120,12 @@ pub fn project_verified_polymarket_evidence(
 
     let mut sampled_books = BTreeMap::<(String, String, i64), &PolymarketEvidenceBook>::new();
     for book in verified.books() {
+        let contract = contracts_by_market
+            .get(book.market_id.as_str())
+            .expect("verified book belongs to a verified contract");
+        if !usable_polymarket_book(contract, book, maximum_source_delay_secs) {
+            continue;
+        }
         let key = (
             book.market_id.clone(),
             book.token_id.clone(),
@@ -314,14 +328,16 @@ mod tests {
     #[test]
     fn rejects_non_positive_book_sample_interval() {
         let evidence = verified(&rows());
-        let error = project_verified_polymarket_evidence(&evidence, 0).unwrap_err();
+        let error = project_verified_polymarket_evidence(&evidence, 0, 30).unwrap_err();
+        assert!(error.to_string().contains("must be positive"), "{error:#}");
+        let error = project_verified_polymarket_evidence(&evidence, 1, 0).unwrap_err();
         assert!(error.to_string().contains("must be positive"), "{error:#}");
     }
 
     #[test]
     fn projects_source_and_availability_clocks_without_lookahead() {
         let evidence = verified(&rows());
-        let projected = project_verified_polymarket_evidence(&evidence, 1).unwrap();
+        let projected = project_verified_polymarket_evidence(&evidence, 1, 30).unwrap();
 
         let (reference_source, reference_available) = projected
             .updates
@@ -359,28 +375,45 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_latest_available_book_in_each_sample_bucket() {
+    fn rejects_delayed_rows_before_sampling() {
         let mut fixture = rows();
-        let mut later_available = fixture[1].clone();
-        later_available["ts"] = json!("2026-07-17T05:30:00.500Z");
-        later_available["recorded_at"] = json!("2026-07-17T05:30:03Z");
-        later_available["available_at"] = json!("2026-07-17T05:30:03Z");
-        later_available["source_sequence"] = json!(8);
-        later_available["bid"] = json!("0.41");
-        later_available["bid_levels"][0]["price"] = json!("0.41");
-        fixture.push(later_available);
+        let mut delayed_book = fixture[1].clone();
+        delayed_book["ts"] = json!("2026-07-17T05:30:01.500Z");
+        delayed_book["recorded_at"] = json!("2026-07-17T05:30:42Z");
+        delayed_book["available_at"] = json!("2026-07-17T05:30:42Z");
+        delayed_book["source_sequence"] = json!(8);
+        delayed_book["bid"] = json!("0.41");
+        delayed_book["bid_levels"][0]["price"] = json!("0.41");
+        fixture.push(delayed_book);
+        let mut delayed_reference = fixture[3].clone();
+        delayed_reference["ts"] = json!("2026-07-17T05:29:54Z");
+        delayed_reference["received_at"] = json!("2026-07-17T05:30:35Z");
+        delayed_reference["recorded_at"] = json!("2026-07-17T05:30:35Z");
+        delayed_reference["available_at"] = json!("2026-07-17T05:30:35Z");
+        delayed_reference["source_sequence"] = json!(9);
+        delayed_reference["price"] = json!("64000");
+        fixture.push(delayed_reference);
 
         let evidence = verified(&fixture);
-        let projected = project_verified_polymarket_evidence(&evidence, 10).unwrap();
+        let projected = project_verified_polymarket_evidence(&evidence, 300, 30).unwrap();
         assert_eq!(projected.surface_counts.books, 3);
+        assert_eq!(projected.surface_counts.references, 2);
         assert_eq!(projected.pm_book_snapshots.len(), 2);
         let down = projected
             .pm_book_snapshots
             .iter()
             .find(|book| book.token_id == "down-token")
             .unwrap();
-        assert_eq!(down.ts, time("2026-07-17T05:30:03Z"));
-        assert_eq!(down.bids[0].price, 0.41);
+        assert_eq!(down.ts, time("2026-07-17T05:30:02Z"));
+        assert_eq!(down.bids[0].price, 0.4);
+        assert_eq!(
+            projected
+                .updates
+                .iter()
+                .filter(|update| matches!(update, MarketUpdate::ReferencePrice { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -398,7 +431,7 @@ mod tests {
 
         for fixture in [forward, reversed] {
             let evidence = verified(&fixture);
-            let projected = project_verified_polymarket_evidence(&evidence, 10).unwrap();
+            let projected = project_verified_polymarket_evidence(&evidence, 10, 30).unwrap();
             let down = projected
                 .pm_book_snapshots
                 .iter()
@@ -419,14 +452,14 @@ mod tests {
         fixture.push(contradictory);
 
         let evidence = verified(&fixture);
-        let error = project_verified_polymarket_evidence(&evidence, 10).unwrap_err();
+        let error = project_verified_polymarket_evidence(&evidence, 10, 30).unwrap_err();
         assert!(error.to_string().contains("ambiguous"), "{error:#}");
     }
 
     #[test]
     fn derives_the_winner_from_verified_semantic_sides() {
         let evidence = verified(&rows());
-        let projected = project_verified_polymarket_evidence(&evidence, 1).unwrap();
+        let projected = project_verified_polymarket_evidence(&evidence, 1, 30).unwrap();
 
         assert_eq!(&projected.evidence_identity, evidence.identity());
         assert_ne!(

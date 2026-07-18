@@ -28,6 +28,40 @@ struct SourceClock {
     received: DateTime<Utc>,
 }
 
+pub(crate) fn usable_polymarket_reference(
+    contract: &PolymarketEvidenceContract,
+    reference: &PolymarketEvidenceReference,
+    maximum_source_delay_secs: i64,
+) -> bool {
+    reference.market_id == contract.market_id
+        && reference.source_time < contract.event_start
+        && !reference.is_carried_forward
+        && reference.available_at >= reference.source_time
+        && reference.available_at - reference.source_time
+            <= Duration::seconds(maximum_source_delay_secs)
+}
+
+pub(crate) fn usable_polymarket_book(
+    contract: &PolymarketEvidenceContract,
+    book: &PolymarketEvidenceBook,
+    maximum_source_delay_secs: i64,
+) -> bool {
+    book.market_id == contract.market_id
+        && (book.token_id == contract.up_token_id || book.token_id == contract.down_token_id)
+        && book.source_time >= contract.event_start
+        && book.source_time < contract.event_end
+        && book.available_at >= book.source_time
+        && book.available_at - book.source_time <= Duration::seconds(maximum_source_delay_secs)
+        && book
+            .bid_levels
+            .as_ref()
+            .is_some_and(|levels| !levels.is_empty())
+        && book
+            .ask_levels
+            .as_ref()
+            .is_some_and(|levels| !levels.is_empty())
+}
+
 pub fn build_prediction_market_data_audit_from_verified_artifacts(
     binance: &VerifiedBinanceMarketTape,
     polymarket: &VerifiedPolymarketEvidenceSet,
@@ -307,11 +341,11 @@ fn chainlink_reference_observation<'a, 'b>(
     });
     let event_index = events
         .iter()
+        .copied()
         .enumerate()
-        .map(|(i, row)| (row.market_id.as_str(), (i as u64, row.event_start)))
+        .map(|(i, row)| (row.market_id.as_str(), (i as u64, row)))
         .collect::<BTreeMap<_, _>>();
     let expected_buckets = u64::try_from(events.len())?;
-    let maximum_delay = Duration::seconds(request.maximum_source_delay_secs);
     let mut row_count = 0_u64;
     let mut usable_row_count = 0_u64;
     let mut source_delay_rejected_rows = 0_u64;
@@ -320,20 +354,16 @@ fn chainlink_reference_observation<'a, 'b>(
     let mut first_at: Option<DateTime<Utc>> = None;
     let mut last_at: Option<DateTime<Utc>> = None;
     for reference in references {
-        let Some(&(event, event_start)) = event_index.get(reference.market_id.as_str()) else {
+        let Some(&(event, contract)) = event_index.get(reference.market_id.as_str()) else {
             continue;
         };
-        if reference.source_time >= event_start || reference.is_carried_forward {
+        if reference.source_time >= contract.event_start || reference.is_carried_forward {
             continue;
         }
         row_count = row_count
             .checked_add(1)
             .context("audit row count overflows")?;
-        if reference.available_at < reference.source_time {
-            causality_violations += 1;
-        } else if reference.available_at - reference.source_time > maximum_delay {
-            source_delay_rejected_rows += 1;
-        } else {
+        if usable_polymarket_reference(contract, reference, request.maximum_source_delay_secs) {
             usable_row_count += 1;
             first_at = Some(first_at.map_or(reference.source_time, |value| {
                 value.min(reference.source_time)
@@ -342,6 +372,10 @@ fn chainlink_reference_observation<'a, 'b>(
                 value.max(reference.source_time)
             }));
             present.insert(event);
+        } else if reference.available_at < reference.source_time {
+            causality_violations += 1;
+        } else {
+            source_delay_rejected_rows += 1;
         }
     }
     // Completeness is one causally usable reference per full five-minute event.
@@ -376,12 +410,10 @@ fn polymarket_book_observation<'a, 'b>(
         {
             continue;
         }
-        let start = contract.event_start;
-        let end = contract.event_end;
         for token in [&contract.up_token_id, &contract.down_token_id] {
             ensure!(
                 windows
-                    .insert((contract.market_id.as_str(), token.as_str()), (start, end))
+                    .insert((contract.market_id.as_str(), token.as_str()), contract)
                     .is_none(),
                 "verified Polymarket audit contains a duplicate token window"
             );
@@ -395,12 +427,15 @@ fn polymarket_book_observation<'a, 'b>(
         .copied()
         .map(|key| (key, BTreeSet::new()))
         .collect::<BTreeMap<_, _>>();
-    for (start, end) in windows.values() {
+    for contract in windows.values() {
         expected_buckets = expected_buckets
-            .checked_add(expected_bucket_count(*start, *end, request.bucket_secs)?)
+            .checked_add(expected_bucket_count(
+                contract.event_start,
+                contract.event_end,
+                request.bucket_secs,
+            )?)
             .context("Polymarket expected bucket count overflows")?;
     }
-    let maximum_delay = Duration::seconds(request.maximum_source_delay_secs);
     let mut row_count = 0_u64;
     let mut usable_row_count = 0_u64;
     let mut invalid_payload_rows = 0_u64;
@@ -408,28 +443,16 @@ fn polymarket_book_observation<'a, 'b>(
     let mut last_at: Option<DateTime<Utc>> = None;
     for book in books {
         let key = (book.market_id.as_str(), book.token_id.as_str());
-        let Some(&(start, end)) = windows.get(&key) else {
+        let Some(&contract) = windows.get(&key) else {
             continue;
         };
-        if book.source_time < start || book.source_time >= end {
+        if book.source_time < contract.event_start || book.source_time >= contract.event_end {
             continue;
         }
         row_count = row_count
             .checked_add(1)
             .context("audit row count overflows")?;
-        if book.available_at - book.source_time > maximum_delay {
-            invalid_payload_rows += 1;
-            continue;
-        }
-        let usable = book
-            .bid_levels
-            .as_ref()
-            .is_some_and(|levels| !levels.is_empty())
-            && book
-                .ask_levels
-                .as_ref()
-                .is_some_and(|levels| !levels.is_empty());
-        if !usable {
+        if !usable_polymarket_book(contract, book, request.maximum_source_delay_secs) {
             invalid_payload_rows += 1;
             continue;
         }
@@ -440,14 +463,18 @@ fn polymarket_book_observation<'a, 'b>(
             .get_mut(&key)
             .expect("verified token window exists")
             .insert(u64::try_from(
-                (book.source_time - start).num_seconds() / request.bucket_secs,
+                (book.source_time - contract.event_start).num_seconds() / request.bucket_secs,
             )?);
     }
     let present_buckets = u64::try_from(present.values().map(BTreeSet::len).sum::<usize>())?;
     let mut max_gap_secs = 0_u64;
-    for (key, (start, end)) in &windows {
+    for (key, contract) in &windows {
         max_gap_secs = max_gap_secs.max(maximum_missing_gap(
-            expected_bucket_count(*start, *end, request.bucket_secs)?,
+            expected_bucket_count(
+                contract.event_start,
+                contract.event_end,
+                request.bucket_secs,
+            )?,
             present.get(key).expect("verified token window exists"),
             request.bucket_secs,
         )?);
@@ -647,6 +674,11 @@ mod tests {
             )
         };
         assert_ts(&evaluate(&references), AuditStatus::Ok, (2, 2), 0, (0, 0));
+        let mut delayed = reference(&contracts[0]);
+        delayed.available_at = delayed.source_time + Duration::seconds(31);
+        references.push(delayed);
+        assert_ts(&evaluate(&references), AuditStatus::Ok, (2, 2), 0, (1, 0));
+        references.pop();
         let mut post_open = reference(&contracts[0]);
         post_open.source_time = contracts[0].event_start;
         post_open.available_at = post_open.source_time;
