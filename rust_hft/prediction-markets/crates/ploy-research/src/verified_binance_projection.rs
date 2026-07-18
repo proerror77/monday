@@ -571,7 +571,10 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!((same_bucket_count, same_bucket_prices), (1, vec![Decimal::from(101)]));
+        assert_eq!(
+            (same_bucket_count, same_bucket_prices),
+            (1, vec![Decimal::from(101)])
+        );
 
         let (split_buckets, split_bucket_count, _) = project_trades(
             &[
