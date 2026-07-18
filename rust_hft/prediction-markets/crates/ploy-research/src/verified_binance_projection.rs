@@ -101,9 +101,18 @@ pub fn project_verified_binance_market_tape(
 }
 
 fn ensure_required_surfaces(counts: &VerifiedBinanceResearchSurfaceCounts) -> Result<()> {
-    ensure!(counts.spot_prices > 0, "verified Binance projection has no spot prices");
-    ensure!(counts.aggregate_trades > 0, "verified Binance projection has no aggregate trades");
-    ensure!(counts.lob_snapshots > 0, "verified Binance projection has no LOB snapshots");
+    ensure!(
+        counts.spot_prices > 0,
+        "verified Binance projection has no spot prices"
+    );
+    ensure!(
+        counts.aggregate_trades > 0,
+        "verified Binance projection has no aggregate trades"
+    );
+    ensure!(
+        counts.lob_snapshots > 0,
+        "verified Binance projection has no LOB snapshots"
+    );
     Ok(())
 }
 
@@ -143,7 +152,10 @@ fn source_bucket(
         .signed_duration_since(history_start)
         .num_nanoseconds()
         .context("Binance source-time bucket span overflows nanoseconds")?;
-    Ok(u64::try_from(elapsed_ns).context("Binance source time precedes history start")? / bucket_ns)
+    Ok(
+        u64::try_from(elapsed_ns).context("Binance source time precedes history start")?
+            / bucket_ns,
+    )
 }
 
 #[derive(Default)]
@@ -185,7 +197,9 @@ fn project_trades(
             spot.insert(spot_key, trade);
         }
         let aggregate_key = source_bucket(source_at, history_start, AGG_TRADE_BUCKET_NS)?;
-        let bucket = aggregate.entry((aggregate_key, trade.is_buyer_maker)).or_default();
+        let bucket = aggregate
+            .entry((aggregate_key, trade.is_buyer_maker))
+            .or_default();
         bucket.quantity += trade.quantity;
         bucket.notional += trade.price * trade.quantity;
         bucket.aggregate_trade_id = bucket.aggregate_trade_id.max(trade.aggregate_trade_id);
