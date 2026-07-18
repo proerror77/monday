@@ -2448,6 +2448,7 @@ mod tests {
             .to_string()
             .contains("expected=11075153756947 received=11075153761591-11075153767256"));
         assert_eq!(process_state.sequence_gaps, 1);
+        assert_eq!(segment.event_count("sequence_gap"), 1);
     }
 
     #[test]
