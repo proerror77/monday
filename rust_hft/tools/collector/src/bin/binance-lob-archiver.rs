@@ -335,10 +335,10 @@ struct ProcessState {
     depth_source_clocks: DepthSourceClockSequenceValidator,
     aggregate_trades: AggregateTradeSequenceValidator,
     aggregate_trade_history_trusted: bool,
+    seen_aggregate_trade: bool,
 }
 
 impl ProcessState {
-    #[cfg(test)]
     fn new(aggregate_trade_history_trusted: bool) -> Self {
         Self {
             aggregate_trade_history_trusted,
@@ -560,11 +560,6 @@ async fn main() -> anyhow::Result<()> {
     if !recovered.is_empty() {
         info!(segments = recovered.len(), "recovered interrupted segments");
     }
-    warn!(
-        spool_dir = %config.spool_dir.display(),
-        "aggregate-trade continuity restore is not implemented; new segments stay replay-unsafe"
-    );
-    let mut process_state = ProcessState::default();
     let watchdog = ProcessWatchdog::start(config.process_watchdog_timeout)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let upload_task = tokio::spawn(upload_loop(config.clone(), shutdown_rx.clone()));
@@ -572,14 +567,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut backoff = 1_u64;
     while !*shutdown_rx.borrow() {
-        match run_session(
-            config.clone(),
-            shutdown_rx.clone(),
-            watchdog.clone(),
-            &mut process_state,
-        )
-        .await
-        {
+        match run_session(config.clone(), shutdown_rx.clone(), watchdog.clone()).await {
             Ok(()) if *shutdown_rx.borrow() => break,
             Ok(()) => backoff = 1,
             Err(error) => {
@@ -600,9 +588,9 @@ async fn run_session(
     config: Arc<Config>,
     mut shutdown: watch::Receiver<bool>,
     watchdog: ProcessWatchdog,
-    process_state: &mut ProcessState,
 ) -> anyhow::Result<()> {
     let session_id = format!("{:x}-{}", now_ns()?, std::process::id());
+    let mut process_state = ProcessState::new(true);
     let active_symbols = config.active_symbols();
     if active_symbols.is_empty() {
         anyhow::bail!("no active symbols remain after runtime exclusions");
@@ -662,7 +650,7 @@ async fn run_session(
                     Some(Ok(Ok(TaskExit::Stopped(Some(event))))) => {
                         pending_action = process_event(
                             &config, &mut segment, &mut states, &mut budget, &session_id, event,
-                            process_state,
+                            &mut process_state,
                         )?;
                     }
                     Some(Ok(Ok(TaskExit::SnapshotComplete))) => {},
@@ -687,7 +675,7 @@ async fn run_session(
                     Some(event) => {
                         match process_event(
                             &config, &mut segment, &mut states, &mut budget, &session_id, event,
-                            process_state,
+                            &mut process_state,
                         ) {
                             Ok(action) => pending_action = action,
                             Err(error) => {
@@ -714,7 +702,7 @@ async fn run_session(
                     &states,
                     &session_id,
                     "sequence_gap",
-                    process_state,
+                    &process_state,
                 )?;
                 sync_deadline = Some(Instant::now() + config.sync_timeout);
                 tasks.spawn(produce_snapshot(
@@ -731,7 +719,7 @@ async fn run_session(
                     &states,
                     &session_id,
                     "symbol_excluded",
-                    process_state,
+                    &process_state,
                 )?;
             }
             ProcessAction::InitialSnapshotsComplete => {
@@ -748,7 +736,7 @@ async fn run_session(
                 &states,
                 &session_id,
                 "scheduled",
-                process_state,
+                &process_state,
             )?;
         }
 
@@ -805,7 +793,7 @@ async fn run_session(
         &states,
         &session_id,
         "shutdown",
-        process_state,
+        &process_state,
     )?;
     write_health(
         &config.spool_dir,
@@ -927,6 +915,7 @@ fn process_event(
                 json!({"session_id":session_id,"frame":frame}),
                 trade.received_at_ns,
             )?;
+            process_state.seen_aggregate_trade = true;
         }
         Event::Snapshot {
             received_at_ns,
@@ -1055,8 +1044,43 @@ fn rotate_segment(
     reason: &str,
     process_state: &ProcessState,
 ) -> anyhow::Result<Segment> {
+    let seed_next =
+        reason == "scheduled" && replay_checkpoint_ready(&segment, states, process_state);
     close_segment(segment, config, states, session_id, reason, process_state)?;
-    Segment::create(config.segment_config(), now_ns()?)
+    let mut next = Segment::create(config.segment_config(), now_ns()?)?;
+    if seed_next {
+        write_checkpoints(&mut next, states, session_id, "segment_open", true)?;
+    }
+    Ok(next)
+}
+
+fn replay_checkpoint_ready(
+    segment: &Segment,
+    states: &HashMap<String, OrderBookState>,
+    process_state: &ProcessState,
+) -> bool {
+    segment.is_replay_safe()
+        && process_state.aggregate_trade_history_trusted
+        && process_state.seen_aggregate_trade
+        && !states.is_empty()
+        && states.values().all(|state| state.bridged)
+}
+
+fn write_checkpoints(
+    segment: &mut Segment,
+    states: &HashMap<String, OrderBookState>,
+    session_id: &str,
+    reason: &str,
+    replay_safe: bool,
+) -> anyhow::Result<()> {
+    for state in states.values() {
+        segment.write(
+            "checkpoint",
+            checkpoint_event(state.checkpoint(session_id)?, reason, replay_safe),
+            now_ns()?,
+        )?;
+    }
+    Ok(())
 }
 
 fn close_segment(
@@ -1073,22 +1097,18 @@ fn close_segment(
         catalog.security_token_symbols,
         catalog.excluded_symbols,
     );
-    if !process_state.aggregate_trade_history_trusted {
+    if !replay_checkpoint_ready(&segment, states, process_state) {
         segment.mark_replay_unsafe();
     }
     if states.values().all(|state| state.synced) {
         let checkpoint_replay_safe = segment.is_replay_safe();
-        for state in states.values() {
-            segment.write(
-                "checkpoint",
-                checkpoint_event(
-                    state.checkpoint(session_id)?,
-                    reason,
-                    checkpoint_replay_safe,
-                ),
-                now_ns()?,
-            )?;
-        }
+        write_checkpoints(
+            &mut segment,
+            states,
+            session_id,
+            reason,
+            checkpoint_replay_safe,
+        )?;
     } else {
         segment.mark_replay_unsafe();
     }
@@ -2283,6 +2303,35 @@ mod tests {
         }
     }
 
+    fn archive_first_btc_aggregate_trade(
+        config: &Config,
+        segment: &mut Segment,
+        states: &mut HashMap<String, OrderBookState>,
+        budget: &mut PendingBudget,
+        process_state: &mut ProcessState,
+    ) {
+        let received_at_ns = now_ns().unwrap();
+        let event_time_ms = received_at_ns / 1_000_000 - 1;
+        let event = event_from_frame(
+            json!({
+                "stream": "btcusdt@aggTrade",
+                "data": {"e":"aggTrade","E":event_time_ms,"s":"BTCUSDT","a":9,"f":10,"l":11,"p":"101","q":"0.2","T":event_time_ms,"m":true}
+            }),
+            received_at_ns,
+        )
+        .unwrap();
+        process_event(
+            config,
+            segment,
+            states,
+            budget,
+            "session-1",
+            event,
+            process_state,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn market_tape_subscribes_depth_and_aggregate_trades_separately() {
         let spot = test_config("http://unused".into()).stream_urls();
@@ -2327,27 +2376,15 @@ mod tests {
         let mut budget = PendingBudget::new(1);
         let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
         let mut process_state = ProcessState::new(true);
-        let received_at_ns = now_ns().unwrap();
-        let event_time_ms = received_at_ns / 1_000_000 - 1;
-        let event = event_from_frame(
-            json!({
-                "stream": "btcusdt@aggTrade",
-                "data": {"e":"aggTrade","E":event_time_ms,"s":"BTCUSDT","a":9,"f":10,"l":11,"p":"101","q":"0.2","T":event_time_ms,"m":true}
-            }),
-            received_at_ns,
-        )
-        .unwrap();
-        process_event(
+        archive_first_btc_aggregate_trade(
             &config,
             &mut segment,
             &mut states,
             &mut budget,
-            "session-1",
-            event,
             &mut process_state,
-        )
-        .unwrap();
+        );
         assert_eq!(segment.event_count("agg_trade"), 1);
+        assert!(process_state.seen_aggregate_trade);
         assert!(!states["BTCUSDT"].synced);
         drop(segment);
         std::fs::remove_dir_all(root).unwrap();
@@ -2716,14 +2753,7 @@ mod tests {
         for attempt in 1..=2 {
             let (_shutdown_tx, shutdown_rx) = watch::channel(false);
             let error = tokio::time::timeout(Duration::from_secs(5), async {
-                let mut process_state = ProcessState::new(true);
-                run_session(
-                    config.clone(),
-                    shutdown_rx,
-                    watchdog.clone(),
-                    &mut process_state,
-                )
-                .await
+                run_session(config.clone(), shutdown_rx, watchdog.clone()).await
             })
             .await
             .unwrap_or_else(|_| panic!("session attempt {attempt} did not fail promptly"))
@@ -2737,7 +2767,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_only_silent_symbol_is_synced_and_closes_replay_safe() {
+    fn snapshot_only_silent_symbol_closes_replay_unsafe() {
         assert!(Command::new("zstd")
             .arg("--version")
             .output()
@@ -2788,7 +2818,7 @@ mod tests {
         assert!(!silent.bridged);
         assert!(bridged.synced);
         assert!(bridged.bridged);
-        let states = HashMap::from([
+        let mut states = HashMap::from([
             ("BTCUSDT".to_owned(), bridged),
             ("TUSDUSDT".to_owned(), silent),
         ]);
@@ -2799,20 +2829,28 @@ mod tests {
             Instant::now(),
         ));
 
-        let segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = ProcessState::new(true);
+        archive_first_btc_aggregate_trade(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            &mut process_state,
+        );
         let artifacts = close_segment(
             segment,
             &config,
             &states,
             "session-1",
             "test",
-            &ProcessState::new(true),
+            &process_state,
         )
         .unwrap()
         .unwrap();
         let manifest: Value =
             serde_json::from_reader(std::fs::File::open(artifacts.manifest).unwrap()).unwrap();
-        assert_eq!(manifest["has_replay_safe_checkpoint"], true);
+        assert_eq!(manifest["has_replay_safe_checkpoint"], false);
         assert_eq!(manifest["snapshot_ready_count"], 2);
         assert_eq!(manifest["bridged_count"], 1);
         assert_eq!(manifest["snapshot_only_symbols"], json!(["TUSDUSDT"]));
@@ -2830,7 +2868,7 @@ mod tests {
             .find(|event| event["symbol"] == "TUSDUSDT")
             .unwrap();
         assert_eq!(checkpoint["type"], "checkpoint");
-        assert_eq!(checkpoint["replay_safe"], true);
+        assert_eq!(checkpoint["replay_safe"], false);
         assert_eq!(checkpoint["synced"], true);
         assert_eq!(checkpoint["bridged"], false);
 
@@ -2861,7 +2899,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_default_keeps_checkpoints_replay_unsafe() {
+    fn trusted_epoch_without_aggregate_trade_closes_replay_unsafe() {
         assert!(Command::new("zstd")
             .arg("--version")
             .output()
@@ -2908,7 +2946,7 @@ mod tests {
             &states,
             "session-1",
             "test",
-            &ProcessState::default(),
+            &ProcessState::new(true),
         )
         .unwrap()
         .unwrap();
@@ -2928,6 +2966,122 @@ mod tests {
             .find(|event| event["type"] == "checkpoint")
             .unwrap();
         assert_eq!(checkpoint["replay_safe"], false);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scheduled_rotation_seeds_but_sequence_gap_does_not() {
+        assert!(Command::new("zstd")
+            .arg("--version")
+            .output()
+            .expect("zstd is required for segment lifecycle tests")
+            .status
+            .success());
+        let root = env::temp_dir().join(format!(
+            "monday-scheduled-segment-open-test-{}",
+            now_ns().unwrap()
+        ));
+        let mut config = test_config("http://unused".into());
+        config.spool_dir = root.clone();
+        config.symbols = vec!["BTCUSDT".into()];
+        let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
+        let mut budget = PendingBudget::new(1);
+        state
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 100,
+                    "bids": [["100", "1"]],
+                    "asks": [["102", "1"]]
+                }),
+                &mut budget,
+            )
+            .unwrap();
+        state
+            .apply_diff(
+                DepthDiff {
+                    symbol: "BTCUSDT".into(),
+                    first_update_id: 101,
+                    final_update_id: 101,
+                    previous_update_id: None,
+                    bids: vec![["100".into(), "2".into()]],
+                    asks: vec![],
+                },
+                &mut budget,
+            )
+            .unwrap();
+        let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
+        let mut segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let mut process_state = ProcessState::new(true);
+        archive_first_btc_aggregate_trade(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            &mut process_state,
+        );
+
+        let next = rotate_segment(
+            segment,
+            &config,
+            &states,
+            "session-1",
+            "scheduled",
+            &process_state,
+        )
+        .unwrap();
+        let artifacts = close_segment(next, &config, &states, "session-1", "test", &process_state)
+            .unwrap()
+            .unwrap();
+        let manifest: Value =
+            serde_json::from_reader(std::fs::File::open(&artifacts.manifest).unwrap()).unwrap();
+        assert_eq!(manifest["has_replay_safe_checkpoint"], true);
+        let output = Command::new("zstd")
+            .args(["-q", "-d", "-c"])
+            .arg(artifacts.data)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let opening = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["type"] == "checkpoint" && event["reason"] == "segment_open")
+            .expect("scheduled rotation must seed the next segment");
+        assert_eq!(opening["session_id"], "session-1");
+        assert_eq!(opening["replay_safe"], true);
+        assert_eq!(opening["bridged"], true);
+
+        let gap_segment = Segment::create(config.segment_config(), now_ns().unwrap()).unwrap();
+        let after_gap = rotate_segment(
+            gap_segment,
+            &config,
+            &states,
+            "session-1",
+            "sequence_gap",
+            &process_state,
+        )
+        .unwrap();
+        let gap_artifacts = close_segment(
+            after_gap,
+            &config,
+            &states,
+            "session-1",
+            "test",
+            &process_state,
+        )
+        .unwrap()
+        .unwrap();
+        let gap_output = Command::new("zstd")
+            .args(["-q", "-d", "-c"])
+            .arg(gap_artifacts.data)
+            .output()
+            .unwrap();
+        assert!(gap_output.status.success());
+        assert!(!String::from_utf8(gap_output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .any(|event| event["type"] == "checkpoint" && event["reason"] == "segment_open"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
