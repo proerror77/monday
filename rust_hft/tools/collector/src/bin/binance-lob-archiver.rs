@@ -596,19 +596,26 @@ async fn run_session(
     let (sender, mut receiver) = mpsc::channel(config.max_buffered_diffs);
     let (session_stop_tx, session_stop_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
-    for url in config.stream_urls() {
+    let stream_urls = config.stream_urls();
+    let expected_streams = stream_urls.len();
+    let (stream_ready_tx, stream_ready_rx) = mpsc::channel(expected_streams);
+    for url in stream_urls {
         tasks.spawn(receive_url(
             url,
             sender.clone(),
+            stream_ready_tx.clone(),
             session_stop_rx.clone(),
             config.stall_timeout,
             watchdog.clone(),
         ));
     }
-    tasks.spawn(produce_snapshots(
+    drop(stream_ready_tx);
+    tasks.spawn(produce_snapshots_after_streams_ready(
         config.clone(),
         sender.clone(),
         session_stop_rx.clone(),
+        stream_ready_rx,
+        expected_streams,
     ));
     let mut states = active_symbols
         .iter()
@@ -1129,6 +1136,7 @@ fn close_segment_at(
 async fn receive_url(
     url: String,
     sender: mpsc::Sender<Event>,
+    stream_ready: mpsc::Sender<()>,
     mut shutdown: watch::Receiver<bool>,
     stall_timeout: Duration,
     watchdog: ProcessWatchdog,
@@ -1136,6 +1144,10 @@ async fn receive_url(
     let (mut websocket, _) = tokio::time::timeout(Duration::from_secs(20), connect_async(&url))
         .await
         .context("websocket connect timed out")??;
+    stream_ready
+        .send(())
+        .await
+        .context("stream readiness receiver dropped")?;
     loop {
         let message = tokio::select! {
             biased;
@@ -1160,6 +1172,28 @@ async fn receive_url(
             }
         }
     }
+}
+
+async fn produce_snapshots_after_streams_ready(
+    config: Arc<Config>,
+    sender: mpsc::Sender<Event>,
+    mut shutdown: watch::Receiver<bool>,
+    mut stream_ready: mpsc::Receiver<()>,
+    expected_streams: usize,
+) -> anyhow::Result<TaskExit> {
+    for _ in 0..expected_streams {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                changed?;
+                return Ok(TaskExit::Stopped(None));
+            }
+            ready = stream_ready.recv() => {
+                ready.context("websocket producer stopped before reporting ready")?;
+            }
+        }
+    }
+    produce_snapshots(config, sender, shutdown).await
 }
 
 fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> {
