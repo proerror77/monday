@@ -243,8 +243,15 @@ pub fn verify_binance_market_tape(
         }
         identities.push(segment.identity(market));
     }
-    if aggregate_trades.is_empty() {
-        bail!("verified market-tape has no aggregate trades");
+    let aggregate_trade_symbols = aggregate_trades
+        .iter()
+        .map(|trade| trade.symbol.as_str())
+        .collect::<BTreeSet<_>>();
+    if symbols
+        .iter()
+        .any(|symbol| !aggregate_trade_symbols.contains(symbol.as_str()))
+    {
+        bail!("verified market-tape is missing aggregate trades for a declared symbol");
     }
     let mut replayed_books = Vec::with_capacity(replay.len());
     for (symbol, validator) in replay {
