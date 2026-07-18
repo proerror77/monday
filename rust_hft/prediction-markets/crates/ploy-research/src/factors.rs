@@ -1210,8 +1210,6 @@ pub fn build_factor_observations_with_lob_sampled_and_source_clocks(
     )
 }
 
-// Consumed by the stacked verified-artifact snapshot adapter.
-#[allow(dead_code)]
 pub(crate) fn build_unlabeled_factor_observations_with_lob_sampled_and_source_clocks(
     updates: &[MarketUpdate],
     lob_snapshots: &[ResearchLobSnapshot],

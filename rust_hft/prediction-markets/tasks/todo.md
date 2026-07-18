@@ -44,6 +44,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Project verified Binance tapes into deterministic research updates, source clocks, and LOB snapshots.
 - [x] Bind immutable Polymarket evidence to external content and manifest SHA-256 anchors before semantic consumption.
 - [x] Project verified Polymarket evidence into availability-safe research carriers without replaying discovery metadata or settlement labels before observation.
+- [ ] Wire the verified-artifact ResearchSnapshot adapter into the snapshot CLI and complete its cloud alpha-harness E2E.
 - [x] Promote snapshot, prediction LoopRun, and event evaluator to precompiled
   Monday binaries; remove runtime `cargo run --example` and research-policy
   coupling to the legacy OMS/runtime workspace.
