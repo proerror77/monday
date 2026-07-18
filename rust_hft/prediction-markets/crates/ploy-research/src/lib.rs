@@ -24,6 +24,7 @@ pub mod replay;
 pub mod research_os;
 pub mod research_snapshot;
 pub mod signal;
+pub mod verified_binance_projection;
 
 #[cfg(feature = "strategy-runtime")]
 pub use backtesting::{run_backtest, BacktestReport};
@@ -85,6 +86,10 @@ pub use research_snapshot::{
     write_research_snapshot, ResearchSnapshot, ResearchSnapshotArtifacts, ResearchSnapshotManifest,
     ResearchSnapshotPhaseTiming, ResearchSnapshotPmBookSource, ResearchSnapshotRequest,
     ResearchSnapshotRowCounts, RESEARCH_SNAPSHOT_SCHEMA_VERSION,
+};
+pub use verified_binance_projection::{
+    project_verified_binance_market_tape, VerifiedBinanceResearchProjection,
+    VerifiedBinanceResearchSurfaceCounts,
 };
 
 pub const CRATE_MARKER: &str = "ploy-research";

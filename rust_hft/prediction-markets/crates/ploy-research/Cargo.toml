@@ -20,6 +20,7 @@ rl = ["dep:burn", "dep:burn-ndarray"]
 strategy-runtime = ["dep:ploy-strategy-bundles", "dep:ploy-trading"]
 
 [dependencies]
+data = { package = "hft-data", path = "../../../data-pipelines/core" }
 rand.workspace = true
 reqwest.workspace = true
 chrono.workspace = true

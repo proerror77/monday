@@ -40,6 +40,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 
 - [x] Aggregate independently verified Polymarket evidence artifacts into a gap-free BTC/SOL 5-minute research set.
 - [x] Verify sealed Polymarket evidence into semantic read-only typed projections.
+- [x] Project verified Binance tapes into deterministic research updates, source clocks, and LOB snapshots.
 - [x] Bind immutable Polymarket evidence to external content and manifest SHA-256 anchors before semantic consumption.
 - [x] Project verified Polymarket evidence into availability-safe research carriers without replaying discovery metadata or settlement labels before observation.
 - [x] Promote snapshot, prediction LoopRun, and event evaluator to precompiled
