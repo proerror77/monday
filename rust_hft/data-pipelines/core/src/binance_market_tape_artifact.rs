@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -268,6 +269,13 @@ pub fn verify_binance_market_tape(
         let book = validator.book_snapshot()?;
         if book.bids.is_empty() || book.asks.is_empty() {
             bail!("verified market-tape contains an empty replayed book");
+        }
+        for [price, quantity] in book.bids.iter().chain(book.asks.iter()) {
+            if price.parse::<Decimal>()? <= Decimal::ZERO
+                || quantity.parse::<Decimal>()? <= Decimal::ZERO
+            {
+                bail!("verified market-tape contains a non-positive replayed book level");
+            }
         }
         replayed_books.push(ReplayedBinanceBook { symbol, book });
     }
@@ -767,6 +775,21 @@ mod tests {
 
         let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
         assert!(error.to_string().contains("snapshot seed"));
+    }
+
+    #[test]
+    fn non_positive_replayed_book_levels_never_return_a_verified_handle() {
+        for (field, value) in [(0usize, "0"), (1usize, "-1")] {
+            let root = tempdir();
+            let mut rows = valid_rows();
+            rows[1]["snapshot"]["asks"][0][field] = json!(value);
+            rows[4]["asks"][0][field] = json!(value);
+            let (triplet, anchor) = write_triplet(root.path(), &rows);
+            let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+            let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
+            assert!(error.to_string().contains("non-positive"));
+        }
     }
 
     #[test]
