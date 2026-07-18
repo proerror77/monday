@@ -15,6 +15,7 @@ use rust_decimal::Decimal;
 use crate::ResearchLobSnapshot;
 
 type ProjectedMarketUpdate = (MarketUpdate, BinanceSourceClock);
+type ProjectedTradeRows = (Vec<ProjectedMarketUpdate>, usize, usize);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedBinanceResearchSurfaceCounts {
@@ -140,7 +141,7 @@ fn project_trades(
     history_start: DateTime<Utc>,
     end: DateTime<Utc>,
     spot_bucket_ns: u64,
-) -> Result<(Vec<ProjectedMarketUpdate>, usize, usize)> {
+) -> Result<ProjectedTradeRows> {
     let mut spot = BTreeMap::<u64, &AggregateTrade>::new();
     let mut aggregate = BTreeMap::<(u64, bool), AggregateTradeBucket>::new();
     for trade in trades.iter().filter(|trade| trade.symbol == symbol) {
