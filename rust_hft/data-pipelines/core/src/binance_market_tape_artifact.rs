@@ -642,10 +642,7 @@ mod tests {
     fn write_triplet(
         root: &Path,
         rows: &[Value],
-    ) -> (
-        BinanceMarketTapeTriplet,
-        BinanceMarketTapeTrustAnchor,
-    ) {
+    ) -> (BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor) {
         write_triplet_for_symbols(root, rows, &["BTCUSDT"])
     }
 
@@ -781,16 +778,10 @@ mod tests {
             checkpoint_row(START_NS + 1_300_000_000, 102),
             sol_checkpoint,
         ];
-        let (first, first_anchor) = write_triplet_for_symbols(
-            root.path(),
-            &first_rows,
-            &["BTCUSDT", "SOLUSDT"],
-        );
-        let (second, second_anchor) = write_triplet_for_symbols(
-            root.path(),
-            &second_rows,
-            &["BTCUSDT", "SOLUSDT"],
-        );
+        let (first, first_anchor) =
+            write_triplet_for_symbols(root.path(), &first_rows, &["BTCUSDT", "SOLUSDT"]);
+        let (second, second_anchor) =
+            write_triplet_for_symbols(root.path(), &second_rows, &["BTCUSDT", "SOLUSDT"]);
         let sealed = vec![
             seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
             seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
