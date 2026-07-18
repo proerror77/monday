@@ -10,10 +10,9 @@ use ploy_market_data::diagnostics::{
     PM_SETTLEMENT_SURFACE,
 };
 use ploy_market_data::polymarket_evidence::{
-    BinaryOutcomeSide, PolymarketEvidenceBook, PolymarketEvidenceContract,
-    PolymarketEvidenceReference, PolymarketEvidenceSettlement, VerifiedPolymarketEvidenceSet,
+    PolymarketEvidenceBook, PolymarketEvidenceContract, PolymarketEvidenceReference,
+    PolymarketEvidenceSettlement, VerifiedPolymarketEvidenceSet,
 };
-use rust_decimal::Decimal;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,7 +327,7 @@ fn chainlink_reference_observation<'a, 'b>(
         row_count = row_count
             .checked_add(1)
             .context("audit row count overflows")?;
-        if reference.source_time > event_start {
+        if reference.source_time >= event_start || reference.is_carried_forward {
             invalid_payload_rows += 1;
         } else if reference.available_at < reference.source_time {
             causality_violations += 1;
@@ -401,8 +400,10 @@ fn polymarket_book_observation<'a, 'b>(
             .checked_add(expected_bucket_count(*start, *end, request.bucket_secs)?)
             .context("Polymarket expected bucket count overflows")?;
     }
+    let maximum_delay = Duration::seconds(request.maximum_source_delay_secs);
     let mut row_count = 0_u64;
     let mut usable_row_count = 0_u64;
+    let mut source_delay_rejected_rows = 0_u64;
     let mut invalid_payload_rows = 0_u64;
     let mut first_at: Option<DateTime<Utc>> = None;
     let mut last_at: Option<DateTime<Utc>> = None;
@@ -417,11 +418,15 @@ fn polymarket_book_observation<'a, 'b>(
         row_count = row_count
             .checked_add(1)
             .context("audit row count overflows")?;
+        if book.available_at - book.source_time > maximum_delay {
+            source_delay_rejected_rows += 1;
+            continue;
+        }
         let usable = book
             .bid_levels
             .as_ref()
             .is_some_and(|levels| !levels.is_empty())
-            || book
+            && book
                 .ask_levels
                 .as_ref()
                 .is_some_and(|levels| !levels.is_empty());
@@ -453,7 +458,7 @@ fn polymarket_book_observation<'a, 'b>(
         symbol: symbol.to_owned(),
         row_count,
         usable_row_count,
-        source_delay_rejected_rows: 0,
+        source_delay_rejected_rows,
         invalid_payload_rows,
         causality_violations: 0,
         first_at,
@@ -473,8 +478,8 @@ fn settlement_observation<'a, 'b>(
 ) -> Result<EventCompletenessObservation> {
     let settlements = settlements
         .into_iter()
-        .map(|settlement| (settlement.market_id.as_str(), settlement))
-        .collect::<BTreeMap<_, _>>();
+        .map(|settlement| settlement.market_id.as_str())
+        .collect::<BTreeSet<_>>();
     let mut eligible_events = 0_u64;
     let mut complete_events = 0_u64;
     let mut resolved_tokens = 0_u64;
@@ -488,28 +493,14 @@ fn settlement_observation<'a, 'b>(
         eligible_events = eligible_events
             .checked_add(1)
             .context("settlement event count overflows")?;
-        let Some(settlement) = settlements.get(contract.market_id.as_str()) else {
-            continue;
-        };
-        let up_resolved =
-            settlement.up_price == Decimal::ZERO || settlement.up_price == Decimal::ONE;
-        let down_resolved =
-            settlement.down_price == Decimal::ZERO || settlement.down_price == Decimal::ONE;
-        resolved_tokens = resolved_tokens
-            .checked_add(u64::from(up_resolved) + u64::from(down_resolved))
-            .context("settlement token count overflows")?;
-        let winner_matches = match settlement.winning_side {
-            BinaryOutcomeSide::Up => settlement.winning_token_id == contract.up_token_id,
-            BinaryOutcomeSide::Down => settlement.winning_token_id == contract.down_token_id,
-        };
-        if up_resolved
-            && down_resolved
-            && settlement.up_price + settlement.down_price == Decimal::ONE
-            && winner_matches
-        {
+        // The private verified-set constructor already binds the winner to the exact 1/0 pair.
+        if settlements.contains(contract.market_id.as_str()) {
             complete_events = complete_events
                 .checked_add(1)
                 .context("complete settlement count overflows")?;
+            resolved_tokens = resolved_tokens
+                .checked_add(2)
+                .context("settlement token count overflows")?;
         }
     }
     Ok(EventCompletenessObservation {
@@ -591,11 +582,11 @@ mod tests {
             source_time: available_at,
             available_at,
             bid: Some(level.price),
-            ask: None,
+            ask: Some(level.price),
             bid_size: Some(level.size),
-            ask_size: None,
-            bid_levels: Some(vec![level]),
-            ask_levels: Some(Vec::new()),
+            ask_size: Some(level.size),
+            bid_levels: Some(vec![level.clone()]),
+            ask_levels: Some(vec![level]),
         }
     }
 
@@ -644,31 +635,29 @@ mod tests {
         second.event_end = second.event_start + Duration::minutes(5);
         let contracts = [first, second];
         let mut references = contracts.iter().map(reference).collect::<Vec<_>>();
-        let healthy = evaluate_time_series_coverage(
-            &request,
-            chainlink_reference_observation(
+        let evaluate = |rows: &[PolymarketEvidenceReference]| {
+            evaluate_time_series_coverage(
                 &request,
-                "BTCUSDT",
-                contracts.iter(),
-                references.iter(),
+                chainlink_reference_observation(
+                    &request,
+                    "BTCUSDT",
+                    contracts.iter(),
+                    rows.iter(),
+                )
+                .unwrap(),
             )
-            .unwrap(),
-        );
+        };
+        let healthy = evaluate(&references);
         assert_time_series(&healthy, AuditStatus::Ok, (2, 2), 0);
-        let late = contracts[0].event_start + Duration::seconds(1);
+        let late = contracts[0].event_start;
         references[0].source_time = late;
         references[0].available_at = late;
-        let missing = evaluate_time_series_coverage(
-            &request,
-            chainlink_reference_observation(
-                &request,
-                "BTCUSDT",
-                contracts.iter(),
-                references.iter(),
-            )
-            .unwrap(),
-        );
+        let missing = evaluate(&references);
         assert_time_series(&missing, AuditStatus::Critical, (2, 1), 300);
+        references[0] = reference(&contracts[0]);
+        references[0].is_carried_forward = true;
+        let carried = evaluate(&references);
+        assert_time_series(&carried, AuditStatus::Critical, (2, 1), 300);
     }
 
     #[test]
@@ -695,18 +684,26 @@ mod tests {
                 ));
             }
         }
-        let healthy = evaluate_time_series_coverage(
-            &book_request,
-            polymarket_book_observation(&request, "BTCUSDT", [&contract], books.iter()).unwrap(),
-        );
+        let evaluate = |rows: &[PolymarketEvidenceBook]| {
+            evaluate_time_series_coverage(
+                &book_request,
+                polymarket_book_observation(&request, "BTCUSDT", [&contract], rows.iter()).unwrap(),
+            )
+        };
+        let healthy = evaluate(&books);
         assert_time_series(&healthy, AuditStatus::Ok, (10, 10), 0);
+        let ask_levels = books[0].ask_levels.take();
+        let one_sided = evaluate(&books);
+        assert_time_series(&one_sided, AuditStatus::Critical, (10, 9), 60);
+        books[0].ask_levels = ask_levels;
+        books[0].available_at += Duration::seconds(31);
+        let late_book = evaluate(&books);
+        assert_time_series(&late_book, AuditStatus::Critical, (10, 9), 60);
+        books[0].available_at = books[0].source_time;
         let delayed = books.last_mut().unwrap();
         delayed.source_time = contract.event_end - Duration::seconds(1);
         delayed.available_at = contract.event_end;
-        let source_complete = evaluate_time_series_coverage(
-            &book_request,
-            polymarket_book_observation(&request, "BTCUSDT", [&contract], books.iter()).unwrap(),
-        );
+        let source_complete = evaluate(&books);
         assert_eq!(source_complete.status, AuditStatus::Ok);
         books.pop();
         let mut missing =
