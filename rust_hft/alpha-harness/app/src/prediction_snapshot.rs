@@ -169,7 +169,7 @@ fn validate_snapshot_args(args: &PredictionSnapshotArgs) -> anyhow::Result<()> {
             "prediction snapshot work directory, result URL, and compiler arguments are required"
         );
     }
-    const VALUE_FLAGS: [&str; 15] = [
+    const VALUE_FLAGS: [&str; 21] = [
         "--start-ts",
         "--end-ts",
         "--start-date",
@@ -185,8 +185,18 @@ fn validate_snapshot_args(args: &PredictionSnapshotArgs) -> anyhow::Result<()> {
         "--data-audit-report",
         "--data-audit-status",
         "--pm-book-archive-dir",
+        "--segment",
+        "--segment-content-sha256",
+        "--segment-manifest-sha256",
+        "--polymarket-artifact",
+        "--polymarket-content-sha256",
+        "--polymarket-manifest-sha256",
     ];
-    const BOOLEAN_FLAGS: [&str; 2] = ["--allow-missing-official-settlement", "--skip-deribit"];
+    const BOOLEAN_FLAGS: [&str; 3] = [
+        "--allow-missing-official-settlement",
+        "--skip-deribit",
+        "--verified-artifacts",
+    ];
     let mut index = 0;
     while index < args.compiler_args.len() {
         let argument = args.compiler_args[index]
@@ -363,6 +373,38 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported"));
+    }
+
+    #[test]
+    fn snapshot_wrapper_accepts_repeated_verified_artifact_triplets() {
+        let digest = |byte: char| byte.to_string().repeat(64);
+        let args = PredictionSnapshotArgs {
+            work_dir: PathBuf::from("work"),
+            result_put_url: "snapshot.zip".to_string(),
+            compiler_args: vec![
+                OsString::from("--verified-artifacts"),
+                OsString::from("--segment"),
+                OsString::from("/cloud/binance/part-1.jsonl.zst"),
+                OsString::from("--segment-content-sha256"),
+                OsString::from(digest('1')),
+                OsString::from("--segment-manifest-sha256"),
+                OsString::from(digest('2')),
+                OsString::from("--polymarket-artifact"),
+                OsString::from("/cloud/polymarket/hour-14.ndjson"),
+                OsString::from("--polymarket-content-sha256"),
+                OsString::from(digest('3')),
+                OsString::from("--polymarket-manifest-sha256"),
+                OsString::from(digest('4')),
+                OsString::from("--polymarket-artifact"),
+                OsString::from("/cloud/polymarket/hour-15.ndjson"),
+                OsString::from("--polymarket-content-sha256"),
+                OsString::from(digest('5')),
+                OsString::from("--polymarket-manifest-sha256"),
+                OsString::from(digest('6')),
+            ],
+        };
+
+        validate_snapshot_args(&args).expect("verified artifact flags must be forwarded");
     }
 
     #[test]

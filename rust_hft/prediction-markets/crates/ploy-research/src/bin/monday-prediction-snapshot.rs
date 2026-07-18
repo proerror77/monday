@@ -1,20 +1,62 @@
-//! Compile a governed point-in-time snapshot from Monday research PostgreSQL tables.
+//! Compile a governed point-in-time snapshot from verified artifacts or Monday research tables.
 //!
 //! This binary is the boundary between collector storage and repeated research
 //! scoring. Factor review, walk-forward, and optimizer jobs should consume the
 //! resulting immutable snapshot artifacts instead of rebuilding raw joins.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use data::binance_market_tape_artifact::{
+    seal_binance_market_tape_triplet, verify_binance_market_tape, BinanceMarketTapeTriplet,
+    BinanceMarketTapeTrustAnchor, VerifiedBinanceMarketTape,
+};
 use ploy_market_data::diagnostics::PredictionMarketDataAuditReport;
+use ploy_market_data::polymarket_evidence::{
+    aggregate_verified_polymarket_evidence, seal_polymarket_evidence_triplet,
+    verify_polymarket_evidence, PolymarketEvidenceTriplet, PolymarketEvidenceTrustAnchor,
+    VerifiedPolymarketEvidenceSet,
+};
 use ploy_research::research_snapshot::ResearchSnapshotInputArtifact;
 use ploy_research::{
-    build_research_snapshot_from_database, write_research_snapshot, ResearchSnapshotBuildOptions,
+    build_research_snapshot_from_database, build_research_snapshot_from_verified_artifacts,
+    write_research_snapshot, ResearchSnapshotBuildOptions, VerifiedArtifactSnapshotBuildOptions,
 };
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
+
+const VERIFIED_ARTIFACT_VALUE_FLAGS: [&str; 6] = [
+    "--segment",
+    "--segment-content-sha256",
+    "--segment-manifest-sha256",
+    "--polymarket-artifact",
+    "--polymarket-content-sha256",
+    "--polymarket-manifest-sha256",
+];
+const VERIFIED_MODE_FORBIDDEN_FLAGS: [&str; 7] = [
+    "--allow-missing-official-settlement",
+    "--data-audit-report",
+    "--data-audit-sha256",
+    "--data-audit-status",
+    "--data-requirements",
+    "--pm-book-archive-dir",
+    "--skip-deribit",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnchoredArtifact {
+    data: PathBuf,
+    content_sha256: String,
+    manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedArtifactArgs {
+    binance: Vec<AnchoredArtifact>,
+    polymarket: Vec<AnchoredArtifact>,
+}
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
@@ -24,6 +66,158 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 fn flag_present(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+fn checked_flag_values(args: &[String], flag: &str) -> anyhow::Result<Vec<String>> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, argument)| argument.as_str() == flag)
+        .map(|(index, _)| {
+            let value = args
+                .get(index + 1)
+                .with_context(|| format!("{flag} requires a value"))?;
+            if value.trim().is_empty() || value.starts_with("--") {
+                anyhow::bail!("{flag} requires a value");
+            }
+            Ok(value.clone())
+        })
+        .collect()
+}
+
+fn parse_anchored_artifacts(
+    args: &[String],
+    data_flag: &str,
+    content_flag: &str,
+    manifest_flag: &str,
+) -> anyhow::Result<Vec<AnchoredArtifact>> {
+    let data = checked_flag_values(args, data_flag)?;
+    let content = checked_flag_values(args, content_flag)?;
+    let manifests = checked_flag_values(args, manifest_flag)?;
+    if data.is_empty() || content.len() != data.len() || manifests.len() != data.len() {
+        anyhow::bail!(
+            "{data_flag}, {content_flag}, and {manifest_flag} must have equal nonzero lengths"
+        );
+    }
+    Ok(data
+        .into_iter()
+        .zip(content)
+        .zip(manifests)
+        .map(
+            |((data, content_sha256), manifest_sha256)| AnchoredArtifact {
+                data: PathBuf::from(data),
+                content_sha256,
+                manifest_sha256,
+            },
+        )
+        .collect())
+}
+
+fn parse_verified_artifact_args(
+    args: &[String],
+    symbols: &[String],
+) -> anyhow::Result<Option<VerifiedArtifactArgs>> {
+    let mode_count = args
+        .iter()
+        .filter(|argument| argument.as_str() == "--verified-artifacts")
+        .count();
+    let has_artifact_value = VERIFIED_ARTIFACT_VALUE_FLAGS
+        .iter()
+        .any(|flag| flag_present(args, flag));
+    if mode_count == 0 {
+        if has_artifact_value {
+            anyhow::bail!("verified artifact inputs require --verified-artifacts");
+        }
+        return Ok(None);
+    }
+    if mode_count != 1 {
+        anyhow::bail!("--verified-artifacts must be supplied exactly once");
+    }
+    if let Some(flag) = VERIFIED_MODE_FORBIDDEN_FLAGS
+        .iter()
+        .find(|flag| flag_present(args, flag))
+    {
+        anyhow::bail!("{flag} cannot be combined with --verified-artifacts");
+    }
+    if symbols.len() != 1 || !matches!(symbols[0].as_str(), "BTCUSDT" | "SOLUSDT") {
+        anyhow::bail!("verified-artifact mode requires exactly one BTCUSDT or SOLUSDT symbol");
+    }
+
+    Ok(Some(VerifiedArtifactArgs {
+        binance: parse_anchored_artifacts(
+            args,
+            "--segment",
+            "--segment-content-sha256",
+            "--segment-manifest-sha256",
+        )?,
+        polymarket: parse_anchored_artifacts(
+            args,
+            "--polymarket-artifact",
+            "--polymarket-content-sha256",
+            "--polymarket-manifest-sha256",
+        )?,
+    }))
+}
+
+fn artifact_triplet(path: &Path) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("artifact path has no UTF-8 file name")?;
+    Ok((
+        path.to_path_buf(),
+        path.with_file_name(format!("{name}.manifest.json")),
+        path.with_file_name(format!("{name}._SUCCESS")),
+    ))
+}
+
+fn verify_binance_artifacts(
+    artifacts: &[AnchoredArtifact],
+) -> anyhow::Result<VerifiedBinanceMarketTape> {
+    let sealed = artifacts
+        .iter()
+        .map(|artifact| {
+            let (data, manifest, success) = artifact_triplet(&artifact.data)?;
+            let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(
+                &artifact.content_sha256,
+                &artifact.manifest_sha256,
+            )?;
+            seal_binance_market_tape_triplet(
+                &BinanceMarketTapeTriplet {
+                    data,
+                    manifest,
+                    success,
+                },
+                &trust,
+            )
+            .with_context(|| format!("seal Binance artifact {}", artifact.data.display()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    verify_binance_market_tape(sealed)
+}
+
+fn verify_polymarket_artifacts(
+    artifacts: &[AnchoredArtifact],
+) -> anyhow::Result<VerifiedPolymarketEvidenceSet> {
+    let verified = artifacts
+        .iter()
+        .map(|artifact| {
+            let (data, manifest, success) = artifact_triplet(&artifact.data)?;
+            let trust = PolymarketEvidenceTrustAnchor::from_lower_hex(
+                &artifact.content_sha256,
+                &artifact.manifest_sha256,
+            )?;
+            verify_polymarket_evidence(seal_polymarket_evidence_triplet(
+                &PolymarketEvidenceTriplet {
+                    data,
+                    manifest,
+                    success,
+                },
+                &trust,
+            )?)
+            .with_context(|| format!("verify Polymarket artifact {}", artifact.data.display()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    aggregate_verified_polymarket_evidence(verified)
 }
 
 fn parse_csv(raw: Option<String>, default: &str) -> Vec<String> {
@@ -96,15 +290,6 @@ async fn main() -> anyhow::Result<()> {
             "--db-url is forbidden because it exposes credentials; use MONDAY_RESEARCH_DATABASE_URL or DATABASE_URL"
         );
     }
-    let db_url = std::env::var("MONDAY_RESEARCH_DATABASE_URL")
-        .ok()
-        .or_else(|| std::env::var("DATABASE_URL").ok())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "database URL is required via MONDAY_RESEARCH_DATABASE_URL or DATABASE_URL"
-            )
-        })?;
     let output_dir =
         PathBuf::from(flag_value(&args, "--output-dir").expect("--output-dir required"));
     let start = flag_value(&args, "--start-ts")
@@ -133,81 +318,127 @@ async fn main() -> anyhow::Result<()> {
     let stake_usd = flag_value(&args, "--stake-usd")
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(15.0);
-    let require_official_settlement = !flag_present(&args, "--allow-missing-official-settlement");
     let optimizer_data_dir =
         flag_value(&args, "--optimizer-data-dir").expect("--optimizer-data-dir required");
-    let data_requirements = parse_csv(flag_value(&args, "--data-requirements"), "all");
-    let (data_audit_status, data_audit_report, data_audit_report_hash) = validated_data_audit(
-        flag_value(&args, "--data-audit-report"),
-        flag_value(&args, "--data-audit-status"),
-        &symbols,
-        start,
-        end,
-    )?;
-    let include_deribit = !flag_present(&args, "--skip-deribit");
-    let pm_book_archive_dir = flag_value(&args, "--pm-book-archive-dir")
-        .or_else(|| std::env::var("MONDAY_PREDICTION_BOOK_ARCHIVE_DIR").ok())
-        .filter(|raw| !raw.trim().is_empty())
-        .map(PathBuf::from);
+    let verified_artifacts = parse_verified_artifact_args(&args, &symbols)?;
 
-    eprintln!(
-        "monday-prediction-snapshot: {} -> {} for {:?}, stake_usd={:.2}, output={}, data_requirements={}, include_deribit={}, pm_book_sample_secs={}, pm_book_archive_dir={}",
-        start,
-        end,
-        symbols,
-        stake_usd,
-        output_dir.display(),
-        data_requirements.join(","),
-        include_deribit,
-        pm_book_sample_secs,
-        pm_book_archive_dir
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<not-configured>".to_string())
-    );
-
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(Duration::from_secs(120))
-        .connect(&db_url)
-        .await?;
-
-    let mut snapshot = build_research_snapshot_from_database(
-        &pool,
-        ResearchSnapshotBuildOptions {
-            symbols,
+    let manifest = if let Some(artifacts) = verified_artifacts {
+        let binance = verify_binance_artifacts(&artifacts.binance)?;
+        let polymarket = verify_polymarket_artifacts(&artifacts.polymarket)?;
+        eprintln!(
+            "monday-prediction-snapshot: {} -> {} for {:?}, source=verified_immutable_artifacts, binance_segments={}, polymarket_members={}, stake_usd={:.2}, output={}, pm_book_sample_secs={}",
             start,
             end,
-            lob_sample_secs,
-            pm_book_sample_secs,
-            observation_sample_secs,
-            max_quote_age_secs,
+            symbols,
+            artifacts.binance.len(),
+            artifacts.polymarket.len(),
             stake_usd,
-            require_official_settlement,
-            optimizer_data_dir: Some(optimizer_data_dir),
-            git_sha: std::env::var("GITHUB_SHA").ok(),
-            data_requirements,
-            data_audit_status,
-            data_audit_report: data_audit_report.clone(),
+            output_dir.display(),
+            pm_book_sample_secs,
+        );
+        let snapshot = build_research_snapshot_from_verified_artifacts(
+            &binance,
+            &polymarket,
+            VerifiedArtifactSnapshotBuildOptions {
+                symbol: symbols[0].clone(),
+                start,
+                end,
+                lob_sample_secs,
+                pm_book_sample_secs,
+                observation_sample_secs,
+                max_quote_age_secs,
+                stake_usd,
+                optimizer_data_dir,
+                git_sha: std::env::var("GITHUB_SHA").ok(),
+            },
+        )?;
+        write_research_snapshot(&output_dir, snapshot)?
+    } else {
+        let db_url = std::env::var("MONDAY_RESEARCH_DATABASE_URL")
+            .ok()
+            .or_else(|| std::env::var("DATABASE_URL").ok())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "database URL is required via MONDAY_RESEARCH_DATABASE_URL or DATABASE_URL"
+                )
+            })?;
+        let require_official_settlement =
+            !flag_present(&args, "--allow-missing-official-settlement");
+        let data_requirements = parse_csv(flag_value(&args, "--data-requirements"), "all");
+        let (data_audit_status, data_audit_report, data_audit_report_hash) =
+            validated_data_audit(
+                flag_value(&args, "--data-audit-report"),
+                flag_value(&args, "--data-audit-status"),
+                &symbols,
+                start,
+                end,
+            )?;
+        let include_deribit = !flag_present(&args, "--skip-deribit");
+        let pm_book_archive_dir = flag_value(&args, "--pm-book-archive-dir")
+            .or_else(|| std::env::var("MONDAY_PREDICTION_BOOK_ARCHIVE_DIR").ok())
+            .filter(|raw| !raw.trim().is_empty())
+            .map(PathBuf::from);
+
+        eprintln!(
+            "monday-prediction-snapshot: {} -> {} for {:?}, stake_usd={:.2}, output={}, data_requirements={}, include_deribit={}, pm_book_sample_secs={}, pm_book_archive_dir={}",
+            start,
+            end,
+            symbols,
+            stake_usd,
+            output_dir.display(),
+            data_requirements.join(","),
             include_deribit,
-            pm_book_archive_dir,
-        },
-    )
-    .await?;
-    if let (Some(path), Some(content_hash)) =
-        (data_audit_report.as_ref(), data_audit_report_hash.as_ref())
-    {
-        snapshot
-            .manifest
-            .input_artifacts
-            .push(ResearchSnapshotInputArtifact {
-                name: "prediction_market_data_audit".to_string(),
-                path: path.clone(),
-                content_hash: Some(content_hash.clone()),
-                row_count: None,
-            });
-    }
-    let manifest = write_research_snapshot(&output_dir, snapshot)?;
+            pm_book_sample_secs,
+            pm_book_archive_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<not-configured>".to_string())
+        );
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(120))
+            .connect(&db_url)
+            .await?;
+
+        let mut snapshot = build_research_snapshot_from_database(
+            &pool,
+            ResearchSnapshotBuildOptions {
+                symbols,
+                start,
+                end,
+                lob_sample_secs,
+                pm_book_sample_secs,
+                observation_sample_secs,
+                max_quote_age_secs,
+                stake_usd,
+                require_official_settlement,
+                optimizer_data_dir: Some(optimizer_data_dir),
+                git_sha: std::env::var("GITHUB_SHA").ok(),
+                data_requirements,
+                data_audit_status,
+                data_audit_report: data_audit_report.clone(),
+                include_deribit,
+                pm_book_archive_dir,
+            },
+        )
+        .await?;
+        if let (Some(path), Some(content_hash)) =
+            (data_audit_report.as_ref(), data_audit_report_hash.as_ref())
+        {
+            snapshot
+                .manifest
+                .input_artifacts
+                .push(ResearchSnapshotInputArtifact {
+                    name: "prediction_market_data_audit".to_string(),
+                    path: path.clone(),
+                    content_hash: Some(content_hash.clone()),
+                    row_count: None,
+                });
+        }
+        write_research_snapshot(&output_dir, snapshot)?
+    };
 
     eprintln!("research snapshot written: {}", output_dir.display());
     eprintln!(
@@ -232,8 +463,37 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validated_data_audit;
+    use super::{parse_verified_artifact_args, validated_data_audit};
     use chrono::{TimeZone, Utc};
+
+    fn digest(byte: char) -> String {
+        byte.to_string().repeat(64)
+    }
+
+    fn verified_args() -> Vec<String> {
+        [
+            "--verified-artifacts".to_string(),
+            "--segment".to_string(),
+            "/cloud/binance/part-1.jsonl.zst".to_string(),
+            "--segment-content-sha256".to_string(),
+            digest('1'),
+            "--segment-manifest-sha256".to_string(),
+            digest('2'),
+            "--polymarket-artifact".to_string(),
+            "/cloud/polymarket/hour-14.ndjson".to_string(),
+            "--polymarket-content-sha256".to_string(),
+            digest('3'),
+            "--polymarket-manifest-sha256".to_string(),
+            digest('4'),
+            "--polymarket-artifact".to_string(),
+            "/cloud/polymarket/hour-15.ndjson".to_string(),
+            "--polymarket-content-sha256".to_string(),
+            digest('5'),
+            "--polymarket-manifest-sha256".to_string(),
+            digest('6'),
+        ]
+        .into()
+    }
 
     #[test]
     fn prediction_snapshot_requires_typed_audit_evidence() {
@@ -252,5 +512,58 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--data-audit-report is required"));
+    }
+
+    #[test]
+    fn verified_artifact_mode_accepts_repeated_anchored_triplets() {
+        let parsed = parse_verified_artifact_args(&verified_args(), &["BTCUSDT".to_string()])
+            .unwrap()
+            .expect("verified artifact mode");
+
+        assert_eq!(parsed.binance.len(), 1);
+        assert_eq!(parsed.polymarket.len(), 2);
+        assert_eq!(parsed.polymarket[1].manifest_sha256, digest('6'));
+    }
+
+    #[test]
+    fn verified_artifact_mode_requires_parallel_external_anchors() {
+        let mut args = verified_args();
+        let index = args
+            .iter()
+            .rposition(|argument| argument == "--polymarket-manifest-sha256")
+            .unwrap();
+        args.drain(index..=index + 1);
+
+        assert!(parse_verified_artifact_args(&args, &["BTCUSDT".to_string()])
+            .unwrap_err()
+            .to_string()
+            .contains("equal nonzero lengths"));
+    }
+
+    #[test]
+    fn verified_artifact_mode_rejects_implicit_mixed_or_multi_symbol_inputs() {
+        let mut implicit = verified_args();
+        implicit.remove(0);
+        assert!(parse_verified_artifact_args(&implicit, &["BTCUSDT".to_string()])
+            .unwrap_err()
+            .to_string()
+            .contains("require --verified-artifacts"));
+
+        for flag in ["--data-audit-report", "--data-audit-sha256"] {
+            let mut mixed = verified_args();
+            mixed.extend([flag.to_string(), "legacy-external-audit".to_string()]);
+            assert!(parse_verified_artifact_args(&mixed, &["BTCUSDT".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be combined"));
+        }
+
+        assert!(parse_verified_artifact_args(
+            &verified_args(),
+            &["BTCUSDT".to_string(), "SOLUSDT".to_string()],
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exactly one BTCUSDT or SOLUSDT symbol"));
     }
 }
