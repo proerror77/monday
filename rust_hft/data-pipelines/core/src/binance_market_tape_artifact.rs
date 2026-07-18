@@ -243,8 +243,15 @@ pub fn verify_binance_market_tape(
         }
         identities.push(segment.identity(market));
     }
-    if aggregate_trades.is_empty() {
-        bail!("verified market-tape has no aggregate trades");
+    let aggregate_trade_symbols = aggregate_trades
+        .iter()
+        .map(|trade| trade.symbol.as_str())
+        .collect::<BTreeSet<_>>();
+    if symbols
+        .iter()
+        .any(|symbol| !aggregate_trade_symbols.contains(symbol.as_str()))
+    {
+        bail!("verified market-tape is missing aggregate trades for a declared symbol");
     }
     let mut replayed_books = Vec::with_capacity(replay.len());
     for (symbol, validator) in replay {
@@ -616,8 +623,31 @@ mod tests {
         json!({"schema":"binance.market_tape.v1","received_at_ns":received_at_ns,"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":last_update_id,"synced":true,"bridged":true,"bids":[["100","2"]],"asks":[["101","1"]],"replay_safe":true,"reason":"test"})
     }
 
+    fn two_symbol_rows_without_sol_trade() -> Vec<Value> {
+        let mut rows = valid_rows();
+        rows[0]["symbols"] = json!(2);
+        let mut sol_snapshot = rows[1].clone();
+        sol_snapshot["received_at_ns"] = json!(START_NS + 150_000_000);
+        sol_snapshot["symbol"] = json!("SOLUSDT");
+        sol_snapshot["snapshot"]["lastUpdateId"] = json!(200);
+        let mut sol_diff = depth_row(START_NS + 250_000_000, 201, 200);
+        sol_diff["frame"]["data"]["s"] = json!("SOLUSDT");
+        let mut sol_checkpoint = checkpoint_row(START_NS + 450_000_000, 201);
+        sol_checkpoint["symbol"] = json!("SOLUSDT");
+        rows.extend([sol_snapshot, sol_diff, sol_checkpoint]);
+        rows.sort_by_key(|row| row["received_at_ns"].as_u64().unwrap());
+        rows
+    }
+
+    fn write_triplet(
+        root: &Path,
+        rows: &[Value],
+    ) -> (BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor) {
+        write_triplet_for_symbols(root, rows, &["BTCUSDT"])
+    }
+
     #[rustfmt::skip]
-    fn write_triplet(root: &Path, rows: &[Value]) -> (BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor) {
+    fn write_triplet_for_symbols(root: &Path, rows: &[Value], symbols: &[&str]) -> (BinanceMarketTapeTriplet, BinanceMarketTapeTrustAnchor) {
         let root = fs::canonicalize(root).unwrap();
         let start = rows.iter().map(|row| row["received_at_ns"].as_u64().unwrap()).min().unwrap();
         let end = rows.iter().map(|row| row["received_at_ns"].as_u64().unwrap()).max().unwrap();
@@ -630,15 +660,23 @@ mod tests {
             *counts.entry(row["type"].as_str().unwrap().to_owned()).or_default() += 1;
             counts
         });
+        let checkpointed_symbols = rows
+            .iter()
+            .filter(|row| row["type"] == "checkpoint")
+            .filter_map(|row| row["symbol"].as_str())
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let declared_symbols = symbols.iter().map(|symbol| (*symbol).to_owned()).collect::<BTreeSet<_>>();
+        let snapshot_only_symbols = declared_symbols.difference(&checkpointed_symbols).cloned().collect::<Vec<_>>();
         let has_checkpoint = counts.get("checkpoint").copied().unwrap_or(0) > 0;
         let data_sha = format!("{:x}", Sha256::digest(&compressed));
         let manifest = json!({
             "schema":"binance.market_tape.v1","venue":"binance","market":"usdm","dataset":"usdm_all","shard_id":"all","mode":"diff",
-            "symbols":["BTCUSDT"],"security_token_symbols":[],"excluded_symbols":[],"snapshot_limit":1000,
+            "symbols":symbols,"security_token_symbols":[],"excluded_symbols":[],"snapshot_limit":1000,
             "replay_scope":"captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs","venue_depth_complete":false,
             "events":rows.len(),"event_types":counts,"has_replay_safe_checkpoint":has_checkpoint,
-            "snapshot_ready_count":u64::from(has_checkpoint),"bridged_count":u64::from(has_checkpoint),
-            "snapshot_only_symbols":if has_checkpoint { json!([]) } else { json!(["BTCUSDT"]) },"all_symbols_bridged":has_checkpoint,
+            "snapshot_ready_count":checkpointed_symbols.len(),"bridged_count":checkpointed_symbols.len(),
+            "snapshot_only_symbols":snapshot_only_symbols,"all_symbols_bridged":checkpointed_symbols == declared_symbols,
             "start_received_at_ns":start,"end_received_at_ns":end,"date":"2023-11-14","hour":"22","file":name,"bytes":compressed.len(),"sha256":data_sha,
             "trade_representation":"aggregate_trade_only","price_surface_derivation":"latest aggregate trade price"
         });
@@ -708,6 +746,54 @@ mod tests {
 
         let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
         assert!(error.to_string().contains("replay-safe checkpoint"));
+    }
+
+    #[test]
+    fn every_declared_symbol_requires_an_aggregate_trade() {
+        let root = tempdir();
+        let rows = two_symbol_rows_without_sol_trade();
+        let (triplet, anchor) =
+            write_triplet_for_symbols(root.path(), &rows, &["BTCUSDT", "SOLUSDT"]);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
+        assert!(error.to_string().contains("aggregate trade"));
+    }
+
+    #[test]
+    fn aggregate_trade_coverage_can_span_segments() {
+        let root = tempdir();
+        let first_rows = two_symbol_rows_without_sol_trade();
+        let mut sol_diff = depth_row(START_NS + 1_100_000_000, 202, 201);
+        sol_diff["frame"]["data"]["s"] = json!("SOLUSDT");
+        let mut sol_trade = trade_row(START_NS + 1_200_000_000, 20);
+        sol_trade["frame"]["stream"] = json!("solusdt@aggTrade");
+        sol_trade["frame"]["data"]["s"] = json!("SOLUSDT");
+        let mut sol_checkpoint = checkpoint_row(START_NS + 1_400_000_000, 202);
+        sol_checkpoint["symbol"] = json!("SOLUSDT");
+        let second_rows = vec![
+            depth_row(START_NS + 1_000_000_000, 102, 101),
+            sol_diff,
+            sol_trade,
+            checkpoint_row(START_NS + 1_300_000_000, 102),
+            sol_checkpoint,
+        ];
+        let (first, first_anchor) =
+            write_triplet_for_symbols(root.path(), &first_rows, &["BTCUSDT", "SOLUSDT"]);
+        let (second, second_anchor) =
+            write_triplet_for_symbols(root.path(), &second_rows, &["BTCUSDT", "SOLUSDT"]);
+        let sealed = vec![
+            seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
+            seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
+        ];
+
+        let verified = verify_binance_market_tape(sealed).unwrap();
+        let trade_symbols = verified
+            .aggregate_trades()
+            .iter()
+            .map(|trade| trade.symbol.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(trade_symbols, BTreeSet::from(["BTCUSDT", "SOLUSDT"]));
     }
 
     #[test]
