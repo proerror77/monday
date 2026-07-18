@@ -145,6 +145,13 @@ fn governed_request(input: &VerifiedArtifactAuditRequest) -> Result<PredictionMa
         matches!(input.symbol.as_str(), "BTCUSDT" | "SOLUSDT"),
         "verified artifact audit supports one BTCUSDT or SOLUSDT mission"
     );
+    ensure!(
+        input.snapshot_start.timestamp().rem_euclid(300) == 0
+            && input.snapshot_start.timestamp_subsec_nanos() == 0
+            && input.snapshot_end.timestamp().rem_euclid(300) == 0
+            && input.snapshot_end.timestamp_subsec_nanos() == 0,
+        "verified artifact audit window must align to full five-minute events"
+    );
     let mut request = PredictionMarketDataAuditRequest::btc_sol_five_minute(
         input.snapshot_start,
         input.snapshot_end,
@@ -400,7 +407,7 @@ fn polymarket_book_observation<'a, 'b>(
         let Some(&(start, end)) = windows.get(&key) else {
             continue;
         };
-        if book.available_at < start || book.available_at >= end {
+        if book.source_time < start || book.source_time >= end {
             continue;
         }
         row_count = row_count.checked_add(1).context("audit row count overflows")?;
@@ -417,13 +424,13 @@ fn polymarket_book_observation<'a, 'b>(
             continue;
         }
         usable_row_count += 1;
-        first_at = Some(first_at.map_or(book.available_at, |value| value.min(book.available_at)));
-        last_at = Some(last_at.map_or(book.available_at, |value| value.max(book.available_at)));
+        first_at = Some(first_at.map_or(book.source_time, |value| value.min(book.source_time)));
+        last_at = Some(last_at.map_or(book.source_time, |value| value.max(book.source_time)));
         present
             .get_mut(&key)
             .expect("verified token window exists")
             .insert(u64::try_from(
-                (book.available_at - start).num_seconds() / request.bucket_secs,
+                (book.source_time - start).num_seconds() / request.bucket_secs,
             )?);
     }
     let present_buckets = u64::try_from(present.values().map(BTreeSet::len).sum::<usize>())?;
@@ -551,6 +558,16 @@ mod tests {
             resolution_source: "chainlink".to_owned(),
             available_at: time("2026-07-17T05:29:59Z"),
         }
+    }
+
+    #[test]
+    fn governed_request_rejects_misaligned_event_windows() {
+        assert!(governed_request(&VerifiedArtifactAuditRequest {
+            symbol: "BTCUSDT".to_owned(),
+            snapshot_start: time("2026-07-17T05:30:01Z"),
+            snapshot_end: time("2026-07-17T05:35:00Z"),
+        })
+        .is_err());
     }
 
     fn book(token_id: &str, available_at: DateTime<Utc>) -> PolymarketEvidenceBook {
@@ -689,6 +706,15 @@ mod tests {
                 ..
             }
         ));
+
+        let delayed = books.last_mut().unwrap();
+        delayed.source_time = contract.event_end - Duration::seconds(1);
+        delayed.available_at = contract.event_end;
+        let source_complete = evaluate_time_series_coverage(
+            &request,
+            polymarket_book_observation(&request, "BTCUSDT", [&contract], books.iter()).unwrap(),
+        );
+        assert_eq!(source_complete.status, AuditStatus::Ok);
 
         books.pop();
         let missing = evaluate_time_series_coverage(
