@@ -31,7 +31,10 @@ const POLICY_INPUTS: [(&str, &str); 12] = [
         "../data-pipelines/core/Cargo.toml",
         "../data-pipelines/core/Cargo.toml",
     ),
-    ("../market-core/core/Cargo.toml", "../market-core/core/Cargo.toml"),
+    (
+        "../market-core/core/Cargo.toml",
+        "../market-core/core/Cargo.toml",
+    ),
     (
         "../market-core/instrument/Cargo.toml",
         "../market-core/instrument/Cargo.toml",
@@ -40,7 +43,10 @@ const POLICY_INPUTS: [(&str, &str); 12] = [
         "../market-core/integration/Cargo.toml",
         "../market-core/integration/Cargo.toml",
     ),
-    ("../market-core/ports/Cargo.toml", "../market-core/ports/Cargo.toml"),
+    (
+        "../market-core/ports/Cargo.toml",
+        "../market-core/ports/Cargo.toml",
+    ),
     (
         "../market-core/snapshot/Cargo.toml",
         "../market-core/snapshot/Cargo.toml",

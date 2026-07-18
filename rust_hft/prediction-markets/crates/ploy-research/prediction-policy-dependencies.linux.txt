@@ -7,6 +7,12 @@ input:crates/ploy-research/Cargo.toml=sha256:44b2e625ae7d618502bb392a006eee866d0
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
 input:crates/ploy-market-data/Cargo.toml=sha256:4f3c213c3d8283de4672b7c2de6f9c9c30d12db11bb8460495f5ebf09225b2bd
+input:../data-pipelines/core/Cargo.toml=sha256:4d4bb79a5456edf8f1922303ee98191401d08a360f60858681c12be2e0795b27
+input:../market-core/core/Cargo.toml=sha256:1871023d225485d0585cf929928690f83d0b5dc1f52eb6e5e578948843872769
+input:../market-core/instrument/Cargo.toml=sha256:057cf9cfb1f029a124ec63f4c85c595897aec468d7ab0861f8246b589eb758eb
+input:../market-core/integration/Cargo.toml=sha256:114e2bd764147c21c5d2b3f9c1da82a05329c790935bf0f8edac2b2547d46600
+input:../market-core/ports/Cargo.toml=sha256:c660d206267c93f0a846e001264b74a7fc9647cca75a32adc2273bff22a88b6b
+input:../market-core/snapshot/Cargo.toml=sha256:05034b38335e1641ec9c5de9d5b9570738fc552d299ff82295141aff9819b56c
 package:allocator-api2@0.2.21|source=registry+https://github.com/rust-lang/crates.io-index|checksum=683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923|features=alloc
 package:anyhow@1.0.103|source=registry+https://github.com/rust-lang/crates.io-index|checksum=2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3|features=default,std
 package:arc-swap@1.9.2|source=registry+https://github.com/rust-lang/crates.io-index|checksum=c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b|features=
