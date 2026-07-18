@@ -770,6 +770,21 @@ mod tests {
     }
 
     #[test]
+    fn non_positive_replayed_book_levels_never_return_a_verified_handle() {
+        for (field, value) in [(0usize, "0"), (1usize, "-1")] {
+            let root = tempdir();
+            let mut rows = valid_rows();
+            rows[1]["snapshot"]["asks"][0][field] = json!(value);
+            rows[4]["asks"][0][field] = json!(value);
+            let (triplet, anchor) = write_triplet(root.path(), &rows);
+            let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+            let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
+            assert!(error.to_string().contains("non-positive"));
+        }
+    }
+
+    #[test]
     fn every_declared_symbol_requires_an_aggregate_trade() {
         let root = tempdir();
         let rows = two_symbol_rows_without_sol_trade();
