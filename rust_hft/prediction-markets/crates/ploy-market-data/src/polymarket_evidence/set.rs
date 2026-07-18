@@ -261,13 +261,33 @@ mod tests {
         rows
     }
 
-    fn verified(rows: &[Value], start: DateTime<Utc>) -> VerifiedPolymarketEvidence {
+    fn hour_rows(start: DateTime<Utc>, suffix: &str) -> Vec<Value> {
+        let mut hour = Vec::new();
+        for slot in 0..12 {
+            let slot_start = start + Duration::seconds(WINDOW_SECS * slot);
+            hour.extend(rows(slot_start, &format!("{suffix}-{slot}")));
+        }
+        hour
+    }
+
+    fn verified_range(
+        rows: &[Value],
+        lower: DateTime<Utc>,
+        upper: DateTime<Utc>,
+    ) -> VerifiedPolymarketEvidence {
         let temp = tempfile::tempdir().unwrap();
         let triplet = artifact_tests::write_triplet_rows(&temp, rows);
         let mut manifest: Value =
             serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
-        manifest["event_start_gte"] = json!(timestamp(start));
-        manifest["event_start_lt"] = json!(timestamp(start + Duration::seconds(WINDOW_SECS)));
+        manifest["event_start_gte"] = json!(timestamp(lower));
+        manifest["event_start_lt"] = json!(timestamp(upper));
+        for dataset in ["market", "reference"] {
+            let input = &mut manifest["validated_inputs"][dataset];
+            input["date"] = json!(lower.format("%Y-%m-%d").to_string());
+            input["hour"] = json!(lower.format("%H").to_string());
+            input["start_recorded_at"] = json!(timestamp(lower));
+            input["end_recorded_at"] = json!(timestamp(lower + Duration::minutes(1)));
+        }
         fs::set_permissions(&triplet.manifest, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(
             &triplet.manifest,
@@ -281,6 +301,10 @@ mod tests {
         )
         .unwrap();
         verify_polymarket_evidence(sealed).unwrap()
+    }
+
+    fn verified(rows: &[Value], start: DateTime<Utc>) -> VerifiedPolymarketEvidence {
+        verified_range(rows, start, start + Duration::seconds(WINDOW_SECS))
     }
 
     fn base() -> DateTime<Utc> {
@@ -321,6 +345,34 @@ mod tests {
         assert_eq!(set.trades().count(), 4);
         assert_eq!(set.settlements().count(), 4);
         assert_eq!(set.identities().next().unwrap().event_start_gte, start);
+    }
+
+    #[test]
+    fn aggregates_two_contiguous_verified_hourly_artifacts() {
+        let start: DateTime<Utc> = "2026-07-17T05:00:00Z".parse().unwrap();
+        let second_start = start + Duration::hours(1);
+        let end = second_start + Duration::hours(1);
+        let first = verified_range(&hour_rows(start, "first"), start, second_start);
+        let second = verified_range(&hour_rows(second_start, "second"), second_start, end);
+
+        let set = aggregate_verified_polymarket_evidence(vec![first, second]).unwrap();
+        assert_eq!(set.members().len(), 2);
+        assert_eq!(set.event_start_gte(), start);
+        assert_eq!(set.event_start_lt(), end);
+        assert_eq!(set.contracts().count(), 48);
+    }
+
+    #[test]
+    fn rejects_verified_manifest_range_not_aligned_to_five_minutes() {
+        let start = base();
+        let member = verified_range(
+            &rows(start, "unaligned"),
+            start - Duration::seconds(1),
+            start + Duration::seconds(WINDOW_SECS),
+        );
+
+        let error = aggregate_verified_polymarket_evidence(vec![member]).unwrap_err();
+        assert!(error.to_string().contains("not aligned"), "{error:#}");
     }
 
     #[test]
