@@ -752,9 +752,7 @@ mod tests {
     fn first_segment_checkpoint_cannot_replace_snapshot_seed() {
         let root = tempdir();
         let mut rows = valid_rows();
-        rows.retain(|row| {
-            !matches!(row["type"].as_str(), Some("snapshot") | Some("diff"))
-        });
+        rows.retain(|row| !matches!(row["type"].as_str(), Some("snapshot") | Some("diff")));
         let (triplet, anchor) = write_triplet(root.path(), &rows);
         let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
 
