@@ -596,19 +596,26 @@ async fn run_session(
     let (sender, mut receiver) = mpsc::channel(config.max_buffered_diffs);
     let (session_stop_tx, session_stop_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
-    for url in config.stream_urls() {
+    let stream_urls = config.stream_urls();
+    let expected_streams = stream_urls.len();
+    let (stream_connected_tx, stream_connected_rx) = mpsc::channel(expected_streams);
+    for url in stream_urls {
         tasks.spawn(receive_url(
             url,
             sender.clone(),
+            stream_connected_tx.clone(),
             session_stop_rx.clone(),
             config.stall_timeout,
             watchdog.clone(),
         ));
     }
-    tasks.spawn(produce_snapshots(
+    drop(stream_connected_tx);
+    tasks.spawn(produce_snapshots_after_streams_connect(
         config.clone(),
         sender.clone(),
         session_stop_rx.clone(),
+        stream_connected_rx,
+        expected_streams,
     ));
     let mut states = active_symbols
         .iter()
@@ -622,7 +629,7 @@ async fn run_session(
             "session_id": session_id,
             "market": config.market.as_str(),
             "symbols": active_symbols.len(),
-            "websocket_shards": config.stream_urls().len(),
+            "websocket_shards": expected_streams,
         }),
         now_ns()?,
     )?;
@@ -1129,6 +1136,7 @@ fn close_segment_at(
 async fn receive_url(
     url: String,
     sender: mpsc::Sender<Event>,
+    stream_connected: mpsc::Sender<()>,
     mut shutdown: watch::Receiver<bool>,
     stall_timeout: Duration,
     watchdog: ProcessWatchdog,
@@ -1136,6 +1144,12 @@ async fn receive_url(
     let (mut websocket, _) = tokio::time::timeout(Duration::from_secs(20), connect_async(&url))
         .await
         .context("websocket connect timed out")??;
+    // Establish every stream before requesting snapshots so updates emitted
+    // during each REST request remain buffered on an already-open connection.
+    stream_connected
+        .send(())
+        .await
+        .context("stream connection receiver dropped")?;
     loop {
         let message = tokio::select! {
             biased;
@@ -1160,6 +1174,28 @@ async fn receive_url(
             }
         }
     }
+}
+
+async fn produce_snapshots_after_streams_connect(
+    config: Arc<Config>,
+    sender: mpsc::Sender<Event>,
+    mut shutdown: watch::Receiver<bool>,
+    mut stream_connected: mpsc::Receiver<()>,
+    expected_streams: usize,
+) -> anyhow::Result<TaskExit> {
+    for _ in 0..expected_streams {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                changed?;
+                return Ok(TaskExit::Stopped(None));
+            }
+            connected = stream_connected.recv() => {
+                connected.context("websocket producer stopped before connecting")?;
+            }
+        }
+    }
+    produce_snapshots(config, sender, shutdown).await
 }
 
 fn event_from_frame(frame: Value, received_at_ns: u64) -> anyhow::Result<Event> {
@@ -2528,6 +2564,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot["lastUpdateId"], 1);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshots_wait_until_every_websocket_stream_is_connected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicU64::new(0));
+        let server_requests = requests.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 38\r\nConnection: close\r\n\r\n{\"lastUpdateId\":1,\"bids\":[],\"asks\":[]}";
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let config = Arc::new(test_config(format!("http://{address}")));
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (connected_tx, connected_rx) = mpsc::channel(2);
+        let producer = tokio::spawn(produce_snapshots_after_streams_connect(
+            config,
+            sender,
+            shutdown_rx,
+            connected_rx,
+            2,
+        ));
+
+        connected_tx.send(()).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+            .await
+            .is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        connected_tx.send(()).await.unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { .. })
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::InitialSnapshotsComplete)
+        ));
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            producer.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
         server.join().unwrap();
     }
 
