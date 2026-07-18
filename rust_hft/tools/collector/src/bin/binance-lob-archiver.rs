@@ -2532,6 +2532,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshots_wait_until_every_websocket_stream_is_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicU64::new(0));
+        let server_requests = requests.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 38\r\nConnection: close\r\n\r\n{\"lastUpdateId\":1,\"bids\":[],\"asks\":[]}";
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let config = Arc::new(test_config(format!("http://{address}")));
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = mpsc::channel(2);
+        let producer = tokio::spawn(produce_snapshots_after_streams_ready(
+            config,
+            sender,
+            shutdown_rx,
+            ready_rx,
+            2,
+        ));
+
+        ready_tx.send(()).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+            .await
+            .is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+        ready_tx.send(()).await.unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::Snapshot { .. })
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Event::InitialSnapshotsComplete)
+        ));
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            producer.await.unwrap().unwrap(),
+            TaskExit::Stopped(None)
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn initial_snapshot_completion_is_emitted_after_last_snapshot() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
