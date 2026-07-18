@@ -127,7 +127,17 @@ jobs:
           components: rustfmt
 
       - name: Check Rust formatting
-        run: cargo +1.91.0 fmt --all -- --check
+        run: |
+          mapfile -t packages < <(
+            cargo +1.91.0 metadata --locked --no-deps --format-version 1 |
+              jq -r '. as $metadata | .packages[] | select(.id as $id | $metadata.workspace_members | index($id)) | .name'
+          )
+          test "${#packages[@]}" -gt 0
+          fmt_args=()
+          for package in "${packages[@]}"; do
+            fmt_args+=(--package "$package")
+          done
+          cargo +1.91.0 fmt "${fmt_args[@]}" -- --check
 
   safety-scans:
     name: Retired route and SSH safety scans
