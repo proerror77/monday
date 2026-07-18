@@ -600,7 +600,7 @@ mod tests {
         }
     }
 
-    fn assert_time_series(
+    fn assert_ts(
         result: &AuditSurfaceResult,
         status: AuditStatus,
         buckets: (u64, u64),
@@ -646,22 +646,22 @@ mod tests {
                     .unwrap(),
             )
         };
-        assert_time_series(&evaluate(&references), AuditStatus::Ok, (2, 2), 0, (0, 0));
+        assert_ts(&evaluate(&references), AuditStatus::Ok, (2, 2), 0, (0, 0));
         let mut post_open = reference(&contracts[0]);
         post_open.source_time = contracts[0].event_start;
         post_open.available_at = post_open.source_time;
         references.push(post_open);
-        assert_time_series(&evaluate(&references), AuditStatus::Ok, (2, 2), 0, (0, 0));
+        assert_ts(&evaluate(&references), AuditStatus::Ok, (2, 2), 0, (0, 0));
         references.pop();
         let late = contracts[0].event_start;
         references[0].source_time = late;
         references[0].available_at = late;
         let missing = evaluate(&references);
-        assert_time_series(&missing, AuditStatus::Critical, (2, 1), 300, (0, 0));
+        assert_ts(&missing, AuditStatus::Critical, (2, 1), 300, (0, 0));
         references[0] = reference(&contracts[0]);
         references[0].is_carried_forward = true;
         let carried = evaluate(&references);
-        assert_time_series(&carried, AuditStatus::Critical, (2, 1), 300, (0, 0));
+        assert_ts(&carried, AuditStatus::Critical, (2, 1), 300, (0, 0));
     }
 
     #[test]
@@ -694,16 +694,16 @@ mod tests {
                 polymarket_book_observation(&request, "BTCUSDT", [&contract], rows.iter()).unwrap(),
             )
         };
-        assert_time_series(&evaluate(&books), AuditStatus::Ok, (10, 10), 0, (0, 0));
+        assert_ts(&evaluate(&books), AuditStatus::Ok, (10, 10), 0, (0, 0));
         books.push(books[0].clone());
         books.last_mut().unwrap().available_at += Duration::seconds(31);
-        assert_time_series(&evaluate(&books), AuditStatus::Ok, (10, 10), 0, (0, 1));
+        assert_ts(&evaluate(&books), AuditStatus::Ok, (10, 10), 0, (0, 1));
         books.pop();
         let ask_levels = books[0].ask_levels.take();
-        assert_time_series(&evaluate(&books), AuditStatus::Critical, (10, 9), 60, (0, 1));
+        assert_ts(&evaluate(&books), AuditStatus::Critical, (10, 9), 60, (0, 1));
         books[0].ask_levels = ask_levels;
         books[0].available_at += Duration::seconds(31);
-        assert_time_series(&evaluate(&books), AuditStatus::Critical, (10, 9), 60, (0, 1));
+        assert_ts(&evaluate(&books), AuditStatus::Critical, (10, 9), 60, (0, 1));
         books[0].available_at = books[0].source_time;
         let delayed = books.last_mut().unwrap();
         delayed.source_time = contract.event_end - Duration::seconds(1);
@@ -714,9 +714,9 @@ mod tests {
         let mut missing =
             polymarket_book_observation(&request, "BTCUSDT", [&contract], books.iter()).unwrap();
         let short_window = evaluate_time_series_coverage(&book_request, missing.clone());
-        assert_time_series(&short_window, AuditStatus::Critical, (10, 9), 60, (0, 0));
+        assert_ts(&short_window, AuditStatus::Critical, (10, 9), 60, (0, 0));
         (missing.expected_buckets, missing.present_buckets) = (1_000, 999);
         let long = evaluate_time_series_coverage(&book_request, missing);
-        assert_time_series(&long, AuditStatus::Critical, (1_000, 999), 60, (0, 0));
+        assert_ts(&long, AuditStatus::Critical, (1_000, 999), 60, (0, 0));
     }
 }
