@@ -38,6 +38,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 
 ### Unified Monday prediction research control plane (2026-07-16)
 
+- [x] Aggregate independently verified Polymarket evidence artifacts into a gap-free BTC/SOL 5-minute research set.
 - [x] Verify sealed Polymarket evidence into semantic read-only typed projections.
 - [x] Bind immutable Polymarket evidence to external content and manifest SHA-256 anchors before semantic consumption.
 - [x] Project verified Polymarket evidence into availability-safe research carriers without replaying discovery metadata or settlement labels before observation.
