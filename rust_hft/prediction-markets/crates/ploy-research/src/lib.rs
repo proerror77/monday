@@ -11,6 +11,7 @@ pub mod event_ml;
 pub mod factors;
 pub mod factors_new;
 pub mod factors_v2;
+pub mod markov;
 #[cfg(any(feature = "ml", feature = "rl"))]
 pub mod model;
 pub mod orderbook;
@@ -167,6 +168,10 @@ pub use factors_v2::{
     SettlementProbabilityWalkForwardReport, SettlementProbabilityWalkForwardWindow,
     SingleFactorReview, ThreeLayerArchive, TradeFormationPathRow, TradeFormationReviewOptions,
     TradeFormationReviewReport, TradeFormationRuleRow,
+};
+pub use markov::{
+    state_from_observation, DistanceBin, FlowBin, MarketState, MarkovEstimate, MarkovModel,
+    MispricingBin, MispricingEstimate, MispricingMarkov, MispricingTrainingRow, TimeBin,
 };
 #[cfg(feature = "rl")]
 pub use model::rl::{BinaryEventEnv, DqnAgent, Environment, ReplayBuffer};
