@@ -338,8 +338,7 @@ fn chainlink_reference_observation<'a, 'b>(
             present.insert(*event);
         }
     }
-    // A verified event promises at least one reference in [start-30s, end),
-    // so completeness is one causally usable unit per full five-minute event.
+    // Completeness is one causally usable reference per full five-minute event.
     Ok(TimeSeriesCoverageObservation {
         surface: CHAINLINK_REFERENCE_SURFACE.to_owned(),
         symbol: symbol.to_owned(),
@@ -383,9 +382,7 @@ fn polymarket_book_observation<'a, 'b>(
         }
     }
 
-    // The immutable evidence contract permits books only inside event lifetime.
-    // Therefore the canonical denominator is every 60-second bucket per token in
-    // that lifetime intersection; legacy DB discovery padding is intentionally absent.
+    // Count every event-lifetime bucket per token, without legacy discovery padding.
     let mut expected_buckets = 0_u64;
     let mut present = windows
         .keys()
@@ -619,7 +616,6 @@ mod tests {
         second.event_end = second.event_start + Duration::minutes(5);
         let contracts = [first, second];
         let mut references = contracts.iter().map(reference).collect::<Vec<_>>();
-
         let healthy = evaluate_time_series_coverage(
             &request,
             chainlink_reference_observation(
@@ -639,7 +635,6 @@ mod tests {
                 ..
             }
         ));
-
         references.pop();
         let missing = evaluate_time_series_coverage(
             &request,
@@ -706,7 +701,6 @@ mod tests {
                 ..
             }
         ));
-
         let delayed = books.last_mut().unwrap();
         delayed.source_time = contract.event_end - Duration::seconds(1);
         delayed.available_at = contract.event_end;
@@ -715,7 +709,6 @@ mod tests {
             polymarket_book_observation(&request, "BTCUSDT", [&contract], books.iter()).unwrap(),
         );
         assert_eq!(source_complete.status, AuditStatus::Ok);
-
         books.pop();
         let missing = evaluate_time_series_coverage(
             &request,
