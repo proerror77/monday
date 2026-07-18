@@ -51,8 +51,7 @@ pub(crate) fn usable_polymarket_book(
         && book.source_time >= contract.event_start
         && book.source_time < contract.event_end
         && book.available_at >= book.source_time
-        && book.available_at - book.source_time
-            <= Duration::seconds(maximum_source_delay_secs)
+        && book.available_at - book.source_time <= Duration::seconds(maximum_source_delay_secs)
         && book
             .bid_levels
             .as_ref()
@@ -364,11 +363,7 @@ fn chainlink_reference_observation<'a, 'b>(
         row_count = row_count
             .checked_add(1)
             .context("audit row count overflows")?;
-        if usable_polymarket_reference(
-            contract,
-            reference,
-            request.maximum_source_delay_secs,
-        ) {
+        if usable_polymarket_reference(contract, reference, request.maximum_source_delay_secs) {
             usable_row_count += 1;
             first_at = Some(first_at.map_or(reference.source_time, |value| {
                 value.min(reference.source_time)
