@@ -834,6 +834,39 @@ mod tests {
     }
 
     #[test]
+    fn equal_receive_times_across_segments_remain_in_the_timeline() {
+        let root = tempdir();
+        let (first, first_anchor) = write_triplet(root.path(), &valid_rows());
+        let second_rows = vec![
+            depth_row(START_NS + 400_000_000, 102, 101),
+            trade_row(START_NS + 450_000_000, 11),
+            checkpoint_row(START_NS + 500_000_000, 102),
+        ];
+        let (second, second_anchor) = write_triplet(root.path(), &second_rows);
+        let verified = verify_binance_market_tape(vec![
+            seal_binance_market_tape_triplet(&first, &first_anchor).unwrap(),
+            seal_binance_market_tape_triplet(&second, &second_anchor).unwrap(),
+        ])
+        .unwrap();
+
+        let event_times = verified.replayed_books()[0]
+            .events()
+            .iter()
+            .map(ReplayedBinanceBookEvent::received_at_ns)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_times,
+            vec![
+                START_NS + 100_000_000,
+                START_NS + 200_000_000,
+                START_NS + 400_000_000,
+                START_NS + 400_000_000,
+                START_NS + 500_000_000,
+            ]
+        );
+    }
+
+    #[test]
     fn mixed_capture_sessions_are_rejected() {
         let root = tempdir();
         let mut rows = valid_rows();
