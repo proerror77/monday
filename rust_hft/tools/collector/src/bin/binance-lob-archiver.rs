@@ -2977,12 +2977,12 @@ mod tests {
             .expect("zstd is required for segment lifecycle tests")
             .status
             .success());
-        let root = env::temp_dir().join(format!(
-            "monday-scheduled-segment-open-test-{}",
-            now_ns().unwrap()
-        ));
+        let root = tempfile::Builder::new()
+            .prefix("monday-scheduled-segment-open-test-")
+            .tempdir()
+            .unwrap();
         let mut config = test_config("http://unused".into());
-        config.spool_dir = root.clone();
+        config.spool_dir = root.path().to_path_buf();
         config.symbols = vec!["BTCUSDT".into()];
         let mut state = OrderBookState::new("BTCUSDT", Market::Spot);
         let mut budget = PendingBudget::new(1);
@@ -3082,7 +3082,6 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .any(|event| event["type"] == "checkpoint" && event["reason"] == "segment_open"));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
