@@ -106,6 +106,9 @@ impl DepthSourceClockSequenceValidator {
         if let Some((previous_event_time, previous_transaction_time, previous_final_update_id)) =
             self.last.get(&clock.symbol).copied()
         {
+            let expected_update_id = previous_final_update_id
+                .checked_add(1)
+                .context("depth update id overflow")?;
             if let Some(reported_previous_id) = clock.previous_final_update_id {
                 if reported_previous_id > previous_final_update_id {
                     anyhow::bail!("{} depth previous-update gap", clock.symbol);
@@ -113,11 +116,7 @@ impl DepthSourceClockSequenceValidator {
                 if reported_previous_id < previous_final_update_id {
                     anyhow::bail!("{} depth previous-update rollback", clock.symbol);
                 }
-            }
-            let expected_update_id = previous_final_update_id
-                .checked_add(1)
-                .context("depth update id overflow")?;
-            if clock.first_update_id > expected_update_id {
+            } else if clock.first_update_id > expected_update_id {
                 anyhow::bail!(
                     "{} depth sequence gap expected={} received={}",
                     clock.symbol,
@@ -481,6 +480,37 @@ mod tests {
         let mut sequence = DepthSourceClockSequenceValidator::default();
         sequence.observe(&reconnect_origin).unwrap();
         sequence.observe(&overlapping_next).unwrap();
+    }
+
+    #[test]
+    fn depth_sequence_accepts_futures_pu_continuity_with_nonconsecutive_first_id() {
+        let received_at_ns = 1_700_000_000_100_000_000;
+        let first = DepthSourceClock::from_frame(
+            &depth_frame_with_sequence(
+                1_700_000_000_000,
+                None,
+                11_074_967_399_926,
+                11_074_967_403_842,
+                Some(11_074_967_399_747),
+            ),
+            received_at_ns,
+        )
+        .unwrap();
+        let next = DepthSourceClock::from_frame(
+            &depth_frame_with_sequence(
+                1_700_000_000_001,
+                None,
+                11_074_967_403_847,
+                11_074_967_407_986,
+                Some(11_074_967_403_842),
+            ),
+            received_at_ns,
+        )
+        .unwrap();
+
+        let mut sequence = DepthSourceClockSequenceValidator::default();
+        sequence.observe(&first).unwrap();
+        sequence.observe(&next).unwrap();
     }
 
     #[test]
