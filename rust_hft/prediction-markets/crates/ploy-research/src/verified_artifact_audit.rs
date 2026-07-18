@@ -700,16 +700,17 @@ mod tests {
         assert_ts(&evaluate(&books), AuditStatus::Ok, (10, 10), 0, (0, 1));
         books.pop();
         let ask_levels = books[0].ask_levels.take();
-        assert_ts(&evaluate(&books), AuditStatus::Critical, (10, 9), 60, (0, 1));
+        let result = evaluate(&books);
+        assert_ts(&result, AuditStatus::Critical, (10, 9), 60, (0, 1));
         books[0].ask_levels = ask_levels;
         books[0].available_at += Duration::seconds(31);
-        assert_ts(&evaluate(&books), AuditStatus::Critical, (10, 9), 60, (0, 1));
+        let result = evaluate(&books);
+        assert_ts(&result, AuditStatus::Critical, (10, 9), 60, (0, 1));
         books[0].available_at = books[0].source_time;
         let delayed = books.last_mut().unwrap();
         delayed.source_time = contract.event_end - Duration::seconds(1);
         delayed.available_at = contract.event_end;
-        let source_complete = evaluate(&books);
-        assert_eq!(source_complete.status, AuditStatus::Ok);
+        assert_eq!(evaluate(&books).status, AuditStatus::Ok);
         books.pop();
         let mut missing =
             polymarket_book_observation(&request, "BTCUSDT", [&contract], books.iter()).unwrap();
