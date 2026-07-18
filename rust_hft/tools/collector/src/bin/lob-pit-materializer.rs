@@ -1,25 +1,25 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
 use data::binance_lob_replay::{
-    source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceValidator,
+    source_revision as governed_source_revision, Market as LobMarket, ReplaySequenceEvent,
+};
+use data::binance_market_tape_artifact::{
+    seal_binance_market_tape_triplet, verify_binance_market_tape, BinanceMarketTapeTriplet,
+    BinanceMarketTapeTrustAnchor, ReplayedBinanceBookEvent, VerifiedBinanceMarketTape,
 };
 use hft_collector::{DataModality, PointInTimeFeatureRow};
 use rust_decimal::{prelude::ToPrimitive, Decimal};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
 };
 
-const RAW_SCHEMA: &str = "binance.lob_tape.v2";
 const MATERIALIZATION_SCHEMA: &str = "binance-lob-pit-v1";
-const MAX_PENDING_DIFFS: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Market {
@@ -32,6 +32,13 @@ impl Market {
         match self {
             Self::Spot => "spot",
             Self::Usdm => "usdm",
+        }
+    }
+
+    fn as_lob_market(self) -> LobMarket {
+        match self {
+            Self::Spot => LobMarket::Spot,
+            Self::Usdm => LobMarket::Usdm,
         }
     }
 }
@@ -56,24 +63,12 @@ struct Args {
     top_depth: usize,
     #[arg(long, required = true)]
     segment: Vec<PathBuf>,
+    #[arg(long, required = true)]
+    segment_content_sha256: Vec<String>,
+    #[arg(long, required = true)]
+    segment_manifest_sha256: Vec<String>,
     #[arg(long)]
     artifact_dir: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawSegmentManifest {
-    schema: String,
-    venue: String,
-    market: String,
-    file: String,
-    bytes: u64,
-    sha256: String,
-    events: u64,
-    event_types: BTreeMap<String, u64>,
-    has_replay_safe_checkpoint: bool,
-    start_received_at_ns: u64,
-    end_received_at_ns: u64,
-    symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,22 +84,8 @@ struct SourceSegmentEvidence {
     events: u64,
 }
 
-#[derive(Debug, Clone)]
-struct VerifiedSegment {
-    evidence: SourceSegmentEvidence,
-}
-
-impl VerifiedSegment {
-    fn path(&self) -> &Path {
-        &self.evidence.path
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 struct BookState {
-    session_id: String,
-    last_update_id: u64,
-    bridged: bool,
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
 }
@@ -149,51 +130,32 @@ struct PublishedMaterialization {
 }
 
 struct Replay {
-    market: Market,
-    symbol: String,
     bucket_ns: u64,
     depth: usize,
     state: Option<BookState>,
-    pending_diffs: Vec<Value>,
     samples: Vec<BookSample>,
     next_bucket_ns: Option<u64>,
     series_id: u64,
-    saw_seed: bool,
-    sequence_validator: ReplaySequenceValidator,
 }
 
 impl Replay {
-    fn new(market: Market, symbol: String, bucket_ns: u64, depth: usize) -> Result<Self> {
-        let sequence_validator = ReplaySequenceValidator::new(
-            match market {
-                Market::Spot => LobMarket::Spot,
-                Market::Usdm => LobMarket::Usdm,
-            },
-            &symbol,
-        )?;
-        Ok(Self {
-            market,
-            symbol,
+    fn new(bucket_ns: u64, depth: usize) -> Self {
+        Self {
             bucket_ns,
             depth,
             state: None,
-            pending_diffs: Vec::new(),
             samples: Vec::new(),
             next_bucket_ns: None,
             series_id: 0,
-            saw_seed: false,
-            sequence_validator,
-        })
+        }
     }
 
     fn start_series(&mut self, state: BookState, received_at_ns: u64) -> Result<()> {
         self.state = Some(state);
-        self.pending_diffs.clear();
         self.series_id = self
             .series_id
             .checked_add(1)
             .context("series id overflow")?;
-        self.saw_seed = true;
         self.next_bucket_ns = Some(ceil_bucket(received_at_ns, self.bucket_ns)?);
         Ok(())
     }
@@ -234,95 +196,44 @@ impl Replay {
         }
     }
 
-    fn ensure_series_can_be_replaced(&self) -> Result<()> {
-        if self.state.as_ref().is_some_and(|state| !state.bridged) {
-            bail!("snapshot-only replay series cannot be replaced before its first valid diff");
-        }
-        Ok(())
-    }
-
-    fn process_event(&mut self, event: Value) -> Result<()> {
-        let received_at_ns = json_u64(&event, "received_at_ns")?;
-        let event_type = event
-            .get("type")
-            .and_then(Value::as_str)
-            .context("event has no type")?;
-        self.sequence_validator.observe(
-            event_type,
-            event.as_object().context("event is not an object")?,
-            received_at_ns,
-        )?;
-        match event_type {
-            "sequence_gap" => bail!("LOB tape contains a sequence gap event"),
-            "snapshot" => self.process_snapshot(event, received_at_ns),
-            "checkpoint" => self.process_checkpoint(event, received_at_ns),
-            "diff" => self.process_diff(event, received_at_ns),
-            _ => Ok(()),
-        }
-    }
-
-    fn process_snapshot(&mut self, event: Value, received_at_ns: u64) -> Result<()> {
-        let mut snapshot = install_snapshot(&event)?;
-        for pending in &self.pending_diffs {
-            if event_session_id(pending)? != snapshot.session_id {
-                bail!("buffered diff session does not match its snapshot");
+    fn consume(&mut self, events: &[ReplayedBinanceBookEvent]) -> Result<()> {
+        let mut start = 0;
+        while start < events.len() {
+            let received_at_ns = events[start].received_at_ns();
+            let mut end = start + 1;
+            while end < events.len() && events[end].received_at_ns() == received_at_ns {
+                end += 1;
             }
-            apply_diff(&mut snapshot, pending, &self.symbol, self.market)?;
-        }
-        if self.state.is_some() {
-            self.ensure_series_can_be_replaced()?;
             self.emit_before(received_at_ns)?;
-        }
-        self.start_series(snapshot, received_at_ns)?;
-        self.emit_at(received_at_ns)
-    }
-
-    fn process_checkpoint(&mut self, event: Value, received_at_ns: u64) -> Result<()> {
-        let checkpoint = install_checkpoint(&event)?;
-        match self.state.as_ref() {
-            None if !self.pending_diffs.is_empty() => bail!(
-                "diffs arrived before replay seed; include a segment with the opening snapshot"
-            ),
-            None => self.start_series(checkpoint, received_at_ns)?,
-            Some(state) if state.session_id != checkpoint.session_id => {
-                self.ensure_series_can_be_replaced()?;
-                self.start_series(checkpoint, received_at_ns)?
-            }
-            Some(_) => {
-                self.emit_before(received_at_ns)?;
-                if self.state.as_ref() != Some(&checkpoint) {
-                    bail!("checkpoint does not match replayed order book");
+            for event in &events[start..end] {
+                match event {
+                    ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                        bids,
+                        asks,
+                        ..
+                    }) => self.start_series(
+                        BookState {
+                            bids: parse_levels(bids, "bid")?,
+                            asks: parse_levels(asks, "ask")?,
+                        },
+                        received_at_ns,
+                    )?,
+                    ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                        bids,
+                        asks,
+                        ..
+                    }) => {
+                        let state = self.state.as_mut().context("diff has no replay state")?;
+                        apply_levels(&mut state.bids, bids, "bid")?;
+                        apply_levels(&mut state.asks, asks, "ask")?;
+                    }
+                    ReplayedBinanceBookEvent::Checkpoint { .. } => {}
                 }
             }
+            self.emit_at(received_at_ns)?;
+            start = end;
         }
-        self.emit_at(received_at_ns)
-    }
-
-    fn process_diff(&mut self, event: Value, received_at_ns: u64) -> Result<()> {
-        let session_id = event_session_id(&event)?.to_string();
-        let Some(current_session) = self.state.as_ref().map(|state| state.session_id.clone())
-        else {
-            self.pending_diffs.push(event);
-            if self.pending_diffs.len() > MAX_PENDING_DIFFS {
-                bail!("too many diffs buffered before replay seed");
-            }
-            return Ok(());
-        };
-        if session_id != current_session {
-            self.ensure_series_can_be_replaced()?;
-            self.state = None;
-            self.next_bucket_ns = None;
-            self.pending_diffs = vec![event];
-            return Ok(());
-        }
-        self.emit_before(received_at_ns)?;
-        apply_diff(
-            self.state.as_mut().context("diff has no replay state")?,
-            &event,
-            &self.symbol,
-            self.market,
-        )?;
-        self.emit_at(received_at_ns)
+        Ok(())
     }
 }
 
@@ -342,45 +253,36 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     if args.bucket_ms == 0 || args.label_horizon_buckets == 0 || args.top_depth == 0 {
         bail!("bucket, label horizon, and top depth must be positive");
     }
-    let mut segments = args
-        .segment
+    let (verified, segment_paths) = verify_segments(args)?;
+    if verified
+        .segments()
         .iter()
-        .map(|path| verify_segment(path, args.market, &symbol))
-        .collect::<Result<Vec<_>>>()?;
-    segments.sort_by_key(|segment| segment.evidence.start_received_at_ns);
-    if segments.is_empty() {
-        bail!("at least one LOB segment is required");
-    }
-    let mut unique_hashes = BTreeSet::new();
-    if segments
-        .iter()
-        .any(|segment| !unique_hashes.insert(segment.evidence.sha256.clone()))
+        .any(|segment| segment.market != args.market.as_lob_market())
     {
-        bail!("duplicate LOB segment supplied");
+        bail!("verified market-tape does not match requested market");
     }
+    let source_segments = source_segment_evidence(&verified, segment_paths)?;
+    let book = verified
+        .replayed_books()
+        .iter()
+        .find(|book| book.symbol == symbol)
+        .with_context(|| {
+            format!("verified market-tape does not contain requested symbol {symbol}")
+        })?;
 
     let bucket_ns = args
         .bucket_ms
         .checked_mul(1_000_000)
         .context("bucket size overflow")?;
-    let mut replay = Replay::new(args.market, symbol.clone(), bucket_ns, args.top_depth)?;
-    for segment in &segments {
-        replay_segment(segment.path(), &symbol, &mut replay)?;
-    }
-    if !replay.saw_seed {
-        bail!("no replay seed found for {symbol}");
-    }
-    if replay.state.as_ref().is_some_and(|state| !state.bridged) {
-        bail!("snapshot-only replay series never received a valid first diff");
-    }
-    replay.sequence_validator.finish()?;
+    let mut replay = Replay::new(bucket_ns, args.top_depth);
+    replay.consume(book.events())?;
 
-    let revision = source_revision(&segments);
+    let revision = source_revision(&source_segments);
     let created_at = Utc::now();
     let ingestion_time = datetime_ns(
-        segments
+        source_segments
             .iter()
-            .map(|segment| segment.evidence.end_received_at_ns)
+            .map(|segment| segment.end_received_at_ns)
             .max()
             .context("segments have no end time")?,
     )?;
@@ -408,10 +310,7 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
         label_horizon_buckets: args.label_horizon_buckets,
         top_depth: args.top_depth,
         source_revision: revision,
-        source_segments: segments
-            .into_iter()
-            .map(|segment| segment.evidence)
-            .collect(),
+        source_segments,
         rows: rows.len(),
         first_event_time: rows.first().context("feature rows are empty")?.event_time,
         last_event_time: rows.last().context("feature rows are empty")?.event_time,
@@ -432,213 +331,70 @@ fn materialize(args: &Args) -> Result<PublishedMaterialization> {
     })
 }
 
-fn verify_segment(path: &Path, market: Market, symbol: &str) -> Result<VerifiedSegment> {
-    let manifest_path = sibling(path, ".manifest.json")?;
-    let success_path = sibling(path, "._SUCCESS")?;
-    if !path.is_file() || !manifest_path.is_file() || !success_path.is_file() {
+fn verify_segments(args: &Args) -> Result<(VerifiedBinanceMarketTape, BTreeMap<String, PathBuf>)> {
+    let count = args.segment.len();
+    if count == 0
+        || args.segment_content_sha256.len() != count
+        || args.segment_manifest_sha256.len() != count
+    {
         bail!(
-            "segment requires data, manifest, and _SUCCESS files: {}",
-            path.display()
+            "--segment, --segment-content-sha256, and --segment-manifest-sha256 must have equal nonzero lengths"
         );
     }
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
-    let manifest: RawSegmentManifest = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("invalid segment manifest {}", manifest_path.display()))?;
-    if manifest.schema != RAW_SCHEMA
-        || manifest.venue != "binance"
-        || manifest.market != market.as_str()
-        || manifest.file != file_name(path)?
-        || manifest.bytes != path.metadata()?.len()
-    {
-        bail!("segment manifest identity mismatch: {}", path.display());
-    }
-    if !manifest
-        .symbols
+    let mut paths = BTreeMap::new();
+    let mut sealed = Vec::with_capacity(count);
+    for ((path, content_sha256), manifest_sha256) in args
+        .segment
         .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(symbol))
+        .zip(&args.segment_content_sha256)
+        .zip(&args.segment_manifest_sha256)
     {
-        bail!(
-            "segment does not declare symbol {symbol}: {}",
-            path.display()
-        );
-    }
-    if manifest
-        .event_types
-        .get("sequence_gap")
-        .copied()
-        .unwrap_or(0)
-        > 0
-    {
-        bail!(
-            "segment manifest contains a sequence gap: {}",
-            path.display()
-        );
-    }
-    if !manifest.has_replay_safe_checkpoint {
-        bail!("segment is not marked replay safe: {}", path.display());
-    }
-    let success_bytes = std::fs::read(&success_path)
-        .with_context(|| format!("failed to read {}", success_path.display()))?;
-    let success_marker_sha256 = hex::encode(Sha256::digest(&success_bytes));
-    let success_hash = std::str::from_utf8(&success_bytes)
-        .with_context(|| format!("invalid _SUCCESS marker {}", success_path.display()))?
-        .trim();
-    if success_hash != manifest.sha256 {
-        bail!(
-            "_SUCCESS marker does not match manifest: {}",
-            path.display()
-        );
-    }
-    let actual_hash = sha256_file(path)?;
-    if actual_hash != manifest.sha256 {
-        bail!("segment SHA256 does not match manifest: {}", path.display());
-    }
-    if manifest.events == 0 || manifest.end_received_at_ns < manifest.start_received_at_ns {
-        bail!(
-            "segment time bounds or event count are invalid: {}",
-            path.display()
-        );
-    }
-    Ok(VerifiedSegment {
-        evidence: SourceSegmentEvidence {
-            path: path.to_path_buf(),
-            sha256: actual_hash,
-            collector_manifest_path: manifest_path,
-            collector_manifest_sha256: manifest_sha256,
-            success_marker_path: success_path,
-            success_marker_sha256,
-            start_received_at_ns: manifest.start_received_at_ns,
-            end_received_at_ns: manifest.end_received_at_ns,
-            events: manifest.events,
-        },
-    })
-}
-
-fn replay_segment(segment: &Path, symbol: &str, replay: &mut Replay) -> Result<()> {
-    let mut child = Command::new("zstd")
-        .args(["-q", "-dc"])
-        .arg(segment)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start zstd for {}", segment.display()))?;
-    let stdout = child.stdout.take().context("zstd stdout is unavailable")?;
-    let result: Result<()> = (|| {
-        for (index, line) in BufReader::new(stdout).lines().enumerate() {
-            let line = line.with_context(|| {
-                format!("failed to read {} line {}", segment.display(), index + 1)
-            })?;
-            if !line.contains(symbol) {
-                continue;
-            }
-            let event: Value = serde_json::from_str(&line).with_context(|| {
-                format!("invalid JSON in {} line {}", segment.display(), index + 1)
-            })?;
-            if event_symbol(&event).as_deref() == Some(symbol) {
-                replay.process_event(event)?;
-            }
+        if paths.insert(content_sha256.clone(), path.clone()).is_some() {
+            bail!("duplicate LOB segment supplied");
         }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = child.kill();
+        let triplet = BinanceMarketTapeTriplet {
+            data: path.clone(),
+            manifest: sibling(path, ".manifest.json")?,
+            success: sibling(path, "._SUCCESS")?,
+        };
+        let trust = BinanceMarketTapeTrustAnchor::from_lower_hex(content_sha256, manifest_sha256)?;
+        sealed.push(seal_binance_market_tape_triplet(&triplet, &trust)?);
     }
-    let output = child.wait_with_output()?;
-    result?;
-    if !output.status.success() {
-        bail!(
-            "zstd failed for {}: {}",
-            segment.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
+    Ok((verify_binance_market_tape(sealed)?, paths))
 }
 
-fn install_snapshot(event: &Value) -> Result<BookState> {
-    let snapshot = event
-        .get("snapshot")
-        .and_then(Value::as_object)
-        .context("snapshot event has no snapshot payload")?;
-    Ok(BookState {
-        session_id: event_session_id(event)?.to_string(),
-        last_update_id: object_u64(snapshot, "lastUpdateId")?,
-        bridged: false,
-        bids: parse_levels(snapshot.get("bids"), "bid")?,
-        asks: parse_levels(snapshot.get("asks"), "ask")?,
-    })
+fn source_segment_evidence(
+    verified: &VerifiedBinanceMarketTape,
+    mut paths: BTreeMap<String, PathBuf>,
+) -> Result<Vec<SourceSegmentEvidence>> {
+    verified
+        .segments()
+        .iter()
+        .map(|segment| {
+            let path = paths
+                .remove(&segment.content_sha256)
+                .context("verified segment has no matching CLI path")?;
+            Ok(SourceSegmentEvidence {
+                collector_manifest_path: sibling(&path, ".manifest.json")?,
+                success_marker_path: sibling(&path, "._SUCCESS")?,
+                success_marker_sha256: hex::encode(Sha256::digest(format!(
+                    "{}\n",
+                    segment.content_sha256
+                ))),
+                path,
+                sha256: segment.content_sha256.clone(),
+                collector_manifest_sha256: segment.manifest_sha256.clone(),
+                start_received_at_ns: segment.start_received_at_ns,
+                end_received_at_ns: segment.end_received_at_ns,
+                events: segment.events,
+            })
+        })
+        .collect()
 }
 
-fn install_checkpoint(event: &Value) -> Result<BookState> {
-    if event.get("replay_safe").and_then(Value::as_bool) != Some(true)
-        || event.get("synced").and_then(Value::as_bool) != Some(true)
-    {
-        bail!("checkpoint is not replay safe");
-    }
-    Ok(BookState {
-        session_id: event_session_id(event)?.to_string(),
-        last_update_id: json_u64(event, "last_update_id")?,
-        bridged: event
-            .get("bridged")
-            .and_then(Value::as_bool)
-            .context("checkpoint has no bridged state")?,
-        bids: parse_levels(event.get("bids"), "bid")?,
-        asks: parse_levels(event.get("asks"), "ask")?,
-    })
-}
-
-fn apply_diff(state: &mut BookState, event: &Value, symbol: &str, market: Market) -> Result<()> {
-    let frame = event
-        .get("frame")
-        .and_then(Value::as_object)
-        .context("diff event has no frame")?;
-    let data = frame
-        .get("data")
-        .and_then(Value::as_object)
-        .context("diff event has no data")?;
-    if object_str(data, "s")?.to_uppercase() != symbol {
-        bail!("diff event identity is invalid");
-    }
-    if event_session_id(event)? != state.session_id {
-        bail!("diff session does not match replay state");
-    }
-    let first_update_id = object_u64(data, "U")?;
-    let final_update_id = object_u64(data, "u")?;
-    if final_update_id <= state.last_update_id {
-        return Ok(());
-    }
-    if first_update_id > final_update_id {
-        bail!("diff update range is reversed");
-    }
-    let previous_update_id = data.get("pu").and_then(Value::as_u64);
-    let mut expected = state.last_update_id + u64::from(market == Market::Spot);
-    let accepted = if !state.bridged {
-        let previous_matches = market == Market::Usdm
-            && previous_update_id.is_some_and(|previous| previous == state.last_update_id);
-        previous_matches || first_update_id <= expected && expected <= final_update_id
-    } else if market == Market::Usdm {
-        expected = state.last_update_id;
-        previous_update_id.is_some_and(|previous| previous == state.last_update_id)
-    } else {
-        first_update_id <= expected && expected <= final_update_id
-    };
-    if !accepted {
-        bail!(
-            "Binance sequence gap: expected {expected}, received {first_update_id}-{final_update_id}"
-        );
-    }
-    apply_levels(&mut state.bids, data.get("b"), "bid")?;
-    apply_levels(&mut state.asks, data.get("a"), "ask")?;
-    state.last_update_id = final_update_id;
-    state.bridged = true;
-    Ok(())
-}
-
-fn parse_levels(value: Option<&Value>, side: &str) -> Result<BTreeMap<Decimal, Decimal>> {
+fn parse_levels(levels: &[[String; 2]], side: &str) -> Result<BTreeMap<Decimal, Decimal>> {
     let mut parsed = BTreeMap::new();
-    for (price, quantity) in validated_levels(value, side)? {
+    for (price, quantity) in validated_levels(levels, side)? {
         if !quantity.is_zero() {
             parsed.insert(price, quantity);
         }
@@ -648,10 +404,10 @@ fn parse_levels(value: Option<&Value>, side: &str) -> Result<BTreeMap<Decimal, D
 
 fn apply_levels(
     book: &mut BTreeMap<Decimal, Decimal>,
-    value: Option<&Value>,
+    levels: &[[String; 2]],
     side: &str,
 ) -> Result<()> {
-    for (price, quantity) in validated_levels(value, side)? {
+    for (price, quantity) in validated_levels(levels, side)? {
         if quantity.is_zero() {
             book.remove(&price);
         } else {
@@ -661,19 +417,16 @@ fn apply_levels(
     Ok(())
 }
 
-fn validated_levels(value: Option<&Value>, side: &str) -> Result<Vec<(Decimal, Decimal)>> {
-    let levels = value
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("{side} levels are not an array"))?;
+fn validated_levels(levels: &[[String; 2]], side: &str) -> Result<Vec<(Decimal, Decimal)>> {
     levels
         .iter()
-        .map(|level| {
-            let pair = level
-                .as_array()
-                .filter(|pair| pair.len() == 2)
-                .ok_or_else(|| anyhow!("invalid {side} price level"))?;
-            let price = decimal_value(&pair[0], side)?;
-            let quantity = decimal_value(&pair[1], side)?;
+        .map(|[price, quantity]| {
+            let price = price
+                .parse::<Decimal>()
+                .with_context(|| format!("invalid decimal in {side} levels"))?;
+            let quantity = quantity
+                .parse::<Decimal>()
+                .with_context(|| format!("invalid decimal in {side} levels"))?;
             if price <= Decimal::ZERO || quantity < Decimal::ZERO {
                 bail!("invalid {side} price or quantity");
             }
@@ -835,12 +588,8 @@ fn publish_immutable(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
-fn source_revision(segments: &[VerifiedSegment]) -> String {
-    governed_source_revision(
-        segments
-            .iter()
-            .map(|segment| segment.evidence.sha256.as_str()),
-    )
+fn source_revision(segments: &[SourceSegmentEvidence]) -> String {
+    governed_source_revision(segments.iter().map(|segment| segment.sha256.as_str()))
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -868,57 +617,6 @@ fn file_name(path: &Path) -> Result<String> {
         .context("path has no UTF-8 file name")
 }
 
-fn json_u64(value: &Value, field: &str) -> Result<u64> {
-    value
-        .get(field)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("{field} is not an unsigned integer"))
-}
-
-fn object_u64(value: &serde_json::Map<String, Value>, field: &str) -> Result<u64> {
-    value
-        .get(field)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("{field} is not an unsigned integer"))
-}
-
-fn object_str<'a>(value: &'a serde_json::Map<String, Value>, field: &str) -> Result<&'a str> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("{field} is not text"))
-}
-
-fn event_session_id(event: &Value) -> Result<&str> {
-    event
-        .get("session_id")
-        .and_then(Value::as_str)
-        .context("event session id is invalid")
-}
-
-fn event_symbol(event: &Value) -> Option<String> {
-    match event.get("type").and_then(Value::as_str) {
-        Some("diff") => event
-            .get("frame")?
-            .get("data")?
-            .get("s")?
-            .as_str()
-            .map(str::to_uppercase),
-        Some("snapshot" | "checkpoint" | "sequence_gap") => {
-            event.get("symbol")?.as_str().map(str::to_uppercase)
-        }
-        _ => None,
-    }
-}
-
-fn decimal_value(value: &Value, side: &str) -> Result<Decimal> {
-    let text = value
-        .as_str()
-        .ok_or_else(|| anyhow!("{side} decimal is not text"))?;
-    text.parse()
-        .with_context(|| format!("invalid decimal in {side} levels"))
-}
-
 fn decimal_f64(value: Decimal) -> Result<f64> {
     value
         .to_f64()
@@ -941,109 +639,114 @@ fn datetime_ns(value: u64) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use serde_json::{json, Value};
+    use std::{
+        io::{BufRead, BufReader},
+        process::Command,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
+    const START_NS: u64 = 1_783_987_200_000_000_000;
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
-    fn event_ns(second: f64) -> u64 {
-        1_783_987_200_000_000_000 + (second * 1_000_000_000.0) as u64
+    fn event_ns(milliseconds: u64) -> u64 {
+        START_NS + milliseconds * 1_000_000
     }
 
+    fn level(price: &str, quantity: &str) -> [String; 2] {
+        [price.to_string(), quantity.to_string()]
+    }
+
+    #[rustfmt::skip]
     fn diff(
-        second: f64,
+        milliseconds: u64,
         first: u64,
         final_id: u64,
         previous: u64,
         bids: Value,
         asks: Value,
     ) -> Value {
+        let received_at_ns = event_ns(milliseconds);
         json!({
-            "received_at_ns": event_ns(second),
+            "schema": "binance.market_tape.v1",
+            "received_at_ns": received_at_ns,
             "type": "diff",
             "session_id": "session-1",
             "frame": {"stream": "btcusdt@depth@100ms", "data": {
-                "e": "depthUpdate", "E": event_ns(second) / 1_000_000,
-                "s": "BTCUSDT", "U": first, "u": final_id, "pu": previous,
-                "b": bids, "a": asks
+                "e": "depthUpdate",
+                "E": received_at_ns / 1_000_000,
+                "T": received_at_ns / 1_000_000,
+                "s": "BTCUSDT",
+                "U": first,
+                "u": final_id,
+                "pu": previous,
+                "b": bids,
+                "a": asks
             }}
         })
     }
 
-    fn snapshot() -> Value {
+    #[rustfmt::skip]
+    fn trade(milliseconds: u64) -> Value {
+        let received_at_ns = event_ns(milliseconds);
         json!({
-            "received_at_ns": event_ns(0.1),
-            "type": "snapshot",
+            "schema": "binance.market_tape.v1",
+            "received_at_ns": received_at_ns,
+            "type": "agg_trade",
             "session_id": "session-1",
-            "symbol": "BTCUSDT",
-            "snapshot": {"lastUpdateId": 100, "bids": [["100", "10"], ["99", "5"]], "asks": [["102", "4"], ["103", "6"]]}
+            "frame": {"stream": "btcusdt@aggTrade", "data": {
+                "e": "aggTrade",
+                "E": received_at_ns / 1_000_000,
+                "s": "BTCUSDT",
+                "a": 10,
+                "p": "100.5",
+                "q": "2",
+                "f": 10,
+                "l": 10,
+                "T": received_at_ns / 1_000_000,
+                "m": false
+            }}
         })
     }
 
-    fn checkpoint() -> Value {
-        json!({
-            "received_at_ns": event_ns(6.5),
-            "type": "checkpoint",
-            "reason": "scheduled",
-            "replay_safe": true,
-            "session_id": "session-1",
-            "symbol": "BTCUSDT",
-            "last_update_id": 181,
-            "synced": true,
-            "bridged": true,
-            "bids": [["100", "12"], ["99", "5"]],
-            "asks": [["101.5", "5"], ["102", "4"], ["103", "6"]]
-        })
-    }
-
-    fn snapshot_only_checkpoint() -> Value {
-        json!({
-            "received_at_ns": event_ns(0.2),
-            "type": "checkpoint",
-            "reason": "scheduled",
-            "replay_safe": true,
-            "session_id": "session-1",
-            "symbol": "BTCUSDT",
-            "last_update_id": 100,
-            "synced": true,
-            "bridged": false,
-            "bids": [["100", "10"], ["99", "5"]],
-            "asks": [["102", "4"], ["103", "6"]]
-        })
-    }
-
-    fn valid_events() -> Vec<Value> {
+    #[rustfmt::skip]
+    fn valid_rows() -> Vec<Value> {
         vec![
-            diff(0.05, 99, 101, 98, json!([]), json!([["101", "8"]])),
-            snapshot(),
-            diff(0.6, 150, 175, 101, json!([["100", "10"]]), json!([])),
-            diff(1.4, 176, 176, 175, json!([]), json!([["101", "0"]])),
-            diff(2.4, 177, 177, 176, json!([["101", "3"]]), json!([])),
-            diff(3.4, 178, 178, 177, json!([]), json!([["101.5", "4"]])),
-            diff(4.4, 179, 179, 178, json!([["101", "0"]]), json!([])),
-            diff(5.4, 180, 180, 179, json!([["100", "12"]]), json!([])),
-            diff(6.4, 181, 181, 180, json!([]), json!([["101.5", "5"]])),
-            checkpoint(),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(0),"type":"session_start","session_id":"session-1","market":"usdm","symbols":1,"websocket_shards":1}),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(100),"type":"snapshot","session_id":"session-1","symbol":"BTCUSDT","request_started_at_ns":event_ns(50),"snapshot":{"lastUpdateId":100,"bids":[["100","10"],["99","5"]],"asks":[["102","4"],["103","6"]]}}),
+            diff(600, 101, 175, 100, json!([["100", "10"]]), json!([["101", "8"]])),
+            trade(700),
+            diff(1_400, 176, 176, 175, json!([]), json!([["101", "0"]])),
+            diff(2_400, 177, 177, 176, json!([["101", "3"]]), json!([])),
+            diff(3_400, 178, 178, 177, json!([]), json!([["101.5", "4"]])),
+            diff(4_400, 179, 179, 178, json!([["101", "0"]]), json!([])),
+            diff(5_400, 180, 180, 179, json!([["100", "12"]]), json!([])),
+            diff(6_400, 181, 181, 180, json!([]), json!([["101.5", "5"]])),
+            json!({"schema":"binance.market_tape.v1","received_at_ns":event_ns(6_500),"type":"checkpoint","session_id":"session-1","symbol":"BTCUSDT","last_update_id":181,"synced":true,"bridged":true,"bids":[["100","12"],["99","5"]],"asks":[["101.5","5"],["102","4"],["103","6"]],"reason":"test","replay_safe":true}),
         ]
     }
 
     struct Fixture {
         directory: PathBuf,
         data: PathBuf,
+        manifest: PathBuf,
         success: PathBuf,
+        content_sha256: String,
+        manifest_sha256: String,
     }
 
     impl Fixture {
-        fn new(events: &[Value]) -> Self {
+        fn new(rows: &[Value]) -> Self {
             let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-            let directory = std::env::temp_dir()
+            let requested_directory = std::env::temp_dir()
                 .join(format!("lob-pit-materializer-{}-{id}", std::process::id()));
-            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::create_dir_all(&requested_directory).unwrap();
+            let directory = std::fs::canonicalize(requested_directory).unwrap();
             let raw = directory.join("part-1.jsonl");
             let data = directory.join("part-1.jsonl.zst");
             let mut raw_file = File::create(&raw).unwrap();
-            for event in events {
-                serde_json::to_writer(&mut raw_file, event).unwrap();
+            for row in rows {
+                serde_json::to_writer(&mut raw_file, row).unwrap();
                 raw_file.write_all(b"\n").unwrap();
             }
             assert!(Command::new("zstd")
@@ -1054,41 +757,60 @@ mod tests {
                 .status()
                 .unwrap()
                 .success());
-            if raw.exists() {
-                std::fs::remove_file(raw).unwrap();
-            }
-            let hash = sha256_file(&data).unwrap();
-            let event_types = events.iter().fold(BTreeMap::new(), |mut counts, event| {
+            std::fs::remove_file(raw).unwrap();
+
+            let content_sha256 = sha256_file(&data).unwrap();
+            let event_types = rows.iter().fold(BTreeMap::new(), |mut counts, row| {
                 *counts
-                    .entry(event["type"].as_str().unwrap().to_string())
+                    .entry(row["type"].as_str().unwrap().to_string())
                     .or_insert(0_u64) += 1;
                 counts
             });
-            let manifest = json!({
-                "schema": RAW_SCHEMA,
+            let manifest_value = json!({
+                "schema": "binance.market_tape.v1",
                 "venue": "binance",
                 "market": "usdm",
-                "file": "part-1.jsonl.zst",
-                "bytes": data.metadata().unwrap().len(),
-                "sha256": hash,
-                "events": events.len(),
+                "dataset": "usdm_all",
+                "shard_id": "all",
+                "mode": "diff",
+                "symbols": ["BTCUSDT"],
+                "security_token_symbols": [],
+                "excluded_symbols": [],
+                "snapshot_limit": 1_000,
+                "replay_scope": "captured_aggregate_trades_plus_snapshot_seed_plus_sequence_checked_diffs",
+                "venue_depth_complete": false,
+                "events": rows.len(),
                 "event_types": event_types,
                 "has_replay_safe_checkpoint": true,
-                "start_received_at_ns": events.first().unwrap()["received_at_ns"],
-                "end_received_at_ns": events.last().unwrap()["received_at_ns"],
-                "symbols": ["btcusdt"]
+                "snapshot_ready_count": 1,
+                "bridged_count": 1,
+                "snapshot_only_symbols": [],
+                "all_symbols_bridged": true,
+                "start_received_at_ns": rows.first().unwrap()["received_at_ns"],
+                "end_received_at_ns": rows.last().unwrap()["received_at_ns"],
+                "date": "2026-07-14",
+                "hour": "00",
+                "file": "part-1.jsonl.zst",
+                "bytes": data.metadata().unwrap().len(),
+                "sha256": content_sha256,
+                "trade_representation": "aggregate_trade_only",
+                "price_surface_derivation": "latest aggregate trade price"
             });
-            std::fs::write(
-                sibling(&data, ".manifest.json").unwrap(),
-                serde_json::to_vec(&manifest).unwrap(),
-            )
-            .unwrap();
+            let mut manifest_bytes = serde_json::to_vec(&manifest_value).unwrap();
+            manifest_bytes.push(b'\n');
+            let manifest = sibling(&data, ".manifest.json").unwrap();
+            std::fs::write(&manifest, &manifest_bytes).unwrap();
+            let manifest_sha256 = hex::encode(Sha256::digest(&manifest_bytes));
             let success = sibling(&data, "._SUCCESS").unwrap();
-            std::fs::write(&success, format!("{hash}\n")).unwrap();
+            std::fs::write(&success, format!("{content_sha256}\n")).unwrap();
+
             Self {
                 directory,
                 data,
+                manifest,
                 success,
+                content_sha256,
+                manifest_sha256,
             }
         }
 
@@ -1101,6 +823,8 @@ mod tests {
                 label_horizon_buckets: 2,
                 top_depth: 5,
                 segment: vec![self.data.clone()],
+                segment_content_sha256: vec![self.content_sha256.clone()],
+                segment_manifest_sha256: vec![self.manifest_sha256.clone()],
                 artifact_dir: self.directory.join("artifacts"),
             }
         }
@@ -1113,171 +837,90 @@ mod tests {
     }
 
     #[test]
-    fn rejects_segment_without_matching_success_marker() {
-        let fixture = Fixture::new(&valid_events());
-        std::fs::write(&fixture.success, format!("{}\n", "0".repeat(64))).unwrap();
+    fn rejects_mismatched_segment_argument_lengths_before_file_access() {
+        let args = Args {
+            mission_id: "data-btc-usdm-1".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            market: Market::Usdm,
+            bucket_ms: 1_000,
+            label_horizon_buckets: 2,
+            top_depth: 5,
+            segment: vec![PathBuf::from("/does/not/exist.jsonl.zst")],
+            segment_content_sha256: Vec::new(),
+            segment_manifest_sha256: vec!["0".repeat(64)],
+            artifact_dir: PathBuf::from("/does/not/matter"),
+        };
 
-        let error = materialize(&fixture.args()).unwrap_err().to_string();
+        let error = materialize(&args).unwrap_err().to_string();
 
-        assert!(error.contains("_SUCCESS marker"));
+        assert!(error.contains("equal nonzero lengths"));
     }
 
     #[test]
-    fn rejects_usdm_previous_update_gap_after_snapshot_bridge() {
-        let mut events = valid_events();
-        events[3]["frame"]["data"]["pu"] = json!(174);
-        let fixture = Fixture::new(&events);
+    fn rejects_bad_external_content_digest() {
+        let fixture = Fixture::new(&valid_rows());
+        let mut args = fixture.args();
+        args.segment_content_sha256[0] = "0".repeat(64);
 
-        let error = materialize(&fixture.args()).unwrap_err().to_string();
+        let error = materialize(&args).unwrap_err().to_string();
 
-        assert!(error.contains("Binance sequence gap"));
+        assert!(error.contains("trusted digest anchor"));
+        assert!(!args.artifact_dir.exists());
     }
 
     #[test]
-    fn rejects_closing_checkpoint_that_would_drop_unseeded_diffs() {
-        let fixture = Fixture::new(&[
-            diff(0.05, 99, 101, 98, json!([]), json!([["101", "8"]])),
-            checkpoint(),
-        ]);
+    fn same_timestamp_snapshot_and_diff_apply_before_one_sample() {
+        let received_at_ns = event_ns(1_000);
+        let events = vec![
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Snapshot {
+                received_at_ns,
+                bids: vec![level("100", "10")],
+                asks: vec![level("102", "4")],
+            }),
+            ReplayedBinanceBookEvent::Replay(ReplaySequenceEvent::Diff {
+                received_at_ns,
+                bids: vec![],
+                asks: vec![level("102", "0"), level("101", "4")],
+            }),
+            ReplayedBinanceBookEvent::Checkpoint { received_at_ns },
+        ];
+        let mut replay = Replay::new(1_000_000_000, 5);
 
-        let error = materialize(&fixture.args()).unwrap_err().to_string();
+        replay.consume(&events).unwrap();
 
-        assert!(error.contains("diffs arrived before replay seed"));
+        assert_eq!(replay.samples.len(), 1);
+        assert_eq!(replay.samples[0].time_ns, received_at_ns);
+        assert!((replay.samples[0].mid_price - 100.5).abs() < 1e-12);
+        assert!((replay.samples[0].ask_depth - 4.0).abs() < 1e-12);
     }
 
     #[test]
-    fn delayed_spot_diff_bridges_snapshot_only_checkpoint() {
-        let mut state = install_checkpoint(&snapshot_only_checkpoint()).unwrap();
-        assert!(!state.bridged);
-
-        apply_diff(
-            &mut state,
-            &diff(0.3, 101, 102, 100, json!([]), json!([["102", "3"]])),
-            "BTCUSDT",
-            Market::Spot,
-        )
-        .unwrap();
-
-        assert!(state.bridged);
-        assert_eq!(state.last_update_id, 102);
-    }
-
-    #[test]
-    fn delayed_usdm_diff_bridges_snapshot_only_checkpoint() {
-        let mut state = install_checkpoint(&snapshot_only_checkpoint()).unwrap();
-        assert!(!state.bridged);
-
-        apply_diff(
-            &mut state,
-            &diff(0.3, 101, 102, 100, json!([]), json!([["102", "3"]])),
-            "BTCUSDT",
-            Market::Usdm,
-        )
-        .unwrap();
-
-        assert!(state.bridged);
-        assert_eq!(state.last_update_id, 102);
-    }
-
-    #[test]
-    fn invalid_delayed_spot_diff_rejects_snapshot_only_checkpoint() {
-        let mut state = install_checkpoint(&snapshot_only_checkpoint()).unwrap();
-
-        let error = apply_diff(
-            &mut state,
-            &diff(0.3, 102, 102, 100, json!([]), json!([["102", "3"]])),
-            "BTCUSDT",
-            Market::Spot,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("Binance sequence gap"));
-        assert!(!state.bridged);
-    }
-
-    #[test]
-    fn invalid_delayed_usdm_diff_rejects_snapshot_only_checkpoint() {
-        let mut state = install_checkpoint(&snapshot_only_checkpoint()).unwrap();
-
-        let error = apply_diff(
-            &mut state,
-            &diff(0.3, 102, 102, 99, json!([]), json!([["102", "3"]])),
-            "BTCUSDT",
-            Market::Usdm,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("Binance sequence gap"));
-        assert!(!state.bridged);
-    }
-
-    #[test]
-    fn snapshot_only_checkpoints_never_publish_without_a_valid_first_diff() {
-        let mut events = Vec::new();
-        for second in [0.2, 3.2, 6.2] {
-            let mut checkpoint = snapshot_only_checkpoint();
-            checkpoint["received_at_ns"] = json!(event_ns(second));
-            events.push(checkpoint);
-        }
-        let fixture = Fixture::new(&events);
-
-        let error = materialize(&fixture.args()).unwrap_err().to_string();
-
-        assert!(error.contains("never received a valid first diff"));
-    }
-
-    #[test]
-    fn publishes_live_imbalance_and_binds_raw_sidecar_bytes() {
-        let fixture = Fixture::new(&valid_events());
+    fn preserves_report_evidence_and_point_in_time_rows() {
+        let fixture = Fixture::new(&valid_rows());
         let published = materialize(&fixture.args()).unwrap();
-        let first_row = BufReader::new(File::open(&published.report.artifact_path).unwrap())
-            .lines()
-            .next()
-            .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
-            .unwrap();
-        let manifest_path = sibling(&fixture.data, ".manifest.json").unwrap();
         let output = serde_json::to_value(&published).unwrap();
         let source = &output["report"]["source_segments"][0];
-
-        assert_eq!(
-            json!({
-                "book_imbalance": first_row.features.get("book_imbalance").copied(),
-                "book_imbalance_top5": first_row.features.get("book_imbalance_top5").copied(),
-                "collector_manifest_path": source["collector_manifest_path"],
-                "collector_manifest_sha256": source["collector_manifest_sha256"],
-                "success_marker_path": source["success_marker_path"],
-                "success_marker_sha256": source["success_marker_sha256"],
-            }),
-            json!({
-                // Fixture row 0 has best-bid quantity 10 and best-ask quantity 4.
-                "book_imbalance": 0.428_571_428_571_428_55,
-                "book_imbalance_top5": 0.2,
-                "collector_manifest_path": manifest_path,
-                "collector_manifest_sha256": hex::encode(Sha256::digest(std::fs::read(&manifest_path).unwrap())),
-                "success_marker_path": fixture.success,
-                "success_marker_sha256": hex::encode(Sha256::digest(std::fs::read(&fixture.success).unwrap())),
-            })
-        );
-    }
-
-    #[test]
-    fn publishes_content_addressed_pit_rows_with_delayed_labels() {
-        let fixture = Fixture::new(&valid_events());
-        let first = materialize(&fixture.args()).unwrap();
-        let second = materialize(&fixture.args()).unwrap();
-
-        assert_eq!(first.report.rows, 3);
-        assert_eq!(first.report.artifact_path, second.report.artifact_path);
-        assert!(first
-            .report
-            .artifact_path
-            .ends_with(format!("{}.jsonl", first.report.artifact_sha256)));
-        let rows = BufReader::new(File::open(&first.report.artifact_path).unwrap())
+        let rows = BufReader::new(File::open(&published.report.artifact_path).unwrap())
             .lines()
             .map(|line| serde_json::from_str::<PointInTimeFeatureRow>(&line.unwrap()).unwrap())
             .collect::<Vec<_>>();
+
+        assert_eq!(published.report.schema_version, MATERIALIZATION_SCHEMA);
+        assert_eq!(published.report.rows, 3);
+        assert_eq!(
+            source,
+            &json!({
+                "path": fixture.data,
+                "sha256": fixture.content_sha256,
+                "collector_manifest_path": fixture.manifest,
+                "collector_manifest_sha256": fixture.manifest_sha256,
+                "success_marker_path": fixture.success,
+                "success_marker_sha256": hex::encode(Sha256::digest(format!("{}\n", fixture.content_sha256))),
+                "start_received_at_ns": event_ns(0),
+                "end_received_at_ns": event_ns(6_500),
+                "events": valid_rows().len()
+            })
+        );
         assert_eq!(rows[0].symbol, "BTCUSDT");
         assert_eq!(rows[0].modalities, BTreeSet::from([DataModality::Lob]));
         assert_eq!(rows[0].event_time.to_rfc3339(), "2026-07-14T00:00:02+00:00");
