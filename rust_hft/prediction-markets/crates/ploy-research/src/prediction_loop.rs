@@ -233,7 +233,7 @@ pub fn current_prediction_policy_snapshot_id() -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
-fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 33] {
+fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 36] {
     [
         (
             "crates/ploy-research/src/autofactor.rs",
@@ -257,8 +257,16 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 33] {
             include_bytes!("polymarket_evidence_projection.rs"),
         ),
         (
+            "crates/ploy-research/src/verified_artifact_audit.rs",
+            include_bytes!("verified_artifact_audit.rs"),
+        ),
+        (
             "crates/ploy-research/src/verified_binance_projection.rs",
             include_bytes!("verified_binance_projection.rs"),
+        ),
+        (
+            "crates/ploy-market-data/src/diagnostics.rs",
+            include_bytes!("../../ploy-market-data/src/diagnostics.rs"),
         ),
         (
             "crates/ploy-market-data/src/polymarket_evidence/mod.rs",
@@ -275,6 +283,10 @@ fn prediction_policy_sources() -> [(&'static str, &'static [u8]); 33] {
         (
             "crates/ploy-market-data/src/polymarket_evidence/verified.rs",
             include_bytes!("../../ploy-market-data/src/polymarket_evidence/verified.rs"),
+        ),
+        (
+            "crates/ploy-market-data/src/polymarket_evidence/set.rs",
+            include_bytes!("../../ploy-market-data/src/polymarket_evidence/set.rs"),
         ),
         (
             "crates/ploy-research/src/prediction_loop.rs",
@@ -3954,12 +3966,15 @@ mod tests {
             .iter()
             .any(|path| path.contains("monday-prediction-research")));
         assert!(paths.contains(&"crates/ploy-research/src/polymarket_evidence_projection.rs"));
+        assert!(paths.contains(&"crates/ploy-research/src/verified_artifact_audit.rs"));
         assert!(paths.contains(&"crates/ploy-research/src/verified_binance_projection.rs"));
         for path in [
+            "crates/ploy-market-data/src/diagnostics.rs",
             "crates/ploy-market-data/src/polymarket_evidence/mod.rs",
             "crates/ploy-market-data/src/polymarket_evidence/artifact.rs",
             "crates/ploy-market-data/src/polymarket_evidence/wire.rs",
             "crates/ploy-market-data/src/polymarket_evidence/verified.rs",
+            "crates/ploy-market-data/src/polymarket_evidence/set.rs",
         ] {
             assert!(paths.contains(&path));
         }

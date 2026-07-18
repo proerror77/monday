@@ -24,6 +24,7 @@ pub mod replay;
 pub mod research_os;
 pub mod research_snapshot;
 pub mod signal;
+pub mod verified_artifact_audit;
 pub mod verified_binance_projection;
 
 #[cfg(feature = "strategy-runtime")]
@@ -191,3 +192,6 @@ pub use model::supervised::{
 pub use model::{RlAgent, StrategyModel, Transition};
 pub use ploy_market_contracts::Regime;
 pub use signal::{RegimeRouter, Signal, SignalSource, ThresholdRule};
+pub use verified_artifact_audit::{
+    build_prediction_market_data_audit_from_verified_artifacts, VerifiedArtifactAuditRequest,
+};
