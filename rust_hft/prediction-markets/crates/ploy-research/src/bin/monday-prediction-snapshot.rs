@@ -366,14 +366,13 @@ async fn main() -> anyhow::Result<()> {
         let require_official_settlement =
             !flag_present(&args, "--allow-missing-official-settlement");
         let data_requirements = parse_csv(flag_value(&args, "--data-requirements"), "all");
-        let (data_audit_status, data_audit_report, data_audit_report_hash) =
-            validated_data_audit(
-                flag_value(&args, "--data-audit-report"),
-                flag_value(&args, "--data-audit-status"),
-                &symbols,
-                start,
-                end,
-            )?;
+        let (data_audit_status, data_audit_report, data_audit_report_hash) = validated_data_audit(
+            flag_value(&args, "--data-audit-report"),
+            flag_value(&args, "--data-audit-status"),
+            &symbols,
+            start,
+            end,
+        )?;
         let include_deribit = !flag_present(&args, "--skip-deribit");
         let pm_book_archive_dir = flag_value(&args, "--pm-book-archive-dir")
             .or_else(|| std::env::var("MONDAY_PREDICTION_BOOK_ARCHIVE_DIR").ok())
@@ -534,28 +533,34 @@ mod tests {
             .unwrap();
         args.drain(index..=index + 1);
 
-        assert!(parse_verified_artifact_args(&args, &["BTCUSDT".to_string()])
-            .unwrap_err()
-            .to_string()
-            .contains("equal nonzero lengths"));
+        assert!(
+            parse_verified_artifact_args(&args, &["BTCUSDT".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("equal nonzero lengths")
+        );
     }
 
     #[test]
     fn verified_artifact_mode_rejects_implicit_mixed_or_multi_symbol_inputs() {
         let mut implicit = verified_args();
         implicit.remove(0);
-        assert!(parse_verified_artifact_args(&implicit, &["BTCUSDT".to_string()])
-            .unwrap_err()
-            .to_string()
-            .contains("require --verified-artifacts"));
+        assert!(
+            parse_verified_artifact_args(&implicit, &["BTCUSDT".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("require --verified-artifacts")
+        );
 
         for flag in ["--data-audit-report", "--data-audit-sha256"] {
             let mut mixed = verified_args();
             mixed.extend([flag.to_string(), "legacy-external-audit".to_string()]);
-            assert!(parse_verified_artifact_args(&mixed, &["BTCUSDT".to_string()])
-                .unwrap_err()
-                .to_string()
-                .contains("cannot be combined"));
+            assert!(
+                parse_verified_artifact_args(&mixed, &["BTCUSDT".to_string()])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot be combined")
+            );
         }
 
         assert!(parse_verified_artifact_args(
