@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -268,6 +269,13 @@ pub fn verify_binance_market_tape(
         let book = validator.book_snapshot()?;
         if book.bids.is_empty() || book.asks.is_empty() {
             bail!("verified market-tape contains an empty replayed book");
+        }
+        for [price, quantity] in book.bids.iter().chain(book.asks.iter()) {
+            if price.parse::<Decimal>()? <= Decimal::ZERO
+                || quantity.parse::<Decimal>()? <= Decimal::ZERO
+            {
+                bail!("verified market-tape contains a non-positive replayed book level");
+            }
         }
         replayed_books.push(ReplayedBinanceBook { symbol, book });
     }
