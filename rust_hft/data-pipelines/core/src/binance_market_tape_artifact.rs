@@ -116,10 +116,18 @@ impl ReplayedBinanceBook {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBinanceLobObservation {
+    pub symbol: String,
+    pub source_time_ms: u64,
+    pub received_at_ns: u64,
+}
+
 #[derive(Debug)]
 pub struct VerifiedBinanceMarketTape {
     segments: Vec<BinanceMarketTapeSegmentIdentity>,
     aggregate_trades: Vec<AggregateTrade>,
+    lob_observations: Vec<VerifiedBinanceLobObservation>,
     replayed_books: Vec<ReplayedBinanceBook>,
 }
 
@@ -130,6 +138,10 @@ impl VerifiedBinanceMarketTape {
 
     pub fn aggregate_trades(&self) -> &[AggregateTrade] {
         &self.aggregate_trades
+    }
+
+    pub fn lob_observations(&self) -> &[VerifiedBinanceLobObservation] {
+        &self.lob_observations
     }
 
     pub fn replayed_books(&self) -> &[ReplayedBinanceBook] {
@@ -196,6 +208,7 @@ pub fn verify_binance_market_tape(
         .collect::<Result<BTreeMap<_, _>>>()?;
     let mut identities = Vec::with_capacity(sealed.len());
     let mut aggregate_trades = Vec::new();
+    let mut lob_observations = Vec::new();
     let mut replayed_events = symbols
         .iter()
         .map(|symbol| (symbol.clone(), Vec::new()))
@@ -250,6 +263,11 @@ pub fn verify_binance_market_tape(
                         received_at_ns,
                     )?;
                     record_replay_events(&mut replayed_events, &clock.symbol, events)?;
+                    lob_observations.push(VerifiedBinanceLobObservation {
+                        symbol: clock.symbol,
+                        source_time_ms: clock.event_time_ms,
+                        received_at_ns: clock.received_at_ns,
+                    });
                 }
                 "snapshot" | "checkpoint" => {
                     let symbol = required_string(raw, "symbol")?.to_ascii_uppercase();
@@ -341,6 +359,7 @@ pub fn verify_binance_market_tape(
     Ok(VerifiedBinanceMarketTape {
         segments: identities,
         aggregate_trades,
+        lob_observations,
         replayed_books,
     })
 }
@@ -831,6 +850,51 @@ mod tests {
 
         let error = verify_binance_market_tape(sealed).unwrap_err();
         assert!(error.to_string().contains("receive time moved backwards"));
+    }
+
+    #[test]
+    fn invalid_depth_source_clocks_never_return_a_verified_handle() {
+        for (event_time, transaction_time, expected) in [
+            (Value::Null, Value::Null, "depth field E is missing"),
+            (json!(0), json!(0), "governed limit"),
+        ] {
+            let root = tempdir();
+            let mut rows = valid_rows();
+            rows[2]["frame"]["data"]["E"] = event_time;
+            rows[2]["frame"]["data"]["T"] = transaction_time;
+            let (triplet, anchor) = write_triplet(root.path(), &rows);
+            let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+            let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn lob_projection_preserves_each_verified_depth_clock() {
+        let root = tempdir();
+        let mut rows = valid_rows();
+        rows.insert(3, depth_row(START_NS + 250_000_000, 102, 101));
+        rows[5]["last_update_id"] = json!(102);
+        let (triplet, anchor) = write_triplet(root.path(), &rows);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let verified = verify_binance_market_tape(vec![sealed]).unwrap();
+        assert_eq!(
+            verified.lob_observations(),
+            [
+                VerifiedBinanceLobObservation {
+                    symbol: "BTCUSDT".to_owned(),
+                    source_time_ms: (START_NS + 200_000_000) / 1_000_000,
+                    received_at_ns: START_NS + 200_000_000,
+                },
+                VerifiedBinanceLobObservation {
+                    symbol: "BTCUSDT".to_owned(),
+                    source_time_ms: (START_NS + 250_000_000) / 1_000_000,
+                    received_at_ns: START_NS + 250_000_000,
+                },
+            ]
+        );
     }
 
     #[test]
