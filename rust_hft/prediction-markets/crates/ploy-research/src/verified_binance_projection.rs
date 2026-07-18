@@ -89,6 +89,7 @@ pub fn project_verified_binance_market_tape(
         aggregate_trades,
         lob_snapshots: lob_snapshots.len(),
     };
+    ensure_required_surfaces(&counts)?;
 
     Ok(VerifiedBinanceResearchProjection {
         updates,
@@ -96,6 +97,22 @@ pub fn project_verified_binance_market_tape(
         lob_snapshots,
         counts,
     })
+}
+
+fn ensure_required_surfaces(counts: &VerifiedBinanceResearchSurfaceCounts) -> Result<()> {
+    ensure!(
+        counts.spot_prices > 0,
+        "verified Binance projection has no spot prices"
+    );
+    ensure!(
+        counts.aggregate_trades > 0,
+        "verified Binance projection has no aggregate trades"
+    );
+    ensure!(
+        counts.lob_snapshots > 0,
+        "verified Binance projection has no LOB snapshots"
+    );
+    Ok(())
 }
 
 fn datetime_from_ns(value: u64) -> Result<DateTime<Utc>> {
@@ -408,7 +425,8 @@ mod tests {
     use super::*;
 
     const RECEIVED_NS: u64 = 1_700_000_030_000_000_000;
-    const SOURCE_MS: u64 = 1_700_000_000_000;
+    // Keep the fixture aligned to an absolute 30-second source-time bucket.
+    const SOURCE_MS: u64 = 1_700_000_010_000;
     const SECOND_NS: u64 = 1_000_000_000;
 
     fn window() -> (DateTime<Utc>, DateTime<Utc>) {
@@ -476,8 +494,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            (rows.len(), rows[0].source_ts),
-            (1, Some(datetime_from_ms(SOURCE_MS).unwrap()))
+            (rows.len(), rows[0].source_ts, rows[0].ts),
+            (
+                1,
+                Some(datetime_from_ms(SOURCE_MS).unwrap()),
+                datetime_from_ns(RECEIVED_NS).unwrap(),
+            )
         );
     }
 
@@ -639,5 +661,32 @@ mod tests {
             ),
             (true, true)
         );
+    }
+
+    #[test]
+    fn missing_required_surface_fails_closed() {
+        let complete = VerifiedBinanceResearchSurfaceCounts {
+            spot_prices: 1,
+            aggregate_trades: 1,
+            lob_snapshots: 1,
+        };
+        assert!(ensure_required_surfaces(&complete).is_ok());
+
+        for missing in [
+            VerifiedBinanceResearchSurfaceCounts {
+                spot_prices: 0,
+                ..complete.clone()
+            },
+            VerifiedBinanceResearchSurfaceCounts {
+                aggregate_trades: 0,
+                ..complete.clone()
+            },
+            VerifiedBinanceResearchSurfaceCounts {
+                lob_snapshots: 0,
+                ..complete.clone()
+            },
+        ] {
+            assert!(ensure_required_surfaces(&missing).is_err());
+        }
     }
 }
