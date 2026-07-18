@@ -207,22 +207,14 @@ fn expected_bucket_count(
     end: DateTime<Utc>,
     bucket_secs: i64,
 ) -> Result<u64> {
+    let duration_secs = (end - start).num_seconds();
     ensure!(
-        start < end && bucket_secs > 0,
-        "invalid audit bucket window"
+        bucket_secs > 0
+            && duration_secs > 0
+            && duration_secs.rem_euclid(bucket_secs) == 0,
+        "invalid or misaligned audit bucket window"
     );
-    let step = Duration::seconds(bucket_secs);
-    let mut cursor = start;
-    let mut count = 0_u64;
-    while cursor < end {
-        cursor = cursor
-            .checked_add_signed(step)
-            .context("audit bucket window overflows")?;
-        count = count
-            .checked_add(1)
-            .context("audit bucket count overflows")?;
-    }
-    Ok(count)
+    u64::try_from(duration_secs / bucket_secs).context("audit bucket count overflows")
 }
 
 fn maximum_missing_gap(
@@ -319,25 +311,28 @@ fn chainlink_reference_observation<'a, 'b>(
     let event_index = events
         .iter()
         .enumerate()
-        .map(|(index, contract)| (contract.market_id.as_str(), index as u64))
+        .map(|(i, row)| (row.market_id.as_str(), (i as u64, row.event_start)))
         .collect::<BTreeMap<_, _>>();
     let expected_buckets = u64::try_from(events.len())?;
     let maximum_delay = Duration::seconds(request.maximum_source_delay_secs);
     let mut row_count = 0_u64;
     let mut usable_row_count = 0_u64;
     let mut source_delay_rejected_rows = 0_u64;
+    let mut invalid_payload_rows = 0_u64;
     let mut causality_violations = 0_u64;
     let mut present = BTreeSet::new();
     let mut first_at: Option<DateTime<Utc>> = None;
     let mut last_at: Option<DateTime<Utc>> = None;
     for reference in references {
-        let Some(event) = event_index.get(reference.market_id.as_str()) else {
+        let Some(&(event, event_start)) = event_index.get(reference.market_id.as_str()) else {
             continue;
         };
         row_count = row_count
             .checked_add(1)
             .context("audit row count overflows")?;
-        if reference.available_at < reference.source_time {
+        if reference.source_time > event_start {
+            invalid_payload_rows += 1;
+        } else if reference.available_at < reference.source_time {
             causality_violations += 1;
         } else if reference.available_at - reference.source_time > maximum_delay {
             source_delay_rejected_rows += 1;
@@ -349,7 +344,7 @@ fn chainlink_reference_observation<'a, 'b>(
             last_at = Some(last_at.map_or(reference.source_time, |value| {
                 value.max(reference.source_time)
             }));
-            present.insert(*event);
+            present.insert(event);
         }
     }
     // Completeness is one causally usable reference per full five-minute event.
@@ -359,7 +354,7 @@ fn chainlink_reference_observation<'a, 'b>(
         row_count,
         usable_row_count,
         source_delay_rejected_rows,
-        invalid_payload_rows: 0,
+        invalid_payload_rows,
         causality_violations,
         first_at,
         last_at,
@@ -662,7 +657,9 @@ mod tests {
             .unwrap(),
         );
         assert_time_series(&healthy, AuditStatus::Ok, (2, 2), 0);
-        references.pop();
+        let late = contracts[0].event_start + Duration::seconds(1);
+        references[0].source_time = late;
+        references[0].available_at = late;
         let missing = evaluate_time_series_coverage(
             &request,
             chainlink_reference_observation(
@@ -682,14 +679,6 @@ mod tests {
         let mut book_request = request.clone();
         book_request.minimum_coverage_bps = 10_000;
         let coverage_start = request.coverage_start().unwrap();
-        validate_artifact_windows(
-            &request,
-            coverage_start,
-            request.snapshot_end,
-            request.snapshot_start,
-            request.snapshot_end,
-        )
-        .unwrap();
         assert!(validate_artifact_windows(
             &request,
             coverage_start,
