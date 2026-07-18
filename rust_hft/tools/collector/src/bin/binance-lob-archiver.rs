@@ -318,13 +318,11 @@ enum Event {
 #[derive(Debug)]
 enum TaskExit {
     Stopped(Option<Event>),
-    SnapshotComplete,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum ProcessAction {
     None,
-    Resnapshot(String),
     Excluded,
     InitialSnapshotsComplete,
 }
@@ -653,7 +651,6 @@ async fn run_session(
                             &mut process_state,
                         )?;
                     }
-                    Some(Ok(Ok(TaskExit::SnapshotComplete))) => {},
                     Some(Ok(Ok(TaskExit::Stopped(None)))) if *session_stop_rx.borrow() => {},
                     Some(Ok(Ok(TaskExit::Stopped(None)))) => {
                         failure = Some(anyhow::anyhow!("producer stopped unexpectedly"));
@@ -695,23 +692,6 @@ async fn run_session(
 
         match pending_action {
             ProcessAction::None => {}
-            ProcessAction::Resnapshot(symbol) => {
-                segment = rotate_segment(
-                    segment,
-                    &config,
-                    &states,
-                    &session_id,
-                    "sequence_gap",
-                    &process_state,
-                )?;
-                sync_deadline = Some(Instant::now() + config.sync_timeout);
-                tasks.spawn(produce_snapshot(
-                    config.clone(),
-                    symbol,
-                    sender.clone(),
-                    session_stop_rx.clone(),
-                ));
-            }
             ProcessAction::Excluded => {
                 segment = rotate_segment(
                     segment,
@@ -879,12 +859,6 @@ fn process_event(
                     json!({"session_id":session_id,"error":error.to_string()}),
                     now_ns()?,
                 )?;
-                if let Some(gap) = error.downcast_ref::<hft_collector::lob_archiver::SequenceGap>()
-                {
-                    let symbol = gap.symbol.clone();
-                    state.invalidate_for_resync(budget);
-                    return Ok(ProcessAction::Resnapshot(symbol));
-                }
                 return Err(error);
             }
         }
@@ -947,12 +921,6 @@ fn process_event(
                     json!({"session_id":session_id,"error":error.to_string()}),
                     now_ns()?,
                 )?;
-                if let Some(gap) = error.downcast_ref::<hft_collector::lob_archiver::SequenceGap>()
-                {
-                    let symbol = gap.symbol.clone();
-                    state.invalidate_for_resync(budget);
-                    return Ok(ProcessAction::Resnapshot(symbol));
-                }
                 return Err(error);
             }
         }
@@ -1272,45 +1240,6 @@ async fn produce_snapshots(
     // Keep the producer alive so a normal completion is not mistaken for a session failure.
     shutdown.changed().await?;
     Ok(TaskExit::Stopped(None))
-}
-
-async fn produce_snapshot(
-    config: Arc<Config>,
-    symbol: String,
-    sender: mpsc::Sender<Event>,
-    mut shutdown: watch::Receiver<bool>,
-) -> anyhow::Result<TaskExit> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
-    let started = now_ns()?;
-    let snapshot = match fetch_snapshot(&client, &config, &symbol, &mut shutdown).await {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => return Ok(TaskExit::Stopped(None)),
-        Err(error) => {
-            if error.downcast_ref::<SnapshotUnavailable>().is_some() {
-                let event = Event::ExcludeSymbol {
-                    symbol,
-                    reason: error.to_string(),
-                };
-                return match send_or_shutdown(&sender, event, &mut shutdown).await? {
-                    SendOutcome::Sent => Ok(TaskExit::SnapshotComplete),
-                    SendOutcome::Shutdown(event) => Ok(TaskExit::Stopped(Some(event))),
-                };
-            }
-            return Err(error);
-        }
-    };
-    let event = Event::Snapshot {
-        received_at_ns: now_ns()?,
-        symbol,
-        request_started_at_ns: started,
-        snapshot,
-    };
-    match send_or_shutdown(&sender, event, &mut shutdown).await? {
-        SendOutcome::Sent => Ok(TaskExit::SnapshotComplete),
-        SendOutcome::Shutdown(event) => Ok(TaskExit::Stopped(Some(event))),
-    }
 }
 
 async fn fetch_snapshot(
@@ -2457,6 +2386,69 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("field E is missing"));
+    }
+
+    #[test]
+    fn depth_gap_ends_the_capture_epoch() {
+        let root = tempfile::Builder::new()
+            .prefix("monday-depth-gap-epoch-test-")
+            .tempdir()
+            .unwrap();
+        let mut config = test_config("http://unused".into());
+        config.market = Market::Usdm;
+        config.spool_dir = root.path().to_path_buf();
+        let mut budget = PendingBudget::new(10);
+        let mut state = OrderBookState::new("BTCUSDT", Market::Usdm);
+        state
+            .install_snapshot(
+                &json!({
+                    "lastUpdateId": 11_075_153_756_947_u64,
+                    "bids": [["100", "1"]],
+                    "asks": [["101", "1"]]
+                }),
+                &mut budget,
+            )
+            .unwrap();
+        let mut states = HashMap::from([("BTCUSDT".to_owned(), state)]);
+        let mut segment =
+            Segment::create(config.segment_config(), 1_784_349_725_319_895_632).unwrap();
+        let mut process_state = ProcessState::new(true);
+        let received_at_ns = 1_784_349_725_538_670_685;
+        let event = event_from_frame(
+            json!({
+                "stream": "btcusdt@depth@100ms",
+                "data": {
+                    "e": "depthUpdate",
+                    "E": 1_784_349_725_538_u64,
+                    "T": 1_784_349_725_538_u64,
+                    "s": "BTCUSDT",
+                    "U": 11_075_153_761_705_u64,
+                    "u": 11_075_153_767_256_u64,
+                    "pu": 11_075_153_761_591_u64,
+                    "b": [],
+                    "a": []
+                }
+            }),
+            received_at_ns,
+        )
+        .unwrap();
+
+        let error = process_event(
+            &config,
+            &mut segment,
+            &mut states,
+            &mut budget,
+            "session-1",
+            event,
+            &mut process_state,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("expected=11075153756947 received=11075153761591-11075153767256"));
+        assert_eq!(process_state.sequence_gaps, 1);
+        assert_eq!(segment.event_count("sequence_gap"), 1);
     }
 
     #[test]
