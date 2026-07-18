@@ -638,13 +638,8 @@ mod tests {
         let evaluate = |rows: &[PolymarketEvidenceReference]| {
             evaluate_time_series_coverage(
                 &request,
-                chainlink_reference_observation(
-                    &request,
-                    "BTCUSDT",
-                    contracts.iter(),
-                    rows.iter(),
-                )
-                .unwrap(),
+                chainlink_reference_observation(&request, "BTCUSDT", contracts.iter(), rows.iter())
+                    .unwrap(),
             )
         };
         let healthy = evaluate(&references);
