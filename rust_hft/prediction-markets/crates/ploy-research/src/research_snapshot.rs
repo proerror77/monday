@@ -2386,7 +2386,7 @@ mod tests {
             assert_eq!(rows[0].settlement_up, expected);
             assert_eq!(
                 rows[0].official_resolution_observed_at.unwrap(),
-                "2026-07-17T05:35:02Z".parse().unwrap()
+                "2026-07-17T05:35:02Z".parse::<DateTime<Utc>>().unwrap()
             );
         }
 
@@ -2546,7 +2546,7 @@ mod tests {
             exact_official_binary_outcome(&outcomes, "event-1", "up", "down")
                 .unwrap()
                 .observed_at,
-            "2026-07-17T05:35:02Z".parse().unwrap()
+            "2026-07-17T05:35:02Z".parse::<DateTime<Utc>>().unwrap()
         );
         assert!(
             !exact_official_binary_outcome(
