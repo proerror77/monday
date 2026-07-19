@@ -4009,6 +4009,12 @@ mod tests {
                 mission.search_policy_snapshot_id,
                 current_prediction_policy_snapshot_id()
             );
+            assert_eq!(mission.time_cohort_boundary_ms, 0);
+            assert!(
+                validate_prediction_mission(&mission, &mission.search_policy_snapshot_id)
+                    .expect_err("template must require an operator-selected cohort boundary")
+                    .contains("time_cohort_boundary_ms")
+            );
         }
     }
 
