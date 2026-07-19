@@ -27,15 +27,17 @@ use ploy_research::{
     walk_forward_meta_label_v1_with_deribit_and_pm_books,
     walk_forward_settlement_probability_report_with_prior,
     walk_forward_settlement_verdict_report_with_prior,
-    write_alpha_search_artifacts_with_state_and_runtime_feedback, AlphaSearchRuntimeFeedback,
-    AlphaZooSnapshot, AutoFactorOptions, AutoFactorV2Target, FactorComboV1Options,
-    FactorObservation, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
-    FillabilityReviewOptions, FullDepthExecutionMatrixOptions, LiquidityGateV1Options,
-    LiquidityGatedAlphaV1Options, LlmPriorSpec, MetaLabelWalkForwardOptions, RepricingIcOptions,
-    ResearchSnapshotRequest, SettlementProbabilityDataQualityMode,
-    SettlementProbabilityPromotionGateOptions, SettlementProbabilityReportOptions,
-    SettlementProbabilityTimeCohort, SettlementProbabilityWalkForwardOptions,
-    TradeFormationReviewOptions,
+    write_alpha_search_artifacts_with_state_and_runtime_feedback,
+    write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback,
+    AlphaSearchRuntimeFeedback, AlphaZooSnapshot, AutoFactorOptions, AutoFactorV2Target,
+    FactorComboV1Options, FactorObservation, FactorReviewOptions, FactorStabilityOptions,
+    FactorWalkForwardOptions, FillabilityReviewOptions, FullDepthExecutionMatrixOptions,
+    LiquidityGateV1Options, LiquidityGatedAlphaV1Options, LlmPriorSpec,
+    MetaLabelWalkForwardOptions, RepricingIcOptions, ResearchSnapshotRequest, ReviewSide,
+    SettlementProbabilityDataQualityMode, SettlementProbabilityPromotionGateOptions,
+    SettlementProbabilityReportOptions, SettlementProbabilityTimeCohort,
+    SettlementProbabilityWalkForwardOptions, TradeFormationReviewOptions,
+    SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -421,22 +423,55 @@ mod tests {
     }
 }
 
-fn alpha_search_plan_factor_names(path: &str) -> Vec<String> {
+fn read_alpha_search_plan(path: &str) -> (String, Option<ReviewSide>, Vec<String>) {
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("read alpha search plan JSON {path} failed: {err}"));
     let json: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|err| panic!("parse alpha search plan JSON {path} failed: {err}"));
-    json.get("selected_nodes")
-        .and_then(serde_json::Value::as_array)
-        .map(|nodes| {
-            nodes
-                .iter()
-                .filter_map(|node| node.get("factor_name"))
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+    let version = json["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("alpha search plan JSON {path} is missing version"));
+    let target = json["target"]
+        .as_str()
+        .unwrap_or_else(|| panic!("alpha search plan JSON {path} is missing target"));
+    let side = parse_optional_review_side(&json, path, "alpha search plan");
+    validate_repricing_input_identity("alpha search plan", version, target, side)
+        .unwrap_or_else(|reason| panic!("{reason} in {path}"));
+    let names = json["selected_nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node["factor_name"].as_str().map(ToOwned::to_owned))
+        .collect();
+    (target.to_string(), side, names)
+}
+
+fn parse_optional_review_side(
+    json: &serde_json::Value,
+    path: &str,
+    kind: &str,
+) -> Option<ReviewSide> {
+    let value = json.get("side")?;
+    serde_json::from_value(value.clone())
+        .unwrap_or_else(|err| panic!("parse {kind} side in {path} failed: {err}"))
+}
+
+fn validate_repricing_input_identity(
+    kind: &str,
+    version: &str,
+    target: &str,
+    side: Option<ReviewSide>,
+) -> Result<(), String> {
+    if matches!(
+        target,
+        "full_depth_reprice_pnl_10s" | "full_depth_reprice_pnl_30s"
+    ) && (version != SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION || side.is_none())
+    {
+        return Err(format!(
+            "{kind} declares repricing target {target} but requires version={SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION} and a side"
+        ));
+    }
+    Ok(())
 }
 
 fn read_llm_prior(path: &str) -> LlmPriorSpec {
@@ -458,6 +493,24 @@ fn runtime_feedback_from_candidate_replay(path: &str) -> Option<AlphaSearchRunti
         .unwrap_or_else(|err| panic!("read candidate strategy replay JSON {path} failed: {err}"));
     let json: serde_json::Value = serde_json::from_str(&raw)
         .unwrap_or_else(|err| panic!("parse candidate strategy replay JSON {path} failed: {err}"));
+    let version = json
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let target = json
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let side = parse_optional_review_side(&json, path, "candidate strategy replay");
+    if let Some(target) = target.as_deref() {
+        validate_repricing_input_identity(
+            "candidate strategy replay",
+            version.as_deref().unwrap_or("<missing>"),
+            target,
+            side,
+        )
+        .unwrap_or_else(|reason| panic!("{reason} in {path}"));
+    }
     let runtime_score = json
         .get("runtime_score")
         .and_then(serde_json::Value::as_str)
@@ -499,6 +552,9 @@ fn runtime_feedback_from_candidate_replay(path: &str) -> Option<AlphaSearchRunti
         .map(|value| value as usize)
         .unwrap_or_else(|| metric("settlement_autofactor_predictive_score_ge_025"));
     Some(AlphaSearchRuntimeFeedback {
+        version,
+        target,
+        side,
         runtime_score,
         base_factor,
         entry_signals: metric("entry_signals"),
@@ -1071,20 +1127,35 @@ async fn main() {
             })
             .ok()
     });
-    let alpha_search_plan_names = alpha_search_plan_json
+    let alpha_search_plan = alpha_search_plan_json
         .as_deref()
-        .map(alpha_search_plan_factor_names)
-        .unwrap_or_default();
+        .map(read_alpha_search_plan);
     let mcts_state = alpha_search_state_json.as_deref().map(|path| {
-        read_mcts_search_state(path)
-            .unwrap_or_else(|err| panic!("read alpha search MCTS state JSON {path} failed: {err}"))
+        let state = read_mcts_search_state(path)
+            .unwrap_or_else(|err| panic!("read alpha search MCTS state JSON {path} failed: {err}"));
+        validate_repricing_input_identity(
+            "alpha search MCTS state",
+            &state.version,
+            &state.target,
+            state.side,
+        )
+        .unwrap_or_else(|reason| panic!("{reason} in {path}"));
+        state
     });
     if let Some(path) = alpha_search_state_json.as_deref() {
         eprintln!("alpha search cumulative MCTS state loaded from {path}");
     }
-    let alpha_zoo = alpha_zoo_snapshot_json
-        .as_deref()
-        .map(read_alpha_zoo_snapshot);
+    let alpha_zoo = alpha_zoo_snapshot_json.as_deref().map(|path| {
+        let zoo = read_alpha_zoo_snapshot(path);
+        validate_repricing_input_identity(
+            "Alpha Zoo snapshot",
+            &zoo.version,
+            &zoo.target,
+            zoo.side,
+        )
+        .unwrap_or_else(|reason| panic!("{reason} in {path}"));
+        zoo
+    });
     if let Some(path) = alpha_zoo_snapshot_json.as_deref() {
         eprintln!("alpha zoo snapshot loaded from {path}");
     }
@@ -1104,43 +1175,100 @@ async fn main() {
     if let Some(path) = alpha_search_plan_json.as_deref() {
         eprintln!(
             "alpha search MCTS plan loaded: {} selected nodes from {}",
-            alpha_search_plan_names.len(),
+            alpha_search_plan
+                .as_ref()
+                .map(|plan| plan.2.len())
+                .unwrap_or_default(),
             path
         );
     }
     for target in [
-        AutoFactorV2Target::FullDepthRepricePnl10s,
-        AutoFactorV2Target::FullDepthRepricePnl30s,
+        AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Up),
+        AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Down),
+        AutoFactorV2Target::FullDepthRepricePnl30s(ReviewSide::Up),
+        AutoFactorV2Target::FullDepthRepricePnl30s(ReviewSide::Down),
         AutoFactorV2Target::FullDepthSettlementExecutablePnl,
         AutoFactorV2Target::TradeableFullDepthSettlementPnl,
     ] {
+        let target_name = target.as_str();
+        let side = target.review_side();
+        let plan_names = alpha_search_plan
+            .as_ref()
+            .filter(|plan| match (plan.1, side) {
+                (Some(input_side), Some(lane_side)) => {
+                    plan.0 == target_name && input_side == lane_side
+                }
+                (None, None) => true,
+                _ => false,
+            })
+            .map(|plan| plan.2.as_slice())
+            .unwrap_or_default();
+        let lane_state = mcts_state
+            .as_ref()
+            .filter(|state| state.target == target_name && state.side == side);
+        let lane_zoo = alpha_zoo
+            .as_ref()
+            .filter(|zoo| zoo.target == target_name && zoo.side == side);
+        let lane_runtime_feedback = runtime_feedback.as_ref().filter(|feedback| match side {
+            Some(side) => {
+                feedback.target.as_deref() == Some(target_name) && feedback.side == Some(side)
+            }
+            None => {
+                feedback.side.is_none()
+                    && feedback
+                        .target
+                        .as_deref()
+                        .map_or(true, |input_target| input_target == target_name)
+            }
+        });
+        let lane_llm_prior = side.is_none().then_some(llm_prior.as_ref()).flatten();
         match mine_domain_autofactors_from_v2_with_guidance(
             &autofactor_rows,
             target,
             &autofactor_options,
-            &alpha_search_plan_names,
-            llm_prior.as_ref(),
+            plan_names,
+            lane_llm_prior,
         ) {
             Ok(reports) => {
                 let reports =
                     filter_autofactor_reports(reports, options.factor_name_filter.as_deref());
-                println!("# AutoFactor target={}", target.as_str());
+                let side_suffix = side
+                    .map(|side| format!(" side={}", side.as_str()))
+                    .unwrap_or_default();
+                println!("# AutoFactor target={target_name}{side_suffix}");
                 println!("{}", format_autofactor_reports(&reports, options.top_n));
                 if let (Some(output_dir), Some(input_names)) = (
                     alpha_search_output_dir.as_deref(),
                     alpha_search_input_names.as_ref(),
                 ) {
-                    match write_alpha_search_artifacts_with_state_and_runtime_feedback(
-                        output_dir,
-                        target.as_str(),
-                        input_names,
-                        &reports,
-                        &autofactor_options,
-                        mcts_state.as_ref(),
-                        runtime_feedback.as_ref(),
-                        llm_prior.as_ref(),
-                        alpha_zoo.as_ref(),
-                    ) {
+                    let write_result = match side {
+                        Some(side) => {
+                            write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
+                                output_dir,
+                                target_name,
+                                side,
+                                input_names,
+                                &reports,
+                                &autofactor_options,
+                                lane_state,
+                                lane_runtime_feedback,
+                                None,
+                                lane_zoo,
+                            )
+                        }
+                        None => write_alpha_search_artifacts_with_state_and_runtime_feedback(
+                            output_dir,
+                            target_name,
+                            input_names,
+                            &reports,
+                            &autofactor_options,
+                            lane_state,
+                            lane_runtime_feedback,
+                            lane_llm_prior,
+                            lane_zoo,
+                        ),
+                    };
+                    match write_result {
                         Ok(summary) => eprintln!(
                             "alpha search artifacts written target={} candidates={} rejected={} best={} dir={}",
                             summary.target,
@@ -1152,17 +1280,14 @@ async fn main() {
                         Err(err) => {
                             eprintln!(
                                 "alpha search artifact write failed for {}: {err}",
-                                target.as_str()
+                                target_name
                             );
                         }
                     }
                 }
             }
             Err(err) => {
-                eprintln!(
-                    "autofactor seed report failed for {}: {err}",
-                    target.as_str()
-                );
+                eprintln!("autofactor seed report failed for {}: {err}", target_name);
             }
         }
     }

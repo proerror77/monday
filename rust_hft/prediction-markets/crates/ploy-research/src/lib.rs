@@ -109,9 +109,11 @@ pub fn crate_marker() -> &'static str {
 pub use alpha_search::{
     read_mcts_search_state, root_gene, write_alpha_search_artifacts,
     write_alpha_search_artifacts_with_state,
-    write_alpha_search_artifacts_with_state_and_runtime_feedback, AlphaSearchArtifactError,
-    AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback, AlphaZooEntry, AlphaZooSnapshot,
-    MctsSearchStateArtifact, MctsSearchStateNode,
+    write_alpha_search_artifacts_with_state_and_runtime_feedback,
+    write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback,
+    AlphaSearchArtifactError, AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback,
+    AlphaZooEntry, AlphaZooSnapshot, MctsSearchStateArtifact, MctsSearchStateNode,
+    SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
 };
 pub use attribution::{factor_pnl, regime_pnl, AttributionReport, RegimePnl};
 pub use autofactor::{

@@ -1092,6 +1092,7 @@ fn group_factor_registry_rows_into_alpha_zoo_snapshot(
     AlphaZooSnapshot {
         version: ALPHA_ZOO_SNAPSHOT_VERSION.to_string(),
         target: target.to_string(),
+        side: None,
         entries,
     }
 }
