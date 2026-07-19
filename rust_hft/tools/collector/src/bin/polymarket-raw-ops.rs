@@ -109,11 +109,11 @@ enum Command {
         #[arg(long)]
         market_success: PathBuf,
         #[arg(long)]
-        reference_data: PathBuf,
+        reference_data: Vec<PathBuf>,
         #[arg(long)]
-        reference_manifest: PathBuf,
+        reference_manifest: Vec<PathBuf>,
         #[arg(long)]
-        reference_success: PathBuf,
+        reference_success: Vec<PathBuf>,
     },
     /// Publish validated BTC/SOL five-minute evidence as an immutable artifact.
     PublishPolymarketEvidence {
@@ -124,11 +124,11 @@ enum Command {
         #[arg(long)]
         market_success: PathBuf,
         #[arg(long)]
-        reference_data: PathBuf,
+        reference_data: Vec<PathBuf>,
         #[arg(long)]
-        reference_manifest: PathBuf,
+        reference_manifest: Vec<PathBuf>,
         #[arg(long)]
-        reference_success: PathBuf,
+        reference_success: Vec<PathBuf>,
         #[arg(long)]
         event_start_gte: String,
         #[arg(long)]
@@ -161,6 +161,26 @@ fn env_u64(value: Option<u64>, name: &str, fallback: u64) -> Result<u64> {
             .transpose()
             .map(|value| value.unwrap_or(fallback)),
     }
+}
+
+fn reference_triplets(
+    data: Vec<PathBuf>,
+    manifests: Vec<PathBuf>,
+    successes: Vec<PathBuf>,
+) -> Result<Vec<ArtifactTriplet>> {
+    if data.is_empty() || data.len() != manifests.len() || data.len() != successes.len() {
+        bail!("reference data/manifest/success counts must match and be nonzero");
+    }
+    Ok(data
+        .into_iter()
+        .zip(manifests)
+        .zip(successes)
+        .map(|((data, manifest), success)| ArtifactTriplet {
+            data,
+            manifest,
+            success,
+        })
+        .collect())
 }
 
 #[tokio::main]
@@ -265,11 +285,11 @@ async fn main() -> Result<()> {
                     manifest: market_manifest,
                     success: market_success,
                 },
-                reference: ArtifactTriplet {
-                    data: reference_data,
-                    manifest: reference_manifest,
-                    success: reference_success,
-                },
+                references: reference_triplets(
+                    reference_data,
+                    reference_manifest,
+                    reference_success,
+                )?,
             })?;
             println!("{}", serde_json::to_string(&report)?);
             Ok(())
@@ -293,11 +313,11 @@ async fn main() -> Result<()> {
                             manifest: market_manifest,
                             success: market_success,
                         },
-                        reference: ArtifactTriplet {
-                            data: reference_data,
-                            manifest: reference_manifest,
-                            success: reference_success,
-                        },
+                        references: reference_triplets(
+                            reference_data,
+                            reference_manifest,
+                            reference_success,
+                        )?,
                     },
                     event_start_gte,
                     event_start_lt,
@@ -366,5 +386,19 @@ mod tests {
         .expect("bounded normalizer CLI must parse")
         .command;
         assert!(matches!(command, Command::PublishPolymarketEvidence { .. }));
+    }
+
+    #[test]
+    fn reference_triplets_preserve_order_and_reject_mismatched_counts() {
+        let paths = |suffix| {
+            vec![
+                PathBuf::from(format!("/tmp/first.{suffix}")),
+                PathBuf::from(format!("/tmp/second.{suffix}")),
+            ]
+        };
+        let triplets = reference_triplets(paths("data"), paths("manifest"), paths("success"))
+            .unwrap();
+        assert_eq!(triplets[1].data, PathBuf::from("/tmp/second.data"));
+        assert!(reference_triplets(paths("data"), vec![], paths("success")).is_err());
     }
 }
