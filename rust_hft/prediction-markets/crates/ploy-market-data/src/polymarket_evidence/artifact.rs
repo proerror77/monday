@@ -553,7 +553,12 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
             validate_segment(&inputs.market, "crypto_expiry")?;
             validate_v2_event_types(
                 &inputs.market,
-                &["event_discovered", "event_expired", "quote", "reference_price"],
+                &[
+                    "event_discovered",
+                    "event_expired",
+                    "quote",
+                    "reference_price",
+                ],
             )?;
             let mut reference_event_types = BTreeMap::<String, u64>::new();
             for reference in &inputs.references {
@@ -612,12 +617,17 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
 }
 
 fn validate_v2_event_types(segment: &SegmentIdentity, allowed: &[&str]) -> Result<()> {
-    let total = segment.event_types.iter().try_fold(0_u64, |total, (kind, count)| {
-        if !allowed.contains(&kind.as_str()) {
-            bail!("validated input contains an unsupported event type");
-        }
-        total.checked_add(*count).context("validated input event count overflow")
-    })?;
+    let total = segment
+        .event_types
+        .iter()
+        .try_fold(0_u64, |total, (kind, count)| {
+            if !allowed.contains(&kind.as_str()) {
+                bail!("validated input contains an unsupported event type");
+            }
+            total
+                .checked_add(*count)
+                .context("validated input event count overflow")
+        })?;
     if segment.event_types.is_empty() || total != segment.events {
         bail!("validated input event types do not match its event count");
     }
@@ -843,10 +853,17 @@ pub(super) mod tests {
         for (hour, accepted) in [("06", true), ("07", false)] {
             let temp = tempfile::tempdir().unwrap();
             let triplet = write_triplet(&temp);
-            let mut manifest: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+            let mut manifest: Value =
+                serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
             manifest["validated_inputs"] = plural_inputs(hour);
-            rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&manifest).unwrap()));
-            assert_eq!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok(), accepted);
+            rewrite_read_only(
+                &triplet.manifest,
+                format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+            );
+            assert_eq!(
+                seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok(),
+                accepted
+            );
         }
     }
 
