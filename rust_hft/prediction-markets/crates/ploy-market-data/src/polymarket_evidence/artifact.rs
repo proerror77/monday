@@ -555,6 +555,7 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
                 &inputs.market,
                 &["event_discovered", "event_expired", "quote", "reference_price"],
             )?;
+            let mut reference_event_types = BTreeMap::<String, u64>::new();
             for reference in &inputs.references {
                 validate_segment(reference, "crypto_expiry_reference")?;
                 validate_v2_event_types(
@@ -575,6 +576,24 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
                 if has_trades != (reference.record_id_versions == ["v2"]) {
                     bail!("validated reference trade identity is inconsistent");
                 }
+                for (kind, count) in &reference.event_types {
+                    let total = reference_event_types.entry(kind.clone()).or_default();
+                    *total = total
+                        .checked_add(*count)
+                        .context("validated reference event count overflow")?;
+                }
+            }
+            if ["market_metadata", "polymarket_trade", "market_settlement"]
+                .iter()
+                .any(|kind| {
+                    reference_event_types
+                        .get(*kind)
+                        .copied()
+                        .unwrap_or_default()
+                        == 0
+                })
+            {
+                bail!("validated reference inputs are missing a required event type");
             }
             for pair in inputs.references.windows(2) {
                 let hour = |segment: &SegmentIdentity| {
@@ -737,7 +756,8 @@ pub(super) mod tests {
 
     fn plural_inputs(second_hour: &str) -> Value {
         let value = inputs();
-        let first = value["reference"].clone();
+        let mut first = value["reference"].clone();
+        first["event_types"] = json!({"market_metadata":1,"polymarket_trade":1});
         let mut second = first.clone();
         second["hour"] = json!(second_hour);
         second["start_recorded_at"] = json!(format!("2026-07-17T{second_hour}:00:00Z"));
@@ -870,6 +890,11 @@ pub(super) mod tests {
         let mut mismatched = plural_inputs("06");
         mismatched["references"][1]["event_types"] = json!({"polymarket_trade":2});
         rejects(mismatched);
+
+        let mut no_trades = plural_inputs("06");
+        no_trades["references"][0]["record_id_versions"] = json!([]);
+        no_trades["references"][0]["event_types"] = json!({"market_metadata":2});
+        rejects(no_trades);
     }
 
     #[test]
