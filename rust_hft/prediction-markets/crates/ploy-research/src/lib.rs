@@ -157,7 +157,8 @@ pub use factors_v2::{
     walk_forward_factors_v2_with_deribit_and_pm_books, walk_forward_meta_label_v1_with_deribit,
     walk_forward_meta_label_v1_with_deribit_and_pm_books,
     walk_forward_settlement_probability_report,
-    walk_forward_settlement_probability_report_with_prior, BinanceDirectionBucketSummary,
+    walk_forward_settlement_probability_report_with_prior,
+    walk_forward_settlement_verdict_report_with_prior, BinanceDirectionBucketSummary,
     DataHealthReport, DeribitFeatureSnapshot, DirectionSideAuditLegSummary,
     DirectionSideAuditSummary, ExecutableEvBucketSummary, FactorComboComponent,
     FactorComboV1Aggregate, FactorComboV1Options, FactorComboV1Report, FactorComboV1Window,
@@ -179,8 +180,10 @@ pub use factors_v2::{
     SettlementProbabilityReportOptions, SettlementProbabilitySymbolHoldoutRow,
     SettlementProbabilityWalkForwardAggregate, SettlementProbabilityWalkForwardOptions,
     SettlementProbabilityWalkForwardReport, SettlementProbabilityWalkForwardWindow,
-    SingleFactorReview, ThreeLayerArchive, TradeFormationPathRow, TradeFormationReviewOptions,
-    TradeFormationReviewReport, TradeFormationRuleRow,
+    SettlementVerdictWalkForwardAggregate, SettlementVerdictWalkForwardReport,
+    SettlementVerdictWalkForwardWindow, SingleFactorReview, ThreeLayerArchive,
+    TradeFormationPathRow, TradeFormationReviewOptions, TradeFormationReviewReport,
+    TradeFormationRuleRow,
 };
 #[cfg(feature = "rl")]
 pub use model::rl::{BinaryEventEnv, DqnAgent, Environment, ReplayBuffer};
