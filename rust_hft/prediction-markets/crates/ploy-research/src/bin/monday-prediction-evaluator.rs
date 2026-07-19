@@ -33,7 +33,8 @@ use ploy_research::{
     LiquidityGatedAlphaV1Options, LlmPriorSpec, MetaLabelWalkForwardOptions, RepricingIcOptions,
     ResearchSnapshotRequest, SettlementProbabilityDataQualityMode,
     SettlementProbabilityPromotionGateOptions, SettlementProbabilityReportOptions,
-    SettlementProbabilityWalkForwardOptions, TradeFormationReviewOptions,
+    SettlementProbabilityTimeCohort, SettlementProbabilityWalkForwardOptions,
+    TradeFormationReviewOptions,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -101,6 +102,67 @@ fn validate_expected_prediction_policy(
         return Err("governed prior policy differs from current evaluator policy".to_string());
     }
     Ok(())
+}
+
+fn parse_time_cohort_boundary(
+    raw: Option<&str>,
+    required: bool,
+) -> Result<Option<DateTime<Utc>>, String> {
+    let Some(raw) = raw else {
+        return if required {
+            Err("governed prediction evaluation requires --time-cohort-boundary-ms".to_string())
+        } else {
+            Ok(None)
+        };
+    };
+    let boundary_ms = raw
+        .parse::<i64>()
+        .map_err(|_| "--time-cohort-boundary-ms must be a positive integer".to_string())?;
+    if boundary_ms <= 0 {
+        return Err("--time-cohort-boundary-ms must be a positive integer".to_string());
+    }
+    let boundary = Utc
+        .timestamp_millis_opt(boundary_ms)
+        .single()
+        .ok_or_else(|| "--time-cohort-boundary-ms is outside the UTC range".to_string())?;
+    Ok(Some(boundary))
+}
+
+fn validate_time_cohort_range(
+    boundary: DateTime<Utc>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<(), String> {
+    if boundary <= start || boundary >= end {
+        return Err(format!(
+            "time-cohort boundary {boundary} must be strictly inside evaluator range [{start}, {end})"
+        ));
+    }
+    Ok(())
+}
+
+fn settlement_time_cohort_from_args(
+    args: &[String],
+    required: bool,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    event_window_secs: Option<i64>,
+) -> Result<Option<SettlementProbabilityTimeCohort>, String> {
+    let Some(boundary) = parse_time_cohort_boundary(
+        flag_value(args, "--time-cohort-boundary-ms").as_deref(),
+        required,
+    )?
+    else {
+        return Ok(None);
+    };
+    validate_time_cohort_range(boundary, start, end)?;
+    let event_window_secs = event_window_secs
+        .filter(|&value| !required || value == 300)
+        .ok_or_else(|| {
+            "prediction evaluator time cohort requires --event-window-secs (300 when governed)"
+                .to_string()
+        })?;
+    SettlementProbabilityTimeCohort::new(boundary, event_window_secs).map(Some)
 }
 
 fn parse_date_start(raw: &str) -> DateTime<Utc> {
@@ -221,9 +283,11 @@ fn replay_parity_evidence(path: &str) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        replay_parity_evidence, validate_expected_prediction_policy,
-        validate_prediction_snapshot_contract_id,
+        parse_time_cohort_boundary, replay_parity_evidence, settlement_time_cohort_from_args,
+        validate_expected_prediction_policy, validate_prediction_snapshot_contract_id,
+        validate_time_cohort_range,
     };
+    use chrono::{TimeZone, Utc};
     use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
     use std::fs;
 
@@ -246,6 +310,38 @@ mod tests {
                 .expect_err("stale controller policy must fail")
                 .contains("does not match")
         );
+    }
+
+    #[test]
+    fn governed_evaluator_rejects_missing_or_invalid_time_cohort_boundary() {
+        let boundary_ms = 1_700_001_000_000_i64;
+        let start = Utc
+            .timestamp_millis_opt(boundary_ms - 1_000)
+            .single()
+            .unwrap();
+        let end = Utc
+            .timestamp_millis_opt(boundary_ms + 1_000)
+            .single()
+            .unwrap();
+        assert!(
+            settlement_time_cohort_from_args(&[], true, start, end, Some(300))
+                .expect_err("governed baseline must carry a boundary")
+                .contains("requires --time-cohort-boundary-ms")
+        );
+        for raw in ["0", "-1", "not-a-timestamp"] {
+            let args = vec!["--time-cohort-boundary-ms".to_string(), raw.to_string()];
+            assert!(settlement_time_cohort_from_args(&args, true, start, end, Some(300)).is_err());
+        }
+
+        let boundary = parse_time_cohort_boundary(Some(&boundary_ms.to_string()), true)
+            .expect("valid governed boundary")
+            .expect("present boundary");
+        assert_eq!(boundary.timestamp_millis(), boundary_ms);
+        validate_time_cohort_range(boundary, start, end).expect("interior boundary");
+        assert!(validate_time_cohort_range(start, start, end).is_err());
+        assert!(validate_time_cohort_range(end, start, end).is_err());
+        let args = vec!["--time-cohort-boundary-ms".into(), boundary_ms.to_string()];
+        assert!(settlement_time_cohort_from_args(&args, true, start, end, Some(900)).is_err());
     }
 
     #[test]
@@ -548,6 +644,14 @@ async fn main() {
     let alpha_search_plan_json = flag_value(&args, "--alpha-search-plan-json");
     let alpha_search_llm_prior_json = flag_value(&args, "--alpha-search-llm-prior-json");
     let expected_prediction_policy = flag_value(&args, "--expected-search-policy-snapshot-id");
+    let settlement_time_cohort = settlement_time_cohort_from_args(
+        &args,
+        expected_prediction_policy.is_some(),
+        start,
+        end,
+        event_window_secs,
+    )
+    .unwrap_or_else(|reason| panic!("prediction evaluator time cohort mismatch: {reason}"));
     let llm_prior = alpha_search_llm_prior_json.as_deref().map(read_llm_prior);
     let governed_prediction_prior = llm_prior
         .as_ref()
@@ -836,6 +940,7 @@ async fn main() {
                     min_bucket_observations: options.review.min_observations.max(20),
                     ..Default::default()
                 },
+                time_cohort: settlement_time_cohort,
                 ..Default::default()
             },
         );

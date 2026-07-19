@@ -24,7 +24,7 @@ use crate::{
     ResearchSnapshotManifest,
 };
 
-pub const PREDICTION_MISSION_SCHEMA_VERSION: &str = "prediction_research_mission.v1";
+pub const PREDICTION_MISSION_SCHEMA_VERSION: &str = "prediction_research_mission.v2";
 pub const PREDICTION_LOOP_TARGET: &str = "full_depth_settlement_executable_pnl";
 pub const PREDICTION_EVENT_WINDOW_SECS: i64 = 300;
 pub const PREDICTION_LOOP_STATE_SCHEMA_VERSION: &str = "monday_prediction_research_loop.v1";
@@ -68,6 +68,7 @@ pub struct PredictionResearchMission {
     pub target: String,
     pub symbols: Vec<String>,
     pub horizon: String,
+    pub time_cohort_boundary_ms: i64,
     pub prompt_snapshot_id: String,
     pub search_policy_snapshot_id: String,
     pub search_budget: PredictionSearchBudget,
@@ -407,6 +408,9 @@ pub fn validate_prediction_mission(
     }
     if mission.horizon != "5m" {
         return Err("mission.horizon must be 5m".to_string());
+    }
+    if mission.time_cohort_boundary_ms <= 0 {
+        return Err("mission.time_cohort_boundary_ms must be positive".to_string());
     }
     if mission.symbols.len() != 1 || !matches!(mission.symbols[0].as_str(), "BTC" | "SOL") {
         return Err(
@@ -3727,6 +3731,7 @@ mod tests {
             target: PREDICTION_LOOP_TARGET.to_string(),
             symbols: vec!["BTC".to_string()],
             horizon: "5m".to_string(),
+            time_cohort_boundary_ms: 1_700_001_000_000,
             prompt_snapshot_id: String::new(),
             search_policy_snapshot_id: format!("sha256:{}", "2".repeat(64)),
             search_budget: PredictionSearchBudget {
@@ -3943,6 +3948,14 @@ mod tests {
                 .expect_err("formula authority must fail")
                 .contains("probability_blend_weights")
         );
+
+        let mut missing_boundary = mission.clone();
+        missing_boundary.time_cohort_boundary_ms = 0;
+        assert!(
+            validate_prediction_mission(&missing_boundary, &mission.search_policy_snapshot_id)
+                .expect_err("missing shared time boundary must fail")
+                .contains("time_cohort_boundary_ms")
+        );
     }
 
     #[test]
@@ -3995,6 +4008,12 @@ mod tests {
             assert_eq!(
                 mission.search_policy_snapshot_id,
                 current_prediction_policy_snapshot_id()
+            );
+            assert_eq!(mission.time_cohort_boundary_ms, 0);
+            assert!(
+                validate_prediction_mission(&mission, &mission.search_policy_snapshot_id)
+                    .expect_err("template must require an operator-selected cohort boundary")
+                    .contains("time_cohort_boundary_ms")
             );
         }
     }

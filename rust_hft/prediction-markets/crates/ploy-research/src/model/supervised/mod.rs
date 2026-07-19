@@ -7,6 +7,8 @@
 pub mod burn_binary;
 
 #[cfg(feature = "ml")]
+pub use burn_binary::BinaryTimeBoundary;
+#[cfg(feature = "ml")]
 pub use burn_binary::{
     train_event_disjoint_binary, BinaryArtifactScope, BinaryBundleDigest, BinaryDatasetContract,
     BinaryDecisionRow, BinaryModelManifest, BinaryOosMetrics, BinaryProbabilityModel,

@@ -1,5 +1,5 @@
 {
-  "schema_version": "prediction_research_mission.v1",
+  "schema_version": "prediction_research_mission.v2",
   "mission_id": "polymarket-btc-5m-v1",
   "lane": "prediction_market",
   "objective": "Estimate BTC five-minute Polymarket official-resolution probabilities before each entry cutoff, using Chainlink contract reference prices and Polymarket CLOB depth for executable evaluation.",
@@ -13,8 +13,9 @@
     "BTC"
   ],
   "horizon": "5m",
+  "time_cohort_boundary_ms": 0,
   "prompt_snapshot_id": "sha256:2b55ba0e724dfc9f5a040911e397058a09c6229e42064e4998739d617b368dcb",
-  "search_policy_snapshot_id": "sha256:c7ccfd3bd8fc0ab7cd1444768cfe8b53b95baefc8973b47f34d5156b31d234c0",
+  "search_policy_snapshot_id": "sha256:77127b2c6740fd18a4914aeb62d72466c1955f4ffab345efec0401d644a8e922",
   "search_budget": {
     "max_candidates": 6,
     "max_llm_calls": 2,
