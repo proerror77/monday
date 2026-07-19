@@ -817,8 +817,8 @@ mod tests {
             .expect("connect PostgreSQL");
         let suffix = Uuid::new_v4().to_string();
         let snapshot_id = format!("manager-side-quarantine-snapshot-{suffix}");
-        let pooled_factor_id = Uuid::new_v4();
-        let side_factor_id = Uuid::new_v4();
+        let pooled_factor_id = Uuid::new_v4().to_string();
+        let side_factor_id = Uuid::new_v4().to_string();
         let pooled_run_id = format!("manager-pooled-run-{suffix}");
         let side_run_id = format!("manager-side-run-{suffix}");
         let pooled_marker = format!("manager-pooled-marker-{suffix}");
@@ -840,8 +840,8 @@ mod tests {
         .expect("insert snapshot");
 
         for (factor_id, marker, review_side) in [
-            (pooled_factor_id, pooled_marker.as_str(), None),
-            (side_factor_id, side_marker.as_str(), Some("up")),
+            (&pooled_factor_id, pooled_marker.as_str(), None),
+            (&side_factor_id, side_marker.as_str(), Some("up")),
         ] {
             sqlx::query(
                 r#"
@@ -850,7 +850,7 @@ mod tests {
                     dsl_source, dsl_hash, ast_json, target, horizon,
                     created_by_agent, review_side, blockers_json
                 ) VALUES (
-                    $1, $2, 'autofactor', 'candidate', 'test',
+                    $1::uuid, $2, 'autofactor', 'candidate', 'test',
                     'feature', $3, '{}'::jsonb, 'full_depth_reprice_pnl_10s',
                     '10s', 'ci-test', $4, '[]'::jsonb
                 )
@@ -872,13 +872,13 @@ mod tests {
                     passed_gate, promotion_decision, promotion_status,
                     blockers_json
                 ) VALUES (
-                    $1, $2, $3, $4, 'ci-test', 'factor_attribution',
+                    $1::uuid, $2::uuid, $3, $4, 'ci-test', 'factor_attribution',
                     'alpha_search_preview', false, 'blocked', 'blocked',
                     $5::jsonb
                 )
                 "#,
             )
-            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4().to_string())
             .bind(factor_id)
             .bind(if review_side.is_some() {
                 &side_run_id
@@ -902,12 +902,12 @@ mod tests {
                     trace_id, run_id, event_type, agent_name, output_json,
                     hash_current, evidence_stage
                 ) VALUES (
-                    $1, $2, 'factor_registry_preview', 'ci-test', $3::jsonb,
+                    $1::uuid, $2, 'factor_registry_preview', 'ci-test', $3::jsonb,
                     $4, 'factor_attribution'
                 )
                 "#,
             )
-            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4().to_string())
             .bind(run_id)
             .bind(json!({"marker": marker, "side": side}).to_string())
             .bind(format!("hash-{marker}"))
@@ -935,15 +935,15 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clean traces");
-        sqlx::query("DELETE FROM factor_evaluations WHERE factor_id IN ($1, $2)")
-            .bind(pooled_factor_id)
-            .bind(side_factor_id)
+        sqlx::query("DELETE FROM factor_evaluations WHERE factor_id IN ($1::uuid, $2::uuid)")
+            .bind(&pooled_factor_id)
+            .bind(&side_factor_id)
             .execute(&pool)
             .await
             .expect("clean evaluations");
-        sqlx::query("DELETE FROM factor_registry WHERE factor_id IN ($1, $2)")
-            .bind(pooled_factor_id)
-            .bind(side_factor_id)
+        sqlx::query("DELETE FROM factor_registry WHERE factor_id IN ($1::uuid, $2::uuid)")
+            .bind(&pooled_factor_id)
+            .bind(&side_factor_id)
             .execute(&pool)
             .await
             .expect("clean factors");
