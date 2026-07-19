@@ -532,7 +532,7 @@ parity, dry-run, or live approval gates.
 ## Rust Prediction LoopRun and Optional LLM Expansion
 
 The optional LLM turn is mission-driven and remains off by default. Its first
-turn requires a reviewed `prediction_research_mission.v2` JSON; later turns may
+turn requires a reviewed `prediction_research_mission.v1` JSON; later turns may
 recover the same mission from the previous typed prior. BTC and SOL must use
 separate mission files so a candidate cannot silently broaden its symbol
 population. Start from one of the checked-in examples. Set `data_snapshot_id`
@@ -540,10 +540,6 @@ to the immutable snapshot manifest's `snapshot_contract_hash`, then verify the
 brief and implementation IDs before dispatching the governed mission. The
 checked-in paths keep the `.example.json` suffix until an operator creates a
 reviewed immutable mission revision:
-
-Set `time_cohort_boundary_ms` to the shared wall-clock cutoff chosen for every
-horizon-specific task of that underlying. The checked-in examples use zero so
-they fail closed until an operator supplies the reviewed boundary.
 
 ```bash
 cargo run -p ploy-research --bin monday-prediction-research -- \

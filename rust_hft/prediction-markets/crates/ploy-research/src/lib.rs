@@ -130,6 +130,7 @@ pub use factors_new::{
     register_automl_attributions, scan_into_registry, AutomlFactorAttribution, FactorMeta,
     FactorRegistry,
 };
+pub use factors_v2::SettlementProbabilityTimeCohort;
 pub use factors_v2::{
     build_data_health_report, build_factor_observations_v2,
     build_factor_observations_v2_with_deribit,
@@ -176,20 +177,20 @@ pub use factors_v2::{
     SettlementProbabilityPromotionGateOptions, SettlementProbabilityPromotionGateReport,
     SettlementProbabilityPromotionGateRow, SettlementProbabilityReport,
     SettlementProbabilityReportOptions, SettlementProbabilitySymbolHoldoutRow,
-    SettlementProbabilityTimeCohort, SettlementProbabilityWalkForwardAggregate,
-    SettlementProbabilityWalkForwardOptions, SettlementProbabilityWalkForwardReport,
-    SettlementProbabilityWalkForwardWindow, SingleFactorReview, ThreeLayerArchive,
-    TradeFormationPathRow, TradeFormationReviewOptions, TradeFormationReviewReport,
-    TradeFormationRuleRow,
+    SettlementProbabilityWalkForwardAggregate, SettlementProbabilityWalkForwardOptions,
+    SettlementProbabilityWalkForwardReport, SettlementProbabilityWalkForwardWindow,
+    SingleFactorReview, ThreeLayerArchive, TradeFormationPathRow, TradeFormationReviewOptions,
+    TradeFormationReviewReport, TradeFormationRuleRow,
 };
 #[cfg(feature = "rl")]
 pub use model::rl::{BinaryEventEnv, DqnAgent, Environment, ReplayBuffer};
+pub use model::supervised::BinaryTimeBoundary;
 #[cfg(feature = "ml")]
 pub use model::supervised::{
     train_event_disjoint_binary, BinaryArtifactScope, BinaryBundleDigest, BinaryDatasetContract,
     BinaryDecisionRow, BinaryModelManifest, BinaryOosMetrics, BinaryProbabilityModel,
-    BinarySettlementAuthority, BinaryTimeBoundary, BinaryTrainingConfig, EventDisjointBinarySplit,
-    FeatureNormalizer, VerifiedBinarySnapshot,
+    BinarySettlementAuthority, BinaryTrainingConfig, EventDisjointBinarySplit, FeatureNormalizer,
+    VerifiedBinarySnapshot,
 };
 #[cfg(any(feature = "ml", feature = "rl"))]
 pub use model::{RlAgent, StrategyModel, Transition};
