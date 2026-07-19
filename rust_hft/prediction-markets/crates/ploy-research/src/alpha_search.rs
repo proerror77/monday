@@ -471,6 +471,23 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
     llm_prior: Option<&LlmPriorSpec>,
     alpha_zoo: Option<&AlphaZooSnapshot>,
 ) -> Result<AlphaSearchArtifactSummary, AlphaSearchArtifactError> {
+    if is_side_bound_repricing_target(target)
+        || reports.iter().any(|report| report.side.is_some())
+        || prior_state.is_some_and(|state| {
+            state.version == SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION || state.side.is_some()
+        })
+        || runtime_feedback.is_some_and(|feedback| {
+            feedback.version.as_deref() == Some(SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION)
+                || feedback.side.is_some()
+        })
+        || alpha_zoo.is_some_and(|zoo| {
+            zoo.version == SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION || zoo.side.is_some()
+        })
+    {
+        return Err(AlphaSearchArtifactError::IdentityMismatch(
+            "side-bound repricing inputs require the side-bound writer".to_string(),
+        ));
+    }
     write_alpha_search_artifacts_core(
         output_root,
         target,
@@ -495,7 +512,6 @@ pub fn write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
     options: &AutoFactorOptions,
     prior_state: Option<&MctsSearchStateArtifact>,
     runtime_feedback: Option<&AlphaSearchRuntimeFeedback>,
-    llm_prior: Option<&LlmPriorSpec>,
     alpha_zoo: Option<&AlphaZooSnapshot>,
 ) -> Result<AlphaSearchArtifactSummary, AlphaSearchArtifactError> {
     write_alpha_search_artifacts_core(
@@ -507,7 +523,7 @@ pub fn write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
         options,
         prior_state,
         runtime_feedback,
-        llm_prior,
+        None,
         alpha_zoo,
     )
 }
@@ -791,10 +807,7 @@ fn validate_side_bound_inputs(
     runtime_feedback: Option<&AlphaSearchRuntimeFeedback>,
     alpha_zoo: Option<&AlphaZooSnapshot>,
 ) -> Result<(), AlphaSearchArtifactError> {
-    if !matches!(
-        target,
-        "full_depth_reprice_pnl_10s" | "full_depth_reprice_pnl_30s"
-    ) {
+    if !is_side_bound_repricing_target(target) {
         return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
             "side-bound writer does not support target={target}"
         )));
@@ -841,6 +854,13 @@ fn validate_side_bound_inputs(
         )?;
     }
     Ok(())
+}
+
+fn is_side_bound_repricing_target(target: &str) -> bool {
+    matches!(
+        target,
+        "full_depth_reprice_pnl_10s" | "full_depth_reprice_pnl_30s"
+    )
 }
 
 fn validate_side_bound_identity(
@@ -2562,11 +2582,8 @@ mod tests {
 
     #[test]
     fn side_bound_artifacts_do_not_overwrite_and_reject_wrong_side_state() {
-        let tmp = std::env::temp_dir().join(format!(
-            "ploy-alpha-search-side-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let temp = tempfile::tempdir().expect("create isolated artifact directory");
+        let tmp = temp.path();
         let target = "full_depth_reprice_pnl_10s";
         let report_for = |side| AutoFactorReport {
             target: Some(target.to_string()),
@@ -2588,17 +2605,16 @@ mod tests {
                 state,
                 None,
                 None,
-                None,
             )
         };
 
         let up = report_for(ReviewSide::Up);
-        let up_summary = write(&tmp, ReviewSide::Up, &up, None).expect("write Up artifacts");
+        let up_summary = write(tmp, ReviewSide::Up, &up, None).expect("write Up artifacts");
         let up_search_space = tmp.join(target).join("up/search-space.json");
         let up_before = std::fs::read(&up_search_space).expect("read Up search space");
 
         let down = report_for(ReviewSide::Down);
-        write(&tmp, ReviewSide::Down, &down, None).expect("write Down artifacts");
+        write(tmp, ReviewSide::Down, &down, None).expect("write Down artifacts");
 
         assert_eq!(up_summary.side, Some(ReviewSide::Up));
         assert_eq!(
@@ -2606,6 +2622,18 @@ mod tests {
             up_before
         );
         assert!(tmp.join(target).join("down/search-space.json").exists());
+
+        let pooled_root = tmp.join("pooled");
+        let err = write_alpha_search_artifacts(
+            &pooled_root,
+            target,
+            &["repricing_gap_side_10s".to_string()],
+            std::slice::from_ref(&up),
+            &AutoFactorOptions::default(),
+        )
+        .expect_err("side-bound reports must not use the pooled writer");
+        assert!(matches!(err, AlphaSearchArtifactError::IdentityMismatch(_)));
+        assert!(!pooled_root.join(target).exists());
 
         let wrong_side_state = MctsSearchStateArtifact {
             version: SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
@@ -2622,7 +2650,6 @@ mod tests {
             .expect_err("wrong-side prior state must fail closed");
         assert!(matches!(err, AlphaSearchArtifactError::IdentityMismatch(_)));
         assert!(!mismatch_root.join(target).join("up").exists());
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

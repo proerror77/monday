@@ -838,6 +838,14 @@ pub fn mine_domain_autofactors_from_v2_with_guidance(
             .collect::<Vec<_>>()
     });
     let rows = side_rows.as_deref().unwrap_or(rows);
+    if rows.is_empty() {
+        if let Some(side) = target.review_side() {
+            return Err(AutoFactorError::MissingInput(format!(
+                "review_side={}",
+                side.as_str()
+            )));
+        }
+    }
     let matrix = autofactor_matrix_from_v2(rows)?;
     let labels = autofactor_labels_from_v2(rows, target);
     let windows = autofactor_windows_from_v2(rows);
@@ -4094,6 +4102,18 @@ mod tests {
                     .unwrap()
             )
             .is_nan());
+
+        let up_only = rows
+            .iter()
+            .filter(|row| row.side == ReviewSide::Up)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(mine_domain_autofactors_from_v2(
+            &up_only,
+            AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Down),
+            &options,
+        )
+        .is_err());
     }
 
     #[test]
