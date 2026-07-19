@@ -1,11 +1,14 @@
 use crate::lob_archiver::command_status_with_timeout;
-use crate::polymarket_upload::{ensure_canonical_directory, scan_tape};
+use crate::polymarket_upload::{
+    ensure_canonical_directory, scan_tape, TRADE_COMPLETION_BASIS, TRADE_COMPLETION_KIND,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rand::random;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -46,6 +49,22 @@ pub struct SegmentIdentity {
     pub replay_scope: String,
     pub recording_policy: Value,
     pub record_id_versions: Value,
+    pub trade_completions: BTreeMap<String, TradeCompletionIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TradeCompletionIdentity {
+    pub condition_id: String,
+    pub symbol: String,
+    pub market_window_secs: u64,
+    pub trade_count: u64,
+    pub trade_record_ids_sha256: String,
+    pub completion_sequence: u64,
+    pub retrieved_at: String,
+    pub completeness_basis: String,
+    pub finalization_lag_secs: u64,
+    pub stable_polls_required: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -70,8 +89,12 @@ const MARKET_EVENT_TYPES: [&str; 4] = [
     "quote",
     "reference_price",
 ];
-const REFERENCE_EVENT_TYPES: [&str; 3] =
-    ["market_metadata", "polymarket_trade", "market_settlement"];
+const REFERENCE_EVENT_TYPES: [&str; 4] = [
+    "market_metadata",
+    "polymarket_trade",
+    "market_settlement",
+    TRADE_COMPLETION_KIND,
+];
 
 fn file_identity(metadata: &Metadata) -> FileIdentity {
     (metadata.dev(), metadata.ino(), metadata.len())
@@ -371,6 +394,13 @@ fn validate_triplet(
     if files.success.read()? != format!("{digest}\n").as_bytes() {
         bail!("_SUCCESS must contain the exact data digest and newline");
     }
+    let trade_completions = serde_json::from_value(
+        manifest
+            .get("trade_completions")
+            .cloned()
+            .ok_or_else(|| anyhow!("manifest trade_completions is missing"))?,
+    )
+    .context("parse manifest event-local trade completions")?;
     Ok(ValidatedArtifact {
         identity: SegmentIdentity {
             schema: text(&manifest, "schema")?,
@@ -391,6 +421,7 @@ fn validate_triplet(
             replay_scope: text(&manifest, "replay_scope")?,
             recording_policy: manifest["recording_policy"].clone(),
             record_id_versions: manifest["record_id_versions"].clone(),
+            trade_completions,
         },
         manifest,
         files,
@@ -484,20 +515,34 @@ fn validate_market_policy(manifest: &Value) -> Result<()> {
     Ok(())
 }
 fn validate_reference_policy(manifest: &Value) -> Result<()> {
+    let trade_completions = manifest
+        .get("trade_completions")
+        .and_then(Value::as_object)
+        .filter(|completions| !completions.is_empty());
     if manifest
         .get("reference_context_complete")
         .and_then(Value::as_bool)
         != Some(true)
-        || ["market_metadata", "polymarket_trade", "market_settlement"]
-            .iter()
-            .any(|kind| manifest["event_types"][kind].as_u64().unwrap_or_default() == 0)
+        || [
+            "market_metadata",
+            "polymarket_trade",
+            "market_settlement",
+            TRADE_COMPLETION_KIND,
+        ]
+        .iter()
+        .any(|kind| manifest["event_types"][kind].as_u64().unwrap_or_default() == 0)
+        || trade_completions.is_none_or(|completions| {
+            completions.values().any(|completion| {
+                completion["completeness_basis"].as_str() != Some(TRADE_COMPLETION_BASIS)
+            })
+        })
         || manifest["record_id_versions"] != Value::from(vec!["v2"])
         || manifest["recording_policy"]["quote_depth_levels"].as_u64() != Some(0)
         || manifest["recording_policy"]["quote_sample_ms"].as_u64() != Some(0)
         || manifest["recording_policy"]["event_scoped_quotes"].as_bool() != Some(true)
         || !has_only_event_types(manifest, &REFERENCE_EVENT_TYPES)
     {
-        bail!("reference segment must contain only metadata, v2 trades, settlements, and exact recording policy");
+        bail!("reference segment must contain only metadata, v2 trades, settlements, event-local trade completion proofs, and exact recording policy");
     }
     Ok(())
 }
@@ -539,7 +584,7 @@ pub fn validate_research_segments(
 mod tests {
     use super::*;
     use crate::lob_archiver::sha256_file;
-    use crate::polymarket_upload::derived_trade_record_id;
+    use crate::polymarket_upload::{derived_trade_record_id, trade_record_ids_sha256};
     use serde_json::json;
     use std::fs::File;
     use std::io::Write;
@@ -621,9 +666,32 @@ mod tests {
     }
 
     fn reference_rows(settlement: bool) -> Vec<Value> {
-        let mut rows = vec![row(0, metadata("market_metadata")), row(1, trade())];
+        let trade = trade();
+        let record_id = trade["record_id"].as_str().unwrap().to_owned();
+        let mut rows = vec![row(0, metadata("market_metadata")), row(1, trade)];
         if settlement {
             rows.push(row(2, metadata("market_settlement")));
+            rows.push(row(
+                3,
+                json!({
+                    "kind": TRADE_COMPLETION_KIND,
+                    "market_id": "market-1",
+                    "condition_id": "0xcondition",
+                    "symbol": "BTCUSDT",
+                    "market_window_secs": 300,
+                    "record_id_version": "v2",
+                    "trade_count": 1,
+                    "trade_record_ids_sha256": trade_record_ids_sha256([record_id.as_str()]),
+                    "source": "polymarket_data_api",
+                    "retrieved_at": "2026-07-17T05:01:00Z",
+                    "completeness_basis": TRADE_COMPLETION_BASIS,
+                    "pagination_exhausted": true,
+                    "settlement_observed": true,
+                    "malformed_trade_rows": 0,
+                    "finalization_lag_secs": 60,
+                    "stable_polls_required": 2,
+                }),
+            ));
         }
         rows
     }
@@ -698,10 +766,8 @@ mod tests {
     }
 
     fn rejects(config: &ResearchSegmentValidationConfig, expected: &str) {
-        assert!(validate_research_segments(config)
-            .unwrap_err()
-            .to_string()
-            .contains(expected));
+        let error = validate_research_segments(config).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
     }
 
     #[test]
@@ -726,6 +792,15 @@ mod tests {
         assert_eq!(first.market.recording_policy["quote_sample_ms"], 1_000);
         assert_eq!(first.reference.record_id_versions, json!(["v2"]));
         assert_eq!(first.reference.recording_policy["quote_sample_ms"], 0);
+    }
+
+    #[test]
+    fn rejects_reference_segment_without_event_local_trade_completion() {
+        let mut reference = reference_rows(true);
+        reference.pop();
+        let (_temp, config) = fixture_rows(&market_rows(), &reference);
+
+        rejects(&config, "event-local trade completion");
     }
 
     #[test]

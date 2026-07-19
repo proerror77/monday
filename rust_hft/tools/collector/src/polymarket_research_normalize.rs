@@ -1,10 +1,12 @@
-use crate::polymarket_research_import::ResearchSegmentValidationReport;
+use crate::polymarket_research_import::{ResearchSegmentValidationReport, TradeCompletionIdentity};
 use crate::polymarket_research_select::{
     decimal_text, json_strings, required, timestamp, utc_text, visit,
     with_selected_research_contracts, ResearchSelectionConfig, SelectedContract, SYMBOLS,
     WINDOW_SECS,
 };
-use crate::polymarket_upload::{validate_canonical_trade, validate_market_settlement};
+use crate::polymarket_upload::{
+    trade_record_ids_sha256, validate_canonical_trade, validate_market_settlement,
+};
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -260,7 +262,7 @@ fn trade_rows(
     pending: Vec<Pending>,
     contracts: &BTreeMap<String, SelectedContract>,
     rows: &mut Vec<Row>,
-    counts: &mut BTreeMap<String, u64>,
+    record_ids: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Result<()> {
     for pending in pending {
         let record_id = validate_canonical_trade(&pending.update, pending.line)?;
@@ -327,6 +329,10 @@ fn trade_rows(
                 "source_dataset": "crypto_expiry_reference"
             }),
         );
+        record_ids
+            .entry(contract.market_id.clone())
+            .or_default()
+            .insert(record_id.clone());
         rows.push(row(
             SurfaceOrder::PolymarketTrade,
             contract,
@@ -335,7 +341,6 @@ fn trade_rows(
             pending.sequence,
             value,
         ));
-        *counts.entry(contract.market_id.clone()).or_default() += 1;
     }
     Ok(())
 }
@@ -565,7 +570,7 @@ fn has_all_surfaces(
     contract: &SelectedContract,
     quote_tokens: &BTreeMap<String, BTreeSet<String>>,
     references: &BTreeMap<String, u64>,
-    trades: &BTreeMap<String, u64>,
+    trades: &BTreeMap<String, BTreeSet<String>>,
     settlements: &BTreeMap<String, String>,
 ) -> bool {
     let expected = BTreeSet::from([contract.up_token.clone(), contract.down_token.clone()]);
@@ -575,8 +580,48 @@ fn has_all_surfaces(
             .copied()
             .unwrap_or_default()
             > 0
-        && trades.get(&contract.market_id).copied().unwrap_or_default() > 0
+        && trades
+            .get(&contract.market_id)
+            .is_some_and(|record_ids| !record_ids.is_empty())
         && settlements.contains_key(&contract.market_id)
+}
+
+fn validate_event_local_trade_completions(
+    completions: &BTreeMap<String, TradeCompletionIdentity>,
+    contracts: &BTreeMap<String, SelectedContract>,
+    trade_record_ids: &BTreeMap<String, BTreeSet<String>>,
+) -> Result<()> {
+    for contract in contracts.values() {
+        let completion = completions.get(&contract.market_id).ok_or_else(|| {
+            anyhow!(
+                "selected market {} has no event-local trade completion proof",
+                contract.market_id
+            )
+        })?;
+        let metadata = contract
+            .metadata
+            .as_ref()
+            .expect("metadata completeness checked");
+        let observed = trade_record_ids
+            .get(&contract.market_id)
+            .cloned()
+            .unwrap_or_default();
+        let observed_count = u64::try_from(observed.len())?;
+        let observed_digest = trade_record_ids_sha256(observed.iter().map(String::as_str));
+        if completion.condition_id != metadata.condition_id
+            || completion.symbol != contract.symbol
+            || completion.market_window_secs != WINDOW_SECS as u64
+            || completion.completeness_basis != crate::polymarket_upload::TRADE_COMPLETION_BASIS
+            || completion.trade_count != observed_count
+            || completion.trade_record_ids_sha256 != observed_digest
+        {
+            bail!(
+                "selected market {} does not match event-local trade completion proof",
+                contract.market_id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn normalize_raw(
@@ -595,6 +640,11 @@ fn normalize_raw(
     let mut references = BTreeMap::new();
     contract_rows(contracts, &mut rows)?;
     trade_rows(trades, contracts, &mut rows, &mut trade_counts)?;
+    validate_event_local_trade_completions(
+        &inputs.reference.trade_completions,
+        contracts,
+        &trade_counts,
+    )?;
     settlement_rows(settlements, contracts, &mut rows, &mut settled)?;
     market_rows(
         market_path,
@@ -996,7 +1046,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value["source_sequence"], 3);
-        assert_eq!(counts.get("market"), Some(&1));
+        assert_eq!(counts.get("market").map(BTreeSet::len), Some(1));
     }
 
     #[test]
@@ -1037,6 +1087,39 @@ mod tests {
     }
 
     #[test]
+    fn rejects_selected_event_missing_a_trade_bound_by_completion_digest() {
+        let contract = selected_contract();
+        let contracts = BTreeMap::from([(contract.market_id.clone(), contract)]);
+        let complete_ids = BTreeSet::from(["trade-a".to_owned(), "trade-b".to_owned()]);
+        let completions = BTreeMap::from([(
+            "market".to_owned(),
+            TradeCompletionIdentity {
+                condition_id: "condition".to_owned(),
+                symbol: "BTCUSDT".to_owned(),
+                market_window_secs: 300,
+                trade_count: 2,
+                trade_record_ids_sha256: trade_record_ids_sha256(
+                    complete_ids.iter().map(String::as_str),
+                ),
+                completion_sequence: 10,
+                retrieved_at: "2026-07-17T05:31:00Z".to_owned(),
+                completeness_basis: crate::polymarket_upload::TRADE_COMPLETION_BASIS.to_owned(),
+                finalization_lag_secs: 60,
+                stable_polls_required: 2,
+            },
+        )]);
+        let observed =
+            BTreeMap::from([("market".to_owned(), BTreeSet::from(["trade-a".to_owned()]))]);
+
+        let error = validate_event_local_trade_completions(&completions, &contracts, &observed)
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match event-local trade completion proof"));
+    }
+
+    #[test]
     fn malformed_recorded_at_fails_even_when_received_at_is_noncausal() {
         let contract = selected_contract();
         let contracts = BTreeMap::from([(contract.market_id.clone(), contract)]);
@@ -1066,7 +1149,7 @@ mod tests {
             "market".to_owned(),
             BTreeSet::from(["up".to_owned(), "down".to_owned()]),
         )]);
-        let trades = BTreeMap::from([("market".to_owned(), 1)]);
+        let trades = BTreeMap::from([("market".to_owned(), BTreeSet::from(["trade".to_owned()]))]);
         let settlements = BTreeMap::from([("market".to_owned(), "digest".to_owned())]);
         assert!(has_all_surfaces(
             &contract,
@@ -1107,7 +1190,7 @@ mod tests {
             BTreeSet::from(["up".to_owned(), "down".to_owned()]),
         )]);
         let mut references = BTreeMap::from([("market".to_owned(), 1)]);
-        let trades = references.clone();
+        let trades = BTreeMap::from([("market".to_owned(), BTreeSet::from(["trade".to_owned()]))]);
         let settlements = BTreeMap::from([("market".to_owned(), "digest".to_owned())]);
         assert!(has_all_surfaces(
             &contract,

@@ -30,13 +30,15 @@ const EVIDENCE_SCOPE: &str =
 const DIGEST_SEMANTICS: &str =
     "content_sha256 binds the published NDJSON bytes only; it is not a snapshot_contract_hash";
 const TRUST_BOUNDARY: &str = "typed collector staging evidence only; not an evaluator label snapshot or snapshot_contract_hash; validated staged triplets and adjacent local supersession markers; omitted remote-prefix markers are not proven absent";
-const TRADE_SEMANTICS: &str = "exact market_id association using canonical v2 records; trade_ts may fall outside the event lifetime";
+const TRADE_SEMANTICS: &str = "exact market_id association using canonical v2 records; selected event count and record IDs match a collector completion proof; trade_ts may fall outside the event lifetime";
 const REFERENCE_SEMANTICS: &str =
     "typed Chainlink BTC/USD or SOL/USD with source timestamp in [event_start - 30 seconds, event_end)";
 const SETTLEMENT_SEMANTICS: &str =
     "gamma_api_closed_market closed-market evidence joined by exact market_id";
 const AVAILABILITY_SEMANTICS: &str =
     "point-in-time rows expose the latest validated recorded or retrieved clock as available_at";
+const TRADE_COMPLETION_BASIS: &str =
+    "polymarket_data_api_exhausted_after_settlement_and_stable_polls_v1";
 
 #[derive(Debug, Clone)]
 pub struct PolymarketEvidenceTriplet {
@@ -177,6 +179,23 @@ struct SegmentIdentity {
     replay_scope: String,
     recording_policy: RecordingPolicy,
     record_id_versions: Vec<String>,
+    #[serde(default)]
+    trade_completions: BTreeMap<String, TradeCompletionIdentity>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TradeCompletionIdentity {
+    condition_id: String,
+    symbol: String,
+    market_window_secs: u64,
+    trade_count: u64,
+    trade_record_ids_sha256: String,
+    completion_sequence: u64,
+    retrieved_at: String,
+    completeness_basis: String,
+    finalization_lag_secs: u64,
+    stable_polls_required: u64,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -257,7 +276,11 @@ fn seal_with_hook(
     if parse_digest(&parsed.content_sha256, "content_sha256")? != trust.expected_content_sha256 {
         bail!("evidence manifest content digest does not match the trusted anchor");
     }
-    let frames = frame_ndjson(&data_bytes, &parsed.surface_counts)?;
+    let frames = frame_ndjson(
+        &data_bytes,
+        &parsed.surface_counts,
+        &parsed.validated_inputs.reference.trade_completions,
+    )?;
     if u64::try_from(frames.len())? != parsed.rows {
         bail!("evidence NDJSON row count does not match the manifest");
     }
@@ -561,6 +584,47 @@ fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
     {
         bail!("validated {dataset} input identity is inconsistent");
     }
+    validate_trade_completions(segment, dataset, start, end)?;
+    Ok(())
+}
+
+fn validate_trade_completions(
+    segment: &SegmentIdentity,
+    dataset: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<()> {
+    if dataset == "crypto_expiry" {
+        if !segment.trade_completions.is_empty() {
+            bail!("validated market input must not declare trade completions");
+        }
+        return Ok(());
+    }
+    if segment.trade_completions.is_empty() {
+        bail!("validated reference event-local trade completion identity is inconsistent");
+    }
+    for (market_id, completion) in &segment.trade_completions {
+        let retrieved_at = parse_time(&completion.retrieved_at, "trade completion retrieved_at")?;
+        if market_id.is_empty()
+            || completion.condition_id.is_empty()
+            || !SYMBOLS.contains(&completion.symbol.as_str())
+            || completion.market_window_secs != 300
+            || parse_digest(
+                &completion.trade_record_ids_sha256,
+                "trade completion record ID digest",
+            )
+            .is_err()
+            || completion.completion_sequence < segment.start_sequence
+            || completion.completion_sequence > segment.end_sequence
+            || retrieved_at < start
+            || retrieved_at > end
+            || completion.completeness_basis != TRADE_COMPLETION_BASIS
+            || completion.finalization_lag_secs == 0
+            || completion.stable_polls_required == 0
+        {
+            bail!("validated reference event-local trade completion identity is inconsistent");
+        }
+    }
     Ok(())
 }
 
@@ -588,12 +652,15 @@ fn parse_time(value: &str, label: &str) -> Result<DateTime<Utc>> {
 fn frame_ndjson(
     bytes: &[u8],
     expected_counts: &BTreeMap<String, u64>,
+    trade_completions: &BTreeMap<String, TradeCompletionIdentity>,
 ) -> Result<Vec<Range<usize>>> {
     if bytes.is_empty() || bytes.last() != Some(&b'\n') || bytes.contains(&b'\r') {
         bail!("evidence data must be non-empty newline-terminated NDJSON");
     }
     let mut frames = Vec::new();
     let mut counts = BTreeMap::new();
+    let mut market_contexts = BTreeMap::<String, (String, String, u64)>::new();
+    let mut trade_record_ids = BTreeMap::<String, BTreeSet<String>>::new();
     let mut start = 0;
     for (end, byte) in bytes.iter().enumerate() {
         if *byte != b'\n' {
@@ -616,11 +683,76 @@ fn frame_ndjson(
             .filter(|surface| SURFACES.contains(surface))
             .ok_or_else(|| anyhow!("unsupported evidence surface"))?;
         *counts.entry(surface.to_owned()).or_default() += 1;
+        if matches!(surface, "market_contract" | "polymarket_trade") {
+            let market_id = object
+                .get("market_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("evidence {surface} row requires market_id"))?;
+            if surface == "market_contract" {
+                let condition_id = object
+                    .get("condition_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow!("evidence market_contract row requires condition_id"))?;
+                let symbol = object
+                    .get("symbol")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow!("evidence market_contract row requires symbol"))?;
+                let window_secs = object
+                    .get("window_secs")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("evidence market_contract row requires window_secs"))?;
+                market_contexts.insert(
+                    market_id.to_owned(),
+                    (condition_id.to_owned(), symbol.to_owned(), window_secs),
+                );
+            } else {
+                let record_id = object
+                    .get("record_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow!("evidence trade row requires record_id"))?;
+                if !trade_record_ids
+                    .entry(market_id.to_owned())
+                    .or_default()
+                    .insert(record_id.to_owned())
+                {
+                    bail!("evidence rows contain a duplicate Polymarket trade record_id");
+                }
+            }
+        }
         frames.push(start..end);
         start = end + 1;
     }
     if &counts != expected_counts {
         bail!("evidence surface counts do not match the manifest");
+    }
+    for (market_id, (condition_id, symbol, window_secs)) in market_contexts {
+        let completion = trade_completions.get(&market_id).ok_or_else(|| {
+            anyhow!("evidence trade rows do not match event-local completion proof")
+        })?;
+        if completion.condition_id != condition_id
+            || completion.symbol != symbol
+            || completion.market_window_secs != window_secs
+        {
+            bail!("evidence trade rows do not match event-local completion proof");
+        }
+        let record_ids = trade_record_ids.remove(&market_id).unwrap_or_default();
+        let mut digest = Sha256::new();
+        for record_id in &record_ids {
+            digest.update(record_id.as_bytes());
+            digest.update(b"\n");
+        }
+        if completion.trade_count != u64::try_from(record_ids.len())?
+            || completion.trade_record_ids_sha256 != format!("{:x}", digest.finalize())
+        {
+            bail!("evidence trade rows do not match event-local completion proof");
+        }
+    }
+    if !trade_record_ids.is_empty() {
+        bail!("evidence trade rows do not match event-local completion proof");
     }
     Ok(frames)
 }
@@ -632,9 +764,25 @@ pub(super) mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[rustfmt::skip]
-    fn inputs() -> Value {
+    fn inputs(rows: &[Value]) -> Value {
+        let mut contexts = BTreeMap::<String, (String, String, u64)>::new();
+        let mut trade_ids = BTreeMap::<String, BTreeSet<String>>::new();
+        for row in rows {
+            let Some(market_id) = row.get("market_id").and_then(Value::as_str) else { continue };
+            match row.get("surface").and_then(Value::as_str) {
+                Some("market_contract") => { contexts.insert(market_id.to_owned(), (row["condition_id"].as_str().unwrap().to_owned(), row["symbol"].as_str().unwrap().to_owned(), row["window_secs"].as_u64().unwrap())); }
+                Some("polymarket_trade") => { trade_ids.entry(market_id.to_owned()).or_default().insert(row["record_id"].as_str().unwrap().to_owned()); }
+                _ => {}
+            }
+        }
+        let trade_completions = contexts.into_iter().map(|(market_id, (condition_id, symbol, market_window_secs))| {
+            let record_ids = trade_ids.remove(&market_id).unwrap_or_default();
+            let mut digest = Sha256::new(); for record_id in &record_ids { digest.update(record_id.as_bytes()); digest.update(b"\n"); }
+            (market_id, json!({"condition_id":condition_id,"symbol":symbol,"market_window_secs":market_window_secs,"trade_count":record_ids.len(),"trade_record_ids_sha256":format!("{:x}", digest.finalize()),"completion_sequence":2,"retrieved_at":"2026-07-17T05:01:00Z","completeness_basis":TRADE_COMPLETION_BASIS,"finalization_lag_secs":60,"stable_polls_required":2}))
+        }).collect::<serde_json::Map<_, _>>();
         let segment = |dataset: &str, sample: u64, versions: Value| {
             let replay = if sample == 0 { "complete_reference_hour_segment" } else { "complete_full_depth_sampled_normalized_hour_segment" };
+            let trade_completions = if sample == 0 { Value::Object(trade_completions.clone()) } else { json!({}) };
             json!({
                 "schema":"monday.polymarket.raw.v1", "venue":"polymarket", "dataset":dataset,
                 "date":"2026-07-17", "hour":"05", "file":format!("{dataset}.ndjson.zst"), "bytes":100,
@@ -642,6 +790,7 @@ pub(super) mod tests {
                 "start_recorded_at":"2026-07-17T05:00:00Z", "end_recorded_at":"2026-07-17T05:01:00Z",
                 "source_file":format!("{dataset}.ndjson"), "replay_scope":replay, "record_id_versions":versions,
                 "recording_policy":{"quote_sample_ms":sample,"quote_depth_levels":0,"event_scoped_quotes":true},
+                "trade_completions":trade_completions,
             })
         };
         json!({"schema":INPUT_SCHEMA, "market":segment("crypto_expiry", 1000, json!([])),
@@ -650,7 +799,11 @@ pub(super) mod tests {
 
     #[rustfmt::skip]
     fn write_triplet(temp: &tempfile::TempDir) -> PolymarketEvidenceTriplet {
-        let rows = SURFACES.map(|surface| json!({"schema":ROW_SCHEMA,"surface":surface}));
+        let rows = SURFACES.map(|surface| {
+            let mut row = json!({"schema":ROW_SCHEMA,"surface":surface,"market_id":"market-1","condition_id":"condition-1","symbol":"BTCUSDT","window_secs":300});
+            if surface == "polymarket_trade" { row["record_id"] = json!("trade-1"); }
+            row
+        });
         write_triplet_rows(temp, &rows)
     }
 
@@ -684,7 +837,7 @@ pub(super) mod tests {
                     "queue_position_modeled":false,"endogenous_impact_modeled":false,"capacity_modeled":false},
                 "trades":TRADE_SEMANTICS,"references":REFERENCE_SEMANTICS,
                 "settlement":SETTLEMENT_SEMANTICS,"availability_clock":AVAILABILITY_SEMANTICS},
-            "trust_boundary":TRUST_BOUNDARY,"validated_inputs":inputs()
+            "trust_boundary":TRUST_BOUNDARY,"validated_inputs":inputs(rows)
         });
         fs::write(&manifest, format!("{}\n", serde_json::to_string(&manifest_value).unwrap())).unwrap();
         fs::write(&success, format!("{digest}\n")).unwrap();
@@ -747,8 +900,52 @@ pub(super) mod tests {
 
     #[test]
     #[rustfmt::skip]
+    fn rejects_manifest_without_event_local_trade_completion_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut value: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        value["validated_inputs"]["reference"].as_object_mut().unwrap().remove("trade_completions");
+        rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&value).unwrap()));
+        let error = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap_err();
+        assert!(error.to_string().contains("event-local trade completion identity"));
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn rejects_trade_rows_not_bound_by_the_completion_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let rows = SURFACES.map(|surface| {
+            let mut row = json!({"schema":ROW_SCHEMA,"surface":surface,"market_id":"market-1","condition_id":"condition-1","symbol":"BTCUSDT","window_secs":300});
+            if surface == "polymarket_trade" { row["record_id"] = json!("trade-not-in-completion"); }
+            row
+        });
+        let triplet = write_triplet_rows(&temp, &rows);
+        let mut value: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        value["validated_inputs"]["reference"]["trade_completions"]["market-1"]["trade_record_ids_sha256"] = json!("2".repeat(64));
+        rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&value).unwrap()));
+        let error = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap_err();
+        assert!(error.to_string().contains("trade rows do not match event-local completion proof"));
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn rejects_trade_rows_for_an_unselected_market() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut rows = Vec::from(SURFACES.map(|surface| {
+            let mut row = json!({"schema":ROW_SCHEMA,"surface":surface,"market_id":"market-1","condition_id":"condition-1","symbol":"BTCUSDT","window_secs":300});
+            if surface == "polymarket_trade" { row["record_id"] = json!("trade-1"); }
+            row
+        }));
+        rows.push(json!({"schema":ROW_SCHEMA,"surface":"polymarket_trade","market_id":"market-2","condition_id":"condition-2","symbol":"BTCUSDT","window_secs":300,"record_id":"trade-2"}));
+        let triplet = write_triplet_rows(&temp, &rows);
+        let error = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap_err();
+        assert!(error.to_string().contains("trade rows do not match event-local completion proof"));
+    }
+
+    #[test]
+    #[rustfmt::skip]
     fn rejects_noncanonical_or_nonregular_data() {
-        assert!(frame_ndjson(b"{}\r\n", &BTreeMap::new()).is_err());
+        assert!(frame_ndjson(b"{}\r\n", &BTreeMap::new(), &BTreeMap::new()).is_err());
         let temp = tempfile::tempdir().unwrap();
         let triplet = write_triplet(&temp);
         let fifo_anchor = trust(&triplet);

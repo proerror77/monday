@@ -118,7 +118,7 @@ fn recording_semantics() -> RecordingSemantics {
             endogenous_impact_modeled: false,
             capacity_modeled: false,
         },
-        trades: "exact market_id association using canonical v2 records; trade_ts may fall outside the event lifetime",
+        trades: "exact market_id association using canonical v2 records; selected event count and record IDs match a collector completion proof; trade_ts may fall outside the event lifetime",
         references: "typed Chainlink BTC/USD or SOL/USD with source timestamp in [event_start - 30 seconds, event_end)",
         settlement: "gamma_api_closed_market closed-market evidence joined by exact market_id",
         availability_clock: "point-in-time rows expose the latest validated recorded or retrieved clock as available_at",
@@ -536,7 +536,9 @@ pub fn publish_polymarket_evidence(
 mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
-    use crate::polymarket_research_import::{ResearchSegmentValidationReport, SegmentIdentity};
+    use crate::polymarket_research_import::{
+        ResearchSegmentValidationReport, SegmentIdentity, TradeCompletionIdentity,
+    };
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
@@ -616,6 +618,26 @@ mod tests {
     #[test]
     fn published_result_returns_digests_for_the_exact_triplet() {
         fn segment(dataset: &str) -> SegmentIdentity {
+            let trade_completions = (dataset == "crypto_expiry_reference")
+                .then(|| {
+                    BTreeMap::from([(
+                        "market-1".to_owned(),
+                        TradeCompletionIdentity {
+                            condition_id: "condition-1".to_owned(),
+                            symbol: "BTCUSDT".to_owned(),
+                            market_window_secs: 300,
+                            trade_count: 1,
+                            trade_record_ids_sha256: "1".repeat(64),
+                            completion_sequence: 1,
+                            retrieved_at: "2026-07-17T05:00:01Z".to_owned(),
+                            completeness_basis: crate::polymarket_upload::TRADE_COMPLETION_BASIS
+                                .to_owned(),
+                            finalization_lag_secs: 60,
+                            stable_polls_required: 2,
+                        },
+                    )])
+                })
+                .unwrap_or_default();
             SegmentIdentity {
                 schema: "monday.polymarket.raw.v1".into(),
                 venue: "polymarket".into(),
@@ -635,6 +657,7 @@ mod tests {
                 replay_scope: "fixture".into(),
                 recording_policy: serde_json::json!({}),
                 record_id_versions: serde_json::json!(["v2"]),
+                trade_completions,
             }
         }
 
@@ -715,6 +738,10 @@ mod tests {
         assert_eq!(orderbook["queue_position_modeled"], false);
         assert_eq!(orderbook["endogenous_impact_modeled"], false);
         assert_eq!(orderbook["capacity_modeled"], false);
+        assert!(semantics["trades"]
+            .as_str()
+            .unwrap()
+            .contains("collector completion proof"));
         assert_eq!(
             semantics["references"],
             "typed Chainlink BTC/USD or SOL/USD with source timestamp in [event_start - 30 seconds, event_end)"

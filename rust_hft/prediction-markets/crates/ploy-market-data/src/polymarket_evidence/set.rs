@@ -296,6 +296,13 @@ mod tests {
             input["start_recorded_at"] = json!(timestamp(lower));
             input["end_recorded_at"] = json!(timestamp(lower + Duration::minutes(1)));
         }
+        for completion in manifest["validated_inputs"]["reference"]["trade_completions"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            completion["retrieved_at"] = json!(timestamp(lower + Duration::minutes(1)));
+        }
         fs::set_permissions(&triplet.manifest, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(
             &triplet.manifest,
