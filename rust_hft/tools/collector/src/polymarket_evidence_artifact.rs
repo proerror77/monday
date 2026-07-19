@@ -156,7 +156,7 @@ fn validate_dataset(dataset: &NormalizedPolymarketEvidence) -> Result<()> {
 
 fn manifest_bytes(report: &PolymarketEvidenceReport, file: &str) -> Result<Vec<u8>> {
     let manifest = PolymarketEvidenceManifest {
-        schema: "monday.polymarket.evidence_artifact.v1",
+        schema: "monday.polymarket.evidence_artifact.v2",
         file,
         format: "ndjson",
         content_sha256: &report.content_sha256,
