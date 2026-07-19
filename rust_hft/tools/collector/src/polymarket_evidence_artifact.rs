@@ -118,7 +118,7 @@ fn recording_semantics() -> RecordingSemantics {
             endogenous_impact_modeled: false,
             capacity_modeled: false,
         },
-        trades: "exact market_id association using canonical v2 records; trade_ts may fall outside the event lifetime",
+        trades: "exact market_id association using canonical v2 records; selected event count and record IDs match a collector completion proof; trade_ts may fall outside the event lifetime",
         references: "typed Chainlink BTC/USD or SOL/USD with source timestamp in [event_start - 30 seconds, event_end)",
         settlement: "gamma_api_closed_market closed-market evidence joined by exact market_id",
         availability_clock: "point-in-time rows expose the latest validated recorded or retrieved clock as available_at",
@@ -156,7 +156,7 @@ fn validate_dataset(dataset: &NormalizedPolymarketEvidence) -> Result<()> {
 
 fn manifest_bytes(report: &PolymarketEvidenceReport, file: &str) -> Result<Vec<u8>> {
     let manifest = PolymarketEvidenceManifest {
-        schema: "monday.polymarket.evidence_artifact.v1",
+        schema: "monday.polymarket.evidence_artifact.v2",
         file,
         format: "ndjson",
         content_sha256: &report.content_sha256,
@@ -536,7 +536,9 @@ pub fn publish_polymarket_evidence(
 mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
-    use crate::polymarket_research_import::{ResearchSegmentValidationReport, SegmentIdentity};
+    use crate::polymarket_research_import::{
+        ResearchSegmentValidationReport, SegmentIdentity, TradeCompletionIdentity,
+    };
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
@@ -616,6 +618,27 @@ mod tests {
     #[test]
     fn published_result_returns_digests_for_the_exact_triplet() {
         fn segment(dataset: &str) -> SegmentIdentity {
+            let is_reference = dataset == "crypto_expiry_reference";
+            let trade_completions = (dataset == "crypto_expiry_reference")
+                .then(|| {
+                    BTreeMap::from([(
+                        "market-1".to_owned(),
+                        TradeCompletionIdentity {
+                            condition_id: "condition-1".to_owned(),
+                            symbol: "BTCUSDT".to_owned(),
+                            market_window_secs: 300,
+                            trade_count: 1,
+                            trade_record_ids_sha256: "1".repeat(64),
+                            completion_sequence: 1,
+                            retrieved_at: "2026-07-17T05:00:01Z".to_owned(),
+                            completeness_basis: crate::polymarket_upload::TRADE_COMPLETION_BASIS
+                                .to_owned(),
+                            finalization_lag_secs: 60,
+                            stable_polls_required: 2,
+                        },
+                    )])
+                })
+                .unwrap_or_default();
             SegmentIdentity {
                 schema: "monday.polymarket.raw.v1".into(),
                 venue: "polymarket".into(),
@@ -625,16 +648,30 @@ mod tests {
                 file: format!("{dataset}.ndjson.zst"),
                 bytes: 1,
                 sha256: "0".repeat(64),
-                events: 1,
+                events: if is_reference { 3 } else { 1 },
                 start_sequence: 1,
-                end_sequence: 1,
+                end_sequence: if is_reference { 3 } else { 1 },
                 sequence_gaps: 0,
                 start_recorded_at: "2026-07-17T05:00:00Z".into(),
                 end_recorded_at: "2026-07-17T05:00:01Z".into(),
                 source_file: format!("{dataset}.ndjson"),
                 replay_scope: "fixture".into(),
                 recording_policy: serde_json::json!({}),
-                record_id_versions: serde_json::json!(["v2"]),
+                record_id_versions: if is_reference {
+                    serde_json::json!(["v2"])
+                } else {
+                    serde_json::json!([])
+                },
+                event_types: if is_reference {
+                    BTreeMap::from([
+                        ("market_metadata".to_owned(), 1),
+                        ("polymarket_trade".to_owned(), 1),
+                        ("market_settlement".to_owned(), 1),
+                    ])
+                } else {
+                    BTreeMap::from([("quote".to_owned(), 1)])
+                },
+                trade_completions,
             }
         }
 
@@ -715,6 +752,10 @@ mod tests {
         assert_eq!(orderbook["queue_position_modeled"], false);
         assert_eq!(orderbook["endogenous_impact_modeled"], false);
         assert_eq!(orderbook["capacity_modeled"], false);
+        assert!(semantics["trades"]
+            .as_str()
+            .unwrap()
+            .contains("collector completion proof"));
         assert_eq!(
             semantics["references"],
             "typed Chainlink BTC/USD or SOL/USD with source timestamp in [event_start - 30 seconds, event_end)"

@@ -3,7 +3,7 @@ use crate::polymarket_upload::{ensure_canonical_directory, scan_tape, TRADE_COMP
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use rand::random;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +48,22 @@ pub struct SegmentIdentity {
     pub recording_policy: Value,
     pub record_id_versions: Value,
     pub event_types: BTreeMap<String, u64>,
+    pub trade_completions: BTreeMap<String, TradeCompletionIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TradeCompletionIdentity {
+    pub condition_id: String,
+    pub symbol: String,
+    pub market_window_secs: u64,
+    pub trade_count: u64,
+    pub trade_record_ids_sha256: String,
+    pub completion_sequence: u64,
+    pub retrieved_at: String,
+    pub completeness_basis: String,
+    pub finalization_lag_secs: u64,
+    pub stable_polls_required: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -404,6 +420,13 @@ fn validate_triplet(
     if files.success.read()? != format!("{digest}\n").as_bytes() {
         bail!("_SUCCESS must contain the exact data digest and newline");
     }
+    let trade_completions = serde_json::from_value(
+        manifest
+            .get("trade_completions")
+            .cloned()
+            .ok_or_else(|| anyhow!("manifest trade_completions is missing"))?,
+    )
+    .context("parse manifest event-local trade completions")?;
     let event_types = serde_json::from_value(
         manifest
             .get("event_types")
@@ -432,6 +455,7 @@ fn validate_triplet(
             recording_policy: manifest["recording_policy"].clone(),
             record_id_versions: manifest["record_id_versions"].clone(),
             event_types,
+            trade_completions,
         },
         manifest,
         files,
@@ -695,9 +719,7 @@ pub fn validate_research_segments(
 mod tests {
     use super::*;
     use crate::lob_archiver::sha256_file;
-    use crate::polymarket_upload::{
-        derived_trade_record_id, trade_record_ids_sha256, TRADE_COMPLETION_BASIS,
-    };
+    use crate::polymarket_upload::{derived_trade_record_id, trade_record_ids_sha256};
     use serde_json::json;
     use std::fs::File;
     use std::io::Write;
@@ -760,7 +782,7 @@ mod tests {
             "trade_record_ids_sha256": trade_record_ids_sha256([record_id.as_str()]),
             "source": "polymarket_data_api",
             "retrieved_at": "2026-07-17T05:01:00Z",
-            "completeness_basis": TRADE_COMPLETION_BASIS,
+            "completeness_basis": crate::polymarket_upload::TRADE_COMPLETION_BASIS,
             "pagination_exhausted": true,
             "settlement_observed": true,
             "malformed_trade_rows": 0,
@@ -800,6 +822,7 @@ mod tests {
         ]
     }
 
+    #[rustfmt::skip]
     fn reference_rows(settlement: bool) -> Vec<Value> {
         let mut rows = vec![row(0, metadata("market_metadata")), row(1, trade())];
         if settlement {
@@ -888,10 +911,8 @@ mod tests {
     }
 
     fn rejects(config: &ResearchSegmentValidationConfig, expected: &str) {
-        assert!(validate_research_segments(config)
-            .unwrap_err()
-            .to_string()
-            .contains(expected));
+        let error = validate_research_segments(config).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
     }
 
     #[test]
