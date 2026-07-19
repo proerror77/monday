@@ -115,6 +115,10 @@ impl RustProcessEvaluator {
             .arg(snapshot.manifest.stake_usd.to_string())
             .arg("--report-suite")
             .arg("core")
+            .arg("--report-output-dir")
+            .arg(request.artifact_dir.join("reports"))
+            .arg("--mission-id")
+            .arg(&request.mission.mission_id)
             .arg("--expected-search-policy-snapshot-id")
             .arg(&request.mission.search_policy_snapshot_id);
 
@@ -705,6 +709,17 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|window| { window[0] == "--event-window-secs" && window[1] == "300" }));
+        assert!(args.windows(2).any(|window| {
+            window[0] == "--report-output-dir"
+                && window[1] == root.join("artifacts").join("reports").to_string_lossy()
+        }));
+        assert!(args.windows(2).any(|window| {
+            window[0] == "--mission-id" && window[1] == request.mission.mission_id
+        }));
+        assert!(args.windows(2).any(|window| {
+            window[0] == "--expected-search-policy-snapshot-id"
+                && window[1] == request.mission.search_policy_snapshot_id
+        }));
         let _ = std::fs::remove_dir_all(root);
     }
 }
