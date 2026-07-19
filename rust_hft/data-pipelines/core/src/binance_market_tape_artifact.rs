@@ -214,7 +214,13 @@ pub fn verify_binance_market_tape(
         .map(|symbol| (symbol.clone(), Vec::new()))
         .collect::<BTreeMap<_, _>>();
     let mut session_id = None;
-    let mut last_received_at_ns = None;
+    let mut depth_receive_clocks = symbols
+        .iter()
+        .map(|symbol| (symbol.clone(), None))
+        .collect::<BTreeMap<_, _>>();
+    let mut trade_receive_clocks = depth_receive_clocks.clone();
+    let mut highest_received_at_ns = None;
+    let mut previous_segment_end_received_at_ns = None;
 
     for segment in sealed {
         if Market::from_str(&segment.manifest.market).map_err(anyhow::Error::msg)? != market
@@ -231,6 +237,12 @@ pub fn verify_binance_market_tape(
             bail!("market-tape segments do not share one market/dataset/shard scope");
         }
         validate_manifest_quality(&segment.manifest)?;
+        if previous_segment_end_received_at_ns
+            .is_some_and(|last| segment.manifest.start_received_at_ns < last)
+        {
+            bail!("market-tape receive time moved backwards across segments");
+        }
+        previous_segment_end_received_at_ns = Some(segment.manifest.end_received_at_ns);
         let mut counts = BTreeMap::<String, u64>::new();
         let mut checkpoints = BTreeSet::new();
         let mut snapshot_seeds = BTreeSet::new();
@@ -242,10 +254,14 @@ pub fn verify_binance_market_tape(
                 .ok_or_else(|| anyhow!("market-tape row must be an object"))?;
             let (event_type, row_session_id, received_at_ns) =
                 validate_row(raw, &segment.manifest)?;
-            if last_received_at_ns.is_some_and(|last| received_at_ns < last) {
-                bail!("market-tape receive time moved backwards");
+            if event_type == "session_start"
+                && highest_received_at_ns.is_some_and(|last| received_at_ns < last)
+            {
+                bail!("market-tape receive time moved backwards for session_start");
             }
-            last_received_at_ns = Some(received_at_ns);
+            highest_received_at_ns = Some(
+                highest_received_at_ns.map_or(received_at_ns, |last: u64| last.max(received_at_ns)),
+            );
             if session_id.get_or_insert_with(|| row_session_id.to_owned()) != row_session_id {
                 bail!("market-tape rows do not share one session_id");
             }
@@ -254,6 +270,11 @@ pub fn verify_binance_market_tape(
                 "diff" => {
                     let clock = DepthSourceClock::from_archived_event(raw, received_at_ns)?;
                     require_symbol(&symbols, &clock.symbol)?;
+                    observe_receive_clock(
+                        &mut depth_receive_clocks,
+                        &clock.symbol,
+                        received_at_ns,
+                    )?;
                     depth_sequence.observe(&clock)?;
                     let events = observe_replay(
                         &mut replay,
@@ -272,6 +293,7 @@ pub fn verify_binance_market_tape(
                 "snapshot" | "checkpoint" => {
                     let symbol = required_string(raw, "symbol")?.to_ascii_uppercase();
                     require_symbol(&symbols, &symbol)?;
+                    observe_receive_clock(&mut depth_receive_clocks, &symbol, received_at_ns)?;
                     if event_type == "snapshot" {
                         snapshot_seeds.insert(symbol.clone());
                     } else {
@@ -302,6 +324,11 @@ pub fn verify_binance_market_tape(
                 "agg_trade" => {
                     let trade = AggregateTrade::from_archived_event(raw, received_at_ns)?;
                     require_symbol(&symbols, &trade.symbol)?;
+                    observe_receive_clock(
+                        &mut trade_receive_clocks,
+                        &trade.symbol,
+                        received_at_ns,
+                    )?;
                     aggregate_sequence.observe(&trade)?;
                     aggregate_trades.push(trade);
                 }
@@ -362,6 +389,21 @@ pub fn verify_binance_market_tape(
         lob_observations,
         replayed_books,
     })
+}
+
+fn observe_receive_clock(
+    clocks: &mut BTreeMap<String, Option<u64>>,
+    symbol: &str,
+    received_at_ns: u64,
+) -> Result<()> {
+    let last = clocks
+        .get_mut(symbol)
+        .context("market-tape receive clock symbol is undeclared")?;
+    if last.as_ref().is_some_and(|last| received_at_ns < *last) {
+        bail!("market-tape receive time moved backwards for {symbol}");
+    }
+    *last = Some(received_at_ns);
+    Ok(())
 }
 
 impl SealedBinanceMarketTapeTriplet {
@@ -849,6 +891,40 @@ mod tests {
         ];
 
         let error = verify_binance_market_tape(sealed).unwrap_err();
+        assert!(error.to_string().contains("receive time moved backwards"));
+    }
+
+    #[test]
+    fn independent_symbol_streams_may_interleave_receive_times() {
+        let root = tempdir();
+        let mut rows = two_symbol_rows_without_sol_trade();
+        let mut sol_trade = trade_row(START_NS + 350_000_081, 20);
+        sol_trade["frame"]["stream"] = json!("solusdt@aggTrade");
+        sol_trade["frame"]["data"]["s"] = json!("SOLUSDT");
+        let checkpoint = rows
+            .iter()
+            .position(|row| row["type"] == "checkpoint" && row["symbol"] == "BTCUSDT")
+            .unwrap();
+        rows[checkpoint]["received_at_ns"] = json!(START_NS + 350_000_000);
+        rows.insert(checkpoint, sol_trade);
+        let (triplet, anchor) =
+            write_triplet_for_symbols(root.path(), &rows, &["BTCUSDT", "SOLUSDT"]);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        verify_binance_market_tape(vec![sealed]).unwrap();
+    }
+
+    #[test]
+    fn backdated_session_start_is_rejected() {
+        let root = tempdir();
+        let mut rows = valid_rows();
+        let mut late_session = rows[0].clone();
+        late_session["received_at_ns"] = json!(START_NS + 250_000_000);
+        rows.insert(4, late_session);
+        let (triplet, anchor) = write_triplet(root.path(), &rows);
+        let sealed = seal_binance_market_tape_triplet(&triplet, &anchor).unwrap();
+
+        let error = verify_binance_market_tape(vec![sealed]).unwrap_err();
         assert!(error.to_string().contains("receive time moved backwards"));
     }
 
