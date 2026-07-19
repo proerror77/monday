@@ -1532,7 +1532,7 @@ fn trade_updates(
     cutoff_at: DateTime<Utc>,
     received_at: DateTime<Utc>,
 ) -> (Vec<Value>, BTreeMap<String, u64>) {
-    let cutoff = cutoff_at.timestamp() - config.market_lookback_secs;
+    let cutoff = cutoff_at.timestamp() - config.settlement_lookback_secs;
     let mut parsed = Vec::new();
     let mut malformed = BTreeMap::new();
     for trade in trades {
@@ -1869,7 +1869,7 @@ impl ReferenceCollector {
         }
         // trade_updates rejects older rows before dedupe, so their IDs cannot
         // affect any future emission and need not stay in operational state.
-        let trade_cutoff = startup_at.timestamp() - config.market_lookback_secs;
+        let trade_cutoff = startup_at.timestamp() - config.settlement_lookback_secs;
         let state_compacted = compact_trade_dedupe(&mut state, trade_cutoff);
         let mut writer = TapeWriter::new_with_recovery(&config.spool_dir, |row| {
             recover_state_from_tape_row(&mut state, row, trade_cutoff)
@@ -2879,7 +2879,7 @@ mod tests {
 
     fn valid_trade_update(recorded_at: DateTime<Utc>, trade_timestamp: i64) -> Value {
         let config = ReferenceConfig {
-            market_lookback_secs: recorded_at
+            settlement_lookback_secs: recorded_at
                 .timestamp()
                 .saturating_sub(trade_timestamp)
                 .max(0)
@@ -3975,6 +3975,37 @@ mod tests {
     }
 
     #[test]
+    fn trade_rows_follow_the_settlement_lookback_until_completion() {
+        let now = fixed_time("2026-07-15T12:00:00Z");
+        let config = ReferenceConfig {
+            market_lookback_secs: 7_200,
+            settlement_lookback_secs: 86_400,
+            ..ReferenceConfig::default()
+        };
+        let (updates, malformed) = trade_updates(
+            &config,
+            &mut CollectorState::default(),
+            "market-1",
+            "condition-1",
+            "BTCUSDT",
+            300,
+            vec![
+                valid_trade((now - TimeDelta::hours(3)).timestamp()),
+                valid_trade((now - TimeDelta::hours(25)).timestamp()),
+            ],
+            now,
+            now,
+        );
+
+        assert!(malformed.is_empty());
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0]["trade_ts_unix"],
+            (now - TimeDelta::hours(3)).timestamp()
+        );
+    }
+
+    #[test]
     fn finalization_requires_lag_and_consecutive_stable_post_settlement_polls() {
         let now = fixed_time("2026-07-15T02:00:00Z");
         let mut tracked = TrackedMarket {
@@ -4718,10 +4749,10 @@ mod tests {
     }
 
     #[test]
-    fn startup_compacts_dedupe_outside_trade_poll_horizon() {
+    fn startup_compacts_dedupe_outside_settlement_horizon() {
         let root = TestDir::new();
         let now = utc_now();
-        let cutoff = now.timestamp() - ReferenceConfig::default().market_lookback_secs;
+        let cutoff = now.timestamp() - ReferenceConfig::default().settlement_lookback_secs;
         atomic_write_json(
             &root.path().join("collector-state.json"),
             &json!({
