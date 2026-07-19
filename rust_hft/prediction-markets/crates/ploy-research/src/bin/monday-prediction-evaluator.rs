@@ -115,6 +115,13 @@ struct RepricePilotSearchArtifact {
     mcts_expansion_plan_sha256: String,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct RepricePilotEpisodeCohorts {
+    key: &'static str,
+    train_market_ids: Vec<String>,
+    test_market_ids: Vec<String>,
+}
+
 #[derive(serde::Serialize)]
 struct RepricePilotArtifact<'a> {
     schema_version: &'static str,
@@ -122,7 +129,7 @@ struct RepricePilotArtifact<'a> {
     #[serde(flatten)]
     context: ReportArtifactContext<'a>,
     status: &'static str,
-    episode_identity: &'static str,
+    episode_cohorts: RepricePilotEpisodeCohorts,
     target: String,
     side: ReviewSide,
     train_rows: usize,
@@ -202,7 +209,7 @@ fn validate_reprice_pilot_config(
         "--alpha-zoo-snapshot-json",
         "--candidate-strategy-replay-json",
     ] {
-        if flag_value(args, flag).is_some() {
+        if flag_present(args, flag) {
             return Err(format!(
                 "--reprice-pilot-10s does not accept {flag}; search must use this run's train cohort only"
             ));
@@ -411,6 +418,18 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn sorted_distinct_reprice_pilot_market_ids<'a>(
+    market_ids: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut market_ids = market_ids
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    market_ids.sort_unstable();
+    market_ids.dedup();
+    market_ids
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_reprice_pilot_10s(
     rows: &[FactorObservationV2],
@@ -443,6 +462,15 @@ fn run_reprice_pilot_10s(
             test_rows.len(),
         ));
     }
+    let episode_cohorts = RepricePilotEpisodeCohorts {
+        key: "polymarket market_id carried as FactorObservationV2.event_id",
+        train_market_ids: sorted_distinct_reprice_pilot_market_ids(
+            train_rows.iter().map(|row| row.event_id.as_str()),
+        ),
+        test_market_ids: sorted_distinct_reprice_pilot_market_ids(
+            test_rows.iter().map(|row| row.event_id.as_str()),
+        ),
+    };
     let (snapshot_hash, snapshot_contract_hash, mission_id, search_policy_snapshot_id) =
         require_report_identity(
             snapshot_hash,
@@ -535,7 +563,7 @@ fn run_reprice_pilot_10s(
             non_finite_floats: "null",
             context,
             status: "pilot_not_promotable",
-            episode_identity: "polymarket market_id carried as FactorObservationV2.event_id",
+            episode_cohorts: episode_cohorts.clone(),
             target: target.as_str().to_string(),
             side,
             train_rows: train_side.len(),
@@ -806,10 +834,10 @@ fn replay_parity_evidence(path: &str) -> (bool, String) {
 mod tests {
     use super::{
         parse_time_cohort_boundary, replay_parity_evidence, require_report_identity,
-        settlement_time_cohort_from_args, validate_expected_prediction_policy,
-        validate_prediction_snapshot_contract_id, validate_report_observation_count,
-        validate_reprice_pilot_config, validate_time_cohort_range, write_report_set,
-        ReportArtifactContext, RepricePilotConfig,
+        settlement_time_cohort_from_args, sorted_distinct_reprice_pilot_market_ids,
+        validate_expected_prediction_policy, validate_prediction_snapshot_contract_id,
+        validate_report_observation_count, validate_reprice_pilot_config,
+        validate_time_cohort_range, write_report_set, ReportArtifactContext, RepricePilotConfig,
     };
     use chrono::{TimeZone, Utc};
     use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
@@ -887,6 +915,18 @@ mod tests {
         assert!(validate_reprice_pilot_config(&stale_state, &config)
             .expect_err("pre-seeded MCTS state can leak held-out evidence")
             .contains("does not accept --alpha-search-state-json"));
+        let bare_stale_state = vec!["--alpha-search-state-json".to_string()];
+        assert!(validate_reprice_pilot_config(&bare_stale_state, &config)
+            .expect_err("a bare pre-seeded MCTS flag must also fail closed")
+            .contains("does not accept --alpha-search-state-json"));
+    }
+
+    #[test]
+    fn reprice_pilot_market_ids_are_sorted_and_distinct() {
+        assert_eq!(
+            sorted_distinct_reprice_pilot_market_ids(["market-c", "market-a", "market-c"]),
+            vec!["market-a".to_string(), "market-c".to_string()]
+        );
     }
 
     #[test]
