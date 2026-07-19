@@ -897,6 +897,7 @@ fn scan_tape_with_identity_at(
     let mut record_ids = BTreeSet::new();
     let mut record_id_versions = BTreeSet::new();
     let mut metadata_contexts = BTreeSet::new();
+    let mut metadata_identities = BTreeMap::new();
     let mut dependent_reference_contexts = BTreeSet::new();
     let mut trade_completions = BTreeMap::<String, Value>::new();
     let mut source_field_presence = BTreeMap::<String, BTreeMap<String, u64>>::new();
@@ -1019,7 +1020,20 @@ fn scan_tape_with_identity_at(
         match kind {
             "market_metadata" => {
                 validate_market_metadata(update, line_number)?;
-                metadata_contexts.insert(reference_context(update, line_number)?);
+                let context = reference_context(update, line_number)?;
+                let identity = (
+                    required_text(update, "symbol", line_number)?.to_owned(),
+                    update["market_window_secs"]
+                        .as_u64()
+                        .expect("metadata validation requires a supported window"),
+                );
+                if metadata_identities
+                    .insert(context.clone(), identity.clone())
+                    .is_some_and(|previous| previous != identity)
+                {
+                    bail!("line {line_number}: market_metadata identity changed within segment");
+                }
+                metadata_contexts.insert(context);
             }
             "polymarket_trade" => {
                 let record_id = validate_canonical_trade(update, line_number)?;
@@ -1159,6 +1173,18 @@ fn scan_tape_with_identity_at(
     ]
     .iter()
     .any(|kind| event_types.get(*kind).copied().unwrap_or_default() > 0);
+    for (market_id, completion) in &trade_completions {
+        let condition_id = completion["condition_id"].as_str().unwrap_or_default();
+        let expected = metadata_identities
+            .get(&(market_id.clone(), condition_id.to_owned()));
+        let actual = (
+            completion["symbol"].as_str().unwrap_or_default().to_owned(),
+            completion["market_window_secs"].as_u64().unwrap_or_default(),
+        );
+        if expected != Some(&actual) {
+            bail!("event-local trade completion identity contradicts market metadata");
+        }
+    }
     let reference_context_complete = dependent_reference_contexts.is_subset(&metadata_contexts);
     let depth_complete = has_quotes && quote_depth_levels == 0;
     let temporal_updates_complete = has_quotes && quote_sample_ms == 0;
@@ -1990,6 +2016,23 @@ mod tests {
         assert_eq!(completion["completion_sequence"], 3);
         assert_eq!(completion["condition_id"], "0xcondition");
         assert_eq!(manifest["event_types"][TRADE_COMPLETION_KIND], 1);
+    }
+
+    #[test]
+    fn rejects_trade_completion_identity_that_contradicts_metadata() {
+        let root = TestDir::new();
+        let mut completion = valid_trade_completion_update();
+        completion["symbol"] = json!("ETHUSDT");
+        completion["market_window_secs"] = json!(900);
+        let rows = vec![
+            record(0, "2026-07-15T03:00:00Z", valid_market_metadata_update()),
+            record(1, "2026-07-15T03:10:00Z", completion),
+        ];
+        let tape = write_tape(root.path(), "market-updates.20260715T030000.ndjson", &rows);
+
+        let error = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap_err();
+
+        assert!(error.to_string().contains("contradicts market metadata"));
     }
 
     #[test]
