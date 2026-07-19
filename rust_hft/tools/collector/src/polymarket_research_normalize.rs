@@ -35,6 +35,12 @@ pub struct PolymarketEvidenceReport {
     pub window_secs: u64,
     pub event_selection: &'static str,
     pub trust_boundary: &'static str,
+    pub trade_tape_sequence_contiguous: bool,
+    pub trade_tape_event_local_complete: bool,
+    pub market_sequence_contiguous: bool,
+    pub reference_sequence_contiguous: bool,
+    pub market_replay_scope: String,
+    pub reference_replay_scope: String,
     pub validated_inputs: ResearchSegmentValidationReport,
 }
 
@@ -556,6 +562,18 @@ fn has_all_surfaces(
         && settlements.contains_key(&contract.market_id)
 }
 
+fn all_contracts_have_all_surfaces(
+    contracts: &BTreeMap<String, SelectedContract>,
+    quote_tokens: &BTreeMap<String, BTreeSet<String>>,
+    references: &BTreeMap<String, u64>,
+    trades: &BTreeMap<String, u64>,
+    settlements: &BTreeMap<String, String>,
+) -> bool {
+    contracts
+        .values()
+        .all(|contract| has_all_surfaces(contract, quote_tokens, references, trades, settlements))
+}
+
 fn normalize_raw(
     inputs: &ResearchSegmentValidationReport,
     market_path: &Path,
@@ -595,6 +613,16 @@ fn normalize_raw(
         }
     }
     let (ndjson, surface_counts) = encode_rows(rows)?;
+    let market_sequence_contiguous = inputs.market.sequence_contiguous;
+    let reference_sequence_contiguous = inputs.reference.sequence_contiguous;
+    let trade_tape_sequence_contiguous = market_sequence_contiguous && reference_sequence_contiguous;
+    let trade_tape_event_local_complete = all_contracts_have_all_surfaces(
+        contracts,
+        &quote_tokens,
+        &references,
+        &trade_counts,
+        &settled,
+    );
     let sha256 = hex::encode(Sha256::digest(&ndjson));
     Ok(NormalizedPolymarketEvidence {
         report: PolymarketEvidenceReport {
@@ -610,6 +638,12 @@ fn normalize_raw(
             window_secs: WINDOW_SECS as u64,
             event_selection: "event_start in [event_start_gte,event_start_lt)",
             trust_boundary: EVIDENCE_TRUST_BOUNDARY,
+            trade_tape_sequence_contiguous,
+            trade_tape_event_local_complete,
+            market_sequence_contiguous,
+            reference_sequence_contiguous,
+            market_replay_scope: inputs.market.replay_scope.clone(),
+            reference_replay_scope: inputs.reference.replay_scope.clone(),
             validated_inputs: inputs.clone(),
         },
         ndjson,

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use serde_json::Value;
 use ploy_market_data::diagnostics::PredictionMarketDataAuditReport;
 use ploy_research::research_snapshot::ResearchSnapshotInputArtifact;
 use ploy_research::{
@@ -85,6 +86,37 @@ fn validated_data_audit(
     Ok((Some(report_status), Some(report_path), Some(report_hash)))
 }
 
+fn parse_polymarket_evidence_manifest(
+    evidence_manifest: Option<String>,
+) -> anyhow::Result<(bool, bool, Option<String>)> {
+    let Some(path) = evidence_manifest else {
+        return Ok((false, false, None));
+    };
+    let bytes = std::fs::read(&path)
+        .map_err(|error| anyhow::anyhow!("read polymarket evidence manifest {path}: {error}"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| anyhow::anyhow!("parse polymarket evidence manifest {path}: {error}"))?;
+    let trade_tape_sequence_contiguous = manifest
+        .get("trade_tape_sequence_contiguous")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            anyhow::anyhow!("polymarket evidence manifest {path} missing trade_tape_sequence_contiguous")
+        })?;
+    let trade_tape_event_local_complete = manifest
+        .get("trade_tape_event_local_complete")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "polymarket evidence manifest {path} missing trade_tape_event_local_complete"
+            )
+        })?;
+    Ok((
+        trade_tape_sequence_contiguous,
+        trade_tape_event_local_complete,
+        Some(path),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -149,6 +181,11 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("MONDAY_PREDICTION_BOOK_ARCHIVE_DIR").ok())
         .filter(|raw| !raw.trim().is_empty())
         .map(PathBuf::from);
+    let (
+        polymarket_trade_tape_sequence_contiguous,
+        polymarket_trade_tape_event_local_complete,
+        polymarket_evidence_manifest,
+    ) = parse_polymarket_evidence_manifest(flag_value(&args, "--polymarket-evidence-manifest"))?;
 
     eprintln!(
         "monday-prediction-snapshot: {} -> {} for {:?}, stake_usd={:.2}, output={}, data_requirements={}, include_deribit={}, pm_book_sample_secs={}, pm_book_archive_dir={}",
@@ -189,6 +226,13 @@ async fn main() -> anyhow::Result<()> {
             data_requirements,
             data_audit_status,
             data_audit_report: data_audit_report.clone(),
+            polymarket_trade_tape_sequence_contiguous: Some(
+                polymarket_trade_tape_sequence_contiguous,
+            ),
+            polymarket_trade_tape_event_local_complete: Some(
+                polymarket_trade_tape_event_local_complete,
+            ),
+            polymarket_evidence_manifest,
             include_deribit,
             pm_book_archive_dir,
         },

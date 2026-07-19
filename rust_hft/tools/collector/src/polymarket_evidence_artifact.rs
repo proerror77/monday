@@ -40,11 +40,18 @@ pub struct PolymarketEvidenceArtifactConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolymarketEvidenceTrustAnchor {
+    pub expected_content_sha256: String,
+    pub expected_manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PublishedPolymarketEvidence {
     pub schema: &'static str,
     pub data_path: PathBuf,
     pub manifest_path: PathBuf,
     pub success_path: PathBuf,
+    pub trust_anchor: PolymarketEvidenceTrustAnchor,
     pub evidence: PolymarketEvidenceReport,
 }
 
@@ -89,6 +96,12 @@ struct PolymarketEvidenceManifest<'a> {
     content_digest_semantics: &'static str,
     recording_semantics: RecordingSemantics,
     trust_boundary: &'a str,
+    trade_tape_sequence_contiguous: bool,
+    trade_tape_event_local_complete: bool,
+    market_sequence_contiguous: bool,
+    reference_sequence_contiguous: bool,
+    market_replay_scope: &'a str,
+    reference_replay_scope: &'a str,
     validated_inputs: &'a ResearchSegmentValidationReport,
 }
 
@@ -128,6 +141,12 @@ fn validate_dataset(dataset: &NormalizedPolymarketEvidence) -> Result<()> {
         || report.rows != rows
         || report.rows != report.surface_counts.values().sum::<u64>()
         || report.events == 0
+        || !report.trade_tape_sequence_contiguous
+        || !report.trade_tape_event_local_complete
+        || !report.market_sequence_contiguous
+        || !report.reference_sequence_contiguous
+        || report.market_replay_scope.trim().is_empty()
+        || report.reference_replay_scope.trim().is_empty()
         || report.surface_counts.get("market_contract") != Some(&report.events)
         || report.surface_counts.get("official_settlement_evidence") != Some(&report.events)
         || report.symbols != ["BTCUSDT", "SOLUSDT"]
@@ -166,6 +185,12 @@ fn manifest_bytes(report: &PolymarketEvidenceReport, file: &str) -> Result<Vec<u
         content_digest_semantics: CONTENT_DIGEST_SEMANTICS,
         recording_semantics: recording_semantics(),
         trust_boundary: report.trust_boundary,
+        trade_tape_sequence_contiguous: report.trade_tape_sequence_contiguous,
+        trade_tape_event_local_complete: report.trade_tape_event_local_complete,
+        market_sequence_contiguous: report.market_sequence_contiguous,
+        reference_sequence_contiguous: report.reference_sequence_contiguous,
+        market_replay_scope: &report.market_replay_scope,
+        reference_replay_scope: &report.reference_replay_scope,
         validated_inputs: &report.validated_inputs,
     };
     let mut bytes = serde_json::to_vec(&manifest)?;
@@ -492,6 +517,7 @@ fn publish_normalized(
     let manifest_path = directory.join(format!("{data_name}.manifest.json"));
     let success_path = directory.join(format!("{data_name}._SUCCESS"));
     let manifest = manifest_bytes(&evidence.report, &data_name)?;
+    let manifest_sha256 = hex::encode(Sha256::digest(&manifest));
     let success = format!("{digest}\n");
     publish_triplet(
         &data_path,
@@ -508,6 +534,10 @@ fn publish_normalized(
         data_path,
         manifest_path,
         success_path,
+        trust_anchor: PolymarketEvidenceTrustAnchor {
+            expected_content_sha256: digest.clone(),
+            expected_manifest_sha256: manifest_sha256,
+        },
         evidence: evidence.report,
     })
 }

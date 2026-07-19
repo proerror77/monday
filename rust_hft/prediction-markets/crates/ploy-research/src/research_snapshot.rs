@@ -128,6 +128,12 @@ pub struct ResearchSnapshotManifest {
     pub data_audit_status: Option<String>,
     #[serde(default)]
     pub data_audit_report: Option<String>,
+    #[serde(default)]
+    pub polymarket_trade_tape_sequence_contiguous: bool,
+    #[serde(default)]
+    pub polymarket_trade_tape_event_local_complete: bool,
+    #[serde(default)]
+    pub polymarket_evidence_manifest: Option<String>,
     #[serde(default = "default_include_deribit")]
     pub include_deribit: bool,
     pub artifacts: ResearchSnapshotArtifacts,
@@ -457,6 +463,16 @@ fn validate_snapshot_request_with_window_mode(
             request.require_official_settlement
         );
     }
+    if !manifest.polymarket_trade_tape_sequence_contiguous {
+        anyhow::bail!(
+            "snapshot does not guarantee polymarket trade-tape sequence continuity; build with polymarket evidence integrity proof"
+        );
+    }
+    if !manifest.polymarket_trade_tape_event_local_complete {
+        anyhow::bail!(
+            "snapshot does not guarantee polymarket event-local trade evidence completeness; build with polymarket evidence integrity proof"
+        );
+    }
     if !manifest.immutable_input {
         anyhow::bail!("snapshot manifest is not marked immutable_input=true");
     }
@@ -487,6 +503,9 @@ pub struct ResearchSnapshotBuildOptions {
     pub data_requirements: Vec<String>,
     pub data_audit_status: Option<String>,
     pub data_audit_report: Option<String>,
+    pub polymarket_trade_tape_sequence_contiguous: Option<bool>,
+    pub polymarket_trade_tape_event_local_complete: Option<bool>,
+    pub polymarket_evidence_manifest: Option<String>,
     pub include_deribit: bool,
     pub pm_book_archive_dir: Option<PathBuf>,
 }
@@ -1489,6 +1508,13 @@ pub async fn build_research_snapshot_from_database(
             data_requirements: options.data_requirements,
             data_audit_status: options.data_audit_status,
             data_audit_report: options.data_audit_report,
+            polymarket_trade_tape_sequence_contiguous: options
+                .polymarket_trade_tape_sequence_contiguous
+                .unwrap_or_default(),
+            polymarket_trade_tape_event_local_complete: options
+                .polymarket_trade_tape_event_local_complete
+                .unwrap_or_default(),
+            polymarket_evidence_manifest: options.polymarket_evidence_manifest.clone(),
             include_deribit: options.include_deribit,
             artifacts: ResearchSnapshotArtifacts::default(),
             row_counts: ResearchSnapshotRowCounts {
@@ -2112,6 +2138,9 @@ mod tests {
                 data_requirements: vec!["polymarket_quotes".to_string()],
                 data_audit_status: Some("ok".to_string()),
                 data_audit_report: Some("data-gap-audit.json".to_string()),
+                polymarket_trade_tape_sequence_contiguous: true,
+                polymarket_trade_tape_event_local_complete: true,
+                polymarket_evidence_manifest: None,
                 include_deribit: false,
                 artifacts: ResearchSnapshotArtifacts::default(),
                 row_counts: ResearchSnapshotRowCounts::default(),
@@ -2329,6 +2358,9 @@ mod tests {
             data_requirements: vec![],
             data_audit_status: Some("ok".to_string()),
             data_audit_report: None,
+            polymarket_trade_tape_sequence_contiguous: true,
+            polymarket_trade_tape_event_local_complete: true,
+            polymarket_evidence_manifest: None,
             include_deribit: false,
             artifacts: ResearchSnapshotArtifacts::default(),
             row_counts: ResearchSnapshotRowCounts::default(),

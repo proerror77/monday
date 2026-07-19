@@ -46,6 +46,8 @@ pub struct SegmentIdentity {
     pub replay_scope: String,
     pub recording_policy: Value,
     pub record_id_versions: Value,
+    #[serde(default)]
+    pub sequence_contiguous: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -371,11 +373,11 @@ fn validate_triplet(
     if files.success.read()? != format!("{digest}\n").as_bytes() {
         bail!("_SUCCESS must contain the exact data digest and newline");
     }
-    Ok(ValidatedArtifact {
-        identity: SegmentIdentity {
-            schema: text(&manifest, "schema")?,
-            venue: text(&manifest, "venue")?,
-            dataset: text(&manifest, "dataset")?,
+        Ok(ValidatedArtifact {
+            identity: SegmentIdentity {
+                schema: text(&manifest, "schema")?,
+                venue: text(&manifest, "venue")?,
+                dataset: text(&manifest, "dataset")?,
             date: date.to_owned(),
             hour: hour.to_owned(),
             file: data_name.to_owned(),
@@ -386,12 +388,13 @@ fn validate_triplet(
             end_sequence,
             sequence_gaps: 0,
             start_recorded_at: text(&manifest, "start_recorded_at")?,
-            end_recorded_at,
-            source_file: text(&manifest, "source_file")?,
-            replay_scope: text(&manifest, "replay_scope")?,
-            recording_policy: manifest["recording_policy"].clone(),
-            record_id_versions: manifest["record_id_versions"].clone(),
-        },
+                end_recorded_at,
+                source_file: text(&manifest, "source_file")?,
+                replay_scope: text(&manifest, "replay_scope")?,
+                recording_policy: manifest["recording_policy"].clone(),
+                record_id_versions: manifest["record_id_versions"].clone(),
+                sequence_contiguous: manifest.get("sequence_gaps").and_then(Value::as_u64) == Some(0),
+            },
         manifest,
         files,
         superseded_marker,

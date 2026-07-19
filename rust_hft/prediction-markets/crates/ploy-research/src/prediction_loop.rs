@@ -3780,6 +3780,9 @@ mod tests {
                 .collect(),
             data_audit_status: Some("ok".to_string()),
             data_audit_report: Some("audit.json".to_string()),
+            polymarket_trade_tape_sequence_contiguous: true,
+            polymarket_trade_tape_event_local_complete: true,
+            polymarket_evidence_manifest: None,
             include_deribit: false,
             artifacts: ResearchSnapshotArtifacts::default(),
             row_counts: ResearchSnapshotRowCounts {
