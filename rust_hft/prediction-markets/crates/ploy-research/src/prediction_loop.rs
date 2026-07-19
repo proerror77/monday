@@ -441,11 +441,18 @@ pub fn validate_prediction_mission(
             "mission.search_policy_snapshot_id does not match the current Rust proposer/evaluator policy; expected {current_policy_snapshot_id}"
         ));
     }
-    if mission.search_budget.max_candidates == 0
-        || mission.search_budget.max_llm_calls == 0
-        || mission.search_budget.max_seconds == 0
+    if mission.search_budget.max_seconds == 0 {
+        return Err("mission.search_budget.max_seconds must be positive".to_string());
+    }
+    let baseline_only_budget =
+        mission.search_budget.max_candidates == 0 && mission.search_budget.max_llm_calls == 0;
+    if (mission.search_budget.max_candidates == 0 || mission.search_budget.max_llm_calls == 0)
+        && !baseline_only_budget
     {
-        return Err("mission.search_budget values must be positive".to_string());
+        return Err(
+            "mission.search_budget baseline-only mode requires max_candidates and max_llm_calls to both be zero"
+                .to_string(),
+        );
     }
     if mission.search_budget.max_candidates > MAX_GOVERNED_CANDIDATES
         || mission.search_budget.max_llm_calls > MAX_GOVERNED_LLM_CALLS
@@ -4019,6 +4026,40 @@ mod tests {
     }
 
     #[test]
+    fn baseline_only_budget_requires_both_search_counts_zero_and_positive_time() {
+        let mission = mission();
+
+        let mut zero_candidates_only = mission.clone();
+        zero_candidates_only.search_budget.max_candidates = 0;
+        assert!(validate_prediction_mission(
+            &zero_candidates_only,
+            &zero_candidates_only.search_policy_snapshot_id
+        )
+        .expect_err("0/N budget must fail")
+        .contains("both be zero"));
+
+        let mut zero_calls_only = mission.clone();
+        zero_calls_only.search_budget.max_llm_calls = 0;
+        assert!(validate_prediction_mission(
+            &zero_calls_only,
+            &zero_calls_only.search_policy_snapshot_id
+        )
+        .expect_err("N/0 budget must fail")
+        .contains("both be zero"));
+
+        let mut zero_everything = mission;
+        zero_everything.search_budget.max_candidates = 0;
+        zero_everything.search_budget.max_llm_calls = 0;
+        zero_everything.search_budget.max_seconds = 0;
+        assert!(validate_prediction_mission(
+            &zero_everything,
+            &zero_everything.search_policy_snapshot_id
+        )
+        .expect_err("0/0/0 budget must fail")
+        .contains("max_seconds"));
+    }
+
+    #[test]
     fn proposal_is_typed_bounded_and_schema_has_no_factor_mutation_surface() {
         let blends = validate_prediction_proposal(proposal(), 2).expect("valid proposal");
         assert_eq!(blends.len(), 1);
@@ -4859,6 +4900,82 @@ mod tests {
                 LlmAttemptStatus::Invalid,
             ]
         );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn baseline_only_budget_runs_once_and_stops_before_any_proposal_call() {
+        let (snapshot_dir, output_dir, mut mission) = governed_test_fixture();
+        let root = output_dir.parent().expect("fixture root").to_path_buf();
+        mission.search_budget.max_candidates = 0;
+        mission.search_budget.max_llm_calls = 0;
+        let mut client = FakeProposalClient {
+            calls: 0,
+            responses: VecDeque::new(),
+        };
+        let mut evaluator = FakeEvaluator {
+            calls: 0,
+            fail_candidate_once: false,
+            verdict: "keep",
+            assert_initial_state_exists: false,
+            advance_clock_on_candidate_millis: 0,
+        };
+
+        let summary = run_or_resume(
+            mission,
+            &snapshot_dir,
+            &output_dir,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("baseline-only mission reaches budget terminal");
+
+        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+        assert_eq!(
+            summary.reason.as_deref(),
+            Some("mission LLM-call budget exhausted")
+        );
+        assert_eq!(summary.llm_calls_used, 0);
+        assert_eq!(summary.candidates_evaluated, 0);
+        assert_eq!(summary.iterations_completed, 0);
+        assert!(summary.keep_models.is_empty());
+        assert_eq!(
+            client.calls, 0,
+            "baseline-only mission must not call ProposalClient"
+        );
+        assert_eq!(
+            evaluator.calls, 1,
+            "baseline evaluator still runs exactly once"
+        );
+        assert!(
+            !output_dir.join("llm-calls").exists(),
+            "baseline-only mission must not create proposal call directories"
+        );
+
+        let state: PredictionLoopState = read_json(&summary.state_path).expect("read final state");
+        let baseline = state
+            .baseline
+            .as_ref()
+            .expect("baseline evidence remains bound in final state");
+        verify_evaluation_evidence(&output_dir, baseline).expect("baseline evidence remains valid");
+        assert!(
+            state.terminal_evidence.is_some(),
+            "budget terminal is recorded"
+        );
+        assert!(
+            state.iterations.is_empty(),
+            "no proposal candidates are evaluated"
+        );
+        assert!(matches!(
+            state.frontier,
+            Frontier::Done {
+                outcome: TerminalOutcome {
+                    status: LoopRunStatusWire::BudgetExhausted,
+                    ..
+                }
+            }
+        ));
+
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
