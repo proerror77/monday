@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::OnceLock;
 
-use chrono::Datelike;
+use chrono::{DateTime, Datelike, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -1145,6 +1145,255 @@ pub fn autofactor_symbols_from_v2(rows: &[FactorObservationV2]) -> Vec<String> {
 
 pub fn autofactor_event_ids_from_v2(rows: &[FactorObservationV2]) -> Vec<String> {
     rows.iter().map(|row| row.event_id.clone()).collect()
+}
+
+/// A fixed train-time candidate threshold for one token-side reprice lane.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepricePilotSelection {
+    pub target: String,
+    pub side: ReviewSide,
+    pub candidate_name: String,
+    pub expr: FactorExpr,
+    pub direction: f64,
+    pub threshold: f64,
+    pub train_scored_decisions: usize,
+    pub train_events: usize,
+}
+
+/// Test-only outcome for a reprice pilot. Decision PnL permits overlapping
+/// horizons; event averages prevent a denser book from dominating the result.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepricePilotMetrics {
+    pub scored_decisions: usize,
+    pub selected_decisions: usize,
+    pub selected_events: usize,
+    pub test_spearman_ic: f64,
+    pub decision_pnl_total: f64,
+    pub avg_decision_pnl: f64,
+    pub avg_event_pnl: f64,
+    pub positive_event_ratio: f64,
+}
+
+/// Split complete five-minute market episodes at `boundary`.
+///
+/// The verified Polymarket projection carries its exact `market_id` through
+/// `FactorObservationV2::event_id`; that market identity is the episode key.
+/// Each episode must carry one stable Up token and one stable Down token.
+/// Events crossing the boundary and events without one consistent canonical
+/// end are excluded.
+pub fn split_reprice_rows_by_event_cohort<'a>(
+    rows: &'a [FactorObservationV2],
+    boundary: DateTime<Utc>,
+) -> Result<(Vec<&'a FactorObservationV2>, Vec<&'a FactorObservationV2>), AutoFactorError> {
+    let mut event_ends: BTreeMap<&str, Option<DateTime<Utc>>> = BTreeMap::new();
+    let mut event_tokens: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
+    for row in rows {
+        if row.event_id.trim().is_empty() || row.pm_token_id.trim().is_empty() {
+            return Err(AutoFactorError::IdentityMismatch(
+                "reprice pilot requires a non-empty market_id event_id and token id".to_string(),
+            ));
+        }
+        match event_ends.entry(row.event_id.as_str()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(row.event_end_ts);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if *entry.get() != row.event_end_ts {
+                    entry.insert(None);
+                }
+            }
+        }
+        let tokens = event_tokens.entry(row.event_id.as_str()).or_default();
+        match row.side {
+            ReviewSide::Up => {
+                tokens.0.insert(row.pm_token_id.as_str());
+            }
+            ReviewSide::Down => {
+                tokens.1.insert(row.pm_token_id.as_str());
+            }
+        }
+    }
+    for (market_id, (up_tokens, down_tokens)) in event_tokens {
+        if up_tokens.len() != 1 || down_tokens.len() != 1 {
+            return Err(AutoFactorError::IdentityMismatch(format!(
+                "market_id {market_id} must have exactly one Up and one Down token"
+            )));
+        }
+    }
+
+    let window = Duration::seconds(300);
+    let train = rows
+        .iter()
+        .filter(|row| {
+            event_ends
+                .get(row.event_id.as_str())
+                .and_then(Option::as_ref)
+                .is_some_and(|event_end| *event_end < boundary)
+        })
+        .collect();
+    let test = rows
+        .iter()
+        .filter(|row| {
+            event_ends
+                .get(row.event_id.as_str())
+                .and_then(Option::as_ref)
+                .and_then(|event_end| event_end.checked_sub_signed(window))
+                .is_some_and(|event_start| event_start >= boundary)
+        })
+        .collect();
+    Ok((train, test))
+}
+
+/// Fit one factor's threshold using training rows only. `target` must be a
+/// side-bound full-depth reprice target.
+pub fn fit_reprice_pilot_selection(
+    candidate: &AutoFactorReport,
+    train_rows: &[FactorObservationV2],
+    target: AutoFactorV2Target,
+    top_quantile: f64,
+) -> Result<RepricePilotSelection, AutoFactorError> {
+    let Some(side) = target.review_side() else {
+        return Err(AutoFactorError::IdentityMismatch(
+            "reprice pilot requires a side-bound target".to_string(),
+        ));
+    };
+    if candidate.target.as_deref() != Some(target.as_str()) || candidate.side != Some(side) {
+        return Err(AutoFactorError::IdentityMismatch(format!(
+            "candidate {} does not match target={} side={}",
+            candidate.name,
+            target.as_str(),
+            side.as_str()
+        )));
+    }
+
+    let scored = reprice_scored_rows(&candidate.expr, train_rows, target)?;
+    if scored.is_empty() {
+        return Err(AutoFactorError::NoValidRepriceDecisions);
+    }
+    let scores = scored
+        .iter()
+        .map(|(_, score, _)| *score)
+        .collect::<Vec<_>>();
+    let labels = scored
+        .iter()
+        .map(|(_, _, label)| *label)
+        .collect::<Vec<_>>();
+    let direction = match spearman_ic(&scores, &labels) {
+        value if value.is_finite() && value.abs() > EPS => value.signum(),
+        _ => 1.0,
+    };
+    let mut directed_scores = scores
+        .iter()
+        .map(|score| score * direction)
+        .collect::<Vec<_>>();
+    directed_scores.sort_by(|lhs, rhs| rhs.total_cmp(lhs));
+    let selected_n = ((directed_scores.len() as f64) * top_quantile.clamp(0.01, 1.0))
+        .ceil()
+        .max(1.0) as usize;
+    let threshold = directed_scores[selected_n.min(directed_scores.len()) - 1];
+    let train_events = scored
+        .iter()
+        .filter_map(|(idx, _, _)| train_rows.get(*idx))
+        .map(|row| row.event_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+
+    Ok(RepricePilotSelection {
+        target: target.as_str().to_string(),
+        side,
+        candidate_name: candidate.name.clone(),
+        expr: candidate.expr.clone(),
+        direction,
+        threshold,
+        train_scored_decisions: scored.len(),
+        train_events,
+    })
+}
+
+/// Score a frozen training selection on held-out rows without refitting it.
+pub fn evaluate_reprice_pilot_selection(
+    selection: &RepricePilotSelection,
+    test_rows: &[FactorObservationV2],
+    target: AutoFactorV2Target,
+) -> Result<RepricePilotMetrics, AutoFactorError> {
+    if selection.target != target.as_str() || target.review_side() != Some(selection.side) {
+        return Err(AutoFactorError::IdentityMismatch(
+            "reprice pilot selection target or side does not match held-out evaluation".to_string(),
+        ));
+    }
+
+    let scored = reprice_scored_rows(&selection.expr, test_rows, target)?;
+    let scores = scored
+        .iter()
+        .map(|(_, score, _)| *score)
+        .collect::<Vec<_>>();
+    let labels = scored
+        .iter()
+        .map(|(_, _, label)| *label)
+        .collect::<Vec<_>>();
+    let test_spearman_ic = spearman_ic(&scores, &labels);
+    let selected = scored
+        .iter()
+        .filter(|(_, score, _)| score * selection.direction >= selection.threshold)
+        .collect::<Vec<_>>();
+    let decision_pnl_total = selected.iter().map(|(_, _, label)| *label).sum::<f64>();
+    let mut event_pnls: BTreeMap<&str, (f64, usize)> = BTreeMap::new();
+    for (idx, _, label) in &selected {
+        let Some(row) = test_rows.get(*idx) else {
+            continue;
+        };
+        let entry = event_pnls.entry(row.event_id.as_str()).or_insert((0.0, 0));
+        entry.0 += label;
+        entry.1 += 1;
+    }
+    let event_means = event_pnls
+        .values()
+        .map(|(sum, count)| sum / *count as f64)
+        .collect::<Vec<_>>();
+    let avg_decision_pnl = if selected.is_empty() {
+        f64::NAN
+    } else {
+        decision_pnl_total / selected.len() as f64
+    };
+    let avg_event_pnl = if event_means.is_empty() {
+        f64::NAN
+    } else {
+        event_means.iter().sum::<f64>() / event_means.len() as f64
+    };
+    let positive_event_ratio = if event_means.is_empty() {
+        0.0
+    } else {
+        event_means.iter().filter(|pnl| **pnl > 0.0).count() as f64 / event_means.len() as f64
+    };
+
+    Ok(RepricePilotMetrics {
+        scored_decisions: scored.len(),
+        selected_decisions: selected.len(),
+        selected_events: event_means.len(),
+        test_spearman_ic,
+        decision_pnl_total,
+        avg_decision_pnl,
+        avg_event_pnl,
+        positive_event_ratio,
+    })
+}
+
+fn reprice_scored_rows(
+    expr: &FactorExpr,
+    rows: &[FactorObservationV2],
+    target: AutoFactorV2Target,
+) -> Result<Vec<(usize, f64, f64)>, AutoFactorError> {
+    let matrix = autofactor_matrix_from_v2(rows)?;
+    let scores = expr.evaluate(&matrix)?;
+    let labels = autofactor_labels_from_v2(rows, target);
+    Ok(scores
+        .into_iter()
+        .zip(labels)
+        .enumerate()
+        .filter_map(|(idx, (score, label))| {
+            (score.is_finite() && label.is_finite()).then_some((idx, score, label))
+        })
+        .collect())
 }
 
 fn valid_pm_price(value: f64) -> bool {
@@ -3075,6 +3324,8 @@ fn has_all(input_names: &BTreeSet<String>, required: &[&str]) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoFactorError {
     MissingInput(String),
+    IdentityMismatch(String),
+    NoValidRepriceDecisions,
     LengthMismatch {
         name: String,
         expected: usize,
@@ -3094,6 +3345,12 @@ impl fmt::Display for AutoFactorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AutoFactorError::MissingInput(name) => write!(f, "missing autofactor input: {name}"),
+            AutoFactorError::IdentityMismatch(reason) => {
+                write!(f, "autofactor identity mismatch: {reason}")
+            }
+            AutoFactorError::NoValidRepriceDecisions => {
+                write!(f, "reprice pilot has no finite score and label pairs")
+            }
             AutoFactorError::LengthMismatch {
                 name,
                 expected,
@@ -3295,6 +3552,111 @@ mod tests {
             label_future_exit_full_depth_fillable_30s: Some(1.0),
             label_future_exit_full_depth_fillable_60s: Some(1.0),
         }
+    }
+
+    #[test]
+    fn reprice_pilot_keeps_complete_events_disjoint_and_freezes_the_threshold() {
+        let boundary = Utc.with_ymd_and_hms(2026, 5, 3, 1, 0, 0).unwrap();
+        let target = AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Up);
+        let row = |event_id: &str, event_end_ts, score: f64, pnl: f64| {
+            let mut row = synthetic_v2_row(0);
+            row.event_id = event_id.to_string();
+            row.event_end_ts = event_end_ts;
+            row.side_model_edge = score;
+            row.label_future_exit_full_depth_pnl_10s = Some(pnl);
+            row
+        };
+        let train_rows = [
+            row("train-a", Some(boundary - Duration::seconds(1)), 1.0, 1.0),
+            row("train-a", Some(boundary - Duration::seconds(1)), 2.0, 2.0),
+            row("train-b", Some(boundary - Duration::seconds(1)), 3.0, 3.0),
+            row("train-b", Some(boundary - Duration::seconds(1)), 4.0, 4.0),
+        ];
+        let test_rows = [
+            row(
+                "test-a",
+                Some(boundary + Duration::seconds(300)),
+                100.0,
+                10.0,
+            ),
+            row(
+                "test-b",
+                Some(boundary + Duration::seconds(300)),
+                -1.0,
+                -1.0,
+            ),
+        ];
+        let excluded_rows = [
+            row(
+                "crossing",
+                Some(boundary + Duration::seconds(1)),
+                50.0,
+                50.0,
+            ),
+            row("missing-end", None, 60.0, 60.0),
+        ];
+        let mut rows = train_rows
+            .into_iter()
+            .chain(test_rows)
+            .chain(excluded_rows)
+            .collect::<Vec<_>>();
+        let down_rows = rows
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.side = ReviewSide::Down;
+                row.pm_token_id = "down-token".to_string();
+                row
+            })
+            .collect::<Vec<_>>();
+        rows.extend(down_rows);
+        assert!(split_reprice_rows_by_event_cohort(
+            &[row(
+                "unpaired-market",
+                Some(boundary - Duration::seconds(1)),
+                1.0,
+                1.0,
+            )],
+            boundary,
+        )
+        .expect_err("a market episode without both tokens must fail closed")
+        .to_string()
+        .contains("exactly one Up and one Down token"));
+
+        let (train, test) =
+            split_reprice_rows_by_event_cohort(&rows, boundary).expect("paired market episodes");
+        assert_eq!(train.len(), 8);
+        assert_eq!(test.len(), 4);
+        assert!(train.iter().all(|row| row.event_id.starts_with("train")));
+        assert!(test.iter().all(|row| row.event_id.starts_with("test")));
+
+        let train = train.into_iter().cloned().collect::<Vec<_>>();
+        let test = test.into_iter().cloned().collect::<Vec<_>>();
+        let reports = mine_domain_autofactors_from_v2(
+            &train,
+            target,
+            &AutoFactorOptions {
+                min_observations: 1,
+                min_window_observations: 1,
+                min_icir: 0.0,
+                ..Default::default()
+            },
+        )
+        .expect("train candidates");
+        let candidate = reports
+            .iter()
+            .find(|report| report.name == "repricing_gap_side_10s")
+            .expect("repricing candidate");
+        let selection = fit_reprice_pilot_selection(candidate, &train, target, 0.25)
+            .expect("train-time selection");
+        assert_eq!(selection.threshold, 4.0);
+        assert_eq!(selection.train_events, 2);
+
+        let metrics = evaluate_reprice_pilot_selection(&selection, &test, target)
+            .expect("held-out evaluation");
+        assert_eq!(metrics.selected_decisions, 1);
+        assert_eq!(metrics.selected_events, 1);
+        assert_eq!(metrics.decision_pnl_total, 10.0);
     }
 
     #[test]
