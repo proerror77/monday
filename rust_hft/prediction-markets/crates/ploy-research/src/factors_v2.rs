@@ -389,6 +389,37 @@ pub struct FullDepthExecutionMatrixReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct FullDepthExecutionEventRow {
+    pub market_id: String,
+    pub symbol: String,
+    pub tick_ts: DateTime<Utc>,
+    pub token_id: String,
+    pub side: ReviewSide,
+    pub stake_usd: f64,
+    pub book_timestamp: Option<DateTime<Utc>>,
+    pub quote_age_secs: Option<f64>,
+    pub spread_bps: Option<f64>,
+    pub entry_fillable: bool,
+    pub entry_avg_price: Option<f64>,
+    pub entry_slippage_bps: Option<f64>,
+    pub entry_levels_used: Option<f64>,
+    pub exit_5s_fillable: bool,
+    pub exit_5s_avg_price: Option<f64>,
+    pub exit_5s_slippage_bps: Option<f64>,
+    pub exit_5s_reprice_pnl: Option<f64>,
+    pub exit_10s_fillable: bool,
+    pub exit_10s_avg_price: Option<f64>,
+    pub exit_10s_slippage_bps: Option<f64>,
+    pub exit_10s_reprice_pnl: Option<f64>,
+    pub exit_30s_fillable: bool,
+    pub exit_30s_avg_price: Option<f64>,
+    pub exit_30s_slippage_bps: Option<f64>,
+    pub exit_30s_reprice_pnl: Option<f64>,
+    pub settlement_outcome: Option<f64>,
+    pub settlement_pnl: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SettlementProbabilityReportOptions {
     pub bucket_count: usize,
     pub min_bucket_observations: usize,
@@ -8122,13 +8153,18 @@ struct FullDepthExecutionSample {
     entry_slippage_bps: f64,
     entry_levels_used: f64,
     exit_5s_fillable: bool,
+    exit_5s_avg_price: f64,
+    exit_5s_slippage_bps: f64,
     exit_10s_fillable: bool,
+    exit_10s_avg_price: f64,
     exit_30s_fillable: bool,
+    exit_30s_avg_price: f64,
     exit_10s_slippage_bps: f64,
     exit_30s_slippage_bps: f64,
     reprice_pnl_5s: Option<f64>,
     reprice_pnl_10s: Option<f64>,
     reprice_pnl_30s: Option<f64>,
+    settlement_outcome: Option<f64>,
     settlement_pnl: Option<f64>,
 }
 
@@ -8137,6 +8173,29 @@ pub fn build_full_depth_execution_matrix(
     pm_books: &[ResearchPmBookSnapshot],
     options: FullDepthExecutionMatrixOptions,
 ) -> FullDepthExecutionMatrixReport {
+    build_full_depth_execution_matrix_internal(source_rows, pm_books, options, false).0
+}
+
+pub fn build_full_depth_execution_matrix_with_event_rows(
+    source_rows: &[FactorObservation],
+    pm_books: &[ResearchPmBookSnapshot],
+    options: FullDepthExecutionMatrixOptions,
+) -> (
+    FullDepthExecutionMatrixReport,
+    Vec<FullDepthExecutionEventRow>,
+) {
+    build_full_depth_execution_matrix_internal(source_rows, pm_books, options, true)
+}
+
+fn build_full_depth_execution_matrix_internal(
+    source_rows: &[FactorObservation],
+    pm_books: &[ResearchPmBookSnapshot],
+    options: FullDepthExecutionMatrixOptions,
+    capture_event_rows: bool,
+) -> (
+    FullDepthExecutionMatrixReport,
+    Vec<FullDepthExecutionEventRow>,
+) {
     let book_index = build_pm_book_index(pm_books);
     let mut by_event: BTreeMap<String, Vec<&FactorObservation>> = BTreeMap::new();
     for row in source_rows {
@@ -8157,6 +8216,7 @@ pub fn build_full_depth_execution_matrix(
         String,
     );
     let mut groups: BTreeMap<ExecutionGroupKey, Vec<FullDepthExecutionSample>> = BTreeMap::new();
+    let mut event_rows = capture_event_rows.then(Vec::new);
     let stakes = if options.stakes_usd.is_empty() {
         vec![DEFAULT_STAKE_USD]
     } else {
@@ -8205,6 +8265,17 @@ pub fn build_full_depth_execution_matrix(
                     &book_index,
                     &options,
                 );
+                if let Some(event_rows) = event_rows.as_mut() {
+                    event_rows.push(build_full_depth_execution_event_row(
+                        source,
+                        side,
+                        stake_usd,
+                        current_book,
+                        quote_age_secs,
+                        pm_spread_bps,
+                        &sample,
+                    ));
+                }
                 groups.entry(key).or_default().push(sample);
             }
         }
@@ -8255,7 +8326,20 @@ pub fn build_full_depth_execution_matrix(
             })
             .then_with(|| b.avg_reprice_pnl_10s.total_cmp(&a.avg_reprice_pnl_10s))
     });
-    FullDepthExecutionMatrixReport { options, rows }
+    if let Some(event_rows) = event_rows.as_mut() {
+        event_rows.sort_by(|a, b| {
+            a.stake_usd
+                .total_cmp(&b.stake_usd)
+                .then_with(|| a.market_id.cmp(&b.market_id))
+                .then_with(|| a.token_id.cmp(&b.token_id))
+                .then_with(|| a.side.as_str().cmp(b.side.as_str()))
+                .then_with(|| a.tick_ts.cmp(&b.tick_ts))
+        });
+    }
+    (
+        FullDepthExecutionMatrixReport { options, rows },
+        event_rows.unwrap_or_default(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8303,6 +8387,7 @@ fn build_full_depth_execution_sample(
         entry_avg_price: entry_sweep.avg_price,
         entry_slippage_bps: entry_sweep.slippage_bps,
         entry_levels_used: entry_sweep.levels_used,
+        settlement_outcome: finite_value(settlement_win),
         settlement_pnl,
         ..Default::default()
     };
@@ -8344,15 +8429,19 @@ fn build_full_depth_execution_sample(
         match horizon_secs {
             5 => {
                 sample.exit_5s_fillable = exit_sweep.fillable;
+                sample.exit_5s_avg_price = exit_sweep.avg_price;
+                sample.exit_5s_slippage_bps = exit_sweep.slippage_bps;
                 sample.reprice_pnl_5s = reprice_pnl;
             }
             10 => {
                 sample.exit_10s_fillable = exit_sweep.fillable;
+                sample.exit_10s_avg_price = exit_sweep.avg_price;
                 sample.exit_10s_slippage_bps = exit_sweep.slippage_bps;
                 sample.reprice_pnl_10s = reprice_pnl;
             }
             30 => {
                 sample.exit_30s_fillable = exit_sweep.fillable;
+                sample.exit_30s_avg_price = exit_sweep.avg_price;
                 sample.exit_30s_slippage_bps = exit_sweep.slippage_bps;
                 sample.reprice_pnl_30s = reprice_pnl;
             }
@@ -8360,6 +8449,56 @@ fn build_full_depth_execution_sample(
         }
     }
     sample
+}
+
+fn build_full_depth_execution_event_row(
+    source: &FactorObservation,
+    side: ReviewSide,
+    stake_usd: f64,
+    current_book: Option<&ResearchPmBookSnapshot>,
+    quote_age_secs: f64,
+    spread_bps: f64,
+    sample: &FullDepthExecutionSample,
+) -> FullDepthExecutionEventRow {
+    FullDepthExecutionEventRow {
+        market_id: source.event_id.clone(),
+        symbol: source.symbol.clone(),
+        tick_ts: source.tick_ts,
+        token_id: side_token_id(source, side).to_string(),
+        side,
+        stake_usd,
+        book_timestamp: current_book.map(|book| book.ts),
+        quote_age_secs: finite_value(quote_age_secs),
+        spread_bps: finite_value(spread_bps),
+        entry_fillable: sample.entry_fillable,
+        entry_avg_price: sample.entry_fillable.then_some(sample.entry_avg_price),
+        entry_slippage_bps: sample.entry_fillable.then_some(sample.entry_slippage_bps),
+        entry_levels_used: sample.entry_fillable.then_some(sample.entry_levels_used),
+        exit_5s_fillable: sample.exit_5s_fillable,
+        exit_5s_avg_price: sample.exit_5s_fillable.then_some(sample.exit_5s_avg_price),
+        exit_5s_slippage_bps: sample
+            .exit_5s_fillable
+            .then_some(sample.exit_5s_slippage_bps),
+        exit_5s_reprice_pnl: sample.reprice_pnl_5s,
+        exit_10s_fillable: sample.exit_10s_fillable,
+        exit_10s_avg_price: sample
+            .exit_10s_fillable
+            .then_some(sample.exit_10s_avg_price),
+        exit_10s_slippage_bps: sample
+            .exit_10s_fillable
+            .then_some(sample.exit_10s_slippage_bps),
+        exit_10s_reprice_pnl: sample.reprice_pnl_10s,
+        exit_30s_fillable: sample.exit_30s_fillable,
+        exit_30s_avg_price: sample
+            .exit_30s_fillable
+            .then_some(sample.exit_30s_avg_price),
+        exit_30s_slippage_bps: sample
+            .exit_30s_fillable
+            .then_some(sample.exit_30s_slippage_bps),
+        exit_30s_reprice_pnl: sample.reprice_pnl_30s,
+        settlement_outcome: sample.settlement_outcome,
+        settlement_pnl: sample.settlement_pnl,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10311,6 +10450,10 @@ fn normalized_iv(value: f64) -> f64 {
 
 fn finite_diff(now: f64, before: f64) -> Option<f64> {
     (now.is_finite() && before.is_finite()).then_some(now - before)
+}
+
+fn finite_value(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
 }
 
 fn diff(now: f64, before: f64) -> f64 {
@@ -12791,6 +12934,127 @@ mod tests {
         assert!(up_1u.roundtrip_fill_rate_10s > up_15u.roundtrip_fill_rate_10s);
         assert!(format_full_depth_execution_matrix_report(&report, 5)
             .contains("Full-depth matrix is the execution gate"));
+    }
+
+    #[test]
+    fn execution_matrix_event_rows_keep_token_and_book_per_side() {
+        let tick_ts = Utc::now();
+        let mut current = base_obs();
+        current.event_id = "market-1".into();
+        current.tick_ts = tick_ts;
+        current.up_token_id = "token-up".into();
+        current.down_token_id = "token-down".into();
+        current.pm_up_ask = 0.52;
+        current.pm_up_bid = 0.51;
+        current.pm_down_ask = 0.41;
+        current.pm_down_bid = 0.40;
+        current.settlement_up = 1.0;
+        let mut future = current.clone();
+        future.tick_ts = tick_ts + chrono::Duration::seconds(10);
+        future.pm_up_bid = 0.70;
+        future.pm_down_bid = 0.22;
+        let books = vec![
+            ResearchPmBookSnapshot {
+                event_id: current.event_id.clone(),
+                token_id: current.up_token_id.clone(),
+                side: "UP".into(),
+                ts: current.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.51,
+                    size: 20.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.52,
+                    size: 20.0,
+                }],
+            },
+            ResearchPmBookSnapshot {
+                event_id: current.event_id.clone(),
+                token_id: current.down_token_id.clone(),
+                side: "DOWN".into(),
+                ts: current.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.40,
+                    size: 20.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.41,
+                    size: 20.0,
+                }],
+            },
+            ResearchPmBookSnapshot {
+                event_id: future.event_id.clone(),
+                token_id: future.up_token_id.clone(),
+                side: "UP".into(),
+                ts: future.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.70,
+                    size: 20.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.72,
+                    size: 20.0,
+                }],
+            },
+            ResearchPmBookSnapshot {
+                event_id: future.event_id.clone(),
+                token_id: future.down_token_id.clone(),
+                side: "DOWN".into(),
+                ts: future.tick_ts,
+                bids: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.22,
+                    size: 20.0,
+                }],
+                asks: vec![crate::factors::ResearchPmBookLevel {
+                    price: 0.24,
+                    size: 20.0,
+                }],
+            },
+        ];
+
+        let observations = vec![current, future];
+        let matrix_options = FullDepthExecutionMatrixOptions {
+            stakes_usd: vec![5.0],
+            min_bucket_observations: 1,
+            ..Default::default()
+        };
+        let report =
+            build_full_depth_execution_matrix(&observations, &books, matrix_options.clone());
+        let (captured_report, event_rows) = build_full_depth_execution_matrix_with_event_rows(
+            &observations,
+            &books,
+            matrix_options,
+        );
+        assert_eq!(
+            format_full_depth_execution_matrix_report(&captured_report, 20),
+            format_full_depth_execution_matrix_report(&report, 20)
+        );
+
+        let up = event_rows
+            .iter()
+            .find(|row| row.side == ReviewSide::Up && row.tick_ts == tick_ts)
+            .expect("up event row");
+        let down = event_rows
+            .iter()
+            .find(|row| row.side == ReviewSide::Down && row.tick_ts == tick_ts)
+            .expect("down event row");
+
+        assert_eq!(up.market_id, "market-1");
+        assert_eq!(up.token_id, "token-up");
+        assert_eq!(down.market_id, "market-1");
+        assert_eq!(down.token_id, "token-down");
+        assert_eq!(up.side, ReviewSide::Up);
+        assert_eq!(down.side, ReviewSide::Down);
+        assert_eq!(up.book_timestamp, Some(tick_ts));
+        assert_eq!(down.book_timestamp, Some(tick_ts));
+        assert!(up.quote_age_secs.unwrap().abs() < EPS);
+        assert!(down.quote_age_secs.unwrap().abs() < EPS);
+        assert!((up.entry_avg_price.unwrap() - 0.52).abs() < EPS);
+        assert!((down.entry_avg_price.unwrap() - 0.41).abs() < EPS);
+        assert!((up.exit_10s_avg_price.unwrap() - 0.70).abs() < EPS);
+        assert!((down.exit_10s_avg_price.unwrap() - 0.22).abs() < EPS);
+        assert!(up.exit_10s_reprice_pnl.unwrap() > 0.0);
+        assert!(down.exit_10s_reprice_pnl.unwrap() < 0.0);
     }
 
     #[test]
