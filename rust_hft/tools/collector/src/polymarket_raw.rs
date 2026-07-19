@@ -1,6 +1,9 @@
 //! Fail-closed Polymarket reference collection and raw tape archival.
 
-use crate::polymarket_upload::{ensure_canonical_directory, validate_reference_tape_for_recovery};
+use crate::polymarket_upload::{
+    ensure_canonical_directory, trade_record_ids_sha256, validate_reference_tape_for_recovery,
+    TRADE_COMPLETION_BASIS, TRADE_COMPLETION_KIND,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt};
@@ -28,6 +31,7 @@ const GAMMA_MARKET_URL: &str = "https://gamma-api.polymarket.com/markets";
 const DATA_TRADES_URL: &str = "https://data-api.polymarket.com/trades";
 const USER_AGENT: &str = "monday-polymarket-reference-collector/2.0";
 const TRADE_ID_VERSION: &str = "v2";
+const TRADE_COMPLETION_VERSION: &str = "v1";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
@@ -272,6 +276,8 @@ impl ReferenceConfig {
 struct CollectorState {
     #[serde(default)]
     trade_id_version: Option<String>,
+    #[serde(default)]
+    trade_completion_version: Option<String>,
     #[serde(default)]
     context_seed_hour: Option<String>,
     #[serde(default)]
@@ -844,15 +850,20 @@ impl PendingUpdates {
     }
 
     fn record_types(&self) -> BTreeMap<&'static str, usize> {
-        ["market_metadata", "polymarket_trade", "market_settlement"]
-            .into_iter()
-            .map(|kind| {
-                (
-                    kind,
-                    self.record_types.get(kind).copied().unwrap_or_default(),
-                )
-            })
-            .collect()
+        [
+            "market_metadata",
+            "polymarket_trade",
+            "market_settlement",
+            TRADE_COMPLETION_KIND,
+        ]
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                self.record_types.get(kind).copied().unwrap_or_default(),
+            )
+        })
+        .collect()
     }
 
     fn push(&mut self, update: Value) -> Result<()> {
@@ -860,6 +871,7 @@ impl PendingUpdates {
             Some("market_metadata") => Some("market_metadata"),
             Some("polymarket_trade") => Some("polymarket_trade"),
             Some("market_settlement") => Some("market_settlement"),
+            Some(TRADE_COMPLETION_KIND) => Some(TRADE_COMPLETION_KIND),
             _ => None,
         };
         let mut encoded = serde_json::to_vec(&update)?;
@@ -1664,6 +1676,46 @@ fn advance_trade_finalization(
     tracked.trade_finalization_stable_polls >= stable_polls_required
 }
 
+#[allow(clippy::too_many_arguments)]
+fn trade_completion_update(
+    state: &CollectorState,
+    market_id: &str,
+    condition_id: &str,
+    symbol: &str,
+    market_window_secs: u64,
+    retrieved_at: DateTime<Utc>,
+    finalization_lag_secs: i64,
+    stable_polls_required: u64,
+) -> Value {
+    let (trade_count, trade_record_ids_sha256) =
+        if let Some(record_ids) = state.trade_seen.get(condition_id) {
+            (
+                record_ids.len(),
+                trade_record_ids_sha256(record_ids.keys().map(String::as_str)),
+            )
+        } else {
+            (0, trade_record_ids_sha256(std::iter::empty::<&str>()))
+        };
+    json!({
+        "kind": TRADE_COMPLETION_KIND,
+        "market_id": market_id,
+        "condition_id": condition_id,
+        "symbol": symbol,
+        "market_window_secs": market_window_secs,
+        "record_id_version": TRADE_ID_VERSION,
+        "trade_count": trade_count,
+        "trade_record_ids_sha256": trade_record_ids_sha256,
+        "source": "polymarket_data_api",
+        "retrieved_at": iso_z(retrieved_at),
+        "completeness_basis": TRADE_COMPLETION_BASIS,
+        "pagination_exhausted": true,
+        "settlement_observed": true,
+        "malformed_trade_rows": 0,
+        "finalization_lag_secs": finalization_lag_secs,
+        "stable_polls_required": stable_polls_required,
+    })
+}
+
 struct ReferenceCollector {
     config: ReferenceConfig,
     symbols: BTreeSet<String>,
@@ -1709,6 +1761,20 @@ fn recover_state_from_tape_row(
                         .insert(record_id.to_owned(), timestamp);
                 }
             }
+        }
+    } else if kind == TRADE_COMPLETION_KIND {
+        if let Some(market_id) = market_id {
+            let tracked = state.markets.entry(market_id.to_owned()).or_default();
+            tracked.condition_id = condition_id.map(str::to_owned);
+            tracked.symbol = update
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(window) = update.get("market_window_secs").and_then(Value::as_u64) {
+                tracked.market_window_secs = window;
+            }
+            tracked.settled = true;
+            tracked.trade_complete = true;
         }
     } else if matches!(kind, "market_metadata" | "market_settlement") {
         if let Some(market_id) = market_id {
@@ -1769,6 +1835,7 @@ impl ReferenceCollector {
         let state_path = config.spool_dir.join("collector-state.json");
         let health_path = config.spool_dir.join("health.json");
         let mut state: CollectorState = read_optional_json(&state_path)?;
+        let mut state_migrated = false;
         if state.trade_id_version.as_deref() != Some(TRADE_ID_VERSION) {
             let active = config.spool_dir.join(ACTIVE_TAPE);
             if active.exists() {
@@ -1787,6 +1854,17 @@ impl ReferenceCollector {
                 tracked.trade_complete = false;
             }
             state.trade_id_version = Some(TRADE_ID_VERSION.to_owned());
+            state_migrated = true;
+        }
+        if state.trade_completion_version.as_deref() != Some(TRADE_COMPLETION_VERSION) {
+            for tracked in state.markets.values_mut() {
+                tracked.trade_complete = false;
+                tracked.trade_finalization_stable_polls = 0;
+            }
+            state.trade_completion_version = Some(TRADE_COMPLETION_VERSION.to_owned());
+            state_migrated = true;
+        }
+        if state_migrated {
             atomic_write_json(&state_path, &state)?;
         }
         // trade_updates rejects older rows before dedupe, so their IDs cannot
@@ -2329,6 +2407,16 @@ impl ReferenceCollector {
                                     self.config.trade_finalization_stable_polls,
                                 )
                             {
+                                updates.push(trade_completion_update(
+                                    &next_state,
+                                    market_id,
+                                    &condition_id,
+                                    &target.symbol,
+                                    target.window_secs,
+                                    trade_received_at,
+                                    self.config.trade_finalization_lag_secs,
+                                    self.config.trade_finalization_stable_polls,
+                                ))?;
                                 tracked.trade_complete = true;
                             }
                         }
@@ -3927,6 +4015,24 @@ mod tests {
     }
 
     #[test]
+    #[rustfmt::skip]
+    fn trade_completion_binds_sorted_record_ids_and_recovers_final_state() {
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let mut state = CollectorState::default();
+        state.trade_seen.insert("condition-1".to_owned(), BTreeMap::from([("trade-b".to_owned(), 2), ("trade-a".to_owned(), 1)]));
+        let completion = trade_completion_update(&state, "market-1", "condition-1", "BTCUSDT", 300, now, 60, 2);
+        assert_eq!(completion["kind"], TRADE_COMPLETION_KIND);
+        assert_eq!(completion["trade_count"], 2);
+        assert_eq!(completion["trade_record_ids_sha256"], trade_record_ids_sha256(["trade-a", "trade-b"]));
+        let row = json!({"update": completion});
+        let mut recovered = CollectorState::default();
+        recover_state_from_tape_row(&mut recovered, &row, 0).unwrap();
+        let tracked = &recovered.markets["market-1"];
+        assert!(tracked.settled);
+        assert!(tracked.trade_complete);
+    }
+
+    #[test]
     fn tape_recovery_truncates_incomplete_tail_and_continues_sequence() {
         let root = TestDir::new();
         let now = fixed_time("2026-07-15T01:00:00Z");
@@ -4116,6 +4222,7 @@ mod tests {
             json!({"kind": "market_metadata", "market_id": "market-1"}),
             json!({"kind": "polymarket_trade", "record_id": "trade-1"}),
             json!({"kind": "market_settlement", "market_id": "market-1"}),
+            json!({"kind": TRADE_COMPLETION_KIND, "market_id": "market-1"}),
         ];
         let mut expected = TapeWriter::new(expected_root.path()).unwrap();
         expected.write_updates(&updates, now).unwrap();
@@ -4128,18 +4235,20 @@ mod tests {
                 ("market_metadata", 0),
                 ("market_settlement", 0),
                 ("polymarket_trade", 0),
+                (TRADE_COMPLETION_KIND, 0),
             ])
         );
         for update in updates {
             pending.push(update).unwrap();
         }
-        assert_eq!(pending.len(), 3);
+        assert_eq!(pending.len(), 4);
         assert_eq!(
             pending.record_types(),
             BTreeMap::from([
                 ("market_metadata", 1),
                 ("market_settlement", 1),
                 ("polymarket_trade", 1),
+                (TRADE_COMPLETION_KIND, 1),
             ])
         );
         assert_eq!(
@@ -4343,6 +4452,10 @@ mod tests {
         let durable_state: CollectorState =
             read_optional_json(&root.path().join("collector-state.json")).unwrap();
         assert_eq!(durable_state.trade_id_version.as_deref(), Some("v2"));
+        assert_eq!(
+            durable_state.trade_completion_version.as_deref(),
+            Some("v1")
+        );
         let quarantined = fs::read_dir(root.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -4395,6 +4508,19 @@ mod tests {
             .count();
         assert_eq!(quarantined_after_restart, 1);
         restarted.writer.close().unwrap();
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn completion_migration_reopens_v2_markets_without_a_proof() {
+        let root = TestDir::new();
+        atomic_write_json(&root.path().join("collector-state.json"), &json!({"trade_id_version":"v2", "markets":{"market-1":{"trade_complete":true,"trade_finalization_stable_polls":9}}})).unwrap();
+        let config = ReferenceConfig { spool_dir: root.path().to_path_buf(), symbols: vec!["BTCUSDT".to_owned()], ..ReferenceConfig::default() };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        assert_eq!(collector.state.trade_completion_version.as_deref(), Some("v1"));
+        assert!(!collector.state.markets["market-1"].trade_complete);
+        assert_eq!(collector.state.markets["market-1"].trade_finalization_stable_polls, 0);
+        collector.writer.close().unwrap();
     }
 
     #[test]
