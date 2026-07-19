@@ -39,7 +39,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 ### Unified Monday prediction research control plane (2026-07-16)
 
 - [x] Build the prediction data audit directly from externally verified artifacts.
-- [x] Aggregate independently verified Polymarket evidence artifacts into a gap-free BTC/SOL 5-minute research set.
+- [x] Aggregate non-overlapping Polymarket evidence artifacts while requiring every member to remain BTC/SOL slot-complete; allow gaps between event-local cohorts.
 - [x] Verify sealed Polymarket evidence into semantic read-only typed projections.
 - [x] Project verified Binance tapes into deterministic research updates, source clocks, and LOB snapshots.
 - [x] Bind immutable Polymarket evidence to external content and manifest SHA-256 anchors before semantic consumption.
