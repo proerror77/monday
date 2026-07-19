@@ -729,6 +729,27 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legacy_reference_manifest_when_rescan_proves_context_complete() {
+        let (_temp, config) = fixture(true);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&config.reference.manifest).unwrap()).unwrap();
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("reference_context_complete");
+        fs::write(
+            &config.reference.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+
+        let report = validate_research_segments(&config)
+            .expect("a producer rescan must authenticate complete legacy reference context");
+
+        assert_eq!(report.reference.dataset, "crypto_expiry_reference");
+    }
+
+    #[test]
     fn rejects_tampered_success_marker() {
         let (_temp, config) = fixture(true);
         fs::write(&config.market.success, b"tampered\n").unwrap();
