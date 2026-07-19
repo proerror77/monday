@@ -1,7 +1,5 @@
 use crate::lob_archiver::command_status_with_timeout;
-use crate::polymarket_upload::{
-    ensure_canonical_directory, scan_tape, TRADE_COMPLETION_KIND,
-};
+use crate::polymarket_upload::{ensure_canonical_directory, scan_tape, TRADE_COMPLETION_KIND};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use rand::random;
@@ -145,9 +143,11 @@ impl BoundFile {
         if identity.2 > max_bytes {
             bail!("artifact exceeds snapshot byte limit");
         }
-        let mut bounded = file
-            .try_clone()?
-            .take(max_bytes.checked_add(1).context("snapshot byte limit overflow")?);
+        let mut bounded = file.try_clone()?.take(
+            max_bytes
+                .checked_add(1)
+                .context("snapshot byte limit overflow")?,
+        );
         if std::io::copy(&mut bounded, &mut snapshot)? > max_bytes {
             bail!("artifact exceeds snapshot byte limit");
         }
@@ -467,7 +467,7 @@ fn decompress_and_rescan(
     artifact: &ValidatedArtifact,
     dataset: &str,
     directory: &Path,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Value)> {
     fs::create_dir(directory)?;
     let source_file = artifact
         .manifest
@@ -516,11 +516,14 @@ fn decompress_and_rescan(
         .ok_or_else(|| anyhow!("recording_policy.quote_sample_ms is missing"))?;
     let rescanned = scan_tape(&raw, dataset, usize::try_from(depth)?, sample_ms)?;
     for (field, value) in rescanned.as_object().expect("scan manifest is an object") {
-        if artifact.manifest.get(field) != Some(value) {
+        let authenticated_legacy_context = field == "reference_context_complete"
+            && artifact.manifest.get(field).is_none()
+            && value.as_bool() == Some(true);
+        if !authenticated_legacy_context && artifact.manifest.get(field) != Some(value) {
             bail!("manifest field {field} does not match producer rescan");
         }
     }
-    Ok(raw)
+    Ok((raw, rescanned))
 }
 
 fn segment_hour(identity: &SegmentIdentity) -> Result<DateTime<Utc>> {
@@ -581,10 +584,9 @@ fn validate_market_policy(manifest: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn validate_reference_policy(references: &[ValidatedArtifact]) -> Result<()> {
+fn validate_reference_policy(references: &[Value]) -> Result<()> {
     let mut event_types = BTreeMap::<String, u64>::new();
-    for reference in references {
-        let manifest = &reference.manifest;
+    for manifest in references {
         let versions = &manifest["record_id_versions"];
         if manifest
             .get("reference_context_complete")
@@ -599,7 +601,10 @@ fn validate_reference_policy(references: &[ValidatedArtifact]) -> Result<()> {
         {
             bail!("reference segments must contain only metadata, v2 trades, settlements, and exact recording policy");
         }
-        for (kind, count) in manifest["event_types"].as_object().expect("validated event types") {
+        for (kind, count) in manifest["event_types"]
+            .as_object()
+            .expect("validated event types")
+        {
             let total = event_types.entry(kind.clone()).or_default();
             *total = total
                 .checked_add(count.as_u64().unwrap_or_default())
@@ -652,16 +657,20 @@ pub(crate) fn with_validated_research_segments<T>(
     }
     let source_bytes = references.iter().try_fold(0_u64, |total, reference| {
         total
-            .checked_add(reference.manifest["source_bytes"].as_u64().unwrap_or(u64::MAX))
+            .checked_add(
+                reference.manifest["source_bytes"]
+                    .as_u64()
+                    .unwrap_or(u64::MAX),
+            )
             .context("reference source byte total overflow")
     })?;
     if source_bytes > MAX_REFERENCE_SOURCE_BYTES {
         bail!("reference segment set exceeds source byte limit");
     }
     validate_market_policy(&market.manifest)?;
-    validate_reference_policy(&references)?;
-    let market_raw = decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
-    let reference_raws = references
+    let (market_raw, _) =
+        decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
+    let rescanned_references = references
         .iter()
         .enumerate()
         .map(|(index, reference)| {
@@ -672,6 +681,15 @@ pub(crate) fn with_validated_research_segments<T>(
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    let reference_manifests = rescanned_references
+        .iter()
+        .map(|(_, manifest)| manifest.clone())
+        .collect::<Vec<_>>();
+    validate_reference_policy(&reference_manifests)?;
+    let reference_raws = rescanned_references
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
     let reference_raw = combine_references(&reference_raws, &scratch.0)?;
     let report = ResearchSegmentValidationReport {
         schema: "monday.polymarket.research_segment_validation.v2",
@@ -930,12 +948,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let market = triplet(&root, "crypto_expiry", &market_rows());
-        let first = triplet(
-            &root,
-            "crypto_expiry_reference",
-            &reference_rows(false),
-        );
-        let mut second = vec![row(0, metadata("market_metadata")), row(1, metadata("market_settlement"))];
+        let first = triplet(&root, "crypto_expiry_reference", &reference_rows(false));
+        let mut second = vec![
+            row(0, metadata("market_metadata")),
+            row(1, metadata("market_settlement")),
+        ];
         for record in &mut second {
             record["recorded_at"] = json!("2026-07-17T06:01:00Z");
         }
@@ -1021,6 +1038,50 @@ mod tests {
         };
 
         rejects(&config, "duplicate polymarket_trade record_id");
+    }
+
+    #[test]
+    fn accepts_legacy_manifests_when_rescan_proves_reference_context_complete() {
+        let (_temp, config) = fixture(true);
+        for triplet in std::iter::once(&config.market).chain(config.references.iter()) {
+            let mut manifest: Value =
+                serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("reference_context_complete");
+            fs::write(
+                &triplet.manifest,
+                format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+            )
+            .unwrap();
+        }
+
+        let report = validate_research_segments(&config)
+            .expect("a producer rescan must authenticate complete legacy reference context");
+
+        assert_eq!(report.references[0].dataset, "crypto_expiry_reference");
+    }
+
+    #[test]
+    fn rejects_legacy_reference_manifest_when_rescan_finds_missing_metadata_context() {
+        let reference = vec![row(0, trade()), row(1, metadata("market_settlement"))];
+        let (_temp, config) = fixture_rows(&market_rows(), &reference);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&config.references[0].manifest).unwrap()).unwrap();
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("reference_context_complete");
+        manifest["canonical"] = json!(true);
+        manifest["segment_complete"] = json!(true);
+        fs::write(
+            &config.references[0].manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+
+        rejects(&config, "producer rescan");
     }
 
     #[test]

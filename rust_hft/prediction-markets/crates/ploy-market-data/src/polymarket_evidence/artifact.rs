@@ -296,11 +296,7 @@ fn seal_with_hook(
     if parse_digest(&parsed.content_sha256, "content_sha256")? != trust.expected_content_sha256 {
         bail!("evidence manifest content digest does not match the trusted anchor");
     }
-    let frames = frame_ndjson(
-        &data_bytes,
-        &parsed.surface_counts,
-        &trade_completions,
-    )?;
+    let frames = frame_ndjson(&data_bytes, &parsed.surface_counts, &trade_completions)?;
     if u64::try_from(frames.len())? != parsed.rows {
         bail!("evidence NDJSON row count does not match the manifest");
     }
@@ -564,7 +560,12 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
             validate_segment(&inputs.market, "crypto_expiry")?;
             validate_v2_event_types(
                 &inputs.market,
-                &["event_discovered", "event_expired", "quote", "reference_price"],
+                &[
+                    "event_discovered",
+                    "event_expired",
+                    "quote",
+                    "reference_price",
+                ],
             )?;
             if inputs.reference.record_id_versions != ["v2"] {
                 bail!("validated reference input must contain v2 trades");
@@ -597,7 +598,12 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
             validate_segment(&inputs.market, "crypto_expiry")?;
             validate_v2_event_types(
                 &inputs.market,
-                &["event_discovered", "event_expired", "quote", "reference_price"],
+                &[
+                    "event_discovered",
+                    "event_expired",
+                    "quote",
+                    "reference_price",
+                ],
             )?;
             let mut reference_event_types = BTreeMap::<String, u64>::new();
             for reference in &inputs.references {
@@ -674,12 +680,17 @@ fn validate_reference_event_identity(reference: &SegmentIdentity) -> Result<()> 
 }
 
 fn validate_v2_event_types(segment: &SegmentIdentity, allowed: &[&str]) -> Result<()> {
-    let total = segment.event_types.iter().try_fold(0_u64, |total, (kind, count)| {
-        if !allowed.contains(&kind.as_str()) {
-            bail!("validated input contains an unsupported event type");
-        }
-        total.checked_add(*count).context("validated input event count overflow")
-    })?;
+    let total = segment
+        .event_types
+        .iter()
+        .try_fold(0_u64, |total, (kind, count)| {
+            if !allowed.contains(&kind.as_str()) {
+                bail!("validated input contains an unsupported event type");
+            }
+            total
+                .checked_add(*count)
+                .context("validated input event count overflow")
+        })?;
     if segment.event_types.is_empty() || total != segment.events {
         bail!("validated input event types do not match its event count");
     }
@@ -1094,10 +1105,17 @@ pub(super) mod tests {
         for (hour, accepted) in [("06", true), ("07", false)] {
             let temp = tempfile::tempdir().unwrap();
             let triplet = write_triplet(&temp);
-            let mut manifest: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+            let mut manifest: Value =
+                serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
             manifest["validated_inputs"] = plural_inputs(hour);
-            rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&manifest).unwrap()));
-            assert_eq!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok(), accepted);
+            rewrite_read_only(
+                &triplet.manifest,
+                format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+            );
+            assert_eq!(
+                seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok(),
+                accepted
+            );
         }
     }
 
@@ -1216,9 +1234,13 @@ pub(super) mod tests {
     fn seals_v2_references_when_the_completion_moves_to_the_next_hour() {
         let temp = tempfile::tempdir().unwrap();
         let triplet = write_triplet(&temp);
-        let mut value: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
         value["validated_inputs"] = plural_inputs("06");
-        rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&value).unwrap()));
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        );
         assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
     }
 
