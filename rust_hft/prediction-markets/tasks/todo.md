@@ -73,6 +73,10 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Enforce mission, symbol, horizon, and exact snapshot provenance again at the Rust evaluator boundary.
 - [x] Keep feedback mission-local and return no-OOS plus conservative-capacity failure reasons for every proposed blend.
 - [x] Add a governed Rust-only Burn binary probability lane with event-disjoint snapshot-bound inputs and content-addressed model evidence.
+- [x] Bind the settlement trainer to a manifest-sealed shared time boundary so overlapping event lifetimes cannot cross train and validation cohorts.
+- [ ] Add separate UP/DOWN token repricing, fill, slippage, and markout evaluators without changing the settlement target.
+- [ ] Add an immutable all-update-tick research tape for token microstructure; keep the one-second L2 tape as the settlement baseline.
+- [ ] Expand governed product-family missions beyond BTC/SOL five-minute only after verified 15-minute and one-hour evidence exists end to end.
 - [x] Complete the repository-wide Rust-only cutover: remove tracked Python and PyTorch/libtorch paths, add native Burn training for both research lanes, and pass focused Rust validation.
 - [x] Remove unused Monday research-store/search crates while preserving active DSL, manifest, and harness contracts.
 
