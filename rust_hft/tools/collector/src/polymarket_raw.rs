@@ -39,6 +39,7 @@ const HARD_CYCLE_WATCHDOG_EXIT_CODE: i32 = 124;
 const HTTP_GET_ATTEMPTS: usize = 3;
 const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const HTTP_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+const MAX_RETAINED_TRADE_IDS: usize = 1_000_000;
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
@@ -606,6 +607,18 @@ fn target_market(market: &Value, symbols: &BTreeSet<String>) -> Option<TargetMar
         symbol: symbol.to_owned(),
         window_secs,
     })
+}
+
+fn recovered_target(
+    market_id: &str,
+    market: &Value,
+    symbols: &BTreeSet<String>,
+) -> Result<TargetMarket> {
+    if market.get("id").and_then(Value::as_str) != Some(market_id) {
+        bail!("Gamma market detail ID does not match requested market");
+    }
+    target_market(market, symbols)
+        .ok_or_else(|| completeness_error("Gamma market detail is not a supported target market"))
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1782,6 +1795,30 @@ fn compact_trade_dedupe(state: &mut CollectorState, cutoff: i64) -> bool {
     changed
 }
 
+fn validate_state_bounds(
+    state: &CollectorState,
+    max_markets: usize,
+    max_retained_trade_ids: usize,
+) -> Result<()> {
+    let retained_trade_ids = state.trade_seen.values().try_fold(0_usize, |total, seen| {
+        total.checked_add(seen.len()).context("trade ID count overflow")
+    })?;
+    if state.markets.len() > max_markets
+        || state.trade_seen.len() > max_markets
+        || retained_trade_ids > max_retained_trade_ids
+    {
+        bail!("collector state exceeds configured market or retained trade ID limit");
+    }
+    Ok(())
+}
+
+fn validate_cycle_hour(target_hour: &str, recorded_at: DateTime<Utc>) -> Result<()> {
+    if hour_key(recorded_at) != target_hour {
+        bail!("collector cycle crossed a UTC-hour boundary; retrying with fresh context");
+    }
+    Ok(())
+}
+
 impl ReferenceCollector {
     fn new(config: ReferenceConfig) -> Result<Self> {
         config.validate()?;
@@ -1836,8 +1873,8 @@ impl ReferenceCollector {
         if state_migrated {
             atomic_write_json(&state_path, &state)?;
         }
-        // trade_updates rejects older rows before dedupe, so their IDs cannot
-        // affect any future emission and need not stay in operational state.
+        // Completed or orphaned conditions may be compacted; incomplete
+        // markets retain every ID until their proof is emitted.
         let trade_cutoff = startup_at.timestamp() - config.settlement_lookback_secs;
         let state_compacted = compact_trade_dedupe(&mut state, trade_cutoff);
         let mut writer = TapeWriter::new_with_recovery(&config.spool_dir, |row| {
@@ -1855,6 +1892,7 @@ impl ReferenceCollector {
             validation?;
             cache_release?;
         }
+        validate_state_bounds(&state, config.max_markets, MAX_RETAINED_TRADE_IDS)?;
         if state_compacted || recovered_active {
             // The state checkpoint must be durable before the recovered segment
             // stops being the active crash-recovery source.
@@ -2138,34 +2176,28 @@ impl ReferenceCollector {
                     .remove(&market_id)
                     .ok_or_else(|| anyhow!("selected market {market_id} has no detail fetch"))?
                 {
-                    Ok(market) if market.is_object() => {
-                        targets.insert(
-                            market_id.clone(),
-                            (
-                                market,
-                                TargetMarket {
-                                    symbol: tracked.symbol.clone().unwrap_or_default(),
-                                    window_secs: tracked.market_window_secs,
-                                },
-                            ),
-                        );
-                        tracked.settlement_failure_since = None;
-                        tracked.settlement_last_error = None;
-                    }
-                    Ok(_) => {
-                        let error = "Gamma market detail response is not an object".to_owned();
+                    Ok(market) => match recovered_target(&market_id, &market, &self.symbols) {
+                        Ok(target) => {
+                            targets.insert(market_id.clone(), (market, target));
+                            tracked.settlement_failure_since = None;
+                            tracked.settlement_last_error = None;
+                        }
+                        Err(error) => {
+                            let error = error.to_string();
+                            errors.push(format!("settlement {market_id}: {error}"));
+                            tracked
+                                .settlement_failure_since
+                                .get_or_insert_with(|| retrieved_at.clone());
+                            tracked.settlement_last_error = Some(error);
+                        }
+                    },
+                    Err(error) => {
+                        let error = error.to_string();
                         errors.push(format!("settlement {market_id}: {error}"));
                         tracked
                             .settlement_failure_since
                             .get_or_insert_with(|| retrieved_at.clone());
                         tracked.settlement_last_error = Some(error);
-                    }
-                    Err(error) => {
-                        errors.push(format!("settlement {market_id}: {error}"));
-                        tracked
-                            .settlement_failure_since
-                            .get_or_insert_with(|| retrieved_at.clone());
-                        tracked.settlement_last_error = Some(error.to_string());
                     }
                 }
             }
@@ -2427,6 +2459,12 @@ impl ReferenceCollector {
         let records_written = updates.len();
         let record_types = updates.record_types();
         let recorded_at = self.now();
+        validate_cycle_hour(&target_hour, recorded_at)?;
+        validate_state_bounds(
+            &next_state,
+            self.config.max_markets,
+            MAX_RETAINED_TRADE_IDS,
+        )?;
         updates.replay(&mut self.writer, recorded_at)?;
         if missing_target_symbols.is_empty() {
             next_state.context_seed_hour = Some(target_hour);
@@ -3677,6 +3715,54 @@ mod tests {
             plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 8).selected,
             BTreeSet::from(["settled".to_owned()])
         );
+    }
+
+    #[test]
+    fn recovered_market_detail_must_match_the_requested_target() {
+        let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
+        let valid = market(
+            "Bitcoin Up or Down - 5 minutes",
+            "2026-07-17T05:00:00Z",
+            "2026-07-17T05:05:00Z",
+        );
+        let market_id = valid["id"].as_str().unwrap();
+        assert!(recovered_target(market_id, &valid, &symbols).is_ok());
+        assert!(recovered_target("wrong-market", &valid, &symbols).is_err());
+
+        let unsupported = market(
+            "Ethereum Up or Down - 5 minutes",
+            "2026-07-17T05:00:00Z",
+            "2026-07-17T05:05:00Z",
+        );
+        let unsupported_id = unsupported["id"].as_str().unwrap();
+        assert!(recovered_target(unsupported_id, &unsupported, &symbols).is_err());
+    }
+
+    #[test]
+    fn state_bounds_fail_closed_before_persisting_more_incomplete_work() {
+        let mut state = CollectorState::default();
+        state.markets.insert("market-1".to_owned(), TrackedMarket::default());
+        state.markets.insert("market-2".to_owned(), TrackedMarket::default());
+        assert!(validate_state_bounds(&state, 1, 10).is_err());
+
+        state.markets.pop_last();
+        state.trade_seen.insert(
+            "condition-1".to_owned(),
+            BTreeMap::from([("trade-1".to_owned(), 1), ("trade-2".to_owned(), 2)]),
+        );
+        assert!(validate_state_bounds(&state, 1, 1).is_err());
+        assert!(validate_state_bounds(&state, 1, 2).is_ok());
+    }
+
+    #[test]
+    fn cycle_crossing_an_hour_requires_a_fresh_context_retry() {
+        let started = fixed_time("2026-07-17T05:59:59Z");
+        assert!(validate_cycle_hour(&hour_key(started), started).is_ok());
+        assert!(validate_cycle_hour(
+            &hour_key(started),
+            fixed_time("2026-07-17T06:00:00Z")
+        )
+        .is_err());
     }
 
     #[test]
