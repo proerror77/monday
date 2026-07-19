@@ -156,9 +156,12 @@ fn settlement_time_cohort_from_args(
         return Ok(None);
     };
     validate_time_cohort_range(boundary, start, end)?;
-    let event_window_secs = event_window_secs.ok_or_else(|| {
-        "prediction evaluator time cohort requires --event-window-secs".to_string()
-    })?;
+    let event_window_secs = event_window_secs
+        .filter(|&value| !required || value == 300)
+        .ok_or_else(|| {
+            "prediction evaluator time cohort requires --event-window-secs (300 when governed)"
+                .to_string()
+        })?;
     SettlementProbabilityTimeCohort::new(boundary, event_window_secs).map(Some)
 }
 
@@ -337,6 +340,8 @@ mod tests {
         validate_time_cohort_range(boundary, start, end).expect("interior boundary");
         assert!(validate_time_cohort_range(start, start, end).is_err());
         assert!(validate_time_cohort_range(end, start, end).is_err());
+        let args = vec!["--time-cohort-boundary-ms".into(), boundary_ms.to_string()];
+        assert!(settlement_time_cohort_from_args(&args, true, start, end, Some(900)).is_err());
     }
 
     #[test]
