@@ -84,6 +84,11 @@ or after it. The boundary is sealed into the immutable mission identity, binary
 dataset contract, and model manifest, while the independent label-availability
 cutoff remains mandatory.
 
+The governed LoopRun forwards that mission boundary to the settlement-only
+walk-forward evaluator, including the no-prior baseline turn. A missing or
+invalid boundary fails closed; generic factor and token-execution reviews do
+not inherit this settlement split implicitly.
+
 The current governed baseline remains BTC/SOL five-minute settlement research
 over the retained one-second full-visible-depth L2 snapshots. Fifteen-minute
 and one-hour missions require their own verified end-to-end data contracts

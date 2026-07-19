@@ -413,9 +413,33 @@ impl Default for SettlementProbabilityReportOptions {
 pub struct SettlementProbabilityWalkForwardOptions {
     pub walk_forward: FactorWalkForwardOptions,
     pub probability: SettlementProbabilityReportOptions,
+    pub time_cohort: Option<SettlementProbabilityTimeCohort>,
     pub max_test_brier_score: f64,
     pub max_test_log_loss: f64,
     pub max_test_expected_calibration_error: f64,
+}
+
+/// Mission-pinned outer train/validation boundary for settlement research.
+/// Generic factor and token-execution reviews leave this unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlementProbabilityTimeCohort {
+    boundary: DateTime<Utc>,
+    event_window_secs: i64,
+}
+
+impl SettlementProbabilityTimeCohort {
+    pub fn new(boundary: DateTime<Utc>, event_window_secs: i64) -> Result<Self, String> {
+        if boundary.timestamp_millis() <= 0 {
+            return Err("settlement time-cohort boundary must be positive".to_string());
+        }
+        if event_window_secs <= 0 {
+            return Err("settlement time-cohort event window must be positive".to_string());
+        }
+        Ok(Self {
+            boundary,
+            event_window_secs,
+        })
+    }
 }
 
 impl Default for SettlementProbabilityWalkForwardOptions {
@@ -423,6 +447,7 @@ impl Default for SettlementProbabilityWalkForwardOptions {
         Self {
             walk_forward: FactorWalkForwardOptions::default(),
             probability: SettlementProbabilityReportOptions::default(),
+            time_cohort: None,
             max_test_brier_score: 0.25,
             max_test_log_loss: std::f64::consts::LN_2,
             max_test_expected_calibration_error: 0.05,
@@ -2273,6 +2298,7 @@ fn walk_forward_factor_rows(
             v2_rows,
             &event_ends,
             &label_observation_times,
+            None,
             train_start,
             train_end,
             test_start,
@@ -2961,6 +2987,7 @@ pub fn walk_forward_settlement_probability_report_with_prior(
             &rows,
             &event_ends,
             &label_observation_times,
+            options.time_cohort.as_ref(),
             train_start,
             train_end,
             test_start,
@@ -3835,6 +3862,13 @@ pub fn format_settlement_probability_walk_forward_report(
         report.options.max_test_log_loss,
         report.options.max_test_expected_calibration_error,
     ));
+    if let Some(cohort) = report.options.time_cohort {
+        out.push_str(&format!(
+            "mission_time_cohort_boundary={} event_window_secs={} crossing_events=purged\n",
+            cohort.boundary.to_rfc3339(),
+            cohort.event_window_secs,
+        ));
+    }
     out.push_str("Test windows evaluate formula probabilities on future rows; EventVolSurface and q_final use only the train window as empirical prior.\n");
     out.push_str("\n--- Aggregate ---\n");
     out.push_str("model,windows,positive_window_ratio,pass_window_ratio,avg_test_brier,avg_test_log_loss,avg_test_ece,avg_test_top_edge_full_depth_pnl,min_test_top_edge_full_depth_pnl,avg_test_top_edge_conservative_pnl,min_test_top_edge_conservative_pnl,min_top_edge_conservative_coverage_rate\n");
@@ -3996,6 +4030,7 @@ fn walk_forward_factor_combo_from_v2_rows(
             v2_rows,
             &event_ends,
             &label_observation_times,
+            None,
             train_start,
             train_end,
             test_start,
@@ -4409,6 +4444,7 @@ fn walk_forward_meta_label_v1_rows(
             v2_rows,
             &event_ends,
             &label_observation_times,
+            None,
             train_start,
             train_end,
             test_start,
@@ -7355,6 +7391,7 @@ fn event_disjoint_walk_forward_slices<'a>(
     rows: &'a [FactorObservationV2],
     event_ends: &EventEndIndex<'_>,
     label_observation_times: &EventLabelObservationIndex<'_>,
+    time_cohort: Option<&SettlementProbabilityTimeCohort>,
     train_start: DateTime<Utc>,
     train_end: DateTime<Utc>,
     test_start: DateTime<Utc>,
@@ -7372,6 +7409,18 @@ fn event_disjoint_walk_forward_slices<'a>(
     let test_rows = test
         .iter()
         .filter(|row| ends_in(row, test_start, test_end))
+        .filter(|row| {
+            time_cohort.is_none_or(|cohort| {
+                event_ends
+                    .get(row.event_id.as_str())
+                    .and_then(Option::as_ref)
+                    .and_then(|event_end| {
+                        Duration::try_seconds(cohort.event_window_secs)
+                            .and_then(|window| event_end.checked_sub_signed(window))
+                    })
+                    .is_some_and(|event_start| event_start >= cohort.boundary)
+            })
+        })
         .collect::<Vec<_>>();
     let Some(first_test_decision) = test_rows.iter().map(|row| row.tick_ts).min() else {
         return (Vec::new(), test_rows);
@@ -7379,6 +7428,15 @@ fn event_disjoint_walk_forward_slices<'a>(
     let train_rows = train
         .iter()
         .filter(|row| ends_in(row, train_start, train_end))
+        .filter(|row| {
+            time_cohort.is_none_or(|cohort| {
+                event_ends
+                    .get(row.event_id.as_str())
+                    .and_then(Option::as_ref)
+                    .and_then(|event_end| event_end.checked_add_signed(Duration::seconds(1)))
+                    .is_some_and(|exclusive_event_end| exclusive_event_end <= cohort.boundary)
+            })
+        })
         .filter(|row| {
             let event_id = row.event_id.as_str();
             let event_end = event_ends.get(event_id).and_then(Option::as_ref);
@@ -10594,6 +10652,7 @@ mod tests {
             rows,
             &event_ends,
             &label_observation_times,
+            None,
             start,
             boundary,
             boundary,
@@ -11550,6 +11609,7 @@ mod tests {
             &rows,
             &inferred_event_ends(&rows),
             &official_label_observation_times(&rows),
+            None,
             start,
             boundary,
             boundary,
@@ -11569,6 +11629,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["crossing", "test-only"]
         );
+    }
+
+    #[test]
+    fn settlement_time_cohort_purges_crossing_and_post_boundary_training_events() {
+        let start = Utc::now();
+        let boundary = start + Duration::hours(12);
+        let mut source_rows = Vec::new();
+        for (event_id, tick_ts) in [
+            ("train-only", start + Duration::hours(1)),
+            ("crossing", boundary - Duration::minutes(1)),
+            ("crossing", boundary + Duration::minutes(1)),
+            ("test-only", boundary + Duration::hours(1)),
+        ] {
+            let mut row = base_obs();
+            row.event_id = event_id.to_string();
+            row.tick_ts = tick_ts;
+            source_rows.push(row);
+        }
+        bind_test_resolution_clocks(&mut source_rows);
+        let mut rows = build_factor_observations_v2(
+            &source_rows,
+            &FactorReviewOptions {
+                min_observations: 1,
+                ..Default::default()
+            },
+        );
+        rows.retain(|row| row.side == ReviewSide::Up);
+        rows.sort_by_key(|row| row.tick_ts);
+        let event_ends = inferred_event_ends(&rows);
+        let label_observation_times = official_label_observation_times(&rows);
+        let cohort = SettlementProbabilityTimeCohort::new(boundary, 300).unwrap();
+
+        let (train, test) = event_disjoint_walk_forward_slices(
+            &rows,
+            &event_ends,
+            &label_observation_times,
+            Some(&cohort),
+            start,
+            boundary,
+            boundary,
+            boundary + Duration::hours(12),
+        );
+        assert_eq!(
+            train
+                .iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["train-only"]
+        );
+        assert_eq!(
+            test.iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["test-only"]
+        );
+
+        let (late_train, _) = event_disjoint_walk_forward_slices(
+            &rows,
+            &event_ends,
+            &label_observation_times,
+            Some(&cohort),
+            boundary,
+            boundary + Duration::minutes(30),
+            boundary + Duration::minutes(30),
+            boundary + Duration::hours(2),
+        );
+        assert!(late_train.is_empty());
     }
 
     #[test]
@@ -11663,6 +11790,7 @@ mod tests {
             &rows,
             &inferred_event_ends(&rows),
             &official_label_observation_times(&rows),
+            None,
             start,
             boundary,
             boundary,

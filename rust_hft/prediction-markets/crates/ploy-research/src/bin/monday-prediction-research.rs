@@ -66,8 +66,12 @@ impl RustProcessEvaluator {
         Ok(Self { executable })
     }
 
-    fn process(&self) -> Command {
-        Command::new(&self.executable)
+    fn process(&self, time_cohort_boundary_ms: i64) -> Command {
+        let mut command = Command::new(&self.executable);
+        command
+            .arg("--time-cohort-boundary-ms")
+            .arg(time_cohort_boundary_ms.to_string());
+        command
     }
 
     fn command(&self, request: &PredictionEvaluationRequest) -> Result<Command, String> {
@@ -81,7 +85,7 @@ impl RustProcessEvaluator {
             .find(|symbol| normalized_underlying_symbol(symbol) == underlying)
             .ok_or_else(|| format!("snapshot has no {underlying} evaluator symbol"))?;
 
-        let mut command = self.process();
+        let mut command = self.process(request.mission.time_cohort_boundary_ms);
         command
             .arg("--snapshot-dir")
             .arg(&request.snapshot_dir)
@@ -588,6 +592,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn evaluator_capture_stops_at_the_governed_byte_limit() {
@@ -610,17 +615,96 @@ mod tests {
     }
 
     #[test]
-    fn evaluator_process_is_the_precompiled_monday_binary() {
+    fn evaluator_command_forwards_the_mission_cohort_boundary() {
+        let root = std::env::temp_dir().join(format!(
+            "ploy-prediction-evaluator-command-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let snapshot_dir = root.join("snapshot");
+        let start = chrono::Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        let written = ploy_research::write_research_snapshot(
+            &snapshot_dir,
+            ploy_research::ResearchSnapshot {
+                manifest: ploy_research::ResearchSnapshotManifest {
+                    schema_version: ploy_research::RESEARCH_SNAPSHOT_SCHEMA_VERSION.to_string(),
+                    snapshot_hash: None,
+                    snapshot_contract_hash: None,
+                    generated_at: start + chrono::Duration::days(2),
+                    git_sha: None,
+                    symbols: vec!["BTCUSDT".to_string()],
+                    start,
+                    end: start + chrono::Duration::days(2),
+                    history_start: start - chrono::Duration::days(1),
+                    lob_sample_secs: 1,
+                    pm_book_sample_secs: Some(1),
+                    observation_sample_secs: 1,
+                    max_quote_age_secs: 30,
+                    stake_usd: 15.0,
+                    require_official_settlement: true,
+                    immutable_input: true,
+                    source_kind: "unit_test".to_string(),
+                    optimizer_data_dir: Some("unit-test".to_string()),
+                    source_surfaces: Vec::new(),
+                    input_artifacts: Vec::new(),
+                    data_requirements: Vec::new(),
+                    data_audit_status: Some("ok".to_string()),
+                    data_audit_report: None,
+                    include_deribit: false,
+                    artifacts: ploy_research::ResearchSnapshotArtifacts::default(),
+                    row_counts: ploy_research::ResearchSnapshotRowCounts::default(),
+                    phase_timings: Vec::new(),
+                    quality_flags: Vec::new(),
+                    pm_book_source: ploy_research::ResearchSnapshotPmBookSource::default(),
+                },
+                observations: Vec::new(),
+                deribit_snapshots: Vec::new(),
+                pm_book_snapshots: Vec::new(),
+            },
+        )
+        .expect("write command test snapshot");
+        let mut mission: PredictionResearchMission = serde_json::from_str(include_str!(
+            "../../../../config/research_missions/polymarket-btc-5m.example.json"
+        ))
+        .unwrap();
+        mission.time_cohort_boundary_ms = 1_700_001_000_000;
+        mission.data_snapshot_id = written.snapshot_contract_hash.unwrap();
         let evaluator = RustProcessEvaluator {
             executable: PathBuf::from("/usr/local/bin/monday-prediction-evaluator"),
         };
+        let request = PredictionEvaluationRequest {
+            mission,
+            snapshot_dir: snapshot_dir.clone(),
+            artifact_dir: root.join("artifacts"),
+            prior: None,
+        };
 
-        let command = evaluator.process();
+        let command = evaluator
+            .command(&request)
+            .expect("build evaluator command");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let snapshot_dir_arg = snapshot_dir.to_string_lossy().into_owned();
 
         assert_eq!(
             command.get_program(),
             Path::new("/usr/local/bin/monday-prediction-evaluator")
         );
         assert_ne!(command.get_program(), "cargo");
+        assert!(args.windows(2).any(|window| {
+            window[0] == "--time-cohort-boundary-ms" && window[1] == "1700001000000"
+        }));
+        assert!(args
+            .windows(2)
+            .any(|window| { window[0] == "--snapshot-dir" && window[1] == snapshot_dir_arg }));
+        assert!(args
+            .windows(2)
+            .any(|window| { window[0] == "--event-window-secs" && window[1] == "300" }));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

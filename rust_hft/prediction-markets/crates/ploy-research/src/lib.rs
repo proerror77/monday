@@ -176,10 +176,11 @@ pub use factors_v2::{
     SettlementProbabilityPromotionGateOptions, SettlementProbabilityPromotionGateReport,
     SettlementProbabilityPromotionGateRow, SettlementProbabilityReport,
     SettlementProbabilityReportOptions, SettlementProbabilitySymbolHoldoutRow,
-    SettlementProbabilityWalkForwardAggregate, SettlementProbabilityWalkForwardOptions,
-    SettlementProbabilityWalkForwardReport, SettlementProbabilityWalkForwardWindow,
-    SingleFactorReview, ThreeLayerArchive, TradeFormationPathRow, TradeFormationReviewOptions,
-    TradeFormationReviewReport, TradeFormationRuleRow,
+    SettlementProbabilityTimeCohort, SettlementProbabilityWalkForwardAggregate,
+    SettlementProbabilityWalkForwardOptions, SettlementProbabilityWalkForwardReport,
+    SettlementProbabilityWalkForwardWindow, SingleFactorReview, ThreeLayerArchive,
+    TradeFormationPathRow, TradeFormationReviewOptions, TradeFormationReviewReport,
+    TradeFormationRuleRow,
 };
 #[cfg(feature = "rl")]
 pub use model::rl::{BinaryEventEnv, DqnAgent, Environment, ReplayBuffer};
