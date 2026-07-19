@@ -1219,6 +1219,15 @@ mod tests {
             ],
         };
 
+        let mut moved_to_next_hour = inputs.clone();
+        moved_to_next_hour.references[0].trade_completions.clear();
+        assert_eq!(
+            aggregated_trade_completions(&moved_to_next_hour)
+                .unwrap()
+                .len(),
+            1
+        );
+
         let error = aggregated_trade_completions(&inputs).unwrap_err();
 
         assert!(error.to_string().contains("duplicate"), "{error:#}");

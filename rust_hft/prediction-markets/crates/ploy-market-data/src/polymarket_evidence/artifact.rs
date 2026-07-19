@@ -600,6 +600,15 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
                 if has_trades != (reference.record_id_versions == ["v2"]) {
                     bail!("validated reference trade identity is inconsistent");
                 }
+                if reference
+                    .event_types
+                    .get("polymarket_trade_collection_complete")
+                    .copied()
+                    .unwrap_or_default()
+                    != u64::try_from(reference.trade_completions.len())?
+                {
+                    bail!("validated reference trade completion count is inconsistent");
+                }
                 for (kind, count) in &reference.event_types {
                     let total = reference_event_types.entry(kind.clone()).or_default();
                     *total = total
@@ -963,7 +972,8 @@ pub(super) mod tests {
         second["start_recorded_at"] = json!(format!("2026-07-17T{second_hour}:00:00Z"));
         second["end_recorded_at"] = json!(format!("2026-07-17T{second_hour}:01:00Z"));
         second["record_id_versions"] = json!([]);
-        second["event_types"] = json!({"market_settlement":2});
+        second["event_types"] =
+            json!({"market_settlement":1,"polymarket_trade_collection_complete":1});
         for completion in second["trade_completions"]
             .as_object_mut()
             .expect("reference trade completions")
@@ -1106,6 +1116,10 @@ pub(super) mod tests {
         no_trades["references"][0]["record_id_versions"] = json!([]);
         no_trades["references"][0]["event_types"] = json!({"market_metadata":2});
         rejects(no_trades);
+
+        let mut missing_marker = plural_inputs("06");
+        missing_marker["references"][1]["event_types"] = json!({"market_settlement":2});
+        rejects(missing_marker);
     }
 
     #[test]
@@ -1153,6 +1167,31 @@ pub(super) mod tests {
         let mut value: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
         value["validated_inputs"] = plural_inputs("06");
         rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&value).unwrap()));
+        assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn selected_five_minute_evidence_tolerates_an_extra_fifteen_minute_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        let mut inputs = plural_inputs("06");
+        let mut extra = inputs["references"][1]["trade_completions"]["market-1"].clone();
+        extra["condition_id"] = json!("condition-15m");
+        extra["market_window_secs"] = json!(900);
+        extra["completion_sequence"] = json!(3);
+        inputs["references"][1]["trade_completions"]["market-15m"] = extra;
+        inputs["references"][1]["events"] = json!(3);
+        inputs["references"][1]["end_sequence"] = json!(3);
+        inputs["references"][1]["event_types"] =
+            json!({"market_settlement":1,"polymarket_trade_collection_complete":2});
+        value["validated_inputs"] = inputs;
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        );
+
         assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
     }
 
