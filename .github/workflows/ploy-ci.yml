@@ -693,6 +693,10 @@ jobs:
           set -euo pipefail
           SECONDS=0
           cargo check --locked -p ploy-research --features db,polars-export,ml,rl,strategy-runtime --lib
+          cargo test --locked -p ploy-research --features db --example persist_research_trace
+          cargo test --locked -p ploy-research --features db --example persist_research_trace \
+            tests::postgres_factor_registry_keeps_pooled_up_down_identity_distinct \
+            -- --ignored --exact
           cargo test --locked -p ploy-research --features db --lib -- --ignored --list \
             | grep -F 'research_snapshot::tests::postgres_official_outcomes_use_token_primary_keys_and_version_clocks: test'
           cargo test --locked -p ploy-research --features db \

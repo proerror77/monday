@@ -163,6 +163,7 @@ async fn factor_registry_summary(pool: &PgPool, limit: usize) -> Result<Value> {
         r#"
         SELECT status, COUNT(*)::BIGINT
         FROM factor_registry
+        WHERE review_side IS NULL
         GROUP BY status
         ORDER BY status
         "#,
@@ -173,6 +174,7 @@ async fn factor_registry_summary(pool: &PgPool, limit: usize) -> Result<Value> {
         r#"
         SELECT factor_name, dsl_hash, target, horizon, status, runtime_contract, blockers_json
         FROM factor_registry
+        WHERE review_side IS NULL
         ORDER BY created_at DESC
         LIMIT $1
         "#,
@@ -229,6 +231,7 @@ async fn runtime_ready_factor_candidates(pool: &PgPool, limit: usize) -> Result<
                 created_at
             FROM factor_registry
             WHERE status = 'candidate'
+              AND review_side IS NULL
               AND runtime_contract->>'version' = 'autofactor_runtime_contract_v1'
               AND COALESCE(runtime_contract->>'runtime_score', '') <> ''
               AND COALESCE(runtime_contract->>'strategy_profile', '') <> ''

@@ -10,10 +10,13 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use ploy_research::alpha_search::{
+    ALPHA_SEARCH_ARTIFACT_VERSION, SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
+};
 use ploy_research::autofactor_target_horizon;
 use ploy_research::research_os::trace::trace_hash;
 use ploy_research::{
-    root_gene, AlphaZooEntry, AlphaZooSnapshot, FactorExpr, ResearchSnapshotManifest,
+    root_gene, AlphaZooEntry, AlphaZooSnapshot, FactorExpr, ResearchSnapshotManifest, ReviewSide,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -41,6 +44,7 @@ struct TracePlan {
     dry_run: bool,
     export_alpha_zoo_snapshot: Option<PathBuf>,
     export_alpha_zoo_target: Option<String>,
+    export_alpha_zoo_side: Option<ReviewSide>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +80,7 @@ struct FactorPreviewRow {
     runtime_contract: Value,
     factor_family: String,
     horizon: String,
+    review_side: Option<ReviewSide>,
     registry_status: String,
     promotion_decision: String,
     promotion_status: String,
@@ -193,13 +198,27 @@ fn flag_present(args: &[String], flag: &str) -> bool {
 }
 
 fn usage() -> &'static str {
-    "usage: persist_research_trace --run-id <id> --snapshot-dir <dir> [--db-url <url>|DATABASE_URL] [--alpha-search-dir <dir>] [--registry-json <path>] [--promotion-json <path>] [--handoff-json <path>] [--candidate-replay-json <path>...] [--full-depth-execution-surface-json <path>...] [--dry-run] [--export-alpha-zoo-snapshot <path> --export-alpha-zoo-target <target>]"
+    "usage: persist_research_trace --run-id <id> --snapshot-dir <dir> [--db-url <url>|DATABASE_URL] [--alpha-search-dir <dir>] [--registry-json <path>] [--promotion-json <path>] [--handoff-json <path>] [--candidate-replay-json <path>...] [--full-depth-execution-surface-json <path>...] [--dry-run] [--export-alpha-zoo-snapshot <path> --export-alpha-zoo-target <target> [--export-alpha-zoo-side up|down]]"
 }
 
 fn parse_args(args: &[String]) -> Result<TracePlan> {
     let run_id = flag_value(args, "--run-id").context("--run-id required")?;
     let snapshot_dir =
         PathBuf::from(flag_value(args, "--snapshot-dir").context("--snapshot-dir required")?);
+    let export_alpha_zoo_snapshot =
+        flag_value(args, "--export-alpha-zoo-snapshot").map(PathBuf::from);
+    let export_alpha_zoo_target = flag_value(args, "--export-alpha-zoo-target");
+    let export_alpha_zoo_side = flag_value(args, "--export-alpha-zoo-side")
+        .map(|raw| review_side_arg(&raw))
+        .transpose()?;
+    if export_alpha_zoo_snapshot.is_some() {
+        let target = export_alpha_zoo_target
+            .as_deref()
+            .context("--export-alpha-zoo-target required with --export-alpha-zoo-snapshot")?;
+        validate_alpha_zoo_export_identity(target, export_alpha_zoo_side)?;
+    } else if export_alpha_zoo_target.is_some() || export_alpha_zoo_side.is_some() {
+        bail!("Alpha Zoo target/side flags require --export-alpha-zoo-snapshot");
+    }
     Ok(TracePlan {
         run_id,
         snapshot_dir,
@@ -219,9 +238,9 @@ fn parse_args(args: &[String]) -> Result<TracePlan> {
         .map(PathBuf::from)
         .collect(),
         dry_run: flag_present(args, "--dry-run"),
-        export_alpha_zoo_snapshot: flag_value(args, "--export-alpha-zoo-snapshot")
-            .map(PathBuf::from),
-        export_alpha_zoo_target: flag_value(args, "--export-alpha-zoo-target"),
+        export_alpha_zoo_snapshot,
+        export_alpha_zoo_target,
+        export_alpha_zoo_side,
     })
 }
 
@@ -349,10 +368,14 @@ async fn main() -> Result<()> {
             .export_alpha_zoo_target
             .as_deref()
             .context("--export-alpha-zoo-target required with --export-alpha-zoo-snapshot")?;
-        export_alpha_zoo_snapshot(&pool, target, output_path).await?;
+        validate_alpha_zoo_export_identity(target, plan.export_alpha_zoo_side)?;
+        export_alpha_zoo_snapshot(&pool, target, plan.export_alpha_zoo_side, output_path).await?;
         eprintln!(
-            "persist_research_trace: alpha zoo snapshot exported target={} path={}",
+            "persist_research_trace: alpha zoo snapshot exported target={} side={} path={}",
             target,
+            plan.export_alpha_zoo_side
+                .map(ReviewSide::as_str)
+                .unwrap_or("pooled"),
             output_path.display()
         );
     }
@@ -456,10 +479,18 @@ fn collect_factor_preview_rows(plan: &TracePlan) -> Result<Vec<FactorPreviewRow>
                 .unwrap_or_else(|| "unknown".to_string());
             let horizon = string_field(&preview, "horizon")
                 .unwrap_or_else(|| default_horizon_for_target(&target));
+            let (version, review_side) = preview_identity(&preview, &target, &horizon, &path)?;
             let factors = preview_factors(&preview)
                 .with_context(|| format!("{} missing factors array", path.display()))?;
             for factor in factors {
-                rows.push(factor_preview_row(factor, &target, &horizon, &path)?);
+                rows.push(factor_preview_row(
+                    factor,
+                    &target,
+                    &horizon,
+                    version.as_deref(),
+                    review_side,
+                    &path,
+                )?);
             }
         }
     }
@@ -484,6 +515,94 @@ fn target_from_preview_path(path: &Path) -> Option<String> {
 
 fn default_horizon_for_target(target: &str) -> String {
     autofactor_target_horizon(target).to_string()
+}
+
+fn review_side_arg(raw: &str) -> Result<ReviewSide> {
+    match raw {
+        "up" => Ok(ReviewSide::Up),
+        "down" => Ok(ReviewSide::Down),
+        _ => bail!("--export-alpha-zoo-side must be up or down, found {raw}"),
+    }
+}
+
+fn review_side_field(value: &Value, key: &str, path: &Path) -> Result<Option<ReviewSide>> {
+    let Some(raw) = value.get(key) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(raw.clone())
+        .map(Some)
+        .with_context(|| format!("{} has invalid {key}; expected Up or Down", path.display()))
+}
+
+fn is_side_bound_repricing_target(target: &str) -> bool {
+    matches!(
+        target,
+        "full_depth_reprice_pnl_10s" | "full_depth_reprice_pnl_30s"
+    )
+}
+
+fn validate_alpha_zoo_export_identity(target: &str, review_side: Option<ReviewSide>) -> Result<()> {
+    match (is_side_bound_repricing_target(target), review_side) {
+        (true, None) => bail!("repricing Alpha Zoo export requires --export-alpha-zoo-side"),
+        (false, Some(side)) => bail!(
+            "target {target} does not accept --export-alpha-zoo-side {}",
+            side.as_str()
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn preview_identity(
+    preview: &Value,
+    target: &str,
+    horizon: &str,
+    path: &Path,
+) -> Result<(Option<String>, Option<ReviewSide>)> {
+    let version = string_field(preview, "version");
+    let side = review_side_field(preview, "side", path)?;
+    match version.as_deref() {
+        Some(SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION) => {
+            if !is_side_bound_repricing_target(target) {
+                bail!(
+                    "{} uses side-bound artifact version for non-repricing target {target}",
+                    path.display()
+                );
+            }
+            if string_field(preview, "target").as_deref() != Some(target) {
+                bail!("{} side-bound preview must declare target", path.display());
+            }
+            let expected_horizon = default_horizon_for_target(target);
+            if string_field(preview, "horizon").as_deref() != Some(expected_horizon.as_str()) {
+                bail!(
+                    "{} side-bound preview target={target} requires horizon={expected_horizon}, found {horizon}",
+                    path.display()
+                );
+            }
+            let side = side
+                .with_context(|| format!("{} side-bound preview missing side", path.display()))?;
+            Ok((version, Some(side)))
+        }
+        Some(ALPHA_SEARCH_ARTIFACT_VERSION) | None => {
+            if side.is_some() {
+                bail!(
+                    "{} pooled preview must not declare a review side",
+                    path.display()
+                );
+            }
+            if is_side_bound_repricing_target(target) {
+                bail!(
+                    "{} repricing preview requires version={} and an explicit side",
+                    path.display(),
+                    SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION
+                );
+            }
+            Ok((version, None))
+        }
+        Some(other) => bail!("{} has unsupported version {other}", path.display()),
+    }
 }
 
 fn collect_candidate_replay_rows(
@@ -768,6 +887,8 @@ fn factor_preview_row(
     factor: &Value,
     default_target: &str,
     default_horizon: &str,
+    version: Option<&str>,
+    expected_side: Option<ReviewSide>,
     path: &Path,
 ) -> Result<FactorPreviewRow> {
     let factor_name = string_field(factor, "factor_name")
@@ -798,6 +919,24 @@ fn factor_preview_row(
     let horizon = string_field(factor, "horizon")
         .or_else(|| string_field(&runtime_contract, "horizon"))
         .unwrap_or_else(|| default_horizon.to_string());
+    let review_side = review_side_field(factor, "side", path)?;
+    if version == Some(SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION) {
+        if string_field(factor, "target").as_deref() != Some(default_target)
+            || string_field(factor, "horizon").as_deref() != Some(default_horizon)
+            || review_side != expected_side
+        {
+            bail!(
+                "{} factor {factor_name} identity must match target={default_target} horizon={default_horizon} side={}",
+                path.display(),
+                expected_side.map(ReviewSide::as_str).unwrap_or("<missing>")
+            );
+        }
+    } else if review_side.is_some() {
+        bail!(
+            "{} pooled factor {factor_name} must not declare a review side",
+            path.display()
+        );
+    }
 
     Ok(FactorPreviewRow {
         factor_name,
@@ -807,6 +946,7 @@ fn factor_preview_row(
         runtime_contract,
         factor_family,
         horizon,
+        review_side,
         registry_status: decision.registry_status,
         promotion_decision: decision.promotion_decision,
         promotion_status: decision.promotion_status,
@@ -980,6 +1120,7 @@ async fn upsert_factor_registry(pool: &PgPool, row: &FactorPreviewRow) -> Result
     let factor_id = Uuid::new_v4().to_string();
     let metadata = json!({
         "source": "alpha_search_factor_registry_preview",
+        "review_side": row.review_side,
         "metrics": row.metrics,
         "blockers": row.blockers,
         "raw": row.raw,
@@ -1000,11 +1141,12 @@ async fn upsert_factor_registry(pool: &PgPool, row: &FactorPreviewRow) -> Result
             blockers_json,
             target,
             horizon,
+            review_side,
             created_by_agent,
             metadata
         )
-        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12, $13, $14, $15::jsonb)
-        ON CONFLICT (dsl_hash, target, horizon) DO UPDATE SET
+        VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12, $13, $14, $15, $16::jsonb)
+        ON CONFLICT (dsl_hash, target, horizon, review_side) DO UPDATE SET
             factor_name = EXCLUDED.factor_name,
             factor_family = EXCLUDED.factor_family,
             status = CASE
@@ -1019,6 +1161,7 @@ async fn upsert_factor_registry(pool: &PgPool, row: &FactorPreviewRow) -> Result
             blockers_json = EXCLUDED.blockers_json,
             target = EXCLUDED.target,
             horizon = EXCLUDED.horizon,
+            review_side = EXCLUDED.review_side,
             metadata = EXCLUDED.metadata
         RETURNING factor_id::text
         "#,
@@ -1039,6 +1182,7 @@ async fn upsert_factor_registry(pool: &PgPool, row: &FactorPreviewRow) -> Result
     .bind(row.blockers.to_string())
     .bind(&row.target)
     .bind(&row.horizon)
+    .bind(row.review_side.map(ReviewSide::as_str))
     .bind(WRITER_AGENT)
     .bind(metadata.to_string())
     .fetch_one(pool)
@@ -1060,6 +1204,7 @@ const ALPHA_ZOO_ACCEPTED_STATUSES: &[&str] = &["candidate", "dry_run", "approved
 #[derive(Debug, Clone)]
 struct FactorRegistryRow {
     target: String,
+    review_side: Option<ReviewSide>,
     status: String,
     ast_json: Value,
 }
@@ -1070,11 +1215,12 @@ struct FactorRegistryRow {
 /// testable without a database.
 fn group_factor_registry_rows_into_alpha_zoo_snapshot(
     target: &str,
+    review_side: Option<ReviewSide>,
     rows: &[FactorRegistryRow],
 ) -> AlphaZooSnapshot {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for row in rows {
-        if row.target != target {
+        if row.target != target || row.review_side != review_side {
             continue;
         }
         if !ALPHA_ZOO_ACCEPTED_STATUSES.contains(&row.status.as_str()) {
@@ -1090,9 +1236,13 @@ fn group_factor_registry_rows_into_alpha_zoo_snapshot(
         .map(|(root_gene, count)| AlphaZooEntry { root_gene, count })
         .collect();
     AlphaZooSnapshot {
-        version: ALPHA_ZOO_SNAPSHOT_VERSION.to_string(),
+        version: if review_side.is_some() {
+            SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION.to_string()
+        } else {
+            ALPHA_ZOO_SNAPSHOT_VERSION.to_string()
+        },
         target: target.to_string(),
-        side: None,
+        side: review_side,
         entries,
     }
 }
@@ -1102,9 +1252,9 @@ fn group_factor_registry_rows_into_alpha_zoo_snapshot(
 /// This is the only function in the Alpha Zoo export path that touches a
 /// `PgPool`.
 async fn fetch_factor_registry_rows(pool: &PgPool) -> Result<Vec<FactorRegistryRow>> {
-    let rows: Vec<(String, String, Value)> = sqlx::query_as(
+    let rows: Vec<(String, Option<String>, String, Value)> = sqlx::query_as(
         r#"
-        SELECT target, status, ast_json
+        SELECT target, review_side, status, ast_json
         FROM factor_registry
         "#,
     )
@@ -1112,17 +1262,36 @@ async fn fetch_factor_registry_rows(pool: &PgPool) -> Result<Vec<FactorRegistryR
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(target, status, ast_json)| FactorRegistryRow {
-            target,
-            status,
-            ast_json,
+        .map(|(target, review_side, status, ast_json)| {
+            Ok(FactorRegistryRow {
+                target,
+                review_side: review_side
+                    .as_deref()
+                    .map(review_side_from_db)
+                    .transpose()?,
+                status,
+                ast_json,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>>>()?)
 }
 
-async fn export_alpha_zoo_snapshot(pool: &PgPool, target: &str, output_path: &Path) -> Result<()> {
+fn review_side_from_db(raw: &str) -> Result<ReviewSide> {
+    match raw {
+        "up" => Ok(ReviewSide::Up),
+        "down" => Ok(ReviewSide::Down),
+        _ => bail!("factor_registry contains invalid review_side {raw}"),
+    }
+}
+
+async fn export_alpha_zoo_snapshot(
+    pool: &PgPool,
+    target: &str,
+    review_side: Option<ReviewSide>,
+    output_path: &Path,
+) -> Result<()> {
     let rows = fetch_factor_registry_rows(pool).await?;
-    let snapshot = group_factor_registry_rows_into_alpha_zoo_snapshot(target, &rows);
+    let snapshot = group_factor_registry_rows_into_alpha_zoo_snapshot(target, review_side, &rows);
     let rendered = serde_json::to_string_pretty(&snapshot)?;
     fs::write(output_path, rendered)
         .with_context(|| format!("write alpha zoo snapshot to {}", output_path.display()))?;
@@ -1503,6 +1672,7 @@ async fn find_candidate_replay_factor_id(
             SELECT factor_id::text
             FROM factor_registry
             WHERE dsl_hash = $1
+              AND review_side IS NULL
               AND ($2::text IS NULL OR target = $2)
               AND ($3::text IS NULL OR horizon = $3)
             ORDER BY created_at DESC
@@ -1524,6 +1694,7 @@ async fn find_candidate_replay_factor_id(
             SELECT factor_id::text
             FROM factor_registry
             WHERE factor_name = $1
+              AND review_side IS NULL
               AND ($2::text IS NULL OR target = $2)
               AND ($3::text IS NULL OR horizon = $3)
             ORDER BY created_at DESC
@@ -1779,40 +1950,91 @@ mod tests {
         let rows = vec![
             FactorRegistryRow {
                 target: target.to_string(),
+                review_side: None,
                 status: "candidate".to_string(),
                 ast_json: input_expr_json("conservative_settlement_edge"),
             },
             FactorRegistryRow {
                 target: target.to_string(),
+                review_side: None,
                 status: "dry_run".to_string(),
                 ast_json: input_expr_json("model_full_depth_settlement_edge"),
             },
             // A different target's rows must not be grouped into this snapshot.
             FactorRegistryRow {
                 target: "full_depth_reprice_pnl_10s".to_string(),
+                review_side: Some(ReviewSide::Up),
                 status: "candidate".to_string(),
                 ast_json: input_expr_json("some_other_input"),
             },
             // A draft/never-accepted row must not inflate the historical count.
             FactorRegistryRow {
                 target: target.to_string(),
+                review_side: None,
                 status: "draft".to_string(),
                 ast_json: input_expr_json("unaccepted_draft_input"),
             },
             // A rejected row must not count either.
             FactorRegistryRow {
                 target: target.to_string(),
+                review_side: None,
                 status: "deprecated".to_string(),
                 ast_json: input_expr_json("deprecated_input"),
             },
         ];
 
-        let snapshot = group_factor_registry_rows_into_alpha_zoo_snapshot(target, &rows);
+        let snapshot = group_factor_registry_rows_into_alpha_zoo_snapshot(target, None, &rows);
 
         assert_eq!(snapshot.target, target);
         assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(snapshot.entries[0].root_gene, "Input");
         assert_eq!(snapshot.entries[0].count, 2);
+    }
+
+    #[test]
+    fn side_bound_alpha_zoo_excludes_other_side_and_pooled_rows() {
+        let target = "full_depth_reprice_pnl_10s";
+        let rows = [
+            (Some(ReviewSide::Up), "up_one"),
+            (Some(ReviewSide::Up), "up_two"),
+            (Some(ReviewSide::Down), "down"),
+            (None, "legacy_pooled"),
+        ]
+        .into_iter()
+        .map(|(review_side, input)| FactorRegistryRow {
+            target: target.to_string(),
+            review_side,
+            status: "candidate".to_string(),
+            ast_json: input_expr_json(input),
+        })
+        .collect::<Vec<_>>();
+
+        let snapshot =
+            group_factor_registry_rows_into_alpha_zoo_snapshot(target, Some(ReviewSide::Up), &rows);
+
+        assert_eq!(snapshot.version, SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION);
+        assert_eq!(snapshot.side, Some(ReviewSide::Up));
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].count, 2);
+    }
+
+    #[test]
+    fn alpha_zoo_export_requires_side_only_for_repricing_targets() {
+        assert!(validate_alpha_zoo_export_identity(
+            "full_depth_reprice_pnl_10s",
+            Some(ReviewSide::Up)
+        )
+        .is_ok());
+        assert!(validate_alpha_zoo_export_identity("full_depth_reprice_pnl_10s", None).is_err());
+        assert!(validate_alpha_zoo_export_identity(
+            "full_depth_settlement_executable_pnl",
+            Some(ReviewSide::Down)
+        )
+        .is_err());
+        assert!(
+            validate_alpha_zoo_export_identity("full_depth_settlement_executable_pnl", None)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1894,6 +2116,7 @@ mod tests {
             dry_run: true,
             export_alpha_zoo_snapshot: None,
             export_alpha_zoo_target: None,
+            export_alpha_zoo_side: None,
         }
     }
 
@@ -1944,17 +2167,17 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].target, "full_depth_settlement_executable_pnl");
         assert_eq!(rows[0].horizon, "5m");
+        assert_eq!(rows[0].review_side, None);
         assert_eq!(rows[0].factor_family, "settlement_probability");
         assert_eq!(rows[0].promotion_decision, "continue");
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn reads_legacy_top_level_array_preview_and_uses_parent_target() {
-        let root =
-            std::env::temp_dir().join(format!("ploy-trace-preview-legacy-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+    fn rejects_legacy_pooled_repricing_preview() {
+        let root = tempfile::tempdir().expect("temp dir");
         let preview_path = root
+            .path()
             .join("full_depth_reprice_pnl_10s")
             .join("factor-registry-preview.json");
         write_preview(
@@ -1969,12 +2192,186 @@ mod tests {
             }]),
         );
 
-        let rows = collect_factor_preview_rows(&preview_plan(root.clone())).expect("rows");
+        let error = collect_factor_preview_rows(&preview_plan(root.path().to_path_buf()))
+            .expect_err("repricing identity must not be pooled");
+        assert!(error.to_string().contains("requires version="));
+    }
+
+    #[test]
+    fn reads_side_bound_up_preview() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let preview_path = root
+            .path()
+            .join("full_depth_reprice_pnl_10s")
+            .join("up")
+            .join("factor-registry-preview.json");
+        write_preview(
+            &preview_path,
+            &json!({
+                "version": SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
+                "target": "full_depth_reprice_pnl_10s",
+                "side": "Up",
+                "horizon": "10s",
+                "factors": [{
+                    "factor_name": "up_reprice",
+                    "target": "full_depth_reprice_pnl_10s",
+                    "side": "Up",
+                    "horizon": "10s",
+                    "dsl_hash": "same-dsl",
+                    "ast_json": {"Input": "external_move_since_poly_update"},
+                    "status": "candidate",
+                    "runtime_contract": {},
+                    "blockers": [],
+                    "metrics": {}
+                }]
+            }),
+        );
+
+        let rows = collect_factor_preview_rows(&preview_plan(root.path().to_path_buf()))
+            .expect("side-bound rows");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].target, "full_depth_reprice_pnl_10s");
-        assert_eq!(rows[0].horizon, "10s");
-        assert_eq!(rows[0].promotion_status, "watchlist");
-        let _ = fs::remove_dir_all(root);
+        assert_eq!(rows[0].review_side, Some(ReviewSide::Up));
+    }
+
+    #[test]
+    fn rejects_side_bound_factor_that_disagrees_with_envelope() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let preview_path = root
+            .path()
+            .join("full_depth_reprice_pnl_10s")
+            .join("up")
+            .join("factor-registry-preview.json");
+        write_preview(
+            &preview_path,
+            &json!({
+                "version": SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
+                "target": "full_depth_reprice_pnl_10s",
+                "side": "Up",
+                "horizon": "10s",
+                "factors": [{
+                    "factor_name": "spoofed_down",
+                    "target": "full_depth_reprice_pnl_10s",
+                    "side": "Down",
+                    "horizon": "10s",
+                    "dsl_hash": "same-dsl",
+                    "ast_json": {"Input": "external_move_since_poly_update"},
+                    "status": "candidate",
+                    "runtime_contract": {},
+                    "blockers": [],
+                    "metrics": {}
+                }]
+            }),
+        );
+
+        let error = collect_factor_preview_rows(&preview_plan(root.path().to_path_buf()))
+            .expect_err("side mismatch must fail closed");
+        assert!(error.to_string().contains("identity must match"));
+    }
+
+    #[test]
+    fn rejects_side_bound_preview_with_wrong_target_horizon() {
+        let preview = json!({
+            "version": SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
+            "target": "full_depth_reprice_pnl_10s",
+            "side": "Up",
+            "horizon": "5m"
+        });
+        let error = preview_identity(
+            &preview,
+            "full_depth_reprice_pnl_10s",
+            "5m",
+            Path::new("preview.json"),
+        )
+        .expect_err("target/horizon mismatch must fail closed");
+        assert!(error.to_string().contains("requires horizon=10s"));
+
+        let missing = json!({
+            "version": SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION,
+            "target": "full_depth_reprice_pnl_10s",
+            "side": "Up"
+        });
+        assert!(preview_identity(
+            &missing,
+            "full_depth_reprice_pnl_10s",
+            "10s",
+            Path::new("preview.json"),
+        )
+        .is_err());
+    }
+
+    fn database_factor_preview(
+        dsl_hash: &str,
+        review_side: Option<ReviewSide>,
+    ) -> FactorPreviewRow {
+        FactorPreviewRow {
+            factor_name: "registry-side-test".to_string(),
+            target: "full_depth_reprice_pnl_10s".to_string(),
+            dsl_hash: dsl_hash.to_string(),
+            ast_json: input_expr_json("external_move_since_poly_update"),
+            runtime_contract: json!({}),
+            factor_family: "autofactor".to_string(),
+            horizon: "10s".to_string(),
+            review_side,
+            registry_status: "candidate".to_string(),
+            promotion_decision: "continue".to_string(),
+            promotion_status: "candidate".to_string(),
+            passed_gate: true,
+            blockers: json!([]),
+            metrics: json!({}),
+            raw: json!({}),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires migrated PostgreSQL from PLOY_TEST_DATABASE_URL"]
+    async fn postgres_factor_registry_keeps_pooled_up_down_identity_distinct() {
+        let db_url = std::env::var("PLOY_TEST_DATABASE_URL").expect("PLOY_TEST_DATABASE_URL");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&db_url)
+            .await
+            .expect("connect PostgreSQL");
+        let dsl_hash = format!("side-registry-test-{}", Uuid::new_v4());
+        let pooled = database_factor_preview(&dsl_hash, None);
+        let up = database_factor_preview(&dsl_hash, Some(ReviewSide::Up));
+        let down = database_factor_preview(&dsl_hash, Some(ReviewSide::Down));
+
+        let pooled_id = upsert_factor_registry(&pool, &pooled)
+            .await
+            .expect("insert pooled");
+        let up_id = upsert_factor_registry(&pool, &up).await.expect("insert up");
+        let down_id = upsert_factor_registry(&pool, &down)
+            .await
+            .expect("insert down");
+
+        assert_ne!(pooled_id, up_id);
+        assert_ne!(pooled_id, down_id);
+        assert_ne!(up_id, down_id);
+        assert_eq!(
+            upsert_factor_registry(&pool, &up).await.expect("upsert up"),
+            up_id
+        );
+        assert_eq!(
+            upsert_factor_registry(&pool, &pooled)
+                .await
+                .expect("upsert pooled"),
+            pooled_id
+        );
+
+        let rows: Vec<(Option<String>, String)> = sqlx::query_as(
+            "SELECT review_side, factor_id::text FROM factor_registry WHERE dsl_hash = $1",
+        )
+        .bind(&dsl_hash)
+        .fetch_all(&pool)
+        .await
+        .expect("read identities");
+        assert_eq!(rows.len(), 3);
+
+        sqlx::query("DELETE FROM factor_registry WHERE dsl_hash = $1")
+            .bind(&dsl_hash)
+            .execute(&pool)
+            .await
+            .expect("clean test rows");
     }
 
     #[test]

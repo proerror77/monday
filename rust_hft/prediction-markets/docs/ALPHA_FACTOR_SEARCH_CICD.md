@@ -380,9 +380,11 @@ row ever recorded for a target.
 Flow:
 
 1. `persist_research_trace --export-alpha-zoo-snapshot <path> --export-alpha-zoo-target <target>`
-   queries every `factor_registry` row, groups the accepted ones by root gene
-   with `group_factor_registry_rows_into_alpha_zoo_snapshot`, and writes an
-   `AlphaZooSnapshot` JSON file.
+   queries pooled settlement rows, groups the accepted ones by root gene with
+   `group_factor_registry_rows_into_alpha_zoo_snapshot`, and writes an
+   `AlphaZooSnapshot` JSON file. Repricing heads must also pass exactly one
+   `--export-alpha-zoo-side up|down`; their Zoo never includes the other token
+   side or ambiguous historical pooled rows.
 2. `factor_walk_forward_v2 --alpha-zoo-snapshot-json <path>` loads that file and
    passes it as `Some(&snapshot)` into
    `write_alpha_search_artifacts_with_state_and_runtime_feedback`. Omitting the

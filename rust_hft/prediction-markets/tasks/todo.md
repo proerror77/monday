@@ -74,6 +74,7 @@ Migrate the imported PLOY compatibility code into Monday's canonical market-fami
 - [x] Keep feedback mission-local and return no-OOS plus conservative-capacity failure reasons for every proposed blend.
 - [x] Add a governed Rust-only Burn binary probability lane with event-disjoint snapshot-bound inputs and content-addressed model evidence.
 - [x] Bind the settlement trainer to a manifest-sealed shared time boundary so overlapping event lifetimes cannot cross train and validation cohorts.
+- [x] Preserve UP/DOWN AutoFactor registry identity and export side-isolated Alpha Zoo snapshots without exposing them to legacy replay/runtime consumers.
 - [ ] Add separate UP/DOWN token repricing, fill, slippage, and markout evaluators without changing the settlement target.
 - [ ] Add an immutable all-update-tick research tape for token microstructure; keep the one-second L2 tape as the settlement baseline.
 - [ ] Expand governed product-family missions beyond BTC/SOL five-minute only after verified 15-minute and one-hour evidence exists end to end.
