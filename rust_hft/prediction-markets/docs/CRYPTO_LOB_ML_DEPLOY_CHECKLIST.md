@@ -15,6 +15,12 @@ The supported model lane is the native Burn binary-probability trainer in
 - Training and validation event IDs are disjoint. The latest time at which a
   complete official training label was locally observed must be no later than
   the earliest validation decision.
+- Every horizon-specific task for an underlying uses the same typed wall-clock
+  boundary. Training episodes must settle strictly before it and validation
+  episodes must start at or after it, so overlapping event lifetimes and their
+  shared Chainlink path cannot cross partitions. The boundary is part of the
+  immutable mission identity, dataset contract, dataset hash, and typed model
+  manifest.
 - Split inputs carry only event ID and decision timestamp selectors. Rust
   projects feature values from a closed, label-free registry against that exact
   content-addressed snapshot row; callers cannot supply feature values, clocks,
@@ -38,9 +44,12 @@ The supported model lane is the native Burn binary-probability trainer in
 - Ordered feature names and their schema hash, mission and strong snapshot
   contract hashes, training configuration and seed, and partition counts are
   bound into the typed model manifest.
-- Split IDs and purge/embargo fields are not part of the current binary-model
-  contract. If they become policy gates, add typed manifest fields and
-  fail-closed tests before relying on them.
+- The shared time boundary is the current purge contract. There is no separate
+  free-form split ID or configurable embargo field; changing that policy
+  requires a typed schema change and new fail-closed counterexample tests.
+- Binary model manifest schema v3 requires that boundary. Older v2 bundles do
+  not contain sufficient cohort evidence and must be retrained; the loader does
+  not infer or backfill a boundary from their selected rows.
 
 ## Model contract
 
