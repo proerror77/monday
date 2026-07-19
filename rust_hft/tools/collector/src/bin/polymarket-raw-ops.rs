@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use hft_collector::polymarket_evidence_artifact::{
     publish_polymarket_evidence, PolymarketEvidenceArtifactConfig,
 };
+use hft_collector::polymarket_holder_flow::{collect_holder_flow, HolderFlowCollectionConfig};
 use hft_collector::polymarket_parity::{verify_shadow_parity, ShadowParityConfig};
 use hft_collector::polymarket_raw::{
     run_reference, ReferenceConfig, DEFAULT_MAX_CONCURRENT_TRADE_POLLS,
@@ -63,6 +64,25 @@ enum Command {
         per_market_delay_ms: u64,
         #[arg(long)]
         once: bool,
+    },
+    /// Collect confirmed Polygon CTF transfers into a holder-flow research artifact.
+    CollectHolderFlow {
+        #[arg(long)]
+        from_block: u64,
+        #[arg(long)]
+        to_block: Option<u64>,
+        #[arg(long, value_delimiter = ',', required = true)]
+        token_ids: Vec<String>,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        rpc_url: Option<String>,
+        #[arg(long, default_value_t = 64)]
+        confirmations: u64,
+        #[arg(long, default_value_t = 10)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 20.0)]
+        http_timeout: f64,
     },
     /// Validate, compress, upload, and read back all closed tape segments.
     Upload {
@@ -198,6 +218,33 @@ async fn main() -> Result<()> {
                 per_market_delay: Duration::from_millis(per_market_delay_ms),
             };
             run_reference(config, once).await
+        }
+        Command::CollectHolderFlow {
+            from_block,
+            to_block,
+            token_ids,
+            output,
+            rpc_url,
+            confirmations,
+            batch_size,
+            http_timeout,
+        } => {
+            let rpc_url = rpc_url
+                .or_else(|| env::var("POLYGON_RPC_URL").ok())
+                .context("--rpc-url or POLYGON_RPC_URL is required")?;
+            collect_holder_flow(&HolderFlowCollectionConfig {
+                rpc_url,
+                from_block,
+                to_block,
+                confirmations,
+                batch_size,
+                token_ids,
+                output: output.clone(),
+                http_timeout: positive_duration(http_timeout, "HTTP timeout")?,
+            })
+            .await?;
+            println!("{}", output.display());
+            Ok(())
         }
         Command::Upload {
             spool_dir,

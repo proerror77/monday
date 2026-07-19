@@ -31,6 +31,7 @@ fs4 = { workspace = true }
 libc = "0.2"
 rust_decimal = { version = "1", features = ["serde"] }
 ordered-float = "4"
+num-bigint = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 engine = { package = "hft-engine", path = "../../market-core/engine" }

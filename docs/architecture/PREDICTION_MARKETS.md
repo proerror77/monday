@@ -71,6 +71,12 @@ authority flags. At each decision timestamp, both `decision - source_ts` and
 mask an old exchange observation. The retained raw feed remains the audit
 source; the aggregate is the bounded research view.
 
+`polymarket-raw-ops collect-holder-flow` adds Polygon CTF holder flow as a research-only
+input from contiguous confirmed blocks. Its output is range flow,
+not an absolute balance unless collection starts before the token's first
+transfer. It may enter a prediction `ResearchSnapshot`; it must not feed
+execution or bypass the CLOB, risk, OMS, and reconciliation path.
+
 LLM proposal paths remain lane-specific as well. `alpha-harness` has a bounded,
 lab-only Formula proposer for derivatives missions. The prediction-market module uses the versioned
 `prediction_research_mission.v1` JSON brief and its existing `LlmPriorSpec`; it
