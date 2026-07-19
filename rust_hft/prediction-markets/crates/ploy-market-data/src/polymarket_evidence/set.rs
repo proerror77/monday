@@ -11,6 +11,7 @@ const WINDOW_SECS: i64 = 300;
 const REQUIRED_SYMBOLS: [&str; 2] = ["BTCUSDT", "SOLUSDT"];
 
 /// An ordered aggregate that retains each independently verified evidence handle.
+/// Members may have disjoint ranges; every member remains complete within its own range.
 #[derive(Debug)]
 pub struct VerifiedPolymarketEvidenceSet {
     members: Vec<VerifiedPolymarketEvidence>,
@@ -118,15 +119,14 @@ fn validate_members(
         if next_start < previous_end {
             bail!("verified evidence artifact ranges overlap");
         }
-        if next_start > previous_end {
-            bail!("verified evidence artifact ranges contain a gap");
-        }
     }
 
     let start = members[0].identity().event_start_gte;
     let end = members[members.len() - 1].identity().event_start_lt;
     validate_global_identities(members)?;
-    validate_slot_pairs(members, start, end)?;
+    for member in members {
+        validate_member_slot_pairs(member)?;
+    }
     Ok((start, end))
 }
 
@@ -170,24 +170,20 @@ fn validate_global_identities(members: &[VerifiedPolymarketEvidence]) -> Result<
     Ok(())
 }
 
-fn validate_slot_pairs(
-    members: &[VerifiedPolymarketEvidence],
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> Result<()> {
+fn validate_member_slot_pairs(member: &VerifiedPolymarketEvidence) -> Result<()> {
+    let start = member.identity().event_start_gte;
+    let end = member.identity().event_start_lt;
     let mut slots: BTreeMap<DateTime<Utc>, BTreeSet<&str>> = BTreeMap::new();
-    for member in members {
-        for contract in member.contracts() {
-            if contract.event_start < start
-                || contract.event_start >= end
-                || contract.event_start.timestamp().rem_euclid(WINDOW_SECS) != 0
-            {
-                bail!("verified evidence contract is outside an aligned aggregate slot");
-            }
-            let symbols = slots.entry(contract.event_start).or_default();
-            if !symbols.insert(contract.symbol.as_str()) {
-                bail!("verified evidence slot contains a duplicate symbol");
-            }
+    for contract in member.contracts() {
+        if contract.event_start < start
+            || contract.event_start >= end
+            || contract.event_start.timestamp().rem_euclid(WINDOW_SECS) != 0
+        {
+            bail!("verified evidence contract is outside an aligned artifact slot");
+        }
+        let symbols = slots.entry(contract.event_start).or_default();
+        if !symbols.insert(contract.symbol.as_str()) {
+            bail!("verified evidence slot contains a duplicate symbol");
         }
     }
 
@@ -391,16 +387,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gap_overlap_or_duplicate_digest() {
+    fn accepts_gap_but_rejects_overlap_or_duplicate_digest() {
         let start = base();
         let first = || verified(&rows(start, "a"), start);
         let gap_start = start + Duration::seconds(WINDOW_SECS * 2);
-        let error = aggregate_verified_polymarket_evidence(vec![
+        let set = aggregate_verified_polymarket_evidence(vec![
             first(),
             verified(&rows(gap_start, "c"), gap_start),
         ])
-        .unwrap_err();
-        assert!(error.to_string().contains("gap"), "{error:#}");
+        .unwrap();
+        assert_eq!(set.members().len(), 2);
+        assert_eq!(set.event_start_gte(), start);
+        assert_eq!(
+            set.event_start_lt(),
+            gap_start + Duration::seconds(WINDOW_SECS)
+        );
 
         let overlap = aggregate_verified_polymarket_evidence(vec![
             first(),
@@ -413,6 +414,22 @@ mod tests {
         assert!(
             duplicate.to_string().contains("duplicate artifact digest"),
             "{duplicate:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_slot_inside_an_artifact_range() {
+        let start = base();
+        let member = verified_range(
+            &rows(start, "missing-slot"),
+            start,
+            start + Duration::seconds(WINDOW_SECS * 2),
+        );
+
+        let error = aggregate_verified_polymarket_evidence(vec![member]).unwrap_err();
+        assert!(
+            error.to_string().contains("missing a 5-minute slot"),
+            "{error:#}"
         );
     }
 
