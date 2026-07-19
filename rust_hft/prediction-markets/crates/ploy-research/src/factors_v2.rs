@@ -1082,6 +1082,7 @@ pub struct RepricingIcReport {
 
 #[derive(Debug, Clone)]
 pub struct RepricingIcRow {
+    pub side: ReviewSide,
     pub factor: String,
     pub family: FactorFamily,
     pub layer: ThreeLayerArchive,
@@ -1212,6 +1213,7 @@ impl Default for FillabilityReviewOptions {
 
 #[derive(Debug, Clone)]
 pub struct FillabilityBucketRow {
+    pub side: ReviewSide,
     pub dimension: String,
     pub bucket: String,
     pub n: usize,
@@ -2513,11 +2515,13 @@ fn review_repricing_ic_rows(
     let targets = repricing_ic_targets();
     let mut rows = Vec::new();
     for descriptor in descriptors {
-        for target in &targets {
-            if let Some(row) =
-                review_one_repricing_ic_target(v2_rows, descriptor, *target, &options)
-            {
-                rows.push(row);
+        for side in [ReviewSide::Up, ReviewSide::Down] {
+            for target in &targets {
+                if let Some(row) =
+                    review_one_repricing_ic_target(v2_rows, descriptor, side, *target, &options)
+                {
+                    rows.push(row);
+                }
             }
         }
     }
@@ -2537,11 +2541,13 @@ fn review_repricing_ic_rows(
 fn review_one_repricing_ic_target(
     rows: &[FactorObservationV2],
     descriptor: FactorV2Descriptor,
+    side: ReviewSide,
     target: RepricingIcTargetDescriptor,
     options: &RepricingIcOptions,
 ) -> Option<RepricingIcRow> {
     let scored: Vec<(&FactorObservationV2, f64, f64)> = rows
         .iter()
+        .filter(|row| row.side == side)
         .filter_map(|row| {
             let score = (descriptor.accessor)(row);
             let label = (target.accessor)(row)?;
@@ -2589,6 +2595,7 @@ fn review_one_repricing_ic_target(
         .all(|window| window[1] + EPS >= window[0]);
 
     Some(RepricingIcRow {
+        side,
         factor: descriptor.name.to_string(),
         family: descriptor.family,
         layer: descriptor.layer,
@@ -2666,44 +2673,50 @@ pub fn format_repricing_ic_report(report: &RepricingIcReport, top_n: usize) -> S
         "settlement",
         "execution",
     ] {
-        let group_rows = report
-            .rows
-            .iter()
-            .filter(|row| row.target_group == group)
-            .take(top_n)
-            .collect::<Vec<_>>();
-        if group_rows.is_empty() {
-            continue;
-        }
-        out.push_str(&format!("\n=== Repricing IC Target Group: {group} ===\n"));
-        out.push_str("target,factor,role,family,layer,n,pearson_ic,spearman_ic,window_count,window_ic_mean,icir,pos_window_ratio,bottom_n,bottom_avg,top_n,top_avg,top_pos_rate,monotonic,avg_entry_ask,avg_pm_spread_bps,entry_fill,exit_fill,bucket_avgs\n");
-        for row in group_rows {
+        for side in [ReviewSide::Up, ReviewSide::Down] {
+            let group_rows = report
+                .rows
+                .iter()
+                .filter(|row| row.target_group == group && row.side == side)
+                .take(top_n)
+                .collect::<Vec<_>>();
+            if group_rows.is_empty() {
+                continue;
+            }
             out.push_str(&format!(
-                "{},{},{},{},{},{},{:.4},{:.4},{},{:.4},{:.4},{:.4},{},{:.4},{},{:.4},{:.4},{},{:.4},{:.2},{:.4},{:.4},{}\n",
-                row.target,
-                row.factor,
-                row.factor_role,
-                row.family.as_str(),
-                row.layer.as_str(),
-                row.n,
-                row.pearson_ic,
-                row.spearman_ic,
-                row.window_count,
-                row.window_ic_mean,
-                row.icir,
-                row.positive_window_ratio,
-                row.bottom_bucket_n,
-                row.bottom_bucket_avg_label,
-                row.top_bucket_n,
-                row.top_bucket_avg_label,
-                row.top_bucket_positive_label_rate,
-                row.monotonic_non_decreasing,
-                row.avg_entry_ask,
-                row.avg_pm_spread_bps,
-                row.entry_fill_rate,
-                row.exit_fill_rate,
-                format_bucket_avgs(&row.bucket_avg_labels),
+                "\n=== Repricing IC Target Group: {group} Side: {} ===\n",
+                side.as_str()
             ));
+            out.push_str("target,side,factor,role,family,layer,n,pearson_ic,spearman_ic,window_count,window_ic_mean,icir,pos_window_ratio,bottom_n,bottom_avg,top_n,top_avg,top_pos_rate,monotonic,avg_entry_ask,avg_pm_spread_bps,entry_fill,exit_fill,bucket_avgs\n");
+            for row in group_rows {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{},{:.4},{:.4},{},{:.4},{:.4},{:.4},{},{:.4},{},{:.4},{:.4},{},{:.4},{:.2},{:.4},{:.4},{}\n",
+                    row.target,
+                    row.side.as_str(),
+                    row.factor,
+                    row.factor_role,
+                    row.family.as_str(),
+                    row.layer.as_str(),
+                    row.n,
+                    row.pearson_ic,
+                    row.spearman_ic,
+                    row.window_count,
+                    row.window_ic_mean,
+                    row.icir,
+                    row.positive_window_ratio,
+                    row.bottom_bucket_n,
+                    row.bottom_bucket_avg_label,
+                    row.top_bucket_n,
+                    row.top_bucket_avg_label,
+                    row.top_bucket_positive_label_rate,
+                    row.monotonic_non_decreasing,
+                    row.avg_entry_ask,
+                    row.avg_pm_spread_bps,
+                    row.entry_fill_rate,
+                    row.exit_fill_rate,
+                    format_bucket_avgs(&row.bucket_avg_labels),
+                ));
+            }
         }
     }
     out
@@ -4325,21 +4338,28 @@ fn build_fillability_review_v1_report(
 ) -> FillabilityReviewReport {
     let health = build_data_health_report(source_rows, v2_rows);
     let mut rows = Vec::new();
-    for spec in fillability_bucket_specs() {
-        let mut buckets: BTreeMap<String, Vec<&FactorObservationV2>> = BTreeMap::new();
-        for row in v2_rows {
-            if let Some(bucket) = (spec.bucket)(row) {
-                buckets.entry(bucket).or_default().push(row);
+    for side in [ReviewSide::Up, ReviewSide::Down] {
+        let side_rows = v2_rows
+            .iter()
+            .filter(|row| row.side == side)
+            .collect::<Vec<_>>();
+        for spec in fillability_bucket_specs() {
+            let mut buckets: BTreeMap<String, Vec<&FactorObservationV2>> = BTreeMap::new();
+            for &row in &side_rows {
+                if let Some(bucket) = (spec.bucket)(row) {
+                    buckets.entry(bucket).or_default().push(row);
+                }
             }
-        }
-        for (bucket, bucket_rows) in buckets {
-            rows.push(build_fillability_bucket_row(
-                spec.dimension,
-                bucket,
-                &bucket_rows,
-                v2_rows.len(),
-                &options,
-            ));
+            for (bucket, bucket_rows) in buckets {
+                rows.push(build_fillability_bucket_row(
+                    side,
+                    spec.dimension,
+                    bucket,
+                    &bucket_rows,
+                    side_rows.len(),
+                    &options,
+                ));
+            }
         }
     }
     rows.sort_by(|a, b| {
@@ -4953,31 +4973,43 @@ pub fn format_fillability_review_v1_report(
         report.options.min_roundtrip_fill_rate,
         report.options.max_rejection_rate,
     ));
-    out.push_str("decision,dimension,bucket,n,coverage,entry_fill,exit_fill,roundtrip_fill,reject_rate,avg_entry_cap,avg_exit_cap,avg_entry_liq,avg_exit_liq,avg_pm_spread_bps,avg_pm_lag_secs,avg_slippage_bps,avg_roundtrip_cost,total_pnl,avg_pnl,reason\n");
-    for row in report.rows.iter().take(top_n.max(1)) {
+    for side in [ReviewSide::Up, ReviewSide::Down] {
         out.push_str(&format!(
-            "{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{:.2},{:.4},{:.4},{:.4},{}\n",
-            row.decision.as_str(),
-            row.dimension,
-            row.bucket,
-            row.n,
-            row.coverage,
-            row.entry_fill_rate,
-            row.exit_fill_rate,
-            row.roundtrip_fill_rate,
-            row.rejection_rate,
-            row.avg_entry_capacity_ratio,
-            row.avg_exit_capacity_ratio,
-            row.avg_entry_liquidity_usd,
-            row.avg_exit_liquidity_usd,
-            row.avg_pm_spread_bps,
-            row.avg_pm_lag_secs,
-            row.avg_slippage_to_fill_bps,
-            row.avg_roundtrip_cost_usd,
-            row.total_executable_pnl_after_cost,
-            row.avg_executable_pnl_after_cost,
-            row.reason,
+            "=== Fillability Review V1 Side: {} ===\n",
+            side.as_str()
         ));
+        out.push_str("decision,side,dimension,bucket,n,coverage,entry_fill,exit_fill,roundtrip_fill,reject_rate,avg_entry_cap,avg_exit_cap,avg_entry_liq,avg_exit_liq,avg_pm_spread_bps,avg_pm_lag_secs,avg_slippage_bps,avg_roundtrip_cost,total_pnl,avg_pnl,reason\n");
+        for row in report
+            .rows
+            .iter()
+            .filter(|row| row.side == side)
+            .take(top_n.max(1))
+        {
+            out.push_str(&format!(
+                "{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{:.2},{:.4},{:.4},{:.4},{}\n",
+                row.decision.as_str(),
+                row.side.as_str(),
+                row.dimension,
+                row.bucket,
+                row.n,
+                row.coverage,
+                row.entry_fill_rate,
+                row.exit_fill_rate,
+                row.roundtrip_fill_rate,
+                row.rejection_rate,
+                row.avg_entry_capacity_ratio,
+                row.avg_exit_capacity_ratio,
+                row.avg_entry_liquidity_usd,
+                row.avg_exit_liquidity_usd,
+                row.avg_pm_spread_bps,
+                row.avg_pm_lag_secs,
+                row.avg_slippage_to_fill_bps,
+                row.avg_roundtrip_cost_usd,
+                row.total_executable_pnl_after_cost,
+                row.avg_executable_pnl_after_cost,
+                row.reason,
+            ));
+        }
     }
     out
 }
@@ -6643,10 +6675,6 @@ fn fillability_bucket_specs() -> Vec<FillabilityBucketSpec> {
             bucket: |row| Some(row.symbol.clone()),
         },
         FillabilityBucketSpec {
-            dimension: "side",
-            bucket: |row| Some(row.side.as_str().to_string()),
-        },
-        FillabilityBucketSpec {
             dimension: "regime",
             bucket: |row| Some(row.regime.as_str().to_string()),
         },
@@ -6755,6 +6783,7 @@ fn fillability_bucket_specs() -> Vec<FillabilityBucketSpec> {
 }
 
 fn build_fillability_bucket_row(
+    side: ReviewSide,
     dimension: &str,
     bucket: String,
     rows: &[&FactorObservationV2],
@@ -6780,6 +6809,7 @@ fn build_fillability_bucket_row(
         options,
     );
     FillabilityBucketRow {
+        side,
         dimension: dimension.to_string(),
         bucket,
         n: rows.len(),
@@ -12791,6 +12821,55 @@ mod tests {
     }
 
     #[test]
+    fn fillability_review_uses_side_denominators_and_formats_each_side() {
+        let observations = (0..4)
+            .map(|idx| {
+                let mut obs = base_obs();
+                obs.event_id = format!("side-fill-{idx}");
+                obs.pm_down_ask_size = 1.0;
+                obs.pm_down_bid_size = 1.0;
+                obs
+            })
+            .collect::<Vec<_>>();
+        let report = review_fillability_v1_with_deribit(
+            &observations,
+            &[],
+            FillabilityReviewOptions {
+                min_bucket_observations: 1,
+                ..Default::default()
+            },
+        );
+
+        let symbol_rows = report
+            .rows
+            .iter()
+            .filter(|row| row.dimension == "symbol" && row.bucket == "BTCUSDT")
+            .collect::<Vec<_>>();
+        assert_eq!(symbol_rows.len(), 2);
+        let up = symbol_rows
+            .iter()
+            .find(|row| row.side == ReviewSide::Up)
+            .expect("up fillability row");
+        let down = symbol_rows
+            .iter()
+            .find(|row| row.side == ReviewSide::Down)
+            .expect("down fillability row");
+        assert!((up.coverage - 1.0).abs() < EPS);
+        assert!((down.coverage - 1.0).abs() < EPS);
+        assert!((up.entry_fill_rate - 1.0).abs() < EPS);
+        assert_eq!(down.entry_fill_rate, 0.0);
+        assert_eq!(up.decision, FillabilityDecision::Candidate);
+        assert_eq!(down.decision, FillabilityDecision::Reject);
+        assert!(report.rows.iter().all(|row| row.dimension != "side"));
+
+        let text = format_fillability_review_v1_report(&report, 1);
+        assert!(text.contains("decision,side,dimension"));
+        assert_eq!(text.matches("=== Fillability Review V1 Side:").count(), 2);
+        assert!(text.lines().any(|line| line.starts_with("candidate,up,")));
+        assert!(text.lines().any(|line| line.starts_with("reject,down,")));
+    }
+
+    #[test]
     fn liquidity_gate_v1_selects_only_point_in_time_capacity() {
         let observations = (0..20)
             .map(|idx| {
@@ -13418,8 +13497,65 @@ mod tests {
             .all(|row| !row.factor.starts_with("future_exit_")));
 
         let text = format_repricing_ic_report(&report, 10);
-        assert!(text.contains("=== Repricing IC Target Group: reprice_pnl ==="));
+        assert!(text.contains("=== Repricing IC Target Group: reprice_pnl Side: up ==="));
         assert!(text.contains("future_exit_* fields are labels/diagnostics only"));
+    }
+
+    #[test]
+    fn repricing_ic_keeps_opposite_side_correlations_and_top_rows_separate() {
+        let base_ts = Utc::now();
+        let mut rows = Vec::new();
+        for idx in 0..6 {
+            let mut obs = base_obs();
+            obs.event_id = format!("side-ic-{idx}");
+            obs.tick_ts = base_ts + Duration::seconds(idx);
+            for (side, label) in [
+                (ReviewSide::Up, idx as f64),
+                (ReviewSide::Down, -(idx as f64)),
+            ] {
+                let mut row = side_row(&obs, side, DEFAULT_STAKE_USD, None);
+                row.side_model_edge = idx as f64;
+                row.label_future_exit_pnl_30s = Some(label);
+                rows.push(row);
+            }
+        }
+
+        let report = review_repricing_ic_rows(
+            &[],
+            &rows,
+            RepricingIcOptions {
+                review: FactorReviewOptions {
+                    min_observations: 6,
+                    ..Default::default()
+                },
+                min_window_observations: 6,
+                bucket_count: 3,
+                factor_name_filter: Some("side_model_edge".to_string()),
+            },
+        );
+        let target_rows = report
+            .rows
+            .iter()
+            .filter(|row| row.target == "reprice_pnl_30s")
+            .collect::<Vec<_>>();
+        assert_eq!(target_rows.len(), 2);
+        let side_ic = |side| {
+            target_rows
+                .iter()
+                .find(|row| row.side == side)
+                .expect("side repricing row")
+                .spearman_ic
+        };
+        assert!(side_ic(ReviewSide::Up) > 0.99);
+        assert!(side_ic(ReviewSide::Down) < -0.99);
+
+        let text = format_repricing_ic_report(&report, 1);
+        assert!(text.contains("target,side,factor"));
+        assert_eq!(
+            text.matches("=== Repricing IC Target Group: reprice_pnl Side:")
+                .count(),
+            2
+        );
     }
 
     #[test]
