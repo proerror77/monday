@@ -59,6 +59,37 @@ The prediction-market lane also keeps data authority explicit:
 - Polymarket CLOB quotes and full depth provide market-implied probability,
   executable entry price, fees, fillability, and capacity evidence.
 
+### Polymarket event and model identity
+
+Crypto-expiry research is partitioned by `underlying x horizon`; each product
+family is a separate mission and model-selection problem. One immutable event
+root is one episode. It binds the event window and exact UP/DOWN token pair,
+while `market_id`, `condition_id`, and market slug remain audited aliases rather
+than competing training keys. The two outcome tokens retain independent LOB
+trajectories inside the episode; they are not two independent settlement
+labels.
+
+The settlement model emits one event probability `p_up` (`p_down = 1 - p_up`).
+Token repricing, fill probability, slippage, and markout belong to separate UP
+and DOWN execution heads and separate evaluator evidence. They may consume the
+event probability at the decision layer, but they cannot change the official
+settlement label or be promoted by settlement calibration alone.
+
+Chainlink reference ticks have one physical source of truth and are projected
+point-in-time into each event window. To keep overlapping 5m/15m/1h events from
+sharing that path across train and validation, every horizon-specific task for
+an underlying must use the same typed wall-clock boundary. A training event
+must end strictly before the boundary; a validation event must start at or
+after it. The boundary is sealed into the binary dataset contract and model
+manifest, while the independent label-availability cutoff remains mandatory.
+
+The current governed baseline remains BTC/SOL five-minute settlement research
+over the retained one-second full-visible-depth L2 snapshots. Fifteen-minute
+and one-hour missions require their own verified end-to-end data contracts
+before they can claim governed coverage. Full order-book update ticks are
+reserved for the later token microstructure/execution lane; they are not a
+prerequisite for the settlement baseline.
+
 The governed snapshot keeps Binance availability semantics separate from source
 time. Spot and L2 are bucket-selected by exchange time but replayed at
 `received_at`; aggTrade rows are aggregated inside each five-second source-time
