@@ -13,36 +13,41 @@ use ploy_research::{
     autofactor_matrix_from_v2, build_factor_observations_v2_with_deribit_and_pm_books,
     build_factor_stability_report, build_prediction_research_feedback,
     build_settlement_probability_promotion_gate_report,
-    build_settlement_probability_report_with_prior, format_autofactor_reports,
-    format_factor_combo_v1_report, format_factor_stability_report,
-    format_factor_walk_forward_v2_report, format_fillability_review_v1_report,
-    format_full_depth_execution_matrix_report, format_liquidity_gate_v1_report,
-    format_liquidity_gated_alpha_v1_report, format_meta_label_walk_forward_v1_report,
-    format_repricing_ic_report, format_settlement_probability_promotion_gate_report,
-    format_settlement_probability_report, format_settlement_probability_walk_forward_report,
-    format_trade_formation_v1_report, liquidity_gate_v1_with_deribit_and_pm_books,
+    build_settlement_probability_report_with_prior, evaluate_reprice_pilot_selection,
+    fit_reprice_pilot_selection, format_autofactor_reports, format_factor_combo_v1_report,
+    format_factor_stability_report, format_factor_walk_forward_v2_report,
+    format_fillability_review_v1_report, format_full_depth_execution_matrix_report,
+    format_liquidity_gate_v1_report, format_liquidity_gated_alpha_v1_report,
+    format_meta_label_walk_forward_v1_report, format_repricing_ic_report,
+    format_settlement_probability_promotion_gate_report, format_settlement_probability_report,
+    format_settlement_probability_walk_forward_report, format_trade_formation_v1_report,
+    liquidity_gate_v1_with_deribit_and_pm_books,
     liquidity_gated_alpha_v1_with_deribit_and_pm_books, load_research_snapshot,
     mine_domain_autofactors_from_v2_with_guidance, read_mcts_search_state,
     review_fillability_v1_with_deribit_and_pm_books, review_repricing_ic_with_deribit_and_pm_books,
-    review_trade_formation_v1_with_deribit_and_pm_books, validate_prediction_research_prior,
-    validate_snapshot_request_coverage, walk_forward_factor_combo_v1_with_deribit_and_pm_books,
+    review_trade_formation_v1_with_deribit_and_pm_books, split_reprice_rows_by_event_cohort,
+    validate_prediction_research_prior, validate_snapshot_request_coverage,
+    walk_forward_factor_combo_v1_with_deribit_and_pm_books,
     walk_forward_factors_v2_with_deribit_and_pm_books,
     walk_forward_meta_label_v1_with_deribit_and_pm_books,
     walk_forward_settlement_probability_report_with_prior,
     walk_forward_settlement_verdict_report_with_prior,
-    write_alpha_search_artifacts_with_state_and_runtime_feedback, AlphaSearchRuntimeFeedback,
-    AlphaZooSnapshot, AutoFactorOptions, AutoFactorV2Target, FactorComboV1Options,
-    FactorObservation, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
+    write_alpha_search_artifacts_with_state_and_runtime_feedback,
+    write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback,
+    AlphaSearchArtifactSummary, AlphaSearchRuntimeFeedback, AlphaZooSnapshot, AutoFactorOptions,
+    AutoFactorV2Target, FactorComboV1Options, FactorObservation, FactorObservationV2,
+    FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
     FillabilityReviewOptions, FullDepthExecutionMatrixOptions, FullDepthExecutionMatrixReport,
     LiquidityGateV1Options, LiquidityGatedAlphaV1Options, LlmPriorSpec,
-    MetaLabelWalkForwardOptions, RepricingIcOptions, ResearchSnapshotRequest, ReviewSide,
-    SettlementProbabilityDataQualityMode, SettlementProbabilityPromotionGateOptions,
-    SettlementProbabilityPromotionGateReport, SettlementProbabilityReport,
-    SettlementProbabilityReportOptions, SettlementProbabilityTimeCohort,
-    SettlementProbabilityWalkForwardAggregate, SettlementProbabilityWalkForwardOptions,
-    SettlementProbabilityWalkForwardReport, SettlementProbabilityWalkForwardWindow,
-    SettlementVerdictWalkForwardAggregate, SettlementVerdictWalkForwardReport,
-    SettlementVerdictWalkForwardWindow, TradeFormationReviewOptions,
+    MetaLabelWalkForwardOptions, RepricePilotMetrics, RepricePilotSelection, RepricingIcOptions,
+    ResearchSnapshotRequest, ReviewSide, SettlementProbabilityDataQualityMode,
+    SettlementProbabilityPromotionGateOptions, SettlementProbabilityPromotionGateReport,
+    SettlementProbabilityReport, SettlementProbabilityReportOptions,
+    SettlementProbabilityTimeCohort, SettlementProbabilityWalkForwardAggregate,
+    SettlementProbabilityWalkForwardOptions, SettlementProbabilityWalkForwardReport,
+    SettlementProbabilityWalkForwardWindow, SettlementVerdictWalkForwardAggregate,
+    SettlementVerdictWalkForwardReport, SettlementVerdictWalkForwardWindow,
+    TradeFormationReviewOptions,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -103,6 +108,43 @@ struct FullDepthExecutionArtifact<'a> {
     conservative: FullDepthExecutionArtifactProfile<'a>,
 }
 
+#[derive(serde::Serialize)]
+struct RepricePilotSearchArtifact {
+    summary: AlphaSearchArtifactSummary,
+    mcts_state_sha256: String,
+    mcts_expansion_plan_sha256: String,
+}
+
+#[derive(serde::Serialize)]
+struct RepricePilotArtifact<'a> {
+    schema_version: &'static str,
+    non_finite_floats: &'static str,
+    #[serde(flatten)]
+    context: ReportArtifactContext<'a>,
+    status: &'static str,
+    episode_identity: &'static str,
+    target: String,
+    side: ReviewSide,
+    train_rows: usize,
+    test_rows: usize,
+    excluded_rows: usize,
+    search: RepricePilotSearchArtifact,
+    selection: &'a RepricePilotSelection,
+    test: &'a RepricePilotMetrics,
+}
+
+#[derive(Clone, Copy)]
+struct RepricePilotConfig<'a> {
+    symbols: &'a [String],
+    event_window_secs: Option<i64>,
+    lob_sample_secs: i32,
+    pm_book_sample_secs: i32,
+    observation_sample_secs: i64,
+    expected_policy: Option<&'a str>,
+    alpha_search_output_dir: Option<&'a str>,
+    report_output_dir: Option<&'a str>,
+}
+
 fn require_report_identity<'a>(
     snapshot_hash: &'a str,
     snapshot_contract_hash: Option<&'a str>,
@@ -121,6 +163,52 @@ fn require_report_identity<'a>(
         required(mission_id, "mission_id")?,
         required(search_policy_snapshot_id, "search_policy_snapshot_id")?,
     ))
+}
+
+fn validate_reprice_pilot_config(
+    args: &[String],
+    config: &RepricePilotConfig<'_>,
+) -> Result<(), String> {
+    if config.symbols.len() != 1 || prediction_underlying_symbol(&config.symbols[0]) != "BTC" {
+        return Err("--reprice-pilot-10s requires exactly one BTC symbol".to_string());
+    }
+    if config.event_window_secs != Some(300) {
+        return Err("--reprice-pilot-10s requires --event-window-secs 300".to_string());
+    }
+    if config.lob_sample_secs != 1
+        || config.pm_book_sample_secs != 1
+        || config.observation_sample_secs != 1
+    {
+        return Err(
+            "--reprice-pilot-10s requires --lob-sample-secs, --pm-book-sample-secs, and --observation-sample-secs to all equal 1".to_string(),
+        );
+    }
+    for (value, flag) in [
+        (
+            config.expected_policy,
+            "--expected-search-policy-snapshot-id",
+        ),
+        (config.alpha_search_output_dir, "--alpha-search-output-dir"),
+        (config.report_output_dir, "--report-output-dir"),
+    ] {
+        if value.is_none_or(|value| value.trim().is_empty()) {
+            return Err(format!("--reprice-pilot-10s requires {flag}"));
+        }
+    }
+    for flag in [
+        "--alpha-search-plan-json",
+        "--alpha-search-llm-prior-json",
+        "--alpha-search-state-json",
+        "--alpha-zoo-snapshot-json",
+        "--candidate-strategy-replay-json",
+    ] {
+        if flag_value(args, flag).is_some() {
+            return Err(format!(
+                "--reprice-pilot-10s does not accept {flag}; search must use this run's train cohort only"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_report_observation_count(
@@ -315,6 +403,162 @@ fn write_report_artifacts(
         conservative_execution_event_rows,
     );
     write_report_set(report_output_dir, &settlement, &up, &down)
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("read search evidence {}: {error}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_reprice_pilot_10s(
+    rows: &[FactorObservationV2],
+    boundary: DateTime<Utc>,
+    alpha_search_output_dir: &Path,
+    report_output_dir: &Path,
+    snapshot_hash: &str,
+    snapshot_contract_hash: Option<&str>,
+    mission_id: Option<&str>,
+    search_policy_snapshot_id: Option<&str>,
+    start: &DateTime<Utc>,
+    end: &DateTime<Utc>,
+    time_cohort_boundary_ms: i64,
+    event_window_secs: Option<i64>,
+    top_quantile: f64,
+    min_observations: usize,
+    min_full_depth_entry_fill_rate: f64,
+) -> Result<[PathBuf; 2], String> {
+    let (train_refs, test_refs) = split_reprice_rows_by_event_cohort(rows, boundary)
+        .map_err(|error| format!("validate reprice market episodes: {error}"))?;
+    let train_rows = train_refs.into_iter().cloned().collect::<Vec<_>>();
+    let test_rows = test_refs.into_iter().cloned().collect::<Vec<_>>();
+    let excluded_rows = rows
+        .len()
+        .saturating_sub(train_rows.len().saturating_add(test_rows.len()));
+    if train_rows.is_empty() || test_rows.is_empty() {
+        return Err(format!(
+            "reprice pilot requires non-empty complete train and test event cohorts; train_rows={} test_rows={} excluded_rows={excluded_rows}",
+            train_rows.len(),
+            test_rows.len(),
+        ));
+    }
+    let (snapshot_hash, snapshot_contract_hash, mission_id, search_policy_snapshot_id) =
+        require_report_identity(
+            snapshot_hash,
+            snapshot_contract_hash,
+            mission_id,
+            search_policy_snapshot_id,
+        )?;
+    let context = ReportArtifactContext {
+        mission_id,
+        search_policy_snapshot_id,
+        snapshot_hash,
+        snapshot_contract_hash,
+        start,
+        end,
+        time_cohort_boundary_ms: Some(time_cohort_boundary_ms),
+        event_window_secs,
+    };
+    let options = AutoFactorOptions {
+        min_observations: min_observations.max(50),
+        min_window_observations: min_observations.max(20),
+        min_top_bucket_full_depth_entry_fill_rate: min_full_depth_entry_fill_rate,
+        ..Default::default()
+    };
+    let run_side = |side| -> Result<PathBuf, String> {
+        let target = AutoFactorV2Target::FullDepthRepricePnl10s(side);
+        let train_side = train_rows
+            .iter()
+            .filter(|row| row.side == side)
+            .cloned()
+            .collect::<Vec<_>>();
+        let test_side = test_rows
+            .iter()
+            .filter(|row| row.side == side)
+            .cloned()
+            .collect::<Vec<_>>();
+        if train_side.is_empty() || test_side.is_empty() {
+            return Err(format!(
+                "reprice pilot target={} side={} requires non-empty train and test rows; train={} test={}",
+                target.as_str(),
+                side.as_str(),
+                train_side.len(),
+                test_side.len(),
+            ));
+        }
+        let reports =
+            mine_domain_autofactors_from_v2_with_guidance(&train_side, target, &options, &[], None)
+                .map_err(|error| format!("mine train-only reprice candidates: {error}"))?;
+        let input_names = autofactor_matrix_from_v2(&train_side)
+            .map_err(|error| format!("build train-only reprice matrix: {error}"))?
+            .input_names()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let summary = write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
+            alpha_search_output_dir,
+            target.as_str(),
+            side,
+            &input_names,
+            &reports,
+            &options,
+            None,
+            None,
+            None,
+        )
+        .map_err(|error| format!("write train-only MCTS search artifacts: {error}"))?;
+        let candidate_name = summary.best_candidate.as_deref().ok_or_else(|| {
+            format!(
+                "MCTS produced no candidate for target={} side={}",
+                target.as_str(),
+                side.as_str()
+            )
+        })?;
+        let candidate = reports
+            .iter()
+            .find(|report| report.name == candidate_name)
+            .ok_or_else(|| {
+                format!("MCTS candidate {candidate_name} was not in its train-only report")
+            })?;
+        let selection = fit_reprice_pilot_selection(candidate, &train_side, target, top_quantile)
+            .map_err(|error| format!("fit train-only reprice selection: {error}"))?;
+        let test = evaluate_reprice_pilot_selection(&selection, &test_side, target)
+            .map_err(|error| format!("evaluate frozen reprice selection: {error}"))?;
+        let search_dir = Path::new(&summary.output_dir);
+        let search = RepricePilotSearchArtifact {
+            mcts_state_sha256: sha256_file(&search_dir.join("mcts-state.json"))?,
+            mcts_expansion_plan_sha256: sha256_file(&search_dir.join("mcts-expansion-plan.json"))?,
+            summary,
+        };
+        let artifact = RepricePilotArtifact {
+            schema_version: "monday.polymarket.reprice_pilot.v1",
+            non_finite_floats: "null",
+            context,
+            status: "pilot_not_promotable",
+            episode_identity: "polymarket market_id carried as FactorObservationV2.event_id",
+            target: target.as_str().to_string(),
+            side,
+            train_rows: train_side.len(),
+            test_rows: test_side.len(),
+            excluded_rows,
+            search,
+            selection: &selection,
+            test: &test,
+        };
+        let prefix = format!("reprice-10s-{}", side.as_str());
+        let path = write_content_addressed_report(report_output_dir, &prefix, &artifact)?;
+        eprintln!(
+            "reprice pilot evidence written target={} side={} train_rows={} test_rows={} selected_test_decisions={} path={}",
+            target.as_str(),
+            side.as_str(),
+            train_side.len(),
+            test_side.len(),
+            test.selected_decisions,
+            path.display()
+        );
+        Ok(path)
+    };
+    Ok([run_side(ReviewSide::Up)?, run_side(ReviewSide::Down)?])
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
@@ -564,7 +808,8 @@ mod tests {
         parse_time_cohort_boundary, replay_parity_evidence, require_report_identity,
         settlement_time_cohort_from_args, validate_expected_prediction_policy,
         validate_prediction_snapshot_contract_id, validate_report_observation_count,
-        validate_time_cohort_range, write_report_set, ReportArtifactContext,
+        validate_reprice_pilot_config, validate_time_cohort_range, write_report_set,
+        ReportArtifactContext, RepricePilotConfig,
     };
     use chrono::{TimeZone, Utc};
     use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
@@ -590,6 +835,58 @@ mod tests {
                 .expect_err("stale controller policy must fail")
                 .contains("does not match")
         );
+    }
+
+    #[test]
+    fn reprice_pilot_configuration_fails_closed() {
+        let btc = vec!["BTCUSDT".to_string()];
+        let config = RepricePilotConfig {
+            symbols: &btc,
+            event_window_secs: Some(300),
+            lob_sample_secs: 1,
+            pm_book_sample_secs: 1,
+            observation_sample_secs: 1,
+            expected_policy: Some("sha256:policy"),
+            alpha_search_output_dir: Some("/tmp/alpha"),
+            report_output_dir: Some("/tmp/reports"),
+        };
+        validate_reprice_pilot_config(&[], &config).expect("complete BTC pilot configuration");
+
+        let eth = vec!["ETHUSDT".to_string()];
+        assert!(validate_reprice_pilot_config(
+            &[],
+            &RepricePilotConfig {
+                symbols: &eth,
+                ..config
+            },
+        )
+        .expect_err("non-BTC pilot must fail")
+        .contains("exactly one BTC"));
+        assert!(validate_reprice_pilot_config(
+            &[],
+            &RepricePilotConfig {
+                observation_sample_secs: 30,
+                ..config
+            },
+        )
+        .expect_err("non-1s observations must fail")
+        .contains("all equal 1"));
+        assert!(validate_reprice_pilot_config(
+            &[],
+            &RepricePilotConfig {
+                alpha_search_output_dir: None,
+                ..config
+            },
+        )
+        .expect_err("missing alpha evidence output must fail")
+        .contains("--alpha-search-output-dir"));
+        let stale_state = vec![
+            "--alpha-search-state-json".to_string(),
+            "stale-state.json".to_string(),
+        ];
+        assert!(validate_reprice_pilot_config(&stale_state, &config)
+            .expect_err("pre-seeded MCTS state can leak held-out evidence")
+            .contains("does not accept --alpha-search-state-json"));
     }
 
     #[test]
@@ -1038,9 +1335,10 @@ async fn main() {
     let alpha_search_plan_json = flag_value(&args, "--alpha-search-plan-json");
     let alpha_search_llm_prior_json = flag_value(&args, "--alpha-search-llm-prior-json");
     let expected_prediction_policy = flag_value(&args, "--expected-search-policy-snapshot-id");
+    let reprice_pilot_10s = flag_present(&args, "--reprice-pilot-10s");
     let settlement_time_cohort = settlement_time_cohort_from_args(
         &args,
-        expected_prediction_policy.is_some(),
+        expected_prediction_policy.is_some() || reprice_pilot_10s,
         start,
         end,
         event_window_secs,
@@ -1050,6 +1348,22 @@ async fn main() {
         raw.parse::<i64>()
             .expect("validated --time-cohort-boundary-ms")
     });
+    if reprice_pilot_10s {
+        validate_reprice_pilot_config(
+            &args,
+            &RepricePilotConfig {
+                symbols: &symbols,
+                event_window_secs,
+                lob_sample_secs,
+                pm_book_sample_secs,
+                observation_sample_secs,
+                expected_policy: expected_prediction_policy.as_deref(),
+                alpha_search_output_dir: alpha_search_output_dir.as_deref(),
+                report_output_dir: report_output_dir.as_deref(),
+            },
+        )
+        .unwrap_or_else(|reason| panic!("reprice pilot configuration mismatch: {reason}"));
+    }
     let llm_prior = alpha_search_llm_prior_json.as_deref().map(read_llm_prior);
     let governed_prediction_prior = llm_prior
         .as_ref()
@@ -1267,6 +1581,54 @@ async fn main() {
         return;
     }
 
+    let autofactor_rows = build_factor_observations_v2_with_deribit_and_pm_books(
+        &observations,
+        &deribit_snapshots,
+        &all_pm_book_snapshots,
+        &options.review,
+    );
+    if reprice_pilot_10s {
+        let boundary_ms = time_cohort_boundary_ms
+            .expect("--reprice-pilot-10s validated --time-cohort-boundary-ms");
+        let boundary = Utc
+            .timestamp_millis_opt(boundary_ms)
+            .single()
+            .expect("--reprice-pilot-10s validated time cohort boundary");
+        println!("{snapshot_provenance}");
+        let paths = run_reprice_pilot_10s(
+            &autofactor_rows,
+            boundary,
+            Path::new(
+                alpha_search_output_dir
+                    .as_deref()
+                    .expect("--reprice-pilot-10s validated alpha output"),
+            ),
+            Path::new(
+                report_output_dir
+                    .as_deref()
+                    .expect("--reprice-pilot-10s validated report output"),
+            ),
+            &snapshot_hash,
+            snapshot_contract_hash.as_deref(),
+            mission_id.as_deref(),
+            expected_prediction_policy.as_deref(),
+            &start,
+            &end,
+            boundary_ms,
+            event_window_secs,
+            options.review.top_quantile,
+            options.review.min_observations,
+            min_promotion_entry_fill_rate,
+        )
+        .unwrap_or_else(|error| panic!("run reprice pilot failed: {error}"));
+        eprintln!(
+            "reprice pilot complete status=pilot_not_promotable up={} down={}",
+            paths[0].display(),
+            paths[1].display()
+        );
+        return;
+    }
+
     let report = walk_forward_factors_v2_with_deribit_and_pm_books(
         &observations,
         &deribit_snapshots,
@@ -1322,12 +1684,6 @@ async fn main() {
             format_repricing_ic_report(&repricing_ic_report, options.top_n)
         );
     }
-    let autofactor_rows = build_factor_observations_v2_with_deribit_and_pm_books(
-        &observations,
-        &deribit_snapshots,
-        &all_pm_book_snapshots,
-        &options.review,
-    );
     let settlement_probability_report = build_settlement_probability_report_with_prior(
         &autofactor_rows,
         llm_prior.as_ref(),
