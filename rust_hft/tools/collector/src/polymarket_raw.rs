@@ -1,6 +1,9 @@
 //! Fail-closed Polymarket reference collection and raw tape archival.
 
-use crate::polymarket_upload::{ensure_canonical_directory, validate_reference_tape_for_recovery};
+use crate::polymarket_upload::{
+    ensure_canonical_directory, trade_record_ids_sha256, validate_reference_tape_for_recovery,
+    TRADE_COMPLETION_BASIS, TRADE_COMPLETION_KIND,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use futures::{stream, StreamExt};
@@ -28,6 +31,7 @@ const GAMMA_MARKET_URL: &str = "https://gamma-api.polymarket.com/markets";
 const DATA_TRADES_URL: &str = "https://data-api.polymarket.com/trades";
 const USER_AGENT: &str = "monday-polymarket-reference-collector/2.0";
 const TRADE_ID_VERSION: &str = "v2";
+const TRADE_COMPLETION_VERSION: &str = "v1";
 const CRYPTO_TAG_ID: u64 = 21;
 const MIN_SETTLEMENT_LOOKBACK_SECS: i64 = 86_400;
 const MAX_CYCLE_DURATION: Duration = Duration::from_secs(180);
@@ -35,6 +39,7 @@ const HARD_CYCLE_WATCHDOG_EXIT_CODE: i32 = 124;
 const HTTP_GET_ATTEMPTS: usize = 3;
 const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const HTTP_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+const MAX_RETAINED_TRADE_IDS: usize = 1_000_000;
 pub const DEFAULT_MAX_MARKETS_PER_LANE: usize = 10_000;
 pub const DEFAULT_MAX_TRADE_POLLS_PER_CYCLE: usize = 112;
 pub const DEFAULT_MAX_CONCURRENT_TRADE_POLLS: usize = 4;
@@ -272,6 +277,8 @@ impl ReferenceConfig {
 struct CollectorState {
     #[serde(default)]
     trade_id_version: Option<String>,
+    #[serde(default)]
+    trade_completion_version: Option<String>,
     #[serde(default)]
     context_seed_hour: Option<String>,
     #[serde(default)]
@@ -602,40 +609,16 @@ fn target_market(market: &Value, symbols: &BTreeSet<String>) -> Option<TargetMar
     })
 }
 
-fn tracked_market_recovery_target(
-    tracked: &TrackedMarket,
+fn recovered_target(
+    market_id: &str,
+    market: &Value,
     symbols: &BTreeSet<String>,
-    now: DateTime<Utc>,
-) -> Option<(Value, TargetMarket)> {
-    if !tracked.settled || tracked.trade_complete {
-        return None;
+) -> Result<TargetMarket> {
+    if market.get("id").and_then(Value::as_str) != Some(market_id) {
+        bail!("Gamma market detail ID does not match requested market");
     }
-    let condition_id = tracked
-        .condition_id
-        .as_deref()
-        .filter(|value| !value.is_empty())?;
-    let symbol = tracked
-        .symbol
-        .as_deref()
-        .filter(|value| symbols.contains(*value))?;
-    let window_secs = tracked.market_window_secs;
-    if !matches!(window_secs, 300 | 900) {
-        return None;
-    }
-    let end_time = tracked.end_time.as_deref()?;
-    if parse_optional_datetime(Some(end_time)).is_none_or(|end| end > now) {
-        return None;
-    }
-    Some((
-        json!({
-            "conditionId": condition_id,
-            "endDate": end_time,
-        }),
-        TargetMarket {
-            symbol: symbol.to_owned(),
-            window_secs,
-        },
-    ))
+    target_market(market, symbols)
+        .ok_or_else(|| completeness_error("Gamma market detail is not a supported target market"))
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -844,15 +827,20 @@ impl PendingUpdates {
     }
 
     fn record_types(&self) -> BTreeMap<&'static str, usize> {
-        ["market_metadata", "polymarket_trade", "market_settlement"]
-            .into_iter()
-            .map(|kind| {
-                (
-                    kind,
-                    self.record_types.get(kind).copied().unwrap_or_default(),
-                )
-            })
-            .collect()
+        [
+            "market_metadata",
+            "polymarket_trade",
+            "market_settlement",
+            TRADE_COMPLETION_KIND,
+        ]
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                self.record_types.get(kind).copied().unwrap_or_default(),
+            )
+        })
+        .collect()
     }
 
     fn push(&mut self, update: Value) -> Result<()> {
@@ -860,6 +848,7 @@ impl PendingUpdates {
             Some("market_metadata") => Some("market_metadata"),
             Some("polymarket_trade") => Some("polymarket_trade"),
             Some("market_settlement") => Some("market_settlement"),
+            Some(TRADE_COMPLETION_KIND) => Some(TRADE_COMPLETION_KIND),
             _ => None,
         };
         let mut encoded = serde_json::to_vec(&update)?;
@@ -1510,17 +1499,16 @@ fn reject(counter: &mut BTreeMap<String, u64>, reason: &str) {
 
 #[allow(clippy::too_many_arguments)]
 fn trade_updates(
-    config: &ReferenceConfig,
+    _config: &ReferenceConfig,
     state: &mut CollectorState,
     market_id: &str,
     condition_id: &str,
     symbol: &str,
     window_secs: u64,
     trades: Vec<Value>,
-    cutoff_at: DateTime<Utc>,
+    _cutoff_at: DateTime<Utc>,
     received_at: DateTime<Utc>,
 ) -> (Vec<Value>, BTreeMap<String, u64>) {
-    let cutoff = cutoff_at.timestamp() - config.market_lookback_secs;
     let mut parsed = Vec::new();
     let mut malformed = BTreeMap::new();
     for trade in trades {
@@ -1594,7 +1582,7 @@ fn trade_updates(
     let mut updates = Vec::new();
     for (timestamp, trade) in parsed {
         let record_id = stable_trade_id(&trade);
-        if timestamp < cutoff || seen.contains_key(&record_id) {
+        if seen.contains_key(&record_id) {
             continue;
         }
         seen.insert(record_id.clone(), timestamp);
@@ -1626,7 +1614,6 @@ fn trade_updates(
             .insert("trade".to_owned(), trade);
         updates.push(update);
     }
-    seen.retain(|_, timestamp| *timestamp >= cutoff);
     (updates, malformed)
 }
 
@@ -1664,6 +1651,46 @@ fn advance_trade_finalization(
     tracked.trade_finalization_stable_polls >= stable_polls_required
 }
 
+#[allow(clippy::too_many_arguments)]
+fn trade_completion_update(
+    state: &CollectorState,
+    market_id: &str,
+    condition_id: &str,
+    symbol: &str,
+    market_window_secs: u64,
+    retrieved_at: DateTime<Utc>,
+    finalization_lag_secs: i64,
+    stable_polls_required: u64,
+) -> Value {
+    let (trade_count, trade_record_ids_sha256) =
+        if let Some(record_ids) = state.trade_seen.get(condition_id) {
+            (
+                record_ids.len(),
+                trade_record_ids_sha256(record_ids.keys().map(String::as_str)),
+            )
+        } else {
+            (0, trade_record_ids_sha256(std::iter::empty::<&str>()))
+        };
+    json!({
+        "kind": TRADE_COMPLETION_KIND,
+        "market_id": market_id,
+        "condition_id": condition_id,
+        "symbol": symbol,
+        "market_window_secs": market_window_secs,
+        "record_id_version": TRADE_ID_VERSION,
+        "trade_count": trade_count,
+        "trade_record_ids_sha256": trade_record_ids_sha256,
+        "source": "polymarket_data_api",
+        "retrieved_at": iso_z(retrieved_at),
+        "completeness_basis": TRADE_COMPLETION_BASIS,
+        "pagination_exhausted": true,
+        "settlement_observed": true,
+        "malformed_trade_rows": 0,
+        "finalization_lag_secs": finalization_lag_secs,
+        "stable_polls_required": stable_polls_required,
+    })
+}
+
 struct ReferenceCollector {
     config: ReferenceConfig,
     symbols: BTreeSet<String>,
@@ -1683,7 +1710,7 @@ struct ReferenceCollector {
 fn recover_state_from_tape_row(
     state: &mut CollectorState,
     row: &Value,
-    trade_cutoff: i64,
+    _trade_cutoff: i64,
 ) -> Result<()> {
     let Some(update) = row.get("update").and_then(Value::as_object) else {
         return Ok(());
@@ -1701,14 +1728,26 @@ fn recover_state_from_tape_row(
                 update.get("record_id").and_then(Value::as_str),
                 update.get("trade_ts_unix").and_then(Value::as_i64),
             ) {
-                if timestamp >= trade_cutoff {
-                    state
-                        .trade_seen
-                        .entry(condition_id.to_owned())
-                        .or_default()
-                        .insert(record_id.to_owned(), timestamp);
-                }
+                state
+                    .trade_seen
+                    .entry(condition_id.to_owned())
+                    .or_default()
+                    .insert(record_id.to_owned(), timestamp);
             }
+        }
+    } else if kind == TRADE_COMPLETION_KIND {
+        if let Some(market_id) = market_id {
+            let tracked = state.markets.entry(market_id.to_owned()).or_default();
+            tracked.condition_id = condition_id.map(str::to_owned);
+            tracked.symbol = update
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(window) = update.get("market_window_secs").and_then(Value::as_u64) {
+                tracked.market_window_secs = window;
+            }
+            tracked.settled = true;
+            tracked.trade_complete = true;
         }
     } else if matches!(kind, "market_metadata" | "market_settlement") {
         if let Some(market_id) = market_id {
@@ -1737,14 +1776,47 @@ fn recover_state_from_tape_row(
 }
 
 fn compact_trade_dedupe(state: &mut CollectorState, cutoff: i64) -> bool {
+    let incomplete = state
+        .markets
+        .values()
+        .filter(|market| !market.trade_complete)
+        .filter_map(|market| market.condition_id.clone())
+        .collect::<BTreeSet<_>>();
     let mut changed = false;
-    state.trade_seen.retain(|_, seen| {
+    state.trade_seen.retain(|condition_id, seen| {
+        if incomplete.contains(condition_id) {
+            return true;
+        }
         let before = seen.len();
         seen.retain(|_, timestamp| *timestamp >= cutoff);
         changed |= seen.len() != before || seen.is_empty();
         !seen.is_empty()
     });
     changed
+}
+
+fn validate_state_bounds(
+    state: &CollectorState,
+    max_markets: usize,
+    max_retained_trade_ids: usize,
+) -> Result<()> {
+    let retained_trade_ids = state.trade_seen.values().try_fold(0_usize, |total, seen| {
+        total.checked_add(seen.len()).context("trade ID count overflow")
+    })?;
+    if state.markets.len() > max_markets
+        || state.trade_seen.len() > max_markets
+        || retained_trade_ids > max_retained_trade_ids
+    {
+        bail!("collector state exceeds configured market or retained trade ID limit");
+    }
+    Ok(())
+}
+
+fn validate_cycle_hour(target_hour: &str, recorded_at: DateTime<Utc>) -> Result<()> {
+    if hour_key(recorded_at) != target_hour {
+        bail!("collector cycle crossed a UTC-hour boundary; retrying with fresh context");
+    }
+    Ok(())
 }
 
 impl ReferenceCollector {
@@ -1769,6 +1841,7 @@ impl ReferenceCollector {
         let state_path = config.spool_dir.join("collector-state.json");
         let health_path = config.spool_dir.join("health.json");
         let mut state: CollectorState = read_optional_json(&state_path)?;
+        let mut state_migrated = false;
         if state.trade_id_version.as_deref() != Some(TRADE_ID_VERSION) {
             let active = config.spool_dir.join(ACTIVE_TAPE);
             if active.exists() {
@@ -1787,11 +1860,22 @@ impl ReferenceCollector {
                 tracked.trade_complete = false;
             }
             state.trade_id_version = Some(TRADE_ID_VERSION.to_owned());
+            state_migrated = true;
+        }
+        if state.trade_completion_version.as_deref() != Some(TRADE_COMPLETION_VERSION) {
+            for tracked in state.markets.values_mut() {
+                tracked.trade_complete = false;
+                tracked.trade_finalization_stable_polls = 0;
+            }
+            state.trade_completion_version = Some(TRADE_COMPLETION_VERSION.to_owned());
+            state_migrated = true;
+        }
+        if state_migrated {
             atomic_write_json(&state_path, &state)?;
         }
-        // trade_updates rejects older rows before dedupe, so their IDs cannot
-        // affect any future emission and need not stay in operational state.
-        let trade_cutoff = startup_at.timestamp() - config.market_lookback_secs;
+        // Completed or orphaned conditions may be compacted; incomplete
+        // markets retain every ID until their proof is emitted.
+        let trade_cutoff = startup_at.timestamp() - config.settlement_lookback_secs;
         let state_compacted = compact_trade_dedupe(&mut state, trade_cutoff);
         let mut writer = TapeWriter::new_with_recovery(&config.spool_dir, |row| {
             recover_state_from_tape_row(&mut state, row, trade_cutoff)
@@ -1808,6 +1892,7 @@ impl ReferenceCollector {
             validation?;
             cache_release?;
         }
+        validate_state_bounds(&state, config.max_markets, MAX_RETAINED_TRADE_IDS)?;
         if state_compacted || recovered_active {
             // The state checkpoint must be durable before the recovered segment
             // stops being the active crash-recovery source.
@@ -2049,18 +2134,6 @@ impl ReferenceCollector {
         }
         let missing_target_symbols = missing_symbols(&self.symbols, &discovered_target_symbols);
 
-        let mut state_recovery_ids = BTreeSet::new();
-        for (market_id, tracked) in &next_state.markets {
-            if targets.contains_key(market_id) {
-                continue;
-            }
-            let Some(recovery_target) = tracked_market_recovery_target(tracked, &self.symbols, now)
-            else {
-                continue;
-            };
-            targets.insert(market_id.clone(), recovery_target);
-            state_recovery_ids.insert(market_id.clone());
-        }
         let target_ids = targets.keys().cloned().collect::<BTreeSet<_>>();
         let market_detail_budget = self
             .config
@@ -2103,34 +2176,28 @@ impl ReferenceCollector {
                     .remove(&market_id)
                     .ok_or_else(|| anyhow!("selected market {market_id} has no detail fetch"))?
                 {
-                    Ok(market) if market.is_object() => {
-                        targets.insert(
-                            market_id.clone(),
-                            (
-                                market,
-                                TargetMarket {
-                                    symbol: tracked.symbol.clone().unwrap_or_default(),
-                                    window_secs: tracked.market_window_secs,
-                                },
-                            ),
-                        );
-                        tracked.settlement_failure_since = None;
-                        tracked.settlement_last_error = None;
-                    }
-                    Ok(_) => {
-                        let error = "Gamma market detail response is not an object".to_owned();
+                    Ok(market) => match recovered_target(&market_id, &market, &self.symbols) {
+                        Ok(target) => {
+                            targets.insert(market_id.clone(), (market, target));
+                            tracked.settlement_failure_since = None;
+                            tracked.settlement_last_error = None;
+                        }
+                        Err(error) => {
+                            let error = error.to_string();
+                            errors.push(format!("settlement {market_id}: {error}"));
+                            tracked
+                                .settlement_failure_since
+                                .get_or_insert_with(|| retrieved_at.clone());
+                            tracked.settlement_last_error = Some(error);
+                        }
+                    },
+                    Err(error) => {
+                        let error = error.to_string();
                         errors.push(format!("settlement {market_id}: {error}"));
                         tracked
                             .settlement_failure_since
                             .get_or_insert_with(|| retrieved_at.clone());
                         tracked.settlement_last_error = Some(error);
-                    }
-                    Err(error) => {
-                        errors.push(format!("settlement {market_id}: {error}"));
-                        tracked
-                            .settlement_failure_since
-                            .get_or_insert_with(|| retrieved_at.clone());
-                        tracked.settlement_last_error = Some(error.to_string());
                     }
                 }
             }
@@ -2224,47 +2291,40 @@ impl ReferenceCollector {
                     tracked.end_time = Some(end_time.to_owned());
                 }
 
-                let state_recovery = state_recovery_ids.contains(market_id);
-                if !state_recovery {
-                    if let Some(metadata) = market_metadata_update(
-                        market_id,
-                        &market,
-                        &target,
-                        &retrieved_at,
-                        force_hour_context,
-                        &mut tracked,
-                    )? {
-                        updates.push(metadata)?;
-                    }
+                if let Some(metadata) = market_metadata_update(
+                    market_id,
+                    &market,
+                    &target,
+                    &retrieved_at,
+                    force_hour_context,
+                    &mut tracked,
+                )? {
+                    updates.push(metadata)?;
                 }
 
-                let settlement = if state_recovery {
-                    None
-                } else {
-                    match settlement_from_market(
-                        &market,
-                        &target.symbol,
-                        target.window_secs,
-                        &retrieved_at,
-                    ) {
-                        Ok(settlement) => settlement,
-                        Err(error) => {
-                            let detail = error.to_string();
-                            errors.push(format!("settlement {market_id}: {detail}"));
-                            invalid_settlement_markets.push(market_id.clone());
-                            tracked
-                                .settlement_failure_since
-                                .get_or_insert_with(|| retrieved_at.clone());
-                            tracked.settlement_last_error = Some(detail);
-                            None
-                        }
+                let settlement = match settlement_from_market(
+                    &market,
+                    &target.symbol,
+                    target.window_secs,
+                    &retrieved_at,
+                ) {
+                    Ok(settlement) => settlement,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        errors.push(format!("settlement {market_id}: {detail}"));
+                        invalid_settlement_markets.push(market_id.clone());
+                        tracked
+                            .settlement_failure_since
+                            .get_or_insert_with(|| retrieved_at.clone());
+                        tracked.settlement_last_error = Some(detail);
+                        None
                     }
                 };
                 if settlement.is_some() {
                     tracked.settlement_failure_since = None;
                     tracked.settlement_last_error = None;
                 }
-                let settlement_available = state_recovery || settlement.is_some();
+                let settlement_available = settlement.is_some();
                 let was_settled = tracked.settled;
                 if !condition_id.is_empty()
                     && !tracked.trade_complete
@@ -2329,6 +2389,16 @@ impl ReferenceCollector {
                                     self.config.trade_finalization_stable_polls,
                                 )
                             {
+                                updates.push(trade_completion_update(
+                                    &next_state,
+                                    market_id,
+                                    &condition_id,
+                                    &target.symbol,
+                                    target.window_secs,
+                                    trade_received_at,
+                                    self.config.trade_finalization_lag_secs,
+                                    self.config.trade_finalization_stable_polls,
+                                ))?;
                                 tracked.trade_complete = true;
                             }
                         }
@@ -2389,6 +2459,12 @@ impl ReferenceCollector {
         let records_written = updates.len();
         let record_types = updates.record_types();
         let recorded_at = self.now();
+        validate_cycle_hour(&target_hour, recorded_at)?;
+        validate_state_bounds(
+            &next_state,
+            self.config.max_markets,
+            MAX_RETAINED_TRADE_IDS,
+        )?;
         updates.replay(&mut self.writer, recorded_at)?;
         if missing_target_symbols.is_empty() {
             next_state.context_seed_hour = Some(target_hour);
@@ -2415,7 +2491,6 @@ impl ReferenceCollector {
             "target_markets": target_count,
             "missing_target_symbols": missing_target_symbols,
             "tracked_markets": self.state.markets.len(),
-            "state_recovery_markets": state_recovery_ids.len(),
             "market_detail_budget": market_detail_budget,
             "market_detail_eligible": market_detail_plan.eligible,
             "market_detail_priority": market_detail_plan.priority,
@@ -2791,7 +2866,7 @@ mod tests {
 
     fn valid_trade_update(recorded_at: DateTime<Utc>, trade_timestamp: i64) -> Value {
         let config = ReferenceConfig {
-            market_lookback_secs: recorded_at
+            settlement_lookback_secs: recorded_at
                 .timestamp()
                 .saturating_sub(trade_timestamp)
                 .max(0)
@@ -3624,7 +3699,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_trade_incomplete_state_recovers_without_market_detail() {
+    fn settled_trade_incomplete_state_requires_authoritative_market_detail() {
         let now = fixed_time("2026-07-17T05:00:00Z");
         let tracked = TrackedMarket {
             condition_id: Some("condition-1".to_owned()),
@@ -3635,18 +3710,59 @@ mod tests {
             trade_complete: false,
             ..TrackedMarket::default()
         };
-        let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
-        let (market, target) = tracked_market_recovery_target(&tracked, &symbols, now).unwrap();
-
-        assert_eq!(market["conditionId"], "condition-1");
-        assert_eq!(target.symbol, "BTCUSDT");
-        assert_eq!(target.window_secs, 300);
         let markets = BTreeMap::from([("settled".to_owned(), tracked)]);
-        let target_ids = BTreeSet::from(["settled".to_owned()]);
         assert_eq!(
-            plan_market_detail_fetches(&markets, &target_ids, now, 8).eligible,
-            0
+            plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 8).selected,
+            BTreeSet::from(["settled".to_owned()])
         );
+    }
+
+    #[test]
+    fn recovered_market_detail_must_match_the_requested_target() {
+        let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
+        let valid = market(
+            "Bitcoin Up or Down - 5 minutes",
+            "2026-07-17T05:00:00Z",
+            "2026-07-17T05:05:00Z",
+        );
+        let market_id = valid["id"].as_str().unwrap();
+        assert!(recovered_target(market_id, &valid, &symbols).is_ok());
+        assert!(recovered_target("wrong-market", &valid, &symbols).is_err());
+
+        let unsupported = market(
+            "Ethereum Up or Down - 5 minutes",
+            "2026-07-17T05:00:00Z",
+            "2026-07-17T05:05:00Z",
+        );
+        let unsupported_id = unsupported["id"].as_str().unwrap();
+        assert!(recovered_target(unsupported_id, &unsupported, &symbols).is_err());
+    }
+
+    #[test]
+    fn state_bounds_fail_closed_before_persisting_more_incomplete_work() {
+        let mut state = CollectorState::default();
+        state.markets.insert("market-1".to_owned(), TrackedMarket::default());
+        state.markets.insert("market-2".to_owned(), TrackedMarket::default());
+        assert!(validate_state_bounds(&state, 1, 10).is_err());
+
+        state.markets.pop_last();
+        state.trade_seen.insert(
+            "condition-1".to_owned(),
+            BTreeMap::from([("trade-1".to_owned(), 1), ("trade-2".to_owned(), 2)]),
+        );
+        assert!(validate_state_bounds(&state, 1, 1).is_err());
+        assert!(validate_state_bounds(&state, 1, 2).is_ok());
+    }
+
+    #[test]
+    fn cycle_crossing_an_hour_requires_a_fresh_context_retry() {
+        let started = fixed_time("2026-07-17T05:59:59Z");
+        assert!(validate_cycle_hour(&hour_key(started), started).is_ok());
+        assert!(validate_cycle_hour(
+            &hour_key(started),
+            fixed_time("2026-07-17T06:00:00Z")
+        )
+        .is_err());
     }
 
     #[test]
@@ -3887,6 +4003,33 @@ mod tests {
     }
 
     #[test]
+    fn trade_rows_are_retained_without_a_time_cutoff_until_completion() {
+        let now = fixed_time("2026-07-15T12:00:00Z");
+        let config = ReferenceConfig {
+            market_lookback_secs: 7_200,
+            settlement_lookback_secs: 86_400,
+            ..ReferenceConfig::default()
+        };
+        let (updates, malformed) = trade_updates(
+            &config,
+            &mut CollectorState::default(),
+            "market-1",
+            "condition-1",
+            "BTCUSDT",
+            300,
+            vec![
+                valid_trade((now - TimeDelta::hours(3)).timestamp()),
+                valid_trade((now - TimeDelta::hours(25)).timestamp()),
+            ],
+            now,
+            now,
+        );
+
+        assert!(malformed.is_empty());
+        assert_eq!(updates.len(), 2);
+    }
+
+    #[test]
     fn finalization_requires_lag_and_consecutive_stable_post_settlement_polls() {
         let now = fixed_time("2026-07-15T02:00:00Z");
         let mut tracked = TrackedMarket {
@@ -3924,6 +4067,24 @@ mod tests {
             2,
         ));
         assert_eq!(tracked.trade_finalization_stable_polls, 0);
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn trade_completion_binds_sorted_record_ids_and_recovers_final_state() {
+        let now = fixed_time("2026-07-15T02:00:00Z");
+        let mut state = CollectorState::default();
+        state.trade_seen.insert("condition-1".to_owned(), BTreeMap::from([("trade-b".to_owned(), 2), ("trade-a".to_owned(), 1)]));
+        let completion = trade_completion_update(&state, "market-1", "condition-1", "BTCUSDT", 300, now, 60, 2);
+        assert_eq!(completion["kind"], TRADE_COMPLETION_KIND);
+        assert_eq!(completion["trade_count"], 2);
+        assert_eq!(completion["trade_record_ids_sha256"], trade_record_ids_sha256(["trade-a", "trade-b"]));
+        let row = json!({"update": completion});
+        let mut recovered = CollectorState::default();
+        recover_state_from_tape_row(&mut recovered, &row, 0).unwrap();
+        let tracked = &recovered.markets["market-1"];
+        assert!(tracked.settled);
+        assert!(tracked.trade_complete);
     }
 
     #[test]
@@ -4116,6 +4277,7 @@ mod tests {
             json!({"kind": "market_metadata", "market_id": "market-1"}),
             json!({"kind": "polymarket_trade", "record_id": "trade-1"}),
             json!({"kind": "market_settlement", "market_id": "market-1"}),
+            json!({"kind": TRADE_COMPLETION_KIND, "market_id": "market-1"}),
         ];
         let mut expected = TapeWriter::new(expected_root.path()).unwrap();
         expected.write_updates(&updates, now).unwrap();
@@ -4128,18 +4290,20 @@ mod tests {
                 ("market_metadata", 0),
                 ("market_settlement", 0),
                 ("polymarket_trade", 0),
+                (TRADE_COMPLETION_KIND, 0),
             ])
         );
         for update in updates {
             pending.push(update).unwrap();
         }
-        assert_eq!(pending.len(), 3);
+        assert_eq!(pending.len(), 4);
         assert_eq!(
             pending.record_types(),
             BTreeMap::from([
                 ("market_metadata", 1),
                 ("market_settlement", 1),
                 ("polymarket_trade", 1),
+                (TRADE_COMPLETION_KIND, 1),
             ])
         );
         assert_eq!(
@@ -4343,6 +4507,10 @@ mod tests {
         let durable_state: CollectorState =
             read_optional_json(&root.path().join("collector-state.json")).unwrap();
         assert_eq!(durable_state.trade_id_version.as_deref(), Some("v2"));
+        assert_eq!(
+            durable_state.trade_completion_version.as_deref(),
+            Some("v1")
+        );
         let quarantined = fs::read_dir(root.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -4395,6 +4563,19 @@ mod tests {
             .count();
         assert_eq!(quarantined_after_restart, 1);
         restarted.writer.close().unwrap();
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn completion_migration_reopens_v2_markets_without_a_proof() {
+        let root = TestDir::new();
+        atomic_write_json(&root.path().join("collector-state.json"), &json!({"trade_id_version":"v2", "markets":{"market-1":{"trade_complete":true,"trade_finalization_stable_polls":9}}})).unwrap();
+        let config = ReferenceConfig { spool_dir: root.path().to_path_buf(), symbols: vec!["BTCUSDT".to_owned()], ..ReferenceConfig::default() };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        assert_eq!(collector.state.trade_completion_version.as_deref(), Some("v1"));
+        assert!(!collector.state.markets["market-1"].trade_complete);
+        assert_eq!(collector.state.markets["market-1"].trade_finalization_stable_polls, 0);
+        collector.writer.close().unwrap();
     }
 
     #[test]
@@ -4592,10 +4773,10 @@ mod tests {
     }
 
     #[test]
-    fn startup_compacts_dedupe_outside_trade_poll_horizon() {
+    fn startup_compacts_dedupe_outside_settlement_horizon() {
         let root = TestDir::new();
         let now = utc_now();
-        let cutoff = now.timestamp() - ReferenceConfig::default().market_lookback_secs;
+        let cutoff = now.timestamp() - ReferenceConfig::default().settlement_lookback_secs;
         atomic_write_json(
             &root.path().join("collector-state.json"),
             &json!({
@@ -4604,18 +4785,25 @@ mod tests {
                     "condition-state": {
                         "expired": cutoff - 60,
                         "recent": cutoff + 60,
+                    },
+                    "condition-incomplete": {
+                        "retained": cutoff - 60,
+                    }
+                },
+                "markets": {
+                    "market-incomplete": {
+                        "condition_id": "condition-incomplete"
                     }
                 },
             }),
         )
         .unwrap();
+        let recovered = valid_trade_update(now - TimeDelta::hours(3), cutoff - 60);
+        let recovered_id = recovered["record_id"].as_str().unwrap().to_owned();
         {
             let mut writer = TapeWriter::new(root.path()).unwrap();
             writer
-                .write_updates(
-                    &[valid_trade_update(now - TimeDelta::hours(3), cutoff - 60)],
-                    now - TimeDelta::hours(3),
-                )
+                .write_updates(&[recovered], now - TimeDelta::hours(3))
                 .unwrap();
         }
         let config = ReferenceConfig {
@@ -4628,10 +4816,20 @@ mod tests {
 
         assert_eq!(
             collector.state.trade_seen,
-            BTreeMap::from([(
-                "condition-state".to_owned(),
-                BTreeMap::from([("recent".to_owned(), cutoff + 60)]),
-            )])
+            BTreeMap::from([
+                (
+                    "condition-state".to_owned(),
+                    BTreeMap::from([("recent".to_owned(), cutoff + 60)]),
+                ),
+                (
+                    "condition-incomplete".to_owned(),
+                    BTreeMap::from([("retained".to_owned(), cutoff - 60)]),
+                ),
+                (
+                    "condition-1".to_owned(),
+                    BTreeMap::from([(recovered_id, cutoff - 60)]),
+                ),
+            ])
         );
         let durable: CollectorState =
             read_optional_json(&root.path().join("collector-state.json")).unwrap();

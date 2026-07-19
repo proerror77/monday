@@ -17,7 +17,11 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::str::FromStr;
 use std::time::Duration;
 
-const ALLOWED_KINDS: [&str; 7] = [
+pub(crate) const TRADE_COMPLETION_KIND: &str = "polymarket_trade_collection_complete";
+pub(crate) const TRADE_COMPLETION_BASIS: &str =
+    "polymarket_data_api_exhausted_after_settlement_and_stable_polls_v1";
+
+const ALLOWED_KINDS: [&str; 8] = [
     "quote",
     "event_discovered",
     "event_expired",
@@ -25,6 +29,7 @@ const ALLOWED_KINDS: [&str; 7] = [
     "market_metadata",
     "polymarket_trade",
     "market_settlement",
+    TRADE_COMPLETION_KIND,
 ];
 const SUPPORTED_SYMBOL_ALIASES: [(&str, &[&str]); 7] = [
     ("BTCUSDT", &["BITCOIN", "BTC"]),
@@ -405,6 +410,15 @@ pub(crate) fn derived_trade_record_id(trade: &Map<String, Value>) -> String {
     hex::encode(Sha256::digest(parts.join("|").as_bytes()))
 }
 
+pub(crate) fn trade_record_ids_sha256<'a>(record_ids: impl IntoIterator<Item = &'a str>) -> String {
+    let mut digest = Sha256::new();
+    for record_id in record_ids {
+        digest.update(record_id.as_bytes());
+        digest.update(b"\n");
+    }
+    hex::encode(digest.finalize())
+}
+
 pub(crate) fn validate_canonical_trade(
     update: &Map<String, Value>,
     line_number: usize,
@@ -490,6 +504,79 @@ pub(crate) fn validate_canonical_trade(
         bail!("line {line_number}: record_id does not match raw trade");
     }
     Ok(record_id)
+}
+
+fn validate_trade_completion(
+    update: &Map<String, Value>,
+    sequence: u64,
+    recorded_at: DateTime<Utc>,
+    line_number: usize,
+) -> Result<(String, (String, String), Value)> {
+    let market_id = required_text(update, "market_id", line_number)?;
+    let condition_id = required_text(update, "condition_id", line_number)?;
+    let symbol = required_text(update, "symbol", line_number)?;
+    let retrieved_at = required_text(update, "retrieved_at", line_number)?;
+    let digest = required_text(update, "trade_record_ids_sha256", line_number)?;
+    let trade_count = update
+        .get("trade_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("line {line_number}: trade completion requires trade_count"))?;
+    let finalization_lag_secs = update
+        .get("finalization_lag_secs")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            anyhow!("line {line_number}: trade completion requires positive finalization_lag_secs")
+        })?;
+    let stable_polls_required = update
+        .get("stable_polls_required")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            anyhow!("line {line_number}: trade completion requires positive stable_polls_required")
+        })?;
+    let market_window_secs = update
+        .get("market_window_secs")
+        .and_then(Value::as_u64)
+        .filter(|value| matches!(value, 300 | 900))
+        .ok_or_else(|| anyhow!("line {line_number}: trade completion has invalid market window"))?;
+    if update.get("record_id_version").and_then(Value::as_str) != Some("v2")
+        || update.get("source").and_then(Value::as_str) != Some("polymarket_data_api")
+        || update.get("completeness_basis").and_then(Value::as_str) != Some(TRADE_COMPLETION_BASIS)
+        || update.get("pagination_exhausted").and_then(Value::as_bool) != Some(true)
+        || update.get("settlement_observed").and_then(Value::as_bool) != Some(true)
+        || update.get("malformed_trade_rows").and_then(Value::as_u64) != Some(0)
+        || !SUPPORTED_SYMBOL_ALIASES
+            .iter()
+            .any(|(supported, _)| *supported == symbol)
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || parse_timestamp(
+            Some(&Value::String(retrieved_at.to_owned())),
+            "retrieved_at",
+            line_number,
+        )? > recorded_at
+    {
+        bail!("line {line_number}: invalid event-local trade completion proof");
+    }
+    Ok((
+        market_id.to_owned(),
+        (market_id.to_owned(), condition_id.to_owned()),
+        json!({
+            "condition_id": condition_id,
+            "symbol": symbol,
+            "market_window_secs": market_window_secs,
+            "trade_count": trade_count,
+            "trade_record_ids_sha256": digest,
+            "completion_sequence": sequence,
+            "retrieved_at": retrieved_at,
+            "completeness_basis": TRADE_COMPLETION_BASIS,
+            "finalization_lag_secs": finalization_lag_secs,
+            "stable_polls_required": stable_polls_required,
+        }),
+    ))
 }
 
 fn validate_market_context(
@@ -748,7 +835,7 @@ pub(crate) fn validate_reference_tape_for_recovery(
     {
         if !matches!(
             kind.as_str(),
-            "market_metadata" | "polymarket_trade" | "market_settlement"
+            "market_metadata" | "polymarket_trade" | "market_settlement" | TRADE_COMPLETION_KIND
         ) {
             bail!("recovered reference tape contains unsupported update kind {kind:?}");
         }
@@ -810,7 +897,9 @@ fn scan_tape_with_identity_at(
     let mut record_ids = BTreeSet::new();
     let mut record_id_versions = BTreeSet::new();
     let mut metadata_contexts = BTreeSet::new();
+    let mut metadata_identities = BTreeMap::new();
     let mut dependent_reference_contexts = BTreeSet::new();
+    let mut trade_completions = BTreeMap::<String, Value>::new();
     let mut source_field_presence = BTreeMap::<String, BTreeMap<String, u64>>::new();
     let mut source_field_non_null = BTreeMap::<String, BTreeMap<String, u64>>::new();
     let mut raw_line = Vec::new();
@@ -931,7 +1020,20 @@ fn scan_tape_with_identity_at(
         match kind {
             "market_metadata" => {
                 validate_market_metadata(update, line_number)?;
-                metadata_contexts.insert(reference_context(update, line_number)?);
+                let context = reference_context(update, line_number)?;
+                let identity = (
+                    required_text(update, "symbol", line_number)?.to_owned(),
+                    update["market_window_secs"]
+                        .as_u64()
+                        .expect("metadata validation requires a supported window"),
+                );
+                if metadata_identities
+                    .insert(context.clone(), identity.clone())
+                    .is_some_and(|previous| previous != identity)
+                {
+                    bail!("line {line_number}: market_metadata identity changed within segment");
+                }
+                metadata_contexts.insert(context);
             }
             "polymarket_trade" => {
                 let record_id = validate_canonical_trade(update, line_number)?;
@@ -957,6 +1059,14 @@ fn scan_tape_with_identity_at(
                 }
                 validate_market_settlement(update, line_number)?;
                 dependent_reference_contexts.insert(reference_context(update, line_number)?);
+            }
+            TRADE_COMPLETION_KIND => {
+                let (market_id, context, completion) =
+                    validate_trade_completion(update, sequence, recorded_at, line_number)?;
+                if trade_completions.insert(market_id, completion).is_some() {
+                    bail!("line {line_number}: duplicate event-local trade completion proof");
+                }
+                dependent_reference_contexts.insert(context);
             }
             _ => {}
         }
@@ -1055,9 +1165,26 @@ fn scan_tape_with_identity_at(
         .with_timezone(&Utc);
     let event_context_complete = contextless_quotes == 0;
     let has_quotes = event_types.get("quote").copied().unwrap_or_default() > 0;
-    let has_reference_records = ["market_metadata", "polymarket_trade", "market_settlement"]
-        .iter()
-        .any(|kind| event_types.get(*kind).copied().unwrap_or_default() > 0);
+    let has_reference_records = [
+        "market_metadata",
+        "polymarket_trade",
+        "market_settlement",
+        TRADE_COMPLETION_KIND,
+    ]
+    .iter()
+    .any(|kind| event_types.get(*kind).copied().unwrap_or_default() > 0);
+    for (market_id, completion) in &trade_completions {
+        let condition_id = completion["condition_id"].as_str().unwrap_or_default();
+        let expected = metadata_identities
+            .get(&(market_id.clone(), condition_id.to_owned()));
+        let actual = (
+            completion["symbol"].as_str().unwrap_or_default().to_owned(),
+            completion["market_window_secs"].as_u64().unwrap_or_default(),
+        );
+        if expected != Some(&actual) {
+            bail!("event-local trade completion identity contradicts market metadata");
+        }
+    }
     let reference_context_complete = dependent_reference_contexts.is_subset(&metadata_contexts);
     let depth_complete = has_quotes && quote_depth_levels == 0;
     let temporal_updates_complete = has_quotes && quote_sample_ms == 0;
@@ -1132,6 +1259,10 @@ fn scan_tape_with_identity_at(
         "source_file": source_file,
         "source_bytes": identity.bytes,
     });
+    manifest
+        .as_object_mut()
+        .expect("manifest is an object")
+        .insert("trade_completions".to_owned(), json!(trade_completions));
     manifest
         .as_object_mut()
         .expect("manifest is an object")
@@ -1814,6 +1945,17 @@ mod tests {
         update
     }
 
+    #[rustfmt::skip]
+    fn valid_trade_completion_update() -> Value {
+        let record_id = valid_v2_trade_update()["record_id"].as_str().unwrap().to_owned();
+        json!({
+            "kind":TRADE_COMPLETION_KIND,"market_id":"market-1","condition_id":"0xcondition","symbol":"BTCUSDT","market_window_secs":300,
+            "record_id_version":"v2","trade_count":1,"trade_record_ids_sha256":trade_record_ids_sha256([record_id.as_str()]),
+            "source":"polymarket_data_api","retrieved_at":"2026-07-15T03:10:00Z","completeness_basis":TRADE_COMPLETION_BASIS,
+            "pagination_exhausted":true,"settlement_observed":true,"malformed_trade_rows":0,"finalization_lag_secs":60,"stable_polls_required":2,
+        })
+    }
+
     fn write_tape(root: &Path, name: &str, rows: &[Value]) -> PathBuf {
         let path = root.join(name);
         let mut file = File::create(&path).unwrap();
@@ -1854,6 +1996,43 @@ mod tests {
         assert_eq!(manifest["quality"]["max_bid_levels"], 1);
         assert_eq!(manifest["field_non_null"]["quote"]["bid"], 1);
         assert_eq!(manifest["field_non_null"]["reference_price"]["price"], 1);
+    }
+
+    #[test]
+    fn records_event_local_trade_completion_identity() {
+        let root = TestDir::new();
+        let rows = vec![
+            record(0, "2026-07-15T03:00:00Z", valid_market_metadata_update()),
+            record(1, "2026-07-15T03:10:00Z", valid_v2_trade_update()),
+            record(2, "2026-07-15T03:10:00Z", valid_market_settlement_update()),
+            record(3, "2026-07-15T03:10:00Z", valid_trade_completion_update()),
+        ];
+        let tape = write_tape(root.path(), "market-updates.20260715T030000.ndjson", &rows);
+
+        let manifest = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap();
+        let completion = &manifest["trade_completions"]["market-1"];
+
+        assert_eq!(completion["trade_count"], 1);
+        assert_eq!(completion["completion_sequence"], 3);
+        assert_eq!(completion["condition_id"], "0xcondition");
+        assert_eq!(manifest["event_types"][TRADE_COMPLETION_KIND], 1);
+    }
+
+    #[test]
+    fn rejects_trade_completion_identity_that_contradicts_metadata() {
+        let root = TestDir::new();
+        let mut completion = valid_trade_completion_update();
+        completion["symbol"] = json!("ETHUSDT");
+        completion["market_window_secs"] = json!(900);
+        let rows = vec![
+            record(0, "2026-07-15T03:00:00Z", valid_market_metadata_update()),
+            record(1, "2026-07-15T03:10:00Z", completion),
+        ];
+        let tape = write_tape(root.path(), "market-updates.20260715T030000.ndjson", &rows);
+
+        let error = scan_tape(&tape, "crypto_expiry_reference", 0, 0).unwrap_err();
+
+        assert!(error.to_string().contains("contradicts market metadata"));
     }
 
     #[test]
