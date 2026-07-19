@@ -4015,30 +4015,15 @@ mod tests {
     }
 
     #[test]
+    #[rustfmt::skip]
     fn trade_completion_binds_sorted_record_ids_and_recovers_final_state() {
         let now = fixed_time("2026-07-15T02:00:00Z");
         let mut state = CollectorState::default();
-        state.trade_seen.insert(
-            "condition-1".to_owned(),
-            BTreeMap::from([("trade-b".to_owned(), 2), ("trade-a".to_owned(), 1)]),
-        );
-        let completion = trade_completion_update(
-            &state,
-            "market-1",
-            "condition-1",
-            "BTCUSDT",
-            300,
-            now,
-            60,
-            2,
-        );
-
+        state.trade_seen.insert("condition-1".to_owned(), BTreeMap::from([("trade-b".to_owned(), 2), ("trade-a".to_owned(), 1)]));
+        let completion = trade_completion_update(&state, "market-1", "condition-1", "BTCUSDT", 300, now, 60, 2);
         assert_eq!(completion["kind"], TRADE_COMPLETION_KIND);
         assert_eq!(completion["trade_count"], 2);
-        assert_eq!(
-            completion["trade_record_ids_sha256"],
-            trade_record_ids_sha256(["trade-a", "trade-b"])
-        );
+        assert_eq!(completion["trade_record_ids_sha256"], trade_record_ids_sha256(["trade-a", "trade-b"]));
         let row = json!({"update": completion});
         let mut recovered = CollectorState::default();
         recover_state_from_tape_row(&mut recovered, &row, 0).unwrap();

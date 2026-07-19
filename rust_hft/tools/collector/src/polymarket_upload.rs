@@ -1919,28 +1919,14 @@ mod tests {
         update
     }
 
+    #[rustfmt::skip]
     fn valid_trade_completion_update() -> Value {
-        let record_id = valid_v2_trade_update()["record_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let record_id = valid_v2_trade_update()["record_id"].as_str().unwrap().to_owned();
         json!({
-            "kind": TRADE_COMPLETION_KIND,
-            "market_id": "market-1",
-            "condition_id": "0xcondition",
-            "symbol": "BTCUSDT",
-            "market_window_secs": 300,
-            "record_id_version": "v2",
-            "trade_count": 1,
-            "trade_record_ids_sha256": trade_record_ids_sha256([record_id.as_str()]),
-            "source": "polymarket_data_api",
-            "retrieved_at": "2026-07-15T03:10:00Z",
-            "completeness_basis": TRADE_COMPLETION_BASIS,
-            "pagination_exhausted": true,
-            "settlement_observed": true,
-            "malformed_trade_rows": 0,
-            "finalization_lag_secs": 60,
-            "stable_polls_required": 2,
+            "kind":TRADE_COMPLETION_KIND,"market_id":"market-1","condition_id":"0xcondition","symbol":"BTCUSDT","market_window_secs":300,
+            "record_id_version":"v2","trade_count":1,"trade_record_ids_sha256":trade_record_ids_sha256([record_id.as_str()]),
+            "source":"polymarket_data_api","retrieved_at":"2026-07-15T03:10:00Z","completeness_basis":TRADE_COMPLETION_BASIS,
+            "pagination_exhausted":true,"settlement_observed":true,"malformed_trade_rows":0,"finalization_lag_secs":60,"stable_polls_required":2,
         })
     }
 
