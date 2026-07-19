@@ -3041,27 +3041,24 @@ pub fn walk_forward_settlement_probability_report_with_prior(
 ) -> SettlementProbabilityWalkForwardReport {
     let mut rows = rows.to_vec();
     rows.sort_by_key(|row| row.tick_ts);
-    let train_duration = options.walk_forward.train_duration();
-    let test_duration = options.walk_forward.test_duration();
-    let step_duration = options.walk_forward.step_duration();
     let probability_options =
         normalize_settlement_probability_report_options(options.probability.clone());
     let event_ends = inferred_event_ends(&rows);
     let label_observation_times = official_label_observation_times(&rows);
 
     let mut windows = Vec::new();
-    let mut train_start = start;
-    let mut window_index = 0usize;
-    while train_start + train_duration + test_duration <= end + Duration::seconds(1) {
-        let train_end = train_start + train_duration;
-        let test_start = train_end;
-        let test_end = test_start + test_duration;
+    for bounds in settlement_walk_forward_window_bounds(start, end, &options) {
         let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
             &rows,
             &event_ends,
             &label_observation_times,
             options.time_cohort.as_ref(),
-            (train_start, train_end, test_start, test_end),
+            (
+                bounds.train_start,
+                bounds.train_end,
+                bounds.test_start,
+                bounds.test_end,
+            ),
         );
 
         if train_rows.len() >= options.walk_forward.review.min_observations
@@ -3080,21 +3077,12 @@ pub fn walk_forward_settlement_probability_report_with_prior(
                 probability_options.clone(),
             );
             windows.extend(settlement_probability_walk_forward_windows(
-                ProbabilityWalkForwardWindowBounds {
-                    window_index,
-                    train_start,
-                    train_end,
-                    test_start,
-                    test_end,
-                },
+                bounds,
                 &train_report,
                 &test_report,
                 &options,
             ));
         }
-
-        window_index += 1;
-        train_start += step_duration;
     }
     let aggregates = aggregate_settlement_probability_walk_forward_windows(&windows);
     SettlementProbabilityWalkForwardReport {
@@ -3111,6 +3099,44 @@ struct ProbabilityWalkForwardWindowBounds {
     train_end: DateTime<Utc>,
     test_start: DateTime<Utc>,
     test_end: DateTime<Utc>,
+}
+
+fn settlement_walk_forward_window_bounds(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    options: &SettlementProbabilityWalkForwardOptions,
+) -> Vec<ProbabilityWalkForwardWindowBounds> {
+    if let Some(cohort) = options.time_cohort {
+        if !(start < cohort.boundary && cohort.boundary < end) {
+            return Vec::new();
+        }
+        return vec![ProbabilityWalkForwardWindowBounds {
+            window_index: 0,
+            train_start: start,
+            train_end: cohort.boundary,
+            test_start: cohort.boundary,
+            test_end: end,
+        }];
+    }
+
+    let train_duration = options.walk_forward.train_duration();
+    let test_duration = options.walk_forward.test_duration();
+    let step_duration = options.walk_forward.step_duration();
+    let mut bounds = Vec::new();
+    let mut train_start = start;
+    while train_start + train_duration + test_duration <= end + Duration::seconds(1) {
+        let train_end = train_start + train_duration;
+        let test_start = train_end;
+        bounds.push(ProbabilityWalkForwardWindowBounds {
+            window_index: bounds.len(),
+            train_start,
+            train_end,
+            test_start,
+            test_end: test_start + test_duration,
+        });
+        train_start += step_duration;
+    }
+    bounds
 }
 
 fn settlement_probability_walk_forward_windows(
@@ -3240,9 +3266,6 @@ pub fn walk_forward_settlement_verdict_report_with_prior(
 ) -> SettlementVerdictWalkForwardReport {
     let mut rows = rows.to_vec();
     rows.sort_by_key(|row| row.tick_ts);
-    let train_duration = options.walk_forward.train_duration();
-    let test_duration = options.walk_forward.test_duration();
-    let step_duration = options.walk_forward.step_duration();
     let probability_options =
         normalize_settlement_probability_report_options(options.probability.clone());
     let min_samples = options
@@ -3254,18 +3277,18 @@ pub fn walk_forward_settlement_verdict_report_with_prior(
     let label_observation_times = official_label_observation_times(&rows);
 
     let mut windows = Vec::new();
-    let mut train_start = start;
-    let mut window_index = 0usize;
-    while train_start + train_duration + test_duration <= end + Duration::seconds(1) {
-        let train_end = train_start + train_duration;
-        let test_start = train_end;
-        let test_end = test_start + test_duration;
+    for bounds in settlement_walk_forward_window_bounds(start, end, &options) {
         let (train_rows, test_rows) = event_disjoint_walk_forward_slices(
             &rows,
             &event_ends,
             &label_observation_times,
             options.time_cohort.as_ref(),
-            (train_start, train_end, test_start, test_end),
+            (
+                bounds.train_start,
+                bounds.train_end,
+                bounds.test_start,
+                bounds.test_end,
+            ),
         );
         let train_by_model =
             settlement_verdict_model_samples(&train_rows, &train_rows, prior, &probability_options);
@@ -3284,7 +3307,7 @@ pub fn walk_forward_settlement_verdict_report_with_prior(
                 && test_log_loss <= options.max_test_log_loss
                 && test_expected_calibration_error <= options.max_test_expected_calibration_error;
             windows.push(SettlementVerdictWalkForwardWindow {
-                window_index,
+                window_index: bounds.window_index,
                 model,
                 test_n,
                 test_brier_score,
@@ -3293,8 +3316,6 @@ pub fn walk_forward_settlement_verdict_report_with_prior(
                 pass,
             });
         }
-        window_index += 1;
-        train_start += step_duration;
     }
     let aggregates = aggregate_settlement_verdict_walk_forward_windows(&windows);
     SettlementVerdictWalkForwardReport {
@@ -11072,6 +11093,58 @@ mod tests {
         }
     }
 
+    fn short_settlement_time_cohort_case() -> (
+        DateTime<Utc>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+        Vec<FactorObservationV2>,
+        SettlementProbabilityWalkForwardOptions,
+    ) {
+        let start = Utc::now();
+        let boundary = start + Duration::minutes(20);
+        let end = start + Duration::minutes(35);
+        let mut source_rows = Vec::new();
+        for (event_id, tick_ts, time_remaining_secs) in [
+            ("train-only", boundary - Duration::minutes(10), 300),
+            ("crossing", boundary - Duration::minutes(1), 180),
+            ("crossing", boundary + Duration::minutes(1), 60),
+            ("test-only", boundary + Duration::minutes(1), 240),
+        ] {
+            let mut row = base_obs();
+            row.event_id = event_id.to_string();
+            row.tick_ts = tick_ts;
+            row.time_remaining_secs = time_remaining_secs;
+            source_rows.push(row);
+        }
+        bind_test_resolution_clocks(&mut source_rows);
+        let mut rows = build_factor_observations_v2(
+            &source_rows,
+            &FactorReviewOptions {
+                min_observations: 1,
+                ..Default::default()
+            },
+        );
+        rows.retain(|row| row.side == ReviewSide::Up);
+        make_settlement_probability_eligible(&mut rows);
+        let options = SettlementProbabilityWalkForwardOptions {
+            walk_forward: FactorWalkForwardOptions {
+                review: FactorReviewOptions {
+                    min_observations: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            probability: SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                event_surface_min_bucket_observations: 1,
+                event_surface_shrinkage_observations: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        (start, boundary, end, rows, options)
+    }
+
     fn minimal_health() -> DataHealthReport {
         DataHealthReport {
             source_observations: 0,
@@ -12200,6 +12273,130 @@ mod tests {
             ),
         );
         assert!(late_train.is_empty());
+    }
+
+    #[test]
+    fn settlement_probability_short_time_cohort_emits_one_held_out_window() {
+        let (start, boundary, end, rows, options) = short_settlement_time_cohort_case();
+        let rolling = walk_forward_settlement_probability_report_with_prior(
+            &rows,
+            start,
+            end,
+            None,
+            options.clone(),
+        );
+        assert!(
+            rolling.windows.is_empty(),
+            "35m cannot fill the default 2d/1d window"
+        );
+
+        let report = walk_forward_settlement_probability_report_with_prior(
+            &rows,
+            start,
+            end,
+            None,
+            SettlementProbabilityWalkForwardOptions {
+                time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+                ..options
+            },
+        );
+
+        assert!(!report.windows.is_empty());
+        assert!(report.windows.iter().all(|window| {
+            window.window_index == 0
+                && window.train_start == start
+                && window.train_end == boundary
+                && window.test_start == boundary
+                && window.test_end == end
+        }));
+        assert!(report
+            .aggregates
+            .iter()
+            .all(|aggregate| aggregate.windows == 1));
+        let midpoint = report
+            .windows
+            .iter()
+            .find(|window| window.model == "q_market_midpoint")
+            .expect("held-out midpoint window");
+        assert_eq!(
+            (midpoint.train_n, midpoint.test_n),
+            (1, 1),
+            "the boundary-crossing event must enter neither cohort"
+        );
+    }
+
+    #[test]
+    fn settlement_verdict_short_time_cohort_emits_one_held_out_window() {
+        let (start, boundary, end, rows, options) = short_settlement_time_cohort_case();
+        let rolling = walk_forward_settlement_verdict_report_with_prior(
+            &rows,
+            start,
+            end,
+            None,
+            options.clone(),
+        );
+        assert!(
+            rolling.windows.is_empty(),
+            "35m cannot fill the default 2d/1d window"
+        );
+
+        let report = walk_forward_settlement_verdict_report_with_prior(
+            &rows,
+            start,
+            end,
+            None,
+            SettlementProbabilityWalkForwardOptions {
+                time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+                ..options
+            },
+        );
+
+        assert!(!report.windows.is_empty());
+        assert!(report.windows.iter().all(|window| window.window_index == 0));
+        assert!(report
+            .aggregates
+            .iter()
+            .all(|aggregate| aggregate.windows == 1));
+        assert_eq!(
+            report
+                .windows
+                .iter()
+                .find(|window| window.model == "q_market_midpoint")
+                .expect("held-out midpoint verdict")
+                .test_n,
+            1,
+            "the boundary-crossing event must not enter the held-out cohort"
+        );
+    }
+
+    #[test]
+    fn settlement_reports_ignore_out_of_range_time_cohort_boundaries() {
+        let (start, _, end, rows, options) = short_settlement_time_cohort_case();
+        for (case, boundary) in [
+            ("before start", start - Duration::seconds(1)),
+            ("at start", start),
+            ("at end", end),
+            ("after end", end + Duration::seconds(1)),
+        ] {
+            let options = SettlementProbabilityWalkForwardOptions {
+                time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+                ..options.clone()
+            };
+            let probability = walk_forward_settlement_probability_report_with_prior(
+                &rows,
+                start,
+                end,
+                None,
+                options.clone(),
+            );
+            let verdict =
+                walk_forward_settlement_verdict_report_with_prior(&rows, start, end, None, options);
+
+            assert!(probability.windows.is_empty(), "probability case={case}");
+            assert!(probability.aggregates.is_empty(), "probability case={case}");
+            assert!(verdict.windows.is_empty(), "verdict case={case}");
+            assert!(verdict.aggregates.is_empty(), "verdict case={case}");
+        }
     }
 
     #[test]
