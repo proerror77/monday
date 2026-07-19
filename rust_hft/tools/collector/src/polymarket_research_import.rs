@@ -1,14 +1,16 @@
 use crate::lob_archiver::command_status_with_timeout;
-use crate::polymarket_upload::{ensure_canonical_directory, scan_tape};
+use crate::polymarket_upload::{
+    ensure_canonical_directory, scan_tape, TRADE_COMPLETION_KIND,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use rand::random;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -71,8 +73,14 @@ const MARKET_EVENT_TYPES: [&str; 4] = [
     "quote",
     "reference_price",
 ];
-const REFERENCE_EVENT_TYPES: [&str; 3] =
-    ["market_metadata", "polymarket_trade", "market_settlement"];
+const REFERENCE_EVENT_TYPES: [&str; 4] = [
+    "market_metadata",
+    "polymarket_trade",
+    "market_settlement",
+    TRADE_COMPLETION_KIND,
+];
+const MAX_REFERENCE_SEGMENTS: usize = 26;
+const MAX_REFERENCE_SOURCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 fn file_identity(metadata: &Metadata) -> FileIdentity {
     (metadata.dev(), metadata.ino(), metadata.len())
@@ -344,12 +352,17 @@ fn validate_triplet(
     {
         bail!("manifest source identity or sequence declaration does not match staged path");
     }
+    let start_recorded_at = text(&manifest, "start_recorded_at")?;
     let end_recorded_at = text(&manifest, "end_recorded_at")?;
-    let end_partition = DateTime::parse_from_rfc3339(&end_recorded_at)?
-        .with_timezone(&Utc)
-        .format("%Y-%m-%dT%H")
-        .to_string();
-    if end_partition != format!("{date}T{hour}") {
+    let partition = |value: &str| -> Result<String> {
+        Ok(DateTime::parse_from_rfc3339(value)?
+            .with_timezone(&Utc)
+            .format("%Y-%m-%dT%H")
+            .to_string())
+    };
+    if partition(&start_recorded_at)? != format!("{date}T{hour}")
+        || partition(&end_recorded_at)? != format!("{date}T{hour}")
+    {
         bail!("segment crosses its UTC-hour partition");
     }
     let start_sequence = manifest
@@ -387,7 +400,7 @@ fn validate_triplet(
             start_sequence,
             end_sequence,
             sequence_gaps: 0,
-            start_recorded_at: text(&manifest, "start_recorded_at")?,
+            start_recorded_at,
             end_recorded_at,
             source_file: text(&manifest, "source_file")?,
             replay_scope: text(&manifest, "replay_scope")?,
@@ -473,7 +486,20 @@ fn combine_references(paths: &[PathBuf], scratch: &Path) -> Result<PathBuf> {
         .create_new(true)
         .mode(0o600)
         .open(&combined)?;
+    let mut trade_ids = BTreeSet::new();
     for path in paths {
+        for line in BufReader::new(File::open(path)?).lines() {
+            let row: Value = serde_json::from_str(&line?)?;
+            let update = &row["update"];
+            if update["kind"] == "polymarket_trade" {
+                let record_id = update["record_id"]
+                    .as_str()
+                    .expect("rescanned trade has a record ID");
+                if !trade_ids.insert(record_id.to_owned()) {
+                    bail!("duplicate polymarket_trade record_id across reference segments");
+                }
+            }
+        }
         std::io::copy(&mut File::open(path)?, &mut output)?;
     }
     output.sync_all()?;
@@ -524,10 +550,13 @@ fn validate_reference_policy(references: &[ValidatedArtifact]) -> Result<()> {
             bail!("reference segments must contain only metadata, v2 trades, settlements, and exact recording policy");
         }
         for (kind, count) in manifest["event_types"].as_object().expect("validated event types") {
-            *event_types.entry(kind.clone()).or_default() += count.as_u64().unwrap_or_default();
+            let total = event_types.entry(kind.clone()).or_default();
+            *total = total
+                .checked_add(count.as_u64().unwrap_or_default())
+                .context("reference event count overflow")?;
         }
     }
-    if REFERENCE_EVENT_TYPES
+    if ["market_metadata", "polymarket_trade", "market_settlement"]
         .iter()
         .any(|kind| event_types.get(*kind).copied().unwrap_or_default() == 0)
     {
@@ -539,8 +568,8 @@ pub(crate) fn with_validated_research_segments<T>(
     config: &ResearchSegmentValidationConfig,
     consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
 ) -> Result<T> {
-    if config.references.is_empty() {
-        bail!("at least one reference segment is required");
+    if config.references.is_empty() || config.references.len() > MAX_REFERENCE_SEGMENTS {
+        bail!("reference segment count must be between 1 and {MAX_REFERENCE_SEGMENTS}");
     }
     let scratch = ScratchDir::create()?;
     let market = validate_triplet(&config.market, "crypto_expiry", "market", &scratch.0)?;
@@ -559,6 +588,14 @@ pub(crate) fn with_validated_research_segments<T>(
             }
         }
         references.push(reference);
+    }
+    let source_bytes = references.iter().try_fold(0_u64, |total, reference| {
+        total
+            .checked_add(reference.manifest["source_bytes"].as_u64().unwrap_or(u64::MAX))
+            .context("reference source byte total overflow")
+    })?;
+    if source_bytes > MAX_REFERENCE_SOURCE_BYTES {
+        bail!("reference segment set exceeds source byte limit");
     }
     validate_market_policy(&market.manifest)?;
     validate_reference_policy(&references)?;
@@ -603,7 +640,9 @@ pub fn validate_research_segments(
 mod tests {
     use super::*;
     use crate::lob_archiver::sha256_file;
-    use crate::polymarket_upload::derived_trade_record_id;
+    use crate::polymarket_upload::{
+        derived_trade_record_id, trade_record_ids_sha256, TRADE_COMPLETION_BASIS,
+    };
     use serde_json::json;
     use std::fs::File;
     use std::io::Write;
@@ -650,6 +689,28 @@ mod tests {
             "transaction_hash": "0xtx", "proxy_wallet": "0xwallet", "outcome": "Up",
             "outcome_index": 0, "source": "polymarket_data_api",
             "received_at": "2026-07-17T05:01:00Z", "trade": raw,
+        })
+    }
+
+    fn trade_completion() -> Value {
+        let record_id = trade()["record_id"].as_str().unwrap().to_owned();
+        json!({
+            "kind": TRADE_COMPLETION_KIND,
+            "market_id": "market-1",
+            "condition_id": "0xcondition",
+            "symbol": "BTCUSDT",
+            "market_window_secs": 300,
+            "record_id_version": "v2",
+            "trade_count": 1,
+            "trade_record_ids_sha256": trade_record_ids_sha256([record_id.as_str()]),
+            "source": "polymarket_data_api",
+            "retrieved_at": "2026-07-17T05:01:00Z",
+            "completeness_basis": TRADE_COMPLETION_BASIS,
+            "pagination_exhausted": true,
+            "settlement_observed": true,
+            "malformed_trade_rows": 0,
+            "finalization_lag_secs": 60,
+            "stable_polls_required": 2,
         })
     }
 
@@ -828,6 +889,76 @@ mod tests {
 
         config.references.reverse();
         rejects(&config, "consecutive UTC hours");
+    }
+
+    #[test]
+    fn accepts_reference_segments_with_event_local_trade_completion_proof() {
+        let mut reference = reference_rows(true);
+        reference.push(row(3, trade_completion()));
+        let (_temp, config) = fixture_rows(&market_rows(), &reference);
+
+        let report = validate_research_segments(&config).unwrap();
+
+        assert_eq!(report.references.len(), 1);
+    }
+
+    #[test]
+    fn rejects_reference_segment_sets_over_resource_limits() {
+        let (_temp, mut config) = fixture(true);
+        config.references = vec![config.references[0].clone(); MAX_REFERENCE_SEGMENTS + 1];
+        rejects(&config, "segment count");
+
+        let (_temp, config) = fixture(true);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&config.references[0].manifest).unwrap()).unwrap();
+        manifest["source_bytes"] = json!(MAX_REFERENCE_SOURCE_BYTES + 1);
+        fs::write(
+            &config.references[0].manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+        rejects(&config, "source byte limit");
+    }
+
+    #[test]
+    fn rejects_manifest_start_outside_its_partition() {
+        let (_temp, config) = fixture(true);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&config.references[0].manifest).unwrap()).unwrap();
+        manifest["start_recorded_at"] = json!("2026-07-17T04:59:59Z");
+        fs::write(
+            &config.references[0].manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+        rejects(&config, "crosses its UTC-hour partition");
+    }
+
+    #[test]
+    fn rejects_duplicate_trade_ids_across_reference_segments() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", &market_rows());
+        let first = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &[row(0, metadata("market_metadata")), row(1, trade())],
+        );
+        let mut second = vec![
+            row(0, metadata("market_metadata")),
+            row(1, trade()),
+            row(2, metadata("market_settlement")),
+        ];
+        for record in &mut second {
+            record["recorded_at"] = json!("2026-07-17T06:01:00Z");
+        }
+        let second = triplet(&root, "crypto_expiry_reference", &second);
+        let config = ResearchSegmentValidationConfig {
+            market,
+            references: vec![first, second],
+        };
+
+        rejects(&config, "duplicate polymarket_trade record_id");
     }
 
     #[test]
