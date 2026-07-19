@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 const MANIFEST_SCHEMA: &str = "monday.polymarket.evidence_artifact.v1";
 const INPUT_SCHEMA: &str = "monday.polymarket.research_segment_validation.v1";
+const INPUT_SCHEMA_V2: &str = "monday.polymarket.research_segment_validation.v2";
 const ROW_SCHEMA: &str = "monday.polymarket.evidence_row.v1";
 const PUBLISHED_MODE: u32 = 0o444;
 const MAX_DATA_BYTES: u64 = 512 * 1024 * 1024;
@@ -149,11 +150,26 @@ struct OrderBookSemantics {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ValidatedInputs {
+    V1(Box<ValidatedInputsV1>),
+    V2(Box<ValidatedInputsV2>),
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ValidatedInputs {
+struct ValidatedInputsV1 {
     schema: String,
     market: SegmentIdentity,
     reference: SegmentIdentity,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidatedInputsV2 {
+    schema: String,
+    market: SegmentIdentity,
+    references: Vec<SegmentIdentity>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -513,23 +529,56 @@ fn validate_manifest(
 }
 
 fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
-    if inputs.schema != INPUT_SCHEMA {
-        bail!("unsupported validated input contract");
+    match inputs {
+        ValidatedInputs::V1(inputs) => {
+            if inputs.schema != INPUT_SCHEMA {
+                bail!("unsupported validated input contract");
+            }
+            validate_segment(&inputs.market, "crypto_expiry")?;
+            if inputs.reference.record_id_versions != ["v2"] {
+                bail!("validated reference input must contain v2 trades");
+            }
+            validate_segment(&inputs.reference, "crypto_expiry_reference")
+        }
+        ValidatedInputs::V2(inputs) => {
+            if inputs.schema != INPUT_SCHEMA_V2 || inputs.references.is_empty() {
+                bail!("unsupported validated input contract");
+            }
+            validate_segment(&inputs.market, "crypto_expiry")?;
+            for reference in &inputs.references {
+                validate_segment(reference, "crypto_expiry_reference")?;
+            }
+            if !inputs
+                .references
+                .iter()
+                .any(|reference| reference.record_id_versions == ["v2"])
+            {
+                bail!("validated reference inputs must contain v2 trades");
+            }
+            for pair in inputs.references.windows(2) {
+                let hour = |segment: &SegmentIdentity| {
+                    parse_time(
+                        &format!("{}T{}:00:00Z", segment.date, segment.hour),
+                        "validated reference date/hour",
+                    )
+                };
+                if hour(&pair[1])? != hour(&pair[0])? + chrono::Duration::hours(1) {
+                    bail!("validated reference inputs must be consecutive UTC hours");
+                }
+            }
+            Ok(())
+        }
     }
-    validate_segment(&inputs.market, "crypto_expiry")?;
-    validate_segment(&inputs.reference, "crypto_expiry_reference")
 }
 
 fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
-    let (quote_sample_ms, replay_scope, record_id_versions): (_, _, &[&str]) = match dataset {
-        "crypto_expiry" => (
-            1_000,
-            "complete_full_depth_sampled_normalized_hour_segment",
-            &[],
-        ),
-        "crypto_expiry_reference" => (0, "complete_reference_hour_segment", &["v2"]),
+    let (quote_sample_ms, replay_scope) = match dataset {
+        "crypto_expiry" => (1_000, "complete_full_depth_sampled_normalized_hour_segment"),
+        "crypto_expiry_reference" => (0, "complete_reference_hour_segment"),
         _ => unreachable!("validated input dataset is fixed by the manifest contract"),
     };
+    let versions_valid = segment.record_id_versions.is_empty()
+        || (dataset == "crypto_expiry_reference" && segment.record_id_versions == ["v2"]);
     parse_digest(&segment.sha256, "validated input sha256")?;
     let start = parse_time(&segment.start_recorded_at, "start_recorded_at")?;
     let end = parse_time(&segment.end_recorded_at, "end_recorded_at")?;
@@ -551,7 +600,7 @@ fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
         || events != Some(segment.events)
         || start > end
         || segment.replay_scope != replay_scope
-        || segment.record_id_versions != record_id_versions
+        || !versions_valid
         || segment.recording_policy
             != (RecordingPolicy {
                 quote_sample_ms,
@@ -648,6 +697,17 @@ pub(super) mod tests {
             "reference":segment("crypto_expiry_reference", 0, json!(["v2"]))})
     }
 
+    fn plural_inputs(second_hour: &str) -> Value {
+        let value = inputs();
+        let first = value["reference"].clone();
+        let mut second = first.clone();
+        second["hour"] = json!(second_hour);
+        second["start_recorded_at"] = json!(format!("2026-07-17T{second_hour}:00:00Z"));
+        second["end_recorded_at"] = json!(format!("2026-07-17T{second_hour}:01:00Z"));
+        second["record_id_versions"] = json!([]);
+        json!({"schema":INPUT_SCHEMA_V2,"market":value["market"].clone(),"references":[first,second]})
+    }
+
     #[rustfmt::skip]
     fn write_triplet(temp: &tempfile::TempDir) -> PolymarketEvidenceTriplet {
         let rows = SURFACES.map(|surface| json!({"schema":ROW_SCHEMA,"surface":surface}));
@@ -717,6 +777,18 @@ pub(super) mod tests {
         let sealed = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap();
         assert_eq!((sealed.rows(), sealed.events()), (5, 1));
         assert_eq!(sealed.manifest_sha256(), format!("{:x}", Sha256::digest(fs::read(&triplet.manifest).unwrap())));
+    }
+
+    #[test]
+    fn seals_consecutive_plural_references_and_rejects_a_gap() {
+        for (hour, accepted) in [("06", true), ("07", false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let triplet = write_triplet(&temp);
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+            manifest["validated_inputs"] = plural_inputs(hour);
+            rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&manifest).unwrap()));
+            assert_eq!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok(), accepted);
+        }
     }
 
     #[test]

@@ -262,8 +262,12 @@ fn trade_rows(
     rows: &mut Vec<Row>,
     counts: &mut BTreeMap<String, u64>,
 ) -> Result<()> {
+    let mut record_ids = BTreeSet::new();
     for pending in pending {
         let record_id = validate_canonical_trade(&pending.update, pending.line)?;
+        if !record_ids.insert(record_id.clone()) {
+            bail!("duplicate polymarket_trade record_id across reference segments");
+        }
         let contract = &contracts[required(&pending.update, "market_id")?];
         let metadata = contract
             .metadata
@@ -851,6 +855,26 @@ mod tests {
         assert_eq!(left, right);
         assert_eq!(left_counts, right_counts);
         assert_eq!(left_counts["test"], 2);
+    }
+
+    #[test]
+    fn duplicate_trade_ids_across_reference_segments_are_rejected() {
+        let contract = selected_contract();
+        let contracts = BTreeMap::from([(contract.market_id.clone(), contract)]);
+        let trade = trade_pending(
+            1,
+            "2026-07-17T05:30:03Z",
+            1_784_266_203,
+            "2026-07-17T05:30:04Z",
+            "2026-07-17T05:30:05Z",
+        );
+        assert!(trade_rows(
+            vec![trade.clone(), trade],
+            &contracts,
+            &mut Vec::new(),
+            &mut BTreeMap::new(),
+        )
+        .is_err());
     }
 
     #[test]

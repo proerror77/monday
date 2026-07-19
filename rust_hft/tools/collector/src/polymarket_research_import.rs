@@ -1,11 +1,12 @@
 use crate::lob_archiver::command_status_with_timeout;
 use crate::polymarket_upload::{ensure_canonical_directory, scan_tape};
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rand::random;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -23,7 +24,7 @@ pub struct ArtifactTriplet {
 #[derive(Debug, Clone)]
 pub struct ResearchSegmentValidationConfig {
     pub market: ArtifactTriplet,
-    pub reference: ArtifactTriplet,
+    pub references: Vec<ArtifactTriplet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -52,7 +53,7 @@ pub struct SegmentIdentity {
 pub struct ResearchSegmentValidationReport {
     pub schema: &'static str,
     pub market: SegmentIdentity,
-    pub reference: SegmentIdentity,
+    pub references: Vec<SegmentIdentity>,
 }
 
 struct ValidatedArtifact {
@@ -233,6 +234,7 @@ fn has_only_event_types(manifest: &Value, allowed: &[&str]) -> bool {
 fn validate_triplet(
     triplet: &ArtifactTriplet,
     dataset: &str,
+    scratch_name: &str,
     scratch: &Path,
 ) -> Result<ValidatedArtifact> {
     let sha_dir = triplet
@@ -260,14 +262,14 @@ fn validate_triplet(
     let superseded_marker = sha_dir.join(format!("{data_name}.SUPERSEDED.json"));
     reject_superseded(&superseded_marker)?;
     let files = BoundTriplet {
-        data: BoundFile::open(&triplet.data, &scratch.join(format!("{dataset}.data")))?,
+        data: BoundFile::open(&triplet.data, &scratch.join(format!("{scratch_name}.data")))?,
         manifest: BoundFile::open(
             &triplet.manifest,
-            &scratch.join(format!("{dataset}.manifest")),
+            &scratch.join(format!("{scratch_name}.manifest")),
         )?,
         success: BoundFile::open(
             &triplet.success,
-            &scratch.join(format!("{dataset}.success")),
+            &scratch.join(format!("{scratch_name}.success")),
         )?,
     };
     let digest = partition(sha_dir, "sha256=")?;
@@ -457,6 +459,26 @@ fn decompress_and_rescan(
     }
     Ok(raw)
 }
+
+fn segment_hour(identity: &SegmentIdentity) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&format!("{}T{}:00:00Z", identity.date, identity.hour))
+        .map(|value| value.with_timezone(&Utc))
+        .context("invalid reference date/hour")
+}
+
+fn combine_references(paths: &[PathBuf], scratch: &Path) -> Result<PathBuf> {
+    let combined = scratch.join("references.ndjson");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&combined)?;
+    for path in paths {
+        std::io::copy(&mut File::open(path)?, &mut output)?;
+    }
+    output.sync_all()?;
+    Ok(combined)
+}
 fn validate_market_policy(manifest: &Value) -> Result<()> {
     if manifest
         .get("venue_depth_complete")
@@ -483,21 +505,33 @@ fn validate_market_policy(manifest: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn validate_reference_policy(manifest: &Value) -> Result<()> {
-    if manifest
-        .get("reference_context_complete")
-        .and_then(Value::as_bool)
-        != Some(true)
-        || ["market_metadata", "polymarket_trade", "market_settlement"]
-            .iter()
-            .any(|kind| manifest["event_types"][kind].as_u64().unwrap_or_default() == 0)
-        || manifest["record_id_versions"] != Value::from(vec!["v2"])
-        || manifest["recording_policy"]["quote_depth_levels"].as_u64() != Some(0)
-        || manifest["recording_policy"]["quote_sample_ms"].as_u64() != Some(0)
-        || manifest["recording_policy"]["event_scoped_quotes"].as_bool() != Some(true)
-        || !has_only_event_types(manifest, &REFERENCE_EVENT_TYPES)
+fn validate_reference_policy(references: &[ValidatedArtifact]) -> Result<()> {
+    let mut event_types = BTreeMap::<String, u64>::new();
+    for reference in references {
+        let manifest = &reference.manifest;
+        let versions = &manifest["record_id_versions"];
+        if manifest
+            .get("reference_context_complete")
+            .and_then(Value::as_bool)
+            != Some(true)
+            || (versions != &Value::from(Vec::<String>::new())
+                && versions != &Value::from(vec!["v2"]))
+            || manifest["recording_policy"]["quote_depth_levels"].as_u64() != Some(0)
+            || manifest["recording_policy"]["quote_sample_ms"].as_u64() != Some(0)
+            || manifest["recording_policy"]["event_scoped_quotes"].as_bool() != Some(true)
+            || !has_only_event_types(manifest, &REFERENCE_EVENT_TYPES)
+        {
+            bail!("reference segments must contain only metadata, v2 trades, settlements, and exact recording policy");
+        }
+        for (kind, count) in manifest["event_types"].as_object().expect("validated event types") {
+            *event_types.entry(kind.clone()).or_default() += count.as_u64().unwrap_or_default();
+        }
+    }
+    if REFERENCE_EVENT_TYPES
+        .iter()
+        .any(|kind| event_types.get(*kind).copied().unwrap_or_default() == 0)
     {
-        bail!("reference segment must contain only metadata, v2 trades, settlements, and exact recording policy");
+        bail!("reference segment set requires metadata, v2 trades, and settlements");
     }
     Ok(())
 }
@@ -505,24 +539,54 @@ pub(crate) fn with_validated_research_segments<T>(
     config: &ResearchSegmentValidationConfig,
     consume: impl FnOnce(&ResearchSegmentValidationReport, &Path, &Path) -> Result<T>,
 ) -> Result<T> {
+    if config.references.is_empty() {
+        bail!("at least one reference segment is required");
+    }
     let scratch = ScratchDir::create()?;
-    let market = validate_triplet(&config.market, "crypto_expiry", &scratch.0)?;
-    let reference = validate_triplet(&config.reference, "crypto_expiry_reference", &scratch.0)?;
+    let market = validate_triplet(&config.market, "crypto_expiry", "market", &scratch.0)?;
+    let mut references = Vec::<ValidatedArtifact>::with_capacity(config.references.len());
+    for (index, triplet) in config.references.iter().enumerate() {
+        let reference = validate_triplet(
+            triplet,
+            "crypto_expiry_reference",
+            &format!("reference-{index}"),
+            &scratch.0,
+        )?;
+        if let Some(previous) = references.last() {
+            let previous = segment_hour(&previous.identity)?;
+            if segment_hour(&reference.identity)? != previous + TimeDelta::hours(1) {
+                bail!("reference segments must be consecutive UTC hours");
+            }
+        }
+        references.push(reference);
+    }
     validate_market_policy(&market.manifest)?;
-    validate_reference_policy(&reference.manifest)?;
+    validate_reference_policy(&references)?;
     let market_raw = decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
-    let reference_raw = decompress_and_rescan(
-        &reference,
-        "crypto_expiry_reference",
-        &scratch.0.join("reference"),
-    )?;
+    let reference_raws = references
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            decompress_and_rescan(
+                reference,
+                "crypto_expiry_reference",
+                &scratch.0.join(format!("reference-{index}")),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let reference_raw = combine_references(&reference_raws, &scratch.0)?;
     let report = ResearchSegmentValidationReport {
-        schema: "monday.polymarket.research_segment_validation.v1",
+        schema: "monday.polymarket.research_segment_validation.v2",
         market: market.identity.clone(),
-        reference: reference.identity.clone(),
+        references: references
+            .iter()
+            .map(|reference| reference.identity.clone())
+            .collect(),
     };
     let result = consume(&report, &market_raw, &reference_raw)?;
-    for artifact in [&market, &reference] {
+    market.files.verify()?;
+    reject_superseded(&market.superseded_marker)?;
+    for artifact in &references {
         artifact.files.verify()?;
         reject_superseded(&artifact.superseded_marker)?;
     }
@@ -652,7 +716,11 @@ mod tests {
         let directory = root
             .join("lake/raw/venue=polymarket")
             .join(format!("dataset={dataset}"))
-            .join("date=2026-07-17/hour=05")
+            .join(format!(
+                "date={}/hour={}",
+                manifest["date"].as_str().unwrap(),
+                manifest["hour"].as_str().unwrap()
+            ))
             .join(format!("sha256={digest}"));
         fs::create_dir_all(&directory).unwrap();
         let data = directory.join(compressed.file_name().unwrap());
@@ -690,7 +758,13 @@ mod tests {
         let root = fs::canonicalize(temp.path()).unwrap();
         let market = triplet(&root, "crypto_expiry", market_rows);
         let reference = triplet(&root, "crypto_expiry_reference", reference_rows);
-        (temp, ResearchSegmentValidationConfig { market, reference })
+        (
+            temp,
+            ResearchSegmentValidationConfig {
+                market,
+                references: vec![reference],
+            },
+        )
     }
 
     fn fixture(settlement: bool) -> (tempfile::TempDir, ResearchSegmentValidationConfig) {
@@ -724,8 +798,36 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.market.recording_policy["quote_depth_levels"], 0);
         assert_eq!(first.market.recording_policy["quote_sample_ms"], 1_000);
-        assert_eq!(first.reference.record_id_versions, json!(["v2"]));
-        assert_eq!(first.reference.recording_policy["quote_sample_ms"], 0);
+        assert_eq!(first.references[0].record_id_versions, json!(["v2"]));
+        assert_eq!(first.references[0].recording_policy["quote_sample_ms"], 0);
+    }
+
+    #[test]
+    fn validates_consecutive_reference_hours_as_one_input_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", &market_rows());
+        let first = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &reference_rows(false),
+        );
+        let mut second = vec![row(0, metadata("market_metadata")), row(1, metadata("market_settlement"))];
+        for record in &mut second {
+            record["recorded_at"] = json!("2026-07-17T06:01:00Z");
+        }
+        let second = triplet(&root, "crypto_expiry_reference", &second);
+        let mut config = ResearchSegmentValidationConfig {
+            market,
+            references: vec![first, second],
+        };
+
+        let report = validate_research_segments(&config).unwrap();
+        assert_eq!(report.references.len(), 2);
+        assert_eq!(report.references[1].hour, "06");
+
+        config.references.reverse();
+        rejects(&config, "consecutive UTC hours");
     }
 
     #[test]
@@ -741,10 +843,10 @@ mod tests {
         rejects(&config, "settlements");
         let (_temp, config) = fixture(true);
         let mut manifest: Value =
-            serde_json::from_slice(&fs::read(&config.reference.manifest).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(&config.references[0].manifest).unwrap()).unwrap();
         manifest["recording_policy"]["quote_sample_ms"] = json!(1_000);
         fs::write(
-            &config.reference.manifest,
+            &config.references[0].manifest,
             format!("{}\n", serde_json::to_string(&manifest).unwrap()),
         )
         .unwrap();
