@@ -402,7 +402,7 @@ fn decompress_and_rescan(
     artifact: &ValidatedArtifact,
     dataset: &str,
     directory: &Path,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Value)> {
     fs::create_dir(directory)?;
     let source_file = artifact
         .manifest
@@ -451,11 +451,14 @@ fn decompress_and_rescan(
         .ok_or_else(|| anyhow!("recording_policy.quote_sample_ms is missing"))?;
     let rescanned = scan_tape(&raw, dataset, usize::try_from(depth)?, sample_ms)?;
     for (field, value) in rescanned.as_object().expect("scan manifest is an object") {
-        if artifact.manifest.get(field) != Some(value) {
+        let authenticated_legacy_context = field == "reference_context_complete"
+            && artifact.manifest.get(field).is_none()
+            && value.as_bool() == Some(true);
+        if !authenticated_legacy_context && artifact.manifest.get(field) != Some(value) {
             bail!("manifest field {field} does not match producer rescan");
         }
     }
-    Ok(raw)
+    Ok((raw, rescanned))
 }
 fn validate_market_policy(manifest: &Value) -> Result<()> {
     if manifest
@@ -509,13 +512,14 @@ pub(crate) fn with_validated_research_segments<T>(
     let market = validate_triplet(&config.market, "crypto_expiry", &scratch.0)?;
     let reference = validate_triplet(&config.reference, "crypto_expiry_reference", &scratch.0)?;
     validate_market_policy(&market.manifest)?;
-    validate_reference_policy(&reference.manifest)?;
-    let market_raw = decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
-    let reference_raw = decompress_and_rescan(
+    let (market_raw, _) =
+        decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
+    let (reference_raw, rescanned_reference) = decompress_and_rescan(
         &reference,
         "crypto_expiry_reference",
         &scratch.0.join("reference"),
     )?;
+    validate_reference_policy(&rescanned_reference)?;
     let report = ResearchSegmentValidationReport {
         schema: "monday.polymarket.research_segment_validation.v1",
         market: market.identity.clone(),
@@ -726,6 +730,50 @@ mod tests {
         assert_eq!(first.market.recording_policy["quote_sample_ms"], 1_000);
         assert_eq!(first.reference.record_id_versions, json!(["v2"]));
         assert_eq!(first.reference.recording_policy["quote_sample_ms"], 0);
+    }
+
+    #[test]
+    fn accepts_legacy_manifests_when_rescan_proves_reference_context_complete() {
+        let (_temp, config) = fixture(true);
+        for triplet in [&config.market, &config.reference] {
+            let mut manifest: Value =
+                serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("reference_context_complete");
+            fs::write(
+                &triplet.manifest,
+                format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+            )
+            .unwrap();
+        }
+
+        let report = validate_research_segments(&config)
+            .expect("a producer rescan must authenticate complete legacy reference context");
+
+        assert_eq!(report.reference.dataset, "crypto_expiry_reference");
+    }
+
+    #[test]
+    fn rejects_legacy_reference_manifest_when_rescan_finds_missing_metadata_context() {
+        let reference = vec![row(0, trade()), row(1, metadata("market_settlement"))];
+        let (_temp, config) = fixture_rows(&market_rows(), &reference);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&config.reference.manifest).unwrap()).unwrap();
+        manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("reference_context_complete");
+        manifest["canonical"] = json!(true);
+        manifest["segment_complete"] = json!(true);
+        fs::write(
+            &config.reference.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+
+        rejects(&config, "producer rescan");
     }
 
     #[test]
