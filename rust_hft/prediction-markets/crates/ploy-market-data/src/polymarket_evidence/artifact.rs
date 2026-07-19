@@ -590,6 +590,8 @@ fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
     if segment.schema != "monday.polymarket.raw.v1"
         || segment.venue != "polymarket"
         || segment.dataset != dataset
+        || start.format("%Y-%m-%d").to_string() != segment.date
+        || start.format("%H").to_string() != segment.hour
         || end.format("%Y-%m-%d").to_string() != segment.date
         || end.format("%H").to_string() != segment.hour
         || source_file != segment.source_file
@@ -789,6 +791,23 @@ pub(super) mod tests {
             rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&manifest).unwrap()));
             assert_eq!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok(), accepted);
         }
+    }
+
+    #[test]
+    fn rejects_plural_reference_whose_start_is_outside_its_hour() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        manifest["validated_inputs"] = plural_inputs("06");
+        manifest["validated_inputs"]["references"][1]["start_recorded_at"] =
+            json!("2026-07-17T05:59:59Z");
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+
+        assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_err());
     }
 
     #[test]
