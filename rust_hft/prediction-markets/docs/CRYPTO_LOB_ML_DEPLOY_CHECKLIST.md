@@ -19,7 +19,8 @@ The supported model lane is the native Burn binary-probability trainer in
   boundary. Training episodes must settle strictly before it and validation
   episodes must start at or after it, so overlapping event lifetimes and their
   shared Chainlink path cannot cross partitions. The boundary is part of the
-  dataset contract, dataset hash, and typed model manifest.
+  immutable mission identity, dataset contract, dataset hash, and typed model
+  manifest.
 - Split inputs carry only event ID and decision timestamp selectors. Rust
   projects feature values from a closed, label-free registry against that exact
   content-addressed snapshot row; callers cannot supply feature values, clocks,

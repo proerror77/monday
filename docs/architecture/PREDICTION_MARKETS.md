@@ -78,10 +78,11 @@ settlement label or be promoted by settlement calibration alone.
 Chainlink reference ticks have one physical source of truth and are projected
 point-in-time into each event window. To keep overlapping 5m/15m/1h events from
 sharing that path across train and validation, every horizon-specific task for
-an underlying must use the same typed wall-clock boundary. A training event
-must end strictly before the boundary; a validation event must start at or
-after it. The boundary is sealed into the binary dataset contract and model
-manifest, while the independent label-availability cutoff remains mandatory.
+an underlying must use the same mission-pinned wall-clock boundary. A training
+event must end strictly before the boundary; a validation event must start at
+or after it. The boundary is sealed into the immutable mission identity, binary
+dataset contract, and model manifest, while the independent label-availability
+cutoff remains mandatory.
 
 The current governed baseline remains BTC/SOL five-minute settlement research
 over the retained one-second full-visible-depth L2 snapshots. Fifteen-minute
@@ -104,7 +105,7 @@ source; the aggregate is the bounded research view.
 
 LLM proposal paths remain lane-specific as well. `alpha-harness` has a bounded,
 lab-only Formula proposer for derivatives missions. The prediction-market module uses the versioned
-`prediction_research_mission.v1` JSON brief and its existing `LlmPriorSpec`; it
+`prediction_research_mission.v2` JSON brief and its existing `LlmPriorSpec`; it
 does not import the alpha-harness Rust domain or loop runtime. Instead, the module has
 its own bounded Rust prediction-research LoopRun in `crates/ploy-research`, with
 `monday-prediction-research` as its precompiled process entrypoint, because an

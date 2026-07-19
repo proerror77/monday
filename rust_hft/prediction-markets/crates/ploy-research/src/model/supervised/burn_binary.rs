@@ -147,7 +147,6 @@ impl BinaryDatasetContract {
     pub fn from_prediction_snapshot(
         verified_snapshot: &VerifiedBinarySnapshot,
         mission: &PredictionResearchMission,
-        time_boundary: BinaryTimeBoundary,
         feature_names: Vec<String>,
     ) -> Result<Self> {
         let snapshot = verified_snapshot.snapshot();
@@ -198,7 +197,9 @@ impl BinaryDatasetContract {
             target_horizon_seconds: PREDICTION_EVENT_WINDOW_SECS as u32,
             max_feature_age_ms,
             settlement_authority: BinarySettlementAuthority::OfficialResolution,
-            time_boundary,
+            time_boundary: BinaryTimeBoundary {
+                boundary_ms: mission.time_cohort_boundary_ms,
+            },
             feature_names,
             feature_schema_sha256,
         };
@@ -269,6 +270,10 @@ impl BinaryDatasetContract {
             self.symbols == mission.symbols && mission.horizon == "5m",
             "binary dataset symbol or horizon differs from prediction mission"
         );
+        ensure!(
+            self.time_boundary.boundary_ms == mission.time_cohort_boundary_ms,
+            "binary dataset time boundary differs from prediction mission"
+        );
         Ok(())
     }
 }
@@ -307,6 +312,7 @@ struct MaterializedBinarySample {
     event_start_at_ms: i64,
     decision_at_ms: i64,
     settlement_at_ms: i64,
+    settlement_exclusive_upper_bound_ms: i64,
     label_observed_at_us: i64,
     features: Vec<f32>,
     outcome: bool,
@@ -806,7 +812,6 @@ pub fn train_event_disjoint_binary(
     let expected_contract = BinaryDatasetContract::from_prediction_snapshot(
         verified_snapshot,
         mission,
-        split.contract.time_boundary.clone(),
         split.contract.feature_names.clone(),
     )?;
     ensure!(
@@ -1008,12 +1013,13 @@ fn validate_split(split: &MaterializedBinarySplit<'_>, input_dim: usize) -> Resu
     if let Some(sample) = split
         .train
         .iter()
-        .find(|sample| sample.settlement_at_ms >= boundary_ms)
+        .find(|sample| sample.settlement_exclusive_upper_bound_ms > boundary_ms)
     {
         bail!(
-            "training event crosses shared time boundary: event {:?} ends at {} but must end before {}",
+            "training event crosses shared time boundary: event {:?} end is in [{}, {}) but must be before {}",
             sample.event_id,
             sample.settlement_at_ms,
+            sample.settlement_exclusive_upper_bound_ms,
             boundary_ms
         );
     }
@@ -1066,7 +1072,7 @@ fn validate_partition<'a>(
     input_dim: usize,
 ) -> Result<HashSet<&'a str>> {
     let mut events = HashSet::new();
-    let mut event_contracts: HashMap<&str, (i64, i64, i64, bool)> = HashMap::new();
+    let mut event_contracts: HashMap<&str, (i64, i64, i64, i64, bool)> = HashMap::new();
     for (row, sample) in samples.iter().enumerate() {
         ensure!(
             !sample.event_id.trim().is_empty(),
@@ -1102,12 +1108,19 @@ fn validate_partition<'a>(
             "settlement label violation in {partition} row {row}: official outcome was observed before settlement"
         );
         let event_id = sample.event_id.as_str();
-        if let Some((event_start_at_ms, settlement_at_ms, label_observed_at_us, outcome)) =
-            event_contracts.get(event_id)
+        if let Some((
+            event_start_at_ms,
+            settlement_at_ms,
+            settlement_exclusive_upper_bound_ms,
+            label_observed_at_us,
+            outcome,
+        )) = event_contracts.get(event_id)
         {
             ensure!(
                 *event_start_at_ms == sample.event_start_at_ms
                     && *settlement_at_ms == sample.settlement_at_ms
+                    && *settlement_exclusive_upper_bound_ms
+                        == sample.settlement_exclusive_upper_bound_ms
                     && *label_observed_at_us == sample.label_observed_at_us
                     && *outcome == sample.outcome,
                 "inconsistent settlement contract for event {event_id:?} in {partition}"
@@ -1118,6 +1131,7 @@ fn validate_partition<'a>(
                 (
                     sample.event_start_at_ms,
                     sample.settlement_at_ms,
+                    sample.settlement_exclusive_upper_bound_ms,
                     sample.label_observed_at_us,
                     sample.outcome,
                 ),
@@ -1196,6 +1210,13 @@ fn materialize_split<'a>(
                                 .context("snapshot settlement offset overflow")?,
                         )
                         .context("snapshot settlement timestamp overflow")?;
+                    // `time_remaining_secs` is produced by chrono::Duration::num_seconds,
+                    // which truncates a positive sub-second remainder. Treat the next
+                    // millisecond second boundary as an exclusive upper bound so a
+                    // training event can never be admitted by rounding its end down.
+                    let settlement_exclusive_upper_bound_ms = settlement_at_ms
+                        .checked_add(1_000)
+                        .context("snapshot settlement upper bound overflow")?;
                     let event_start_at_ms = settlement_at_ms
                         .checked_sub(target_horizon_ms)
                         .context("snapshot event start timestamp overflow")?;
@@ -1222,6 +1243,7 @@ fn materialize_split<'a>(
                         event_start_at_ms,
                         decision_at_ms: selector.decision_at_ms,
                         settlement_at_ms,
+                        settlement_exclusive_upper_bound_ms,
                         label_observed_at_us,
                         features,
                         outcome,
@@ -1527,6 +1549,7 @@ mod tests {
             target: PREDICTION_LOOP_TARGET.to_owned(),
             symbols: vec!["BTC".to_owned()],
             horizon: "5m".to_owned(),
+            time_cohort_boundary_ms: 1_700_001_000_000,
             prompt_snapshot_id: String::new(),
             search_policy_snapshot_id: format!("sha256:{}", "2".repeat(64)),
             search_budget: PredictionSearchBudget {
@@ -1748,15 +1771,12 @@ mod tests {
             .map(|index| sample("validation", index, index % 2 == 0))
             .collect::<Vec<_>>();
         let all_samples = train.iter().chain(&validation).cloned().collect::<Vec<_>>();
-        let mission = mission();
+        let mut mission = mission();
+        mission.time_cohort_boundary_ms = time_boundary(&train, &validation).boundary_ms;
         let snapshot = snapshot(&all_samples);
-        let contract = BinaryDatasetContract::from_prediction_snapshot(
-            &snapshot,
-            &mission,
-            time_boundary(&train, &validation),
-            feature_names(),
-        )
-        .expect("valid governed test contract");
+        let contract =
+            BinaryDatasetContract::from_prediction_snapshot(&snapshot, &mission, feature_names())
+                .expect("valid governed test contract");
         TestContext {
             mission,
             snapshot,
@@ -1812,8 +1832,14 @@ mod tests {
             .iter()
             .find(|row| row.event_id == last_train.event_id)
             .unwrap();
-        context.split.contract.time_boundary.boundary_ms =
+        context.mission.time_cohort_boundary_ms =
             row.tick_ts.timestamp_millis() + row.time_remaining_secs * 1_000;
+        context.split.contract = BinaryDatasetContract::from_prediction_snapshot(
+            &context.snapshot,
+            &context.mission,
+            feature_names(),
+        )
+        .unwrap();
 
         let error = train_event_disjoint_binary(
             &context.snapshot,
@@ -1828,10 +1854,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_training_event_that_may_cross_boundary_after_second_truncation() {
+        let mut context = context();
+        let last_train = context.split.train.last().unwrap();
+        let row = context
+            .snapshot
+            .snapshot
+            .observations
+            .iter()
+            .find(|row| row.event_id == last_train.event_id)
+            .unwrap();
+        let truncated_event_end = row.tick_ts.timestamp_millis() + row.time_remaining_secs * 1_000;
+        context.mission.time_cohort_boundary_ms = truncated_event_end + 500;
+        context.split.contract = BinaryDatasetContract::from_prediction_snapshot(
+            &context.snapshot,
+            &context.mission,
+            feature_names(),
+        )
+        .unwrap();
+
+        let error = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            test_config(),
+        )
+        .expect_err("sub-second uncertainty must not round a training event before the boundary");
+        assert!(error
+            .to_string()
+            .contains("training event crosses shared time boundary"));
+    }
+
+    #[test]
     fn rejects_validation_event_that_starts_before_shared_time_boundary() {
         let mut context = context();
         let first_validation = context.split.validation.first().unwrap();
-        context.split.contract.time_boundary.boundary_ms = first_validation.decision_at_ms;
+        context.mission.time_cohort_boundary_ms = first_validation.decision_at_ms;
+        context.split.contract = BinaryDatasetContract::from_prediction_snapshot(
+            &context.snapshot,
+            &context.mission,
+            feature_names(),
+        )
+        .unwrap();
 
         let error = train_event_disjoint_binary(
             &context.snapshot,
@@ -1858,6 +1922,23 @@ mod tests {
         )
         .expect_err("mixed-horizon rows must not enter a product-family model");
         assert!(format!("{error:#}").contains("horizon"));
+    }
+
+    #[test]
+    fn rejects_dataset_time_boundary_that_differs_from_the_mission() {
+        let mut context = context();
+        context.split.contract.time_boundary.boundary_ms += 1;
+
+        let error = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            test_config(),
+        )
+        .expect_err("caller-selected boundary must not drift from the mission");
+        assert!(error
+            .to_string()
+            .contains("time boundary differs from prediction mission"));
     }
 
     #[test]
@@ -1903,7 +1984,6 @@ mod tests {
             let error = BinaryDatasetContract::from_prediction_snapshot(
                 &context.snapshot,
                 &context.mission,
-                context.split.contract.time_boundary.clone(),
                 vec![forbidden.to_owned()],
             )
             .expect_err("labels and unknown fields must not enter the feature registry");
@@ -1986,11 +2066,11 @@ mod tests {
         let snapshot = VerifiedBinarySnapshot::load(temp.path(), &trusted_contract).unwrap();
         let mut mission = mission();
         mission.data_snapshot_id = trusted_contract;
+        mission.time_cohort_boundary_ms = time_boundary(&train, &validation).boundary_ms;
         let split = EventDisjointBinarySplit {
             contract: BinaryDatasetContract::from_prediction_snapshot(
                 &snapshot,
                 &mission,
-                time_boundary(&train, &validation),
                 feature_names(),
             )
             .unwrap(),
@@ -2205,22 +2285,39 @@ mod tests {
     }
 
     #[test]
-    fn manifest_without_shared_time_boundary_fails_closed() {
+    fn load_rejects_registry_rehashed_v2_manifest_without_shared_time_boundary() {
         let context = context();
-        let model = train_event_disjoint_binary(
+        let mut model = train_event_disjoint_binary(
             &context.snapshot,
             &context.mission,
             &context.split,
             test_config(),
         )
         .unwrap();
-        let mut manifest = serde_json::to_value(model.manifest()).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("binary-research-model");
+        let digest = model.save_bundle(&bundle).unwrap();
+        let manifest_path = bundle.join(MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["schema_version"] = serde_json::json!(2);
         manifest["dataset_contract"]
             .as_object_mut()
             .unwrap()
             .remove("time_boundary");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let rehashed = BinaryBundleDigest {
+            manifest_sha256: sha256_file(&manifest_path).unwrap(),
+            model_sha256: digest.model_sha256,
+        };
 
-        assert!(serde_json::from_value::<BinaryModelManifest>(manifest).is_err());
+        let error = BinaryProbabilityModel::load_bundle(&bundle, &rehashed, &context.mission)
+            .expect_err("trusted digest must not make a v2 manifest acceptable");
+        assert!(error.to_string().contains("parse binary model manifest"));
     }
 
     #[test]
