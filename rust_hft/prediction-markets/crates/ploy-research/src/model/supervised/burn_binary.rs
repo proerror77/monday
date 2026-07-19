@@ -1571,6 +1571,7 @@ mod tests {
             event_id: sample.event_id.clone(),
             symbol: "BTCUSDT".to_owned(),
             tick_ts,
+            event_end_ts: None,
             up_token_id: format!("{}-up", sample.event_id),
             down_token_id: format!("{}-down", sample.event_id),
             chainlink_reference_fresh: true,

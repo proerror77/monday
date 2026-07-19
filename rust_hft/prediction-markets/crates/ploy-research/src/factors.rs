@@ -103,6 +103,8 @@ pub struct FactorObservation {
     pub symbol: String,
     pub tick_ts: DateTime<Utc>,
     #[serde(default)]
+    pub event_end_ts: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub up_token_id: String,
     #[serde(default)]
     pub down_token_id: String,
@@ -1853,6 +1855,7 @@ fn build_factor_observations_with_lob_sampled_and_source_clocks_impl(
                         event_id: event.event_id.clone(),
                         symbol: sym.clone(),
                         tick_ts: *ts,
+                        event_end_ts: Some(end_time),
                         up_token_id: event.up_token.clone(),
                         down_token_id: event.down_token.clone(),
                         chainlink_reference_fresh: chainlink_prob_up.is_finite()
@@ -2274,6 +2277,7 @@ pub fn observations_to_frame(rows: &[FactorObservation]) -> PolarsResult<DataFra
         "event_id" => rows.iter().map(|row| row.event_id.as_str()).collect::<Vec<_>>(),
         "symbol" => rows.iter().map(|row| row.symbol.as_str()).collect::<Vec<_>>(),
         "tick_ts" => rows.iter().map(|row| row.tick_ts.timestamp_millis()).collect::<Vec<_>>(),
+        "event_end_ts_us" => rows.iter().map(|row| row.event_end_ts.map(|value| value.timestamp_micros())).collect::<Vec<_>>(),
         "event_window_secs" => rows.iter().map(|row| row.event_window_secs).collect::<Vec<_>>(),
         "time_remaining_secs" => rows.iter().map(|row| row.time_remaining_secs).collect::<Vec<_>>(),
         "signed_distance_to_beat" => rows.iter().map(|row| row.signed_distance_to_beat).collect::<Vec<_>>(),
@@ -2882,6 +2886,7 @@ mod tests {
             tick_ts: chrono::DateTime::from_timestamp(tick_ts_secs, 0)
                 .unwrap()
                 .with_timezone(&Utc),
+            event_end_ts: None,
             up_token_id: String::new(),
             down_token_id: String::new(),
             chainlink_reference_fresh: false,
@@ -2948,17 +2953,21 @@ mod tests {
 
     #[cfg(feature = "polars-export")]
     #[test]
-    fn parquet_frame_preserves_official_resolution_clock_at_microsecond_precision() {
+    fn parquet_frame_preserves_event_and_resolution_clocks_at_microsecond_precision() {
         let mut observation = test_factor_observation("evt", "BTCUSDT", 100, 1.0, None);
+        let event_end = Utc.timestamp_micros(100_000_123).single().unwrap();
         let observed_at = Utc.timestamp_micros(100_123_456).single().unwrap();
+        observation.event_end_ts = Some(event_end);
         observation.official_resolution_observed_at = Some(observed_at);
 
         let frame = super::observations_to_frame(&[observation]).unwrap();
+        let event_ends = frame.column("event_end_ts_us").unwrap().i64().unwrap();
         let clocks = frame
             .column("official_resolution_observed_at_us")
             .unwrap()
             .i64()
             .unwrap();
+        assert_eq!(event_ends.get(0), Some(event_end.timestamp_micros()));
         assert_eq!(clocks.get(0), Some(observed_at.timestamp_micros()));
     }
 
@@ -3035,17 +3044,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_snapshot_observation_defaults_missing_event_window_to_zero() {
+    fn legacy_snapshot_observation_defaults_missing_event_metadata() {
         let observation = test_factor_observation("evt", "BTCUSDT", 100, 1.0, None);
         let mut json = serde_json::to_value(observation).expect("serialize observation");
-        json.as_object_mut()
-            .expect("observation object")
-            .remove("event_window_secs");
+        let object = json.as_object_mut().expect("observation object");
+        object.remove("event_window_secs");
+        object.remove("event_end_ts");
 
         let decoded: FactorObservation =
             serde_json::from_value(json).expect("deserialize legacy observation");
 
         assert_eq!(decoded.event_window_secs, 0);
+        assert_eq!(decoded.event_end_ts, None);
     }
 
     #[test]
@@ -3140,6 +3150,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tick_ts, Utc.timestamp_opt(710, 0).unwrap());
+        assert_eq!(rows[0].event_end_ts, Some(end));
         assert_eq!(rows[0].event_window_secs, 300);
         assert!(rows[0].tick_ts >= start);
         assert!(rows[0].chainlink_prob_up.is_finite());
@@ -3750,6 +3761,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts2,
+                    event_end_ts: None,
                     up_token_id: String::new(),
                     down_token_id: String::new(),
                     chainlink_reference_fresh: false,
@@ -3816,6 +3828,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts0,
+                    event_end_ts: None,
                     up_token_id: String::new(),
                     down_token_id: String::new(),
                     chainlink_reference_fresh: false,
@@ -3882,6 +3895,7 @@ mod tests {
                     event_id: "evt".into(),
                     symbol: "BTCUSDT".into(),
                     tick_ts: ts1,
+                    event_end_ts: None,
                     up_token_id: String::new(),
                     down_token_id: String::new(),
                     chainlink_reference_fresh: false,

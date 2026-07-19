@@ -104,6 +104,7 @@ mod tests {
             event_id: "e1".into(),
             symbol: "BTC".into(),
             tick_ts: Utc::now(),
+            event_end_ts: None,
             up_token_id: String::new(),
             down_token_id: String::new(),
             chainlink_reference_fresh: false,
