@@ -22,6 +22,7 @@ const MAX_DATA_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ROWS: usize = 5_000_000;
+const MAX_REFERENCE_SEGMENTS: usize = 26;
 const SYMBOLS: [&str; 2] = ["BTCUSDT", "SOLUSDT"];
 #[rustfmt::skip]
 const SURFACES: [&str; 5] = ["chainlink_reference", "market_contract", "orderbook_snapshot", "polymarket_trade", "official_settlement_evidence"];
@@ -193,6 +194,8 @@ struct SegmentIdentity {
     replay_scope: String,
     recording_policy: RecordingPolicy,
     record_id_versions: Vec<String>,
+    #[serde(default)]
+    event_types: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -541,19 +544,37 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
             validate_segment(&inputs.reference, "crypto_expiry_reference")
         }
         ValidatedInputs::V2(inputs) => {
-            if inputs.schema != INPUT_SCHEMA_V2 || inputs.references.is_empty() {
+            if inputs.schema != INPUT_SCHEMA_V2
+                || inputs.references.is_empty()
+                || inputs.references.len() > MAX_REFERENCE_SEGMENTS
+            {
                 bail!("unsupported validated input contract");
             }
             validate_segment(&inputs.market, "crypto_expiry")?;
+            validate_v2_event_types(
+                &inputs.market,
+                &["event_discovered", "event_expired", "quote", "reference_price"],
+            )?;
             for reference in &inputs.references {
                 validate_segment(reference, "crypto_expiry_reference")?;
-            }
-            if !inputs
-                .references
-                .iter()
-                .any(|reference| reference.record_id_versions == ["v2"])
-            {
-                bail!("validated reference inputs must contain v2 trades");
+                validate_v2_event_types(
+                    reference,
+                    &[
+                        "market_metadata",
+                        "polymarket_trade",
+                        "market_settlement",
+                        "polymarket_trade_collection_complete",
+                    ],
+                )?;
+                let has_trades = reference
+                    .event_types
+                    .get("polymarket_trade")
+                    .copied()
+                    .unwrap_or_default()
+                    > 0;
+                if has_trades != (reference.record_id_versions == ["v2"]) {
+                    bail!("validated reference trade identity is inconsistent");
+                }
             }
             for pair in inputs.references.windows(2) {
                 let hour = |segment: &SegmentIdentity| {
@@ -569,6 +590,19 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn validate_v2_event_types(segment: &SegmentIdentity, allowed: &[&str]) -> Result<()> {
+    let total = segment.event_types.iter().try_fold(0_u64, |total, (kind, count)| {
+        if !allowed.contains(&kind.as_str()) {
+            bail!("validated input contains an unsupported event type");
+        }
+        total.checked_add(*count).context("validated input event count overflow")
+    })?;
+    if segment.event_types.is_empty() || total != segment.events {
+        bail!("validated input event types do not match its event count");
+    }
+    Ok(())
 }
 
 fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
@@ -686,12 +720,14 @@ pub(super) mod tests {
     fn inputs() -> Value {
         let segment = |dataset: &str, sample: u64, versions: Value| {
             let replay = if sample == 0 { "complete_reference_hour_segment" } else { "complete_full_depth_sampled_normalized_hour_segment" };
+            let event_types = if sample == 0 { json!({"polymarket_trade":2}) } else { json!({"quote":2}) };
             json!({
                 "schema":"monday.polymarket.raw.v1", "venue":"polymarket", "dataset":dataset,
                 "date":"2026-07-17", "hour":"05", "file":format!("{dataset}.ndjson.zst"), "bytes":100,
                 "sha256":"1".repeat(64), "events":2, "start_sequence":1, "end_sequence":2, "sequence_gaps":0,
                 "start_recorded_at":"2026-07-17T05:00:00Z", "end_recorded_at":"2026-07-17T05:01:00Z",
                 "source_file":format!("{dataset}.ndjson"), "replay_scope":replay, "record_id_versions":versions,
+                "event_types":event_types,
                 "recording_policy":{"quote_sample_ms":sample,"quote_depth_levels":0,"event_scoped_quotes":true},
             })
         };
@@ -707,6 +743,7 @@ pub(super) mod tests {
         second["start_recorded_at"] = json!(format!("2026-07-17T{second_hour}:00:00Z"));
         second["end_recorded_at"] = json!(format!("2026-07-17T{second_hour}:01:00Z"));
         second["record_id_versions"] = json!([]);
+        second["event_types"] = json!({"market_settlement":2});
         json!({"schema":INPUT_SCHEMA_V2,"market":value["market"].clone(),"references":[first,second]})
     }
 
@@ -808,6 +845,31 @@ pub(super) mod tests {
         );
 
         assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_err());
+    }
+
+    #[test]
+    fn rejects_plural_reference_count_and_trade_version_mismatches() {
+        let rejects = |inputs: Value| {
+            let temp = tempfile::tempdir().unwrap();
+            let triplet = write_triplet(&temp);
+            let mut manifest: Value =
+                serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+            manifest["validated_inputs"] = inputs;
+            rewrite_read_only(
+                &triplet.manifest,
+                format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+            );
+            assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_err());
+        };
+
+        let mut too_many = plural_inputs("06");
+        let reference = too_many["references"][0].clone();
+        too_many["references"] = json!(vec![reference; MAX_REFERENCE_SEGMENTS + 1]);
+        rejects(too_many);
+
+        let mut mismatched = plural_inputs("06");
+        mismatched["references"][1]["event_types"] = json!({"polymarket_trade":2});
+        rejects(mismatched);
     }
 
     #[test]
