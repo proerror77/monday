@@ -26,6 +26,7 @@ use ploy_research::{
     walk_forward_factors_v2_with_deribit_and_pm_books,
     walk_forward_meta_label_v1_with_deribit_and_pm_books,
     walk_forward_settlement_probability_report_with_prior,
+    walk_forward_settlement_verdict_report_with_prior,
     write_alpha_search_artifacts_with_state_and_runtime_feedback, AlphaSearchRuntimeFeedback,
     AlphaZooSnapshot, AutoFactorOptions, AutoFactorV2Target, FactorComboV1Options,
     FactorObservation, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
@@ -928,22 +929,30 @@ async fn main() {
         "{}",
         format_settlement_probability_report(&settlement_probability_report)
     );
+    let settlement_walk_forward_options = SettlementProbabilityWalkForwardOptions {
+        walk_forward: options.clone(),
+        probability: SettlementProbabilityReportOptions {
+            min_bucket_observations: options.review.min_observations.max(20),
+            ..Default::default()
+        },
+        time_cohort: settlement_time_cohort,
+        ..Default::default()
+    };
     let settlement_probability_walk_forward_report =
         walk_forward_settlement_probability_report_with_prior(
             &autofactor_rows,
             start,
             end,
             llm_prior.as_ref(),
-            SettlementProbabilityWalkForwardOptions {
-                walk_forward: options.clone(),
-                probability: SettlementProbabilityReportOptions {
-                    min_bucket_observations: options.review.min_observations.max(20),
-                    ..Default::default()
-                },
-                time_cohort: settlement_time_cohort,
-                ..Default::default()
-            },
+            settlement_walk_forward_options.clone(),
         );
+    let settlement_verdict_walk_forward_report = walk_forward_settlement_verdict_report_with_prior(
+        &autofactor_rows,
+        start,
+        end,
+        llm_prior.as_ref(),
+        settlement_walk_forward_options,
+    );
     println!(
         "{}",
         format_settlement_probability_walk_forward_report(
@@ -1001,7 +1010,7 @@ async fn main() {
     {
         if let Some(feedback) = build_prediction_research_feedback(
             prior,
-            &settlement_probability_walk_forward_report,
+            &settlement_verdict_walk_forward_report,
             promotion_gate_report.options.min_positive_window_ratio,
         ) {
             let output_dir = std::path::Path::new(output_root)
