@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 const MANIFEST_SCHEMA: &str = "monday.polymarket.evidence_artifact.v1";
 const INPUT_SCHEMA: &str = "monday.polymarket.research_segment_validation.v1";
+const INPUT_SCHEMA_V2: &str = "monday.polymarket.research_segment_validation.v2";
 const ROW_SCHEMA: &str = "monday.polymarket.evidence_row.v1";
 const PUBLISHED_MODE: u32 = 0o444;
 const MAX_DATA_BYTES: u64 = 512 * 1024 * 1024;
@@ -151,11 +152,26 @@ struct OrderBookSemantics {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ValidatedInputs {
+    V1(Box<ValidatedInputsV1>),
+    V2(Box<ValidatedInputsV2>),
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ValidatedInputs {
+struct ValidatedInputsV1 {
     schema: String,
     market: SegmentIdentity,
     reference: SegmentIdentity,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidatedInputsV2 {
+    schema: String,
+    market: SegmentIdentity,
+    references: Vec<SegmentIdentity>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,7 +199,7 @@ struct SegmentIdentity {
     trade_completions: BTreeMap<String, TradeCompletionIdentity>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TradeCompletionIdentity {
     condition_id: String,
@@ -268,6 +284,7 @@ fn seal_with_hook(
 
     let parsed = parse_manifest(&manifest_bytes)?;
     validate_manifest(&parsed, triplet, &success_bytes)?;
+    let trade_completions = validated_reference_trade_completions(&parsed.validated_inputs)?;
     if u64::try_from(data_bytes.len())? != parsed.content_bytes
         || format!("{:x}", Sha256::digest(&data_bytes)) != parsed.content_sha256
     {
@@ -279,7 +296,7 @@ fn seal_with_hook(
     let frames = frame_ndjson(
         &data_bytes,
         &parsed.surface_counts,
-        &parsed.validated_inputs.reference.trade_completions,
+        &trade_completions,
     )?;
     if u64::try_from(frames.len())? != parsed.rows {
         bail!("evidence NDJSON row count does not match the manifest");
@@ -536,23 +553,62 @@ fn validate_manifest(
 }
 
 fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
-    if inputs.schema != INPUT_SCHEMA {
-        bail!("unsupported validated input contract");
+    match inputs {
+        ValidatedInputs::V1(inputs) => {
+            if inputs.schema != INPUT_SCHEMA {
+                bail!("unsupported validated input contract");
+            }
+            validate_segment(&inputs.market, "crypto_expiry")?;
+            if inputs.reference.record_id_versions != ["v2"] {
+                bail!("validated reference input must contain v2 trades");
+            }
+            validate_segment(&inputs.reference, "crypto_expiry_reference")
+        }
+        ValidatedInputs::V2(inputs) => {
+            if inputs.schema != INPUT_SCHEMA_V2 || inputs.references.is_empty() {
+                bail!("unsupported validated input contract");
+            }
+            validate_segment(&inputs.market, "crypto_expiry")?;
+            for reference in &inputs.references {
+                validate_segment(reference, "crypto_expiry_reference")?;
+            }
+            if !inputs
+                .references
+                .iter()
+                .any(|reference| reference.record_id_versions == ["v2"])
+            {
+                bail!("validated reference inputs must contain v2 trades");
+            }
+            for pair in inputs.references.windows(2) {
+                let hour = |segment: &SegmentIdentity| {
+                    parse_time(
+                        &format!("{}T{}:00:00Z", segment.date, segment.hour),
+                        "validated reference date/hour",
+                    )
+                };
+                if hour(&pair[1])? != hour(&pair[0])? + chrono::Duration::hours(1) {
+                    bail!("validated reference inputs must be consecutive UTC hours");
+                }
+            }
+            aggregate_reference_trade_completions(
+                inputs
+                    .references
+                    .iter()
+                    .map(|reference| &reference.trade_completions),
+            )
+            .map(|_| ())
+        }
     }
-    validate_segment(&inputs.market, "crypto_expiry")?;
-    validate_segment(&inputs.reference, "crypto_expiry_reference")
 }
 
 fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
-    let (quote_sample_ms, replay_scope, record_id_versions): (_, _, &[&str]) = match dataset {
-        "crypto_expiry" => (
-            1_000,
-            "complete_full_depth_sampled_normalized_hour_segment",
-            &[],
-        ),
-        "crypto_expiry_reference" => (0, "complete_reference_hour_segment", &["v2"]),
+    let (quote_sample_ms, replay_scope) = match dataset {
+        "crypto_expiry" => (1_000, "complete_full_depth_sampled_normalized_hour_segment"),
+        "crypto_expiry_reference" => (0, "complete_reference_hour_segment"),
         _ => unreachable!("validated input dataset is fixed by the manifest contract"),
     };
+    let versions_valid = segment.record_id_versions.is_empty()
+        || (dataset == "crypto_expiry_reference" && segment.record_id_versions == ["v2"]);
     parse_digest(&segment.sha256, "validated input sha256")?;
     let start = parse_time(&segment.start_recorded_at, "start_recorded_at")?;
     let end = parse_time(&segment.end_recorded_at, "end_recorded_at")?;
@@ -574,7 +630,7 @@ fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
         || events != Some(segment.events)
         || start > end
         || segment.replay_scope != replay_scope
-        || segment.record_id_versions != record_id_versions
+        || !versions_valid
         || segment.recording_policy
             != (RecordingPolicy {
                 quote_sample_ms,
@@ -601,14 +657,14 @@ fn validate_trade_completions(
         return Ok(());
     }
     if segment.trade_completions.is_empty() {
-        bail!("validated reference event-local trade completion identity is inconsistent");
+        return Ok(());
     }
     for (market_id, completion) in &segment.trade_completions {
         let retrieved_at = parse_time(&completion.retrieved_at, "trade completion retrieved_at")?;
         if market_id.is_empty()
             || completion.condition_id.is_empty()
             || !SYMBOLS.contains(&completion.symbol.as_str())
-            || completion.market_window_secs != 300
+            || !matches!(completion.market_window_secs, 300 | 900)
             || parse_digest(
                 &completion.trade_record_ids_sha256,
                 "trade completion record ID digest",
@@ -626,6 +682,42 @@ fn validate_trade_completions(
         }
     }
     Ok(())
+}
+
+fn validated_reference_trade_completions(
+    inputs: &ValidatedInputs,
+) -> Result<BTreeMap<String, TradeCompletionIdentity>> {
+    match inputs {
+        ValidatedInputs::V1(inputs) => {
+            if inputs.reference.trade_completions.is_empty() {
+                bail!("validated reference event-local trade completion identity is inconsistent");
+            }
+            aggregate_reference_trade_completions([&inputs.reference.trade_completions])
+        }
+        ValidatedInputs::V2(inputs) => aggregate_reference_trade_completions(
+            inputs
+                .references
+                .iter()
+                .map(|reference| &reference.trade_completions),
+        ),
+    }
+}
+
+fn aggregate_reference_trade_completions<'a>(
+    maps: impl IntoIterator<Item = &'a BTreeMap<String, TradeCompletionIdentity>>,
+) -> Result<BTreeMap<String, TradeCompletionIdentity>> {
+    let mut completions = BTreeMap::new();
+    for map in maps {
+        for (market_id, completion) in map {
+            if completions
+                .insert(market_id.clone(), completion.clone())
+                .is_some()
+            {
+                bail!("validated reference event-local trade completion identity is inconsistent");
+            }
+        }
+    }
+    Ok(completions)
 }
 
 fn parse_digest(value: &str, label: &str) -> Result<[u8; 32]> {
@@ -797,6 +889,32 @@ pub(super) mod tests {
             "reference":segment("crypto_expiry_reference", 0, json!(["v2"]))})
     }
 
+    fn plural_inputs(second_hour: &str) -> Value {
+        let rows = SURFACES.map(|surface| {
+            let mut row = json!({"schema":ROW_SCHEMA,"surface":surface,"market_id":"market-1","condition_id":"condition-1","symbol":"BTCUSDT","window_secs":300});
+            if surface == "polymarket_trade" {
+                row["record_id"] = json!("trade-1");
+            }
+            row
+        });
+        let value = inputs(&rows);
+        let mut first = value["reference"].clone();
+        first["trade_completions"] = json!({});
+        let mut second = value["reference"].clone();
+        second["hour"] = json!(second_hour);
+        second["start_recorded_at"] = json!(format!("2026-07-17T{second_hour}:00:00Z"));
+        second["end_recorded_at"] = json!(format!("2026-07-17T{second_hour}:01:00Z"));
+        second["record_id_versions"] = json!([]);
+        for completion in second["trade_completions"]
+            .as_object_mut()
+            .expect("reference trade completions")
+            .values_mut()
+        {
+            completion["retrieved_at"] = json!(format!("2026-07-17T{second_hour}:01:00Z"));
+        }
+        json!({"schema":INPUT_SCHEMA_V2,"market":value["market"].clone(),"references":[first,second]})
+    }
+
     #[rustfmt::skip]
     fn write_triplet(temp: &tempfile::TempDir) -> PolymarketEvidenceTriplet {
         let rows = SURFACES.map(|surface| {
@@ -873,6 +991,18 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn seals_consecutive_plural_references_and_rejects_a_gap() {
+        for (hour, accepted) in [("06", true), ("07", false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let triplet = write_triplet(&temp);
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+            manifest["validated_inputs"] = plural_inputs(hour);
+            rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&manifest).unwrap()));
+            assert_eq!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok(), accepted);
+        }
+    }
+
+    #[test]
     #[rustfmt::skip]
     fn rejects_same_inode_mutation_after_open() {
         let temp = tempfile::tempdir().unwrap();
@@ -908,6 +1038,16 @@ pub(super) mod tests {
         rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&value).unwrap()));
         let error = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap_err();
         assert!(error.to_string().contains("event-local trade completion identity"));
+    }
+
+    #[test]
+    fn seals_v2_references_when_the_completion_moves_to_the_next_hour() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut value: Value = serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        value["validated_inputs"] = plural_inputs("06");
+        rewrite_read_only(&triplet.manifest, format!("{}\n", serde_json::to_string(&value).unwrap()));
+        assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
     }
 
     #[test]

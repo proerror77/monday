@@ -681,9 +681,9 @@ mod tests {
                 event_selection: "event_start in [event_start_gte,event_start_lt)",
                 trust_boundary: "fixture",
                 validated_inputs: ResearchSegmentValidationReport {
-                    schema: "monday.polymarket.research_segment_validation.v1",
+                    schema: "monday.polymarket.research_segment_validation.v2",
                     market: segment("crypto_expiry"),
-                    reference: segment("crypto_expiry_reference"),
+                    references: vec![segment("crypto_expiry_reference")],
                 },
             },
             ndjson,

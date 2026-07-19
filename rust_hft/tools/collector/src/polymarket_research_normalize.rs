@@ -586,6 +586,23 @@ fn has_all_surfaces(
         && settlements.contains_key(&contract.market_id)
 }
 
+fn aggregated_trade_completions(
+    inputs: &ResearchSegmentValidationReport,
+) -> Result<BTreeMap<String, TradeCompletionIdentity>> {
+    let mut completions = BTreeMap::new();
+    for reference in &inputs.references {
+        for (market_id, completion) in &reference.trade_completions {
+            if completions
+                .insert(market_id.clone(), completion.clone())
+                .is_some()
+            {
+                bail!("selected evidence received duplicate event-local trade completion proofs");
+            }
+        }
+    }
+    Ok(completions)
+}
+
 fn validate_event_local_trade_completions(
     completions: &BTreeMap<String, TradeCompletionIdentity>,
     contracts: &BTreeMap<String, SelectedContract>,
@@ -633,6 +650,7 @@ fn normalize_raw(
     end: DateTime<Utc>,
 ) -> Result<NormalizedPolymarketEvidence> {
     let (trades, settlements) = reference_records(reference_path, contracts)?;
+    let completions = aggregated_trade_completions(inputs)?;
     let mut rows = Vec::new();
     let mut trade_counts = BTreeMap::new();
     let mut settled = BTreeMap::new();
@@ -640,11 +658,7 @@ fn normalize_raw(
     let mut references = BTreeMap::new();
     contract_rows(contracts, &mut rows)?;
     trade_rows(trades, contracts, &mut rows, &mut trade_counts)?;
-    validate_event_local_trade_completions(
-        &inputs.reference.trade_completions,
-        contracts,
-        &trade_counts,
-    )?;
+    validate_event_local_trade_completions(&completions, contracts, &trade_counts)?;
     settlement_rows(settlements, contracts, &mut rows, &mut settled)?;
     market_rows(
         market_path,
@@ -1117,6 +1131,94 @@ mod tests {
         assert!(error
             .to_string()
             .contains("does not match event-local trade completion proof"));
+    }
+
+    #[test]
+    fn rejects_duplicate_trade_completion_proofs_across_reference_segments() {
+        let completion = TradeCompletionIdentity {
+            condition_id: "condition".to_owned(),
+            symbol: "BTCUSDT".to_owned(),
+            market_window_secs: 300,
+            trade_count: 1,
+            trade_record_ids_sha256: "1".repeat(64),
+            completion_sequence: 10,
+            retrieved_at: "2026-07-17T05:31:00Z".to_owned(),
+            completeness_basis: crate::polymarket_upload::TRADE_COMPLETION_BASIS.to_owned(),
+            finalization_lag_secs: 60,
+            stable_polls_required: 2,
+        };
+        let inputs = ResearchSegmentValidationReport {
+            schema: "monday.polymarket.research_segment_validation.v2",
+            market: crate::polymarket_research_import::SegmentIdentity {
+                schema: "monday.polymarket.raw.v1".to_owned(),
+                venue: "polymarket".to_owned(),
+                dataset: "crypto_expiry".to_owned(),
+                date: "2026-07-17".to_owned(),
+                hour: "05".to_owned(),
+                file: "market.ndjson.zst".to_owned(),
+                bytes: 1,
+                sha256: "0".repeat(64),
+                events: 1,
+                start_sequence: 1,
+                end_sequence: 1,
+                sequence_gaps: 0,
+                start_recorded_at: "2026-07-17T05:00:00Z".to_owned(),
+                end_recorded_at: "2026-07-17T05:00:01Z".to_owned(),
+                source_file: "market.ndjson".to_owned(),
+                replay_scope: "fixture".to_owned(),
+                recording_policy: json!({}),
+                record_id_versions: json!([]),
+                trade_completions: BTreeMap::new(),
+            },
+            references: vec![
+                crate::polymarket_research_import::SegmentIdentity {
+                    schema: "monday.polymarket.raw.v1".to_owned(),
+                    venue: "polymarket".to_owned(),
+                    dataset: "crypto_expiry_reference".to_owned(),
+                    date: "2026-07-17".to_owned(),
+                    hour: "05".to_owned(),
+                    file: "reference-05.ndjson.zst".to_owned(),
+                    bytes: 1,
+                    sha256: "0".repeat(64),
+                    events: 1,
+                    start_sequence: 1,
+                    end_sequence: 1,
+                    sequence_gaps: 0,
+                    start_recorded_at: "2026-07-17T05:00:00Z".to_owned(),
+                    end_recorded_at: "2026-07-17T05:00:01Z".to_owned(),
+                    source_file: "reference-05.ndjson".to_owned(),
+                    replay_scope: "fixture".to_owned(),
+                    recording_policy: json!({}),
+                    record_id_versions: json!(["v2"]),
+                    trade_completions: BTreeMap::from([("market".to_owned(), completion.clone())]),
+                },
+                crate::polymarket_research_import::SegmentIdentity {
+                    schema: "monday.polymarket.raw.v1".to_owned(),
+                    venue: "polymarket".to_owned(),
+                    dataset: "crypto_expiry_reference".to_owned(),
+                    date: "2026-07-17".to_owned(),
+                    hour: "06".to_owned(),
+                    file: "reference-06.ndjson.zst".to_owned(),
+                    bytes: 1,
+                    sha256: "0".repeat(64),
+                    events: 1,
+                    start_sequence: 2,
+                    end_sequence: 2,
+                    sequence_gaps: 0,
+                    start_recorded_at: "2026-07-17T06:00:00Z".to_owned(),
+                    end_recorded_at: "2026-07-17T06:00:01Z".to_owned(),
+                    source_file: "reference-06.ndjson".to_owned(),
+                    replay_scope: "fixture".to_owned(),
+                    recording_policy: json!({}),
+                    record_id_versions: json!([]),
+                    trade_completions: BTreeMap::from([("market".to_owned(), completion)]),
+                },
+            ],
+        };
+
+        let error = aggregated_trade_completions(&inputs).unwrap_err();
+
+        assert!(error.to_string().contains("duplicate"), "{error:#}");
     }
 
     #[test]

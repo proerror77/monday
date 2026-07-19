@@ -468,7 +468,7 @@ mod tests {
         ResearchSelectionConfig {
             segments: ResearchSegmentValidationConfig {
                 market: triplet.clone(),
-                reference: triplet,
+                references: vec![triplet],
             },
             event_start_gte: start.to_owned(),
             event_start_lt: end.to_owned(),
