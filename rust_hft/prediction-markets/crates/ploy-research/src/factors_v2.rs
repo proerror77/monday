@@ -2299,10 +2299,7 @@ fn walk_forward_factor_rows(
             &event_ends,
             &label_observation_times,
             None,
-            train_start,
-            train_end,
-            test_start,
-            test_end,
+            (train_start, train_end, test_start, test_end),
         );
 
         if train_rows.len() >= options.review.min_observations
@@ -2988,10 +2985,7 @@ pub fn walk_forward_settlement_probability_report_with_prior(
             &event_ends,
             &label_observation_times,
             options.time_cohort.as_ref(),
-            train_start,
-            train_end,
-            test_start,
-            test_end,
+            (train_start, train_end, test_start, test_end),
         );
 
         if train_rows.len() >= options.walk_forward.review.min_observations
@@ -4031,10 +4025,7 @@ fn walk_forward_factor_combo_from_v2_rows(
             &event_ends,
             &label_observation_times,
             None,
-            train_start,
-            train_end,
-            test_start,
-            test_end,
+            (train_start, train_end, test_start, test_end),
         );
 
         if train_rows.len() >= options.walk_forward.review.min_observations
@@ -4445,10 +4436,7 @@ fn walk_forward_meta_label_v1_rows(
             &event_ends,
             &label_observation_times,
             None,
-            train_start,
-            train_end,
-            test_start,
-            test_end,
+            (train_start, train_end, test_start, test_end),
         );
         let train_gated = train_slice
             .into_iter()
@@ -7392,11 +7380,9 @@ fn event_disjoint_walk_forward_slices<'a>(
     event_ends: &EventEndIndex<'_>,
     label_observation_times: &EventLabelObservationIndex<'_>,
     time_cohort: Option<&SettlementProbabilityTimeCohort>,
-    train_start: DateTime<Utc>,
-    train_end: DateTime<Utc>,
-    test_start: DateTime<Utc>,
-    test_end: DateTime<Utc>,
+    bounds: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>),
 ) -> (Vec<&'a FactorObservationV2>, Vec<&'a FactorObservationV2>) {
+    let (train_start, train_end, test_start, test_end) = bounds;
     let train = walk_forward_time_slice(rows, train_start, train_end);
     let test = walk_forward_time_slice(rows, test_start, test_end);
     let ends_in = |row: &&FactorObservationV2, start, end| {
@@ -10653,10 +10639,7 @@ mod tests {
             &event_ends,
             &label_observation_times,
             None,
-            start,
-            boundary,
-            boundary,
-            boundary + Duration::hours(12),
+            (start, boundary, boundary, boundary + Duration::hours(12)),
         )
     }
 
@@ -11610,10 +11593,7 @@ mod tests {
             &inferred_event_ends(&rows),
             &official_label_observation_times(&rows),
             None,
-            start,
-            boundary,
-            boundary,
-            boundary + Duration::hours(12),
+            (start, boundary, boundary, boundary + Duration::hours(12)),
         );
 
         assert_eq!(
@@ -11666,10 +11646,7 @@ mod tests {
             &event_ends,
             &label_observation_times,
             Some(&cohort),
-            start,
-            boundary,
-            boundary,
-            boundary + Duration::hours(12),
+            (start, boundary, boundary, boundary + Duration::hours(12)),
         );
         assert_eq!(
             train
@@ -11690,10 +11667,12 @@ mod tests {
             &event_ends,
             &label_observation_times,
             Some(&cohort),
-            boundary,
-            boundary + Duration::minutes(30),
-            boundary + Duration::minutes(30),
-            boundary + Duration::hours(2),
+            (
+                boundary,
+                boundary + Duration::minutes(30),
+                boundary + Duration::minutes(30),
+                boundary + Duration::hours(2),
+            ),
         );
         assert!(late_train.is_empty());
     }
@@ -11791,10 +11770,7 @@ mod tests {
             &inferred_event_ends(&rows),
             &official_label_observation_times(&rows),
             None,
-            start,
-            boundary,
-            boundary,
-            boundary + Duration::hours(12),
+            (start, boundary, boundary, boundary + Duration::hours(12)),
         );
 
         assert!(train.is_empty());
