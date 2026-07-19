@@ -1168,6 +1168,7 @@ mod tests {
                 replay_scope: "fixture".to_owned(),
                 recording_policy: json!({}),
                 record_id_versions: json!([]),
+                event_types: BTreeMap::new(),
                 trade_completions: BTreeMap::new(),
             },
             references: vec![
@@ -1190,6 +1191,7 @@ mod tests {
                     replay_scope: "fixture".to_owned(),
                     recording_policy: json!({}),
                     record_id_versions: json!(["v2"]),
+                    event_types: BTreeMap::new(),
                     trade_completions: BTreeMap::from([("market".to_owned(), completion.clone())]),
                 },
                 crate::polymarket_research_import::SegmentIdentity {
@@ -1211,6 +1213,7 @@ mod tests {
                     replay_scope: "fixture".to_owned(),
                     recording_policy: json!({}),
                     record_id_versions: json!([]),
+                    event_types: BTreeMap::new(),
                     trade_completions: BTreeMap::from([("market".to_owned(), completion)]),
                 },
             ],

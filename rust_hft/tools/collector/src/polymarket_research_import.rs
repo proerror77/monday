@@ -49,6 +49,7 @@ pub struct SegmentIdentity {
     pub replay_scope: String,
     pub recording_policy: Value,
     pub record_id_versions: Value,
+    pub event_types: BTreeMap<String, u64>,
     pub trade_completions: BTreeMap<String, TradeCompletionIdentity>,
 }
 
@@ -97,6 +98,8 @@ const REFERENCE_EVENT_TYPES: [&str; 4] = [
 ];
 const MAX_REFERENCE_SEGMENTS: usize = 26;
 const MAX_REFERENCE_SOURCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_SUCCESS_BYTES: u64 = 65;
 
 fn file_identity(metadata: &Metadata) -> FileIdentity {
     (metadata.dev(), metadata.ino(), metadata.len())
@@ -111,7 +114,7 @@ struct BoundFile {
 }
 
 impl BoundFile {
-    fn open(path: &Path, snapshot_path: &Path) -> Result<Self> {
+    fn open(path: &Path, snapshot_path: &Path, max_bytes: u64) -> Result<Self> {
         if !path.is_absolute()
             || path
                 .components()
@@ -139,7 +142,15 @@ impl BoundFile {
             .create_new(true)
             .mode(0o600)
             .open(snapshot_path)?;
-        std::io::copy(&mut file.try_clone()?, &mut snapshot)?;
+        if identity.2 > max_bytes {
+            bail!("artifact exceeds snapshot byte limit");
+        }
+        let mut bounded = file
+            .try_clone()?
+            .take(max_bytes.checked_add(1).context("snapshot byte limit overflow")?);
+        if std::io::copy(&mut bounded, &mut snapshot)? > max_bytes {
+            bail!("artifact exceeds snapshot byte limit");
+        }
         let sha256 = Self::hash(&snapshot)?;
         Ok(Self {
             path: path.to_owned(),
@@ -260,6 +271,7 @@ fn validate_triplet(
     dataset: &str,
     scratch_name: &str,
     scratch: &Path,
+    max_data_bytes: u64,
 ) -> Result<ValidatedArtifact> {
     let sha_dir = triplet
         .data
@@ -286,14 +298,20 @@ fn validate_triplet(
     let superseded_marker = sha_dir.join(format!("{data_name}.SUPERSEDED.json"));
     reject_superseded(&superseded_marker)?;
     let files = BoundTriplet {
-        data: BoundFile::open(&triplet.data, &scratch.join(format!("{scratch_name}.data")))?,
+        data: BoundFile::open(
+            &triplet.data,
+            &scratch.join(format!("{scratch_name}.data")),
+            max_data_bytes,
+        )?,
         manifest: BoundFile::open(
             &triplet.manifest,
             &scratch.join(format!("{scratch_name}.manifest")),
+            MAX_MANIFEST_BYTES,
         )?,
         success: BoundFile::open(
             &triplet.success,
             &scratch.join(format!("{scratch_name}.success")),
+            MAX_SUCCESS_BYTES,
         )?,
     };
     let digest = partition(sha_dir, "sha256=")?;
@@ -409,6 +427,13 @@ fn validate_triplet(
             .ok_or_else(|| anyhow!("manifest trade_completions is missing"))?,
     )
     .context("parse manifest event-local trade completions")?;
+    let event_types = serde_json::from_value(
+        manifest
+            .get("event_types")
+            .cloned()
+            .ok_or_else(|| anyhow!("manifest event_types is missing"))?,
+    )
+    .context("parse manifest event types")?;
     Ok(ValidatedArtifact {
         identity: SegmentIdentity {
             schema: text(&manifest, "schema")?,
@@ -429,6 +454,7 @@ fn validate_triplet(
             replay_scope: text(&manifest, "replay_scope")?,
             recording_policy: manifest["recording_policy"].clone(),
             record_id_versions: manifest["record_id_versions"].clone(),
+            event_types,
             trade_completions,
         },
         manifest,
@@ -596,15 +622,26 @@ pub(crate) fn with_validated_research_segments<T>(
         bail!("reference segment count must be between 1 and {MAX_REFERENCE_SEGMENTS}");
     }
     let scratch = ScratchDir::create()?;
-    let market = validate_triplet(&config.market, "crypto_expiry", "market", &scratch.0)?;
+    let market = validate_triplet(
+        &config.market,
+        "crypto_expiry",
+        "market",
+        &scratch.0,
+        MAX_REFERENCE_SOURCE_BYTES,
+    )?;
     let mut references = Vec::<ValidatedArtifact>::with_capacity(config.references.len());
+    let mut remaining_archive_bytes = MAX_REFERENCE_SOURCE_BYTES;
     for (index, triplet) in config.references.iter().enumerate() {
         let reference = validate_triplet(
             triplet,
             "crypto_expiry_reference",
             &format!("reference-{index}"),
             &scratch.0,
+            remaining_archive_bytes,
         )?;
+        remaining_archive_bytes = remaining_archive_bytes
+            .checked_sub(reference.identity.bytes)
+            .context("reference archive byte total overflow")?;
         if let Some(previous) = references.last() {
             let previous = segment_hour(&previous.identity)?;
             if segment_hour(&reference.identity)? != previous + TimeDelta::hours(1) {
@@ -866,10 +903,14 @@ mod tests {
         let root = fs::canonicalize(temp.path()).unwrap();
         let path = root.join("artifact");
         fs::write(&path, b"before").unwrap();
-        let bound = BoundFile::open(&path, &root.join("snapshot")).unwrap();
+        let bound = BoundFile::open(&path, &root.join("snapshot"), 6).unwrap();
         fs::write(&path, b"after!").unwrap();
         assert_eq!(bound.read().unwrap(), b"before");
         assert!(bound.verify().is_err());
+
+        let oversized = root.join("oversized");
+        fs::write(&oversized, b"123456").unwrap();
+        assert!(BoundFile::open(&oversized, &root.join("oversized.snapshot"), 5).is_err());
     }
 
     #[test]

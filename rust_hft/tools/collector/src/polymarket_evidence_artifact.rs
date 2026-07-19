@@ -618,6 +618,7 @@ mod tests {
     #[test]
     fn published_result_returns_digests_for_the_exact_triplet() {
         fn segment(dataset: &str) -> SegmentIdentity {
+            let is_reference = dataset == "crypto_expiry_reference";
             let trade_completions = (dataset == "crypto_expiry_reference")
                 .then(|| {
                     BTreeMap::from([(
@@ -647,16 +648,29 @@ mod tests {
                 file: format!("{dataset}.ndjson.zst"),
                 bytes: 1,
                 sha256: "0".repeat(64),
-                events: 1,
+                events: if is_reference { 3 } else { 1 },
                 start_sequence: 1,
-                end_sequence: 1,
+                end_sequence: if is_reference { 3 } else { 1 },
                 sequence_gaps: 0,
                 start_recorded_at: "2026-07-17T05:00:00Z".into(),
                 end_recorded_at: "2026-07-17T05:00:01Z".into(),
                 source_file: format!("{dataset}.ndjson"),
                 replay_scope: "fixture".into(),
                 recording_policy: serde_json::json!({}),
-                record_id_versions: serde_json::json!(["v2"]),
+                record_id_versions: if is_reference {
+                    serde_json::json!(["v2"])
+                } else {
+                    serde_json::json!([])
+                },
+                event_types: if is_reference {
+                    BTreeMap::from([
+                        ("market_metadata".to_owned(), 1),
+                        ("polymarket_trade".to_owned(), 1),
+                        ("market_settlement".to_owned(), 1),
+                    ])
+                } else {
+                    BTreeMap::from([("quote".to_owned(), 1)])
+                },
                 trade_completions,
             }
         }
