@@ -1210,12 +1210,12 @@ fn materialize_split<'a>(
                                 .context("snapshot settlement offset overflow")?,
                         )
                         .context("snapshot settlement timestamp overflow")?;
-                    // `time_remaining_secs` is produced by chrono::Duration::num_seconds,
-                    // which truncates a positive sub-second remainder. Treat the next
-                    // millisecond second boundary as an exclusive upper bound so a
-                    // training event can never be admitted by rounding its end down.
+                    // `decision_at_ms` floors the nanosecond tick timestamp and
+                    // `time_remaining_secs` truncates a positive sub-second remainder.
+                    // Add one second plus one millisecond for a strict exclusive upper
+                    // bound so neither truncation can admit a crossing training event.
                     let settlement_exclusive_upper_bound_ms = settlement_at_ms
-                        .checked_add(1_000)
+                        .checked_add(1_001)
                         .context("snapshot settlement upper bound overflow")?;
                     let event_start_at_ms = settlement_at_ms
                         .checked_sub(target_horizon_ms)
@@ -1880,6 +1880,44 @@ mod tests {
             test_config(),
         )
         .expect_err("sub-second uncertainty must not round a training event before the boundary");
+        assert!(error
+            .to_string()
+            .contains("training event crosses shared time boundary"));
+    }
+
+    #[test]
+    fn rejects_training_event_that_crosses_boundary_after_nanosecond_and_second_truncation() {
+        let mut context = context();
+        let last_train = context.split.train.last().unwrap().clone();
+        let boundary_ms = last_train.decision_at_ms + 2_000;
+        let row = context
+            .snapshot
+            .snapshot
+            .observations
+            .iter_mut()
+            .find(|row| row.event_id == last_train.event_id)
+            .unwrap();
+        row.tick_ts = Utc
+            .timestamp_millis_opt(last_train.decision_at_ms)
+            .single()
+            .unwrap()
+            + Duration::microseconds(500);
+        row.time_remaining_secs = 1;
+        context.mission.time_cohort_boundary_ms = boundary_ms;
+        context.split.contract = BinaryDatasetContract::from_prediction_snapshot(
+            &context.snapshot,
+            &context.mission,
+            feature_names(),
+        )
+        .unwrap();
+
+        let error = train_event_disjoint_binary(
+            &context.snapshot,
+            &context.mission,
+            &context.split,
+            test_config(),
+        )
+        .expect_err("combined timestamp truncation must not admit a crossing event");
         assert!(error
             .to_string()
             .contains("training event crosses shared time boundary"));
