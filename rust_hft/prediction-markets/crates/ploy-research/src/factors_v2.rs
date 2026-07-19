@@ -3045,7 +3045,7 @@ pub fn walk_forward_settlement_probability_report_with_prior(
     rows.sort_by_key(|row| row.tick_ts);
     let probability_options =
         normalize_settlement_probability_report_options(options.probability.clone());
-    let event_ends = inferred_event_ends(&rows);
+    let event_ends = event_ends_for_walk_forward(&rows, options.time_cohort.as_ref());
     let label_observation_times = official_label_observation_times(&rows);
 
     let mut windows = Vec::new();
@@ -3275,7 +3275,7 @@ pub fn walk_forward_settlement_verdict_report_with_prior(
         .review
         .min_observations
         .max(probability_options.min_bucket_observations);
-    let event_ends = inferred_event_ends(&rows);
+    let event_ends = event_ends_for_walk_forward(&rows, options.time_cohort.as_ref());
     let label_observation_times = official_label_observation_times(&rows);
 
     let mut windows = Vec::new();
@@ -7693,6 +7693,17 @@ fn canonical_event_ends(rows: &[FactorObservationV2]) -> EventEndIndex<'_> {
     event_ends
 }
 
+fn event_ends_for_walk_forward<'a>(
+    rows: &'a [FactorObservationV2],
+    time_cohort: Option<&SettlementProbabilityTimeCohort>,
+) -> EventEndIndex<'a> {
+    if time_cohort.is_some() {
+        canonical_event_ends(rows)
+    } else {
+        inferred_event_ends(rows)
+    }
+}
+
 fn official_label_observation_times(
     rows: &[FactorObservationV2],
 ) -> EventLabelObservationIndex<'_> {
@@ -7714,14 +7725,12 @@ fn official_label_observation_times(
 
 fn event_disjoint_walk_forward_slices<'a>(
     rows: &'a [FactorObservationV2],
-    legacy_event_ends: &EventEndIndex<'_>,
+    event_ends: &EventEndIndex<'_>,
     label_observation_times: &EventLabelObservationIndex<'_>,
     time_cohort: Option<&SettlementProbabilityTimeCohort>,
     bounds: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>),
 ) -> (Vec<&'a FactorObservationV2>, Vec<&'a FactorObservationV2>) {
     let (train_start, train_end, test_start, test_end) = bounds;
-    let governed_event_ends = time_cohort.map(|_| canonical_event_ends(rows));
-    let event_ends = governed_event_ends.as_ref().unwrap_or(legacy_event_ends);
     let train = walk_forward_time_slice(rows, train_start, train_end);
     let test = walk_forward_time_slice(rows, test_start, test_end);
     let ends_in = |row: &&FactorObservationV2, start, end| {
@@ -12454,18 +12463,28 @@ mod tests {
         let mut train_row = side_row(&base_obs(), ReviewSide::Up, 15.0, None);
         train_row.event_id = "train".to_string();
         train_row.tick_ts = boundary - Duration::minutes(6);
+        train_row.time_remaining_secs = 60;
         train_row.event_end_ts = Some(boundary - Duration::minutes(5));
         train_row.official_resolution_observed_at = Some(boundary - Duration::minutes(4));
 
         let mut missing = side_row(&base_obs(), ReviewSide::Up, 15.0, None);
         missing.event_id = "missing".to_string();
         missing.tick_ts = boundary + Duration::minutes(1);
+        missing.time_remaining_secs = 240;
         missing.event_end_ts = None;
         let mut missing_rows = vec![train_row.clone(), missing];
         make_settlement_probability_eligible(&mut missing_rows);
+        let (legacy_train, legacy_test) = event_disjoint_walk_forward_slices(
+            &missing_rows,
+            &inferred_event_ends(&missing_rows),
+            &official_label_observation_times(&missing_rows),
+            Some(&cohort),
+            bounds,
+        );
+        assert_eq!((legacy_train.len(), legacy_test.len()), (1, 1));
         let (train, test) = event_disjoint_walk_forward_slices(
             &missing_rows,
-            &canonical_event_ends(&missing_rows),
+            &event_ends_for_walk_forward(&missing_rows, Some(&cohort)),
             &official_label_observation_times(&missing_rows),
             Some(&cohort),
             bounds,
@@ -12477,15 +12496,24 @@ mod tests {
         let mut first = side_row(&base_obs(), ReviewSide::Up, 15.0, None);
         first.event_id = "conflict".to_string();
         first.tick_ts = boundary + Duration::minutes(1);
+        first.time_remaining_secs = 240;
         first.event_end_ts = Some(boundary + Duration::minutes(5));
         let mut second = first.clone();
         second.tick_ts += Duration::seconds(1);
         second.event_end_ts = Some(boundary + Duration::minutes(6));
         let mut conflicting_rows = vec![train_row, first, second];
         make_settlement_probability_eligible(&mut conflicting_rows);
+        let (legacy_train, legacy_test) = event_disjoint_walk_forward_slices(
+            &conflicting_rows,
+            &inferred_event_ends(&conflicting_rows),
+            &official_label_observation_times(&conflicting_rows),
+            Some(&cohort),
+            bounds,
+        );
+        assert_eq!((legacy_train.len(), legacy_test.len()), (1, 2));
         let (train, test) = event_disjoint_walk_forward_slices(
             &conflicting_rows,
-            &canonical_event_ends(&conflicting_rows),
+            &event_ends_for_walk_forward(&conflicting_rows, Some(&cohort)),
             &official_label_observation_times(&conflicting_rows),
             Some(&cohort),
             bounds,
