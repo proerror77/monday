@@ -32,7 +32,7 @@ use ploy_research::{
     FactorObservation, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
     FillabilityReviewOptions, FullDepthExecutionMatrixOptions, LiquidityGateV1Options,
     LiquidityGatedAlphaV1Options, LlmPriorSpec, MetaLabelWalkForwardOptions, RepricingIcOptions,
-    ResearchSnapshotRequest, SettlementProbabilityDataQualityMode,
+    ResearchSnapshotRequest, ReviewSide, SettlementProbabilityDataQualityMode,
     SettlementProbabilityPromotionGateOptions, SettlementProbabilityReportOptions,
     SettlementProbabilityTimeCohort, SettlementProbabilityWalkForwardOptions,
     TradeFormationReviewOptions,
@@ -499,6 +499,9 @@ fn runtime_feedback_from_candidate_replay(path: &str) -> Option<AlphaSearchRunti
         .map(|value| value as usize)
         .unwrap_or_else(|| metric("settlement_autofactor_predictive_score_ge_025"));
     Some(AlphaSearchRuntimeFeedback {
+        version: None,
+        target: None,
+        side: None,
         runtime_score,
         base_factor,
         entry_signals: metric("entry_signals"),
@@ -1109,60 +1112,69 @@ async fn main() {
         );
     }
     for target in [
-        AutoFactorV2Target::FullDepthRepricePnl10s,
-        AutoFactorV2Target::FullDepthRepricePnl30s,
+        AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Up),
+        AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Down),
+        AutoFactorV2Target::FullDepthRepricePnl30s(ReviewSide::Up),
+        AutoFactorV2Target::FullDepthRepricePnl30s(ReviewSide::Down),
         AutoFactorV2Target::FullDepthSettlementExecutablePnl,
         AutoFactorV2Target::TradeableFullDepthSettlementPnl,
     ] {
+        let target_name = target.as_str();
+        let side = target.review_side();
+        let plan_names = side
+            .is_none()
+            .then_some(alpha_search_plan_names.as_slice())
+            .unwrap_or_default();
+        let lane_llm_prior = side.is_none().then_some(llm_prior.as_ref()).flatten();
         match mine_domain_autofactors_from_v2_with_guidance(
             &autofactor_rows,
             target,
             &autofactor_options,
-            &alpha_search_plan_names,
-            llm_prior.as_ref(),
+            plan_names,
+            lane_llm_prior,
         ) {
             Ok(reports) => {
                 let reports =
                     filter_autofactor_reports(reports, options.factor_name_filter.as_deref());
-                println!("# AutoFactor target={}", target.as_str());
+                let side_suffix = side
+                    .map(|side| format!(" side={}", side.as_str()))
+                    .unwrap_or_default();
+                println!("# AutoFactor target={target_name}{side_suffix}");
                 println!("{}", format_autofactor_reports(&reports, options.top_n));
                 if let (Some(output_dir), Some(input_names)) = (
                     alpha_search_output_dir.as_deref(),
                     alpha_search_input_names.as_ref(),
                 ) {
-                    match write_alpha_search_artifacts_with_state_and_runtime_feedback(
-                        output_dir,
-                        target.as_str(),
-                        input_names,
-                        &reports,
-                        &autofactor_options,
-                        mcts_state.as_ref(),
-                        runtime_feedback.as_ref(),
-                        llm_prior.as_ref(),
-                        alpha_zoo.as_ref(),
-                    ) {
-                        Ok(summary) => eprintln!(
-                            "alpha search artifacts written target={} candidates={} rejected={} best={} dir={}",
-                            summary.target,
-                            summary.candidate_count,
-                            summary.rejected_count,
-                            summary.best_candidate.as_deref().unwrap_or("<none>"),
-                            summary.output_dir
-                        ),
-                        Err(err) => {
-                            eprintln!(
+                    if side.is_none() {
+                        match write_alpha_search_artifacts_with_state_and_runtime_feedback(
+                            output_dir,
+                            target_name,
+                            input_names,
+                            &reports,
+                            &autofactor_options,
+                            mcts_state.as_ref(),
+                            runtime_feedback.as_ref(),
+                            llm_prior.as_ref(),
+                            alpha_zoo.as_ref(),
+                        ) {
+                            Ok(summary) => eprintln!(
+                                "alpha search artifacts written target={} candidates={} rejected={} best={} dir={}",
+                                summary.target,
+                                summary.candidate_count,
+                                summary.rejected_count,
+                                summary.best_candidate.as_deref().unwrap_or("<none>"),
+                                summary.output_dir
+                            ),
+                            Err(err) => eprintln!(
                                 "alpha search artifact write failed for {}: {err}",
-                                target.as_str()
-                            );
+                                target_name
+                            ),
                         }
                     }
                 }
             }
             Err(err) => {
-                eprintln!(
-                    "autofactor seed report failed for {}: {err}",
-                    target.as_str()
-                );
+                eprintln!("autofactor seed report failed for {}: {err}", target_name);
             }
         }
     }

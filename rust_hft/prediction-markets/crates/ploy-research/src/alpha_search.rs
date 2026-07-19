@@ -8,12 +8,16 @@ use crate::autofactor::{
     autofactor_runtime_contract_catalog, autofactor_target_horizon, factor_expr_hash,
     AutoFactorDecision, AutoFactorOptions, AutoFactorReport, FactorExpr, LlmPriorSpec,
 };
+use crate::factors_v2::ReviewSide;
 
-const ALPHA_SEARCH_ARTIFACT_VERSION: &str = "alpha_search_artifacts_v1";
+pub const ALPHA_SEARCH_ARTIFACT_VERSION: &str = "alpha_search_artifacts_v1";
+pub const SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION: &str = "alpha_search_artifacts_v2";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AlphaSearchArtifactSummary {
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<ReviewSide>,
     pub output_dir: String,
     pub candidate_count: usize,
     pub rejected_count: usize,
@@ -22,6 +26,12 @@ pub struct AlphaSearchArtifactSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlphaSearchRuntimeFeedback {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<ReviewSide>,
     pub runtime_score: String,
     pub base_factor: String,
     pub entry_signals: usize,
@@ -55,6 +65,8 @@ pub struct MctsSearchStateArtifact {
     pub version: String,
     pub mode: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<ReviewSide>,
     pub total_visits: usize,
     #[serde(default)]
     pub backpropagation_truncated_count: usize,
@@ -90,6 +102,8 @@ pub struct MctsSearchStateNode {
 pub struct AlphaZooSnapshot {
     pub version: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<ReviewSide>,
     pub entries: Vec<AlphaZooEntry>,
 }
 
@@ -111,6 +125,7 @@ pub struct SubtreeFrequencyState {
 pub enum AlphaSearchArtifactError {
     Io(std::io::Error),
     Json(serde_json::Error),
+    IdentityMismatch(String),
 }
 
 impl fmt::Display for AlphaSearchArtifactError {
@@ -118,6 +133,9 @@ impl fmt::Display for AlphaSearchArtifactError {
         match self {
             Self::Io(err) => write!(f, "alpha search artifact I/O failed: {err}"),
             Self::Json(err) => write!(f, "alpha search artifact JSON failed: {err}"),
+            Self::IdentityMismatch(reason) => {
+                write!(f, "alpha search artifact identity mismatch: {reason}")
+            }
         }
     }
 }
@@ -141,6 +159,8 @@ struct SearchSpaceArtifact {
     version: &'static str,
     mode: &'static str,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     feature_pool: Vec<String>,
     constant_pool: Vec<f64>,
     operator_pool: Vec<&'static str>,
@@ -165,6 +185,8 @@ struct LlmPriorArtifact {
     version: &'static str,
     mode: &'static str,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     hypotheses: Vec<PriorHypothesis>,
     allowed_mutation_types: Vec<&'static str>,
     note: &'static str,
@@ -182,6 +204,8 @@ struct PriorHypothesis {
 struct CandidateExpression {
     name: String,
     target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     source: &'static str,
     complexity: usize,
     root_gene: String,
@@ -193,6 +217,8 @@ struct CandidateExpression {
 struct RejectedExpression {
     name: String,
     target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     root_gene: String,
     structural_signature: String,
     reason: String,
@@ -204,6 +230,8 @@ struct TreeTraceArtifact {
     version: &'static str,
     mode: &'static str,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     nodes: Vec<TreeTraceNode>,
 }
 
@@ -225,6 +253,8 @@ struct NodeMetric {
     factor_name: String,
     parent_name: Option<String>,
     target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     decision: String,
     reason: String,
     selected_dimension: String,
@@ -259,6 +289,8 @@ struct NodeMetric {
 
 #[derive(Debug, Serialize)]
 struct AvoidedSubtree {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     root_gene: String,
     structural_signature: String,
     depth: usize,
@@ -272,6 +304,8 @@ struct SearchFeedbackArtifact {
     version: &'static str,
     mode: &'static str,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     candidate_count: usize,
     rejected_count: usize,
     watchlist_count: usize,
@@ -285,6 +319,8 @@ struct SearchFeedbackArtifact {
 
 #[derive(Debug, Serialize)]
 struct RuntimeFeedbackSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     runtime_score: String,
     base_factor: String,
     entry_signals: usize,
@@ -319,6 +355,8 @@ struct RuntimeAvoidance {
 struct FactorRegistryPreviewRow {
     factor_name: String,
     target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     horizon: String,
     dsl_hash: String,
     ast_json: serde_json::Value,
@@ -332,6 +370,8 @@ struct FactorRegistryPreviewRow {
 struct FactorRegistryPreviewArtifact {
     version: &'static str,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     horizon: String,
     factors: Vec<FactorRegistryPreviewRow>,
 }
@@ -355,6 +395,8 @@ struct MctsExpansionPlan {
     version: &'static str,
     mode: &'static str,
     target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<ReviewSide>,
     exploration_weight: f64,
     selected_nodes: Vec<MctsSelectedNode>,
     note: &'static str,
@@ -429,7 +471,95 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
     llm_prior: Option<&LlmPriorSpec>,
     alpha_zoo: Option<&AlphaZooSnapshot>,
 ) -> Result<AlphaSearchArtifactSummary, AlphaSearchArtifactError> {
-    let output_dir = output_root.as_ref().join(target);
+    if is_side_bound_repricing_target(target)
+        || reports.iter().any(|report| report.side.is_some())
+        || prior_state.is_some_and(|state| {
+            state.version == SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION || state.side.is_some()
+        })
+        || runtime_feedback.is_some_and(|feedback| {
+            feedback.version.as_deref() == Some(SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION)
+                || feedback.side.is_some()
+        })
+        || alpha_zoo.is_some_and(|zoo| {
+            zoo.version == SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION || zoo.side.is_some()
+        })
+    {
+        return Err(AlphaSearchArtifactError::IdentityMismatch(
+            "side-bound repricing inputs require the side-bound writer".to_string(),
+        ));
+    }
+    write_alpha_search_artifacts_core(
+        output_root,
+        target,
+        None,
+        input_names,
+        reports,
+        options,
+        prior_state,
+        runtime_feedback,
+        llm_prior,
+        alpha_zoo,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
+    output_root: impl AsRef<Path>,
+    target: &str,
+    side: ReviewSide,
+    input_names: &[String],
+    reports: &[AutoFactorReport],
+    options: &AutoFactorOptions,
+    prior_state: Option<&MctsSearchStateArtifact>,
+    runtime_feedback: Option<&AlphaSearchRuntimeFeedback>,
+    alpha_zoo: Option<&AlphaZooSnapshot>,
+) -> Result<AlphaSearchArtifactSummary, AlphaSearchArtifactError> {
+    write_alpha_search_artifacts_core(
+        output_root,
+        target,
+        Some(side),
+        input_names,
+        reports,
+        options,
+        prior_state,
+        runtime_feedback,
+        None,
+        alpha_zoo,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_alpha_search_artifacts_core(
+    output_root: impl AsRef<Path>,
+    target: &str,
+    side: Option<ReviewSide>,
+    input_names: &[String],
+    reports: &[AutoFactorReport],
+    options: &AutoFactorOptions,
+    prior_state: Option<&MctsSearchStateArtifact>,
+    runtime_feedback: Option<&AlphaSearchRuntimeFeedback>,
+    llm_prior: Option<&LlmPriorSpec>,
+    alpha_zoo: Option<&AlphaZooSnapshot>,
+) -> Result<AlphaSearchArtifactSummary, AlphaSearchArtifactError> {
+    if let Some(side) = side {
+        validate_side_bound_inputs(
+            target,
+            side,
+            reports,
+            prior_state,
+            runtime_feedback,
+            alpha_zoo,
+        )?;
+    }
+    let version = if side.is_some() {
+        SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION
+    } else {
+        ALPHA_SEARCH_ARTIFACT_VERSION
+    };
+    let output_dir = side.map_or_else(
+        || output_root.as_ref().join(target),
+        |side| output_root.as_ref().join(target).join(side.as_str()),
+    );
     std::fs::create_dir_all(&output_dir)?;
 
     let feature_pool = {
@@ -440,9 +570,10 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
     write_json(
         &output_dir.join("search-space.json"),
         &SearchSpaceArtifact {
-            version: ALPHA_SEARCH_ARTIFACT_VERSION,
+            version,
             mode: "deterministic_seed_search",
             target: target.to_string(),
+            side,
             feature_pool,
             constant_pool: vec![
                 0.001, 0.005, 0.01, 0.02, 0.05, 0.10, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0, 60.0, 300.0,
@@ -483,9 +614,10 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
     write_json(
         &output_dir.join("llm-priors.json"),
         &LlmPriorArtifact {
-            version: ALPHA_SEARCH_ARTIFACT_VERSION,
+            version,
             mode: "deterministic_domain_prior_placeholder",
             target: target.to_string(),
+            side,
             hypotheses: default_hypotheses(target),
             allowed_mutation_types: vec![
                 "add_feature_gate",
@@ -507,6 +639,7 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
         .map(|report| CandidateExpression {
             name: report.name.clone(),
             target: report.target.clone(),
+            side: report.side,
             source: candidate_source(&report.name),
             complexity: report.complexity,
             root_gene: root_gene(&report.expr),
@@ -522,6 +655,7 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
         .map(|report| RejectedExpression {
             name: report.name.clone(),
             target: report.target.clone(),
+            side: report.side,
             root_gene: root_gene(&report.expr),
             structural_signature: structural_signature(&report.expr),
             reason: report.reason.clone(),
@@ -548,9 +682,16 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
     write_json(&output_dir.join("node-metrics.json"), &node_metrics)?;
     write_json(
         &output_dir.join("factor-registry-preview.json"),
-        &factor_registry_preview_artifact(target, reports, &node_metrics)?,
+        &factor_registry_preview_artifact(version, target, side, reports, &node_metrics)?,
     )?;
-    let mcts_state = mcts_search_state(target, &node_metrics, prior_state, subtree_frequencies);
+    let mcts_state = mcts_search_state(
+        version,
+        target,
+        side,
+        &node_metrics,
+        prior_state,
+        subtree_frequencies,
+    );
     let prior_truncated_count = prior_state
         .filter(|state| state.target == target)
         .map(|state| state.backpropagation_truncated_count)
@@ -567,15 +708,16 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
     write_json(&output_dir.join("mcts-state.json"), &mcts_state)?;
     write_json(
         &output_dir.join("mcts-expansion-plan.json"),
-        &mcts_expansion_plan(target, &node_metrics, &mcts_state),
+        &mcts_expansion_plan(version, target, side, &node_metrics, &mcts_state),
     )?;
 
     write_json(
         &output_dir.join("tree-trace.json"),
         &TreeTraceArtifact {
-            version: ALPHA_SEARCH_ARTIFACT_VERSION,
+            version,
             mode: "single_depth_seed_tree",
             target: target.to_string(),
+            side,
             nodes: reports
                 .iter()
                 .enumerate()
@@ -600,16 +742,17 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
 
     write_json(
         &output_dir.join("avoided-subtrees.json"),
-        &avoided_subtrees(&mcts_state.subtree_frequencies),
+        &avoided_subtrees(side, &mcts_state.subtree_frequencies),
     )?;
 
     let best = node_metrics
         .iter()
         .max_by(|lhs, rhs| lhs.reward.total_cmp(&rhs.reward));
     let feedback = SearchFeedbackArtifact {
-        version: ALPHA_SEARCH_ARTIFACT_VERSION,
+        version,
         mode: "deterministic_seed_search",
         target: target.to_string(),
+        side,
         candidate_count: reports.len(),
         rejected_count: rejected.len(),
         watchlist_count: reports
@@ -623,6 +766,7 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
         best_candidate: best.map(|metric| metric.factor_name.clone()),
         best_reward: best.map(|metric| metric.reward),
         runtime_feedback: runtime_feedback.map(|feedback| RuntimeFeedbackSummary {
+            side: feedback.side,
             runtime_score: feedback.runtime_score.clone(),
             base_factor: feedback.base_factor.clone(),
             entry_signals: feedback.entry_signals,
@@ -647,11 +791,99 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
 
     Ok(AlphaSearchArtifactSummary {
         target: target.to_string(),
+        side,
         output_dir: output_dir.display().to_string(),
         candidate_count: reports.len(),
         rejected_count: rejected.len(),
         best_candidate: feedback.best_candidate,
     })
+}
+
+fn validate_side_bound_inputs(
+    target: &str,
+    side: ReviewSide,
+    reports: &[AutoFactorReport],
+    prior_state: Option<&MctsSearchStateArtifact>,
+    runtime_feedback: Option<&AlphaSearchRuntimeFeedback>,
+    alpha_zoo: Option<&AlphaZooSnapshot>,
+) -> Result<(), AlphaSearchArtifactError> {
+    if !is_side_bound_repricing_target(target) {
+        return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
+            "side-bound writer does not support target={target}"
+        )));
+    }
+    for report in reports {
+        if report.target.as_deref() != Some(target) || report.side != Some(side) {
+            return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
+                "report `{}` expected target={target} side={}, found target={} side={}",
+                report.name,
+                side.as_str(),
+                report.target.as_deref().unwrap_or("<missing>"),
+                report.side.map(ReviewSide::as_str).unwrap_or("<missing>")
+            )));
+        }
+    }
+    if let Some(state) = prior_state {
+        validate_side_bound_identity(
+            "MCTS state",
+            Some(state.version.as_str()),
+            Some(state.target.as_str()),
+            state.side,
+            target,
+            side,
+        )?;
+    }
+    if let Some(feedback) = runtime_feedback {
+        validate_side_bound_identity(
+            "runtime feedback",
+            feedback.version.as_deref(),
+            feedback.target.as_deref(),
+            feedback.side,
+            target,
+            side,
+        )?;
+    }
+    if let Some(zoo) = alpha_zoo {
+        validate_side_bound_identity(
+            "Alpha Zoo",
+            Some(zoo.version.as_str()),
+            Some(zoo.target.as_str()),
+            zoo.side,
+            target,
+            side,
+        )?;
+    }
+    Ok(())
+}
+
+fn is_side_bound_repricing_target(target: &str) -> bool {
+    matches!(
+        target,
+        "full_depth_reprice_pnl_10s" | "full_depth_reprice_pnl_30s"
+    )
+}
+
+fn validate_side_bound_identity(
+    kind: &str,
+    version: Option<&str>,
+    target: Option<&str>,
+    side: Option<ReviewSide>,
+    expected_target: &str,
+    expected_side: ReviewSide,
+) -> Result<(), AlphaSearchArtifactError> {
+    if version != Some(SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION)
+        || target != Some(expected_target)
+        || side != Some(expected_side)
+    {
+        return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
+            "{kind} expected version={SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION} target={expected_target} side={}, found version={} target={} side={}",
+            expected_side.as_str(),
+            version.unwrap_or("<missing>"),
+            target.unwrap_or("<missing>"),
+            side.map(ReviewSide::as_str).unwrap_or("<missing>")
+        )));
+    }
+    Ok(())
 }
 
 fn factor_registry_preview_rows(
@@ -672,6 +904,7 @@ fn factor_registry_preview_rows(
             Ok(FactorRegistryPreviewRow {
                 factor_name: report.name.clone(),
                 target: report.target.clone(),
+                side: report.side,
                 horizon: horizon.clone(),
                 dsl_hash,
                 ast_json,
@@ -685,13 +918,16 @@ fn factor_registry_preview_rows(
 }
 
 fn factor_registry_preview_artifact(
+    version: &'static str,
     target: &str,
+    side: Option<ReviewSide>,
     reports: &[AutoFactorReport],
     node_metrics: &[NodeMetric],
 ) -> Result<FactorRegistryPreviewArtifact, AlphaSearchArtifactError> {
     Ok(FactorRegistryPreviewArtifact {
-        version: ALPHA_SEARCH_ARTIFACT_VERSION,
+        version,
         target: target.to_string(),
+        side,
         horizon: factor_horizon(target),
         factors: factor_registry_preview_rows(target, reports, node_metrics)?,
     })
@@ -1135,6 +1371,7 @@ fn node_metric(
         factor_name: report.name.clone(),
         parent_name: report.parent_name.clone(),
         target: report.target.clone(),
+        side: report.side,
         decision: report.decision.as_str().to_string(),
         reason: report.reason.clone(),
         selected_dimension: selected_dimension(report, runtime_avoidances),
@@ -1189,7 +1426,9 @@ fn node_metric(
 }
 
 fn mcts_search_state(
+    version: &str,
     target: &str,
+    side: Option<ReviewSide>,
     metrics: &[NodeMetric],
     prior_state: Option<&MctsSearchStateArtifact>,
     subtree_frequencies: Vec<SubtreeFrequencyState>,
@@ -1245,9 +1484,10 @@ fn mcts_search_state(
     nodes.sort_by(|lhs, rhs| lhs.factor_name.cmp(&rhs.factor_name));
     let total_visits = nodes.iter().map(|node| node.visits).sum();
     MctsSearchStateArtifact {
-        version: ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
+        version: version.to_string(),
         mode: "cumulative_ucb_state".to_string(),
         target: target.to_string(),
+        side,
         total_visits,
         backpropagation_truncated_count,
         nodes,
@@ -1285,7 +1525,9 @@ fn backpropagate(
 }
 
 fn mcts_expansion_plan(
+    version: &'static str,
     target: &str,
+    side: Option<ReviewSide>,
     metrics: &[NodeMetric],
     state: &MctsSearchStateArtifact,
 ) -> MctsExpansionPlan {
@@ -1322,9 +1564,10 @@ fn mcts_expansion_plan(
     selected.truncate(12);
 
     MctsExpansionPlan {
-        version: ALPHA_SEARCH_ARTIFACT_VERSION,
+        version,
         mode: "single_run_ucb_planner",
         target: target.to_string(),
+        side,
         exploration_weight,
         selected_nodes: selected,
         note: "MCTS state accumulates leaf visits and backpropagates leaf rewards through recorded parent lineage; this plan selects branches for the next bounded search run with UCB priority.",
@@ -1539,11 +1782,15 @@ fn subtree_frequency_state(
         .collect()
 }
 
-fn avoided_subtrees(frequencies: &[SubtreeFrequencyState]) -> Vec<AvoidedSubtree> {
+fn avoided_subtrees(
+    side: Option<ReviewSide>,
+    frequencies: &[SubtreeFrequencyState],
+) -> Vec<AvoidedSubtree> {
     frequencies
         .iter()
         .filter(|item| item.count > 2)
         .map(|item| AvoidedSubtree {
+            side,
             root_gene: item.root_gene.clone(),
             structural_signature: item.structural_signature.clone(),
             depth: item.depth,
@@ -2019,6 +2266,7 @@ mod tests {
         AutoFactorReport {
             name: name.to_string(),
             target: Some("full_depth_settlement_executable_pnl".to_string()),
+            side: None,
             expr: FactorExpr::Input("conservative_settlement_edge".to_string()),
             n: 100,
             pearson_ic: 0.2,
@@ -2142,7 +2390,7 @@ mod tests {
 
         let frequencies =
             subtree_frequency_state("full_depth_settlement_executable_pnl", &reports, None, None);
-        let avoided = avoided_subtrees(&frequencies);
+        let avoided = avoided_subtrees(None, &frequencies);
         let inner_signature = structural_signature(&inner);
         let subtree = avoided
             .iter()
@@ -2173,6 +2421,7 @@ mod tests {
             version: ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
             mode: "cumulative_ucb_state".to_string(),
             target: "full_depth_settlement_executable_pnl".to_string(),
+            side: None,
             total_visits: 0,
             backpropagation_truncated_count: 0,
             nodes: Vec::new(),
@@ -2239,6 +2488,7 @@ mod tests {
         let report = AutoFactorReport {
             name: "auto_settlement_conservative_settlement_edge".to_string(),
             target: Some("full_depth_settlement_executable_pnl".to_string()),
+            side: None,
             expr: FactorExpr::Input("conservative_settlement_edge".to_string()),
             n: 100,
             pearson_ic: 0.2,
@@ -2297,6 +2547,7 @@ mod tests {
                 .expect("preview json");
         assert_eq!(preview["version"], ALPHA_SEARCH_ARTIFACT_VERSION);
         assert_eq!(preview["target"], "full_depth_settlement_executable_pnl");
+        assert!(preview.get("side").is_none());
         assert_eq!(preview["horizon"], "5m");
         let rows = preview["factors"].as_array().expect("factors array");
         assert_eq!(
@@ -2327,6 +2578,78 @@ mod tests {
             serde_json::json!(["settlement_edge"])
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn side_bound_artifacts_do_not_overwrite_and_reject_wrong_side_state() {
+        let temp = tempfile::tempdir().expect("create isolated artifact directory");
+        let tmp = temp.path();
+        let target = "full_depth_reprice_pnl_10s";
+        let report_for = |side| AutoFactorReport {
+            target: Some(target.to_string()),
+            side: Some(side),
+            expr: FactorExpr::Input("repricing_gap_side_10s".to_string()),
+            ..sample_report("repricing_gap_side_10s")
+        };
+        let write = |root: &Path,
+                     side,
+                     report: &AutoFactorReport,
+                     state: Option<&MctsSearchStateArtifact>| {
+            write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
+                root,
+                target,
+                side,
+                &["repricing_gap_side_10s".to_string()],
+                std::slice::from_ref(report),
+                &AutoFactorOptions::default(),
+                state,
+                None,
+                None,
+            )
+        };
+
+        let up = report_for(ReviewSide::Up);
+        let up_summary = write(tmp, ReviewSide::Up, &up, None).expect("write Up artifacts");
+        let up_search_space = tmp.join(target).join("up/search-space.json");
+        let up_before = std::fs::read(&up_search_space).expect("read Up search space");
+
+        let down = report_for(ReviewSide::Down);
+        write(tmp, ReviewSide::Down, &down, None).expect("write Down artifacts");
+
+        assert_eq!(up_summary.side, Some(ReviewSide::Up));
+        assert_eq!(
+            std::fs::read(&up_search_space).expect("reread Up search space"),
+            up_before
+        );
+        assert!(tmp.join(target).join("down/search-space.json").exists());
+
+        let pooled_root = tmp.join("pooled");
+        let err = write_alpha_search_artifacts(
+            &pooled_root,
+            target,
+            &["repricing_gap_side_10s".to_string()],
+            std::slice::from_ref(&up),
+            &AutoFactorOptions::default(),
+        )
+        .expect_err("side-bound reports must not use the pooled writer");
+        assert!(matches!(err, AlphaSearchArtifactError::IdentityMismatch(_)));
+        assert!(!pooled_root.join(target).exists());
+
+        let wrong_side_state = MctsSearchStateArtifact {
+            version: SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
+            mode: "cumulative_ucb_state".to_string(),
+            target: target.to_string(),
+            side: Some(ReviewSide::Down),
+            total_visits: 0,
+            backpropagation_truncated_count: 0,
+            nodes: Vec::new(),
+            subtree_frequencies: Vec::new(),
+        };
+        let mismatch_root = tmp.join("mismatch");
+        let err = write(&mismatch_root, ReviewSide::Up, &up, Some(&wrong_side_state))
+            .expect_err("wrong-side prior state must fail closed");
+        assert!(matches!(err, AlphaSearchArtifactError::IdentityMismatch(_)));
+        assert!(!mismatch_root.join(target).join("up").exists());
     }
 
     #[test]
@@ -2509,6 +2832,7 @@ mod tests {
         let report = AutoFactorReport {
             name: "auto_settlement_conservative_settlement_edge".to_string(),
             target: Some("full_depth_settlement_executable_pnl".to_string()),
+            side: None,
             expr: FactorExpr::Input("conservative_settlement_edge".to_string()),
             n: 100,
             pearson_ic: 0.2,
@@ -2542,6 +2866,7 @@ mod tests {
             version: ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
             mode: "cumulative_ucb_state".to_string(),
             target: "full_depth_settlement_executable_pnl".to_string(),
+            side: None,
             total_visits: 3,
             backpropagation_truncated_count: 0,
             nodes: vec![MctsSearchStateNode {
@@ -2605,7 +2930,9 @@ mod tests {
             .map(|metric| (metric.factor_name.as_str(), metric.reward))
             .collect::<BTreeMap<_, _>>();
         let state = mcts_search_state(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
             "full_depth_settlement_executable_pnl",
+            None,
             &metrics,
             None,
             Vec::new(),
@@ -2661,7 +2988,9 @@ mod tests {
             .collect::<Vec<_>>();
         let expected_root_total = metrics.iter().map(|metric| metric.reward).sum::<f64>();
         let state = mcts_search_state(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
             "full_depth_settlement_executable_pnl",
+            None,
             &metrics,
             None,
             Vec::new(),
@@ -2693,6 +3022,7 @@ mod tests {
             version: ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
             mode: "cumulative_ucb_state".to_string(),
             target: "full_depth_settlement_executable_pnl".to_string(),
+            side: None,
             total_visits: 0,
             backpropagation_truncated_count: 0,
             nodes: vec![MctsSearchStateNode {
@@ -2709,7 +3039,9 @@ mod tests {
         };
 
         let state = mcts_search_state(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
             "full_depth_settlement_executable_pnl",
+            None,
             &metrics,
             Some(&prior),
             Vec::new(),
@@ -2747,12 +3079,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let state = mcts_search_state(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
             "full_depth_settlement_executable_pnl",
+            None,
             &metrics,
             None,
             subtree_frequencies.clone(),
         );
-        let plan = mcts_expansion_plan("full_depth_settlement_executable_pnl", &metrics, &state);
+        let plan = mcts_expansion_plan(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_settlement_executable_pnl",
+            None,
+            &metrics,
+            &state,
+        );
 
         assert_eq!(
             plan.selected_nodes
@@ -2814,6 +3154,9 @@ mod tests {
         alternative.top_bucket_avg_label = 0.35;
 
         let feedback = AlphaSearchRuntimeFeedback {
+            version: None,
+            target: None,
+            side: None,
             runtime_score: "autofactor_formula:mut_spread_adjusted_external_move_near_strike"
                 .to_string(),
             base_factor: "mut_spread_adjusted_external_move_near_strike".to_string(),
@@ -2851,6 +3194,9 @@ mod tests {
 
         let alternative = sample_report("auto_settlement_full_depth_settlement_edge_x_capacity");
         let feedback = AlphaSearchRuntimeFeedback {
+            version: None,
+            target: None,
+            side: None,
             runtime_score: "autofactor_formula:mut_spread_adjusted_external_move_near_strike"
                 .to_string(),
             base_factor: "mut_spread_adjusted_external_move_near_strike".to_string(),
@@ -2871,12 +3217,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let state = mcts_search_state(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
             "full_depth_settlement_executable_pnl",
+            None,
             &metrics,
             None,
             subtree_frequencies,
         );
-        let plan = mcts_expansion_plan("full_depth_settlement_executable_pnl", &metrics, &state);
+        let plan = mcts_expansion_plan(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_settlement_executable_pnl",
+            None,
+            &metrics,
+            &state,
+        );
 
         assert!(!plan
             .selected_nodes
@@ -2930,12 +3284,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let state = mcts_search_state(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
             "full_depth_settlement_executable_pnl",
+            None,
             &metrics,
             None,
             subtree_frequencies,
         );
-        let plan = mcts_expansion_plan("full_depth_settlement_executable_pnl", &metrics, &state);
+        let plan = mcts_expansion_plan(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_settlement_executable_pnl",
+            None,
+            &metrics,
+            &state,
+        );
 
         assert!(plan
             .selected_nodes
@@ -3018,6 +3380,7 @@ mod tests {
         let zoo = AlphaZooSnapshot {
             version: "alpha_zoo_v1".to_string(),
             target: "full_depth_settlement_executable_pnl".to_string(),
+            side: None,
             entries: vec![AlphaZooEntry {
                 root_gene: root_gene(&report.expr),
                 count: 50,
@@ -3048,6 +3411,7 @@ mod tests {
         let zoo = AlphaZooSnapshot {
             version: "alpha_zoo_v1".to_string(),
             target: "full_depth_reprice_pnl_10s".to_string(),
+            side: None,
             entries: vec![AlphaZooEntry {
                 root_gene: root_gene(&report.expr),
                 count: 50,
@@ -3082,6 +3446,7 @@ mod tests {
         let empty_zoo = AlphaZooSnapshot {
             version: "alpha_zoo_v1".to_string(),
             target: "full_depth_settlement_executable_pnl".to_string(),
+            side: None,
             entries: Vec::new(),
         };
         let reward_with_empty_zoo =

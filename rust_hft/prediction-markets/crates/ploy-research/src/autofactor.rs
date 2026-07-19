@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::factors::{pearson_ic, spearman_ic};
-use crate::factors_v2::FactorObservationV2;
+use crate::factors_v2::{FactorObservationV2, ReviewSide};
 
 const EPS: f64 = 1e-9;
 const MAX_DETERMINISTIC_MUTATION_DEPTH: usize = 2;
@@ -418,6 +418,8 @@ impl AutoFactorDecision {
 pub struct AutoFactorReport {
     pub name: String,
     pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<ReviewSide>,
     pub expr: FactorExpr,
     pub n: usize,
     pub pearson_ic: f64,
@@ -455,8 +457,8 @@ pub struct AutoFactorReport {
 pub enum AutoFactorV2Target {
     RepricePnl10s,
     RepricePnl30s,
-    FullDepthRepricePnl10s,
-    FullDepthRepricePnl30s,
+    FullDepthRepricePnl10s(ReviewSide),
+    FullDepthRepricePnl30s(ReviewSide),
     SettlementExecutablePnl,
     FullDepthSettlementExecutablePnl,
     TradeableFullDepthSettlementPnl,
@@ -467,8 +469,8 @@ impl AutoFactorV2Target {
         match self {
             AutoFactorV2Target::RepricePnl10s => "reprice_pnl_10s",
             AutoFactorV2Target::RepricePnl30s => "reprice_pnl_30s",
-            AutoFactorV2Target::FullDepthRepricePnl10s => "full_depth_reprice_pnl_10s",
-            AutoFactorV2Target::FullDepthRepricePnl30s => "full_depth_reprice_pnl_30s",
+            AutoFactorV2Target::FullDepthRepricePnl10s(_) => "full_depth_reprice_pnl_10s",
+            AutoFactorV2Target::FullDepthRepricePnl30s(_) => "full_depth_reprice_pnl_30s",
             AutoFactorV2Target::SettlementExecutablePnl => "settlement_executable_pnl",
             AutoFactorV2Target::FullDepthSettlementExecutablePnl => {
                 "full_depth_settlement_executable_pnl"
@@ -479,12 +481,25 @@ impl AutoFactorV2Target {
         }
     }
 
+    pub fn review_side(self) -> Option<ReviewSide> {
+        match self {
+            Self::FullDepthRepricePnl10s(side) | Self::FullDepthRepricePnl30s(side) => Some(side),
+            _ => None,
+        }
+    }
+
     fn label(self, row: &FactorObservationV2) -> f64 {
         match self {
             AutoFactorV2Target::RepricePnl10s => row.label_future_exit_pnl_10s,
             AutoFactorV2Target::RepricePnl30s => row.label_future_exit_pnl_30s,
-            AutoFactorV2Target::FullDepthRepricePnl10s => row.label_future_exit_full_depth_pnl_10s,
-            AutoFactorV2Target::FullDepthRepricePnl30s => row.label_future_exit_full_depth_pnl_30s,
+            AutoFactorV2Target::FullDepthRepricePnl10s(side) if row.side == side => {
+                row.label_future_exit_full_depth_pnl_10s
+            }
+            AutoFactorV2Target::FullDepthRepricePnl30s(side) if row.side == side => {
+                row.label_future_exit_full_depth_pnl_30s
+            }
+            AutoFactorV2Target::FullDepthRepricePnl10s(_)
+            | AutoFactorV2Target::FullDepthRepricePnl30s(_) => None,
             AutoFactorV2Target::SettlementExecutablePnl => row.label_executable_pnl_15u,
             AutoFactorV2Target::FullDepthSettlementExecutablePnl => {
                 row.label_full_depth_executable_pnl_15u
@@ -666,6 +681,7 @@ pub fn evaluate_named_factor(
     Ok(AutoFactorReport {
         name: factor.name.clone(),
         target: factor.target.clone(),
+        side: None,
         expr: factor.expr.clone(),
         n: scored.len(),
         pearson_ic: pearson,
@@ -751,14 +767,15 @@ pub fn format_autofactor_reports(reports: &[AutoFactorReport], top_n: usize) -> 
         "target labels are side-aligned executable PnL for the requested target; reports are candidate discovery gates, not deploy decisions.\n",
     );
     out.push_str(
-        "rank,name,target,decision,reason,n,spearman_ic,pearson_ic,window_count,icir,positive_window_ratio,symbol_count,symbol_positive_ratio,monotonicity,top_bucket_n,top_bucket_avg_label,top_bucket_positive_label_rate,top_bucket_full_depth_entry_fill_rate,top_bucket_avg_entry_sweep_slip_bps,top_bucket_avg_entry_sweep_levels,top_bucket_unique_event_count,top_bucket_max_event_decisions,complexity\n",
+        "rank,name,target,side,decision,reason,n,spearman_ic,pearson_ic,window_count,icir,positive_window_ratio,symbol_count,symbol_positive_ratio,monotonicity,top_bucket_n,top_bucket_avg_label,top_bucket_positive_label_rate,top_bucket_full_depth_entry_fill_rate,top_bucket_avg_entry_sweep_slip_bps,top_bucket_avg_entry_sweep_levels,top_bucket_unique_event_count,top_bucket_max_event_decisions,complexity\n",
     );
     for (idx, report) in reports.iter().take(top_n).enumerate() {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{:.6},{:.6},{},{:.6},{:.4},{},{:.4},{:.4},{},{:.6},{:.4},{:.4},{:.2},{:.2},{},{},{}\n",
+            "{},{},{},{},{},{},{},{:.6},{:.6},{},{:.6},{:.4},{},{:.4},{:.4},{},{:.6},{:.4},{:.4},{:.2},{:.2},{},{},{}\n",
             idx + 1,
             report.name,
             report.target.as_deref().unwrap_or("<unspecified>"),
+            report.side.map(ReviewSide::as_str).unwrap_or("<pooled>"),
             report.decision.as_str(),
             report.reason,
             report.n,
@@ -814,6 +831,21 @@ pub fn mine_domain_autofactors_from_v2_with_guidance(
     mcts_selected_factor_names: &[String],
     llm_prior: Option<&LlmPriorSpec>,
 ) -> Result<Vec<AutoFactorReport>, AutoFactorError> {
+    let side_rows = target.review_side().map(|side| {
+        rows.iter()
+            .filter(|row| row.side == side)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    let rows = side_rows.as_deref().unwrap_or(rows);
+    if rows.is_empty() {
+        if let Some(side) = target.review_side() {
+            return Err(AutoFactorError::MissingInput(format!(
+                "review_side={}",
+                side.as_str()
+            )));
+        }
+    }
     let matrix = autofactor_matrix_from_v2(rows)?;
     let labels = autofactor_labels_from_v2(rows, target);
     let windows = autofactor_windows_from_v2(rows);
@@ -832,7 +864,7 @@ pub fn mine_domain_autofactors_from_v2_with_guidance(
         factor
     })
     .collect::<Vec<_>>();
-    mine_autofactors_with_event_ids(
+    let mut reports = mine_autofactors_with_event_ids(
         &candidates,
         &matrix,
         &labels,
@@ -840,7 +872,11 @@ pub fn mine_domain_autofactors_from_v2_with_guidance(
         &symbols,
         &event_ids,
         options,
-    )
+    )?;
+    for report in &mut reports {
+        report.side = target.review_side();
+    }
+    Ok(reports)
 }
 
 pub fn autofactor_matrix_from_v2(
@@ -4010,7 +4046,7 @@ mod tests {
 
         let reports = mine_domain_autofactors_from_v2(
             &rows,
-            AutoFactorV2Target::FullDepthRepricePnl10s,
+            AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Up),
             &options,
         )
         .expect("reports");
@@ -4018,6 +4054,66 @@ mod tests {
         assert!(reports
             .iter()
             .all(|report| !report.name.starts_with("auto_settlement_")));
+    }
+
+    #[test]
+    fn full_depth_repricing_mines_each_token_side_without_pooling() {
+        let rows = (0..80)
+            .flat_map(|idx| {
+                let up = synthetic_v2_row(idx);
+                let mut down = up.clone();
+                down.side = ReviewSide::Down;
+                down.pm_token_id = "down-token".to_string();
+                down.side_is_up = 0.0;
+                down.label_future_exit_full_depth_pnl_10s =
+                    up.label_future_exit_full_depth_pnl_10s.map(|label| -label);
+                [up, down]
+            })
+            .collect::<Vec<_>>();
+        let options = AutoFactorOptions {
+            min_observations: 40,
+            min_window_observations: 10,
+            min_icir: 0.1,
+            ..Default::default()
+        };
+
+        let report_for = |side| {
+            mine_domain_autofactors_from_v2(
+                &rows,
+                AutoFactorV2Target::FullDepthRepricePnl10s(side),
+                &options,
+            )
+            .expect("side-bound reports")
+            .into_iter()
+            .find(|report| report.name == "repricing_gap_side_10s")
+            .expect("repricing gap report")
+        };
+        let up = report_for(ReviewSide::Up);
+        let down = report_for(ReviewSide::Down);
+
+        assert_eq!((up.n, up.side), (80, Some(ReviewSide::Up)));
+        assert_eq!((down.n, down.side), (80, Some(ReviewSide::Down)));
+        assert!(up.spearman_ic > 0.99);
+        assert!(down.spearman_ic < -0.99);
+        assert!(AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Up)
+            .label(
+                rows.iter()
+                    .find(|row| row.side == ReviewSide::Down)
+                    .unwrap()
+            )
+            .is_nan());
+
+        let up_only = rows
+            .iter()
+            .filter(|row| row.side == ReviewSide::Up)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(mine_domain_autofactors_from_v2(
+            &up_only,
+            AutoFactorV2Target::FullDepthRepricePnl10s(ReviewSide::Down),
+            &options,
+        )
+        .is_err());
     }
 
     #[test]
