@@ -184,6 +184,7 @@ pub use factors_v2::{
 };
 #[cfg(feature = "rl")]
 pub use model::rl::{BinaryEventEnv, DqnAgent, Environment, ReplayBuffer};
+#[cfg(feature = "ml")]
 pub use model::supervised::BinaryTimeBoundary;
 #[cfg(feature = "ml")]
 pub use model::supervised::{

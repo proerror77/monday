@@ -6,6 +6,7 @@
 #[cfg(feature = "ml")]
 pub mod burn_binary;
 
+#[cfg(feature = "ml")]
 pub use burn_binary::BinaryTimeBoundary;
 #[cfg(feature = "ml")]
 pub use burn_binary::{
