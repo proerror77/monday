@@ -1974,7 +1974,9 @@ mod tests {
             test_config(),
         )
         .expect_err("decision at settlement must fail");
-        assert!(error.to_string().contains("settlement cutoff violation"));
+        assert!(error
+            .to_string()
+            .contains("snapshot decision is not before settlement"));
     }
 
     #[test]
