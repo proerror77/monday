@@ -1181,10 +1181,10 @@ pub struct RepricePilotMetrics {
 /// Each episode must carry one stable Up token and one stable Down token.
 /// Events crossing the boundary and events without one consistent canonical
 /// end are excluded.
-pub fn split_reprice_rows_by_event_cohort<'a>(
-    rows: &'a [FactorObservationV2],
+pub fn split_reprice_rows_by_event_cohort(
+    rows: &[FactorObservationV2],
     boundary: DateTime<Utc>,
-) -> Result<(Vec<&'a FactorObservationV2>, Vec<&'a FactorObservationV2>), AutoFactorError> {
+) -> Result<(Vec<&FactorObservationV2>, Vec<&FactorObservationV2>), AutoFactorError> {
     let mut event_ends: BTreeMap<&str, Option<DateTime<Utc>>> = BTreeMap::new();
     let mut event_tokens: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = BTreeMap::new();
     for row in rows {
