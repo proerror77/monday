@@ -3158,6 +3158,7 @@ mod tests {
             tick_ts: chrono::Utc.with_ymd_and_hms(2026, 5, 3, 0, 0, 0).unwrap()
                 + chrono::Duration::days((idx / 20) as i64)
                 + chrono::Duration::seconds(idx as i64),
+            event_end_ts: None,
             time_remaining_secs: 120,
             official_resolution_observed_at: None,
             regime: Regime::Middle,

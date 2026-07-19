@@ -129,6 +129,8 @@ pub struct FactorObservationV2 {
     pub event_id: String,
     pub symbol: String,
     pub tick_ts: DateTime<Utc>,
+    #[serde(default)]
+    pub event_end_ts: Option<DateTime<Utc>>,
     pub time_remaining_secs: i64,
     /// Label provenance only; never exposed through the factor registry.
     #[serde(default)]
@@ -7674,6 +7676,23 @@ fn inferred_event_ends(rows: &[FactorObservationV2]) -> EventEndIndex<'_> {
     event_ends
 }
 
+fn canonical_event_ends(rows: &[FactorObservationV2]) -> EventEndIndex<'_> {
+    let mut event_ends = HashMap::new();
+    for row in rows {
+        match event_ends.entry(row.event_id.as_str()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(row.event_end_ts);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if *entry.get() != row.event_end_ts {
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    event_ends
+}
+
 fn official_label_observation_times(
     rows: &[FactorObservationV2],
 ) -> EventLabelObservationIndex<'_> {
@@ -7695,12 +7714,14 @@ fn official_label_observation_times(
 
 fn event_disjoint_walk_forward_slices<'a>(
     rows: &'a [FactorObservationV2],
-    event_ends: &EventEndIndex<'_>,
+    legacy_event_ends: &EventEndIndex<'_>,
     label_observation_times: &EventLabelObservationIndex<'_>,
     time_cohort: Option<&SettlementProbabilityTimeCohort>,
     bounds: (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>, DateTime<Utc>),
 ) -> (Vec<&'a FactorObservationV2>, Vec<&'a FactorObservationV2>) {
     let (train_start, train_end, test_start, test_end) = bounds;
+    let governed_event_ends = time_cohort.map(|_| canonical_event_ends(rows));
+    let event_ends = governed_event_ends.as_ref().unwrap_or(legacy_event_ends);
     let train = walk_forward_time_slice(rows, train_start, train_end);
     let test = walk_forward_time_slice(rows, test_start, test_end);
     let ends_in = |row: &&FactorObservationV2, start, end| {
@@ -7737,8 +7758,7 @@ fn event_disjoint_walk_forward_slices<'a>(
                 event_ends
                     .get(row.event_id.as_str())
                     .and_then(Option::as_ref)
-                    .and_then(|event_end| event_end.checked_add_signed(Duration::seconds(1)))
-                    .is_some_and(|exclusive_event_end| exclusive_event_end <= cohort.boundary)
+                    .is_some_and(|event_end| *event_end < cohort.boundary)
             })
         })
         .filter(|row| {
@@ -9916,6 +9936,7 @@ fn side_row(
         event_id: row.event_id.clone(),
         symbol: row.symbol.clone(),
         tick_ts: row.tick_ts,
+        event_end_ts: row.event_end_ts,
         time_remaining_secs: row.time_remaining_secs,
         official_resolution_observed_at: row.official_resolution_observed_at,
         regime: Regime::from_secs(row.time_remaining_secs),
@@ -10982,6 +11003,7 @@ mod tests {
             event_id: "evt".into(),
             symbol: "BTCUSDT".into(),
             tick_ts,
+            event_end_ts: Some(tick_ts + Duration::seconds(220)),
             up_token_id: "up-token".into(),
             down_token_id: "down-token".into(),
             chainlink_reference_fresh: false,
@@ -11059,7 +11081,8 @@ mod tests {
             }
         }
         for row in rows {
-            row.official_resolution_observed_at = event_ends.get(&row.event_id).copied();
+            row.event_end_ts = event_ends.get(&row.event_id).copied();
+            row.official_resolution_observed_at = row.event_end_ts;
         }
     }
 
@@ -11091,6 +11114,53 @@ mod tests {
             row.label_full_depth_executable_pnl_15u = pnl;
             row.label_conservative_executable_pnl_15u = pnl;
         }
+    }
+
+    fn governed_time_cohort_options(
+        boundary: DateTime<Utc>,
+    ) -> SettlementProbabilityWalkForwardOptions {
+        SettlementProbabilityWalkForwardOptions {
+            walk_forward: FactorWalkForwardOptions {
+                review: FactorReviewOptions {
+                    min_observations: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            probability: SettlementProbabilityReportOptions {
+                min_bucket_observations: 1,
+                event_surface_min_bucket_observations: 1,
+                event_surface_shrinkage_observations: 1,
+                ..Default::default()
+            },
+            time_cohort: Some(SettlementProbabilityTimeCohort::new(boundary, 300).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    fn assert_governed_settlement_reports_empty(
+        rows: &[FactorObservationV2],
+        start: DateTime<Utc>,
+        boundary: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) {
+        let probability = walk_forward_settlement_probability_report(
+            rows,
+            start,
+            end,
+            governed_time_cohort_options(boundary),
+        );
+        let verdict = walk_forward_settlement_verdict_report_with_prior(
+            rows,
+            start,
+            end,
+            None,
+            governed_time_cohort_options(boundary),
+        );
+        assert!(probability.windows.is_empty());
+        assert!(probability.aggregates.is_empty());
+        assert!(verdict.windows.is_empty());
+        assert!(verdict.aggregates.is_empty());
     }
 
     fn short_settlement_time_cohort_case() -> (
@@ -12235,7 +12305,7 @@ mod tests {
         );
         rows.retain(|row| row.side == ReviewSide::Up);
         rows.sort_by_key(|row| row.tick_ts);
-        let event_ends = inferred_event_ends(&rows);
+        let event_ends = canonical_event_ends(&rows);
         let label_observation_times = official_label_observation_times(&rows);
         let cohort = SettlementProbabilityTimeCohort::new(boundary, 300).unwrap();
 
@@ -12273,6 +12343,156 @@ mod tests {
             ),
         );
         assert!(late_train.is_empty());
+    }
+
+    #[test]
+    fn settlement_time_cohort_uses_canonical_end_at_subsecond_boundary() {
+        let boundary = "2026-07-18T14:35:00Z".parse::<DateTime<Utc>>().unwrap();
+        let train_end = boundary - Duration::minutes(5);
+        let mut train_source = base_obs();
+        train_source.event_id = "train".to_string();
+        train_source.tick_ts = boundary - Duration::minutes(6);
+        train_source.time_remaining_secs = 60;
+        train_source.event_end_ts = Some(train_end);
+        train_source.official_resolution_observed_at = Some(train_end + Duration::minutes(1));
+
+        let mut boundary_end = base_obs();
+        boundary_end.event_id = "boundary-end".to_string();
+        boundary_end.tick_ts = boundary - Duration::minutes(1);
+        boundary_end.time_remaining_secs = 60;
+        boundary_end.event_end_ts = Some(boundary);
+        boundary_end.official_resolution_observed_at = Some(boundary);
+
+        let held_out_end = boundary + Duration::minutes(5);
+        let mut held_out = base_obs();
+        held_out.event_id = "held-out".to_string();
+        held_out.tick_ts = boundary + Duration::milliseconds(123);
+        held_out.time_remaining_secs = 299;
+        held_out.event_end_ts = Some(held_out_end);
+        held_out.official_resolution_observed_at = Some(held_out_end + Duration::seconds(1));
+
+        let crossing_end = boundary + Duration::minutes(2);
+        let mut crossing = base_obs();
+        crossing.event_id = "crossing".to_string();
+        crossing.tick_ts = boundary + Duration::minutes(1);
+        crossing.time_remaining_secs = 60;
+        crossing.event_end_ts = Some(crossing_end);
+        crossing.official_resolution_observed_at = Some(crossing_end + Duration::seconds(1));
+
+        let mut rows = build_factor_observations_v2(
+            &[train_source, boundary_end, held_out, crossing],
+            &FactorReviewOptions::default(),
+        );
+        rows.retain(|row| row.side == ReviewSide::Up);
+        make_settlement_probability_eligible(&mut rows);
+        rows.sort_by_key(|row| row.tick_ts);
+
+        let held_out_row = rows.iter().find(|row| row.event_id == "held-out").unwrap();
+        let lossy_event_end = inferred_event_end(held_out_row).unwrap();
+        assert!(lossy_event_end < held_out_end);
+        assert!(lossy_event_end - Duration::seconds(300) < boundary);
+        let cohort = SettlementProbabilityTimeCohort::new(boundary, 300).unwrap();
+        let (train, test) = event_disjoint_walk_forward_slices(
+            &rows,
+            &canonical_event_ends(&rows),
+            &official_label_observation_times(&rows),
+            Some(&cohort),
+            (
+                boundary - Duration::minutes(15),
+                boundary,
+                boundary,
+                boundary + Duration::minutes(10),
+            ),
+        );
+
+        assert_eq!(
+            train
+                .iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["train"]
+        );
+        assert_eq!(
+            test.iter()
+                .map(|row| row.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["held-out"]
+        );
+
+        let probability = walk_forward_settlement_probability_report(
+            &rows,
+            boundary - Duration::minutes(15),
+            boundary + Duration::minutes(10),
+            governed_time_cohort_options(boundary),
+        );
+        assert!(!probability.windows.is_empty());
+        assert!(probability
+            .windows
+            .iter()
+            .all(|window| window.train_n == 1 && window.test_n == 1));
+        let verdict = walk_forward_settlement_verdict_report_with_prior(
+            &rows,
+            boundary - Duration::minutes(15),
+            boundary + Duration::minutes(10),
+            None,
+            governed_time_cohort_options(boundary),
+        );
+        assert!(!verdict.windows.is_empty());
+        assert!(verdict.windows.iter().all(|window| window.test_n == 1));
+    }
+
+    #[test]
+    fn settlement_time_cohort_rejects_missing_or_conflicting_canonical_ends() {
+        let boundary = "2026-07-18T14:35:00Z".parse::<DateTime<Utc>>().unwrap();
+        let cohort = SettlementProbabilityTimeCohort::new(boundary, 300).unwrap();
+        let bounds = (
+            boundary - Duration::minutes(15),
+            boundary,
+            boundary,
+            boundary + Duration::minutes(10),
+        );
+        let mut train_row = side_row(&base_obs(), ReviewSide::Up, 15.0, None);
+        train_row.event_id = "train".to_string();
+        train_row.tick_ts = boundary - Duration::minutes(6);
+        train_row.event_end_ts = Some(boundary - Duration::minutes(5));
+        train_row.official_resolution_observed_at = Some(boundary - Duration::minutes(4));
+
+        let mut missing = side_row(&base_obs(), ReviewSide::Up, 15.0, None);
+        missing.event_id = "missing".to_string();
+        missing.tick_ts = boundary + Duration::minutes(1);
+        missing.event_end_ts = None;
+        let mut missing_rows = vec![train_row.clone(), missing];
+        make_settlement_probability_eligible(&mut missing_rows);
+        let (train, test) = event_disjoint_walk_forward_slices(
+            &missing_rows,
+            &canonical_event_ends(&missing_rows),
+            &official_label_observation_times(&missing_rows),
+            Some(&cohort),
+            bounds,
+        );
+        assert!(train.is_empty());
+        assert!(test.is_empty());
+        assert_governed_settlement_reports_empty(&missing_rows, bounds.0, boundary, bounds.3);
+
+        let mut first = side_row(&base_obs(), ReviewSide::Up, 15.0, None);
+        first.event_id = "conflict".to_string();
+        first.tick_ts = boundary + Duration::minutes(1);
+        first.event_end_ts = Some(boundary + Duration::minutes(5));
+        let mut second = first.clone();
+        second.tick_ts += Duration::seconds(1);
+        second.event_end_ts = Some(boundary + Duration::minutes(6));
+        let mut conflicting_rows = vec![train_row, first, second];
+        make_settlement_probability_eligible(&mut conflicting_rows);
+        let (train, test) = event_disjoint_walk_forward_slices(
+            &conflicting_rows,
+            &canonical_event_ends(&conflicting_rows),
+            &official_label_observation_times(&conflicting_rows),
+            Some(&cohort),
+            bounds,
+        );
+        assert!(train.is_empty());
+        assert!(test.is_empty());
+        assert_governed_settlement_reports_empty(&conflicting_rows, bounds.0, boundary, bounds.3);
     }
 
     #[test]

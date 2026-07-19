@@ -2223,6 +2223,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             tick_ts: Utc.with_ymd_and_hms(2026, 4, 25, 0, 0, 0).unwrap()
                 + chrono::Duration::seconds(ts_offset_secs),
+            event_end_ts: None,
             time_remaining_secs: 120,
             official_resolution_observed_at: None,
             regime: Regime::Middle,

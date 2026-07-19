@@ -978,6 +978,7 @@ mod tests {
             event_id: event_id.to_string(),
             symbol: symbol.to_string(),
             tick_ts: event_start + Duration::seconds(row_idx * 30),
+            event_end_ts: None,
             up_token_id: String::new(),
             down_token_id: String::new(),
             chainlink_reference_fresh: false,

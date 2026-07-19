@@ -134,6 +134,10 @@ persisted with `event_window_secs=300`; legacy observations default to zero and
 must be rebuilt into a new snapshot. The mission binds the snapshot's strong
 `snapshot_contract_hash`, which covers the evaluator-visible manifest semantics
 and artifacts, rather than relying only on the legacy content hash.
+Governed time-cohort evaluation also requires each observation's optional
+`event_end_ts` to be bound to the verified market contract. Missing or
+inconsistent event ends fail closed; event starts are derived from that exact
+end and the governed window instead of integer `time_remaining_secs`.
 
 Prediction snapshot v2 atomically reads the exact UP/DOWN token-primary-key
 pair, its complementary official outcome, and the local availability time of

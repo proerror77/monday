@@ -3850,6 +3850,7 @@ mod tests {
             event_id: "event-1".to_string(),
             symbol: "BTCUSDT".to_string(),
             tick_ts,
+            event_end_ts: None,
             up_token_id: "up-token".to_string(),
             down_token_id: "down-token".to_string(),
             chainlink_reference_fresh: true,

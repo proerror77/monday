@@ -309,6 +309,13 @@ fn bind_and_filter_verified_observations(
                 && row.down_token_id == contract.down_token_id,
             "factor event/token mismatch"
         );
+        if let Some(event_end_ts) = row.event_end_ts {
+            ensure!(
+                event_end_ts == contract.event_end,
+                "factor event end mismatch"
+            );
+        }
+        row.event_end_ts = Some(contract.event_end);
         if !observation_is_available(row.tick_ts, contract, start, end) {
             continue;
         }
@@ -2388,6 +2395,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(rows[0].settlement_up, expected);
+            assert_eq!(rows[0].event_end_ts, Some(contract.event_end));
             assert_eq!(
                 rows[0].official_resolution_observed_at.unwrap(),
                 "2026-07-17T05:35:02Z".parse::<DateTime<Utc>>().unwrap()
@@ -2458,6 +2466,25 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("no available factor observation"));
+    }
+
+    #[test]
+    fn verified_observation_event_end_binding_rejects_mismatch() {
+        let contract = verified_contract("2026-07-17T05:31:00Z");
+        let mut row = verified_observation("2026-07-17T05:31:00Z");
+        row.event_end_ts = Some(contract.event_end + chrono::Duration::microseconds(1));
+
+        assert!(bind_and_filter_verified_observations(
+            vec![row],
+            std::slice::from_ref(&contract),
+            &verified_outcomes(true),
+            "BTCUSDT",
+            contract.event_start,
+            contract.event_end,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("factor event end mismatch"));
     }
 
     #[test]
