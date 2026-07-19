@@ -16,4 +16,9 @@ ALTER TABLE factor_registry
 CREATE UNIQUE INDEX idx_factor_registry_dsl_target_horizon_review_side
     ON factor_registry(dsl_hash, target, horizon, review_side) NULLS NOT DISTINCT;
 
+-- This is a forward-only identity widening for the manual Research OS writer,
+-- not a rolling service migration. Older writers deliberately fail closed
+-- after this point because their three-column ON CONFLICT arbiter no longer
+-- exists. Do not roll back the writer without first archiving side-bound rows
+-- and restoring the old index as an explicit operator action.
 DROP INDEX idx_factor_registry_dsl_target_horizon;
