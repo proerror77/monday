@@ -5,11 +5,14 @@
 //! scores executable PnL after PM CLOB fillability.
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use ploy_research::factors_v2::{
+    build_full_depth_execution_matrix_with_event_rows, FullDepthExecutionEventRow,
+};
 use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
 use ploy_research::{
     autofactor_matrix_from_v2, build_factor_observations_v2_with_deribit_and_pm_books,
-    build_factor_stability_report, build_full_depth_execution_matrix,
-    build_prediction_research_feedback, build_settlement_probability_promotion_gate_report,
+    build_factor_stability_report, build_prediction_research_feedback,
+    build_settlement_probability_promotion_gate_report,
     build_settlement_probability_report_with_prior, format_autofactor_reports,
     format_factor_combo_v1_report, format_factor_stability_report,
     format_factor_walk_forward_v2_report, format_fillability_review_v1_report,
@@ -30,15 +33,289 @@ use ploy_research::{
     write_alpha_search_artifacts_with_state_and_runtime_feedback, AlphaSearchRuntimeFeedback,
     AlphaZooSnapshot, AutoFactorOptions, AutoFactorV2Target, FactorComboV1Options,
     FactorObservation, FactorReviewOptions, FactorStabilityOptions, FactorWalkForwardOptions,
-    FillabilityReviewOptions, FullDepthExecutionMatrixOptions, LiquidityGateV1Options,
-    LiquidityGatedAlphaV1Options, LlmPriorSpec, MetaLabelWalkForwardOptions, RepricingIcOptions,
-    ResearchSnapshotRequest, ReviewSide, SettlementProbabilityDataQualityMode,
-    SettlementProbabilityPromotionGateOptions, SettlementProbabilityReportOptions,
-    SettlementProbabilityTimeCohort, SettlementProbabilityWalkForwardOptions,
-    TradeFormationReviewOptions,
+    FillabilityReviewOptions, FullDepthExecutionMatrixOptions, FullDepthExecutionMatrixReport,
+    LiquidityGateV1Options, LiquidityGatedAlphaV1Options, LlmPriorSpec,
+    MetaLabelWalkForwardOptions, RepricingIcOptions, ResearchSnapshotRequest, ReviewSide,
+    SettlementProbabilityDataQualityMode, SettlementProbabilityPromotionGateOptions,
+    SettlementProbabilityPromotionGateReport, SettlementProbabilityReport,
+    SettlementProbabilityReportOptions, SettlementProbabilityTimeCohort,
+    SettlementProbabilityWalkForwardAggregate, SettlementProbabilityWalkForwardOptions,
+    SettlementProbabilityWalkForwardReport, SettlementProbabilityWalkForwardWindow,
+    SettlementVerdictWalkForwardAggregate, SettlementVerdictWalkForwardReport,
+    SettlementVerdictWalkForwardWindow, TradeFormationReviewOptions,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, serde::Serialize)]
+struct ReportArtifactContext<'a> {
+    mission_id: &'a str,
+    search_policy_snapshot_id: &'a str,
+    snapshot_hash: &'a str,
+    snapshot_contract_hash: &'a str,
+    start: &'a DateTime<Utc>,
+    end: &'a DateTime<Utc>,
+    time_cohort_boundary_ms: Option<i64>,
+    event_window_secs: Option<i64>,
+}
+
+#[derive(serde::Serialize)]
+struct SettlementBaselineArtifact<'a> {
+    schema_version: &'static str,
+    non_finite_floats: &'static str,
+    #[serde(flatten)]
+    context: ReportArtifactContext<'a>,
+    settlement_probability: &'a SettlementProbabilityReport,
+    settlement_probability_walk_forward: SettlementProbabilityWalkForwardArtifact<'a>,
+    settlement_verdict_walk_forward: SettlementVerdictWalkForwardArtifact<'a>,
+    promotion_gate: &'a SettlementProbabilityPromotionGateReport,
+}
+
+#[derive(serde::Serialize)]
+struct SettlementProbabilityWalkForwardArtifact<'a> {
+    windows: &'a [SettlementProbabilityWalkForwardWindow],
+    aggregates: &'a [SettlementProbabilityWalkForwardAggregate],
+}
+
+#[derive(serde::Serialize)]
+struct SettlementVerdictWalkForwardArtifact<'a> {
+    windows: &'a [SettlementVerdictWalkForwardWindow],
+    aggregates: &'a [SettlementVerdictWalkForwardAggregate],
+}
+
+#[derive(serde::Serialize)]
+struct FullDepthExecutionArtifactProfile<'a> {
+    options: &'a FullDepthExecutionMatrixOptions,
+    rows: Vec<&'a FullDepthExecutionEventRow>,
+}
+
+#[derive(serde::Serialize)]
+struct FullDepthExecutionArtifact<'a> {
+    schema_version: &'static str,
+    non_finite_floats: &'static str,
+    #[serde(flatten)]
+    context: ReportArtifactContext<'a>,
+    side: ReviewSide,
+    observed: FullDepthExecutionArtifactProfile<'a>,
+    conservative: FullDepthExecutionArtifactProfile<'a>,
+}
+
+fn require_report_identity<'a>(
+    snapshot_hash: &'a str,
+    snapshot_contract_hash: Option<&'a str>,
+    mission_id: Option<&'a str>,
+    search_policy_snapshot_id: Option<&'a str>,
+) -> Result<(&'a str, &'a str, &'a str, &'a str), String> {
+    fn required<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str, String> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("evaluator report output requires {field}"))
+    }
+    Ok((
+        required(Some(snapshot_hash), "snapshot_hash")?,
+        required(snapshot_contract_hash, "snapshot_contract_hash")?,
+        required(mission_id, "mission_id")?,
+        required(search_policy_snapshot_id, "search_policy_snapshot_id")?,
+    ))
+}
+
+fn validate_report_observation_count(
+    report_output_dir: Option<&str>,
+    observation_count: usize,
+) -> Result<(), &'static str> {
+    if report_output_dir.is_some() && observation_count == 0 {
+        return Err("requested evaluator reports require at least one observation");
+    }
+    Ok(())
+}
+
+fn reject_report_digest_sibling(
+    report_output_dir: &Path,
+    prefix: &str,
+    output_path: &Path,
+) -> Result<(), String> {
+    let filename_prefix = format!("{prefix}-");
+    let entries = std::fs::read_dir(report_output_dir)
+        .map_err(|error| format!("read report directory: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read report directory entry: {error}"))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path != output_path && name.starts_with(&filename_prefix) && name.ends_with(".json") {
+            return Err(format!("report {prefix} has different digest sibling"));
+        }
+    }
+    Ok(())
+}
+
+fn write_content_addressed_report<T: serde::Serialize>(
+    report_output_dir: &Path,
+    prefix: &str,
+    value: &T,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(report_output_dir)
+        .map_err(|error| format!("create report directory: {error}"))?;
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("serialize {prefix}: {error}"))?;
+    let bytes = format!("{json}\n");
+    let digest = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+    let output_path = report_output_dir.join(format!("{prefix}-{digest}.json"));
+    let lock_path = report_output_dir.join(format!(".{prefix}.lock"));
+    std::fs::create_dir(&lock_path)
+        .map_err(|error| format!("acquire report lock {}: {error}", lock_path.display()))?;
+    let result = (|| -> Result<(), String> {
+        reject_report_digest_sibling(report_output_dir, prefix, &output_path)?;
+        let temp_path = lock_path.join("report.tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| format!("create report temp {}: {error}", temp_path.display()))?;
+        file.write_all(bytes.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("write report temp {}: {error}", temp_path.display()))?;
+        reject_report_digest_sibling(report_output_dir, prefix, &output_path)?;
+        match std::fs::hard_link(&temp_path, &output_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let existing = std::fs::read(&output_path)
+                    .map_err(|error| format!("read existing report: {error}"))?;
+                if existing == bytes.as_bytes() {
+                    Ok(())
+                } else {
+                    Err("existing report has different bytes".to_string())
+                }
+            }
+            Err(error) => Err(format!("publish report {}: {error}", output_path.display())),
+        }
+    })();
+    let cleanup = std::fs::remove_dir_all(&lock_path);
+    let directory_sync = std::fs::File::open(report_output_dir).and_then(|dir| dir.sync_all());
+    result?;
+    cleanup.map_err(|error| format!("remove report lock {}: {error}", lock_path.display()))?;
+    directory_sync.map_err(|error| format!("sync report directory: {error}"))?;
+    Ok(output_path)
+}
+
+fn write_report_set<S: serde::Serialize, U: serde::Serialize, D: serde::Serialize>(
+    report_output_dir: &Path,
+    settlement: &S,
+    up: &U,
+    down: &D,
+) -> Result<[PathBuf; 3], String> {
+    Ok([
+        write_content_addressed_report(report_output_dir, "settlement-baseline", settlement)?,
+        write_content_addressed_report(report_output_dir, "full-depth-execution-up", up)?,
+        write_content_addressed_report(report_output_dir, "full-depth-execution-down", down)?,
+    ])
+}
+
+fn execution_rows_for_side<'a>(
+    rows: &'a [FullDepthExecutionEventRow],
+    side: ReviewSide,
+) -> Vec<&'a FullDepthExecutionEventRow> {
+    rows.iter().filter(|row| row.side == side).collect()
+}
+
+fn full_depth_execution_artifact<'a>(
+    context: ReportArtifactContext<'a>,
+    side: ReviewSide,
+    execution_matrix: &'a FullDepthExecutionMatrixReport,
+    execution_event_rows: &'a [FullDepthExecutionEventRow],
+    conservative_execution_matrix: &'a FullDepthExecutionMatrixReport,
+    conservative_execution_event_rows: &'a [FullDepthExecutionEventRow],
+) -> FullDepthExecutionArtifact<'a> {
+    FullDepthExecutionArtifact {
+        schema_version: "monday.polymarket.full_depth_execution.v1",
+        non_finite_floats: "null",
+        context,
+        side,
+        observed: FullDepthExecutionArtifactProfile {
+            options: &execution_matrix.options,
+            rows: execution_rows_for_side(execution_event_rows, side),
+        },
+        conservative: FullDepthExecutionArtifactProfile {
+            options: &conservative_execution_matrix.options,
+            rows: execution_rows_for_side(conservative_execution_event_rows, side),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_report_artifacts(
+    report_output_dir: &Path,
+    snapshot_hash: &str,
+    snapshot_contract_hash: Option<&str>,
+    mission_id: Option<&str>,
+    search_policy_snapshot_id: Option<&str>,
+    start: &DateTime<Utc>,
+    end: &DateTime<Utc>,
+    time_cohort_boundary_ms: Option<i64>,
+    event_window_secs: Option<i64>,
+    execution_matrix: &FullDepthExecutionMatrixReport,
+    execution_event_rows: &[FullDepthExecutionEventRow],
+    conservative_execution_matrix: &FullDepthExecutionMatrixReport,
+    conservative_execution_event_rows: &[FullDepthExecutionEventRow],
+    settlement_probability_report: &SettlementProbabilityReport,
+    settlement_probability_walk_forward_report: &SettlementProbabilityWalkForwardReport,
+    settlement_verdict_walk_forward_report: &SettlementVerdictWalkForwardReport,
+    promotion_gate_report: &SettlementProbabilityPromotionGateReport,
+) -> Result<[PathBuf; 3], String> {
+    let (snapshot_hash, snapshot_contract_hash, mission_id, search_policy_snapshot_id) =
+        require_report_identity(
+            snapshot_hash,
+            snapshot_contract_hash,
+            mission_id,
+            search_policy_snapshot_id,
+        )?;
+    let context = ReportArtifactContext {
+        mission_id,
+        search_policy_snapshot_id,
+        snapshot_hash,
+        snapshot_contract_hash,
+        start,
+        end,
+        time_cohort_boundary_ms,
+        event_window_secs,
+    };
+    let settlement = SettlementBaselineArtifact {
+        schema_version: "monday.polymarket.settlement_baseline.v1",
+        non_finite_floats: "null",
+        context,
+        settlement_probability: settlement_probability_report,
+        settlement_probability_walk_forward: SettlementProbabilityWalkForwardArtifact {
+            windows: &settlement_probability_walk_forward_report.windows,
+            aggregates: &settlement_probability_walk_forward_report.aggregates,
+        },
+        settlement_verdict_walk_forward: SettlementVerdictWalkForwardArtifact {
+            windows: &settlement_verdict_walk_forward_report.windows,
+            aggregates: &settlement_verdict_walk_forward_report.aggregates,
+        },
+        promotion_gate: promotion_gate_report,
+    };
+    let up = full_depth_execution_artifact(
+        context,
+        ReviewSide::Up,
+        execution_matrix,
+        execution_event_rows,
+        conservative_execution_matrix,
+        conservative_execution_event_rows,
+    );
+    let down = full_depth_execution_artifact(
+        context,
+        ReviewSide::Down,
+        execution_matrix,
+        execution_event_rows,
+        conservative_execution_matrix,
+        conservative_execution_event_rows,
+    );
+    write_report_set(report_output_dir, &settlement, &up, &down)
+}
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
@@ -284,12 +561,14 @@ fn replay_parity_evidence(path: &str) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_time_cohort_boundary, replay_parity_evidence, settlement_time_cohort_from_args,
-        validate_expected_prediction_policy, validate_prediction_snapshot_contract_id,
-        validate_time_cohort_range,
+        parse_time_cohort_boundary, replay_parity_evidence, require_report_identity,
+        settlement_time_cohort_from_args, validate_expected_prediction_policy,
+        validate_prediction_snapshot_contract_id, validate_report_observation_count,
+        validate_time_cohort_range, write_report_set, ReportArtifactContext,
     };
     use chrono::{TimeZone, Utc};
     use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
+    use sha2::{Digest, Sha256};
     use std::fs;
 
     fn write_parity_fixture(name: &str, payload: &str) -> String {
@@ -418,6 +697,115 @@ mod tests {
             validate_prediction_snapshot_contract_id(&content_hash, Some(&contract_hash)).is_err()
         );
         assert!(validate_prediction_snapshot_contract_id(&contract_hash, None).is_err());
+    }
+
+    #[test]
+    fn evaluator_report_set_is_content_addressed_stable_and_rejects_tampering() {
+        #[derive(serde::Serialize)]
+        struct ArtifactFixture<'a> {
+            schema_version: &'static str,
+            #[serde(flatten)]
+            context: ReportArtifactContext<'a>,
+            value: f64,
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "monday-prediction-evaluator-reports-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let start = Utc.timestamp_opt(0, 0).single().unwrap();
+        let context = ReportArtifactContext {
+            mission_id: "mission-1",
+            search_policy_snapshot_id: "policy-1",
+            snapshot_hash: "snapshot-1",
+            snapshot_contract_hash: "contract-1",
+            start: &start,
+            end: &start,
+            time_cohort_boundary_ms: Some(1_700_000_500_000),
+            event_window_secs: Some(300),
+        };
+        let artifact = |schema_version: &'static str, value: f64| ArtifactFixture {
+            schema_version,
+            context,
+            value,
+        };
+        let settlement = artifact("monday.polymarket.settlement_baseline.v1", 1.0);
+        let up = artifact("monday.polymarket.full_depth_execution.v1", 2.0);
+        let down = artifact("monday.polymarket.full_depth_execution.v1", 3.0);
+
+        let first = write_report_set(&root, &settlement, &up, &down).expect("first report set");
+        let expected_prefixes = [
+            "settlement-baseline-",
+            "full-depth-execution-up-",
+            "full-depth-execution-down-",
+        ];
+        assert_eq!(fs::read_dir(&root).expect("report directory").count(), 3);
+        let first_bytes = first
+            .iter()
+            .map(|path| fs::read(path).expect("read first report"))
+            .collect::<Vec<_>>();
+        for ((path, prefix), bytes) in first.iter().zip(expected_prefixes).zip(first_bytes.iter()) {
+            let digest = format!("{:x}", Sha256::digest(bytes));
+            let json: serde_json::Value =
+                serde_json::from_slice(bytes).expect("parse report artifact");
+            assert_eq!(
+                path.file_name()
+                    .expect("report filename")
+                    .to_str()
+                    .expect("UTF-8 report filename"),
+                format!("{prefix}{digest}.json")
+            );
+            assert_eq!(json["mission_id"], "mission-1");
+            assert_eq!(json["search_policy_snapshot_id"], "policy-1");
+        }
+
+        let second = write_report_set(&root, &settlement, &up, &down).expect("stable report set");
+        assert_eq!(second, first);
+        assert_eq!(fs::read_dir(&root).expect("report directory").count(), 3);
+        for (path, expected) in second.iter().zip(first_bytes) {
+            assert_eq!(fs::read(path).expect("read stable report"), expected);
+        }
+
+        let changed_up = artifact("monday.polymarket.full_depth_execution.v1", 4.0);
+        let changed_error = write_report_set(&root, &settlement, &changed_up, &down)
+            .expect_err("different digest sibling must fail closed");
+        assert!(changed_error.contains("different digest sibling"));
+        assert_eq!(fs::read_dir(&root).expect("report directory").count(), 3);
+
+        fs::write(&first[1], b"tampered\n").expect("tamper hash-named report");
+        write_report_set(&root, &settlement, &up, &down)
+            .expect_err("existing hash-named path with different bytes must fail closed");
+        assert_eq!(fs::read_dir(&root).expect("report directory").count(), 3);
+
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let non_finite =
+                serde_json::to_value(artifact("test", value)).expect("serialize non-finite");
+            assert!(non_finite["value"].is_null(), "value={value}");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn evaluator_report_writer_gate_requires_snapshot_and_mission_identity() {
+        for (snapshot, contract, mission, policy) in [
+            ("", Some("contract"), Some("mission"), Some("policy")),
+            ("snapshot", None, Some("mission"), Some("policy")),
+            ("snapshot", Some("contract"), None, Some("policy")),
+            ("snapshot", Some("contract"), Some("mission"), None),
+        ] {
+            assert!(require_report_identity(snapshot, contract, mission, policy).is_err());
+        }
+    }
+
+    #[test]
+    fn evaluator_report_mode_rejects_empty_observations() {
+        assert!(validate_report_observation_count(Some("reports"), 0).is_err());
+        assert!(validate_report_observation_count(Some("reports"), 1).is_ok());
+        assert!(validate_report_observation_count(None, 0).is_ok());
     }
 }
 
@@ -645,6 +1033,8 @@ async fn main() {
     let replay_parity_json = flag_value(&args, "--replay-parity-json");
     let candidate_strategy_replay_json = flag_value(&args, "--candidate-strategy-replay-json");
     let alpha_search_output_dir = flag_value(&args, "--alpha-search-output-dir");
+    let report_output_dir = flag_value(&args, "--report-output-dir");
+    let mission_id = flag_value(&args, "--mission-id");
     let alpha_search_plan_json = flag_value(&args, "--alpha-search-plan-json");
     let alpha_search_llm_prior_json = flag_value(&args, "--alpha-search-llm-prior-json");
     let expected_prediction_policy = flag_value(&args, "--expected-search-policy-snapshot-id");
@@ -656,6 +1046,10 @@ async fn main() {
         event_window_secs,
     )
     .unwrap_or_else(|reason| panic!("prediction evaluator time cohort mismatch: {reason}"));
+    let time_cohort_boundary_ms = flag_value(&args, "--time-cohort-boundary-ms").map(|raw| {
+        raw.parse::<i64>()
+            .expect("validated --time-cohort-boundary-ms")
+    });
     let llm_prior = alpha_search_llm_prior_json.as_deref().map(read_llm_prior);
     let governed_prediction_prior = llm_prior
         .as_ref()
@@ -825,6 +1219,16 @@ async fn main() {
         (observations, deribit_snapshots, pm_book_snapshots)
     };
 
+    if report_output_dir.is_some() {
+        require_report_identity(
+            &snapshot_hash,
+            snapshot_contract_hash.as_deref(),
+            mission_id.as_deref(),
+            expected_prediction_policy.as_deref(),
+        )
+        .unwrap_or_else(|reason| panic!("evaluator report identity invalid: {reason}"));
+    }
+
     if let Some(prior) = governed_prediction_prior {
         let prior_snapshot_id = prior
             .data_snapshot_id
@@ -857,6 +1261,8 @@ async fn main() {
     }
 
     if observations.is_empty() {
+        validate_report_observation_count(report_output_dir.as_deref(), observations.len())
+            .unwrap_or_else(|reason| panic!("evaluator report output failed: {reason}"));
         eprintln!("no observations — check date range, symbols, quote coverage, and settlements");
         return;
     }
@@ -871,30 +1277,32 @@ async fn main() {
     );
     println!("{snapshot_provenance}");
     println!("{}", format_factor_walk_forward_v2_report(&report));
-    let execution_matrix = build_full_depth_execution_matrix(
-        &observations,
-        &all_pm_book_snapshots,
-        FullDepthExecutionMatrixOptions {
-            min_bucket_observations: options.review.min_observations.max(20),
-            max_quote_age_secs,
-            ..Default::default()
-        },
-    );
+    let (execution_matrix, execution_event_rows) =
+        build_full_depth_execution_matrix_with_event_rows(
+            &observations,
+            &all_pm_book_snapshots,
+            FullDepthExecutionMatrixOptions {
+                min_bucket_observations: options.review.min_observations.max(20),
+                max_quote_age_secs,
+                ..Default::default()
+            },
+        );
     println!(
         "{}",
         format_full_depth_execution_matrix_report(&execution_matrix, options.top_n)
     );
-    let conservative_execution_matrix = build_full_depth_execution_matrix(
-        &observations,
-        &all_pm_book_snapshots,
-        FullDepthExecutionMatrixOptions {
-            visible_depth_haircut: 0.5,
-            max_levels: Some(3),
-            min_bucket_observations: options.review.min_observations.max(20),
-            max_quote_age_secs,
-            ..Default::default()
-        },
-    );
+    let (conservative_execution_matrix, conservative_execution_event_rows) =
+        build_full_depth_execution_matrix_with_event_rows(
+            &observations,
+            &all_pm_book_snapshots,
+            FullDepthExecutionMatrixOptions {
+                visible_depth_haircut: 0.5,
+                max_levels: Some(3),
+                min_bucket_observations: options.review.min_observations.max(20),
+                max_quote_age_secs,
+                ..Default::default()
+            },
+        );
     println!(
         "{}",
         format_full_depth_execution_matrix_report(&conservative_execution_matrix, options.top_n)
@@ -1008,6 +1416,28 @@ async fn main() {
         "{}",
         format_settlement_probability_promotion_gate_report(&promotion_gate_report)
     );
+    if let Some(report_output_dir) = report_output_dir.as_deref() {
+        write_report_artifacts(
+            Path::new(report_output_dir),
+            &snapshot_hash,
+            snapshot_contract_hash.as_deref(),
+            mission_id.as_deref(),
+            expected_prediction_policy.as_deref(),
+            &start,
+            &end,
+            time_cohort_boundary_ms,
+            event_window_secs,
+            &execution_matrix,
+            &execution_event_rows,
+            &conservative_execution_matrix,
+            &conservative_execution_event_rows,
+            &settlement_probability_report,
+            &settlement_probability_walk_forward_report,
+            &settlement_verdict_walk_forward_report,
+            &promotion_gate_report,
+        )
+        .unwrap_or_else(|error| panic!("write evaluator report artifacts failed: {error}"));
+    }
     if let (Some(output_root), Some(prior)) =
         (alpha_search_output_dir.as_deref(), llm_prior.as_ref())
     {
