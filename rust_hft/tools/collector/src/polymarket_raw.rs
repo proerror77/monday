@@ -608,42 +608,6 @@ fn target_market(market: &Value, symbols: &BTreeSet<String>) -> Option<TargetMar
     })
 }
 
-fn tracked_market_recovery_target(
-    tracked: &TrackedMarket,
-    symbols: &BTreeSet<String>,
-    now: DateTime<Utc>,
-) -> Option<(Value, TargetMarket)> {
-    if !tracked.settled || tracked.trade_complete {
-        return None;
-    }
-    let condition_id = tracked
-        .condition_id
-        .as_deref()
-        .filter(|value| !value.is_empty())?;
-    let symbol = tracked
-        .symbol
-        .as_deref()
-        .filter(|value| symbols.contains(*value))?;
-    let window_secs = tracked.market_window_secs;
-    if !matches!(window_secs, 300 | 900) {
-        return None;
-    }
-    let end_time = tracked.end_time.as_deref()?;
-    if parse_optional_datetime(Some(end_time)).is_none_or(|end| end > now) {
-        return None;
-    }
-    Some((
-        json!({
-            "conditionId": condition_id,
-            "endDate": end_time,
-        }),
-        TargetMarket {
-            symbol: symbol.to_owned(),
-            window_secs,
-        },
-    ))
-}
-
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
@@ -1522,17 +1486,16 @@ fn reject(counter: &mut BTreeMap<String, u64>, reason: &str) {
 
 #[allow(clippy::too_many_arguments)]
 fn trade_updates(
-    config: &ReferenceConfig,
+    _config: &ReferenceConfig,
     state: &mut CollectorState,
     market_id: &str,
     condition_id: &str,
     symbol: &str,
     window_secs: u64,
     trades: Vec<Value>,
-    cutoff_at: DateTime<Utc>,
+    _cutoff_at: DateTime<Utc>,
     received_at: DateTime<Utc>,
 ) -> (Vec<Value>, BTreeMap<String, u64>) {
-    let cutoff = cutoff_at.timestamp() - config.settlement_lookback_secs;
     let mut parsed = Vec::new();
     let mut malformed = BTreeMap::new();
     for trade in trades {
@@ -1606,7 +1569,7 @@ fn trade_updates(
     let mut updates = Vec::new();
     for (timestamp, trade) in parsed {
         let record_id = stable_trade_id(&trade);
-        if timestamp < cutoff || seen.contains_key(&record_id) {
+        if seen.contains_key(&record_id) {
             continue;
         }
         seen.insert(record_id.clone(), timestamp);
@@ -1638,7 +1601,6 @@ fn trade_updates(
             .insert("trade".to_owned(), trade);
         updates.push(update);
     }
-    seen.retain(|_, timestamp| *timestamp >= cutoff);
     (updates, malformed)
 }
 
@@ -1735,7 +1697,7 @@ struct ReferenceCollector {
 fn recover_state_from_tape_row(
     state: &mut CollectorState,
     row: &Value,
-    trade_cutoff: i64,
+    _trade_cutoff: i64,
 ) -> Result<()> {
     let Some(update) = row.get("update").and_then(Value::as_object) else {
         return Ok(());
@@ -1753,13 +1715,11 @@ fn recover_state_from_tape_row(
                 update.get("record_id").and_then(Value::as_str),
                 update.get("trade_ts_unix").and_then(Value::as_i64),
             ) {
-                if timestamp >= trade_cutoff {
-                    state
-                        .trade_seen
-                        .entry(condition_id.to_owned())
-                        .or_default()
-                        .insert(record_id.to_owned(), timestamp);
-                }
+                state
+                    .trade_seen
+                    .entry(condition_id.to_owned())
+                    .or_default()
+                    .insert(record_id.to_owned(), timestamp);
             }
         }
     } else if kind == TRADE_COMPLETION_KIND {
@@ -1803,8 +1763,17 @@ fn recover_state_from_tape_row(
 }
 
 fn compact_trade_dedupe(state: &mut CollectorState, cutoff: i64) -> bool {
+    let incomplete = state
+        .markets
+        .values()
+        .filter(|market| !market.trade_complete)
+        .filter_map(|market| market.condition_id.clone())
+        .collect::<BTreeSet<_>>();
     let mut changed = false;
-    state.trade_seen.retain(|_, seen| {
+    state.trade_seen.retain(|condition_id, seen| {
+        if incomplete.contains(condition_id) {
+            return true;
+        }
         let before = seen.len();
         seen.retain(|_, timestamp| *timestamp >= cutoff);
         changed |= seen.len() != before || seen.is_empty();
@@ -2127,18 +2096,6 @@ impl ReferenceCollector {
         }
         let missing_target_symbols = missing_symbols(&self.symbols, &discovered_target_symbols);
 
-        let mut state_recovery_ids = BTreeSet::new();
-        for (market_id, tracked) in &next_state.markets {
-            if targets.contains_key(market_id) {
-                continue;
-            }
-            let Some(recovery_target) = tracked_market_recovery_target(tracked, &self.symbols, now)
-            else {
-                continue;
-            };
-            targets.insert(market_id.clone(), recovery_target);
-            state_recovery_ids.insert(market_id.clone());
-        }
         let target_ids = targets.keys().cloned().collect::<BTreeSet<_>>();
         let market_detail_budget = self
             .config
@@ -2302,47 +2259,40 @@ impl ReferenceCollector {
                     tracked.end_time = Some(end_time.to_owned());
                 }
 
-                let state_recovery = state_recovery_ids.contains(market_id);
-                if !state_recovery {
-                    if let Some(metadata) = market_metadata_update(
-                        market_id,
-                        &market,
-                        &target,
-                        &retrieved_at,
-                        force_hour_context,
-                        &mut tracked,
-                    )? {
-                        updates.push(metadata)?;
-                    }
+                if let Some(metadata) = market_metadata_update(
+                    market_id,
+                    &market,
+                    &target,
+                    &retrieved_at,
+                    force_hour_context,
+                    &mut tracked,
+                )? {
+                    updates.push(metadata)?;
                 }
 
-                let settlement = if state_recovery {
-                    None
-                } else {
-                    match settlement_from_market(
-                        &market,
-                        &target.symbol,
-                        target.window_secs,
-                        &retrieved_at,
-                    ) {
-                        Ok(settlement) => settlement,
-                        Err(error) => {
-                            let detail = error.to_string();
-                            errors.push(format!("settlement {market_id}: {detail}"));
-                            invalid_settlement_markets.push(market_id.clone());
-                            tracked
-                                .settlement_failure_since
-                                .get_or_insert_with(|| retrieved_at.clone());
-                            tracked.settlement_last_error = Some(detail);
-                            None
-                        }
+                let settlement = match settlement_from_market(
+                    &market,
+                    &target.symbol,
+                    target.window_secs,
+                    &retrieved_at,
+                ) {
+                    Ok(settlement) => settlement,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        errors.push(format!("settlement {market_id}: {detail}"));
+                        invalid_settlement_markets.push(market_id.clone());
+                        tracked
+                            .settlement_failure_since
+                            .get_or_insert_with(|| retrieved_at.clone());
+                        tracked.settlement_last_error = Some(detail);
+                        None
                     }
                 };
                 if settlement.is_some() {
                     tracked.settlement_failure_since = None;
                     tracked.settlement_last_error = None;
                 }
-                let settlement_available = state_recovery || settlement.is_some();
+                let settlement_available = settlement.is_some();
                 let was_settled = tracked.settled;
                 if !condition_id.is_empty()
                     && !tracked.trade_complete
@@ -2503,7 +2453,6 @@ impl ReferenceCollector {
             "target_markets": target_count,
             "missing_target_symbols": missing_target_symbols,
             "tracked_markets": self.state.markets.len(),
-            "state_recovery_markets": state_recovery_ids.len(),
             "market_detail_budget": market_detail_budget,
             "market_detail_eligible": market_detail_plan.eligible,
             "market_detail_priority": market_detail_plan.priority,
@@ -3712,7 +3661,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_trade_incomplete_state_recovers_without_market_detail() {
+    fn settled_trade_incomplete_state_requires_authoritative_market_detail() {
         let now = fixed_time("2026-07-17T05:00:00Z");
         let tracked = TrackedMarket {
             condition_id: Some("condition-1".to_owned()),
@@ -3723,17 +3672,10 @@ mod tests {
             trade_complete: false,
             ..TrackedMarket::default()
         };
-        let symbols = BTreeSet::from(["BTCUSDT".to_owned()]);
-        let (market, target) = tracked_market_recovery_target(&tracked, &symbols, now).unwrap();
-
-        assert_eq!(market["conditionId"], "condition-1");
-        assert_eq!(target.symbol, "BTCUSDT");
-        assert_eq!(target.window_secs, 300);
         let markets = BTreeMap::from([("settled".to_owned(), tracked)]);
-        let target_ids = BTreeSet::from(["settled".to_owned()]);
         assert_eq!(
-            plan_market_detail_fetches(&markets, &target_ids, now, 8).eligible,
-            0
+            plan_market_detail_fetches(&markets, &BTreeSet::new(), now, 8).selected,
+            BTreeSet::from(["settled".to_owned()])
         );
     }
 
@@ -3975,7 +3917,7 @@ mod tests {
     }
 
     #[test]
-    fn trade_rows_follow_the_settlement_lookback_until_completion() {
+    fn trade_rows_are_retained_without_a_time_cutoff_until_completion() {
         let now = fixed_time("2026-07-15T12:00:00Z");
         let config = ReferenceConfig {
             market_lookback_secs: 7_200,
@@ -3998,11 +3940,7 @@ mod tests {
         );
 
         assert!(malformed.is_empty());
-        assert_eq!(updates.len(), 1);
-        assert_eq!(
-            updates[0]["trade_ts_unix"],
-            (now - TimeDelta::hours(3)).timestamp()
-        );
+        assert_eq!(updates.len(), 2);
     }
 
     #[test]
@@ -4761,18 +4699,25 @@ mod tests {
                     "condition-state": {
                         "expired": cutoff - 60,
                         "recent": cutoff + 60,
+                    },
+                    "condition-incomplete": {
+                        "retained": cutoff - 60,
+                    }
+                },
+                "markets": {
+                    "market-incomplete": {
+                        "condition_id": "condition-incomplete"
                     }
                 },
             }),
         )
         .unwrap();
+        let recovered = valid_trade_update(now - TimeDelta::hours(3), cutoff - 60);
+        let recovered_id = recovered["record_id"].as_str().unwrap().to_owned();
         {
             let mut writer = TapeWriter::new(root.path()).unwrap();
             writer
-                .write_updates(
-                    &[valid_trade_update(now - TimeDelta::hours(3), cutoff - 60)],
-                    now - TimeDelta::hours(3),
-                )
+                .write_updates(&[recovered], now - TimeDelta::hours(3))
                 .unwrap();
         }
         let config = ReferenceConfig {
@@ -4785,10 +4730,20 @@ mod tests {
 
         assert_eq!(
             collector.state.trade_seen,
-            BTreeMap::from([(
-                "condition-state".to_owned(),
-                BTreeMap::from([("recent".to_owned(), cutoff + 60)]),
-            )])
+            BTreeMap::from([
+                (
+                    "condition-state".to_owned(),
+                    BTreeMap::from([("recent".to_owned(), cutoff + 60)]),
+                ),
+                (
+                    "condition-incomplete".to_owned(),
+                    BTreeMap::from([("retained".to_owned(), cutoff - 60)]),
+                ),
+                (
+                    "condition-1".to_owned(),
+                    BTreeMap::from([(recovered_id, cutoff - 60)]),
+                ),
+            ])
         );
         let durable: CollectorState =
             read_optional_json(&root.path().join("collector-state.json")).unwrap();
