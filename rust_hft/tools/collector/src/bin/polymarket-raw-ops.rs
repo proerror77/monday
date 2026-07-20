@@ -39,6 +39,8 @@ enum Command {
             default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT"
         )]
         symbols: Vec<String>,
+        #[arg(long = "market-id")]
+        market_ids: Vec<String>,
         #[arg(long, default_value_t = 30.0)]
         poll_interval_secs: f64,
         #[arg(long, default_value_t = 7_200)]
@@ -189,6 +191,7 @@ async fn main() -> Result<()> {
         Command::CollectReference {
             spool_dir,
             symbols,
+            market_ids,
             poll_interval_secs,
             market_lookback_secs,
             settlement_lookback_secs,
@@ -205,6 +208,7 @@ async fn main() -> Result<()> {
             let config = ReferenceConfig {
                 spool_dir,
                 symbols,
+                market_ids: market_ids.into_iter().collect(),
                 poll_interval: positive_duration(poll_interval_secs, "poll interval")?,
                 market_lookback_secs,
                 settlement_lookback_secs,
@@ -356,6 +360,27 @@ mod tests {
         assert_eq!(
             max_concurrent_trade_polls,
             ReferenceConfig::default().max_concurrent_trade_polls
+        );
+    }
+
+    #[test]
+    fn collect_reference_cli_accepts_explicit_market_id_filter() {
+        let command = Cli::try_parse_from([
+            "polymarket-raw-ops",
+            "collect-reference",
+            "--market-id",
+            "2959141",
+            "--market-id",
+            "2959146",
+        ])
+        .expect("market-id filtered collector CLI must parse")
+        .command;
+        let Command::CollectReference { market_ids, .. } = command else {
+            panic!("collect-reference must select the collector command");
+        };
+        assert_eq!(
+            market_ids,
+            vec!["2959141".to_owned(), "2959146".to_owned()]
         );
     }
 
