@@ -420,13 +420,13 @@ fn validate_triplet(
     if files.success.read()? != format!("{digest}\n").as_bytes() {
         bail!("_SUCCESS must contain the exact data digest and newline");
     }
-    let trade_completions = serde_json::from_value(
-        manifest
-            .get("trade_completions")
-            .cloned()
-            .ok_or_else(|| anyhow!("manifest trade_completions is missing"))?,
-    )
-    .context("parse manifest event-local trade completions")?;
+    let trade_completions = manifest
+        .get("trade_completions")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("parse manifest event-local trade completions")?
+        .unwrap_or_default();
     let event_types = serde_json::from_value(
         manifest
             .get("event_types")
@@ -516,14 +516,31 @@ fn decompress_and_rescan(
         .ok_or_else(|| anyhow!("recording_policy.quote_sample_ms is missing"))?;
     let rescanned = scan_tape(&raw, dataset, usize::try_from(depth)?, sample_ms)?;
     for (field, value) in rescanned.as_object().expect("scan manifest is an object") {
-        let authenticated_legacy_context = field == "reference_context_complete"
-            && artifact.manifest.get(field).is_none()
-            && value.as_bool() == Some(true);
-        if !authenticated_legacy_context && artifact.manifest.get(field) != Some(value) {
+        let authenticated_legacy_field = artifact.manifest.get(field).is_none()
+            && match field.as_str() {
+                "reference_context_complete" => value.as_bool() == Some(true),
+                "trade_completions" => value.is_object(),
+                _ => false,
+            };
+        if !authenticated_legacy_field && artifact.manifest.get(field) != Some(value) {
             bail!("manifest field {field} does not match producer rescan");
         }
     }
     Ok((raw, rescanned))
+}
+
+fn refresh_trade_completions_from_rescan(
+    identity: &mut SegmentIdentity,
+    rescanned: &Value,
+) -> Result<()> {
+    identity.trade_completions = serde_json::from_value(
+        rescanned
+            .get("trade_completions")
+            .cloned()
+            .ok_or_else(|| anyhow!("producer rescan trade_completions is missing"))?,
+    )
+    .context("parse producer rescan event-local trade completions")?;
+    Ok(())
 }
 
 fn segment_hour(identity: &SegmentIdentity) -> Result<DateTime<Utc>> {
@@ -669,8 +686,10 @@ pub(crate) fn with_validated_research_segments<T>(
         bail!("reference segment set exceeds source byte limit");
     }
     validate_market_policy(&market.manifest)?;
-    let (market_raw, _) =
+    let (market_raw, market_manifest) =
         decompress_and_rescan(&market, "crypto_expiry", &scratch.0.join("market"))?;
+    let mut market_identity = market.identity.clone();
+    refresh_trade_completions_from_rescan(&mut market_identity, &market_manifest)?;
     let rescanned_references = references
         .iter()
         .enumerate()
@@ -692,13 +711,19 @@ pub(crate) fn with_validated_research_segments<T>(
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
     let reference_raw = combine_references(&reference_raws, &scratch.0)?;
+    let reference_identities = references
+        .iter()
+        .zip(rescanned_references.iter())
+        .map(|(reference, (_, manifest))| {
+            let mut identity = reference.identity.clone();
+            refresh_trade_completions_from_rescan(&mut identity, manifest)?;
+            Ok(identity)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let report = ResearchSegmentValidationReport {
         schema: "monday.polymarket.research_segment_validation.v2",
-        market: market.identity.clone(),
-        references: references
-            .iter()
-            .map(|reference| reference.identity.clone())
-            .collect(),
+        market: market_identity,
+        references: reference_identities,
     };
     let result = consume(&report, &market_raw, &reference_raw)?;
     market.files.verify()?;
@@ -1098,15 +1123,16 @@ mod tests {
     }
 
     #[test]
-    fn accepts_legacy_manifests_when_rescan_proves_reference_context_complete() {
-        let (_temp, config) = fixture(true);
+    fn authenticates_legacy_derived_manifest_fields_by_rescanning_bound_data() {
+        let mut reference = reference_rows(true);
+        reference.push(row(3, trade_completion()));
+        let (_temp, config) = fixture_rows(&market_rows(), &reference);
         for triplet in std::iter::once(&config.market).chain(config.references.iter()) {
             let mut manifest: Value =
                 serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
-            manifest
-                .as_object_mut()
-                .unwrap()
-                .remove("reference_context_complete");
+            let fields = manifest.as_object_mut().unwrap();
+            fields.remove("reference_context_complete");
+            fields.remove("trade_completions");
             fs::write(
                 &triplet.manifest,
                 format!("{}\n", serde_json::to_string(&manifest).unwrap()),
@@ -1115,9 +1141,34 @@ mod tests {
         }
 
         let report = validate_research_segments(&config)
-            .expect("a producer rescan must authenticate complete legacy reference context");
+            .expect("a producer rescan must authenticate legacy derived fields");
 
         assert_eq!(report.references[0].dataset, "crypto_expiry_reference");
+        assert!(report.market.trade_completions.is_empty());
+        let completion = &report.references[0].trade_completions["market-1"];
+        assert_eq!(completion.condition_id, "0xcondition");
+        assert_eq!(completion.trade_count, 1);
+        assert_eq!(completion.completion_sequence, 3);
+    }
+
+    #[test]
+    fn rejects_present_trade_completions_that_contradict_producer_rescan() {
+        let mut reference = reference_rows(true);
+        reference.push(row(3, trade_completion()));
+        let (_temp, config) = fixture_rows(&market_rows(), &reference);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&config.references[0].manifest).unwrap()).unwrap();
+        manifest["trade_completions"] = json!({});
+        fs::write(
+            &config.references[0].manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        )
+        .unwrap();
+
+        rejects(
+            &config,
+            "manifest field trade_completions does not match producer rescan",
+        );
     }
 
     #[test]
