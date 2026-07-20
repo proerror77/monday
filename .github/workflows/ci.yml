@@ -339,6 +339,33 @@ jobs:
             /work/rust_hft/deployment/k8s \
             /work/deployment/aliyun/research/k8s
 
+  polymarket_evidence_compiler_image:
+    name: Polymarket Evidence Compiler Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build and inspect Polymarket evidence compiler image
+        run: |
+          image=polymarket-evidence-compiler:${{ github.sha }}
+          docker build \
+            --file rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler \
+            --tag "$image" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            rust_hft
+          docker run --rm --entrypoint /usr/local/bin/polymarket-raw-ops "$image" \
+            publish-polymarket-evidence --help >/dev/null
+          docker run --rm --entrypoint /usr/local/bin/aliyun "$image" version >/dev/null
+          docker run --rm --entrypoint /bin/sh "$image" -ec \
+            'test ! -e /usr/local/bin/binance-lob-archiver'
+          actual_source_revision=$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "$image")
+          test "$actual_source_revision" = "${{ github.sha }}"
+
   rust_hft_engine_fast_lane:
     name: Rust HFT Engine Fast Lane
     runs-on: ubuntu-latest
