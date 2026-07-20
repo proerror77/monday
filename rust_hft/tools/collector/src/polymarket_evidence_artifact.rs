@@ -733,10 +733,10 @@ mod tests {
         );
         assert_eq!(
             published.published_digests.expected_manifest_sha256,
-            hex::encode(Sha256::digest(fs::read(published.manifest_path).unwrap()))
+            hex::encode(Sha256::digest(fs::read(&published.manifest_path).unwrap()))
         );
         let manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(published.manifest_path).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
         assert_eq!(manifest["schema"], "monday.polymarket.evidence_artifact.v3");
         assert_eq!(manifest["market_ids"], serde_json::json!(["market-1"]));
         assert_eq!(manifest["symbols"], serde_json::json!(["BTCUSDT"]));
