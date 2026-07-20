@@ -649,8 +649,9 @@ pub(crate) fn with_validated_research_segments<T>(
             .context("reference archive byte total overflow")?;
         if let Some(previous) = references.last() {
             let previous = segment_hour(&previous.identity)?;
-            if segment_hour(&reference.identity)? != previous + TimeDelta::hours(1) {
-                bail!("reference segments must be consecutive UTC hours");
+            let current = segment_hour(&reference.identity)?;
+            if current < previous || current > previous + TimeDelta::hours(1) {
+                bail!("reference segments must be same or consecutive UTC hours");
             }
         }
         references.push(reference);
@@ -971,6 +972,62 @@ mod tests {
     }
 
     #[test]
+    fn validates_closed_reference_fragments_from_the_same_hour() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", &market_rows());
+        let first = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &[row(0, metadata("market_metadata")), row(1, trade())],
+        );
+        let second = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &[
+                row(0, metadata("market_metadata")),
+                row(1, metadata("market_settlement")),
+            ],
+        );
+        let config = ResearchSegmentValidationConfig {
+            market,
+            references: vec![first, second],
+        };
+
+        let report = validate_research_segments(&config).unwrap();
+
+        assert_eq!(report.references.len(), 2);
+        assert_eq!(report.references[0].hour, "05");
+        assert_eq!(report.references[1].hour, "05");
+    }
+
+    #[test]
+    fn rejects_skipped_reference_hours() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let market = triplet(&root, "crypto_expiry", &market_rows());
+        let first = triplet(
+            &root,
+            "crypto_expiry_reference",
+            &[row(0, metadata("market_metadata")), row(1, trade())],
+        );
+        let mut second = vec![
+            row(0, metadata("market_metadata")),
+            row(1, metadata("market_settlement")),
+        ];
+        for record in &mut second {
+            record["recorded_at"] = json!("2026-07-17T07:01:00Z");
+        }
+        let second = triplet(&root, "crypto_expiry_reference", &second);
+        let config = ResearchSegmentValidationConfig {
+            market,
+            references: vec![first, second],
+        };
+
+        rejects(&config, "same or consecutive UTC hours");
+    }
+
+    #[test]
     fn accepts_reference_segments_with_event_local_trade_completion_proof() {
         let mut reference = reference_rows(true);
         reference.push(row(3, trade_completion()));
@@ -1029,7 +1086,7 @@ mod tests {
             row(2, metadata("market_settlement")),
         ];
         for record in &mut second {
-            record["recorded_at"] = json!("2026-07-17T06:01:00Z");
+            record["recorded_at"] = json!("2026-07-17T05:02:00Z");
         }
         let second = triplet(&root, "crypto_expiry_reference", &second);
         let config = ResearchSegmentValidationConfig {
