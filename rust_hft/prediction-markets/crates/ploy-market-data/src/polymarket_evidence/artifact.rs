@@ -14,6 +14,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 const MANIFEST_SCHEMA: &str = "monday.polymarket.evidence_artifact.v2";
+const EXPLICIT_MANIFEST_SCHEMA: &str = "monday.polymarket.evidence_artifact.v3";
 const INPUT_SCHEMA: &str = "monday.polymarket.research_segment_validation.v1";
 const INPUT_SCHEMA_V2: &str = "monday.polymarket.research_segment_validation.v2";
 const ROW_SCHEMA: &str = "monday.polymarket.evidence_row.v1";
@@ -27,6 +28,8 @@ const SYMBOLS: [&str; 2] = ["BTCUSDT", "SOLUSDT"];
 #[rustfmt::skip]
 const SURFACES: [&str; 5] = ["chainlink_reference", "market_contract", "orderbook_snapshot", "polymarket_trade", "official_settlement_evidence"];
 const EVENT_SELECTION: &str = "event_start in [event_start_gte,event_start_lt)";
+const EXPLICIT_EVENT_SELECTION: &str =
+    "explicit market_ids constrained to [event_start_gte,event_start_lt)";
 const EVIDENCE_SCOPE: &str =
     "immutable collector evidence only; not an execution authorization or evaluator label artifact";
 const DIGEST_SEMANTICS: &str =
@@ -118,7 +121,9 @@ struct EvidenceManifest {
     surface_counts: BTreeMap<String, u64>,
     event_start_gte: String,
     event_start_lt: String,
-    symbols: [String; 2],
+    #[serde(default)]
+    market_ids: Vec<String>,
+    symbols: Vec<String>,
     window_secs: u64,
     event_selection: String,
     evidence_scope: String,
@@ -286,7 +291,7 @@ fn seal_with_hook(
     }
 
     let parsed = parse_manifest(&manifest_bytes)?;
-    validate_manifest(&parsed, triplet, &success_bytes)?;
+    let explicit_selection = validate_manifest(&parsed, triplet, &success_bytes)?;
     let trade_completions = validated_reference_trade_completions(&parsed.validated_inputs)?;
     if u64::try_from(data_bytes.len())? != parsed.content_bytes
         || format!("{:x}", Sha256::digest(&data_bytes)) != parsed.content_sha256
@@ -296,7 +301,12 @@ fn seal_with_hook(
     if parse_digest(&parsed.content_sha256, "content_sha256")? != trust.expected_content_sha256 {
         bail!("evidence manifest content digest does not match the trusted anchor");
     }
-    let frames = frame_ndjson(&data_bytes, &parsed.surface_counts, &trade_completions)?;
+    let frames = frame_ndjson(
+        &data_bytes,
+        &parsed.surface_counts,
+        &trade_completions,
+        explicit_selection.as_ref(),
+    )?;
     if u64::try_from(frames.len())? != parsed.rows {
         bail!("evidence NDJSON row count does not match the manifest");
     }
@@ -485,13 +495,23 @@ fn validate_manifest(
     manifest: &EvidenceManifest,
     triplet: &PolymarketEvidenceTriplet,
     success: &[u8],
-) -> Result<()> {
+) -> Result<Option<ExplicitSelection>> {
     let orderbook = &manifest.recording_semantics.orderbook;
-    if manifest.schema != MANIFEST_SCHEMA
-        || manifest.format != "ndjson"
-        || manifest.symbols != SYMBOLS.map(str::to_owned)
+    let explicit_selection = match manifest.schema.as_str() {
+        MANIFEST_SCHEMA
+            if manifest.market_ids.is_empty()
+                && manifest.symbols == SYMBOLS.map(str::to_owned)
+                && manifest.event_selection == EVENT_SELECTION =>
+        {
+            None
+        }
+        EXPLICIT_MANIFEST_SCHEMA if manifest.event_selection == EXPLICIT_EVENT_SELECTION => {
+            Some(validate_explicit_selection(manifest)?)
+        }
+        _ => bail!("unsupported immutable evidence manifest contract"),
+    };
+    if manifest.format != "ndjson"
         || manifest.window_secs != 300
-        || manifest.event_selection != EVENT_SELECTION
         || manifest.evidence_scope != EVIDENCE_SCOPE
         || manifest.content_digest_semantics != DIGEST_SEMANTICS
         || manifest.trust_boundary != TRUST_BOUNDARY
@@ -525,7 +545,13 @@ fn validate_manifest(
         .values()
         .try_fold(0u64, |sum, count| sum.checked_add(*count))
         .ok_or_else(|| anyhow!("evidence surface counts overflow"))?;
-    if lower >= upper || manifest.rows != rows || keys != BTreeSet::from(SURFACES) {
+    if lower >= upper
+        || manifest.rows != rows
+        || manifest.events == 0
+        || manifest.surface_counts.get("market_contract") != Some(&manifest.events)
+        || manifest.surface_counts.get("official_settlement_evidence") != Some(&manifest.events)
+        || keys != BTreeSet::from(SURFACES)
+    {
         bail!("immutable evidence manifest identity is inconsistent");
     }
     let name = triplet
@@ -548,7 +574,37 @@ fn validate_manifest(
     {
         bail!("evidence file names or _SUCCESS marker do not match the manifest");
     }
-    Ok(())
+    Ok(explicit_selection)
+}
+
+#[derive(Debug)]
+struct ExplicitSelection {
+    market_ids: BTreeSet<String>,
+    symbols: BTreeSet<String>,
+}
+
+fn validate_explicit_selection(manifest: &EvidenceManifest) -> Result<ExplicitSelection> {
+    let market_ids = manifest.market_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let symbols = manifest.symbols.iter().cloned().collect::<BTreeSet<_>>();
+    if market_ids.is_empty()
+        || market_ids.len() != manifest.market_ids.len()
+        || manifest
+            .market_ids
+            .iter()
+            .any(|market_id| market_id.is_empty() || market_id.chars().any(char::is_whitespace))
+        || symbols.is_empty()
+        || symbols.len() != manifest.symbols.len()
+        || symbols
+            .iter()
+            .any(|symbol| !SYMBOLS.contains(&symbol.as_str()))
+        || manifest.events != u64::try_from(market_ids.len())?
+    {
+        bail!("explicit market ID selection is inconsistent");
+    }
+    Ok(ExplicitSelection {
+        market_ids,
+        symbols,
+    })
 }
 
 fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
@@ -843,6 +899,7 @@ fn frame_ndjson(
     bytes: &[u8],
     expected_counts: &BTreeMap<String, u64>,
     trade_completions: &BTreeMap<String, TradeCompletionIdentity>,
+    explicit_selection: Option<&ExplicitSelection>,
 ) -> Result<Vec<Range<usize>>> {
     if bytes.is_empty() || bytes.last() != Some(&b'\n') || bytes.contains(&b'\r') {
         bail!("evidence data must be non-empty newline-terminated NDJSON");
@@ -918,6 +975,16 @@ fn frame_ndjson(
     }
     if &counts != expected_counts {
         bail!("evidence surface counts do not match the manifest");
+    }
+    if let Some(selection) = explicit_selection {
+        let observed_market_ids = market_contexts.keys().cloned().collect::<BTreeSet<_>>();
+        let observed_symbols = market_contexts
+            .values()
+            .map(|(_, symbol, _)| symbol.clone())
+            .collect::<BTreeSet<_>>();
+        if observed_market_ids != selection.market_ids || observed_symbols != selection.symbols {
+            bail!("evidence rows do not match the explicit market ID selection");
+        }
     }
     for (market_id, (condition_id, symbol, window_secs)) in market_contexts {
         let completion = trade_completions.get(&market_id).ok_or_else(|| {
@@ -1085,7 +1152,7 @@ pub(super) mod tests {
         PolymarketEvidenceTrustAnchor::from_lower_hex(&digest(&triplet.data), &digest(&triplet.manifest)).unwrap()
     }
 
-    fn rewrite_read_only(path: &Path, bytes: impl AsRef<[u8]>) {
+    pub(in crate::polymarket_evidence) fn rewrite_read_only(path: &Path, bytes: impl AsRef<[u8]>) {
         set_mode(path, 0o644);
         fs::write(path, bytes).unwrap();
         set_mode(path, PUBLISHED_MODE);
@@ -1098,6 +1165,65 @@ pub(super) mod tests {
         let sealed = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap();
         assert_eq!((sealed.rows(), sealed.events()), (5, 1));
         assert_eq!(sealed.manifest_sha256(), format!("{:x}", Sha256::digest(fs::read(&triplet.manifest).unwrap())));
+    }
+
+    #[test]
+    fn seals_a_single_explicit_market_id_v3_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        manifest["schema"] = json!("monday.polymarket.evidence_artifact.v3");
+        manifest["market_ids"] = json!(["market-1"]);
+        manifest["symbols"] = json!(["BTCUSDT"]);
+        manifest["event_selection"] =
+            json!("explicit market_ids constrained to [event_start_gte,event_start_lt)");
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+
+        assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_v3_manifest_whose_explicit_market_id_is_not_in_the_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        manifest["schema"] = json!("monday.polymarket.evidence_artifact.v3");
+        manifest["market_ids"] = json!(["market-2"]);
+        manifest["symbols"] = json!(["BTCUSDT"]);
+        manifest["event_selection"] =
+            json!("explicit market_ids constrained to [event_start_gte,event_start_lt)");
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+
+        let error = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap_err();
+        assert!(error.to_string().contains("explicit market ID selection"));
+    }
+
+    #[test]
+    fn rejects_a_v3_manifest_with_internal_market_id_whitespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        manifest["schema"] = json!("monday.polymarket.evidence_artifact.v3");
+        manifest["market_ids"] = json!(["market 1"]);
+        manifest["symbols"] = json!(["BTCUSDT"]);
+        manifest["event_selection"] =
+            json!("explicit market_ids constrained to [event_start_gte,event_start_lt)");
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+
+        let error = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap_err();
+        assert!(error.to_string().contains("explicit market ID selection"));
     }
 
     #[test]
@@ -1296,7 +1422,7 @@ pub(super) mod tests {
     #[test]
     #[rustfmt::skip]
     fn rejects_noncanonical_or_nonregular_data() {
-        assert!(frame_ndjson(b"{}\r\n", &BTreeMap::new(), &BTreeMap::new()).is_err());
+        assert!(frame_ndjson(b"{}\r\n", &BTreeMap::new(), &BTreeMap::new(), None).is_err());
         let temp = tempfile::tempdir().unwrap();
         let triplet = write_triplet(&temp);
         let fifo_anchor = trust(&triplet);

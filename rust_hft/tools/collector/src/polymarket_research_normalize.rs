@@ -1,8 +1,7 @@
 use crate::polymarket_research_import::{ResearchSegmentValidationReport, TradeCompletionIdentity};
 use crate::polymarket_research_select::{
     decimal_text, json_strings, required, timestamp, utc_text, visit,
-    with_selected_research_contracts, ResearchSelectionConfig, SelectedContract, SYMBOLS,
-    WINDOW_SECS,
+    with_selected_research_contracts, ResearchSelectionConfig, SelectedContract, WINDOW_SECS,
 };
 use crate::polymarket_upload::{
     trade_record_ids_sha256, validate_canonical_trade, validate_market_settlement,
@@ -18,6 +17,8 @@ use std::path::Path;
 use std::str::FromStr;
 
 const CHAINLINK_OPEN_LOOKBACK_SECS: i64 = 30;
+pub(crate) const EXPLICIT_MARKET_ID_SELECTION: &str =
+    "explicit market_ids constrained to [event_start_gte,event_start_lt)";
 const EVIDENCE_TRUST_BOUNDARY: &str = "typed collector staging evidence only; not an evaluator label snapshot or snapshot_contract_hash; validated staged triplets and adjacent local supersession markers; omitted remote-prefix markers are not proven absent";
 
 pub type PolymarketEvidenceConfig = ResearchSelectionConfig;
@@ -33,7 +34,8 @@ pub struct PolymarketEvidenceReport {
     pub surface_counts: BTreeMap<String, u64>,
     pub event_start_gte: String,
     pub event_start_lt: String,
-    pub symbols: [&'static str; 2],
+    pub market_ids: Vec<String>,
+    pub symbols: Vec<String>,
     pub window_secs: u64,
     pub event_selection: &'static str,
     pub trust_boundary: &'static str,
@@ -683,9 +685,16 @@ fn normalize_raw(
     }
     let (ndjson, surface_counts) = encode_rows(rows)?;
     let sha256 = hex::encode(Sha256::digest(&ndjson));
+    let market_ids = contracts.keys().cloned().collect();
+    let symbols = contracts
+        .values()
+        .map(|contract| contract.symbol.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     Ok(NormalizedPolymarketEvidence {
         report: PolymarketEvidenceReport {
-            schema: "monday.polymarket.normalized_evidence.v1",
+            schema: "monday.polymarket.normalized_evidence.v2",
             content_sha256: sha256,
             content_bytes: u64::try_from(ndjson.len())?,
             rows: surface_counts.values().sum(),
@@ -693,9 +702,10 @@ fn normalize_raw(
             surface_counts,
             event_start_gte: utc_text(start),
             event_start_lt: utc_text(end),
-            symbols: SYMBOLS,
+            market_ids,
+            symbols,
             window_secs: WINDOW_SECS as u64,
-            event_selection: "event_start in [event_start_gte,event_start_lt)",
+            event_selection: EXPLICIT_MARKET_ID_SELECTION,
             trust_boundary: EVIDENCE_TRUST_BOUNDARY,
             validated_inputs: inputs.clone(),
         },

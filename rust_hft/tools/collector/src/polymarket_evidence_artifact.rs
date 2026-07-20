@@ -1,13 +1,13 @@
 use crate::polymarket_research_import::ResearchSegmentValidationReport;
 use crate::polymarket_research_normalize::{
     normalize_polymarket_evidence, NormalizedPolymarketEvidence, PolymarketEvidenceConfig,
-    PolymarketEvidenceReport,
+    PolymarketEvidenceReport, EXPLICIT_MARKET_ID_SELECTION,
 };
 use crate::polymarket_upload::ensure_canonical_directory;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::Read;
@@ -89,7 +89,8 @@ struct PolymarketEvidenceManifest<'a> {
     surface_counts: &'a BTreeMap<String, u64>,
     event_start_gte: &'a str,
     event_start_lt: &'a str,
-    symbols: [&'static str; 2],
+    market_ids: &'a [String],
+    symbols: &'a [String],
     window_secs: u64,
     event_selection: &'a str,
     evidence_scope: &'static str,
@@ -129,16 +130,29 @@ fn validate_dataset(dataset: &NormalizedPolymarketEvidence) -> Result<()> {
     let report = &dataset.report;
     let digest = hex::encode(Sha256::digest(&dataset.ndjson));
     let rows = u64::try_from(dataset.ndjson.iter().filter(|byte| **byte == b'\n').count())?;
-    if report.schema != "monday.polymarket.normalized_evidence.v1"
+    if report.schema != "monday.polymarket.normalized_evidence.v2"
         || digest != report.content_sha256
         || report.content_bytes != u64::try_from(dataset.ndjson.len())?
         || report.rows != rows
         || report.rows != report.surface_counts.values().sum::<u64>()
         || report.events == 0
+        || report.events != u64::try_from(report.market_ids.len())?
         || report.surface_counts.get("market_contract") != Some(&report.events)
         || report.surface_counts.get("official_settlement_evidence") != Some(&report.events)
-        || report.symbols != ["BTCUSDT", "SOLUSDT"]
+        || report.market_ids.is_empty()
+        || report
+            .market_ids
+            .iter()
+            .any(|market_id| market_id.is_empty() || market_id.chars().any(char::is_whitespace))
+        || report.market_ids.iter().collect::<BTreeSet<_>>().len() != report.market_ids.len()
+        || report.symbols.is_empty()
+        || report
+            .symbols
+            .iter()
+            .any(|symbol| !["BTCUSDT", "SOLUSDT"].contains(&symbol.as_str()))
+        || report.symbols.iter().collect::<BTreeSet<_>>().len() != report.symbols.len()
         || report.window_secs != 300
+        || report.event_selection != EXPLICIT_MARKET_ID_SELECTION
         || report.surface_counts.len() != SURFACES.len()
         || SURFACES.iter().any(|surface| {
             report
@@ -156,7 +170,7 @@ fn validate_dataset(dataset: &NormalizedPolymarketEvidence) -> Result<()> {
 
 fn manifest_bytes(report: &PolymarketEvidenceReport, file: &str) -> Result<Vec<u8>> {
     let manifest = PolymarketEvidenceManifest {
-        schema: "monday.polymarket.evidence_artifact.v2",
+        schema: "monday.polymarket.evidence_artifact.v3",
         file,
         format: "ndjson",
         content_sha256: &report.content_sha256,
@@ -166,7 +180,8 @@ fn manifest_bytes(report: &PolymarketEvidenceReport, file: &str) -> Result<Vec<u
         surface_counts: &report.surface_counts,
         event_start_gte: &report.event_start_gte,
         event_start_lt: &report.event_start_lt,
-        symbols: report.symbols,
+        market_ids: &report.market_ids,
+        symbols: &report.symbols,
         window_secs: report.window_secs,
         event_selection: report.event_selection,
         evidence_scope: "immutable collector evidence only; not an execution authorization or evaluator label artifact",
@@ -494,7 +509,7 @@ fn publish_normalized(
     let digest = &evidence.report.content_sha256;
     let directory = output_root.join(format!("sha256={digest}"));
     ensure_canonical_directory(&directory)?;
-    let data_name = format!("polymarket-btc-sol-5m.{digest}.ndjson");
+    let data_name = format!("polymarket-evidence-5m.{digest}.ndjson");
     let data_path = directory.join(&data_name);
     let manifest_path = directory.join(format!("{data_name}.manifest.json"));
     let success_path = directory.join(format!("{data_name}._SUCCESS"));
@@ -679,7 +694,7 @@ mod tests {
         let content_sha256 = hex::encode(Sha256::digest(&ndjson));
         let evidence = NormalizedPolymarketEvidence {
             report: PolymarketEvidenceReport {
-                schema: "monday.polymarket.normalized_evidence.v1",
+                schema: "monday.polymarket.normalized_evidence.v2",
                 content_sha256: content_sha256.clone(),
                 content_bytes: u64::try_from(ndjson.len()).unwrap(),
                 rows: 5,
@@ -690,9 +705,10 @@ mod tests {
                     .collect(),
                 event_start_gte: "2026-07-17T05:30:00Z".into(),
                 event_start_lt: "2026-07-17T05:35:00Z".into(),
-                symbols: ["BTCUSDT", "SOLUSDT"],
+                market_ids: vec!["market-1".to_owned()],
+                symbols: vec!["BTCUSDT".to_owned()],
                 window_secs: 300,
-                event_selection: "event_start in [event_start_gte,event_start_lt)",
+                event_selection: EXPLICIT_MARKET_ID_SELECTION,
                 trust_boundary: "fixture",
                 validated_inputs: ResearchSegmentValidationReport {
                     schema: "monday.polymarket.research_segment_validation.v2",
@@ -705,6 +721,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
 
+        let mut malformed = evidence.clone();
+        malformed.report.market_ids = vec!["market 1".to_owned()];
+        assert!(validate_dataset(&malformed).is_err());
+
         let published = publish_normalized(&root, evidence).unwrap();
 
         assert_eq!(
@@ -713,8 +733,14 @@ mod tests {
         );
         assert_eq!(
             published.published_digests.expected_manifest_sha256,
-            hex::encode(Sha256::digest(fs::read(published.manifest_path).unwrap()))
+            hex::encode(Sha256::digest(fs::read(&published.manifest_path).unwrap()))
         );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&published.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["schema"], "monday.polymarket.evidence_artifact.v3");
+        assert_eq!(manifest["market_ids"], serde_json::json!(["market-1"]));
+        assert_eq!(manifest["symbols"], serde_json::json!(["BTCUSDT"]));
+        assert_eq!(manifest["event_selection"], EXPLICIT_MARKET_ID_SELECTION);
     }
 
     #[cfg(target_os = "linux")]
