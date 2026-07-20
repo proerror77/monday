@@ -619,26 +619,26 @@ mod tests {
     fn published_result_returns_digests_for_the_exact_triplet() {
         fn segment(dataset: &str) -> SegmentIdentity {
             let is_reference = dataset == "crypto_expiry_reference";
-            let trade_completions = (dataset == "crypto_expiry_reference")
-                .then(|| {
-                    BTreeMap::from([(
-                        "market-1".to_owned(),
-                        TradeCompletionIdentity {
-                            condition_id: "condition-1".to_owned(),
-                            symbol: "BTCUSDT".to_owned(),
-                            market_window_secs: 300,
-                            trade_count: 1,
-                            trade_record_ids_sha256: "1".repeat(64),
-                            completion_sequence: 1,
-                            retrieved_at: "2026-07-17T05:00:01Z".to_owned(),
-                            completeness_basis: crate::polymarket_upload::TRADE_COMPLETION_BASIS
-                                .to_owned(),
-                            finalization_lag_secs: 60,
-                            stable_polls_required: 2,
-                        },
-                    )])
-                })
-                .unwrap_or_default();
+            let trade_completions = if is_reference {
+                BTreeMap::from([(
+                    "market-1".to_owned(),
+                    TradeCompletionIdentity {
+                        condition_id: "condition-1".to_owned(),
+                        symbol: "BTCUSDT".to_owned(),
+                        market_window_secs: 300,
+                        trade_count: 1,
+                        trade_record_ids_sha256: "1".repeat(64),
+                        completion_sequence: 1,
+                        retrieved_at: "2026-07-17T05:00:01Z".to_owned(),
+                        completeness_basis: crate::polymarket_upload::TRADE_COMPLETION_BASIS
+                            .to_owned(),
+                        finalization_lag_secs: 60,
+                        stable_polls_required: 2,
+                    },
+                )])
+            } else {
+                BTreeMap::new()
+            };
             SegmentIdentity {
                 schema: "monday.polymarket.raw.v1".into(),
                 venue: "polymarket".into(),
