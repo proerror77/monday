@@ -235,6 +235,13 @@ impl ReferenceConfig {
         }) {
             bail!("market IDs must be non-empty, whitespace-free identifiers");
         }
+        if self.market_ids.len() > self.max_markets {
+            bail!(
+                "requested market IDs={} exceed max_markets={}",
+                self.market_ids.len(),
+                self.max_markets
+            );
+        }
         if self.max_concurrent_trade_polls > DEFAULT_MAX_CONCURRENT_TRADE_POLLS {
             bail!(
                 "concurrent trade polls cannot exceed the hard limit of {DEFAULT_MAX_CONCURRENT_TRADE_POLLS}"
@@ -2065,6 +2072,26 @@ impl ReferenceCollector {
     }
 
     async fn discover_markets(&self, now: DateTime<Utc>) -> Result<Vec<Value>> {
+        if !self.config.market_ids.is_empty() {
+            let mut markets = Vec::with_capacity(self.config.market_ids.len());
+            for market_id in &self.config.market_ids {
+                let url = format!(
+                    "{}/{}",
+                    self.endpoints.gamma_market,
+                    urlencoding::encode(market_id)
+                );
+                let market = self
+                    .get_json(&url, &[])
+                    .await
+                    .with_context(|| format!("Gamma market detail request failed for {market_id}"))?;
+                if market.get("id").and_then(Value::as_str) != Some(market_id.as_str()) {
+                    bail!("Gamma market detail did not return requested market ID {market_id}");
+                }
+                markets.push(market);
+            }
+            return Ok(markets);
+        }
+
         let mut discovery = GammaDiscovery::default();
         for lane in [GammaLane::Open, GammaLane::Closed] {
             let base = gamma_discovery_params(&self.config, now, lane.is_closed());
@@ -3589,6 +3616,14 @@ mod tests {
         let error = malformed_market_id.validate().unwrap_err();
         assert!(error.to_string().contains("market IDs"));
 
+        let excessive_requested_market_ids = ReferenceConfig {
+            market_ids: BTreeSet::from(["market-1".to_owned(), "market-2".to_owned()]),
+            max_markets: 1,
+            ..default.clone()
+        };
+        let error = excessive_requested_market_ids.validate().unwrap_err();
+        assert!(error.to_string().contains("requested market IDs"));
+
         let exact_capacity = ReferenceConfig {
             max_markets: 2_688,
             ..default.clone()
@@ -3918,6 +3953,157 @@ mod tests {
         assert_eq!(closed["related_tags"], "false");
         assert_eq!(open["end_date_min"], "2026-07-15T00:00:00.000000Z");
         assert_eq!(closed["end_date_min"], "2026-07-14T02:00:00.000000Z");
+    }
+
+    #[tokio::test]
+    async fn requested_market_ids_bypass_broad_gamma_discovery() {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut requested = Vec::new();
+            while requested.len() < 2 && Instant::now() < deadline {
+                let (mut connection, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("test server accept failed: {error}"),
+                };
+                connection.set_nonblocking(false).unwrap();
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut chunk = [0_u8; 1_024];
+                    let bytes = connection.read(&mut chunk).unwrap();
+                    assert!(bytes > 0, "HTTP request ended before its headers");
+                    request.extend_from_slice(&chunk[..bytes]);
+                }
+                let request = std::str::from_utf8(&request).unwrap();
+                let request_line = request.lines().next().unwrap_or_default();
+                let market_id = request_line
+                    .strip_prefix("GET /markets/")
+                    .and_then(|path| path.split_once(" HTTP/"))
+                    .map(|(market_id, _)| market_id)
+                    .expect("explicit market IDs must not request the Gamma keyset");
+                requested.push(market_id.to_owned());
+                let body = serde_json::to_vec(&json!({
+                    "id": market_id,
+                    "conditionId": format!("condition-{market_id}"),
+                    "question": "Bitcoin Up or Down - 5 minutes",
+                    "startDate": "2026-07-20T08:00:00Z",
+                    "endDate": "2026-07-20T08:05:00Z",
+                    "clobTokenIds": ["up-token", "down-token"],
+                }))
+                .unwrap();
+                write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                connection.write_all(&body).unwrap();
+                connection.flush().unwrap();
+            }
+            requested
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            market_ids: BTreeSet::from(["bounded-1".to_owned(), "bounded-2".to_owned()]),
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let markets = collector
+            .discover_markets(fixed_time("2026-07-20T09:00:00Z"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            markets
+                .iter()
+                .filter_map(|market| market.get("id").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["bounded-1".to_owned(), "bounded-2".to_owned()])
+        );
+        assert_eq!(server.join().unwrap(), ["bounded-1", "bounded-2"]);
+    }
+
+    #[tokio::test]
+    async fn requested_non_target_market_fails_before_completion() {
+        use std::io::Read as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 1_024];
+                let bytes = connection.read(&mut chunk).unwrap();
+                assert!(bytes > 0, "HTTP request ended before its headers");
+                request.extend_from_slice(&chunk[..bytes]);
+            }
+            assert!(std::str::from_utf8(&request)
+                .unwrap()
+                .starts_with("GET /markets/unrelated-market HTTP/"));
+            let body = serde_json::to_vec(&json!({
+                "id": "unrelated-market",
+                "conditionId": "unrelated-condition",
+                "question": "Will it rain tomorrow?",
+                "startDate": "2026-07-20T08:00:00Z",
+                "endDate": "2026-07-20T08:05:00Z",
+                "clobTokenIds": ["up-token", "down-token"],
+            }))
+            .unwrap();
+            write!(
+                connection,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            connection.write_all(&body).unwrap();
+            connection.flush().unwrap();
+        });
+
+        let temp = TestDir::new();
+        let config = ReferenceConfig {
+            spool_dir: temp.path().to_owned(),
+            symbols: vec!["BTCUSDT".to_owned()],
+            market_ids: BTreeSet::from(["unrelated-market".to_owned()]),
+            ..ReferenceConfig::default()
+        };
+        let mut collector = ReferenceCollector::new(config).unwrap();
+        let base_url = format!("http://{address}");
+        collector.endpoints = ReferenceEndpoints {
+            gamma_markets: format!("{base_url}/markets/keyset"),
+            gamma_market: format!("{base_url}/markets"),
+            data_trades: format!("{base_url}/trades"),
+        };
+
+        let error = collector.collect_once().await.unwrap_err();
+
+        assert!(error.to_string().contains("unrelated-market"));
+        assert!(!fs::read_to_string(temp.path().join(ACTIVE_TAPE))
+            .unwrap()
+            .contains(TRADE_COMPLETION_KIND));
+        server.join().unwrap();
     }
 
     #[test]
