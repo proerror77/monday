@@ -39,6 +39,8 @@ enum Command {
             default_value = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,HYPEUSDT,BNBUSDT"
         )]
         symbols: Vec<String>,
+        #[arg(long = "market-id")]
+        market_ids: Vec<String>,
         #[arg(long, default_value_t = 30.0)]
         poll_interval_secs: f64,
         #[arg(long, default_value_t = 7_200)]
@@ -189,6 +191,7 @@ async fn main() -> Result<()> {
         Command::CollectReference {
             spool_dir,
             symbols,
+            market_ids,
             poll_interval_secs,
             market_lookback_secs,
             settlement_lookback_secs,
@@ -205,6 +208,7 @@ async fn main() -> Result<()> {
             let config = ReferenceConfig {
                 spool_dir,
                 symbols,
+                market_ids: market_ids.into_iter().collect(),
                 poll_interval: positive_duration(poll_interval_secs, "poll interval")?,
                 market_lookback_secs,
                 settlement_lookback_secs,

@@ -176,6 +176,7 @@ fn http_retry_delay(
 pub struct ReferenceConfig {
     pub spool_dir: PathBuf,
     pub symbols: Vec<String>,
+    pub market_ids: BTreeSet<String>,
     pub poll_interval: Duration,
     pub market_lookback_secs: i64,
     pub settlement_lookback_secs: i64,
@@ -197,6 +198,7 @@ impl Default for ReferenceConfig {
                 .iter()
                 .map(|(symbol, _)| (*symbol).to_owned())
                 .collect(),
+            market_ids: BTreeSet::new(),
             poll_interval: Duration::from_secs(30),
             market_lookback_secs: 7_200,
             settlement_lookback_secs: 86_400,
@@ -227,6 +229,11 @@ impl ReferenceConfig {
             || self.trade_finalization_stable_polls == 0
         {
             bail!("reference collector limits must be positive");
+        }
+        if self.market_ids.iter().any(|market_id| {
+            market_id.is_empty() || market_id.trim() != market_id
+        }) {
+            bail!("market IDs must be non-empty, whitespace-free identifiers");
         }
         if self.max_concurrent_trade_polls > DEFAULT_MAX_CONCURRENT_TRADE_POLLS {
             bail!(
@@ -1196,6 +1203,42 @@ fn missing_symbols(configured: &BTreeSet<String>, discovered: &BTreeSet<String>)
     configured.difference(discovered).cloned().collect()
 }
 
+fn validate_requested_market_ids(
+    requested: &BTreeSet<String>,
+    discovered: &BTreeSet<String>,
+) -> Result<()> {
+    let missing = requested
+        .difference(discovered)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!("requested Polymarket market IDs were absent from Gamma discovery: {missing:?}");
+    }
+    Ok(())
+}
+
+fn retain_requested_market_state(
+    state: &mut CollectorState,
+    requested: &BTreeSet<String>,
+) -> bool {
+    if requested.is_empty() {
+        return false;
+    }
+    let prior_market_count = state.markets.len();
+    state.markets.retain(|market_id, _| requested.contains(market_id));
+    let retained_conditions = state
+        .markets
+        .values()
+        .filter_map(|tracked| tracked.condition_id.as_ref())
+        .collect::<BTreeSet<_>>();
+    let prior_trade_condition_count = state.trade_seen.len();
+    state
+        .trade_seen
+        .retain(|condition_id, _| retained_conditions.contains(condition_id));
+    state.markets.len() != prior_market_count
+        || state.trade_seen.len() != prior_trade_condition_count
+}
+
 fn settlement_from_market(
     market: &Value,
     symbol: &str,
@@ -1892,8 +1935,9 @@ impl ReferenceCollector {
             validation?;
             cache_release?;
         }
+        let state_scoped = retain_requested_market_state(&mut state, &config.market_ids);
         validate_state_bounds(&state, config.max_markets, MAX_RETAINED_TRADE_IDS)?;
-        if state_compacted || recovered_active {
+        if state_compacted || recovered_active || state_scoped {
             // The state checkpoint must be durable before the recovered segment
             // stops being the active crash-recovery source.
             atomic_write_json(&state_path, &state)?;
@@ -2116,6 +2160,11 @@ impl ReferenceCollector {
             else {
                 continue;
             };
+            if !self.config.market_ids.is_empty()
+                && !self.config.market_ids.contains(market_id)
+            {
+                continue;
+            }
             let condition_id = market
                 .get("conditionId")
                 .and_then(Value::as_str)
@@ -2132,9 +2181,9 @@ impl ReferenceCollector {
             discovered_target_symbols.insert(target.symbol.clone());
             targets.insert(market_id.to_owned(), (market, target));
         }
-        let missing_target_symbols = missing_symbols(&self.symbols, &discovered_target_symbols);
-
         let target_ids = targets.keys().cloned().collect::<BTreeSet<_>>();
+        validate_requested_market_ids(&self.config.market_ids, &target_ids)?;
+        let missing_target_symbols = missing_symbols(&self.symbols, &discovered_target_symbols);
         let market_detail_budget = self
             .config
             .max_trade_polls_per_cycle
@@ -2489,6 +2538,7 @@ impl ReferenceCollector {
             "updated_at": completed_at,
             "last_success_at": completed_at,
             "target_markets": target_count,
+            "configured_market_ids": self.config.market_ids.len(),
             "missing_target_symbols": missing_target_symbols,
             "tracked_markets": self.state.markets.len(),
             "market_detail_budget": market_detail_budget,
@@ -3532,6 +3582,13 @@ mod tests {
         );
         default.validate().unwrap();
 
+        let malformed_market_id = ReferenceConfig {
+            market_ids: BTreeSet::from([" 2959141".to_owned()]),
+            ..default.clone()
+        };
+        let error = malformed_market_id.validate().unwrap_err();
+        assert!(error.to_string().contains("market IDs"));
+
         let exact_capacity = ReferenceConfig {
             max_markets: 2_688,
             ..default.clone()
@@ -3872,6 +3929,36 @@ mod tests {
             .expect_err("a requested market missing from Gamma discovery must fail");
 
         assert!(error.to_string().contains("2959146"));
+    }
+
+    #[test]
+    fn market_allowlist_prunes_unrelated_recovered_state() {
+        let mut state = CollectorState::default();
+        state.markets.insert(
+            "2959141".to_owned(),
+            TrackedMarket {
+                condition_id: Some("allowed-condition".to_owned()),
+                ..TrackedMarket::default()
+            },
+        );
+        state.markets.insert(
+            "unrelated".to_owned(),
+            TrackedMarket {
+                condition_id: Some("unrelated-condition".to_owned()),
+                ..TrackedMarket::default()
+            },
+        );
+        state.trade_seen.insert("allowed-condition".to_owned(), BTreeMap::new());
+        state.trade_seen.insert("unrelated-condition".to_owned(), BTreeMap::new());
+
+        assert!(retain_requested_market_state(
+            &mut state,
+            &BTreeSet::from(["2959141".to_owned()]),
+        ));
+        assert_eq!(state.markets.len(), 1);
+        assert!(state.markets.contains_key("2959141"));
+        assert_eq!(state.trade_seen.len(), 1);
+        assert!(state.trade_seen.contains_key("allowed-condition"));
     }
 
     #[cfg(unix)]
