@@ -629,6 +629,7 @@ mod tests {
     use super::*;
     use crate::polymarket_evidence::{artifact::tests, seal_polymarket_evidence_triplet};
     use serde_json::{json, Value};
+    use std::fs;
 
     #[rustfmt::skip]
     fn valid_rows() -> Vec<Value> {
@@ -677,6 +678,34 @@ mod tests {
         verify_polymarket_evidence(sealed)
     }
 
+    fn verify_v3_rows(rows: &[Value]) -> Result<VerifiedPolymarketEvidence> {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = tests::write_triplet_rows(&temp, rows);
+        let mut manifest: Value = serde_json::from_slice(&fs::read(&triplet.manifest)?)?;
+        let contracts = rows
+            .iter()
+            .filter(|row| row["surface"] == "market_contract")
+            .collect::<Vec<_>>();
+        manifest["schema"] = json!("monday.polymarket.evidence_artifact.v3");
+        manifest["market_ids"] = json!(contracts
+            .iter()
+            .map(|row| row["market_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>());
+        manifest["symbols"] = json!(contracts
+            .iter()
+            .map(|row| row["symbol"].as_str().unwrap())
+            .collect::<BTreeSet<_>>());
+        manifest["event_selection"] =
+            json!("explicit market_ids constrained to [event_start_gte,event_start_lt)");
+        tests::rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest)?),
+        );
+
+        let sealed = seal_polymarket_evidence_triplet(&triplet, &tests::trust(&triplet))?;
+        verify_polymarket_evidence(sealed)
+    }
+
     fn row<'a>(rows: &'a mut [Value], surface: &str, offset: usize) -> &'a mut Value {
         rows.iter_mut()
             .filter(|row| row["surface"] == surface)
@@ -705,6 +734,34 @@ mod tests {
             verified.settlements()[0].winning_side,
             BinaryOutcomeSide::Up
         );
+    }
+
+    #[test]
+    fn verifies_v3_single_episode_with_both_token_books() {
+        let verified = verify_v3_rows(&valid_rows()).unwrap();
+
+        assert_eq!(verified.contracts().len(), 1);
+        assert_eq!(verified.books().len(), 2);
+        assert_eq!(
+            verified
+                .books()
+                .iter()
+                .map(|book| book.side)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([BinaryOutcomeSide::Down, BinaryOutcomeSide::Up])
+        );
+    }
+
+    #[test]
+    fn rejects_v3_book_row_for_an_unrequested_market() {
+        let mut rows = valid_rows();
+        let mut unrequested_book = rows[1].clone();
+        unrequested_book["market_id"] = json!("market-2");
+        unrequested_book["condition_id"] = json!("condition-2");
+        rows.push(unrequested_book);
+
+        let error = format!("{:#}", verify_v3_rows(&rows).unwrap_err());
+        assert!(error.contains("unknown market"), "{error}");
     }
 
     #[test]

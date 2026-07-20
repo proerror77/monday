@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -23,6 +23,7 @@ pub struct ResearchSelectionConfig {
     pub segments: ResearchSegmentValidationConfig,
     pub event_start_gte: String,
     pub event_start_lt: String,
+    pub market_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -49,7 +50,8 @@ pub struct ResearchSelectionReport {
     pub schema: &'static str,
     pub event_start_gte: String,
     pub event_start_lt: String,
-    pub symbols: [&'static str; 2],
+    pub market_ids: Vec<String>,
+    pub symbols: Vec<String>,
     pub window_secs: u64,
     pub contracts: Vec<SelectedResearchContract>,
     pub validated_inputs: ResearchSegmentValidationReport,
@@ -169,7 +171,9 @@ pub(crate) fn visit(
     Ok(())
 }
 
-fn selection(config: &ResearchSelectionConfig) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+fn selection(
+    config: &ResearchSelectionConfig,
+) -> Result<(DateTime<Utc>, DateTime<Utc>, BTreeSet<String>)> {
     let start = timestamp(&config.event_start_gte, "event_start_gte")?;
     let end = timestamp(&config.event_start_lt, "event_start_lt")?;
     if start.timestamp_subsec_nanos() != 0
@@ -180,19 +184,36 @@ fn selection(config: &ResearchSelectionConfig) -> Result<(DateTime<Utc>, DateTim
     {
         bail!("event selection must be a positive UTC interval aligned to five minutes");
     }
-    Ok((start, end))
+    let mut market_ids = BTreeSet::new();
+    for market_id in &config.market_ids {
+        if market_id.is_empty()
+            || market_id.chars().any(char::is_whitespace)
+            || !market_ids.insert(market_id.clone())
+        {
+            bail!("market IDs must be unique, non-empty, whitespace-free identifiers");
+        }
+    }
+    if market_ids.is_empty() {
+        bail!("at least one market ID is required");
+    }
+    Ok((start, end, market_ids))
 }
 
 fn discover(
     path: &Path,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    market_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, SelectedContract>> {
     let mut contracts = BTreeMap::new();
     visit(path, |line, sequence, recorded_at, update| {
         if update.get("kind").and_then(Value::as_str) != Some("event_discovered")
             || update.get("window_secs").and_then(Value::as_u64) != Some(WINDOW_SECS as u64)
         {
+            return Ok(());
+        }
+        let market_id = required(update, "event_id")?.to_owned();
+        if !market_ids.contains(&market_id) {
             return Ok(());
         }
         let symbol = required(update, "symbol")?;
@@ -204,7 +225,6 @@ fn discover(
         if event_start < start || event_start >= end {
             return Ok(());
         }
-        let market_id = required(update, "event_id")?.to_owned();
         let up_token = required(update, "up_token")?.to_owned();
         let down_token = required(update, "down_token")?.to_owned();
         if up_token == down_token {
@@ -231,32 +251,14 @@ fn discover(
         }
         Ok(())
     })?;
-    verify_grid(&contracts, start, end)?;
-    Ok(contracts)
-}
-
-fn verify_grid(
-    contracts: &BTreeMap<String, SelectedContract>,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> Result<()> {
-    let mut slot = start;
-    while slot < end {
-        for symbol in SYMBOLS {
-            let matches = contracts
-                .values()
-                .filter(|contract| contract.symbol == symbol && contract.event_start == slot)
-                .count();
-            if matches != 1 {
-                bail!(
-                    "expected one {symbol} five-minute discovery at {}, found {matches}",
-                    utc_text(slot)
-                );
-            }
-        }
-        slot += Duration::seconds(WINDOW_SECS);
+    if contracts.len() != market_ids.len()
+        || market_ids
+            .iter()
+            .any(|market_id| !contracts.contains_key(market_id))
+    {
+        bail!("one or more requested market IDs were not discovered in the bounded market tape");
     }
-    Ok(())
+    Ok(contracts)
 }
 
 fn raw_market_start(market: &Map<String, Value>) -> Result<DateTime<Utc>> {
@@ -405,9 +407,9 @@ pub(crate) fn with_selected_research_contracts<T>(
         DateTime<Utc>,
     ) -> Result<T>,
 ) -> Result<T> {
-    let (start, end) = selection(config)?;
+    let (start, end, market_ids) = selection(config)?;
     with_validated_research_segments(&config.segments, |inputs, market_path, reference_path| {
-        let mut contracts = discover(market_path, start, end)?;
+        let mut contracts = discover(market_path, start, end, &market_ids)?;
         enrich_metadata(reference_path, &mut contracts)?;
         consume(inputs, market_path, reference_path, &contracts, start, end)
     })
@@ -417,6 +419,13 @@ pub fn select_research_contracts(
     config: &ResearchSelectionConfig,
 ) -> Result<ResearchSelectionReport> {
     with_selected_research_contracts(config, |inputs, _, _, contracts, start, end| {
+        let market_ids = contracts.keys().cloned().collect();
+        let symbols = contracts
+            .values()
+            .map(|contract| contract.symbol.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let contracts = contracts
             .values()
             .map(|contract| {
@@ -441,10 +450,11 @@ pub fn select_research_contracts(
             })
             .collect();
         Ok(ResearchSelectionReport {
-            schema: "monday.polymarket.research_selection.v1",
+            schema: "monday.polymarket.research_selection.v2",
             event_start_gte: utc_text(start),
             event_start_lt: utc_text(end),
-            symbols: SYMBOLS,
+            market_ids,
+            symbols,
             window_secs: WINDOW_SECS as u64,
             contracts,
             validated_inputs: inputs.clone(),
@@ -472,6 +482,7 @@ mod tests {
             },
             event_start_gte: start.to_owned(),
             event_start_lt: end.to_owned(),
+            market_ids: vec!["market-1".to_owned()],
         }
     }
 
@@ -497,6 +508,22 @@ mod tests {
     }
 
     #[test]
+    fn selection_rejects_duplicate_market_ids() {
+        let mut config = config("2026-07-17T05:30:00Z", "2026-07-17T05:35:00Z");
+        config.market_ids.push("market-1".to_owned());
+        let error = selection(&config).unwrap_err();
+        assert!(error.to_string().contains("market IDs must be unique"));
+    }
+
+    #[test]
+    fn selection_rejects_market_ids_with_internal_whitespace() {
+        let mut config = config("2026-07-17T05:30:00Z", "2026-07-17T05:35:00Z");
+        config.market_ids = vec!["market 1".to_owned()];
+        let error = selection(&config).unwrap_err();
+        assert!(error.to_string().contains("whitespace-free"));
+    }
+
+    #[test]
     fn semantic_outcomes_support_reversed_arrays_and_reject_duplicates() {
         let reversed = ["Down".to_owned(), "Up".to_owned()];
         assert_eq!(semantic_index(&reversed, true).unwrap(), 1);
@@ -515,19 +542,6 @@ mod tests {
             utc_text(raw_market_start(market.as_object().unwrap()).unwrap()),
             "2026-07-17T05:30:00Z"
         );
-    }
-
-    #[test]
-    fn grid_rejects_two_market_ids_for_one_symbol_and_slot() {
-        let start = timestamp("2026-07-17T05:30:00Z", "start").unwrap();
-        let end = start + Duration::seconds(WINDOW_SECS);
-        let contracts = BTreeMap::from([
-            ("btc-a".to_owned(), contract("btc-a", "BTCUSDT", start)),
-            ("btc-b".to_owned(), contract("btc-b", "BTCUSDT", start)),
-            ("sol".to_owned(), contract("sol", "SOLUSDT", start)),
-        ]);
-        let error = verify_grid(&contracts, start, end).unwrap_err();
-        assert!(error.to_string().contains("found 2"));
     }
 
     #[test]
@@ -595,11 +609,73 @@ mod tests {
             + "\n";
         std::fs::write(&path, tape).unwrap();
         let start = timestamp("2026-07-17T05:30:00Z", "start").unwrap();
-        let error = match discover(&path, start, start + Duration::seconds(WINDOW_SECS)) {
+        let error = match discover(
+            &path,
+            start,
+            start + Duration::seconds(WINDOW_SECS),
+            &BTreeSet::from(["btc-market".to_owned(), "sol-market".to_owned()]),
+        ) {
             Ok(_) => panic!("non-positive price_to_beat should fail"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("price_to_beat must be positive"));
+    }
+
+    #[test]
+    fn discovery_selects_only_the_requested_market_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("market.ndjson");
+        let rows = [
+            json!({
+                "sequence": 0,
+                "recorded_at": "2026-07-17T05:29:00Z",
+                "update": {
+                    "kind": "event_discovered",
+                    "window_secs": 300,
+                    "symbol": "BTCUSDT",
+                    "end_time": "2026-07-17T05:35:00Z",
+                    "event_id": "btc-market",
+                    "up_token": "btc-up",
+                    "down_token": "btc-down",
+                    "price_to_beat": "100"
+                }
+            }),
+            json!({
+                "sequence": 1,
+                "recorded_at": "2026-07-17T05:29:01Z",
+                "update": {
+                    "kind": "event_discovered",
+                    "window_secs": 300,
+                    "symbol": "SOLUSDT",
+                    "end_time": "2026-07-17T05:35:00Z",
+                    "event_id": "sol-market",
+                    "up_token": "sol-up",
+                    "down_token": "sol-down",
+                    "price_to_beat": "100"
+                }
+            }),
+        ];
+        let tape = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+            + "\n";
+        std::fs::write(&path, tape).unwrap();
+
+        let start = timestamp("2026-07-17T05:30:00Z", "start").unwrap();
+        let contracts = discover(
+            &path,
+            start,
+            start + Duration::seconds(WINDOW_SECS),
+            &BTreeSet::from(["btc-market".to_owned()]),
+        )
+        .expect("the requested BTC episode must not require the unrelated SOL episode");
+
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts["btc-market"].symbol, "BTCUSDT");
+        assert!(!contracts.contains_key("sol-market"));
     }
 
     #[test]

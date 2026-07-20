@@ -117,7 +117,7 @@ enum Command {
         #[arg(long)]
         reference_success: Vec<PathBuf>,
     },
-    /// Publish validated BTC/SOL five-minute evidence as an immutable artifact.
+    /// Publish validated five-minute evidence for explicit Polymarket episodes.
     PublishPolymarketEvidence {
         #[arg(long)]
         market_data: PathBuf,
@@ -135,6 +135,8 @@ enum Command {
         event_start_gte: String,
         #[arg(long)]
         event_start_lt: String,
+        #[arg(long = "market-id", required = true)]
+        market_ids: Vec<String>,
         #[arg(long)]
         output_root: PathBuf,
     },
@@ -307,6 +309,7 @@ async fn main() -> Result<()> {
             reference_success,
             event_start_gte,
             event_start_lt,
+            market_ids,
             output_root,
         } => {
             let report = publish_polymarket_evidence(&PolymarketEvidenceArtifactConfig {
@@ -325,6 +328,7 @@ async fn main() -> Result<()> {
                     },
                     event_start_gte,
                     event_start_lt,
+                    market_ids,
                 },
                 output_root,
             })?;
@@ -385,8 +389,8 @@ mod tests {
     }
 
     #[test]
-    fn publish_polymarket_evidence_cli_requires_a_bounded_window_and_output_root() {
-        let command = Cli::try_parse_from([
+    fn publish_polymarket_evidence_cli_requires_explicit_market_ids() {
+        let required = [
             "polymarket-raw-ops",
             "publish-polymarket-evidence",
             "--market-data",
@@ -407,10 +411,39 @@ mod tests {
             "2026-07-17T05:40:00Z",
             "--output-root",
             "/tmp/output",
+        ];
+        assert!(Cli::try_parse_from(required).is_err());
+
+        let command = Cli::try_parse_from([
+            "polymarket-raw-ops",
+            "publish-polymarket-evidence",
+            "--market-data",
+            "/tmp/market",
+            "--market-manifest",
+            "/tmp/market.manifest",
+            "--market-success",
+            "/tmp/market.success",
+            "--reference-data",
+            "/tmp/reference",
+            "--reference-manifest",
+            "/tmp/reference.manifest",
+            "--reference-success",
+            "/tmp/reference.success",
+            "--event-start-gte",
+            "2026-07-17T05:30:00Z",
+            "--event-start-lt",
+            "2026-07-17T05:40:00Z",
+            "--market-id",
+            "2985854",
+            "--output-root",
+            "/tmp/output",
         ])
-        .expect("bounded normalizer CLI must parse")
+        .expect("episode-scoped publisher CLI must parse")
         .command;
-        assert!(matches!(command, Command::PublishPolymarketEvidence { .. }));
+        let Command::PublishPolymarketEvidence { market_ids, .. } = command else {
+            panic!("publish-polymarket-evidence must select the publisher command");
+        };
+        assert_eq!(market_ids, vec!["2985854".to_owned()]);
     }
 
     #[test]
