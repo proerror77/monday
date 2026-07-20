@@ -823,6 +823,8 @@ mod tests {
         let side_run_id = format!("manager-side-run-{suffix}");
         let pooled_marker = format!("manager-pooled-marker-{suffix}");
         let side_marker = format!("manager-side-marker-{suffix}");
+        let dataset_start = Utc::now() - chrono::Duration::minutes(1);
+        let dataset_end = Utc::now();
 
         sqlx::query(
             r#"
@@ -833,8 +835,8 @@ mod tests {
             "#,
         )
         .bind(&snapshot_id)
-        .bind(Utc::now() - chrono::Duration::minutes(1))
-        .bind(Utc::now())
+        .bind(dataset_start)
+        .bind(dataset_end)
         .execute(&pool)
         .await
         .expect("insert snapshot");
@@ -868,13 +870,14 @@ mod tests {
                 r#"
                 INSERT INTO factor_evaluations (
                     eval_id, factor_id, run_id, data_snapshot_id,
+                    dataset_start_ts, dataset_end_ts,
                     evaluator_version, evidence_stage, evaluation_kind,
                     passed_gate, promotion_decision, promotion_status,
                     blockers_json
                 ) VALUES (
-                    $1::uuid, $2::uuid, $3, $4, 'ci-test', 'factor_attribution',
-                    'alpha_search_preview', false, 'blocked', 'blocked',
-                    $5::jsonb
+                    $1::uuid, $2::uuid, $3, $4, $5, $6, 'ci-test',
+                    'factor_attribution', 'alpha_search_preview', false, 'blocked',
+                    'blocked', $7::jsonb
                 )
                 "#,
             )
@@ -886,6 +889,8 @@ mod tests {
                 &pooled_run_id
             })
             .bind(&snapshot_id)
+            .bind(dataset_start)
+            .bind(dataset_end)
             .bind(json!([marker]).to_string())
             .execute(&pool)
             .await
