@@ -17,6 +17,7 @@ readonly CUTOVER="$SCRIPT_DIR/polymarket-raw-ops-cutover.sh"
 readonly WORKFLOW="$SCRIPT_DIR/../../.github/workflows/acr-publish.yml"
 readonly CI_WORKFLOW="$SCRIPT_DIR/../../.github/workflows/ci.yml"
 readonly README="$SCRIPT_DIR/README.md"
+readonly POLYMARKET_COMPILER_DOCKERFILE="$SCRIPT_DIR/../../rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler"
 
 if command -v gsha256sum >/dev/null 2>&1; then
   sha256sum() {
@@ -36,6 +37,20 @@ shellcheck "$GATE" "$CUTOVER" "$0"
 cargo build --quiet --manifest-path "$RUST_MANIFEST" -p hft-collector \
   --bin polymarket-raw-ops --no-default-features --locked
 "$VERIFY" verify-shadow-parity --help >/dev/null
+
+[[ -f $POLYMARKET_COMPILER_DOCKERFILE ]] || {
+  printf 'missing Polymarket evidence compiler Dockerfile\n' >&2
+  exit 1
+}
+grep -Fq 'polymarket-evidence-compiler' "$WORKFLOW"
+grep -Fq 'Dockerfile.polymarket-evidence-compiler' "$WORKFLOW"
+grep -Fq 'org.opencontainers.image.revision=${{ github.sha }}' "$WORKFLOW"
+grep -Fq 'Verify Polymarket compiler source binding' "$WORKFLOW"
+grep -Fq '/usr/local/bin/polymarket-raw-ops' "$POLYMARKET_COMPILER_DOCKERFILE"
+if grep -Fq '/usr/local/bin/binance-lob-archiver' "$POLYMARKET_COMPILER_DOCKERFILE"; then
+  printf 'Polymarket evidence compiler image includes a Binance LOB executable\n' >&2
+  exit 1
+fi
 
 tmp_dir=$(mktemp -d)
 tmp_dir=$(cd -- "$tmp_dir" && pwd -P)

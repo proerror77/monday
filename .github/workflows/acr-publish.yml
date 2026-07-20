@@ -13,6 +13,7 @@ on:
           - research-runner
           - hft-trading
           - binance-lob-archiver
+          - polymarket-evidence-compiler
 
 permissions:
   contents: read
@@ -33,13 +34,14 @@ jobs:
           TARGET: ${{ inputs.target }}
         run: |
           case "$TARGET" in
-            all|research-runner|hft-trading|binance-lob-archiver) ;;
+            all|research-runner|hft-trading|binance-lob-archiver|polymarket-evidence-compiler) ;;
             *) echo "Unsupported publish target: $TARGET" >&2; exit 1 ;;
           esac
           matrix=$(jq -cn --arg target "$TARGET" '
             [{repository:"research-runner",file:"rust_hft/deployment/docker/Dockerfile.research"},
              {repository:"hft-trading",file:"rust_hft/deployment/docker/Dockerfile.trading"},
-             {repository:"binance-lob-archiver",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"}]
+             {repository:"binance-lob-archiver",file:"rust_hft/deployment/docker/Dockerfile.binance-lob-archiver"},
+             {repository:"polymarket-evidence-compiler",file:"rust_hft/deployment/docker/Dockerfile.polymarket-evidence-compiler"}]
             | {include: map(select($target == "all" or .repository == $target))}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
@@ -77,10 +79,24 @@ jobs:
             ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}:run-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=acr-${{ matrix.repository }}
           cache-to: type=gha,mode=max,scope=acr-${{ matrix.repository }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Record immutable image
         run: |
           echo '${{ matrix.repository }}=${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify Polymarket compiler source binding
+        if: matrix.repository == 'polymarket-evidence-compiler'
+        env:
+          IMAGE: ${{ vars.ACR_REGISTRY }}/wildcard0923/${{ matrix.repository }}@${{ steps.build.outputs.digest }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          docker pull "$IMAGE"
+          actual_source_revision=$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "$IMAGE")
+          test "$actual_source_revision" = "$SOURCE_REVISION"
 
       - name: Package bare-metal trading host contract
         if: matrix.repository == 'hft-trading'
