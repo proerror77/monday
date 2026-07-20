@@ -360,6 +360,27 @@ mod tests {
     }
 
     #[test]
+    fn collect_reference_cli_accepts_explicit_market_id_filter() {
+        let command = Cli::try_parse_from([
+            "polymarket-raw-ops",
+            "collect-reference",
+            "--market-id",
+            "2959141",
+            "--market-id",
+            "2959146",
+        ])
+        .expect("market-id filtered collector CLI must parse")
+        .command;
+        let Command::CollectReference { market_ids, .. } = command else {
+            panic!("collect-reference must select the collector command");
+        };
+        assert_eq!(
+            market_ids,
+            vec!["2959141".to_owned(), "2959146".to_owned()]
+        );
+    }
+
+    #[test]
     fn publish_polymarket_evidence_cli_requires_a_bounded_window_and_output_root() {
         let command = Cli::try_parse_from([
             "polymarket-raw-ops",

@@ -3863,6 +3863,17 @@ mod tests {
         assert_eq!(closed["end_date_min"], "2026-07-14T02:00:00.000000Z");
     }
 
+    #[test]
+    fn requested_market_ids_fail_closed_when_discovery_is_incomplete() {
+        let requested = BTreeSet::from(["2959141".to_owned(), "2959146".to_owned()]);
+        let discovered = BTreeSet::from(["2959141".to_owned()]);
+
+        let error = validate_requested_market_ids(&requested, &discovered)
+            .expect_err("a requested market missing from Gamma discovery must fail");
+
+        assert!(error.to_string().contains("2959146"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn collector_rejects_symlinked_or_noncanonical_spool_ancestors() {
