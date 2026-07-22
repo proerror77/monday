@@ -141,7 +141,12 @@ setup_fixture() {
     '{symbol_count:1200,snapshot_ready_count:1200,sequence_gaps:0,
       upload_failure_count:0,health_samples:121,max_health_silence_seconds:30,
       catalog_sha256:"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      session_id:"shadow-session",oss_roundtrips:2}')
+      session_id:"shadow-session",oss_roundtrips:2,
+      agg_trade_segments:2,agg_trade_count:2,
+      oss_roundtrip_evidence:[
+        {success_uri:"oss://bucket/part-1.jsonl.zst._SUCCESS",start_received_at_ns:100,end_received_at_ns:200,agg_trade_count:1},
+        {success_uri:"oss://bucket/part-2.jsonl.zst._SUCCESS",start_received_at_ns:200,end_received_at_ns:300,agg_trade_count:1}
+      ]}')
   jq -n \
     --arg artifact "$CANDIDATE_SHA256" \
     --arg bundle "$DEPLOYMENT_BUNDLE_SHA256" \
