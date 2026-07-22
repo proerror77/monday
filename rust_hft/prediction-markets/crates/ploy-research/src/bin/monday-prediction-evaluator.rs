@@ -568,7 +568,7 @@ fn run_reprice_pilot_10s(
             summary,
         };
         let artifact = RepricePilotArtifact {
-            schema_version: "monday.polymarket.reprice_pilot.v1",
+            schema_version: "monday.polymarket.reprice_pilot.v2",
             non_finite_floats: "null",
             context,
             status: "pilot_not_promotable",
@@ -1453,6 +1453,13 @@ async fn main() {
         );
     }
     let formula_mcts_checkpoint_json = flag_value(&args, "--formula-mcts-checkpoint-json");
+    let mcts_state = formula_mcts_checkpoint_json.as_deref().map(|path| {
+        read_formula_mcts_checkpoint(path)
+            .unwrap_or_else(|err| panic!("read Formula MCTS checkpoint JSON {path} failed: {err}"))
+    });
+    if let Some(path) = formula_mcts_checkpoint_json.as_deref() {
+        eprintln!("Formula MCTS checkpoint loaded from {path}");
+    }
     let alpha_zoo_snapshot_json = flag_value(&args, "--alpha-zoo-snapshot-json");
     let data_quality_mode = parse_data_quality_mode(flag_value(&args, "--data-quality-mode"));
     let require_deribit = flag_present(&args, "--require-deribit");
@@ -2013,13 +2020,6 @@ async fn main() {
         .as_deref()
         .map(alpha_search_plan_factor_names)
         .unwrap_or_default();
-    let mcts_state = formula_mcts_checkpoint_json.as_deref().map(|path| {
-        read_formula_mcts_checkpoint(path)
-            .unwrap_or_else(|err| panic!("read Formula MCTS checkpoint JSON {path} failed: {err}"))
-    });
-    if let Some(path) = formula_mcts_checkpoint_json.as_deref() {
-        eprintln!("Formula MCTS checkpoint loaded from {path}");
-    }
     let alpha_zoo = alpha_zoo_snapshot_json
         .as_deref()
         .map(read_alpha_zoo_snapshot);

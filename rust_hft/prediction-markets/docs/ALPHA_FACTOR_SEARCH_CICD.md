@@ -768,7 +768,7 @@ Current implementation status:
   expose this as `options_json.alpha_search_plan_json`.
 - Implemented: `monday-prediction-evaluator
   --formula-mcts-checkpoint-json <path>` resumes only from the new checkpoint.
-  `--alpha-search-state-json` is a legacy projection input and is rejected
+  `--alpha-search-state-json` is a legacy state input and is rejected
   with an explicit migration diagnostic.
 - Implemented: `factor_walk_forward_v2 --alpha-search-llm-prior-json <path>`
   accepts a typed LLM-prior JSON file with bounded mutation requests. The Rust
