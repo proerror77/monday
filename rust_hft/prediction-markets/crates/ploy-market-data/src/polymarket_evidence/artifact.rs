@@ -691,7 +691,12 @@ fn validate_inputs(inputs: &ValidatedInputs) -> Result<()> {
                         "validated reference date/hour",
                     )
                 };
-                if hour(&pair[1])? != hour(&pair[0])? + chrono::Duration::hours(1) {
+                let current_hour = hour(&pair[0])?;
+                let next_hour = hour(&pair[1])?;
+                let ordered_same_hour = next_hour == current_hour
+                    && parse_time(&pair[1].start_recorded_at, "start_recorded_at")?
+                        >= parse_time(&pair[0].end_recorded_at, "end_recorded_at")?;
+                if !ordered_same_hour && next_hour != current_hour + chrono::Duration::hours(1) {
                     bail!("validated reference inputs must be consecutive UTC hours");
                 }
             }
@@ -1246,6 +1251,73 @@ pub(super) mod tests {
                 seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok(),
                 accepted
             );
+        }
+    }
+
+    #[test]
+    fn seals_ordered_same_hour_reference_fragments() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        let mut inputs = plural_inputs("05");
+        inputs["references"][1]["start_recorded_at"] = json!("2026-07-17T05:02:00Z");
+        inputs["references"][1]["end_recorded_at"] = json!("2026-07-17T05:03:00Z");
+        for completion in inputs["references"][1]["trade_completions"]
+            .as_object_mut()
+            .expect("reference trade completions")
+            .values_mut()
+        {
+            completion["retrieved_at"] = json!("2026-07-17T05:03:00Z");
+        }
+        manifest["validated_inputs"] = inputs;
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+        );
+
+        assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn rejects_reversed_or_overlapping_same_hour_reference_fragments() {
+        for (first_start, first_end, second_start, second_end) in [
+            (
+                "2026-07-17T05:02:00Z",
+                "2026-07-17T05:03:00Z",
+                "2026-07-17T05:00:00Z",
+                "2026-07-17T05:01:00Z",
+            ),
+            (
+                "2026-07-17T05:00:00Z",
+                "2026-07-17T05:02:00Z",
+                "2026-07-17T05:01:00Z",
+                "2026-07-17T05:03:00Z",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let triplet = write_triplet(&temp);
+            let mut manifest: Value =
+                serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+            let mut inputs = plural_inputs("05");
+            inputs["references"][0]["start_recorded_at"] = json!(first_start);
+            inputs["references"][0]["end_recorded_at"] = json!(first_end);
+            inputs["references"][1]["start_recorded_at"] = json!(second_start);
+            inputs["references"][1]["end_recorded_at"] = json!(second_end);
+            for completion in inputs["references"][1]["trade_completions"]
+                .as_object_mut()
+                .expect("reference trade completions")
+                .values_mut()
+            {
+                completion["retrieved_at"] = json!(second_end);
+            }
+            manifest["validated_inputs"] = inputs;
+            rewrite_read_only(
+                &triplet.manifest,
+                format!("{}\n", serde_json::to_string(&manifest).unwrap()),
+            );
+
+            assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_err());
         }
     }
 
