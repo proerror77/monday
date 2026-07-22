@@ -17,7 +17,7 @@ use ploy_market_data::diagnostics::PredictionMarketDataAuditReport;
 use ploy_market_data::polymarket_evidence::{
     aggregate_verified_polymarket_evidence, seal_polymarket_evidence_triplet,
     verify_polymarket_evidence, PolymarketEvidenceTriplet, PolymarketEvidenceTrustAnchor,
-    VerifiedPolymarketEvidenceSet,
+    VerifiedPolymarketEvidence, VerifiedPolymarketEvidenceSet,
 };
 use ploy_research::research_snapshot::ResearchSnapshotInputArtifact;
 use ploy_research::{
@@ -158,6 +158,37 @@ fn parse_verified_artifact_args(
     }))
 }
 
+fn parse_polymarket_verify_args(args: &[String]) -> anyhow::Result<Vec<AnchoredArtifact>> {
+    if args.get(1).map(String::as_str) != Some("--verify-polymarket-evidence") {
+        anyhow::bail!("--verify-polymarket-evidence must be supplied exactly once");
+    }
+    let groups = &args[2..];
+    if groups.is_empty() || groups.len() % 6 != 0 {
+        anyhow::bail!(
+            "--verify-polymarket-evidence requires complete artifact groups: +             --polymarket-artifact PATH --polymarket-content-sha256 SHA256 +             --polymarket-manifest-sha256 SHA256"
+        );
+    }
+    groups
+        .chunks_exact(6)
+        .map(|group| {
+            if group[0] != "--polymarket-artifact"
+                || group[2] != "--polymarket-content-sha256"
+                || group[4] != "--polymarket-manifest-sha256"
+                || [&group[1], &group[3], &group[5]]
+                    .iter()
+                    .any(|value| value.trim().is_empty() || value.starts_with("--"))
+            {
+                anyhow::bail!("--verify-polymarket-evidence requires complete artifact groups");
+            }
+            Ok(AnchoredArtifact {
+                data: PathBuf::from(&group[1]),
+                content_sha256: group[3].clone(),
+                manifest_sha256: group[5].clone(),
+            })
+        })
+        .collect()
+}
+
 fn artifact_triplet(path: &Path) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
     let name = path
         .file_name()
@@ -168,6 +199,25 @@ fn artifact_triplet(path: &Path) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> 
         path.with_file_name(format!("{name}.manifest.json")),
         path.with_file_name(format!("{name}._SUCCESS")),
     ))
+}
+
+fn verify_polymarket_artifact(
+    artifact: &AnchoredArtifact,
+) -> anyhow::Result<VerifiedPolymarketEvidence> {
+    let (data, manifest, success) = artifact_triplet(&artifact.data)?;
+    let trust = PolymarketEvidenceTrustAnchor::from_lower_hex(
+        &artifact.content_sha256,
+        &artifact.manifest_sha256,
+    )?;
+    verify_polymarket_evidence(seal_polymarket_evidence_triplet(
+        &PolymarketEvidenceTriplet {
+            data,
+            manifest,
+            success,
+        },
+        &trust,
+    )?)
+    .with_context(|| format!("verify Polymarket artifact {}", artifact.data.display()))
 }
 
 fn verify_binance_artifacts(
@@ -200,24 +250,48 @@ fn verify_polymarket_artifacts(
 ) -> anyhow::Result<VerifiedPolymarketEvidenceSet> {
     let verified = artifacts
         .iter()
-        .map(|artifact| {
-            let (data, manifest, success) = artifact_triplet(&artifact.data)?;
-            let trust = PolymarketEvidenceTrustAnchor::from_lower_hex(
-                &artifact.content_sha256,
-                &artifact.manifest_sha256,
-            )?;
-            verify_polymarket_evidence(seal_polymarket_evidence_triplet(
-                &PolymarketEvidenceTriplet {
-                    data,
-                    manifest,
-                    success,
-                },
-                &trust,
-            )?)
-            .with_context(|| format!("verify Polymarket artifact {}", artifact.data.display()))
-        })
+        .map(verify_polymarket_artifact)
         .collect::<anyhow::Result<Vec<_>>>()?;
     aggregate_verified_polymarket_evidence(verified)
+}
+
+fn verify_polymarket_only(args: &[String]) -> anyhow::Result<()> {
+    let artifacts = parse_polymarket_verify_args(args)?;
+    let members = artifacts
+        .iter()
+        .map(|artifact| {
+            let verified = verify_polymarket_artifact(artifact)?;
+            let identity = verified.identity();
+            let market_ids = verified
+                .contracts()
+                .iter()
+                .map(|contract| contract.market_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            Ok(serde_json::json!({
+                "data": artifact.data,
+                "content_sha256": identity.content_sha256,
+                "manifest_sha256": identity.manifest_sha256,
+                "event_start_gte": identity.event_start_gte.to_rfc3339(),
+                "event_start_lt": identity.event_start_lt.to_rfc3339(),
+                "rows": identity.rows,
+                "events": identity.events,
+                "market_ids": market_ids,
+                "contracts": verified.contracts().len(),
+                "books": verified.books().len(),
+                "references": verified.references().len(),
+                "trades": verified.trades().len(),
+                "settlements": verified.settlements().len(),
+            }))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "schema": "monday.polymarket.evidence_verification.v1",
+            "members": members,
+        }))?
+    );
+    Ok(())
 }
 
 fn parse_csv(raw: Option<String>, default: &str) -> Vec<String> {
@@ -282,6 +356,9 @@ fn validated_data_audit(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if flag_present(&args, "--verify-polymarket-evidence") {
+        return verify_polymarket_only(&args);
+    }
     if args
         .iter()
         .any(|arg| arg == "--db-url" || arg.starts_with("--db-url="))
@@ -462,7 +539,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_verified_artifact_args, validated_data_audit};
+    use super::{parse_polymarket_verify_args, parse_verified_artifact_args, validated_data_audit};
     use chrono::{TimeZone, Utc};
 
     fn digest(byte: char) -> String {
@@ -522,6 +599,74 @@ mod tests {
         assert_eq!(parsed.binance.len(), 1);
         assert_eq!(parsed.polymarket.len(), 2);
         assert_eq!(parsed.polymarket[1].manifest_sha256, digest('6'));
+    }
+
+    #[test]
+    fn polymarket_verify_mode_accepts_only_repeated_polymarket_anchors() {
+        let args = [
+            "monday-prediction-snapshot".to_string(),
+            "--verify-polymarket-evidence".to_string(),
+            "--polymarket-artifact".to_string(),
+            "/cloud/polymarket/one.ndjson".to_string(),
+            "--polymarket-content-sha256".to_string(),
+            digest('1'),
+            "--polymarket-manifest-sha256".to_string(),
+            digest('2'),
+            "--polymarket-artifact".to_string(),
+            "/cloud/polymarket/two.ndjson".to_string(),
+            "--polymarket-content-sha256".to_string(),
+            digest('3'),
+            "--polymarket-manifest-sha256".to_string(),
+            digest('4'),
+        ];
+
+        let parsed = parse_polymarket_verify_args(&args).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].content_sha256, digest('3'));
+
+        let mut mixed = args.to_vec();
+        mixed.extend(["--output-dir".to_string(), "/tmp/snapshot".to_string()]);
+        assert!(parse_polymarket_verify_args(&mixed)
+            .unwrap_err()
+            .to_string()
+            .contains("complete artifact groups"));
+
+        let ungrouped = [
+            "monday-prediction-snapshot".to_string(),
+            "--verify-polymarket-evidence".to_string(),
+            "--polymarket-artifact".to_string(),
+            "/cloud/polymarket/one.ndjson".to_string(),
+            "--polymarket-artifact".to_string(),
+            "/cloud/polymarket/two.ndjson".to_string(),
+            "--polymarket-content-sha256".to_string(),
+            digest('1'),
+            "--polymarket-content-sha256".to_string(),
+            digest('3'),
+            "--polymarket-manifest-sha256".to_string(),
+            digest('2'),
+            "--polymarket-manifest-sha256".to_string(),
+            digest('4'),
+        ];
+        assert!(parse_polymarket_verify_args(&ungrouped)
+            .unwrap_err()
+            .to_string()
+            .contains("complete artifact groups"));
+    }
+
+    #[test]
+    fn polymarket_verify_mode_rejects_malformed_trust_anchor_before_file_access() {
+        let artifact = super::AnchoredArtifact {
+            data: "/does/not/exist.ndjson".into(),
+            content_sha256: digest('A'),
+            manifest_sha256: digest('b'),
+        };
+
+        let error = super::verify_polymarket_artifact(&artifact).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("expected content SHA-256 must be 64 lowercase hexadecimal characters"));
     }
 
     #[test]
