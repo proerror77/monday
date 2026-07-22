@@ -387,6 +387,27 @@ impl PredictionMctsCheckpoint {
                 .collect(),
         })
     }
+
+    pub(crate) fn validate_pending_candidate(
+        &self,
+        candidate: &PredictionMctsCandidate,
+    ) -> Result<(), String> {
+        self.validate()?;
+        let node_id = *self
+            .pending
+            .get(&candidate.candidate_id)
+            .ok_or_else(|| "unknown prediction MCTS pending candidate".to_string())?;
+        let pending = &self.nodes[node_id];
+        let expected_digest = blend_digest(&pending.blend);
+        if candidate.identity != self.config.identity
+            || candidate.source != pending.source
+            || candidate.probability_blend_sha256 != expected_digest
+            || blend_digest(&candidate.probability_blend) != expected_digest
+        {
+            return Err("prediction MCTS pending candidate payload mismatch".to_string());
+        }
+        Ok(())
+    }
 }
 
 pub struct PredictionMctsEngine {
