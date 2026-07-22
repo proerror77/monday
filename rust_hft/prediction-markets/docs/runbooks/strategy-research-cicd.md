@@ -132,7 +132,11 @@ rtk cargo run -p ploy-research --example persist_research_trace --features db --
 The writer stores the sampled snapshot manifest, factor registry preview,
 factor evaluations, blockers, runtime contracts, and artifact hash chain. It
 stores alpha-search rows as `factor_attribution` /
-`alpha_search_preview` evaluations keyed by `(dsl_hash, target, horizon)`. It
+`alpha_search_preview` evaluations keyed by
+`(dsl_hash, target, horizon, optional review_side)`. Historical pooled rows
+remain `review_side IS NULL`; UP and DOWN repricing rows are distinct and are
+quarantined from legacy replay/runtime planning until those consumers carry the
+same typed identity. It
 stores promotion registry, AutoFactor promotion, and handoff artifacts as
 `walk_forward` trace rows, not as factor attribution. It does not create dry-run
 or live promotion evidence; candidate factors remain `continue` / `candidate`

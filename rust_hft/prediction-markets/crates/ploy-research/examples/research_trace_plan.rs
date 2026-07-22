@@ -103,6 +103,8 @@ async fn latest_runs(pool: &PgPool, evidence_stage: &str, limit: usize) -> Resul
             ) AS artifacts
         FROM experiment_trace
         WHERE evidence_stage = $1
+          AND NULLIF(output_json->>'side', '') IS NULL
+          AND NULLIF(output_json#>>'{source_factor,side}', '') IS NULL
         GROUP BY run_id
         ORDER BY latest_created_at DESC
         LIMIT $2
@@ -136,6 +138,8 @@ async fn ready_strategy_handoffs(pool: &PgPool, limit: usize) -> Result<Value> {
         WHERE event_type IN ('strategy_handoff', 'autofactor_strategy_handoff')
           AND output_json->>'status' = 'ready'
           AND output_json->>'recommended_action' = 'create_dry_run_handoff'
+          AND NULLIF(output_json->>'side', '') IS NULL
+          AND NULLIF(output_json#>>'{source_factor,side}', '') IS NULL
         ORDER BY created_at DESC
         LIMIT $1
         "#,
@@ -163,6 +167,7 @@ async fn factor_registry_summary(pool: &PgPool, limit: usize) -> Result<Value> {
         r#"
         SELECT status, COUNT(*)::BIGINT
         FROM factor_registry
+        WHERE review_side IS NULL
         GROUP BY status
         ORDER BY status
         "#,
@@ -173,6 +178,7 @@ async fn factor_registry_summary(pool: &PgPool, limit: usize) -> Result<Value> {
         r#"
         SELECT factor_name, dsl_hash, target, horizon, status, runtime_contract, blockers_json
         FROM factor_registry
+        WHERE review_side IS NULL
         ORDER BY created_at DESC
         LIMIT $1
         "#,
@@ -229,6 +235,7 @@ async fn runtime_ready_factor_candidates(pool: &PgPool, limit: usize) -> Result<
                 created_at
             FROM factor_registry
             WHERE status = 'candidate'
+              AND review_side IS NULL
               AND runtime_contract->>'version' = 'autofactor_runtime_contract_v1'
               AND COALESCE(runtime_contract->>'runtime_score', '') <> ''
               AND COALESCE(runtime_contract->>'strategy_profile', '') <> ''
@@ -305,6 +312,8 @@ async fn ready_candidate_replays(pool: &PgPool, limit: usize) -> Result<Value> {
         FROM candidate_replay_tapes
         WHERE promotion_ready = true
           AND basis = 'runtime_market_update_replay'
+          AND NULLIF(artifact_json->>'side', '') IS NULL
+          AND NULLIF(artifact_json#>>'{source_factor,side}', '') IS NULL
           AND jsonb_typeof(blocking_risk_flags_json) = 'array'
           AND jsonb_array_length(blocking_risk_flags_json) = 0
         ORDER BY created_at DESC
@@ -379,6 +388,8 @@ async fn recent_candidate_replays(pool: &PgPool, limit: usize) -> Result<Value> 
             created_at
         FROM candidate_replay_tapes
         WHERE basis = 'runtime_market_update_replay'
+          AND NULLIF(artifact_json->>'side', '') IS NULL
+          AND NULLIF(artifact_json#>>'{source_factor,side}', '') IS NULL
         ORDER BY created_at DESC
         LIMIT $1
         "#,
@@ -416,11 +427,15 @@ async fn recent_candidate_replays(pool: &PgPool, limit: usize) -> Result<Value> 
 async fn rejected_factor_patterns(pool: &PgPool, limit: usize) -> Result<Value> {
     let rows: Vec<(String, String, Value, i64)> = sqlx::query_as(
         r#"
-        SELECT promotion_decision, promotion_status, blockers_json, COUNT(*)::BIGINT
-        FROM factor_evaluations
-        WHERE promotion_status IN ('blocked', 'rejected')
-           OR promotion_decision IN ('blocked', 'reject', 'revise')
-        GROUP BY promotion_decision, promotion_status, blockers_json
+        SELECT e.promotion_decision, e.promotion_status, e.blockers_json, COUNT(*)::BIGINT
+        FROM factor_evaluations e
+        INNER JOIN factor_registry f ON f.factor_id = e.factor_id
+        WHERE f.review_side IS NULL
+          AND (
+              e.promotion_status IN ('blocked', 'rejected')
+              OR e.promotion_decision IN ('blocked', 'reject', 'revise')
+          )
+        GROUP BY e.promotion_decision, e.promotion_status, e.blockers_json
         ORDER BY COUNT(*) DESC
         LIMIT $1
         "#,
@@ -745,6 +760,7 @@ fn execution_surface_covered(execution_surfaces: &Value, surface_name: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn settlement_coverage_clears_non_materialized_settlement_surface_blocker() {
@@ -788,5 +804,152 @@ mod tests {
             blockers[0].get("reason").and_then(Value::as_str),
             Some("required_execution_surface_not_materialized")
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires migrated PostgreSQL from PLOY_TEST_DATABASE_URL"]
+    async fn postgres_legacy_manager_excludes_side_bound_trace_and_evaluation() {
+        let db_url = std::env::var("PLOY_TEST_DATABASE_URL").expect("PLOY_TEST_DATABASE_URL");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&db_url)
+            .await
+            .expect("connect PostgreSQL");
+        let suffix = Uuid::new_v4().to_string();
+        let snapshot_id = format!("manager-side-quarantine-snapshot-{suffix}");
+        let pooled_factor_id = Uuid::new_v4().to_string();
+        let side_factor_id = Uuid::new_v4().to_string();
+        let pooled_run_id = format!("manager-pooled-run-{suffix}");
+        let side_run_id = format!("manager-side-run-{suffix}");
+        let pooled_marker = format!("manager-pooled-marker-{suffix}");
+        let side_marker = format!("manager-side-marker-{suffix}");
+        let dataset_start = Utc::now() - chrono::Duration::minutes(1);
+        let dataset_end = Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO research_dataset_snapshots (
+                data_snapshot_id, schema_version, source_kind,
+                dataset_start_ts, dataset_end_ts
+            ) VALUES ($1, 'test.v1', 'test', $2, $3)
+            "#,
+        )
+        .bind(&snapshot_id)
+        .bind(dataset_start)
+        .bind(dataset_end)
+        .execute(&pool)
+        .await
+        .expect("insert snapshot");
+
+        for (factor_id, marker, review_side) in [
+            (&pooled_factor_id, pooled_marker.as_str(), None),
+            (&side_factor_id, side_marker.as_str(), Some("up")),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO factor_registry (
+                    factor_id, factor_name, factor_family, status, hypothesis,
+                    dsl_source, dsl_hash, ast_json, target, horizon,
+                    created_by_agent, review_side, blockers_json
+                ) VALUES (
+                    $1::uuid, $2, 'autofactor', 'candidate', 'test',
+                    'feature', $3, '{}'::jsonb, 'full_depth_reprice_pnl_10s',
+                    '10s', 'ci-test', $4, '[]'::jsonb
+                )
+                "#,
+            )
+            .bind(factor_id)
+            .bind(marker)
+            .bind(format!("dsl-{marker}"))
+            .bind(review_side)
+            .execute(&pool)
+            .await
+            .expect("insert factor");
+
+            sqlx::query(
+                r#"
+                INSERT INTO factor_evaluations (
+                    eval_id, factor_id, run_id, data_snapshot_id,
+                    dataset_start_ts, dataset_end_ts,
+                    evaluator_version, evidence_stage, evaluation_kind,
+                    passed_gate, promotion_decision, promotion_status,
+                    blockers_json
+                ) VALUES (
+                    $1::uuid, $2::uuid, $3, $4, $5, $6, 'ci-test',
+                    'factor_attribution', 'alpha_search_preview', false, 'blocked',
+                    'blocked', $7::jsonb
+                )
+                "#,
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(factor_id)
+            .bind(if review_side.is_some() {
+                &side_run_id
+            } else {
+                &pooled_run_id
+            })
+            .bind(&snapshot_id)
+            .bind(dataset_start)
+            .bind(dataset_end)
+            .bind(json!([marker]).to_string())
+            .execute(&pool)
+            .await
+            .expect("insert evaluation");
+        }
+
+        for (run_id, marker, side) in [
+            (pooled_run_id.as_str(), pooled_marker.as_str(), None),
+            (side_run_id.as_str(), side_marker.as_str(), Some("Up")),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO experiment_trace (
+                    trace_id, run_id, event_type, agent_name, output_json,
+                    hash_current, evidence_stage
+                ) VALUES (
+                    $1::uuid, $2, 'factor_registry_preview', 'ci-test', $3::jsonb,
+                    $4, 'factor_attribution'
+                )
+                "#,
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(run_id)
+            .bind(json!({"marker": marker, "side": side}).to_string())
+            .bind(format!("hash-{marker}"))
+            .execute(&pool)
+            .await
+            .expect("insert trace");
+        }
+
+        let latest = latest_runs(&pool, "factor_attribution", 100)
+            .await
+            .expect("read latest runs")
+            .to_string();
+        let patterns = rejected_factor_patterns(&pool, 100)
+            .await
+            .expect("read rejected patterns")
+            .to_string();
+        assert!(latest.contains(&pooled_marker));
+        assert!(!latest.contains(&side_marker));
+        assert!(patterns.contains(&pooled_marker));
+        assert!(!patterns.contains(&side_marker));
+
+        sqlx::query("DELETE FROM factor_evaluations WHERE factor_id IN ($1::uuid, $2::uuid)")
+            .bind(&pooled_factor_id)
+            .bind(&side_factor_id)
+            .execute(&pool)
+            .await
+            .expect("clean evaluations");
+        sqlx::query("DELETE FROM factor_registry WHERE factor_id IN ($1::uuid, $2::uuid)")
+            .bind(&pooled_factor_id)
+            .bind(&side_factor_id)
+            .execute(&pool)
+            .await
+            .expect("clean factors");
+        sqlx::query("DELETE FROM research_dataset_snapshots WHERE data_snapshot_id = $1")
+            .bind(&snapshot_id)
+            .execute(&pool)
+            .await
+            .expect("clean snapshot");
     }
 }
