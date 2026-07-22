@@ -250,6 +250,30 @@ pub struct PredictionMctsCheckpoint {
     proposed: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PredictionMctsCheckpointArtifact {
+    pub version: u32,
+    pub identity: PredictionMctsIdentity,
+    pub proposed: usize,
+    pub nodes: Vec<PredictionMctsCheckpointNodeArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PredictionMctsCheckpointNodeArtifact {
+    pub node_id: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_node_id: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_candidate_id: Option<String>,
+    pub source: PredictionExpansionSource,
+    pub probability_blend_sha256: String,
+    pub depth: usize,
+    pub visits: u64,
+    pub total_reward: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_reward: Option<f64>,
+}
+
 impl PredictionMctsCheckpoint {
     fn validate(&self) -> Result<(), String> {
         if self.version != CHECKPOINT_VERSION
@@ -330,6 +354,57 @@ impl PredictionMctsCheckpoint {
             {
                 return Err("invalid prediction MCTS pending candidate map".to_string());
             }
+        }
+        Ok(())
+    }
+
+    pub fn read_only_artifact(&self) -> Result<PredictionMctsCheckpointArtifact, String> {
+        self.validate()?;
+        let pending_by_node = self
+            .pending
+            .iter()
+            .map(|(candidate_id, node_id)| (*node_id, candidate_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        Ok(PredictionMctsCheckpointArtifact {
+            version: self.version,
+            identity: self.config.identity.clone(),
+            proposed: self.proposed,
+            nodes: self
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(node_id, node)| PredictionMctsCheckpointNodeArtifact {
+                    node_id,
+                    parent_node_id: node.parent,
+                    pending_candidate_id: pending_by_node.get(&node_id).cloned(),
+                    source: node.source,
+                    probability_blend_sha256: blend_digest(&node.blend),
+                    depth: node.depth,
+                    visits: node.visits,
+                    total_reward: node.total_reward,
+                    best_reward: node.best_reward,
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn validate_pending_candidate(
+        &self,
+        candidate: &PredictionMctsCandidate,
+    ) -> Result<(), String> {
+        self.validate()?;
+        let node_id = *self
+            .pending
+            .get(&candidate.candidate_id)
+            .ok_or_else(|| "unknown prediction MCTS pending candidate".to_string())?;
+        let pending = &self.nodes[node_id];
+        let expected_digest = blend_digest(&pending.blend);
+        if candidate.identity != self.config.identity
+            || candidate.source != pending.source
+            || candidate.probability_blend_sha256 != expected_digest
+            || blend_digest(&candidate.probability_blend) != expected_digest
+        {
+            return Err("prediction MCTS pending candidate payload mismatch".to_string());
         }
         Ok(())
     }

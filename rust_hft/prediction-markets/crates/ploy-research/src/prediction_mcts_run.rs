@@ -10,13 +10,18 @@ use crate::prediction_loop::{
     validate_prediction_proposal, LoopRunStatus, LoopRunSummary, PredictionProposal,
     PredictionResearchMission, ProposalClient, ProposedProbabilityBlend,
 };
-use crate::prediction_loop_fs::{atomic_write_json, next_attempt_dir, read_json, OutputLock};
+use crate::prediction_loop_fs::{
+    atomic_write_json, next_attempt_dir, read_json, write_content_addressed_json, ArtifactRef,
+    OutputLock,
+};
 use crate::prediction_mcts::{
-    PredictionMctsCandidate, PredictionMctsCheckpoint, PredictionMctsEngine,
-    PredictionMctsEvaluation,
+    PredictionMctsCandidate, PredictionMctsCheckpoint, PredictionMctsCheckpointArtifact,
+    PredictionMctsEngine, PredictionMctsEvaluation, PredictionMctsIdentity,
+    SettlementTrainingEvidence,
 };
 
 const RUN_STATE_VERSION: u32 = 1;
+const RUN_ARTIFACT_VERSION: &str = "prediction_mcts_checkpoint_artifact_v1";
 const MCTS_SEED: u64 = 7;
 const MCTS_EXPLORATION: f64 = 1.4;
 const MCTS_MAX_DEPTH: usize = 3;
@@ -67,11 +72,136 @@ struct PredictionMctsRunState {
     advisor: Option<Vec<ProposedProbabilityBlend>>,
     advisor_failure: Option<String>,
     checkpoint: Option<PredictionMctsCheckpoint>,
+    checkpoint_artifact: Option<ArtifactRef>,
+    #[serde(default)]
+    budget_exhausted: bool,
     pending: Option<PredictionMctsCandidate>,
     training: Vec<TrainingRecord>,
     selected: Option<PredictionMctsCandidate>,
     held_out_complete: bool,
     pause_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PredictionMctsRunArtifact {
+    version: &'static str,
+    identity: PredictionMctsIdentity,
+    prompt_snapshot_id: String,
+    search_policy_snapshot_id: String,
+    phase: &'static str,
+    baseline_complete: bool,
+    checkpoint: Option<PredictionMctsCheckpointArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending: Option<PredictionMctsCandidate>,
+    training: Vec<PredictionMctsTrainingArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected: Option<PredictionMctsCandidate>,
+    held_out_complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pause_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PredictionMctsTrainingArtifact {
+    candidate: PredictionMctsCandidate,
+    training_settlement: SettlementTrainingEvidence,
+}
+
+impl PredictionMctsRunState {
+    fn read_only_artifact(&self) -> Result<PredictionMctsRunArtifact, String> {
+        let identity = PredictionMctsIdentity::from_mission(&self.mission)?;
+        let checkpoint_state = self.checkpoint.as_ref();
+        let checkpoint = checkpoint_state
+            .map(PredictionMctsCheckpoint::read_only_artifact)
+            .transpose()?;
+        if checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.identity != identity)
+        {
+            return Err(
+                "prediction MCTS checkpoint identity does not match the mission".to_string(),
+            );
+        }
+        let training = self
+            .training
+            .iter()
+            .map(|record| {
+                if record.candidate.identity != identity
+                    || record.evaluation.training_settlement.identity != identity
+                    || record.evaluation.training_settlement.candidate_id
+                        != record.candidate.candidate_id
+                    || record
+                        .evaluation
+                        .training_settlement
+                        .probability_blend_sha256
+                        != record.candidate.probability_blend_sha256
+                {
+                    return Err("invalid prediction MCTS training artifact state".to_string());
+                }
+                Ok(PredictionMctsTrainingArtifact {
+                    candidate: record.candidate.clone(),
+                    training_settlement: record.evaluation.training_settlement.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(pending) = &self.pending {
+            if pending.identity != identity {
+                return Err(
+                    "prediction MCTS candidate identity does not match the mission".to_string(),
+                );
+            }
+            checkpoint_state
+                .ok_or_else(|| "prediction MCTS pending candidate has no checkpoint".to_string())?
+                .validate_pending_candidate(pending)?;
+        }
+        if let Some(selected) = &self.selected {
+            if selected.identity != identity {
+                return Err(
+                    "prediction MCTS candidate identity does not match the mission".to_string(),
+                );
+            }
+            if !self
+                .training
+                .iter()
+                .any(|record| record.candidate == *selected)
+            {
+                return Err(
+                    "prediction MCTS selected candidate is not backed by training evidence"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(PredictionMctsRunArtifact {
+            version: RUN_ARTIFACT_VERSION,
+            identity,
+            prompt_snapshot_id: self.mission.prompt_snapshot_id.clone(),
+            search_policy_snapshot_id: self.mission.search_policy_snapshot_id.clone(),
+            phase: if self.pause_reason.is_some() {
+                "paused"
+            } else if self.held_out_complete {
+                "held_out_complete"
+            } else if self.budget_exhausted {
+                "budget_exhausted"
+            } else if self.selected.is_some() {
+                "selected"
+            } else if self.pending.is_some() {
+                "training_pending"
+            } else if self.checkpoint.is_some() {
+                "training_ready"
+            } else if self.baseline_complete {
+                "baseline_complete"
+            } else {
+                "baseline_pending"
+            },
+            baseline_complete: self.baseline_complete,
+            checkpoint,
+            pending: self.pending.clone(),
+            training,
+            selected: self.selected.clone(),
+            held_out_complete: self.held_out_complete,
+            pause_reason: self.pause_reason.clone(),
+        })
+    }
 }
 
 /// Run the shared-kernel prediction controller after the caller has validated
@@ -112,6 +242,8 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
             advisor: None,
             advisor_failure: None,
             checkpoint: None,
+            checkpoint_artifact: None,
+            budget_exhausted: false,
             pending: None,
             training: Vec::new(),
             selected: None,
@@ -120,7 +252,16 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
         }
     };
     state.pause_reason = None;
-    checkpoint(&state_path, &state)?;
+    checkpoint(&state_path, &mut state)?;
+
+    if state.budget_exhausted {
+        return Ok(summary(
+            &mission,
+            &state_path,
+            &state,
+            LoopRunStatus::BudgetExhausted,
+        ));
+    }
 
     if !state.baseline_complete {
         let artifact_dir = next_attempt_dir(&output_dir.join("baseline"))?;
@@ -133,10 +274,12 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
             return pause(&mission, &state_path, &mut state, reason);
         }
         state.baseline_complete = true;
-        checkpoint(&state_path, &state)?;
+        checkpoint(&state_path, &mut state)?;
     }
 
     if mission.search_budget.max_candidates == 0 {
+        state.budget_exhausted = true;
+        checkpoint(&state_path, &mut state)?;
         return Ok(summary(
             &mission,
             &state_path,
@@ -154,7 +297,7 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
             );
         } else {
             state.advisor_call_consumed = true;
-            checkpoint(&state_path, &state)?;
+            checkpoint(&state_path, &mut state)?;
             let prompt =
                 build_prediction_prompt(&mission, mission.search_budget.max_candidates, &[]);
             match client.propose(&prompt, remaining_time(&state)) {
@@ -181,7 +324,7 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
             }
         };
         state.advisor = Some(advice);
-        checkpoint(&state_path, &state)?;
+        checkpoint(&state_path, &mut state)?;
     }
 
     let mut engine = PredictionMctsEngine::new(
@@ -196,11 +339,13 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
         engine.restore_checkpoint(saved)?;
     } else {
         state.checkpoint = Some(engine.checkpoint()?);
-        checkpoint(&state_path, &state)?;
+        checkpoint(&state_path, &mut state)?;
     }
 
     while state.training.len() < mission.search_budget.max_candidates {
         if remaining_time(&state).is_zero() {
+            state.budget_exhausted = true;
+            checkpoint(&state_path, &mut state)?;
             return Ok(summary(
                 &mission,
                 &state_path,
@@ -214,7 +359,7 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
             let candidate = engine.propose()?;
             state.pending = Some(candidate.clone());
             state.checkpoint = Some(engine.checkpoint()?);
-            checkpoint(&state_path, &state)?;
+            checkpoint(&state_path, &mut state)?;
             candidate
         };
         let artifact_dir = next_attempt_dir(
@@ -239,7 +384,7 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
         });
         state.pending = None;
         state.checkpoint = Some(engine.checkpoint()?);
-        checkpoint(&state_path, &state)?;
+        checkpoint(&state_path, &mut state)?;
     }
 
     if state.selected.is_none() {
@@ -250,7 +395,7 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
                 training_loss(&left.evaluation).total_cmp(&training_loss(&right.evaluation))
             })
             .map(|record| record.candidate.clone());
-        checkpoint(&state_path, &state)?;
+        checkpoint(&state_path, &mut state)?;
     }
     if !state.held_out_complete {
         let selected = state
@@ -268,7 +413,7 @@ pub fn run_or_resume_prediction_mcts<C: ProposalClient, E: PredictionMctsRunEval
             return pause(&mission, &state_path, &mut state, reason);
         }
         state.held_out_complete = true;
-        checkpoint(&state_path, &state)?;
+        checkpoint(&state_path, &mut state)?;
     }
 
     Ok(summary(
@@ -336,8 +481,22 @@ fn summary(
     }
 }
 
-fn checkpoint(path: &Path, state: &PredictionMctsRunState) -> Result<(), String> {
-    atomic_write_json(path, state)
+fn checkpoint(path: &Path, state: &mut PredictionMctsRunState) -> Result<(), String> {
+    let artifact = state.read_only_artifact()?;
+    let output_dir = path.parent().ok_or_else(|| {
+        format!(
+            "prediction MCTS state path has no parent: {}",
+            path.display()
+        )
+    })?;
+    state.checkpoint_artifact = Some(write_content_addressed_json(
+        output_dir,
+        &output_dir.join("prediction-mcts-artifacts"),
+        "prediction-mcts-artifact",
+        &artifact,
+    )?);
+    atomic_write_json(path, state)?;
+    Ok(())
 }
 
 fn now_unix_millis() -> u64 {
@@ -365,7 +524,11 @@ mod tests {
         PredictionSearchBudget, ProposalCallOutput, PREDICTION_LOOP_TARGET,
         PREDICTION_MISSION_SCHEMA_VERSION,
     };
-    use crate::prediction_mcts::{PredictionMctsIdentity, SettlementTrainingEvidence};
+    use crate::prediction_loop_fs::sha256_hex;
+    use crate::prediction_mcts::{
+        HeldOutSettlementEvidence, PredictionExecutionEvidence, PredictionMctsIdentity,
+        SettlementTrainingEvidence, TokenExecutionEvidence,
+    };
 
     fn mission(max_candidates: usize, max_llm_calls: usize) -> PredictionResearchMission {
         let mut mission = PredictionResearchMission {
@@ -428,6 +591,7 @@ mod tests {
         calls: Vec<String>,
         fail_training: VecDeque<bool>,
         candidate_ids: Vec<String>,
+        include_auxiliary_evidence: bool,
     }
 
     impl PredictionMctsRunEvaluator for FakeEvaluator {
@@ -465,8 +629,25 @@ mod tests {
                     mean_brier_score: 0.2,
                     mean_log_loss: 0.3,
                 },
-                held_out_settlement: None,
-                execution: None,
+                held_out_settlement: self.include_auxiliary_evidence.then_some(
+                    HeldOutSettlementEvidence {
+                        event_count: 4,
+                        mean_brier_score: 0.3,
+                        mean_log_loss: 0.4,
+                    },
+                ),
+                execution: self
+                    .include_auxiliary_evidence
+                    .then_some(PredictionExecutionEvidence {
+                        up: TokenExecutionEvidence {
+                            fill_rate: 0.9,
+                            mean_slippage_bps: 1.0,
+                        },
+                        down: TokenExecutionEvidence {
+                            fill_rate: 0.8,
+                            mean_slippage_bps: 2.0,
+                        },
+                    }),
             })
         }
 
@@ -490,6 +671,18 @@ mod tests {
             std::process::id(),
             uuid::Uuid::new_v4()
         ))
+    }
+
+    fn published_artifact_path(output: &Path) -> PathBuf {
+        let state: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output.join("prediction-mcts-state.json")).unwrap(),
+        )
+        .unwrap();
+        output.join(
+            state["checkpoint_artifact"]["path"]
+                .as_str()
+                .expect("content-addressed checkpoint artifact path"),
+        )
     }
 
     #[test]
@@ -572,6 +765,289 @@ mod tests {
             PredictionMctsIdentity::from_mission(&mission(2, 1))
                 .unwrap()
                 .mission_id
+        );
+    }
+
+    #[test]
+    fn runner_writes_a_stable_read_only_checkpoint_artifact() {
+        let output = temp_dir("checkpoint-artifact");
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
+
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("search run");
+
+        let artifact_path = published_artifact_path(&output);
+        let first = std::fs::read(&artifact_path).expect("checkpoint artifact");
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&first).expect("parse checkpoint artifact");
+        assert_eq!(artifact["training"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            artifact["prompt_snapshot_id"],
+            mission(1, 1).prompt_snapshot_id
+        );
+        assert_eq!(
+            artifact["search_policy_snapshot_id"],
+            mission(1, 1).search_policy_snapshot_id
+        );
+        assert!(artifact["training"][0].get("held_out_settlement").is_none());
+        assert!(artifact["training"][0].get("execution").is_none());
+        assert!(artifact_path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&sha256_hex(&first)));
+
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("resume completed run");
+        assert_eq!(std::fs::read(&artifact_path).unwrap(), first);
+        assert_eq!(published_artifact_path(&output), artifact_path);
+    }
+
+    #[test]
+    fn runner_omits_auxiliary_evidence_without_rejecting_the_training_result() {
+        let output = temp_dir("auxiliary-evidence");
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator {
+            include_auxiliary_evidence: true,
+            ..Default::default()
+        };
+
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("auxiliary evidence must not block training checkpoint publication");
+
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(published_artifact_path(&output)).unwrap())
+                .unwrap();
+        assert!(artifact["training"][0].get("held_out_settlement").is_none());
+        assert!(artifact["training"][0].get("execution").is_none());
+    }
+
+    #[test]
+    fn runner_rejects_forged_pending_candidate_before_evaluation() {
+        let output = temp_dir("forged-pending-artifact");
+        let mut client = FakeClient { calls: 0 };
+        let mut paused = FakeEvaluator {
+            fail_training: VecDeque::from([true]),
+            ..Default::default()
+        };
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut paused,
+        )
+        .expect("pause with a durable pending candidate");
+
+        let state_path = output.join("prediction-mcts-state.json");
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        forged["pending"]["candidate_id"] = serde_json::json!("forged-pending-candidate");
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+
+        let mut resumed = FakeEvaluator::default();
+        let error = run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut resumed,
+        )
+        .expect_err("forged pending candidate must be rejected before evaluation");
+        assert!(error.contains("pending candidate"));
+        assert!(resumed.calls.is_empty());
+    }
+
+    #[test]
+    fn runner_publishes_deadline_exhaustion_as_a_terminal_phase() {
+        let output = temp_dir("deadline-exhausted-artifact");
+        let mut client = FakeClient { calls: 0 };
+        let mut paused = FakeEvaluator {
+            fail_training: VecDeque::from([true]),
+            ..Default::default()
+        };
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut paused,
+        )
+        .expect("pause with incomplete training");
+
+        let state_path = output.join("prediction-mcts-state.json");
+        let mut expired: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        expired["deadline_unix_millis"] = serde_json::json!(0);
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&expired).unwrap()).unwrap();
+
+        let mut resumed = FakeEvaluator::default();
+        let summary = run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut resumed,
+        )
+        .expect("expired run returns a terminal summary");
+        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+        assert!(resumed.calls.is_empty());
+
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(published_artifact_path(&output)).unwrap())
+                .unwrap();
+        assert_eq!(artifact["phase"], "budget_exhausted");
+    }
+
+    #[test]
+    fn read_only_projection_does_not_change_when_an_unobserved_deadline_passes() {
+        let output = temp_dir("stable-before-deadline");
+        let mut client = FakeClient { calls: 0 };
+        let mut paused = FakeEvaluator {
+            fail_training: VecDeque::from([true]),
+            ..Default::default()
+        };
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut paused,
+        )
+        .expect("pause with a durable checkpoint");
+
+        let mut state: PredictionMctsRunState =
+            read_json(&output.join("prediction-mcts-state.json")).unwrap();
+        state.pause_reason = None;
+        state.deadline_unix_millis = now_unix_millis() + 20;
+        let before = serde_json::to_vec(&state.read_only_artifact().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let after = serde_json::to_vec(&state.read_only_artifact().unwrap()).unwrap();
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn runner_resumes_a_legacy_state_without_budget_exhausted() {
+        let output = temp_dir("legacy-budget-exhausted");
+        let mut client = FakeClient { calls: 0 };
+        let mut paused = FakeEvaluator {
+            fail_training: VecDeque::from([true]),
+            ..Default::default()
+        };
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut paused,
+        )
+        .expect("pause with a durable v1 state");
+
+        let state_path = output.join("prediction-mcts-state.json");
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("budget_exhausted");
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let mut resumed = FakeEvaluator::default();
+        let summary = run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut resumed,
+        )
+        .expect("legacy state resumes with a false terminal flag");
+        assert_eq!(summary.status, LoopRunStatus::BudgetExhausted);
+    }
+
+    #[test]
+    fn runner_rejects_a_selected_candidate_missing_from_training() {
+        let output = temp_dir("forged-selected-artifact");
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("completed run");
+
+        let state_path = output.join("prediction-mcts-state.json");
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        forged["selected"]["candidate_id"] = serde_json::json!("forged-selected-candidate");
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+
+        let error = run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect_err("selected candidate must be backed by a training record");
+        assert!(error.contains("selected candidate"));
+    }
+
+    #[test]
+    fn runner_rejects_a_checkpoint_with_a_mismatched_identity_before_rewriting_it() {
+        let output = temp_dir("forged-checkpoint-artifact");
+        let mut client = FakeClient { calls: 0 };
+        let mut evaluator = FakeEvaluator::default();
+        run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect("search run");
+
+        let state_path = output.join("prediction-mcts-state.json");
+        let artifact_path = published_artifact_path(&output);
+        let artifact_before_forgery = std::fs::read(&artifact_path).unwrap();
+        let mut forged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        forged["checkpoint"]["config"]["identity"]["symbol"] = serde_json::json!("SOL");
+        let forged = serde_json::to_vec_pretty(&forged).unwrap();
+        std::fs::write(&state_path, &forged).unwrap();
+
+        let error = run_or_resume_prediction_mcts(
+            mission(1, 1),
+            Path::new("unused-snapshot"),
+            &output,
+            &mut client,
+            &mut evaluator,
+        )
+        .expect_err("forged checkpoint must be rejected");
+        assert!(error.contains("checkpoint identity does not match the mission"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), forged);
+        assert_eq!(
+            std::fs::read(&artifact_path).unwrap(),
+            artifact_before_forgery
         );
     }
 }
