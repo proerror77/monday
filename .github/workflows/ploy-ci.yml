@@ -6,17 +6,33 @@ on:
     paths:
       - "rust_hft/prediction-markets/**"
       - "rust_hft/alpha-harness/**"
+      - "rust_hft/**/Cargo.toml"
+      - "rust_hft/**/Cargo.lock"
+      - "rust_hft/**/rust-toolchain*"
+      - "rust_hft/.cargo/**"
+      - ".cargo/**"
+      - "rust_hft/.dockerignore"
       - "rust_hft/deployment/docker/Dockerfile.research"
       - "deployment/aliyun/research/**"
       - ".github/workflows/ploy-ci.yml"
+      - ".github/scripts/select-prediction-image-smoke.sh"
+      - ".github/scripts/test-select-prediction-image-smoke.sh"
   push:
     branches: [main]
     paths:
       - "rust_hft/prediction-markets/**"
       - "rust_hft/alpha-harness/**"
+      - "rust_hft/**/Cargo.toml"
+      - "rust_hft/**/Cargo.lock"
+      - "rust_hft/**/rust-toolchain*"
+      - "rust_hft/.cargo/**"
+      - ".cargo/**"
+      - "rust_hft/.dockerignore"
       - "rust_hft/deployment/docker/Dockerfile.research"
       - "deployment/aliyun/research/**"
       - ".github/workflows/ploy-ci.yml"
+      - ".github/scripts/select-prediction-image-smoke.sh"
+      - ".github/scripts/test-select-prediction-image-smoke.sh"
   workflow_dispatch:
 
 concurrency:
@@ -37,6 +53,32 @@ env:
   SCCACHE_CACHE_SIZE: 10G
 
 jobs:
+  image-smoke-scope:
+    name: Research image smoke scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      research_image_smoke: ${{ steps.scope.outputs.research_image_smoke }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Test image smoke selector
+        run: ../../.github/scripts/test-select-prediction-image-smoke.sh
+
+      - name: Select full image smoke
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          ../../.github/scripts/select-prediction-image-smoke.sh
+          --event "${GITHUB_EVENT_NAME}"
+          --base "${BASE_SHA}"
+          --head "${HEAD_SHA}"
+
   commit-hygiene:
     name: Commit hygiene
     runs-on: ubuntu-latest
@@ -81,6 +123,8 @@ jobs:
 
   research-image-smoke:
     name: Research image smoke
+    needs: image-smoke-scope
+    if: ${{ needs.image-smoke-scope.outputs.research_image_smoke == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
