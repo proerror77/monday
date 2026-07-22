@@ -756,27 +756,20 @@ Current implementation status:
   a candidate cap to keep CI runs bounded.
 - Implemented: workflow upload path for the artifact bundle through both
   Factor Walk-Forward V2 workflows.
-- Implemented: MCTS control artifacts, `mcts-state.json` and
-  `mcts-expansion-plan.json`. The state artifact stores explicit factor
-  parent lineage, accumulates leaf visits, backpropagates leaf rewards through
-  ancestor nodes across runs, and persists structural subtree frequencies
-  across runs. The expansion plan ranks non-rejected current-run nodes with a
-  UCB-style priority using that cumulative state.
-  `mcts-state.json.backpropagation_truncated_count > 0` means reward
-  propagation hit a defensive stop before reaching a root node. Inspect
-  `parent_name` lineage for cycles first; if there is no cycle, check whether
-  the search state graph has grown beyond the expected bounded chain size. CI
-  warnings report only newly observed truncations while including the
-  cumulative artifact count.
+- Implemented: `formula-mcts-checkpoint.json` is the only resumable Formula
+  search state. It records candidate parent lineage, reward statistics, and
+  the existing 12-branch selection budget around the shared UCT kernel.
+  `mcts-state.json` and `mcts-expansion-plan.json` are read-only projections.
+  Invalid lineage, reordered roots, altered budgets, and legacy state versions
+  fail closed rather than being reinterpreted.
 - Implemented: `factor_walk_forward_v2 --alpha-search-plan-json <path>` can
   consume a prior `mcts-expansion-plan.json` and generate extra `mcts_*`
   guided mutations for selected branches. The Factor Walk-Forward workflows
   expose this as `options_json.alpha_search_plan_json`.
-- Implemented: `factor_walk_forward_v2 --alpha-search-state-json <path>` can
-  consume a prior `mcts-state.json`; when a prior alpha-search artifact is
-  downloaded via `options_json.alpha_search_plan_run_id`, the workflows pass
-  its `mcts-state.json` automatically when present. This carries both MCTS node
-  rewards and structural subtree frequency counts into the next run.
+- Implemented: `monday-prediction-evaluator
+  --formula-mcts-checkpoint-json <path>` resumes only from the new checkpoint.
+  `--alpha-search-state-json` is a legacy state input and is rejected
+  with an explicit migration diagnostic.
 - Implemented: `factor_walk_forward_v2 --alpha-search-llm-prior-json <path>`
   accepts a typed LLM-prior JSON file with bounded mutation requests. The Rust
   layer compiles those requests into existing `FactorExpr` candidates only when

@@ -27,7 +27,7 @@ use ploy_research::{
     format_settlement_probability_walk_forward_report, format_trade_formation_v1_report,
     liquidity_gate_v1_with_deribit_and_pm_books,
     liquidity_gated_alpha_v1_with_deribit_and_pm_books, load_research_snapshot,
-    mine_domain_autofactors_from_v2_with_guidance, read_mcts_search_state,
+    mine_domain_autofactors_from_v2_with_guidance, read_formula_mcts_checkpoint,
     review_fillability_v1_with_deribit_and_pm_books, review_repricing_ic_with_deribit_and_pm_books,
     review_trade_formation_v1_with_deribit_and_pm_books, split_reprice_rows_by_event_cohort,
     validate_prediction_research_prior, validate_snapshot_request_coverage,
@@ -115,6 +115,7 @@ struct FullDepthExecutionArtifact<'a> {
 #[derive(serde::Serialize)]
 struct RepricePilotSearchArtifact {
     summary: AlphaSearchArtifactSummary,
+    formula_mcts_checkpoint_sha256: String,
     mcts_state_sha256: String,
     mcts_expansion_plan_sha256: String,
 }
@@ -210,6 +211,7 @@ fn validate_reprice_pilot_config(
         "--alpha-search-plan-json",
         "--alpha-search-llm-prior-json",
         "--alpha-search-state-json",
+        "--formula-mcts-checkpoint-json",
         "--alpha-zoo-snapshot-json",
         "--candidate-strategy-replay-json",
     ] {
@@ -558,12 +560,15 @@ fn run_reprice_pilot_10s(
             .map_err(|error| format!("evaluate frozen reprice selection: {error}"))?;
         let search_dir = Path::new(&summary.output_dir);
         let search = RepricePilotSearchArtifact {
+            formula_mcts_checkpoint_sha256: sha256_file(
+                &search_dir.join("formula-mcts-checkpoint.json"),
+            )?,
             mcts_state_sha256: sha256_file(&search_dir.join("mcts-state.json"))?,
             mcts_expansion_plan_sha256: sha256_file(&search_dir.join("mcts-expansion-plan.json"))?,
             summary,
         };
         let artifact = RepricePilotArtifact {
-            schema_version: "monday.polymarket.reprice_pilot.v1",
+            schema_version: "monday.polymarket.reprice_pilot.v2",
             non_finite_floats: "null",
             context,
             status: "pilot_not_promotable",
@@ -1442,6 +1447,19 @@ async fn main() {
         eprintln!("alpha search typed LLM prior loaded from {path}");
     }
     let alpha_search_state_json = flag_value(&args, "--alpha-search-state-json");
+    if let Some(path) = alpha_search_state_json.as_deref() {
+        panic!(
+            "legacy alpha search state `{path}` is not resumable; use --formula-mcts-checkpoint-json"
+        );
+    }
+    let formula_mcts_checkpoint_json = flag_value(&args, "--formula-mcts-checkpoint-json");
+    let mcts_state = formula_mcts_checkpoint_json.as_deref().map(|path| {
+        read_formula_mcts_checkpoint(path)
+            .unwrap_or_else(|err| panic!("read Formula MCTS checkpoint JSON {path} failed: {err}"))
+    });
+    if let Some(path) = formula_mcts_checkpoint_json.as_deref() {
+        eprintln!("Formula MCTS checkpoint loaded from {path}");
+    }
     let alpha_zoo_snapshot_json = flag_value(&args, "--alpha-zoo-snapshot-json");
     let data_quality_mode = parse_data_quality_mode(flag_value(&args, "--data-quality-mode"));
     let require_deribit = flag_present(&args, "--require-deribit");
@@ -2002,13 +2020,6 @@ async fn main() {
         .as_deref()
         .map(alpha_search_plan_factor_names)
         .unwrap_or_default();
-    let mcts_state = alpha_search_state_json.as_deref().map(|path| {
-        read_mcts_search_state(path)
-            .unwrap_or_else(|err| panic!("read alpha search MCTS state JSON {path} failed: {err}"))
-    });
-    if let Some(path) = alpha_search_state_json.as_deref() {
-        eprintln!("alpha search cumulative MCTS state loaded from {path}");
-    }
     let alpha_zoo = alpha_zoo_snapshot_json
         .as_deref()
         .map(read_alpha_zoo_snapshot);

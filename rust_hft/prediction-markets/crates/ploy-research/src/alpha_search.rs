@@ -4,6 +4,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use hft_search_kernel::{
+    backpropagate as kernel_backpropagate, select_expandable as kernel_select_expandable,
+    validate_tree as validate_kernel_tree, UctError, UctNode, UctStats,
+};
+
 use crate::autofactor::{
     autofactor_runtime_contract_catalog, autofactor_target_horizon, factor_expr_hash,
     AutoFactorDecision, AutoFactorOptions, AutoFactorReport, FactorExpr, LlmPriorSpec,
@@ -12,6 +17,9 @@ use crate::factors_v2::ReviewSide;
 
 pub const ALPHA_SEARCH_ARTIFACT_VERSION: &str = "alpha_search_artifacts_v1";
 pub const SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION: &str = "alpha_search_artifacts_v2";
+pub const FORMULA_MCTS_CHECKPOINT_VERSION: &str = "formula_mcts_checkpoint_v1";
+const FORMULA_MCTS_ROOT_ID: &str = "__formula_mcts_root__";
+const FORMULA_MCTS_SELECTION_BUDGET: usize = 12;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AlphaSearchArtifactSummary {
@@ -88,6 +96,34 @@ pub struct MctsSearchStateNode {
     pub last_decision: String,
 }
 
+/// The only mutable Formula search state. It binds Formula-specific candidate
+/// identity and metadata around the domain-neutral shared UCT kernel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormulaMctsCheckpoint {
+    pub version: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<ReviewSide>,
+    pub selection_budget: usize,
+    pub nodes: Vec<FormulaMctsCheckpointNode>,
+    #[serde(default)]
+    pub subtree_frequencies: Vec<SubtreeFrequencyState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormulaMctsCheckpointNode {
+    pub factor_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_name: Option<String>,
+    pub visits: u64,
+    pub total_reward: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_reward: Option<f64>,
+    pub last_reward: f64,
+    pub selected_dimension: String,
+    pub last_decision: String,
+}
+
 /// A durable, cross-run snapshot of previously-accepted factors grouped by
 /// root gene, sourced from the `factor_registry` table across all historical
 /// runs. This is the "Alpha Zoo" from the "Navigating the Alpha Jungle" paper:
@@ -126,6 +162,8 @@ pub enum AlphaSearchArtifactError {
     Io(std::io::Error),
     Json(serde_json::Error),
     IdentityMismatch(String),
+    LegacyCheckpointVersion(String),
+    Kernel(UctError),
 }
 
 impl fmt::Display for AlphaSearchArtifactError {
@@ -136,6 +174,11 @@ impl fmt::Display for AlphaSearchArtifactError {
             Self::IdentityMismatch(reason) => {
                 write!(f, "alpha search artifact identity mismatch: {reason}")
             }
+            Self::LegacyCheckpointVersion(version) => write!(
+                f,
+                "alpha search checkpoint version `{version}` is legacy; expected `{FORMULA_MCTS_CHECKPOINT_VERSION}`"
+            ),
+            Self::Kernel(err) => write!(f, "alpha search shared MCTS kernel failed: {err}"),
         }
     }
 }
@@ -151,6 +194,12 @@ impl From<std::io::Error> for AlphaSearchArtifactError {
 impl From<serde_json::Error> for AlphaSearchArtifactError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
+    }
+}
+
+impl From<UctError> for AlphaSearchArtifactError {
+    fn from(value: UctError) -> Self {
+        Self::Kernel(value)
     }
 }
 
@@ -409,7 +458,6 @@ struct MctsSelectedNode {
     selected_dimension: String,
     proposed_mutation: &'static str,
     reward: f64,
-    ucb_priority: f64,
 }
 
 pub fn write_alpha_search_artifacts(
@@ -436,13 +484,32 @@ pub fn read_mcts_search_state(
     Ok(serde_json::from_str(&raw)?)
 }
 
+pub fn read_formula_mcts_checkpoint(
+    path: impl AsRef<Path>,
+) -> Result<FormulaMctsCheckpoint, AlphaSearchArtifactError> {
+    let raw = std::fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<missing>");
+    if version != FORMULA_MCTS_CHECKPOINT_VERSION {
+        return Err(AlphaSearchArtifactError::LegacyCheckpointVersion(
+            version.to_string(),
+        ));
+    }
+    let checkpoint = serde_json::from_value::<FormulaMctsCheckpoint>(value)?;
+    validate_formula_mcts_checkpoint(&checkpoint)?;
+    Ok(checkpoint)
+}
+
 pub fn write_alpha_search_artifacts_with_state(
     output_root: impl AsRef<Path>,
     target: &str,
     input_names: &[String],
     reports: &[AutoFactorReport],
     options: &AutoFactorOptions,
-    prior_state: Option<&MctsSearchStateArtifact>,
+    prior_state: Option<&FormulaMctsCheckpoint>,
 ) -> Result<AlphaSearchArtifactSummary, AlphaSearchArtifactError> {
     write_alpha_search_artifacts_with_state_and_runtime_feedback(
         output_root,
@@ -466,16 +533,14 @@ pub fn write_alpha_search_artifacts_with_state_and_runtime_feedback(
     input_names: &[String],
     reports: &[AutoFactorReport],
     options: &AutoFactorOptions,
-    prior_state: Option<&MctsSearchStateArtifact>,
+    prior_state: Option<&FormulaMctsCheckpoint>,
     runtime_feedback: Option<&AlphaSearchRuntimeFeedback>,
     llm_prior: Option<&LlmPriorSpec>,
     alpha_zoo: Option<&AlphaZooSnapshot>,
 ) -> Result<AlphaSearchArtifactSummary, AlphaSearchArtifactError> {
     if is_side_bound_repricing_target(target)
         || reports.iter().any(|report| report.side.is_some())
-        || prior_state.is_some_and(|state| {
-            state.version == SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION || state.side.is_some()
-        })
+        || prior_state.is_some_and(|state| state.side.is_some())
         || runtime_feedback.is_some_and(|feedback| {
             feedback.version.as_deref() == Some(SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION)
                 || feedback.side.is_some()
@@ -510,7 +575,7 @@ pub fn write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
     input_names: &[String],
     reports: &[AutoFactorReport],
     options: &AutoFactorOptions,
-    prior_state: Option<&MctsSearchStateArtifact>,
+    prior_state: Option<&FormulaMctsCheckpoint>,
     runtime_feedback: Option<&AlphaSearchRuntimeFeedback>,
     alpha_zoo: Option<&AlphaZooSnapshot>,
 ) -> Result<AlphaSearchArtifactSummary, AlphaSearchArtifactError> {
@@ -536,7 +601,7 @@ fn write_alpha_search_artifacts_core(
     input_names: &[String],
     reports: &[AutoFactorReport],
     options: &AutoFactorOptions,
-    prior_state: Option<&MctsSearchStateArtifact>,
+    prior_state: Option<&FormulaMctsCheckpoint>,
     runtime_feedback: Option<&AlphaSearchRuntimeFeedback>,
     llm_prior: Option<&LlmPriorSpec>,
     alpha_zoo: Option<&AlphaZooSnapshot>,
@@ -684,31 +749,23 @@ fn write_alpha_search_artifacts_core(
         &output_dir.join("factor-registry-preview.json"),
         &factor_registry_preview_artifact(version, target, side, reports, &node_metrics)?,
     )?;
-    let mcts_state = mcts_search_state(
+    let checkpoint = formula_mcts_checkpoint(
         version,
         target,
         side,
         &node_metrics,
         prior_state,
         subtree_frequencies,
-    );
-    let prior_truncated_count = prior_state
-        .filter(|state| state.target == target)
-        .map(|state| state.backpropagation_truncated_count)
-        .unwrap_or_default();
-    let new_truncated_count = mcts_state
-        .backpropagation_truncated_count
-        .saturating_sub(prior_truncated_count);
-    if new_truncated_count > 0 {
-        eprintln!(
-            "alpha-search warning: MCTS backpropagation truncated {} new time(s) for target `{}` ({} cumulative); inspect parent_name lineage for cycles or impossible depth.",
-            new_truncated_count, target, mcts_state.backpropagation_truncated_count
-        );
-    }
+    )?;
+    let mcts_state = mcts_search_state_projection(&checkpoint)?;
+    write_json(
+        &output_dir.join("formula-mcts-checkpoint.json"),
+        &checkpoint,
+    )?;
     write_json(&output_dir.join("mcts-state.json"), &mcts_state)?;
     write_json(
         &output_dir.join("mcts-expansion-plan.json"),
-        &mcts_expansion_plan(version, target, side, &node_metrics, &mcts_state),
+        &formula_mcts_expansion_plan(version, target, side, &checkpoint)?,
     )?;
 
     write_json(
@@ -731,7 +788,7 @@ fn write_alpha_search_artifacts_core(
                         report,
                         &runtime_avoidances,
                         alpha_zoo,
-                        &mcts_state.subtree_frequencies,
+                        &checkpoint.subtree_frequencies,
                     ),
                     visits: 1,
                     decision: report.decision.as_str().to_string(),
@@ -803,7 +860,7 @@ fn validate_side_bound_inputs(
     target: &str,
     side: ReviewSide,
     reports: &[AutoFactorReport],
-    prior_state: Option<&MctsSearchStateArtifact>,
+    prior_state: Option<&FormulaMctsCheckpoint>,
     runtime_feedback: Option<&AlphaSearchRuntimeFeedback>,
     alpha_zoo: Option<&AlphaZooSnapshot>,
 ) -> Result<(), AlphaSearchArtifactError> {
@@ -824,14 +881,18 @@ fn validate_side_bound_inputs(
         }
     }
     if let Some(state) = prior_state {
-        validate_side_bound_identity(
-            "MCTS state",
-            Some(state.version.as_str()),
-            Some(state.target.as_str()),
-            state.side,
-            target,
-            side,
-        )?;
+        if state.version != FORMULA_MCTS_CHECKPOINT_VERSION
+            || state.target != target
+            || state.side != Some(side)
+        {
+            return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
+                "Formula MCTS checkpoint expected target={target} side={}, found version={} target={} side={}",
+                side.as_str(),
+                state.version,
+                state.target,
+                state.side.map(ReviewSide::as_str).unwrap_or("<missing>")
+            )));
+        }
     }
     if let Some(feedback) = runtime_feedback {
         validate_side_bound_identity(
@@ -1425,16 +1486,27 @@ fn node_metric(
     }
 }
 
-fn mcts_search_state(
-    version: &str,
+fn formula_mcts_checkpoint(
+    _artifact_version: &str,
     target: &str,
     side: Option<ReviewSide>,
     metrics: &[NodeMetric],
-    prior_state: Option<&MctsSearchStateArtifact>,
+    prior_state: Option<&FormulaMctsCheckpoint>,
     subtree_frequencies: Vec<SubtreeFrequencyState>,
-) -> MctsSearchStateArtifact {
-    let mut nodes = prior_state
-        .filter(|state| state.target == target)
+) -> Result<FormulaMctsCheckpoint, AlphaSearchArtifactError> {
+    if let Some(prior) = prior_state {
+        validate_formula_mcts_checkpoint(prior)?;
+        if prior.target != target || prior.side != side {
+            return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
+                "Formula MCTS checkpoint expected target={target} side={}, found target={} side={}",
+                side.map(ReviewSide::as_str).unwrap_or("<none>"),
+                prior.target,
+                prior.side.map(ReviewSide::as_str).unwrap_or("<none>")
+            )));
+        }
+    }
+
+    let mut records = prior_state
         .map(|state| {
             state
                 .nodes
@@ -1443,135 +1515,351 @@ fn mcts_search_state(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    records
+        .entry(FORMULA_MCTS_ROOT_ID.to_string())
+        .or_insert_with(|| FormulaMctsCheckpointNode {
+            factor_name: FORMULA_MCTS_ROOT_ID.to_string(),
+            parent_name: None,
+            visits: 0,
+            total_reward: 0.0,
+            best_reward: None,
+            last_reward: 0.0,
+            selected_dimension: "root".to_string(),
+            last_decision: "root".to_string(),
+        });
 
     for metric in metrics {
-        let node = nodes
-            .entry(metric.factor_name.clone())
-            .or_insert_with(|| MctsSearchStateNode {
-                factor_name: metric.factor_name.clone(),
-                parent_name: metric.parent_name.clone(),
-                visits: 0,
-                total_reward: 0.0,
-                best_reward: f64::NEG_INFINITY,
-                last_reward: 0.0,
-                selected_dimension: metric.selected_dimension.clone(),
-                last_decision: metric.decision.clone(),
-            });
-        node.parent_name = metric.parent_name.clone();
-    }
-
-    let mut backpropagation_truncated_count = prior_state
-        .filter(|state| state.target == target)
-        .map(|state| state.backpropagation_truncated_count)
-        .unwrap_or_default();
-
-    for metric in metrics {
-        let Some(node) = nodes.get_mut(&metric.factor_name) else {
-            continue;
-        };
-        node.visits = node.visits.saturating_add(1);
-        node.total_reward += metric.reward;
-        node.best_reward = node.best_reward.max(metric.reward);
-        node.last_reward = metric.reward;
-        node.selected_dimension = metric.selected_dimension.clone();
-        node.last_decision = metric.decision.clone();
-        if backpropagate(&mut nodes, &metric.factor_name, metric.reward) {
-            backpropagation_truncated_count = backpropagation_truncated_count.saturating_add(1);
+        if metric.factor_name == FORMULA_MCTS_ROOT_ID {
+            return Err(AlphaSearchArtifactError::IdentityMismatch(
+                "Formula candidate identity uses the reserved MCTS root id".to_string(),
+            ));
+        }
+        let parent_name = metric.parent_name.clone();
+        match records.get(&metric.factor_name) {
+            Some(node) if node.parent_name != parent_name => {
+                return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
+                    "Formula candidate `{}` changed parent from {:?} to {:?}",
+                    metric.factor_name, node.parent_name, parent_name
+                )));
+            }
+            Some(_) => {}
+            None => {
+                records.insert(
+                    metric.factor_name.clone(),
+                    FormulaMctsCheckpointNode {
+                        factor_name: metric.factor_name.clone(),
+                        parent_name,
+                        visits: 0,
+                        total_reward: 0.0,
+                        best_reward: None,
+                        last_reward: 0.0,
+                        selected_dimension: metric.selected_dimension.clone(),
+                        last_decision: metric.decision.clone(),
+                    },
+                );
+            }
         }
     }
 
-    let mut nodes = nodes.into_values().collect::<Vec<_>>();
-    nodes.sort_by(|lhs, rhs| lhs.factor_name.cmp(&rhs.factor_name));
-    let total_visits = nodes.iter().map(|node| node.visits).sum();
-    MctsSearchStateArtifact {
-        version: version.to_string(),
-        mode: "cumulative_ucb_state".to_string(),
+    let mut nodes = formula_mcts_kernel_nodes(records)?;
+    for metric in metrics {
+        let node_id = nodes
+            .iter()
+            .position(|node| node.record.factor_name == metric.factor_name)
+            .ok_or_else(|| {
+                AlphaSearchArtifactError::IdentityMismatch(format!(
+                    "Formula candidate `{}` disappeared from its MCTS checkpoint",
+                    metric.factor_name
+                ))
+            })?;
+        nodes[node_id].record.last_reward = metric.reward;
+        nodes[node_id].record.selected_dimension = metric.selected_dimension.clone();
+        nodes[node_id].record.last_decision = metric.decision.clone();
+        kernel_backpropagate(&mut nodes, 0, node_id, metric.reward)?;
+    }
+
+    validate_kernel_tree(&nodes, 0, usize::MAX)?;
+    Ok(FormulaMctsCheckpoint {
+        version: FORMULA_MCTS_CHECKPOINT_VERSION.to_string(),
         target: target.to_string(),
         side,
-        total_visits,
-        backpropagation_truncated_count,
-        nodes,
+        selection_budget: FORMULA_MCTS_SELECTION_BUDGET,
+        nodes: nodes.into_iter().map(|node| node.record).collect(),
         subtree_frequencies,
-    }
+    })
 }
 
-fn backpropagate(
-    nodes: &mut BTreeMap<String, MctsSearchStateNode>,
-    leaf_name: &str,
-    reward: f64,
-) -> bool {
-    let mut current = leaf_name.to_string();
-    let mut visited = BTreeSet::new();
-    let max_hops = nodes.len().max(1);
-    for _ in 0..max_hops {
-        if !visited.insert(current.clone()) {
-            return true;
+fn mcts_search_state_projection(
+    checkpoint: &FormulaMctsCheckpoint,
+) -> Result<MctsSearchStateArtifact, AlphaSearchArtifactError> {
+    validate_formula_mcts_checkpoint(checkpoint)?;
+    let root = checkpoint
+        .nodes
+        .first()
+        .expect("validated Formula MCTS checkpoint has a root");
+    let mut nodes = checkpoint
+        .nodes
+        .iter()
+        .filter(|node| node.factor_name != FORMULA_MCTS_ROOT_ID)
+        .map(|node| {
+            Ok(MctsSearchStateNode {
+                factor_name: node.factor_name.clone(),
+                parent_name: node.parent_name.clone(),
+                visits: usize::try_from(node.visits).map_err(|_| UctError::StatsOverflow)?,
+                total_reward: node.total_reward,
+                best_reward: node.best_reward.unwrap_or(0.0),
+                last_reward: node.last_reward,
+                selected_dimension: node.selected_dimension.clone(),
+                last_decision: node.last_decision.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, AlphaSearchArtifactError>>()?;
+    nodes.sort_by(|lhs, rhs| lhs.factor_name.cmp(&rhs.factor_name));
+    Ok(MctsSearchStateArtifact {
+        version: FORMULA_MCTS_CHECKPOINT_VERSION.to_string(),
+        mode: "shared_kernel_projection".to_string(),
+        target: checkpoint.target.clone(),
+        side: checkpoint.side,
+        total_visits: usize::try_from(root.visits).map_err(|_| UctError::StatsOverflow)?,
+        backpropagation_truncated_count: 0,
+        nodes,
+        subtree_frequencies: checkpoint.subtree_frequencies.clone(),
+    })
+}
+
+#[cfg(test)]
+fn mcts_search_state(
+    version: &str,
+    target: &str,
+    side: Option<ReviewSide>,
+    metrics: &[NodeMetric],
+    prior_state: Option<&FormulaMctsCheckpoint>,
+    subtree_frequencies: Vec<SubtreeFrequencyState>,
+) -> MctsSearchStateArtifact {
+    let checkpoint = formula_mcts_checkpoint(
+        version,
+        target,
+        side,
+        metrics,
+        prior_state,
+        subtree_frequencies,
+    )
+    .expect("test Formula MCTS checkpoint");
+    mcts_search_state_projection(&checkpoint).expect("test Formula MCTS projection")
+}
+
+fn formula_mcts_expansion_plan(
+    version: &'static str,
+    target: &str,
+    side: Option<ReviewSide>,
+    checkpoint: &FormulaMctsCheckpoint,
+) -> Result<MctsExpansionPlan, AlphaSearchArtifactError> {
+    if checkpoint.target != target || checkpoint.side != side {
+        return Err(AlphaSearchArtifactError::IdentityMismatch(
+            "Formula MCTS checkpoint identity does not match expansion plan".to_string(),
+        ));
+    }
+    let exploration_weight = 0.75;
+    let mut nodes = formula_mcts_kernel_nodes(
+        checkpoint
+            .nodes
+            .iter()
+            .map(|node| (node.factor_name.clone(), node.clone()))
+            .collect(),
+    )?;
+    let mut selected = Vec::new();
+    while selected.len() < checkpoint.selection_budget {
+        let Some(node_id) = kernel_select_expandable(&nodes, 0, exploration_weight)? else {
+            break;
+        };
+        if node_id == 0 {
+            break;
         }
-        let Some(parent_name) = nodes
-            .get(&current)
-            .and_then(|node| node.parent_name.clone())
-        else {
-            return false;
-        };
-        let Some(parent) = nodes.get_mut(&parent_name) else {
-            return false;
-        };
-        parent.visits = parent.visits.saturating_add(1);
-        parent.total_reward += reward;
-        parent.best_reward = parent.best_reward.max(reward);
-        current = parent_name;
+        let node = &mut nodes[node_id];
+        node.expandable = false;
+        selected.push(MctsSelectedNode {
+            node_id: node.record.factor_name.clone(),
+            factor_name: node.record.factor_name.clone(),
+            selected_dimension: node.record.selected_dimension.clone(),
+            proposed_mutation: proposed_mutation(&node.record.selected_dimension),
+            reward: node.record.last_reward,
+        });
     }
-    true
+
+    Ok(MctsExpansionPlan {
+        version,
+        mode: "shared_kernel_selection_projection",
+        target: target.to_string(),
+        side,
+        exploration_weight,
+        selected_nodes: selected,
+        note: "Formula candidate identity is adapter metadata around the shared UCT kernel; this plan is a read-only projection of kernel selection.",
+    })
 }
 
+#[derive(Clone)]
+struct FormulaMctsKernelNode {
+    record: FormulaMctsCheckpointNode,
+    parent: Option<usize>,
+    children: Vec<usize>,
+    depth: usize,
+    expandable: bool,
+}
+
+impl UctNode for FormulaMctsKernelNode {
+    fn parent(&self) -> Option<usize> {
+        self.parent
+    }
+
+    fn children(&self) -> &[usize] {
+        &self.children
+    }
+
+    fn is_expandable(&self) -> bool {
+        self.expandable
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn stats(&self) -> Result<UctStats, UctError> {
+        UctStats::from_parts(
+            self.record.visits,
+            self.record.total_reward,
+            self.record.best_reward,
+        )
+    }
+
+    fn replace_stats(&mut self, stats: UctStats) {
+        self.record.visits = stats.visits();
+        self.record.total_reward = stats.total_reward();
+        self.record.best_reward = stats.best_reward();
+    }
+}
+
+fn formula_mcts_kernel_nodes(
+    mut records: BTreeMap<String, FormulaMctsCheckpointNode>,
+) -> Result<Vec<FormulaMctsKernelNode>, AlphaSearchArtifactError> {
+    let root = records.remove(FORMULA_MCTS_ROOT_ID).ok_or_else(|| {
+        AlphaSearchArtifactError::IdentityMismatch(
+            "Formula MCTS checkpoint is missing its reserved root node".to_string(),
+        )
+    })?;
+    if root.parent_name.is_some() || root.factor_name != FORMULA_MCTS_ROOT_ID {
+        return Err(AlphaSearchArtifactError::IdentityMismatch(
+            "Formula MCTS checkpoint root identity is invalid".to_string(),
+        ));
+    }
+    let mut nodes = vec![FormulaMctsKernelNode {
+        record: root,
+        parent: None,
+        children: Vec::new(),
+        depth: 0,
+        expandable: false,
+    }];
+    let mut by_name = BTreeMap::from([(FORMULA_MCTS_ROOT_ID.to_string(), 0usize)]);
+
+    while !records.is_empty() {
+        let ready = records
+            .iter()
+            .filter_map(|(name, node)| {
+                let parent = node.parent_name.as_deref().unwrap_or(FORMULA_MCTS_ROOT_ID);
+                by_name.contains_key(parent).then_some(name.clone())
+            })
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            let unresolved = records.keys().cloned().collect::<Vec<_>>().join(", ");
+            return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
+                "Formula MCTS candidate lineage is cyclic or references a missing parent: {unresolved}"
+            )));
+        }
+        for name in ready {
+            let record = records.remove(&name).expect("ready Formula node exists");
+            if record.factor_name != name {
+                return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
+                    "Formula MCTS checkpoint key `{name}` does not match candidate identity `{}`",
+                    record.factor_name
+                )));
+            }
+            let parent_name = record
+                .parent_name
+                .as_deref()
+                .unwrap_or(FORMULA_MCTS_ROOT_ID);
+            let parent = *by_name.get(parent_name).expect("ready parent is assigned");
+            let depth = nodes[parent].depth.saturating_add(1);
+            let node_id = nodes.len();
+            nodes[parent].children.push(node_id);
+            nodes.push(FormulaMctsKernelNode {
+                expandable: false,
+                record,
+                parent: Some(parent),
+                children: Vec::new(),
+                depth,
+            });
+            by_name.insert(name, node_id);
+        }
+    }
+    for node in &mut nodes {
+        node.expandable = node.parent.is_some()
+            && node.children.is_empty()
+            && node.record.last_decision != "reject"
+            && node.record.selected_dimension != "runtime_executable_entry";
+    }
+    validate_kernel_tree(&nodes, 0, usize::MAX)?;
+    Ok(nodes)
+}
+
+fn validate_formula_mcts_checkpoint(
+    checkpoint: &FormulaMctsCheckpoint,
+) -> Result<(), AlphaSearchArtifactError> {
+    if checkpoint.version != FORMULA_MCTS_CHECKPOINT_VERSION {
+        return Err(AlphaSearchArtifactError::LegacyCheckpointVersion(
+            checkpoint.version.clone(),
+        ));
+    }
+    if checkpoint.selection_budget != FORMULA_MCTS_SELECTION_BUDGET {
+        return Err(AlphaSearchArtifactError::IdentityMismatch(format!(
+            "Formula MCTS checkpoint selection budget {} does not match {FORMULA_MCTS_SELECTION_BUDGET}",
+            checkpoint.selection_budget
+        )));
+    }
+    if checkpoint
+        .nodes
+        .first()
+        .map(|node| node.factor_name.as_str())
+        != Some(FORMULA_MCTS_ROOT_ID)
+    {
+        return Err(AlphaSearchArtifactError::IdentityMismatch(
+            "Formula MCTS checkpoint root must be the first node".to_string(),
+        ));
+    }
+    let records = checkpoint
+        .nodes
+        .iter()
+        .map(|node| (node.factor_name.clone(), node.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if records.len() != checkpoint.nodes.len() {
+        return Err(AlphaSearchArtifactError::IdentityMismatch(
+            "Formula MCTS checkpoint contains duplicate candidate identities".to_string(),
+        ));
+    }
+    formula_mcts_kernel_nodes(records)?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn mcts_expansion_plan(
     version: &'static str,
     target: &str,
     side: Option<ReviewSide>,
     metrics: &[NodeMetric],
-    state: &MctsSearchStateArtifact,
+    _state: &MctsSearchStateArtifact,
 ) -> MctsExpansionPlan {
-    let exploration_weight = 0.75;
-    let total_visits = state.total_visits.max(1) as f64;
-    let state_by_factor = state
-        .nodes
-        .iter()
-        .map(|node| (node.factor_name.as_str(), node))
-        .collect::<BTreeMap<_, _>>();
-    let mut selected = metrics
-        .iter()
-        .filter(|metric| metric.decision != "reject")
-        .filter(|metric| metric.runtime_pass_through_penalty < 8.0)
-        .map(|metric| {
-            let state_node = state_by_factor.get(metric.factor_name.as_str());
-            let visits = state_node.map(|node| node.visits).unwrap_or(1).max(1) as f64;
-            let average_reward = state_node
-                .map(|node| node.total_reward / visits)
-                .unwrap_or(metric.reward);
-            let ucb_priority =
-                average_reward + exploration_weight * (total_visits.ln() / visits).sqrt();
-            MctsSelectedNode {
-                node_id: metric.id.clone(),
-                factor_name: metric.factor_name.clone(),
-                selected_dimension: metric.selected_dimension.clone(),
-                proposed_mutation: proposed_mutation(&metric.selected_dimension),
-                reward: metric.reward,
-                ucb_priority,
-            }
-        })
-        .collect::<Vec<_>>();
-    selected.sort_by(|lhs, rhs| rhs.ucb_priority.total_cmp(&lhs.ucb_priority));
-    selected.truncate(12);
-
-    MctsExpansionPlan {
-        version,
-        mode: "single_run_ucb_planner",
-        target: target.to_string(),
-        side,
-        exploration_weight,
-        selected_nodes: selected,
-        note: "MCTS state accumulates leaf visits and backpropagates leaf rewards through recorded parent lineage; this plan selects branches for the next bounded search run with UCB priority.",
-    }
+    let checkpoint = formula_mcts_checkpoint(version, target, side, metrics, None, Vec::new())
+        .expect("test Formula MCTS checkpoint");
+    formula_mcts_expansion_plan(version, target, side, &checkpoint)
+        .expect("test Formula MCTS expansion plan")
 }
 
 fn proposed_mutation(selected_dimension: &str) -> &'static str {
@@ -1720,7 +2008,7 @@ fn selected_dimension(
 fn subtree_frequency_state(
     target: &str,
     reports: &[AutoFactorReport],
-    prior_state: Option<&MctsSearchStateArtifact>,
+    prior_state: Option<&FormulaMctsCheckpoint>,
     llm_prior: Option<&LlmPriorSpec>,
 ) -> Vec<SubtreeFrequencyState> {
     let mut counts: BTreeMap<String, StructuralSubtreeCount> = prior_state
@@ -2298,6 +2586,33 @@ mod tests {
         }
     }
 
+    fn checkpoint(
+        target: &str,
+        side: Option<ReviewSide>,
+        nodes: Vec<FormulaMctsCheckpointNode>,
+        subtree_frequencies: Vec<SubtreeFrequencyState>,
+    ) -> FormulaMctsCheckpoint {
+        FormulaMctsCheckpoint {
+            version: FORMULA_MCTS_CHECKPOINT_VERSION.to_string(),
+            target: target.to_string(),
+            side,
+            selection_budget: FORMULA_MCTS_SELECTION_BUDGET,
+            nodes: std::iter::once(FormulaMctsCheckpointNode {
+                factor_name: FORMULA_MCTS_ROOT_ID.to_string(),
+                parent_name: None,
+                visits: 0,
+                total_reward: 0.0,
+                best_reward: None,
+                last_reward: 0.0,
+                selected_dimension: "root".to_string(),
+                last_decision: "root".to_string(),
+            })
+            .chain(nodes)
+            .collect(),
+            subtree_frequencies,
+        }
+    }
+
     #[test]
     fn structural_signature_normalizes_commutative_operands() {
         let lhs = FactorExpr::Add(
@@ -2417,21 +2732,17 @@ mod tests {
             ..sample_report("current_safe_div")
         };
         let signature = structural_signature(&expr);
-        let prior = MctsSearchStateArtifact {
-            version: ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
-            mode: "cumulative_ucb_state".to_string(),
-            target: "full_depth_settlement_executable_pnl".to_string(),
-            side: None,
-            total_visits: 0,
-            backpropagation_truncated_count: 0,
-            nodes: Vec::new(),
-            subtree_frequencies: vec![SubtreeFrequencyState {
+        let prior = checkpoint(
+            "full_depth_settlement_executable_pnl",
+            None,
+            Vec::new(),
+            vec![SubtreeFrequencyState {
                 root_gene: "SafeDiv".to_string(),
                 structural_signature: signature.clone(),
                 depth: structural_depth(&expr),
                 count: 2,
             }],
-        };
+        );
 
         let frequencies = subtree_frequency_state(
             "full_depth_settlement_executable_pnl",
@@ -2594,7 +2905,7 @@ mod tests {
         let write = |root: &Path,
                      side,
                      report: &AutoFactorReport,
-                     state: Option<&MctsSearchStateArtifact>| {
+                     state: Option<&FormulaMctsCheckpoint>| {
             write_side_bound_alpha_search_artifacts_with_state_and_runtime_feedback(
                 root,
                 target,
@@ -2635,16 +2946,7 @@ mod tests {
         assert!(matches!(err, AlphaSearchArtifactError::IdentityMismatch(_)));
         assert!(!pooled_root.join(target).exists());
 
-        let wrong_side_state = MctsSearchStateArtifact {
-            version: SIDE_BOUND_ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
-            mode: "cumulative_ucb_state".to_string(),
-            target: target.to_string(),
-            side: Some(ReviewSide::Down),
-            total_visits: 0,
-            backpropagation_truncated_count: 0,
-            nodes: Vec::new(),
-            subtree_frequencies: Vec::new(),
-        };
+        let wrong_side_state = checkpoint(target, Some(ReviewSide::Down), Vec::new(), Vec::new());
         let mismatch_root = tmp.join("mismatch");
         let err = write(&mismatch_root, ReviewSide::Up, &up, Some(&wrong_side_state))
             .expect_err("wrong-side prior state must fail closed");
@@ -2862,25 +3164,25 @@ mod tests {
             reason: "passed".to_string(),
             parent_name: None,
         };
-        let prior = MctsSearchStateArtifact {
-            version: ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
-            mode: "cumulative_ucb_state".to_string(),
-            target: "full_depth_settlement_executable_pnl".to_string(),
-            side: None,
-            total_visits: 3,
-            backpropagation_truncated_count: 0,
-            nodes: vec![MctsSearchStateNode {
+        let mut prior = checkpoint(
+            "full_depth_settlement_executable_pnl",
+            None,
+            vec![FormulaMctsCheckpointNode {
                 factor_name: "auto_settlement_conservative_settlement_edge".to_string(),
                 parent_name: None,
                 visits: 3,
                 total_reward: 6.0,
-                best_reward: 2.0,
+                best_reward: Some(2.0),
                 last_reward: 2.0,
                 selected_dimension: "exploit".to_string(),
                 last_decision: "candidate".to_string(),
             }],
-            subtree_frequencies: Vec::new(),
-        };
+            Vec::new(),
+        );
+        let root = prior.nodes.first_mut().expect("checkpoint root");
+        root.visits = 3;
+        root.total_reward = 6.0;
+        root.best_reward = Some(2.0);
 
         write_alpha_search_artifacts_with_state(
             &tmp,
@@ -3007,7 +3309,7 @@ mod tests {
     }
 
     #[test]
-    fn mcts_state_counts_cycle_truncated_backpropagation() {
+    fn formula_mcts_checkpoint_rejects_cyclic_lineage() {
         let runtime_avoidances = Vec::new();
         let mut report = sample_report("cycle_a");
         report.parent_name = Some("cycle_b".to_string());
@@ -3018,38 +3320,146 @@ mod tests {
             None,
             &Vec::new(),
         )];
-        let prior = MctsSearchStateArtifact {
-            version: ALPHA_SEARCH_ARTIFACT_VERSION.to_string(),
-            mode: "cumulative_ucb_state".to_string(),
-            target: "full_depth_settlement_executable_pnl".to_string(),
-            side: None,
-            total_visits: 0,
-            backpropagation_truncated_count: 0,
-            nodes: vec![MctsSearchStateNode {
+        let prior = checkpoint(
+            "full_depth_settlement_executable_pnl",
+            None,
+            vec![FormulaMctsCheckpointNode {
                 factor_name: "cycle_b".to_string(),
                 parent_name: Some("cycle_a".to_string()),
                 visits: 0,
                 total_reward: 0.0,
-                best_reward: f64::NEG_INFINITY,
+                best_reward: None,
                 last_reward: 0.0,
                 selected_dimension: "exploit".to_string(),
                 last_decision: "candidate".to_string(),
             }],
-            subtree_frequencies: Vec::new(),
-        };
+            Vec::new(),
+        );
 
-        let state = mcts_search_state(
+        let err = formula_mcts_checkpoint(
             ALPHA_SEARCH_ARTIFACT_VERSION,
             "full_depth_settlement_executable_pnl",
             None,
             &metrics,
             Some(&prior),
             Vec::new(),
-        );
+        )
+        .expect_err("cyclic Formula candidate lineage must fail closed");
 
-        assert_eq!(state.backpropagation_truncated_count, 1);
-        assert!(state.nodes.iter().any(|node| node.factor_name == "cycle_a"));
-        assert!(state.nodes.iter().any(|node| node.factor_name == "cycle_b"));
+        assert!(matches!(err, AlphaSearchArtifactError::IdentityMismatch(_)));
+    }
+
+    #[test]
+    fn formula_mcts_checkpoint_resume_matches_uninterrupted_run() {
+        let runtime_avoidances = Vec::new();
+        let root = sample_report("resume_root");
+        let mut child = sample_report("resume_child");
+        child.parent_name = Some(root.name.clone());
+        let metrics = [root, child]
+            .iter()
+            .enumerate()
+            .map(|(idx, report)| node_metric(idx, report, &runtime_avoidances, None, &Vec::new()))
+            .collect::<Vec<_>>();
+        let uninterrupted = formula_mcts_checkpoint(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_settlement_executable_pnl",
+            None,
+            &metrics,
+            None,
+            Vec::new(),
+        )
+        .expect("uninterrupted checkpoint");
+        let first = formula_mcts_checkpoint(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_settlement_executable_pnl",
+            None,
+            &metrics[..1],
+            None,
+            Vec::new(),
+        )
+        .expect("first checkpoint");
+        let resumed = formula_mcts_checkpoint(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_settlement_executable_pnl",
+            None,
+            &metrics[1..],
+            Some(&first),
+            Vec::new(),
+        )
+        .expect("resumed checkpoint");
+
+        assert_eq!(
+            serde_json::to_vec(&resumed).expect("serialize resumed checkpoint"),
+            serde_json::to_vec(&uninterrupted).expect("serialize uninterrupted checkpoint")
+        );
+    }
+
+    #[test]
+    fn formula_mcts_checkpoint_rejects_forged_target_and_legacy_state() {
+        let forged = checkpoint("other_target", None, Vec::new(), Vec::new());
+        let err = formula_mcts_checkpoint(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_settlement_executable_pnl",
+            None,
+            &[],
+            Some(&forged),
+            Vec::new(),
+        )
+        .expect_err("forged target must not resume Formula search");
+        assert!(matches!(err, AlphaSearchArtifactError::IdentityMismatch(_)));
+
+        let mut altered_budget = checkpoint(
+            "full_depth_settlement_executable_pnl",
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        altered_budget.selection_budget = FORMULA_MCTS_SELECTION_BUDGET + 1;
+        let err = formula_mcts_checkpoint(
+            ALPHA_SEARCH_ARTIFACT_VERSION,
+            "full_depth_settlement_executable_pnl",
+            None,
+            &[],
+            Some(&altered_budget),
+            Vec::new(),
+        )
+        .expect_err("altered selection budget must not resume Formula search");
+        assert!(matches!(err, AlphaSearchArtifactError::IdentityMismatch(_)));
+
+        let mut reordered = checkpoint(
+            "full_depth_settlement_executable_pnl",
+            None,
+            vec![FormulaMctsCheckpointNode {
+                factor_name: "forged_candidate".to_string(),
+                parent_name: None,
+                visits: 1,
+                total_reward: 1.0,
+                best_reward: Some(1.0),
+                last_reward: 1.0,
+                selected_dimension: "exploit".to_string(),
+                last_decision: "candidate".to_string(),
+            }],
+            Vec::new(),
+        );
+        reordered.nodes.swap(0, 1);
+        let err = mcts_search_state_projection(&reordered)
+            .expect_err("reordered checkpoint must not project a wrong root budget");
+        assert!(matches!(err, AlphaSearchArtifactError::IdentityMismatch(_)));
+
+        let temp = tempfile::tempdir().expect("temporary legacy state");
+        let path = temp.path().join("mcts-state.json");
+        std::fs::write(
+            &path,
+            r#"{"version":"alpha_search_artifacts_v1","target":"full_depth_settlement_executable_pnl"}"#,
+        )
+        .expect("write legacy state");
+        let err = read_formula_mcts_checkpoint(&path)
+            .expect_err("legacy projection must not be reinterpreted as a checkpoint");
+        assert!(matches!(
+            err,
+            AlphaSearchArtifactError::LegacyCheckpointVersion(ref version)
+                if version == ALPHA_SEARCH_ARTIFACT_VERSION
+        ));
     }
 
     #[test]
