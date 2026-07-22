@@ -762,6 +762,10 @@ fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
     let versions_valid = segment.record_id_versions.is_empty()
         || (dataset == "crypto_expiry_reference" && segment.record_id_versions == ["v2"]);
     parse_digest(&segment.sha256, "validated input sha256")?;
+    let hour_start = parse_time(
+        &format!("{}T{}:00:00Z", segment.date, segment.hour),
+        "validated input date/hour",
+    )?;
     let start = parse_time(&segment.start_recorded_at, "start_recorded_at")?;
     let end = parse_time(&segment.end_recorded_at, "end_recorded_at")?;
     let events = segment
@@ -794,14 +798,14 @@ fn validate_segment(segment: &SegmentIdentity, dataset: &str) -> Result<()> {
     {
         bail!("validated {dataset} input identity is inconsistent");
     }
-    validate_trade_completions(segment, dataset, start, end)?;
+    validate_trade_completions(segment, dataset, hour_start, end)?;
     Ok(())
 }
 
 fn validate_trade_completions(
     segment: &SegmentIdentity,
     dataset: &str,
-    start: DateTime<Utc>,
+    hour_start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<()> {
     if dataset == "crypto_expiry" {
@@ -826,7 +830,7 @@ fn validate_trade_completions(
             .is_err()
             || completion.completion_sequence < segment.start_sequence
             || completion.completion_sequence > segment.end_sequence
-            || retrieved_at < start
+            || retrieved_at < hour_start
             || retrieved_at > end
             || completion.completeness_basis != TRADE_COMPLETION_BASIS
             || completion.finalization_lag_secs == 0
@@ -1368,6 +1372,66 @@ pub(super) mod tests {
             format!("{}\n", serde_json::to_string(&value).unwrap()),
         );
         assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn seals_completion_retrieved_before_its_batched_segment_is_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        value["validated_inputs"]["reference"]["start_recorded_at"] = json!("2026-07-17T05:02:00Z");
+        value["validated_inputs"]["reference"]["end_recorded_at"] = json!("2026-07-17T05:02:00Z");
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        );
+
+        assert!(seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).is_ok());
+    }
+
+    #[test]
+    fn rejects_completion_retrieved_after_its_segment_is_recorded() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        value["validated_inputs"]["reference"]["trade_completions"]["market-1"]["retrieved_at"] =
+            json!("2026-07-17T05:02:00Z");
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        );
+
+        let error = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("event-local trade completion identity is inconsistent"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_completion_retrieved_before_its_segment_hour() {
+        let temp = tempfile::tempdir().unwrap();
+        let triplet = write_triplet(&temp);
+        let mut value: Value =
+            serde_json::from_slice(&fs::read(&triplet.manifest).unwrap()).unwrap();
+        value["validated_inputs"]["reference"]["trade_completions"]["market-1"]["retrieved_at"] =
+            json!("2026-07-17T04:59:59Z");
+        rewrite_read_only(
+            &triplet.manifest,
+            format!("{}\n", serde_json::to_string(&value).unwrap()),
+        );
+
+        let error = seal_polymarket_evidence_triplet(&triplet, &trust(&triplet)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("event-local trade completion identity is inconsistent"),
+            "{error:#}"
+        );
     }
 
     #[test]
