@@ -9,11 +9,15 @@ use ploy_research::factors_v2::{
     build_full_depth_execution_matrix_with_event_rows, FullDepthExecutionEventRow,
 };
 use ploy_research::prediction_loop::current_prediction_policy_snapshot_id;
+use ploy_research::prediction_mcts::{
+    PredictionMctsCandidate, PredictionMctsEvaluation, SettlementTrainingEvidence,
+};
 use ploy_research::{
     autofactor_matrix_from_v2, build_factor_observations_v2_with_deribit_and_pm_books,
     build_factor_stability_report, build_prediction_research_feedback,
     build_settlement_probability_promotion_gate_report,
-    build_settlement_probability_report_with_prior, evaluate_reprice_pilot_selection,
+    build_settlement_probability_report_with_prior,
+    build_settlement_training_probability_report_with_prior, evaluate_reprice_pilot_selection,
     fit_reprice_pilot_selection, format_autofactor_reports, format_factor_combo_v1_report,
     format_factor_stability_report, format_factor_walk_forward_v2_report,
     format_fillability_review_v1_report, format_full_depth_execution_matrix_report,
@@ -1374,6 +1378,8 @@ async fn main() {
     let mission_id = flag_value(&args, "--mission-id");
     let alpha_search_plan_json = flag_value(&args, "--alpha-search-plan-json");
     let alpha_search_llm_prior_json = flag_value(&args, "--alpha-search-llm-prior-json");
+    let prediction_mcts_training_candidate_json =
+        flag_value(&args, "--prediction-mcts-training-candidate-json");
     let expected_prediction_policy = flag_value(&args, "--expected-search-policy-snapshot-id");
     let reprice_pilot_10s = flag_present(&args, "--reprice-pilot-10s");
     let settlement_time_cohort = settlement_time_cohort_from_args(
@@ -1627,6 +1633,77 @@ async fn main() {
         &all_pm_book_snapshots,
         &options.review,
     );
+    if let Some(candidate_path) = prediction_mcts_training_candidate_json.as_deref() {
+        let candidate: PredictionMctsCandidate = std::fs::read(candidate_path)
+            .map_err(|error| format!("read prediction MCTS candidate: {error}"))
+            .and_then(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| format!("parse prediction MCTS candidate: {error}"))
+            })
+            .unwrap_or_else(|reason| panic!("prediction MCTS training input invalid: {reason}"));
+        let prior = governed_prediction_prior
+            .filter(|prior| prior.probability_blends.len() == 1)
+            .unwrap_or_else(|| panic!("prediction MCTS training requires one governed blend"));
+        if prior.mission_id.as_deref() != Some(candidate.identity.mission_id.as_str())
+            || prior.data_snapshot_id.as_deref()
+                != Some(candidate.identity.data_snapshot_id.as_str())
+            || prior.symbols.as_slice() != [candidate.identity.symbol.as_str()]
+            || prior.horizon.as_deref() != Some(candidate.identity.horizon.as_str())
+            || prior.probability_blends[0] != candidate.probability_blend
+        {
+            panic!("prediction MCTS candidate does not match governed evaluator prior");
+        }
+        let training = build_settlement_training_probability_report_with_prior(
+            &autofactor_rows,
+            start,
+            end,
+            Some(prior),
+            SettlementProbabilityWalkForwardOptions {
+                walk_forward: options.clone(),
+                probability: SettlementProbabilityReportOptions {
+                    min_bucket_observations: options.review.min_observations.max(20),
+                    ..Default::default()
+                },
+                time_cohort: settlement_time_cohort,
+                ..Default::default()
+            },
+        );
+        let model = format!("q_llm_{}", candidate.probability_blend.name);
+        let metrics = training
+            .baselines
+            .iter()
+            .find(|row| row.model == model)
+            .unwrap_or_else(|| panic!("prediction MCTS training produced no candidate metrics"));
+        let evidence = PredictionMctsEvaluation {
+            training_settlement: SettlementTrainingEvidence {
+                candidate_id: candidate.candidate_id.clone(),
+                identity: candidate.identity.clone(),
+                probability_blend_sha256: candidate.probability_blend_sha256.clone(),
+                training_cohort_id: training.training_cohort_id,
+                event_count: training.event_count,
+                mean_brier_score: metrics.brier_score,
+                mean_log_loss: metrics.log_loss,
+            },
+            held_out_settlement: None,
+            execution: None,
+        };
+        let output_dir = report_output_dir
+            .as_deref()
+            .unwrap_or_else(|| panic!("prediction MCTS training requires --report-output-dir"));
+        let path = write_content_addressed_report(
+            Path::new(output_dir),
+            "prediction-mcts-training-evidence",
+            &evidence,
+        )
+        .unwrap_or_else(|reason| panic!("write prediction MCTS training evidence: {reason}"));
+        println!("{snapshot_provenance}");
+        eprintln!(
+            "prediction MCTS training complete candidate_id={} path={}",
+            candidate.candidate_id,
+            path.display()
+        );
+        return;
+    }
     if reprice_pilot_10s {
         let boundary_ms = time_cohort_boundary_ms
             .expect("--reprice-pilot-10s validated --time-cohort-boundary-ms");
