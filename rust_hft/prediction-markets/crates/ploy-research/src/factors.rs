@@ -41,6 +41,10 @@ where
     Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(f64::NAN))
 }
 
+fn nullable_f64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    deserialize_nullable_f64_as_nan(deserializer)
+}
+
 #[cfg(any(feature = "db", test))]
 const PM_BOOK_SAMPLED_QUERY: &str = r#"
         WITH token_map AS (
@@ -119,16 +123,22 @@ pub struct FactorObservation {
     #[serde(default)]
     pub event_window_secs: i64,
     pub time_remaining_secs: i64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub signed_distance_to_beat: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub abs_distance_to_beat: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub drift_10s: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub drift_30s: f64,
     #[serde(
         default = "nan_f64",
         deserialize_with = "deserialize_nullable_f64_as_nan"
     )]
     pub flip_age_secs: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub post_flip_drift: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub sigma_horizon: f64,
     #[serde(
         default = "nan_f64",
@@ -155,7 +165,9 @@ pub struct FactorObservation {
         deserialize_with = "deserialize_nullable_f64_as_nan"
     )]
     pub vol_gap: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub distance_over_sigma: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub model_prob_up: f64,
     #[serde(
         default = "nan_f64",
@@ -177,14 +189,18 @@ pub struct FactorObservation {
         deserialize_with = "deserialize_nullable_f64_as_nan"
     )]
     pub reward_risk_down: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub obi: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub spread_bps: f64,
     #[serde(
         default = "nan_f64",
         deserialize_with = "deserialize_nullable_f64_as_nan"
     )]
     pub microprice_offset_bps: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub bid_depth_near: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub ask_depth_near: f64,
     #[serde(
         default = "nan_f64",
@@ -206,6 +222,7 @@ pub struct FactorObservation {
         deserialize_with = "deserialize_nullable_f64_as_nan"
     )]
     pub depth_acceleration: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub obi_10: f64,
     #[serde(
         default = "nan_f64",
@@ -255,10 +272,15 @@ pub struct FactorObservation {
     pub official_resolution_observed_at: Option<DateTime<Utc>>,
     pub future_up_ask_change_30s: Option<f64>,
     pub future_up_ask_change_60s: Option<f64>,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub cum_obi_delta_5m: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub cum_depth_delta_5m: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub cum_mprice_drift_5m: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub cum_trade_imbalance_5m: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub cex_bar_return_30s: f64,
     #[serde(
         default = "nan_f64",
@@ -280,7 +302,9 @@ pub struct FactorObservation {
         deserialize_with = "deserialize_nullable_f64_as_nan"
     )]
     pub cex_signed_volume_ratio_30s: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub cex_consecutive_up_bars: f64,
+    #[serde(default = "nan_f64", deserialize_with = "nullable_f64")]
     pub cex_consecutive_down_bars: f64,
     #[serde(
         default = "nan_f64",

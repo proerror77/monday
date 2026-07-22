@@ -21,8 +21,10 @@ use ploy_market_data::polymarket_evidence::{
 };
 use ploy_research::research_snapshot::ResearchSnapshotInputArtifact;
 use ploy_research::{
-    build_research_snapshot_from_database, build_research_snapshot_from_verified_artifacts,
-    write_research_snapshot, ResearchSnapshotBuildOptions, VerifiedArtifactSnapshotBuildOptions,
+    build_research_snapshot_from_database,
+    build_research_snapshot_from_polymarket_chainlink_baseline,
+    build_research_snapshot_from_verified_artifacts, write_research_snapshot,
+    ResearchSnapshotBuildOptions, VerifiedArtifactSnapshotBuildOptions,
 };
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
@@ -56,6 +58,7 @@ struct AnchoredArtifact {
 struct VerifiedArtifactArgs {
     binance: Vec<AnchoredArtifact>,
     polymarket: Vec<AnchoredArtifact>,
+    polymarket_chainlink_baseline: bool,
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
@@ -116,45 +119,74 @@ fn parse_verified_artifact_args(
     args: &[String],
     symbols: &[String],
 ) -> anyhow::Result<Option<VerifiedArtifactArgs>> {
-    let mode_count = args
+    let full_mode_count = args
         .iter()
         .filter(|argument| argument.as_str() == "--verified-artifacts")
         .count();
+    let baseline_mode_count = args
+        .iter()
+        .filter(|argument| argument.as_str() == "--polymarket-chainlink-baseline")
+        .count();
+    let mode_count = full_mode_count + baseline_mode_count;
     let has_artifact_value = VERIFIED_ARTIFACT_VALUE_FLAGS
         .iter()
         .any(|flag| flag_present(args, flag));
     if mode_count == 0 {
         if has_artifact_value {
-            anyhow::bail!("verified artifact inputs require --verified-artifacts");
+            anyhow::bail!(
+                "verified artifact inputs require --verified-artifacts or --polymarket-chainlink-baseline"
+            );
         }
         return Ok(None);
     }
     if mode_count != 1 {
-        anyhow::bail!("--verified-artifacts must be supplied exactly once");
+        anyhow::bail!(
+            "exactly one of --verified-artifacts or --polymarket-chainlink-baseline is required"
+        );
     }
     if let Some(flag) = VERIFIED_MODE_FORBIDDEN_FLAGS
         .iter()
         .find(|flag| flag_present(args, flag))
     {
-        anyhow::bail!("{flag} cannot be combined with --verified-artifacts");
+        anyhow::bail!("{flag} cannot be combined with verified artifact modes");
     }
     if symbols.len() != 1 || !matches!(symbols[0].as_str(), "BTCUSDT" | "SOLUSDT") {
         anyhow::bail!("verified-artifact mode requires exactly one BTCUSDT or SOLUSDT symbol");
     }
 
-    Ok(Some(VerifiedArtifactArgs {
-        binance: parse_anchored_artifacts(
+    let polymarket_chainlink_baseline = baseline_mode_count == 1;
+    let binance = if polymarket_chainlink_baseline {
+        if [
+            "--segment",
+            "--segment-content-sha256",
+            "--segment-manifest-sha256",
+        ]
+        .iter()
+        .any(|flag| flag_present(args, flag))
+        {
+            anyhow::bail!(
+                "Binance segment arguments cannot be combined with --polymarket-chainlink-baseline"
+            );
+        }
+        Vec::new()
+    } else {
+        parse_anchored_artifacts(
             args,
             "--segment",
             "--segment-content-sha256",
             "--segment-manifest-sha256",
-        )?,
+        )?
+    };
+
+    Ok(Some(VerifiedArtifactArgs {
+        binance,
         polymarket: parse_anchored_artifacts(
             args,
             "--polymarket-artifact",
             "--polymarket-content-sha256",
             "--polymarket-manifest-sha256",
         )?,
+        polymarket_chainlink_baseline,
     }))
 }
 
@@ -400,35 +432,46 @@ async fn main() -> anyhow::Result<()> {
     let verified_artifacts = parse_verified_artifact_args(&args, &symbols)?;
 
     let manifest = if let Some(artifacts) = verified_artifacts {
-        let binance = verify_binance_artifacts(&artifacts.binance)?;
         let polymarket = verify_polymarket_artifacts(&artifacts.polymarket)?;
-        eprintln!(
-            "monday-prediction-snapshot: {} -> {} for {:?}, source=verified_immutable_artifacts, binance_segments={}, polymarket_members={}, stake_usd={:.2}, output={}, pm_book_sample_secs={}",
+        let options = VerifiedArtifactSnapshotBuildOptions {
+            symbol: symbols[0].clone(),
+            start,
+            end,
+            lob_sample_secs,
+            pm_book_sample_secs,
+            observation_sample_secs,
+            max_quote_age_secs,
+            stake_usd,
+            optimizer_data_dir,
+            git_sha: std::env::var("GITHUB_SHA").ok(),
+        };
+        let snapshot = if artifacts.polymarket_chainlink_baseline {
+            eprintln!(
+                "monday-prediction-snapshot: {} -> {} for {:?}, source=verified_polymarket_chainlink_baseline, polymarket_members={}, stake_usd={:.2}, output={}, pm_book_sample_secs={}",
             start,
             end,
             symbols,
-            artifacts.binance.len(),
             artifacts.polymarket.len(),
             stake_usd,
             output_dir.display(),
             pm_book_sample_secs,
         );
-        let snapshot = build_research_snapshot_from_verified_artifacts(
-            &binance,
-            &polymarket,
-            VerifiedArtifactSnapshotBuildOptions {
-                symbol: symbols[0].clone(),
+            build_research_snapshot_from_polymarket_chainlink_baseline(&polymarket, options)?
+        } else {
+            let binance = verify_binance_artifacts(&artifacts.binance)?;
+            eprintln!(
+                "monday-prediction-snapshot: {} -> {} for {:?}, source=verified_immutable_artifacts, binance_segments={}, polymarket_members={}, stake_usd={:.2}, output={}, pm_book_sample_secs={}",
                 start,
                 end,
-                lob_sample_secs,
-                pm_book_sample_secs,
-                observation_sample_secs,
-                max_quote_age_secs,
+                symbols,
+                artifacts.binance.len(),
+                artifacts.polymarket.len(),
                 stake_usd,
-                optimizer_data_dir,
-                git_sha: std::env::var("GITHUB_SHA").ok(),
-            },
-        )?;
+                output_dir.display(),
+                pm_book_sample_secs,
+            );
+            build_research_snapshot_from_verified_artifacts(&binance, &polymarket, options)?
+        };
         write_research_snapshot(&output_dir, snapshot)?
     } else {
         let db_url = std::env::var("MONDAY_RESEARCH_DATABASE_URL")
@@ -571,6 +614,19 @@ mod tests {
         .into()
     }
 
+    fn polymarket_chainlink_baseline_args() -> Vec<String> {
+        [
+            "--polymarket-chainlink-baseline".to_string(),
+            "--polymarket-artifact".to_string(),
+            "/cloud/polymarket/hour-14.ndjson".to_string(),
+            "--polymarket-content-sha256".to_string(),
+            digest('3'),
+            "--polymarket-manifest-sha256".to_string(),
+            digest('4'),
+        ]
+        .into()
+    }
+
     #[test]
     fn prediction_snapshot_requires_typed_audit_evidence() {
         let start = Utc
@@ -599,6 +655,35 @@ mod tests {
         assert_eq!(parsed.binance.len(), 1);
         assert_eq!(parsed.polymarket.len(), 2);
         assert_eq!(parsed.polymarket[1].manifest_sha256, digest('6'));
+    }
+
+    #[test]
+    fn polymarket_chainlink_baseline_is_explicit_and_forbids_binance_segments() {
+        let parsed = parse_verified_artifact_args(
+            &polymarket_chainlink_baseline_args(),
+            &["BTCUSDT".to_string()],
+        )
+        .unwrap()
+        .expect("explicit Polymarket + Chainlink baseline");
+
+        assert!(parsed.binance.is_empty());
+        assert_eq!(parsed.polymarket.len(), 1);
+
+        let mut mixed = polymarket_chainlink_baseline_args();
+        mixed.extend([
+            "--segment".to_string(),
+            "/cloud/binance/part-1.jsonl.zst".to_string(),
+            "--segment-content-sha256".to_string(),
+            digest('1'),
+            "--segment-manifest-sha256".to_string(),
+            digest('2'),
+        ]);
+        assert!(
+            parse_verified_artifact_args(&mixed, &["BTCUSDT".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be combined")
+        );
     }
 
     #[test]
