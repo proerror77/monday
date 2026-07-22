@@ -175,13 +175,14 @@ impl Contract {
         {
             bail!("contract must define one positive binary UP/DOWN market");
         }
+        // Raw hourly tapes are zero-based. Deserialization still requires both
+        // provenance sequences to be present unsigned integers.
+        let _source_sequences = (raw.discovery_source_sequence, raw.metadata_source_sequence);
         if raw.available_at
             != raw
                 .metadata_retrieved_at
                 .max(raw.discovery_recorded_at)
                 .max(raw.metadata_recorded_at)
-            || raw.discovery_source_sequence == 0
-            || raw.metadata_source_sequence == 0
             || raw.source_datasets != ["crypto_expiry", "crypto_expiry_reference"]
         {
             bail!("contract provenance or availability clock is invalid");
@@ -734,6 +735,50 @@ mod tests {
             verified.settlements()[0].winning_side,
             BinaryOutcomeSide::Up
         );
+    }
+
+    #[test]
+    fn accepts_zero_based_contract_source_sequence() {
+        let mut rows = valid_rows();
+        row(&mut rows, "market_contract", 0)["metadata_source_sequence"] = json!(0);
+
+        verify_rows(&rows).unwrap();
+    }
+
+    #[test]
+    fn accepts_zero_based_discovery_source_sequence() {
+        let mut rows = valid_rows();
+        row(&mut rows, "market_contract", 0)["discovery_source_sequence"] = json!(0);
+
+        verify_rows(&rows).unwrap();
+    }
+
+    #[test]
+    fn zero_based_sequences_do_not_relax_contract_provenance() {
+        let mut rows = valid_rows();
+        let contract = row(&mut rows, "market_contract", 0);
+        contract["metadata_source_sequence"] = json!(0);
+        contract["available_at"] = json!("2026-07-17T05:29:58Z");
+        assert_rejected(&rows, "provenance or availability clock");
+
+        let mut rows = valid_rows();
+        let contract = row(&mut rows, "market_contract", 0);
+        contract["metadata_source_sequence"] = json!(0);
+        contract["source_datasets"] = json!(["crypto_expiry_reference", "crypto_expiry"]);
+        assert_rejected(&rows, "provenance or availability clock");
+
+        for field in ["discovery_source_sequence", "metadata_source_sequence"] {
+            let mut rows = valid_rows();
+            row(&mut rows, "market_contract", 0)
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(verify_rows(&rows).is_err());
+
+            let mut rows = valid_rows();
+            row(&mut rows, "market_contract", 0)[field] = json!("0");
+            assert!(verify_rows(&rows).is_err());
+        }
     }
 
     #[test]
