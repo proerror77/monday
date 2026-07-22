@@ -14,6 +14,33 @@
   another installed skill only when it more directly matches the request or the
   user explicitly asks for that workflow.
 
+## Mandatory Matt Engineering Flow
+
+Every development request must explicitly enter through the appropriate Matt
+Pocock skill before code, deployment configuration, or runtime changes begin.
+Do not treat a long conversation, a TODO list, or a dirty worktree as a
+substitute for a scoped work item.
+
+- For a multi-step or multi-session outcome, first use `to-prd`, then
+  `to-issues`; each issue gets its own branch, change contract, acceptance
+  evidence, and out-of-scope boundary.
+- For an approved issue, use `implement`, which drives `tdd`, then finish with
+  `code-review` before commit or PR.
+- For an incoming report, use `triage`; for a defect or runtime drift, use
+  `diagnosing-bugs` to establish a focused failing proof before proposing a
+  fix.
+- For a small, already-specified behavior change, use `tdd` directly; state
+  why a PRD is unnecessary in the PR description.
+- Before starting a new issue, re-state the current PRD/issue contract and
+  stop if the requested work would add a different behavior, trust domain, or
+  rollout unit. Create or update the relevant issue instead of extending the
+  active one.
+
+For the Polymarket research lane specifically, collector deployment, cohort and
+snapshot construction, evaluator/MCTS execution, and result publication are
+separate issues. A deployment gate must not become an excuse to modify research
+logic, and a research issue must not change a production collector.
+
 ## Karpathy-Inspired Coding Principles
 
 - **Think Before Coding.** State material assumptions explicitly. When ambiguity
@@ -70,6 +97,20 @@ test, not only workspace compilation.
 
 ## Concurrent Work Control
 
+- A section, issue, and PR are one independently mergeable and rollbackable
+  behavior contract unless a declared stacked dependency says otherwise.
+- Before any write for a new contract, create a dedicated worktree under
+  `.worktrees/codex/<slug>` using approved worktree tooling. Use a
+  `codex/<slug>` branch from the declared integration base; record the exact
+  base SHA rather than assuming `main` is the correct base.
+- Before delegation, record the contract, write owner, worktree path, branch,
+  base SHA, allowed files, and declared dependency. Do not share a writable
+  worktree between agents, even when their file lists do not overlap.
+- Store that record in the worktree-private path returned by
+  `git rev-parse --git-path agent-worktree.yml`; it must not be committed or
+  replace the shared policy documents.
+- A worktree status report must distinguish active, dirty, and prunable
+  entries. Removing a worktree or branch requires explicit user authorization.
 - Each branch, worktree, and PR has exactly one write owner at a time. Record
   the owner and current head before delegating; reviewers and researchers are
   read-only unless ownership is explicitly transferred.

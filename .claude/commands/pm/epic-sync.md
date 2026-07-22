@@ -378,20 +378,10 @@ echo "" >> .claude/epics/$ARGUMENTS/github-mapping.md
 echo "Synced: $(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> .claude/epics/$ARGUMENTS/github-mapping.md
 ```
 
-### 7. Create Worktree
+### 7. Hand off ready issues
 
-Follow `/rules/worktree-operations.md` to create development worktree:
-
-```bash
-# Ensure main is current
-git checkout main
-git pull origin main
-
-# Create worktree for epic
-git worktree add ../epic-$ARGUMENTS -b epic/$ARGUMENTS
-
-echo "✅ Created worktree: ../epic-$ARGUMENTS"
-```
+Do not create an epic-wide writable worktree here. Each ready issue creates
+its dedicated worktree through `/rules/worktree-operations.md`.
 
 ### 8. Output
 
@@ -402,7 +392,7 @@ echo "✅ Created worktree: ../epic-$ARGUMENTS"
   - Labels applied: epic, task, epic:{name}
   - Files renamed: 001.md → {issue_id}.md
   - References updated: depends_on/conflicts_with now use issue IDs
-  - Worktree: ../epic-$ARGUMENTS
+  - Worktrees: one dedicated path per ready issue
 
 Next steps:
   - Start parallel execution: /pm:epic-start $ARGUMENTS
