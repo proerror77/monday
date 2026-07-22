@@ -16,9 +16,14 @@ use std::time::{Duration, Instant};
 
 use ploy_research::prediction_llm::OpenAiCompatibleProposalClient;
 use ploy_research::prediction_loop::{
-    current_prediction_policy_snapshot_id, research_brief_snapshot_id, run_or_resume,
-    LoopRunStatus, PredictionEvaluationOutput, PredictionEvaluationRequest, PredictionEvaluator,
-    PredictionResearchMission, ProposalCallOutput, ProposalClient,
+    current_prediction_policy_snapshot_id, prediction_prior_for_blends, research_brief_snapshot_id,
+    run_or_resume, validate_prediction_run_inputs, LoopRunStatus, PredictionEvaluationOutput,
+    PredictionEvaluationRequest, PredictionEvaluator, PredictionResearchMission,
+    ProposalCallOutput, ProposalClient,
+};
+use ploy_research::prediction_mcts::{PredictionMctsCandidate, PredictionMctsEvaluation};
+use ploy_research::prediction_mcts_run::{
+    run_or_resume_prediction_mcts, PredictionMctsRunEvaluator,
 };
 use ploy_research::{
     load_research_snapshot, normalized_underlying_symbol, PredictionResearchFeedback,
@@ -29,7 +34,7 @@ const MAX_EVALUATOR_LOG_BYTES: usize = 16 * 1024 * 1024;
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  monday-prediction-research --print-policy-snapshot-id\n  monday-prediction-research --print-brief-snapshot-id <mission.json>\n  monday-prediction-research <mission.json> <snapshot-dir> <output-dir>"
+        "usage:\n  monday-prediction-research --print-policy-snapshot-id\n  monday-prediction-research --print-brief-snapshot-id <mission.json>\n  monday-prediction-research [--legacy-loop] <mission.json> <snapshot-dir> <output-dir>"
     );
     std::process::exit(2);
 }
@@ -131,6 +136,16 @@ impl RustProcessEvaluator {
                 .arg(&prior.artifact_path)
                 .arg("--alpha-search-output-dir")
                 .arg(request.artifact_dir.join("alpha-search"));
+        }
+        if let Some(candidate_path) = request.training_candidate_json.as_ref() {
+            command
+                .arg("--prediction-mcts-training-candidate-json")
+                .arg(candidate_path);
+        }
+        if let Some(candidate_path) = request.selected_candidate_json.as_ref() {
+            command
+                .arg("--prediction-mcts-selected-candidate-json")
+                .arg(candidate_path);
         }
         Ok(command)
     }
@@ -266,7 +281,9 @@ impl PredictionEvaluator for RustProcessEvaluator {
             );
         }
 
-        let feedback = if request.prior.is_some() {
+        let feedback = if request.training_candidate_json.is_some() {
+            None
+        } else if request.prior.is_some() {
             match read_unique_feedback(&request.artifact_dir) {
                 Ok(feedback) => Some(feedback),
                 Err(reason) => {
@@ -277,6 +294,123 @@ impl PredictionEvaluator for RustProcessEvaluator {
             None
         };
         PredictionEvaluationOutput::success(feedback, stdout, stderr)
+    }
+}
+
+impl PredictionMctsRunEvaluator for RustProcessEvaluator {
+    fn evaluate_baseline(
+        &mut self,
+        mission: &PredictionResearchMission,
+        snapshot_dir: &Path,
+        artifact_dir: &Path,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let output = self.evaluate(
+            &PredictionEvaluationRequest {
+                mission: mission.clone(),
+                snapshot_dir: snapshot_dir.to_path_buf(),
+                artifact_dir: artifact_dir.to_path_buf(),
+                prior: None,
+                training_candidate_json: None,
+                selected_candidate_json: None,
+            },
+            timeout,
+        );
+        match output.outcome {
+            ploy_research::prediction_loop::PredictionEvaluationOutcome::Success {
+                feedback: None,
+            } => Ok(()),
+            ploy_research::prediction_loop::PredictionEvaluationOutcome::Success {
+                feedback: Some(_),
+            } => Err("baseline evaluator unexpectedly returned candidate feedback".to_string()),
+            ploy_research::prediction_loop::PredictionEvaluationOutcome::Failure { reason } => {
+                Err(reason)
+            }
+        }
+    }
+
+    fn evaluate_training(
+        &mut self,
+        mission: &PredictionResearchMission,
+        snapshot_dir: &Path,
+        artifact_dir: &Path,
+        candidate: &PredictionMctsCandidate,
+        timeout: Duration,
+    ) -> Result<PredictionMctsEvaluation, String> {
+        fs::create_dir_all(artifact_dir)
+            .map_err(|error| format!("create MCTS training artifact directory: {error}"))?;
+        let prior = prediction_prior_for_blends(mission, vec![candidate.probability_blend.clone()]);
+        let prior_path = artifact_dir.join("prediction-prior.json");
+        let candidate_path = artifact_dir.join("prediction-mcts-candidate.json");
+        write_json_new(&prior_path, &prior)?;
+        write_json_new(&candidate_path, candidate)?;
+        let output = self.evaluate(
+            &PredictionEvaluationRequest {
+                mission: mission.clone(),
+                snapshot_dir: snapshot_dir.to_path_buf(),
+                artifact_dir: artifact_dir.to_path_buf(),
+                prior: Some(ploy_research::prediction_loop::PredictionEvaluationPrior {
+                    value: prior,
+                    artifact_path: prior_path,
+                }),
+                training_candidate_json: Some(candidate_path),
+                selected_candidate_json: None,
+            },
+            timeout,
+        );
+        match output.outcome {
+            ploy_research::prediction_loop::PredictionEvaluationOutcome::Success {
+                feedback: None,
+            } => read_unique_training_evidence(artifact_dir),
+            ploy_research::prediction_loop::PredictionEvaluationOutcome::Success {
+                feedback: Some(_),
+            } => Err("training evaluator unexpectedly returned held-out feedback".to_string()),
+            ploy_research::prediction_loop::PredictionEvaluationOutcome::Failure { reason } => {
+                Err(reason)
+            }
+        }
+    }
+
+    fn evaluate_selected(
+        &mut self,
+        mission: &PredictionResearchMission,
+        snapshot_dir: &Path,
+        artifact_dir: &Path,
+        candidate: &PredictionMctsCandidate,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        fs::create_dir_all(artifact_dir)
+            .map_err(|error| format!("create selected evaluator directory: {error}"))?;
+        let prior = prediction_prior_for_blends(mission, vec![candidate.probability_blend.clone()]);
+        let prior_path = artifact_dir.join("prediction-prior.json");
+        let candidate_path = artifact_dir.join("prediction-mcts-selected-candidate.json");
+        write_json_new(&prior_path, &prior)?;
+        write_json_new(&candidate_path, candidate)?;
+        let output = self.evaluate(
+            &PredictionEvaluationRequest {
+                mission: mission.clone(),
+                snapshot_dir: snapshot_dir.to_path_buf(),
+                artifact_dir: artifact_dir.to_path_buf(),
+                prior: Some(ploy_research::prediction_loop::PredictionEvaluationPrior {
+                    value: prior,
+                    artifact_path: prior_path,
+                }),
+                training_candidate_json: None,
+                selected_candidate_json: Some(candidate_path),
+            },
+            timeout,
+        );
+        match output.outcome {
+            ploy_research::prediction_loop::PredictionEvaluationOutcome::Success {
+                feedback: Some(_),
+            } => Ok(()),
+            ploy_research::prediction_loop::PredictionEvaluationOutcome::Success {
+                feedback: None,
+            } => Err("selected evaluator emitted no held-out feedback".to_string()),
+            ploy_research::prediction_loop::PredictionEvaluationOutcome::Failure { reason } => {
+                Err(reason)
+            }
+        }
     }
 }
 
@@ -481,6 +615,53 @@ fn write_bounded_output(path: &Path, body: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("write evaluator output {}: {error}", path.display()))
 }
 
+fn write_json_new<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let body = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("serialize {}: {error}", path.display()))?;
+    write_bounded_output(path, &body)
+}
+
+fn read_unique_training_evidence(artifact_dir: &Path) -> Result<PredictionMctsEvaluation, String> {
+    let root = artifact_dir.join("reports");
+    let mut matches = fs::read_dir(&root)
+        .map_err(|error| {
+            format!(
+                "read training evidence directory {}: {error}",
+                root.display()
+            )
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("prediction-mcts-training-evidence-")
+                        && name.ends_with(".json")
+                })
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    let [path] = matches.as_slice() else {
+        return Err(format!(
+            "expected exactly one prediction MCTS training evidence file, found {}",
+            matches.len()
+        ));
+    };
+    let body = fs::read(path)
+        .map_err(|error| format!("read training evidence {}: {error}", path.display()))?;
+    let digest = format!("{:x}", Sha256::digest(&body));
+    if !path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&digest))
+    {
+        return Err("prediction MCTS training evidence is not content-addressed".to_string());
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("parse training evidence {}: {error}", path.display()))
+}
+
 fn read_unique_feedback(artifact_dir: &Path) -> Result<PredictionResearchFeedback, String> {
     let root = artifact_dir
         .join("alpha-search")
@@ -556,27 +737,49 @@ fn main() {
         println!("{}", research_brief_snapshot_id(&mission));
         return;
     }
-    let [mission_path, snapshot_dir, output_dir] = args.as_slice() else {
-        usage();
+    let (legacy_loop, mission_path, snapshot_dir, output_dir) = match args.as_slice() {
+        [mission_path, snapshot_dir, output_dir] => (false, mission_path, snapshot_dir, output_dir),
+        [flag, mission_path, snapshot_dir, output_dir] if flag == "--legacy-loop" => {
+            (true, mission_path, snapshot_dir, output_dir)
+        }
+        _ => usage(),
     };
     let mission: PredictionResearchMission =
         read_json(Path::new(mission_path)).unwrap_or_else(|reason| {
             eprintln!("ERROR: {reason}");
             std::process::exit(2);
         });
+    let snapshot = load_research_snapshot(Path::new(snapshot_dir)).unwrap_or_else(|error| {
+        eprintln!("ERROR: load governed research snapshot: {error:#}");
+        std::process::exit(2);
+    });
+    validate_prediction_run_inputs(&mission, &snapshot).unwrap_or_else(|reason| {
+        eprintln!("ERROR: {reason}");
+        std::process::exit(2);
+    });
     let timeout = Duration::from_secs(mission.search_budget.max_seconds.max(1));
     let mut client = LazyProposalClient::new(timeout);
     let mut evaluator = RustProcessEvaluator::new().unwrap_or_else(|reason| {
         eprintln!("ERROR: {reason}");
         std::process::exit(2);
     });
-    let summary = run_or_resume(
-        mission,
-        Path::new(snapshot_dir),
-        Path::new(output_dir),
-        &mut client,
-        &mut evaluator,
-    )
+    let summary = (if legacy_loop {
+        run_or_resume(
+            mission,
+            Path::new(snapshot_dir),
+            Path::new(output_dir),
+            &mut client,
+            &mut evaluator,
+        )
+    } else {
+        run_or_resume_prediction_mcts(
+            mission,
+            Path::new(snapshot_dir),
+            Path::new(output_dir),
+            &mut client,
+            &mut evaluator,
+        )
+    })
     .unwrap_or_else(|reason| {
         eprintln!("ERROR: {reason}");
         std::process::exit(2);
@@ -679,11 +882,14 @@ mod tests {
         let evaluator = RustProcessEvaluator {
             executable: PathBuf::from("/usr/local/bin/monday-prediction-evaluator"),
         };
+        let candidate_path = root.join("training-candidate.json");
         let request = PredictionEvaluationRequest {
             mission,
             snapshot_dir: snapshot_dir.clone(),
             artifact_dir: root.join("artifacts"),
             prior: None,
+            training_candidate_json: Some(candidate_path.clone()),
+            selected_candidate_json: None,
         };
 
         let command = evaluator
@@ -719,6 +925,27 @@ mod tests {
         assert!(args.windows(2).any(|window| {
             window[0] == "--expected-search-policy-snapshot-id"
                 && window[1] == request.mission.search_policy_snapshot_id
+        }));
+        assert!(args.windows(2).any(|window| {
+            window[0] == "--prediction-mcts-training-candidate-json"
+                && window[1] == candidate_path.to_string_lossy()
+        }));
+        let selected_candidate_path = root.join("selected-candidate.json");
+        let selected_request = PredictionEvaluationRequest {
+            training_candidate_json: None,
+            selected_candidate_json: Some(selected_candidate_path.clone()),
+            ..request
+        };
+        let selected_command = evaluator
+            .command(&selected_request)
+            .expect("build selected evaluator command");
+        let selected_args = selected_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(selected_args.windows(2).any(|window| {
+            window[0] == "--prediction-mcts-selected-candidate-json"
+                && window[1] == selected_candidate_path.to_string_lossy()
         }));
         let _ = std::fs::remove_dir_all(root);
     }

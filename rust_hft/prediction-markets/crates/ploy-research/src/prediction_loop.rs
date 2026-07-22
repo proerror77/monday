@@ -912,6 +912,16 @@ pub fn validate_prediction_snapshot_coverage(
     Ok(())
 }
 
+pub fn validate_prediction_run_inputs(
+    mission: &PredictionResearchMission,
+    snapshot: &ResearchSnapshot,
+) -> Result<(), String> {
+    validate_prediction_mission(mission, &current_prediction_policy_snapshot_id())?;
+    validate_prediction_snapshot_sources(&snapshot.manifest)?;
+    validate_mission_snapshot_binding(mission, &snapshot.manifest)?;
+    validate_prediction_snapshot_coverage(snapshot, mission)
+}
+
 #[derive(Debug, Clone)]
 pub struct ProposalCallOutput {
     /// The assistant's JSON object, before it is trusted or deserialized.
@@ -947,6 +957,8 @@ pub struct PredictionEvaluationRequest {
     pub snapshot_dir: PathBuf,
     pub artifact_dir: PathBuf,
     pub prior: Option<PredictionEvaluationPrior>,
+    pub training_candidate_json: Option<PathBuf>,
+    pub selected_candidate_json: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1244,13 +1256,9 @@ pub fn run_or_resume<C: ProposalClient, E: PredictionEvaluator>(
     let state_path = output_dir.join("prediction-loop-state.json");
     reject_unbound_output_directory(output_dir, &state_path)?;
 
-    let current_policy = current_prediction_policy_snapshot_id();
-    validate_prediction_mission(&mission, &current_policy)?;
     let snapshot = load_research_snapshot(snapshot_dir)
         .map_err(|error| format!("load governed research snapshot: {error:#}"))?;
-    validate_prediction_snapshot_sources(&snapshot.manifest)?;
-    validate_mission_snapshot_binding(&mission, &snapshot.manifest)?;
-    validate_prediction_snapshot_coverage(&snapshot, &mission)?;
+    validate_prediction_run_inputs(&mission, &snapshot)?;
 
     let identity = run_identity(&mission, &snapshot.manifest)?;
     let (mut state, new_state) = if state_path.exists() {
@@ -1335,6 +1343,8 @@ pub fn run_or_resume<C: ProposalClient, E: PredictionEvaluator>(
                     snapshot_dir: snapshot_dir.to_path_buf(),
                     artifact_dir: attempt_dir.clone(),
                     prior: None,
+                    training_candidate_json: None,
+                    selected_candidate_json: None,
                 };
                 let output = evaluator.evaluate(&request, remaining_time(&mission, &state));
                 let evidence = persist_evaluation_output(
@@ -1531,7 +1541,7 @@ pub fn run_or_resume<C: ProposalClient, E: PredictionEvaluator>(
                         continue;
                     }
                 };
-                let prior = mission_prior(&mission, blends);
+                let prior = prediction_prior_for_blends(&mission, blends);
                 validate_prediction_research_prior(&prior).map_err(|reason| {
                     format!("Rust evaluator rejected proposal prior: {reason}")
                 })?;
@@ -1585,6 +1595,8 @@ pub fn run_or_resume<C: ProposalClient, E: PredictionEvaluator>(
                             value: prior.clone(),
                             artifact_path: prior_path,
                         }),
+                        training_candidate_json: None,
+                        selected_candidate_json: None,
                     };
                     let output = evaluator.evaluate(&request, remaining_time(&mission, &state));
                     let evidence = persist_evaluation_output(
@@ -2085,7 +2097,7 @@ fn qualitative_prior_outcomes(state: &PredictionLoopState) -> Vec<serde_json::Va
         .collect()
 }
 
-fn mission_prior(
+pub fn prediction_prior_for_blends(
     mission: &PredictionResearchMission,
     probability_blends: Vec<LlmProbabilityBlendSpec>,
 ) -> LlmPriorSpec {
@@ -2111,7 +2123,7 @@ fn validate_pending_prior(
 ) -> Result<(), String> {
     validate_prediction_research_prior(prior)
         .map_err(|reason| format!("pending prior is invalid: {reason}"))?;
-    let expected = mission_prior(mission, prior.probability_blends.clone());
+    let expected = prediction_prior_for_blends(mission, prior.probability_blends.clone());
     if canonical_json_bytes(prior)? != canonical_json_bytes(&expected)? {
         return Err("pending prior provenance does not exactly match mission".to_string());
     }
@@ -3998,6 +4010,7 @@ mod tests {
         assert!(paths.contains(&"crates/ploy-research/src/verified_artifact_audit.rs"));
         assert!(paths.contains(&"crates/ploy-research/src/verified_binance_projection.rs"));
         assert!(paths.contains(&"crates/ploy-research/src/prediction_mcts.rs"));
+        assert!(paths.contains(&"crates/ploy-research/src/prediction_mcts_run.rs"));
         for path in [
             "crates/ploy-market-data/src/diagnostics.rs",
             "crates/ploy-market-data/src/polymarket_evidence/mod.rs",
