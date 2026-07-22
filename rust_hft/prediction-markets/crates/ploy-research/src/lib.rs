@@ -18,6 +18,7 @@ pub mod polymarket_evidence_projection;
 pub mod prediction_llm;
 pub mod prediction_loop;
 mod prediction_loop_fs;
+pub mod prediction_mcts;
 mod prediction_policy_identity;
 #[cfg(feature = "strategy-runtime")]
 pub mod replay;

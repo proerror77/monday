@@ -1,9 +1,9 @@
 prediction-policy-dependencies.v5
 target=x86_64-unknown-linux-gnu
 profile=default,db
-input:Cargo.lock=sha256:ba50968fdd7546f24a293ea65ddc6ea2e9bfd2dba6cd4fa9772d18a3fcaef77f
+input:Cargo.lock=sha256:c3346b8cd700b030d8f9a106ad7c3b6a8e776b8cdaf8d7aaa10f57b9d83b95ad
 input:Cargo.toml=sha256:fbcd5c33c246ade9700e461e9fd62c1f56f3af262ac67d8206a29b4d0bf626f9
-input:crates/ploy-research/Cargo.toml=sha256:44b2e625ae7d618502bb392a006eee866d066377b312e2dce8924f0095eaed33
+input:crates/ploy-research/Cargo.toml=sha256:0962c6b853e0929ab0fd0c009e03067d235526536559d279817dfa94ac6f4fe6
 input:crates/ploy-feed-loaders/Cargo.toml=sha256:abf8f1b8adec93b1ad84a66294cb58eb65f9cbca33c701cc81c7635eb9b35e2c
 input:crates/ploy-market-contracts/Cargo.toml=sha256:e086ddc8f162ff0abcabe832b1b61549f0daf7e98a78ab96f5512c596c3dc7f0
 input:crates/ploy-market-data/Cargo.toml=sha256:4f3c213c3d8283de4672b7c2de6f9c9c30d12db11bb8460495f5ebf09225b2bd
@@ -69,6 +69,7 @@ package:hft-data@0.1.0|source=path|checksum=none|features=default
 package:hft-instrument@0.1.0|source=path|checksum=none|features=default
 package:hft-integration@0.1.0|source=path|checksum=none|features=default
 package:hft-ports@0.1.0|source=path|checksum=none|features=default
+package:hft-search-kernel@0.1.0|source=path|checksum=none|features=
 package:hft-snapshot@0.1.0|source=path|checksum=none|features=
 package:hkdf@0.12.4|source=registry+https://github.com/rust-lang/crates.io-index|checksum=7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7|features=
 package:hmac@0.12.1|source=registry+https://github.com/rust-lang/crates.io-index|checksum=6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e|features=reset
